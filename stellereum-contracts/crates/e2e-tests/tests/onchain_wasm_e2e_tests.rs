@@ -1,44 +1,56 @@
 //! End-to-End Onchain Integration Tests for Rust-Compiled WASM Contracts in Stellereum VM
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::fs;
-use stellereum::sharding::Transaction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme};
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 
-async fn funded_engine() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+async fn funded_engine() -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
-    let sk = SigningKey::generate(&mut OsRng);
-    let addr = sk.verifying_key().to_bytes();
+    let kp = FalconKeypair::generate();
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &[0u8; 16]);
     engine
         .update_account(AccountState::new(addr, 10_000_000_000_000))
         .await;
-    (engine, sk, addr)
+    (engine, kp, addr)
 }
 
-fn deploy_tx(sk: &SigningKey, nonce: u64, code: Vec<u8>) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        [0u8; 32],
-        0,
-        10_000_000,
+fn sign_pq_tx(kp: &FalconKeypair, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &[0u8; 16]);
+    let mut tx = Transaction {
+        from,
+        to: [0u8; 32],
+        amount: 0,
+        gas_limit: 10_000_000,
         nonce,
-        1,
-        1,
-        vec![OpCode::SysCallDeployContract { code }],
-    )
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = kp.sign(&msg);
+    tx.signature =
+        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, kp.public_key.clone(), sig).encode();
+    tx
 }
 
-fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i64) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        [0u8; 32],
-        0,
-        10_000_000,
+fn deploy_tx(kp: &FalconKeypair, nonce: u64, code: Vec<u8>) -> Transaction {
+    sign_pq_tx(kp, nonce, vec![OpCode::SysCallDeployContract { code }])
+}
+
+fn call_tx(
+    kp: &FalconKeypair,
+    nonce: u64,
+    contract: [u8; 32],
+    method: &str,
+    arg: i64,
+) -> Transaction {
+    sign_pq_tx(
+        kp,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallCallContract {
             contract,
             method: method.as_bytes().to_vec(),

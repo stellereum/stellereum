@@ -50,7 +50,8 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     let t0 = 1_760_000_000u64;
     let p0 = 1_000_000u64;
     assert_eq!(
-        s.commit_feed_pq(&feed_at(&pubk, "STELL", p0, t0), t0).unwrap(),
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p0, t0), t0)
+            .unwrap(),
         p0
     );
     // Same-key walk is capped at 5%/step (O1 fix): +5% commits without latching.
@@ -173,7 +174,9 @@ fn oracle_freshness_monotonicity_peg_and_shape_are_fail_closed() {
     assert!(s.breaker_tripped);
     // Malformed inputs are refused WITHOUT latching (fresh state here).
     let mut s2 = state_with_pq_publisher(&pubk);
-    assert!(s2.commit_feed_pq(&feed_at(&pubk, "STELL", 0, t0), t0).is_err());
+    assert!(s2
+        .commit_feed_pq(&feed_at(&pubk, "STELL", 0, t0), t0)
+        .is_err());
     assert!(s2
         .commit_feed_pq(&feed_at(&pubk, "", 1_000_000, t0), t0)
         .is_err());

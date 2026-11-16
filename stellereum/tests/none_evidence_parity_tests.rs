@@ -27,7 +27,7 @@
 
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
@@ -84,7 +84,13 @@ async fn parked_engines(ks: &[SigningKey], silent: &[u8; 32]) -> Vec<Arc<InMemor
     out
 }
 
-fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
+fn mkblock(
+    pkey: &SigningKey,
+    pfk: &FalconKeypair,
+    h: u64,
+    prev: [u8; 32],
+    root: [u8; 32],
+) -> Block {
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: h,
@@ -104,32 +110,32 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pkey);
+    b.sign_block_with_falcon(pkey, pfk);
     b
 }
 
 /// A genuine 3-of-4 precommit QC over `bh` (the silent validator omitted).
 fn three_of_four_qc(
+    vs: &ValidatorSet,
     ks: &[SigningKey],
     fks: &[FalconKeypair],
     h: u64,
     r: u32,
     bh: [u8; 32],
 ) -> QuorumCertificate {
-    QuorumCertificate {
-        height: h,
-        round: r,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: ks[..3]
-            .iter()
-            .zip(fks[..3].iter())
-            .map(|(k, fk)| {
-                let v = falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+    let mut set = VoteSet::new();
+    for (k, fk) in ks[..3].iter().zip(fks[..3].iter()) {
+        set.add(
+            falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, Some(bh)),
+            vs,
+            h,
+            r,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(bh), vs, &[0u8; 32])
+        .expect("3-of-4 reaches quorum")
 }
 
 #[tokio::test]
@@ -147,14 +153,13 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
     );
 
     let root0 = st_live.get_state_root().await;
-    let pkey = vs
+    let p_idx = vs
         .proposer_for(1, 0)
-        .and_then(|want| ks.iter().find(|k| k.verifying_key().to_bytes() == want))
-        .cloned()
+        .and_then(|want| ks.iter().position(|k| k.verifying_key().to_bytes() == want))
         .expect("schedule proposer is one of our keys");
-    let block = mkblock(&pkey, 1, [0u8; 32], root0);
+    let block = mkblock(&ks[p_idx], &fks[p_idx], 1, [0u8; 32], root0);
     let bh = block.compute_hash();
-    let qc = three_of_four_qc(&ks, &fks, 1, 0, bh);
+    let qc = three_of_four_qc(&vs, &ks, &fks, 1, 0, bh);
     assert!(
         qc.verify(&vs),
         "precondition: 3-of-4 certificate is genuine"
@@ -163,10 +168,24 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
     // ---- Route LIVE: local finalize. ----
     let mut live = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_live.clone(), 1);
     for (k, fk) in ks[..3].iter().zip(fks[..3].iter()) {
-        live.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
-            .expect("prevote accepted");
-        live.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
-            .expect("precommit accepted");
+        live.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .expect("prevote accepted");
+        live.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(live.hc.try_precommit_quorum(), Some(bh));
     live.blocks.insert(bh, {

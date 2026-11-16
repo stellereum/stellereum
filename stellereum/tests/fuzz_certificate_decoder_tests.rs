@@ -18,8 +18,8 @@
 //! `tests/fuzz_decoder_tests.rs` uses.
 
 use stellereum::consensus::{
-    decode_pq_epoch_envelope, decode_pq_micro_envelope,
-    encode_pq_epoch_envelope, encode_pq_micro_envelope,
+    decode_pq_epoch_envelope, decode_pq_micro_envelope, encode_pq_epoch_envelope,
+    encode_pq_micro_envelope,
 };
 use stellereum::evm_adapter::{decode_raw_transaction, DecodedTransaction, RlpItem};
 

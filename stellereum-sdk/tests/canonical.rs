@@ -69,7 +69,18 @@ fn transfer_is_live_with_intended_fields() {
         .nonce(5)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to, amount: 1_000, gas: GAS_BASIC_TRANSFER, nonce: 5, payload: vec![] }, "transfer");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to,
+            amount: 1_000,
+            gas: GAS_BASIC_TRANSFER,
+            nonce: 5,
+            payload: vec![],
+        },
+        "transfer",
+    );
     assert!(sdk.is_bound() && sdk.chain_id() == Some(CHAIN));
 }
 
@@ -88,7 +99,18 @@ fn token_transfer_is_live_with_intended_fields() {
         .nonce(7)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 7, payload: vec![op] }, "token_transfer");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 7,
+            payload: vec![op],
+        },
+        "token_transfer",
+    );
 }
 
 #[test]
@@ -103,7 +125,18 @@ fn token_approve_and_transfer_from_are_live() {
     let sdk = TxBuilder::token_approve(token, spender, 500)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 0, payload: vec![op] }, "token_approve");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 0,
+            payload: vec![op],
+        },
+        "token_approve",
+    );
 
     let from = [0x44u8; 32];
     let to = [0x55u8; 32];
@@ -116,7 +149,18 @@ fn token_approve_and_transfer_from_are_live() {
     let sdk2 = TxBuilder::token_transfer_from(token, from, to, 100)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk2, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op2), nonce: 0, payload: vec![op2] }, "token_transfer_from");
+    assert_live(
+        &sdk2,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op2),
+            nonce: 0,
+            payload: vec![op2],
+        },
+        "token_transfer_from",
+    );
 }
 
 // --- shape 3: staking -------------------------------------------------------
@@ -133,7 +177,18 @@ fn stake_bond_delegate_undelegate_are_live() {
         .nonce(1)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 1, payload: vec![op] }, "stake_bond");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 1,
+            payload: vec![op],
+        },
+        "stake_bond",
+    );
 
     let op = OpCode::SysCallDelegate {
         validator: val,
@@ -143,7 +198,18 @@ fn stake_bond_delegate_undelegate_are_live() {
         .nonce(2)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 2, payload: vec![op] }, "delegate");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 2,
+            payload: vec![op],
+        },
+        "delegate",
+    );
 
     let op = OpCode::SysCallBeginUndelegate {
         validator: val,
@@ -153,14 +219,36 @@ fn stake_bond_delegate_undelegate_are_live() {
         .nonce(3)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 3, payload: vec![op] }, "begin_undelegate");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 3,
+            payload: vec![op],
+        },
+        "begin_undelegate",
+    );
 
     let op = OpCode::SysCallUndelegate { validator: val };
     let sdk = TxBuilder::undelegate_withdraw(val)
         .nonce(4)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 4, payload: vec![op] }, "undelegate_withdraw");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 4,
+            payload: vec![op],
+        },
+        "undelegate_withdraw",
+    );
 }
 
 // --- shape 4: contract deploy -----------------------------------------------
@@ -173,7 +261,18 @@ fn contract_deploy_is_live_and_address_uses_node_function() {
         .nonce(9)
         .sign(&hybrid_key())
         .unwrap();
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 9, payload: vec![op] }, "contract_deploy");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: hybrid_addr(),
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 9,
+            payload: vec![op],
+        },
+        "contract_deploy",
+    );
 
     // The SDK predicts the deploy address with the node's own function
     // (imported, not reimplemented): sender + sender-nonce.
@@ -227,7 +326,18 @@ fn contract_call_is_live_with_abi_calldata() {
         args: scalars,
         calldata: calldata.clone(),
     };
-    assert_live(&sdk, &Expect { from: hybrid_addr(), to: contract, amount: 0, gas: opcode_gas(&op), nonce: 3, payload: vec![op] }, "contract_call");
+    assert_live(
+        &sdk,
+        &Expect {
+            from: hybrid_addr(),
+            to: contract,
+            amount: 0,
+            gas: opcode_gas(&op),
+            nonce: 3,
+            payload: vec![op],
+        },
+        "contract_call",
+    );
 
     // The calldata on the wire IS the ABI encoding.
     match &sdk.as_node_tx().payload[0] {
@@ -259,7 +369,9 @@ fn bound_by_default_and_unbound_escape_warns() {
             "bound PQ tx must pass the strict chain check"
         );
         assert!(
-            !signed.as_node_tx().verify_signature_for_chain(CHAIN + 1, true),
+            !signed
+                .as_node_tx()
+                .verify_signature_for_chain(CHAIN + 1, true),
             "wrong chain must fail the strict chain check"
         );
     }
@@ -286,7 +398,9 @@ fn bound_by_default_and_unbound_escape_warns() {
 
 #[test]
 fn fee_estimate_params_match_node_expectation() {
-    let sdk = TxBuilder::transfer([9u8; 32], 42).sign(&hybrid_key()).unwrap();
+    let sdk = TxBuilder::transfer([9u8; 32], 42)
+        .sign(&hybrid_key())
+        .unwrap();
     let params = sdk.fee_estimate_params();
     // Exactly {"tx": "<hex>"}: the raw-transaction arm of handle_estimate_fee
     // (src/rpc.rs) reads params["tx"] as a string, hex-decodes it and

@@ -250,7 +250,9 @@ async fn budget_revoked_key_reports_revoked() {
     // the master's own Falcon-signed chain-bound transaction.
     let revoke = master_payload_tx(
         &master,
-        vec![stellereum::svm::OpCode::SysCallRevokeSession { session_pubkey: session_pub }],
+        vec![stellereum::svm::OpCode::SysCallRevokeSession {
+            session_pubkey: session_pub,
+        }],
         50_000,
         1,
     );
@@ -311,17 +313,7 @@ async fn ed25519_grants_stay_refused_end_to_end() {
         "Ed grant must stay invalid at any time"
     );
 
-    let tx = Transaction::sign_with_session(
-        &session,
-        grant,
-        [9u8; 32],
-        10,
-        100,
-        0,
-        1,
-        1,
-        vec![],
-    );
+    let tx = Transaction::sign_with_session(&session, grant, [9u8; 32], 10, 100, 0, 1, 1, vec![]);
     assert!(tx.is_session_keyed());
     assert!(
         !tx.verify_signature(),
@@ -333,10 +325,7 @@ async fn ed25519_grants_stay_refused_end_to_end() {
         "Ed grant must fail the stateless policy as BadGrant"
     );
     assert!(
-        st.engine
-            .apply_transaction(&tx, now_secs())
-            .await
-            .is_err(),
+        st.engine.apply_transaction(&tx, now_secs()).await.is_err(),
         "Ed session transaction must never apply"
     );
 }

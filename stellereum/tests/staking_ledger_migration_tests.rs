@@ -91,7 +91,7 @@ fn current_shape_still_decodes_directly() {
 /// Truly corrupt bytes are still refused fail-closed.
 #[test]
 fn v7_pre_jail_trio_bytes_decode_with_empty_new_maps() {
-    use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER, StakingLedger};
+    use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
     use stellereum::storage::{DomainSnapshotV7, StakingLedgerV4};
 
     // A live ledger in the V7-era shape: bonded, delegated, and carrying

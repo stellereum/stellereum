@@ -21,8 +21,11 @@
 
 use ed25519_dalek::SigningKey;
 
-use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
-use stellereum::sharding::Transaction;
+use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError, PQ_ACTIVATION_SURCHARGE_GAS};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
+use stellereum::sharding::{PqSignatureEnvelope, SponsorPolicyError, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 
@@ -35,15 +38,26 @@ const CHAIN_ID: u64 = 5757;
 /// declared limit is what execution charges (governed floor is 0 on a fresh
 /// engine).
 const GAS_LIMIT: u64 = 300_000;
+/// Explicit PQ1 activation inner adds `PQ_ACTIVATION_SURCHARGE_GAS` (45_000)
+/// to the fee charged by mempool, proposer, and execution.
+const EXPECTED_SPONSORED_FEE: u64 = GAS_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS;
 /// Far-future grant expiry for tests that are not about expiry.
 const NO_EXPIRY: u64 = u64::MAX;
 
-fn key(seed: u8) -> SigningKey {
+fn ed_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+fn falcon_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
 fn addr_of(seed: u8) -> [u8; 32] {
-    key(seed).verifying_key().to_bytes()
+    derive_pq_address(
+        PqScheme::Falcon512,
+        falcon_key(seed).public_key(),
+        &DEFAULT_SALT,
+    )
 }
 
 /// A sponsored transaction from `user` (nonce `n`) moving `amount` to `to`,
@@ -61,9 +75,9 @@ fn sponsored_tx(
     allowlist: Vec<[u8; 32]>,
     payload: Vec<OpCode>,
 ) -> Transaction {
-    Transaction::sign_with_sponsor(
-        &key(user),
-        &key(sponsor),
+    Transaction::sign_with_sponsor_falcon512(
+        &falcon_key(user),
+        &falcon_key(sponsor),
         to,
         amount,
         gas_limit,
@@ -144,14 +158,17 @@ async fn sponsored_success_sponsor_pays_fee_user_pays_value() {
         .await;
     assert_eq!((applied, failed), (1, 0));
     assert_eq!(status, vec![true]);
-    assert_eq!(fees, GAS_LIMIT);
-    assert_eq!(tx_fees, vec![GAS_LIMIT]);
+    assert_eq!(fees, EXPECTED_SPONSORED_FEE);
+    assert_eq!(tx_fees, vec![EXPECTED_SPONSORED_FEE]);
 
     // The USER paid VALUE only: amount out, fee untouched.
     assert_eq!(balance_of(&engine, &user).await, 10_000_000 - 1_000_000);
     assert_eq!(nonce_of(&engine, &user).await, 1);
     // The SPONSOR paid FEE only: fee out, nonce untouched, no value moved.
-    assert_eq!(balance_of(&engine, &sponsor).await, 5_000_000 - GAS_LIMIT);
+    assert_eq!(
+        balance_of(&engine, &sponsor).await,
+        5_000_000 - EXPECTED_SPONSORED_FEE
+    );
     assert_eq!(nonce_of(&engine, &sponsor).await, sponsor_nonce_before);
     // The recipient got the value.
     assert_eq!(balance_of(&engine, &recipient).await, 1_000_000);
@@ -161,7 +178,10 @@ async fn sponsored_success_sponsor_pays_fee_user_pays_value() {
     engine2.apply_transaction(&tx, 0).await.expect("applies");
     assert_eq!(balance_of(&engine2, &user2).await, 10_000_000 - 1_000_000);
     assert_eq!(nonce_of(&engine2, &user2).await, 1);
-    assert_eq!(balance_of(&engine2, &sponsor2).await, 5_000_000 - GAS_LIMIT);
+    assert_eq!(
+        balance_of(&engine2, &sponsor2).await,
+        5_000_000 - EXPECTED_SPONSORED_FEE
+    );
     assert_eq!(nonce_of(&engine2, &sponsor2).await, 0);
 }
 
@@ -197,14 +217,17 @@ async fn sponsored_failure_sponsor_pays_fee_user_nonce_advances() {
         .await;
     assert_eq!((applied, failed), (0, 1));
     assert_eq!(status, vec![false]);
-    assert_eq!(fees, GAS_LIMIT, "the failure fee is collected");
-    assert_eq!(tx_fees, vec![GAS_LIMIT]);
+    assert_eq!(fees, EXPECTED_SPONSORED_FEE, "the failure fee is collected");
+    assert_eq!(tx_fees, vec![EXPECTED_SPONSORED_FEE]);
 
     // The USER paid NOTHING but its nonce advanced (anti-replay).
     assert_eq!(balance_of(&engine, &user).await, 50_000);
     assert_eq!(nonce_of(&engine, &user).await, 1);
     // The SPONSOR paid the failure fee; its nonce is untouched.
-    assert_eq!(balance_of(&engine, &sponsor).await, 5_000_000 - GAS_LIMIT);
+    assert_eq!(
+        balance_of(&engine, &sponsor).await,
+        5_000_000 - EXPECTED_SPONSORED_FEE
+    );
     assert_eq!(nonce_of(&engine, &sponsor).await, 0);
     // No value moved anywhere.
     assert_eq!(balance_of(&engine, &sink).await, 0);
@@ -214,7 +237,10 @@ async fn sponsored_failure_sponsor_pays_fee_user_nonce_advances() {
     assert!(engine2.apply_transaction(&tx, 0).await.is_err());
     assert_eq!(balance_of(&engine2, &user2).await, 50_000);
     assert_eq!(nonce_of(&engine2, &user2).await, 1);
-    assert_eq!(balance_of(&engine2, &sponsor2).await, 5_000_000 - GAS_LIMIT);
+    assert_eq!(
+        balance_of(&engine2, &sponsor2).await,
+        5_000_000 - EXPECTED_SPONSORED_FEE
+    );
 }
 
 // ===========================================================================
@@ -235,12 +261,17 @@ async fn sponsored_bad_sponsor_signature_refused_by_name() {
         vec![],
         vec![],
     );
-    // Tamper a byte INSIDE `sponsor_sig` (the last 64 bytes of the auth
-    // body): the envelope still parses, but the sponsor signature no longer
-    // verifies — BOTH signatures are required, so the whole transaction is
-    // refused by name.
-    let len = tx.signature.len();
-    tx.signature[len - 20] ^= 0xFF;
+    // Tamper a byte INSIDE `sponsor_sig`: the envelope still parses, but the
+    // sponsor signature no longer verifies — BOTH signatures are required, so
+    // the whole transaction is refused by name.
+    let auth = tx.sponsor_auth().expect("sponsor auth parses");
+    assert_eq!(auth.sponsor_sig.len(), FALCON512_SIG_LEN);
+    let sig_pos = tx
+        .signature
+        .windows(auth.sponsor_sig.len())
+        .rposition(|w| w == auth.sponsor_sig.as_slice())
+        .expect("sponsor_sig bytes present in envelope");
+    tx.signature[sig_pos + 10] ^= 0xFF;
     assert!(!tx.sponsor_malformed(), "the envelope still parses");
     assert!(
         !tx.verify_signature(),
@@ -432,11 +463,11 @@ async fn self_sponsored_routes_as_plain() {
         .apply_block_parallel_fees(std::slice::from_ref(&tx), 0)
         .await;
     assert_eq!((applied, failed), (1, 0));
-    assert_eq!(fees, GAS_LIMIT);
-    // The user paid amount + fee, exactly like a legacy transaction.
+    assert_eq!(fees, EXPECTED_SPONSORED_FEE);
+    // The user paid amount + fee, exactly like a plain activation transaction.
     assert_eq!(
         balance_of(&engine, &user).await,
-        10_000_000 - 1_000_000 - GAS_LIMIT
+        10_000_000 - 1_000_000 - EXPECTED_SPONSORED_FEE
     );
     assert_eq!(nonce_of(&engine, &user).await, 1);
 
@@ -457,7 +488,7 @@ const LEGACY_TX_BYTES_HEX: &str = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016
 const LEGACY_TX_HASH_HEX: &str = "a9e7adc5eafa2d585e0294ccb9030812c9d4f550ce2789178f8b0c21ae959232";
 
 fn legacy_tx() -> Transaction {
-    Transaction::sign(&key(0x11), [0x22; 32], 1_000, GAS_LIMIT, 7, 1, 1)
+    Transaction::sign(&ed_key(0x11), [0x22; 32], 1_000, GAS_LIMIT, 7, 1, 1)
 }
 
 #[test]
@@ -504,7 +535,10 @@ fn sponsored_envelope_changes_bytes_and_hash_but_not_legacy() {
     // unaffected by the existence of the sponsor machinery.
     assert_ne!(sponsored.compute_tx_hash(), legacy_tx().compute_tx_hash());
     assert!(sponsored.verify_signature());
-    assert!(legacy_tx().verify_signature());
+    assert!(
+        !legacy_tx().verify_signature(),
+        "classical legacy tx is refused under Pure PQ"
+    );
 }
 
 // ===========================================================================
@@ -543,11 +577,11 @@ async fn sponsor_drain_via_victim_failures_is_capped() {
     assert_eq!((applied, failed), (0, 3));
     assert_eq!(status, vec![false; 3]);
     // Each failure cost EXACTLY the failure fee (<= cap), nonces advanced.
-    assert_eq!(fees, 3 * GAS_LIMIT);
-    assert!(3 * GAS_LIMIT <= 3 * cap);
+    assert_eq!(fees, 3 * EXPECTED_SPONSORED_FEE);
+    assert!(3 * EXPECTED_SPONSORED_FEE <= 3 * cap);
     assert_eq!(
         balance_of(&engine, &sponsor).await,
-        10_000_000 - 3 * GAS_LIMIT
+        10_000_000 - 3 * EXPECTED_SPONSORED_FEE
     );
     assert_eq!(
         nonce_of(&engine, &user).await,
@@ -669,7 +703,7 @@ async fn mid_mempool_spend_down_is_re_refused() {
 /// the joint reservation: the first admits, the second is refused.
 #[tokio::test]
 async fn joint_reservation_stops_unforeseen_block_overspend() {
-    // Sponsor holds 500_000: one 300_000 fee fits, two do not.
+    // Sponsor holds 500_000: one 345_000 fee fits, two (690_000) do not.
     let tx0 = sponsored_tx(
         0xD4,
         0xE4,
@@ -703,7 +737,7 @@ async fn joint_reservation_stops_unforeseen_block_overspend() {
     );
     // The user leg is reserved separately: the user still only needs `amount`.
     assert_eq!(pool.reserved_for(&addr_of(0xD4)), 0);
-    assert_eq!(pool.reserved_for(&addr_of(0xE4)), GAS_LIMIT);
+    assert_eq!(pool.reserved_for(&addr_of(0xE4)), EXPECTED_SPONSORED_FEE);
 }
 
 /// A failing transaction whose fee the sponsor CANNOT cover moves NOTHING
@@ -779,14 +813,14 @@ async fn malformed_sponsor_suffix_refused_by_name() {
 }
 
 /// A priority bid composes with the sponsor envelope: the bid binds both
-/// signatures and the fee math, while the inner signature stays 64 bytes
-/// in memory (the priority envelope is a wire-time encoding applied by the
-/// custom `Serialize` impl, stripped back at parse time).
+/// signatures and the fee math, while the inner signature stays a valid
+/// PQ1 envelope in memory (the priority envelope is a wire-time encoding
+/// applied by the custom `Serialize` impl, stripped back at parse time).
 #[tokio::test]
 async fn sponsored_priority_bid_composes() {
-    let tx = Transaction::sign_with_sponsor(
-        &key(0xA1),
-        &key(0xB1),
+    let tx = Transaction::sign_with_sponsor_falcon512(
+        &falcon_key(0xA1),
+        &falcon_key(0xB1),
         [0xC1; 32],
         100,
         GAS_LIMIT,
@@ -801,10 +835,9 @@ async fn sponsored_priority_bid_composes() {
         CHAIN_ID,
     );
     assert_eq!(tx.priority_fee_per_gas, 50_000);
-    assert_eq!(
-        tx.sponsor_inner_sig().len(),
-        64,
-        "v1 inner shape holds with a bid"
+    assert!(
+        tx.has_pq_sponsor_inner(),
+        "v2 PQ1 inner shape holds with a bid"
     );
     assert!(tx.verify_signature());
 
@@ -815,7 +848,7 @@ async fn sponsored_priority_bid_composes() {
     assert!(back.verify_signature());
     assert_eq!(back.sponsored_grant().unwrap().max_fee_per_tx, 1_000_000);
 
-    // Admission and execution accept it; the fee is the declared gas.
+    // Admission and execution accept it; the fee is declared gas + PQ activation surcharge.
     let mut pool = Mempool::new(100, 100);
     admit_sponsored(&mut pool, back.clone(), 1_000_000, 5_000_000, 0)
         .expect("priority sponsored admits");
@@ -824,9 +857,12 @@ async fn sponsored_priority_bid_composes() {
         .apply_block_parallel_fees(std::slice::from_ref(&back), 0)
         .await;
     assert_eq!((applied, failed), (1, 0));
-    assert_eq!(fees, GAS_LIMIT);
+    assert_eq!(fees, EXPECTED_SPONSORED_FEE);
     assert_eq!(balance_of(&engine, &user).await, 1_000_000 - 100);
-    assert_eq!(balance_of(&engine, &sponsor).await, 5_000_000 - GAS_LIMIT);
+    assert_eq!(
+        balance_of(&engine, &sponsor).await,
+        5_000_000 - EXPECTED_SPONSORED_FEE
+    );
 }
 
 #[tokio::test]
@@ -853,4 +889,205 @@ async fn sponsor_with_wrong_chain_id_refused_at_apply() {
     let foreign = engine.with_chain_id(9999);
     assert!(foreign.apply_transaction(&tx, 0).await.is_err());
     let _ = (user, sponsor);
+}
+
+// ===========================================================================
+// 8. FULL-PQ Paymaster v2 enforcement: classical Ed25519 refused, batch
+//    verification passes PQ1+SP1, unactivated implicit PQ1+SP1 refused.
+// ===========================================================================
+
+#[tokio::test]
+async fn classical_ed25519_sign_with_sponsor_refused_under_pure_pq() {
+    let user_ed = ed_key(0xA1);
+    let sponsor_ed = ed_key(0xB1);
+    let ed_tx = Transaction::sign_with_sponsor(
+        &user_ed,
+        &sponsor_ed,
+        [0xC1; 32],
+        100,
+        GAS_LIMIT,
+        0,
+        1,
+        1,
+        vec![],
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        CHAIN_ID,
+    );
+    assert!(ed_tx.is_sponsored());
+    assert!(!ed_tx.sponsor_malformed());
+    assert!(!ed_tx.has_pq_sponsor_inner());
+    assert!(
+        !ed_tx.verify_signature(),
+        "classical Ed25519 sign_with_sponsor must fail verify_signature under Pure PQ"
+    );
+    assert!(
+        !Transaction::verify_signatures_batch(std::slice::from_ref(&ed_tx)),
+        "classical Ed25519 sign_with_sponsor must fail batch verify under Pure PQ"
+    );
+    assert_eq!(
+        Transaction::verify_signatures_partitioned(std::slice::from_ref(&ed_tx)),
+        vec![false]
+    );
+    assert_eq!(
+        ed_tx.check_sponsor_policy(0, GAS_LIMIT),
+        Err(SponsorPolicyError::BadGrant)
+    );
+
+    let mut pool = Mempool::new(100, 100);
+    assert!(
+        matches!(
+            admit_sponsored(&mut pool, ed_tx.clone(), 1_000_000, 5_000_000, 0),
+            Err(MempoolError::Malformed(_))
+        ),
+        "mempool must refuse classical Ed25519 sign_with_sponsor under Pure PQ"
+    );
+
+    let engine = InMemoryStateEngine::new();
+    engine
+        .update_account(AccountState::new(
+            user_ed.verifying_key().to_bytes(),
+            1_000_000,
+        ))
+        .await;
+    engine
+        .update_account(AccountState::new(
+            sponsor_ed.verifying_key().to_bytes(),
+            5_000_000,
+        ))
+        .await;
+    assert!(
+        engine.apply_transaction(&ed_tx, 0).await.is_err(),
+        "state engine must refuse classical Ed25519 sign_with_sponsor under Pure PQ"
+    );
+    let (applied, failed, fees, _, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&ed_tx), 0)
+        .await;
+    assert_eq!((applied, failed, fees), (0, 1, 0));
+}
+
+#[test]
+fn pq1_inner_with_classical_ed25519_sponsor_sig_fails_sponsor_bad_signature() {
+    // Construct a hybrid transaction: valid Falcon-512 PQ1 user inner, paired
+    // with a 64-byte classical Ed25519 SP1 suffix (from `sign_with_sponsor`).
+    let pq_tx = sponsored_tx(
+        0xA2,
+        0xB2,
+        [0xC2; 32],
+        100,
+        GAS_LIMIT,
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        vec![],
+    );
+    let ed_tx = Transaction::sign_with_sponsor(
+        &ed_key(0xA2),
+        &ed_key(0xB2),
+        [0xC2; 32],
+        100,
+        GAS_LIMIT,
+        0,
+        1,
+        1,
+        vec![],
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        CHAIN_ID,
+    );
+    let (ed_inner_len, _, _) = Transaction::split_sponsor_envelope(&ed_tx.signature);
+    let ed_suffix = &ed_tx.signature[ed_inner_len..];
+
+    let mut hybrid = pq_tx.clone();
+    let mut sig = pq_tx.sponsor_inner_sig().to_vec();
+    sig.extend_from_slice(ed_suffix);
+    hybrid.signature = sig;
+
+    assert!(
+        !hybrid.sponsor_malformed(),
+        "64-byte sponsor_sig parses cleanly so it fails as SponsorBadSignature"
+    );
+    assert!(hybrid.has_pq_sponsor_inner());
+    assert!(!hybrid.verify_signature());
+
+    let mut pool = Mempool::new(100, 100);
+    assert_eq!(
+        admit_sponsored(&mut pool, hybrid, 1_000_000, 5_000_000, 0),
+        Err(MempoolError::SponsorBadSignature)
+    );
+}
+
+#[test]
+fn batch_and_partitioned_verify_accept_valid_pq_sponsored_txs() {
+    let tx0 = sponsored_tx(
+        0xA1,
+        0xB1,
+        [0xC1; 32],
+        100,
+        GAS_LIMIT,
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        vec![],
+    );
+    let tx1 = sponsored_tx(
+        0xA2,
+        0xB2,
+        [0xC2; 32],
+        200,
+        GAS_LIMIT,
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        vec![],
+    );
+    let txs = vec![tx0, tx1];
+    assert!(Transaction::verify_signatures_batch(&txs));
+    assert!(Transaction::verify_signatures_batch_parallel(&txs));
+    assert_eq!(
+        Transaction::verify_signatures_partitioned(&txs),
+        vec![true, true]
+    );
+}
+
+#[test]
+fn unactivated_implicit_pq_sponsored_tx_refused_before_activation_buffer() {
+    let pq_tx = sponsored_tx(
+        0xA7,
+        0xB7,
+        [0xC7; 32],
+        100,
+        GAS_LIMIT,
+        0,
+        1_000_000,
+        NO_EXPIRY,
+        vec![],
+        vec![],
+    );
+    let (_inner_len, _, _) = Transaction::split_sponsor_envelope(&pq_tx.signature);
+    let inner_env = pq_tx.pq_envelope().expect("pq inner");
+    let implicit_inner =
+        PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, inner_env.signature_bytes).encode();
+    let suffix = &pq_tx.signature[pq_tx.sponsor_inner_sig().len()..];
+
+    let mut implicit_sponsored = pq_tx.clone();
+    let mut sig = implicit_inner;
+    sig.extend_from_slice(suffix);
+    implicit_sponsored.signature = sig;
+
+    assert!(implicit_sponsored.is_pq_implicit());
+    assert!(implicit_sponsored.sponsored_grant().is_some());
+
+    let mut pool = Mempool::new(100, 100);
+    assert_eq!(
+        admit_sponsored(&mut pool, implicit_sponsored, 1_000_000, 5_000_000, 0),
+        Err(MempoolError::SponsorBadGrant)
+    );
 }

@@ -18,8 +18,9 @@ use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 
-use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
-use stellereum::mempool::Mempool;
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet};
+use stellereum::mempool::{Mempool, PQ_ACTIVATION_SURCHARGE_GAS};
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::runtime::{ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -31,11 +32,18 @@ const BAL: u64 = 1_000_000_000_000;
 const RECIPIENT: [u8; 32] = [9u8; 32];
 const REPS: usize = 5;
 const SNAPSHOT_INTERVAL: u64 = 50;
+const PQ_GAS: u64 = GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS;
 
 fn det_key(i: u64) -> SigningKey {
     let mut seed = [0xA5u8; 32];
     seed[..8].copy_from_slice(&i.to_le_bytes());
     SigningKey::from_bytes(&seed)
+}
+
+fn pq_seed(i: u64) -> [u8; 32] {
+    let mut seed = [0x51u8; 32];
+    seed[..8].copy_from_slice(&i.to_le_bytes());
+    seed
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -59,17 +67,39 @@ fn build_txs(n: usize) -> (Vec<Transaction>, Vec<[u8; 32]>) {
     let mut txs = Vec::with_capacity(n);
     let mut senders = Vec::with_capacity(n);
     for i in 0..n as u64 {
-        let sk = det_key(1000 + i);
-        senders.push(sk.verifying_key().to_bytes());
-        txs.push(Transaction::sign(
-            &sk,
+        let kp = FalconKeypair::generate_from_seed_bytes(&pq_seed(50_000 + i));
+        let pk = kp.public_key.clone();
+        let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        let skeleton = Transaction {
+            from,
+            to: RECIPIENT,
+            amount: 1,
+            gas_limit: PQ_GAS,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = skeleton.signing_message();
+        let sig = kp.sign_with_seed(&msg, &pq_seed(90_000 + i));
+        let tx = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            pk,
+            sig,
             RECIPIENT,
             1,
-            GAS_BASIC_TRANSFER,
+            PQ_GAS,
             0,
             1,
             1,
-        ));
+            Vec::new(),
+            &DEFAULT_SALT,
+        );
+        assert!(tx.verify_signature());
+        senders.push(from);
+        txs.push(tx);
     }
     (txs, senders)
 }
@@ -145,15 +175,30 @@ fn bench_row(n: usize) {
         }
 
         let vkeys: Vec<SigningKey> = (0..4u64).map(|i| det_key(800_000 + i)).collect();
-        let vids: Vec<[u8; 32]> =
-            vkeys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let fkeys: Vec<FalconKeypair> = (0..4u64)
+            .map(|i| FalconKeypair::generate_from_seed_bytes(&pq_seed(800_000 + i)))
+            .collect();
+        let vids: Vec<[u8; 32]> = vkeys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        for i in 0..4 {
+            register_validator_pq_key(vids[i], PqScheme::Falcon512, fkeys[i].public_key.clone());
+        }
         let vs = ValidatorSet::from_list(vids.iter().map(|id| (*id, 1)).collect());
         let mut qc_asm = Vec::with_capacity(REPS);
         let mut qc_ver = Vec::with_capacity(REPS);
         for r in 0..REPS {
             let votes: Vec<Vote> = vkeys
                 .iter()
-                .map(|k| Vote::sign(k, 1, r as u32, VoteKind::Precommit, Some(block_hash)))
+                .zip(fkeys.iter())
+                .map(|(k, fk)| {
+                    Vote::sign_with_falcon(
+                        k,
+                        fk,
+                        1,
+                        r as u32,
+                        VoteKind::Precommit,
+                        Some(block_hash),
+                    )
+                })
                 .collect();
             let t = Instant::now();
             let mut set = VoteSet::new();
@@ -185,8 +230,7 @@ fn bench_row(n: usize) {
             apply.push(d);
         }
 
-        let dir = std::env::temp_dir()
-            .join(format!("stell_bench_cpu_{n}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("stell_bench_cpu_{n}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Storage::open(&dir).expect("temp storage opens");
         let mut commit = Vec::with_capacity(REPS);
@@ -219,8 +263,14 @@ fn bench_row(n: usize) {
             median(apply),
             median(commit),
         );
-        let total =
-            select_ms + propose_ms + intake_ms + qc_asm_ms + qc_ver_ms + apply_ms + commit_ms + snap_each;
+        let total = select_ms
+            + propose_ms
+            + intake_ms
+            + qc_asm_ms
+            + qc_ver_ms
+            + apply_ms
+            + commit_ms
+            + snap_each;
         println!(
             "[bench][cpu-budget] n={n:>4} select={select_ms:8.2}ms propose={propose_ms:8.2}ms intake={intake_ms:8.2}ms qc_asm={qc_asm_ms:8.2}ms qc_ver={qc_ver_ms:8.2}ms apply={apply_ms:8.2}ms commit={commit_ms:8.2}ms snap/50={snap_each:8.2}ms TOTAL={total:8.2}ms (median-of-5)"
         );

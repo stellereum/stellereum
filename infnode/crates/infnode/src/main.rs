@@ -317,7 +317,15 @@ enum Cmd {
     },
 }
 
-fn load(cfg: &Path) -> Result<(NodeConfig, NodeKeys, infnode::keyring::PqKeys, PathBuf, PathBuf)> {
+fn load(
+    cfg: &Path,
+) -> Result<(
+    NodeConfig,
+    NodeKeys,
+    infnode::keyring::PqKeys,
+    PathBuf,
+    PathBuf,
+)> {
     let cfg_obj = infnode::config::load(cfg)?;
     let keys_dir = cfg
         .parent()

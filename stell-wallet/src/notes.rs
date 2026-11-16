@@ -112,6 +112,12 @@ impl HardenedNotesStore {
             .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
             .map_err(|e| format!("Argon2 derivation error: {e:?}"))?;
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let cipher = XChaCha20Poly1305::new((&derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
@@ -190,11 +196,23 @@ impl HardenedNotesStore {
         let auth_tag =
             hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
+        if salt.len() != 16 {
+            return Err(format!(
+                "Invalid salt length: expected 16 bytes, got {}",
+                salt.len()
+            ));
+        }
         let mut material = [0u8; 48];
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
         let derived_key = blake3::derive_key("STELL_NOTES_SECRET_KDF_V1", &material);
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let cipher = XChaCha20Poly1305::new((&derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
@@ -548,6 +566,12 @@ fn decrypt_legacy_notes_file(path: &Path) -> Result<Vec<ShieldedNote>, String> {
         let mut salt_arr = [0u8; 16];
         salt_arr.copy_from_slice(&salt);
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let key = derive_storage_key(path, &salt_arr)?;
         let cipher = XChaCha20Poly1305::new((&key).into());
         let xnonce = XNonce::from_slice(&nonce);
@@ -923,6 +947,12 @@ impl HardenedStealthStore {
             .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
             .map_err(|e| format!("Argon2 derivation error: {e:?}"))?;
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let cipher = XChaCha20Poly1305::new((&derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
@@ -999,11 +1029,23 @@ impl HardenedStealthStore {
         let auth_tag =
             hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
+        if salt.len() != 16 {
+            return Err(format!(
+                "Invalid salt length: expected 16 bytes, got {}",
+                salt.len()
+            ));
+        }
         let mut material = [0u8; 48];
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
         let derived_key = blake3::derive_key("STELL_STEALTH_SECRET_KDF_V1", &material);
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let cipher = XChaCha20Poly1305::new((&derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
@@ -1094,6 +1136,12 @@ fn decrypt_stealth_store_with_storage_key(
     let mut salt_arr = [0u8; 16];
     salt_arr.copy_from_slice(&salt);
 
+    if nonce.len() != 24 {
+        return Err(format!(
+            "Invalid nonce length: expected 24 bytes, got {}",
+            nonce.len()
+        ));
+    }
     let key = derive_stealth_storage_key(path, &salt_arr)?;
     let cipher = XChaCha20Poly1305::new((&key).into());
     let xnonce = XNonce::from_slice(&nonce);
@@ -1200,7 +1248,6 @@ fn stealth_is_duplicate(outputs: &[StealthOutput], output: &StealthOutput) -> bo
     })
 }
 
-
 /// Secret-bound variant of [`add_stealth_output`] (preferred when the master secret is
 /// available, e.g. right after unlocking the keystore).
 pub fn add_stealth_output_with_secret(
@@ -1232,7 +1279,6 @@ pub fn add_stealth_output_with_password(
     Ok(true)
 }
 
-
 /// Secret-bound variant of [`get_unspent_stealth_outputs`].
 pub fn get_unspent_stealth_outputs_with_secret(
     path: &Path,
@@ -1241,7 +1287,6 @@ pub fn get_unspent_stealth_outputs_with_secret(
     let outputs = load_stealth_outputs_with_secret(path, secret)?;
     Ok(outputs.into_iter().filter(|o| !o.spent).collect())
 }
-
 
 /// Secret-bound variant of [`mark_stealth_output_spent`].
 pub fn mark_stealth_output_spent_with_secret(
@@ -1266,8 +1311,6 @@ pub fn mark_stealth_output_spent_with_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
 
     #[test]
     fn test_stealth_outputs_store_lifecycle() {
@@ -1486,7 +1529,8 @@ mod tests {
         assert!(load_stealth_outputs_with_secret(&legacy, &secret).is_err());
         assert!(
             migrate_stealth_to_secret(&legacy, &secret).expect("migrate legacy stealth"),
-            "migration must report done");
+            "migration must report done"
+        );
         assert_eq!(
             load_stealth_outputs_with_secret(&legacy, &secret).unwrap(),
             outputs
@@ -1596,22 +1640,19 @@ mod tests {
 
         // Exact single match
         let sel10 =
-            select_notes_for_unshield_with_secret(&notes_file, 10_000_000_000, &secret)
-                .unwrap();
+            select_notes_for_unshield_with_secret(&notes_file, 10_000_000_000, &secret).unwrap();
         assert_eq!(sel10.len(), 1);
         assert_eq!(sel10[0].commitment, "c2");
 
         // Combination match: 15 STELL = 5 + 10
         let sel15 =
-            select_notes_for_unshield_with_secret(&notes_file, 15_000_000_000, &secret)
-                .unwrap();
+            select_notes_for_unshield_with_secret(&notes_file, 15_000_000_000, &secret).unwrap();
         assert_eq!(sel15.len(), 2);
         assert_eq!(sel15.iter().map(|n| n.amount).sum::<u64>(), 15_000_000_000);
 
         // Mark spent
         mark_notes_spent_with_secret(&notes_file, &["c2".to_string()], &secret).unwrap();
-        let unspent =
-            get_unspent_notes_with_secret(&notes_file, &secret).unwrap();
+        let unspent = get_unspent_notes_with_secret(&notes_file, &secret).unwrap();
         assert_eq!(unspent.len(), 2);
         assert_eq!(calculate_shielded_balance(&unspent), 25_000_000_000);
 
@@ -1754,7 +1795,8 @@ mod tests {
         // 3. Explicit migration (secret in hand = explicit trust) upgrades it.
         assert!(
             migrate_notes_to_secret(&notes_file, &secret).expect("migrate plaintext"),
-            "migration must report done");
+            "migration must report done"
+        );
 
         // 5. Encrypt with password and save
         save_notes_with_password(&notes_file, &legacy_notes, "SecretPass#2026")

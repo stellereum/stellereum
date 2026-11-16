@@ -14,7 +14,8 @@
 //!   `set_pure_pq_override` (process-wide in integration builds), serialized
 //!   by `SERIAL` and always reset to `None` on guard drop.
 //! * Default-mode behavior is pinned by `default_test_key_behavior_unchanged`:
-//!   without the override the faucet account is the classical ed25519 address.
+//!   Pure-PQ is always-on, so `Faucet::new` derives the PQ Falcon address even
+//!   when `PurePqGuard::disabled()` clears the override.
 
 use std::sync::Mutex;
 use stellereum::post_quantum::{is_pure_pq_enforced, set_pure_pq_override, PqScheme};
@@ -96,13 +97,19 @@ fn chmod(path: &std::path::Path, mode: u32) {
 async fn pq_key_file_loads_at_0600_and_drives_pq_account() {
     let _guard = PurePqGuard::enforce();
     let path = scratch_key_path("load0600");
-    std::fs::write(&path, "1111111111111111111111111111111111111111111111111111111111111111\n")
-        .expect("write scratch key file");
+    std::fs::write(
+        &path,
+        "1111111111111111111111111111111111111111111111111111111111111111\n",
+    )
+    .expect("write scratch key file");
     chmod(&path, 0o600);
 
-    let seed = stellereum::rpc::load_faucet_seed_from_file(&path)
-        .expect("0600 hex seed file must load");
-    assert_eq!(seed, PQ_FAUCET_SEED, "loaded seed must be the fixed test key");
+    let seed =
+        stellereum::rpc::load_faucet_seed_from_file(&path).expect("0600 hex seed file must load");
+    assert_eq!(
+        seed, PQ_FAUCET_SEED,
+        "loaded seed must be the fixed test key"
+    );
     assert!(
         stellereum::rpc::is_test_key_seed(&seed),
         "the fixed seed must be recognized as the public test key"
@@ -111,8 +118,7 @@ async fn pq_key_file_loads_at_0600_and_drives_pq_account() {
     // The loaded seed feeds the PQ path: the serving account is the Falcon
     // address, derived exactly as `Faucet::new` derives it.
     let faucet = Faucet::new(seed, 0, DRIP, CAP);
-    let expected =
-        InMemoryStateEngine::faucet_pq_account_from_seed(&PQ_FAUCET_SEED);
+    let expected = InMemoryStateEngine::faucet_pq_account_from_seed(&PQ_FAUCET_SEED);
     assert_eq!(
         faucet.account(),
         expected,
@@ -128,8 +134,11 @@ async fn pq_key_file_loads_at_0600_and_drives_pq_account() {
 async fn pq_key_file_refuses_insecure_permissions() {
     let _serial = SERIAL.lock().expect("faucet-pq serial mutex poisoned");
     let path = scratch_key_path("perms0644");
-    std::fs::write(&path, "1111111111111111111111111111111111111111111111111111111111111111\n")
-        .expect("write scratch key file");
+    std::fs::write(
+        &path,
+        "1111111111111111111111111111111111111111111111111111111111111111\n",
+    )
+    .expect("write scratch key file");
     chmod(&path, 0o644);
 
     let err = stellereum::rpc::load_faucet_seed_from_file(&path)
@@ -159,7 +168,10 @@ async fn pq_key_file_refuses_missing_and_empty() {
     chmod(&empty, 0o600);
     let err = stellereum::rpc::load_faucet_seed_from_file(&empty)
         .expect_err("empty key file must be refused");
-    assert!(err.contains("empty"), "refusal must name the problem: {err}");
+    assert!(
+        err.contains("empty"),
+        "refusal must name the problem: {err}"
+    );
     let _ = std::fs::remove_file(&empty);
 }
 
@@ -214,15 +226,20 @@ async fn pq_genesis_funds_payout_account_and_drip_verifies_and_applies() {
     assert_eq!(tx.target_shard, 0);
     assert_eq!(
         tx.gas_limit,
-        stellereum::svm::GAS_BASIC_TRANSFER
-            + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+        stellereum::svm::GAS_BASIC_TRANSFER + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
         "PQ drip must carry the activation surcharge"
     );
     assert!(tx.is_pq(), "drip must ride a PQ1 envelope, never bare ed");
     let env = tx.pq_envelope().expect("PQ envelope must decode");
     assert_eq!(env.scheme, PqScheme::Falcon512);
-    assert!(!env.is_implicit, "always explicit: first spend needs no registry");
-    assert!(env.pubkey.is_some(), "explicit carrier must embed the pubkey");
+    assert!(
+        !env.is_implicit,
+        "always explicit: first spend needs no registry"
+    );
+    assert!(
+        env.pubkey.is_some(),
+        "explicit carrier must embed the pubkey"
+    );
     assert!(
         tx.verify_signature(),
         "PQ drip must verify on the PQ path before admission"
@@ -238,7 +255,10 @@ async fn pq_genesis_funds_payout_account_and_drip_verifies_and_applies() {
         .get_account(&who)
         .await
         .expect("recipient must exist after apply");
-    assert_eq!(recipient.balance, amount, "recipient must be credited the drip");
+    assert_eq!(
+        recipient.balance, amount,
+        "recipient must be credited the drip"
+    );
     assert_eq!(recipient.nonce, 0, "recipient nonce untouched by a credit");
     let sender = engine
         .get_account(&pq_account)
@@ -293,9 +313,9 @@ async fn pq_drip_nonces_increase_and_lifetime_cap_holds() {
     );
 }
 
-// 6. Default test-key behavior is UNCHANGED: without pure-PQ the faucet
-//    account is the classical ed25519 address (no flag day), the fixed seed
-//    parses with and without `0x`, and it is still the public test key.
+// 6. Always-on PQ behavior: even with `PurePqGuard::disabled()`, `Faucet::new`
+//    derives the PQ Falcon-512 address (never classical ed25519), the fixed
+//    seed parses with and without `0x`, and it is still the public test key.
 #[tokio::test]
 async fn default_test_key_behavior_unchanged() {
     let _guard = PurePqGuard::disabled();
@@ -303,10 +323,16 @@ async fn default_test_key_behavior_unchanged() {
     let classical = ed25519_dalek::SigningKey::from_bytes(&PQ_FAUCET_SEED)
         .verifying_key()
         .to_bytes();
-    assert_eq!(
+    let expected_pq = InMemoryStateEngine::faucet_pq_account_from_seed(&PQ_FAUCET_SEED);
+    assert_ne!(
         faucet.account(),
         classical,
-        "default faucet account must stay the classical ed25519 address"
+        "always-on PQ faucet must never derive the classical ed25519 address"
+    );
+    assert_eq!(
+        faucet.account(),
+        expected_pq,
+        "faucet account must always be the PQ Falcon-512 address"
     );
 
     for raw in [

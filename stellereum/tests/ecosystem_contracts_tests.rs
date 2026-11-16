@@ -2,46 +2,67 @@
 //! 1. STS-20 Custom Fungible Token Contract (`sts20_token.wat`)
 //! 2. Automated Market Maker Liquidity Pool Contract (`liquidity_pool.wat`)
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::fs;
 use stellereum::cell::PatriciaTrie;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{contract_key, AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 
-async fn funded_engine() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+async fn funded_engine() -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
-    let sk = SigningKey::generate(&mut OsRng);
-    let addr = sk.verifying_key().to_bytes();
+    let sk = FalconKeypair::generate_from_seed_bytes(&[0x42; 32]);
+    let addr = derive_pq_address(PqScheme::Falcon512, sk.pubkey(), &DEFAULT_SALT);
     engine
         .update_account(AccountState::new(addr, 10_000_000_000_000))
         .await;
     (engine, sk, addr)
 }
 
-fn deploy_tx(sk: &SigningKey, nonce: u64, code: Vec<u8>) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
+fn pq_payload_tx(sk: &FalconKeypair, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, sk.pubkey(), &DEFAULT_SALT);
+    let probe = Transaction {
+        from,
+        to: [0u8; 32],
+        amount: 0,
+        gas_limit: 10_000_000,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: payload.clone(),
+        priority_fee_per_gas: 0,
+    };
+    let sig = sk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sk.pubkey().to_vec(),
+        sig,
         [0u8; 32],
         0,
         10_000_000,
         nonce,
         1,
         1,
-        vec![OpCode::SysCallDeployContract { code }],
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
-fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i64) -> Transaction {
-    Transaction::sign_with_payload(
+fn deploy_tx(sk: &FalconKeypair, nonce: u64, code: Vec<u8>) -> Transaction {
+    pq_payload_tx(sk, nonce, vec![OpCode::SysCallDeployContract { code }])
+}
+
+fn call_tx(
+    sk: &FalconKeypair,
+    nonce: u64,
+    contract: [u8; 32],
+    method: &str,
+    arg: i64,
+) -> Transaction {
+    pq_payload_tx(
         sk,
-        [0u8; 32],
-        0,
-        10_000_000,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallCallContract {
             contract,
             method: method.as_bytes().to_vec(),
@@ -52,7 +73,7 @@ fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i
 
 #[tokio::test]
 async fn test_sts20_token_contract_lifecycle() {
-    let (engine, sk, _) = funded_engine().await;
+    let (engine, sk, _addr) = funded_engine().await;
 
     // 1. Read and compile sts20_token.wat
     let wat_src = fs::read_to_string("contracts/sts20_token.wat").expect("sts20_token.wat exists");
@@ -192,7 +213,7 @@ async fn test_sts20_token_contract_lifecycle() {
 
 #[tokio::test]
 async fn test_liquidity_pool_amm_contract_lifecycle() {
-    let (engine, sk, _) = funded_engine().await;
+    let (engine, sk, _addr) = funded_engine().await;
 
     // 1. Read and compile liquidity_pool.wat
     let wat_src =
@@ -316,7 +337,7 @@ async fn test_liquidity_pool_amm_contract_lifecycle() {
 
 #[tokio::test]
 async fn test_account_object_smart_account_lifecycle() {
-    let (engine, sk, _) = funded_engine().await;
+    let (engine, sk, addr) = funded_engine().await;
 
     // 1. Read and compile account_object.wat
     let wat_src =
@@ -452,11 +473,7 @@ async fn test_account_object_smart_account_lifecycle() {
         "Over-budget spend must fail closed"
     );
 
-    let current_nonce = engine
-        .get_account(&sk.verifying_key().to_bytes())
-        .await
-        .unwrap()
-        .nonce;
+    let current_nonce = engine.get_account(&addr).await.unwrap().nonce;
     eprintln!("Current onchain nonce after failed call: {}", current_nonce);
 
     // 9. Revoke Session 1
@@ -504,7 +521,7 @@ async fn test_account_object_smart_account_lifecycle() {
 
 #[tokio::test]
 async fn test_stl_domain_registry_auction_and_dns_lifecycle() {
-    let (engine, sk, _) = funded_engine().await;
+    let (engine, sk, addr) = funded_engine().await;
 
     // 1. Read and compile stl_domain_registry.wat
     let wat_src = fs::read_to_string("contracts/stl_domain_registry.wat")
@@ -550,11 +567,7 @@ async fn test_stl_domain_registry_auction_and_dns_lifecycle() {
 
     // 4b. Start Auction for 4-letter premium domain 'star.stl' (domain_id = 1, bidder = 10, length = 4, min bid 200 STELL)
     // packed: domain_id (1) * 10,000,000,000 + bidder_id (10) * 100,000 + length (4)
-    let cur_nonce = engine
-        .get_account(&sk.verifying_key().to_bytes())
-        .await
-        .unwrap()
-        .nonce;
+    let cur_nonce = engine.get_account(&addr).await.unwrap().nonce;
     let start_arg = 10_000_000_000 + 10 * 100_000 + 4;
     let (applied, _) = engine
         .apply_block_parallel(
@@ -678,11 +691,7 @@ async fn test_stl_domain_registry_auction_and_dns_lifecycle() {
 
     // 9. Transfer domain (NFT Sale / Transfer): User 20 transfers domain to User 30
     // packed: domain_id (1) * 10,000,000,000 + caller_id (20) * 100,000 + new_owner (30)
-    let cur_nonce = engine
-        .get_account(&sk.verifying_key().to_bytes())
-        .await
-        .unwrap()
-        .nonce;
+    let cur_nonce = engine.get_account(&addr).await.unwrap().nonce;
     let transfer_arg = 10_000_000_000 + 20 * 100_000 + 30;
     let (applied, _) = engine
         .apply_block_parallel(
@@ -719,11 +728,7 @@ async fn test_stl_domain_registry_auction_and_dns_lifecycle() {
     );
 
     // New owner User 30 sets target to 999 -> SUCCEEDS
-    let cur_nonce2 = engine
-        .get_account(&sk.verifying_key().to_bytes())
-        .await
-        .unwrap()
-        .nonce;
+    let cur_nonce2 = engine.get_account(&addr).await.unwrap().nonce;
     let new_owner_set_arg = 10_000_000_000 + 30 * 100_000 + 999;
     let (applied, _) = engine
         .apply_block_parallel(
@@ -763,7 +768,10 @@ fn bvm_poc_abi_decode_return_ignores_trailing_bytes() {
     // FIXED (audit B-VM): trailing bytes after a bare scalar refuse.
     let err = abi.decode_return("get", &bytes).unwrap_err();
     assert!(
-        matches!(err, stellereum::contract_abi::AbiError::TrailingBytes { got: 1 }),
+        matches!(
+            err,
+            stellereum::contract_abi::AbiError::TrailingBytes { got: 1 }
+        ),
         "expected TrailingBytes(1), got {err:?}"
     );
     // Control: exact bytes still decode.

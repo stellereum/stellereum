@@ -2,59 +2,152 @@ use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-pub fn resolve_address_variants(address: &str) -> (String, String, String) {
-    let clean = if let Ok(b) = stellereum::address::parse_address(address) {
-        let full = hex::encode(b);
-        if let Some(stripped) = full.strip_prefix("000000000000000000000000") {
-            stripped.to_string()
-        } else {
-            full
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedAddress {
+    /// Explicit shard prefix if `<shard>:<addr>` was provided (e.g. `-1:` -> 0, `1:` -> 1).
+    pub shard_hint: Option<u32>,
+    /// Canonical lowercase hex without `0x`:
+    /// - 64 chars for a 32-byte PQ / native address (preserving leading zeros)
+    /// - 40 chars for a 20-byte EVM address
+    /// - trimmed, `0x`/`0X`-stripped lowercase string otherwise
+    pub hex_clean: String,
+    /// `0x`-prefixed `hex_clean` (empty string when `hex_clean` is empty).
+    pub hex_0x: String,
+    /// Full 32-byte representation (for 20-byte EVM addresses, left-padded with 12 zero bytes).
+    pub bytes32: Option<[u8; 32]>,
+    /// Branded `Stl57...` representation when `bytes32` is `Some`.
+    pub stl57: Option<String>,
+    /// True when the input is a 20-byte EVM address (40 hex chars).
+    pub is_evm20: bool,
+}
+
+fn decode_20_byte_hex(s: &str) -> Option<[u8; 20]> {
+    let t = s.trim();
+    let body = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    if body.len() != 40 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let decoded = hex::decode(body).ok()?;
+    let arr: [u8; 20] = decoded.try_into().ok()?;
+    Some(arr)
+}
+
+/// Normalize any supported Stellereum address (`0x`+64 hex, bare 64 hex,
+/// `Stl57...`, `0x`+40 hex EVM, optional `<shard>:` prefix) without truncating
+/// 32-byte addresses or padding 12 zero bytes onto already-32-byte addresses.
+pub fn normalize_address_info(raw: &str) -> NormalizedAddress {
+    let trimmed = raw.trim();
+    let (shard_hint, addr_str) = match stellereum::sharding::split_shard_prefix(trimmed) {
+        (Some(sid), rest)
+            if stellereum::address::parse_address(rest).is_ok()
+                || decode_20_byte_hex(rest).is_some() =>
+        {
+            (Some(sid), rest)
         }
-    } else {
-        address
-            .strip_prefix("0x")
-            .or_else(|| address.strip_prefix("0X"))
-            .unwrap_or(address)
-            .to_string()
+        _ => (None, trimmed),
     };
-    let with_0x = format!("0x{}", clean.to_lowercase());
-    let clean_lower = clean.to_lowercase();
+
+    if let Ok(b32) = stellereum::address::parse_address(addr_str) {
+        let hex_clean = hex::encode(b32);
+        let hex_0x = format!("0x{hex_clean}");
+        let stl57 = Some(stellereum::address::encode_stl57_address(&b32));
+        return NormalizedAddress {
+            shard_hint,
+            hex_clean,
+            hex_0x,
+            bytes32: Some(b32),
+            stl57,
+            is_evm20: false,
+        };
+    }
+
+    if let Some(b20) = decode_20_byte_hex(addr_str) {
+        let hex_clean = hex::encode(b20);
+        let hex_0x = format!("0x{hex_clean}");
+        let mut b32 = [0u8; 32];
+        b32[12..].copy_from_slice(&b20);
+        let stl57 = Some(stellereum::address::encode_stl57_address(&b32));
+        return NormalizedAddress {
+            shard_hint,
+            hex_clean,
+            hex_0x,
+            bytes32: Some(b32),
+            stl57,
+            is_evm20: true,
+        };
+    }
+
+    let stripped = addr_str
+        .strip_prefix("0x")
+        .or_else(|| addr_str.strip_prefix("0X"))
+        .unwrap_or(addr_str);
+    let hex_clean = stripped.trim().to_lowercase();
+    let hex_0x = if hex_clean.is_empty() {
+        String::new()
+    } else {
+        format!("0x{hex_clean}")
+    };
+    NormalizedAddress {
+        shard_hint,
+        hex_clean,
+        hex_0x,
+        bytes32: None,
+        stl57: None,
+        is_evm20: false,
+    }
+}
+
+/// All canonical lowercase lookup forms for `address` in SQLite queries.
+pub fn address_match_candidates(address: &str) -> Vec<String> {
+    let norm = normalize_address_info(address);
+    if norm.hex_clean.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(5);
+    let mut push_unique = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    push_unique(norm.hex_0x);
+    push_unique(norm.hex_clean);
+    if let Some(b32) = norm.bytes32 {
+        let full = hex::encode(b32);
+        push_unique(format!("0x{full}"));
+        push_unique(full);
+        if b32[..12] == [0u8; 12] {
+            let evm = hex::encode(&b32[12..]);
+            push_unique(format!("0x{evm}"));
+            push_unique(evm);
+        }
+    }
+    if let Some(stl) = norm.stl57 {
+        push_unique(stl.to_lowercase());
+    }
+    out
+}
+
+pub fn resolve_address_variants(address: &str) -> (String, String, String) {
+    let norm = normalize_address_info(address);
     // Audit B-IDX-1: escape LIKE metacharacters (`%`, `_`, `\`) so user
     // input cannot widen the match (cross-account disclosure). Queries using
     // this pattern carry an explicit `ESCAPE '\'` clause.
-    let mut escaped = String::with_capacity(clean_lower.len());
-    for c in clean_lower.chars() {
+    let mut escaped = String::with_capacity(norm.hex_clean.len());
+    for c in norm.hex_clean.chars() {
         if matches!(c, '%' | '_' | '\\') {
             escaped.push('\\');
         }
         escaped.push(c);
     }
     let pattern = format!("%{escaped}%");
-    (with_0x, clean_lower, pattern)
+    (norm.hex_0x, norm.hex_clean, pattern)
 }
 
 pub fn to_stl57(addr: &str) -> Option<String> {
-    let clean = addr
-        .strip_prefix("0x")
-        .or_else(|| addr.strip_prefix("0X"))
-        .unwrap_or(addr);
-    if let Ok(b) = stellereum::address::parse_address(addr) {
-        Some(stellereum::address::encode_stl57_address(&b))
-    } else if let Ok(decoded) = hex::decode(clean) {
-        if decoded.len() == 32 {
-            let mut b = [0u8; 32];
-            b.copy_from_slice(&decoded);
-            Some(stellereum::address::encode_stl57_address(&b))
-        } else if decoded.len() == 20 {
-            let mut b = [0u8; 32];
-            b[12..].copy_from_slice(&decoded);
-            Some(stellereum::address::encode_stl57_address(&b))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    normalize_address_info(addr).stl57
 }
 
 #[derive(Clone)]
@@ -63,14 +156,11 @@ pub struct Database {
 }
 
 /// Normalize a contract address into the canonical lookup key: trimmed,
-/// `0x`-prefix stripped, lowercase (the same normalization the event queries
-/// apply, so `0xAA…` and `aa…` address the same row).
+/// `Stl57...` decoded if applicable, `0x`-prefix stripped, lowercase (the same
+/// normalization the event queries apply, so `0xAA…`, `aa…`, and `Stl57…`
+/// address the same row).
 pub fn normalize_contract_key(address: &str) -> String {
-    let t = address.trim();
-    t.strip_prefix("0x")
-        .or_else(|| t.strip_prefix("0X"))
-        .unwrap_or(t)
-        .to_lowercase()
+    normalize_address_info(address).hex_clean
 }
 
 /// One VERIFIED contract source (audit P2 item 15).
@@ -227,6 +317,7 @@ impl Database {
              );
 
              CREATE TABLE IF NOT EXISTS transactions (
+                 shard_id INTEGER NOT NULL DEFAULT 0,
                  tx_hash TEXT PRIMARY KEY,
                  block_height INTEGER NOT NULL,
                  tx_index INTEGER NOT NULL,
@@ -257,6 +348,7 @@ impl Database {
              -- form, filled when the contract's manifest is known.
              CREATE TABLE IF NOT EXISTS contract_events (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 shard_id INTEGER NOT NULL DEFAULT 0,
                  tx_hash TEXT NOT NULL,
                  block_height INTEGER NOT NULL,
                  log_index INTEGER NOT NULL DEFAULT 0,
@@ -290,9 +382,25 @@ impl Database {
              ",
         )?;
 
-        // Auto-migration: ensure shard_id column exists if table was created in an earlier version
+        // Auto-migration: ensure shard_id column exists if tables were created in an earlier version
         let _ = conn.execute(
             "ALTER TABLE blocks ADD COLUMN shard_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE transactions ADD COLUMN shard_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE contract_events ADD COLUMN shard_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_shard_block ON transactions(shard_id, block_height)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_shard_block ON contract_events(shard_id, block_height)",
             [],
         );
 
@@ -302,12 +410,11 @@ impl Database {
     }
 
     pub fn insert_block(&self, b: &BlockRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // Audit B-IDX-2: same (shard,height) with a DIFFERENT hash is a
         // reorg — the new canonical hash must win (INSERT OR IGNORE kept
-        // stale forks forever). Dependents at this height are invalidated
-        // with it (same-height scope; cross-shard height overlap needs the
-        // shard-scoped schema migration tracked in ROADMAP).
+        // stale forks forever). Dependents at this (shard,height) are
+        // invalidated with it.
         let existing: Option<String> = match conn.query_row(
             "SELECT hash FROM blocks WHERE shard_id = ?1 AND height = ?2",
             params![b.shard_id, b.height],
@@ -322,12 +429,12 @@ impl Database {
                 return Ok(()); // idempotent fast path
             }
             conn.execute(
-                "DELETE FROM transactions WHERE block_height = ?1",
-                params![b.height],
+                "DELETE FROM transactions WHERE shard_id = ?1 AND block_height = ?2",
+                params![b.shard_id, b.height],
             )?;
             conn.execute(
-                "DELETE FROM contract_events WHERE block_height = ?1",
-                params![b.height],
+                "DELETE FROM contract_events WHERE shard_id = ?1 AND block_height = ?2",
+                params![b.shard_id, b.height],
             )?;
             conn.execute(
                 "DELETE FROM blocks WHERE shard_id = ?1 AND height = ?2",
@@ -337,18 +444,31 @@ impl Database {
         conn.execute(
             "INSERT INTO blocks (shard_id, height, hash, timestamp, tx_count, proposer, state_root)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![b.shard_id, b.height, b.hash, b.timestamp, b.tx_count, b.proposer, b.state_root],
+            params![
+                b.shard_id,
+                b.height,
+                b.hash,
+                b.timestamp,
+                b.tx_count,
+                b.proposer,
+                b.state_root
+            ],
         )?;
         Ok(())
     }
 
     pub fn insert_transaction(&self, tx: &TxRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        self.insert_transaction_in_shard(0, tx)
+    }
+
+    pub fn insert_transaction_in_shard(&self, shard_id: u32, tx: &TxRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO transactions
-             (tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (shard_id, tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                shard_id,
                 tx.tx_hash,
                 tx.block_height,
                 tx.tx_index,
@@ -389,10 +509,35 @@ impl Database {
 
     #[allow(dead_code)]
     pub fn get_tip_height(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT COALESCE(MAX(height), 0) FROM blocks")?;
         let height: u64 = stmt.query_row([], |row| row.get(0))?;
         Ok(height)
+    }
+
+    pub fn get_shard_tip_height(&self, shard_id: u32) -> Result<u64> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt =
+            conn.prepare("SELECT COALESCE(MAX(height), 0) FROM blocks WHERE shard_id = ?1")?;
+        let height: u64 = stmt.query_row(params![shard_id], |row| row.get(0))?;
+        Ok(height)
+    }
+
+    /// Returns `(shard_id, tip_height, block_count)` for every indexed shard, ordered by `shard_id`.
+    pub fn get_shard_index_stats(&self) -> Result<Vec<(u32, u64, u64)>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT shard_id, COALESCE(MAX(height), 0), COUNT(*)
+             FROM blocks
+             GROUP BY shard_id
+             ORDER BY shard_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     // ---- contract events ----
@@ -403,12 +548,17 @@ impl Database {
     /// transaction (a re-sync, a restart) REPLACES the row instead of
     /// duplicating it.
     pub fn insert_event(&self, e: &EventRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        self.insert_event_in_shard(0, e)
+    }
+
+    pub fn insert_event_in_shard(&self, shard_id: u32, e: &EventRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO contract_events
-             (tx_hash, block_height, log_index, contract, topic0, topics_json, data, event_name, decoded_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (shard_id, tx_hash, block_height, log_index, contract, topic0, topics_json, data, event_name, decoded_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                shard_id,
                 e.tx_hash,
                 e.block_height,
                 e.log_index,
@@ -425,16 +575,21 @@ impl Database {
 
     /// Store a batch of contract events in one transaction.
     pub fn insert_events(&self, events: &[EventRecord]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        self.insert_events_in_shard(0, events)
+    }
+
+    pub fn insert_events_in_shard(&self, shard_id: u32, events: &[EventRecord]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO contract_events
-                 (tx_hash, block_height, log_index, contract, topic0, topics_json, data, event_name, decoded_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (shard_id, tx_hash, block_height, log_index, contract, topic0, topics_json, data, event_name, decoded_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for e in events {
                 stmt.execute(params![
+                    shard_id,
                     e.tx_hash,
                     e.block_height,
                     e.log_index,
@@ -464,64 +619,94 @@ impl Database {
     fn clamp_block_bound(v: Option<u64>) -> Option<i64> {
         v.map(|x| x.min(i64::MAX as u64) as i64)
     }
+
+    fn build_event_where(filter: &EventFilter) -> Option<(String, Vec<rusqlite::types::Value>)> {
+        let mut clauses = Vec::new();
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(fb) = Self::clamp_block_bound(filter.from_block) {
+            args.push(fb.into());
+            clauses.push(format!("block_height >= ?{}", args.len()));
+        }
+        if let Some(tb) = Self::clamp_block_bound(filter.to_block) {
+            args.push(tb.into());
+            clauses.push(format!("block_height <= ?{}", args.len()));
+        }
+        if let Some(c) = filter.contract.as_ref() {
+            let candidates = address_match_candidates(c);
+            if candidates.is_empty() {
+                return None;
+            }
+            let ph: Vec<String> = candidates
+                .into_iter()
+                .map(|cand| {
+                    args.push(cand.into());
+                    format!("?{}", args.len())
+                })
+                .collect();
+            clauses.push(format!("LOWER(contract) IN ({})", ph.join(", ")));
+        }
+        if let Some(h) = filter.tx_hash.as_ref() {
+            let clean = h
+                .trim()
+                .strip_prefix("0x")
+                .or_else(|| h.trim().strip_prefix("0X"))
+                .unwrap_or(h.trim())
+                .to_lowercase();
+            if clean.is_empty() {
+                return None;
+            }
+            let with_0x = format!("0x{clean}");
+            args.push(with_0x.into());
+            let p1 = args.len();
+            args.push(clean.into());
+            let p2 = args.len();
+            clauses.push(format!(
+                "(LOWER(tx_hash) = ?{p1} OR LOWER(tx_hash) = ?{p2})"
+            ));
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        Some((where_sql, args))
+    }
+
     pub fn get_events(
         &self,
         filter: &EventFilter,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<EventRecord>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let Some((where_sql, mut args)) = Self::build_event_where(filter) else {
+            return Ok(Vec::new());
+        };
+        args.push((limit as i64).into());
+        let limit_p = args.len();
+        args.push((offset as i64).into());
+        let offset_p = args.len();
+        let sql = format!(
             "SELECT tx_hash, block_height, log_index, contract, topic0, topics_json, data, event_name, decoded_json
              FROM contract_events
-             WHERE (?1 IS NULL OR block_height >= ?1)
-               AND (?2 IS NULL OR block_height <= ?2)
-               AND (?3 IS NULL OR LOWER(contract) = ?4 OR LOWER(contract) = ?5)
-               AND (?6 IS NULL OR LOWER(tx_hash) = ?7 OR LOWER(tx_hash) = ?8)
+             {where_sql}
              ORDER BY block_height DESC, id DESC
-             LIMIT ?9 OFFSET ?10",
-        )?;
-        let (contract_flag, contract_a, contract_b) = match filter.contract.as_ref() {
-            Some(c) => {
-                let (with_0x, clean, _) = resolve_address_variants(c);
-                (Some(1i64), with_0x.to_lowercase(), clean)
-            }
-            None => (None, String::new(), String::new()),
-        };
-        let (hash_flag, hash_a, hash_b) = match filter.tx_hash.as_ref() {
-            Some(h) => {
-                let (with_0x, clean, _) = resolve_address_variants(h);
-                (Some(1i64), with_0x.to_lowercase(), clean)
-            }
-            None => (None, String::new(), String::new()),
-        };
-        let rows = stmt.query_map(
-            params![
-                Self::clamp_block_bound(filter.from_block),
-                Self::clamp_block_bound(filter.to_block),
-                contract_flag,
-                contract_a,
-                contract_b,
-                hash_flag,
-                hash_a,
-                hash_b,
-                limit,
-                offset
-            ],
-            |row| {
-                Ok(EventRecord {
-                    tx_hash: row.get(0)?,
-                    block_height: row.get(1)?,
-                    log_index: row.get(2)?,
-                    contract: row.get(3)?,
-                    topic0: row.get(4)?,
-                    topics_json: row.get(5)?,
-                    data: row.get(6)?,
-                    event_name: row.get(7)?,
-                    decoded_json: row.get(8)?,
-                })
-            },
-        )?;
+             LIMIT ?{limit_p} OFFSET ?{offset_p}"
+        );
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok(EventRecord {
+                tx_hash: row.get(0)?,
+                block_height: row.get(1)?,
+                log_index: row.get(2)?,
+                contract: row.get(3)?,
+                topic0: row.get(4)?,
+                topics_json: row.get(5)?,
+                data: row.get(6)?,
+                event_name: row.get(7)?,
+                decoded_json: row.get(8)?,
+            })
+        })?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -531,41 +716,14 @@ impl Database {
 
     /// How many contract events are indexed (with the same filters).
     pub fn count_events(&self, filter: &EventFilter) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM contract_events
-             WHERE (?1 IS NULL OR block_height >= ?1)
-               AND (?2 IS NULL OR block_height <= ?2)
-               AND (?3 IS NULL OR LOWER(contract) = ?4 OR LOWER(contract) = ?5)
-               AND (?6 IS NULL OR LOWER(tx_hash) = ?7 OR LOWER(tx_hash) = ?8)",
-        )?;
-        let (contract_flag, contract_a, contract_b) = match filter.contract.as_ref() {
-            Some(c) => {
-                let (with_0x, clean, _) = resolve_address_variants(c);
-                (Some(1i64), with_0x.to_lowercase(), clean)
-            }
-            None => (None, String::new(), String::new()),
+        let Some((where_sql, args)) = Self::build_event_where(filter) else {
+            return Ok(0);
         };
-        let (hash_flag, hash_a, hash_b) = match filter.tx_hash.as_ref() {
-            Some(h) => {
-                let (with_0x, clean, _) = resolve_address_variants(h);
-                (Some(1i64), with_0x.to_lowercase(), clean)
-            }
-            None => (None, String::new(), String::new()),
-        };
-        let count: u64 = stmt.query_row(
-            params![
-                Self::clamp_block_bound(filter.from_block),
-                Self::clamp_block_bound(filter.to_block),
-                contract_flag,
-                contract_a,
-                contract_b,
-                hash_flag,
-                hash_a,
-                hash_b
-            ],
-            |row| row.get(0),
-        )?;
+        let sql = format!("SELECT COUNT(*) FROM contract_events {where_sql}");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&sql)?;
+        let count: u64 =
+            stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?;
         Ok(count)
     }
 
@@ -576,7 +734,7 @@ impl Database {
     /// attacker-growable (anyone can deploy a contract and emit events), so an
     /// unbounded dump would be a DoS amplifier.
     pub fn list_contracts(&self, limit: u32, offset: u32) -> Result<Vec<ContractSummary>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT contract,
                     COUNT(*)          AS event_count,
@@ -610,7 +768,7 @@ impl Database {
 
     /// How many distinct contracts emitted at least one indexed event.
     pub fn count_contracts(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt =
             conn.prepare("SELECT COUNT(DISTINCT LOWER(contract)) FROM contract_events")?;
         let count: u64 = stmt.query_row([], |row| row.get(0))?;
@@ -624,7 +782,7 @@ impl Database {
     /// Callers MUST only invoke this after the node confirmed the rebuild —
     /// the database does not (and cannot) check the claim itself.
     pub fn upsert_verified_source(&self, v: &VerifiedSource) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO verified_contract_sources
              (contract, source_text, compiler, flags, source_hash, code_hash, verified_at)
@@ -645,13 +803,19 @@ impl Database {
     /// The verified source of a contract, if the node ever confirmed one.
     /// `None` is an honest "not verified", never a guess.
     pub fn get_verified_source(&self, contract: &str) -> Result<Option<VerifiedSource>> {
-        let conn = self.conn.lock().unwrap();
-        let key = normalize_contract_key(contract);
-        let mut stmt = conn.prepare(
+        let candidates = address_match_candidates(contract);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let placeholders: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
             "SELECT contract, source_text, compiler, flags, source_hash, code_hash, verified_at
-             FROM verified_contract_sources WHERE contract = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![key], |row| {
+             FROM verified_contract_sources WHERE LOWER(contract) IN ({}) LIMIT 1",
+            placeholders.join(", ")
+        );
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(rusqlite::params_from_iter(candidates.iter()), |row| {
             Ok(VerifiedSource {
                 contract: row.get(0)?,
                 source_text: row.get(1)?,
@@ -670,12 +834,18 @@ impl Database {
     }
 
     pub fn get_blocks(&self, limit: u32, offset: u32) -> Result<Vec<BlockRecord>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
-             FROM blocks ORDER BY height DESC, shard_id ASC LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt.query_map(params![limit, offset], |row| {
+        self.get_blocks_by_shard(None, limit, offset)
+    }
+
+    pub fn get_blocks_by_shard(
+        &self,
+        shard_id: Option<u32>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<BlockRecord>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut res = Vec::new();
+        let map_row = |row: &rusqlite::Row<'_>| -> Result<BlockRecord> {
             let proposer: Option<String> = row.get(5)?;
             let proposer_stl57 = proposer.as_deref().and_then(to_stl57);
             Ok(BlockRecord {
@@ -688,17 +858,34 @@ impl Database {
                 proposer_stl57,
                 state_root: row.get(6)?,
             })
-        })?;
-
-        let mut res = Vec::new();
-        for r in rows {
-            res.push(r?);
+        };
+        match shard_id {
+            Some(sid) => {
+                let mut stmt = conn.prepare(
+                    "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
+                     FROM blocks WHERE shard_id = ?1 ORDER BY height DESC LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = stmt.query_map(params![sid, limit, offset], map_row)?;
+                for r in rows {
+                    res.push(r?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
+                     FROM blocks ORDER BY height DESC, shard_id ASC LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![limit, offset], map_row)?;
+                for r in rows {
+                    res.push(r?);
+                }
+            }
         }
         Ok(res)
     }
 
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<BlockRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
              FROM blocks WHERE height = ?1 ORDER BY shard_id ASC LIMIT 1",
@@ -729,7 +916,7 @@ impl Database {
         shard_id: u32,
         height: u64,
     ) -> Result<Option<BlockRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
              FROM blocks WHERE shard_id = ?1 AND height = ?2",
@@ -756,12 +943,19 @@ impl Database {
     }
 
     pub fn get_block_by_hash(&self, hash: &str) -> Result<Option<BlockRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let clean = hash
+            .trim()
+            .strip_prefix("0x")
+            .or_else(|| hash.trim().strip_prefix("0X"))
+            .unwrap_or(hash.trim())
+            .to_lowercase();
+        let with_0x = format!("0x{clean}");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
-             FROM blocks WHERE hash = ?1",
+             FROM blocks WHERE LOWER(hash) = ?1 OR LOWER(hash) = ?2",
         )?;
-        let mut rows = stmt.query_map(params![hash], |row| {
+        let mut rows = stmt.query_map(params![clean, with_0x], |row| {
             let proposer: Option<String> = row.get(5)?;
             let proposer_stl57 = proposer.as_deref().and_then(to_stl57);
             Ok(BlockRecord {
@@ -783,31 +977,12 @@ impl Database {
     }
 
     pub fn get_block_txs(&self, height: u64) -> Result<Vec<TxRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions WHERE block_height = ?1 ORDER BY tx_index ASC",
         )?;
-        let rows = stmt.query_map(params![height], |row| {
-            let from_addr: String = row.get(3)?;
-            let to_addr: String = row.get(4)?;
-            let from_stl57 = to_stl57(&from_addr);
-            let to_stl57 = to_stl57(&to_addr);
-            Ok(TxRecord {
-                tx_hash: row.get(0)?,
-                block_height: row.get(1)?,
-                tx_index: row.get(2)?,
-                from_addr,
-                to_addr,
-                from_stl57,
-                to_stl57,
-                amount: row.get(5)?,
-                fee_charged: row.get(6)?,
-                gas_limit: row.get(7)?,
-                status: row.get(8)?,
-                timestamp: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![height], Self::map_tx_row)?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -815,32 +990,55 @@ impl Database {
         Ok(res)
     }
 
-    pub fn get_tx_by_hash(&self, hash: &str) -> Result<Option<TxRecord>> {
-        let conn = self.conn.lock().unwrap();
+    pub fn get_block_txs_for_shard(&self, shard_id: u32, height: u64) -> Result<Vec<TxRecord>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
-             FROM transactions WHERE tx_hash = ?1 COLLATE NOCASE",
+             FROM transactions WHERE shard_id = ?1 AND block_height = ?2 ORDER BY tx_index ASC",
         )?;
-        let mut rows = stmt.query_map(params![hash], |row| {
-            let from_addr: String = row.get(3)?;
-            let to_addr: String = row.get(4)?;
-            let from_stl57 = to_stl57(&from_addr);
-            let to_stl57 = to_stl57(&to_addr);
-            Ok(TxRecord {
-                tx_hash: row.get(0)?,
-                block_height: row.get(1)?,
-                tx_index: row.get(2)?,
-                from_addr,
-                to_addr,
-                from_stl57,
-                to_stl57,
-                amount: row.get(5)?,
-                fee_charged: row.get(6)?,
-                gas_limit: row.get(7)?,
-                status: row.get(8)?,
-                timestamp: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![shard_id, height], Self::map_tx_row)?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
+    fn map_tx_row(row: &rusqlite::Row<'_>) -> Result<TxRecord> {
+        let from_addr: String = row.get(3)?;
+        let to_addr: String = row.get(4)?;
+        let from_stl57 = to_stl57(&from_addr);
+        let to_stl57 = to_stl57(&to_addr);
+        Ok(TxRecord {
+            tx_hash: row.get(0)?,
+            block_height: row.get(1)?,
+            tx_index: row.get(2)?,
+            from_addr,
+            to_addr,
+            from_stl57,
+            to_stl57,
+            amount: row.get(5)?,
+            fee_charged: row.get(6)?,
+            gas_limit: row.get(7)?,
+            status: row.get(8)?,
+            timestamp: row.get(9)?,
+        })
+    }
+
+    pub fn get_tx_by_hash(&self, hash: &str) -> Result<Option<TxRecord>> {
+        let clean = hash
+            .trim()
+            .strip_prefix("0x")
+            .or_else(|| hash.trim().strip_prefix("0X"))
+            .unwrap_or(hash.trim())
+            .to_lowercase();
+        let with_0x = format!("0x{clean}");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
+             FROM transactions WHERE LOWER(tx_hash) = ?1 OR LOWER(tx_hash) = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![clean, with_0x], Self::map_tx_row)?;
         if let Some(r) = rows.next() {
             Ok(Some(r?))
         } else {
@@ -849,34 +1047,15 @@ impl Database {
     }
 
     pub fn get_account_txs(&self, address: &str, limit: u32, offset: u32) -> Result<Vec<TxRecord>> {
-        let conn = self.conn.lock().unwrap();
-        if address.is_empty() {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if address.trim().is_empty() {
             let mut stmt = conn.prepare(
                 "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
                  FROM transactions
                  ORDER BY block_height DESC, tx_index DESC
                  LIMIT ?1 OFFSET ?2",
             )?;
-            let rows = stmt.query_map(params![limit, offset], |row| {
-                let from_addr: String = row.get(3)?;
-                let to_addr: String = row.get(4)?;
-                let from_stl57 = to_stl57(&from_addr);
-                let to_stl57 = to_stl57(&to_addr);
-                Ok(TxRecord {
-                    tx_hash: row.get(0)?,
-                    block_height: row.get(1)?,
-                    tx_index: row.get(2)?,
-                    from_addr,
-                    to_addr,
-                    from_stl57,
-                    to_stl57,
-                    amount: row.get(5)?,
-                    fee_charged: row.get(6)?,
-                    gas_limit: row.get(7)?,
-                    status: row.get(8)?,
-                    timestamp: row.get(9)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![limit, offset], Self::map_tx_row)?;
             let mut res = Vec::new();
             for r in rows {
                 res.push(r?);
@@ -884,40 +1063,27 @@ impl Database {
             return Ok(res);
         }
 
-        let (with_0x, clean_lower, pattern) = resolve_address_variants(address);
-
-        let mut stmt = conn.prepare(
+        let candidates = address_match_candidates(address);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
+        let in_list = ph.join(", ");
+        let limit_p = candidates.len() + 1;
+        let offset_p = candidates.len() + 2;
+        let sql = format!(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions
-             WHERE LOWER(from_addr) = ?1 OR LOWER(to_addr) = ?1
-                OR LOWER(from_addr) = ?2 OR LOWER(to_addr) = ?2
-                OR LOWER(from_addr) LIKE ?3 ESCAPE '\\' OR LOWER(to_addr) LIKE ?3 ESCAPE '\\'
+             WHERE LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list})
              ORDER BY block_height DESC, tx_index DESC
-             LIMIT ?4 OFFSET ?5",
-        )?;
-        let rows = stmt.query_map(
-            params![with_0x, clean_lower, pattern, limit, offset],
-            |row| {
-                let from_addr: String = row.get(3)?;
-                let to_addr: String = row.get(4)?;
-                let from_stl57 = to_stl57(&from_addr);
-                let to_stl57 = to_stl57(&to_addr);
-                Ok(TxRecord {
-                    tx_hash: row.get(0)?,
-                    block_height: row.get(1)?,
-                    tx_index: row.get(2)?,
-                    from_addr,
-                    to_addr,
-                    from_stl57,
-                    to_stl57,
-                    amount: row.get(5)?,
-                    fee_charged: row.get(6)?,
-                    gas_limit: row.get(7)?,
-                    status: row.get(8)?,
-                    timestamp: row.get(9)?,
-                })
-            },
-        )?;
+             LIMIT ?{limit_p} OFFSET ?{offset_p}"
+        );
+        let mut args: Vec<rusqlite::types::Value> =
+            candidates.into_iter().map(Into::into).collect();
+        args.push((limit as i64).into());
+        args.push((offset as i64).into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), Self::map_tx_row)?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -926,22 +1092,26 @@ impl Database {
     }
 
     pub fn get_account_tx_count(&self, address: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        let (with_0x, clean_lower, pattern) = resolve_address_variants(address);
-
-        let mut stmt = conn.prepare(
+        let candidates = address_match_candidates(address);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let ph: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
+        let in_list = ph.join(", ");
+        let sql = format!(
             "SELECT COUNT(*) FROM transactions
-             WHERE LOWER(from_addr) = ?1 OR LOWER(to_addr) = ?1
-                OR LOWER(from_addr) = ?2 OR LOWER(to_addr) = ?2
-                OR LOWER(from_addr) LIKE ?3 ESCAPE '\\' OR LOWER(to_addr) LIKE ?3 ESCAPE '\\'",
-        )?;
-        let count: u64 =
-            stmt.query_row(params![with_0x, clean_lower, pattern], |row| row.get(0))?;
+             WHERE LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list})"
+        );
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&sql)?;
+        let count: u64 = stmt.query_row(rusqlite::params_from_iter(candidates.iter()), |row| {
+            row.get(0)
+        })?;
         Ok(count)
     }
 
     pub fn get_stats(&self) -> Result<NetworkStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tip_height: u64 =
             conn.query_row("SELECT COALESCE(MAX(height), 0) FROM blocks", [], |r| {
                 r.get(0)
@@ -985,7 +1155,7 @@ impl Database {
     }
 
     pub fn get_charts(&self) -> Result<serde_json::Value> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         // 1. Hourly transactions: [ [hour_ts, count], ... ]
         let mut stmt = conn.prepare(
@@ -1170,5 +1340,210 @@ mod event_tests {
         let page2 = db.get_events(&EventFilter::default(), 2, 2).unwrap();
         assert_eq!(page2.len(), 2);
         assert_ne!(page[0].tx_hash, page2[0].tx_hash);
+    }
+
+    #[test]
+    fn normalizes_32b_pq_stl57_and_20b_evm_consistently() {
+        let pq_bytes = [0xC2u8; 32];
+        let pq_hex = hex::encode(pq_bytes);
+        let pq_0x = format!("0x{pq_hex}");
+        let pq_upper = format!("0X{}", pq_hex.to_uppercase());
+        let pq_stl57 = stellereum::address::encode_stl57_address(&pq_bytes);
+
+        for form in [
+            pq_hex.as_str(),
+            pq_0x.as_str(),
+            pq_upper.as_str(),
+            pq_stl57.as_str(),
+        ] {
+            let norm = normalize_address_info(form);
+            assert_eq!(norm.hex_clean, pq_hex, "32b must never truncate ({form})");
+            assert_eq!(norm.hex_0x, pq_0x);
+            assert_eq!(norm.bytes32, Some(pq_bytes));
+            assert_eq!(norm.stl57.as_deref(), Some(pq_stl57.as_str()));
+            assert!(!norm.is_evm20);
+            assert_eq!(to_stl57(form).as_deref(), Some(pq_stl57.as_str()));
+            assert_eq!(normalize_contract_key(form), pq_hex);
+        }
+
+        // A 32-byte address with 12 leading zero bytes must still preserve full 64 hex chars
+        let mut evm_padded = [0u8; 32];
+        evm_padded[12..].copy_from_slice(&[0xABu8; 20]);
+        let evm_padded_hex = hex::encode(evm_padded);
+        let evm_padded_stl57 = stellereum::address::encode_stl57_address(&evm_padded);
+        let evm20_0x = format!("0x{}", "ab".repeat(20));
+        let evm20_clean = "ab".repeat(20);
+
+        let n_32 = normalize_address_info(&format!("0x{evm_padded_hex}"));
+        assert_eq!(n_32.hex_clean, evm_padded_hex);
+        assert_eq!(n_32.hex_clean.len(), 64);
+        assert!(!n_32.is_evm20);
+
+        let n_stl = normalize_address_info(&evm_padded_stl57);
+        assert_eq!(n_stl.hex_clean, evm_padded_hex);
+        assert_eq!(n_stl.bytes32, Some(evm_padded));
+
+        let n_20 = normalize_address_info(&evm20_0x);
+        assert_eq!(n_20.hex_clean, evm20_clean);
+        assert_eq!(n_20.hex_clean.len(), 40);
+        assert!(n_20.is_evm20);
+        assert_eq!(n_20.bytes32, Some(evm_padded));
+        assert_eq!(n_20.stl57.as_deref(), Some(evm_padded_stl57.as_str()));
+
+        // Shard-prefixed addresses
+        let sharded = normalize_address_info(&format!("1:{pq_stl57}"));
+        assert_eq!(sharded.shard_hint, Some(1));
+        assert_eq!(sharded.hex_clean, pq_hex);
+        let mc_sharded = normalize_address_info(&format!("-1:{pq_0x}"));
+        assert_eq!(mc_sharded.shard_hint, Some(0));
+        assert_eq!(mc_sharded.hex_clean, pq_hex);
+
+        // DB queries match across 0x+64 hex, Stl57, and 20-byte EVM aliases
+        let db = Database::open(":memory:").unwrap();
+        db.insert_transaction(&TxRecord {
+            tx_hash: "0x11".to_string(),
+            block_height: 1,
+            tx_index: 0,
+            from_addr: pq_0x.clone(),
+            to_addr: format!("0x{evm_padded_hex}"),
+            from_stl57: Some(pq_stl57.clone()),
+            to_stl57: Some(evm_padded_stl57.clone()),
+            amount: "100".to_string(),
+            fee_charged: "1".to_string(),
+            gas_limit: "10".to_string(),
+            status: "success".to_string(),
+            timestamp: 1_792_000_000,
+        })
+        .unwrap();
+
+        assert_eq!(db.get_account_tx_count(&pq_stl57).unwrap(), 1);
+        assert_eq!(db.get_account_tx_count(&pq_0x).unwrap(), 1);
+        assert_eq!(db.get_account_tx_count(&evm20_0x).unwrap(), 1);
+        assert_eq!(db.get_account_tx_count(&evm_padded_stl57).unwrap(), 1);
+
+        // Verified source and events also resolve via Stl57 and 20-byte EVM alias
+        db.insert_event(&event("0x11", 1, 0, &evm_padded_hex))
+            .unwrap();
+        assert_eq!(
+            db.count_events(&EventFilter {
+                contract: Some(evm_padded_stl57.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_events(&EventFilter {
+                contract: Some(evm20_0x.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn multi_shard_blocks_and_reorg_isolation() {
+        let db = Database::open(":memory:").unwrap();
+
+        // Both shard 0 and shard 1 have block height 10
+        db.insert_block(&BlockRecord {
+            shard_id: 0,
+            height: 10,
+            hash: "0xshard0_h10".to_string(),
+            timestamp: 1_792_000_010,
+            tx_count: 1,
+            proposer: None,
+            proposer_stl57: None,
+            state_root: None,
+        })
+        .unwrap();
+        db.insert_block(&BlockRecord {
+            shard_id: 1,
+            height: 10,
+            hash: "0xshard1_h10_old".to_string(),
+            timestamp: 1_792_000_010,
+            tx_count: 1,
+            proposer: None,
+            proposer_stl57: None,
+            state_root: None,
+        })
+        .unwrap();
+        db.insert_block(&BlockRecord {
+            shard_id: 1,
+            height: 15,
+            hash: "0xshard1_h15".to_string(),
+            timestamp: 1_792_000_015,
+            tx_count: 0,
+            proposer: None,
+            proposer_stl57: None,
+            state_root: None,
+        })
+        .unwrap();
+
+        db.insert_transaction_in_shard(
+            0,
+            &TxRecord {
+                tx_hash: "0xs0_tx".to_string(),
+                block_height: 10,
+                tx_index: 0,
+                from_addr: format!("0x{}", "11".repeat(32)),
+                to_addr: format!("0x{}", "22".repeat(32)),
+                from_stl57: None,
+                to_stl57: None,
+                amount: "50".to_string(),
+                fee_charged: "1".to_string(),
+                gas_limit: "10".to_string(),
+                status: "success".to_string(),
+                timestamp: 1_792_000_010,
+            },
+        )
+        .unwrap();
+        db.insert_transaction_in_shard(
+            1,
+            &TxRecord {
+                tx_hash: "0xs1_tx".to_string(),
+                block_height: 10,
+                tx_index: 0,
+                from_addr: format!("0x{}", "33".repeat(32)),
+                to_addr: format!("0x{}", "44".repeat(32)),
+                from_stl57: None,
+                to_stl57: None,
+                amount: "60".to_string(),
+                fee_charged: "1".to_string(),
+                gas_limit: "10".to_string(),
+                status: "success".to_string(),
+                timestamp: 1_792_000_010,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.get_shard_tip_height(0).unwrap(), 10);
+        assert_eq!(db.get_shard_tip_height(1).unwrap(), 15);
+        assert_eq!(db.get_blocks_by_shard(None, 50, 0).unwrap().len(), 3);
+        assert_eq!(db.get_blocks_by_shard(Some(0), 50, 0).unwrap().len(), 1);
+        assert_eq!(db.get_blocks_by_shard(Some(1), 50, 0).unwrap().len(), 2);
+
+        // Reorg shard 1 height 10 must NOT delete shard 0 height 10 tx!
+        db.insert_block(&BlockRecord {
+            shard_id: 1,
+            height: 10,
+            hash: "0xshard1_h10_new".to_string(),
+            timestamp: 1_792_000_011,
+            tx_count: 0,
+            proposer: None,
+            proposer_stl57: None,
+            state_root: None,
+        })
+        .unwrap();
+        assert_eq!(db.get_block_txs_for_shard(0, 10).unwrap().len(), 1);
+        assert_eq!(db.get_block_txs_for_shard(1, 10).unwrap().len(), 0);
+        assert_eq!(
+            db.get_block_by_shard_and_height(1, 10)
+                .unwrap()
+                .unwrap()
+                .hash,
+            "0xshard1_h10_new"
+        );
     }
 }

@@ -271,7 +271,8 @@ async fn same_key_six_percent_feed_fails_open_breaker() {
         );
     }
     assert_eq!(
-        e.get_state_root().await, with_baseline,
+        e.get_state_root().await,
+        with_baseline,
         "a refused feed commits nothing, so the root is unchanged"
     );
 
@@ -290,7 +291,8 @@ async fn same_key_six_percent_feed_fails_open_breaker() {
         1_060_000
     );
     assert_ne!(
-        e.get_state_root().await, with_baseline,
+        e.get_state_root().await,
+        with_baseline,
         "the rotated-key commit moves the root"
     );
 }

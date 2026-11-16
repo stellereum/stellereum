@@ -120,7 +120,13 @@ async fn publish_height(
         let mut to = [0u8; 32];
         to[..8].copy_from_slice(&i.to_be_bytes());
         txs.push(stellereum::sharding::Transaction::sign(
-            &sk, to, 1_000 + i, 21_000, i, 0, 0,
+            &sk,
+            to,
+            1_000 + i,
+            21_000,
+            i,
+            0,
+            0,
         ));
     }
     let statuses = vec![true; txs.len()];
@@ -130,7 +136,11 @@ async fn publish_height(
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: h,
-        prev_hash: if h == 0 { [0u8; 32] } else { block_hash_of(h - 1, 0xB0) },
+        prev_hash: if h == 0 {
+            [0u8; 32]
+        } else {
+            block_hash_of(h - 1, 0xB0)
+        },
         state_root: [(h % 251) as u8; 32],
         transactions: vec![],
         cross_shard_out: vec![],
@@ -148,8 +158,7 @@ async fn publish_height(
     let prev = b.prev_hash;
     b.precommit_qc = Some(qc_for(ks, fks, h, fbh, &prev));
     st.record_finalized_header(&b).await;
-    st.height
-        .store(h, std::sync::atomic::Ordering::Relaxed);
+    st.height.store(h, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn stats() -> (usize, u64, u64) {
@@ -167,7 +176,10 @@ async fn time_calls(st: &Arc<RpcState>, method: &str, params: Value, iters: usiz
         samples.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (samples[samples.len() / 2], samples.iter().sum::<f64>() / samples.len() as f64)
+    (
+        samples[samples.len() / 2],
+        samples.iter().sum::<f64>() / samples.len() as f64,
+    )
 }
 
 fn probe_addr(i: u64) -> String {
@@ -190,8 +202,13 @@ fn probe_val(i: u64) -> String {
 async fn fixed_workload() -> Arc<RpcState> {
     let st = test_state(1000);
     for h in 900u64..=1000 {
-        st.record_block(h, block_hash_of(h, 0xB0), ((h % 7) as usize) + 1, 1_700_000_000 + h)
-            .await;
+        st.record_block(
+            h,
+            block_hash_of(h, 0xB0),
+            ((h % 7) as usize) + 1,
+            1_700_000_000 + h,
+        )
+        .await;
     }
     for h in 980u64..1000 {
         let mut txs = Vec::new();
@@ -203,7 +220,13 @@ async fn fixed_workload() -> Arc<RpcState> {
             let mut to = [0u8; 32];
             to[..8].copy_from_slice(&i.to_be_bytes());
             txs.push(stellereum::sharding::Transaction::sign(
-                &sk, to, 1_000_000_000, 21_000, i, 0, 0,
+                &sk,
+                to,
+                1_000_000_000,
+                21_000,
+                i,
+                0,
+                0,
             ));
         }
         let statuses = vec![true; 50];
@@ -235,8 +258,7 @@ async fn fixed_workload() -> Arc<RpcState> {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height
-        .store(1152, std::sync::atomic::Ordering::Relaxed);
+    st.height.store(1152, std::sync::atomic::Ordering::Relaxed);
     for i in 0u64..200 {
         let mut a = [0u8; 32];
         a[..8].copy_from_slice(&i.to_be_bytes());
@@ -346,8 +368,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height
-        .store(5248, std::sync::atomic::Ordering::Relaxed);
+    st.height.store(5248, std::sync::atomic::Ordering::Relaxed);
 
     let block_p = json!({ "height": 4005u64 });
     let blocktx_p = json!({ "height": 4005u64 });
@@ -405,8 +426,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
                 0,
                 0,
             );
-            pool
-                .add_checked_ctx(tx, 1_000_000_000_000, AdmissionCtx::wall_now())
+            pool.add_checked_ctx(tx, 1_000_000_000_000, AdmissionCtx::wall_now())
                 .expect("churn admission must succeed");
         }
     }
@@ -440,7 +460,10 @@ async fn finalized_read_cache_soundness_and_invalidation() {
         stellereum::rpc::finalized_read_cache_expire_all_for_tests();
         let recomputed = st.call("stell_getBlock", block_p.clone()).await;
         let (l2, h2, m2) = stats();
-        assert_eq!(cached, recomputed, "TTL expiry must recompute identical bytes");
+        assert_eq!(
+            cached, recomputed,
+            "TTL expiry must recompute identical bytes"
+        );
         assert_eq!(h2, h1, "expiry must miss, not hit");
         assert!(m2 > m0, "expiry must count a miss");
         assert_eq!(l2, l0, "expiry must re-admit under the same key");
@@ -563,7 +586,8 @@ async fn finalized_read_cache_live_reads_bypass() {
     a[0] = 0xBA;
     st.engine.update_account(AccountState::new(a, 500)).await;
     let addr = hex::encode(a);
-    st.record_block(700, block_hash_of(700, 0xB0), 0, 1_700_000_700).await;
+    st.record_block(700, block_hash_of(700, 0xB0), 0, 1_700_000_700)
+        .await;
 
     // Balance / Spv / proof / validators: fresh after a same-tip mutation.
     let b1 = st.call("stell_getBalance", json!(addr.clone())).await;
@@ -571,13 +595,23 @@ async fn finalized_read_cache_live_reads_bypass() {
     st.engine.update_account(AccountState::new(a, 999)).await;
     let (l0, h0, m0) = stats();
     let b2 = st.call("stell_getBalance", json!(addr.clone())).await;
-    let b3 = st.call("stell_getBalanceSpv", json!({ "address": addr.clone() })).await;
-    let b4 = st.call("stell_getProof", json!({ "address": addr.clone() })).await;
+    let b3 = st
+        .call("stell_getBalanceSpv", json!({ "address": addr.clone() }))
+        .await;
+    let b4 = st
+        .call("stell_getProof", json!({ "address": addr.clone() }))
+        .await;
     let b5 = st.call("stell_getValidators", json!({})).await;
-    let b6 = st.call("stell_stakeOf", json!({ "validator": probe_val(3) })).await;
+    let b6 = st
+        .call("stell_stakeOf", json!({ "validator": probe_val(3) }))
+        .await;
     let (l1, h1, m1) = stats();
     assert_eq!(b2["balance"], "999", "balance must track same-tip writes");
-    assert_eq!((l1, h1, m1), (l0, h0, m0), "live reads must bypass entirely");
+    assert_eq!(
+        (l1, h1, m1),
+        (l0, h0, m0),
+        "live reads must bypass entirely"
+    );
     assert_eq!(b3["balance"], "999");
     assert_eq!(b4["balance"], 999);
     assert!(b5.get("error").is_none());
@@ -671,8 +705,7 @@ async fn finalized_read_cache_bounded_growth() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height
-        .store(7350, std::sync::atomic::Ordering::Relaxed);
+    st.height.store(7350, std::sync::atomic::Ordering::Relaxed);
 
     let mut keys: Vec<(&str, Value)> = Vec::new();
     for h in 6000u64..6100 {
@@ -760,8 +793,7 @@ async fn finalized_read_cache_before_after() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height
-        .store(8320, std::sync::atomic::Ordering::Relaxed);
+    st.height.store(8320, std::sync::atomic::Ordering::Relaxed);
 
     let cases: Vec<(&str, Value)> = vec![
         ("stell_getBlock", json!({ "height": 8005u64 })),

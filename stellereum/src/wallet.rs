@@ -689,8 +689,7 @@ pub fn load_wallet_key(path: &Path) -> Result<WalletKeyMaterial, String> {
 }
 
 fn is_hex_text(s: &str) -> bool {
-    s.bytes()
-        .all(|b| b.is_ascii_hexdigit())
+    s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl WalletKeyMaterial {
@@ -1584,7 +1583,11 @@ pub struct SilentScanner {
 impl SilentScanner {
     /// Disarmed unless `crate::SILENT_PAY_ENABLED` flips (default OFF).
     pub fn new(owner_kem_seed: [u8; 64], chain_id: u64) -> Self {
-        Self { owner_kem_seed, chain_id, armed: crate::SILENT_PAY_ENABLED }
+        Self {
+            owner_kem_seed,
+            chain_id,
+            armed: crate::SILENT_PAY_ENABLED,
+        }
     }
 
     /// Test-only arming. Never called on the live path (grep-proof: only
@@ -1908,12 +1911,7 @@ mod tests {
         );
 
         let payload = vec![crate::svm::OpCode::Nop, crate::svm::OpCode::Pop];
-        let ptx = wallet.sign_bound_payload_transfer(
-            payload,
-            100_000,
-            6,
-            TEST_CHAIN_ID,
-        );
+        let ptx = wallet.sign_bound_payload_transfer(payload, 100_000, 6, TEST_CHAIN_ID);
         assert!(
             ptx.chain_id().is_some(),
             "the default payload tx must carry a chain binding"
@@ -1933,14 +1931,7 @@ mod tests {
     #[test]
     fn unbound_legacy_hatch_builds_replayable_transactions() {
         let wallet = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
-        let tx = wallet.sign_transfer(
-            [0x99u8; 32],
-            1_000,
-            crate::svm::GAS_BASIC_TRANSFER,
-            5,
-            0,
-            0,
-        );
+        let tx = wallet.sign_transfer([0x99u8; 32], 1_000, crate::svm::GAS_BASIC_TRANSFER, 5, 0, 0);
         assert!(
             !tx.is_chain_id_bound(),
             "the legacy hatch must stay unbound"

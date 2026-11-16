@@ -89,11 +89,7 @@ fn fixture_bytes(n: usize) -> Vec<Vec<u8>> {
 
 /// Timed run of the fixed small-blob fixture under the SERIAL reference:
 /// every chunk pays `delay_ms` (weak-link RTT stand-in), always hits.
-async fn run_serial_fixed(
-    n: usize,
-    delay_ms: u64,
-    expected: Vec<Vec<u8>>,
-) -> (Vec<Vec<u8>>, u128) {
+async fn run_serial_fixed(n: usize, delay_ms: u64, expected: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, u128) {
     let e = expected.clone();
     let t0 = std::time::Instant::now();
     let out = serial_reference(n, SNAPSHOT_CHUNK_RETRIES, move |i| {
@@ -150,7 +146,10 @@ async fn before_after_fixed_8chunk_fixture() {
     eprintln!("[walk-concurrency] BEFORE (serial) {before_ms}ms vs AFTER (batched) {after_ms}ms on fixed N={N}x{DELAY_MS}ms fixture");
     assert_eq!(before, expected, "serial reference is byte-exact");
     assert_eq!(after, expected, "batched production is byte-exact");
-    assert_eq!(before, after, "synced roots equal serial-walk roots: identical bytes");
+    assert_eq!(
+        before, after,
+        "synced roots equal serial-walk roots: identical bytes"
+    );
     for (i, chunk) in after.iter().enumerate() {
         assert_eq!(*chunk, expected[i], "canonical index order at {i}");
     }
@@ -193,9 +192,23 @@ async fn adversarial_forged_bytes_identical_both_shapes() {
 async fn adversarial_tamper_as_miss_fails_identically() {
     const N: usize = 8;
     // Chunk 3 always misses (tampered: hash mismatch reported as miss).
-    let miss = |i: usize| async move { if i == 3 { None } else { Some(vec![i as u8; 16]) } };
-    let before = serial_reference(N, 2, miss).await.expect_err("serial must fail loud");
-    let miss2 = |i: usize| async move { if i == 3 { None } else { Some(vec![i as u8; 16]) } };
+    let miss = |i: usize| async move {
+        if i == 3 {
+            None
+        } else {
+            Some(vec![i as u8; 16])
+        }
+    };
+    let before = serial_reference(N, 2, miss)
+        .await
+        .expect_err("serial must fail loud");
+    let miss2 = |i: usize| async move {
+        if i == 3 {
+            None
+        } else {
+            Some(vec![i as u8; 16])
+        }
+    };
     let after = assemble_chunks_resumable(N, 2, miss2)
         .await
         .expect_err("batched must fail loud");
@@ -262,7 +275,9 @@ async fn small_blob_concurrency_bounded_by_const() {
     .expect("small blob converges");
     assert_eq!(out.len(), N);
     let max = max_seen.load(Ordering::SeqCst);
-    eprintln!("[walk-concurrency] small-blob N={N} max in-flight={max} (cap={FETCH_BLOB_CHUNK_BATCH})");
+    eprintln!(
+        "[walk-concurrency] small-blob N={N} max in-flight={max} (cap={FETCH_BLOB_CHUNK_BATCH})"
+    );
     assert!(
         max <= FETCH_BLOB_CHUNK_BATCH,
         "max in-flight {max} exceeds const cap {FETCH_BLOB_CHUNK_BATCH} (unbounded fan-out)"
@@ -303,7 +318,10 @@ async fn large_blob_stays_serial_width_one() {
     }
     let max = max_seen.load(Ordering::SeqCst);
     eprintln!("[walk-concurrency] large-blob N={N} max in-flight={max} (must stay 1)");
-    assert_eq!(max, 1, "snapshot-sized assembly must stay serial (max={max})");
+    assert_eq!(
+        max, 1,
+        "snapshot-sized assembly must stay serial (max={max})"
+    );
 }
 
 /// PER-PEER FAIRNESS: even indices from a fast peer (5ms), odd from a slow

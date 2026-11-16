@@ -365,10 +365,24 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     let block = mkblock(&pkey, 1, [0u8; 32], root);
     let bh = block.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
-        rt.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
-            .unwrap();
-        rt.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));
     let cert: QuorumCertificate = rt.hc.precommit_qc.clone().expect("QC exists");
@@ -403,10 +417,24 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     block2.sign_block(&pkey2);
     let bh2 = block2.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
-        rt.on_prevote(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Prevote, Some(bh2)))
-            .unwrap();
-        rt.on_precommit(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Precommit, Some(bh2)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            2,
+            0,
+            VoteKind::Prevote,
+            Some(bh2),
+        ))
+        .unwrap();
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            2,
+            0,
+            VoteKind::Precommit,
+            Some(bh2),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh2));
     rt.blocks.insert(bh2, block2);
@@ -669,7 +697,8 @@ async fn unbonding_matures_only_after_period() {
     let v = [0x91u8; 32];
     l.bond(v, stell(1100), 0).unwrap();
     l.unbond(v, stell(1100), 1_000).unwrap();
-    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS - 1).unwrap();
+    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS - 1)
+        .unwrap();
     assert_eq!(l.withdrawable_of(&v), 0, "one second early is still locked");
     assert_eq!(l.withdraw(v), Err(StakingError::NothingToWithdraw));
     l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS).unwrap();

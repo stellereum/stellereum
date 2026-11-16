@@ -10,14 +10,48 @@
 //!  4. inbound bandwidth shed (per-second counter, refuse new + keep
 //!     existing, recovers next second).
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::consensus_net::{
     evict_candidate, InboundShed, PeerScore, SendRateLimiter, INBOUND_SHED_BYTES_PER_SEC,
     PEER_EVICT_TARGET_MAX,
 };
 use stellereum::mempool::Mempool;
-use stellereum::sharding::Transaction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
+
+fn det_pq_account(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed_bytes(&[seed; 32]);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+fn pq_sign_tx(
+    kp: &FalconKeypair,
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = kp.sign(&msg);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    tx
+}
 
 fn peer_id(n: u64) -> [u8; 20] {
     let mut id = [0u8; 20];
@@ -76,15 +110,11 @@ fn send_limiter_caps_spammer_publisher() {
 
 #[test]
 fn recheck_drops_spent_nonce_txs_post_commit() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let me: [u8; 32] = sk.verifying_key().to_bytes();
+    let (sk, me) = det_pq_account(0x11);
     let mut mp = Mempool::new(100, 100);
     for i in 0..3u64 {
-        mp.add_checked(
-            Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
-            1_000_000,
-        )
-        .unwrap();
+        mp.add_checked(pq_sign_tx(&sk, me, [1u8; 32], 10, 1_000, i), 1_000_000)
+            .unwrap();
     }
     // The commit consumed nonce 0 (which `prune_confirmed` removes by hash)
     // and advanced the on-chain nonce to 1: the recheck must drop nothing
@@ -125,11 +155,7 @@ fn recheck_drops_spent_nonce_txs_post_commit() {
     // Honest traffic unaffected: pre-commit view drops nothing.
     let mut mp3 = Mempool::new(100, 100);
     for i in 0..3u64 {
-        mp3
-            .add_checked(
-                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
-                1_000_000,
-            )
+        mp3.add_checked(pq_sign_tx(&sk, me, [1u8; 32], 10, 1_000, i), 1_000_000)
             .unwrap();
     }
     let dropped = mp3.recheck(1_000_003, |a| {
@@ -145,22 +171,13 @@ fn recheck_drops_spent_nonce_txs_post_commit() {
     // Moved fee floor: a D2 failure penalty accrues post-commit, pushing the
     // floor above the pooled txs' gas_limit — all must drop, while another
     // sender's txs are untouched.
-    let sk2 = SigningKey::generate(&mut OsRng);
-    let other: [u8; 32] = sk2.verifying_key().to_bytes();
+    let (sk2, other) = det_pq_account(0x22);
     let mut mp4 = Mempool::new(100, 100);
     for i in 0..2u64 {
-        mp4
-            .add_checked(
-                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
-                1_000_000,
-            )
+        mp4.add_checked(pq_sign_tx(&sk, me, [1u8; 32], 10, 1_000, i), 1_000_000)
             .unwrap();
     }
-    mp4
-        .add_checked(
-            Transaction::sign(&sk2, [1u8; 32], 10, 1_000, 0, 1, 1),
-            1_000_000,
-        )
+    mp4.add_checked(pq_sign_tx(&sk2, other, [1u8; 32], 10, 1_000, 0), 1_000_000)
         .unwrap();
     mp4.penalize_sender(&me);
     let dropped = mp4.recheck(1_000_004, |a| {
@@ -247,10 +264,7 @@ fn bandwidth_shed_triggers_and_recovers() {
         }
     }
     assert!(tripped, "flood must trigger the shed");
-    assert!(
-        shed.refused_total() > 0,
-        "shed must count refusals"
-    );
+    assert!(shed.refused_total() > 0, "shed must count refusals");
     assert!(shed.shed_active(0), "shed must be active this second");
 
     // Next second recovers: existing traffic flows again.

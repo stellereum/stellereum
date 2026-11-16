@@ -284,9 +284,9 @@ impl std::str::FromStr for PqScheme {
             "ed25519" | "1" => Ok(Self::Ed25519),
             "falcon512" | "falcon" | "2" => Ok(Self::Falcon512),
             // Audit HIGH-2: disabled like node side (also blocks CLI pq-generate).
-            "mldsa44" | "mldsa" | "dilithium" | "dilithium2" | "3" => Err(
-                "ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid".to_string(),
-            ),
+            "mldsa44" | "mldsa" | "dilithium" | "dilithium2" | "3" => {
+                Err("ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid".to_string())
+            }
             "hybrid" | "4" => Ok(Self::Hybrid),
             other => Err(format!(
                 "Unknown scheme: '{other}'. Available schemes: ed25519, falcon512, hybrid"
@@ -530,51 +530,15 @@ impl crate::client::PqSigner for PqKeyPair {
 }
 
 /// Signs a message with Falcon-512 conforming to Stellereum PQ-BFT v4 verification rules.
-pub fn sign_falcon512(secret_key: &[u8], pubkey: &[u8], message: &[u8]) -> Vec<u8> {
-    if secret_key.len() >= 32 {
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&secret_key[..32]);
-        let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
-        return falcon_kp.sign_with_seed(message, &seed);
+/// Fails closed (returns empty signature) if `secret_key` is shorter than 32 bytes.
+pub fn sign_falcon512(secret_key: &[u8], _pubkey: &[u8], message: &[u8]) -> Vec<u8> {
+    if secret_key.len() < 32 {
+        return Vec::new();
     }
-
-    let mut sig = vec![0u8; FALCON512_SIG_LEN];
-    sig[0] = 0x01; // Header byte conforming to non-trivial lattice state (sig[0] != 0xFF)
-
-    // Derive 40-byte non-degenerate nonce
-    let mut nonce_hasher = blake3::Hasher::new_derive_key("FALCON512_NONCE_GEN_V4");
-    nonce_hasher.update(secret_key);
-    nonce_hasher.update(message);
-    let mut nonce_reader = nonce_hasher.finalize_xof();
-    nonce_reader.fill(&mut sig[1..40]);
-    if sig[..40].iter().all(|&b| b == 0) {
-        sig[1] = 0x01;
-    }
-
-    // Fill polynomial body (40..665)
-    let mut body_hasher = blake3::Hasher::new_derive_key("FALCON512_BODY_GEN_V4");
-    body_hasher.update(secret_key);
-    body_hasher.update(pubkey);
-    body_hasher.update(message);
-    body_hasher.update(&sig[..40]);
-    let mut body_reader = body_hasher.finalize_xof();
-    body_reader.fill(&mut sig[40..FALCON512_SIG_LEN - 1]);
-
-    // Verifier commitment
-    let mut h = blake3::Hasher::new_derive_key("FALCON512_VERIFY_V4");
-    h.update(pubkey);
-    h.update(message);
-    let commitment = *h.finalize().as_bytes();
-
-    // Verifier check digest
-    let mut checker = blake3::Hasher::new_derive_key("FALCON512_SIG_CHECK_V4");
-    checker.update(&commitment);
-    checker.update(&sig[..40]);
-    checker.update(&sig[40..FALCON512_SIG_LEN - 1]);
-    let check_digest = checker.finalize();
-
-    sig[FALCON512_SIG_LEN - 1] = check_digest.as_bytes()[0];
-    sig
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&secret_key[..32]);
+    let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+    falcon_kp.sign_with_seed(message, &seed)
 }
 
 /// Signs a message with Hybrid scheme (Ed25519 + Falcon-512).

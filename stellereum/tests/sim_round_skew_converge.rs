@@ -47,8 +47,16 @@ async fn staggered_round_offsets_reconverge() {
     // The network starts at the highest offset; the staggered nodes behind.
     assert_eq!(c.base_round(), 12, "the network must start at round 12");
     assert_eq!(c.runtime(0).hc.round, 12);
-    assert_eq!(c.runtime(2).hc.round, 6, "the 6-late node starts at round 6");
-    assert_eq!(c.runtime(3).hc.round, 0, "the 12-late node starts at round 0");
+    assert_eq!(
+        c.runtime(2).hc.round,
+        6,
+        "the 6-late node starts at round 6"
+    );
+    assert_eq!(
+        c.runtime(3).hc.round,
+        0,
+        "the 12-late node starts at round 0"
+    );
 
     let report = c.run_until(TARGET_HEIGHT, BUDGET_MS).await;
 
@@ -60,8 +68,16 @@ async fn staggered_round_offsets_reconverge() {
         report.ticks,
         report.best_height,
         report.common_height,
-        report.nodes.iter().map(|n| n.decide_rounds.clone()).collect::<Vec<_>>(),
-        report.nodes.iter().map(|n| n.sync_jumps).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.clone())
+            .collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.sync_jumps)
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
 
@@ -72,7 +88,8 @@ async fn staggered_round_offsets_reconverge() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "the late nodes must catch up and finalize with the rest.\n{}",
         report.diagnostics()
     );
@@ -106,7 +123,11 @@ async fn staggered_round_offsets_reconverge() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),

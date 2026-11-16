@@ -146,8 +146,7 @@ fn bench_fee_row(
     // the attested path and the timer isolates apply+fees).
     {
         let e = fresh_engine(key_base, parallel);
-        let (applied, failed, fees, _, _) =
-            rt_block_on(e.apply_block_parallel_fees(txs, TS));
+        let (applied, failed, fees, _, _) = rt_block_on(e.apply_block_parallel_fees(txs, TS));
         assert_eq!((applied, failed), (expect_applied, expect_failed), "{name}");
         assert_eq!(fees, expect_fees, "{name} fees_collected");
     }
@@ -156,8 +155,7 @@ fn bench_fee_row(
     for _ in 0..repeats {
         let e = fresh_engine(key_base, parallel);
         let t = Instant::now();
-        let (applied, failed, fees, _, _) =
-            rt_block_on(e.apply_block_parallel_fees(txs, TS));
+        let (applied, failed, fees, _, _) = rt_block_on(e.apply_block_parallel_fees(txs, TS));
         samples.push(t.elapsed().as_secs_f64());
         assert_eq!((applied, failed), (expect_applied, expect_failed), "{name}");
         assert_eq!(fees, expect_fees, "{name} fees_collected");

@@ -32,17 +32,17 @@ mod silentpay;
 #[allow(dead_code)]
 mod hashpool;
 
-use silentpay::{
-    SpNote, SpPool, SpRecipient, SpError, SpSpendAuth, sp_attacker_rebuild, sp_chain_step,
-    sp_commit, sp_nullifier, sp_send, sp_shake256, sp_shake256_32, sp_spend_sig_msg,
-    sp_stealth_address, SP_CHAIN_DST, SP_CT_LEN, SP_EK_LEN, SP_GENESIS_CHAIN,
-    SP_SPEND_DST, SP_STEALTH_DST,
-};
 use ml_kem::{
-    MlKem768,
     kem::{FromSeed, KeyExport},
+    MlKem768,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
+use silentpay::{
+    sp_attacker_rebuild, sp_chain_step, sp_commit, sp_nullifier, sp_send, sp_shake256,
+    sp_shake256_32, sp_spend_sig_msg, sp_stealth_address, SpError, SpNote, SpPool, SpRecipient,
+    SpSpendAuth, SP_CHAIN_DST, SP_CT_LEN, SP_EK_LEN, SP_GENESIS_CHAIN, SP_SPEND_DST,
+    SP_STEALTH_DST,
+};
+use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -78,12 +78,15 @@ struct SenderMirror {
 
 impl SenderMirror {
     fn new(seed_byte: u8) -> Self {
-        Self { ek: ek_bytes(seed_byte), chain: SP_GENESIS_CHAIN, index: 0 }
+        Self {
+            ek: ek_bytes(seed_byte),
+            chain: SP_GENESIS_CHAIN,
+            index: 0,
+        }
     }
 
     fn send(&mut self, randomness: &[u8; 32]) -> SpNote {
-        let note =
-            sp_send(&self.ek, CHAIN, &self.chain, self.index, randomness).expect("sp_send");
+        let note = sp_send(&self.ek, CHAIN, &self.chain, self.index, randomness).expect("sp_send");
         self.chain = note.next_chain;
         self.index += 1;
         note
@@ -107,10 +110,16 @@ struct FixtureNote {
 /// round-robin (note `k` goes to recipient `k % counts.len()` while that
 /// recipient still has quota). Returns the notes in global delivery order.
 fn build_notes(counts: &[usize], value_base: u64) -> (Vec<[u8; 64]>, Vec<FixtureNote>) {
-    let seeds: Vec<[u8; 64]> =
-        [0x11u8, 0x22u8, 0x33u8, 0x44u8].iter().take(counts.len()).map(|&b| kem_seed(b)).collect();
-    let mut mirrors: Vec<SenderMirror> =
-        [0x11u8, 0x22u8, 0x33u8, 0x44u8].iter().take(counts.len()).map(|&b| SenderMirror::new(b)).collect();
+    let seeds: Vec<[u8; 64]> = [0x11u8, 0x22u8, 0x33u8, 0x44u8]
+        .iter()
+        .take(counts.len())
+        .map(|&b| kem_seed(b))
+        .collect();
+    let mut mirrors: Vec<SenderMirror> = [0x11u8, 0x22u8, 0x33u8, 0x44u8]
+        .iter()
+        .take(counts.len())
+        .map(|&b| SenderMirror::new(b))
+        .collect();
     let mut remaining = counts.to_vec();
     let mut notes = Vec::new();
     let mut i = 0usize;
@@ -170,7 +179,11 @@ fn silent_roundtrip_three_recipients_exact_receipt() {
                 hits.push(n.recipient);
             }
         }
-        assert_eq!(hits, vec![r, r], "recipient {r} must find exactly its own 2 notes");
+        assert_eq!(
+            hits,
+            vec![r, r],
+            "recipient {r} must find exactly its own 2 notes"
+        );
         assert_eq!(rec.next_index(), 2);
         assert_ne!(rec.chain(), SP_GENESIS_CHAIN);
     }
@@ -212,7 +225,12 @@ fn wrong_recipient_and_tampered_ct_excluded() {
     // Non-recipients derive nothing: state untouched, no receipt.
     for seed in [&seeds[1], &seeds[2]] {
         let mut other = SpRecipient::new(*seed, CHAIN);
-        assert_eq!(other.receive(&notes[0].ct, &notes[0].stealth).expect("receive"), None);
+        assert_eq!(
+            other
+                .receive(&notes[0].ct, &notes[0].stealth)
+                .expect("receive"),
+            None
+        );
         assert_eq!(other.chain(), SP_GENESIS_CHAIN);
         assert_eq!(other.next_index(), 0);
     }
@@ -222,10 +240,17 @@ fn wrong_recipient_and_tampered_ct_excluded() {
     let mut bad = notes[0].ct.clone();
     bad[513] ^= 0x01;
     let mut rec = SpRecipient::new(seeds[0], CHAIN);
-    assert_eq!(rec.receive(&bad, &notes[0].stealth).expect("decap infallible"), None);
+    assert_eq!(
+        rec.receive(&bad, &notes[0].stealth)
+            .expect("decap infallible"),
+        None
+    );
     assert_eq!((rec.chain(), rec.next_index()), (SP_GENESIS_CHAIN, 0));
     // The untampered note still receives afterwards (no state corruption).
-    assert!(rec.receive(&notes[0].ct, &notes[0].stealth).expect("receive").is_some());
+    assert!(rec
+        .receive(&notes[0].ct, &notes[0].stealth)
+        .expect("receive")
+        .is_some());
 
     // Malformed inputs are refused outright.
     assert_eq!(
@@ -296,7 +321,11 @@ fn fs_unwind_impossibility_game_attacker_advantage_zero() {
     let mut attacker_hits = 0u32;
     for i in 0..4 {
         let fwd = sp_chain_step(&chains[i], &notes[i].ss_sender);
-        assert_eq!(fwd, chains[i + 1], "forward step from compromised material is computable");
+        assert_eq!(
+            fwd,
+            chains[i + 1],
+            "forward step from compromised material is computable"
+        );
         let known_chains = [chains[i], chains[i + 1]];
         for j in 0..4 {
             if j == i {
@@ -313,7 +342,10 @@ fn fs_unwind_impossibility_game_attacker_advantage_zero() {
             }
         }
     }
-    assert_eq!(attacker_hits, 0, "no compromised material unwinds any other note");
+    assert_eq!(
+        attacker_hits, 0,
+        "no compromised material unwinds any other note"
+    );
 
     // Indistinguishability on fixed fixtures: attacker decision procedure is
     // "candidate == anything I can rebuild". Fixed decoys stand in for
@@ -370,7 +402,8 @@ fn fs_compromised_note_key_does_not_open_other_notes() {
 // ---------------------------------------------------------------------------
 
 fn deposit_note(pool: &mut SpPool, n: &FixtureNote) {
-    pool.deposit(n.commitment, n.stealth, n.nullifier).expect("deposit");
+    pool.deposit(n.commitment, n.stealth, n.nullifier)
+        .expect("deposit");
 }
 
 #[test]
@@ -386,7 +419,10 @@ fn spend_happy_double_spend_and_substitution_refused() {
 
     // Happy spend of note 0.
     let n0 = &notes[0];
-    assert_eq!(pool.spend(&n0.commitment, &n0.serial, n0.value, &n0.blinding), Ok(n0.nullifier));
+    assert_eq!(
+        pool.spend(&n0.commitment, &n0.serial, n0.value, &n0.blinding),
+        Ok(n0.nullifier)
+    );
     assert!(pool.is_spent(&n0.nullifier));
     assert_eq!(pool.spent_len(), 1);
 
@@ -403,7 +439,10 @@ fn spend_happy_double_spend_and_substitution_refused() {
     );
     // Note 1 still spends exactly once.
     let n1 = &notes[1];
-    assert_eq!(pool.spend(&n1.commitment, &n1.serial, n1.value, &n1.blinding), Ok(n1.nullifier));
+    assert_eq!(
+        pool.spend(&n1.commitment, &n1.serial, n1.value, &n1.blinding),
+        Ok(n1.nullifier)
+    );
     assert_eq!(pool.spent_len(), 2);
 }
 
@@ -457,7 +496,10 @@ fn spend_signed_happy_bad_sig_and_wrong_msg_refused() {
     // Happy path: valid Falcon-512 owner signature authorizes the spend.
     let mut pool = SpPool::new(CHAIN);
     deposit_note(&mut pool, n);
-    assert_eq!(pool.spend_signed(&auth(sig.clone()), &falcon_verify), Ok(n.nullifier));
+    assert_eq!(
+        pool.spend_signed(&auth(sig.clone()), &falcon_verify),
+        Ok(n.nullifier)
+    );
     assert!(pool.is_spent(&n.nullifier));
 
     // One flipped signature byte: refused, state untouched (still unspent,

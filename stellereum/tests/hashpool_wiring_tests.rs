@@ -18,10 +18,10 @@
 //!   state roots reflect pool ops deterministically.
 
 use stellereum::hashpool::{
-    CoinJoinBatch, HashPool, HpError, OutputNote, SpendOpening, coinjoin_build, coinjoin_sig_msg,
-    coinjoin_verify, note_commit, note_nullifier,
+    coinjoin_build, coinjoin_sig_msg, coinjoin_verify, note_commit, note_nullifier, CoinJoinBatch,
+    HashPool, HpError, OutputNote, SpendOpening,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
+use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{
     HashPoolApplyOutcome, HashPoolBlockOps, HashPoolDepositOp, HashPoolOpError, HashPoolSpendOp,
@@ -42,8 +42,8 @@ fn kem_seed(byte: u8) -> [u8; 64] {
 
 fn ek_bytes(seed_byte: u8) -> Vec<u8> {
     use ml_kem::{
-        MlKem768,
         kem::{FromSeed, KeyExport},
+        MlKem768,
     };
     let seed: ml_kem::Seed = kem_seed(seed_byte).into();
     let (_, ek) = MlKem768::from_seed(&seed);
@@ -87,7 +87,12 @@ async fn fund_engine(
             .apply_hashpool_deposit(c, stealth, nf)
             .await
             .expect("deposit applies while gate is on");
-        openings.push(SpendOpening { serial, value: DENOM, blinding, stealth });
+        openings.push(SpendOpening {
+            serial,
+            value: DENOM,
+            blinding,
+            stealth,
+        });
         keys.push(falcon(0xD0 + i as u8));
     }
     (openings, keys)
@@ -110,7 +115,12 @@ fn sign_canonical(
     in_nfs.sort();
     let mut out_pairs: Vec<([u8; 32], [u8; 32])> = outputs
         .iter()
-        .map(|o| (note_commit(chain, o.value, &o.blinding, &o.stealth), note_nullifier(&o.serial)))
+        .map(|o| {
+            (
+                note_commit(chain, o.value, &o.blinding, &o.stealth),
+                note_nullifier(&o.serial),
+            )
+        })
         .collect();
     out_pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let out_cs: Vec<[u8; 32]> = out_pairs.iter().map(|(c, _)| *c).collect();
@@ -170,7 +180,9 @@ async fn off_path_refuses_without_touching_state() {
     let root_before = engine.get_state_root().await;
     let c = [0x11u8; 32];
     assert_eq!(
-        engine.apply_hashpool_deposit(c, [0x22u8; 32], [0x33u8; 32]).await,
+        engine
+            .apply_hashpool_deposit(c, [0x22u8; 32], [0x33u8; 32])
+            .await,
         Err(HashPoolOpError::Disabled)
     );
     assert_eq!(
@@ -192,7 +204,8 @@ async fn off_path_refuses_without_touching_state() {
     assert_eq!(engine.hashpool_len().await, 0);
     assert!(!engine.hashpool_contains(&c).await);
     assert_eq!(
-        engine.get_state_root().await, root_before,
+        engine.get_state_root().await,
+        root_before,
         "refused ops must not move the state root"
     );
 }
@@ -204,14 +217,22 @@ async fn off_path_block_sidecar_is_byte_identical() {
     // exactly; the sidecar reports a wholesale skip.
     let chain = engine_chain();
     let ek = ek_bytes(0x10);
-    let (_, stealth) =
-        stellereum::hashpool::stealth_encap(&ek, 0, &[0xA0u8; 32]).expect("encap");
+    let (_, stealth) = stellereum::hashpool::stealth_encap(&ek, 0, &[0xA0u8; 32]).expect("encap");
     let blinding = [0xB0u8; 32];
     let serial = [0xC0u8; 32];
     let c = note_commit(chain, DENOM, &blinding, &stealth);
     let ops = HashPoolBlockOps {
-        deposits: vec![HashPoolDepositOp { commitment: c, stealth, nullifier: note_nullifier(&serial) }],
-        spends: vec![HashPoolSpendOp { commitment: c, serial, value: DENOM, blinding }],
+        deposits: vec![HashPoolDepositOp {
+            commitment: c,
+            stealth,
+            nullifier: note_nullifier(&serial),
+        }],
+        spends: vec![HashPoolSpendOp {
+            commitment: c,
+            serial,
+            value: DENOM,
+            blinding,
+        }],
         batches: vec![],
     };
 
@@ -231,12 +252,16 @@ async fn off_path_block_sidecar_is_byte_identical() {
     );
     assert_eq!(
         hp,
-        HashPoolApplyOutcome { skipped_gate_off: true, ..Default::default() },
+        HashPoolApplyOutcome {
+            skipped_gate_off: true,
+            ..Default::default()
+        },
         "no op may be counted while off"
     );
     assert_eq!(wired.hashpool_len().await, 0);
     assert_eq!(
-        wired.get_state_root().await, root_plain,
+        wired.get_state_root().await,
+        root_plain,
         "state root must equal the plain path exactly while off"
     );
 }
@@ -255,13 +280,14 @@ async fn deposit_registers_and_root_moves_deterministically() {
     let bare = a.get_state_root().await;
 
     let ek = ek_bytes(0x10);
-    let (_, stealth) =
-        stellereum::hashpool::stealth_encap(&ek, 0, &[0xA0u8; 32]).expect("encap");
+    let (_, stealth) = stellereum::hashpool::stealth_encap(&ek, 0, &[0xA0u8; 32]).expect("encap");
     let blinding = [0xB0u8; 32];
     let serial = [0xC0u8; 32];
     let c = note_commit(chain, DENOM, &blinding, &stealth);
     let nf = note_nullifier(&serial);
-    a.apply_hashpool_deposit(c, stealth, nf).await.expect("deposit");
+    a.apply_hashpool_deposit(c, stealth, nf)
+        .await
+        .expect("deposit");
     assert!(a.hashpool_contains(&c).await);
     assert_eq!(a.hashpool_len().await, 1);
     let moved = a.get_state_root().await;
@@ -277,9 +303,12 @@ async fn deposit_registers_and_root_moves_deterministically() {
     // Determinism: a second engine with the same ops derives the same root.
     let b = InMemoryStateEngine::new();
     b.enable_hashpool_for_tests().await;
-    b.apply_hashpool_deposit(c, stealth, nf).await.expect("deposit");
+    b.apply_hashpool_deposit(c, stealth, nf)
+        .await
+        .expect("deposit");
     assert_eq!(
-        b.get_state_root().await, moved,
+        b.get_state_root().await,
+        moved,
         "same ops must derive the same root on every node"
     );
 }
@@ -304,7 +333,9 @@ async fn spend_consumes_and_double_spend_refused() {
 
     // Same nullifier twice: refused.
     assert_eq!(
-        engine.apply_hashpool_spend(&c, &o.serial, o.value, &o.blinding).await,
+        engine
+            .apply_hashpool_spend(&c, &o.serial, o.value, &o.blinding)
+            .await,
         Err(HashPoolOpError::Pool(HpError::AlreadySpent))
     );
     // Serial substitution on the same note: refused (serial bound at deposit).
@@ -316,7 +347,9 @@ async fn spend_consumes_and_double_spend_refused() {
     );
     // Tampered value: recomputation misses.
     assert_eq!(
-        engine.apply_hashpool_spend(&c, &o.serial, o.value + 1, &o.blinding).await,
+        engine
+            .apply_hashpool_spend(&c, &o.serial, o.value + 1, &o.blinding)
+            .await,
         Err(HashPoolOpError::Pool(HpError::CommitmentMismatch))
     );
 }
@@ -360,7 +393,11 @@ async fn batch_verifies_conservation_and_applies() {
     assert_eq!(engine.hashpool_len().await, 8);
     assert_eq!(engine.hashpool_spent_len().await, 4);
     for o in &outputs {
-        assert!(engine.hashpool_contains(&note_commit(chain, o.value, &o.blinding, &o.stealth)).await);
+        assert!(
+            engine
+                .hashpool_contains(&note_commit(chain, o.value, &o.blinding, &o.stealth))
+                .await
+        );
         assert!(!engine.hashpool_is_spent(&note_nullifier(&o.serial)).await);
     }
     // Inputs are now spent: note-level re-spend is refused too.
@@ -391,7 +428,11 @@ async fn unbalanced_batch_refused_state_untouched() {
     let spends = sign_canonical(chain, &openings, &short, 0, &keys);
     assert_eq!(
         coinjoin_build(chain, spends, short, 0),
-        Err(HpError::Unbalanced { sum_in: 100, sum_out: 75, fee: 0 })
+        Err(HpError::Unbalanced {
+            sum_in: 100,
+            sum_out: 75,
+            fee: 0
+        })
     );
 
     // A structurally valid batch whose signature is broken is refused at
@@ -407,7 +448,8 @@ async fn unbalanced_batch_refused_state_untouched() {
     assert_eq!(engine.hashpool_len().await, 4);
     assert_eq!(engine.hashpool_spent_len().await, 0);
     assert_eq!(
-        engine.get_state_root().await, before,
+        engine.get_state_root().await,
+        before,
         "refused batch must leave pool and root untouched"
     );
 }
@@ -436,16 +478,27 @@ async fn block_sidecar_applies_ops_in_order() {
             stealth,
             nullifier: note_nullifier(&serial),
         });
-        openings.push(SpendOpening { serial, value: DENOM, blinding, stealth });
+        openings.push(SpendOpening {
+            serial,
+            value: DENOM,
+            blinding,
+            stealth,
+        });
         keys.push(falcon(0xD0 + i as u8));
     }
     let outputs = fresh_outputs(4);
     let spends = sign_canonical(chain, &openings, &outputs, 0, &keys);
     let batch = coinjoin_build(chain, spends, outputs.clone(), 0).expect("build");
-    let ops = HashPoolBlockOps { deposits, spends: vec![], batches: vec![batch] };
+    let ops = HashPoolBlockOps {
+        deposits,
+        spends: vec![],
+        batches: vec![batch],
+    };
 
     let block = empty_block(1);
-    let (base, hp) = engine.apply_block_transition_with_hashpool(&block, 0, &ops).await;
+    let (base, hp) = engine
+        .apply_block_transition_with_hashpool(&block, 0, &ops)
+        .await;
     assert_eq!((base.applied, base.failed), (0, 0));
     assert_eq!(
         hp,
@@ -462,7 +515,9 @@ async fn block_sidecar_applies_ops_in_order() {
     // block + sidecar derives the identical root.
     let mirror = InMemoryStateEngine::new();
     mirror.enable_hashpool_for_tests().await;
-    let (base_b, hp_b) = mirror.apply_block_transition_with_hashpool(&block, 0, &ops).await;
+    let (base_b, hp_b) = mirror
+        .apply_block_transition_with_hashpool(&block, 0, &ops)
+        .await;
     assert_eq!(base, base_b);
     assert_eq!(hp, hp_b);
     assert_eq!(

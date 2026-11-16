@@ -47,8 +47,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::post_quantum::{
-    FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN, FalconKeypair, PqScheme,
-    verify_pq_signature,
+    verify_pq_signature, FalconKeypair, PqScheme, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +63,8 @@ pub const EPOCH_LEN: u64 = 7200;
 
 /// Domain separation: commitment preimage (spec §1.2).
 pub const CNVRF_COMMIT_DST: &[u8] = b"STELL_CNVRF_COMMIT_V1";
+/// Domain separation: commit-carrier authentication signature over the public commitment.
+pub const CNVRF_COMMIT_SIG_DST: &[u8] = b"STELL_CNVRF_COMMIT_SIG_V1";
 /// Domain separation: Falcon-signed open message (spec §1.2).
 pub const CNVRF_OPEN_DST: &[u8] = b"STELL_CNVRF_OPEN_V1";
 /// Domain separation: beta derivation (spec §1.2).
@@ -84,6 +85,8 @@ pub const CNVRF_FIELD_LEN: usize = 32;
 /// spec's totals are off by one. Same for the open (131, not 130) and beta
 /// (123, not 122) preimages below.
 pub const COMMIT_PREIMAGE_LEN: usize = 101;
+/// Commit-carrier signature message length: 25 + 8 + 32 + 8 + 32 = 105 B.
+pub const COMMIT_SIG_MESSAGE_LEN: usize = 105;
 /// Open message length: 19 + 8 + 32 + 8 + 32 + 32 = 131 B (spec §1.4; the
 /// normative `CNVRF_OPEN_DST` is 19 bytes, spec prints 18 — see note above).
 pub const OPEN_MESSAGE_LEN: usize = 131;
@@ -130,12 +133,12 @@ pub fn shake256_xof(data: &[u8], out: &mut [u8]) {
     let mut state = [0u64; 25];
     let mut offset = 0;
     while offset + RATE <= data.len() {
-        for (word, chunk) in state.iter_mut().take(WORDS).zip(
-            data[offset..offset + RATE].chunks_exact(8),
-        ) {
-            let bytes: [u8; 8] = chunk
-                .try_into()
-                .expect("chunks_exact(8) yields 8 bytes");
+        for (word, chunk) in state
+            .iter_mut()
+            .take(WORDS)
+            .zip(data[offset..offset + RATE].chunks_exact(8))
+        {
+            let bytes: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8 bytes");
             *word ^= u64::from_le_bytes(bytes);
         }
         crate::post_quantum::keccak_f1600(&mut state);
@@ -147,9 +150,7 @@ pub fn shake256_xof(data: &[u8], out: &mut [u8]) {
     block[rem] = 0x1F;
     block[RATE - 1] |= 0x80;
     for (word, chunk) in state.iter_mut().take(WORDS).zip(block.chunks_exact(8)) {
-        let bytes: [u8; 8] = chunk
-            .try_into()
-            .expect("chunks_exact(8) yields 8 bytes");
+        let bytes: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8 bytes");
         *word ^= u64::from_le_bytes(bytes);
     }
     crate::post_quantum::keccak_f1600(&mut state);
@@ -230,6 +231,26 @@ pub fn beta_preimage_bytes(
     out
 }
 
+/// `commit_sig_message = COMMIT_SIG_DST || chain_id(le) || validator_id ||
+/// epoch(le) || commitment` — exactly 105 bytes. Signs the PUBLIC commitment
+/// `c` (never the secret `nonce`) so epoch N−1 verifiers can authenticate
+/// `CommitCarrier` without learning `nonce`.
+pub fn commit_sig_message_bytes(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    commitment: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COMMIT_SIG_MESSAGE_LEN);
+    out.extend_from_slice(CNVRF_COMMIT_SIG_DST);
+    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.extend_from_slice(validator_id);
+    out.extend_from_slice(&epoch_n.to_le_bytes());
+    out.extend_from_slice(commitment);
+    debug_assert_eq!(out.len(), COMMIT_SIG_MESSAGE_LEN);
+    out
+}
+
 /// `c = SHAKE256(commit_preimage, 32)` (spec §1.3).
 pub fn commit_hash(
     chain_id: u64,
@@ -258,7 +279,8 @@ pub struct CommitCarrier {
     pub epoch_n: u64,
     /// `c = SHAKE256(commit_preimage, 32)`.
     pub c: [u8; 32],
-    /// Falcon-512 sig over the commit preimage by the registered PQ key.
+    /// Falcon-512 sig over `commit_sig_message_bytes(chain_id, validator_id, epoch_n, c)`
+    /// by the registered PQ key (verifiable in epoch N−1 without `nonce`).
     pub sig: [u8; FALCON512_SIG_LEN],
 }
 
@@ -296,12 +318,57 @@ impl RevealCarrier {
 // API shapes (spec §3.3)
 // ---------------------------------------------------------------------------
 
-/// Signs the §1.3 commitment preimage with the registered Falcon key.
+/// Error returned by commit-carrier verification and authenticated state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CnVrfError {
+    /// Public key length is not `CNVRF_PK_LEN` (897 bytes).
+    InvalidPublicKeyLength,
+    /// Commit carrier signature is empty/zeroed or failed Falcon-512 verification.
+    InvalidCommitSignature,
+    /// Commitment state transition refused (stale/current or too far ahead).
+    CommitState(CommitError),
+}
+
+impl core::fmt::Display for CnVrfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidPublicKeyLength => {
+                write!(
+                    f,
+                    "invalid Falcon-512 public key length (expected {CNVRF_PK_LEN})"
+                )
+            }
+            Self::InvalidCommitSignature => {
+                write!(f, "invalid or empty commit carrier signature")
+            }
+            Self::CommitState(CommitError::StaleOrCurrent) => {
+                write!(f, "commit epoch is stale or current (must be current + 1)")
+            }
+            Self::CommitState(CommitError::TooFarAhead) => {
+                write!(f, "commit epoch is too far ahead (must be current + 1)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CnVrfError {}
+
+impl From<CommitError> for CnVrfError {
+    fn from(err: CommitError) -> Self {
+        Self::CommitState(err)
+    }
+}
+
+/// Computes `c = commit_hash(chain_id, validator_id, epoch_n, nonce)` and signs
+/// the PUBLIC commit-signature message `commit_sig_message_bytes(chain_id,
+/// validator_id, epoch_n, &c)` with the registered Falcon key (never signing
+/// the secret `nonce`, so epoch N−1 verifiers can authenticate the carrier).
 /// Returns the commit carrier for epoch N (publish in epoch N−1).
 ///
 /// `nonce`/`validator_id` lengths are type-enforced (`[u8; 32]`). If the
 /// signer refuses (incomplete key — `sign` returns short), the carrier keeps
-/// a zeroed `sig` so every downstream path fail-closes at verify.
+/// a zeroed `sig` so [`cnvrf_verify_commit`] and every downstream path
+/// fail-closes cleanly.
 pub fn cnvrf_commit(
     sk: &FalconKeypair,
     chain_id: u64,
@@ -309,8 +376,9 @@ pub fn cnvrf_commit(
     epoch_n: u64,
     nonce: &[u8; 32],
 ) -> CommitCarrier {
-    let preimage = commit_preimage_bytes(chain_id, validator_id, epoch_n, nonce);
-    let sig = sk.sign(&preimage);
+    let c = commit_hash(chain_id, validator_id, epoch_n, nonce);
+    let msg = commit_sig_message_bytes(chain_id, validator_id, epoch_n, &c);
+    let sig = sk.sign(&msg);
     let mut sig_arr = [0u8; FALCON512_SIG_LEN];
     if sig.len() == FALCON512_SIG_LEN {
         sig_arr.copy_from_slice(&sig);
@@ -318,9 +386,35 @@ pub fn cnvrf_commit(
     CommitCarrier {
         validator_id: *validator_id,
         epoch_n,
-        c: commit_hash(chain_id, validator_id, epoch_n, nonce),
+        c,
         sig: sig_arr,
     }
+}
+
+/// Verifies a [`CommitCarrier`] in epoch N−1 WITHOUT knowing the secret `nonce`.
+///
+/// Fails closed on:
+/// - `pk.len() != CNVRF_PK_LEN`
+/// - empty / all-zero `carrier.sig`
+/// - invalid Falcon-512 signature over `commit_sig_message_bytes(chain_id,
+///   &carrier.validator_id, carrier.epoch_n, &carrier.c)`
+pub fn cnvrf_verify_commit(
+    carrier: &CommitCarrier,
+    chain_id: u64,
+    pk: &[u8],
+) -> Result<(), CnVrfError> {
+    if pk.len() != CNVRF_PK_LEN {
+        return Err(CnVrfError::InvalidPublicKeyLength);
+    }
+    if carrier.sig.iter().all(|&b| b == 0) {
+        return Err(CnVrfError::InvalidCommitSignature);
+    }
+    let msg =
+        commit_sig_message_bytes(chain_id, &carrier.validator_id, carrier.epoch_n, &carrier.c);
+    if !verify_pq_signature(PqScheme::Falcon512, pk, &msg, &carrier.sig) {
+        return Err(CnVrfError::InvalidCommitSignature);
+    }
+    Ok(())
 }
 
 /// Signs `open_message(alpha)` (§1.4). Randomized under the hood
@@ -575,6 +669,30 @@ pub fn cnvrf_commit_state(
     }
 }
 
+/// Authenticated commit state transition: verifies `carrier.sig` against `pk`
+/// and `chain_id` via [`cnvrf_verify_commit`] BEFORE inserting into `store`.
+/// Blocks unauthenticated slot squatting (first-committed-wins cannot be
+/// hijacked by forged or empty-sig `CommitCarrier`s).
+pub fn cnvrf_commit_verified_state(
+    store: &mut CnVrfCommitments,
+    carrier: &CommitCarrier,
+    chain_id: u64,
+    pk: &[u8],
+    commit_height: u64,
+    current_epoch: u64,
+) -> Result<CommitOutcome, CnVrfError> {
+    cnvrf_verify_commit(carrier, chain_id, pk)?;
+    cnvrf_commit_state(
+        store,
+        &carrier.validator_id,
+        carrier.epoch_n,
+        &carrier.c,
+        commit_height,
+        current_epoch,
+    )
+    .map_err(CnVrfError::CommitState)
+}
+
 /// Pure reveal-marking (O7): sets `revealed` once a VALID reveal lands.
 /// Returns `true` iff an entry for `(validator_id, epoch_n)` exists AND
 /// `epoch_n == current_epoch` (guard 4a: reveals are valid only in their
@@ -620,11 +738,7 @@ pub fn cnvrf_expire_before(store: &mut CnVrfCommitments, current_epoch: u64) -> 
 /// caller falls back to the legacy draw for them AND charges absence through
 /// the EXISTING downtime path (`note_missed_heights` — no new counters, no
 /// equivocation arm; deliberate abort is downtime-only).
-pub fn cnvrf_draw_absence(
-    store: &CnVrfCommitments,
-    validator_id: &[u8; 32],
-    epoch_n: u64,
-) -> bool {
+pub fn cnvrf_draw_absence(store: &CnVrfCommitments, validator_id: &[u8; 32], epoch_n: u64) -> bool {
     match store.get(&(*validator_id, epoch_n)) {
         Some(rec) => !rec.revealed,
         None => true,
@@ -640,26 +754,137 @@ pub fn cnvrf_draw_absence(
 /// Save an epoch nonce to `path` with owner-only (0600) permissions.
 ///
 /// Mirrors the `node_keys.rs` secret-file posture: hex-encoded first line.
-/// Parent directories are created as needed; permissions are forced to 0600
-/// after writing (umask-independent). Unit-tested with temp dirs only.
+/// Refuses symlinks on `path` and its immediate parent, creates a unique temp
+/// file in the same directory with `O_CREAT | O_EXCL` and `0o600` mode (no
+/// world-readable window), writes + syncs, and atomically renames into `path`.
+/// Unit-tested with temp dirs only.
 pub fn save_cnvrf_nonce_to_file(path: &Path, nonce: &[u8; 32]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("[cnvrf] cannot create nonce dir {}: {e}", parent.display()))?;
+            match std::fs::symlink_metadata(parent) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "[cnvrf] REFUSING: nonce parent {} is a symbolic link",
+                            parent.display()
+                        ));
+                    }
+                    if !meta.is_dir() {
+                        return Err(format!(
+                            "[cnvrf] REFUSING: nonce parent {} is not a directory",
+                            parent.display()
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(parent).map_err(|err| {
+                        format!(
+                            "[cnvrf] cannot create nonce dir {}: {err}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "[cnvrf] cannot stat nonce dir {}: {e}",
+                        parent.display()
+                    ));
+                }
+            }
         }
     }
-    std::fs::write(path, format!("{}\n", hex::encode(nonce)))
-        .map_err(|e| format!("[cnvrf] cannot write nonce file {}: {e}", path.display()))?;
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce path {} is a symbolic link",
+                path.display()
+            ));
+        }
+        if !meta.is_file() {
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce path {} is not a regular file",
+                path.display()
+            ));
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| format!("[cnvrf] invalid nonce file path {}", path.display()))?;
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{pid}.{seq}"));
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let payload = format!("{}\n", hex::encode(nonce));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut f = opts.open(&tmp_path).map_err(|e| {
+        format!(
+            "[cnvrf] cannot create temp nonce file {}: {e}",
+            tmp_path.display()
+        )
+    })?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            format!(
-                "[cnvrf] cannot chmod 0600 nonce file {}: {e}",
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "[cnvrf] cannot chmod 0600 temp nonce file {}: {e}",
+                tmp_path.display()
+            ));
+        }
+    }
+
+    if let Err(e) = f.write_all(payload.as_bytes()).and_then(|()| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "[cnvrf] cannot write temp nonce file {}: {e}",
+            tmp_path.display()
+        ));
+    }
+    drop(f);
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce path {} is a symbolic link",
                 path.display()
-            )
-        })?;
+            ));
+        }
+        if !meta.is_file() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce path {} is not a regular file",
+                path.display()
+            ));
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "[cnvrf] cannot install nonce file {}: {e}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -669,8 +894,7 @@ pub fn save_cnvrf_nonce_to_file(path: &Path, nonce: &[u8; 32]) -> Result<(), Str
 pub fn parse_cnvrf_nonce_hex(raw: &str) -> Result<[u8; 32], String> {
     let trimmed = raw.trim();
     let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed).trim();
-    let bytes =
-        hex::decode(hex_part).map_err(|e| format!("[cnvrf] invalid nonce hex: {e}"))?;
+    let bytes = hex::decode(hex_part).map_err(|e| format!("[cnvrf] invalid nonce hex: {e}"))?;
     if bytes.len() != CNVRF_FIELD_LEN {
         return Err(format!(
             "[cnvrf] invalid nonce length: expected 32 bytes, got {}",
@@ -682,24 +906,34 @@ pub fn parse_cnvrf_nonce_hex(raw: &str) -> Result<[u8; 32], String> {
     Ok(nonce)
 }
 
-/// Load an epoch nonce from `path`: 0600-checked (owner-only, fail-closed),
-/// first non-empty line, hex. Same discipline as `node_keys.rs`
+/// Load an epoch nonce from `path`: symlink-refused (`symlink_metadata` +
+/// fd identity check), owner-only permissions checked (`(mode & 0o077) == 0`,
+/// fail-closed), first non-empty line, hex. Same discipline as `node_keys.rs`
 /// (the old `load_vrf_secret_from_file` was deleted with ECVRF).
 /// Unit-tested with temp dirs only.
 pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
+    use std::io::Read;
+
+    let lmeta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("[cnvrf] cannot stat nonce file {}: {e}", path.display()))?;
+    if lmeta.file_type().is_symlink() {
+        return Err(format!(
+            "[cnvrf] REFUSING: nonce path {} is a symbolic link",
+            path.display()
+        ));
+    }
+    if !lmeta.is_file() {
+        return Err(format!(
+            "[cnvrf] REFUSING: nonce path {} is not a file",
+            path.display()
+        ));
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path)
-            .map_err(|e| format!("[cnvrf] cannot stat nonce file {}: {e}", path.display()))?;
-        if !meta.is_file() {
-            return Err(format!(
-                "[cnvrf] REFUSING: nonce path {} is not a file",
-                path.display()
-            ));
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
+        let mode = lmeta.permissions().mode() & 0o777;
+        if (mode & 0o077) != 0 {
             return Err(format!(
                 "[cnvrf] REFUSING: nonce file {} has insecure permissions 0o{:03o} \
                  (group/other must have NO access — chmod 0600 {})",
@@ -709,16 +943,42 @@ pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
             ));
         }
     }
-    #[cfg(not(unix))]
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("[cnvrf] cannot open nonce file {}: {e}", path.display()))?;
+
+    #[cfg(unix)]
     {
-        if !path.is_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fmeta = file
+            .metadata()
+            .map_err(|e| format!("[cnvrf] cannot fstat nonce file {}: {e}", path.display()))?;
+        if fmeta.file_type().is_symlink() || !fmeta.is_file() {
             return Err(format!(
-                "[cnvrf] REFUSING: nonce path {} is not a file",
+                "[cnvrf] REFUSING: nonce path {} is not a regular file",
+                path.display()
+            ));
+        }
+        if lmeta.dev() != fmeta.dev() || lmeta.ino() != fmeta.ino() {
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce path {} changed concurrently (TOCTOU)",
+                path.display()
+            ));
+        }
+        let fmode = fmeta.permissions().mode() & 0o777;
+        if (fmode & 0o077) != 0 {
+            return Err(format!(
+                "[cnvrf] REFUSING: nonce file {} has insecure permissions 0o{:03o} \
+                 (group/other must have NO access — chmod 0600 {})",
+                path.display(),
+                fmode,
                 path.display()
             ));
         }
     }
-    let raw = std::fs::read_to_string(path)
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .map_err(|e| format!("[cnvrf] cannot read nonce file {}: {e}", path.display()))?;
     let line = raw
         .lines()

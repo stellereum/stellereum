@@ -2208,8 +2208,7 @@ pub struct StakingLedgerV4 {
     pub reward_accumulators:
         HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorRewardState>,
     #[serde(default)]
-    pub delegator_reward_checkpoints:
-        HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
+    pub delegator_reward_checkpoints: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
 }
 
 impl StakingLedgerV4 {
@@ -3343,8 +3342,7 @@ impl AsyncPersistence {
     /// drain wait adds a bounded settle grace after observing zero rather
     /// than exiting immediately.
     pub fn pending(&self) -> u64 {
-        self.queue_depth
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.queue_depth.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Snapshot the current state of an engine and enqueue it (convenience).
@@ -3901,7 +3899,9 @@ mod tests {
         // Live engine at post-S state, with NON-EMPTY replay sets.
         let engine = InMemoryStateEngine::new();
         let who = [11u8; 32];
-        engine.update_account(AccountState::new(who, 1_000_000)).await;
+        engine
+            .update_account(AccountState::new(who, 1_000_000))
+            .await;
         engine
             .restore_cross_shard_replay(&CrossShardReplaySnapshot {
                 engine_consumed: vec![CrossShardKey {
@@ -3918,15 +3918,11 @@ mod tests {
         // Capture the FULL snapshot exactly as the live path does (accounts +
         // domains + every aux domain + the replay set, all pre-apply).
         let accounts = clone_account_snapshot(&engine).await;
-        let state_bytes = serialize_off_tick(accounts)
-            .await
-            .expect("encode accounts");
+        let state_bytes = serialize_off_tick(accounts).await.expect("encode accounts");
         let staking = engine.staking_read().await.clone();
         let gov = engine.governance_read().await.clone();
         let domains = DomainSnapshot::capture(&engine, &staking, &gov).await;
-        let domain_bytes = serialize_off_tick(domains)
-            .await
-            .expect("encode domains");
+        let domain_bytes = serialize_off_tick(domains).await.expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
@@ -4010,7 +4006,9 @@ mod tests {
 
         let engine = InMemoryStateEngine::new();
         let who = [11u8; 32];
-        engine.update_account(AccountState::new(who, 1_000_000)).await;
+        engine
+            .update_account(AccountState::new(who, 1_000_000))
+            .await;
         engine
             .restore_cross_shard_replay(&CrossShardReplaySnapshot {
                 engine_consumed: vec![CrossShardKey {
@@ -4026,15 +4024,11 @@ mod tests {
 
         // Accounts/domains/aux captured at S (pre-apply), exactly as live.
         let accounts = clone_account_snapshot(&engine).await;
-        let state_bytes = serialize_off_tick(accounts)
-            .await
-            .expect("encode accounts");
+        let state_bytes = serialize_off_tick(accounts).await.expect("encode accounts");
         let staking = engine.staking_read().await.clone();
         let gov = engine.governance_read().await.clone();
         let domains = DomainSnapshot::capture(&engine, &staking, &gov).await;
-        let domain_bytes = serialize_off_tick(domains)
-            .await
-            .expect("encode domains");
+        let domain_bytes = serialize_off_tick(domains).await.expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
@@ -4666,8 +4660,14 @@ mod archive_proof_tests {
     ) -> QuorumCertificate {
         let mut set = crate::consensus::VoteSet::new();
         for (sk, fk) in keys {
-            let v =
-                Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            let v = Vote::sign_with_falcon(
+                sk,
+                fk,
+                height,
+                round,
+                VoteKind::Precommit,
+                Some(block_hash),
+            );
             set.add(v, vs, height, round, VoteKind::Precommit)
                 .expect("falcon vote must ingest");
         }

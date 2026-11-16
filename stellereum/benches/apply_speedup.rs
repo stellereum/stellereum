@@ -25,9 +25,9 @@
 //!     N=2000 / 8 threads - wall ms per chunk size, naming the best stable
 //!     value (the default the engine ships when the env is unset).
 
-use ed25519_dalek::SigningKey;
 use rayon::ThreadPoolBuilder;
 use std::time::Instant;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::GAS_BASIC_TRANSFER;
@@ -39,34 +39,62 @@ const THREADS: [usize; 4] = [1, 2, 4, 8];
 const CHUNKS: [usize; 6] = [1, 8, 32, 128, 512, 2048];
 const REPEATS: usize = 5;
 
-fn det_key(i: u64) -> SigningKey {
+fn pq_seed(i: u64) -> [u8; 32] {
     let mut seed = [0x3Du8; 32];
     seed[..8].copy_from_slice(&i.to_le_bytes());
     seed[8..16].copy_from_slice(&0xA0_9Fu64.to_le_bytes());
-    SigningKey::from_bytes(&seed)
+    seed
 }
 
-fn addr_of(i: u64) -> [u8; 32] {
-    det_key(i).verifying_key().to_bytes()
+fn recipient_addr(i: u64) -> [u8; 32] {
+    let mut addr = [0xD1u8; 32];
+    addr[..8].copy_from_slice(&i.to_le_bytes());
+    addr
 }
 
-/// N mutually-disjoint plain transfers: sender `base+i` -> fresh recipient
-/// `base+N+i`. Distinct senders AND distinct recipients, so the scheduler
-/// puts the whole block in ONE wave of N (the concurrent shape).
-fn disjoint_txs(n: usize, base: u64) -> Vec<Transaction> {
-    (0..n as u64)
-        .map(|i| {
-            Transaction::sign(
-                &det_key(base + i),
-                addr_of(base + n as u64 + i),
-                1,
-                GAS_BASIC_TRANSFER,
-                0,
-                1,
-                1,
-            )
-        })
-        .collect()
+/// N mutually-disjoint plain Falcon-512 implicit PQ transfers: sender `base+i`
+/// (registered in the implicit key registry) -> fresh recipient `base+N+i`.
+/// Distinct senders AND distinct recipients, so the scheduler puts the whole
+/// block in ONE wave of N (the `apply_plain_wave` concurrent shape).
+fn disjoint_txs(n: usize, base: u64) -> (Vec<Transaction>, Vec<[u8; 32]>) {
+    let mut txs = Vec::with_capacity(n);
+    let mut senders = Vec::with_capacity(n);
+    let registry = Transaction::global_implicit_registry();
+    for i in 0..n as u64 {
+        let kp = FalconKeypair::generate_from_seed_bytes(&pq_seed(base + i));
+        let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        let _ = registry.register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        let to = recipient_addr(base + n as u64 + i);
+        let skeleton = Transaction {
+            from,
+            to,
+            amount: 1,
+            gas_limit: GAS_BASIC_TRANSFER,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = skeleton.signing_message();
+        let sig = kp.sign_with_seed(&msg, &pq_seed(1_000_000_000 + base + i));
+        let tx = Transaction::new_pq_implicit(
+            from,
+            PqScheme::Falcon512,
+            sig,
+            to,
+            1,
+            GAS_BASIC_TRANSFER,
+            0,
+            1,
+            1,
+            Vec::new(),
+        );
+        senders.push(from);
+        txs.push(tx);
+    }
+    (txs, senders)
 }
 
 fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -77,13 +105,12 @@ fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-fn fresh_engine(base: u64, n: usize, parallel: bool) -> InMemoryStateEngine {
+fn fresh_engine(senders: &[[u8; 32]], parallel: bool) -> InMemoryStateEngine {
     rt_block_on(async {
         let e = InMemoryStateEngine::new();
         e.set_parallel_exec(parallel);
-        for i in 0..n as u64 {
-            e.update_account(AccountState::new(addr_of(base + i), BAL))
-                .await;
+        for sender in senders {
+            e.update_account(AccountState::new(*sender, BAL)).await;
         }
         e
     })
@@ -94,13 +121,13 @@ fn fresh_engine(base: u64, n: usize, parallel: bool) -> InMemoryStateEngine {
 /// Asserts the exact expected verdicts and fee total - correctness, not timing.
 fn median_apply_secs(
     txs: &[Transaction],
-    base: u64,
+    senders: &[[u8; 32]],
     parallel: bool,
     pool: Option<&rayon::ThreadPool>,
 ) -> f64 {
     let expect_fees = txs.len() as u64 * GAS_BASIC_TRANSFER;
     let run_once = || {
-        let e = fresh_engine(base, txs.len(), parallel);
+        let e = fresh_engine(senders, parallel);
         let t = Instant::now();
         let (applied, failed, fees, _, _) = match pool {
             Some(p) => p.install(|| rt_block_on(e.apply_block_parallel_fees(txs, TS))),
@@ -121,20 +148,20 @@ fn apply_speedup_matrix() {
     // Correctness-first + attestation: every fixture transaction is verified
     // once here (verify-once cache), so all timed samples below run the
     // attested path and the timer isolates apply+fees.
-    let mut fixtures: Vec<(usize, u64, Vec<Transaction>)> = Vec::new();
+    let mut fixtures: Vec<(usize, Vec<Transaction>, Vec<[u8; 32]>)> = Vec::new();
     for (row, &n) in NS.iter().enumerate() {
         let base = 40_000_000u64 + row as u64 * 10_000;
-        let txs = disjoint_txs(n, base);
-        let e = fresh_engine(base, n, true);
+        let (txs, senders) = disjoint_txs(n, base);
+        let e = fresh_engine(&senders, true);
         let (applied, failed, fees, _, _) = rt_block_on(e.apply_block_parallel_fees(&txs, TS));
         assert_eq!((applied, failed), (n, 0));
         assert_eq!(fees, n as u64 * GAS_BASIC_TRANSFER);
-        fixtures.push((n, base, txs));
+        fixtures.push((n, txs, senders));
     }
 
     // --- curve: serial baseline, then 1/2/4/8 threads, same box ----------
-    for (n, base, txs) in &fixtures {
-        let serial = median_apply_secs(txs, *base, false, None);
+    for (n, txs, senders) in &fixtures {
+        let serial = median_apply_secs(txs, senders, false, None);
         println!(
             "[bench][apply_speedup][curve] n={n} threads=serial wall={:.3} ms ({:.0} ns/tx) speedup_vs_serial=1.00x",
             serial * 1_000.0,
@@ -145,7 +172,7 @@ fn apply_speedup_matrix() {
                 .num_threads(t)
                 .build()
                 .expect("pool builds");
-            let wall = median_apply_secs(txs, *base, true, Some(&pool));
+            let wall = median_apply_secs(txs, senders, true, Some(&pool));
             println!(
                 "[bench][apply_speedup][curve] n={n} threads={t} wall={:.3} ms ({:.0} ns/tx) speedup_vs_serial={:.2}x",
                 wall * 1_000.0,
@@ -156,7 +183,7 @@ fn apply_speedup_matrix() {
     }
 
     // --- chunk sensitivity: fixed N=2000, fixed 8 threads -----------------
-    let (n, base, txs) = fixtures.last().expect("N=2000 fixture");
+    let (n, txs, senders) = fixtures.last().expect("N=2000 fixture");
     assert_eq!(*n, 2000);
     let pool = ThreadPoolBuilder::new()
         .num_threads(8)
@@ -165,7 +192,7 @@ fn apply_speedup_matrix() {
     let mut best = (0usize, f64::INFINITY);
     for &c in &CHUNKS {
         std::env::set_var("STELL_PARALLEL_PLAN_CHUNK", c.to_string());
-        let wall = median_apply_secs(txs, *base, true, Some(&pool));
+        let wall = median_apply_secs(txs, senders, true, Some(&pool));
         println!(
             "[bench][apply_speedup][chunk] n={n} threads=8 plan_chunk={c} wall={:.3} ms ({:.0} ns/tx)",
             wall * 1_000.0,

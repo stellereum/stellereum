@@ -115,7 +115,11 @@ export const Shards: React.FC = () => {
                         </Link>
                       </td>
                       <td className="mono">
-                        {s.tip_hash ? truncateMiddle(s.tip_hash, 10, 8) : '-'}
+                        {s.tip_hash ? (
+                          <Link to={`/block/${s.tip_hash}`}>
+                            {truncateMiddle(s.tip_hash, 10, 8)}
+                          </Link>
+                        ) : '-'}
                       </td>
                       <td className="mono" style={{ color: 'var(--text-dim)' }}>
                         {s.state_root ? truncateMiddle(s.state_root, 10, 8) : '-'}

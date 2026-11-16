@@ -7,15 +7,15 @@
 //! not enough genuine old-set power behind the point.
 
 use ed25519_dalek::SigningKey;
+use std::path::{Path, PathBuf};
 use stellereum::consensus::{
-    QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet, register_validator_pq_key,
+    register_validator_pq_key, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::light_client::{Checkpoint, LightClient, LightHeader};
 use stellereum::light_client_cli::{
     anchor_show, load_checkpoint_file, load_rotation_proof_file, rotate_anchor, verify_header_file,
 };
-use std::path::{Path, PathBuf};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
 // This file uses `fvote` with file-local keys (`pq_for` below); `falcon_set`
 // in the shared helper covers the fixed-seed case and is unused here.
@@ -30,9 +30,7 @@ fn test_keys(start: u8, n: u8) -> Vec<SigningKey> {
 }
 
 fn ids_of(keys: &[SigningKey]) -> Vec<ValidatorId> {
-    keys.iter()
-        .map(|k| k.verifying_key().to_bytes())
-        .collect()
+    keys.iter().map(|k| k.verifying_key().to_bytes()).collect()
 }
 
 fn qc_from(
@@ -113,9 +111,7 @@ fn fresh_dir(tag: &str) -> PathBuf {
 fn write_validators_file(dir: &Path, ids: &[ValidatorId]) -> PathBuf {
     let entries: Vec<serde_json::Value> = ids
         .iter()
-        .map(|id| {
-            serde_json::json!({"validator": hex::encode(id), "power": 1u64})
-        })
+        .map(|id| serde_json::json!({"validator": hex::encode(id), "power": 1u64}))
         .collect();
     let doc = serde_json::json!({"validators": entries});
     let path = dir.join("validators.json");
@@ -125,11 +121,7 @@ fn write_validators_file(dir: &Path, ids: &[ValidatorId]) -> PathBuf {
 
 fn write_json_file(dir: &Path, name: &str, value: &impl serde::Serialize) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(value).expect("json"),
-    )
-    .expect("write");
+    std::fs::write(&path, serde_json::to_string_pretty(value).expect("json")).expect("write");
     path
 }
 
@@ -174,13 +166,17 @@ fn header_at(
     }
 }
 
-fn write_rotation_file(dir: &Path, name: &str, rotation: &LightHeader, next_ids: &[ValidatorId]) -> PathBuf {
+fn write_rotation_file(
+    dir: &Path,
+    name: &str,
+    rotation: &LightHeader,
+    next_ids: &[ValidatorId],
+) -> PathBuf {
     let entries: Vec<serde_json::Value> = next_ids
         .iter()
         .map(|id| serde_json::json!({"validator": hex::encode(id), "power": 1u64}))
         .collect();
-    let doc =
-        serde_json::json!({"rotation": rotation, "next_set": {"validators": entries}});
+    let doc = serde_json::json!({"rotation": rotation, "next_set": {"validators": entries}});
     let path = dir.join(name);
     std::fs::write(&path, serde_json::to_string_pretty(&doc).expect("json")).expect("write");
     path
@@ -343,8 +339,7 @@ fn rotated_client_refuses_stale_set_header() {
     );
     let rotation_path = write_rotation_file(&dir, "rotation.json", &rotation_header, &new_ids);
     // The CLI helper applies the rotation fail-closed first.
-    rotate_anchor(&validators_path, &checkpoint_path, &rotation_path)
-        .expect("rotation must apply");
+    rotate_anchor(&validators_path, &checkpoint_path, &rotation_path).expect("rotation must apply");
     // Replay the same evidence through the library: after the rotation the
     // NEW set is the only authority, so a header certified only by the OLD
     // set at height 3 is refused.

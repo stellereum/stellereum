@@ -18,8 +18,8 @@
 //! * `mixed_fee_vectors_parallel_waves`: the same pinned vectors with
 //!   parallel wave execution on (the `apply_plain_wave` path).
 
-use ed25519_dalek::SigningKey;
-use stellereum::sharding::Transaction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 use stellereum::zkml::effective_chain_id;
@@ -35,12 +35,47 @@ const SPON_BAL: u64 = 10_000_000;
 const FLOOR: u64 = 500_000;
 const RECIPIENT: [u8; 32] = [0xB0; 32];
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+fn pq_key(seed: u8) -> FalconKeypair {
+    let mut bytes = [0xF1u8; 32];
+    bytes[0] = seed;
+    FalconKeypair::generate_from_seed_bytes(&bytes)
 }
 
 fn addr_of(seed: u8) -> [u8; 32] {
-    key(seed).verifying_key().to_bytes()
+    let kp = pq_key(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    addr
+}
+
+fn pq_sign(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let kp = pq_key(seed);
+    let from = addr_of(seed);
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = kp.sign(&msg);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    tx
 }
 
 fn rt_block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -70,14 +105,13 @@ fn plain_block_matches_sequential_singles() {
         const N: usize = 64;
         let txs: Vec<Transaction> = (0..N as u64)
             .map(|i| {
-                Transaction::sign(
-                    &key((100 + i) as u8),
+                pq_sign(
+                    (100 + i) as u8,
                     RECIPIENT,
                     1,
                     GAS_BASIC_TRANSFER,
                     0,
-                    1,
-                    1,
+                    Vec::new(),
                 )
             })
             .collect();
@@ -159,13 +193,13 @@ fn mixed_fixture() -> (Vec<Transaction>, [u8; 32], [u8; 32]) {
     let user = addr_of(15);
     let sponsor = addr_of(16);
     let txs = vec![
-        Transaction::sign(&key(11), RECIPIENT, 1, GAS_BASIC_TRANSFER, 0, 1, 1),
-        Transaction::sign(&key(12), RECIPIENT, 2, 600_000, 0, 1, 1),
-        Transaction::sign(&key(13), RECIPIENT, BAL - 50, 100, 0, 1, 1),
-        Transaction::sign_with_payload(&key(14), RECIPIENT, 1, 100, 0, 1, 1, oom_payload()),
-        Transaction::sign_with_sponsor(
-            &key(15),
-            &key(16),
+        pq_sign(11, RECIPIENT, 1, GAS_BASIC_TRANSFER, 0, Vec::new()),
+        pq_sign(12, RECIPIENT, 2, 600_000, 0, Vec::new()),
+        pq_sign(13, RECIPIENT, BAL - 50, 100, 0, Vec::new()),
+        pq_sign(14, RECIPIENT, 1, 100, 0, oom_payload()),
+        Transaction::sign_with_sponsor_falcon512(
+            &pq_key(15),
+            &pq_key(16),
             RECIPIENT,
             7,
             GAS_BASIC_TRANSFER,
@@ -179,7 +213,7 @@ fn mixed_fixture() -> (Vec<Transaction>, [u8; 32], [u8; 32]) {
             Vec::new(),
             effective_chain_id(),
         ),
-        Transaction::sign(&key(17), RECIPIENT, 1, GAS_BASIC_TRANSFER, 5, 1, 1),
+        pq_sign(17, RECIPIENT, 1, GAS_BASIC_TRANSFER, 5, Vec::new()),
     ];
     (txs, user, sponsor)
 }
@@ -188,11 +222,13 @@ async fn funded_mixed_engine(parallel: bool) -> InMemoryStateEngine {
     let e = engine_with_floor(FLOOR).await;
     e.set_parallel_exec(parallel);
     for seed in [11u8, 12, 14, 15, 17] {
-        e.update_account(AccountState::new(addr_of(seed), BAL)).await;
+        e.update_account(AccountState::new(addr_of(seed), BAL))
+            .await;
     }
     // s2 covers amount+declared but not amount+floor.
     e.update_account(AccountState::new(addr_of(13), BAL)).await;
-    e.update_account(AccountState::new(addr_of(16), SPON_BAL)).await;
+    e.update_account(AccountState::new(addr_of(16), SPON_BAL))
+        .await;
     e.update_account(AccountState::new(RECIPIENT, 0)).await;
     e
 }
@@ -204,20 +240,19 @@ fn mixed_fee_vectors_are_pinned() {
         let e = funded_mixed_engine(false).await;
         let (applied, failed, fees_collected, status, fees) =
             e.apply_block_parallel_fees(&txs, TS).await;
-        // Pinned fee vectors (captured from the pre-optimization run —
-        // byte-identical balances/fees are the gate: 1 wei of divergence
-        // fails this test).
+        // Pinned fee vectors (byte-identical balances/fees are the gate:
+        // row 4 is explicit PQ1+SP1 so charges FLOOR + PQ_ACTIVATION_SURCHARGE_GAS = 545_000).
         assert_eq!((applied, failed), (3, 3));
         assert_eq!(status, vec![true, true, false, false, true, false]);
-        assert_eq!(fees, vec![500_000, 600_000, 0, 500_000, 500_000, 0]);
-        assert_eq!(fees_collected, 2_100_000);
+        assert_eq!(fees, vec![500_000, 600_000, 0, 500_000, 545_000, 0]);
+        assert_eq!(fees_collected, 2_145_000);
         let pinned: [([u8; 32], u64, u64); 8] = [
             (addr_of(11), 9_499_999, 1),
             (addr_of(12), 9_399_998, 1),
             (addr_of(13), BAL, 0),
             (addr_of(14), 9_500_000, 1),
             (addr_of(15), 9_999_993, 1),
-            (addr_of(16), 9_500_000, 0),
+            (addr_of(16), 9_455_000, 0),
             (addr_of(17), BAL, 0),
             (RECIPIENT, 10, 0),
         ];
@@ -236,18 +271,28 @@ fn mixed_fee_vectors_parallel_waves() {
         let seq = e_seq.apply_block_parallel_fees(&txs, TS).await;
         let e_par = funded_mixed_engine(true).await;
         let par = e_par.apply_block_parallel_fees(&txs, TS).await;
-        assert_eq!((seq.0, seq.1, seq.2, seq.3, seq.4), (par.0, par.1, par.2, par.3, par.4));
-        for seed in [11u8, 12, 13, 14, 15, 16, 17] {
-            let addr = addr_of(seed);
+        assert_eq!(
+            (seq.0, seq.1, seq.2, seq.3, seq.4),
+            (par.0, par.1, par.2, par.3, par.4)
+        );
+        for addr in [
+            addr_of(11),
+            addr_of(12),
+            addr_of(13),
+            addr_of(14),
+            addr_of(15),
+            addr_of(16),
+            addr_of(17),
+        ] {
             assert_eq!(
                 balance_of(&e_seq, &addr).await,
                 balance_of(&e_par, &addr).await,
-                "seed {seed}"
+                "addr {addr:?}"
             );
             assert_eq!(
                 nonce_of(&e_seq, &addr).await,
                 nonce_of(&e_par, &addr).await,
-                "seed {seed}"
+                "addr {addr:?}"
             );
         }
     });

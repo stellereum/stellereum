@@ -151,7 +151,8 @@ async fn restore_and_check(store: &Storage, snap_h: u64, canonical: [u8; 32], n:
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(h, snap_h, "restored height must equal the paired height");
     assert_eq!(
-        fresh.get_state_root().await, canonical,
+        fresh.get_state_root().await,
+        canonical,
         "restored root must equal the canonical root at N={n}"
     );
     // Spot balances at both ends of the deterministic range.
@@ -265,8 +266,7 @@ async fn restore_perf_scale_roots_times_sizes() {
         let proj = base.restore_ms * (p.n as f64 / 100.0);
         eprintln!(
             "[restore-perf] N={}: restore_ms={:.1} linear_proj={proj:.1} bound={bound:.1}",
-            p.n,
-            p.restore_ms
+            p.n, p.restore_ms
         );
         assert!(
             p.restore_ms <= bound,
@@ -285,7 +285,10 @@ async fn restore_perf_vlegs_decode_or_refuse_at_scale() {
     let engine = funded_engine_n(1_000).await;
     let dom = DomainSnapshot::capture(&engine, &StakingLedger::new(), &Governance::new()).await;
     let cur = bincode::serialize(&dom).expect("current encodes");
-    eprintln!("[restore-perf] N=1000 current domain blob: {} bytes", cur.len());
+    eprintln!(
+        "[restore-perf] N=1000 current domain blob: {} bytes",
+        cur.len()
+    );
     let back = decode_domain_snapshot(&cur).expect("current lenient decodes");
     let recoded = bincode::serialize(&back).expect("decoded re-encodes");
     decode_domain_snapshot(&recoded).expect("re-encoded decodes");

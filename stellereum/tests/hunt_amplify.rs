@@ -252,7 +252,8 @@ fn a_slashed_delegator_recovers_only_what_the_pool_still_holds() {
     // The delegator asks for everything it ever delegated.
     let claim = sum_delegations(&l, val);
     l.undelegate(d(1), val, claim, 1_000).unwrap();
-    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS + 1).unwrap();
+    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS + 1)
+        .unwrap();
     let paid = l.withdraw_delegator(d(1), val).unwrap();
     pool -= paid;
 

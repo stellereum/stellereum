@@ -126,6 +126,8 @@ pub const FUEL_BLAKE3_BASE: u64 = 20;
 pub const FUEL_BLAKE3_PER_BYTE: u64 = 1;
 /// Fuel charged for Ed25519 signature verification.
 pub const FUEL_ED25519_VERIFY: u64 = 500;
+/// Base fuel charged for Falcon-512 post-quantum signature verification.
+pub const FUEL_FALCON512_VERIFY: u64 = 2_000;
 /// Base fuel charged for setting return data.
 pub const FUEL_RETURN_DATA_BASE: u64 = 10;
 /// Fuel charged per byte of return data.
@@ -1377,6 +1379,48 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
     );
     let _ = linker.func_wrap(
         "host",
+        "falcon512_verify",
+        |mut caller: wasmi::Caller<'_, HostState>,
+         msg_ptr: i32,
+         msg_len: i32,
+         pk_ptr: i32,
+         pk_len: i32,
+         sig_ptr: i32,
+         sig_len: i32|
+         -> Result<i32, wasmi::Error> {
+            if msg_len < 0 || pk_len < 0 || sig_len < 0 {
+                return Err(wasmi::Error::new("negative length for falcon512_verify"));
+            }
+            let mlen = msg_len as usize;
+            let pklen = pk_len as usize;
+            let siglen = sig_len as usize;
+            if mlen > MAX_CONTRACT_MEMORY
+                || pklen > MAX_CONTRACT_MEMORY
+                || siglen > MAX_CONTRACT_MEMORY
+            {
+                return Err(wasmi::Error::new(
+                    "falcon512_verify input length exceeds maximum memory",
+                ));
+            }
+            let fuel = FUEL_FALCON512_VERIFY
+                .saturating_add(mlen as u64)
+                .saturating_add(pklen as u64)
+                .saturating_add(siglen as u64);
+            HostState::charge(&mut caller, fuel)?;
+            let msg_bytes = read_wasm_memory(&mut caller, msg_ptr, mlen)?;
+            let pk_bytes = read_wasm_memory(&mut caller, pk_ptr, pklen)?;
+            let sig_bytes = read_wasm_memory(&mut caller, sig_ptr, siglen)?;
+            let valid = crate::post_quantum::verify_pq_signature(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk_bytes,
+                &msg_bytes,
+                &sig_bytes,
+            );
+            Ok(i32::from(valid))
+        },
+    );
+    let _ = linker.func_wrap(
+        "host",
         "return_data",
         |mut caller: wasmi::Caller<'_, HostState>,
          ptr: i32,
@@ -1611,7 +1655,7 @@ fn call_export_exact(
 
 /// Execute an exported method in a fully sandboxed, metered store with
 /// host storage (sload/sstore), event emission (emit), outbound messages (send_message),
-/// and contextual/crypto host functions (caller, value, block_time, block_hash, sha256, blake3, ed25519_verify, return_data).
+/// and contextual/crypto host functions (caller, value, block_time, block_hash, sha256, blake3, ed25519_verify, falcon512_verify, return_data).
 ///
 /// The method may take up to [`MAX_CONTRACT_CALL_ARGS`] `i64` parameters.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -2643,6 +2687,113 @@ mod tests {
     }
 
     #[test]
+    fn test_host_falcon512_verify_valid_and_invalid() {
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0x5A);
+        let msg = b"contract falcon512 payload verification";
+        let sig = kp.sign(msg);
+        assert_eq!(
+            kp.public_key.len(),
+            crate::post_quantum::FALCON512_PUBKEY_LEN
+        );
+        assert_eq!(sig.len(), crate::post_quantum::FALCON512_SIG_LEN);
+
+        // Layout in 1-page (64 KiB) linear memory:
+        //   0..len(msg)    : msg
+        //   64..961        : pk (897 bytes)
+        //   1024..1690     : sig (666 bytes)
+        let wat_src = format!(
+            r#"(module
+                 (import "host" "falcon512_verify" (func $falcon512_verify (param i32 i32 i32 i32 i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (data (i32.const 0) "{msg_esc}")
+                 (data (i32.const 64) "{pk_esc}")
+                 (data (i32.const 1024) "{sig_esc}")
+                 (func (export "verify_sig") (param $corrupt i64) (result i64)
+                   (if (i64.ne (local.get $corrupt) (i64.const 0))
+                     (then
+                       (i32.store8 (i32.const 1024) (i32.xor (i32.load8_u (i32.const 1024)) (i32.const 0xff)))))
+                   (i64.extend_i32_u
+                     (call $falcon512_verify
+                       (i32.const 0) (i32.const {msg_len})
+                       (i32.const 64) (i32.const {pk_len})
+                       (i32.const 1024) (i32.const {sig_len}))))
+                 (func (export "verify_wrong_pk_len") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $falcon512_verify
+                       (i32.const 0) (i32.const {msg_len})
+                       (i32.const 64) (i32.const 32)
+                       (i32.const 1024) (i32.const {sig_len}))))
+                 (func (export "verify_oob") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $falcon512_verify
+                       (i32.const 0) (i32.const {msg_len})
+                       (i32.const 64) (i32.const {pk_len})
+                       (i32.const 70000) (i32.const {sig_len}))))
+                 (func (export "verify_oversized") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $falcon512_verify
+                       (i32.const 0) (i32.const {msg_len})
+                       (i32.const 64) (i32.const {oversized})
+                       (i32.const 1024) (i32.const {sig_len}))))
+                 (func (export "verify_neg_len") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $falcon512_verify
+                       (i32.const 0) (i32.const -1)
+                       (i32.const 64) (i32.const {pk_len})
+                       (i32.const 1024) (i32.const {sig_len})))))"#,
+            msg_esc = escape_wat_bytes(msg),
+            pk_esc = escape_wat_bytes(&kp.public_key),
+            sig_esc = escape_wat_bytes(&sig),
+            msg_len = msg.len(),
+            pk_len = kp.public_key.len(),
+            sig_len = sig.len(),
+            oversized = MAX_CONTRACT_MEMORY + 1,
+        );
+
+        let wasm = wat::parse_str(&wat_src).unwrap();
+        let mut reg = ContractRegistry::new();
+        let addr = reg.deploy([4u8; 32], wasm, 0).unwrap();
+
+        // Valid Falcon-512 signature -> returns 1
+        let (valid_res, fuel_used, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
+        assert_eq!(valid_res, 1, "valid Falcon-512 signature must return 1");
+        assert!(
+            fuel_used >= FUEL_FALCON512_VERIFY,
+            "must charge deterministic Falcon-512 verification gas"
+        );
+
+        // Tampered signature -> returns 0
+        let (corrupt_res, ..) = reg.call(&addr, "verify_sig", 1, 100_000).unwrap();
+        assert_eq!(
+            corrupt_res, 0,
+            "tampered Falcon-512 signature must return 0"
+        );
+
+        // Wrong pubkey length -> returns 0
+        let (wrong_len_res, ..) = reg.call(&addr, "verify_wrong_pk_len", 0, 100_000).unwrap();
+        assert_eq!(
+            wrong_len_res, 0,
+            "wrong Falcon-512 pubkey length must return 0"
+        );
+
+        // Out-of-bounds pointer -> traps
+        let oob_err = reg.call(&addr, "verify_oob", 0, 100_000).unwrap_err();
+        assert!(matches!(oob_err, ContractError::Trapped));
+
+        // Oversized length (> MAX_CONTRACT_MEMORY) -> traps
+        let oversized_err = reg.call(&addr, "verify_oversized", 0, 100_000).unwrap_err();
+        assert!(matches!(oversized_err, ContractError::Trapped));
+
+        // Negative length -> traps
+        let neg_err = reg.call(&addr, "verify_neg_len", 0, 100_000).unwrap_err();
+        assert!(matches!(neg_err, ContractError::Trapped));
+
+        // Insufficient fuel -> OutOfFuel
+        let fuel_err = reg.call(&addr, "verify_sig", 0, 100).unwrap_err();
+        assert!(matches!(fuel_err, ContractError::OutOfFuel));
+    }
+
+    #[test]
     fn test_host_return_data_and_bounds_checking() {
         let wasm = wat::parse_str(
             r#"(module
@@ -2702,6 +2853,7 @@ mod tests {
                  (import "host" "sha256" (func $sha256 (param i32 i32 i32)))
                  (import "host" "blake3" (func $blake3 (param i32 i32 i32)))
                  (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
+                 (import "host" "falcon512_verify" (func $falcon512_verify (param i32 i32 i32 i32 i32 i32) (result i32)))
                  (import "host" "return_data" (func $return_data (param i32 i32)))
                  (memory (export "memory") 1)
                  (func (export "run_all") (param $arg i64) (result i64)
@@ -2715,6 +2867,7 @@ mod tests {
                    (drop (call $value))
                    (drop (call $block_time))
                    (drop (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const 10) (i32.const 64)))
+                   (drop (call $falcon512_verify (i32.const 0) (i32.const 10) (i32.const 64) (i32.const 32) (i32.const 128) (i32.const 32)))
                    (i64.const 123)))"#,
         )
         .unwrap();

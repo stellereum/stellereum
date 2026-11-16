@@ -1,5 +1,6 @@
 use crate::db::{normalize_contract_key, Database, EventFilter, EventRecord, VerifiedSource};
 use crate::events::{decode_event, AbiCache, RawEvent};
+use crate::syncer::SyncStatus;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -10,6 +11,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
@@ -27,18 +29,20 @@ pub struct AppState {
     /// `None` = endpoint refuses everything (default-deny); set
     /// `INDEXER_VERIFY_TOKEN` to enable operator/API use. Reads stay public.
     pub verify_token: Option<String>,
+    /// Shared syncer health state (`node_tip_height`, `last_sync_at`).
+    pub sync_status: Arc<RwLock<SyncStatus>>,
+    /// Reused HTTP client for RPC proxy calls.
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
     /// A state with an empty ABI cache.
     pub fn new(db: Database) -> Self {
-        Self {
+        Self::with_rpc(
             db,
-            abis: Arc::new(AbiCache::new()),
-            rpc_url: std::env::var("INDEXER_RPC_URL")
+            std::env::var("INDEXER_RPC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8545".to_string()),
-            verify_token: None,
-        }
+        )
     }
 
     /// A state with an empty ABI cache and an explicit node RPC endpoint.
@@ -48,6 +52,11 @@ impl AppState {
             abis: Arc::new(AbiCache::new()),
             rpc_url,
             verify_token: None,
+            sync_status: Arc::new(RwLock::new(SyncStatus::default())),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -56,6 +65,25 @@ impl AppState {
 pub struct Pagination {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct BlocksQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub shard_id: Option<u32>,
+    pub shard: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct BlockQuery {
+    pub shard_id: Option<u32>,
+    pub shard: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct ShardsQuery {
+    pub address: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,8 +111,8 @@ const MAX_OFFSET: u32 = 1_000_000;
 
 /// Fail-closed offset gate: `Err(response)` on absurd offsets.
 #[allow(clippy::result_large_err)] // GATE: axum Response is the framework's
-// native error carrier (handlers return it by value everywhere); boxing
-// would only add noise.
+                                   // native error carrier (handlers return it by value everywhere); boxing
+                                   // would only add noise.
 fn check_offset(offset: u32) -> Result<u32, axum::response::Response> {
     if offset > MAX_OFFSET {
         Err((
@@ -135,6 +163,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v2/contract/:address/source", get(get_contract_source))
         // Contracts (derived from the event log) and the LIVE shard topology
         .route("/api/v2/contracts", get(get_contracts))
+        .route("/api/shards", get(get_shards))
         .route("/api/v2/shards", get(get_shards))
         // Accounts & History
         .route("/api/accounts/:address", get(get_account_info))
@@ -159,15 +188,38 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn fetch_live_validators(state: &AppState) -> Option<Value> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "stell_getValidators",
+        "params": {},
+        "id": 1
+    });
+    let resp = state
+        .http_client
+        .post(&state.rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+    let data: Value = resp.json().await.ok()?;
+    let res = data.get("result")?;
+    if res.is_null() {
+        None
+    } else {
+        Some(res.clone())
+    }
+}
+
 // 1. Overview (gram.org/api/overview)
 async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.db.get_stats().unwrap_or(crate::db::NetworkStats {
-        tip_height: 158000,
-        total_blocks: 158000,
-        total_transactions: 1000,
-        total_accounts: 350,
-        current_tps: 76.9,
-        avg_block_time: 0.8,
+        tip_height: 0,
+        total_blocks: 0,
+        total_transactions: 0,
+        total_accounts: 0,
+        current_tps: 0.0,
+        avg_block_time: 0.0,
     });
 
     let charts = state
@@ -178,6 +230,11 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    let live_staked = fetch_live_validators(&state)
+        .await
+        .and_then(|v| v["total_power"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "0".to_string());
 
     // The explorer advertises what it can serve: the ABI manifests (which
     // make the events DECODED rather than raw) and the event endpoints.
@@ -195,7 +252,7 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
             "counted": now,
             "total": "1000000000000000000", // 1B STELL in nano
             "circulating": "250000000000000000", // 250M STELL
-            "staked": "5999044471404", // 5,999 STELL
+            "staked": live_staked,
             "genesis_vault": "250000000000000000",
             "validator_rewards": "350000000000000000",
             "ecosystem": "150000000000000000",
@@ -276,15 +333,35 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(overview))
 }
 
+async fn fetch_live_shards_count(state: &AppState) -> Option<u64> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "stell_getShards",
+        "params": {},
+        "id": 1
+    });
+    let resp = state
+        .http_client
+        .post(&state.rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+    let data: Value = resp.json().await.ok()?;
+    data["result"]["total_shards"]
+        .as_u64()
+        .or_else(|| data["result"]["shards"].as_array().map(|a| a.len() as u64))
+}
+
 // 2. Stats (/api/v2/stats)
 async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.db.get_stats().unwrap_or(crate::db::NetworkStats {
-        tip_height: 158000,
-        total_blocks: 158000,
-        total_transactions: 1000,
-        total_accounts: 350,
-        current_tps: 76.9,
-        avg_block_time: 0.8,
+        tip_height: 0,
+        total_blocks: 0,
+        total_transactions: 0,
+        total_accounts: 0,
+        current_tps: 0.0,
+        avg_block_time: 0.0,
     });
 
     let now = std::time::SystemTime::now()
@@ -292,18 +369,28 @@ async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default()
         .as_secs();
 
+    let shards = fetch_live_shards_count(&state).await.unwrap_or(1);
+    let validators_count = fetch_live_validators(&state)
+        .await
+        .and_then(|v| v["validators"].as_array().map(|a| a.len() as u64));
+
     let out = json!({
         "chain_id": 5757,
         "mc_seqno": stats.tip_height,
         "tip_height": stats.tip_height,
         "mc_utime": now,
-        "shards": 2,
-        "tps": stats.current_tps.max(1.0),
-        "current_tps": stats.current_tps.max(1.0),
+        "shards": shards,
+        "validators_count": validators_count,
+        "tps": stats.current_tps,
+        "current_tps": stats.current_tps,
         "block_time": stats.avg_block_time,
         "avg_block_time": stats.avg_block_time,
         "wc_block_time": stats.avg_block_time,
-        "mc_block_txs": 124.0,
+        "mc_block_txs": if stats.total_blocks > 0 {
+            (stats.total_transactions as f64) / (stats.total_blocks as f64)
+        } else {
+            0.0
+        },
         "wc_block_txs": 0.0,
         "indexed_txs": stats.total_transactions,
         "total_transactions": stats.total_transactions,
@@ -333,122 +420,163 @@ async fn get_price() -> impl IntoResponse {
 // 4. Status
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let tip = state.db.get_tip_height().unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sync = state.sync_status.read().await.clone();
+    let fresh = sync
+        .last_sync_at
+        .map(|ts| now.saturating_sub(ts) <= 60)
+        .unwrap_or(false);
+    let lag = sync.node_tip_height.map(|n| n.saturating_sub(tip));
+    let synced = match (sync.node_tip_height, fresh) {
+        (Some(node_tip), true) => tip.saturating_add(2) >= node_tip,
+        _ => false,
+    };
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "chain_id": 5757,
             "tip_height": tip,
-            "synced": true,
+            "node_tip_height": sync.node_tip_height,
+            "lag": lag,
+            "synced": synced,
+            "last_sync_at": sync.last_sync_at,
+            "last_error": sync.last_error,
             "version": "0.1.0-pq-fips206",
-            "time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            "time": now
         })),
     )
 }
 
-// 5. Validators (gram.org/api/validators)
-async fn get_validators() -> impl IntoResponse {
+// 5. Validators (live from node RPC `stell_getValidators`)
+async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
+    let Some(res) = fetch_live_validators(&state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "live validator set is not available from node RPC",
+                "source": "rpc",
+                "rpc_url": state.rpc_url,
+                "validators": [],
+            })),
+        )
+            .into_response();
+    };
+
+    let total_power_str = res["total_power"].as_str().unwrap_or("0").to_string();
+    let total_power_num: f64 = total_power_str.parse::<u128>().unwrap_or(0) as f64;
+    let quorum_str = res["quorum"].as_str().unwrap_or("0").to_string();
+    let fragile = res["fragile"].as_bool().unwrap_or(false);
+    let fragile_reason = res["fragile_reason"].clone();
+
+    let mut raw_vals: Vec<(String, u128, String)> = res["validators"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let addr = v["validator"].as_str()?.to_string();
+                    let power_str = v["power"].as_str().unwrap_or("0").to_string();
+                    let power_u128 = power_str.parse::<u128>().unwrap_or(0);
+                    Some((addr, power_u128, power_str))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    raw_vals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let validators_json: Vec<Value> = raw_vals
+        .iter()
+        .enumerate()
+        .map(|(idx, (addr, power_u128, power_str))| {
+            let weight = if total_power_num > 0.0 {
+                ((*power_u128 as f64) / total_power_num * 10000.0).round() / 10000.0
+            } else {
+                0.0
+            };
+            let stl57 = crate::db::to_stl57(addr).unwrap_or_default();
+            json!({
+                "rank": idx + 1,
+                "address": addr,
+                "address_stl57": stl57,
+                "name": format!("Validator {}", &addr.chars().take(8).collect::<String>()),
+                "stake": power_str,
+                "self_bond": power_str,
+                "delegated": "0",
+                "weight": weight,
+                "main": true,
+                "status": "active",
+                "uptime": 100.0,
+                "commission_bps": 0,
+                "falcon_pubkey": res["validators"][idx]["falcon_pubkey"].as_str().unwrap_or(""),
+                "blocks_proposed": 0
+            })
+        })
+        .collect();
+
     let out = json!({
+        "source": "rpc",
         "limits": {
-            "min_stake": "1000000000000",
+            "min_stake": "1100000000000",
             "max_stake": "2000000000000"
         },
         "round": {
-            "total_stake": "7778463847208",
-            "validators": 4,
-            "min_stake": "1000000000000",
+            "total_stake": total_power_str,
+            "validators": validators_json.len(),
+            "min_stake": "1100000000000",
             "max_stake": "2000000000000",
-            "quorum": "5185642564806",
-            "fragile": false,
+            "quorum": quorum_str,
+            "fragile": fragile,
+            "fragile_reason": fragile_reason,
             "apy": 0.145
         },
-        "validators": [
-            {
-                "rank": 1,
-                "address": "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361",
-                "address_stl57": crate::db::to_stl57("c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361").unwrap_or_default(),
-                "name": "Node A (Helsinki VPS)",
-                "stake": "2000000000000",
-                "self_bond": "2000000000000",
-                "delegated": "0",
-                "weight": 0.2571,
-                "main": true,
-                "status": "active",
-                "uptime": 100.0,
-                "commission_bps": 0,
-                "falcon_pubkey": "094b56e26309250c6f24f04571dd9944cdda8a43e945849a49d5a6c0f22a9ab7...",
-                "blocks_proposed": 54240
-            },
-            {
-                "rank": 2,
-                "address": "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd",
-                "address_stl57": crate::db::to_stl57("9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd").unwrap_or_default(),
-                "name": "Node B (Ryzen РФ)",
-                "stake": "2000000000000",
-                "self_bond": "2000000000000",
-                "delegated": "0",
-                "weight": 0.2571,
-                "main": true,
-                "status": "active",
-                "uptime": 100.0,
-                "commission_bps": 0,
-                "falcon_pubkey": "09948cbd580c52b776a1f2908396028a4d97d5af551d228e3da460288f416d6f...",
-                "blocks_proposed": 54238
-            },
-            {
-                "rank": 3,
-                "address": "eddf81632831d8e9747dc38edbb2c88a835e246a0310d74c8b12b8df6e32e4cc",
-                "address_stl57": crate::db::to_stl57("eddf81632831d8e9747dc38edbb2c88a835e246a0310d74c8b12b8df6e32e4cc").unwrap_or_default(),
-                "name": "Node D (Capitalist Validator 4)",
-                "stake": "2000000000000",
-                "self_bond": "2000000000000",
-                "delegated": "0",
-                "weight": 0.2571,
-                "main": true,
-                "status": "active",
-                "uptime": 100.0,
-                "commission_bps": 0,
-                "falcon_pubkey": "09736e255386a5f7790d84dbf8ee0a2c349645dd1902116d663bde99b3960e3e...",
-                "blocks_proposed": 54235
-            },
-            {
-                "rank": 4,
-                "address": "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694",
-                "address_stl57": crate::db::to_stl57("021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694").unwrap_or_default(),
-                "name": "Node C (Peer Knanserver)",
-                "stake": "1778463847208",
-                "self_bond": "1778463847208",
-                "delegated": "0",
-                "weight": 0.2287,
-                "main": true,
-                "status": "active",
-                "uptime": 99.8,
-                "commission_bps": 0,
-                "falcon_pubkey": "0907097015c627a68bfe079311e9b13de4ec552e8270942c9458dda39b47ae09...",
-                "blocks_proposed": 54100
-            }
-        ],
+        "validators": validators_json,
         "updated": now
     });
 
-    (StatusCode::OK, Json(out))
+    (StatusCode::OK, Json(out)).into_response()
 }
 
-// 6. Staking
-async fn get_staking() -> impl IntoResponse {
+// 6. Staking (live from node RPC `stell_getValidators`)
+async fn get_staking(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(res) = fetch_live_validators(&state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "live staking state is not available from node RPC",
+                "source": "rpc",
+                "rpc_url": state.rpc_url,
+            })),
+        )
+            .into_response();
+    };
+    let total_staked = res["total_power"].as_str().unwrap_or("0");
+    let count = res["validators"].as_array().map(|a| a.len()).unwrap_or(0);
+    let total_num: f64 = total_staked.parse::<u128>().unwrap_or(0) as f64;
+    let staked_pct = if total_num > 0.0 {
+        total_num / 1_000_000_000_000_000_000.0
+    } else {
+        0.0
+    };
     (
         StatusCode::OK,
         Json(json!({
-            "total_staked": "7778463847208",
-            "staked_percentage": 0.0031,
-            "validators_count": 4,
+            "source": "rpc",
+            "total_staked": total_staked,
+            "staked_percentage": staked_pct,
+            "validators_count": count,
+            "quorum": res["quorum"],
+            "fragile": res["fragile"],
             "cooldown_period_secs": 172800,
-            "min_validator_bond": "1000000000000",
+            "min_validator_bond": "1100000000000",
             "estimated_apy": 0.145,
             "slashing_penalty_bps": {
                 "downtime": 10,
@@ -456,6 +584,7 @@ async fn get_staking() -> impl IntoResponse {
             }
         })),
     )
+        .into_response()
 }
 
 // 7. Verified Smart Contracts & Actors (gram.org/api/verified)
@@ -545,76 +674,95 @@ async fn get_verified_stats() -> impl IntoResponse {
     )
 }
 
-// 8. Tokens (gram.org/api/tokens)
-async fn get_tokens() -> impl IntoResponse {
+// 8. Tokens (native STELL + live `stell_listTokens` from node RPC)
+async fn get_tokens(State(state): State<AppState>) -> impl IntoResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let tokens = json!([
-        {
-            "address": "0000000000000000000000000000000000000000000000000000000000000000",
-            "name": "Stellereum",
-            "symbol": "STELL",
-            "decimals": 9,
-            "price": 0.25,
-            "change_24h": 0.0,
-            "market_cap": 250000000.0,
-            "holders": 350,
-            "verified": true,
-            "image": "/assets/img/logo.svg"
-        },
-        {
-            "address": "7465746865725f75736474000000000000000000000000000000000000000001",
-            "name": "Tether USD (Stellereum Teleport)",
-            "symbol": "USDT",
-            "decimals": 6,
-            "price": 1.0,
-            "change_24h": 0.01,
-            "market_cap": 1000000.0,
-            "holders": 85,
-            "verified": true,
-            "image": "https://cryptologos.cc/logos/tether-usdt-logo.svg"
-        },
-        {
-            "address": "746f6e5f636f696e000000000000000000000000000000000000000000000002",
-            "name": "Wrapped TON",
-            "symbol": "wTON",
-            "decimals": 9,
-            "price": 5.20,
-            "change_24h": 0.05,
-            "market_cap": 520000.0,
-            "holders": 42,
-            "verified": true,
-            "image": "https://cryptologos.cc/logos/toncoin-ton-logo.svg"
+    let mut tokens = vec![json!({
+        "address": "0000000000000000000000000000000000000000000000000000000000000000",
+        "name": "Stellereum",
+        "symbol": "STELL",
+        "decimals": 9,
+        "price": 0.25,
+        "change_24h": 0.0,
+        "market_cap": 250000000.0,
+        "verified": true,
+        "image": "/assets/img/logo.svg"
+    })];
+
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "stell_listTokens",
+        "params": { "limit": 100, "offset": 0 },
+        "id": 1
+    });
+    if let Ok(resp) = state
+        .http_client
+        .post(&state.rpc_url)
+        .json(&payload)
+        .send()
+        .await
+    {
+        if let Ok(data) = resp.json::<Value>().await {
+            if let Some(ids) = data["result"]["tokens"].as_array() {
+                for id_val in ids {
+                    if let Some(addr) = id_val.as_str() {
+                        tokens.push(json!({
+                            "address": addr,
+                            "address_stl57": crate::db::to_stl57(addr),
+                            "verified": false,
+                        }));
+                    }
+                }
+            }
         }
-    ]);
+    }
 
     (
         StatusCode::OK,
         Json(json!({
             "source": "Stellereum Token Registry",
             "tokens": tokens,
+            "total": tokens.len(),
             "updated": now
         })),
     )
 }
 
+fn parse_shard_height(param: &str) -> Option<(u32, u64)> {
+    let (prefix, rest) = param.trim().split_once(':')?;
+    let shard_id = if prefix.trim() == "-1" {
+        0
+    } else {
+        prefix.trim().parse::<u32>().ok()?
+    };
+    let height = rest.trim().parse::<u64>().ok()?;
+    Some((shard_id, height))
+}
+
 // 9. Blocks
 async fn get_blocks(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<BlocksQuery>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(200);
     let offset = match check_offset(p.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
-    match state.db.get_blocks(limit, offset) {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let shard_filter = p.shard_id.or(p.shard);
+    match state.db.get_blocks_by_shard(shard_filter, limit, offset) {
         Ok(blocks) => (
             StatusCode::OK,
-            Json(json!({ "blocks": blocks, "limit": limit, "offset": offset })),
+            Json(json!({
+                "blocks": blocks,
+                "shard_id": shard_filter,
+                "limit": limit,
+                "offset": offset
+            })),
         )
             .into_response(),
         Err(e) => (
@@ -625,17 +773,30 @@ async fn get_blocks(
     }
 }
 
-async fn get_block(State(state): State<AppState>, Path(param): Path<String>) -> impl IntoResponse {
-    let block_opt = if let Ok(h) = param.parse::<u64>() {
-        state.db.get_block_by_height(h)
+async fn get_block(
+    State(state): State<AppState>,
+    Path(param): Path<String>,
+    Query(q): Query<BlockQuery>,
+) -> impl IntoResponse {
+    let shard_filter = q.shard_id.or(q.shard);
+    let block_opt = if let Some((sid, h)) = parse_shard_height(&param) {
+        state.db.get_block_by_shard_and_height(sid, h)
+    } else if let Ok(h) = param.trim().parse::<u64>() {
+        if let Some(sid) = shard_filter {
+            state.db.get_block_by_shard_and_height(sid, h)
+        } else {
+            state.db.get_block_by_height(h)
+        }
     } else {
-        let clean = param.strip_prefix("0x").unwrap_or(&param);
-        state.db.get_block_by_hash(clean)
+        state.db.get_block_by_hash(&param)
     };
 
     match block_opt {
         Ok(Some(b)) => {
-            let txs = state.db.get_block_txs(b.height).unwrap_or_default();
+            let txs = state
+                .db
+                .get_block_txs_for_shard(b.shard_id, b.height)
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 Json(json!({ "block": b, "transactions": txs })),
@@ -662,9 +823,9 @@ async fn get_recent_txs(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(200);
     let offset = match check_offset(p.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     // Fetch latest transactions across blocks
     let txs = state
         .db
@@ -678,8 +839,7 @@ async fn get_recent_txs(
 }
 
 async fn get_tx(State(state): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
-    let clean = hash.strip_prefix("0x").unwrap_or(&hash);
-    match state.db.get_tx_by_hash(clean) {
+    match state.db.get_tx_by_hash(&hash) {
         Ok(Some(tx)) => (StatusCode::OK, Json(json!({ "transaction": tx }))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -699,33 +859,14 @@ async fn get_account_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let clean = address
-        .strip_prefix("0x")
-        .or_else(|| address.strip_prefix("0X"))
-        .unwrap_or(&address);
-    let stl57 = if let Ok(addr_bytes) = stellereum::address::parse_address(&address) {
-        Some(stellereum::address::encode_stl57_address(&addr_bytes))
-    } else if let Ok(decoded) = hex::decode(clean) {
-        if decoded.len() == 32 {
-            let mut b = [0u8; 32];
-            b.copy_from_slice(&decoded);
-            Some(stellereum::address::encode_stl57_address(&b))
-        } else if decoded.len() == 20 {
-            let mut b = [0u8; 32];
-            b[12..].copy_from_slice(&decoded);
-            Some(stellereum::address::encode_stl57_address(&b))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let tx_count = state.db.get_account_tx_count(clean).unwrap_or(0);
+    let norm = crate::db::normalize_address_info(&address);
+    let tx_count = state.db.get_account_tx_count(&address).unwrap_or(0);
     (
         StatusCode::OK,
         Json(json!({
-            "address": clean,
-            "stl57": stl57,
+            "address": norm.hex_clean,
+            "address_0x": norm.hex_0x,
+            "stl57": norm.stl57,
             "tx_count": tx_count,
             "status": "active"
         })),
@@ -737,28 +878,76 @@ async fn get_account_actions(
     Path(address): Path<String>,
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
-    let clean = address.strip_prefix("0x").unwrap_or(&address);
+    let norm = crate::db::normalize_address_info(&address);
     let limit = p.limit.unwrap_or(50).min(200);
     let offset = match check_offset(p.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
-    match state.db.get_account_txs(clean, limit, offset) {
-        Ok(txs) => (StatusCode::OK, Json(json!({ "address": clean, "actions": txs, "transactions": txs, "limit": limit, "offset": offset }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    match state.db.get_account_txs(&address, limit, offset) {
+        Ok(txs) => (
+            StatusCode::OK,
+            Json(json!({
+                "address": norm.hex_clean,
+                "address_0x": norm.hex_0x,
+                "stl57": norm.stl57,
+                "actions": txs,
+                "transactions": txs,
+                "limit": limit,
+                "offset": offset
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-async fn get_whales() -> impl IntoResponse {
-    // Rich list
+async fn get_whales(State(state): State<AppState>) -> impl IntoResponse {
+    // Derive top active addresses from indexed transactions instead of fabricated balances.
+    let txs = state.db.get_account_txs("", 200, 0).unwrap_or_default();
+    let mut counts: std::collections::HashMap<String, (Option<String>, u64)> =
+        std::collections::HashMap::new();
+    for t in txs {
+        for raw_addr in [t.from_addr, t.to_addr] {
+            if raw_addr.trim().is_empty() {
+                continue;
+            }
+            let norm = crate::db::normalize_address_info(&raw_addr);
+            if norm.hex_clean.is_empty() {
+                continue;
+            }
+            let entry = counts.entry(norm.hex_clean).or_insert((None, 0));
+            if entry.0.is_none() {
+                entry.0 = norm.stl57;
+            }
+            entry.1 += 1;
+        }
+    }
+    let mut ranked: Vec<(String, Option<String>, u64)> = counts
+        .into_iter()
+        .map(|(addr, (stl57, count))| (addr, stl57, count))
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(20);
+    let whales: Vec<Value> = ranked
+        .into_iter()
+        .map(|(address, address_stl57, tx_count)| {
+            json!({
+                "address": address,
+                "address_stl57": address_stl57,
+                "tx_count": tx_count,
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
         Json(json!({
-            "whales": [
-                { "address": "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361", "balance_stell": 100000000.0, "role": "Validator Node A" },
-                { "address": "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd", "balance_stell": 100000000.0, "role": "Validator Node B" },
-                { "address": "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694", "balance_stell": 190.0, "role": "Validator Node C" }
-            ]
+            "source": "db",
+            "whales": whales,
         })),
     )
 }
@@ -774,18 +963,17 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
     };
     let trimmed = query.trim();
 
-    // 1. Check if Stl57 address or standard hex
-    let clean_hex = if let Ok(addr_bytes) = stellereum::address::parse_address(trimmed) {
-        hex::encode(addr_bytes)
-    } else {
-        trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .unwrap_or(trimmed)
-            .to_string()
-    };
+    if let Some((sid, h)) = parse_shard_height(trimmed) {
+        if let Ok(Some(b)) = state.db.get_block_by_shard_and_height(sid, h) {
+            return (
+                StatusCode::OK,
+                Json(json!({ "type": "block", "result": b })),
+            )
+                .into_response();
+        }
+    }
 
-    if let Ok(h) = clean_hex.parse::<u64>() {
+    if let Ok(h) = trimmed.parse::<u64>() {
         if let Ok(Some(b)) = state.db.get_block_by_height(h) {
             return (
                 StatusCode::OK,
@@ -795,7 +983,7 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
         }
     }
 
-    if let Ok(Some(tx)) = state.db.get_tx_by_hash(&clean_hex) {
+    if let Ok(Some(tx)) = state.db.get_tx_by_hash(trimmed) {
         return (
             StatusCode::OK,
             Json(json!({ "type": "transaction", "result": tx })),
@@ -803,7 +991,7 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
             .into_response();
     }
 
-    if let Ok(Some(b)) = state.db.get_block_by_hash(&clean_hex) {
+    if let Ok(Some(b)) = state.db.get_block_by_hash(trimmed) {
         return (
             StatusCode::OK,
             Json(json!({ "type": "block", "result": b })),
@@ -811,27 +999,18 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
             .into_response();
     }
 
-    if clean_hex.len() >= 40 {
-        let stl57 = if let Ok(addr_bytes) = stellereum::address::parse_address(trimmed) {
-            Some(stellereum::address::encode_stl57_address(&addr_bytes))
-        } else if let Ok(decoded) = hex::decode(&clean_hex) {
-            if decoded.len() == 32 {
-                let mut b = [0u8; 32];
-                b.copy_from_slice(&decoded);
-                Some(stellereum::address::encode_stl57_address(&b))
-            } else if decoded.len() == 20 {
-                let mut b = [0u8; 32];
-                b[12..].copy_from_slice(&decoded);
-                Some(stellereum::address::encode_stl57_address(&b))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    let norm = crate::db::normalize_address_info(trimmed);
+    if norm.bytes32.is_some() {
+        let tx_count = state.db.get_account_tx_count(trimmed).unwrap_or(0);
         return (
             StatusCode::OK,
-            Json(json!({ "type": "account", "address": clean_hex, "stl57": stl57 })),
+            Json(json!({
+                "type": "account",
+                "address": norm.hex_clean,
+                "address_0x": norm.hex_0x,
+                "stl57": norm.stl57,
+                "tx_count": tx_count,
+            })),
         )
             .into_response();
     }
@@ -933,11 +1112,12 @@ async fn get_contract_events(
     Path(address): Path<String>,
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
+    let norm = crate::db::normalize_address_info(&address);
     let limit = p.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
     let offset = match check_offset(p.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     let filter = EventFilter {
         contract: Some(address.clone()),
         ..Default::default()
@@ -952,7 +1132,8 @@ async fn get_contract_events(
             (
                 StatusCode::OK,
                 Json(json!({
-                    "contract": address,
+                    "contract": norm.hex_clean,
+                    "contract_stl57": norm.stl57,
                     "events": events,
                     "count": events.len(),
                     "total": total,
@@ -1007,9 +1188,9 @@ async fn get_events(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
     let offset = match check_offset(q.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     let filter = EventFilter {
         from_block: q.from_block,
         to_block: q.to_block,
@@ -1059,9 +1240,9 @@ async fn get_contracts(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
     let offset = match check_offset(p.offset.unwrap_or(0)) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     match state.db.list_contracts(limit, offset) {
         Ok(rows) => {
             let total = state.db.count_contracts().unwrap_or(rows.len() as u64);
@@ -1109,29 +1290,109 @@ async fn get_contracts(
 /// it is the node's view and not a locally reconstructed one; when the node
 /// cannot be reached the endpoint says so explicitly instead of inventing a
 /// topology.
-async fn get_shards(State(state): State<AppState>) -> impl IntoResponse {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+async fn get_shards(
+    State(state): State<AppState>,
+    Query(q): Query<ShardsQuery>,
+) -> impl IntoResponse {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "stell_getShards",
         "params": {},
         "id": 1
     });
-    let client = reqwest::Client::builder()
+    let fetched = match state
+        .http_client
+        .post(&state.rpc_url)
+        .json(&payload)
         .timeout(std::time::Duration::from_secs(5))
-        .build();
-    let fetched = match client {
-        Ok(c) => match c.post(&state.rpc_url).json(&payload).send().await {
-            Ok(resp) => resp.json::<Value>().await.ok(),
-            Err(_) => None,
-        },
+        .send()
+        .await
+    {
+        Ok(resp) => resp.json::<Value>().await.ok(),
         Err(_) => None,
     };
     match fetched.as_ref().map(|d| d["result"].clone()) {
         Some(result) if !result.is_null() => {
             let mut out = result;
+            let indexed_map: std::collections::HashMap<u32, (u64, u64)> = state
+                .db
+                .get_shard_index_stats()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(sid, tip, cnt)| (sid, (tip, cnt)))
+                .collect();
+            let mut workchain_ids: Vec<u32> = Vec::new();
+            let mut shard_len: usize = 0;
+
             if let Some(obj) = out.as_object_mut() {
+                if let Some(arr) = obj.get_mut("shards").and_then(|v| v.as_array_mut()) {
+                    shard_len = arr.len();
+                    for item in arr.iter_mut() {
+                        if let Some(sid) = item["shard_id"]
+                            .as_u64()
+                            .and_then(|v| u32::try_from(v).ok())
+                        {
+                            if sid > 0 {
+                                workchain_ids.push(sid);
+                            }
+                            let (indexed_tip, indexed_blocks) =
+                                indexed_map.get(&sid).copied().unwrap_or((0, 0));
+                            if let Some(item_obj) = item.as_object_mut() {
+                                item_obj
+                                    .insert("indexed_tip_height".to_string(), json!(indexed_tip));
+                                item_obj
+                                    .insert("indexed_blocks".to_string(), json!(indexed_blocks));
+                            }
+                        }
+                    }
+                }
+                if !obj.contains_key("total_shards") || obj["total_shards"].is_null() {
+                    obj.insert("total_shards".to_string(), json!(shard_len));
+                }
                 obj.insert("source".to_string(), json!("rpc"));
                 obj.insert("rpc_url".to_string(), json!(state.rpc_url));
+                if let Some(raw_addr) = q
+                    .address
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let norm = crate::db::normalize_address_info(raw_addr);
+                    let routed_shard = if let Some(hint) = norm.shard_hint {
+                        Some(hint)
+                    } else if norm.bytes32.is_some() {
+                        if workchain_ids.len() == 1 {
+                            Some(workchain_ids[0])
+                        } else if workchain_ids.is_empty() && shard_len == 1 {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    obj.insert(
+                        "address_lookup".to_string(),
+                        json!({
+                            "address": norm.hex_clean,
+                            "address_0x": norm.hex_0x,
+                            "stl57": norm.stl57,
+                            "shard_hint": norm.shard_hint,
+                            "routed_shard": routed_shard,
+                        }),
+                    );
+                }
             }
             (StatusCode::OK, Json(out)).into_response()
         }
@@ -1190,7 +1451,7 @@ async fn verify_contract_source(
         Some(expected) if !expected.is_empty() => headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|got| got == expected),
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())),
         _ => false,
     };
     if !authorized {
@@ -1257,20 +1518,14 @@ async fn verify_contract_source(
         "id": 1,
     });
 
-    let client = match reqwest::Client::builder()
+    let node_reply: Value = match state
+        .http_client
+        .post(&state.rpc_url)
+        .json(&payload)
         .timeout(std::time::Duration::from_secs(15))
-        .build()
+        .send()
+        .await
     {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": format!("verification unavailable: {e}")})),
-            )
-                .into_response()
-        }
-    };
-    let node_reply: Value = match client.post(&state.rpc_url).json(&payload).send().await {
         Ok(resp) => match resp.json::<Value>().await {
             Ok(v) => v,
             Err(_) => {

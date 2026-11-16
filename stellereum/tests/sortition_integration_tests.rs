@@ -42,6 +42,7 @@
 use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
+use std::sync::Arc;
 use stellereum::consensus::{
     derive_sortition_committee, register_validator_pq_key, sortition_seed, HeightConsensus,
     QuorumCertificate, ValidatorSet, VoteKind,
@@ -49,7 +50,6 @@ use stellereum::consensus::{
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::sync::{proposer_matches_schedule, verify_finality_for_header};
-use std::sync::Arc;
 
 #[path = "support/falcon_votes.rs"]
 mod falcon_votes;
@@ -101,7 +101,14 @@ fn precommit_qc(
     let sigs = signers
         .iter()
         .map(|k| {
-            let v = falcon_votes::fvote(k, &fk_for(k), height, round, VoteKind::Precommit, Some(block_hash));
+            let v = falcon_votes::fvote(
+                k,
+                &fk_for(k),
+                height,
+                round,
+                VoteKind::Precommit,
+                Some(block_hash),
+            );
             (v.voter, v.signature)
         })
         .collect();
@@ -188,8 +195,7 @@ fn proposer_schedule_uniformity_is_measured_and_bounded() {
         kb.verifying_key().to_bytes(),
         kc.verifying_key().to_bytes(),
     );
-    let skewed =
-        ValidatorSet::from_list(vec![(a, 2 * floor()), (b, floor()), (c, floor())]);
+    let skewed = ValidatorSet::from_list(vec![(a, 2 * floor()), (b, floor()), (c, floor())]);
     const M: usize = 8000;
     let (mut na, mut nb, mut nc) = (0usize, 0usize, 0usize);
     for i in 0..M {
@@ -242,8 +248,9 @@ fn proposer_round_dimension_varies_not_pinned_to_height_parity() {
     // At a fixed height, several rounds must spread over several proposers.
     let mut varied_heights = 0usize;
     for h in 0..64u64 {
-        let distinct: HashSet<[u8; 32]> =
-            (0..8u32).map(|r| vs.proposer_for(h, r).expect("elects")).collect();
+        let distinct: HashSet<[u8; 32]> = (0..8u32)
+            .map(|r| vs.proposer_for(h, r).expect("elects"))
+            .collect();
         if distinct.len() >= 2 {
             varied_heights += 1;
         }
@@ -322,10 +329,18 @@ async fn runtime_across_join() -> (
         engine.staking_write().await.bond(id, amt, 0).unwrap();
     }
     let old = ValidatorSet::from_list(vec![(b, floor()), (c, floor())]);
-    let mut rt =
-        stellereum::runtime::ValidatorRuntime::new(kb.clone(), old.clone(), engine.clone(), BOUNDARY_H);
+    let mut rt = stellereum::runtime::ValidatorRuntime::new(
+        kb.clone(),
+        old.clone(),
+        engine.clone(),
+        BOUNDARY_H,
+    );
     engine.credit_native(&a, 8 * floor()).await.unwrap();
-    engine.staking_write().await.bond(a, 2 * floor(), 0).unwrap();
+    engine
+        .staking_write()
+        .await
+        .bond(a, 2 * floor(), 0)
+        .unwrap();
     assert!(
         rt.refresh_validator_set_from_staking().await,
         "join must stage a pending set"
@@ -337,7 +352,10 @@ async fn runtime_across_join() -> (
 async fn schedule_across_rotation_boundary_uses_set_at_height() {
     let (rt, a, b, c, _ka, _kb, _kc) = runtime_across_join().await;
     // Staged, not installed: the in-force set at H is still the old one.
-    assert_eq!(rt.pending_validators.as_ref().map(|(h, _)| *h), Some(BOUNDARY_H + 1));
+    assert_eq!(
+        rt.pending_validators.as_ref().map(|(h, _)| *h),
+        Some(BOUNDARY_H + 1)
+    );
     let at_h = rt.validator_set_for_height(BOUNDARY_H);
     let at_h1 = rt.validator_set_for_height(BOUNDARY_H + 1);
     assert_eq!(at_h.validators.len(), 2, "H still elects B+C only");
@@ -390,7 +408,10 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     let block_hash = [0xABu8; 32];
     let proposer = in_force.proposer_for(BOUNDARY_H + 1, 0).expect("elects");
     let qc = precommit_qc(&[&ka, &kc], BOUNDARY_H + 1, 0, block_hash);
-    assert!(qc.verify(&in_force), "fixture QC must verify under the H+1 set");
+    assert!(
+        qc.verify(&in_force),
+        "fixture QC must verify under the H+1 set"
+    );
     assert!(
         verify_finality_for_header(&in_force, BOUNDARY_H + 1, &block_hash, &proposer, &qc).is_ok(),
         "header+QC valid under the set in force at H+1"
@@ -400,7 +421,10 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     // power counts there: F < floor(4F/3)+1 quorum) — this pins "verify
     // against the set at the header's height, never the live/stale set".
     let stale = rt.validator_set_for_height(BOUNDARY_H);
-    assert!(!qc.verify(&stale), "fixture QC must NOT verify under the old set");
+    assert!(
+        !qc.verify(&stale),
+        "fixture QC must NOT verify under the old set"
+    );
     assert!(
         verify_finality_for_header(&stale, BOUNDARY_H + 1, &block_hash, &proposer, &qc).is_err(),
         "stale-set verification must refuse a rotated-height header"
@@ -408,12 +432,17 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     // Wrong-QC-kind / wrong-hash variants fail closed under the right set too.
     let mut wrong_kind = qc.clone();
     wrong_kind.kind = VoteKind::Prevote;
+    assert!(verify_finality_for_header(
+        &in_force,
+        BOUNDARY_H + 1,
+        &block_hash,
+        &proposer,
+        &wrong_kind
+    )
+    .is_err());
     assert!(
-        verify_finality_for_header(&in_force, BOUNDARY_H + 1, &block_hash, &proposer, &wrong_kind)
+        verify_finality_for_header(&in_force, BOUNDARY_H + 1, &[0x00u8; 32], &proposer, &qc)
             .is_err()
-    );
-    assert!(
-        verify_finality_for_header(&in_force, BOUNDARY_H + 1, &[0x00u8; 32], &proposer, &qc).is_err()
     );
     let _ = (a, kb);
 }
@@ -425,7 +454,11 @@ fn canonical_draw_pinned_byte_identical_to_today() {
     // Live consensus bytes are unchanged: canonical parent-hash draw.
     // Fixed vectors captured from the canonical path.
     fn h32(s: &str) -> [u8; 32] {
-        hex::decode(s).expect("pin hex").as_slice().try_into().expect("32B")
+        hex::decode(s)
+            .expect("pin hex")
+            .as_slice()
+            .try_into()
+            .expect("32B")
     }
     let (vs, _) = fixed_set_equal4();
     let parent = [0x5Au8; 32];
@@ -452,10 +485,7 @@ fn canonical_draw_pinned_byte_identical_to_today() {
                         derive_sortition_committee(&vs, h, r, k, p),
                         "canonical draw must be deterministic (h={h} r={r} k={k})"
                     );
-                    assert_eq!(
-                        sortition_seed(p, h, r),
-                        sortition_seed(p, h, r)
-                    );
+                    assert_eq!(sortition_seed(p, h, r), sortition_seed(p, h, r));
                 }
             }
         }
@@ -503,10 +533,26 @@ fn proposer_schedule_vectors_pinned() {
         ]
     );
     for (h, r, want) in [
-        (0u64, 0u32, "1414141414141414141414141414141414141414141414141414141414141414"),
-        (1, 0, "1313131313131313131313131313131313131313131313131313131313131313"),
-        (9, 2, "1212121212121212121212121212121212121212121212121212121212121212"),
-        (292_785, 3, "1414141414141414141414141414141414141414141414141414141414141414"),
+        (
+            0u64,
+            0u32,
+            "1414141414141414141414141414141414141414141414141414141414141414",
+        ),
+        (
+            1,
+            0,
+            "1313131313131313131313131313131313131313131313131313131313131313",
+        ),
+        (
+            9,
+            2,
+            "1212121212121212121212121212121212121212121212121212121212121212",
+        ),
+        (
+            292_785,
+            3,
+            "1414141414141414141414141414141414141414141414141414141414141414",
+        ),
     ] {
         assert_eq!(
             hex::encode(vs.proposer_for(h, r).expect("elects")),

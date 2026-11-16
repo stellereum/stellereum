@@ -1006,10 +1006,10 @@ impl Node {
         }
         let e = map.entry(pid).or_insert_with(|| RepEntry::fresh(now));
         e.touch(&cfg, now);
-        e.score = e
-            .score
-            .saturating_add(delta)
-            .clamp(crate::reputation::REP_SCORE_MIN, crate::reputation::REP_SCORE_MAX);
+        e.score = e.score.saturating_add(delta).clamp(
+            crate::reputation::REP_SCORE_MIN,
+            crate::reputation::REP_SCORE_MAX,
+        );
         e.updated = now;
         if delta < 0 && e.score <= cfg.ban_score && !e.banned_at(now) {
             e.bans = e.bans.saturating_add(1);
@@ -1172,7 +1172,12 @@ impl Node {
 
     /// Pending messages queued for one peer.
     pub async fn bp_outbox_len(&self, pid: [u8; NODEID_LEN]) -> usize {
-        self.outbox.read().await.get(&pid).map(|q| q.len()).unwrap_or(0)
+        self.outbox
+            .read()
+            .await
+            .get(&pid)
+            .map(|q| q.len())
+            .unwrap_or(0)
     }
 
     /// Distinct peers with a pending outbox queue.
@@ -1250,7 +1255,12 @@ impl Node {
 
     /// Live local subscribers of one topic (after dead-prune on register).
     pub async fn bp_app_subs_len(&self, topic: &str) -> usize {
-        self.app_subs.read().await.get(topic).map(|v| v.len()).unwrap_or(0)
+        self.app_subs
+            .read()
+            .await
+            .get(topic)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Insert via the real `session_insert` path. Returns false on shed.
@@ -1270,7 +1280,12 @@ impl Node {
 
     /// Tracked connections for one peer.
     pub async fn bp_conns_len(&self, pid: [u8; NODEID_LEN]) -> usize {
-        self.conns.read().await.get(&pid).map(|v| v.len()).unwrap_or(0)
+        self.conns
+            .read()
+            .await
+            .get(&pid)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Distinct peers with tracked connections.
@@ -3051,8 +3066,7 @@ impl Node {
                 // per-sender token bucket is charged to the real sender).
                 // Backpressure sheds deliver immediately instead of buffering
                 // (no loss, no stall; ordering best-effort under overflow).
-                for (d, d_src, d_seq) in self.reorder_offer(&origin, &topic, seq, data, src).await
-                {
+                for (d, d_src, d_seq) in self.reorder_offer(&origin, &topic, seq, data, src).await {
                     ordered.push(
                         json!({ "topic": topic, "data": d, "seq": d_seq, "origin": origin, "src": d_src })
                             .to_string(),
@@ -3068,10 +3082,9 @@ impl Node {
             // throttled [diag] eprintlns were removed after the blackhole
             // root cause (unsharded-vs-sharded topic mismatch) was found.
             if senders.is_empty() {
-                self.metrics.msgs_dropped_no_sub.fetch_add(
-                    1,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.metrics
+                    .msgs_dropped_no_sub
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             for msg in &ordered {
                 for tx in &senders {
@@ -3483,7 +3496,7 @@ impl Node {
             }
         }
         let outbox_file = self.data_dir.join("outbox.json");
-                if let Ok(raw) = std::fs::read_to_string(&outbox_file) {
+        if let Ok(raw) = std::fs::read_to_string(&outbox_file) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<QueuedMsg>>>(&raw) {
                 let mut outbox = self.outbox.write().await;
                 for (k, v) in map {
@@ -3495,8 +3508,7 @@ impl Node {
                             // untrusted input — enforce the same caps as the
                             // live path (per-queue trim keeps newest, outer
                             // cap sheds whole peer queues).
-                            if !outbox.contains_key(&pid)
-                                && outbox.len() >= MAX_OUTBOX_PEERS_TOTAL
+                            if !outbox.contains_key(&pid) && outbox.len() >= MAX_OUTBOX_PEERS_TOTAL
                             {
                                 self.metrics.outbox_dropped.fetch_add(1, Ordering::Relaxed);
                                 continue;
@@ -4630,8 +4642,8 @@ impl Node {
     ) -> Option<Vec<u8>> {
         // Fail-closed: лимит ограничен сверху (иначе пир просит сериализовать
         // сколь угодно много), а переросшие кап значения не отдаются вовсе.
-        let limit = (v["limit"].as_u64().unwrap_or(10000) as usize)
-            .min(crate::proto::MAX_DHT_SYNC_LIMIT);
+        let limit =
+            (v["limit"].as_u64().unwrap_or(10000) as usize).min(crate::proto::MAX_DHT_SYNC_LIMIT);
         let now = crate::dht::now_ms();
         let mail_ok = self.peer_allows(&from, "mail").await;
         let files_ok = self.peer_allows(&from, "files").await;
@@ -6008,7 +6020,10 @@ impl Node {
         if !c.contains_key(&name) && c.len() >= MAX_MAIL_CACHE_ENTRIES {
             c.retain(|_, (_, ts)| now - *ts < 60_000);
             if c.len() >= MAX_MAIL_CACHE_ENTRIES {
-                if let Some(oldest) = c.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| k.clone())
+                if let Some(oldest) = c
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| k.clone())
                 {
                     c.remove(&oldest);
                 }
@@ -6841,10 +6856,7 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
                     return;
                 }
                 if !node.handshake_allowed(ip).await {
-                    eprintln!(
-                        "[{}] handshake throttled for {ip}, refusing",
-                        node.cfg.name
-                    );
+                    eprintln!("[{}] handshake throttled for {ip}, refusing", node.cfg.name);
                     incoming.refuse();
                     return;
                 }
@@ -7038,7 +7050,9 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                     preauth_secs,
                     conn.stable_id()
                 );
-                node.metrics.preauth_timeouts.fetch_add(1, Ordering::Relaxed);
+                node.metrics
+                    .preauth_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
                 conn.close(quinn::VarInt::from(0u32), b"preauth deadline");
                 break;
             }
@@ -7061,7 +7075,9 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                         preauth_secs,
                         conn.stable_id()
                     );
-                    node.metrics.preauth_timeouts.fetch_add(1, Ordering::Relaxed);
+                    node.metrics
+                        .preauth_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
                     conn.close(quinn::VarInt::from(0u32), b"preauth deadline");
                     break;
                 }
@@ -7721,7 +7737,7 @@ async fn handle_stream(
             let svc_name = proto::svc_name(f.svc).unwrap_or("?").to_string();
             node.metrics.reqs_total.fetch_add(1, Ordering::Relaxed);
             {
-                let mut m = node.svc_counters.lock().unwrap();
+                let mut m = node.svc_counters.lock().unwrap_or_else(|e| e.into_inner());
                 *m.entry(svc_name.clone()).or_insert(0) += 1;
             }
             // heartbeat: любой успешный запрос от пира обновляет last_seen —
@@ -7890,11 +7906,7 @@ fn frame_seal_body(
 /// canonical AAD from the received header and open with `kex_frame_open`
 /// (fail-closed: any error drops the frame, never a plaintext fallback);
 /// classical sessions (`None`) call legacy `e2e_decrypt` byte-identical.
-fn frame_open_body(
-    key: &[u8; 32],
-    pq_digest: Option<[u8; 32]>,
-    f: &Frame,
-) -> Result<Vec<u8>> {
+fn frame_open_body(key: &[u8; 32], pq_digest: Option<[u8; 32]>, f: &Frame) -> Result<Vec<u8>> {
     match pq_digest {
         Some(d) => {
             let aad = proto::kex_frame_aad(f.kind, f.seq, f.ts, &f.src, &f.dst, f.svc, &d);
@@ -8206,7 +8218,33 @@ fn load_or_create_mail_key(data_dir: &std::path::Path) -> [u8; 32] {
     }
     let mut k = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut k);
-    let _ = std::fs::write(&path, k);
+    let tmp = data_dir.join("mail.key.tmp");
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&k)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if wrote.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     k
 }
@@ -8239,8 +8277,7 @@ fn challenge_fields(v: &serde_json::Value) -> Result<ChallengeFields> {
 
 fn hex_fixed_32(s: Option<&str>, what: &str) -> Result<[u8; 32]> {
     let b = hex::decode(s.ok_or_else(|| anyhow!("challenge without {what}"))?)?;
-    b.try_into()
-        .map_err(|_| anyhow!("{what} is not 32 bytes"))
+    b.try_into().map_err(|_| anyhow!("{what} is not 32 bytes"))
 }
 
 /// PQ HANDSHAKE helpers (default-ON since PQ 9.1 — same
@@ -8320,8 +8357,9 @@ pub fn pq_decapsulate(dk: &ml_kem::DecapsulationKey768, ct_bytes: &[u8]) -> Resu
     if ct_bytes.len() != 1088 {
         bail!("pq ct malformed");
     }
-    let ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> =
-        ct_bytes.try_into().map_err(|_| anyhow!("pq ct malformed"))?;
+    let ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> = ct_bytes
+        .try_into()
+        .map_err(|_| anyhow!("pq ct malformed"))?;
     let ss = dk.decapsulate(&ct);
     let mut shared = [0u8; 32];
     shared.copy_from_slice(ss.as_slice());
@@ -8382,8 +8420,7 @@ pub fn pq_responder_accept(
     }
     let ver = pq_read_u64(ch, "pq_ver")?;
     let suite = pq_read_u64(ch, "pq_suite")?;
-    if ver != proto::PQ_TRANSCRIPT_VERSION as u64
-        || suite != proto::PQ_SUITE_MLKEM768_HYBRID as u64
+    if ver != proto::PQ_TRANSCRIPT_VERSION as u64 || suite != proto::PQ_SUITE_MLKEM768_HYBRID as u64
     {
         bail!("unsupported pq suite/version");
     }
@@ -8409,7 +8446,14 @@ pub fn pq_responder_accept(
         proto::PQ_SUITE_MLKEM768_HYBRID,
     );
     let tag = proto::pq_auth_tag(&shared, &digest);
-    Ok(Some((ct, PqAgreed { shared, digest, tag })))
+    Ok(Some((
+        ct,
+        PqAgreed {
+            shared,
+            digest,
+            tag,
+        },
+    )))
 }
 
 /// Dial-side PQ answer check. `Ok(None)` = classical responder: window
@@ -8431,8 +8475,8 @@ pub fn pq_initiator_answer(
         .ok_or_else(|| anyhow!("pq answer without offer"))?;
     let ver = pq_read_u64(&av, "pq_ver").unwrap_or(u64::MAX);
     let suite = pq_read_u64(&av, "pq_suite").unwrap_or(u64::MAX);
-    let suite_ok =
-        ver == proto::PQ_TRANSCRIPT_VERSION as u64 && suite == proto::PQ_SUITE_MLKEM768_HYBRID as u64;
+    let suite_ok = ver == proto::PQ_TRANSCRIPT_VERSION as u64
+        && suite == proto::PQ_SUITE_MLKEM768_HYBRID as u64;
     let ct = av
         .get("pq_ct")
         .and_then(|x| x.as_str())
@@ -8449,7 +8493,8 @@ pub fn pq_initiator_answer(
         .and_then(|s| hex::decode(s).ok())
         .unwrap_or_default();
     let auth_at = av.get("at").and_then(|x| x.as_i64()).unwrap_or(-1);
-    let wellformed = ct.len() == 1088 && tag_raw.len() == 32 && auth_eph.len() == 32 && auth_at >= 0;
+    let wellformed =
+        ct.len() == 1088 && tag_raw.len() == 32 && auth_eph.len() == 32 && auth_at >= 0;
     let mut tag_ok = false;
     let mut agreed = PqAgreed {
         shared: [0u8; 32],
@@ -8475,7 +8520,11 @@ pub fn pq_initiator_answer(
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&tag_raw);
         tag_ok = proto::pq_verify_tag(&proto::pq_auth_tag(&shared, &digest), &tag);
-        agreed = PqAgreed { shared, digest, tag };
+        agreed = PqAgreed {
+            shared,
+            digest,
+            tag,
+        };
     }
     match proto::pq_mixed_policy(
         true,
@@ -8800,10 +8849,9 @@ impl ServerCertVerifier for PinnedVerifier {
             .map_err(|_| rustls::Error::General("bad cert".to_string()))?;
         // Срок действия: раньше `_now` игнорировался — просроченный/ещё не
         // действующий сертификат принимался.
-        let now_asn1 = x509_parser::time::ASN1Time::from_timestamp(
-            i64::try_from(now.as_secs()).unwrap_or(0),
-        )
-        .map_err(|_| rustls::Error::General("bad now".to_string()))?;
+        let now_asn1 =
+            x509_parser::time::ASN1Time::from_timestamp(i64::try_from(now.as_secs()).unwrap_or(0))
+                .map_err(|_| rustls::Error::General("bad now".to_string()))?;
         if !cert.validity().is_valid_at(now_asn1) {
             return Err(rustls::Error::General("cert not valid at now".to_string()));
         }
@@ -9074,10 +9122,7 @@ mod disk_growth_tests {
             .await
             .is_err());
         assert!(node
-            .register_dns_candidate(
-                &hex::encode([0x52u8; 32]),
-                vec!["not-an-endpoint".into()]
-            )
+            .register_dns_candidate(&hex::encode([0x52u8; 32]), vec!["not-an-endpoint".into()])
             .await
             .is_err());
     }
@@ -9767,13 +9812,19 @@ mod session_heal_tests {
             let idb = crate::node::ceremony_local_id(&kb, &pb);
             let (lo_keys, lo_pq, hi_keys, hi_pq, lo_listen, hi_listen) = if ida < idb {
                 (
-                    ka, pa, kb, pb,
+                    ka,
+                    pa,
+                    kb,
+                    pb,
                     format!("127.0.0.1:{port_base}"),
                     format!("127.0.0.1:{}", port_base + 1),
                 )
             } else {
                 (
-                    kb, pb, ka, pa,
+                    kb,
+                    pb,
+                    ka,
+                    pa,
                     format!("127.0.0.1:{}", port_base + 1),
                     format!("127.0.0.1:{port_base}"),
                 )
@@ -9781,7 +9832,11 @@ mod session_heal_tests {
             let lo_listen: &str = Box::leak(lo_listen.into_boxed_str());
             let hi_listen: &str = Box::leak(hi_listen.into_boxed_str());
             let lo = Node::new(
-                cfg("LO", lo_listen, vec![peer_of("HI", &hi_keys, &hi_pq, hi_listen)]),
+                cfg(
+                    "LO",
+                    lo_listen,
+                    vec![peer_of("HI", &hi_keys, &hi_pq, hi_listen)],
+                ),
                 lo_keys.clone(),
                 lo_pq.clone(),
                 tmp.join("lo"),
@@ -9790,7 +9845,11 @@ mod session_heal_tests {
             .await
             .expect("node LO");
             let hi = Node::new(
-                cfg("HI", hi_listen, vec![peer_of("LO", &lo_keys, &lo_pq, lo_listen)]),
+                cfg(
+                    "HI",
+                    hi_listen,
+                    vec![peer_of("LO", &lo_keys, &lo_pq, lo_listen)],
+                ),
                 hi_keys.clone(),
                 hi_pq.clone(),
                 tmp.join("hi"),

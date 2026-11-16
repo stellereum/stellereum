@@ -2518,18 +2518,45 @@ async fn test_evm_adapter_module_level_helpers() {
 // Block, Transaction, and Receipt EVM Translation & MetaMask Compatibility Tests
 // ============================================================================
 
-fn test_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+fn test_signing_key(seed: u8) -> stellereum::post_quantum::FalconKeypair {
+    stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[seed; 32])
 }
 
 fn test_signed_tx(
-    from_key: &ed25519_dalek::SigningKey,
+    from_key: &stellereum::post_quantum::FalconKeypair,
     to: [u8; 32],
     amount: u64,
     gas_limit: u64,
     nonce: u64,
 ) -> Transaction {
-    Transaction::sign(from_key, to, amount, gas_limit, nonce, 0, 0)
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let from = derive_pq_address(PqScheme::Falcon512, from_key.pubkey(), &DEFAULT_SALT);
+    let probe = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let sig = from_key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        from_key.pubkey().to_vec(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        0,
+        0,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
 }
 
 async fn test_rpc_state_with_height(height: u64) -> Arc<RpcState> {
@@ -3041,7 +3068,13 @@ async fn test_eth_get_transaction_by_hash_metamask_compatibility() {
     // 2. Lookup pending transaction from mempool
     let key1 = test_signing_key(21);
     let to1 = [0xddu8; 32];
-    let tx1 = test_signed_tx(&key1, to1, 500_000_000, 21_000, 0);
+    let tx1 = test_signed_tx(
+        &key1,
+        to1,
+        500_000_000,
+        21_000 + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+        0,
+    );
     let tx1_hash = tx1.compute_tx_hash();
     st.mempool.write().await.add(tx1.clone()).unwrap();
 
@@ -5361,8 +5394,7 @@ fn bvm_poc_short_calldata_word_is_zero_padded_not_rejected() {
 fn bvm_poc_secp_prefix_aliasing_accepts_nonzero_prefix() {
     use stellereum::evm_adapter as evm;
     let privkey =
-        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-            .unwrap();
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let secp_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
     let sender20 =
         evm::pubkey_to_address(secp_key.verifying_key().to_encoded_point(false).as_bytes())

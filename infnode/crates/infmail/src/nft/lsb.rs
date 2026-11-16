@@ -81,6 +81,10 @@ pub fn extract(pixels: &[u8]) -> Result<(Vec<u8>, [u8; SIG_LEN]), String> {
     }
     let lenb = read_bytes(pixels, 40, 2);
     let len = ((lenb[0] as usize) << 8) | lenb[1] as usize;
+    let needed_bits = (4 + 1 + 2 + len + SIG_LEN).saturating_mul(8);
+    if pixels.len() < needed_bits {
+        return Err("картинка слишком мала для LSB payload".into());
+    }
     let payload = read_bytes(pixels, 56, len);
     let sig_bytes = read_bytes(pixels, (4 + 1 + 2 + len) * 8, SIG_LEN);
     let mut sig = [0u8; SIG_LEN];
@@ -188,5 +192,15 @@ mod tests {
             .map(|(p, s)| verify(&p, &s, &pubkey))
             .unwrap_or(false);
         assert!(!bad_res, "tampered card must NOT verify");
+    }
+
+    #[test]
+    fn truncated_payload_length_returns_err_without_panic() {
+        let mut pixels = vec![0u8; (4 + 1 + 2 + SIG_LEN) * 8];
+        write_bits(&mut pixels, 0, MAGIC);
+        write_bits(&mut pixels, 32, &[VERSION]);
+        // Declare a payload length larger than the remaining pixels.
+        write_bits(&mut pixels, 40, &u16::MAX.to_be_bytes());
+        assert!(extract(&pixels).is_err());
     }
 }

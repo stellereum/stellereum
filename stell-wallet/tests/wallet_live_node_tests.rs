@@ -15,10 +15,15 @@
 mod rpc;
 
 #[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
+#[path = "../src/pq.rs"]
+mod pq;
+
+#[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
 #[path = "../src/client.rs"]
 mod client;
 
 use client::LightClient;
+use pq::{PqKeyPair, PqScheme, DEFAULT_SALT};
 use rpc::{RpcConfig, TxFinality};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -101,6 +106,20 @@ async fn rpc_client(node: &LiveNode, auth: Option<String>, faucet: Option<String
         .expect("connect_rpc")
 }
 
+struct PqWallet {
+    kp: PqKeyPair,
+    address: [u8; 32],
+}
+
+fn pq_wallet(seed_byte: u8) -> PqWallet {
+    let mut seed = [0u8; 32];
+    seed[0] = seed_byte;
+    seed[1] = 0xA5;
+    let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &seed);
+    let address = kp.derive_address(&DEFAULT_SALT);
+    PqWallet { kp, address }
+}
+
 fn wallet(seed_byte: u8) -> stellereum::wallet::WalletAccount {
     let mut seed = [0u8; 32];
     seed[0] = seed_byte;
@@ -135,12 +154,22 @@ async fn rpc_balance_spv_against_real_node_verifies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_pay_pending_then_confirmed_after_finalize_hook() {
     let node = spawn_node(None, false).await;
-    let sender = wallet(0x21);
-    let recipient = wallet(0x22);
+    let sender = pq_wallet(0x21);
+    let recipient = pq_wallet(0x22);
     fund(&node, sender.address, 50_000_000_000).await;
 
     let client = rpc_client(&node, None, None).await;
-    let tx = sender.create_transaction(recipient.address, 1_000_000_000, 0, 1, 1);
+    let tx = LightClient::build_pq_transfer_tx_bound(
+        &sender.kp,
+        recipient.address,
+        1_000_000_000,
+        500_000,
+        0,
+        1,
+        1,
+        true,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
+    );
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(hash, tx.compute_tx_hash());
     // No blocks are produced here: the honest answer is Pending, never Confirmed.
@@ -167,11 +196,21 @@ async fn rpc_pay_pending_then_confirmed_after_finalize_hook() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_failed_receipt_reports_failed_not_confirmed() {
     let node = spawn_node(None, false).await;
-    let sender = wallet(0x31);
+    let sender = pq_wallet(0x31);
     fund(&node, sender.address, 50_000_000_000).await;
 
     let client = rpc_client(&node, None, None).await;
-    let tx = sender.create_transaction(wallet(0x32).address, 1_000_000_000, 0, 1, 1);
+    let tx = LightClient::build_pq_transfer_tx_bound(
+        &sender.kp,
+        pq_wallet(0x32).address,
+        1_000_000_000,
+        500_000,
+        0,
+        1,
+        1,
+        true,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
+    );
     let (hash, _) = client.broadcast_tx(&tx).await.unwrap();
     node.state
         .record_receipts(
@@ -200,12 +239,22 @@ async fn rpc_failed_receipt_reports_failed_not_confirmed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_write_without_token_is_rejected() {
     let node = spawn_node(Some("secret".to_string()), false).await;
-    let sender = wallet(0x41);
+    let sender = pq_wallet(0x41);
     fund(&node, sender.address, 50_000_000_000).await;
 
     // Public signed transactions are accepted without an admin API token
     let anon = rpc_client(&node, None, None).await;
-    let tx = sender.create_transaction(wallet(0x42).address, 1_000, 0, 1, 1);
+    let tx = LightClient::build_pq_transfer_tx_bound(
+        &sender.kp,
+        pq_wallet(0x42).address,
+        1_000,
+        500_000,
+        0,
+        1,
+        1,
+        true,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
+    );
     let (_, finality) = anon
         .broadcast_tx(&tx)
         .await
@@ -235,8 +284,8 @@ async fn rpc_faucet_drips_to_mempool_with_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_token_balance_spv_and_send_admission() {
     let node = spawn_node(None, false).await;
-    let owner = wallet(0x61);
-    let recipient = wallet(0x62);
+    let owner = pq_wallet(0x61);
+    let recipient = pq_wallet(0x62);
     fund(&node, owner.address, 50_000_000_000).await;
 
     let token_id = node
@@ -267,13 +316,14 @@ async fn rpc_token_balance_spv_and_send_admission() {
     assert!(verified, "real node token proof must verify locally");
     assert_eq!(root_hex.len(), 64);
 
-    let tx = LightClient::build_token_transfer_tx(
-        &owner.signing_key,
+    let tx = LightClient::build_pq_token_transfer_tx(
+        &owner.kp,
         token_id,
         recipient.address,
         500_000,
         0,
         1,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
     );
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(finality, TxFinality::Pending);
@@ -295,46 +345,51 @@ async fn rpc_token_balance_spv_and_send_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_confidential_payload_admitted() {
+async fn rpc_reserved_confidential_payload_refused() {
+    use stellereum::svm::OpCode;
     let node = spawn_node(None, false).await;
     let sender = wallet(0x71);
     fund(&node, sender.address, 80_000_000_000).await;
 
     let client = rpc_client(&node, None, None).await;
-    let (transfer, blinding) = sender.create_confidential_transfer(3_000_000_000, 1_500);
-    let recipient = wallet(0x72).address;
-    let (hash, finality) = client
-        .broadcast_confidential_tx(
-            &sender.signing_key,
-            recipient,
-            transfer,
-            3_000_000_000,
-            1_500,
-            blinding.to_bytes(),
-            0,
-            1,
-        )
-        .await
-        .unwrap();
-    assert_eq!(finality, TxFinality::Pending);
-    assert!(node.state.mempool.read().await.contains(&hash));
+    let tx = sender.create_payload_transaction(
+        vec![OpCode::Reserved42ConfidentialUnshield(
+            stellereum::svm::ReservedOpcodeMarker,
+        )],
+        0,
+        stellereum::svm::GAS_BASIC_TRANSFER,
+    );
+    let err = client.broadcast_tx(&tx).await;
+    assert!(
+        err.is_err(),
+        "excised confidential opcode must be refused fail-closed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_stake_payload_admitted_to_mempool() {
     use stellereum::svm::OpCode;
     let node = spawn_node(None, false).await;
-    let sender = wallet(0x81);
+    let sender = pq_wallet(0x81);
     fund(&node, sender.address, 50_000_000_000).await;
 
     let client = rpc_client(&node, None, None).await;
-    let tx = sender.create_payload_transaction(
+    let tx = LightClient::build_pq_payload_tx_bound(
+        &sender.kp,
+        sender.address,
+        0,
+        stellereum::svm::GAS_STAKE_BOND
+            + stellereum::svm::GAS_BASIC_TRANSFER
+            + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+        0,
+        1,
+        1,
+        true,
         vec![OpCode::SysCallStake {
             validator: sender.address,
             amount: 5_000_000_000,
         }],
-        stellereum::svm::GAS_STAKE_BOND + stellereum::svm::GAS_BASIC_TRANSFER,
-        0,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
     );
     // The builder signs a well-formed payload tx (verifies locally).
     assert!(stellereum::sharding::Transaction::verify_signatures_batch(

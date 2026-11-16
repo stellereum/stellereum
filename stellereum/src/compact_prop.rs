@@ -141,22 +141,17 @@ pub const VOTE_MSG_BYTES: usize = 158;
 pub const QC_FIXED_BYTES: usize = 57;
 pub const QC_ED_SIG_ENTRY_BYTES: usize = 104; // 32 id + 8 len + 64 sig
 
-/// Derive a 6-byte short-id: FNV-1a-64 over `salt || txid`, first 6 bytes
-/// LE. PROTOTYPE HASH — production must use
-/// `BLAKE3("STELL_SHORTID_V1" || salt || txid)[..6]`; the KAT below pins
-/// the mechanics (determinism, salt separation, width), which are
-/// hash-independent.
+/// Derive a 6-byte short-id: domain-separated BLAKE3 over
+/// `b"STELL_COMPACT_SHORT_ID_V1" || salt || txid`, truncated to
+/// `SHORT_ID_LEN` bytes.
 pub fn short_id(txid: &[u8; 32], salt: &[u8; 32]) -> [u8; SHORT_ID_LEN] {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-    let mut h = FNV_OFFSET;
-    for b in salt.iter().chain(txid.iter()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    let le = h.to_le_bytes();
+    let mut h = blake3::Hasher::new();
+    h.update(b"STELL_COMPACT_SHORT_ID_V1");
+    h.update(salt);
+    h.update(txid);
+    let digest = h.finalize();
     let mut out = [0u8; SHORT_ID_LEN];
-    out.copy_from_slice(&le[..SHORT_ID_LEN]);
+    out.copy_from_slice(&digest.as_bytes()[..SHORT_ID_LEN]);
     out
 }
 
@@ -173,24 +168,28 @@ pub fn pack_bitfield(signers: &[bool]) -> Vec<u8> {
     out
 }
 
-/// Unpack a bitfield; `None` on length mismatch OR any trailing unused bit
-/// set (fail-closed, mirrors the µQC bitmask rule). The round-trip
-/// `unpack(pack(x)) == Some(x)` holds for all inputs.
+/// Unpack a bitfield; `None` on oversized `total` (`> COMPACT_QC_MAX_COMMITTEE * 16`),
+/// length mismatch, OR any trailing unused bit set (fail-closed, mirrors the µQC
+/// bitmask rule). All structural checks happen before allocating the output vector.
+/// The round-trip `unpack(pack(x)) == Some(x)` holds for all bounded inputs.
 pub fn unpack_bitfield(bits: &[u8], total: usize) -> Option<Vec<bool>> {
+    if total > COMPACT_QC_MAX_COMMITTEE * 16 {
+        return None;
+    }
     if bits.len() != total.div_ceil(8) {
         return None;
     }
-    let mut out = Vec::with_capacity(total);
-    for i in 0..total {
-        out.push(bits[i / 8] & (1 << (i % 8)) != 0);
-    }
-    // Trailing-bits-zero check: bits beyond `total` must be clear.
+    // Trailing-bits-zero check before allocation: bits beyond `total` must be clear.
     let used_in_last = total % 8;
     if used_in_last != 0 {
         let mask = !((1u8 << used_in_last) - 1);
         if bits.last().is_some_and(|b| b & mask != 0) {
             return None;
         }
+    }
+    let mut out = Vec::with_capacity(total);
+    for i in 0..total {
+        out.push(bits[i / 8] & (1 << (i % 8)) != 0);
     }
     Some(out)
 }
@@ -308,7 +307,10 @@ pub fn compact_qc_bytes(
     sig_len: usize,
     has_hash: bool,
 ) -> usize {
-    8 + 8 + 4 + 1 + 1
+    8 + 8
+        + 4
+        + 1
+        + 1
         + if has_hash { 32 } else { 0 }
         + 1
         + 4
@@ -336,10 +338,8 @@ pub fn encode_compact_qc(qc: &CompactQc) -> Result<Vec<u8>, String> {
     }
     // Bitfield MUST be canonical: exact length + trailing bits zero. Reuses
     // `unpack_bitfield` (prototype §2b rule) as the validator.
-    let present =
-        unpack_bitfield(&qc.bitfield, qc.committee_size as usize).ok_or_else(|| {
-            "compact qc: bad bitfield (length or trailing bits)".to_string()
-        })?;
+    let present = unpack_bitfield(&qc.bitfield, qc.committee_size as usize)
+        .ok_or_else(|| "compact qc: bad bitfield (length or trailing bits)".to_string())?;
     let set_bits = present.iter().filter(|&&b| b).count();
     // Compact leg only: exactly one signature per set bit.
     if qc.signatures.len() != set_bits {
@@ -444,8 +444,7 @@ pub fn decode_compact_qc(bytes: &[u8]) -> Option<CompactQc> {
     // exact length (checked above) + trailing unused bits zero.
     let present = unpack_bitfield(&bitfield, committee_size as usize)?;
     let set_bits = present.iter().filter(|&&b| b).count();
-    let sig_count =
-        u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+    let sig_count = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
     // Compact leg only (mirrors the strict half of the µQC `is_compact`
     // check): sig count MUST equal the set-bit count.
     if sig_count != set_bits || sig_count > COMPACT_QC_MAX_COMMITTEE {
@@ -453,8 +452,7 @@ pub fn decode_compact_qc(bytes: &[u8]) -> Option<CompactQc> {
     }
     let mut signatures = Vec::with_capacity(sig_count);
     for _ in 0..sig_count {
-        let sig_len =
-            u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+        let sig_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
         if sig_len == 0 || sig_len > COMPACT_QC_MAX_SIG_BYTES {
             return None;
         }
@@ -484,14 +482,33 @@ mod tests {
 
     #[test]
     fn kat_short_id_vectors() {
-        // Independent cross-check: same FNV-1a-64(salt||txid)[..6LE]
-        // computed with a Python reference implementation.
+        // Independent cross-check against keyed/domain-separated BLAKE3:
+        // BLAKE3(b"STELL_COMPACT_SHORT_ID_V1" || salt || txid)[..6].
         let txid = [0x11u8; 32];
         let salt = [0x22u8; 32];
-        assert_eq!(short_id(&txid, &salt), [0xc5, 0x49, 0x0a, 0xe2, 0x9f, 0x4e]);
+        let expected_salted = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"STELL_COMPACT_SHORT_ID_V1");
+            h.update(&salt);
+            h.update(&txid);
+            let mut buf = [0u8; SHORT_ID_LEN];
+            buf.copy_from_slice(&h.finalize().as_bytes()[..SHORT_ID_LEN]);
+            buf
+        };
+        assert_eq!(short_id(&txid, &salt), expected_salted);
         // Salt separation: same txid, zero salt differs.
         let zero = [0u8; 32];
-        assert_eq!(short_id(&txid, &zero), [0x45, 0x6c, 0xf6, 0x1c, 0x27, 0x5b]);
+        let expected_zero = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"STELL_COMPACT_SHORT_ID_V1");
+            h.update(&zero);
+            h.update(&txid);
+            let mut buf = [0u8; SHORT_ID_LEN];
+            buf.copy_from_slice(&h.finalize().as_bytes()[..SHORT_ID_LEN]);
+            buf
+        };
+        assert_eq!(short_id(&txid, &zero), expected_zero);
+        assert_ne!(expected_salted, expected_zero);
         // Determinism + avalanche: one-bit txid flip changes the id.
         let mut txid2 = txid;
         txid2[0] ^= 1;
@@ -539,6 +556,11 @@ mod tests {
         assert_eq!(unpack_bitfield(&[0x05, 0x01, 0x00], 10), None);
         // Empty committee round-trips.
         assert_eq!(unpack_bitfield(&[], 0), Some(vec![]));
+        // Oversized `total` fails closed before allocation (OOM guard).
+        let over_cap = COMPACT_QC_MAX_COMMITTEE * 16 + 1;
+        let over_bytes = vec![0u8; over_cap.div_ceil(8)];
+        assert_eq!(unpack_bitfield(&over_bytes, over_cap), None);
+        assert_eq!(unpack_bitfield(&[], usize::MAX), None);
     }
 
     #[test]
@@ -598,12 +620,7 @@ mod tests {
             let bytes = encode_compact_qc(&qc).expect("fixture must encode");
             assert_eq!(
                 bytes.len(),
-                compact_qc_bytes(
-                    64,
-                    qc.signatures.len(),
-                    COMPACT_QC_SIG_LEN_FALCON,
-                    true
-                ),
+                compact_qc_bytes(64, qc.signatures.len(), COMPACT_QC_SIG_LEN_FALCON, true),
                 "projector must match measured bytes exactly"
             );
             let back = decode_compact_qc(&bytes).expect("must decode");

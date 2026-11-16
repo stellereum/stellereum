@@ -33,8 +33,10 @@
 //! `privacy_live_tests.rs`). THIS file pins the parts that are domain
 //! independent: the two rows where NOTHING may move.
 
-use ed25519_dalek::SigningKey;
-
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -49,23 +51,49 @@ use support::{
 /// 280_000); the declared limit below must cover it.
 const GAS_TRANSFER_LIMIT: u64 = 300_000;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+fn key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
 }
 
 fn addr_of(seed: u8) -> [u8; 32] {
-    key(seed).verifying_key().to_bytes()
+    derive_pq_address(PqScheme::Falcon512, &key(seed).public_key, &DEFAULT_SALT)
 }
 
 fn tx_of(
-    k: &SigningKey,
+    k: &FalconKeypair,
     nonce: u64,
     amount: u64,
     gas_limit: u64,
     payload: Vec<OpCode>,
 ) -> Transaction {
-    let from = k.verifying_key().to_bytes();
-    Transaction::sign_with_payload(k, from, amount, gas_limit, nonce, 1, 1, payload)
+    let from = derive_pq_address(PqScheme::Falcon512, &k.public_key, &DEFAULT_SALT);
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        k.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        from,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = k.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        k.public_key.clone(),
+        sig,
+        from,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 async fn engine_with(balance: u64, seed: u8) -> (InMemoryStateEngine, [u8; 32]) {
@@ -237,16 +265,17 @@ async fn a_failure_the_sender_cannot_cover_moves_nothing() {
         "the drain applies, the doomed one fails"
     );
     assert_eq!(status, vec![true, false]);
-    assert_eq!(fees, GAS_TRANSFER_LIMIT, "only the drain paid a fee");
+    let drain_fee = GAS_TRANSFER_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS;
+    assert_eq!(fees, drain_fee, "only the drain paid a fee");
     assert_eq!(
         tx_fees,
-        vec![GAS_TRANSFER_LIMIT, 0],
+        vec![drain_fee, 0],
         "I15: the uncoverable failure is charged NOTHING - not even the dust"
     );
 
     // The sender keeps every coin it had after the drain, and its nonce was
     // not burned: the failure moves NOTHING.
-    let balance_after_drain = 10_000_000 - 9_000_000 - GAS_TRANSFER_LIMIT;
+    let balance_after_drain = 10_000_000 - 9_000_000 - drain_fee;
     assert_eq!(
         balance_of(&engine, &addr).await,
         balance_after_drain,
@@ -304,8 +333,9 @@ async fn an_attributable_failure_pays_exactly_the_failure_fee() {
 
     let fee = failure_fee(&engine, &t).await;
     assert_eq!(
-        fee, GAS_TRANSFER_LIMIT,
-        "the declared limit is the floor here"
+        fee,
+        GAS_TRANSFER_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS,
+        "the declared limit plus PQ activation surcharge is the failure fee here"
     );
     let before = balance_of(&engine, &addr).await;
     assert!(

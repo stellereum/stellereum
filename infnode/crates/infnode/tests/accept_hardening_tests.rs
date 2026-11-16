@@ -132,15 +132,19 @@ async fn raw_connect(addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
 
 /// None = refused (connection closed / timeout / non-AUTH). Some = accepted.
 async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
-    let (mut send, mut recv) =
-        tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await.ok()?.ok()?;
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .ok()?
+        .ok()?;
     send.write_all(wire).await.ok()?;
     let _ = send.finish();
     let bytes = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(65536))
         .await
         .ok()?
         .ok()?;
-    Frame::decode(&bytes).ok().filter(|f| f.kind == proto::kind::AUTH)
+    Frame::decode(&bytes)
+        .ok()
+        .filter(|f| f.kind == proto::kind::AUTH)
 }
 
 fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
@@ -209,7 +213,8 @@ async fn harden_strikes_reset_on_success() {
     let pq = PqKeys::generate();
     let node = Node::new(
         cfg("S", "127.0.0.1:0", vec![], false),
-        keys, pq,
+        keys,
+        pq,
         tmp.join("s"),
         PathBuf::new(),
     )
@@ -247,7 +252,8 @@ async fn harden_slow_handshake_rain_deadline_closes() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19911", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -300,7 +306,9 @@ async fn harden_slow_handshake_rain_deadline_closes() {
     let nonce: String = hex::encode(rand::random::<[u8; 16]>());
     let p = tofu_payload(&ke, &nonce, proto::now_ms());
     let w = challenge_wire(&ke.signing, ke.id(), &p, proto::now_ms());
-    let c = raw_connect(listen).await.expect("permits free after deadline");
+    let c = raw_connect(listen)
+        .await
+        .expect("permits free after deadline");
     assert!(
         raw_handshake(&c, &w).await.is_some(),
         "server serves honestly after the rain"
@@ -322,7 +330,8 @@ async fn harden_burst_dials_throttled() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19912", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -377,7 +386,8 @@ async fn harden_strikes_cooldown_recovery() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19913", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -410,10 +420,7 @@ async fn harden_strikes_cooldown_recovery() {
     for n in ["01", "02"] {
         let wire = bad_once(&format!("0{n}").repeat(16));
         let c = raw_connect(listen).await.expect("admission passes");
-        assert!(
-            raw_handshake(&c, &wire).await.is_none(),
-            "bad sig refused"
-        );
+        assert!(raw_handshake(&c, &wire).await.is_none(), "bad sig refused");
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
     let w = good_wire();
@@ -467,7 +474,8 @@ async fn harden_legit_handshake_unaffected() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19914", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )

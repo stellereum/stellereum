@@ -36,6 +36,47 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn sharded() -> ShardRegistry {
     ShardRegistry::from_ids([SHARD0, SHARD1])
 }
@@ -50,10 +91,22 @@ async fn sharded_pair(
     let s0 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard0_funding {
         s0.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s0.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard1_funding {
         s1.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s1.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     ShardedCluster::new(
         sharded(),
@@ -87,8 +140,14 @@ async fn shard2_soak_both_shards_finalize() {
     for h in 1..=SOAK_HEIGHTS {
         let bh0 = sc.run_height(SHARD0, h * 2 - 1).await;
         let bh1 = sc.run_height(SHARD1, h * 2).await;
-        assert_eq!(sc.shard(SHARD0).nodes[0].blocks.get(&bh0).unwrap().shard_id, SHARD0);
-        assert_eq!(sc.shard(SHARD1).nodes[0].blocks.get(&bh1).unwrap().shard_id, SHARD1);
+        assert_eq!(
+            sc.shard(SHARD0).nodes[0].blocks.get(&bh0).unwrap().shard_id,
+            SHARD0
+        );
+        assert_eq!(
+            sc.shard(SHARD1).nodes[0].blocks.get(&bh1).unwrap().shard_id,
+            SHARD1
+        );
     }
     let dt = t0.elapsed();
     let f0 = finalized_len(sc.shard(SHARD0));
@@ -109,9 +168,8 @@ async fn shard2_soak_both_shards_finalize() {
 #[tokio::test]
 async fn shard2_soak_cross_shard_transfer_conserves_supply() {
     let validator = key(11);
-    let sender = key(12);
     let recipient = key(13);
-    let sender_addr = sender.verifying_key().to_bytes();
+    let sender_addr = pq_id(12);
     let recipient_addr = recipient.verifying_key().to_bytes();
     let validator_addr = validator.verifying_key().to_bytes();
 
@@ -127,12 +185,17 @@ async fn shard2_soak_cross_shard_transfer_conserves_supply() {
 
     let amount = 10_000u64;
     let gas = 50u64;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
+    let tx = pq_tx(12, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
     sc.shard_mut(SHARD1).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 4).await;
     assert_eq!(
-        sc.shard(SHARD0).nodes[0].blocks.get(&src_bh).unwrap().cross_shard_out.len(),
+        sc.shard(SHARD0).nodes[0]
+            .blocks
+            .get(&src_bh)
+            .unwrap()
+            .cross_shard_out
+            .len(),
         1,
         "source must emit exactly one outbound message"
     );
@@ -212,11 +275,15 @@ async fn shard2_soak_rotation_propagates_to_workchain() {
 
     // The masterchain itself is a silent no-op for the workchain repair.
     assert!(
-        !sc.shard_mut(SHARD0).nodes[0].refresh_workchain_set_from_master().await,
+        !sc.shard_mut(SHARD0).nodes[0]
+            .refresh_workchain_set_from_master()
+            .await,
         "masterchain must ignore the workchain repair"
     );
     // The workchain picks the rotation up with no finalize in between.
-    let staged = sc.shard_mut(SHARD1).nodes[0].refresh_workchain_set_from_master().await;
+    let staged = sc.shard_mut(SHARD1).nodes[0]
+        .refresh_workchain_set_from_master()
+        .await;
     let w = &sc.shard(SHARD1).nodes[0];
     let (activation, pending) = w
         .pending_validators
@@ -251,9 +318,8 @@ async fn shard2_soak_rotation_propagates_to_workchain() {
 #[tokio::test]
 async fn shard2_soak_freeze_and_heal() {
     let validator = key(31);
-    let sender = key(32);
     let recipient = key(33);
-    let sender_addr = sender.verifying_key().to_bytes();
+    let sender_addr = pq_id(32);
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 500_000)], &[]).await;
@@ -272,7 +338,11 @@ async fn shard2_soak_freeze_and_heal() {
     eprintln!(
         "SOAK freeze: finals0 {f0_pre}->{f0_frozen} finals1 {f1_pre}->{f1_frozen} (shard1 frozen)"
     );
-    assert_eq!(f0_frozen, f0_pre + 4, "shard0 keeps finalizing while shard1 is frozen");
+    assert_eq!(
+        f0_frozen,
+        f0_pre + 4,
+        "shard0 keeps finalizing while shard1 is frozen"
+    );
     assert_eq!(f1_frozen, f1_pre, "frozen shard finalizes nothing");
     // HEAL: shard1 resumes finalizing from where it stopped.
     for h in 4..=7 {
@@ -282,7 +352,7 @@ async fn shard2_soak_freeze_and_heal() {
     eprintln!("SOAK heal: finals1 {f1_frozen}->{f1_healed}");
     assert_eq!(f1_healed, f1_pre + 4, "healed shard catches up");
     // Interop still works after the heal.
-    let tx = Transaction::sign(&sender, recipient_addr, 5_000, 25, 0, SHARD0, SHARD1);
+    let tx = pq_tx(32, recipient_addr, 5_000, 25, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
     sc.shard_mut(SHARD1).broadcast_tx(tx).await;
     sc.run_height(SHARD0, 8).await;

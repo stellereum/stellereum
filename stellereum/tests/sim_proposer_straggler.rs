@@ -105,8 +105,7 @@ fn build_control() -> ConsensusCluster {
 }
 
 fn build_fixed() -> ConsensusCluster {
-    build_control()
-        .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS))
+    build_control().with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS))
 }
 
 /// Shared metrics line: finals per budget window (scaled to a virtual hour in
@@ -163,7 +162,11 @@ async fn proposer_stale_chase_control_stalls() {
     c.seed_transactions(3).await;
     let report = c.run_for(BUDGET_MS).await;
 
-    println!("[sim][proposer-chase][control] seed=0x{:x} {}", SEED, metrics_line(&report));
+    println!(
+        "[sim][proposer-chase][control] seed=0x{:x} {}",
+        SEED,
+        metrics_line(&report)
+    );
     println!("{}", report.diagnostics());
 
     // LIVENESS (absent): the chase must burn the hour with ~no finals.
@@ -229,7 +232,11 @@ async fn proposer_stale_chase_control_stalls() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),
@@ -246,7 +253,11 @@ async fn proposer_straggler_grace_finalizes() {
     c.seed_transactions(3).await;
     let report = c.run_for(BUDGET_MS).await;
 
-    println!("[sim][proposer-chase][fixed] seed=0x{:x} {}", SEED, metrics_line(&report));
+    println!(
+        "[sim][proposer-chase][fixed] seed=0x{:x} {}",
+        SEED,
+        metrics_line(&report)
+    );
     println!("{}", report.diagnostics());
 
     // LIVENESS: the same window that stalls the control finalizes steadily.
@@ -303,7 +314,8 @@ async fn proposer_straggler_grace_finalizes() {
     for n in &report.nodes {
         for (k, d) in n.decide_rounds.iter().enumerate().skip(1) {
             assert_eq!(
-                *d, 0,
+                *d,
+                0,
                 "node {} decided height {} in round +{d}: a stale round \
                  carried the decision.\n{}",
                 n.index,
@@ -330,7 +342,11 @@ async fn proposer_straggler_grace_finalizes() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),

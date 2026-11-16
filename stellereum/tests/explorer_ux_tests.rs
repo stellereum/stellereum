@@ -7,8 +7,12 @@
 
 use std::sync::Arc;
 use stellereum::explorer::{self, GatewayState};
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::rpc::{ReceiptIndex, RpcState, TxReceipt};
+use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::svm::OpCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -17,6 +21,53 @@ const JAILED: [u8; 32] = [0x22u8; 32];
 const SENDER: [u8; 32] = [0x33u8; 32];
 const SENDER_KEY: [u8; 32] = [0x34u8; 32];
 const OTHER: [u8; 32] = [0x35u8; 32];
+const PQ_GAS_LIMIT: u64 = 1_000 + PQ_ACTIVATION_SURCHARGE_GAS;
+
+fn sender_kp() -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&SENDER_KEY)
+}
+
+fn sender_addr() -> [u8; 32] {
+    let kp = sender_kp();
+    derive_pq_address(PqScheme::Falcon512, kp.pubkey(), &DEFAULT_SALT)
+}
+
+fn pq_tx(
+    kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, kp.pubkey(), &DEFAULT_SALT);
+    let probe = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: payload.clone(),
+        priority_fee_per_gas: 0,
+    };
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.pubkey().to_vec(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        0,
+        0,
+        payload,
+        &DEFAULT_SALT,
+    )
+}
 
 async fn seeded_state() -> Arc<RpcState> {
     let engine = Arc::new(InMemoryStateEngine::new());
@@ -30,12 +81,11 @@ async fn seeded_state() -> Arc<RpcState> {
     // Proof of correctness for delegation_count==1: the account view keys
     // delegations by exact delegator address (`*d == a` over
     // (validator, delegator) keys), and the happy-path test queries the
-    // ed25519 pubkey derived from SENDER_KEY -- not the raw SENDER constant
+    // PQ-derived address from SENDER_KEY -- not the raw SENDER constant
     // ([0x33; 32]). Seeding the delegation from SENDER therefore correctly
-    // yields 0 for the queried address; seed it from the derived pubkey so
+    // yields 0 for the queried address; seed it from the derived PQ address so
     // the queried account is the delegator (validator totals unchanged).
-    let sender_pub =
-        ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY).verifying_key().to_bytes();
+    let sender_pub = sender_addr();
     ledger
         .delegate(sender_pub, VALIDATOR, 100_000_000_000)
         .unwrap();
@@ -89,12 +139,12 @@ async fn seeded_state() -> Arc<RpcState> {
     });
 
     // One pending transfer SENDER -> OTHER (nonce 0).
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let sender = key.verifying_key().to_bytes();
+    let key = sender_kp();
+    let sender = sender_addr();
     st.engine
         .update_account(AccountState::new(sender, 9_000_000_000_000_000))
         .await;
-    let tx = stellereum::sharding::Transaction::sign(&key, OTHER, 42, 1000, 0, 0, 0);
+    let tx = pq_tx(&key, OTHER, 42, PQ_GAS_LIMIT, 0, Vec::new());
     st.mempool.write().await.add(tx).unwrap();
     st
 }
@@ -196,7 +246,10 @@ async fn validator_summary_unknown_and_bad() {
     let addr = spawn(seeded_state().await).await;
     let unknown = hex::encode([0x99u8; 32]);
     let (status, body) = http_get(addr, &format!("/api/validator/{unknown}")).await;
-    assert!(status.contains("200"), "unknown is data, not error: {status}");
+    assert!(
+        status.contains("200"),
+        "unknown is data, not error: {status}"
+    );
     let j = body_json(&body);
     assert_eq!(j["known"], false);
     assert_eq!(j["validator"], unknown);
@@ -205,7 +258,10 @@ async fn validator_summary_unknown_and_bad() {
     assert!(j["self_bond"].is_null());
 
     let (status, _) = http_get(addr, "/api/validator/zzzz").await;
-    assert!(status.contains("400"), "bad address must fail closed: {status}");
+    assert!(
+        status.contains("400"),
+        "bad address must fail closed: {status}"
+    );
 }
 
 #[tokio::test]
@@ -234,7 +290,10 @@ async fn finals_feed_cap_enforced() {
     let addr = spawn(seeded_state().await).await;
     // Oversized N clamps to the hard cap (store holds 5, cap is 100).
     let (status, body) = http_get(addr, "/api/finals?limit=10000").await;
-    assert!(status.contains("200"), "oversized clamps, not errors: {status}");
+    assert!(
+        status.contains("200"),
+        "oversized clamps, not errors: {status}"
+    );
     let rows = body_json(&body).as_array().unwrap().len();
     assert_eq!(rows, 5);
     // Small N paginates newest-first.
@@ -248,7 +307,10 @@ async fn finals_feed_cap_enforced() {
     let (status, _) = http_get(addr, "/api/finals?limit=0").await;
     assert!(status.contains("400"), "zero must be refused: {status}");
     let (status, _) = http_get(addr, "/api/finals?limit=abc").await;
-    assert!(status.contains("400"), "non-numeric must be refused: {status}");
+    assert!(
+        status.contains("400"),
+        "non-numeric must be refused: {status}"
+    );
 }
 
 #[tokio::test]
@@ -262,8 +324,7 @@ async fn finals_feed_empty_store() {
 #[tokio::test]
 async fn account_summary_happy_path() {
     let addr = spawn(seeded_state().await).await;
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let sender = hex::encode(key.verifying_key().to_bytes());
+    let sender = hex::encode(sender_addr());
     let (status, body) = http_get(addr, &format!("/api/account/{sender}")).await;
     assert!(status.contains("200"), "status: {status}");
     let j = body_json(&body);
@@ -292,10 +353,10 @@ async fn account_summary_happy_path() {
 async fn account_summary_tx_cap_enforced() {
     let st = seeded_state().await;
     // 25 pending from the same sender (nonces 1..=25; nonce 0 already pooled).
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let sender = key.verifying_key().to_bytes();
+    let key = sender_kp();
+    let sender = sender_addr();
     for n in 1u64..=25 {
-        let tx = stellereum::sharding::Transaction::sign(&key, OTHER, n, 1000, n, 0, 0);
+        let tx = pq_tx(&key, OTHER, n, PQ_GAS_LIMIT, n, Vec::new());
         st.mempool.write().await.add(tx).unwrap();
     }
     let addr = spawn(st).await;
@@ -326,7 +387,10 @@ async fn account_summary_empty_store() {
     assert_eq!(j["withdrawable"], "0");
 
     let (status, _) = http_get(addr, "/api/account/not-hex").await;
-    assert!(status.contains("400"), "bad address must fail closed: {status}");
+    assert!(
+        status.contains("400"),
+        "bad address must fail closed: {status}"
+    );
 }
 
 // --- Explorer 9.0: tx-detail + block-detail human views (additive; the
@@ -349,7 +413,7 @@ async fn tx_detail_finalized_happy_path() {
         block_hash: [0xABu8; 32],
         index: 0,
         success: true,
-        gas_limit: 1000,
+        gas_limit: PQ_GAS_LIMIT,
         fee_charged: 10,
         ..Default::default()
     });
@@ -361,13 +425,12 @@ async fn tx_detail_finalized_happy_path() {
     assert_eq!(j["height"], 14);
     assert_eq!(j["block_hash"], hex::encode([0xABu8; 32]));
     assert_eq!(j["index"], 0);
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let sender = hex::encode(key.verifying_key().to_bytes());
+    let sender = hex::encode(sender_addr());
     assert_eq!(j["sender"], sender);
     assert_eq!(j["recipient"], hex::encode(OTHER));
     assert_eq!(j["amount"], "42");
     assert_eq!(j["nonce"], 0);
-    assert_eq!(j["gas_limit"], "1000");
+    assert_eq!(j["gas_limit"], PQ_GAS_LIMIT.to_string());
     assert_eq!(j["fee_charged"], "10");
     assert!(j["memo"].is_null(), "no memo bytes are indexed: {j}");
     assert_eq!(j["intent"]["kind"], "transparent");
@@ -381,15 +444,13 @@ async fn tx_detail_finalized_happy_path() {
 #[tokio::test]
 async fn tx_detail_decoded_intent_delegate() {
     let st = seeded_state().await;
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let tx = stellereum::sharding::Transaction::sign_with_payload(
+    let key = sender_kp();
+    let tx = pq_tx(
         &key,
         OTHER,
         1,
-        1000,
+        PQ_GAS_LIMIT,
         77,
-        0,
-        0,
         vec![stellereum::svm::OpCode::SysCallDelegate {
             validator: VALIDATOR,
             amount: 5,
@@ -436,13 +497,26 @@ async fn tx_detail_pending_redacted_and_errors() {
     assert_eq!(j["status"], "pending");
     assert_eq!(j["tx_hash"], hex::encode(tx_hash));
     assert!(j.get("nonce").is_some(), "redacted view keeps the nonce");
-    assert!(j.get("sender").is_none(), "pending body stays redacted: {body}");
+    assert!(
+        j.get("sender").is_none(),
+        "pending body stays redacted: {body}"
+    );
 
     let (status, _) = http_get(addr, "/api/tx-detail/zzzz").await;
-    assert!(status.contains("400"), "malformed hash must fail closed: {status}");
+    assert!(
+        status.contains("400"),
+        "malformed hash must fail closed: {status}"
+    );
 
-    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode([0xEEu8; 32]))).await;
-    assert!(status.contains("404"), "unknown hash must fail closed: {status}");
+    let (status, body) = http_get(
+        addr,
+        &format!("/api/tx-detail/{}", hex::encode([0xEEu8; 32])),
+    )
+    .await;
+    assert!(
+        status.contains("404"),
+        "unknown hash must fail closed: {status}"
+    );
     assert_eq!(body_json(&body)["status"], "unknown");
 }
 
@@ -450,15 +524,13 @@ async fn tx_detail_pending_redacted_and_errors() {
 #[tokio::test]
 async fn tx_detail_caps_enforced() {
     let st = seeded_state().await;
-    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
-    let tx = stellereum::sharding::Transaction::sign_with_payload(
+    let key = sender_kp();
+    let tx = pq_tx(
         &key,
         OTHER,
         1,
-        1000,
+        PQ_GAS_LIMIT,
         78,
-        0,
-        0,
         vec![stellereum::svm::OpCode::Nop; 60],
     );
     let h = tx.compute_tx_hash();
@@ -504,10 +576,7 @@ async fn block_detail_happy_path() {
         round: 3,
         kind: stellereum::consensus::VoteKind::Precommit,
         block_hash: None,
-        signatures: vec![
-            ([0x11u8; 32], vec![1u8, 2, 3]),
-            ([0x12u8; 32], vec![4u8]),
-        ],
+        signatures: vec![([0x11u8; 32], vec![1u8, 2, 3]), ([0x12u8; 32], vec![4u8])],
     };
     let block = stellereum::sharding::Block {
         height: 700_131,
@@ -534,7 +603,11 @@ async fn block_detail_happy_path() {
     assert_eq!(j["finality_latency_secs"], 10);
     assert!(j["proposer"].is_null(), "no header recorded for 14: {j}");
 
-    let (status, body) = http_get(addr, &format!("/api/block-detail/{}", hex::encode([0xABu8; 32]))).await;
+    let (status, body) = http_get(
+        addr,
+        &format!("/api/block-detail/{}", hex::encode([0xABu8; 32])),
+    )
+    .await;
     assert!(status.contains("200"), "hash lookup: {status}");
     assert_eq!(body_json(&body)["height"], 14);
 
@@ -581,9 +654,15 @@ async fn block_detail_errors_and_caps() {
     assert_eq!(j["tx_refs_truncated"], true);
 
     let (status, body) = http_get(addr, "/api/block-detail/999998").await;
-    assert!(status.contains("404"), "unknown height must fail closed: {status}");
+    assert!(
+        status.contains("404"),
+        "unknown height must fail closed: {status}"
+    );
     assert_eq!(body_json(&body)["status"], "unknown");
 
     let (status, _) = http_get(addr, "/api/block-detail/zzzz").await;
-    assert!(status.contains("400"), "malformed query must fail closed: {status}");
+    assert!(
+        status.contains("400"),
+        "malformed query must fail closed: {status}"
+    );
 }

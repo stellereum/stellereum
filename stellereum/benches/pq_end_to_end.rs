@@ -19,8 +19,8 @@ use std::time::Instant;
 use ed25519_dalek::{Signer, SigningKey};
 
 use stellereum::consensus::{
-    encode_pq_micro_envelope, vote_sign_bytes, PQ_UQC_MARKER_ID, PqMicroCertificate,
-    QuorumCertificate, ValidatorSet, VoteKind,
+    register_validator_pq_key, vote_sign_bytes, QuorumCertificate, ValidatorSet, Vote, VoteKind,
+    VoteSet, PQ_UQC_MARKER_ID,
 };
 use stellereum::mempool::{Mempool, PQ_ACTIVATION_SURCHARGE_GAS};
 use stellereum::post_quantum::{
@@ -213,50 +213,42 @@ fn bench_row(n: usize) {
 fn bench_qc_row(n: usize) {
     let _guard = PqGuard::observe();
     let mut vs = ValidatorSet::new();
-    let mut fkeys: Vec<([u8; 32], FalconKeypair)> = Vec::with_capacity(n);
+    let mut keys: Vec<(SigningKey, FalconKeypair)> = Vec::with_capacity(n);
     for i in 0..n {
-        let fk = FalconKeypair::generate_from_seed_bytes(&pq_seed(80_000 + n as u64 * 1000 + i as u64));
-        let id = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+        let mut ed_seed = [0u8; 32];
+        ed_seed[..8].copy_from_slice(&(80_000 + n as u64 * 1000 + i as u64).to_le_bytes());
+        let sk = SigningKey::from_bytes(&ed_seed);
+        let id = sk.verifying_key().to_bytes();
+        let fk =
+            FalconKeypair::generate_from_seed_bytes(&pq_seed(80_000 + n as u64 * 1000 + i as u64));
         vs.add(id, 10);
-        stellereum::consensus::register_validator_pq_key(id, PqScheme::Falcon512, fk.public_key.clone());
-        fkeys.push((id, fk));
+        register_validator_pq_key(id, PqScheme::Falcon512, fk.public_key.clone());
+        keys.push((sk, fk));
     }
     let height = 42u64;
     let round = 1u32;
     let parent = [0x9u8; 32];
-    let committee_size = stellereum::consensus::micro_committee_size(vs.len());
-    assert_eq!(committee_size as usize, n);
-    let committee =
-        stellereum::consensus::derive_sortition_committee(&vs, height, round, committee_size, &parent);
     let kind = VoteKind::Precommit;
     let block_hash = Some([0xBBu8; 32]);
-    let msg = vote_sign_bytes(height, round, kind, &block_hash);
-    let mut signatures = Vec::with_capacity(n);
-    let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
-    for (i, val_id) in committee.iter().enumerate() {
-        let (_, fk) = fkeys.iter().find(|(id, _)| id == val_id).expect("member key");
-        signatures.push(fk.sign_with_seed(&msg, &pq_seed(88_000 + n as u64 * 1000 + i as u64)));
-        bitmask[i / 8] |= 1 << (i % 8);
+    let mut vote_set = VoteSet::new();
+    for (sk, fk) in &keys {
+        let vote = Vote::sign_with_falcon(sk, fk, height, round, kind, block_hash);
+        vote_set
+            .add(vote, &vs, height, round, kind)
+            .expect("Falcon vote must be admitted");
     }
-    let uqc = PqMicroCertificate::new(
-        PqScheme::Falcon512,
-        height,
-        round,
-        committee_size,
-        bitmask,
-        signatures,
-        parent,
-    );
-    let payload = encode_pq_micro_envelope(&uqc);
-    let pq_qc = QuorumCertificate {
-        height,
-        round,
-        kind,
-        block_hash,
-        signatures: vec![(PQ_UQC_MARKER_ID, payload.clone())],
-    };
+    let pq_qc = vote_set
+        .certificate(block_hash, &vs, &parent)
+        .expect("Falcon quorum must compile uQC");
     assert!(pq_qc.verify_unified(&vs));
+    let payload_len = pq_qc
+        .signatures
+        .iter()
+        .find(|(voter, _)| *voter == PQ_UQC_MARKER_ID)
+        .map(|(_, bytes)| bytes.len())
+        .expect("compiled QC must carry PQ_UQC_MARKER_ID");
 
+    let msg = vote_sign_bytes(height, round, kind, &block_hash);
     let mut cvs = ValidatorSet::new();
     let mut csigs = Vec::with_capacity(n);
     for i in 0..n {
@@ -274,12 +266,15 @@ fn bench_qc_row(n: usize) {
         block_hash,
         signatures: csigs,
     };
-    assert!(cqc.verify_unified(&cvs));
+    assert!(
+        !cqc.verify_unified(&cvs),
+        "FULL-PQ: classical Ed25519 QC must fail closed"
+    );
     let cqc_bin = bincode::serialize(&cqc).expect("serialize").len();
     println!(
         "[bench][pq-e2e-qc] N={n:>2} falcon-uqc={}B ed-qc={cqc_bin}B falcon-per-signer={}B",
-        payload.len(),
-        payload.len() / n
+        payload_len,
+        payload_len / n
     );
 }
 
@@ -301,8 +296,18 @@ fn pq_e2e_sizes() {
     let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
     let msg = skeleton_tx(from).signing_message();
     let sig = kp.sign_with_seed(&msg, &pq_seed(61_002));
-    let falcon_imp_tx =
-        Transaction::new_pq_implicit(from, PqScheme::Falcon512, sig, RECIPIENT, 1, PQ_GAS, 0, 1, 1, Vec::new());
+    let falcon_imp_tx = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        RECIPIENT,
+        1,
+        PQ_GAS,
+        0,
+        1,
+        1,
+        Vec::new(),
+    );
     println!(
         "[bench][pq-e2e-size] ed={}B falcon-implicit={}B falcon-explicit={}B hybrid-implicit=739B hybrid-explicit=1684B",
         ed_tx.signature.len(),
@@ -311,7 +316,10 @@ fn pq_e2e_sizes() {
     );
     assert_eq!(ed_tx.signature.len(), 64);
     assert_eq!(falcon_imp_tx.signature.len(), 3 + 1 + 1 + 2 + 2 + 666);
-    assert_eq!(falcon_exp_tx.signature.len(), 3 + 1 + 1 + 2 + 897 + 16 + 2 + 666);
+    assert_eq!(
+        falcon_exp_tx.signature.len(),
+        3 + 1 + 1 + 2 + 897 + 16 + 2 + 666
+    );
 }
 
 #[test]

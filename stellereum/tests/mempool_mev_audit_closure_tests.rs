@@ -107,7 +107,8 @@ async fn f02_add_tx_refuses_gapped_nonce() {
     let vs = ValidatorSet::from_list(vec![(me, 1)]);
     let st = Arc::new(InMemoryStateEngine::new());
     st.update_account(AccountState::new(me, 100 * STELL)).await;
-    st.update_account(AccountState::new(tx_from, 100 * STELL)).await;
+    st.update_account(AccountState::new(tx_from, 100 * STELL))
+        .await;
     let mut rt = ValidatorRuntime::new(k.clone(), vs, st, 1);
 
     rt.add_tx(transfer(&tx_seed, [9u8; 32], 1, 1_000, 32)).await;

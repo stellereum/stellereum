@@ -68,28 +68,112 @@ fn env_override_is_honored_and_nothing_else_touches_env() {
 fn alarm_decision_matrix() {
     let cases = [
         // Fresh traffic: silent.
-        AlarmCase { last_rx: 1_000, now: 1_000, is_validator: true, peers: 2, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 1_000,
+            now: 1_000,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // Recent traffic, well under the threshold: silent.
-        AlarmCase { last_rx: 1_000, now: 1_000 + 60_000, is_validator: true, peers: 2, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 1_000,
+            now: 1_000 + 60_000,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // BOUNDARY: silence exactly == threshold stays silent (strict `>`).
-        AlarmCase { last_rx: 0, now: THRESHOLD, is_validator: true, peers: 2, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 0,
+            now: THRESHOLD,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // BOUNDARY + 1ms: screams. This is the 18-day-isolation line.
-        AlarmCase { last_rx: 0, now: THRESHOLD + 1, is_validator: true, peers: 2, threshold: THRESHOLD, want: true },
+        AlarmCase {
+            last_rx: 0,
+            now: THRESHOLD + 1,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: true,
+        },
         // Long silence, validator, peers: screams.
-        AlarmCase { last_rx: 0, now: 18 * 24 * 3_600_000, is_validator: true, peers: 2, threshold: THRESHOLD, want: true },
+        AlarmCase {
+            last_rx: 0,
+            now: 18 * 24 * 3_600_000,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: true,
+        },
         // Single configured peer is enough to arm the alarm.
-        AlarmCase { last_rx: 0, now: THRESHOLD + 1, is_validator: true, peers: 1, threshold: THRESHOLD, want: true },
+        AlarmCase {
+            last_rx: 0,
+            now: THRESHOLD + 1,
+            is_validator: true,
+            peers: 1,
+            threshold: THRESHOLD,
+            want: true,
+        },
         // Observer / non-validator with peers and total silence: silent.
-        AlarmCase { last_rx: 0, now: 18 * 24 * 3_600_000, is_validator: false, peers: 2, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 0,
+            now: 18 * 24 * 3_600_000,
+            is_validator: false,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // Solo/dev stand (no configured peers) with total silence: silent.
-        AlarmCase { last_rx: 0, now: 18 * 24 * 3_600_000, is_validator: true, peers: 0, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 0,
+            now: 18 * 24 * 3_600_000,
+            is_validator: true,
+            peers: 0,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // Non-validator AND no peers: silent.
-        AlarmCase { last_rx: 0, now: 18 * 24 * 3_600_000, is_validator: false, peers: 0, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 0,
+            now: 18 * 24 * 3_600_000,
+            is_validator: false,
+            peers: 0,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // Clock skew (now < last_rx): saturates to zero silence, silent.
-        AlarmCase { last_rx: 5_000, now: 1_000, is_validator: true, peers: 2, threshold: THRESHOLD, want: false },
+        AlarmCase {
+            last_rx: 5_000,
+            now: 1_000,
+            is_validator: true,
+            peers: 2,
+            threshold: THRESHOLD,
+            want: false,
+        },
         // Custom small threshold via env knob is honored as a parameter.
-        AlarmCase { last_rx: 0, now: 1_001, is_validator: true, peers: 3, threshold: 1_000, want: true },
-        AlarmCase { last_rx: 0, now: 1_000, is_validator: true, peers: 3, threshold: 1_000, want: false },
+        AlarmCase {
+            last_rx: 0,
+            now: 1_001,
+            is_validator: true,
+            peers: 3,
+            threshold: 1_000,
+            want: true,
+        },
+        AlarmCase {
+            last_rx: 0,
+            now: 1_000,
+            is_validator: true,
+            peers: 3,
+            threshold: 1_000,
+            want: false,
+        },
     ];
     for c in &cases {
         assert_eq!(

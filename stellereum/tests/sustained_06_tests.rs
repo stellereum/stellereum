@@ -137,7 +137,12 @@ async fn sustained_fast_p50_no_stall_no_fork() {
 
     // Warmup: height 1 is the virtual-t=0 genesis transient; measure 2..=HEIGHTS+1.
     let warm = c.run_until(1, STEP_BUDGET_MS).await;
-    assert_eq!(warm.common_height, 1, "warmup stall:\n{}", warm.diagnostics());
+    assert_eq!(
+        warm.common_height,
+        1,
+        "warmup stall:\n{}",
+        warm.diagnostics()
+    );
     let mut prev = warm.virtual_ms;
     let mut dts: Vec<u64> = Vec::with_capacity(HEIGHTS as usize);
     for h in 2..=(HEIGHTS + 1) {
@@ -190,7 +195,12 @@ async fn sustained_degraded_slow_member_bounded() {
     c.seed_transactions(3).await;
 
     let warm = c.run_until(1, STEP_BUDGET_MS).await;
-    assert_eq!(warm.common_height, 1, "warmup stall:\n{}", warm.diagnostics());
+    assert_eq!(
+        warm.common_height,
+        1,
+        "warmup stall:\n{}",
+        warm.diagnostics()
+    );
     let mut prev = warm.virtual_ms;
     let mut dts: Vec<u64> = Vec::with_capacity(HEIGHTS as usize);
     for h in 2..=(HEIGHTS + 1) {

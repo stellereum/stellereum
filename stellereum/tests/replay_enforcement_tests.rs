@@ -151,9 +151,7 @@ fn sender_of(tx: &Transaction) -> [u8; 32] {
 }
 
 async fn rpc_state(chain_id: u64, finalized_height: u64) -> Arc<RpcState> {
-    let engine = Arc::new(
-        InMemoryStateEngine::new().with_chain_id(chain_id),
-    );
+    let engine = Arc::new(InMemoryStateEngine::new().with_chain_id(chain_id));
     let mempool = Arc::new(tokio::sync::RwLock::new(Mempool::default()));
     Arc::new(RpcState {
         engine,
@@ -224,7 +222,11 @@ async fn rpc_refuses_replay_at_later_height_but_admits_when_gate_off() {
         err.contains(&ACTIVATION_HEIGHT.to_string()),
         "RPC refusal must name the activation height, got: {err}"
     );
-    assert_eq!(refused_count(), before + 1, "one refusal counts exactly once");
+    assert_eq!(
+        refused_count(),
+        before + 1,
+        "one refusal counts exactly once"
+    );
     assert!(
         st.mempool.read().await.is_empty(),
         "a refused tx must never enter the mempool"
@@ -562,11 +564,7 @@ async fn default_off_full_path_accepts_with_env_unset() {
         .await
         .expect("apply must succeed while off, at any height");
     let (applied, failed, _, status, _) = engine
-        .apply_block_parallel_fees_at_height(
-            std::slice::from_ref(&tx_pool),
-            0,
-            ACTIVATION_HEIGHT,
-        )
+        .apply_block_parallel_fees_at_height(std::slice::from_ref(&tx_pool), 0, ACTIVATION_HEIGHT)
         .await;
     // NOTE: `tx_pool` was never applied (fresh engine, nonce 0) — it applies
     // here on the block path.

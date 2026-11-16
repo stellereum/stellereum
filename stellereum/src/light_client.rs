@@ -611,8 +611,12 @@ impl LightHeader {
                 if pure_pq && (!scheme.is_post_quantum() || scheme.is_disabled()) {
                     continue; // classical/disabled registration lends no power in pure-PQ
                 }
-                if crate::post_quantum::verify_pq_signature(scheme, &pk, &self.block_hash, sig_bytes)
-                {
+                if crate::post_quantum::verify_pq_signature(
+                    scheme,
+                    &pk,
+                    &self.block_hash,
+                    sig_bytes,
+                ) {
                     members += 1;
                     power = power.saturating_add(vp);
                     continue;
@@ -1183,10 +1187,7 @@ impl ValidatorSetRotation {
     /// here: verification happens in [`LightClient::rotate_validator_set`],
     /// which is the only thing that may install the set.
     pub fn new(rotation: LightHeader, next_set: ValidatorSet) -> Self {
-        Self {
-            rotation,
-            next_set,
-        }
+        Self { rotation, next_set }
     }
 
     /// The height the new set takes effect at (the rotation header's height).
@@ -2306,7 +2307,14 @@ mod tests {
     ) -> QuorumCertificate {
         let mut set = crate::consensus::VoteSet::new();
         for (sk, fk) in keys {
-            let v = Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            let v = Vote::sign_with_falcon(
+                sk,
+                fk,
+                height,
+                round,
+                VoteKind::Precommit,
+                Some(block_hash),
+            );
             set.add(v, vs, height, round, VoteKind::Precommit)
                 .expect("falcon vote must ingest");
         }

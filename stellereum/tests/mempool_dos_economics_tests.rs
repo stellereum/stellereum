@@ -149,11 +149,7 @@ fn fill_to_cap_costs_real_money_every_slot_funded() {
     // anything (needs the 5% premium: 100 + ceil(100/20) = 105).
     let stranger = key();
     assert_eq!(
-        mp.add_checked_ctx(
-            tx(&stranger, 10, 100, 0),
-            1_000_000,
-            AdmissionCtx::new(NOW)
-        ),
+        mp.add_checked_ctx(tx(&stranger, 10, 100, 0), 1_000_000, AdmissionCtx::new(NOW)),
         Err(MempoolError::Full)
     );
     assert_eq!(mp.len(), 8, "pool untouched by floor-price stranger");
@@ -178,7 +174,11 @@ fn unfunded_junk_is_always_refused_on_the_checked_path() {
         Err(MempoolError::FeeTooLow)
     );
     assert_eq!(mp.len(), 0, "no junk may occupy a slot");
-    assert_eq!(mp.reserved_for(&addr(&sk)), 0, "no reservation without admission");
+    assert_eq!(
+        mp.reserved_for(&addr(&sk)),
+        0,
+        "no reservation without admission"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +206,10 @@ fn funded_victims_survive_unfunded_and_cheaper_eviction() {
         Err(MempoolError::Full),
         "the unchecked path must never displace a funded transaction"
     );
-    assert!(mp.contains(&victim), "victim must survive the unfunded attack");
+    assert!(
+        mp.contains(&victim),
+        "victim must survive the unfunded attack"
+    );
 
     // (b) FUNDED but cheaper / at-price / sub-premium: never evicts.
     for fee in [50, 99, 100, 104] {
@@ -218,7 +221,10 @@ fn funded_victims_survive_unfunded_and_cheaper_eviction() {
         );
     }
     for h in &honest_hashes {
-        assert!(mp.contains(h), "all funded victims must survive cheap attacks");
+        assert!(
+            mp.contains(h),
+            "all funded victims must survive cheap attacks"
+        );
     }
     assert_eq!(mp.len(), 4);
 
@@ -227,7 +233,10 @@ fn funded_victims_survive_unfunded_and_cheaper_eviction() {
     mp.add_checked_ctx(tx(&attacker, 10, 105, 0), 1_000_000, AdmissionCtx::new(NOW))
         .expect("a 5% premium must displace the cheapest pooled tx");
     assert_eq!(mp.len(), 4);
-    assert!(!mp.contains(&victim), "exactly the cheapest tx must be evicted");
+    assert!(
+        !mp.contains(&victim),
+        "exactly the cheapest tx must be evicted"
+    );
     for h in &honest_hashes {
         if *h != victim {
             assert!(mp.contains(h), "non-cheapest victims must stay");
@@ -273,8 +282,12 @@ fn fee_market_suppression_always_costs_at_least_the_victim_price() {
 
     // (b) Higher tier paying MORE evicts — the attacker outspends the victim.
     let esc = key();
-    mp.add_checked_ctx(tx_prio(&esc, 10, 101, 0, 5), 1_000_000, AdmissionCtx::new(NOW))
-        .expect("escalation paying more than the victim evicts");
+    mp.add_checked_ctx(
+        tx_prio(&esc, 10, 101, 0, 5),
+        1_000_000,
+        AdmissionCtx::new(NOW),
+    )
+    .expect("escalation paying more than the victim evicts");
     assert_eq!(mp.len(), 4);
 
     // (c) A LOWER tier never displaces, whatever it pays.
@@ -283,11 +296,19 @@ fn fee_market_suppression_always_costs_at_least_the_victim_price() {
     // tx carries priority, then attack it from below.
     let mut mp2 = Mempool::new(2, 100);
     let h = key();
-    mp2.add_checked_ctx(tx_prio(&h, 10, 100, 0, 50), 1_000_000, AdmissionCtx::new(NOW))
-        .unwrap();
+    mp2.add_checked_ctx(
+        tx_prio(&h, 10, 100, 0, 50),
+        1_000_000,
+        AdmissionCtx::new(NOW),
+    )
+    .unwrap();
     let h2 = key();
-    mp2.add_checked_ctx(tx_prio(&h2, 10, 100, 1, 50), 1_000_000, AdmissionCtx::new(NOW))
-        .unwrap();
+    mp2.add_checked_ctx(
+        tx_prio(&h2, 10, 100, 1, 50),
+        1_000_000,
+        AdmissionCtx::new(NOW),
+    )
+    .unwrap();
     let low = key();
     assert_eq!(
         mp2.add_checked_ctx(
@@ -312,8 +333,12 @@ fn fee_market_suppression_always_costs_at_least_the_victim_price() {
         Err(MempoolError::Full),
         "sub-premium re-entry is refused"
     );
-    mp2.add_checked_ctx(tx_prio(&honest, 10, 105, 0, 50), 1_000_000, AdmissionCtx::new(NOW))
-        .expect("premium re-entry must succeed: no below-cost lockout");
+    mp2.add_checked_ctx(
+        tx_prio(&honest, 10, 105, 0, 50),
+        1_000_000,
+        AdmissionCtx::new(NOW),
+    )
+    .expect("premium re-entry must succeed: no below-cost lockout");
 }
 
 #[test]
@@ -480,7 +505,11 @@ fn sweep_keeps_executable_whatever_age_and_drops_stuck() {
         .unwrap();
     let broke_sk = key();
     let h_broke = mp
-        .add_checked_ctx(tx(&broke_sk, 9_000, 1_000, 0), 20_000, AdmissionCtx::new(NOW))
+        .add_checked_ctx(
+            tx(&broke_sk, 9_000, 1_000, 0),
+            20_000,
+            AdmissionCtx::new(NOW),
+        )
         .unwrap();
     let gap_sk = key();
     let gap_me = addr(&gap_sk);

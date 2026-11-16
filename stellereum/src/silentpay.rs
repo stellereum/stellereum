@@ -98,8 +98,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ml_kem::{
-    EncapsulationKey768, MlKem768,
     kem::{Decapsulate, FromSeed, Key},
+    EncapsulationKey768, MlKem768,
 };
 
 // ---------------------------------------------------------------------------
@@ -332,12 +332,7 @@ pub fn sp_chain_step(prev_chain: &[u8; 32], ss: &[u8; 32]) -> [u8; 32] {
 /// Derive a stealth address bound to the chain state, the KEM shared secret,
 /// and the per-recipient note index:
 /// `SHAKE256(SP_STEALTH_DST || chain_id_be64 || chain || ss || index_be64)`.
-pub fn sp_stealth_address(
-    chain_id: u64,
-    chain: &[u8; 32],
-    ss: &[u8; 32],
-    index: u64,
-) -> [u8; 32] {
+pub fn sp_stealth_address(chain_id: u64, chain: &[u8; 32], ss: &[u8; 32], index: u64) -> [u8; 32] {
     let mut pre = Vec::with_capacity(SP_STEALTH_DST.len() + 8 + 32 + 32 + 8);
     pre.extend_from_slice(SP_STEALTH_DST);
     pre.extend_from_slice(&chain_id.to_be_bytes());
@@ -390,7 +385,12 @@ pub fn sp_send(
     ss32.copy_from_slice(ss.as_slice());
     let stealth = sp_stealth_address(chain_id, chain, &ss32, index);
     let next_chain = sp_chain_step(chain, &ss32);
-    Ok(SpNote { ct: ct.as_slice().to_vec(), ss: ss32, stealth, next_chain })
+    Ok(SpNote {
+        ct: ct.as_slice().to_vec(),
+        ss: ss32,
+        stealth,
+        next_chain,
+    })
 }
 
 /// What an attacker holding a compromised `(chain, ss)` pair (a leaked note
@@ -442,7 +442,12 @@ pub struct SpRecipient {
 impl SpRecipient {
     /// Fresh recipient: genesis chain, index zero.
     pub fn new(seed: [u8; 64], chain_id: u64) -> Self {
-        Self { seed, chain_id, chain: SP_GENESIS_CHAIN, next_index: 0 }
+        Self {
+            seed,
+            chain_id,
+            chain: SP_GENESIS_CHAIN,
+            next_index: 0,
+        }
     }
 
     /// Current chain state (exposed for the FS game KATs).
@@ -494,12 +499,7 @@ impl SpRecipient {
 /// Note commitment — HashPool-identical shape and tag:
 /// `SHAKE256(SP_COMMIT_DST || chain_be64 || value_be64 || blinding || stealth)`
 /// where `SP_COMMIT_DST == HP_COMMIT_DST` byte-for-byte (same tags, no forks).
-pub fn sp_commit(
-    chain_id: u64,
-    value: u64,
-    blinding: &[u8; 32],
-    stealth: &[u8; 32],
-) -> [u8; 32] {
+pub fn sp_commit(chain_id: u64, value: u64, blinding: &[u8; 32], stealth: &[u8; 32]) -> [u8; 32] {
     let mut pre = Vec::with_capacity(SP_COMMIT_DST.len() + 8 + 8 + 32 + 32);
     pre.extend_from_slice(SP_COMMIT_DST);
     pre.extend_from_slice(&chain_id.to_be_bytes());
@@ -522,11 +522,7 @@ pub fn sp_nullifier(serial: &[u8; 32]) -> [u8; 32] {
 /// `SHAKE256(SP_SPEND_DST || chain_be64 || commitment || nullifier)`.
 /// Binds the exact note and the exact nullifier being released, so a
 /// signature cannot be replayed onto a different note or chain.
-pub fn sp_spend_sig_msg(
-    chain_id: u64,
-    commitment: &[u8; 32],
-    nullifier: &[u8; 32],
-) -> [u8; 32] {
+pub fn sp_spend_sig_msg(chain_id: u64, commitment: &[u8; 32], nullifier: &[u8; 32]) -> [u8; 32] {
     let mut pre = Vec::with_capacity(SP_SPEND_DST.len() + 8 + 32 + 32);
     pre.extend_from_slice(SP_SPEND_DST);
     pre.extend_from_slice(&chain_id.to_be_bytes());
@@ -592,7 +588,11 @@ impl SpPool {
     /// Empty pool bound to `chain_id` (commitments bind the chain id, so a
     /// pool only admits notes for its own chain).
     pub fn new(chain_id: u64) -> Self {
-        Self { chain_id, notes: BTreeMap::new(), spent: BTreeSet::new() }
+        Self {
+            chain_id,
+            notes: BTreeMap::new(),
+            spent: BTreeSet::new(),
+        }
     }
 
     /// Chain id this pool is bound to.
@@ -638,7 +638,8 @@ impl SpPool {
         if self.notes.contains_key(&commitment) {
             return Err(SpError::DuplicateDeposit);
         }
-        self.notes.insert(commitment, SpStoredNote { stealth, nullifier });
+        self.notes
+            .insert(commitment, SpStoredNote { stealth, nullifier });
         Ok(())
     }
 
@@ -654,7 +655,10 @@ impl SpPool {
         value: u64,
         blinding: &[u8; 32],
     ) -> Result<[u8; 32], SpError> {
-        let stored = self.notes.get(commitment).ok_or(SpError::UnknownCommitment)?;
+        let stored = self
+            .notes
+            .get(commitment)
+            .ok_or(SpError::UnknownCommitment)?;
         let recomputed = sp_commit(self.chain_id, value, blinding, &stored.stealth);
         if &recomputed != commitment {
             return Err(SpError::CommitmentMismatch);

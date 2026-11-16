@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { Transaction, TxOutcome } from '../types';
 import { getTransaction, getTxOutcome } from '../lib/api';
-import { formatStell, formatNano, formatDateTime, timeAgo, copyToClipboard } from '../lib/format';
+import { formatStell, formatNano, formatDateTime, timeAgo, truncateMiddle, copyToClipboard } from '../lib/format';
 
 export const TxDetail: React.FC = () => {
   const { hash } = useParams<{ hash: string }>();
@@ -56,9 +56,13 @@ export const TxDetail: React.FC = () => {
           <div className="flow-card">
             <div className="flow-side">
               <span className="flow-label">Sender</span>
-              <Link to={`/address/${tx.from_stl57 || tx.from_addr}`} className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>
-                {tx.from_stl57 || tx.from_addr}
-              </Link>
+              {(tx.from_stl57 || tx.from_addr) ? (
+                <Link to={`/address/${tx.from_stl57 || tx.from_addr}`} className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>
+                  {tx.from_stl57 || tx.from_addr}
+                </Link>
+              ) : (
+                <span className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>—</span>
+              )}
             </div>
 
             <div style={{ textAlign: 'center' }}>
@@ -70,9 +74,13 @@ export const TxDetail: React.FC = () => {
 
             <div className="flow-side" style={{ alignItems: 'flex-end' }}>
               <span className="flow-label">Recipient</span>
-              <Link to={`/address/${tx.to_stl57 || tx.to_addr}`} className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>
-                {tx.to_stl57 || tx.to_addr}
-              </Link>
+              {(tx.to_stl57 || tx.to_addr) ? (
+                <Link to={`/address/${tx.to_stl57 || tx.to_addr}`} className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>
+                  {tx.to_stl57 || tx.to_addr}
+                </Link>
+              ) : (
+                <span className="mono" style={{ fontSize: '0.95rem', fontWeight: 600 }}>—</span>
+              )}
             </div>
           </div>
 
@@ -203,7 +211,7 @@ export const TxDetail: React.FC = () => {
                   <div className="detail-label">Contract</div>
                   <div className="detail-val mono">
                     <Link to={`/address/${outcome.contract_address}`}>
-                      {outcome.contract_address.slice(0, 18)}...
+                      {truncateMiddle(outcome.contract_address, 10, 8)}
                     </Link>
                   </div>
                 </div>

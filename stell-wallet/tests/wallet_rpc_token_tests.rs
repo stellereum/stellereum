@@ -11,10 +11,15 @@
 mod rpc;
 
 #[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
+#[path = "../src/pq.rs"]
+mod pq;
+
+#[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
 #[path = "../src/client.rs"]
 mod client;
 
 use client::LightClient;
+use pq::{PqKeyPair, PqScheme, DEFAULT_SALT};
 use rpc::{RpcConfig, TxFinality};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -268,13 +273,10 @@ fn rpc_call_maps_node_error_to_err() {
         let mut chunk = [0u8; 4096];
         loop {
             match stream.read(&mut chunk) {
-                Ok(0) => break 0usize,
+                Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if let Some(hend) = buf
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map(|i| i + 4)
+                    if let Some(hend) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
                     {
                         let head = String::from_utf8_lossy(&buf[..hend]).into_owned();
                         let len = head
@@ -286,13 +288,13 @@ fn rpc_call_maps_node_error_to_err() {
                             })
                             .unwrap_or(0);
                         if buf.len() >= hend + len {
-                            break len;
+                            break;
                         }
                     }
                 }
-                Err(_) => break 0usize,
+                Err(_) => break,
             }
-        };
+        }
         let text = String::from_utf8_lossy(&buf);
         // Audit B-WALLET-5: echo the request id (client refuses mismatches).
         let req_id = text
@@ -437,15 +439,23 @@ fn token_spv_proof_key_is_recomputed_not_trusted() {
 #[tokio::test]
 async fn local_broadcast_is_pending_never_confirmed() {
     let client = local_client().await;
-    let from = addr(31);
     let to = addr(32);
-    client.set_balance(from, 10_000_000_000, 0).await;
-
-    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-    // NOTE: key [7;32] must own `from`. Derive the real sender instead.
-    let sender = stellereum::wallet::WalletAccount::from_seed(&[7u8; 32]);
-    client.set_balance(sender.address, 10_000_000_000, 0).await;
-    let tx = sender.create_transaction(to, 1_000_000_000, 0, 1, 1);
+    let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &[7u8; 32]);
+    let sender_addr = kp.derive_address(&DEFAULT_SALT);
+    client.set_balance(sender_addr, 10_000_000_000, 0).await;
+    let gas = stellereum::svm::GAS_BASIC_TRANSFER
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let tx = LightClient::build_pq_transfer_tx_bound(
+        &kp,
+        to,
+        1_000_000_000,
+        gas,
+        0,
+        1,
+        1,
+        true,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
+    );
 
     let (hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast");
     assert_eq!(hash, tx.compute_tx_hash());
@@ -472,15 +482,11 @@ async fn local_broadcast_is_pending_never_confirmed() {
     );
 
     // Local effects still applied (self-consistent simulation).
-    let (bal, nonce, _) = client.get_balance_spv(&sender.address, 1).await.unwrap();
-    assert_eq!(
-        bal,
-        10_000_000_000 - 1_000_000_000 - stellereum::svm::GAS_BASIC_TRANSFER
-    );
+    let (bal, nonce, _) = client.get_balance_spv(&sender_addr, 1).await.unwrap();
+    assert_eq!(bal, 10_000_000_000 - 1_000_000_000 - gas);
     assert_eq!(nonce, 1);
     let (tobal, _, _) = client.get_balance_spv(&to, 1).await.unwrap();
     assert_eq!(tobal, 1_000_000_000);
-    let _ = (from, key);
 }
 
 #[tokio::test]
@@ -515,53 +521,50 @@ fn test_metadata() -> stellereum::token::TokenMetadata {
 #[tokio::test]
 async fn token_transfer_tx_shape_and_local_execution() {
     let client = local_client().await;
-    let owner = stellereum::wallet::WalletAccount::from_seed(&[41u8; 32]);
-    let recipient = stellereum::wallet::WalletAccount::from_seed(&[42u8; 32]);
-    client.set_balance(owner.address, 5_000_000_000, 0).await;
+    let owner = PqKeyPair::from_seed(PqScheme::Falcon512, &[41u8; 32]);
+    let owner_addr = owner.derive_address(&DEFAULT_SALT);
+    let recipient_addr =
+        PqKeyPair::from_seed(PqScheme::Falcon512, &[42u8; 32]).derive_address(&DEFAULT_SALT);
+    client.set_balance(owner_addr, 5_000_000_000, 0).await;
 
     let token_id = client
         .state_engine
-        .create_token(owner.address, test_metadata(), 1_000_000)
+        .create_token(owner_addr, test_metadata(), 1_000_000)
         .await
         .expect("create token");
     assert_eq!(
-        client
-            .token_balance(&token_id, &owner.address)
-            .await
-            .unwrap(),
+        client.token_balance(&token_id, &owner_addr).await.unwrap(),
         1_000_000
     );
 
     // Builder shape: SysCallTokenTransfer, zero native amount, gas >= base fee.
-    let tx = LightClient::build_token_transfer_tx(
-        &owner.signing_key,
+    let tx = LightClient::build_pq_token_transfer_tx(
+        &owner,
         token_id,
-        recipient.address,
+        recipient_addr,
         400_000,
         0,
         1,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
     );
     assert_eq!(tx.amount, 0);
     assert!(tx.gas_limit >= stellereum::svm::GAS_BASIC_TRANSFER);
     assert!(matches!(
         &tx.payload[..],
         [stellereum::svm::OpCode::SysCallTokenTransfer { token_id: t, to, amount: 400_000 }]
-            if *t == token_id && *to == recipient.address
+            if *t == token_id && *to == recipient_addr
     ));
     assert!(tx.verify_signature());
 
     let (hash, finality) = client.broadcast_tx(&tx).await.expect("token send");
     assert_eq!(finality, TxFinality::Pending);
     assert_eq!(
-        client
-            .token_balance(&token_id, &owner.address)
-            .await
-            .unwrap(),
+        client.token_balance(&token_id, &owner_addr).await.unwrap(),
         600_000
     );
     assert_eq!(
         client
-            .token_balance(&token_id, &recipient.address)
+            .token_balance(&token_id, &recipient_addr)
             .await
             .unwrap(),
         400_000
@@ -577,25 +580,28 @@ async fn token_transfer_tx_shape_and_local_execution() {
 #[tokio::test]
 async fn token_approve_then_transfer_from_local() {
     let client = local_client().await;
-    let owner = stellereum::wallet::WalletAccount::from_seed(&[43u8; 32]);
-    let spender = stellereum::wallet::WalletAccount::from_seed(&[44u8; 32]);
+    let owner = PqKeyPair::from_seed(PqScheme::Falcon512, &[43u8; 32]);
+    let owner_addr = owner.derive_address(&DEFAULT_SALT);
+    let spender_addr =
+        PqKeyPair::from_seed(PqScheme::Falcon512, &[44u8; 32]).derive_address(&DEFAULT_SALT);
     let third = addr(45);
-    client.set_balance(owner.address, 5_000_000_000, 0).await;
-    client.set_balance(spender.address, 5_000_000_000, 0).await;
+    client.set_balance(owner_addr, 5_000_000_000, 0).await;
+    client.set_balance(spender_addr, 5_000_000_000, 0).await;
 
     let token_id = client
         .state_engine
-        .create_token(owner.address, test_metadata(), 100_000)
+        .create_token(owner_addr, test_metadata(), 100_000)
         .await
         .expect("create token");
 
-    let approve = LightClient::build_token_approve_tx(
-        &owner.signing_key,
+    let approve = LightClient::build_pq_token_approve_tx(
+        &owner,
         token_id,
-        spender.address,
+        spender_addr,
         30_000,
         0,
         1,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
     );
     assert!(matches!(
         &approve.payload[..],
@@ -609,9 +615,9 @@ async fn token_approve_then_transfer_from_local() {
         .state_engine
         .token_execute(
             &token_id,
-            spender.address,
+            spender_addr,
             stellereum::token::TokenOp::TransferFrom {
-                from: owner.address,
+                from: owner_addr,
                 to: third,
                 amount: 30_000,
             },
@@ -624,103 +630,64 @@ async fn token_approve_then_transfer_from_local() {
     );
 }
 
-// ------------------------------------------------------------ confidential
+// ------------------------------------------------------------ confidential (PQ-excised)
 
-#[tokio::test]
-async fn confidential_tx_conserves_and_stays_simulated_locally() {
-    let client = local_client().await;
-    let sender = stellereum::wallet::WalletAccount::from_seed(&[51u8; 32]);
-    client.set_balance(sender.address, 50_000_000_000, 0).await;
-
-    let (transfer, blinding) = sender.create_confidential_transfer(2_000_000_000, 1_500);
-    assert!(transfer.verify_balance_conservation());
-
-    let recipient = addr(52);
-    let (hash, finality) = client
-        .broadcast_confidential_tx(
-            &sender.signing_key,
-            recipient,
-            transfer,
-            2_000_000_000,
-            1_500,
-            blinding.to_bytes(),
-            0,
-            1,
-        )
-        .await
-        .expect("confidential broadcast");
-    assert_eq!(finality, TxFinality::Pending);
-    assert!(!finality.is_confirmed());
-    let row = client
-        .get_tx_history()
-        .into_iter()
-        .find(|r| r.tx_hash == hex::encode(hash))
-        .unwrap();
-    assert!(row.is_confidential, "history must flag the shielded tx");
-    assert!(!row.status.contains("Confirmed"), "{}", row.status);
-}
-
-#[tokio::test]
-async fn confidential_broken_conservation_is_rejected_before_signing() {
-    let client = local_client().await;
-    let sender = stellereum::wallet::WalletAccount::from_seed(&[53u8; 32]);
-    client.set_balance(sender.address, 50_000_000_000, 0).await;
-
-    // Forge: outputs exceed inputs -> conservation fails.
-    let r = stellereum::crypto_privacy::PedersenCommitment::random_blinding();
-    let c_in = stellereum::crypto_privacy::PedersenCommitment::commit(100, &r);
-    let c_out = stellereum::crypto_privacy::PedersenCommitment::commit(999_999, &r);
-    let forged = stellereum::crypto_privacy::ConfidentialTransfer::new(vec![c_in], vec![c_out], 0);
-    assert!(!forged.verify_balance_conservation());
-    assert!(client
-        .broadcast_confidential_tx(
-            &sender.signing_key,
-            addr(54),
-            forged,
-            100,
-            0,
-            r.to_bytes(),
-            0,
-            1,
-        )
-        .await
-        .is_err());
+#[test]
+fn legacy_stealth_wallet_bytes_are_refused_fail_closed() {
+    let legacy = br#"{"stealth_address":{"one_time_pub":[0]},"address_hex":"00"}"#;
+    let err = stellereum::wallet::reject_legacy_stealth_wallet_bytes(legacy).unwrap_err();
+    assert!(err.contains("excised"), "unexpected error: {err}");
 }
 
 // ------------------------------------------------------------- session keys
 
 #[test]
 fn session_delegation_six_args_bind_scope_and_chain() {
-    let master = stellereum::wallet::WalletAccount::from_seed(&[61u8; 32]);
-    let session = ed25519_dalek::SigningKey::from_bytes(&[62u8; 32]);
-    let session_pub = session.verifying_key().to_bytes();
-
-    let auth = master.delegate_bot_session(
-        session_pub,
-        50_000,
-        3600,
-        stellereum::zkml::SCOPE_TRANSFER,
-        1_000_000_000,
-        stellereum::zkml::DEFAULT_CHAIN_ID,
+    let master_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[61u8; 32]);
+    let master_addr = stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        master_kp.public_key(),
+        &DEFAULT_SALT,
     );
+    let master = stellereum::wallet::WalletKeyMaterial::Falcon {
+        keypair: Box::new(master_kp),
+    };
+    let session_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[62u8; 32]);
+    let session_pub = session_kp.public_key();
+
+    let auth = master
+        .delegate_bot_session_falcon512(
+            session_pub,
+            50_000,
+            3600,
+            stellereum::zkml::SCOPE_TRANSFER,
+            1_000_000_000,
+            stellereum::zkml::DEFAULT_CHAIN_ID,
+        )
+        .expect("falcon512 delegation");
     assert_eq!(auth.scope, stellereum::zkml::SCOPE_TRANSFER);
     assert_eq!(auth.chain_id, stellereum::zkml::DEFAULT_CHAIN_ID);
     assert_eq!(auth.max_value_per_tx, 1_000_000_000);
-    assert_eq!(auth.session_pubkey, session_pub);
-    assert_eq!(auth.master_address, master.address);
+    assert_eq!(
+        auth.session_scheme,
+        stellereum::post_quantum::PqScheme::Falcon512
+    );
+    assert_eq!(auth.master_address, master_addr);
     assert!(auth.verify_signature(), "master signature must verify");
     assert!(auth.grants_scope(stellereum::zkml::SCOPE_TRANSFER));
     assert!(!auth.grants_scope(stellereum::zkml::SCOPE_SVM_PAYLOAD));
 
     // Wrong-chain grant must not silently pass as the default chain's.
-    let other = master.delegate_bot_session(
-        session_pub,
-        50_000,
-        3600,
-        stellereum::zkml::SCOPE_ALL,
-        u64::MAX,
-        9999,
-    );
+    let other = master
+        .delegate_bot_session_falcon512(
+            session_pub,
+            50_000,
+            3600,
+            stellereum::zkml::SCOPE_ALL,
+            u64::MAX,
+            9999,
+        )
+        .expect("falcon512 delegation other");
     assert_ne!(other.chain_id, stellereum::zkml::DEFAULT_CHAIN_ID);
     assert!(other.master_signature != auth.master_signature);
 }
@@ -728,12 +695,13 @@ fn session_delegation_six_args_bind_scope_and_chain() {
 #[tokio::test]
 async fn token_create_tx_shape_and_local_execution() {
     let client = local_client().await;
-    let owner = stellereum::wallet::WalletAccount::from_seed(&[43u8; 32]);
-    client.set_balance(owner.address, 5_000_000_000, 0).await;
+    let owner = PqKeyPair::from_seed(PqScheme::Falcon512, &[43u8; 32]);
+    let owner_addr = owner.derive_address(&DEFAULT_SALT);
+    client.set_balance(owner_addr, 5_000_000_000, 0).await;
 
     // Builder shape: SysCallTokenCreate, zero native amount, gas >= base fee.
-    let tx = LightClient::build_token_create_tx(
-        &owner.signing_key,
+    let tx = LightClient::build_pq_token_create_tx(
+        &owner,
         "Test Coin".into(),
         "TST".into(),
         6,
@@ -741,6 +709,7 @@ async fn token_create_tx_shape_and_local_execution() {
         Some(2_000_000),
         0,
         1,
+        stellereum::zkml::DEFAULT_CHAIN_ID,
     );
     assert_eq!(tx.amount, 0);
     assert!(tx.gas_limit >= stellereum::svm::GAS_BASIC_TRANSFER);
@@ -756,16 +725,16 @@ async fn token_create_tx_shape_and_local_execution() {
     assert!(!hash.iter().all(|b| *b == 0));
     client
         .state_engine
-        .create_token(owner.address, test_metadata(), 1_000_000)
+        .create_token(owner_addr, test_metadata(), 1_000_000)
         .await
         .expect("engine create");
     let found = client
         .state_engine
-        .token_resolve(&owner.address, "Test Token", "TST")
+        .token_resolve(&owner_addr, "Test Token", "TST")
         .await
         .expect("created token must resolve");
     assert_eq!(
-        client.token_balance(&found, &owner.address).await.unwrap(),
+        client.token_balance(&found, &owner_addr).await.unwrap(),
         1_000_000
     );
 }

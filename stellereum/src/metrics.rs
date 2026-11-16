@@ -1697,5 +1697,4 @@ mod tests {
             "stell_divergence_total must be scraped:\n{text}"
         );
     }
-
 }

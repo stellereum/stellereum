@@ -40,7 +40,7 @@
 mod consensus_cluster;
 
 use consensus_cluster::{ConsensusCluster, NodeProfile};
-use stellereum::consensus::{NIL_CIRCUIT_BREAKER_K, ROUND_LOOKBACK, VoteKind};
+use stellereum::consensus::{VoteKind, NIL_CIRCUIT_BREAKER_K, ROUND_LOOKBACK};
 
 /// Tick grid under test (harness-injected directly).
 const TICKS: [u64; 3] = [50, 20, 10];
@@ -98,7 +98,11 @@ fn assert_safe(tag: &str, report: &consensus_cluster::ClusterReport, exempt: &[u
         let mut hs: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hs.sort();
         hs.dedup();
-        assert_eq!(hs.len(), 1, "[{tag}] height {h} must have one decided block");
+        assert_eq!(
+            hs.len(),
+            1,
+            "[{tag}] height {h} must have one decided block"
+        );
     }
     assert!(
         report.double_votes(exempt).is_empty(),
@@ -198,15 +202,21 @@ async fn tick_downproposer_sweep_reports_p50_and_zero_false_positives() {
                 report.diagnostics()
             );
             assert_eq!(
-                fp_total, 0,
+                fp_total,
+                0,
                 "[tick={tick} down={down}] false positives must be 0 \
                  (breaker={fp_breaker} nil={fp_nil} widened={widened}).\n{}",
                 report.diagnostics()
             );
 
             // --- Slow member: 4 nodes, one slow; no starvation.
-            let mut s =
-                ConsensusCluster::build(4, slow_profiles(), (SEED ^ tag).wrapping_add(0x5_100), tick, base);
+            let mut s = ConsensusCluster::build(
+                4,
+                slow_profiles(),
+                (SEED ^ tag).wrapping_add(0x5_100),
+                tick,
+                base,
+            );
             s.seed_transactions(3).await;
             let slow_report = s.run_until(SLOW_H, BUDGET_MS).await;
             assert_safe(&format!("slow tick={tick} down={down}"), &slow_report, &[]);
@@ -227,8 +237,9 @@ async fn tick_downproposer_sweep_reports_p50_and_zero_false_positives() {
                 "[tick={tick} down={down}] head spread {head_gap} (no starvation).\n{}",
                 slow_report.diagnostics()
             );
-            let slow_gap =
-                slow_report.best_height.saturating_sub(slow_report.nodes[3].finalized_height);
+            let slow_gap = slow_report
+                .best_height
+                .saturating_sub(slow_report.nodes[3].finalized_height);
             assert!(
                 slow_gap <= 1,
                 "[tick={tick} down={down}] slow member trails by {slow_gap}.\n{}",
@@ -244,7 +255,13 @@ async fn tick_downproposer_sweep_reports_p50_and_zero_false_positives() {
                 let cand = (p50, mean, tick, down);
                 best = Some(match best {
                     None => cand,
-                    Some(b) => if (cand.0, cand.1) < (b.0, b.1) { cand } else { b },
+                    Some(b) => {
+                        if (cand.0, cand.1) < (b.0, b.1) {
+                            cand
+                        } else {
+                            b
+                        }
+                    }
                 });
             }
         }

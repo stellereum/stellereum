@@ -603,8 +603,7 @@ fn distinct_falcon_signers(
     if validators.is_empty() {
         return Err("bridge quorum: empty validator set refuses fail-closed".to_string());
     }
-    let allowed: std::collections::BTreeSet<[u8; 32]> =
-        validators.iter().copied().collect();
+    let allowed: std::collections::BTreeSet<[u8; 32]> = validators.iter().copied().collect();
     let mut seen: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
     for (id, sig) in sigs {
         if seen.contains(id) {
@@ -2773,10 +2772,7 @@ mod tests {
     /// id. Ed ids are fixed per test (`ed_seed`); the Falcon key derives from
     /// `falcon_seed`, so parallel tests registering the same id converge on
     /// the same key (idempotent overwrite, no cross-test flake).
-    fn falcon_id(
-        ed_seed: u8,
-        falcon_seed: u8,
-    ) -> ([u8; 32], crate::post_quantum::FalconKeypair) {
+    fn falcon_id(ed_seed: u8, falcon_seed: u8) -> ([u8; 32], crate::post_quantum::FalconKeypair) {
         let sk = SigningKey::from_bytes(&[ed_seed; 32]);
         let id = sk.verifying_key().to_bytes();
         let fk = crate::post_quantum::FalconKeypair::generate_from_seed(falcon_seed);

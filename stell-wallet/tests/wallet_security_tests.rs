@@ -364,13 +364,12 @@ fn poc_legacy_notes_key_derivable_from_public_files() {
     // (legacy decrypt paths are removed; secret load fails without secret).
     assert!(notes::load_notes_with_secret(&notes_path, &wrong).is_err());
     // Owner migrates with the secret: legacy -> secret-bound, then reads.
-    assert!(notes::migrate_notes_to_secret(&notes_path, &secret).expect("migrate")); 
+    assert!(notes::migrate_notes_to_secret(&notes_path, &secret).expect("migrate"));
     let migrated = notes::load_notes_with_secret(&notes_path, &secret).expect("read migrated");
     assert_eq!(migrated, vec![note]);
     assert!(notes::load_notes_with_secret(&notes_path, &wrong).is_err());
     let _ = fs::remove_dir_all(&base);
 }
-
 
 // B-WALLET PoC-4: plaintext fallback trusts unauthenticated file (notes.rs:433-492).
 // After encryption shipped, `load_notes` still accepts a bare JSON array with
@@ -379,10 +378,7 @@ fn poc_legacy_notes_key_derivable_from_public_files() {
 // Secure: plaintext must be rejected (or migrate-forward loudly), not trusted.
 #[test]
 fn poc_notes_plaintext_fallback_trusts_tampered_file() {
-    let base = std::env::temp_dir().join(format!(
-        "stell_poc_plain_{}",
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("stell_poc_plain_{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("mkdir");
     let wallet_path = base.join("wallet.json");
@@ -400,9 +396,8 @@ fn poc_notes_plaintext_fallback_trusts_tampered_file() {
         serde_json::to_string_pretty(&forged).expect("json"),
     )
     .expect("write forged plaintext");
-    let err = notes::load_notes_with_secret(&notes_path, &[0x5Eu8; 32]).expect_err(
-        "FIXED (audit B-WALLET-4): forged plaintext must be refused, never trusted",
-    );
+    let err = notes::load_notes_with_secret(&notes_path, &[0x5Eu8; 32])
+        .expect_err("FIXED (audit B-WALLET-4): forged plaintext must be refused, never trusted");
     println!("forged plaintext refused: {err}");
     assert!(
         err.contains("refusing unauthenticated plaintext"),
@@ -423,27 +418,17 @@ fn poc_rpc_http_token_and_id_not_verified() {
     assert_eq!(path, "/");
     // FIXED (audit B-WALLET-5a): non-loopback http + token refused before
     // any byte is sent; loopback keeps working (bytes never leave the host).
-    assert!(rpc::check_http_token_policy(
-        "http://127.0.0.1:19090/",
-        Some("SECRET-TOKEN")
-    )
-    .is_ok());
+    assert!(rpc::check_http_token_policy("http://127.0.0.1:19090/", Some("SECRET-TOKEN")).is_ok());
     assert!(rpc::check_http_token_policy("http://127.0.0.1:19090/", None).is_ok());
     assert!(rpc::check_http_token_policy("https://node/x", Some("SECRET-TOKEN")).is_ok());
-    assert!(rpc::check_http_token_policy(
-        "http://192.0.2.7:8546/",
-        Some("SECRET-TOKEN")
-    )
-    .is_err());
-    assert!(rpc::check_http_token_policy(
-        "http://localhost.evil.com:8546/",
-        Some("SECRET-TOKEN")
-    )
-    .is_err());
+    assert!(rpc::check_http_token_policy("http://192.0.2.7:8546/", Some("SECRET-TOKEN")).is_err());
+    assert!(
+        rpc::check_http_token_policy("http://localhost.evil.com:8546/", Some("SECRET-TOKEN"))
+            .is_err()
+    );
     // FIXED (audit B-WALLET-5b): a response with a mismatched JSON-RPC id is
     // refused (replay mixing). Mock server answers every call with id 999.
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("mock listener");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("mock listener");
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
         // Serve exactly one request, then close.
@@ -466,9 +451,8 @@ fn poc_rpc_http_token_and_id_not_verified() {
         auth_token: None,
         faucet_token: None,
     };
-    let err = rpc::rpc_call(&cfg, "stell_chainId", serde_json::json!({})).expect_err(
-        "FIXED (audit B-WALLET-5b): id-mismatched response must be refused",
-    );
+    let err = rpc::rpc_call(&cfg, "stell_chainId", serde_json::json!({}))
+        .expect_err("FIXED (audit B-WALLET-5b): id-mismatched response must be refused");
     assert!(
         err.contains("id mismatch"),
         "refusal must name id mismatch, got: {err}"

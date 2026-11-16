@@ -144,10 +144,24 @@ async fn test1_downtime_parity_local_vs_adopt() {
     // Height-1 round on path A (local): 3 honest votes, silent absent.
     for &i in &signers {
         c1[0]
-            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh1)))
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh1),
+            ))
             .unwrap();
         c1[0]
-            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh1)))
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh1),
+            ))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh1));
@@ -203,10 +217,24 @@ async fn test1_downtime_parity_local_vs_adopt() {
     let pool_before_l = pool_of(&c1[0].state).await;
     for &i in &signers {
         c1[0]
-            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
             .unwrap();
         c1[0]
-            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh2));
@@ -320,7 +348,14 @@ async fn test2_equivocation_parity_local_vs_adopt() {
     let pool_before_l = pool_of(&c1[0].state).await;
     for &i in &signers {
         c1[0]
-            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
     }
     // Cheater's first prevote (for bh) then conflicting prevote (for 0x99..).
@@ -335,7 +370,14 @@ async fn test2_equivocation_parity_local_vs_adopt() {
     );
     for &i in &signers {
         c1[0]
-            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh));
@@ -432,10 +474,24 @@ async fn test3_bond_new_validator_mid_chain() {
     let bh1 = b1.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()) {
         nodes[0]
-            .on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh1)))
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh1),
+            ))
             .unwrap();
         nodes[0]
-            .on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh1)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh1),
+            ))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh1));
@@ -494,10 +550,24 @@ async fn test3_bond_new_validator_mid_chain() {
     let bh2 = b2.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()) {
         nodes[0]
-            .on_prevote(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
             .unwrap();
         nodes[0]
-            .on_precommit(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
@@ -600,12 +670,26 @@ async fn test4_full_unbond_drops_validator_at_boundary() {
     // Only the 3 remaining validators vote; the victim is silent/absent.
     for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
         nodes[0]
-            .on_prevote(falcon_votes::fvote(k, fk, h, r, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                h,
+                r,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
     }
     for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
         nodes[0]
-            .on_precommit(falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                h,
+                r,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     assert_eq!(
@@ -657,10 +741,24 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let bh = blk.compute_hash();
     for &i in &[0usize, 1, 2] {
         nodes[0]
-            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         nodes[0]
-            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
@@ -694,10 +792,24 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let bh2 = blk2.compute_hash();
     for &i in &[0usize, 1, 2] {
         nodes[0]
-            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
             .unwrap();
         nodes[0]
-            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));

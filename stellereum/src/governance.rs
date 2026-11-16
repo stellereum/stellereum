@@ -22,8 +22,8 @@
 use crate::consensus::ValidatorId;
 use crate::staking::StakingLedger;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Quorum: minimum share of total stake that must participate (2/3), in bps.
 /// 6,666 bps = 66.66%, so an exact 2/3 turnout passes.
@@ -964,10 +964,7 @@ pub fn governance_write_allowed(
 /// [`governance_multinode_escape_enabled`]. This is the 3-line hook the RPC
 /// layer calls before touching governance state.
 pub fn governance_write_allowed_from_env(validator_count: usize) -> Result<(), String> {
-    governance_write_allowed(
-        validator_count,
-        governance_multinode_escape_enabled(),
-    )
+    governance_write_allowed(validator_count, governance_multinode_escape_enabled())
 }
 
 impl Governance {
@@ -1190,15 +1187,7 @@ impl Governance {
             &serde_json::to_value(action).unwrap_or(serde_json::Value::Null),
         );
         let mut out = Vec::with_capacity(
-            Self::GOV_PROPOSE_TAG.len()
-                + 1
-                + 8
-                + 32
-                + 8
-                + 8
-                + title.len()
-                + 8
-                + action_json.len(),
+            Self::GOV_PROPOSE_TAG.len() + 1 + 8 + 32 + 8 + 8 + title.len() + 8 + action_json.len(),
         );
         out.extend_from_slice(Self::GOV_PROPOSE_TAG);
         out.push(0x00);
@@ -1702,9 +1691,7 @@ impl Governance {
                 let status = self.proposals.get(&proposal_id).map(|p| p.status);
                 match status {
                     Some(ProposalStatus::Passed) => return Err(GovError::Timelocked),
-                    Some(ProposalStatus::Executed) => {
-                        return Err(GovError::AlreadyExecuted)
-                    }
+                    Some(ProposalStatus::Executed) => return Err(GovError::AlreadyExecuted),
                     Some(_) => return Err(GovError::NotPassed),
                     None => return Err(GovError::UnknownProposal),
                 }
@@ -2282,13 +2269,31 @@ mod tests {
         let sig = key.sign_message(CHAIN, &msg).unwrap();
         assert!(!g.propose_nonce_used(&addr, nonce));
         let id = g
-            .propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig)
+            .propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                nonce,
+                &sig,
+            )
             .unwrap();
         assert_eq!(id, 1);
         assert!(g.propose_nonce_used(&addr, nonce));
         // Exact replay: same envelope, nonce already consumed.
         assert_eq!(
-            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig),
+            g.propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                nonce,
+                &sig
+            ),
             Err(GovError::ReplayedNonce)
         );
         // Owner double-signs a different title under the same nonce: the
@@ -2312,21 +2317,48 @@ mod tests {
         let wrong_msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, 8);
         let wrong = other.sign_message(CHAIN, &wrong_msg).unwrap();
         assert_eq!(
-            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 8, &wrong),
+            g.propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                8,
+                &wrong
+            ),
             Err(GovError::BadSignature)
         );
         // Tampered title: sign one title, present for another.
         let tampered_msg = Governance::gov_propose_message(CHAIN, &addr, "tampered", &action, 9);
         let tampered_sig = key.sign_message(CHAIN, &tampered_msg).unwrap();
         assert_eq!(
-            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 9, &tampered_sig),
+            g.propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                9,
+                &tampered_sig
+            ),
             Err(GovError::BadSignature)
         );
         // Wrong chain: minted elsewhere, refused here.
         let cross_msg = Governance::gov_propose_message(CHAIN + 1, &addr, &title, &action, 10);
         let cross = key.sign_message(CHAIN + 1, &cross_msg).unwrap();
         assert_eq!(
-            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 10, &cross),
+            g.propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                10,
+                &cross
+            ),
             Err(GovError::BadSignature)
         );
         // Stakeless key with a PERFECTLY valid signature: NotStaker, not Open.
@@ -2354,10 +2386,17 @@ mod tests {
         let mut l = StakingLedger::new();
         l.bond(proposer, stell(10_000), DEFAULT_COMMISSION_BPS)
             .unwrap();
-        l.bond(voter, stell(20_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(voter, stell(20_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let mut g = Governance::new();
         let id = g
-            .propose(&mut l, proposer, "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(
+                &mut l,
+                proposer,
+                "x".into(),
+                GovAction::Signal("t".into()),
+                0,
+            )
             .unwrap();
         // Valid envelope records the weight.
         let msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &voter);
@@ -2433,13 +2472,26 @@ mod tests {
         let msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, 1);
         let sig = key.sign_message(CHAIN, &msg).unwrap();
         // Read-only: twice is fine, nothing consumed, nothing opened.
-        assert!(g.check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig).is_ok());
-        assert!(g.check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig).is_ok());
+        assert!(g
+            .check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig)
+            .is_ok());
+        assert!(g
+            .check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig)
+            .is_ok());
         assert!(!g.propose_nonce_used(&addr, 1));
         assert!(g.proposals.is_empty());
         // The signed path opens and consumes.
         let id = g
-            .propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 1, &sig)
+            .propose_signed(
+                &mut l,
+                addr,
+                title.clone(),
+                action.clone(),
+                0,
+                CHAIN,
+                1,
+                &sig,
+            )
             .unwrap();
         // ...and only now does the check report the spent nonce.
         assert_eq!(
@@ -2449,7 +2501,9 @@ mod tests {
         // Vote checks verify without recording (tally unmoved).
         let vmsg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &addr);
         let vsig = key.sign_message(CHAIN, &vmsg).unwrap();
-        assert!(g.check_vote_envelope(addr, id, VoteChoice::Yes, CHAIN, &vsig).is_ok());
+        assert!(g
+            .check_vote_envelope(addr, id, VoteChoice::Yes, CHAIN, &vsig)
+            .is_ok());
         assert_eq!(g.proposals.get(&id).unwrap().yes, 0);
         let w = g
             .vote_signed(&mut l, addr, id, VoteChoice::Yes, 1, CHAIN, &vsig)
@@ -2520,14 +2574,17 @@ mod tests {
         // Templates: self-directed carrier, caller nonce/gas/shards, empty
         // signature slot for the caller's own PQ signature, one-op payload.
         let from = [0xA1u8; 32];
-        let tx = Governance::gov_propose_tx(from, 7, 100_000, 0, 0, 4, "t".into(), action, 41)
-            .unwrap();
+        let tx =
+            Governance::gov_propose_tx(from, 7, 100_000, 0, 0, 4, "t".into(), action, 41).unwrap();
         assert_eq!(tx.from, from);
         assert_eq!(tx.to, from);
         assert_eq!(tx.amount, 0);
         assert_eq!(tx.nonce, 7);
         assert_eq!(tx.gas_limit, 100_000);
-        assert!(tx.signature.is_empty(), "template is unsigned: the caller signs");
+        assert!(
+            tx.signature.is_empty(),
+            "template is unsigned: the caller signs"
+        );
         assert_eq!(tx.payload.len(), 1);
         assert!(matches!(
             tx.payload[0],
@@ -2565,7 +2622,10 @@ mod tests {
         }
         assert_eq!(g.finalize(&mut l, p1, end).unwrap(), ProposalStatus::Passed);
         g.execute([0xEu8; 32], p1).unwrap();
-        assert_eq!(g.finalize(&mut l, p2, end).unwrap(), ProposalStatus::Rejected);
+        assert_eq!(
+            g.finalize(&mut l, p2, end).unwrap(),
+            ProposalStatus::Rejected
+        );
         // p3 stays Open. Smuggle one invalid action past propose-time checks
         // (direct map insert, as a pre-activation byte shape would).
         g.proposals.insert(
@@ -2599,7 +2659,10 @@ mod tests {
         assert_eq!(sum.rejected, 1);
         assert_eq!(sum.executed, 1);
         assert_eq!(sum.invalid_actions, 1, "counted, never removed");
-        assert!(g.proposals.contains_key(&9), "migration must not drop proposals");
+        assert!(
+            g.proposals.contains_key(&9),
+            "migration must not drop proposals"
+        );
         assert!(g.proposals.contains_key(&p3));
     }
 
@@ -2613,8 +2676,8 @@ mod tests {
         g.propose(&mut l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
             .unwrap();
         g.next_id = 1; // stale restore: id 1 exists, counter claims 1
-        // Byte-compare via bincode (serde_json cannot map the nonce/proposal
-        // keys, which are not strings — same wire form the RPC tests use).
+                       // Byte-compare via bincode (serde_json cannot map the nonce/proposal
+                       // keys, which are not strings — same wire form the RPC tests use).
         let before = bincode::serialize(&g).expect("governance serializes");
         let first = g.migrate_gov_proposals_to_genesis();
         assert!(first.next_id_repaired);
@@ -2660,7 +2723,13 @@ mod tests {
             .unwrap();
         let mut g = Governance::new();
         let id = g
-            .propose(&mut l, [1u8; 32], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(
+                &mut l,
+                [1u8; 32],
+                "x".into(),
+                GovAction::Signal("t".into()),
+                0,
+            )
             .unwrap();
         let w1 = g.vote(&mut l, [1u8; 32], id, VoteChoice::Yes, 1).unwrap();
         let w2 = g.vote(&mut l, [2u8; 32], id, VoteChoice::No, 1).unwrap();
@@ -3676,13 +3745,9 @@ mod tests {
     #[test]
     fn gov_write_guard_multi_refuses_without_escape() {
         for n in [2usize, 3, 100] {
-            let err = governance_write_allowed(n, false).expect_err(
-                "multi-node set without the escape must refuse writes",
-            );
-            assert!(
-                err.contains("REFUSED"),
-                "refusal must be loud, got: {err}"
-            );
+            let err = governance_write_allowed(n, false)
+                .expect_err("multi-node set without the escape must refuse writes");
+            assert!(err.contains("REFUSED"), "refusal must be loud, got: {err}");
             assert!(
                 err.contains(&n.to_string()),
                 "refusal must name the validator set size, got: {err}"

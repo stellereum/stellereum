@@ -66,7 +66,9 @@ async fn four_nodes_kill_one_mid_run_slack_absorbs() {
     // Phase 2: kill node 3 at time T.
     let kill_at = c.now_ms();
     c.set_down(3, true);
-    let report = c.run_until(POST_KILL_TARGET, kill_at + POST_KILL_BUDGET_MS).await;
+    let report = c
+        .run_until(POST_KILL_TARGET, kill_at + POST_KILL_BUDGET_MS)
+        .await;
 
     println!(
         "[sim][dead-4node][slack] seed=0x{:x} kill_at={} virtual_ms={} best={} common={} \
@@ -77,7 +79,11 @@ async fn four_nodes_kill_one_mid_run_slack_absorbs() {
         report.best_height,
         report.common_height,
         report.nodes[3].finalized_height,
-        report.nodes.iter().map(|n| n.decide_rounds.clone()).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.clone())
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
 
@@ -90,7 +96,8 @@ async fn four_nodes_kill_one_mid_run_slack_absorbs() {
     // The dead node's head is frozen at the kill height (it finalizes
     // nothing while down; `common_height` excludes it by construction).
     assert_eq!(
-        report.nodes[3].finalized_height, PRE_KILL_HEIGHT,
+        report.nodes[3].finalized_height,
+        PRE_KILL_HEIGHT,
         "the killed node must not finalize past the kill.\n{}",
         report.diagnostics()
     );
@@ -162,12 +169,14 @@ async fn three_node_unanimity_kill_one_mid_run_halts() {
 
     // LIVENESS LOST: nothing new finalizes — 2/3 can never reach quorum 3.
     assert_eq!(
-        report.best_height, PRE_KILL_HEIGHT,
+        report.best_height,
+        PRE_KILL_HEIGHT,
         "no node may finalize past the kill under unanimity.\n{}",
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, PRE_KILL_HEIGHT,
+        report.common_height,
+        PRE_KILL_HEIGHT,
         "the common head must not move.\n{}",
         report.diagnostics()
     );
@@ -191,7 +200,8 @@ async fn three_node_unanimity_kill_one_mid_run_halts() {
         // diagnosis (`ConsensusCluster::report` also keeps the stale
         // `prevote_qc_round`, so a naive "a QC exists" read would lie).
         assert_eq!(
-            n.decide_rounds, pre.nodes[i].decide_rounds,
+            n.decide_rounds,
+            pre.nodes[i].decide_rounds,
             "live node {} decided something after the kill.\n{}",
             n.index,
             report.diagnostics()

@@ -8,8 +8,16 @@ use stellereum_indexer::server::{create_router, AppState};
 
 fn seed_two_txs(db: &Database) {
     for (hash, from, to) in [
-        ("0xaaaa", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        ("0xbbbb", "0xcccccccccccccccccccccccccccccccccccccccc", "0xdddddddddddddddddddddddddddddddddddddddd"),
+        (
+            "0xaaaa",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        (
+            "0xbbbb",
+            "0xcccccccccccccccccccccccccccccccccccccccc",
+            "0xdddddddddddddddddddddddddddddddddddddddd",
+        ),
     ] {
         db.insert_transaction(&TxRecord {
             tx_hash: hash.to_string(),
@@ -200,7 +208,11 @@ async fn poc_f5_tx_lookup_is_case_insensitive() {
 
     let client = reqwest::Client::new();
     let upper = format!("0x{}", hash.to_uppercase());
-    let res = client.get(format!("{base}/api/v2/tx/{upper}")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/v2/tx/{upper}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         res.status(),
         reqwest::StatusCode::OK,

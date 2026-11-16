@@ -134,20 +134,19 @@ async fn fragile_equal_three_halts_on_single_byzantine_nil_voter_while_skewed_se
     fragile.seed_transactions(2).await;
     let stalled = fragile.run_for(30_000).await;
     assert_eq!(
-        stalled.best_height, 0,
+        stalled.best_height,
+        0,
         "fragile 1/1/1 with one NIL grinder must finalize NOTHING (quorum 3 needs all three):\n{}",
         stalled.diagnostics()
     );
     assert_eq!(
-        stalled.common_height, 0,
+        stalled.common_height,
+        0,
         "no up node may advance past the stall:\n{}",
         stalled.diagnostics()
     );
     assert!(
-        stalled
-            .nodes
-            .iter()
-            .all(|n| n.precommit_qc_round.is_none()),
+        stalled.nodes.iter().all(|n| n.precommit_qc_round.is_none()),
         "no precommit QC may form without a value polka:\n{}",
         stalled.diagnostics()
     );

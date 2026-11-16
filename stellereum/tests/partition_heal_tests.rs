@@ -169,8 +169,15 @@ fn decide_with(
     bh: [u8; 32],
 ) -> Option<[u8; 32]> {
     for (k, fk) in voters.iter().zip(vfks.iter()) {
-        hc.add_prevote(falcon_votes::fvote(k, fk, height, round, VoteKind::Prevote, Some(bh)))
-            .unwrap();
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            height,
+            round,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
     }
     hc.try_prevote_quorum();
     for (k, fk) in voters.iter().zip(vfks.iter()) {
@@ -235,18 +242,46 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     // Partition {0,1} vs {2,3}: each side sees only its own two votes.
     for (k, fk) in ks[..2].iter().zip(fks[..2].iter()) {
         side_a
-            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         side_a
-            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     for (k, fk) in ks[2..].iter().zip(fks[2..].iter()) {
         side_b
-            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         side_b
-            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
 
@@ -269,18 +304,46 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     // HEAL: deliver all cross-partition votes and blocks.
     for (k, fk) in ks[2..].iter().zip(fks[2..].iter()) {
         side_a
-            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         side_a
-            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     for (k, fk) in ks[..2].iter().zip(fks[..2].iter()) {
         side_b
-            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         side_b
-            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     // Late votes for the round we waited in still count (rounds_to_inspect).

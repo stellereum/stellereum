@@ -74,7 +74,8 @@ async fn equivocating_leader_finalizes_single_fork() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same head.\n{}",
         report.diagnostics()
     );
@@ -123,7 +124,8 @@ async fn slow_leader_rotation_keeps_finalizing() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same head.\n{}",
         report.diagnostics()
     );
@@ -162,7 +164,8 @@ async fn vote_withholding_minority_no_stall() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every UP node must reach the same head.\n{}",
         report.diagnostics()
     );
@@ -214,7 +217,8 @@ async fn combined_equivocator_slow_down_stays_live() {
         .min()
         .unwrap_or(0);
     assert_eq!(
-        up_common, report.best_height,
+        up_common,
+        report.best_height,
         "every UP node must reach the same head.\n{}",
         report.diagnostics()
     );

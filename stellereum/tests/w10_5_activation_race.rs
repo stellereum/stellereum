@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
-use stellereum::consensus::register_validator_pq_key;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -97,7 +97,14 @@ fn precommit_qc(
     let sigs = signers
         .iter()
         .map(|k| {
-            let v = falcon_votes::fvote(k, &fk_for(k), height, round, VoteKind::Precommit, Some(block_hash));
+            let v = falcon_votes::fvote(
+                k,
+                &fk_for(k),
+                height,
+                round,
+                VoteKind::Precommit,
+                Some(block_hash),
+            );
             (v.voter, v.signature)
         })
         .collect();

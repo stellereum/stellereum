@@ -124,7 +124,6 @@ fn quorum_proof(
     }
 }
 
-
 /// Implicit Falcon-512 sender for a seed, registered globally. Pure-PQ tx
 /// admission refuses legacy `Transaction::sign_with_payload`, so the wrapping
 /// txs in these tests ride the sanctioned implicit-Falcon envelope (the same
@@ -227,7 +226,8 @@ async fn challenge_freezes_quorum_deposit() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx = bridge_tx(challenger_seed,
+    let tx = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -279,7 +279,8 @@ async fn double_challenge_is_refused() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
 
-    let tx_a = bridge_tx(challenger_seed,
+    let tx_a = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -287,17 +288,13 @@ async fn double_challenge_is_refused() {
     );
     let out = e
         .apply_block_transition(
-            &bridge_block(
-                2,
-                TS + 10,
-                vec![tx_a],
-                pq_id(challenger_seed),
-            ),
+            &bridge_block(2, TS + 10, vec![tx_a], pq_id(challenger_seed)),
             0,
         )
         .await;
     assert_eq!(out.status, vec![true]);
-    let tx_b = bridge_tx(challenger_seed,
+    let tx_b = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -306,12 +303,7 @@ async fn double_challenge_is_refused() {
     let settled = e.get_state_root().await;
     let out = e
         .apply_block_transition(
-            &bridge_block(
-                3,
-                TS + 20,
-                vec![tx_b],
-                pq_id(challenger_seed),
-            ),
+            &bridge_block(3, TS + 20, vec![tx_b], pq_id(challenger_seed)),
             0,
         )
         .await;
@@ -358,7 +350,8 @@ async fn challenge_unknown_hash_is_refused() {
     let payer_pk = pq_id(0x03);
     let challenger_seed: u8 = 0xC0;
     fund(&e, &pq_id(challenger_seed), 10 * STELL).await;
-    let tx = bridge_tx(challenger_seed,
+    let tx = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: [0x99u8; 32],
@@ -381,7 +374,8 @@ async fn challenge_stale_deposit_is_refused() {
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
 
     // 25h later: past the 24h challenge age even though no dispute exists.
-    let tx = bridge_tx(challenger_seed,
+    let tx = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -414,7 +408,8 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -429,7 +424,8 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
     let resolver_seed: u8 = 0xD0;
     let resolver_pk = pq_id(resolver_seed);
     fund(&e, &resolver_pk, 10 * STELL).await;
-    let tx_r = bridge_tx(resolver_seed,
+    let tx_r = bridge_tx(
+        resolver_seed,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -451,7 +447,8 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
         assert!(d.resolved && d.confirmed);
     }
     // Terminal: resolving again refuses.
-    let tx_r2 = bridge_tx(resolver_seed,
+    let tx_r2 = bridge_tx(
+        resolver_seed,
         1,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -503,7 +500,8 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -514,7 +512,8 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
         .await;
     assert_eq!(out.status, vec![true]);
 
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -540,7 +539,8 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
     let bond = stellereum::bridge::challenge_bond_for(amount);
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -554,7 +554,8 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
     // Past the 1h window with FAILING evidence (fraud signal) and no valid
     // evidence: revoke. (An empty resolve here would DEFER with no payout —
     // the B2 truth gate, pinned in bridge_challenge_tests.)
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![
             BridgeIntent::DepositProof {
@@ -635,7 +636,8 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -654,7 +656,8 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
 
     // The relayer quorum retracts the deposit (a genuine, verifiable fraud
     // proof): the finder is paid bond + reward, the rest burns.
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![
             failure_proof(hash, recipient, amount, &vals),
@@ -713,7 +716,8 @@ async fn challenge_evidence_path_deposit_is_refused() {
     let hash = [0x81u8; 32];
 
     // Admit via the evidence path (no quorum attestation at all).
-    let tx = bridge_tx(0x03,
+    let tx = bridge_tx(
+        0x03,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -729,7 +733,8 @@ async fn challenge_evidence_path_deposit_is_refused() {
         assert!(!br.deposit_records.get(&hash).unwrap().via_quorum);
     }
 
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -842,7 +847,8 @@ async fn dispute_state_is_committed_in_the_root() {
     // The bridge domain is already non-empty (records commit on deposit).
     assert!(!e.bridge_read().await.is_empty());
     let root_with_record = e.get_state_root().await;
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,

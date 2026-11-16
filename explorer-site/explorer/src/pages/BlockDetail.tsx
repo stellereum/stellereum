@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { Block, Transaction } from '../types';
 import { getBlock } from '../lib/api';
-import { formatDateTime, timeAgo, copyToClipboard } from '../lib/format';
+import { formatStell, formatDateTime, timeAgo, truncateMiddle, copyToClipboard } from '../lib/format';
 
 export const BlockDetail: React.FC = () => {
   const { height } = useParams<{ height: string }>();
@@ -113,9 +113,13 @@ export const BlockDetail: React.FC = () => {
             <div className="detail-row">
               <div className="detail-label">Proposer</div>
               <div className="detail-val mono">
-                <Link to={`/address/${block.proposer_stl57 || block.proposer}`}>
-                  {block.proposer_stl57 || block.proposer}
-                </Link>
+                {(block.proposer_stl57 || block.proposer) ? (
+                  <Link to={`/address/${block.proposer_stl57 || block.proposer}`}>
+                    {block.proposer_stl57 || block.proposer}
+                  </Link>
+                ) : (
+                  '—'
+                )}
               </div>
             </div>
 
@@ -155,24 +159,39 @@ export const BlockDetail: React.FC = () => {
                   <th>Tx Hash</th>
                   <th>From</th>
                   <th>To</th>
+                  <th>Value</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {txs.map((t) => (
+                {txs.map((t) => {
+                  const fromAddr = t.from_stl57 || t.from_addr;
+                  const toAddr = t.to_stl57 || t.to_addr;
+                  return (
                   <tr key={t.hash}>
                     <td className="mono">
-                      <Link to={`/tx/${t.hash}`}>{t.hash.slice(0, 16)}...</Link>
+                      <Link to={`/tx/${t.hash}`}>{truncateMiddle(t.hash, 8, 8)}</Link>
                     </td>
                     <td className="mono">
-                      <Link to={`/address/${t.from_stl57 || t.from_addr}`}>
-                        {(t.from_stl57 || t.from_addr).slice(0, 12)}...
-                      </Link>
+                      {fromAddr ? (
+                        <Link to={`/address/${fromAddr}`}>
+                          {truncateMiddle(fromAddr, 6, 6)}
+                        </Link>
+                      ) : (
+                        '—'
+                      )}
                     </td>
                     <td className="mono">
-                      <Link to={`/address/${t.to_stl57 || t.to_addr}`}>
-                        {(t.to_stl57 || t.to_addr).slice(0, 12)}...
-                      </Link>
+                      {toAddr ? (
+                        <Link to={`/address/${toAddr}`}>
+                          {truncateMiddle(toAddr, 6, 6)}
+                        </Link>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td style={{ fontWeight: 600, color: 'var(--primary)' }}>
+                      {formatStell(t.amount)}
                     </td>
                     <td>
                       <span className={`badge-status ${t.status || 'success'}`}>
@@ -180,7 +199,8 @@ export const BlockDetail: React.FC = () => {
                       </span>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

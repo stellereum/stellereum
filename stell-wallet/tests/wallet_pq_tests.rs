@@ -200,9 +200,11 @@ fn test_scheme_from_str_parsing() {
     );
     // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (mirrors node
     // `from_id(3)` refusal) — parse paths must refuse it loudly.
-    assert!("mldsa44".parse::<PqScheme>().is_err());
-    assert!("ml-dsa-44".parse::<PqScheme>().is_err());
-    assert!("3".parse::<PqScheme>().is_err());
+    for disabled in ["mldsa44", "ml-dsa-44", "3"] {
+        let err = disabled.parse::<PqScheme>().unwrap_err();
+        assert!(err.to_lowercase().contains("disabled"));
+        assert!(err.contains("falcon512") && err.contains("hybrid"));
+    }
     assert_eq!("hybrid".parse::<PqScheme>().unwrap(), PqScheme::Hybrid);
     assert!("not-a-scheme".parse::<PqScheme>().is_err());
 }
@@ -350,8 +352,11 @@ fn test_cli_pq_generate_execution_all_schemes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out.status.success() || combined.to_lowercase().contains("disabled"),
-        "mldsa44 generation must refuse (fail-closed); got: {combined}"
+        !out.status.success()
+            && combined.to_lowercase().contains("disabled")
+            && combined.contains("falcon512")
+            && combined.contains("hybrid"),
+        "mldsa44 generation must refuse fail-closed pointing to falcon512/hybrid; got: {combined}"
     );
 }
 
@@ -384,8 +389,11 @@ fn test_cli_pq_address_execution_all_schemes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out.status.success() || combined.to_lowercase().contains("disabled"),
-        "mldsa44 address derivation must refuse (fail-closed); got: {combined}"
+        !out.status.success()
+            && combined.to_lowercase().contains("disabled")
+            && combined.contains("falcon512")
+            && combined.contains("hybrid"),
+        "mldsa44 address derivation must refuse fail-closed pointing to falcon512/hybrid; got: {combined}"
     );
 }
 

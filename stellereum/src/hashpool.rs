@@ -102,8 +102,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ml_kem::{
-    EncapsulationKey768, MlKem768,
     kem::{Decapsulate, FromSeed, Key},
+    EncapsulationKey768, MlKem768,
 };
 
 // ---------------------------------------------------------------------------
@@ -182,7 +182,11 @@ impl std::fmt::Display for HpError {
             HpError::DuplicateNote => write!(f, "duplicate commitment in batch"),
             HpError::DuplicateNullifier => write!(f, "duplicate nullifier in batch"),
             HpError::OrderNotCanonical => write!(f, "batch order is not canonical"),
-            HpError::Unbalanced { sum_in, sum_out, fee } => write!(
+            HpError::Unbalanced {
+                sum_in,
+                sum_out,
+                fee,
+            } => write!(
                 f,
                 "unbalanced batch: sum_in {sum_in} != sum_out {sum_out} + fee {fee}"
             ),
@@ -382,11 +386,7 @@ pub fn stealth_encap(
 /// stealth address for `index`. Infallible for well-formed `ct` (FIPS 203
 /// implicit rejection: a tampered `ct` yields the fallback key, hence a
 /// non-matching stealth address — never an error).
-pub fn stealth_decap(
-    kem_seed: &[u8; 64],
-    ct: &[u8],
-    index: u64,
-) -> Result<[u8; 32], HpError> {
+pub fn stealth_decap(kem_seed: &[u8; 64], ct: &[u8], index: u64) -> Result<[u8; 32], HpError> {
     if ct.len() != HP_CT_LEN {
         return Err(HpError::BadCiphertext);
     }
@@ -422,12 +422,7 @@ pub fn stealth_scan(
 
 /// Note commitment:
 /// `SHAKE256(HP_COMMIT_DST || chain_be64 || value_be64 || blinding || stealth)`.
-pub fn note_commit(
-    chain_id: u64,
-    value: u64,
-    blinding: &[u8; 32],
-    stealth: &[u8; 32],
-) -> [u8; 32] {
+pub fn note_commit(chain_id: u64, value: u64, blinding: &[u8; 32], stealth: &[u8; 32]) -> [u8; 32] {
     let mut pre = Vec::with_capacity(HP_COMMIT_DST.len() + 8 + 8 + 32 + 32);
     pre.extend_from_slice(HP_COMMIT_DST);
     pre.extend_from_slice(&chain_id.to_be_bytes());
@@ -526,7 +521,8 @@ impl HashPool {
         if self.notes.contains_key(&commitment) {
             return Err(HpError::DuplicateDeposit);
         }
-        self.notes.insert(commitment, StoredNote { stealth, nullifier });
+        self.notes
+            .insert(commitment, StoredNote { stealth, nullifier });
         Ok(())
     }
 
@@ -542,7 +538,10 @@ impl HashPool {
         value: u64,
         blinding: &[u8; 32],
     ) -> Result<[u8; 32], HpError> {
-        let stored = self.notes.get(commitment).ok_or(HpError::UnknownCommitment)?;
+        let stored = self
+            .notes
+            .get(commitment)
+            .ok_or(HpError::UnknownCommitment)?;
         let recomputed = note_commit(self.chain_id, value, blinding, &stored.stealth);
         if &recomputed != commitment {
             return Err(HpError::CommitmentMismatch);
@@ -708,7 +707,11 @@ pub fn coinjoin_build(
     let sum_out = sum_checked(outputs.iter().map(|o| o.value))?;
     let needed = sum_out.checked_add(fee).ok_or(HpError::Overflow)?;
     if sum_in != needed {
-        return Err(HpError::Unbalanced { sum_in, sum_out, fee });
+        return Err(HpError::Unbalanced {
+            sum_in,
+            sum_out,
+            fee,
+        });
     }
 
     // Distinct output stealths (fresh addresses per note — the unlinkability
@@ -735,7 +738,12 @@ pub fn coinjoin_build(
     let mut inputs: Vec<SignedInput> = Vec::with_capacity(spends.len());
     for (opening, owner_pk, owner_sig) in spends {
         let commitment = note_commit(chain_id, opening.value, &opening.blinding, &opening.stealth);
-        inputs.push(SignedInput { opening, commitment, owner_pk, owner_sig });
+        inputs.push(SignedInput {
+            opening,
+            commitment,
+            owner_pk,
+            owner_sig,
+        });
     }
     inputs.sort_by(|a, b| a.commitment.cmp(&b.commitment));
     for w in inputs.windows(2) {
@@ -745,16 +753,19 @@ pub fn coinjoin_build(
     }
 
     let mut sorted_outputs = outputs;
-    sorted_outputs.sort_by(|a, b| {
-        output_commitment(chain_id, a).cmp(&output_commitment(chain_id, b))
-    });
+    sorted_outputs.sort_by_key(|a| output_commitment(chain_id, a));
     for w in sorted_outputs.windows(2) {
         if output_commitment(chain_id, &w[0]) == output_commitment(chain_id, &w[1]) {
             return Err(HpError::DuplicateNote);
         }
     }
 
-    Ok(CoinJoinBatch { chain_id, fee, inputs, outputs: sorted_outputs })
+    Ok(CoinJoinBatch {
+        chain_id,
+        fee,
+        inputs,
+        outputs: sorted_outputs,
+    })
 }
 
 /// Caller-supplied Falcon owner-signature verifier: `verify(pk, msg, sig)`.
@@ -793,7 +804,11 @@ pub fn coinjoin_verify(
     let sum_out = sum_checked(batch.outputs.iter().map(|o| o.value))?;
     let needed = sum_out.checked_add(batch.fee).ok_or(HpError::Overflow)?;
     if sum_in != needed {
-        return Err(HpError::Unbalanced { sum_in, sum_out, fee: batch.fee });
+        return Err(HpError::Unbalanced {
+            sum_in,
+            sum_out,
+            fee: batch.fee,
+        });
     }
 
     // Canonical input order: strictly ascending by commitment (the builder
@@ -817,7 +832,12 @@ pub fn coinjoin_verify(
         if inp.opening.stealth != stored.stealth {
             return Err(HpError::CommitmentMismatch);
         }
-        let recomputed = note_commit(pool.chain_id, inp.opening.value, &inp.opening.blinding, &stored.stealth);
+        let recomputed = note_commit(
+            pool.chain_id,
+            inp.opening.value,
+            &inp.opening.blinding,
+            &stored.stealth,
+        );
         if recomputed != inp.commitment {
             return Err(HpError::CommitmentMismatch);
         }
@@ -858,7 +878,11 @@ pub fn coinjoin_verify(
             return Err(HpError::DuplicateStealth);
         }
     }
-    let out_nfs: Vec<[u8; 32]> = batch.outputs.iter().map(|o| note_nullifier(&o.serial)).collect();
+    let out_nfs: Vec<[u8; 32]> = batch
+        .outputs
+        .iter()
+        .map(|o| note_nullifier(&o.serial))
+        .collect();
     let mut nfs_sorted = out_nfs.clone();
     nfs_sorted.sort();
     for w in nfs_sorted.windows(2) {
@@ -880,8 +904,11 @@ pub fn coinjoin_verify(
     // Owner signatures over the canonical message (real commitments, batch
     // order == sorted order, enforced above).
     let in_cs: Vec<[u8; 32]> = batch.inputs.iter().map(|i| i.commitment).collect();
-    let mut out_pairs: Vec<([u8; 32], [u8; 32])> =
-        out_cs.iter().zip(out_nfs.iter()).map(|(c, n)| (*c, *n)).collect();
+    let mut out_pairs: Vec<([u8; 32], [u8; 32])> = out_cs
+        .iter()
+        .zip(out_nfs.iter())
+        .map(|(c, n)| (*c, *n))
+        .collect();
     out_pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let out_cs_sorted: Vec<[u8; 32]> = out_pairs.iter().map(|(c, _)| *c).collect();
     let out_nfs_sorted: Vec<[u8; 32]> = out_pairs.iter().map(|(_, n)| *n).collect();
@@ -931,7 +958,12 @@ pub fn coinjoin_apply(pool: &mut HashPool, batch: &CoinJoinBatch) -> Result<(), 
         if inp.opening.stealth != stored.stealth {
             return Err(HpError::CommitmentMismatch);
         }
-        let recomputed = note_commit(pool.chain_id, inp.opening.value, &inp.opening.blinding, &stored.stealth);
+        let recomputed = note_commit(
+            pool.chain_id,
+            inp.opening.value,
+            &inp.opening.blinding,
+            &stored.stealth,
+        );
         if recomputed != inp.commitment {
             return Err(HpError::CommitmentMismatch);
         }
@@ -963,7 +995,11 @@ pub fn coinjoin_apply(pool: &mut HashPool, batch: &CoinJoinBatch) -> Result<(), 
     let sum_out = sum_checked(batch.outputs.iter().map(|o| o.value))?;
     let needed = sum_out.checked_add(batch.fee).ok_or(HpError::Overflow)?;
     if sum_in != needed {
-        return Err(HpError::Unbalanced { sum_in, sum_out, fee: batch.fee });
+        return Err(HpError::Unbalanced {
+            sum_in,
+            sum_out,
+            fee: batch.fee,
+        });
     }
 
     let out_cs: Vec<[u8; 32]> = batch
@@ -976,7 +1012,11 @@ pub fn coinjoin_apply(pool: &mut HashPool, batch: &CoinJoinBatch) -> Result<(), 
             return Err(HpError::OrderNotCanonical);
         }
     }
-    let out_nfs: Vec<[u8; 32]> = batch.outputs.iter().map(|o| note_nullifier(&o.serial)).collect();
+    let out_nfs: Vec<[u8; 32]> = batch
+        .outputs
+        .iter()
+        .map(|o| note_nullifier(&o.serial))
+        .collect();
     let mut nfs_sorted = out_nfs.clone();
     nfs_sorted.sort();
     for w in nfs_sorted.windows(2) {
@@ -1005,7 +1045,13 @@ pub fn coinjoin_apply(pool: &mut HashPool, batch: &CoinJoinBatch) -> Result<(), 
         pool.spent.insert(*nf);
     }
     for ((out, c), nf) in batch.outputs.iter().zip(out_cs.iter()).zip(out_nfs.iter()) {
-        pool.notes.insert(*c, StoredNote { stealth: out.stealth, nullifier: *nf });
+        pool.notes.insert(
+            *c,
+            StoredNote {
+                stealth: out.stealth,
+                nullifier: *nf,
+            },
+        );
     }
     Ok(())
 }

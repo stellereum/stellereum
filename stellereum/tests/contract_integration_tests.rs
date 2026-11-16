@@ -31,12 +31,7 @@ fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
     (from, pk)
 }
 
-fn pq_sign_with_payload(
-    seed: u8,
-    nonce: u64,
-    gas: u64,
-    payload: Vec<OpCode>,
-) -> Transaction {
+fn pq_sign_with_payload(seed: u8, nonce: u64, gas: u64, payload: Vec<OpCode>) -> Transaction {
     let (from, pk) = pq_pair(seed);
     let mut tx = Transaction {
         from,

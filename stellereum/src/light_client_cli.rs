@@ -452,8 +452,12 @@ pub fn validator_set_digest(set: &ValidatorSet) -> [u8; 32] {
 pub fn load_checkpoint_file(path: &Path) -> anyhow::Result<Checkpoint> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("cannot read checkpoint file {}: {e}", path.display()))?;
-    serde_json::from_str::<Checkpoint>(&raw)
-        .map_err(|e| anyhow::anyhow!("checkpoint file {} is not a Checkpoint: {e}", path.display()))
+    serde_json::from_str::<Checkpoint>(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "checkpoint file {} is not a Checkpoint: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Load a finalized header from a JSON file.
@@ -479,9 +483,8 @@ pub fn load_light_header_file(path: &Path) -> anyhow::Result<LightHeader> {
 /// [`ValidatorSet`] serializes its map with non-string keys, which JSON
 /// cannot round-trip, so the pinned file shape is the only stable form.
 pub fn load_rotation_proof_file(path: &Path) -> anyhow::Result<ValidatorSetRotation> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        anyhow::anyhow!("cannot read rotation proof file {}: {e}", path.display())
-    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read rotation proof file {}: {e}", path.display()))?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
             "rotation proof file {} is not valid JSON: {e}",
@@ -524,9 +527,8 @@ pub fn load_rotation_proof_file(path: &Path) -> anyhow::Result<ValidatorSetRotat
 pub fn anchor_show(validators_path: &Path, checkpoint_path: &Path) -> anyhow::Result<String> {
     let set = load_validator_set(validators_path)?;
     let checkpoint = load_checkpoint_file(checkpoint_path)?;
-    let client = LightClient::new(set.clone(), checkpoint.clone()).map_err(|e| {
-        anyhow::anyhow!("the anchor was REFUSED by the light client: {e}")
-    })?;
+    let client = LightClient::new(set.clone(), checkpoint.clone())
+        .map_err(|e| anyhow::anyhow!("the anchor was REFUSED by the light client: {e}"))?;
     let anchor = match client.anchor() {
         LightAnchor::Checkpoint(cp) => cp,
         LightAnchor::Genesis(_) => {

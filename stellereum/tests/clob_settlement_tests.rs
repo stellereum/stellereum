@@ -1,10 +1,10 @@
 //! A7: the native CLOB actually settles matched trades against real balances
 //! (native STELL base, wUSDT quote), all-or-nothing.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::orderbook::{OrderSide, OrderType, PAIR_STELL_USDT};
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::token::{TokenMetadata, TokenOp};
 
@@ -399,14 +399,37 @@ fn wusdt_quote(price: u64, amount: u64) -> u64 {
 }
 
 fn order_tx(
-    key: &ed25519_dalek::SigningKey,
+    key: &FalconKeypair,
     nonce: u64,
     gas_limit: u64,
     payload: Vec<stellereum::svm::OpCode>,
-) -> stellereum::sharding::Transaction {
-    let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, from, 0, gas_limit, nonce, 1, 1, payload,
+) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, key.pubkey(), &DEFAULT_SALT);
+    let probe = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: payload.clone(),
+        priority_fee_per_gas: 0,
+    };
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.pubkey().to_vec(),
+        sig,
+        from,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -539,8 +562,8 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
 
     // 2) FILL 4 of the 10 through the SVM: the taker pays
     //    native_quote = 250_000 * 4e9 / 1e6 = 1 STELL of quote.
-    let taker = SigningKey::generate(&mut OsRng);
-    let taker_addr = taker.verifying_key().to_bytes();
+    let taker = FalconKeypair::generate_from_seed_bytes(&[0x31; 32]);
+    let taker_addr = derive_pq_address(PqScheme::Falcon512, taker.pubkey(), &DEFAULT_SALT);
     let cost = native_quote(price, 4 * STELL);
     assert_eq!(cost, STELL, "4 STELL at $0.25 is 1.00 of quote");
     engine
@@ -548,6 +571,7 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
         .await;
 
     let gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
+    let fee = gas + PQ_ACTIVATION_SURCHARGE_GAS;
     let t = order_tx(
         &taker,
         0,
@@ -581,7 +605,7 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
     );
     assert_eq!(
         native_of(&engine, &taker_addr).await,
-        10 * STELL - cost + 4 * STELL - gas,
+        10 * STELL - cost + 4 * STELL - fee,
         "the taker paid the quote, received the collateral and paid the fee"
     );
     assert_escrow_invariants(&engine, PAIR_STELL_USDT).await;
@@ -609,7 +633,7 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
 
     // Native value is conserved up to the burned fee.
     let total = native_of(&engine, &seller).await + native_of(&engine, &taker_addr).await;
-    assert_eq!(total, 110 * STELL - gas, "exactly the fee left the system");
+    assert_eq!(total, 110 * STELL - fee, "exactly the fee left the system");
 }
 
 /// GRIEFING: an account that can afford the quote but not the fee/amount
@@ -651,8 +675,8 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
     // locked. Fund it with exactly the cost + 500: admission still passes
     // (the balance is far above the declared limit) but after the lock only
     // 500 remain, which cannot pay the fee - the settlement must refuse.
-    let taker = SigningKey::generate(&mut OsRng);
-    let taker_addr = taker.verifying_key().to_bytes();
+    let taker = FalconKeypair::generate_from_seed_bytes(&[0x32; 32]);
+    let taker_addr = derive_pq_address(PqScheme::Falcon512, taker.pubkey(), &DEFAULT_SALT);
     engine
         .update_account(AccountState::new(taker_addr, cost + 500))
         .await;
@@ -774,11 +798,14 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
         .unwrap();
 
     // An SVM bid that rests: its whole order_cost is locked in native.
-    let bot = SigningKey::generate(&mut OsRng);
-    let bot_addr = bot.verifying_key().to_bytes();
+    let bot = FalconKeypair::generate_from_seed_bytes(&[0x33; 32]);
+    let bot_addr = derive_pq_address(PqScheme::Falcon512, bot.pubkey(), &DEFAULT_SALT);
     let gas = stellereum::svm::GAS_ORDER_PLACE;
     engine
-        .update_account(AccountState::new(bot_addr, 4 * STELL + gas))
+        .update_account(AccountState::new(
+            bot_addr,
+            4 * STELL + gas + PQ_ACTIVATION_SURCHARGE_GAS,
+        ))
         .await;
     let cost = native_quote(price - 1, 4 * STELL);
     engine
@@ -811,10 +838,13 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     );
 
     // An SVM sell that rests: base lock.
-    let bot2 = SigningKey::generate(&mut OsRng);
-    let bot2_addr = bot2.verifying_key().to_bytes();
+    let bot2 = FalconKeypair::generate_from_seed_bytes(&[0x34; 32]);
+    let bot2_addr = derive_pq_address(PqScheme::Falcon512, bot2.pubkey(), &DEFAULT_SALT);
     engine
-        .update_account(AccountState::new(bot2_addr, 6 * STELL + gas))
+        .update_account(AccountState::new(
+            bot2_addr,
+            6 * STELL + gas + PQ_ACTIVATION_SURCHARGE_GAS,
+        ))
         .await;
     engine
         .apply_transaction(
@@ -836,8 +866,8 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     assert_escrow_invariants(&engine, PAIR_STELL_USDT).await;
 
     // A crossing fill drains one record completely and leaves another intact.
-    let crosser = SigningKey::generate(&mut OsRng);
-    let crosser_addr = crosser.verifying_key().to_bytes();
+    let crosser = FalconKeypair::generate_from_seed_bytes(&[0x35; 32]);
+    let crosser_addr = derive_pq_address(PqScheme::Falcon512, crosser.pubkey(), &DEFAULT_SALT);
     let fill_gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
     engine
         .update_account(AccountState::new(crosser_addr, 10 * STELL))

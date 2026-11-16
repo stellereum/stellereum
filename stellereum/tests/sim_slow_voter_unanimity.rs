@@ -86,7 +86,8 @@ async fn slow_voter_unanimity_finalizes_with_fresh_votes() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -101,7 +102,8 @@ async fn slow_voter_unanimity_finalizes_with_fresh_votes() {
             .filter(|v| v.kind == VoteKind::Prevote && v.target.is_none())
             .count();
         assert_eq!(
-            nils, 0,
+            nils,
+            0,
             "node {} cast {nils} NIL prevotes: its votes went stale \
              (proposal arrived after 2x timeout).\n{}",
             n.index,
@@ -115,7 +117,8 @@ async fn slow_voter_unanimity_finalizes_with_fresh_votes() {
     for n in &report.nodes {
         for (k, d) in n.decide_rounds.iter().enumerate().skip(1) {
             assert_eq!(
-                *d, 0,
+                *d,
+                0,
                 "node {} decided height {} in round +{d}: a stale round \
                  carried the decision.\n{}",
                 n.index,
@@ -129,7 +132,11 @@ async fn slow_voter_unanimity_finalizes_with_fresh_votes() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),

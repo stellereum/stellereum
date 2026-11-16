@@ -158,7 +158,11 @@ fn assert_safe(tag: &str, report: &consensus_cluster::ClusterReport) {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "[{tag}] height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "[{tag}] height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),
@@ -207,15 +211,27 @@ fn dead_profiles() -> Vec<NodeProfile> {
 async fn dead_proposer_still_advances_with_and_without_nil_grace() {
     // Control: policy disabled = exact old harness behaviour (NIL at the
     // plain 2x bound, view change at the deterministic timeout).
-    let mut control = ConsensusCluster::build(dead_profiles().len(), dead_profiles(), DEAD_SEED, TICK_MS, BASE_MS);
+    let mut control = ConsensusCluster::build(
+        dead_profiles().len(),
+        dead_profiles(),
+        DEAD_SEED,
+        TICK_MS,
+        BASE_MS,
+    );
     control.seed_transactions(3).await;
     let control_report = control.run_until(TARGET_HEIGHTS, BUDGET_MS).await;
     println!("{}", metrics_line("dead-control", &control_report));
 
     // Fix-candidate regime (production today): additive grace on both the
     // view change and the NIL wait.
-    let mut graced = ConsensusCluster::build(dead_profiles().len(), dead_profiles(), DEAD_SEED, TICK_MS, BASE_MS)
-        .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS));
+    let mut graced = ConsensusCluster::build(
+        dead_profiles().len(),
+        dead_profiles(),
+        DEAD_SEED,
+        TICK_MS,
+        BASE_MS,
+    )
+    .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS));
     graced.seed_transactions(3).await;
     let graced_report = graced.run_until(TARGET_HEIGHTS, BUDGET_MS).await;
     println!("{}", metrics_line("dead-graced", &graced_report));
@@ -224,9 +240,13 @@ async fn dead_proposer_still_advances_with_and_without_nil_grace() {
     // member holding ~1/4 of the (height, round-0) proposer slots. The dead
     // heights cost exactly the view-change + next-round decide; the grace
     // never parks them.
-    for (tag, report) in [("dead-control", &control_report), ("dead-graced", &graced_report)] {
+    for (tag, report) in [
+        ("dead-control", &control_report),
+        ("dead-graced", &graced_report),
+    ] {
         assert_eq!(
-            report.common_height, TARGET_HEIGHTS,
+            report.common_height,
+            TARGET_HEIGHTS,
             "[{tag}] must finalize all {TARGET_HEIGHTS} heights with one member down.\n{}",
             report.diagnostics()
         );
@@ -237,7 +257,10 @@ async fn dead_proposer_still_advances_with_and_without_nil_grace() {
     // round 0 in each run (a down proposer cannot decide round 0 — the value
     // arrives never — so any all-round-0 run would prove nothing about dead
     // rounds).
-    for (tag, report) in [("dead-control", &control_report), ("dead-graced", &graced_report)] {
+    for (tag, report) in [
+        ("dead-control", &control_report),
+        ("dead-graced", &graced_report),
+    ] {
         let past_zero = report.nodes[0]
             .decide_rounds
             .iter()
@@ -273,7 +296,10 @@ async fn dead_proposer_still_advances_with_and_without_nil_grace() {
     // where `effective >= 2*base` lets the NIL fire first) is outside what
     // this harness exhibits — one reason the verdict below stays
     // inconclusive-as-empirical-proof for that path.
-    for (tag, report) in [("dead-control", &control_report), ("dead-graced", &graced_report)] {
+    for (tag, report) in [
+        ("dead-control", &control_report),
+        ("dead-graced", &graced_report),
+    ] {
         assert_eq!(
             total_nils(report), 0,
             "[{tag}] honest sim NILs must be 0 (view change outruns the NIL wait at low rounds).\n{}",
@@ -311,28 +337,45 @@ async fn slow_proposer_waits_churn_down() {
     // Fast-forward OFF: the harness fast-forward would zero the slow
     // proposal build (same-tick prebuilt propose), hiding the trigger this
     // scenario measures. Identical in both runs.
-    let mut control = ConsensusCluster::build(slow_profiles().len(), slow_profiles(), SLOW_SEED, TICK_MS, BASE_MS)
-        .with_fast_forward(false);
+    let mut control = ConsensusCluster::build(
+        slow_profiles().len(),
+        slow_profiles(),
+        SLOW_SEED,
+        TICK_MS,
+        BASE_MS,
+    )
+    .with_fast_forward(false);
     control.seed_transactions(3).await;
     let control_report = control.run_until(TARGET_HEIGHTS, BUDGET_MS).await;
     println!("{}", metrics_line("slow-control", &control_report));
 
-    let mut graced = ConsensusCluster::build(slow_profiles().len(), slow_profiles(), SLOW_SEED, TICK_MS, BASE_MS)
-        .with_fast_forward(false)
-        .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS));
+    let mut graced = ConsensusCluster::build(
+        slow_profiles().len(),
+        slow_profiles(),
+        SLOW_SEED,
+        TICK_MS,
+        BASE_MS,
+    )
+    .with_fast_forward(false)
+    .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, GRACE_MS, FRESHNESS_MS));
     graced.seed_transactions(3).await;
     let graced_report = graced.run_until(TARGET_HEIGHTS, BUDGET_MS).await;
     println!("{}", metrics_line("slow-grained", &graced_report));
 
     // LIVENESS: both finalize everything; safety in both.
-    for (tag, report) in [("slow-control", &control_report), ("slow-grained", &graced_report)] {
+    for (tag, report) in [
+        ("slow-control", &control_report),
+        ("slow-grained", &graced_report),
+    ] {
         assert_eq!(
-            report.common_height, TARGET_HEIGHTS,
+            report.common_height,
+            TARGET_HEIGHTS,
             "[{tag}] must finalize all {TARGET_HEIGHTS} heights.\n{}",
             report.diagnostics()
         );
         assert_eq!(
-            report.best_height, TARGET_HEIGHTS,
+            report.best_height,
+            TARGET_HEIGHTS,
             "[{tag}] no node may trail at the end.\n{}",
             report.diagnostics()
         );
@@ -383,7 +426,8 @@ async fn slow_proposer_waits_churn_down() {
         graced_report.diagnostics()
     );
     assert_eq!(
-        total_nils(&graced_report), 0,
+        total_nils(&graced_report),
+        0,
         "graced slow heights vote VALUE, never NIL (the wait covers the build).\n{}",
         graced_report.diagnostics()
     );
@@ -396,7 +440,10 @@ async fn slow_proposer_waits_churn_down() {
         graced_report.diagnostics()
     );
     let control_extends: u64 = control_report.nodes.iter().map(|n| n.grace_extends).sum();
-    assert_eq!(control_extends, 0, "control must not extend (policy disabled).");
+    assert_eq!(
+        control_extends, 0,
+        "control must not extend (policy disabled)."
+    );
 }
 
 // ------------------------------------------------------------------
@@ -424,12 +471,17 @@ fn nil_capped_deadline_is_the_plain_two_x_bound() {
     // not subsumed.
     for hold in [0, 1, 500, grace, 100_000] {
         assert_eq!(
-            cap_hold_mirror(hold, 2 * base, base), 0,
+            cap_hold_mirror(hold, 2 * base, base),
+            0,
             "NIL slack is 2*base - 2*base = 0: any hold caps to 0"
         );
     }
     let capped_deadline = 2 * base + cap_hold_mirror(grace.min(cap), 2 * base, base);
-    assert_eq!(capped_deadline, 2 * base, "capped NIL deadline is the plain 2x bound");
+    assert_eq!(
+        capped_deadline,
+        2 * base,
+        "capped NIL deadline is the plain 2x bound"
+    );
     assert_eq!(capped_deadline, 1_600);
 
     // THE GAP WINDOW (Test 2's slow build, lower-bounded): the proposal is

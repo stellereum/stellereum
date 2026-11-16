@@ -16,13 +16,12 @@
 
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::consensus::register_validator_pq_key;
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{
-    decode_domain_snapshot_strict, snapshot_validator_set_strict, DomainSnapshot,
-    DomainSnapshotV1,
+    decode_domain_snapshot_strict, snapshot_validator_set_strict, DomainSnapshot, DomainSnapshotV1,
 };
 use stellereum::sync::{
     check_snapshot_set_binding, fast_sync_state_with_set_binding,
@@ -339,16 +338,15 @@ fn set_binding_refuses_legacy_and_empty_commitments() {
     let empty = bincode::serialize(&DomainSnapshot::default()).unwrap();
     let err = check_snapshot_set_binding(100, &domains_bundle(empty), &anchor_set)
         .expect_err("empty set commitment must be refused");
-    assert!(err.contains("EMPTY"), "empty refusal is explicit, got: {err}");
+    assert!(
+        err.contains("EMPTY"),
+        "empty refusal is explicit, got: {err}"
+    );
 
     // An empty ANCHOR set proves nothing, so there is no binding to check.
     let full = bonded_full_domains(&keys);
-    let err = check_snapshot_set_binding(
-        100,
-        &domains_bundle(full),
-        &ValidatorSet::new(),
-    )
-    .expect_err("empty anchor set must be refused");
+    let err = check_snapshot_set_binding(100, &domains_bundle(full), &ValidatorSet::new())
+        .expect_err("empty anchor set must be refused");
     assert!(
         err.contains("never quorum-verified"),
         "anchor-emptiness refusal is explicit, got: {err}"
@@ -384,28 +382,39 @@ fn window_links(hashes: &[[u8; 32]]) -> Vec<WindowLink> {
         .collect()
 }
 
-fn qc_for(signers: &[SigningKey], height: u64, block_hash: [u8; 32]) -> QuorumCertificate {
-    let sigs = signers
-        .iter()
-        .map(|k| {
-            let v = falcon_votes::fvote(k, &fk_for(k), height, 0, VoteKind::Precommit, Some(block_hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(block_hash),
-        signatures: sigs,
+fn qc_for(
+    signers: &[SigningKey],
+    set: &ValidatorSet,
+    height: u64,
+    block_hash: [u8; 32],
+    parent: [u8; 32],
+) -> QuorumCertificate {
+    let mut votes = VoteSet::new();
+    let mut raw = Vec::with_capacity(signers.len());
+    for k in signers {
+        let v = falcon_votes::fvote(
+            k,
+            &fk_for(k),
+            height,
+            0,
+            VoteKind::Precommit,
+            Some(block_hash),
+        );
+        let _ = votes.add(v.clone(), set, height, 0, VoteKind::Precommit);
+        raw.push(v);
     }
+    votes
+        .certificate_with_parent(Some(block_hash), set, Some(&parent))
+        .unwrap_or(QuorumCertificate {
+            height,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(block_hash),
+            signatures: raw.into_iter().map(|v| (v.voter, v.signature)).collect(),
+        })
 }
 
-fn header_link(
-    w: &WindowLink,
-    set: &ValidatorSet,
-    signers: &[SigningKey],
-) -> HeaderLink {
+fn header_link(w: &WindowLink, set: &ValidatorSet, signers: &[SigningKey]) -> HeaderLink {
     let proposer = set
         .proposer_for(w.height, 0)
         .expect("non-empty set names a proposer");
@@ -415,7 +424,7 @@ fn header_link(
         prev_hash: w.prev_hash,
         state_root: [w.height as u8; 32],
         proposer,
-        qc: qc_for(signers, w.height, w.block_hash),
+        qc: qc_for(signers, set, w.height, w.block_hash, w.prev_hash),
     }
 }
 
@@ -507,8 +516,7 @@ async fn anchor_with_sets_refuses_an_unresolvable_height() {
     );
     let hashes = [[0xB2u8; 32], [0xB3u8; 32], [0xB4u8; 32]];
     let window = window_links(&hashes);
-    let links: Vec<HeaderLink> =
-        window.iter().map(|w| header_link(w, &set, &keys)).collect();
+    let links: Vec<HeaderLink> = window.iter().map(|w| header_link(w, &set, &keys)).collect();
 
     let err = verify_snapshot_anchor_tail_with_sets(
         4,

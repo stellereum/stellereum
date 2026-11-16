@@ -372,10 +372,7 @@ impl DandelionRelay {
 
     /// Held stem entry for `tx`, if any.
     pub fn stem_entry(&self, tx: &TxHash) -> Option<StemEntry> {
-        self.stem
-            .iter()
-            .find(|(h, _)| h == tx)
-            .map(|(_, e)| *e)
+        self.stem.iter().find(|(h, _)| h == tx).map(|(_, e)| *e)
     }
 
     /// Whether `tx` was already acted on (loop-protection probe).

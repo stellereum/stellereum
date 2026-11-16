@@ -41,11 +41,7 @@ fn node_info(id_byte: u8, ed_pub: &str, endpoints: &[&str]) -> infnode::dht::Nod
     }
 }
 
-fn peer_config(
-    name: &str,
-    ed_pub: &str,
-    endpoints: &[&str],
-) -> infnode::config::PeerConfig {
+fn peer_config(name: &str, ed_pub: &str, endpoints: &[&str]) -> infnode::config::PeerConfig {
     infnode::config::PeerConfig {
         name: name.to_string(),
         ed_pub: ed_pub.to_string(),

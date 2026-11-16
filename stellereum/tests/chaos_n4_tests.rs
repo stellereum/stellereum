@@ -42,8 +42,8 @@
 #[path = "support/consensus_cluster.rs"]
 mod consensus_cluster;
 
-use consensus_cluster::{ConsensusCluster, NodeProfile, key_at};
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+use consensus_cluster::{key_at, ConsensusCluster, NodeProfile};
+use stellereum::consensus::{Vote, VoteKind, VoteSet};
 
 const TICK_MS: u64 = 100;
 const BASE_MS: u64 = 1_000;
@@ -128,17 +128,20 @@ async fn wan_skew_degraded_but_live_finals_keep_moving() {
         report.diagnostics()
     );
     assert_eq!(
-        report.nodes[3].finalized_height, 0,
+        report.nodes[3].finalized_height,
+        0,
         "the down member must finalize nothing.\n{}",
         report.diagnostics()
     );
     assert_eq!(
-        report.nodes[3].prevotes_cast, 0,
+        report.nodes[3].prevotes_cast,
+        0,
         "the down member must cast no prevotes.\n{}",
         report.diagnostics()
     );
     assert_eq!(
-        report.nodes[3].precommits_cast, 0,
+        report.nodes[3].precommits_cast,
+        0,
         "the down member must cast no precommits.\n{}",
         report.diagnostics()
     );
@@ -244,7 +247,11 @@ async fn slow_straggler_catches_up_via_phase_sync() {
             .iter()
             .map(|n| n.decide_rounds.clone())
             .collect::<Vec<_>>(),
-        report.nodes.iter().map(|n| n.sync_jumps).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.sync_jumps)
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
 
@@ -261,7 +268,8 @@ async fn slow_straggler_catches_up_via_phase_sync() {
         report.diagnostics()
     );
     assert_eq!(
-        report.nodes[SLOW].finalized_height, report.best_height,
+        report.nodes[SLOW].finalized_height,
+        report.best_height,
         "the straggler must converge exactly onto the live head.\n{}",
         report.diagnostics()
     );
@@ -357,7 +365,8 @@ async fn kill_heal_mid_run_liveness_holds_with_reported_height_gap() {
         mid.diagnostics()
     );
     assert_eq!(
-        mid.nodes[SLOW].finalized_height, dead_head,
+        mid.nodes[SLOW].finalized_height,
+        dead_head,
         "the killed member's head must stay frozen while down.\n{}",
         mid.diagnostics()
     );
@@ -394,7 +403,11 @@ async fn kill_heal_mid_run_liveness_holds_with_reported_height_gap() {
         report.common_height,
         report.nodes[SLOW].finalized_height,
         report.nodes[SLOW].prevotes_cast,
-        report.nodes.iter().map(|n| n.sync_jumps).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.sync_jumps)
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
     assert!(
@@ -430,8 +443,7 @@ async fn kill_heal_mid_run_liveness_holds_with_reported_height_gap() {
         "[chaos][REPORTED-GAP] multi-height returnee catch-up not expressible in-sim \
          (exact-height adopt, no walk): returnee_head={} vs best={}; \
          height convergence lives in the sync walk (partition_heal_tests).",
-        report.nodes[SLOW].finalized_height,
-        report.best_height,
+        report.nodes[SLOW].finalized_height, report.best_height,
     );
 }
 
@@ -500,27 +512,26 @@ async fn down_member_marked_by_downtime_evidence() {
         .expect("fund pool");
 
     let evidence_hash = [0xAAu8; 32];
-    let qc = QuorumCertificate {
-        height: QC_HEIGHT,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(evidence_hash),
-        signatures: live
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(
-                    &key_at(SEED, i as u64),
-                    QC_HEIGHT,
-                    0,
-                    VoteKind::Precommit,
-                    Some(evidence_hash),
-                );
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
     let val_set = engine.staking_read().await.to_validator_set();
     assert_eq!(val_set.len(), 4, "precondition: 4 bonded members");
+    let mut vote_set = VoteSet::new();
+    for &i in &live {
+        let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(i as u8);
+        let v = Vote::sign_with_falcon(
+            &key_at(SEED, i as u64),
+            &fk,
+            QC_HEIGHT,
+            0,
+            VoteKind::Precommit,
+            Some(evidence_hash),
+        );
+        vote_set
+            .add(v, &val_set, QC_HEIGHT, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    let qc = vote_set
+        .certificate(Some(evidence_hash), &val_set, &[0u8; 32])
+        .expect("3-of-4 reaches quorum");
     assert!(
         qc.verify(&val_set),
         "precondition: the 3-signer QC must verify under the bonded set"

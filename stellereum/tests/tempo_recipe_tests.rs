@@ -126,7 +126,12 @@ async fn tempo_recipe_sustained_p50_and_rate() {
     // Warmup: height 1 is the virtual-t=0 genesis transient (timestamp-0
     // proposals refused until t>=1s); measure heights 2..=HEIGHTS_A+1.
     let warm = c.run_until(1, STEP_BUDGET_MS).await;
-    assert_eq!(warm.common_height, 1, "warmup stall:\n{}", warm.diagnostics());
+    assert_eq!(
+        warm.common_height,
+        1,
+        "warmup stall:\n{}",
+        warm.diagnostics()
+    );
     let mut prev = warm.virtual_ms;
     let mut dts: Vec<u64> = Vec::with_capacity(HEIGHTS_A as usize);
     for h in 2..=(HEIGHTS_A + 1) {
@@ -198,7 +203,11 @@ async fn tempo_recipe_window_no_stall_deterministic() {
     let report = c.run_for(WINDOW_MS).await;
     let finals = report.common_height;
     let per_hour = finals * 3_600_000 / WINDOW_MS;
-    let mean_ms = if finals > 0 { WINDOW_MS / finals } else { u64::MAX };
+    let mean_ms = if finals > 0 {
+        WINDOW_MS / finals
+    } else {
+        u64::MAX
+    };
     let total_vc: u64 = report.nodes.iter().map(|n| n.view_changes).sum();
     let vc_per_final = total_vc as f64 / finals.max(1) as f64;
     println!(
@@ -256,7 +265,11 @@ async fn tempo_recipe_window_no_stall_deterministic() {
     let mut max_dt = 0u64;
     for h in 2..=21 {
         let r = c3.run_until(h, STEP_BUDGET_MS).await;
-        assert!(r.common_height >= h, "seed_C stall at {h}:\n{}", r.diagnostics());
+        assert!(
+            r.common_height >= h,
+            "seed_C stall at {h}:\n{}",
+            r.diagnostics()
+        );
         max_dt = max_dt.max(r.virtual_ms - prev);
         prev = r.virtual_ms;
     }

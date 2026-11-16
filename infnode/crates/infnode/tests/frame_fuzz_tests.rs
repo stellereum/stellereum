@@ -219,10 +219,8 @@ mod reference {
         if b.len() < HDR + 64 {
             anyhow::bail!("frame too short");
         }
-        let plen =
-            u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
-        let nlen =
-            u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow!("nlen"))?) as usize;
+        let plen = u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
+        let nlen = u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow!("nlen"))?) as usize;
         if plen > MAX_FRAME {
             anyhow::bail!("payload too large");
         }
@@ -240,9 +238,7 @@ mod reference {
         if total != b.len() {
             anyhow::bail!("frame length mismatch");
         }
-        let sig: [u8; 64] = b[b.len() - 64..]
-            .try_into()
-            .map_err(|_| anyhow!("sig"))?;
+        let sig: [u8; 64] = b[b.len() - 64..].try_into().map_err(|_| anyhow!("sig"))?;
         let f = Frame {
             kind: b[1],
             seq: u32::from_le_bytes(b[2..6].try_into().map_err(|_| anyhow!("seq"))?),

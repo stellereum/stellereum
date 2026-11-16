@@ -45,10 +45,24 @@ async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
     let slashed_before = st.staking_read().await.validators[&id(&honest)].total_slashed;
 
     // The textbook equivocation: says A out loud, commits B.
-    rt.on_prevote(falcon_votes::fvote(&honest, &fks[1], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
-        .unwrap();
-    rt.on_precommit(falcon_votes::fvote(&honest, &fks[1], 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
-        .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &honest,
+        &fks[1],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(0xA1)),
+    ))
+    .unwrap();
+    rt.on_precommit(falcon_votes::fvote(
+        &honest,
+        &fks[1],
+        1,
+        0,
+        VoteKind::Precommit,
+        Some(bh(0xB2)),
+    ))
+    .unwrap();
 
     let evidence = rt.hc.equivocations();
     eprintln!(
@@ -90,10 +104,24 @@ async fn hunt20_equivocation_evidence_is_never_cleared_after_charging() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
     let victim = ks[3].clone();
 
-    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
-        .unwrap();
-    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
-        .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &victim,
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(0xA1)),
+    ))
+    .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &victim,
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(0xA2)),
+    ))
+    .unwrap();
     let first = rt.apply_equivocation_slashes().await;
     let after_first = st.staking_read().await.validators[&id(&victim)].total_slashed;
     // The runtime is NOT advanced (no finalize), so the same evidence is live.
@@ -186,14 +214,35 @@ fn hunt22_negative_vote_scope_is_enforced() {
 
     // wrong height
     assert!(hc
-        .add_prevote(falcon_votes::fvote(&ks[0], &fks[0], 2, 0, VoteKind::Prevote, Some(bh(1))))
+        .add_prevote(falcon_votes::fvote(
+            &ks[0],
+            &fks[0],
+            2,
+            0,
+            VoteKind::Prevote,
+            Some(bh(1))
+        ))
         .is_err());
     // wrong round for the CURRENT quorum: stored, but invisible to quorum.
-    hc.add_prevote(falcon_votes::fvote(&ks[0], &fks[0], 1, 5, VoteKind::Prevote, Some(bh(1))))
-        .unwrap();
+    hc.add_prevote(falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        1,
+        5,
+        VoteKind::Prevote,
+        Some(bh(1)),
+    ))
+    .unwrap();
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh(1))))
-            .unwrap();
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh(1)),
+        ))
+        .unwrap();
     }
     assert_eq!(
         hc.try_prevote_quorum(),

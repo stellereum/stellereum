@@ -156,12 +156,10 @@ mod tests {
 
     /// In-tree NIST ShortMsgKAT pin (`test_shake256_matches_the_nist_test_vectors`,
     /// `tests/cn_vrf_tests.rs:48`): `SHAKE256("")` 32 bytes out.
-    const NIST_EMPTY_32: &str =
-        "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f";
+    const NIST_EMPTY_32: &str = "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f";
     /// In-tree NIST ShortMsgKAT pin (`test_shake256_matches_the_nist_test_vectors`,
     /// `tests/cn_vrf_tests.rs:52`): `SHAKE256("abc")` 32 bytes out.
-    const NIST_ABC_32: &str =
-        "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739";
+    const NIST_ABC_32: &str = "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739";
 
     #[test]
     fn output_length_is_48_bytes() {
@@ -183,7 +181,11 @@ mod tests {
         h1.update(b"brown fox");
         let mut h2 = Hash384::new(b"STELL_HASH384_TEST_V1");
         h2.update(b"the quick brown fox");
-        assert_eq!(h1.finalize(), h2.finalize(), "streaming must be deterministic");
+        assert_eq!(
+            h1.finalize(),
+            h2.finalize(),
+            "streaming must be deterministic"
+        );
         // Multi-block absorb (> 136-byte rate) stays deterministic.
         let long = vec![0xABu8; 200];
         assert_eq!(hash384(b"D", &long), hash384(b"D", &long));

@@ -14,13 +14,13 @@
 mod falcon_votes;
 
 use ed25519_dalek::SigningKey;
+use std::time::Instant;
 use stellereum::consensus::{
-    Vote, VoteKind, VoteSet, ValidatorSet, clear_verified_vote_cache,
-    invalidate_verified_vote_cache, register_validator_pq_key, verified_vote_cache_len,
-    verified_vote_cache_reset_stats, verified_vote_cache_stats,
+    clear_verified_vote_cache, invalidate_verified_vote_cache, register_validator_pq_key,
+    verified_vote_cache_len, verified_vote_cache_reset_stats, verified_vote_cache_stats,
+    ValidatorSet, Vote, VoteKind, VoteSet,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
-use std::time::Instant;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -89,7 +89,10 @@ fn vote_ingest_baseline_timing_reports() {
     let (hits1, misses1) = verified_vote_cache_stats();
     assert_eq!(set.len(), n);
     assert_eq!(hits1, 0, "cold pass must not hit");
-    assert!(misses1 >= n as u64, "cold pass must fully verify every vote");
+    assert!(
+        misses1 >= n as u64,
+        "cold pass must fully verify every vote"
+    );
 
     // Pass 2: same bytes, fresh set, same validators — cache hits, no crypto.
     verified_vote_cache_reset_stats();
@@ -157,7 +160,10 @@ fn stale_entry_after_set_change_must_miss() {
     let vs_empty = ValidatorSet::new();
     let mut set2 = VoteSet::new();
     let res = set2.add(vote.clone(), &vs_empty, 21, 0, VoteKind::Prevote);
-    assert!(res.is_err(), "non-member vote must be refused after set change");
+    assert!(
+        res.is_err(),
+        "non-member vote must be refused after set change"
+    );
     let (hits, misses) = verified_vote_cache_stats();
     assert_eq!(hits, 0, "stale entry must not hit after set change");
     assert!(misses >= 1, "set change must force full re-verify");
@@ -166,7 +172,9 @@ fn stale_entry_after_set_change_must_miss() {
     verified_vote_cache_reset_stats();
     let vs_big = ValidatorSet::from_list(vec![(voter, 42)]);
     let mut set3 = VoteSet::new();
-    assert!(set3.add(vote.clone(), &vs_big, 21, 0, VoteKind::Prevote).is_ok());
+    assert!(set3
+        .add(vote.clone(), &vs_big, 21, 0, VoteKind::Prevote)
+        .is_ok());
     let (hits3, misses3) = verified_vote_cache_stats();
     assert_eq!(hits3, 0, "power change must miss");
     assert!(misses3 >= 1);
@@ -206,7 +214,10 @@ fn equivocating_votes_never_count_twice_from_cache() {
     let vs = ValidatorSet::from_list(vec![(voter, 7)]);
     let a = falcon_votes::fvote(sk, fk, 41, 2, VoteKind::Precommit, Some([0xAAu8; 32]));
     let b = falcon_votes::fvote(sk, fk, 41, 2, VoteKind::Precommit, Some([0xBBu8; 32]));
-    assert!(a.verify() && b.verify(), "both equivocating votes are genuinely signed");
+    assert!(
+        a.verify() && b.verify(),
+        "both equivocating votes are genuinely signed"
+    );
 
     let mut set = VoteSet::new();
     assert!(set.add(a.clone(), &vs, 41, 2, VoteKind::Precommit).is_ok());
@@ -282,5 +293,9 @@ fn invalidation_hook_forces_reverify() {
     invalidate_verified_vote_cache();
     assert_eq!(verified_vote_cache_len(), 0);
     assert!(vote.verify(), "verdict unchanged after invalidation");
-    assert_eq!(verified_vote_cache_stats(), (1, 2), "invalidation must force a miss");
+    assert_eq!(
+        verified_vote_cache_stats(),
+        (1, 2),
+        "invalidation must force a miss"
+    );
 }

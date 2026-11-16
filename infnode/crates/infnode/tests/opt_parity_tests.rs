@@ -48,8 +48,7 @@ fn ref_merge_index(
             let tombs: Vec<String> = match tombs_json {
                 None => Vec::new(),
                 Some(t) => {
-                    let m: HashMap<String, i64> =
-                        serde_json::from_str(t).unwrap_or_default();
+                    let m: HashMap<String, i64> = serde_json::from_str(t).unwrap_or_default();
                     m.into_keys().collect()
                 }
             };
@@ -254,7 +253,8 @@ fn opt_index_union_parity_randomized() {
             Some(l) if l.expires > now => Some(l.clone()),
             _ => None,
         };
-        let prod_changed = kv.merge_replica(&key, incoming_value.clone(), ttl_ms, origin(), stored_at);
+        let prod_changed =
+            kv.merge_replica(&key, incoming_value.clone(), ttl_ms, origin(), stored_at);
         if !is_index {
             // LWW path (unchanged code): apply iff strictly newer; the
             // `stored_at <= 0` guard sits above all paths.
@@ -269,10 +269,20 @@ fn opt_index_union_parity_randomized() {
             assert_eq!(prod_changed, expected, "round {round}: LWW flag diverged");
             let got = kv.entries_clone();
             if expected {
-                assert_eq!(got[&key].value, incoming_value, "round {round}: LWW value diverged");
-                assert_eq!(got[&key].stored_at, stored_at, "round {round}: LWW stored_at diverged");
+                assert_eq!(
+                    got[&key].value, incoming_value,
+                    "round {round}: LWW value diverged"
+                );
+                assert_eq!(
+                    got[&key].stored_at, stored_at,
+                    "round {round}: LWW stored_at diverged"
+                );
             } else if local.is_some() {
-                assert_eq!(got[&key].value, local.as_ref().unwrap().value, "round {round}: LWW kept diverged");
+                assert_eq!(
+                    got[&key].value,
+                    local.as_ref().unwrap().value,
+                    "round {round}: LWW kept diverged"
+                );
             }
             continue;
         }
@@ -283,13 +293,15 @@ fn opt_index_union_parity_randomized() {
         // Compare STORED state (entries_clone keeps expired entries too),
         // so negative-TTL inserts — invisible to peek() on both sides —
         // still compare byte-identical with no clock involved.
-        let prod_final: Option<String> =
-            kv.entries_clone().get(&key).map(|s| s.value.clone());
+        let prod_final: Option<String> = kv.entries_clone().get(&key).map(|s| s.value.clone());
         let ref_final: Option<String> = match &ref_new {
             Some(nv) => Some(nv.value.clone()),
             None => local_live.map(|l| l.value),
         };
-        assert_eq!(prod_final, ref_final, "round {round}: merged value diverged");
+        assert_eq!(
+            prod_final, ref_final,
+            "round {round}: merged value diverged"
+        );
         if let (Some(p), Some(r)) = (kv.peek(&key), ref_new) {
             assert!(
                 (p.1 - r.expires).abs() <= 5_000,
@@ -298,7 +310,10 @@ fn opt_index_union_parity_randomized() {
             let got = kv.entries_clone();
             let st = &got[&key];
             assert_eq!(st.ttl_ms, r.ttl_ms, "round {round}: ttl diverged");
-            assert_eq!(st.stored_at, r.stored_at, "round {round}: stored_at diverged");
+            assert_eq!(
+                st.stored_at, r.stored_at,
+                "round {round}: stored_at diverged"
+            );
         }
     }
 }
@@ -389,7 +404,13 @@ fn time_prod(n: usize, iters: usize) -> f64 {
                 stored_at: now_ms(),
             },
         );
-        std::hint::black_box(kv.merge_replica("b:index", incoming.clone(), 86_400_000, origin(), now_ms()));
+        std::hint::black_box(kv.merge_replica(
+            "b:index",
+            incoming.clone(),
+            86_400_000,
+            origin(),
+            now_ms(),
+        ));
     }
     let t = Instant::now();
     for _ in 0..iters {
@@ -405,7 +426,13 @@ fn time_prod(n: usize, iters: usize) -> f64 {
                 stored_at: now_ms(),
             },
         );
-        std::hint::black_box(kv.merge_replica("b:index", incoming.clone(), 86_400_000, origin(), now_ms()));
+        std::hint::black_box(kv.merge_replica(
+            "b:index",
+            incoming.clone(),
+            86_400_000,
+            origin(),
+            now_ms(),
+        ));
     }
     t.elapsed().as_nanos() as f64 / iters as f64
 }
@@ -444,7 +471,10 @@ fn opt_index_union_never_slower() {
     for (n, iters) in [(200usize, 50usize), (2000usize, 5usize)] {
         let r = time_ref(n, iters);
         let p = time_prod(n, iters);
-        println!("[opt-gate] index-union n={n}: ref {r:.0} ns/op prod {p:.0} ns/op ({:.2}x)", r / p.max(1.0));
+        println!(
+            "[opt-gate] index-union n={n}: ref {r:.0} ns/op prod {p:.0} ns/op ({:.2}x)",
+            r / p.max(1.0)
+        );
         assert!(
             p <= r,
             "REGRESSION at n={n}: prod {p:.0} ns/op slower than ref {r:.0} ns/op"

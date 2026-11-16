@@ -9,7 +9,7 @@
 # Two-phase flow (solves the chicken-and-egg: configs need peer node-ids
 # before first boot, but keys generate on first boot):
 #   Phase 1: `stellereum keys init` per node (idempotent, no node boot),
-#            collect id/ed/x/falcon from the NODE IDENTITY line.
+#            collect id/ed/falcon from the NODE IDENTITY line.
 #   Phase 2: write full node.yaml per node (ALL ids in validators:, peers =
 #            every OTHER node), then boot all fresh with STELL_NEW_CHAIN=1.
 #
@@ -43,6 +43,10 @@ SHARDS_2="0,1"           # opt-in 2-shard registry: one process drives mastercha
 
 # --- binary: prefer debug, else release; NEVER build here ---------------------
 resolve_bin() {
+    if [[ -n "${STELL_BIN:-}" && -x "${STELL_BIN:-}" ]]; then
+        echo "$STELL_BIN"
+        return 0
+    fi
     for cand in \
         "$ROOT/stellereum/target/debug/stellereum" \
         "$ROOT/stellereum/target/release/stellereum" \
@@ -83,14 +87,19 @@ ports_free_for() {
 node_dir() { echo "$CLUSTER/node$1"; }
 
 # --- phase 1: keygen via the real CLI (same mechanism as `run`) ---------------
-# Prints: id=<inf1:...> ed=<hex> x=<hex> falcon=<hex>
+# Prints: <id> <ed> <pq_pub> <falcon>
 keygen_node() {
     local bin="$1" i="$2" dir
     dir="$(node_dir "$i")"
     mkdir -p "$dir/keys" "$dir/data"
+    if [[ -f "$dir/keys/e2e.key" ]] && (( $(wc -c < "$dir/keys/e2e.key") <= 64 )); then
+        echo "[local-cluster] removing stale pre-PQ $dir/keys/e2e.key" >&2
+        rm -f "$dir/keys/e2e.key"
+    fi
     local out
-    out="$(STELL_KEY_PLAINTEXT=1 "$bin" keys init --keys-dir "$dir/keys" 2>/dev/null)" || {
-        echo "[local-cluster] FATAL: keys init failed for node$i" >&2
+    out="$(STELL_KEY_PLAINTEXT=1 "$bin" keys init --keys-dir "$dir/keys" 2>&1)" || {
+        echo "[local-cluster] FATAL: keys init failed for node$i:" >&2
+        echo "$out" >&2
         return 1
     }
     local ident
@@ -100,16 +109,16 @@ keygen_node() {
         echo "$out" >&2
         return 1
     fi
-    local id ed x falcon
+    local id ed pq_pub falcon
     id="$(echo "$ident" | grep -oE 'id=[^ ]+' | cut -d= -f2)"
     ed="$(echo "$ident" | grep -oE 'ed=[^ ]+' | cut -d= -f2)"
-    x="$(echo "$ident" | grep -oE 'x=[^ ]+' | cut -d= -f2)"
+    pq_pub="$(echo "$ident" | grep -oE 'pq_pub=[^ ]+' | cut -d= -f2)"
     falcon="$(echo "$ident" | grep -oE 'falcon=[^ ]+' | cut -d= -f2)"
-    if [[ -z "$id" || -z "$ed" || -z "$x" || -z "$falcon" ]]; then
+    if [[ -z "$id" || -z "$ed" || -z "$pq_pub" || -z "$falcon" ]]; then
         echo "[local-cluster] FATAL: could not parse NODE IDENTITY for node$i: $ident" >&2
         return 1
     fi
-    echo "$id $ed $x $falcon"
+    echo "$id $ed $pq_pub $falcon"
 }
 
 # --- phase 2: write node.yaml + env.i ------------------------------------------
@@ -118,12 +127,12 @@ keygen_node() {
 write_configs() {
     local n="$1"; shift
     local shards="$1"; shift
-    # remaining args: per-node "id ed x falcon" in order 1..n
-    local -a IDS=() EDS=() XS=() FALCONS=()
+    # remaining args: per-node "id ed pq_pub falcon" in order 1..n
+    local -a IDS=() EDS=() PQS=() FALCONS=()
     local i
     for ((i = 1; i <= n; i++)); do
-        read -r id ed x falcon <<< "$1"; shift
-        IDS+=("$id"); EDS+=("$ed"); XS+=("$x"); FALCONS+=("$falcon")
+        read -r id ed pq_pub falcon <<< "$1"; shift
+        IDS+=("$id"); EDS+=("$ed"); PQS+=("$pq_pub"); FALCONS+=("$falcon")
     done
     # STELL_PEER_PQ_KEYS: identical on every node (ed:pq for ALL members).
     local pq_keys=""
@@ -148,9 +157,8 @@ write_configs() {
                 if [[ "$j" -eq "$i" ]]; then continue; fi
                 local k=$((j - 1)) jp=$((P2P_BASE + j))
                 echo "  - name: local$j"
-                echo "    node-id: \"${IDS[$k]}\""
                 echo "    ed-pub: \"${EDS[$k]}\""
-                echo "    x-pub: \"${XS[$k]}\""
+                echo "    pq-pub: \"${PQS[$k]}\""
                 echo "    endpoints: [\"127.0.0.1:$jp\"]"
                 echo "    allow: [\"*\"]"
             done

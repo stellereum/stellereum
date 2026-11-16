@@ -33,11 +33,42 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json();
 }
 
-/** The indexer answers with hex-string quantities (`"0xf4240"`, `"0x0"`). */
+/** The indexer answers with decimal or `0x`-hex integer quantities. */
 function hexToNumber(v: unknown): number {
-  if (typeof v === 'number') return v;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
   if (typeof v === 'string') {
-    const n = v.startsWith('0x') || v.startsWith('0X') ? parseInt(v, 16) : Number(v);
+    const s = v.trim();
+    if (!s) return 0;
+    const n = s.startsWith('0x') || s.startsWith('0X') ? Number.parseInt(s, 16) : Number(s);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+const MAX_SAFE_BI = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BI = BigInt(Number.MIN_SAFE_INTEGER);
+
+/**
+ * Parse a nano-STELL quantity (decimal integer string, `0x` hex fallback, or
+ * number) without losing precision when the integer exceeds MAX_SAFE_INTEGER.
+ */
+function toNanoAmount(v: unknown): number | string {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (!s) return 0;
+    if (/^-?0x[0-9a-fA-F]+$/i.test(s) || /^-?\d+$/.test(s)) {
+      try {
+        const bi = s.startsWith('-0x') || s.startsWith('-0X') ? -BigInt(s.slice(1)) : BigInt(s);
+        if (bi >= MIN_SAFE_BI && bi <= MAX_SAFE_BI) {
+          return Number(bi);
+        }
+        return bi.toString();
+      } catch {
+        return 0;
+      }
+    }
+    const n = Number(s);
     return Number.isFinite(n) ? n : 0;
   }
   return 0;
@@ -58,12 +89,12 @@ function toBlock(raw: any): Block {
   const b = raw && typeof raw === 'object' ? raw : {};
   return {
     height: hexToNumber(b.height ?? 0),
-    block_hash: b.block_hash ?? b.hash ?? '',
+    block_hash: b.block_hash || b.hash || '',
     tx_count: hexToNumber(b.tx_count ?? 0),
     timestamp: hexToNumber(b.timestamp ?? 0),
-    shard_id: hexToNumber(b.shard_id ?? 0),
-    proposer: b.proposer ?? b.proposer_stl57 ?? '',
-    proposer_stl57: b.proposer_stl57 ?? undefined,
+    shard_id: hexToNumber(b.shard_id ?? b.shardId ?? 0),
+    proposer: b.proposer || b.proposer_stl57 || '',
+    proposer_stl57: b.proposer_stl57 || undefined,
     state_root: b.state_root ?? undefined,
     prev_hash: b.prev_hash ?? b.prevHash ?? undefined,
     size: b.size ?? undefined,
@@ -73,28 +104,29 @@ function toBlock(raw: any): Block {
 /**
  * One transaction, normalized.
  *
- * The indexer serves `{tx_hash, amount: "0x..", fee_charged, gas_limit:
- * "0x..", ...}`; the UI reads `hash`, a numeric `amount`/`fee` and always
- * renders addresses through null-tolerant formatters.
+ * The indexer serves `{tx_hash, amount: "1000000000" | "0x..", fee_charged,
+ * gas_limit, ...}`; the UI reads `hash`, `amount`/`fee` (preserving full
+ * precision on large nano-STELL strings) and always renders addresses through
+ * null-tolerant formatters.
  */
 function toTransaction(raw: any): Transaction {
   const t = raw && typeof raw === 'object' ? raw : {};
   return {
-    hash: t.hash ?? t.tx_hash ?? '',
+    hash: t.hash || t.tx_hash || '',
     block_height: hexToNumber(t.block_height ?? 0),
-    from_addr: t.from_addr ?? t.from ?? '',
-    from_stl57: t.from_stl57 ?? undefined,
-    to_addr: t.to_addr ?? t.to ?? '',
-    to_stl57: t.to_stl57 ?? undefined,
-    amount: hexToNumber(t.amount ?? 0),
+    from_addr: t.from_addr || t.from || '',
+    from_stl57: t.from_stl57 || undefined,
+    to_addr: t.to_addr || t.to || '',
+    to_stl57: t.to_stl57 || undefined,
+    amount: toNanoAmount(t.amount ?? 0),
     gas_limit: hexToNumber(t.gas_limit ?? 0),
     gas_used: hexToNumber(t.gas_used ?? t.gas ?? 0),
-    fee: hexToNumber(t.fee ?? t.fee_charged ?? 0),
+    fee: toNanoAmount(t.fee ?? t.fee_charged ?? 0),
     nonce: hexToNumber(t.nonce ?? 0),
     status: t.status === 'failed' || t.status === 'pending' ? t.status : 'success',
     timestamp: hexToNumber(t.timestamp ?? 0),
-    source_shard: hexToNumber(t.source_shard ?? 0),
-    target_shard: hexToNumber(t.target_shard ?? 0),
+    source_shard: hexToNumber(t.source_shard ?? t.sourceShard ?? 0),
+    target_shard: hexToNumber(t.target_shard ?? t.targetShard ?? 0),
     payload_opcodes: Array.isArray(t.payload_opcodes) ? t.payload_opcodes : undefined,
     signature_scheme: t.signature_scheme ?? undefined,
   };
@@ -129,7 +161,7 @@ export async function getLatestBlocks(limit = 12): Promise<Block[]> {
 }
 
 export async function getBlock(hashOrHeight: string | number): Promise<Block> {
-  const raw = await fetchJson<any>(`${API_BASE}/block/${hashOrHeight}`);
+  const raw = await fetchJson<any>(`${API_BASE}/block/${encodeURIComponent(String(hashOrHeight))}`);
   // The indexer wraps the block: `{block: {...}, transactions: [...]}`.
   const b = raw?.block ?? raw;
   const block = toBlock(b);
@@ -148,9 +180,9 @@ export async function getLatestTransactions(limit = 12): Promise<Transaction[]> 
 }
 
 export async function getTransaction(hash: string): Promise<Transaction> {
-  const raw = await fetchJson<any>(`${API_BASE}/tx/${hash}`);
-  // Accept both the bare shape and a `{tx: {...}}` / `{result: {...}}` wrap.
-  return toTransaction(raw?.tx ?? raw?.result ?? raw);
+  const raw = await fetchJson<any>(`${API_BASE}/tx/${encodeURIComponent(hash)}`);
+  // Accept `{transaction: {...}}` (indexer v2), `{tx: {...}}`, `{result: {...}}`, or bare shape.
+  return toTransaction(raw?.transaction ?? raw?.tx ?? raw?.result ?? raw);
 }
 
 export async function getValidators(): Promise<{ validators: Validator[]; limits: any; round: any }> {
@@ -184,23 +216,23 @@ export async function getLiveStakeOf(validator: string): Promise<{
 }
 
 export async function getAccount(address: string): Promise<AccountInfo> {
-  const raw = await fetchJson<any>(`${API_BASE}/account/${address}`);
+  const raw = await fetchJson<any>(`${API_BASE}/account/${encodeURIComponent(address)}`);
   // The indexer answers `{address, status, stl57, tx_count}` — no balance or
   // nonce. Map what exists; the page renders `0` for the rest, never blank.
   return {
-    address: raw?.address ?? raw?.stl57 ?? address,
-    address_stl57: raw?.address_stl57 ?? raw?.stl57 ?? (address.startsWith('Stl57') ? address : ''),
-    balance: hexToNumber(raw?.balance ?? 0),
+    address: raw?.address || raw?.stl57 || address,
+    address_stl57: raw?.address_stl57 || raw?.stl57 || (address.startsWith('Stl57') ? address : ''),
+    balance: toNanoAmount(raw?.balance ?? 0),
     nonce: hexToNumber(raw?.nonce ?? 0),
     tx_count: hexToNumber(raw?.tx_count ?? 0),
     is_contract: Boolean(raw?.is_contract ?? false),
-    staked_amount: raw?.staked_amount !== undefined ? hexToNumber(raw.staked_amount) : undefined,
-    reward_balance: raw?.reward_balance !== undefined ? hexToNumber(raw.reward_balance) : undefined,
+    staked_amount: raw?.staked_amount !== undefined ? toNanoAmount(raw.staked_amount) : undefined,
+    reward_balance: raw?.reward_balance !== undefined ? toNanoAmount(raw.reward_balance) : undefined,
   };
 }
 
 export async function getAccountTransactions(address: string, limit = 25): Promise<Transaction[]> {
-  const raw = await fetchJson<any>(`${API_BASE}/account/${address}/txs?limit=${limit}`);
+  const raw = await fetchJson<any>(`${API_BASE}/account/${encodeURIComponent(address)}/txs?limit=${limit}`);
   // The indexer wraps the list: `{actions: [...], address, limit, offset}`.
   const list = Array.isArray(raw) ? raw : raw?.actions ?? raw?.transactions;
   return asArray<any>(list).map(toTransaction);
@@ -208,10 +240,11 @@ export async function getAccountTransactions(address: string, limit = 25): Promi
 
 export async function search(q: string): Promise<{ type: 'block' | 'tx' | 'address' | 'unknown'; value: any }> {
   const raw = await fetchJson<any>(`${API_BASE}/search?q=${encodeURIComponent(q.trim())}`);
-  // The indexer answers `{result, type: 'block'}` for blocks and
-  // `{address, stl57, type: 'account'}` for accounts — unify both.
+  // The indexer answers `{result, type: 'block'}` for blocks,
+  // `{result, type: 'tx' | 'transaction'}` for txs, and
+  // `{address, stl57, type: 'account'}` for accounts — unify all.
   const type = raw?.type === 'block' ? 'block'
-    : raw?.type === 'tx' ? 'tx'
+    : raw?.type === 'tx' || raw?.type === 'transaction' ? 'tx'
     : raw?.type === 'address' || raw?.type === 'account' ? 'address'
     : 'unknown';
   return { type, value: raw?.value ?? raw?.result ?? raw };
@@ -240,13 +273,13 @@ export interface EventsPage {
 
 /** The events of one transaction (`GET /api/v2/tx/:hash/events`). */
 export async function getTxEvents(hash: string): Promise<EventsPage> {
-  const page = await fetchJson<any>(`${API_BASE}/tx/${hash}/events`);
+  const page = await fetchJson<any>(`${API_BASE}/tx/${encodeURIComponent(hash)}/events`);
   return { ...page, events: asArray<ContractEvent>(page?.events) };
 }
 
 /** The events of one contract (`GET /api/v2/contract/:address/events`). */
 export async function getContractEvents(address: string, limit = 50, offset = 0): Promise<EventsPage> {
-  const page = await fetchJson<any>(`${API_BASE}/contract/${address}/events?limit=${limit}&offset=${offset}`);
+  const page = await fetchJson<any>(`${API_BASE}/contract/${encodeURIComponent(address)}/events?limit=${limit}&offset=${offset}`);
   return { ...page, events: asArray<ContractEvent>(page?.events) };
 }
 
@@ -301,11 +334,28 @@ export async function getContractAbi(contract: string): Promise<{
  * the explorer never has to guess the layout; when the proxy is unavailable
  * the RPC is asked directly.
  */
+function normalizeShardTopology(topo: ShardTopology): ShardTopology {
+  return {
+    ...topo,
+    total_shards: hexToNumber(topo.total_shards ?? topo.shards.length),
+    routing_prefix_bits: hexToNumber(topo.routing_prefix_bits ?? 0),
+    shards: topo.shards.map((s: any) => {
+      const shardId = hexToNumber(s?.shard_id ?? s?.shardId ?? 0);
+      return {
+        ...s,
+        shard_id: shardId,
+        tip_height: hexToNumber(s?.tip_height ?? s?.tipHeight ?? 0),
+        type: s?.type || (shardId === 0 ? 'masterchain' : 'workchain'),
+      };
+    }),
+  };
+}
+
 export async function getShards(): Promise<ShardTopology> {
   try {
     const topo = await fetchJson<ShardTopology>(`${API_BASE}/shards`);
-    if (topo && Array.isArray(topo.shards) && topo.shards.length >= 0) {
-      return topo;
+    if (topo && Array.isArray(topo.shards)) {
+      return normalizeShardTopology(topo);
     }
     throw new Error('indexer answered without a shards list');
   } catch (err) {
@@ -314,7 +364,7 @@ export async function getShards(): Promise<ShardTopology> {
     try {
       const topo = await rpcCall<ShardTopology>('stell_getShards', {});
       if (topo && Array.isArray((topo as any).shards)) {
-        return topo;
+        return normalizeShardTopology(topo);
       }
       throw new Error('node answered without a shards list');
     } catch {

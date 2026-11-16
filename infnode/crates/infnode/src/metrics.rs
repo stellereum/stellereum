@@ -265,7 +265,7 @@ pub fn render(
         "configured peers",
         peer_count as u64,
     );
-    let svc = svc.lock().unwrap();
+    let svc = svc.lock().unwrap_or_else(|e| e.into_inner());
     for (name, count) in svc.iter() {
         let key = format!("infnode_service_requests_total{{service=\"{name}\"}} {count}\n");
         out.push_str(&key);

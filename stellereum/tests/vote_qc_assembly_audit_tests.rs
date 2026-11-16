@@ -19,9 +19,8 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
-    consensus_quorum_min, register_validator_pq_key, BlockHash, HeightConsensus,
-    QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet, PQ_QC_MARKER_ID,
-    PQ_UQC_MARKER_ID,
+    consensus_quorum_min, register_validator_pq_key, BlockHash, HeightConsensus, QuorumCertificate,
+    ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
@@ -60,12 +59,7 @@ fn block_hash(n: u8) -> BlockHash {
     [n; 32]
 }
 
-fn prevote(
-    key: &SigningKey,
-    height: u64,
-    round: u32,
-    target: Option<BlockHash>,
-) -> Vote {
+fn prevote(key: &SigningKey, height: u64, round: u32, target: Option<BlockHash>) -> Vote {
     // FULL-PQ: votes verify Falcon-only (`Vote::verify` rejects Ed-only
     // votes), so every fixture vote carries the registered Falcon half.
     // `fk_for` is a pure function of the key, so call sites are unchanged.
@@ -73,12 +67,7 @@ fn prevote(
     Vote::sign_with_falcon(key, &fk, height, round, VoteKind::Prevote, target)
 }
 
-fn precommit(
-    key: &SigningKey,
-    height: u64,
-    round: u32,
-    target: Option<BlockHash>,
-) -> Vote {
+fn precommit(key: &SigningKey, height: u64, round: u32, target: Option<BlockHash>) -> Vote {
     let fk = fk_for(key);
     Vote::sign_with_falcon(key, &fk, height, round, VoteKind::Precommit, target)
 }
@@ -94,8 +83,14 @@ fn add_prevotes(
     vs: &ValidatorSet,
 ) {
     for k in ks.iter().take(count) {
-        set.add(prevote(k, height, round, target), vs, height, round, VoteKind::Prevote)
-            .expect("honest vote must be admitted");
+        set.add(
+            prevote(k, height, round, target),
+            vs,
+            height,
+            round,
+            VoteKind::Prevote,
+        )
+        .expect("honest vote must be admitted");
     }
 }
 
@@ -106,15 +101,16 @@ fn add_prevotes(
 #[test]
 fn threshold_table_uniform_power_n1_to_n7() {
     // (n, expected quorum power at power 1 each)
-    let table: [(usize, u64); 7] =
-        [(1, 1), (2, 2), (3, 3), (4, 3), (5, 4), (6, 5), (7, 5)];
+    let table: [(usize, u64); 7] = [(1, 1), (2, 2), (3, 3), (4, 3), (5, 4), (6, 5), (7, 5)];
     for (n, expected_q) in table {
         assert_eq!(
             consensus_quorum_min(n as u64),
             expected_q,
             "floor(2*{n}/3)+1 must be {expected_q}"
         );
-        let ks: Vec<SigningKey> = (0..n).map(|i| SigningKey::from_bytes(&[(i + 1) as u8; 32])).collect();
+        let ks: Vec<SigningKey> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[(i + 1) as u8; 32]))
+            .collect();
         let vs = uniform_set(&ks, 1);
         assert_eq!(vs.total_power(), n as u64);
         assert_eq!(vs.quorum_power(), expected_q);
@@ -138,7 +134,15 @@ fn threshold_table_uniform_power_n1_to_n7() {
 
         // q votes: quorum + verifiable certificate.
         let mut full = VoteSet::new();
-        add_prevotes(&mut full, &ks, expected_q as usize, 1, 0, Some(block_hash(9)), &vs);
+        add_prevotes(
+            &mut full,
+            &ks,
+            expected_q as usize,
+            1,
+            0,
+            Some(block_hash(9)),
+            &vs,
+        );
         assert_eq!(
             full.quorum_target(&vs),
             Some(Some(block_hash(9))),
@@ -148,7 +152,10 @@ fn threshold_table_uniform_power_n1_to_n7() {
             .certificate(Some(block_hash(9)), &vs, &[0u8; 32])
             .expect("n={n}: QC must assemble at quorum");
         assert!(qc.verify(&vs), "n={n}: assembled QC must verify");
-        assert!(vs.qc_meets_quorum(&qc), "n={n}: assembled QC must meet quorum");
+        assert!(
+            vs.qc_meets_quorum(&qc),
+            "n={n}: assembled QC must meet quorum"
+        );
         assert_eq!(vs.qc_signed_power(&qc), expected_q);
     }
 }
@@ -165,9 +172,17 @@ fn n3_requires_unanimity() {
     add_prevotes(&mut set, &ks, 2, 1, 0, Some(block_hash(1)), &vs);
     assert_eq!(set.power_for(Some(block_hash(1))), 2_000);
     assert!(set.quorum_target(&vs).is_none());
-    assert!(set.certificate(Some(block_hash(1)), &vs, &[0u8; 32]).is_none());
-    set.add(prevote(&ks[2], 1, 0, Some(block_hash(1))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
+    assert!(set
+        .certificate(Some(block_hash(1)), &vs, &[0u8; 32])
+        .is_none());
+    set.add(
+        prevote(&ks[2], 1, 0, Some(block_hash(1))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
     assert_eq!(set.quorum_target(&vs), Some(Some(block_hash(1))));
 }
 
@@ -179,9 +194,18 @@ fn n4_tolerates_one_fault() {
     assert_eq!(vs.quorum_power(), 2_667);
     let mut set = VoteSet::new();
     add_prevotes(&mut set, &ks, 2, 1, 0, Some(block_hash(1)), &vs);
-    assert!(set.quorum_target(&vs).is_none(), "two of four must not suffice");
-    set.add(prevote(&ks[2], 1, 0, Some(block_hash(1))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
+    assert!(
+        set.quorum_target(&vs).is_none(),
+        "two of four must not suffice"
+    );
+    set.add(
+        prevote(&ks[2], 1, 0, Some(block_hash(1))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
     assert_eq!(set.quorum_target(&vs), Some(Some(block_hash(1))));
 }
 
@@ -206,7 +230,13 @@ fn skewed_power_quorum_is_power_not_headcount() {
     // The heavy validator alone reaches quorum (one signer is enough).
     let mut heavy = VoteSet::new();
     heavy
-        .add(prevote(&a, 1, 0, Some(block_hash(7))), &vs, 1, 0, VoteKind::Prevote)
+        .add(
+            prevote(&a, 1, 0, Some(block_hash(7))),
+            &vs,
+            1,
+            0,
+            VoteKind::Prevote,
+        )
         .unwrap();
     assert_eq!(heavy.quorum_target(&vs), Some(Some(block_hash(7))));
     let qc = heavy
@@ -219,14 +249,28 @@ fn skewed_power_quorum_is_power_not_headcount() {
     // The two light validators together (two signers, power 2) do not.
     let mut lights = VoteSet::new();
     lights
-        .add(prevote(&b, 1, 0, Some(block_hash(7))), &vs, 1, 0, VoteKind::Prevote)
+        .add(
+            prevote(&b, 1, 0, Some(block_hash(7))),
+            &vs,
+            1,
+            0,
+            VoteKind::Prevote,
+        )
         .unwrap();
     lights
-        .add(prevote(&c, 1, 0, Some(block_hash(7))), &vs, 1, 0, VoteKind::Prevote)
+        .add(
+            prevote(&c, 1, 0, Some(block_hash(7))),
+            &vs,
+            1,
+            0,
+            VoteKind::Prevote,
+        )
         .unwrap();
     assert_eq!(lights.power_for(Some(block_hash(7))), 2);
     assert!(lights.quorum_target(&vs).is_none());
-    assert!(lights.certificate(Some(block_hash(7)), &vs, &[0u8; 32]).is_none());
+    assert!(lights
+        .certificate(Some(block_hash(7)), &vs, &[0u8; 32])
+        .is_none());
 }
 
 #[test]
@@ -241,7 +285,13 @@ fn headcount_majority_without_power_is_refused() {
     let mut three_lights = VoteSet::new();
     for k in &ks[1..] {
         three_lights
-            .add(prevote(k, 1, 0, Some(block_hash(3))), &vs, 1, 0, VoteKind::Prevote)
+            .add(
+                prevote(k, 1, 0, Some(block_hash(3))),
+                &vs,
+                1,
+                0,
+                VoteKind::Prevote,
+            )
             .unwrap();
     }
     assert!(three_lights.quorum_target(&vs).is_none());
@@ -254,7 +304,10 @@ fn headcount_majority_without_power_is_refused() {
         block_hash: Some(block_hash(3)),
         signatures: three_lights_signatures(&ks[1..], 1, 0, Some(block_hash(3))),
     };
-    assert!(!hand_qc.verify(&vs), "3 light signers must not verify at power 3 of 5");
+    assert!(
+        !hand_qc.verify(&vs),
+        "3 light signers must not verify at power 3 of 5"
+    );
     assert!(!vs.qc_meets_quorum(&hand_qc));
     // FULL-PQ: attribution mirrors verification exactly (`signers_set`
     // names only µQC/epoch-envelope signers), so inert classical legs
@@ -265,11 +318,19 @@ fn headcount_majority_without_power_is_refused() {
     let mut enough = VoteSet::new();
     for k in [&ks[0], &ks[1], &ks[2]] {
         enough
-            .add(prevote(k, 1, 0, Some(block_hash(3))), &vs, 1, 0, VoteKind::Prevote)
+            .add(
+                prevote(k, 1, 0, Some(block_hash(3))),
+                &vs,
+                1,
+                0,
+                VoteKind::Prevote,
+            )
             .unwrap();
     }
     assert_eq!(enough.quorum_target(&vs), Some(Some(block_hash(3))));
-    let qc = enough.certificate(Some(block_hash(3)), &vs, &[0u8; 32]).unwrap();
+    let qc = enough
+        .certificate(Some(block_hash(3)), &vs, &[0u8; 32])
+        .unwrap();
     assert!(qc.verify(&vs));
     assert!(vs.qc_meets_quorum(&qc));
 }
@@ -303,10 +364,15 @@ fn double_vote_for_same_target_counts_once() {
     set.add(v2, &vs, 1, 0, VoteKind::Prevote).unwrap();
     assert_eq!(set.len(), 1, "same voter admitted once");
     assert_eq!(set.power_for(Some(block_hash(1))), 1, "power counted once");
-    assert!(set.equivocations().is_empty(), "same target is not equivocation");
+    assert!(
+        set.equivocations().is_empty(),
+        "same target is not equivocation"
+    );
     // One voter double-voting must not fabricate a quorum of 3.
     assert!(set.quorum_target(&vs).is_none());
-    assert!(set.certificate(Some(block_hash(1)), &vs, &[0u8; 32]).is_none());
+    assert!(set
+        .certificate(Some(block_hash(1)), &vs, &[0u8; 32])
+        .is_none());
 }
 
 #[test]
@@ -337,7 +403,8 @@ fn stale_round_votes_never_complete_current_round_qc() {
 
     // Full quorum for block X in round 0.
     for k in &ks[..3] {
-        hc.add_prevote(prevote(k, 1, 0, Some(block_hash(1)))).unwrap();
+        hc.add_prevote(prevote(k, 1, 0, Some(block_hash(1))))
+            .unwrap();
     }
     assert_eq!(
         hc.prevote_set(0).unwrap().quorum_target(&vs),
@@ -348,7 +415,8 @@ fn stale_round_votes_never_complete_current_round_qc() {
 
     // Move to round 1 and add a single round-1 prevote: still no round-1 quorum.
     hc.round = 1;
-    hc.add_prevote(prevote(&ks[0], 1, 1, Some(block_hash(1)))).unwrap();
+    hc.add_prevote(prevote(&ks[0], 1, 1, Some(block_hash(1))))
+        .unwrap();
     assert_eq!(hc.prevote_set(1).unwrap().power_for(Some(block_hash(1))), 1);
     assert!(hc.prevote_set(1).unwrap().quorum_target(&vs).is_none());
     // The round-0 quorum is intact in its own bucket and did not leak.
@@ -365,13 +433,16 @@ fn late_vote_completes_its_own_round_never_another() {
     let mut hc = HeightConsensus::new(1, vs.clone());
     hc.round = 50; // far ahead; late round-0 votes must still land in bucket 0.
 
-    hc.add_prevote(prevote(&ks[0], 1, 0, Some(block_hash(1)))).unwrap();
-    hc.add_prevote(prevote(&ks[1], 1, 0, Some(block_hash(1)))).unwrap();
+    hc.add_prevote(prevote(&ks[0], 1, 0, Some(block_hash(1))))
+        .unwrap();
+    hc.add_prevote(prevote(&ks[1], 1, 0, Some(block_hash(1))))
+        .unwrap();
     assert!(hc.prevote_set(0).unwrap().quorum_target(&vs).is_none());
     assert!(hc.prevote_set(50).is_none());
 
     // The quorum-completing late vote completes round 0 only.
-    hc.add_prevote(prevote(&ks[2], 1, 0, Some(block_hash(1)))).unwrap();
+    hc.add_prevote(prevote(&ks[2], 1, 0, Some(block_hash(1))))
+        .unwrap();
     assert_eq!(
         hc.prevote_set(0).unwrap().quorum_target(&vs),
         Some(Some(block_hash(1)))
@@ -431,11 +502,13 @@ fn precommit_qc_requires_same_round_prevote_qc() {
     let mut hc = HeightConsensus::new(1, vs.clone());
 
     for k in &ks[..3] {
-        hc.add_prevote(prevote(k, 1, 0, Some(block_hash(1)))).unwrap();
+        hc.add_prevote(prevote(k, 1, 0, Some(block_hash(1))))
+            .unwrap();
     }
     hc.round = 1;
     for k in &ks[..3] {
-        hc.add_precommit(precommit(k, 1, 1, Some(block_hash(1)))).unwrap();
+        hc.add_precommit(precommit(k, 1, 1, Some(block_hash(1))))
+            .unwrap();
     }
     assert!(
         hc.try_precommit_quorum().is_none(),
@@ -445,7 +518,8 @@ fn precommit_qc_requires_same_round_prevote_qc() {
 
     // Completing the round-1 prevote QC unlocks the round-1 decision.
     for k in &ks[..3] {
-        hc.add_prevote(prevote(k, 1, 1, Some(block_hash(1)))).unwrap();
+        hc.add_prevote(prevote(k, 1, 1, Some(block_hash(1))))
+            .unwrap();
     }
     assert_eq!(hc.try_precommit_quorum(), Some(block_hash(1)));
     assert_eq!(hc.decided, Some(block_hash(1)));
@@ -468,19 +542,41 @@ fn equivocation_first_vote_kept_second_excluded() {
     set.add(vb, &vs, 1, 0, VoteKind::Prevote).unwrap();
 
     assert_eq!(set.len(), 1, "equivocator occupies one seat");
-    assert_eq!(set.power_for(Some(block_hash(1))), 1, "first vote keeps its power");
-    assert_eq!(set.power_for(Some(block_hash(2))), 0, "second vote counts nothing");
+    assert_eq!(
+        set.power_for(Some(block_hash(1))),
+        1,
+        "first vote keeps its power"
+    );
+    assert_eq!(
+        set.power_for(Some(block_hash(2))),
+        0,
+        "second vote counts nothing"
+    );
     assert_eq!(set.equivocations().len(), 1, "double-vote recorded once");
 
     // Two honest votes for B plus the equivocator's excluded second vote:
     // still no quorum for B (fail-closed: excluded, not counted).
-    set.add(prevote(&ks[1], 1, 0, Some(block_hash(2))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
-    set.add(prevote(&ks[2], 1, 0, Some(block_hash(2))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
+    set.add(
+        prevote(&ks[1], 1, 0, Some(block_hash(2))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
+    set.add(
+        prevote(&ks[2], 1, 0, Some(block_hash(2))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
     assert_eq!(set.power_for(Some(block_hash(2))), 2);
     assert!(set.quorum_target(&vs).is_none());
-    assert!(set.certificate(Some(block_hash(2)), &vs, &[0u8; 32]).is_none());
+    assert!(set
+        .certificate(Some(block_hash(2)), &vs, &[0u8; 32])
+        .is_none());
 }
 
 #[test]
@@ -510,17 +606,43 @@ fn equivocator_first_vote_still_counts_toward_honest_quorum() {
     let ks = keys(4);
     let vs = uniform_set(&ks, 1);
     let mut set = VoteSet::new();
-    set.add(prevote(&ks[0], 1, 0, Some(block_hash(1))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
-    set.add(prevote(&ks[0], 1, 0, Some(block_hash(2))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
-    set.add(prevote(&ks[1], 1, 0, Some(block_hash(1))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
-    set.add(prevote(&ks[2], 1, 0, Some(block_hash(1))), &vs, 1, 0, VoteKind::Prevote)
-        .unwrap();
+    set.add(
+        prevote(&ks[0], 1, 0, Some(block_hash(1))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
+    set.add(
+        prevote(&ks[0], 1, 0, Some(block_hash(2))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
+    set.add(
+        prevote(&ks[1], 1, 0, Some(block_hash(1))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
+    set.add(
+        prevote(&ks[2], 1, 0, Some(block_hash(1))),
+        &vs,
+        1,
+        0,
+        VoteKind::Prevote,
+    )
+    .unwrap();
     assert_eq!(set.power_for(Some(block_hash(1))), 3);
     assert_eq!(set.quorum_target(&vs), Some(Some(block_hash(1))));
-    let qc = set.certificate(Some(block_hash(1)), &vs, &[0u8; 32]).unwrap();
+    let qc = set
+        .certificate(Some(block_hash(1)), &vs, &[0u8; 32])
+        .unwrap();
     assert!(qc.verify(&vs));
 }
 
@@ -533,7 +655,9 @@ fn assembled_prevote_qc() -> (ValidatorSet, Vec<SigningKey>, QuorumCertificate) 
     let vs = uniform_set(&ks, 1);
     let mut set = VoteSet::new();
     add_prevotes(&mut set, &ks, 3, 1, 0, Some(block_hash(1)), &vs);
-    let qc = set.certificate(Some(block_hash(1)), &vs, &[0u8; 32]).unwrap();
+    let qc = set
+        .certificate(Some(block_hash(1)), &vs, &[0u8; 32])
+        .unwrap();
     assert!(qc.verify(&vs));
     (vs, ks, qc)
 }
@@ -637,7 +761,10 @@ fn garbage_envelope_markers_contribute_zero_power() {
     let mut forged = qc.clone();
     forged.signatures.push((PQ_UQC_MARKER_ID, vec![0u8; 32]));
     forged.signatures.push((PQ_QC_MARKER_ID, vec![0u8; 64]));
-    assert!(forged.verify(&vs), "garbage markers must not break the µQC quorum");
+    assert!(
+        forged.verify(&vs),
+        "garbage markers must not break the µQC quorum"
+    );
     assert_eq!(
         vs.qc_signed_power(&forged),
         honest_power,
@@ -683,5 +810,7 @@ fn empty_validator_set_never_forms_a_qc() {
         "non-member vote must be refused"
     );
     assert!(set.quorum_target(&empty).is_none());
-    assert!(set.certificate(Some(block_hash(1)), &empty, &[0u8; 32]).is_none());
+    assert!(set
+        .certificate(Some(block_hash(1)), &empty, &[0u8; 32])
+        .is_none());
 }

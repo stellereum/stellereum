@@ -145,8 +145,35 @@ async fn test_gram_api_schema_conformance_and_search() {
     };
     db.insert_transaction(&tx).unwrap();
 
+    // Start mock node RPC for live validator/staking endpoints
+    let mock_rpc = axum::Router::new().route(
+        "/",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "validators": [
+                        { "validator": "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361", "power": "1000000000000" },
+                        { "validator": "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd", "power": "1000000000000" },
+                        { "validator": "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694", "power": "1000000000000" }
+                    ],
+                    "total_power": "3000000000000",
+                    "quorum": "2000000000001",
+                    "fragile": true,
+                    "fragile_reason": "N=3 equal stake requires 3/3"
+                }
+            }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_rpc).await.unwrap();
+    });
+
     // Start server on ephemeral port
-    let app = create_router(AppState::new(db.clone()));
+    let app = create_router(AppState::with_rpc(db.clone(), mock_url));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -191,7 +218,8 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert_eq!(v["chain_id"], 5757);
     assert_eq!(v["mc_seqno"], 500);
     assert_eq!(v["tip_height"], 500);
-    assert_eq!(v["shards"], 2);
+    assert_eq!(v["shards"], 1);
+    assert_eq!(v["validators_count"], 3);
     assert!(v["tps"].is_number());
     assert!(v["current_tps"].is_number());
     assert_eq!(v["current_tps"], v["tps"]);
@@ -586,12 +614,9 @@ async fn test_events_are_decoded_with_the_contract_abi() {
     ));
     abis.put(&contract, Some(abi));
 
-    let app = create_router(AppState {
-        db: db.clone(),
-        abis: abis.clone(),
-        rpc_url: "http://127.0.0.1:1".to_string(),
-        verify_token: None,
-    });
+    let mut state = AppState::with_rpc(db.clone(), "http://127.0.0.1:1".to_string());
+    state.abis = abis.clone();
+    let app = create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -834,4 +859,556 @@ async fn test_contract_source_verify_round_trip() {
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["source"], VERIFY_WAT);
     assert_eq!(v["source_hash"], source_hash);
+}
+
+#[tokio::test]
+async fn test_tx_0x_prefix_sync_status_and_live_validators() {
+    let db = Database::open(":memory:").expect("db");
+    let tx_0x = "0x1bfac6710000000000000000000000000000000000000000000000000000a552";
+    let tx_bare = "1bfac6710000000000000000000000000000000000000000000000000000a552";
+    let blk_0x = "0xdeadbeef0000000000000000000000000000000000000000000000000000beef";
+    let blk_bare = "deadbeef0000000000000000000000000000000000000000000000000000beef";
+
+    db.insert_block(&BlockRecord {
+        shard_id: 0,
+        height: 42,
+        hash: blk_0x.to_string(),
+        timestamp: 1_794_000_000,
+        tx_count: 1,
+        proposer: None,
+        proposer_stl57: None,
+        state_root: None,
+    })
+    .unwrap();
+    db.insert_transaction(&TxRecord {
+        tx_hash: tx_0x.to_string(),
+        block_height: 42,
+        tx_index: 0,
+        from_addr: "aa".repeat(32),
+        to_addr: "bb".repeat(32),
+        from_stl57: None,
+        to_stl57: None,
+        amount: "100".to_string(),
+        fee_charged: "1".to_string(),
+        gas_limit: "10".to_string(),
+        status: "success".to_string(),
+        timestamp: 1_794_000_000,
+    })
+    .unwrap();
+
+    // Unreachable RPC port -> honest 503 on validators and synced=false on status.
+    let state = AppState::with_rpc(db.clone(), "http://127.0.0.1:1".to_string());
+    let sync_status = state.sync_status.clone();
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // Item 1: /api/v2/tx/:hash works BOTH with 0x and without 0x.
+    for q in [tx_0x, tx_bare] {
+        let r = client
+            .get(format!("{base}/api/v2/tx/{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::OK,
+            "tx lookup failed for {q}"
+        );
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["transaction"]["tx_hash"], tx_0x);
+    }
+
+    // Same for /api/v2/block/:hash with 0x and without 0x.
+    for q in [blk_0x, blk_bare] {
+        let r = client
+            .get(format!("{base}/api/v2/block/{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::OK,
+            "block lookup failed for {q}"
+        );
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["block"]["height"], 42);
+    }
+
+    // Item 3: /api/v2/status is NOT synced=true when lagging or disconnected.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut s = sync_status.write().await;
+        s.node_tip_height = Some(100);
+        s.last_sync_at = Some(now);
+    }
+    let st_lag: Value = client
+        .get(format!("{base}/api/v2/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_lag["synced"], false);
+    assert_eq!(st_lag["lag"], 58);
+
+    // Caught up -> synced: true.
+    {
+        let mut s = sync_status.write().await;
+        s.node_tip_height = Some(42);
+    }
+    let st_ok: Value = client
+        .get(format!("{base}/api/v2/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_ok["synced"], true);
+    assert_eq!(st_ok["lag"], 0);
+
+    // Item 5: unreachable node RPC -> 503 on /api/v2/validators (no fake hardcoded snapshot).
+    let val_res = client
+        .get(format!("{base}/api/v2/validators"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(val_res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_pq_32b_stl57_and_evm_20b_address_queries_across_endpoints() {
+    let db = Database::open(":memory:").expect("db");
+
+    // Full 32-byte PQ address (non-zero in first 12 bytes)
+    let pq_bytes = [0xD4u8; 32];
+    let pq_hex = hex::encode(pq_bytes);
+    let pq_0x = format!("0x{pq_hex}");
+    let pq_upper = format!("0X{}", pq_hex.to_uppercase());
+    let pq_stl57 = stellereum::address::encode_stl57_address(&pq_bytes);
+
+    // 32-byte zero-padded address & its 20-byte EVM equivalent
+    let mut evm_padded_bytes = [0u8; 32];
+    evm_padded_bytes[12..].copy_from_slice(&[0x55u8; 20]);
+    let evm_padded_hex = hex::encode(evm_padded_bytes);
+    let evm_padded_stl57 = stellereum::address::encode_stl57_address(&evm_padded_bytes);
+    let evm20_hex = "55".repeat(20);
+    let evm20_0x = format!("0x{evm20_hex}");
+
+    // Seed two txs using mixed representations of the same PQ address (0x+64 and bare 64)
+    db.insert_transaction(&TxRecord {
+        tx_hash: "0xaa01".to_string(),
+        block_height: 10,
+        tx_index: 0,
+        from_addr: pq_0x.clone(),
+        to_addr: format!("0x{evm_padded_hex}"),
+        from_stl57: Some(pq_stl57.clone()),
+        to_stl57: Some(evm_padded_stl57.clone()),
+        amount: "1000".to_string(),
+        fee_charged: "10".to_string(),
+        gas_limit: "100".to_string(),
+        status: "success".to_string(),
+        timestamp: 1_792_000_010,
+    })
+    .unwrap();
+    db.insert_transaction(&TxRecord {
+        tx_hash: "0xaa02".to_string(),
+        block_height: 11,
+        tx_index: 0,
+        from_addr: pq_hex.clone(),
+        to_addr: evm20_0x.clone(),
+        from_stl57: Some(pq_stl57.clone()),
+        to_stl57: Some(evm_padded_stl57.clone()),
+        amount: "2000".to_string(),
+        fee_charged: "10".to_string(),
+        gas_limit: "100".to_string(),
+        status: "success".to_string(),
+        timestamp: 1_792_000_011,
+    })
+    .unwrap();
+
+    // Seed a contract event & verified source using the 32-byte PQ address
+    db.insert_event(&EventRecord {
+        tx_hash: "0xaa01".to_string(),
+        block_height: 10,
+        log_index: 0,
+        contract: pq_hex.clone(),
+        topic0: format!("0x{:064x}", 0),
+        topics_json: "[]".to_string(),
+        data: "{\"value\":42}".to_string(),
+        event_name: Some("Ping".to_string()),
+        decoded_json: None,
+    })
+    .unwrap();
+    db.upsert_verified_source(&stellereum_indexer::db::VerifiedSource {
+        contract: pq_0x.clone(),
+        source_text: "(module)".to_string(),
+        compiler: "wat2wasm-1.0".to_string(),
+        flags: String::new(),
+        source_hash: "11".repeat(32),
+        code_hash: "22".repeat(32),
+        verified_at: 1_792_000_010,
+    })
+    .unwrap();
+
+    let app = create_router(AppState::new(db));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // 1. Account & tx queries with 0x+64 hex, 0X+64 hex, bare 64 hex, and Stl57...
+    for form in [&pq_0x, &pq_upper, &pq_hex, &pq_stl57] {
+        let acct: Value = client
+            .get(format!("{base}/api/v2/account/{form}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(acct["address"], pq_hex);
+        assert_eq!(acct["address_0x"], pq_0x);
+        assert_eq!(acct["stl57"], pq_stl57);
+        assert_eq!(acct["tx_count"], 2, "failed tx_count for {form}");
+
+        let txs: Value = client
+            .get(format!("{base}/api/v2/account/{form}/txs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(txs["address"], pq_hex);
+        assert_eq!(txs["stl57"], pq_stl57);
+        assert_eq!(txs["transactions"].as_array().unwrap().len(), 2);
+
+        let srch: Value = client
+            .get(format!("{base}/api/v2/search?q={form}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(srch["type"], "account");
+        assert_eq!(srch["address"], pq_hex);
+        assert_eq!(srch["stl57"], pq_stl57);
+        assert_eq!(srch["tx_count"], 2);
+    }
+
+    // 2. 20-byte EVM address & its 32-byte zero-padded Stl57 match both tx rows
+    for evm_form in [&evm20_0x, &evm_padded_stl57] {
+        let acct: Value = client
+            .get(format!("{base}/api/v2/account/{evm_form}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(acct["stl57"], evm_padded_stl57);
+        assert_eq!(acct["tx_count"], 2, "EVM/Stl57 alias failed for {evm_form}");
+    }
+    let evm_search: Value = client
+        .get(format!(
+            "{base}/api/v2/search?q=0X{}",
+            evm20_hex.to_uppercase()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(evm_search["type"], "account");
+    assert_eq!(evm_search["address"], evm20_hex);
+    assert_eq!(evm_search["stl57"], evm_padded_stl57);
+
+    // 3. Whales coalesces 0x+64 and bare 64 into one 32-byte entry with tx_count=2
+    let whales: Value = client
+        .get(format!("{base}/api/v2/whales"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let whale_list = whales["whales"].as_array().unwrap();
+    let pq_whale = whale_list
+        .iter()
+        .find(|w| w["address"] == pq_hex)
+        .expect("full 32-byte PQ whale entry");
+    assert_eq!(pq_whale["tx_count"], 2);
+    assert_eq!(pq_whale["address_stl57"], pq_stl57);
+
+    // 4. Contract events & verified source resolve by Stl57 as well as 0x+64 hex
+    for form in [&pq_0x, &pq_stl57] {
+        let ev: Value = client
+            .get(format!("{base}/api/v2/contract/{form}/events"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ev["contract"], pq_hex);
+        assert_eq!(ev["contract_stl57"], pq_stl57);
+        assert_eq!(ev["count"], 1);
+
+        let src: Value = client
+            .get(format!("{base}/api/v2/contract/{form}/source"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(src["verified"], true);
+        assert_eq!(src["contract"], pq_hex);
+        assert_eq!(src["contract_stl57"], pq_stl57);
+    }
+}
+
+#[tokio::test]
+async fn test_multi_shard_blocks_and_shards_endpoints() {
+    let db = Database::open(":memory:").expect("db");
+
+    // Seed blocks on shard 0 and shard 1 at overlapping height 10 + distinct heights
+    db.insert_block(&BlockRecord {
+        shard_id: 0,
+        height: 10,
+        hash: "0xs0_block10".to_string(),
+        timestamp: 1_792_000_010,
+        tx_count: 1,
+        proposer: None,
+        proposer_stl57: None,
+        state_root: Some("0xmc_root_10".to_string()),
+    })
+    .unwrap();
+    db.insert_block(&BlockRecord {
+        shard_id: 1,
+        height: 10,
+        hash: "0xs1_block10".to_string(),
+        timestamp: 1_792_000_010,
+        tx_count: 1,
+        proposer: None,
+        proposer_stl57: None,
+        state_root: Some("0xwc_root_10".to_string()),
+    })
+    .unwrap();
+    db.insert_block(&BlockRecord {
+        shard_id: 1,
+        height: 12,
+        hash: "0xs1_block12".to_string(),
+        timestamp: 1_792_000_012,
+        tx_count: 0,
+        proposer: None,
+        proposer_stl57: None,
+        state_root: Some("0xwc_root_12".to_string()),
+    })
+    .unwrap();
+
+    db.insert_transaction_in_shard(
+        0,
+        &TxRecord {
+            tx_hash: "0xtx_shard0".to_string(),
+            block_height: 10,
+            tx_index: 0,
+            from_addr: format!("0x{}", "11".repeat(32)),
+            to_addr: format!("0x{}", "22".repeat(32)),
+            from_stl57: None,
+            to_stl57: None,
+            amount: "100".to_string(),
+            fee_charged: "1".to_string(),
+            gas_limit: "10".to_string(),
+            status: "success".to_string(),
+            timestamp: 1_792_000_010,
+        },
+    )
+    .unwrap();
+    db.insert_transaction_in_shard(
+        1,
+        &TxRecord {
+            tx_hash: "0xtx_shard1".to_string(),
+            block_height: 10,
+            tx_index: 0,
+            from_addr: format!("0x{}", "33".repeat(32)),
+            to_addr: format!("0x{}", "44".repeat(32)),
+            from_stl57: None,
+            to_stl57: None,
+            amount: "200".to_string(),
+            fee_charged: "1".to_string(),
+            gas_limit: "10".to_string(),
+            status: "success".to_string(),
+            timestamp: 1_792_000_010,
+        },
+    )
+    .unwrap();
+
+    // Mock node RPC serving STELL_SHARDS=0,1 topology
+    let mock_rpc = axum::Router::new().route(
+        "/",
+        axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            let method = body["method"].as_str().unwrap_or("");
+            let result = match method {
+                "stell_getShards" => serde_json::json!({
+                    "shards": [
+                        {
+                            "shard_id": 0,
+                            "type": "masterchain",
+                            "tip_height": 10,
+                            "tip_hash": "0xs0_block10",
+                            "state_root": "0xmc_root_10",
+                            "local": true
+                        },
+                        {
+                            "shard_id": 1,
+                            "type": "workchain",
+                            "tip_height": 12,
+                            "tip_hash": "0xs1_block12",
+                            "state_root": "0xwc_root_12",
+                            "local": false
+                        }
+                    ],
+                    "total_shards": 2,
+                    "routing_prefix_bits": 1,
+                    "sharding": { "min_shards": 2 }
+                }),
+                _ => Value::Null,
+            };
+            axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock_rpc).await.unwrap() });
+
+    let app = create_router(AppState::with_rpc(db, mock_url));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // 1. /api/v2/shards reports both shards + indexed stats + address lookup
+    let addr32 = [0x77u8; 32];
+    let stl57 = stellereum::address::encode_stl57_address(&addr32);
+    let shards_res: Value = client
+        .get(format!("{base}/api/v2/shards?address={stl57}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shards_res["source"], "rpc");
+    assert_eq!(shards_res["total_shards"], 2);
+    assert_eq!(shards_res["routing_prefix_bits"], 1);
+    let shards = shards_res["shards"].as_array().unwrap();
+    assert_eq!(shards.len(), 2);
+    assert_eq!(shards[0]["shard_id"], 0);
+    assert_eq!(shards[0]["indexed_tip_height"], 10);
+    assert_eq!(shards[0]["indexed_blocks"], 1);
+    assert_eq!(shards[1]["shard_id"], 1);
+    assert_eq!(shards[1]["indexed_tip_height"], 12);
+    assert_eq!(shards[1]["indexed_blocks"], 2);
+    assert_eq!(shards_res["address_lookup"]["address"], hex::encode(addr32));
+    assert_eq!(shards_res["address_lookup"]["stl57"], stl57);
+    assert_eq!(shards_res["address_lookup"]["routed_shard"], 1);
+
+    // 2. /api/v2/stats reports shards=2
+    let stats_res: Value = client
+        .get(format!("{base}/api/v2/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats_res["shards"], 2);
+
+    // 3. /api/v2/blocks supports unfiltered (all shards) and shard-filtered queries
+    let all_blocks: Value = client
+        .get(format!("{base}/api/v2/blocks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all_blocks["blocks"].as_array().unwrap().len(), 3);
+
+    let s0_blocks: Value = client
+        .get(format!("{base}/api/v2/blocks?shard_id=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s0_blocks["shard_id"], 0);
+    assert_eq!(s0_blocks["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(s0_blocks["blocks"][0]["hash"], "0xs0_block10");
+
+    let s1_blocks: Value = client
+        .get(format!("{base}/api/v2/blocks?shard=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s1_blocks["shard_id"], 1);
+    assert_eq!(s1_blocks["blocks"].as_array().unwrap().len(), 2);
+    assert_eq!(s1_blocks["blocks"][0]["height"], 12);
+
+    // 4. /api/v2/block/:param supports ?shard_id=1 and shard:height (1:10) with shard-scoped txs
+    for path in ["/api/v2/block/10?shard_id=1", "/api/v2/block/1:10"] {
+        let blk: Value = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(blk["block"]["shard_id"], 1);
+        assert_eq!(blk["block"]["hash"], "0xs1_block10");
+        let txs = blk["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["tx_hash"], "0xtx_shard1");
+    }
+
+    let blk0: Value = client
+        .get(format!("{base}/api/v2/block/10?shard_id=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(blk0["block"]["shard_id"], 0);
+    assert_eq!(blk0["transactions"].as_array().unwrap().len(), 1);
+    assert_eq!(blk0["transactions"][0]["tx_hash"], "0xtx_shard0");
+
+    // 5. /api/v2/search?q=1:10 finds shard 1 block 10
+    let srch: Value = client
+        .get(format!("{base}/api/v2/search?q=1:10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(srch["type"], "block");
+    assert_eq!(srch["result"]["shard_id"], 1);
+    assert_eq!(srch["result"]["hash"], "0xs1_block10");
 }

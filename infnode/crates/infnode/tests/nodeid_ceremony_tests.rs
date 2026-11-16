@@ -14,8 +14,8 @@
 
 use infnode::config::PeerConfig;
 use infnode::keyring::{
-    dual_announce_hex, dual_announce_ids, parse_dual_announce, resolve_node_id,
-    NodeIdKind, NodeKeys, PqKeys, ResolvedNodeId,
+    dual_announce_hex, dual_announce_ids, parse_dual_announce, resolve_node_id, NodeIdKind,
+    NodeKeys, PqKeys, ResolvedNodeId,
 };
 use infnode::node::{ceremony_local_id, PqBindOutcome, PqIdentityRegistry};
 use infnode::proto::{self};
@@ -60,7 +60,13 @@ fn ceremony_01_pq_nodeid_derivation_vector() {
     assert!(!r.is_legacy());
     assert_eq!(r.kind_label(), "PQ");
     assert_eq!(r.id, pq.pq_id());
-    assert_eq!(r, ResolvedNodeId { id: pq.pq_id(), kind: NodeIdKind::Pq });
+    assert_eq!(
+        r,
+        ResolvedNodeId {
+            id: pq.pq_id(),
+            kind: NodeIdKind::Pq
+        }
+    );
 
     // Canonical call site agrees.
     assert_eq!(ceremony_local_id(&ed, &pq), pq.pq_id());
@@ -133,13 +139,19 @@ fn ceremony_03_rebinding_refused_first_pq_wins() {
         PqBindOutcome::Quarantined,
         "attacker must not rebind honest ed to own pq"
     );
-    assert_eq!(reg.bound_pq(&classical), Some(honest_pq.pq_pub().as_slice()));
+    assert_eq!(
+        reg.bound_pq(&classical),
+        Some(honest_pq.pq_pub().as_slice())
+    );
     // Attacker retry with bad tag: still quarantined, still unchanged.
     assert_eq!(
         reg.announce(&classical, &attacker_pq.pq_pub(), false),
         PqBindOutcome::Quarantined
     );
-    assert_eq!(reg.bound_pq(&classical), Some(honest_pq.pq_pub().as_slice()));
+    assert_eq!(
+        reg.bound_pq(&classical),
+        Some(honest_pq.pq_pub().as_slice())
+    );
     // Honest re-announce is steady state, not a re-bind.
     assert_eq!(
         reg.announce(&classical, &honest_pq.pq_pub(), true),
@@ -161,7 +173,11 @@ fn ceremony_04_classical_only_refused() {
     // for frozen route/TLS-pin call sites, never as identity.
     let ed = NodeKeys::generate();
     let pq = fixed_pq();
-    assert_ne!(ed.id(), pq.pq_id(), "classical helper must differ from PQ id");
+    assert_ne!(
+        ed.id(),
+        pq.pq_id(),
+        "classical helper must differ from PQ id"
+    );
     assert_eq!(ceremony_local_id(&ed, &pq), pq.pq_id());
 
     // PeerConfig without pq_pub (code-constructed dynamic): refused.
@@ -169,7 +185,10 @@ fn ceremony_04_classical_only_refused() {
     // `ceremony_05`), never silently classical.
     let legacy_cfg = peer_cfg(None);
     assert!(legacy_cfg.primary_id().is_err(), "classical peer refused");
-    assert!(legacy_cfg.dual_announce_ids().is_err(), "classical peer refused");
+    assert!(
+        legacy_cfg.dual_announce_ids().is_err(),
+        "classical peer refused"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +214,10 @@ peers:
         .expect_err("old single-ed config must fail at parse");
     let msg = err.to_string();
     assert!(
-        msg.contains("FULL-PQ") || msg.contains("pq-pub") || msg.contains("node-id") || msg.contains("x-pub"),
+        msg.contains("FULL-PQ")
+            || msg.contains("pq-pub")
+            || msg.contains("node-id")
+            || msg.contains("x-pub"),
         "migration error must be clear, got: {msg}"
     );
 

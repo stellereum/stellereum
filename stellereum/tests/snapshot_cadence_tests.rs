@@ -47,9 +47,14 @@ fn legacy_trigger(height: u64, last_snapshot_height: u64, snap_int: u64) -> bool
 
 #[test]
 fn candidate_matches_legacy_trigger() {
-    assert_eq!(CATCHUP_GRID, 100, "grid const must match the legacy literal");
+    assert_eq!(
+        CATCHUP_GRID, 100,
+        "grid const must match the legacy literal"
+    );
     for snap_int in [50u64, 51, 99, 100, 101, 500, 1000, 4096] {
-        for last in [0u64, 1, 49, 50, 99, 100, 999, 1000, 1050, 1999, 2000, 10_000] {
+        for last in [
+            0u64, 1, 49, 50, 99, 100, 999, 1000, 1050, 1999, 2000, 10_000,
+        ] {
             let lo = last.saturating_sub(5);
             for h in lo..last.saturating_add(2600) {
                 assert_eq!(
@@ -104,7 +109,10 @@ fn idle_skips_below_floor_floor_forces_submit() {
             last_sub = h;
         }
     }
-    assert!(submitted.len() > 2, "idle chain must still snapshot: {submitted:?}");
+    assert!(
+        submitted.len() > 2,
+        "idle chain must still snapshot: {submitted:?}"
+    );
     for w in submitted.windows(2) {
         let gap = w[1] - w[0];
         assert!(
@@ -149,7 +157,10 @@ async fn unchanged_state_snapshots_byte_identical() {
     let b = e.create_snapshot().await;
     assert_eq!(e.get_state_root().await, root_before);
     assert_eq!(a, b, "captures of unmoved state must be byte-identical");
-    eprintln!("[snapshot-cadence] N=1000 idle re-capture byte-identical ({} bytes)", a.len());
+    eprintln!(
+        "[snapshot-cadence] N=1000 idle re-capture byte-identical ({} bytes)",
+        a.len()
+    );
 }
 
 /// Differential with/without skips over a mixed idle+active span.
@@ -188,7 +199,9 @@ async fn skipped_heights_restore_from_nearest_plus_replay() {
             // Active span: mutate one account per height.
             let idx = (h - H_SKIP - 1) as usize % N;
             let bal = 10_000 + idx as u64 + h;
-            engine.update_account(AccountState::new(fixed_addr(idx), bal)).await;
+            engine
+                .update_account(AccountState::new(fixed_addr(idx), bal))
+                .await;
             deltas.push((h, idx, bal));
         }
         let r = engine.get_state_root().await;
@@ -209,12 +222,16 @@ async fn skipped_heights_restore_from_nearest_plus_replay() {
     // replaying the (empty) idle delta log.
     let legacy = funded_engine(N).await;
     let legacy_snap0 = legacy.create_snapshot().await;
-    assert_eq!(snap0, legacy_snap0, "same state must snapshot identically across runs");
+    assert_eq!(
+        snap0, legacy_snap0,
+        "same state must snapshot identically across runs"
+    );
     // Idle span on the legacy engine: root must track the canonical idle
     // root exactly (no divergence from skipping — nothing was skipped yet).
     for h in H_SNAP0 + 1..=H_SKIP {
         assert_eq!(
-            legacy.get_state_root().await, canonical_skip_root,
+            legacy.get_state_root().await,
+            canonical_skip_root,
             "legacy idle root must equal canonical (h={h})"
         );
     }
@@ -225,34 +242,51 @@ async fn skipped_heights_restore_from_nearest_plus_replay() {
     );
     // Active span with identical deltas → identical tip root + bytes.
     for (_, idx, bal) in &deltas {
-        legacy.update_account(AccountState::new(fixed_addr(*idx), *bal)).await;
+        legacy
+            .update_account(AccountState::new(fixed_addr(*idx), *bal))
+            .await;
     }
     assert_eq!(legacy.get_state_root().await, canonical_tip_root);
     let legacy_snap1 = legacy.create_snapshot().await;
-    assert_eq!(snap1, legacy_snap1, "post-active snapshot bytes must agree with/without skips");
+    assert_eq!(
+        snap1, legacy_snap1,
+        "post-active snapshot bytes must agree with/without skips"
+    );
 
     // Restore-equivalence: skipped H=2000 from nearest snapshot (H=1000) +
     // replay of the recorded idle deltas (empty) == canonical root.
     let restored = InMemoryStateEngine::new();
-    restored.restore_snapshot(&snap0).await.expect("nearest snapshot restores");
+    restored
+        .restore_snapshot(&snap0)
+        .await
+        .expect("nearest snapshot restores");
     let idle_replay: Vec<_> = deltas.iter().filter(|(h, _, _)| *h <= H_SKIP).collect();
     assert!(idle_replay.is_empty(), "idle span must replay zero deltas");
     for (_, idx, bal) in idle_replay {
-        restored.update_account(AccountState::new(fixed_addr(*idx), *bal)).await;
+        restored
+            .update_account(AccountState::new(fixed_addr(*idx), *bal))
+            .await;
     }
     assert_eq!(
-        restored.get_state_root().await, canonical_skip_root,
+        restored.get_state_root().await,
+        canonical_skip_root,
         "skipped height restores from nearest snapshot + replay to the canonical root"
     );
 
     // And the tip restores from the post-skip snapshot + full replay log.
     let restored_tip = InMemoryStateEngine::new();
-    restored_tip.restore_snapshot(&snap0).await.expect("snap0 restores");
+    restored_tip
+        .restore_snapshot(&snap0)
+        .await
+        .expect("snap0 restores");
     for (_, idx, bal) in &deltas {
-        restored_tip.update_account(AccountState::new(fixed_addr(*idx), *bal)).await;
+        restored_tip
+            .update_account(AccountState::new(fixed_addr(*idx), *bal))
+            .await;
     }
     assert_eq!(
-        restored_tip.get_state_root().await, canonical_tip_root,
+        restored_tip.get_state_root().await,
+        canonical_tip_root,
         "tip replays from the pre-skip snapshot to the canonical root"
     );
     eprintln!(
@@ -286,7 +320,10 @@ async fn snapshot_cost_report() {
         bytes_len = bytes.len();
         // Round-trip correctness every rep: restore == canonical root.
         let fresh = InMemoryStateEngine::new();
-        fresh.restore_snapshot(&bytes).await.expect("snapshot restores");
+        fresh
+            .restore_snapshot(&bytes)
+            .await
+            .expect("snapshot restores");
         assert_eq!(fresh.get_state_root().await, canonical);
     }
     assert!(bytes_len > 1024, "fixture must be non-trivial");

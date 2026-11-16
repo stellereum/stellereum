@@ -78,10 +78,10 @@ use stellereum::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
 use stellereum::staking::{
     required_bond_floor_nano, BPS_DENOMINATOR, COMMISSION_CHANGE_COOLDOWN_HEIGHTS,
     COMMISSION_EFFECT_DELAY_HEIGHTS, COMMISSION_MAX_DELTA_BPS, DEFAULT_COMMISSION_BPS,
-    DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, DOWNTIME_SLASH_BPS,
-    EQUIVOCATION_SLASH_BPS, JAIL_RELEASE_DELAY_HEIGHTS, MAX_ACTIVE_VALIDATORS,
-    MICRO_COMMITTEE_SLASH_BPS, MIN_VALIDATOR_BOND, REENTRY_LIVENESS_WINDOW_HEIGHTS,
-    STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
+    DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, DOWNTIME_SLASH_BPS, EQUIVOCATION_SLASH_BPS,
+    JAIL_RELEASE_DELAY_HEIGHTS, MAX_ACTIVE_VALIDATORS, MICRO_COMMITTEE_SLASH_BPS,
+    MIN_VALIDATOR_BOND, REENTRY_LIVENESS_WINDOW_HEIGHTS, STELL_MIN_BOND_BUFFER,
+    UNBONDING_PERIOD_SECS,
 };
 use stellereum::svm::GAS_BASIC_TRANSFER;
 
@@ -111,9 +111,18 @@ fn frozen_base_timeout_is_pinned() {
 #[test]
 fn frozen_fee_floor_is_pinned() {
     assert_eq!(black_box(Mempool::FROZEN_MIN_GAS_FLOOR), 280_000);
-    assert_eq!(black_box(Mempool::FROZEN_MIN_GAS_FLOOR), black_box(GAS_BASIC_TRANSFER));
-    assert_eq!(black_box(Mempool::frozen_base_fee_floor()), black_box(Mempool::FROZEN_MIN_GAS_FLOOR));
-    assert_eq!(black_box(MAX_MIN_GAS_LIMIT), 10 * black_box(GAS_BASIC_TRANSFER));
+    assert_eq!(
+        black_box(Mempool::FROZEN_MIN_GAS_FLOOR),
+        black_box(GAS_BASIC_TRANSFER)
+    );
+    assert_eq!(
+        black_box(Mempool::frozen_base_fee_floor()),
+        black_box(Mempool::FROZEN_MIN_GAS_FLOOR)
+    );
+    assert_eq!(
+        black_box(MAX_MIN_GAS_LIMIT),
+        10 * black_box(GAS_BASIC_TRANSFER)
+    );
     assert_eq!(black_box(MAX_MIN_GAS_LIMIT), 2_800_000);
 }
 

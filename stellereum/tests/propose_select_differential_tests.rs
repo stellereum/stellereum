@@ -21,8 +21,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::runtime::{ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS};
-use stellereum::sharding::Transaction;
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 use stellereum::zkml_attestation::AttestationProof;
@@ -37,6 +38,45 @@ fn det_key(i: u64) -> SigningKey {
     let mut seed = [0xA5u8; 32];
     seed[..8].copy_from_slice(&i.to_le_bytes());
     SigningKey::from_bytes(&seed)
+}
+
+fn det_pq_key(i: u64) -> (FalconKeypair, [u8; 32]) {
+    let mut seed = [0xA5u8; 32];
+    seed[..8].copy_from_slice(&i.to_le_bytes());
+    let kp = FalconKeypair::generate_from_seed_bytes(&seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+fn pq_sign_with_payload_and_priority(
+    i: u64,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+    priority_fee_per_gas: u64,
+) -> Transaction {
+    let (kp, from) = det_pq_key(i);
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas,
+    };
+    let msg = tx.signing_message();
+    let sig = kp.sign(&msg);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    tx
 }
 
 /// Deterministic xorshift64: fixed seeds, no wall clock, no OsRng.
@@ -97,7 +137,8 @@ where
             let tx = by_hash[h];
             if !accept(tx) {
                 continue;
-            }            let g = tx.gas_limit;
+            }
+            let g = tx.gas_limit;
             if gas.saturating_add(g) > max_gas {
                 continue;
             }
@@ -157,7 +198,7 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
     let mut all: Vec<Transaction> = Vec::new();
     let n_senders = 30 + rng.below(21); // 30..=50
     for s in 0..n_senders {
-        let sk = det_key(900_000 + seed * 1_000 + s);
+        let key_id = 900_000 + seed * 1_000 + s;
         let depth = 1 + rng.below(6); // 1..=6 deep chains
         let mut nonce = rng.below(2); // some senders start ahead (gap at 0)
         for _ in 0..depth {
@@ -178,16 +219,8 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
                     })
                     .collect()
             };
-            let tx = Transaction::sign_with_payload_and_priority(
-                &sk,
-                [7u8; 32],
-                amount,
-                gas,
-                nonce,
-                1,
-                1,
-                payload,
-                bid,
+            let tx = pq_sign_with_payload_and_priority(
+                key_id, [7u8; 32], amount, gas, nonce, payload, bid,
             );
             nonce += 1;
             pool.add_checked(tx.clone(), BAL).expect("funded admission");
@@ -197,7 +230,10 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
     // Duplicate insert attempts must not change the pool (admission refuses
     // them); the reference dedups identically. Re-push one known tx.
     if let Some(dup) = all.first().cloned() {
-        assert!(pool.add_checked(dup, BAL).is_err(), "duplicate must be refused");
+        assert!(
+            pool.add_checked(dup, BAL).is_err(),
+            "duplicate must be refused"
+        );
     }
     // Wire pressure: 20 fat txs (~1MB estimated wire each) with HIGH bids so
     // they select first and fill ~20MB of the 24MB wire budget. Later fat
@@ -205,7 +241,7 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
     // agree exactly which. (Single oversize txs never reach selection:
     // admission refuses them, so the wire cap only binds cumulatively.)
     for i in 0..20u64 {
-        let sk = det_key(777_000 + seed * 100 + i);
+        let key_id = 777_000 + seed * 100 + i;
         let fat_ops: Vec<OpCode> = (0..5_000)
             .map(|k| OpCode::Transfer {
                 recipient: [(k % 251) as u8; 32],
@@ -213,14 +249,12 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
             })
             .collect();
         let bid = 50_000 + i;
-        let fat = Transaction::sign_with_payload_and_priority(
-            &sk,
+        let fat = pq_sign_with_payload_and_priority(
+            key_id,
             [8u8; 32],
             1,
             GAS_BASIC_TRANSFER + bid + 1_000,
             0,
-            1,
-            1,
             fat_ops,
             bid,
         );
@@ -231,7 +265,7 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
     // 2560 cumulative units > 2048 cap, so the tail must skip on proofs.
     // Bids sit below the fat txs but above the small fry.
     for i in 0..40u64 {
-        let sk = det_key(778_000 + seed * 100 + i);
+        let key_id = 778_000 + seed * 100 + i;
         let bid = 30_000 + i;
         let ops = vec![OpCode::SysCallVerifyZkMlAttestation {
             model_id: [3u8; 32],
@@ -243,14 +277,12 @@ fn randomized_pool(seed: u64) -> (Mempool, Vec<Transaction>) {
                 proof_bytes: Vec::new(),
             }),
         }];
-        let heavy = Transaction::sign_with_payload_and_priority(
-            &sk,
+        let heavy = pq_sign_with_payload_and_priority(
+            key_id,
             [8u8; 32],
             1,
             GAS_BASIC_TRANSFER + bid + 1_000,
             0,
-            1,
-            1,
             ops,
             bid,
         );
@@ -338,8 +370,16 @@ async fn propose_same_state_byte_identical_bodies() {
         )
         .with_mempool(pool.clone());
         let b = rt.propose(TS).await.expect("propose must succeed");
-        bodies.push(b.transactions.iter().map(|t| t.compute_tx_hash()).collect::<Vec<_>>());
+        bodies.push(
+            b.transactions
+                .iter()
+                .map(|t| t.compute_tx_hash())
+                .collect::<Vec<_>>(),
+        );
     }
     assert!(!bodies[0].is_empty());
-    assert_eq!(bodies[0], bodies[1], "same state must propose identical bodies");
+    assert_eq!(
+        bodies[0], bodies[1],
+        "same state must propose identical bodies"
+    );
 }

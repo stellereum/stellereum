@@ -7,10 +7,10 @@ interface StatsGridProps {
 }
 
 export const StatsGrid: React.FC<StatsGridProps> = ({ stats, loading }) => {
-  const tipHeight = stats?.tip_height ?? 285027;
-  const tps = stats?.current_tps ?? 1.0;
-  const blockTime = stats?.avg_block_time ? stats.avg_block_time.toFixed(2) : '0.49';
-  const valCount = stats?.validators_count ?? 4;
+  const tipHeight = stats?.tip_height ?? 0;
+  const tps = stats?.current_tps ?? 0.0;
+  const blockTime = stats?.avg_block_time ? stats.avg_block_time.toFixed(2) : '0.00';
+  const valCount = stats?.validators_count ?? 0;
 
   return (
     <div className="stats-ribbon">
@@ -33,7 +33,7 @@ export const StatsGrid: React.FC<StatsGridProps> = ({ stats, loading }) => {
         <div className="stat-value">
           {loading ? '...' : tps.toFixed(1)} <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>TPS</span>
         </div>
-        <div className="stat-sub">{stats?.total_transactions?.toLocaleString() ?? '44'} indexed txs</div>
+        <div className="stat-sub">{stats?.total_transactions?.toLocaleString() ?? '0'} indexed txs</div>
       </div>
 
       <div className="stat-card">
@@ -50,12 +50,12 @@ export const StatsGrid: React.FC<StatsGridProps> = ({ stats, loading }) => {
       <div className="stat-card">
         <div className="stat-label">
           <span>Active Validators</span>
-          <span style={{ color: 'var(--accent)', fontSize: '0.7rem', fontWeight: 600 }}>N=4</span>
+          <span style={{ color: 'var(--accent)', fontSize: '0.7rem', fontWeight: 600 }}>N={valCount || '—'}</span>
         </div>
         <div className="stat-value">
-          {loading ? '...' : `${valCount} / 4`}
+          {loading ? '...' : `${valCount}`}
         </div>
-        <div className="stat-sub">BFT Quorum 3/4 (2/3+)</div>
+        <div className="stat-sub">BFT Quorum 2/3+</div>
       </div>
     </div>
   );

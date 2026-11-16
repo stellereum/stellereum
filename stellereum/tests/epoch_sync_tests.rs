@@ -34,15 +34,13 @@ use rand::rngs::OsRng;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use stellereum::consensus::{
-    register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet,
-};
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet};
 use stellereum::consensus_net::{consensus_topic, tx_topic};
 use stellereum::network::{
     block_body_blob_name, EpochTag, BUCKET_STELLEREUM_BLOCKS, BUCKET_STELLEREUM_HEAD,
     BUCKET_STELLEREUM_HEADERS, BUCKET_STELLEREUM_STATE,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::BlockHeaderRecord;

@@ -1,0 +1,490 @@
+use ed25519_dalek::SigningKey;
+use std::path::PathBuf;
+
+use stellereum::bridge::TeleportBridgeEngine;
+use stellereum::sharding::Transaction;
+use stellereum::zkml::SessionKeyAuthorization;
+
+/// Declared gas budget for a CLI-built payload transaction.
+///
+/// Never below the opcode's own cost, and never below the default admission
+/// base fee: a transaction the mempool refuses on arrival can never reach a
+/// block, so the cheapest useful budget is the larger of the two.
+pub(crate) fn cli_tx_gas(opcode_gas: u64) -> u64 {
+    opcode_gas.max(stellereum::svm::GAS_BASIC_TRANSFER)
+}
+
+pub(crate) fn falcon_pq_address(kp: &stellereum::post_quantum::FalconKeypair) -> [u8; 32] {
+    stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &kp.public_key,
+        &stellereum::post_quantum::DEFAULT_SALT,
+    )
+}
+
+pub(crate) fn falcon_from_hex_seed(
+    raw: &str,
+    what: &str,
+) -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
+    let seed = zeroize::Zeroizing::new(parse_wallet_seed(raw, what)?);
+    Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed))
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: explicit PQ payload tx builder mirrors Transaction::new_pq_explicit; callers supply full tx fields.
+pub(crate) fn sign_pq_explicit_payload(
+    pq_key: &stellereum::post_quantum::FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<stellereum::svm::OpCode>,
+) -> Transaction {
+    let from = falcon_pq_address(pq_key);
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = pq_key.sign(&msg);
+    let env = stellereum::sharding::PqSignatureEnvelope::new_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        pq_key.public_key.clone(),
+        sig,
+    );
+    tx.signature = env.encode();
+    tx
+}
+
+/// Build the transaction that places an order on the committed book.
+///
+/// The order lives only as this payload; the book it lands in is the one every
+/// node derives from the block, not a local copy.
+pub(crate) fn build_place_order_tx(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    pair: u32,
+    is_buy: bool,
+    price: u64,
+    amount: u64,
+    nonce: u64,
+) -> Transaction {
+    let from = falcon_pq_address(trader);
+    let gas = cli_tx_gas(stellereum::svm::GAS_ORDER_PLACE)
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload(
+        trader,
+        from,
+        0,
+        gas,
+        nonce,
+        1,
+        1,
+        vec![stellereum::svm::OpCode::SysCallPlaceOrder {
+            pair_id: pair,
+            is_buy,
+            price,
+            amount,
+        }],
+    )
+}
+
+/// Build the transaction that cancels an order on the committed book.
+///
+/// The pair is not carried: `SysCallCancelOrder` resolves the order by id
+/// against every book at block time, so a wrong `--pair` cannot strand a
+/// cancellation the way a locally-scoped lookup could.
+pub(crate) fn build_cancel_order_tx(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    order_id: u64,
+    nonce: u64,
+) -> Transaction {
+    let from = falcon_pq_address(trader);
+    let gas = cli_tx_gas(stellereum::svm::GAS_ORDER_CANCEL)
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload(
+        trader,
+        from,
+        0,
+        gas,
+        nonce,
+        1,
+        1,
+        vec![stellereum::svm::OpCode::SysCallCancelOrder { order_id }],
+    )
+}
+
+/// Build the transaction that publishes a master-signed session grant on chain.
+///
+/// The grant rides in the payload, so it is bound into the transaction hash
+/// and retrievable from the receipt: a delegation becomes a committed record
+/// instead of a printout. Note the pair `(pair, order_id)` of the cancel is
+/// carried by the opcode alone - the book is looked up by id at block time.
+pub(crate) fn build_session_grant_tx(
+    master: &stellereum::post_quantum::FalconKeypair,
+    grant: &SessionKeyAuthorization,
+    nonce: u64,
+) -> Transaction {
+    let from = falcon_pq_address(master);
+    let gas = cli_tx_gas(stellereum::svm::GAS_PUBLISH_SESSION_GRANT)
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload(
+        master,
+        from,
+        0,
+        gas,
+        nonce,
+        1,
+        1,
+        vec![stellereum::svm::OpCode::SysCallPublishSessionGrant(
+            Box::new(grant.clone()),
+        )],
+    )
+}
+
+/// Build the transaction that carries one or more teleport-bridge intents.
+///
+/// TRANSPORT + NATIVE LEG + POLICY: every intent rides in the payload, so it is
+/// bound into the tx hash and reaches every node through a block. A DEPOSIT is
+/// always built as the pair `[Attest, Deposit]` - `BridgeState::plan` counts the
+/// attestations carried by the SAME transaction as the claim they authorize and
+/// refuses a claim without a 2/3 quorum of the committed relayer set, so a
+/// deposit submitted alone is refused by every block. Settlement then runs the
+/// §8 policy and only moves coins when it passes.
+///
+/// Gas is priced PER OPCODE, so a two-op payload declares two bridge budgets
+/// (still floored by the admission base fee).
+pub(crate) fn build_bridge_intent_tx(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    intents: &[stellereum::bridge::BridgeIntent],
+    nonce: u64,
+) -> Transaction {
+    assert!(
+        !intents.is_empty(),
+        "a bridge transaction always carries at least one intent"
+    );
+    let from = falcon_pq_address(signer);
+    let gas = cli_tx_gas(stellereum::svm::GAS_BRIDGE_INTENT * intents.len() as u64)
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let payload: Vec<stellereum::svm::OpCode> = intents
+        .iter()
+        .map(|i| stellereum::svm::OpCode::SysCallBridge(Box::new(i.clone())))
+        .collect();
+    sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload)
+}
+
+/// Resolve the validator/relayer keys that will attest a deposit claim.
+///
+/// Helpers for `wallet sign` / `wallet verify` (WALLET SIGNATURE STANDARD).
+///
+/// The wallet signs LOCALLY: the key material never leaves this machine and
+/// is never sent to a node. `stell_signMessage` exists for testing/devnet
+/// only; production wallets use these commands (or the library directly).
+///
+/// Parse a 32-byte hex seed (optional `0x` prefix).
+pub(crate) fn parse_wallet_seed(raw: &str, what: &str) -> anyhow::Result<[u8; 32]> {
+    let clean = raw.strip_prefix("0x").unwrap_or(raw);
+    let bytes = hex::decode(clean).map_err(|e| anyhow::anyhow!("Invalid {what} hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|b: Vec<u8>| anyhow::anyhow!("{what} must be 32 bytes, got {} bytes", b.len()))
+}
+
+/// Parse a 32-byte hex address (optional `0x` prefix).
+pub(crate) fn parse_wallet_address(raw: &str) -> anyhow::Result<[u8; 32]> {
+    parse_wallet_seed(raw, "address")
+}
+
+/// Build the wallet signing key the `sign` commands use.
+///
+/// * `ed25519` needs `--from-key`;
+/// * `falcon` needs `--falcon-key-file` (a stored key, preferred) or
+///   `--falcon-seed` (deterministic, dev/test reproducibility);
+/// * `hybrid` needs both halves.
+pub(crate) fn resolve_wallet_signing_key(
+    scheme: &str,
+    from_key: Option<String>,
+    falcon_key_file: Option<PathBuf>,
+    falcon_seed: Option<String>,
+) -> anyhow::Result<stellereum::wallet_signing::WalletSigningKey> {
+    use stellereum::wallet_signing::WalletSigningKey;
+    let load_falcon = || -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
+        if let Some(path) = falcon_key_file.as_ref() {
+            return stellereum::node_keys::load_falcon_key(path)
+                .map_err(|e| anyhow::anyhow!("cannot load falcon key {}: {e}", path.display()));
+        }
+        if let Some(seed_hex) = falcon_seed.as_ref() {
+            let seed = parse_wallet_seed(seed_hex, "falcon seed")?;
+            return Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed));
+        }
+        anyhow::bail!(
+            "scheme '{scheme}' needs a Falcon-512 key: pass --falcon-key-file or --falcon-seed"
+        )
+    };
+    match scheme {
+        "ed25519" => {
+            let raw = from_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheme 'ed25519' needs --from-key"))?;
+            Ok(WalletSigningKey::ed25519(parse_wallet_seed(
+                raw,
+                "private key",
+            )?))
+        }
+        "falcon" => Ok(WalletSigningKey::Falcon {
+            keypair: load_falcon()?,
+        }),
+        "hybrid" => {
+            let raw = from_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheme 'hybrid' needs --from-key"))?;
+            Ok(WalletSigningKey::Hybrid {
+                ed_seed: parse_wallet_seed(raw, "private key")?,
+                falcon: load_falcon()?,
+            })
+        }
+        other => anyhow::bail!("unknown scheme '{other}': expected ed25519, falcon or hybrid"),
+    }
+}
+
+/// Parse the structured typed-data fields the `sign-typed-data` /
+/// `verify-typed-data` commands take.
+pub(crate) fn parse_wallet_typed_data(
+    contract: &str,
+    method: &str,
+    args: Option<&str>,
+    value: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> anyhow::Result<stellereum::wallet_signing::TypedCallData> {
+    let contract_bytes = parse_wallet_seed(contract, "contract address")?;
+    let args_value = match args {
+        None => serde_json::Value::Null,
+        Some(raw) => {
+            serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("Invalid --args JSON: {e}"))?
+        }
+    };
+    stellereum::wallet_signing::TypedCallData::new(
+        &contract_bytes,
+        method,
+        args_value,
+        value,
+        nonce,
+        chain_id,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The quorum is counted at settlement against the COMMITTED staking set, so
+/// only seeds whose public key is a bonded validator actually count. What the
+/// CLI can offer is what the operator has on this machine:
+///
+///  * every `--attest-key` (32-byte hex seed, repeatable) - explicit wins;
+///  * otherwise the local stand's node key at `<keys_dir>/identity.key`, the
+///    very key `run` loads and `fund_genesis` bonds (a solo/dev stand has one
+///    bonded validator, so `(1*2+2)/3 = 1` - that one signature IS the quorum).
+///
+/// FAILS LOUD instead of submitting an unattested claim: under §8 policy every
+/// block refuses one, so a "successful" submission would be a deposit that
+/// never credits and only fails later, where the operator cannot see why.
+pub(crate) struct AttestKey {
+    pub(crate) validator_id: [u8; 32],
+    pub(crate) falcon: stellereum::post_quantum::FalconKeypair,
+}
+
+impl std::fmt::Debug for AttestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttestKey")
+            .field("validator_id", &hex::encode(self.validator_id))
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) fn resolve_attest_keys(
+    explicit: &[String],
+    keys_dir: &std::path::Path,
+) -> anyhow::Result<Vec<AttestKey>> {
+    let mut keys: Vec<AttestKey> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in explicit {
+        let clean = raw.strip_prefix("0x").unwrap_or(raw);
+        let bytes =
+            hex::decode(clean).map_err(|e| anyhow::anyhow!("invalid --attest-key hex: {e}"))?;
+        let seed: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
+            anyhow::anyhow!(
+                "--attest-key must be a 32-byte hex seed, got {} bytes",
+                b.len()
+            )
+        })?;
+        let seed = zeroize::Zeroizing::new(seed);
+        let k = SigningKey::from_bytes(&seed);
+        let validator_id = k.verifying_key().to_bytes();
+        if seen.insert(validator_id) {
+            let falcon = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+            keys.push(AttestKey {
+                validator_id,
+                falcon,
+            });
+        }
+    }
+
+    let mut default_err: Option<String> = None;
+    if keys.is_empty() && keys_dir.join("identity.key").exists() {
+        match stellereum::node_keys::load_node_keys(keys_dir) {
+            Ok(node_keys) => {
+                let validator_id = node_keys.signing.verifying_key().to_bytes();
+                let falcon_path = keys_dir.join("falcon.key");
+                let falcon_res = if falcon_path.exists() {
+                    stellereum::node_keys::load_falcon_key(&falcon_path)
+                        .map_err(|e| format!("falcon key at {}: {e}", falcon_path.display()))
+                } else {
+                    let seed = zeroize::Zeroizing::new(node_keys.signing.to_bytes());
+                    Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed))
+                };
+                match falcon_res {
+                    Ok(falcon) => keys.push(AttestKey {
+                        validator_id,
+                        falcon,
+                    }),
+                    Err(e) => default_err = Some(e),
+                }
+            }
+            Err(e) => default_err = Some(format!("identity key at {}: {e}", keys_dir.display())),
+        }
+    }
+
+    if keys.is_empty() {
+        let hint = default_err.map(|e| format!(" ({e})")).unwrap_or_default();
+        anyhow::bail!(
+            "no attestation key available{hint}: pass --attest-key <hex seed> once per bonded \
+             validator you hold - a deposit without a 2/3 quorum of the committed relayer set \
+             is refused by every block"
+        );
+    }
+    Ok(keys)
+}
+
+/// Assemble the `BridgeIntent::Attest` bundle that authorizes `deposit`.
+///
+/// The signers cover `TeleportBridgeEngine::deposit_signing_message` of the
+/// deposit - the exact message `BridgeState::plan` verifies at settlement,
+/// against the committed staking set, counting DISTINCT validators. Duplicated
+/// seeds are collapsed: the quorum counts validators, not signatures.
+pub(crate) fn attest_for(
+    deposit: &stellereum::bridge::BridgeIntent,
+    keys: &[AttestKey],
+) -> anyhow::Result<stellereum::bridge::BridgeIntent> {
+    let source_tx_hash = match deposit {
+        stellereum::bridge::BridgeIntent::Deposit { source_tx_hash, .. } => *source_tx_hash,
+        other => anyhow::bail!("attestations only pair with a deposit intent, not {other:?}"),
+    };
+    if keys.is_empty() {
+        anyhow::bail!("an attestation bundle must carry at least one signature");
+    }
+    let event = deposit
+        .deposit_event(Vec::new())
+        .expect("a Deposit always yields its event");
+    let msg = TeleportBridgeEngine::deposit_signing_message(&event);
+    let mut seen = std::collections::HashSet::new();
+    let mut signatures = Vec::with_capacity(keys.len());
+    for k in keys {
+        if seen.insert(k.validator_id) {
+            let sig = k.falcon.sign(&msg);
+            if sig.len() != stellereum::post_quantum::FALCON512_SIG_LEN {
+                anyhow::bail!(
+                    "Falcon-512 attestation signature failed closed (got {} bytes)",
+                    sig.len()
+                );
+            }
+            signatures.push((k.validator_id, sig));
+        }
+    }
+    Ok(stellereum::bridge::BridgeIntent::Attest {
+        source_tx_hash,
+        signatures,
+    })
+}
+
+/// Query a node for an account's nonce, so consecutive CLI submissions do not
+/// replay each other. The address is the PUBLIC key - querying with the seed
+/// silently returns a fresh account every time.
+pub(crate) fn rpc_account_nonce(rpc: &str, account: &[u8; 32]) -> anyhow::Result<u64> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "stell_getBalance",
+        "params": { "address": hex::encode(account) }
+    })
+    .to_string();
+    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    if let Some(e) = resp.get("error") {
+        anyhow::bail!("RPC error: {e}");
+    }
+    resp["result"]
+        .get("nonce")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("node did not return an account nonce"))
+}
+
+/// Submit a signed transaction to a node's mempool.
+///
+/// This is only admission: the node verifies the signature and the balance and
+/// gossips it, and the transaction becomes state when a proposer includes it
+/// in a block. Nothing is written by this call.
+pub(crate) fn rpc_submit_tx(
+    rpc: &str,
+    method: &str,
+    tx: &Transaction,
+    token: Option<&str>,
+) -> anyhow::Result<String> {
+    let raw = hex::encode(bincode::serialize(tx)?);
+    let mut params = serde_json::json!({ "tx": raw });
+    if let Some(t) = token {
+        params["token"] = serde_json::json!(t);
+    }
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+    })
+    .to_string();
+    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    if let Some(e) = resp.get("error") {
+        anyhow::bail!("rejected by node: {e}");
+    }
+    Ok(resp["result"].as_str().unwrap_or("?").to_string())
+}
+
+/// Parse a `--chain` / `--target-chain` string into the bridge's own enum, so
+/// a typo is refused here instead of silently becoming some other chain.
+pub(crate) fn parse_supported_chain(
+    raw: &str,
+) -> anyhow::Result<stellereum::bridge::SupportedChain> {
+    use stellereum::bridge::SupportedChain;
+    Ok(match raw.to_lowercase().as_str() {
+        "ton" => SupportedChain::Ton,
+        "arbitrum" => SupportedChain::Arbitrum,
+        "ethereum" | "eth" => SupportedChain::Ethereum,
+        "solana" => SupportedChain::Solana,
+        other => anyhow::bail!("unknown chain {other:?} (expected ton|arbitrum|ethereum|solana)"),
+    })
+}
+
+/// Resolve the sender nonce: an explicit `--nonce`, or the account's current
+/// on-chain nonce from the node.
+pub(crate) fn resolve_nonce(
+    rpc: &str,
+    account: &[u8; 32],
+    nonce: Option<u64>,
+) -> anyhow::Result<u64> {
+    match nonce {
+        Some(n) => Ok(n),
+        None => rpc_account_nonce(rpc, account),
+    }
+}

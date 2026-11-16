@@ -493,7 +493,14 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
     // 3 of 4 validators precommit; validator #4 is partitioned and does not.
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
         node_a
-            .on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(block_hash)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(block_hash),
+            ))
             .unwrap();
     }
     let cert = {
@@ -508,8 +515,7 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
             )
             .expect("genuine vote admits");
         }
-        cset
-            .certificate(Some(block_hash), &vset, &[0u8; 32])
+        cset.certificate(Some(block_hash), &vset, &[0u8; 32])
             .expect("3-of-4 reaches quorum")
     };
     assert!(
@@ -558,8 +564,15 @@ async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
     // validators signing is enough, and we simply never deliver the block.
     let phantom = blake3::hash(b"attacker-chosen-block-contents").into();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
-        rt.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(phantom)))
-            .unwrap();
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(phantom),
+        ))
+        .unwrap();
     }
     assert!(
         !rt.blocks.contains_key(&phantom),
@@ -625,16 +638,30 @@ fn hunt7_peer_messages_cannot_drag_the_round_counter_past_the_network() {
     hc.advance_to_round(honest_round);
     hc.receive_proposal(honest, bh(2)).unwrap();
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        hc.add_prevote(falcon_votes::fvote(k, fk, 1, honest_round, VoteKind::Prevote, Some(bh(2))))
-            .unwrap();
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            honest_round,
+            VoteKind::Prevote,
+            Some(bh(2)),
+        ))
+        .unwrap();
     }
     assert!(
         hc.try_prevote_quorum().is_some(),
         "a real 4/4 prevote quorum at our own round is still visible"
     );
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        hc.add_precommit(falcon_votes::fvote(k, fk, 1, honest_round, VoteKind::Precommit, Some(bh(2))))
-            .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            honest_round,
+            VoteKind::Precommit,
+            Some(bh(2)),
+        ))
+        .unwrap();
     }
     assert!(
         hc.try_precommit_quorum().is_some(),
@@ -819,7 +846,14 @@ fn hunt9_zero_power_quorum_guard_cannot_be_bypassed() {
     for (k, fk) in ks.iter().zip(fks.iter()) {
         // Nobody is a validator, so every vote is rejected as non-validator.
         assert!(hc
-            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh(1))))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh(1))
+            ))
             .is_err());
     }
     assert_eq!(hc.try_prevote_quorum(), None);

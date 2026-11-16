@@ -44,9 +44,20 @@ function isHex64(s: string): boolean {
   return /^[0-9a-fA-F]{64}$/.test(v);
 }
 
+function isStl57(s: string): boolean {
+  const v = s.trim();
+  return /^Stl57[1-9A-HJ-NP-Za-km-z]{38,60}$/.test(v);
+}
+
+function isValidAddress(s: string): boolean {
+  return isHex64(s) || isStl57(s);
+}
+
 function norm(s: string): string {
-  const v = s.trim().toLowerCase();
-  return v.startsWith('0x') ? v.slice(2) : v;
+  const v = s.trim();
+  if (isStl57(v)) return v;
+  const lower = v.toLowerCase();
+  return lower.startsWith('0x') ? lower.slice(2) : lower;
 }
 
 app.get('/status', (_req, res) => {
@@ -69,8 +80,8 @@ app.get('/healthz', async (_req, res) => {
 
 app.post('/drip', async (req, res) => {
   const address = String(req.body?.address || '').trim();
-  if (!isHex64(address)) {
-    res.status(400).json({ ok: false, message: 'Invalid address. Enter 64 hexadecimal characters (0-9, a-f).' });
+  if (!isValidAddress(address)) {
+    res.status(400).json({ ok: false, message: 'Invalid address. Enter 64 hex chars or an Stl57... address.' });
     return;
   }
   const ip = String(req.ip || req.socket.remoteAddress || 'unknown');

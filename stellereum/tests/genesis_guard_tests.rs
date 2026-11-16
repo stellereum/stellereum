@@ -30,10 +30,7 @@ fn shard_message_contains_both_roots_names_shard_and_hints() {
         msg.contains("STELL_FAUCET_KEY"),
         "must name the faucet key suspect: {msg}"
     );
-    assert!(
-        msg.contains("./data"),
-        "must name the wipe path: {msg}"
-    );
+    assert!(msg.contains("./data"), "must name the wipe path: {msg}");
 }
 
 #[test]

@@ -115,13 +115,25 @@ fn e4_oversize_signal_rejected_at_propose_time() {
     let (mut l, a, _, _) = ledger_29k();
     let mut g = Governance::new();
     assert_eq!(
-        g.propose(&mut l, a, "t".into(), GovAction::Signal("s".repeat(1025)), 0),
+        g.propose(
+            &mut l,
+            a,
+            "t".into(),
+            GovAction::Signal("s".repeat(1025)),
+            0
+        ),
         Err(GovError::InvalidAction),
         "E4: 1025B signal must be refused"
     );
     assert!(
-        g.propose(&mut l, a, "t".into(), GovAction::Signal("s".repeat(1024)), 0)
-            .is_ok(),
+        g.propose(
+            &mut l,
+            a,
+            "t".into(),
+            GovAction::Signal("s".repeat(1024)),
+            0
+        )
+        .is_ok(),
         "E4: 1024B signal must be accepted"
     );
 }

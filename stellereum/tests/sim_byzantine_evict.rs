@@ -67,9 +67,17 @@ async fn equivocating_proposer_cannot_fork_the_chain() {
         report.ticks,
         report.best_height,
         report.common_height,
-        report.nodes.iter().map(|n| n.decide_rounds.clone()).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.clone())
+            .collect::<Vec<_>>(),
         refused,
-        report.nodes.iter().map(|n| n.proposals_refused).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.proposals_refused)
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
 
@@ -80,7 +88,8 @@ async fn equivocating_proposer_cannot_fork_the_chain() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -95,7 +104,8 @@ async fn equivocating_proposer_cannot_fork_the_chain() {
     // The equivocator itself stays on the same chain (it votes honestly;
     // only its proposals equivocate), so it finalizes with everyone else.
     assert_eq!(
-        report.nodes[EVIL].finalized_height, report.best_height,
+        report.nodes[EVIL].finalized_height,
+        report.best_height,
         "the equivocating proposer must still finalize the decided chain.\n{}",
         report.diagnostics()
     );

@@ -274,7 +274,7 @@ fn f2_push_policy_classes() {
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
-        persist_push_policy(&        PersistJob::Domains {
+        persist_push_policy(&PersistJob::Domains {
             height: 1,
             bytes: vec![],
             session_keys: vec![],
@@ -471,12 +471,23 @@ async fn domain_upgrade_current_roundtrips_garbage_fails() {
 #[test]
 fn bond_genesis_callers_only_fund_genesis() {
     let srcdir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut calls: Vec<(String, usize, String)> = Vec::new();
-    for entry in std::fs::read_dir(&srcdir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("tests") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
         }
+    }
+    let mut rs_files = Vec::new();
+    collect_rs_files(&srcdir, &mut rs_files);
+    let mut calls: Vec<(std::path::PathBuf, usize, String)> = Vec::new();
+    for path in rs_files {
         let text = std::fs::read_to_string(&path).unwrap();
         for (i, line) in text.lines().enumerate() {
             if !line.contains("bond_genesis(") {
@@ -491,7 +502,7 @@ fn bond_genesis_callers_only_fund_genesis() {
                 continue;
             }
             calls.push((
-                path.file_name().unwrap().to_string_lossy().into_owned(),
+                path.strip_prefix(&srcdir).unwrap().to_path_buf(),
                 i + 1,
                 line.trim().to_owned(),
             ));
@@ -503,11 +514,12 @@ fn bond_genesis_callers_only_fund_genesis() {
         "exactly one bond_genesis call site may exist (fund_genesis): {calls:?}"
     );
     assert_eq!(
-        calls[0].0, "runtime.rs",
-        "the call must live in runtime.rs: {calls:?}"
+        calls[0].0,
+        std::path::Path::new("runtime/lanes.rs"),
+        "the call must live in runtime/lanes.rs: {calls:?}"
     );
     // The call must sit inside `fund_genesis`: nearest preceding fn item.
-    let text = std::fs::read_to_string(srcdir.join("runtime.rs")).unwrap();
+    let text = std::fs::read_to_string(srcdir.join(&calls[0].0)).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     let call_line = calls[0].1;
     let mut enclosing = String::new();
@@ -596,9 +608,7 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         InMemoryStateEngine,
         stellereum::state_engine::BlockTransitionOutcome,
     ) {
-        use stellereum::consensus::{
-            register_validator_pq_key, VoteSet,
-        };
+        use stellereum::consensus::{register_validator_pq_key, VoteSet};
         use stellereum::post_quantum::{FalconKeypair, PqScheme};
         let (e, v) = prepared_engine(w_key, w).await;
         // Genuine height-9 QC signed by the witness alone (quorum-alone power,

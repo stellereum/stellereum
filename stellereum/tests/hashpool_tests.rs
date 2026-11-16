@@ -23,15 +23,15 @@
 mod hashpool;
 
 use hashpool::{
-    HashPool, HpError, OutputNote, SpendOpening, coinjoin_apply, coinjoin_build,
-    coinjoin_sig_msg, coinjoin_verify, hp_shake256, note_commit, note_nullifier,
-    stealth_decap, stealth_encap, stealth_scan, HP_CT_LEN, HP_EK_LEN,
+    coinjoin_apply, coinjoin_build, coinjoin_sig_msg, coinjoin_verify, hp_shake256, note_commit,
+    note_nullifier, stealth_decap, stealth_encap, stealth_scan, HashPool, HpError, OutputNote,
+    SpendOpening, HP_CT_LEN, HP_EK_LEN,
 };
 use ml_kem::{
-    MlKem768,
     kem::{FromSeed, KeyExport},
+    MlKem768,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
+use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -75,7 +75,12 @@ fn funded_pool(n: usize) -> (HashPool, Vec<SpendOpening>, Vec<FalconKeypair>) {
         let c = note_commit(CHAIN, DENOM, &blinding, &stealth);
         let nf = note_nullifier(&serial);
         pool.deposit(c, stealth, nf).expect("deposit");
-        openings.push(SpendOpening { serial, value: DENOM, blinding, stealth });
+        openings.push(SpendOpening {
+            serial,
+            value: DENOM,
+            blinding,
+            stealth,
+        });
         keys.push(falcon(0xD0 + i as u8));
     }
     (pool, openings, keys)
@@ -97,7 +102,12 @@ fn sign_canonical(
     in_nfs.sort();
     let mut out_pairs: Vec<([u8; 32], [u8; 32])> = outputs
         .iter()
-        .map(|o| (note_commit(CHAIN, o.value, &o.blinding, &o.stealth), note_nullifier(&o.serial)))
+        .map(|o| {
+            (
+                note_commit(CHAIN, o.value, &o.blinding, &o.stealth),
+                note_nullifier(&o.serial),
+            )
+        })
         .collect();
     out_pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let out_cs: Vec<[u8; 32]> = out_pairs.iter().map(|(c, _)| *c).collect();
@@ -169,8 +179,14 @@ fn stealth_wrong_recipients_excluded() {
     let seeds = [kem_seed(0x11), kem_seed(0x22), kem_seed(0x33)];
     assert_eq!(stealth_scan(&seeds, &bad, index, &addr), None);
     // Malformed inputs are refused outright.
-    assert_eq!(stealth_encap(&[0u8; 100], index, &randomness), Err(HpError::BadEncapsulationKey));
-    assert_eq!(stealth_decap(&kem_seed(0x22), &[0u8; 10], index), Err(HpError::BadCiphertext));
+    assert_eq!(
+        stealth_encap(&[0u8; 100], index, &randomness),
+        Err(HpError::BadEncapsulationKey)
+    );
+    assert_eq!(
+        stealth_decap(&kem_seed(0x22), &[0u8; 10], index),
+        Err(HpError::BadCiphertext)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +260,8 @@ fn tampered_opening_refused() {
     let stealth = [0x02u8; 32];
     let serial = [0x03u8; 32];
     let c = note_commit(CHAIN, DENOM, &blinding, &stealth);
-    pool.deposit(c, stealth, note_nullifier(&serial)).expect("deposit");
+    pool.deposit(c, stealth, note_nullifier(&serial))
+        .expect("deposit");
     // Duplicate registration refused.
     assert_eq!(
         pool.deposit(c, stealth, note_nullifier(&serial)),
@@ -304,7 +321,12 @@ fn batch_happy_4x25_exact_conservation() {
     // Inputs are now spent: note-level re-spend is refused too.
     let first = &batch.inputs[0];
     assert_eq!(
-        pool.spend(&first.commitment, &first.opening.serial, DENOM, &first.opening.blinding),
+        pool.spend(
+            &first.commitment,
+            &first.opening.serial,
+            DENOM,
+            &first.opening.blinding
+        ),
         Err(HpError::AlreadySpent)
     );
     // Non-canonical input order is refused.
@@ -324,14 +346,22 @@ fn batch_unbalanced_refused() {
     let spends = sign_canonical(&openings, &short, 0, &keys);
     assert_eq!(
         coinjoin_build(CHAIN, spends, short, 0),
-        Err(HpError::Unbalanced { sum_in: 100, sum_out: 75, fee: 0 })
+        Err(HpError::Unbalanced {
+            sum_in: 100,
+            sum_out: 75,
+            fee: 0
+        })
     );
     // Fee made explicit: 4x25 in vs 4x25 out with fee 1 does not conserve.
     let outputs = fresh_outputs(4);
     let spends = sign_canonical(&openings, &outputs, 1, &keys);
     assert_eq!(
         coinjoin_build(CHAIN, spends, outputs, 1),
-        Err(HpError::Unbalanced { sum_in: 100, sum_out: 100, fee: 1 })
+        Err(HpError::Unbalanced {
+            sum_in: 100,
+            sum_out: 100,
+            fee: 1
+        })
     );
 }
 
@@ -346,7 +376,10 @@ fn batch_one_bad_sig_refused() {
     // Flip one byte of one signature: refused.
     spends[2].2[10] ^= 0x01;
     let bad = coinjoin_build(CHAIN, spends, outputs, 0).expect("build");
-    assert_eq!(coinjoin_verify(&pool, &bad, &falcon_verify), Err(HpError::BadSignature));
+    assert_eq!(
+        coinjoin_verify(&pool, &bad, &falcon_verify),
+        Err(HpError::BadSignature)
+    );
 }
 
 #[test]
@@ -402,7 +435,8 @@ fn domain_separation_commit_vs_nullifier() {
         let stealth = [0x02u8; 32];
         let serial = [0x03u8; 32];
         let cc = note_commit(CHAIN, DENOM, &blinding, &stealth);
-        pool.deposit(cc, stealth, note_nullifier(&serial)).expect("deposit");
+        pool.deposit(cc, stealth, note_nullifier(&serial))
+            .expect("deposit");
         assert_ne!(note_nullifier(&cc), note_nullifier(&serial));
         assert_eq!(
             pool.spend(&cc, &cc, DENOM, &blinding),
@@ -410,7 +444,14 @@ fn domain_separation_commit_vs_nullifier() {
         );
     }
     // The batch sig-message domain is distinct from note domains.
-    let msg = coinjoin_sig_msg(CHAIN, &[[0x11u8; 32]], &[[0x22u8; 32]], &[[0x33u8; 32]], &[[0x44u8; 32]], 0);
+    let msg = coinjoin_sig_msg(
+        CHAIN,
+        &[[0x11u8; 32]],
+        &[[0x22u8; 32]],
+        &[[0x33u8; 32]],
+        &[[0x44u8; 32]],
+        0,
+    );
     assert_ne!(msg, note_commit(CHAIN, DENOM, &[0x11u8; 32], &[0x33u8; 32]));
     assert_ne!(msg, note_nullifier(&[0x11u8; 32]));
 }

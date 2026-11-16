@@ -163,7 +163,12 @@ fn profiles() -> Vec<NodeProfile> {
 
 /// Finalized head of one node, read directly (cheap per-tick probe).
 fn finalized_of(cluster: &ConsensusCluster, index: usize) -> u64 {
-    cluster.runtime(index).finalized.last().map(|(h, _)| *h).unwrap_or(0)
+    cluster
+        .runtime(index)
+        .finalized
+        .last()
+        .map(|(h, _)| *h)
+        .unwrap_or(0)
 }
 
 /// Retained vote-set rounds of one node, counted directly from the production
@@ -390,12 +395,7 @@ async fn run_horizon_once() -> HorizonOutcome {
                     "outage must stall finalization (best {stall_best_at_kill} -> {now_best}); \
                      the quorum is lost, so continued progress would mean the kill did not take"
                 );
-                assert_breaker_hold_stalled(
-                    &c,
-                    "stall",
-                    &kill_heads,
-                    OUTAGE_MS / 1000,
-                );
+                assert_breaker_hold_stalled(&c, "stall", &kill_heads, OUTAGE_MS / 1000);
             }
         }
         // Engagement watch: track the survivor's progress and first fire.
@@ -440,7 +440,10 @@ async fn run_horizon_once() -> HorizonOutcome {
             let h3 = finalized_of(&c, 3);
             if h0 == h1 && h1 == h2 && h2 == h3 {
                 let rep = c.report().await;
-                if KILL_PAIR.iter().all(|i| rep.nodes[*i].prevotes_cast > heal_votes_snapshot[*i]) {
+                if KILL_PAIR
+                    .iter()
+                    .all(|i| rep.nodes[*i].prevotes_cast > heal_votes_snapshot[*i])
+                {
                     heal_latencies_ms.push(c.now_ms() - heal_tick);
                     heal_tick = 0;
                 }
@@ -658,8 +661,8 @@ async fn horizon_soak_advances_finals_bounds_resources_and_replays() {
     // per stall second (quorum-starved rounds turn without deciding).
     let total_view_changes: u64 = report.nodes.iter().map(|n| n.view_changes).sum();
     let stall_secs = (OUTAGE_MS / 1000 * KILL_AT.len() as u64) as f64;
-    let vc_budget =
-        MAX_VIEW_CHANGES_PER_HEIGHT * report.best_height.max(1) as f64 + MAX_STALL_VC_PER_SEC * stall_secs;
+    let vc_budget = MAX_VIEW_CHANGES_PER_HEIGHT * report.best_height.max(1) as f64
+        + MAX_STALL_VC_PER_SEC * stall_secs;
     assert!(
         total_view_changes as f64 <= vc_budget,
         "view changes {} exceed budget {vc_budget:.0} \

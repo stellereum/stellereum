@@ -1,27 +1,55 @@
-//! Batch Ed25519 verification tests for transactions.
+//! Batch Falcon-512 verification tests for transactions.
 //! Batch verify must accept all-valid sets and reject if ANY signature is bad
 //! (same security guarantee as one-by-one verification, but faster).
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::post_quantum::{FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN};
 use stellereum::sharding::Transaction;
 
-fn tx(sk: &SigningKey, n: u64) -> Transaction {
-    Transaction::sign(sk, [9u8; 32], 10, n, n, 1, 1)
+fn pq_tx(fk: &FalconKeypair, n: u64) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [9u8; 32],
+        10,
+        n,
+        n,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        sig,
+        [9u8; 32],
+        10,
+        n,
+        n,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
 }
 #[test]
 fn batch_accepts_all_valid() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let txs: Vec<Transaction> = (0..100).map(|i| tx(&sk, i)).collect();
+    let sk = FalconKeypair::generate_from_seed(1);
+    let txs: Vec<Transaction> = (0..100).map(|i| pq_tx(&sk, i)).collect();
     assert!(Transaction::verify_signatures_batch(&txs));
 }
 
 #[test]
 fn batch_rejects_if_any_invalid() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mut txs: Vec<Transaction> = (0..50).map(|i| tx(&sk, i)).collect();
+    let sk = FalconKeypair::generate_from_seed(2);
+    let mut txs: Vec<Transaction> = (0..50).map(|i| pq_tx(&sk, i)).collect();
     // tamper one signature
-    txs[17].signature[0] ^= 0xFF;
+    let last = txs[17].signature.len() - 1;
+    txs[17].signature[last] ^= 0xFF;
     assert!(
         !Transaction::verify_signatures_batch(&txs),
         "batch must reject a bad signature"
@@ -30,10 +58,11 @@ fn batch_rejects_if_any_invalid() {
 
 #[test]
 fn batch_matches_single_verification() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let txs: Vec<Transaction> = (0..64).map(|i| tx(&sk, i)).collect();
+    let sk = FalconKeypair::generate_from_seed(3);
+    let txs: Vec<Transaction> = (0..64).map(|i| pq_tx(&sk, i)).collect();
     let single_all = txs.iter().all(|t| t.verify_signature());
     let batch = Transaction::verify_signatures_batch(&txs);
+    assert!(batch);
     assert_eq!(single_all, batch);
 
     // tamper amount (signature no longer matches) -> both must be false
@@ -53,12 +82,13 @@ fn batch_mixed_keys() {
     // Transactions from many different senders must each verify.
     let mut txs = Vec::new();
     for i in 0..40u64 {
-        let sk = SigningKey::generate(&mut OsRng);
-        txs.push(Transaction::sign(&sk, [1u8; 32], i, i, i, 1, 1));
+        let sk = FalconKeypair::generate_from_seed(10 + i as u8);
+        txs.push(pq_tx(&sk, i));
     }
     assert!(Transaction::verify_signatures_batch(&txs));
     // corrupt one
-    txs[3].signature[10] ^= 0x01;
+    let last = txs[3].signature.len() - 1;
+    txs[3].signature[last] ^= 0x01;
     assert!(!Transaction::verify_signatures_batch(&txs));
 }
 
@@ -80,9 +110,10 @@ fn det_rng() -> StdRng {
 
 #[test]
 fn partitioned_keeps_good_txs_with_one_forgery() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mut txs: Vec<Transaction> = (0..50).map(|i| tx(&sk, i)).collect();
-    txs[17].signature[0] ^= 0xFF;
+    let sk = FalconKeypair::generate_from_seed(4);
+    let mut txs: Vec<Transaction> = (0..50).map(|i| pq_tx(&sk, i)).collect();
+    let last = txs[17].signature.len() - 1;
+    txs[17].signature[last] ^= 0xFF;
     // All-or-nothing batch still fails closed...
     assert!(!Transaction::verify_signatures_batch(&txs));
     // ...but the partitioned form identifies exactly the offender.
@@ -92,7 +123,7 @@ fn partitioned_keeps_good_txs_with_one_forgery() {
         assert_eq!(*f, i != 17, "only index 17 is forged");
     }
     // And the all-valid set partitions to all-true.
-    let good: Vec<Transaction> = (0..50).map(|i| tx(&sk, i + 1000)).collect();
+    let good: Vec<Transaction> = (0..50).map(|i| pq_tx(&sk, i + 1000)).collect();
     assert!(Transaction::verify_signatures_partitioned(&good)
         .iter()
         .all(|b| *b));
@@ -109,13 +140,13 @@ fn partitioned_matches_scalar_differential_randomized() {
         for i in 0..n {
             // Mix of shared-sender and fresh-sender txs.
             let sk = if rng.next_u32().is_multiple_of(2) {
-                SigningKey::from_bytes(&[round as u8; 32])
+                FalconKeypair::generate_from_seed(round as u8)
             } else {
                 let mut b = [0u8; 32];
                 rng.fill_bytes(&mut b);
-                SigningKey::from_bytes(&b)
+                FalconKeypair::generate_from_seed_bytes(&b)
             };
-            let mut t = Transaction::sign(&sk, [1u8; 32], i as u64, i as u64, i as u64, 1, 1);
+            let mut t = pq_tx(&sk, i as u64);
             // Corrupt ~1/4 of items: signature bytes, amount (detached sig),
             // or sender (wrong key).
             match rng.next_u32() % 4 {
@@ -161,21 +192,31 @@ fn partitioned_matches_scalar_differential_randomized() {
 fn partitioned_mixed_session_and_legacy() {
     use stellereum::zkml::{SessionKeyAuthorization, SCOPE_TRANSFER};
     const CHAIN_ID: u64 = 5757;
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng);
-    let grant = SessionKeyAuthorization::sign_delegation(
+    let master = FalconKeypair::generate_from_seed(0x81);
+    let session = FalconKeypair::generate_from_seed(0x82);
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        session.public_key(),
         u64::MAX,
         1_000_000,
         SCOPE_TRANSFER,
         1_000_000,
         CHAIN_ID,
     );
-    let stx =
-        Transaction::sign_with_session(&session, grant, [1u8; 32], 10, 100, 0, 1, 1, Vec::new());
+    let stx = Transaction::sign_with_session_falcon512(
+        &session,
+        grant,
+        [1u8; 32],
+        10,
+        100,
+        0,
+        1,
+        1,
+        Vec::new(),
+    );
     assert!(stx.verify_signature());
-    let mut txs = vec![tx(&master, 0), stx, tx(&master, 1)];
+    let mut txs = vec![pq_tx(&master, 0), stx, pq_tx(&master, 1)];
     assert!(Transaction::verify_signatures_batch(&txs));
     assert!(Transaction::verify_signatures_partitioned(&txs)
         .iter()

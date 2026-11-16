@@ -71,11 +71,14 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 async fn ping_ok(from: &Arc<Node>, pid: [u8; NODEID_LEN]) -> bool {
-    tokio::time::timeout(Duration::from_secs(15), from.request_to(pid, "core.ping", vec![]))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .is_some()
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        from.request_to(pid, "core.ping", vec![]),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .is_some()
 }
 
 fn resp_text(resp: &[u8]) -> String {
@@ -99,7 +102,8 @@ async fn audit_handshake_flood_is_bounded() {
     // rate-limit refusals, not hangs, errors, or an outage.
     let a = Node::new(
         cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
-        ka.clone(), pa.clone(),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -107,7 +111,8 @@ async fn audit_handshake_flood_is_bounded() {
     .expect("node A");
     let b = Node::new(
         cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 10, vec![])], false),
-        kb.clone(), pb.clone(),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -177,7 +182,8 @@ async fn audit_oversized_messages_refused() {
     let pb = PqKeys::generate();
     let a = Node::new(
         cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
-        ka.clone(), pa.clone(),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -185,7 +191,8 @@ async fn audit_oversized_messages_refused() {
     .expect("node A");
     let b = Node::new(
         cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 0, vec![])], false),
-        kb.clone(), pb.clone(),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -271,10 +278,13 @@ async fn audit_oversized_messages_refused() {
     let p = serde_json::json!({ "topic": "audit", "data": "d".repeat(2 * 1024 * 1024) })
         .to_string()
         .into_bytes();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "pubsub.publish", p))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.request_to(b_id, "pubsub.publish", p),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     assert!(
         resp_text(&r).contains("data too large"),
         "oversized publish refused"
@@ -350,8 +360,8 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 }
 
 async fn raw_connect(addr: SocketAddr) -> quinn::Connection {
-    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
-        .expect("client endpoint");
+    let mut ep =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
     let rc = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -373,21 +383,27 @@ async fn raw_connect(addr: SocketAddr) -> quinn::Connection {
 
 /// None = refused (connection closed / timeout / non-AUTH). Some = accepted.
 async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
-    let (mut send, mut recv) =
-        tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
-            .await
-            .ok()?
-            .ok()?;
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .ok()?
+        .ok()?;
     send.write_all(wire).await.ok()?;
     let _ = send.finish();
     let bytes = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(65536))
         .await
         .ok()?
         .ok()?;
-    Frame::decode(&bytes).ok().filter(|f| f.kind == proto::kind::AUTH)
+    Frame::decode(&bytes)
+        .ok()
+        .filter(|f| f.kind == proto::kind::AUTH)
 }
 
-fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload_hex: &str, ts: i64) -> Vec<u8> {
+fn challenge_wire(
+    signing: &SigningKey,
+    src: [u8; NODEID_LEN],
+    payload_hex: &str,
+    ts: i64,
+) -> Vec<u8> {
     let mut f = Frame {
         kind: proto::kind::CHALLENGE,
         seq: 1,
@@ -428,7 +444,8 @@ async fn audit_forged_auth_refused() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19824", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -557,7 +574,8 @@ async fn audit_dht_poison_refused() {
     // B believes A stores files only: mail writes from A must be denied.
     let a = Node::new(
         cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
-        ka.clone(), pa.clone(),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -565,9 +583,15 @@ async fn audit_dht_poison_refused() {
     .expect("node A");
     let mut b_peer_a = peer_of("A", &ka, &pa, la, 0, vec!["files".to_string()]);
     b_peer_a.allow = vec!["*".to_string()];
-    let b = Node::new(cfg("B", lb, vec![b_peer_a], false), kb.clone(), pb.clone(), tmp.join("b"), PathBuf::new())
-        .await
-        .expect("node B");
+    let b = Node::new(
+        cfg("B", lb, vec![b_peer_a], false),
+        kb.clone(),
+        pb.clone(),
+        tmp.join("b"),
+        PathBuf::new(),
+    )
+    .await
+    .expect("node B");
     let sa = tokio::spawn({
         let n = a.clone();
         async move { n.serve().await }
@@ -630,13 +654,17 @@ async fn audit_dht_poison_refused() {
             "ed_pub": hex::encode(evil.verifying.to_bytes()),
         }
     });
-    let p = serde_json::json!({ "routes": routes }).to_string().into_bytes();
+    let p = serde_json::json!({ "routes": routes })
+        .to_string()
+        .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.update", p))
         .await
         .expect("no hang")
         .expect("transport ok");
     assert!(resp_text(&r).contains("\"ok\":true"), "update answered");
-    let p = serde_json::json!({ "node": poison_id, "ttl": 1 }).to_string().into_bytes();
+    let p = serde_json::json!({ "node": poison_id, "ttl": 1 })
+        .to_string()
+        .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.lookup", p))
         .await
         .expect("no hang")
@@ -659,7 +687,9 @@ async fn audit_dht_poison_refused() {
         );
     }
     assert_eq!(big.len(), 600, "test must actually send 600 routes");
-    let p = serde_json::json!({ "routes": big }).to_string().into_bytes();
+    let p = serde_json::json!({ "routes": big })
+        .to_string()
+        .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.update", p))
         .await
         .expect("no hang")
@@ -710,7 +740,8 @@ async fn audit_pubsub_spam_contained() {
     let pb = PqKeys::generate();
     let a = Node::new(
         cfg("A", la, vec![peer_of("B", &kb, &pb, lb, 0, vec![])], false),
-        ka.clone(), pa.clone(),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -719,7 +750,8 @@ async fn audit_pubsub_spam_contained() {
     // B throttles A to 10/s and also learns A as a DHT peer (discovery-only).
     let b = Node::new(
         cfg("B", lb, vec![peer_of("A", &ka, &pa, la, 10, vec![])], false),
-        kb.clone(), pb.clone(),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -740,10 +772,13 @@ async fn audit_pubsub_spam_contained() {
     let p = serde_json::json!({ "topic": "audit", "data": "x", "ttl": u64::MAX })
         .to_string()
         .into_bytes();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "pubsub.publish", p))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.request_to(b_id, "pubsub.publish", p),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     assert!(
         resp_text(&r).contains("\"ok\":true"),
         "clamped TTL publish answered"
@@ -756,10 +791,13 @@ async fn audit_pubsub_spam_contained() {
         let p = serde_json::json!({ "topic": "audit", "data": format!("spam-{i}") })
             .to_string()
             .into_bytes();
-        let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "pubsub.publish", p))
-            .await
-            .expect("no hang")
-            .expect("transport ok");
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            a.request_to(b_id, "pubsub.publish", p),
+        )
+        .await
+        .expect("no hang")
+        .expect("transport ok");
         let t = resp_text(&r);
         if t.contains("rate limit exceeded") {
             limited += 1;
@@ -778,7 +816,8 @@ async fn audit_pubsub_spam_contained() {
     // no-op and the assertions below would read the static entry.
     let b2 = Node::new(
         cfg("B2", "127.0.0.1:19829", vec![], false),
-        NodeKeys::generate(), PqKeys::generate(),
+        NodeKeys::generate(),
+        PqKeys::generate(),
         tmp.join("b2"),
         PathBuf::new(),
     )

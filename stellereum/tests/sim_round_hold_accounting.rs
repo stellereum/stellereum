@@ -105,7 +105,11 @@ fn build_stacked() -> ConsensusCluster {
 fn build_subsumed() -> ConsensusCluster {
     ConsensusCluster::build(3, accounting_profiles(), SEED, TICK_MS, BASE_MS)
         .with_fast_forward(false)
-        .with_straggler_policy(StragglerPolicy::fixed_subsumed(GRACE_MS, GRACE_MS, FRESHNESS_MS))
+        .with_straggler_policy(StragglerPolicy::fixed_subsumed(
+            GRACE_MS,
+            GRACE_MS,
+            FRESHNESS_MS,
+        ))
 }
 
 /// Shared metrics line (mirrors `sim_proposer_straggler`).
@@ -165,12 +169,14 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
     // fix must never cost a final.
     for (tag, report) in [("stacked", &stacked_report), ("subsumed", &subsumed_report)] {
         assert_eq!(
-            report.common_height, TARGET_HEIGHTS,
+            report.common_height,
+            TARGET_HEIGHTS,
             "[{tag}] must finalize all {TARGET_HEIGHTS} heights.\n{}",
             report.diagnostics()
         );
         assert_eq!(
-            report.best_height, TARGET_HEIGHTS,
+            report.best_height,
+            TARGET_HEIGHTS,
             "[{tag}] no node may trail at the end.\n{}",
             report.diagnostics()
         );
@@ -188,11 +194,14 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
         .enumerate()
     {
         assert_eq!(
-            a.decide_rounds, b.decide_rounds,
+            a.decide_rounds,
+            b.decide_rounds,
             "node {i}: deciding rounds must match exactly \
              (stacked {:?} vs subsumed {:?}).\n{}\n{}",
-            a.decide_rounds, b.decide_rounds,
-            stacked_report.diagnostics(), subsumed_report.diagnostics()
+            a.decide_rounds,
+            b.decide_rounds,
+            stacked_report.diagnostics(),
+            subsumed_report.diagnostics()
         );
     }
     // Both compositions must actually USE the failing rung (otherwise the
@@ -215,7 +224,8 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
     let stacked_changes: u64 = stacked_report.nodes.iter().map(|n| n.view_changes).sum();
     let subsumed_changes: u64 = subsumed_report.nodes.iter().map(|n| n.view_changes).sum();
     assert_eq!(
-        stacked_changes, subsumed_changes,
+        stacked_changes,
+        subsumed_changes,
         "view-change counts must match (same trajectories).\n{}\n{}",
         stacked_report.diagnostics(),
         subsumed_report.diagnostics()
@@ -242,7 +252,8 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
         for n in &report.nodes {
             if n.index < 2 {
                 assert_eq!(
-                    n.sync_jumps, 0,
+                    n.sync_jumps,
+                    0,
                     "[{tag}] fast nodes must never jump (else round-0 exits \
                      are not all deadline timeouts).\n{}",
                     report.diagnostics()
@@ -277,7 +288,11 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
             let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
             hashes.sort();
             hashes.dedup();
-            assert_eq!(hashes.len(), 1, "[{tag}] height {h} must have exactly one decided block");
+            assert_eq!(
+                hashes.len(),
+                1,
+                "[{tag}] height {h} must have exactly one decided block"
+            );
         }
         assert!(
             report.double_votes(&[]).is_empty(),

@@ -27,7 +27,7 @@ mod client;
 mod pq;
 
 use client::LightClient;
-use pq::{generate_sample_keypair, PqScheme, DEFAULT_SALT};
+use pq::{generate_sample_keypair, PqKeyPair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 
 const CHAIN: u64 = 5757;
@@ -118,14 +118,22 @@ fn legacy_pq_builders_stay_unbound_but_verifying() {
 
 #[test]
 fn transaction_chain_parity_between_paths() {
-    // Classical parity (the CLI's ed25519 path) is pinned here at the seam:
-    // bound verifies strictly on its chain only; unbound verifies loosely.
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[0xABu8; 32]);
+    // FULL-PQ: Falcon-512 bound verifies strictly on its chain only; unbound
+    // verifies loosely (refused when `require_chain_id = true`). Classical
+    // Ed25519 is always refused.
+    let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &[0xABu8; 32]);
+    let from = kp.derive_address(&DEFAULT_SALT);
     let to = [0x11u8; 32];
-    let bound = Transaction::sign_with_chain_id(&sk, to, 1, 100_000, 0, 0, 0, CHAIN);
+    let bound = LightClient::build_pq_transfer_tx_bound(&kp, to, 1, 500_000, 0, 0, 0, true, CHAIN);
     assert!(bound.verify_signature_for_chain(CHAIN, true));
     assert!(!bound.verify_signature_for_chain(OTHER_CHAIN, true));
-    let unbound = Transaction::sign(&sk, to, 1, 100_000, 0, 0, 0);
+    let unbound = LightClient::build_pq_transfer_tx(&kp, to, 1, 0, 0, true);
+    assert_eq!(unbound.from, from);
     assert!(unbound.verify_signature());
     assert!(!unbound.verify_signature_for_chain(CHAIN, true));
+
+    // Classical Ed25519 is refused on FULL-PQ.
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0xABu8; 32]);
+    let ed_tx = Transaction::sign_with_chain_id(&sk, to, 1, 100_000, 0, 0, 0, CHAIN);
+    assert!(!ed_tx.verify_signature());
 }

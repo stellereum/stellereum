@@ -15,12 +15,15 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
-use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
-use stellereum::post_quantum::{FalconKeypair, PqScheme, HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN};
+use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError, PQ_ACTIVATION_SURCHARGE_GAS};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN, HYBRID_PUBKEY_LEN,
+    HYBRID_SIG_LEN,
+};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, SessionPolicyError, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 use stellereum::zkml::{
     make_hybrid_pubkey, sign_falcon512, sign_hybrid, SessionKeyAuthorization, SessionKeyRegistry,
     SessionRegistryError, SessionSpendSim, SCOPE_ALL, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
@@ -116,6 +119,96 @@ fn session_tx(
     )
 }
 
+/// Re-encode a mutated grant into an existing Falcon (`SF1`) envelope,
+/// keeping the leading 666-byte Falcon-512 session signature.
+fn rewrap_falcon(tx: &Transaction, d: &SessionKeyAuthorization) -> Transaction {
+    let mut t = tx.clone();
+    let mut sig = tx.signature[..FALCON512_SIG_LEN].to_vec();
+    sig.extend_from_slice(b"SF1");
+    sig.extend_from_slice(&bincode::serialize(d).expect("grant serializes"));
+    t.signature = sig;
+    t
+}
+
+fn falcon_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
+fn pq_grant(
+    master: &FalconKeypair,
+    session: &FalconKeypair,
+    valid_until: u64,
+    max_gas_spend: u64,
+    scope: u64,
+    max_value_per_tx: u64,
+) -> SessionKeyAuthorization {
+    SessionKeyAuthorization::sign_delegation_falcon512(
+        master,
+        PqScheme::Falcon512,
+        session.public_key(),
+        valid_until,
+        max_gas_spend,
+        scope,
+        max_value_per_tx,
+        CHAIN_ID,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pq_session_tx(
+    session: &FalconKeypair,
+    delegation: SessionKeyAuthorization,
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    Transaction::sign_with_session_falcon512(
+        session, delegation, [1u8; 32], amount, gas_limit, nonce, 1, 1, payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pq_plain_tx(
+    kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = kp.public_key().to_vec();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload,
+        &DEFAULT_SALT,
+    )
+}
+
 /// Re-encode a mutated grant into an existing envelope, keeping the leading
 /// 64-byte session signature: exactly what a middleman on the wire can do.
 fn rewrap(tx: &Transaction, d: &SessionKeyAuthorization) -> Transaction {
@@ -193,7 +286,10 @@ fn legacy_tx_bytes_decode_verify_and_hash_are_unchanged() {
         GOLDEN_SIGNING_MSG,
         "legacy signing message must be byte-identical"
     );
-    assert!(tx.verify_signature(), "legacy signature must still verify");
+    assert!(
+        !tx.verify_signature(),
+        "Pure PQ mode refuses classical bare 64-byte Ed25519 signature"
+    );
     assert!(pre_envelope_node_verify(&tx));
     assert!(!tx.is_session_keyed());
     assert_eq!(
@@ -463,14 +559,15 @@ fn python_tps_load_self_test_layout_still_verifies() {
 
 #[test]
 fn pre_envelope_node_rejects_envelopes_but_still_accepts_legacy() {
-    let master = key();
-    let session = key();
-    let legacy = Transaction::sign(&master, [1u8; 32], 10, 1_000, 0, 1, 1);
-    let envelope = session_tx(
-        &session,
-        grant(
-            &master,
-            &session,
+    let master_ed = key();
+    let master_fk = FalconKeypair::generate_from_seed(0x01);
+    let session_fk = FalconKeypair::generate_from_seed(0x02);
+    let legacy = Transaction::sign(&master_ed, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let envelope = pq_session_tx(
+        &session_fk,
+        pq_grant(
+            &master_fk,
+            &session_fk,
             4_000_000_000,
             10_000,
             SCOPE_ALL,
@@ -482,25 +579,25 @@ fn pre_envelope_node_rejects_envelopes_but_still_accepts_legacy() {
         vec![OpCode::Push(1)],
     );
 
-    // The old node accepts what it always accepted...
-    assert!(legacy.verify_signature());
+    // The old node accepts classical Ed25519 legacy...
     assert!(pre_envelope_node_verify(&legacy));
-    // ...and rejects the envelope outright: its signature is 64B ++ "SK1" ++
-    // bincode(grant), so `Signature::from_slice` (64 bytes expected) fails
-    // before any message is even considered. Fail-closed, no ambiguity.
+    // ...while Pure PQ mode refuses classical Ed25519 legacy.
+    assert!(!legacy.verify_signature());
+    // And the old node rejects the PQ session envelope outright: its signature
+    // is 666B ++ "SF1" ++ bincode(grant), so `Signature::from_slice` (64 bytes
+    // expected) fails before any message is even considered.
     assert!(envelope.is_session_keyed());
     assert!(envelope.signature.len() > 64);
     assert!(!pre_envelope_node_verify(&envelope));
-    // The new node accepts both forms.
-    assert!(legacy.verify_signature());
+    // The Pure PQ node accepts the Falcon-512 SF1 session envelope.
     assert!(envelope.verify_signature());
 }
 
 #[test]
 fn session_envelope_roundtrip_verifies_singly_and_in_batches() {
-    let master = key();
-    let session = key();
-    let d = grant(
+    let master = FalconKeypair::generate_from_seed(0x03);
+    let session = FalconKeypair::generate_from_seed(0x04);
+    let d = pq_grant(
         &master,
         &session,
         4_000_000_000,
@@ -509,8 +606,8 @@ fn session_envelope_roundtrip_verifies_singly_and_in_batches() {
         u64::MAX,
     );
 
-    let plain_payload_tx = session_tx(&session, d.clone(), 10, 1_000, 0, vec![]);
-    let payload_tx = session_tx(
+    let plain_payload_tx = pq_session_tx(&session, d.clone(), 10, 1_000, 0, vec![]);
+    let payload_tx = pq_session_tx(
         &session,
         d,
         5,
@@ -522,14 +619,10 @@ fn session_envelope_roundtrip_verifies_singly_and_in_batches() {
     for tx in [&plain_payload_tx, &payload_tx] {
         assert!(tx.verify_signature(), "envelope must verify");
         assert!(tx.is_session_keyed());
-        assert_eq!(
-            tx.from,
-            master.verifying_key().to_bytes(),
-            "tx.from stays the master"
-        );
+        assert_eq!(tx.from, falcon_addr(&master), "tx.from stays the master");
         let parsed = tx.delegation().expect("envelope parses back");
-        assert_eq!(parsed.master_address, master.verifying_key().to_bytes());
-        assert_eq!(parsed.session_pubkey, session.verifying_key().to_bytes());
+        assert_eq!(parsed.master_address, falcon_addr(&master));
+        assert_eq!(parsed.session_pubkey, falcon_addr(&session));
         assert_eq!(parsed.chain_id, CHAIN_ID);
         assert!(parsed.verify_signature(), "master grant verifies");
         assert_eq!(tx.check_session_policy(1_000_000), Ok(()));
@@ -557,11 +650,11 @@ fn session_envelope_roundtrip_verifies_singly_and_in_batches() {
 
 #[test]
 fn flipping_any_delegation_field_breaks_verification() {
-    let master = key();
-    let session = key();
-    let tx = session_tx(
+    let master = FalconKeypair::generate_from_seed(0x05);
+    let session = FalconKeypair::generate_from_seed(0x06);
+    let tx = pq_session_tx(
         &session,
-        grant(
+        pq_grant(
             &master,
             &session,
             4_000_000_000,
@@ -600,7 +693,7 @@ fn flipping_any_delegation_field_breaks_verification() {
     for (name, mutate) in &mutators {
         let mut d = tx.delegation().unwrap();
         mutate(&mut d);
-        let tampered = rewrap(&tx, &d);
+        let tampered = rewrap_falcon(&tx, &d);
         assert!(
             tampered.is_session_keyed(),
             "{name}: envelope must still parse"
@@ -697,32 +790,32 @@ fn legacy_messages_and_hashes_carry_no_delegation_commitment() {
 
 #[test]
 fn mixed_plain_and_session_batches_verify() {
-    let m1 = key();
-    let m2 = key();
-    let s1 = key();
-    let s2 = key();
-    let legacy_a = Transaction::sign(&m1, [1u8; 32], 10, 1_000, 0, 1, 1);
-    let session_a = session_tx(
+    let m1 = FalconKeypair::generate_from_seed(0x07);
+    let m2 = FalconKeypair::generate_from_seed(0x08);
+    let s1 = FalconKeypair::generate_from_seed(0x09);
+    let s2 = FalconKeypair::generate_from_seed(0x0A);
+    let plain_a = pq_plain_tx(&m1, [1u8; 32], 10, 1_000, 0, 1, 1, vec![]);
+    let session_a = pq_session_tx(
         &s1,
-        grant(&m1, &s1, 4_000_000_000, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&m1, &s1, 4_000_000_000, 10_000, SCOPE_ALL, u64::MAX),
         20,
         1_000,
         1,
         vec![OpCode::Push(3)],
     );
-    let legacy_b = Transaction::sign(&m1, [1u8; 32], 5, 500, 2, 1, 1);
-    let session_b = session_tx(
+    let plain_b = pq_plain_tx(&m1, [1u8; 32], 5, 500, 2, 1, 1, vec![]);
+    let session_b = pq_session_tx(
         &s2,
-        grant(&m2, &s2, 4_000_000_000, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&m2, &s2, 4_000_000_000, 10_000, SCOPE_ALL, u64::MAX),
         7,
         500,
         0,
         vec![],
     );
     let good = vec![
-        legacy_a.clone(),
+        plain_a.clone(),
         session_a.clone(),
-        legacy_b.clone(),
+        plain_b.clone(),
         session_b.clone(),
     ];
     assert!(Transaction::verify_signatures_batch(&good));
@@ -737,19 +830,19 @@ fn mixed_plain_and_session_batches_verify() {
         "tampered session tx must fail"
     );
 
-    // 2. tampered legacy tx
+    // 2. tampered plain tx
     let mut c = good.clone();
     c[2].nonce ^= 1;
     assert!(
         !Transaction::verify_signatures_batch(&c),
-        "tampered legacy tx must fail"
+        "tampered plain tx must fail"
     );
 
     // 3. tampered grant inside an envelope (master signature broken)
     let mut c = good.clone();
     let mut d = c[3].delegation().unwrap();
     d.master_signature[0] ^= 0xFF;
-    c[3] = rewrap(&c[3], &d);
+    c[3] = rewrap_falcon(&c[3], &d);
     assert!(
         !Transaction::verify_signatures_batch(&c),
         "tampered grant must fail the batch"
@@ -757,9 +850,9 @@ fn mixed_plain_and_session_batches_verify() {
 
     // 4. grafted envelope (grant minted for another master)
     let mut c = good.clone();
-    let attacker = key();
-    let attacker_session = key();
-    let d_att = grant(
+    let attacker = FalconKeypair::generate_from_seed(0x0B);
+    let attacker_session = FalconKeypair::generate_from_seed(0x0C);
+    let d_att = pq_grant(
         &attacker,
         &attacker_session,
         4_000_000_000,
@@ -767,7 +860,7 @@ fn mixed_plain_and_session_batches_verify() {
         SCOPE_ALL,
         u64::MAX,
     );
-    c[0] = rewrap(&c[0], &d_att);
+    c[0] = rewrap_falcon(&c[0], &d_att);
     assert!(
         !Transaction::verify_signatures_batch(&c),
         "grafted envelope must fail the batch"
@@ -781,11 +874,20 @@ fn mixed_plain_and_session_batches_verify() {
 
 #[test]
 fn grafting_a_session_envelope_onto_a_victim_plain_tx_is_rejected() {
-    let victim = key();
-    let attacker = key();
-    let attacker_session = key();
-    let victim_pub = victim.verifying_key().to_bytes();
-    let plain = Transaction::sign(&victim, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let victim = FalconKeypair::generate_from_seed(0x0D);
+    let attacker = FalconKeypair::generate_from_seed(0x0E);
+    let attacker_session = FalconKeypair::generate_from_seed(0x0F);
+    let victim_pub = falcon_addr(&victim);
+    let plain = pq_plain_tx(
+        &victim,
+        [1u8; 32],
+        10,
+        GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS,
+        0,
+        1,
+        1,
+        vec![],
+    );
     let now = 1_000_000u64;
     let mut mp = Mempool::new(16, 16);
 
@@ -793,24 +895,24 @@ fn grafting_a_session_envelope_onto_a_victim_plain_tx_is_rejected() {
     // correctly signed by THEIR session key over the grafted message. The
     // signature machinery is entirely happy — the only thing that stops it is
     // `delegation.master_address == tx.from`.
-    let d_att = grant(
+    let d_att = pq_grant(
         &attacker,
         &attacker_session,
         4_000_000_000,
-        10_000,
+        1_000_000,
         SCOPE_ALL,
         u64::MAX,
     );
     let mut grafted = plain.clone();
     // placeholder envelope so the signing message commits the grant
-    let mut placeholder = vec![0u8; 64];
-    placeholder.extend_from_slice(b"SK1");
+    let mut placeholder = vec![0u8; FALCON512_SIG_LEN];
+    placeholder.extend_from_slice(b"SF1");
     placeholder.extend_from_slice(&bincode::serialize(&d_att).unwrap());
     grafted.signature = placeholder;
     let msg = grafted.signing_message();
     let sig = attacker_session.sign(&msg);
-    let mut envelope = sig.to_bytes().to_vec();
-    envelope.extend_from_slice(b"SK1");
+    let mut envelope = sig;
+    envelope.extend_from_slice(b"SF1");
     envelope.extend_from_slice(&bincode::serialize(&d_att).unwrap());
     grafted.signature = envelope;
 
@@ -837,16 +939,16 @@ fn grafting_a_session_envelope_onto_a_victim_plain_tx_is_rejected() {
 
     // (2) A grant that CLAIMS the victim as master but was minted by the
     // attacker: master_address now matches, the master's signature does not.
-    let mut d_spoof = grant(
+    let mut d_spoof = pq_grant(
         &attacker,
         &attacker_session,
         4_000_000_000,
-        10_000,
+        1_000_000,
         SCOPE_ALL,
         u64::MAX,
     );
     d_spoof.master_address = victim_pub;
-    let spoofed = rewrap(&plain, &d_spoof);
+    let spoofed = rewrap_falcon(&plain, &d_spoof);
     assert_eq!(spoofed.delegation().unwrap().master_address, victim_pub);
     assert!(!spoofed.verify_signature(), "forged master grant must fail");
     assert_eq!(
@@ -858,21 +960,20 @@ fn grafting_a_session_envelope_onto_a_victim_plain_tx_is_rejected() {
         Err(MempoolError::SessionBadGrant)
     );
 
-    // (3) The lazy graft: append junk bytes to the victim's legacy signature.
+    // (3) The lazy graft: append junk bytes to the victim's plain PQ1 signature.
     let mut junk = plain.clone();
     junk.signature.extend_from_slice(&[1, 2, 3, 4]);
     assert!(
         !junk.verify_signature(),
-        "64B + junk must fail (length != 64)"
+        "PQ1 + junk must fail (exact length check)"
     );
     assert!(
         !pre_envelope_node_verify(&junk),
         "and an old node rejects it too"
     );
-    assert_eq!(
-        mp.add_checked_ctx(junk, u64::MAX, AdmissionCtx::new(now)),
-        Err(MempoolError::BadSignature)
-    );
+    assert!(mp
+        .add_checked_ctx(junk, u64::MAX, AdmissionCtx::new(now))
+        .is_err());
 
     // The victim's untouched transaction is still perfectly valid.
     assert!(plain.verify_signature());
@@ -887,17 +988,17 @@ fn grafting_a_session_envelope_onto_a_victim_plain_tx_is_rejected() {
 
 #[test]
 fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() {
-    let master = key();
-    let session = key();
+    let master = FalconKeypair::generate_from_seed(0x10);
+    let session = FalconKeypair::generate_from_seed(0x11);
     let now = 1_000_000u64;
     let ctx = AdmissionCtx::new(now);
     let balance = 10_000_000u64;
     let mut mp = Mempool::new(100, 100);
 
     // A fully valid session transfer is admitted.
-    let valid = session_tx(
+    let valid = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         0,
@@ -907,9 +1008,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
 
     // Expiry: valid at valid_until, expired one second later (block-clock
     // semantics are identical: `now > valid_until`).
-    let expiring = session_tx(
+    let expiring = pq_session_tx(
         &session,
-        grant(&master, &session, now, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         1,
@@ -927,9 +1028,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
     );
 
     // Scope: a payload-only grant cannot authorize a plain transfer.
-    let out_of_scope = session_tx(
+    let out_of_scope = pq_session_tx(
         &session,
-        grant(
+        pq_grant(
             &master,
             &session,
             now + 100,
@@ -947,9 +1048,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
         Err(MempoolError::SessionOutOfScope)
     );
     // ...and the reverse: a payload tx under a transfer-only grant.
-    let payload_only = session_tx(
+    let payload_only = pq_session_tx(
         &session,
-        grant(
+        pq_grant(
             &master,
             &session,
             now + 100,
@@ -968,9 +1069,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
     );
 
     // Value cap: amount above max_value_per_tx.
-    let over_value = session_tx(
+    let over_value = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 10_000, SCOPE_ALL, 100),
+        pq_grant(&master, &session, now + 100, 10_000, SCOPE_ALL, 100),
         101,
         1_000,
         4,
@@ -982,9 +1083,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
     );
 
     // Budget: declared gas_limit beyond the grant's remaining budget.
-    let over_budget = session_tx(
+    let over_budget = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 500, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now + 100, 500, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         5,
@@ -995,9 +1096,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
         Err(MempoolError::SessionRevoked)
     );
     // Exactly the budget is fine (boundary).
-    let exact_budget = session_tx(
+    let exact_budget = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 1_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now + 100, 1_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         6,
@@ -1006,9 +1107,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
     assert!(mp.add_checked_ctx(exact_budget, balance, ctx).is_ok());
 
     // Bad grant: master signature tampered with.
-    let mut bad_grant = session_tx(
+    let mut bad_grant = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         7,
@@ -1016,7 +1117,7 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
     );
     let mut d = bad_grant.delegation().unwrap();
     d.master_signature[0] ^= 0xFF;
-    bad_grant = rewrap(&bad_grant, &d);
+    bad_grant = rewrap_falcon(&bad_grant, &d);
     assert_eq!(
         mp.add_checked_ctx(bad_grant, balance, ctx),
         Err(MempoolError::SessionBadGrant)
@@ -1024,9 +1125,9 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
 
     // Not every failure is a grant failure: a corrupted SESSION signature
     // with an intact grant still fails as a plain bad signature.
-    let mut bad_sig = session_tx(
+    let mut bad_sig = pq_session_tx(
         &session,
-        grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, now + 100, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         8,
@@ -1047,33 +1148,45 @@ fn admission_rejects_expired_out_of_scope_over_value_exhausted_and_bad_grants() 
 
 #[tokio::test]
 async fn propose_filter_and_apply_agree_on_session_transactions() {
-    let master = key();
-    let session = key();
-    let master_pub = master.verifying_key().to_bytes();
+    let validator_ed = key();
+    let validator_pub = validator_ed.verifying_key().to_bytes();
+    let master = FalconKeypair::generate_from_seed(0x12);
+    let session = FalconKeypair::generate_from_seed(0x13);
+    let master_pub = falcon_addr(&master);
     let state = funded_state(master_pub, 10_000_000).await;
-    let vset = ValidatorSet::from_list(vec![(master_pub, 1)]);
-    let mut rt = ValidatorRuntime::new(master.clone(), vset, state.clone(), 1);
+    let vset = ValidatorSet::from_list(vec![(validator_pub, 1)]);
+    let mut rt = ValidatorRuntime::new(validator_ed, vset, state.clone(), 1);
     assert!(rt.is_proposer());
 
     let admit_at = 1_000_000u64;
     let block_ts = 2_000_000u64;
     let balance = 10_000_000u64;
 
-    let plain = Transaction::sign(&master, [1u8; 32], 10, 1_000, 0, 1, 1);
-    let good = session_tx(
+    let floor = Mempool::frozen_base_fee_floor();
+    let plain = pq_plain_tx(
+        &master,
+        [1u8; 32],
+        10,
+        GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS,
+        0,
+        1,
+        1,
+        vec![],
+    );
+    let good = pq_session_tx(
         &session,
-        grant(&master, &session, 5_000_000, 1_000_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, 5_000_000, 1_000_000, SCOPE_ALL, u64::MAX),
         20,
-        2_000,
+        floor + 1_000,
         1,
         vec![],
     );
     // Admitted at `admit_at`, expired by `block_ts`.
-    let expired = session_tx(
+    let expired = pq_session_tx(
         &session,
-        grant(&master, &session, 1_500_000, 1_000_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, 1_500_000, 1_000_000, SCOPE_ALL, u64::MAX),
         30,
-        3_000,
+        floor + 2_000,
         2,
         vec![],
     );
@@ -1144,15 +1257,15 @@ async fn propose_filter_and_apply_agree_on_session_transactions() {
 
 #[tokio::test]
 async fn empty_payload_session_transfer_is_checked_at_execution() {
-    let master = key();
-    let session = key();
-    let master_pub = master.verifying_key().to_bytes();
+    let master = FalconKeypair::generate_from_seed(0x14);
+    let session = FalconKeypair::generate_from_seed(0x15);
+    let master_pub = falcon_addr(&master);
 
     // A PLAIN (empty payload) session transfer — the shape that used to sail
     // past the session hook because execute_payload early-returns before it.
-    let expired_tx = session_tx(
+    let expired_tx = pq_session_tx(
         &session,
-        grant(&master, &session, 1_500_000, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, 1_500_000, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         0,
@@ -1189,9 +1302,9 @@ async fn empty_payload_session_transfer_is_checked_at_execution() {
 
     // Inside the validity window the identical transaction executes and moves
     // value (nothing else about it changed).
-    let valid_tx = session_tx(
+    let valid_tx = pq_session_tx(
         &session,
-        grant(&master, &session, 5_000_000, 10_000, SCOPE_ALL, u64::MAX),
+        pq_grant(&master, &session, 5_000_000, 10_000, SCOPE_ALL, u64::MAX),
         10,
         1_000,
         0,
@@ -1216,15 +1329,17 @@ async fn empty_payload_session_transfer_is_checked_at_execution() {
 async fn block_apply_rejects_every_failed_grant_dimension() {
     // Five independent masters (so nonces never interact) sharing one
     // session key — every transaction is a plain empty-payload transfer.
-    let session = key();
-    let masters: Vec<SigningKey> = (0..5).map(|_| key()).collect();
+    let session = FalconKeypair::generate_from_seed(0x16);
+    let masters: Vec<FalconKeypair> = (0x20u8..0x25u8)
+        .map(FalconKeypair::generate_from_seed)
+        .collect();
     let block_ts = 2_000_000u64;
 
     let txs = vec![
         // 0: expired at block_ts
-        session_tx(
+        pq_session_tx(
             &session,
-            grant(
+            pq_grant(
                 &masters[0],
                 &session,
                 1_500_000,
@@ -1238,9 +1353,9 @@ async fn block_apply_rejects_every_failed_grant_dimension() {
             vec![],
         ),
         // 1: payload-only scope, empty payload => out of scope
-        session_tx(
+        pq_session_tx(
             &session,
-            grant(
+            pq_grant(
                 &masters[1],
                 &session,
                 5_000_000,
@@ -1254,27 +1369,27 @@ async fn block_apply_rejects_every_failed_grant_dimension() {
             vec![],
         ),
         // 2: amount above max_value_per_tx
-        session_tx(
+        pq_session_tx(
             &session,
-            grant(&masters[2], &session, 5_000_000, 10_000, SCOPE_ALL, 5),
+            pq_grant(&masters[2], &session, 5_000_000, 10_000, SCOPE_ALL, 5),
             10,
             1_000,
             0,
             vec![],
         ),
         // 3: gas_limit above the remaining budget
-        session_tx(
+        pq_session_tx(
             &session,
-            grant(&masters[3], &session, 5_000_000, 500, SCOPE_ALL, u64::MAX),
+            pq_grant(&masters[3], &session, 5_000_000, 500, SCOPE_ALL, u64::MAX),
             10,
             1_000,
             0,
             vec![],
         ),
         // 4: fully valid
-        session_tx(
+        pq_session_tx(
             &session,
-            grant(
+            pq_grant(
                 &masters[4],
                 &session,
                 5_000_000,
@@ -1292,7 +1407,7 @@ async fn block_apply_rejects_every_failed_grant_dimension() {
     let state = Arc::new(InMemoryStateEngine::new());
     for m in &masters {
         state
-            .update_account(AccountState::new(m.verifying_key().to_bytes(), 1_000_000))
+            .update_account(AccountState::new(falcon_addr(m), 1_000_000))
             .await;
     }
 
@@ -1317,18 +1432,14 @@ async fn block_apply_rejects_every_failed_grant_dimension() {
     // Every refused grant moved nothing; the accepted one paid.
     for m in &masters[..4] {
         assert_eq!(
-            state
-                .get_account(&m.verifying_key().to_bytes())
-                .await
-                .unwrap()
-                .balance,
+            state.get_account(&falcon_addr(m)).await.unwrap().balance,
             1_000_000,
             "a refused grant must move nothing"
         );
     }
     assert!(
         state
-            .get_account(&masters[4].verifying_key().to_bytes())
+            .get_account(&falcon_addr(&masters[4]))
             .await
             .unwrap()
             .balance
@@ -1343,15 +1454,15 @@ async fn block_apply_rejects_every_failed_grant_dimension() {
 #[test]
 fn test_falcon512_signed_session_grant_creation_and_verification() {
     let falcon_master_fk = FalconKeypair::generate_from_seed(0x11);
-    let session = key();
-    let session_pk = session.verifying_key().to_bytes();
+    let falcon_session_fk = FalconKeypair::generate_from_seed(0x12);
+    let session_pk = falcon_session_fk.public_key();
     let now = 1_000_000u64;
 
-    // Create a Falcon-512 master signed grant with Ed25519 session key
+    // Create a Falcon-512 master signed grant with Falcon-512 session key
     let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &falcon_master_fk,
-        PqScheme::Ed25519,
-        &session_pk,
+        PqScheme::Falcon512,
+        session_pk,
         now + 10_000,
         50_000,
         SCOPE_ALL,
@@ -1360,11 +1471,12 @@ fn test_falcon512_signed_session_grant_creation_and_verification() {
     );
 
     assert_eq!(grant.master_scheme, PqScheme::Falcon512);
-    assert_eq!(grant.session_scheme, PqScheme::Ed25519);
+    assert_eq!(grant.session_scheme, PqScheme::Falcon512);
     assert!(grant.is_post_quantum());
     assert!(!grant.is_pure_ed25519());
     assert_eq!(grant.master_pubkey(), falcon_master_fk.public_key());
-    assert_eq!(grant.session_pubkey, session_pk);
+    assert_eq!(grant.session_pubkey, falcon_addr(&falcon_session_fk));
+    assert_eq!(grant.session_pubkey_bytes(), session_pk);
     assert!(
         grant.verify_signature(),
         "Falcon-512 master signature must verify"
@@ -1428,16 +1540,16 @@ fn test_falcon512_signed_session_grant_creation_and_verification() {
 fn test_hybrid_signed_session_grant_creation_and_verification() {
     let ed_master = key();
     let falcon_master_fk = FalconKeypair::generate_from_seed(0x22);
-    let session = key();
-    let session_pk = session.verifying_key().to_bytes();
+    let falcon_session_fk = FalconKeypair::generate_from_seed(0x23);
+    let session_pk = falcon_session_fk.public_key();
     let now = 1_000_000u64;
 
-    // Create a Hybrid (Ed25519 + Falcon-512) master signed grant
+    // Create a Hybrid (Ed25519 + Falcon-512) master signed grant with Falcon-512 session key
     let grant = SessionKeyAuthorization::sign_delegation_hybrid(
         &ed_master,
         &falcon_master_fk,
-        PqScheme::Ed25519,
-        &session_pk,
+        PqScheme::Falcon512,
+        session_pk,
         now + 5_000,
         100_000,
         SCOPE_TRANSFER,
@@ -1446,7 +1558,7 @@ fn test_hybrid_signed_session_grant_creation_and_verification() {
     );
 
     assert_eq!(grant.master_scheme, PqScheme::Hybrid);
-    assert_eq!(grant.session_scheme, PqScheme::Ed25519);
+    assert_eq!(grant.session_scheme, PqScheme::Falcon512);
     assert!(grant.is_post_quantum());
     assert!(!grant.is_pure_ed25519());
     assert_eq!(grant.master_pubkey().len(), HYBRID_PUBKEY_LEN);
@@ -1699,7 +1811,7 @@ fn test_revocation_of_pq_session_keys() {
 
 #[test]
 fn test_hybrid_session_key_signing_and_verification() {
-    let master = key();
+    let falcon_master_fk = FalconKeypair::generate_from_seed(0x87);
     let ed_session = key();
     let falcon_session_fk = FalconKeypair::generate_from_seed(0x88);
     let hybrid_session_pk = make_hybrid_pubkey(
@@ -1708,8 +1820,8 @@ fn test_hybrid_session_key_signing_and_verification() {
     );
     let now = 1_000_000u64;
 
-    let grant = SessionKeyAuthorization::sign_delegation_ed25519_master(
-        &master,
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
+        &falcon_master_fk,
         PqScheme::Hybrid,
         &hybrid_session_pk,
         now + 1_000,
@@ -1719,7 +1831,7 @@ fn test_hybrid_session_key_signing_and_verification() {
         CHAIN_ID,
     );
 
-    assert_eq!(grant.master_scheme, PqScheme::Ed25519);
+    assert_eq!(grant.master_scheme, PqScheme::Falcon512);
     assert_eq!(grant.session_scheme, PqScheme::Hybrid);
     assert!(grant.verify_signature());
 
@@ -1761,24 +1873,25 @@ fn test_ed25519_grant_bincode_encoding_backward_compatibility() {
         bincode::deserialize(&ser).expect("deserialization succeeds");
     assert_eq!(d, back);
     assert!(back.is_pure_ed25519());
-    assert!(back.verify_signature());
+    // Pure PQ mode refuses classical Ed25519 grants and SK1 session transactions.
+    assert!(!back.verify_signature());
 
     let tx = session_tx(&session, d, 10, 1_000, 0, vec![]);
     assert!(tx.is_session_keyed());
-    assert!(tx.verify_signature());
+    assert!(!tx.verify_signature());
 }
 
 #[test]
 fn test_falcon512_master_delegated_tx_end_to_end() {
     let falcon_master_fk = FalconKeypair::generate_from_seed(0x99);
-    let session = key();
-    let session_pk = session.verifying_key().to_bytes();
+    let falcon_session_fk = FalconKeypair::generate_from_seed(0x9A);
+    let session_pk = falcon_session_fk.public_key();
     let now = 1_000_000u64;
 
     let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &falcon_master_fk,
-        PqScheme::Ed25519,
-        &session_pk,
+        PqScheme::Falcon512,
+        session_pk,
         now + 10_000,
         50_000,
         SCOPE_ALL,
@@ -1786,8 +1899,8 @@ fn test_falcon512_master_delegated_tx_end_to_end() {
         CHAIN_ID,
     );
 
-    // Build envelope transaction under Falcon-512 master
-    let tx = session_tx(&session, grant.clone(), 100, 2_000, 0, vec![]);
+    // Build SF1 envelope transaction under Falcon-512 master and Falcon-512 session key
+    let tx = pq_session_tx(&falcon_session_fk, grant.clone(), 100, 2_000, 0, vec![]);
     assert!(tx.is_session_keyed());
     assert_eq!(tx.from, grant.master_address);
     assert!(

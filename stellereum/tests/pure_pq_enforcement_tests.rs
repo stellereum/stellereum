@@ -307,9 +307,7 @@ fn test_pure_pq_env_and_override_resolution() {
     // is parsed-and-ignored (WARN at main.rs:2845-2847, never a gate). With
     // the production pin (main.rs:2849) installed, every env spelling —
     // including opt-out spellings and unset — still enforces identically.
-    const ENVS: [&str; 8] = [
-        "1", "true", "TRUE", "always", "ALWAYS", "0", "false", "",
-    ];
+    const ENVS: [&str; 8] = ["1", "true", "TRUE", "always", "ALWAYS", "0", "false", ""];
     for env in ENVS {
         std::env::set_var("STELL_PURE_PQ", env);
         set_pure_pq_override(Some(true));

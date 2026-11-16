@@ -327,7 +327,8 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
     engine
         .staking_write()
         .await
-        .process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
+        .process_unbonding(UNBONDING_PERIOD_SECS + 1)
+        .unwrap();
     assert_eq!(
         engine
             .staking_read()

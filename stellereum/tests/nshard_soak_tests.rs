@@ -40,6 +40,47 @@ fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 /// N single-validator shards sharing one node-local cross-shard transport
 /// (the M2 idiom). Funding is per shard: `funding[i]` funds shard `i`.
 async fn sharded_n(
@@ -63,6 +104,13 @@ async fn sharded_n(
         let engine = Arc::new(InMemoryStateEngine::new());
         for (addr, bal) in fund {
             engine.update_account(AccountState::new(*addr, *bal)).await;
+            if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+                use stellereum::post_quantum::DEFAULT_SALT;
+                engine
+                    .pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                    .await
+                    .expect("PQ sender must pin");
+            }
         }
         entries.push((*shard, vec![(validator.clone(), engine)]));
     }
@@ -125,7 +173,10 @@ fn nshard_parse_refuses_invalid_fail_closed() {
         .collect::<Vec<_>>()
         .join(",");
     let e = ShardRegistry::parse_list(&over).expect_err("N>cap must be refused");
-    assert!(e.contains(&MAX_SHARDS.to_string()), "cap error must name it: {e}");
+    assert!(
+        e.contains(&MAX_SHARDS.to_string()),
+        "cap error must name it: {e}"
+    );
     // Unparsable entry.
     let e = ShardRegistry::parse_list("0,abc").expect_err("bad id must be refused");
     assert!(e.contains("abc"), "bad-id error must name the entry: {e}");
@@ -141,7 +192,10 @@ fn nshard_guard_hatch_allows_configured_set_only() {
     // Valid configured set: refused without hatch, allowed with it.
     let e = check_workchain_boot_guard_with_hatch(&valid3, false)
         .expect_err("multishard without hatch must refuse");
-    assert!(e.contains(WORKCHAIN_FREEZE_DOC), "must name freeze doc: {e}");
+    assert!(
+        e.contains(WORKCHAIN_FREEZE_DOC),
+        "must name freeze doc: {e}"
+    );
     assert!(check_workchain_boot_guard_with_hatch(&valid3, true).is_ok());
     // INVALID set (multi-shard, no masterchain): refused EVEN with the hatch.
     let invalid = ShardRegistry::from_ids([1, 2]);
@@ -166,13 +220,11 @@ fn nshard_guard_hatch_allows_configured_set_only() {
 #[tokio::test]
 async fn nshard_3_all_finalize_and_xfer_across_pairs() {
     let validator = key(41);
-    let sender0 = key(42);
-    let sender1 = key(43);
     let recipient1 = key(44);
     let recipient2 = key(45);
     let validator_addr = id_of(&validator);
-    let s0 = id_of(&sender0);
-    let s1 = id_of(&sender1);
+    let s0 = pq_id(42);
+    let s1 = pq_id(43);
     let r1 = id_of(&recipient1);
     let r2 = id_of(&recipient2);
 
@@ -200,7 +252,7 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
         + balance_at(&sc, SHARD2, &validator_addr).await;
 
     // Pair 1: 0 -> 1.
-    let tx_a = Transaction::sign(&sender0, r1, 10_000, 50, 0, SHARD0, SHARD1);
+    let tx_a = pq_tx(42, r1, 10_000, 50, 0, SHARD0, SHARD1);
     sc.broadcast_tx(tx_a.clone()).await;
     ts += 1;
     sc.run_height(SHARD0, ts).await;
@@ -217,7 +269,7 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
     assert_eq!(balance_at(&sc, SHARD1, &r1).await, 10_000);
 
     // Pair 2: 1 -> 2.
-    let tx_b = Transaction::sign(&sender1, r2, 4_000, 20, 0, SHARD1, SHARD2);
+    let tx_b = pq_tx(43, r2, 4_000, 20, 0, SHARD1, SHARD2);
     sc.broadcast_tx(tx_b.clone()).await;
     ts += 1;
     sc.run_height(SHARD1, ts).await;
@@ -234,7 +286,7 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
     assert_eq!(balance_at(&sc, SHARD2, &r2).await, 4_000);
 
     // Pair 3: 0 -> 2 (second nonce on sender0).
-    let tx_c = Transaction::sign(&sender0, r2, 5_000, 25, 1, SHARD0, SHARD2);
+    let tx_c = pq_tx(42, r2, 5_000, 25, 1, SHARD0, SHARD2);
     sc.broadcast_tx(tx_c.clone()).await;
     ts += 1;
     sc.run_height(SHARD0, ts).await;
@@ -261,7 +313,10 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
     let f0 = finalized_len(sc.shard(SHARD0));
     let f1 = finalized_len(sc.shard(SHARD1));
     let f2 = finalized_len(sc.shard(SHARD2));
-    assert!(f0 >= 8 && f1 >= 8 && f2 >= 8, "every shard finalizes throughout");
+    assert!(
+        f0 >= 8 && f1 >= 8 && f2 >= 8,
+        "every shard finalizes throughout"
+    );
     assert_eq!(sc.shard(SHARD0).height(), sc.shard(SHARD1).height());
     assert_eq!(sc.shard(SHARD1).height(), sc.shard(SHARD2).height());
 

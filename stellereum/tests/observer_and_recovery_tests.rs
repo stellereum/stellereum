@@ -19,14 +19,14 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use stellereum::consensus::{
-    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size,
-    vote_sign_bytes, HeightConsensus, PqMicroCertificate, QuorumCertificate, ValidatorSet,
-    VoteKind, PQ_UQC_MARKER_ID,
+    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size, vote_sign_bytes,
+    HeightConsensus, PqMicroCertificate, QuorumCertificate, ValidatorSet, VoteKind,
+    PQ_UQC_MARKER_ID,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::network::{
     head_publish_allowed, peer_head_is_ahead, SNAPSHOT_PUBLISH_DOMAIN_KINDS,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{

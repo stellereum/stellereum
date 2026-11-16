@@ -32,8 +32,8 @@
 //! possible) and it differs from the sender's shared secret.
 
 use ml_kem::{
-    B32, MlKem1024, MlKem512, MlKem768, Seed,
     kem::{Ciphertext, Decapsulate, FromSeed, KeyExport},
+    MlKem1024, MlKem512, MlKem768, Seed, B32,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,10 +131,7 @@ fn decode_seed(hex_str: &str) -> Seed {
     bytes.as_slice().try_into().expect("seed must be 64 bytes")
 }
 
-fn wyche_keypair_768() -> (
-    ml_kem::DecapsulationKey768,
-    ml_kem::EncapsulationKey768,
-) {
+fn wyche_keypair_768() -> (ml_kem::DecapsulationKey768, ml_kem::EncapsulationKey768) {
     let seed = decode_seed(WYCHE_SEED_HEX);
     MlKem768::from_seed(&seed)
 }

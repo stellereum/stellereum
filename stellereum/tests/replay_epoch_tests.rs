@@ -125,7 +125,11 @@ fn foreign() -> u64 {
 
 fn own_fixture(seed: u8, nonce: u64) -> Transaction {
     let tx = pq_fixture(seed, nonce, Some(ours()));
-    assert_eq!(tx.chain_id(), Some(ours()), "own fixture must bind OUR chain");
+    assert_eq!(
+        tx.chain_id(),
+        Some(ours()),
+        "own fixture must bind OUR chain"
+    );
     tx
 }
 

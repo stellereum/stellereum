@@ -197,16 +197,49 @@ async fn vel_waste_composition_300() {
             n.index, n.finalized_height, n.prevotes_cast, n.prevotes_received, n.precommits_cast,
             n.precommits_received, n.proposals_received, n.proposals_refused, n.sync_jumps);
     }
-    // slow-validation CPU probe (host wall ms, real crypto): batch-verify + order-commit for 20-tx block
+    // slow-validation CPU probe (host wall ms, real PQ crypto): batch-verify + order-commit for 20-tx block
     {
-        use ed25519_dalek::SigningKey;
-        let sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x42u8; 32]);
+        let from = stellereum::post_quantum::derive_pq_address(
+            stellereum::post_quantum::PqScheme::Falcon512,
+            &kp.public_key,
+            &stellereum::post_quantum::DEFAULT_SALT,
+        );
+        stellereum::sharding::Transaction::global_implicit_registry()
+            .register(
+                from,
+                stellereum::post_quantum::PqScheme::Falcon512,
+                &kp.public_key,
+                &stellereum::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ key register");
         let to = [0x11u8; 32];
         let txs: Vec<stellereum::sharding::Transaction> = (0..20u64)
-            .map(|n| stellereum::sharding::Transaction::sign(&sk, to, 1_000, 21_000, n, 0, 0))
+            .map(|n| {
+                let mut tx = stellereum::sharding::Transaction {
+                    from,
+                    to,
+                    amount: 1_000,
+                    gas_limit: 21_000,
+                    nonce: n,
+                    source_shard: 0,
+                    target_shard: 0,
+                    signature: Vec::new(),
+                    payload: Vec::new(),
+                    priority_fee_per_gas: 0,
+                };
+                let msg = tx.signing_message();
+                let sig = kp.sign(&msg);
+                tx.signature = stellereum::sharding::PqSignatureEnvelope::new_implicit(
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    sig,
+                )
+                .encode();
+                tx
+            })
             .collect();
         let t = Instant::now();
-        let ok = stellereum::sharding::Transaction::verify_signatures_batch(&txs);
+        let ok = stellereum::sharding::Transaction::verify_signatures_batch_parallel(&txs);
         let batch_ms = t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
         let _root = stellereum::mev::compute_order_merkle_root(&txs);

@@ -411,7 +411,11 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
         target_address: "0xdeadbeef".to_string(),
         amount: LARGE_WITHDRAWAL_THRESHOLD_NANO,
     };
-    let tx = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
+    let tx = bridge_tx(
+        payer_seed,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(withdraw))],
+    );
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -466,7 +470,11 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
     // (Nonce 2: the refused early release consumed its nonce - a refused
     // transaction still advances the nonce.)
     let matured = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(payer_seed, 2, vec![OpCode::SysCallBridge(Box::new(matured))]);
+    let tx = bridge_tx(
+        payer_seed,
+        2,
+        vec![OpCode::SysCallBridge(Box::new(matured))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(3, TS + WITHDRAWAL_TIME_LOCK_SECS, vec![tx], payer_pk),
@@ -510,7 +518,11 @@ async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
         target_address: "EQD-test".to_string(),
         amount: 100 * STELL,
     };
-    let tx = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
+    let tx = bridge_tx(
+        payer_seed,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(withdraw))],
+    );
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -523,7 +535,11 @@ async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
     drop(br);
 
     let release = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(payer_seed, 1, vec![OpCode::SysCallBridge(Box::new(release))]);
+    let tx = bridge_tx(
+        payer_seed,
+        1,
+        vec![OpCode::SysCallBridge(Box::new(release))],
+    );
     let out = e
         .apply_block_transition(&bridge_block(2, TS, vec![tx], payer_pk), 0)
         .await;
@@ -557,8 +573,16 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
         "precondition: these two together breach the hourly cap"
     );
 
-    let tx_a = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(w(first)))]);
-    let tx_b = bridge_tx(payer_seed, 1, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
+    let tx_a = bridge_tx(
+        payer_seed,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(w(first)))],
+    );
+    let tx_b = bridge_tx(
+        payer_seed,
+        1,
+        vec![OpCode::SysCallBridge(Box::new(w(second)))],
+    );
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx_a, tx_b], payer_pk), 0)
         .await;
@@ -590,7 +614,11 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
     // One hour later the window rolls over and the same amount is admitted.
     // (The payer's nonce is 2: the refused withdrawal consumed its nonce -
     // a refused transaction still advances the nonce.)
-    let tx_c = bridge_tx(payer_seed, 2, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
+    let tx_c = bridge_tx(
+        payer_seed,
+        2,
+        vec![OpCode::SysCallBridge(Box::new(w(second)))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(2, TS + WITHDRAWAL_TIME_LOCK_SECS, vec![tx_c], payer_pk),
@@ -1006,7 +1034,8 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     let amount = 77 * STELL;
     let hash = [0x81u8; 32];
 
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         proof_ops(
             ton_proof(hash, recipient, amount, &vals, None),
@@ -1031,7 +1060,8 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     );
 
     // Replay with the SAME valid evidence in a later block: refused.
-    let replay = bridge_tx(payer_seed,
+    let replay = bridge_tx(
+        payer_seed,
         1,
         proof_ops(
             ton_proof(hash, recipient, amount, &vals, None),
@@ -1074,7 +1104,8 @@ async fn adapter_evm_evidence_deposit_credits_on_the_block_path() {
         recipient,
         amount,
     };
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         proof_ops(evm_proof(hash, recipient, amount, &vals), dep),
     );
@@ -1102,7 +1133,8 @@ async fn adapter_tampered_evidence_is_refused_on_the_block_path() {
     let recipient = [0xC3u8; 32];
     let hash = [0x83u8; 32];
 
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         proof_ops(
             ton_proof(hash, recipient, 9 * STELL, &vals, Some([0xFFu8; 32])),
@@ -1149,7 +1181,8 @@ async fn zk_placeholder_evidence_is_refused_on_the_block_path() {
             },
         ),
     };
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         proof_ops(placeholder, deposit(hash, recipient, 5 * STELL)),
     );
@@ -1190,7 +1223,8 @@ async fn quorum_path_ignores_bogus_evidence() {
     let dep = deposit(hash, recipient, amount);
     let att = attest(&dep, &vals[..2]);
     let bogus = ton_proof(hash, recipient, amount, &vals, Some([0xFFu8; 32]));
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         vec![
             OpCode::SysCallBridge(Box::new(att)),
@@ -1221,7 +1255,8 @@ async fn lone_deposit_proof_commits_nothing() {
     let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let hash = [0x86u8; 32];
-    let lone = bridge_tx(payer_seed,
+    let lone = bridge_tx(
+        payer_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(ton_proof(
             hash,
@@ -1354,7 +1389,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
 
     // Small withdrawal parks immediately (unlock_at = now).
     let amount = STELL;
-    let tx = bridge_tx(payer_seed,
+    let tx = bridge_tx(
+        payer_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Withdraw {
             chain: SupportedChain::Arbitrum,
@@ -1369,7 +1405,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(balance(&e, &BRIDGE_ESCROW).await, amount);
 
     // Too early: grace has not passed.
-    let early = bridge_tx(payer_seed,
+    let early = bridge_tx(
+        payer_seed,
         1,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1386,7 +1423,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     e.credit_native(&stranger_pk, STELL)
         .await
         .expect("fund stranger");
-    let wrong = bridge_tx(stranger_seed,
+    let wrong = bridge_tx(
+        stranger_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1403,7 +1441,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     // Past grace, right sender: escrow back, request gone. Nonce is 2: the
     // refused early refund consumed its nonce (a refused transaction still
     // advances the nonce and pays the D2 floor step).
-    let ok = bridge_tx(payer_seed,
+    let ok = bridge_tx(
+        payer_seed,
         2,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1423,7 +1462,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     );
 
     // Double refund: unknown id now. (Nonce 3: the refund above consumed 2.)
-    let again = bridge_tx(payer_seed,
+    let again = bridge_tx(
+        payer_seed,
         3,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1438,7 +1478,8 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(out.status, vec![false], "second refund finds nothing");
 
     // Release after refund: also unknown.
-    let rel = bridge_tx(payer_seed,
+    let rel = bridge_tx(
+        payer_seed,
         2,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Release {
             req_id: 0,
@@ -1531,7 +1572,11 @@ async fn bridge_intents_from_a_workchain_are_refused() {
             &bridge_block(
                 2,
                 TS + 1,
-                vec![workchain_bridge_tx(payer_seed, 1, ops(Some(att_wc), dep_wc))],
+                vec![workchain_bridge_tx(
+                    payer_seed,
+                    1,
+                    ops(Some(att_wc), dep_wc),
+                )],
                 payer_pk,
             ),
             0,
@@ -1630,7 +1675,11 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
             &bridge_block(
                 1,
                 TS,
-                vec![bridge_tx(payer_seed, 0, ops(Some(att.clone()), dep.clone()))],
+                vec![bridge_tx(
+                    payer_seed,
+                    0,
+                    ops(Some(att.clone()), dep.clone()),
+                )],
                 payer_pk,
             ),
             0,
@@ -1639,7 +1688,10 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
     assert_eq!(out.status, vec![true], "control quorum deposit must apply");
     assert_eq!(balance(&e, &recipient).await, amount);
     assert!(
-        e.bridge_read().await.processed_source_txs.contains(&[0x83u8; 32]),
+        e.bridge_read()
+            .await
+            .processed_source_txs
+            .contains(&[0x83u8; 32]),
         "the credited source tx must be in the committed replay set"
     );
     let escrow_after_credit = balance(&e, &BRIDGE_ESCROW).await;
@@ -1650,7 +1702,8 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
             &bridge_block(
                 2,
                 TS + 1,
-                vec![workchain_bridge_tx(payer_seed,
+                vec![workchain_bridge_tx(
+                    payer_seed,
                     1,
                     ops(Some(att.clone()), dep.clone()),
                 )],
@@ -1690,7 +1743,12 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
     // The global replay set survived: a masterchain replay is still refused.
     let out = e
         .apply_block_transition(
-            &bridge_block(3, TS + 2, vec![bridge_tx(payer_seed, 2, ops(Some(att), dep))], payer_pk),
+            &bridge_block(
+                3,
+                TS + 2,
+                vec![bridge_tx(payer_seed, 2, ops(Some(att), dep))],
+                payer_pk,
+            ),
             0,
         )
         .await;

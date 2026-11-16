@@ -543,12 +543,12 @@ mod tests {
             (0, 1),
             (0, 1_000_000_000),             // 1 STELL from empty
             (1_000_000_000, 1_000_000_000), // tiny supply
-            (sc / 1000, sc / 100),         // small S/S_c
-            (sc / 2, sc / 10),             // S = 0.5 S_c
-            (sc, sc / 10),                 // S = S_c (report: old code paid 2.56%)
+            (sc / 1000, sc / 100),          // small S/S_c
+            (sc / 2, sc / 10),              // S = 0.5 S_c
+            (sc, sc / 10),                  // S = S_c (report: old code paid 2.56%)
             (sc, sc / 2),
             (3 * sc, 3 * sc / 10), // S = 3 S_c (old code went Dust here)
-            (5 * sc, 5 * sc),     // full-sell at headline magnitude
+            (5 * sc, 5 * sc),      // full-sell at headline magnitude
         ];
         for &(s0, d) in cases {
             let buy = pmm.buy_cost_micro(s0, d);
@@ -574,26 +574,28 @@ mod tests {
         let sc = PMM_DEPTH_CAP_NANO;
         // (s, d) pairs at headline scale: 250M-USD supply is ~3.12 S_c.
         let cases: &[(u128, u128)] = &[
-            (3 * sc, 3 * sc),     // full sell at 3 S_c
+            (3 * sc, 3 * sc),                                           // full sell at 3 S_c
             (390_388_203 * 1_000_000_000, 390_388_203 * 1_000_000_000), // ~250M-USD S
-            (5 * sc, 5 * sc),     // full sell at 5 S_c
-            (5 * sc, 5 * sc / 2), // half sell at 5 S_c
+            (5 * sc, 5 * sc),                                           // full sell at 5 S_c
+            (5 * sc, 5 * sc / 2),                                       // half sell at 5 S_c
             (5 * sc, 1),
         ];
         for &(s, d) in cases {
             assert!(d <= s, "test setup: d <= s");
             // Recompute quad exactly as the fn does, with checked ops to prove
             // headroom (no saturation engaged).
-            let quad = (s * s - (s - d) * (s - d))
-                .checked_div(2 * sc)
-                .unwrap();
+            let quad = (s * s - (s - d) * (s - d)).checked_div(2 * sc).unwrap();
             let sum = d.checked_add(quad).expect("d + quad must not overflow");
             let prod = (pmm.base_price_micro as u128)
                 .checked_mul(sum)
                 .expect("P0*(d+quad) must not overflow u128");
             assert!(prod / 1_000_000_000 < u128::MAX / 2, "headroom sanity");
             let payout = pmm.sell_payout_micro(s, d);
-            assert_eq!(payout, prod / 1_000_000_000, "saturating path == exact path");
+            assert_eq!(
+                payout,
+                prod / 1_000_000_000,
+                "saturating path == exact path"
+            );
             // 1-nano dust floors to 0 micro — finiteness (no panic/saturate)
             // is the property under test at that scale.
             if d > 1_000_000_000 {
@@ -617,10 +619,10 @@ mod tests {
         let pmm = PrimaryMarketMaker::new();
         // (buy_usd, pre-fix sell_code_usd pin from pmm.json, S/S_c pin)
         const VECTORS: &[(u128, u128)] = &[
-            (10_000, 9_996),       // S/S_c ≈ 0.00032, old loss 0.03%
-            (1_000_000, 968_984),   // S/S_c ≈ 0.03150, old loss 3.10%
+            (10_000, 9_996),          // S/S_c ≈ 0.00032, old loss 0.03%
+            (1_000_000, 968_984),     // S/S_c ≈ 0.03150, old loss 3.10%
             (100_000_000, 7_518_381), // S/S_c ≈ 1.72029, old loss 92.48%
-            (250_000_000, 0),       // S/S_c ≈ 3.12311, old loss 100% (Dust)
+            (250_000_000, 0),         // S/S_c ≈ 3.12311, old loss 100% (Dust)
         ];
         for &(buy_usd, code_pin_usd) in VECTORS {
             let u = buy_usd * 1_000_000; // micro
@@ -644,17 +646,15 @@ mod tests {
             // Regression pins: the OLD `d - quad` formula underpays.
             let sc = PMM_DEPTH_CAP_NANO;
             let quad = (d * d) / (2 * sc); // s=d: quad = d^2/(2 S_c)
-            let buggy =
-                (pmm.base_price_micro as u128).saturating_mul(d.saturating_sub(quad))
-                    / 1_000_000_000;
+            let buggy = (pmm.base_price_micro as u128).saturating_mul(d.saturating_sub(quad))
+                / 1_000_000_000;
             let pin_micro = code_pin_usd * 1_000_000;
             if code_pin_usd == 0 {
                 assert_eq!(buggy, 0, "250M-USD case: old formula is Dust");
             } else {
                 // Python-float pins vs integer floors: allow 1% band.
                 assert!(
-                    buggy <= pin_micro + pin_micro / 100
-                        && buggy + pin_micro / 100 >= pin_micro,
+                    buggy <= pin_micro + pin_micro / 100 && buggy + pin_micro / 100 >= pin_micro,
                     "buggy {buggy} should reproduce report pin {pin_micro}"
                 );
             }
@@ -677,13 +677,13 @@ mod tests {
         pmm.buy_exact_stell(sc_stell_nano).unwrap();
         assert_eq!(
             pmm.usable_reserve_micro(),
-            pmm.reserve_micro.saturating_sub(pmm.redemption_buffer_micro),
+            pmm.reserve_micro
+                .saturating_sub(pmm.redemption_buffer_micro),
             "usable must stay exactly reserve - buffer"
         );
         // 20% buffer is withheld: full redemption must NOT fit.
         assert!(
-            pmm.sell_payout_micro(pmm.minted_nano, pmm.minted_nano)
-                > pmm.usable_reserve_micro(),
+            pmm.sell_payout_micro(pmm.minted_nano, pmm.minted_nano) > pmm.usable_reserve_micro(),
             "withheld buffer must block a full instant drain"
         );
         // f_max spot (≈0.735 at x=1, b=0.2 per report table): integer band
@@ -750,7 +750,8 @@ mod tests {
         assert_eq!(pmm.redemption_buffer_micro, usdt(2_000) as u128);
         assert_eq!(
             pmm.usable_reserve_micro(),
-            pmm.reserve_micro.saturating_sub(pmm.redemption_buffer_micro),
+            pmm.reserve_micro
+                .saturating_sub(pmm.redemption_buffer_micro),
             "variant B binding rule: usable = reserve - buffer"
         );
         assert_eq!(pmm.usable_reserve_micro(), usdt(8_000) as u128);
@@ -784,7 +785,8 @@ mod tests {
         assert!(pmm.redemption_buffer_micro <= pmm.reserve_micro);
         assert_eq!(
             pmm.usable_reserve_micro(),
-            pmm.reserve_micro.saturating_sub(pmm.redemption_buffer_micro)
+            pmm.reserve_micro
+                .saturating_sub(pmm.redemption_buffer_micro)
         );
     }
 }

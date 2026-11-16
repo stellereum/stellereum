@@ -172,7 +172,8 @@ async fn pq_rpc_height_indexed_reads_pre_post_effective() {
 
     let direct_pre = {
         let reg = pq_registry_handle().read().await;
-        reg.get_active_key(&id, eff - 1).expect("direct pre must hit")
+        reg.get_active_key(&id, eff - 1)
+            .expect("direct pre must hit")
     };
     let direct_post = {
         let reg = pq_registry_handle().read().await;
@@ -201,7 +202,10 @@ async fn pq_rpc_pending_rotation_visible_then_clears_on_apply() {
     let pending_out = st
         .call("stell_getPqKey", json!({"validator": hex::encode(id)}))
         .await;
-    assert_eq!(pending_out["pending"]["pubkey_hex"], json!(hex::encode(&new)));
+    assert_eq!(
+        pending_out["pending"]["pubkey_hex"],
+        json!(hex::encode(&new))
+    );
     assert_eq!(
         pending_out["pending"]["effective_height"],
         json!(PQ_ROTATION_DELAY_HEIGHTS)

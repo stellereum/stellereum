@@ -83,7 +83,14 @@ fn per_round_cap() -> u32 {
 async fn lone_vote_moves_at_most_one_lookback_step() {
     let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
-    let far = falcon_votes::fvote(&ks[1], &fks[1], h, r + 100, VoteKind::Prevote, Some([7u8; 32]));
+    let far = falcon_votes::fvote(
+        &ks[1],
+        &fks[1],
+        h,
+        r + 100,
+        VoteKind::Prevote,
+        Some([7u8; 32]),
+    );
     rt.on_prevote(far).unwrap();
     assert_eq!(
         rt.hc.round,
@@ -105,11 +112,25 @@ async fn corroborated_chase_capped_by_per_round_budget() {
     let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     let target = r + 200;
-    rt.on_prevote(falcon_votes::fvote(&ks[1], &fks[1], h, target, VoteKind::Prevote, None))
-        .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &ks[1],
+        &fks[1],
+        h,
+        target,
+        VoteKind::Prevote,
+        None,
+    ))
+    .unwrap();
     assert_eq!(rt.hc.round, r + ROUND_LOOKBACK);
-    rt.on_prevote(falcon_votes::fvote(&ks[2], &fks[2], h, target, VoteKind::Prevote, None))
-        .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &ks[2],
+        &fks[2],
+        h,
+        target,
+        VoteKind::Prevote,
+        None,
+    ))
+    .unwrap();
     assert_eq!(
         rt.hc.round,
         r + per_round_cap(),
@@ -131,8 +152,15 @@ async fn spent_budget_blocks_fresh_votes_until_view_change() {
     let (h, r) = (rt.hc.height, rt.hc.round);
     let target = r + 200;
     for (k, fk) in [(&ks[1], &fks[1]), (&ks[2], &fks[2])] {
-        rt.on_prevote(falcon_votes::fvote(k, fk, h, target, VoteKind::Prevote, None))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            h,
+            target,
+            VoteKind::Prevote,
+            None,
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.round, r + per_round_cap());
     // Fresh round number, same attacker keys: budget is gone, no movement —
@@ -233,7 +261,10 @@ async fn sync_never_moves_backwards_on_any_path() {
 
     // Local re-phase never rewinds either (tested for +1/idempotence below);
     // here just pin it cannot go down from a fresh state with no evidence.
-    assert_eq!(rt.hc.round, r, "round counter must be monotonic across all sync entries");
+    assert_eq!(
+        rt.hc.round, r,
+        "round counter must be monotonic across all sync entries"
+    );
 }
 
 /// Per-voter peer counters are monotonic: a delayed old vote never rewinds
@@ -418,9 +449,15 @@ fn nil_wait_grace_is_bounded_and_expires_with_evidence() {
     let base = 3_500u64;
     let (grace, cap) = (5_000u64, 5_000u64);
     let fresh_deadline = 2 * base + grace.min(cap);
-    assert_eq!(fresh_deadline, 12_000, "fresh straggler evidence holds nil one bounded grace");
+    assert_eq!(
+        fresh_deadline, 12_000,
+        "fresh straggler evidence holds nil one bounded grace"
+    );
     let stale_deadline = 2 * base;
-    assert_eq!(stale_deadline, 7_000, "stale evidence falls back to the plain 2x nil wait");
+    assert_eq!(
+        stale_deadline, 7_000,
+        "stale evidence falls back to the plain 2x nil wait"
+    );
     assert!(
         fresh_deadline - stale_deadline <= cap,
         "the nil grace can never exceed its cap no matter the evidence"
@@ -499,7 +536,10 @@ fn breaker_target_is_gated_corroborated_and_jump_bounded() {
     assert!(!hc.apply_deadlock_jump(target));
     assert!(!hc.apply_deadlock_jump(318));
     assert!(!hc.apply_deadlock_jump(target.saturating_sub(1)));
-    assert_eq!(hc.round, target, "round counter never rewinds via the breaker");
+    assert_eq!(
+        hc.round, target,
+        "round counter never rewinds via the breaker"
+    );
     // NOTE: `apply_deadlock_jump` itself is a pure forward gate — the SIZE
     // bound lives in `deadlock_breaker_target` (pinned above), which is the
     // only producer of targets on the production path
@@ -510,7 +550,9 @@ fn breaker_target_is_gated_corroborated_and_jump_bounded() {
     // Still-ahead claims offer a FURTHER target, but still clamped: every
     // breaker fire moves at most MAX_DEADLOCK_JUMP, and fires are
     // rate-limited to one per silence window by the caller.
-    let again = hc.deadlock_breaker_target(10_000, 300).expect("still ahead");
+    let again = hc
+        .deadlock_breaker_target(10_000, 300)
+        .expect("still ahead");
     assert_eq!(again, hc.round.saturating_add(MAX_DEADLOCK_JUMP));
 }
 
@@ -537,7 +579,10 @@ fn local_reset_moves_forward_once_and_sticks() {
     );
     let before_scan = hc.scan_lookback;
     assert!(hc.apply_deadlock_local_reset(false));
-    assert_eq!(hc.round, 413, "re-phase advances exactly one round, never rewinds");
+    assert_eq!(
+        hc.round, 413,
+        "re-phase advances exactly one round, never rewinds"
+    );
     assert_eq!(
         hc.scan_lookback, REPHASE_SCAN_WINDOW,
         "re-phase widens the scan window to {REPHASE_SCAN_WINDOW}"

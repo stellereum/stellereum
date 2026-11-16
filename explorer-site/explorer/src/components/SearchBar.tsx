@@ -24,25 +24,28 @@ export const SearchBar: React.FC = () => {
     e.preventDefault();
     const q = query.trim();
     if (!q) return;
+    setError(null);
 
-    // Direct routing heuristics
+    // Direct routing heuristics: block height
     if (/^\d+$/.test(q)) {
       navigate(`/block/${q}`);
       setQuery('');
       return;
     }
 
-    if (q.startsWith('Stl57') || (q.length === 64 && /^[0-9a-fA-F]+$/.test(q))) {
+    const isStl57 = q.startsWith('Stl57');
+    const isHex64 = /^(0x)?[0-9a-fA-F]{64}$/i.test(q);
+
+    if (isStl57 || isHex64) {
       setLoading(true);
-      setError(null);
       try {
         const res = await search(q);
         if (res.type === 'block') {
-          navigate(`/block/${res.value.height || q}`);
+          navigate(`/block/${res.value?.height ?? res.value?.block_height ?? q}`);
         } else if (res.type === 'tx') {
-          navigate(`/tx/${res.value.hash || q}`);
+          navigate(`/tx/${res.value?.hash || res.value?.tx_hash || q}`);
         } else if (res.type === 'address') {
-          navigate(`/address/${res.value.address || q}`);
+          navigate(`/address/${res.value?.address_stl57 || res.value?.stl57 || res.value?.address || q}`);
         } else {
           // Default to address if starts with Stl57 or is 64 hex
           navigate(`/address/${q}`);
@@ -57,7 +60,26 @@ export const SearchBar: React.FC = () => {
       return;
     }
 
-    navigate(`/search?q=${encodeURIComponent(q)}`);
+    setLoading(true);
+    try {
+      const res = await search(q);
+      if (res.type === 'block') {
+        navigate(`/block/${res.value?.height ?? res.value?.block_height ?? q}`);
+        setQuery('');
+      } else if (res.type === 'tx') {
+        navigate(`/tx/${res.value?.hash || res.value?.tx_hash || q}`);
+        setQuery('');
+      } else if (res.type === 'address') {
+        navigate(`/address/${res.value?.address_stl57 || res.value?.stl57 || res.value?.address || q}`);
+        setQuery('');
+      } else {
+        setError('Enter a block #, Stl57... address, or 64-hex hash/address.');
+      }
+    } catch {
+      setError('Enter a block #, Stl57... address, or 64-hex hash/address.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -72,7 +94,10 @@ export const SearchBar: React.FC = () => {
           type="text"
           placeholder="Search by Address (Stl57 / hex), Tx Hash, Block #..."
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            if (error) setError(null);
+          }}
         />
         {loading ? (
           <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>Searching...</span>

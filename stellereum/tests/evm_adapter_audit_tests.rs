@@ -90,10 +90,7 @@ fn f4_pure_vs_served_split_is_coherent_and_pinned() {
         "0x445c0"
     );
     // Zero floor passes the pure figure through unchanged.
-    assert_eq!(
-        eth_estimate_gas_with_floor(&empty, 0).unwrap(),
-        "0x5208"
-    );
+    assert_eq!(eth_estimate_gas_with_floor(&empty, 0).unwrap(), "0x5208");
 
     // served == max(pure, floor) for a range of floors: pure never exceeds served.
     for floor in [0u64, 1, 21_000, 100_000, 280_000, 1_000_000] {
@@ -149,7 +146,16 @@ fn gas_exhaustion_halts_cleanly_and_rolls_back() {
         VmExecutionResult::Success { .. } => {}
         other => panic!("funded call must succeed, got {other:?}"),
     }
-    assert_eq!(ctx.contracts.as_ref().unwrap().get(&addr).unwrap().storage.get(&42), Some(&1));
+    assert_eq!(
+        ctx.contracts
+            .as_ref()
+            .unwrap()
+            .get(&addr)
+            .unwrap()
+            .storage
+            .get(&42),
+        Some(&1)
+    );
 
     // Starve the call of wasmi fuel (covers the table charge, not the body):
     // must report OutOfGas and leave storage at 1 (no partial increment).
@@ -160,7 +166,13 @@ fn gas_exhaustion_halts_cleanly_and_rolls_back() {
         other => panic!("starved call must be OutOfGas, got {other:?}"),
     }
     assert_eq!(
-        ctx.contracts.as_ref().unwrap().get(&addr).unwrap().storage.get(&42),
+        ctx.contracts
+            .as_ref()
+            .unwrap()
+            .get(&addr)
+            .unwrap()
+            .storage
+            .get(&42),
         Some(&1),
         "out-of-gas must not persist a partial write"
     );
@@ -186,7 +198,10 @@ fn contract_call_wire_caps_fail_closed() {
     }];
     let mut ctx = test_ctx(sender, 1_000_000, Some(&mut reg));
     assert!(
-        matches!(Svm::execute(&big_method, 10_000_000, &mut ctx), VmExecutionResult::Reverted(_)),
+        matches!(
+            Svm::execute(&big_method, 10_000_000, &mut ctx),
+            VmExecutionResult::Reverted(_)
+        ),
         "oversized method must revert"
     );
 
@@ -199,7 +214,10 @@ fn contract_call_wire_caps_fail_closed() {
     }];
     let mut ctx = test_ctx(sender, 1_000_000, Some(&mut reg));
     assert!(
-        matches!(Svm::execute(&big_data, 10_000_000, &mut ctx), VmExecutionResult::Reverted(_)),
+        matches!(
+            Svm::execute(&big_data, 10_000_000, &mut ctx),
+            VmExecutionResult::Reverted(_)
+        ),
         "oversized calldata must revert"
     );
 
@@ -212,7 +230,10 @@ fn contract_call_wire_caps_fail_closed() {
     }];
     let mut ctx = test_ctx(sender, 1_000_000, Some(&mut reg));
     assert!(
-        matches!(Svm::execute(&many_args, 10_000_000, &mut ctx), VmExecutionResult::Reverted(_)),
+        matches!(
+            Svm::execute(&many_args, 10_000_000, &mut ctx),
+            VmExecutionResult::Reverted(_)
+        ),
         "9-arg call must revert (max 8)"
     );
 
@@ -269,7 +290,8 @@ fn precompile_malformed_inputs_fail_clean() {
 
     // Nonzero-padded word: NOT an address (malformed ABI) — must be empty,
     // never aliased to the embedded low 20 bytes.
-    let padded = "0x70a08231ffffffffffffffffffffffff1111111111111111111111111111111111111111".to_string();
+    let padded =
+        "0x70a08231ffffffffffffffffffffffff1111111111111111111111111111111111111111".to_string();
     assert_eq!(adapter.emulate_erc20_call(&padded), "0x");
     assert_eq!(
         evm_adapter::extract_address_from_calldata(
@@ -290,7 +312,11 @@ fn precompile_malformed_inputs_fail_clean() {
     // State-changing selectors are read-only emulation: pinned true, never error.
     for sel in ["a9059cbb", "095ea7b3", "23b87266"] {
         let out = adapter.emulate_erc20_call(&format!("0x{sel}"));
-        assert_eq!(out, format!("0x{:0>64}", "1"), "selector {sel} must emulate true");
+        assert_eq!(
+            out,
+            format!("0x{:0>64}", "1"),
+            "selector {sel} must emulate true"
+        );
     }
     // Allowance emulation pins u128::MAX.
     let out = adapter.emulate_erc20_call("0xdd62ed3e");

@@ -405,10 +405,19 @@ async fn adopt_runtime(ks: &[SigningKey], idx: usize) -> ValidatorRuntime {
     ValidatorRuntime::new(ks[idx].clone(), vs, st, 1)
 }
 
-async fn block_at(round: u32, rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block {
+async fn block_at(
+    round: u32,
+    rt: &ValidatorRuntime,
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+) -> Block {
     let vs = rt.validators.clone();
     let proposer = vs.proposer_for(1, round).unwrap();
-    let pk = ks.iter().find(|k| id(k) == proposer).unwrap();
+    let (pk, fk) = ks
+        .iter()
+        .zip(fks.iter())
+        .find(|(k, _)| id(k) == proposer)
+        .unwrap();
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: 1,
@@ -426,7 +435,7 @@ async fn block_at(round: u32, rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pk);
+    b.sign_block_with_falcon(pk, fk);
     b
 }
 
@@ -467,7 +476,7 @@ async fn a_later_round_certificate_supersedes_the_lock() {
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
-    let blk = block_at(6, &rt, &ks).await;
+    let blk = block_at(6, &rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let cert = cert_at(&ks, &fks, 6, bh, &blk.prev_hash);
     let r = rt.adopt_committed(1, blk, cert).await;
@@ -487,7 +496,7 @@ async fn a_same_round_certificate_naming_another_block_is_refused() {
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
-    let blk = block_at(5, &rt, &ks).await;
+    let blk = block_at(5, &rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     assert_ne!(bh, [0xA1u8; 32], "the fixture must name a DIFFERENT block");
     let cert = cert_at(&ks, &fks, 5, bh, &blk.prev_hash);
@@ -505,7 +514,7 @@ async fn an_earlier_round_certificate_naming_another_block_is_refused() {
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
-    let blk = block_at(4, &rt, &ks).await;
+    let blk = block_at(4, &rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let cert = cert_at(&ks, &fks, 4, bh, &blk.prev_hash);
     let r = rt.adopt_committed(1, blk, cert).await;

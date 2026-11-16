@@ -30,8 +30,8 @@ use ed25519_dalek::SigningKey;
 use stellereum::mev::compute_order_merkle_root;
 use stellereum::oracle::PriceFeedUpdate;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{self, MIN_DELEGATION};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{
     OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_SUBMIT_PRICE_FEED,
 };
@@ -99,10 +99,20 @@ async fn native_sum(engine: &InMemoryStateEngine) -> u128 {
 }
 
 async fn pool_balance(engine: &InMemoryStateEngine, pool: &[u8; 32]) -> u64 {
-    engine.get_account(pool).await.map(|a| a.balance).unwrap_or(0)
+    engine
+        .get_account(pool)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
-fn mk_block(height: u64, prev: [u8; 32], ts: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
+fn mk_block(
+    height: u64,
+    prev: [u8; 32],
+    ts: u64,
+    txs: Vec<Transaction>,
+    proposer: [u8; 32],
+) -> Block {
     let order_merkle_root = compute_order_merkle_root(&txs);
     Block {
         shard_id: MASTERCHAIN_SHARD,
@@ -137,7 +147,9 @@ impl Harness {
         let mut funded_total: u128 = 0;
         for i in 0..N_USERS {
             let addr = user_addr(i);
-            engine.update_account(AccountState::new(addr, USER_FUNDS)).await;
+            engine
+                .update_account(AccountState::new(addr, USER_FUNDS))
+                .await;
             funded_total += USER_FUNDS as u128;
         }
         let faucet_addr = faucet_key().verifying_key().to_bytes();
@@ -457,7 +469,11 @@ async fn run_campaign(seed: u64) -> CampaignReport {
         let outcome = h.engine.apply_block_transition(&block, BLOCK_REWARD).await;
 
         // Outcome shape.
-        assert_eq!(outcome.status.len(), txs.len(), "seed {seed} h{height}: status len");
+        assert_eq!(
+            outcome.status.len(),
+            txs.len(),
+            "seed {seed} h{height}: status len"
+        );
         asserts += 1;
         assert_eq!(
             outcome.applied + outcome.failed,
@@ -465,7 +481,11 @@ async fn run_campaign(seed: u64) -> CampaignReport {
             "seed {seed} h{height}: applied+failed==len"
         );
         asserts += 1;
-        assert_eq!(outcome.tx_fees.len(), txs.len(), "seed {seed} h{height}: tx_fees len");
+        assert_eq!(
+            outcome.tx_fees.len(),
+            txs.len(),
+            "seed {seed} h{height}: tx_fees len"
+        );
         asserts += 1;
         // Receipt consistency: the status vector partitions the block, and
         // the collected fees equal the sum of per-tx receipts. (Fee leg
@@ -474,9 +494,15 @@ async fn run_campaign(seed: u64) -> CampaignReport {
         // pin is receipt consistency, not a declared-gas bound.)
         let failed_count = outcome.status.iter().filter(|s| !**s).count();
         let applied_count = outcome.status.iter().filter(|s| **s).count();
-        assert_eq!(outcome.failed, failed_count, "seed {seed} h{height}: failed count");
+        assert_eq!(
+            outcome.failed, failed_count,
+            "seed {seed} h{height}: failed count"
+        );
         asserts += 1;
-        assert_eq!(outcome.applied, applied_count, "seed {seed} h{height}: applied count");
+        assert_eq!(
+            outcome.applied, applied_count,
+            "seed {seed} h{height}: applied count"
+        );
         asserts += 1;
         assert_eq!(
             outcome.fees_collected,
@@ -549,7 +575,10 @@ async fn run_campaign(seed: u64) -> CampaignReport {
     // (3) Determinism: rebuild twice — re-apply the recorded blocks on a
     // fresh engine and demand identical per-block roots (replay equality).
     let h2 = Harness::genesis().await;
-    assert_eq!(h2.funded_total, h.funded_total, "genesis funding must be deterministic");
+    assert_eq!(
+        h2.funded_total, h.funded_total,
+        "genesis funding must be deterministic"
+    );
     asserts += 1;
     for (i, block) in blocks.iter().enumerate() {
         let outcome2 = h2.engine.apply_block_transition(block, BLOCK_REWARD).await;
@@ -561,7 +590,12 @@ async fn run_campaign(seed: u64) -> CampaignReport {
         );
         asserts += 1;
         let root2 = h2.engine.get_state_root().await;
-        assert_eq!(root2, roots[i], "replay seed {seed} h{}: root diverged", i + 1);
+        assert_eq!(
+            root2,
+            roots[i],
+            "replay seed {seed} h{}: root diverged",
+            i + 1
+        );
         asserts += 1;
     }
     let final_root = *roots.last().expect("at least one block");
@@ -579,8 +613,14 @@ async fn run_campaign(seed: u64) -> CampaignReport {
 #[tokio::test]
 async fn protocol_fuzz_campaign_a_blocks_conserve_and_replay() {
     let r = run_campaign(SEED_A).await;
-    assert_eq!(r.blocks, BLOCKS_PER_CAMPAIGN, "campaign A must apply all blocks");
-    assert!(r.assertions > BLOCKS_PER_CAMPAIGN * 8, "campaign A must do real work");
+    assert_eq!(
+        r.blocks, BLOCKS_PER_CAMPAIGN,
+        "campaign A must apply all blocks"
+    );
+    assert!(
+        r.assertions > BLOCKS_PER_CAMPAIGN * 8,
+        "campaign A must do real work"
+    );
     println!(
         "CAMPAIGN A seed={:#x} blocks={} applied={} failed={} assertions={} final_root={}",
         r.seed,
@@ -595,8 +635,14 @@ async fn protocol_fuzz_campaign_a_blocks_conserve_and_replay() {
 #[tokio::test]
 async fn protocol_fuzz_campaign_b_blocks_conserve_and_replay() {
     let r = run_campaign(SEED_B).await;
-    assert_eq!(r.blocks, BLOCKS_PER_CAMPAIGN, "campaign B must apply all blocks");
-    assert!(r.assertions > BLOCKS_PER_CAMPAIGN * 8, "campaign B must do real work");
+    assert_eq!(
+        r.blocks, BLOCKS_PER_CAMPAIGN,
+        "campaign B must apply all blocks"
+    );
+    assert!(
+        r.assertions > BLOCKS_PER_CAMPAIGN * 8,
+        "campaign B must do real work"
+    );
     println!(
         "CAMPAIGN B seed={:#x} blocks={} applied={} failed={} assertions={} final_root={}",
         r.seed,
@@ -611,8 +657,14 @@ async fn protocol_fuzz_campaign_b_blocks_conserve_and_replay() {
 #[tokio::test]
 async fn protocol_fuzz_campaign_c_blocks_conserve_and_replay() {
     let r = run_campaign(SEED_C).await;
-    assert_eq!(r.blocks, BLOCKS_PER_CAMPAIGN, "campaign C must apply all blocks");
-    assert!(r.assertions > BLOCKS_PER_CAMPAIGN * 8, "campaign C must do real work");
+    assert_eq!(
+        r.blocks, BLOCKS_PER_CAMPAIGN,
+        "campaign C must apply all blocks"
+    );
+    assert!(
+        r.assertions > BLOCKS_PER_CAMPAIGN * 8,
+        "campaign C must do real work"
+    );
     println!(
         "CAMPAIGN C seed={:#x} blocks={} applied={} failed={} assertions={} final_root={}",
         r.seed,

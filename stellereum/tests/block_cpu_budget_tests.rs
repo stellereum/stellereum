@@ -23,8 +23,9 @@ use ed25519_dalek::SigningKey;
 
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::runtime::{ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS};
-use stellereum::sharding::Transaction;
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::Storage;
 use stellereum::svm::GAS_BASIC_TRANSFER;
@@ -63,17 +64,30 @@ fn build_txs(n: usize) -> (Vec<Transaction>, Vec<[u8; 32]>) {
     let mut txs = Vec::with_capacity(n);
     let mut senders = Vec::with_capacity(n);
     for i in 0..n as u64 {
-        let sk = det_key(1000 + i);
-        senders.push(sk.verifying_key().to_bytes());
-        txs.push(Transaction::sign(
-            &sk,
-            RECIPIENT,
-            1,
-            GAS_BASIC_TRANSFER,
-            0,
-            1,
-            1,
-        ));
+        let mut seed = [0xA5u8; 32];
+        seed[..8].copy_from_slice(&(1000 + i).to_le_bytes());
+        let kp = FalconKeypair::generate_from_seed_bytes(&seed);
+        let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        Transaction::global_implicit_registry()
+            .register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+            .expect("PQ test key must register");
+        senders.push(from);
+        let mut tx = Transaction {
+            from,
+            to: RECIPIENT,
+            amount: 1,
+            gas_limit: GAS_BASIC_TRANSFER,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = kp.sign(&msg);
+        tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+        txs.push(tx);
     }
     (txs, senders)
 }
@@ -262,7 +276,10 @@ async fn measure_n(n: usize) -> BudgetRow {
         + row.apply_ms
         + row.commit_ms
         + row.snap_each_ms;
-    BudgetRow { total_ms: total, ..row }
+    BudgetRow {
+        total_ms: total,
+        ..row
+    }
 }
 
 #[tokio::test]

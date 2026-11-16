@@ -13,10 +13,10 @@
 use std::collections::HashMap;
 
 use stellereum::governance::{
-    GovAction, GovError, Governance, Proposal, ProposalStatus, VoteChoice,
-    GOVERNANCE_QUORUM_BPS, GOVERNANCE_QUORUM_FLOOR_BPS, GOVERNANCE_VOTING_PERIOD_SECS,
-    MAX_BLOCK_REWARD_NANO, MAX_MIN_GAS_LIMIT, MAX_PROPOSAL_TITLE_BYTES, MAX_SIGNAL_BYTES,
-    MAX_VALIDATOR_BOND, PROPOSAL_MIN_STAKE_NANO,
+    GovAction, GovError, Governance, Proposal, ProposalStatus, VoteChoice, GOVERNANCE_QUORUM_BPS,
+    GOVERNANCE_QUORUM_FLOOR_BPS, GOVERNANCE_VOTING_PERIOD_SECS, MAX_BLOCK_REWARD_NANO,
+    MAX_MIN_GAS_LIMIT, MAX_PROPOSAL_TITLE_BYTES, MAX_SIGNAL_BYTES, MAX_VALIDATOR_BOND,
+    PROPOSAL_MIN_STAKE_NANO,
 };
 use stellereum::oracle::OracleState;
 use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS, MIN_VALIDATOR_BOND};
@@ -301,7 +301,8 @@ fn attack_double_execution_refused() {
     g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
     g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
     assert_eq!(
-        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap(),
+        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap(),
         ProposalStatus::Passed
     );
     g.execute(ids[2], id).unwrap();
@@ -325,7 +326,13 @@ fn attack_unauthorized_propose_and_vote_refused() {
     let mut g = Governance::new();
     // Zero-stake caller cannot propose.
     assert_eq!(
-        g.propose(&mut l, [0xFFu8; 32], "t".into(), GovAction::Signal("t".into()), 0),
+        g.propose(
+            &mut l,
+            [0xFFu8; 32],
+            "t".into(),
+            GovAction::Signal("t".into()),
+            0
+        ),
         Err(GovError::NotStaker)
     );
     // Below-minimum stake cannot propose; exact minimum can.
@@ -334,7 +341,13 @@ fn attack_unauthorized_propose_and_vote_refused() {
         .bond(vid(9), stell(9_999), DEFAULT_COMMISSION_BPS)
         .unwrap();
     assert_eq!(
-        g.propose(&mut small, vid(9), "t".into(), GovAction::Signal("t".into()), 0),
+        g.propose(
+            &mut small,
+            vid(9),
+            "t".into(),
+            GovAction::Signal("t".into()),
+            0
+        ),
         Err(GovError::InsufficientStake)
     );
     // Voting gates.
@@ -357,7 +370,13 @@ fn attack_unauthorized_propose_and_vote_refused() {
         "no vote flipping"
     );
     assert_eq!(
-        g.vote(&mut l, ids[1], id, VoteChoice::Yes, GOVERNANCE_VOTING_PERIOD_SECS + 1),
+        g.vote(
+            &mut l,
+            ids[1],
+            id,
+            VoteChoice::Yes,
+            GOVERNANCE_VOTING_PERIOD_SECS + 1
+        ),
         Err(GovError::VotingClosed),
         "no voting after close"
     );
@@ -381,7 +400,8 @@ fn attack_execute_gates() {
     g.vote(&mut l, ids[1], open, VoteChoice::No, 1).unwrap();
     g.vote(&mut l, ids[2], open, VoteChoice::No, 1).unwrap();
     assert_eq!(
-        g.finalize(&mut l, open, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap(),
+        g.finalize(&mut l, open, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap(),
         ProposalStatus::Rejected
     );
     assert_eq!(g.execute(ids[0], open), Err(GovError::NotPassed));
@@ -399,7 +419,8 @@ fn attack_execute_gates() {
         .unwrap();
     g2.vote(&mut l2, ids2[0], oid, VoteChoice::Yes, 1).unwrap();
     g2.vote(&mut l2, ids2[1], oid, VoteChoice::Yes, 1).unwrap();
-    g2.finalize(&mut l2, oid, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+    g2.finalize(&mut l2, oid, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
     assert_eq!(g2.execute(ids2[0], oid), Err(GovError::InvalidAction));
     assert_eq!(g2.get(oid).unwrap().status, ProposalStatus::Passed);
     // ... and the oracle-aware path then applies it exactly once.
@@ -411,12 +432,22 @@ fn attack_execute_gates() {
     let mut g3 = Governance::new();
     let (mut l3, ids3) = funded_ledger(3, 10_000);
     let aid = g3
-        .propose(&mut l3, ids3[0], "s".into(), GovAction::Signal("hi".into()), 0)
+        .propose(
+            &mut l3,
+            ids3[0],
+            "s".into(),
+            GovAction::Signal("hi".into()),
+            0,
+        )
         .unwrap();
     g3.vote(&mut l3, ids3[0], aid, VoteChoice::Yes, 1).unwrap();
     g3.vote(&mut l3, ids3[1], aid, VoteChoice::Yes, 1).unwrap();
-    g3.finalize(&mut l3, aid, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
-    assert!(g3.execute(ids3[2], aid).is_ok(), "anyone-can-execute by design");
+    g3.finalize(&mut l3, aid, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
+    assert!(
+        g3.execute(ids3[2], aid).is_ok(),
+        "anyone-can-execute by design"
+    );
 }
 
 // ---------- 7. threshold edge cases ----------
@@ -470,7 +501,8 @@ fn attack_quorum_threshold_edges() {
         .unwrap();
     g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
     assert_eq!(
-        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap(),
+        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap(),
         ProposalStatus::Rejected,
         "10k/30k turnout must miss the 6666 bps quorum"
     );
@@ -493,23 +525,33 @@ fn attack_slash_bps_matches_staking_cap() {
         )
         .expect("10000 bps must propose");
     g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
-    g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+    g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
     g.execute(ids[0], id).unwrap();
     assert_eq!(g.applied.equivocation_slash_bps, Some(10_000));
     let mut ls = StakingLedger::new();
-    ls.bond(vid(5), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
-    assert!(ls.slash(vid(5), 10_000).is_ok(), "staking accepts 100% slash");
+    ls.bond(vid(5), stell(10_000), DEFAULT_COMMISSION_BPS)
+        .unwrap();
+    assert!(
+        ls.slash(vid(5), 10_000).is_ok(),
+        "staking accepts 100% slash"
+    );
     // Governed 10001 bps is refused at BOTH gates; staking refuses it too.
     assert_eq!(
         GovAction::SetEquivocationSlashBps(10_001).validate(),
         Err(GovError::InvalidAction)
     );
     let mut g2 = Governance::new();
-    let smuggled = smuggle_passed(&mut g2, GovAction::SetEquivocationSlashBps(10_001), "s".into());
+    let smuggled = smuggle_passed(
+        &mut g2,
+        GovAction::SetEquivocationSlashBps(10_001),
+        "s".into(),
+    );
     assert_eq!(g2.execute(ids[0], smuggled), Err(GovError::InvalidAction));
     assert_eq!(g2.get(smuggled).unwrap().status, ProposalStatus::Passed);
     let mut ls2 = StakingLedger::new();
-    ls2.bond(vid(6), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+    ls2.bond(vid(6), stell(10_000), DEFAULT_COMMISSION_BPS)
+        .unwrap();
     assert!(
         ls2.slash(vid(6), 10_001).is_err(),
         "staking refuses >10000 bps — caps agree"
@@ -523,7 +565,13 @@ fn attack_no_timelock_execute_immediately_after_finalize() {
     let (mut l, ids) = funded_ledger(3, 10_000);
     let mut g = Governance::new();
     let id = g
-        .propose(&mut l, ids[0], "t".into(), GovAction::Signal("now".into()), 0)
+        .propose(
+            &mut l,
+            ids[0],
+            "t".into(),
+            GovAction::Signal("now".into()),
+            0,
+        )
         .unwrap();
     // Finalizing BEFORE the window ends is refused (no early pass).
     assert_eq!(
@@ -567,7 +615,13 @@ fn regression_voting_end_saturates_near_u64_max() {
     let mut g = Governance::new();
     let now = u64::MAX - 10;
     let id = g
-        .propose(&mut l, ids[0], "edge".into(), GovAction::Signal("e".into()), now)
+        .propose(
+            &mut l,
+            ids[0],
+            "edge".into(),
+            GovAction::Signal("e".into()),
+            now,
+        )
         .expect("propose near u64::MAX must not wrap/panic");
     assert_eq!(
         g.get(id).unwrap().voting_end,

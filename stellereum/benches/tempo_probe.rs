@@ -25,9 +25,8 @@ use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use stellereum::commitment::{
-    AbiJsonCache, Domain, DomainCache, assemble_cached_digest, assemble_from_cache,
-    contracts_preimage, contracts_preimage_cached, staking_preimage, tokens_preimage,
-    CommitmentSnapshot,
+    assemble_cached_digest, assemble_from_cache, contracts_preimage, contracts_preimage_cached,
+    staking_preimage, tokens_preimage, AbiJsonCache, CommitmentSnapshot, Domain, DomainCache,
 };
 use stellereum::contract::ContractRegistry;
 use stellereum::contract_abi::{AbiEvent, AbiMethod, AbiParam, AbiType, ContractAbi};
@@ -76,7 +75,9 @@ fn make_tokens(n_tokens: usize, bals_per_token: usize) -> stellereum::token::Tok
         let mut actor =
             stellereum::token::TokenActor::new(id, md, 1_000_000).expect("valid test metadata");
         for j in 0..bals_per_token {
-            actor.balances.insert(det_key(0xA1, j as u64), (i as u64) * 1000 + j as u64);
+            actor
+                .balances
+                .insert(det_key(0xA1, j as u64), (i as u64) * 1000 + j as u64);
         }
         reg.tokens.insert(id, actor);
     }
@@ -191,7 +192,10 @@ fn tempo_tokens_domain() {
         let b = tokens_preimage(&reg);
         len = b.len();
     });
-    println!("[tempo][tokens] 200tok/8bal preimage={len} bytes time={} (median-of-10)", medal_ms(ms));
+    println!(
+        "[tempo][tokens] 200tok/8bal preimage={len} bytes time={} (median-of-10)",
+        medal_ms(ms)
+    );
     assert!(len > 0);
 }
 
@@ -232,7 +236,10 @@ fn tempo_staking_domain() {
         let b = staking_preimage(&l);
         len = b.len();
     });
-    println!("[tempo][staking] 50 vals preimage={len} bytes time={} (median-of-10)", medal_ms(ms));
+    println!(
+        "[tempo][staking] 50 vals preimage={len} bytes time={} (median-of-10)",
+        medal_ms(ms)
+    );
     assert!(len > 0);
 }
 
@@ -301,10 +308,7 @@ fn tempo_assemble_hot_vs_streaming() {
             Domain::Xpc,
             stellereum::commitment::xpc_preimage(&s.cross_shard_xpc)
         ),
-        fill!(
-            Domain::Zkml,
-            stellereum::commitment::zkml_preimage(&zkml)
-        ),
+        fill!(Domain::Zkml, stellereum::commitment::zkml_preimage(&zkml)),
     ];
     let total: usize = domains.iter().map(|b| b.len()).sum();
     let refs: [&[u8]; 13] = [
@@ -322,7 +326,11 @@ fn tempo_assemble_hot_vs_streaming() {
         &domains[11],
         &domains[12],
     ];
-    assert_eq!(assemble_cached_digest(refs), reference, "cached == streaming");
+    assert_eq!(
+        assemble_cached_digest(refs),
+        reference,
+        "cached == streaming"
+    );
     cache.reset_counters();
     let ms_hot = median_ms(10, 2, || {
         let mut parts: [Vec<u8>; 13] = std::array::from_fn(|_| Vec::new());
@@ -330,9 +338,8 @@ fn tempo_assemble_hot_vs_streaming() {
             parts[d.index()] = cache.get(d, gens[d.index()]).expect("all-hit");
         }
         let r: [&[u8]; 13] = [
-            &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
-            &parts[6], &parts[7], &parts[8], &parts[9], &parts[10], &parts[11],
-            &parts[12],
+            &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5], &parts[6], &parts[7],
+            &parts[8], &parts[9], &parts[10], &parts[11], &parts[12],
         ];
         let _ = assemble_cached_digest(r);
     });
@@ -387,7 +394,11 @@ fn tempo_batch_verify_20tx() {
     let ms = median_ms(20, 2, || {
         ok = Transaction::verify_signatures_batch(&txs);
     });
-    println!("[tempo][validate] batch_verify_20tx={} ok={ok} ({:.3} ms/tx)", medal_ms(ms), ms / 20.0);
+    println!(
+        "[tempo][validate] batch_verify_20tx={} ok={ok} ({:.3} ms/tx)",
+        medal_ms(ms),
+        ms / 20.0
+    );
     assert!(ok);
 }
 
@@ -517,10 +528,7 @@ fn tempo_assemble_zero_copy_vs_hot() {
             Domain::Xpc,
             stellereum::commitment::xpc_preimage(&s.cross_shard_xpc)
         ),
-        fill!(
-            Domain::Zkml,
-            stellereum::commitment::zkml_preimage(&zkml)
-        ),
+        fill!(Domain::Zkml, stellereum::commitment::zkml_preimage(&zkml)),
     ];
     let total: usize = domains.iter().map(|b| b.len()).sum();
     let refs: [&[u8]; 13] = [
@@ -538,7 +546,11 @@ fn tempo_assemble_zero_copy_vs_hot() {
         &domains[11],
         &domains[12],
     ];
-    assert_eq!(assemble_cached_digest(refs), reference, "cached == streaming");
+    assert_eq!(
+        assemble_cached_digest(refs),
+        reference,
+        "cached == streaming"
+    );
     assert_eq!(
         assemble_from_cache(&mut cache, &gens).expect("all-hit"),
         reference,
@@ -551,9 +563,8 @@ fn tempo_assemble_zero_copy_vs_hot() {
             parts[d.index()] = cache.get(d, gens[d.index()]).expect("all-hit");
         }
         let r: [&[u8]; 13] = [
-            &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
-            &parts[6], &parts[7], &parts[8], &parts[9], &parts[10], &parts[11],
-            &parts[12],
+            &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5], &parts[6], &parts[7],
+            &parts[8], &parts[9], &parts[10], &parts[11], &parts[12],
         ];
         let _ = assemble_cached_digest(r);
     });

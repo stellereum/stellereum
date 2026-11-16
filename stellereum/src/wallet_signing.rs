@@ -350,9 +350,7 @@ impl WalletSignature {
                     )
                 }
                 Ok(vk) if vk.is_weak() => {
-                    return Err(
-                        "wallet signature: Ed25519 public key is small-order".to_string(),
-                    )
+                    return Err("wallet signature: Ed25519 public key is small-order".to_string())
                 }
                 Ok(_) => {}
             }

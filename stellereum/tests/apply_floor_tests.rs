@@ -34,8 +34,8 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use stellereum::consensus::ValidatorSet;
 use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
@@ -463,23 +463,34 @@ async fn pq_activation_floor_includes_surcharge_at_apply() {
 // VALIDATE: refuse underpriced blocks, loudly
 // ===========================================================================
 
-fn single_validator() -> (SigningKey, ValidatorSet, Arc<InMemoryStateEngine>) {
+fn single_validator() -> (
+    SigningKey,
+    stellereum::post_quantum::FalconKeypair,
+    ValidatorSet,
+    Arc<InMemoryStateEngine>,
+) {
     let key = SigningKey::generate(&mut OsRng);
     let me = id_of(&key);
+    let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&key.to_bytes());
+    stellereum::consensus::register_validator_pq_key(
+        me,
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
     let engine = Arc::new(InMemoryStateEngine::new());
     let vset = ValidatorSet::from_list(vec![(me, 1)]);
-    (key, vset, engine)
+    (key, fk, vset, engine)
 }
 
 /// A honestly-proposed block at/above the floor validates.
 #[tokio::test]
 async fn validate_accepts_block_at_or_above_floor() {
-    let (key, vset, engine) = single_validator();
+    let (key, fk, vset, engine) = single_validator();
     let me = id_of(&key);
     engine
         .update_account(AccountState::new(me, 10_000_000))
         .await;
-    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
+    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk);
     rt.mempool.write().await.base_fee = FLOOR;
 
     // Funded above amount + floor, declared above the floor: packed + valid.
@@ -505,12 +516,13 @@ async fn validate_accepts_block_at_or_above_floor() {
 /// naming the transaction hash.
 #[tokio::test]
 async fn validate_refuses_underpriced_block_naming_tx() {
-    let (key, vset, engine) = single_validator();
+    let (key, fk, vset, engine) = single_validator();
     let me = id_of(&key);
     engine
         .update_account(AccountState::new(me, 10_000_000))
         .await;
-    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
     rt.mempool.write().await.base_fee = FLOOR;
 
     let alice = pq_user();
@@ -538,7 +550,8 @@ async fn validate_refuses_underpriced_block_naming_tx() {
     // of the signed hash, so a Byzantine proposer updates it too (that is
     // exactly what keeps the ORDER commitment meaningful).
     bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
-    bad.sign_block(&key);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
     let err = rt
         .validate_proposal(&bad, root)
         .expect_err("underpriced block must be refused");
@@ -561,12 +574,13 @@ async fn validate_refuses_activation_missing_surcharge() {
     };
     use stellereum::sharding::Transaction as Tx;
 
-    let (key, vset, engine) = single_validator();
+    let (key, fk, vset, engine) = single_validator();
     let me = id_of(&key);
     engine
         .update_account(AccountState::new(me, 10_000_000))
         .await;
-    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
     rt.mempool.write().await.base_fee = FLOOR;
 
     // Genuine block for a correct envelope.
@@ -608,7 +622,8 @@ async fn validate_refuses_activation_missing_surcharge() {
     let mut bad = genuine.clone();
     bad.transactions = vec![act];
     bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
-    bad.sign_block(&key);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
     let err = rt
         .validate_proposal(&bad, root)
         .expect_err("activation missing the surcharge must be refused");
@@ -620,12 +635,13 @@ async fn validate_refuses_activation_missing_surcharge() {
 /// the sender must over-post, exactly like admission.
 #[tokio::test]
 async fn validate_enforces_failure_penalty_like_admission() {
-    let (key, vset, engine) = single_validator();
+    let (key, fk, vset, engine) = single_validator();
     let me = id_of(&key);
     engine
         .update_account(AccountState::new(me, 10_000_000))
         .await;
-    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
 
     let alice = pq_user();
     let from = pq_id(&alice);
@@ -658,7 +674,8 @@ async fn validate_enforces_failure_penalty_like_admission() {
     let mut bad = genuine.clone();
     bad.transactions = vec![penalised];
     bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
-    bad.sign_block(&key);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
     let err = rt
         .validate_proposal(&bad, root)
         .expect_err("penalty-underpriced block must be refused");
@@ -670,7 +687,8 @@ async fn validate_enforces_failure_penalty_like_admission() {
     let mut good = genuine.clone();
     good.transactions = vec![rich];
     good.order_merkle_root = stellereum::mev::compute_order_merkle_root(&good.transactions);
-    good.sign_block(&key);
+    good.validator_signatures.clear();
+    good.sign_block_with_falcon(&key, &fk);
     rt.validate_proposal(&good, root)
         .expect("base + penalty must validate");
 }

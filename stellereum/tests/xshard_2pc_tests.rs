@@ -35,12 +35,15 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use stellereum::network::CrossShardTransport;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::ShardedCluster;
 use stellereum::sharding::{
     CrossShardKind, CrossShardMessage, ShardRegistry, Transaction, BASE_WORKCHAIN_SHARD_INITIAL,
     MASTERCHAIN_SHARD,
 };
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine, PQ_ACTIVATION_SURCHARGE_GAS};
 use stellereum::xshard2pc::{XpcActivation, XpcPhase};
 
 const SHARD0: u32 = MASTERCHAIN_SHARD;
@@ -49,6 +52,50 @@ const TS: u64 = 1_770_000_000;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+fn pq_sender(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    (kp, addr)
+}
+
+fn sign_pq_tx(
+    sender: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sender.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = sender.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sender.public_key.clone(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
 }
 
 fn sharded() -> ShardRegistry {
@@ -123,9 +170,8 @@ async fn run_2pc_to_completion(cluster: &mut ShardedCluster, rounds: usize) {
 #[tokio::test]
 async fn two_phase_commit_credits_the_target_exactly_once() {
     let validator = key(1);
-    let sender = key(2);
+    let (sender, sender_addr) = pq_sender(2);
     let recipient = key(3);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -134,7 +180,7 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
 
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -156,10 +202,10 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
         "a 2PC transfer must NOT be published as a plain transfer (that would \
          let the target credit before the source has a vote)"
     );
-    // The escrow: the sender is debited at the source.
+    // The escrow: the sender is debited at the source (amount + gas + PQ activation surcharge).
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the source escrows the value"
     );
     assert_eq!(
@@ -237,7 +283,7 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
     );
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the escrow was released, not refunded"
     );
 }
@@ -252,9 +298,8 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
 #[tokio::test]
 async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
     let validator = key(4);
-    let sender = key(5);
+    let (sender, sender_addr) = pq_sender(5);
     let recipient = key(6);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -262,7 +307,7 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -293,8 +338,12 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
 
     let fresh = Arc::new(InMemoryStateEngine::new());
     // The recovered engine is a SHARD engine: the cross-shard gate is on
-    // (without it the engine would not apply the cross-shard records at all).
+    // (without it the engine would not apply the cross-shard records at all),
+    // and it has the node's finalized-header anchor registry attached (C1).
     fresh.enable_cross_shard();
+    if let Some(hdrs) = source_engine.finalized_headers() {
+        fresh.with_finalized_headers(hdrs);
+    }
     for acc in &accounts {
         fresh.update_account(acc.clone()).await;
     }
@@ -332,7 +381,7 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
         .unwrap_or(0);
     assert_eq!(
         recovered_sender,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the recovered source must NOT refund the escrow"
     );
 }
@@ -348,9 +397,8 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
 #[tokio::test]
 async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() {
     let validator = key(7);
-    let sender = key(8);
+    let (sender, sender_addr) = pq_sender(8);
     let recipient = key(9);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -358,7 +406,7 @@ async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() 
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -407,7 +455,7 @@ async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() 
     );
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the value moved once and only once"
     );
 }
@@ -432,9 +480,8 @@ async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() 
 #[tokio::test]
 async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
     let validator = key(10);
-    let sender = key(11);
+    let (sender, sender_addr) = pq_sender(11);
     let recipient = key(12);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -442,7 +489,7 @@ async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -526,7 +573,7 @@ async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
     );
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the sender is NOT refunded: no double spend"
     );
 }
@@ -543,9 +590,8 @@ async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
 #[tokio::test]
 async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double_spend() {
     let validator = key(13);
-    let sender = key(14);
+    let (sender, sender_addr) = pq_sender(14);
     let recipient = key(15);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -553,7 +599,7 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -604,7 +650,7 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
     // a liveness loss, NOT a double spend.
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "a committed transfer is never refunded"
     );
     assert_eq!(
@@ -630,9 +676,8 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
 #[tokio::test]
 async fn replay_of_a_prepare_or_commit_is_rejected() {
     let validator = key(16);
-    let sender = key(17);
+    let (sender, sender_addr) = pq_sender(17);
     let recipient = key(18);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -640,7 +685,7 @@ async fn replay_of_a_prepare_or_commit_is_rejected() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -729,9 +774,8 @@ async fn replay_of_a_prepare_or_commit_is_rejected() {
 async fn a_two_validator_shard_accepts_the_2pc_records() {
     let v1 = key(20);
     let v2 = key(21);
-    let sender = key(22);
+    let (sender, sender_addr) = pq_sender(22);
     let recipient = key(23);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -758,7 +802,7 @@ async fn a_two_validator_shard_accepts_the_2pc_records() {
     );
     cluster.with_xpc_activation(XpcActivation::FromHeight(0));
 
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -804,9 +848,8 @@ async fn a_two_validator_shard_accepts_the_2pc_records() {
 #[tokio::test]
 async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
     let validator = key(40);
-    let sender = key(41);
+    let (sender, sender_addr) = pq_sender(41);
     let recipient = key(42);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -814,7 +857,7 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -874,7 +917,7 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
     );
     assert_eq!(
         balance(&cluster, SHARD0, &sender_addr).await,
-        initial - amount - fee,
+        initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the escrow was released, not refunded"
     );
 }
@@ -894,9 +937,8 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
 async fn a_refused_escrow_leaves_no_prepared_record() {
     use stellereum::sharding::Block;
 
-    let sender = key(29);
+    let (sender, sender_addr) = pq_sender(29);
     let recipient = key(30);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let engine = Arc::new(InMemoryStateEngine::new());
@@ -906,7 +948,7 @@ async fn a_refused_escrow_leaves_no_prepared_record() {
         .await;
 
     // The account's nonce is 0, so a transaction with nonce 7 is REFUSED.
-    let tx = Transaction::sign(
+    let tx = sign_pq_tx(
         &sender,
         recipient_addr,
         1_000_000_000u64,
@@ -978,9 +1020,8 @@ async fn a_refused_escrow_leaves_no_prepared_record() {
 #[tokio::test]
 async fn the_activation_boundary_switches_the_protocol() {
     let validator = key(24);
-    let sender = key(25);
+    let (sender, sender_addr) = pq_sender(25);
     let recipient = key(26);
-    let sender_addr = sender.verifying_key().to_bytes();
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial = 5_000_000_000u64;
@@ -1003,7 +1044,7 @@ async fn the_activation_boundary_switches_the_protocol() {
     cluster.with_xpc_activation(XpcActivation::FromHeight(2));
 
     // ---- height 1: the LEGACY flow. ----
-    let legacy_tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let legacy_tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let legacy_hash = legacy_tx.compute_tx_hash();
     cluster.broadcast_tx(legacy_tx.clone()).await;
     let h1 = cluster.run_height(SHARD0, TS).await;
@@ -1034,7 +1075,7 @@ async fn the_activation_boundary_switches_the_protocol() {
     );
 
     // ---- height 2+: the 2PC. ----
-    let xpc_tx = Transaction::sign(&sender, recipient_addr, amount, fee, 1, SHARD0, SHARD1);
+    let xpc_tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 1, SHARD0, SHARD1);
     let xpc_hash = xpc_tx.compute_tx_hash();
     cluster.broadcast_tx(xpc_tx.clone()).await;
     let h2 = cluster.run_height(SHARD0, TS + 3).await;
@@ -1069,11 +1110,12 @@ async fn the_activation_boundary_switches_the_protocol() {
 /// resumes to the SAME decision).
 #[tokio::test]
 async fn the_2pc_state_is_committed_in_the_digest_and_the_snapshot() {
-    let tx = Transaction::sign(
-        &key(27),
+    let (sender, _) = pq_sender(27);
+    let tx = sign_pq_tx(
+        &sender,
         key(28).verifying_key().to_bytes(),
         1_000,
-        10,
+        280_000,
         0,
         SHARD0,
         SHARD1,

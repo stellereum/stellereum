@@ -151,8 +151,7 @@ fn run_classical(
         dkgs.iter().all(|d| d.can_finalize()),
         "every member finalizes"
     );
-    dkgs
-        .iter_mut()
+    dkgs.iter_mut()
         .map(|d| d.finalize().expect("finalize succeeds"))
         .collect()
 }
@@ -201,8 +200,7 @@ fn run_swapped(
         dkgs.iter().all(|d| d.can_finalize()),
         "every member finalizes through the swapped path"
     );
-    dkgs
-        .iter_mut()
+    dkgs.iter_mut()
         .map(|d| d.finalize().expect("finalize succeeds"))
         .collect()
 }
@@ -256,7 +254,11 @@ fn pq_transport_seal_verify_roundtrip_fixed_vectors() {
         msg_a.starts_with(PQ_TRANSPORT_SIG_DOMAIN),
         "the domain leads the preimage"
     );
-    let len = u32::from_be_bytes(msg_a[PQ_TRANSPORT_SIG_DOMAIN.len()..][..4].try_into().unwrap());
+    let len = u32::from_be_bytes(
+        msg_a[PQ_TRANSPORT_SIG_DOMAIN.len()..][..4]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(
         len as usize,
         contribution.canonical_bytes().len(),
@@ -267,14 +269,12 @@ fn pq_transport_seal_verify_roundtrip_fixed_vectors() {
     let envelope = pq_transport_seal(&members[0].falcon, contribution.clone());
     assert_eq!(envelope.falcon_pk, members[0].falcon_pk);
     assert_eq!(envelope.falcon_sig.len(), 666);
-    pq_transport_verify(&envelope, &members[0].falcon_pk)
-        .expect("a fresh envelope verifies");
+    pq_transport_verify(&envelope, &members[0].falcon_pk).expect("a fresh envelope verifies");
 
     // Falcon signing randomizes: a second seal verifies too (never assert
     // signature equality — FIPS 206 requires fresh randomness per signature).
     let envelope2 = pq_transport_seal(&members[0].falcon, contribution.clone());
-    pq_transport_verify(&envelope2, &members[0].falcon_pk)
-        .expect("a second seal verifies as well");
+    pq_transport_verify(&envelope2, &members[0].falcon_pk).expect("a second seal verifies as well");
 }
 
 // ===========================================================================
@@ -401,7 +401,10 @@ fn pq_transport_fallback_is_byte_identical() {
             "member {i}: same transcript root"
         );
         assert_eq!(a.share, b.share, "member {i}: same share");
-        assert_eq!(a.committee_hash, b.committee_hash, "member {i}: same committee");
+        assert_eq!(
+            a.committee_hash, b.committee_hash,
+            "member {i}: same committee"
+        );
         assert_eq!(a.threshold, b.threshold, "member {i}: same threshold");
     }
 }
@@ -689,7 +692,9 @@ fn run_pq_kem(
     // Contributors must build (not publish) first so the own-contribution
     // ingest path has its evaluation.
     for i in 0..members.len() {
-        let index = committee.index_of(&members[i].id).expect("member has an index");
+        let index = committee
+            .index_of(&members[i].id)
+            .expect("member has an index");
         if committee.is_contributor(index) {
             dkgs[i]
                 .contribution_pq(members[i].id, &members[i].secret, &ek_map)
@@ -709,12 +714,10 @@ fn run_pq_kem(
         dkgs.iter().all(|d| d.can_finalize()),
         "every member finalizes through the PQ-KEM path"
     );
-    dkgs
-        .iter_mut()
+    dkgs.iter_mut()
         .map(|d| d.finalize().expect("finalize succeeds"))
         .collect()
 }
-
 
 // ===========================================================================
 // 5. KEM primitive fixed vectors
@@ -797,7 +800,8 @@ fn pq_kem_package_roundtrip_and_refusals() {
     let members = four_members();
     let parties = kem_parties(&members);
     let plaintext = [0x77u8; 32];
-    let pkg = encrypt_share_package_pq(2, &parties[0].kem_ek, &plaintext).expect("pq encrypt works");
+    let pkg =
+        encrypt_share_package_pq(2, &parties[0].kem_ek, &plaintext).expect("pq encrypt works");
     assert_eq!(pkg.recipient_index, 2);
     assert_eq!(pkg.ciphertext.len(), PQ_KEM_PACKAGE_CT_LEN);
     assert_eq!(pkg.ephemeral_pk, [0u8; 32]);
@@ -810,7 +814,10 @@ fn pq_kem_package_roundtrip_and_refusals() {
     // key mismatch surfaces as an AEAD refusal — never a wrong share.
     let err = decrypt_share_package_pq(&parties[1].kem_seed, &pkg)
         .expect_err("wrong recipient must be refused");
-    assert!(err.contains("pq kem"), "the refusal names the pq kem leg: {err}");
+    assert!(
+        err.contains("pq kem"),
+        "the refusal names the pq kem leg: {err}"
+    );
     // Tampered KEM ct at the start, middle and end of the kem_ct region.
     for tamper_at in [0usize, 511, PQ_KEM_CT_LEN - 1] {
         let mut bad = pkg.clone();
@@ -834,7 +841,10 @@ fn pq_kem_package_roundtrip_and_refusals() {
     let classical_pkg = classical[0].0.packages[0].clone();
     let err = decrypt_share_package_pq(&parties[1].kem_seed, &classical_pkg)
         .expect_err("classical package must be refused by the PQ decryptor");
-    assert!(err.contains("pq kem"), "the refusal names the pq kem leg: {err}");
+    assert!(
+        err.contains("pq kem"),
+        "the refusal names the pq kem leg: {err}"
+    );
     // And the classical ingest refuses the PQ-KEM shape fail-closed.
     let pq_envelopes = build_pq_envelopes(&committee, &members, &parties);
     let foreign = pq_envelopes
@@ -891,13 +901,19 @@ fn pq_kem_tampered_ct_refused_end_to_end() {
     let err = dkg
         .ingest_authenticated_pq(&resealed, victim_seed, &expected)
         .expect_err("tampered kem ct must not ingest");
-    assert!(err.contains("pq kem"), "the refusal names the pq kem leg: {err}");
+    assert!(
+        err.contains("pq kem"),
+        "the refusal names the pq kem leg: {err}"
+    );
     // Without the re-seal, Falcon guards the PQ-shaped bytes first.
     let mut dkg2 = EpochDkg::new(committee.clone(), victim.id);
     let err = dkg2
         .ingest_authenticated_pq(&tampered, victim_seed, &expected)
         .expect_err("un-sealed tamper must not ingest");
-    assert!(err.contains("falcon"), "the refusal names the falcon leg: {err}");
+    assert!(
+        err.contains("falcon"),
+        "the refusal names the falcon leg: {err}"
+    );
     // Wrong recipient seed end-to-end: the victim's DKG opened with
     // another member's valid seed refuses at transport (implicit-rejection
     // key mismatch -> AEAD tag failure).
@@ -910,7 +926,10 @@ fn pq_kem_tampered_ct_refused_end_to_end() {
     let err = dkg3
         .ingest_authenticated_pq(&envelopes[0], wrong_seed, &expected)
         .expect_err("wrong-recipient ingest must be refused");
-    assert!(err.contains("pq kem"), "the refusal names the pq kem leg: {err}");
+    assert!(
+        err.contains("pq kem"),
+        "the refusal names the pq kem leg: {err}"
+    );
 }
 
 // ===========================================================================
@@ -1173,10 +1192,7 @@ fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
     let err = solo
         .ingest_classical_at_h(contributions[0].0.clone(), &members[1].enc_secret, PQ_H - 1)
         .expect_err("classical pre-H must be refused under FULL-PQ");
-    assert!(
-        err.contains("FULL-PQ"),
-        "refusal must name FULL-PQ: {err}"
-    );
+    assert!(err.contains("FULL-PQ"), "refusal must name FULL-PQ: {err}");
 }
 
 /// FULL-PQ: classical refused at ANY height (pre-H and post-H alike),
@@ -1217,9 +1233,199 @@ fn pq_h_gate_classical_post_h_refused() {
         let err = solo
             .ingest_classical_at_h(first_contribution.clone(), &members[1].enc_secret, height)
             .expect_err("classical ingest must be refused under FULL-PQ");
-        assert!(
-            err.contains("FULL-PQ"),
-            "the refusal names FULL-PQ: {err}"
-        );
+        assert!(err.contains("FULL-PQ"), "the refusal names FULL-PQ: {err}");
     }
+}
+
+// ===========================================================================
+// 12. MevFrame::PqDkg (b"STPQ") wire framing + ValidatorRuntime::on_mev_frame
+// ===========================================================================
+
+#[test]
+fn pq_dkg_frame_roundtrip_and_malformed_decode_fails_closed() {
+    use stellereum::mev_epoch::{
+        is_mev_frame, MevFrame, DKG_PAYLOAD_MAGIC, MAX_MEV_FRAME_BYTES, PQ_DKG_PAYLOAD_MAGIC,
+    };
+
+    assert_eq!(PQ_DKG_PAYLOAD_MAGIC, b"STPQ");
+    assert_eq!(DKG_PAYLOAD_MAGIC, b"STD1");
+
+    let members = four_members();
+    let committee = committee_of(5, &members);
+    let parties = kem_parties(&members);
+    let envelopes = build_pq_envelopes(&committee, &members, &parties);
+    let env = envelopes[0].clone();
+
+    // Classical Dkg frame magic/bytes are unchanged.
+    let classical_frame = MevFrame::Dkg(env.contribution.clone());
+    assert_eq!(classical_frame.magic(), DKG_PAYLOAD_MAGIC);
+    let classical_wire = classical_frame.encode().expect("classical dkg encodes");
+    assert_eq!(&classical_wire[..4], b"STD1");
+    assert_eq!(
+        MevFrame::decode(&classical_wire).expect("classical dkg decodes"),
+        classical_frame
+    );
+
+    // PqDkg frame uses b"STPQ", is recognised by is_mev_frame, and round-trips.
+    let frame = MevFrame::PqDkg(env.clone());
+    assert_eq!(frame.magic(), PQ_DKG_PAYLOAD_MAGIC);
+    let wire = frame.encode().expect("pq dkg encodes");
+    assert_eq!(&wire[..4], b"STPQ");
+    assert!(is_mev_frame(&wire), "is_mev_frame must recognize b\"STPQ\"");
+    assert!(!is_mev_frame(b"STPQ"), "magic-only 4 bytes is not a frame");
+    assert_eq!(MevFrame::decode(&wire).expect("pq dkg round-trips"), frame);
+
+    // Truncated body fails closed.
+    assert!(MevFrame::decode(b"STPQ").is_err());
+    let mut truncated = wire.clone();
+    truncated.truncate(wire.len() - 5);
+    assert!(
+        MevFrame::decode(&truncated).is_err(),
+        "truncated STPQ frame must fail closed"
+    );
+
+    // Trailing garbage fails closed.
+    let mut trailing = wire.clone();
+    trailing.push(0xAA);
+    assert!(
+        MevFrame::decode(&trailing).is_err(),
+        "trailing bytes on STPQ frame must fail closed"
+    );
+
+    // Structurally corrupt body bytes fail closed at decode.
+    let mut corrupt_garbage = PQ_DKG_PAYLOAD_MAGIC.to_vec();
+    corrupt_garbage.extend_from_slice(&[0xFF; 16]);
+    assert!(
+        MevFrame::decode(&corrupt_garbage).is_err(),
+        "corrupt STPQ body must fail closed at decode"
+    );
+
+    // Flipping payload bytes (e.g., epoch u64) still fails Falcon authentication after decode.
+    let mut flipped = wire.clone();
+    flipped[4] ^= 0xFF;
+    let decoded_flipped =
+        MevFrame::decode(&flipped).expect("valid u64 bitflip decodes structurally");
+    match decoded_flipped {
+        MevFrame::PqDkg(tampered_env) => {
+            assert!(
+                pq_transport_verify(&tampered_env, &env.falcon_pk).is_err(),
+                "tampered STPQ payload must fail Falcon verification"
+            );
+        }
+        other => panic!("expected PqDkg frame, got {other:?}"),
+    }
+
+    // Pathological bincode length prefix fails closed without OOM.
+    let mut evil = PQ_DKG_PAYLOAD_MAGIC.to_vec();
+    evil.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        MevFrame::decode(&evil).is_err(),
+        "pathological length prefix on STPQ must fail closed"
+    );
+
+    // Oversized STPQ frame (> MAX_MEV_FRAME_BYTES body) fails closed.
+    let mut oversized = Vec::with_capacity(4 + MAX_MEV_FRAME_BYTES as usize + 1);
+    oversized.extend_from_slice(PQ_DKG_PAYLOAD_MAGIC);
+    oversized.resize(4 + MAX_MEV_FRAME_BYTES as usize + 1, 0x11);
+    assert!(is_mev_frame(&oversized));
+    let err = MevFrame::decode(&oversized).expect_err("oversized STPQ frame must fail closed");
+    assert!(
+        err.contains("exceeds max wire size"),
+        "oversized refusal names wire limit: {err}"
+    );
+}
+
+#[tokio::test]
+async fn validator_runtime_on_mev_frame_accepts_valid_pq_dkg_and_rejects_tampered() {
+    use std::sync::Arc;
+    use stellereum::consensus::ValidatorSet;
+    use stellereum::mev_epoch::{EpochSealManager, MevFrame};
+    use stellereum::runtime::ValidatorRuntime;
+    use stellereum::state_engine::InMemoryStateEngine;
+
+    let sk0 = SigningKey::from_bytes(&[0xD1; 32]);
+    let sk1 = SigningKey::from_bytes(&[0xD2; 32]);
+    let id0 = sk0.verifying_key().to_bytes();
+    let id1 = sk1.verifying_key().to_bytes();
+    let fk0 = FalconKeypair::generate_from_seed_bytes(&[0xE1; 32]);
+    let fk1 = FalconKeypair::generate_from_seed_bytes(&[0xE2; 32]);
+
+    let validators = ValidatorSet::from_list(vec![(id0, 100), (id1, 100)]);
+    let st0 = Arc::new(InMemoryStateEngine::new());
+    let mut rt0 = ValidatorRuntime::new(sk0.clone(), validators, st0, 1).with_falcon_key(fk0);
+
+    // Register contributor 1's Falcon key via a runtime (mirrors node startup).
+    let st1 = Arc::new(InMemoryStateEngine::new());
+    let _rt1_reg = ValidatorRuntime::new(
+        sk1.clone(),
+        ValidatorSet::from_list(vec![(id0, 100), (id1, 100)]),
+        st1,
+        1,
+    )
+    .with_falcon_key(fk1.clone());
+
+    // Start epoch 0 DKG on rt0 (2-member committee => threshold = 2, both contribute).
+    rt0.sync_mev_epoch().await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "single contribution must not finalize 2-of-2 DKG"
+    );
+
+    // Build contributor 1's contribution and Falcon-seal it into MevFrame::PqDkg.
+    let ids = vec![id0, id1];
+    let mut mgr1 = EpochSealManager::new();
+    let c1 = mgr1
+        .sync_epoch(0, &ids, id1, &sk1.to_bytes())
+        .expect("epoch sync succeeds")
+        .expect("validator 1 contributes in 2-of-2 committee");
+    let valid_env = pq_transport_seal(&fk1, c1.clone());
+
+    // 1. Tampered Falcon signature must be rejected fail-closed.
+    let mut bad_sig = valid_env.clone();
+    bad_sig.falcon_sig[50] ^= 0x01;
+    rt0.on_mev_frame(MevFrame::PqDkg(bad_sig)).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "tampered falcon_sig must be refused"
+    );
+
+    // 2. Mutated contribution must be rejected fail-closed.
+    let mut bad_contrib = valid_env.clone();
+    bad_contrib.contribution.commitments[0][0] ^= 0x01;
+    rt0.on_mev_frame(MevFrame::PqDkg(bad_contrib)).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "mutated contribution must be refused"
+    );
+
+    // 3. Swapped self-carried Falcon key (signed by attacker's own key) must be rejected.
+    let attacker_fk = FalconKeypair::generate_from_seed_bytes(&[0xE9; 32]);
+    let forged_env = pq_transport_seal(&attacker_fk, c1);
+    rt0.on_mev_frame(MevFrame::PqDkg(forged_env)).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "forged key not matching validator registry must be refused"
+    );
+
+    // 4. Unregistered contributor id must be rejected fail-closed.
+    let ghost_sk = SigningKey::from_bytes(&[0xD9; 32]);
+    let mut ghost_env = valid_env.clone();
+    ghost_env.contribution.validator_id = ghost_sk.verifying_key().to_bytes();
+    let ghost_env = pq_transport_seal(&attacker_fk, ghost_env.contribution);
+    rt0.on_mev_frame(MevFrame::PqDkg(ghost_env)).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "unregistered contributor must be refused"
+    );
+
+    // 5. Valid MevFrame::PqDkg round-tripped through wire decode is accepted and finalizes DKG.
+    let wire = MevFrame::PqDkg(valid_env.clone())
+        .encode()
+        .expect("pq dkg encodes");
+    let decoded = MevFrame::decode(&wire).expect("pq dkg decodes");
+    rt0.on_mev_frame(decoded).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_some(),
+        "valid MevFrame::PqDkg must verify and finalize epoch DKG"
+    );
 }

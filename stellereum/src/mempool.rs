@@ -517,6 +517,16 @@ pub struct Mempool {
     order: BTreeMap<(u64, u64, TxHash), TxHash>,
     /// sender -> number of pending txs
     per_sender: HashMap<[u8; 32], usize>,
+    /// sender -> (nonce -> count of pooled txs with that nonce).
+    ///
+    /// Maintained alongside `txs` in `insert`/`evict` so `check_nonce_gap` runs
+    /// in O(log K_sender) instead of scanning the whole pool. A reference count
+    /// (not a `BTreeSet<u64>`) is required because same-`(sender, nonce)`
+    /// coexistence is deliberate (V-P2 / F10): evicting one copy must not drop
+    /// the nonce while a sibling remains. `#[serde(skip)]` keeps the `MP03`
+    /// bincode layout unchanged; `load_into` rebuilds it via `insert`.
+    #[serde(skip)]
+    sender_nonces: HashMap<[u8; 32], BTreeMap<u64, usize>>,
     /// sender -> sum of `tx_cost` over their pooled transactions (audit-mempool
     /// F-03: balance never reserved — one funding backed all 256 per-sender
     /// slots, so a Sybil squatter filled its whole quota with mutually
@@ -675,6 +685,7 @@ impl Mempool {
             txs: HashMap::new(),
             order: BTreeMap::new(),
             per_sender: HashMap::new(),
+            sender_nonces: HashMap::new(),
             reserved: HashMap::new(),
             inserted_at: HashMap::new(),
             max_size,
@@ -1733,29 +1744,7 @@ impl Mempool {
     {
         // Per-sender executable heads (mex of onchain + pooled), computed once:
         // a tx past its head is waiting for a gap that may never be filled.
-        let mut heads: HashMap<[u8; 32], u64> = HashMap::new();
-        {
-            let mut by_sender: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
-            for tx in self.txs.values() {
-                by_sender.entry(tx.from).or_default().push(tx.nonce);
-            }
-            for (sender, mut nonces) in by_sender {
-                nonces.sort_unstable();
-                let base = account(&sender).map(|(n, _)| n).unwrap_or(0);
-                let mut want = base;
-                for n in nonces {
-                    if n < want {
-                        continue;
-                    }
-                    if n == want {
-                        want = want.saturating_add(1);
-                    } else {
-                        break;
-                    }
-                }
-                heads.insert(sender, want);
-            }
-        }
+        let heads = self.sender_heads(&mut account);
         let doomed: Vec<TxHash> = self
             .txs
             .values()
@@ -1798,6 +1787,52 @@ impl Mempool {
             self.evict(h);
         }
         doomed.len()
+    }
+
+    /// Compute each pooled sender's executable nonce head (`mex(onchain, pooled)`).
+    fn sender_heads<F>(&self, account: &mut F) -> HashMap<[u8; 32], u64>
+    where
+        F: FnMut(&[u8; 32]) -> Option<(u64, u64)>,
+    {
+        if self.sender_nonces.is_empty() && !self.txs.is_empty() {
+            // Directly-deserialized pools skip `sender_nonces`: fall back to scanning `txs`.
+            let mut heads: HashMap<[u8; 32], u64> = HashMap::new();
+            let mut by_sender: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
+            for tx in self.txs.values() {
+                by_sender.entry(tx.from).or_default().push(tx.nonce);
+            }
+            for (sender, mut nonces) in by_sender {
+                nonces.sort_unstable();
+                let base = account(&sender).map(|(n, _)| n).unwrap_or(0);
+                let mut want = base;
+                for n in nonces {
+                    if n < want {
+                        continue;
+                    }
+                    if n == want {
+                        want = want.saturating_add(1);
+                    } else {
+                        break;
+                    }
+                }
+                heads.insert(sender, want);
+            }
+            return heads;
+        }
+        let mut heads: HashMap<[u8; 32], u64> = HashMap::with_capacity(self.sender_nonces.len());
+        for (sender, nonces) in &self.sender_nonces {
+            let base = account(sender).map(|(n, _)| n).unwrap_or(0);
+            let mut want = base;
+            for (&n, _) in nonces.range(base..) {
+                if n == want {
+                    want = want.saturating_add(1);
+                } else if n > want {
+                    break;
+                }
+            }
+            heads.insert(*sender, want);
+        }
+        heads
     }
 
     /// Age of a pooled transaction in seconds (0 when it has no stamp).
@@ -1853,12 +1888,24 @@ impl Mempool {
                 ));
             }
         }
+        // Malformed sponsor suffix (`SP1` tag present, unparsable body / bad
+        // length / over-bound): must fail closed as `SponsorBadGrant` BEFORE
+        // `pq_envelope()` / `delegation()`, since an unstripped suffix makes
+        // the inner envelope appear to have trailing bytes.
+        if tx.sponsor_malformed() {
+            return Err(MempoolError::SponsorBadGrant);
+        }
         // FULL-PQ (no compat, nodes wiped): a PQ envelope carrying a
         // post-quantum scheme is mandatory on EVERY admission path. The old
         // flag-gated allowance for classical (bare ed25519 / non-PQ
         // envelopes) is deleted, not gated — there is no mode in which a
         // classical transaction is admissible.
-        {
+        //
+        // SESSION-AUTH CARVE-OUT: `SF1` session-key envelopes (`delegation().is_some()`)
+        // do not carry a `PQ1` transport wrapper — they skip this transport gate
+        // and fall through to `check_session_policy()` and `verify_signature()`,
+        // which enforce post-quantum master + session schemes and refuse Ed25519 grants.
+        if tx.delegation().is_none() {
             let Some(env) = tx.pq_envelope() else {
                 return Err(MempoolError::Malformed(
                     "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope".to_string(),
@@ -1984,11 +2031,8 @@ impl Mempool {
         // balance down — mid-mempool is re-refused there (proposer re-check
         // + apply refusal). Inclusion is therefore reproducible from block +
         // state alone; admission never decides it.
-        if tx.sponsor_malformed() {
-            return Err(MempoolError::SponsorBadGrant);
-        }
         let sponsor_fee: Option<u64> = if let Some(auth) = tx.sponsored_grant() {
-            if tx.sponsor_inner_sig().len() != 64 {
+            if !tx.has_pq_sponsor_inner() {
                 return Err(MempoolError::SponsorBadGrant);
             }
             if !tx.verify_sponsor_sig(&auth) {
@@ -2040,6 +2084,9 @@ impl Mempool {
         // is not yet activated (public key not registered in implicit registry),
         // buffer it in PendingActivationBuffer rather than rejecting.
         if tx.is_pq_implicit() && self.implicit_registry().lookup(&tx.from).is_none() {
+            if tx.sponsored_grant().is_some() {
+                return Err(MempoolError::SponsorBadGrant);
+            }
             let cost = Self::tx_cost(&tx);
             // The activation buffer is a GLOBAL, capped resource (2048 slots
             // shared by every unactivated account), so a buffered transaction
@@ -2198,6 +2245,12 @@ impl Mempool {
         }
         self.order.insert((priority, fee, hash), hash);
         *self.per_sender.entry(sender).or_insert(0) += 1;
+        *self
+            .sender_nonces
+            .entry(sender)
+            .or_default()
+            .entry(tx.nonce)
+            .or_insert(0) += 1;
         // F-03: this tx's full execution cost is now claimed against its
         // funder's balance until it leaves the pool (via `evict` below, which
         // is the single removal path for `remove`/`prune_confirmed`/
@@ -2275,26 +2328,64 @@ impl Mempool {
         nonce: u64,
         onchain_nonce: u64,
     ) -> Option<MempoolError> {
-        let mut pending: Vec<u64> = self
-            .txs
-            .values()
-            .filter(|t| &t.from == from)
-            .map(|t| t.nonce)
-            .collect();
-        if let Some(buffered) = self.activation_buffer.buffered.get(from) {
-            pending.extend(buffered.keys().copied());
-        }
-        pending.sort_unstable();
         let mut want = onchain_nonce;
-        for n in pending {
-            if n < want {
-                continue;
+        match (
+            self.sender_nonces.get(from),
+            self.activation_buffer.buffered.get(from),
+        ) {
+            (Some(pooled), None) => {
+                for (&n, _) in pooled.range(onchain_nonce..) {
+                    if n == want {
+                        want = want.saturating_add(1);
+                    } else if n > want {
+                        break;
+                    }
+                }
             }
-            if n == want {
-                want = want.saturating_add(1);
-            } else {
-                break;
+            (None, Some(buffered)) => {
+                for (&n, _) in buffered.range(onchain_nonce..) {
+                    if n == want {
+                        want = want.saturating_add(1);
+                    } else if n > want {
+                        break;
+                    }
+                }
             }
+            (Some(pooled), Some(buffered)) => {
+                let mut p_iter = pooled.range(onchain_nonce..).map(|(&n, _)| n).peekable();
+                let mut b_iter = buffered.range(onchain_nonce..).map(|(&n, _)| n).peekable();
+                loop {
+                    let next = match (p_iter.peek().copied(), b_iter.peek().copied()) {
+                        (Some(pn), Some(bn)) => {
+                            if pn <= bn {
+                                p_iter.next();
+                                pn
+                            } else {
+                                b_iter.next();
+                                bn
+                            }
+                        }
+                        (Some(pn), None) => {
+                            p_iter.next();
+                            pn
+                        }
+                        (None, Some(bn)) => {
+                            b_iter.next();
+                            bn
+                        }
+                        (None, None) => break,
+                    };
+                    if next < want {
+                        continue;
+                    }
+                    if next == want {
+                        want = want.saturating_add(1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            (None, None) => {}
         }
         if nonce > want.saturating_add(Self::NONCE_FUTURE_WINDOW) {
             Some(MempoolError::NonceGap {
@@ -2317,30 +2408,7 @@ impl Mempool {
     {
         // Per-sender executable heads (mex of onchain + pooled), computed once:
         // a tx past its head can never execute until the gap fills.
-        let mut heads: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
-        {
-            let mut by_sender: std::collections::HashMap<[u8; 32], Vec<u64>> =
-                std::collections::HashMap::new();
-            for tx in self.txs.values() {
-                by_sender.entry(tx.from).or_default().push(tx.nonce);
-            }
-            for (sender, mut nonces) in by_sender {
-                nonces.sort_unstable();
-                let base = account(&sender).map(|(n, _)| n).unwrap_or(0);
-                let mut want = base;
-                for n in nonces {
-                    if n < want {
-                        continue;
-                    }
-                    if n == want {
-                        want = want.saturating_add(1);
-                    } else {
-                        break;
-                    }
-                }
-                heads.insert(sender, want);
-            }
-        }
+        let heads = self.sender_heads(&mut account);
         let doomed: Vec<TxHash> = self
             .txs
             .values()
@@ -2411,6 +2479,17 @@ impl Mempool {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
                     self.per_sender.remove(&tx.from);
+                }
+            }
+            if let Some(nonces) = self.sender_nonces.get_mut(&tx.from) {
+                if let Some(cnt) = nonces.get_mut(&tx.nonce) {
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        nonces.remove(&tx.nonce);
+                    }
+                }
+                if nonces.is_empty() {
+                    self.sender_nonces.remove(&tx.from);
                 }
             }
             // F-03: release this tx's claim (saturating: a directly-decoded
@@ -2551,97 +2630,113 @@ impl Mempool {
         accept: F,
         passes: usize,
     ) -> Vec<Transaction> {
-        let mut out = Vec::with_capacity(max_txs.min(txs.len()));
+        if txs.is_empty() || max_txs == 0 {
+            return Vec::new();
+        }
         let mut gas = 0u64;
         let mut wire = 0usize;
         let mut proofs = 0usize;
-        // Snapshot the fee order ONCE into contiguous arrays. Every pass walks
-        // the same descending `(priority, fee, hash)` sequence the map walk
-        // would yield, but without re-descending tree nodes or re-probing the
-        // transaction map per element per pass. The visit order — and therefore
-        // the selected set — is unchanged (`&self` borrows both maps
-        // immutably, so the precomputed alignment cannot drift mid-selection).
-        let fee_order: Vec<(u64, u64, TxHash)> = order.keys().copied().collect();
-        let aligned: Vec<Option<&Transaction>> =
-            fee_order.iter().map(|(_, _, h)| txs.get(h)).collect();
-        // Hoisted per-tx packing costs (pure functions of the transaction, so
-        // the values are identical to recomputing them inline): `gas_limit`
-        // is a field copy, the wire estimate walks the payload op shapes and
-        // the proof-unit count walks the same payload. The hot loop below
-        // re-walks every untaken element on EVERY pass (up to 64 passes x
-        // 10k elements with scattered fees/deep nonce chains), so recomputing
-        // these per element per pass is pure waste — one batch pass here
-        // replaces up to `passes` recomputations per element. The accept
-        // predicate still runs inline in the original order (it is stateful:
-        // nonce advance, budget debit, census), and the cap checks below read
-        // the same values in the same order, so the selected set and order
-        // are unchanged. `None` slots are never selected (the loop skips them
-        // before reading the costs), so their filler values are irrelevant.
-        let gas_of: Vec<u64> = aligned
-            .iter()
-            .map(|t| t.map(|t| t.gas_limit).unwrap_or(0))
-            .collect();
-        let wire_of: Vec<usize> = aligned
-            .iter()
-            .map(|t| t.map(Self::estimate_tx_wire_bytes).unwrap_or(0))
-            .collect();
-        let proof_of: Vec<usize> = aligned
-            .iter()
-            .map(|t| t.map(Self::count_tx_proof_units).unwrap_or(0))
-            .collect();
-        // Transactions a previous pass already took, aligned with `fee_order`:
-        // each fee-order position appears at most once (BTreeMap keys are
-        // unique), so a positional bit is exactly the old hash-keyed set —
-        // rejected ones stay clear and are revisited (their nonce may have
-        // become expected), taken ones stay set. One indexed load per element
-        // instead of hashing 32 bytes per probe per pass (64 passes x 10k
-        // probes at MAX_BLOCK_TXS with scattered fees).
-        let mut taken = vec![false; fee_order.len()];
-        for _ in 0..passes.max(1) {
-            let before = out.len();
-            for i in (0..fee_order.len()).rev() {
-                if out.len() >= max_txs {
+        // Collect matching references until final selection so we avoid cloning
+        // full `Transaction` payloads into `out` prematurely and avoid
+        // copying 48-byte `order` keys into a separate vector.
+        let mut selected: Vec<&Transaction> = Vec::with_capacity(max_txs.min(txs.len()));
+
+        if passes <= 1 {
+            for h in order.values().rev() {
+                if selected.len() >= max_txs {
                     break;
                 }
-                // Only skip what a previous pass already took; rejected ones
-                // must be revisited (their nonce may have become expected).
-                if taken[i] {
-                    continue;
-                }
-                let Some(tx) = aligned[i] else {
+                let Some(tx) = txs.get(h) else {
                     continue;
                 };
                 if !accept(tx) {
                     continue;
                 }
-                let g = gas_of[i];
+                let g = tx.gas_limit;
                 if gas.saturating_add(g) > max_gas {
-                    // This one does not fit. A cheaper one behind it might, so keep
-                    // walking rather than truncating the block here.
                     continue;
                 }
-                // Wire + proof-unit caps (audit: blocks troubles): gas-valid
-                // does not mean gossipable or verifiable-in-time. Skip (do
-                // not truncate: a smaller tx behind may still fit).
-                let w = wire_of[i];
+                let w = Self::estimate_tx_wire_bytes(tx);
                 if wire.saturating_add(w) > Self::MAX_BLOCK_WIRE_BYTES {
                     continue;
                 }
-                let p = proof_of[i];
+                let p = Self::count_tx_proof_units(tx);
                 if proofs.saturating_add(p) > Self::MAX_BLOCK_PROOF_UNITS {
                     continue;
                 }
                 gas = gas.saturating_add(g);
                 wire = wire.saturating_add(w);
                 proofs = proofs.saturating_add(p);
-                taken[i] = true;
-                out.push(tx.clone());
+                selected.push(tx);
             }
-            if out.len() == before {
+            return selected.into_iter().cloned().collect();
+        }
+
+        // Multi-pass: snapshot descending fee-order references + cached packing
+        // costs into one contiguous array (computing wire/proofs lazily on
+        // first acceptance so rejected txs never pay for payload walks).
+        const UNCOMPUTED: usize = usize::MAX;
+        struct Candidate<'a> {
+            tx: &'a Transaction,
+            wire: usize,
+            proofs: usize,
+            taken: bool,
+        }
+        let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(order.len());
+        for h in order.values().rev() {
+            if let Some(tx) = txs.get(h) {
+                candidates.push(Candidate {
+                    tx,
+                    wire: UNCOMPUTED,
+                    proofs: UNCOMPUTED,
+                    taken: false,
+                });
+            }
+        }
+        for _ in 0..passes {
+            let before = selected.len();
+            for c in &mut candidates {
+                if selected.len() >= max_txs {
+                    break;
+                }
+                // Only skip what a previous pass already took; rejected ones
+                // must be revisited (their nonce may have become expected).
+                if c.taken {
+                    continue;
+                }
+                if !accept(c.tx) {
+                    continue;
+                }
+                let g = c.tx.gas_limit;
+                if gas.saturating_add(g) > max_gas {
+                    // This one does not fit. A cheaper one behind it might, so keep
+                    // walking rather than truncating the block here.
+                    continue;
+                }
+                if c.wire == UNCOMPUTED {
+                    c.wire = Self::estimate_tx_wire_bytes(c.tx);
+                    c.proofs = Self::count_tx_proof_units(c.tx);
+                }
+                // Wire + proof-unit caps (audit: blocks troubles): gas-valid
+                // does not mean gossipable or verifiable-in-time. Skip (do
+                // not truncate: a smaller tx behind may still fit).
+                if wire.saturating_add(c.wire) > Self::MAX_BLOCK_WIRE_BYTES {
+                    continue;
+                }
+                if proofs.saturating_add(c.proofs) > Self::MAX_BLOCK_PROOF_UNITS {
+                    continue;
+                }
+                gas = gas.saturating_add(g);
+                wire = wire.saturating_add(c.wire);
+                proofs = proofs.saturating_add(c.proofs);
+                c.taken = true;
+                selected.push(c.tx);
+            }
+            if selected.len() == before {
                 break;
             }
         }
-        out
+        selected.into_iter().cloned().collect()
     }
 
     /// Estimated bincode wire bytes of a transaction for packing (audit:
@@ -3150,7 +3245,8 @@ mod tests {
             "a legacy transaction must not commit to a priority"
         );
         assert!(
-            bid_tx.signing_message()
+            bid_tx
+                .signing_message()
                 .windows(8)
                 .any(|w| w == crate::sharding::PRIORITY_FEE_COMMITMENT_TAG),
             "a priority transaction must commit to its bid"
@@ -4324,6 +4420,55 @@ mod tests {
         assert_eq!(swept, 1);
         assert!(!mp.activation_buffer.contains_hash(&h));
         assert_eq!(mp.activation_buffer.len(), 0);
+    }
+
+    #[test]
+    fn sender_nonces_stays_synced_across_rbf_evict_remove_and_prune() {
+        let sk = key();
+        let me = addr(&sk);
+        let mut mp = Mempool::new(100, 100);
+
+        // Insert nonce 0 twice (same-nonce RBF pair) and nonce 1.
+        let h0a = mp.add(tx(&sk, [1; 32], 10, 0)).unwrap();
+        let h0b = mp.add(tx(&sk, [1; 32], 20, 0)).unwrap();
+        let h1 = mp.add(tx(&sk, [1; 32], 15, 1)).unwrap();
+
+        // Head is 2, so nonce 6 (2 + 4) is allowed, nonce 7 is gapped.
+        assert!(mp.check_nonce_gap(&me, 6, 0).is_none());
+        assert!(matches!(
+            mp.check_nonce_gap(&me, 7, 0),
+            Some(MempoolError::NonceGap {
+                expected: 2,
+                got: 7
+            })
+        ));
+
+        // Remove ONE of the nonce-0 duplicates: nonce 0 is STILL in the pool via h0b!
+        assert!(mp.remove(&h0a).is_some());
+        assert!(mp.check_nonce_gap(&me, 6, 0).is_none());
+        assert!(matches!(
+            mp.check_nonce_gap(&me, 7, 0),
+            Some(MempoolError::NonceGap {
+                expected: 2,
+                got: 7
+            })
+        ));
+
+        // Remove the second nonce-0 tx: head drops back to 0!
+        mp.prune_confirmed(&[h0b]);
+        assert!(matches!(
+            mp.check_nonce_gap(&me, 5, 0),
+            Some(MempoolError::NonceGap {
+                expected: 0,
+                got: 5
+            })
+        ));
+
+        // Remove nonce 1 via evict_unexecutable: sender_nonces entry must be cleaned up completely.
+        let evicted = mp.evict_unexecutable(|_| Some((5, 0)));
+        assert_eq!(evicted, 1);
+        assert!(!mp.sender_nonces.contains_key(&me));
+        assert!(!mp.contains(&h1));
     }
 }
 

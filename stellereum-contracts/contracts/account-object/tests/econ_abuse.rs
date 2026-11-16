@@ -88,9 +88,7 @@ fn overflow_bounds_fail_closed() {
     assert_eq!(create_session(csess(11, 50_000)), 11);
     // Amount 0 and >= 1_000_000 breach the packing boundary: trap.
     assert!(std::panic::catch_unwind(|| spend_with_session(spend(11, 0))).is_err());
-    assert!(
-        std::panic::catch_unwind(|| spend_with_session(spend(11, 1_000_000))).is_err()
-    );
+    assert!(std::panic::catch_unwind(|| spend_with_session(spend(11, 1_000_000))).is_err());
     // Bad session ids trap.
     assert!(std::panic::catch_unwind(|| spend_with_session(spend(0, 1))).is_err());
     assert_eq!(get_session_budget(11), 50_000, "failed spends move nothing");

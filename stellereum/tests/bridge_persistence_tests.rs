@@ -548,11 +548,7 @@ async fn withdrawal_queue_and_rate_window_survive_the_restore() {
     // in is refused by the block, exactly as before the restart.
     // Fresh engine: the payer's account starts at nonce 0 here.
     let early = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(
-        PAYER_SEED,
-        0,
-        vec![OpCode::SysCallBridge(Box::new(early))],
-    );
+    let tx = bridge_tx(PAYER_SEED, 0, vec![OpCode::SysCallBridge(Box::new(early))]);
     let out = fresh
         .apply_block_transition(&bridge_block(2, TS + 60, vec![tx], payer_pk), 0)
         .await;

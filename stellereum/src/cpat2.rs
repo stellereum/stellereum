@@ -27,7 +27,7 @@ pub type H = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Node {
-    Leaf(Key, Vec<u8>),
+    Leaf(Key, H),
     Branch {
         skip: u16,
         bit: u8,
@@ -95,8 +95,7 @@ fn common(a: &Key, b: &Key, from: usize) -> usize {
 
 fn node_hash(node: &Node) -> H {
     match node {
-        Node::Leaf(k, v) => leaf_hash(k, v),
-        Node::Branch { hash, .. } => *hash,
+        Node::Leaf(_, h) | Node::Branch { hash: h, .. } => *h,
     }
 }
 
@@ -114,14 +113,15 @@ fn mk_branch(skip: u16, bit: u8, left: Node, right: Node) -> Node {
     }
 }
 
-/// Insert `key` into subtree rooted at `node`, consuming keys from absolute
-/// depth `depth` (depth is only used to compute skips, not stored).
-fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
+/// Insert `key` (with precomputed `lh = leaf_hash(&key, val)`) into subtree
+/// rooted at `node`, consuming keys from absolute depth `depth` (depth is only
+/// used to compute skips, not stored).
+fn insert(node: Option<Node>, key: Key, lh: H, depth: usize) -> Node {
     match node {
-        None => Node::Leaf(key, val),
-        Some(Node::Leaf(ek, ev)) => {
+        None => Node::Leaf(key, lh),
+        Some(Node::Leaf(ek, eh)) => {
             if ek == key {
-                return Node::Leaf(key, val);
+                return Node::Leaf(key, lh);
             }
             let cp = common(&ek, &key, depth);
             // cp < 256. Divergence at cp.
@@ -129,9 +129,9 @@ fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
             let bit0 = bit(&ek, cp); // existing key's bit at divergence
                                      // left = bit 0, right = bit 1
             let (left, right) = if bit0 == 0 {
-                (Node::Leaf(ek, ev), Node::Leaf(key, val))
+                (Node::Leaf(ek, eh), Node::Leaf(key, lh))
             } else {
-                (Node::Leaf(key, val), Node::Leaf(ek, ev))
+                (Node::Leaf(key, lh), Node::Leaf(ek, eh))
             };
             let _ = bit0;
             mk_branch(skip, 0, left, right)
@@ -166,7 +166,7 @@ fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
                 let new_bit = bit(&key, diverge_at);
                 let existing_skip = (skip as usize - cp_skip - 1) as u16;
                 let existing = mk_branch(existing_skip, bbit, *left, *right);
-                let incoming = Node::Leaf(key, val);
+                let incoming = Node::Leaf(key, lh);
                 let (l, r) = if new_bit == 0 {
                     (incoming, existing)
                 } else {
@@ -176,10 +176,10 @@ fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
             }
             // Key follows the skipped bits; descend on its bit at bp.
             if bit(&key, bp) == 0 {
-                let nl = insert(Some(*left), key, val, bp + 1);
+                let nl = insert(Some(*left), key, lh, bp + 1);
                 mk_branch(skip, bbit, nl, *right)
             } else {
-                let nr = insert(Some(*right), key, val, bp + 1);
+                let nr = insert(Some(*right), key, lh, bp + 1);
                 mk_branch(skip, bbit, *left, nr)
             }
         }
@@ -194,7 +194,7 @@ fn common_prefix_len(key: &Key, left: &Node, right: &Node, depth: usize, skip: u
     match rep {
         Some(rk) => {
             let mut d = 0;
-            while d < skip && bit(key, depth + d) == bit(&rk, depth + d) {
+            while d < skip && bit(key, depth + d) == bit(rk, depth + d) {
                 d += 1;
             }
             d
@@ -203,9 +203,9 @@ fn common_prefix_len(key: &Key, left: &Node, right: &Node, depth: usize, skip: u
     }
 }
 
-fn representative_key(n: &Node) -> Option<Key> {
+fn representative_key(n: &Node) -> Option<&Key> {
     match n {
-        Node::Leaf(k, _) => Some(*k),
+        Node::Leaf(k, _) => Some(k),
         Node::Branch { left, .. } => representative_key(left),
     }
 }
@@ -216,7 +216,7 @@ fn representative_key(n: &Node) -> Option<Key> {
 /// `parent_skip + 1` to account for the bypassed parent branch.
 fn collapse(parent_skip: u16, sibling: Node) -> Node {
     match sibling {
-        Node::Leaf(k, v) => Node::Leaf(k, v),
+        Node::Leaf(k, h) => Node::Leaf(k, h),
         Node::Branch {
             skip: sib_skip,
             bit: sib_bit,
@@ -304,9 +304,18 @@ impl CompressedTrie {
         }
     }
     pub fn insert(&mut self, key: &Key, value: &[u8]) {
-        self.entries.insert(*key, value.to_vec());
+        if let Some(existing) = self.entries.get_mut(key) {
+            if existing.as_slice() == value && self.root.is_some() {
+                return;
+            }
+            existing.clear();
+            existing.extend_from_slice(value);
+        } else {
+            self.entries.insert(*key, value.to_vec());
+        }
+        let lh = leaf_hash(key, value);
         let r = self.root.take();
-        self.root = Some(insert(r, *key, value.to_vec(), 0));
+        self.root = Some(insert(r, *key, lh, 0));
     }
     pub fn get(&self, key: &Key) -> Option<&[u8]> {
         self.entries.get(key).map(|v| v.as_slice())
@@ -338,9 +347,9 @@ impl CompressedTrie {
         let mut depth = 0usize;
         loop {
             match node {
-                Node::Leaf(k, _) if k == key => {
+                Node::Leaf(k, lh) if k == key => {
                     path.reverse();
-                    return Some((path, leaf_hash(k, &self.entries[k])));
+                    return Some((path, *lh));
                 }
                 Node::Leaf(_, _) => return None,
                 Node::Branch {
@@ -500,14 +509,14 @@ impl CompressedTrie {
         let mut depth = 0usize;
         loop {
             match node {
-                Node::Leaf(k, v) => {
-                    let lh = leaf_hash(k, v);
+                Node::Leaf(k, lh) => {
+                    let v = self.entries.get(k).cloned().unwrap_or_default();
                     if k == key {
                         return Some((
                             steps.into_iter().rev().collect(),
                             Witness::Inclusion {
-                                value: v.clone(),
-                                leaf_hash: lh,
+                                value: v,
+                                leaf_hash: *lh,
                             },
                         ));
                     }
@@ -517,8 +526,8 @@ impl CompressedTrie {
                         steps.into_iter().rev().collect(),
                         Witness::ExclusionLeaf {
                             key: *k,
-                            value: v.clone(),
-                            leaf_hash: lh,
+                            value: v,
+                            leaf_hash: *lh,
                         },
                     ));
                 }
@@ -539,13 +548,13 @@ impl CompressedTrie {
                         // key under a branch shares its skipped prefix, so that
                         // leaf's bits in [depth, bp) are the shared prefix the
                         // queried key contradicts.
-                        let (wkey, wval) = match leftmost_leaf(left) {
-                            Node::Leaf(k, v) => (*k, v.clone()),
+                        let (wkey, lh) = match leftmost_leaf(left) {
+                            Node::Leaf(k, h) => (*k, *h),
                             _ => return None,
                         };
-                        let lh = leaf_hash(&wkey, &wval);
                         // Steps from the witness leaf up to this branch's child.
                         let mut path = collect_path_up(left, bp + 1, &wkey)?;
+                        let wval = self.entries.get(&wkey).cloned().unwrap_or_default();
                         let div_step = path.len();
                         // The branch itself: we descend into its LEFT child, so
                         // the sibling sits on the right.
@@ -882,40 +891,29 @@ impl MerkleProof {
 
 /// Absolute branch positions of a leaf → root path.
 ///
-/// Returns, for every step, the branch's absolute bit position and the depth
-/// consumed before it, plus the depth the whole path consumes (the leaf's
-/// depth). `None` when the path is longer than a 32-byte key can need or
-/// descends past bit 256.
-fn path_positions(path: &[Step]) -> Option<(Vec<(u16, u16)>, u16)> {
+/// Populates `out[..path.len()]` in root → leaf order with each branch's
+/// `(branch_pos, depth_before)` and returns the depth the whole path consumes
+/// (the leaf's depth). `None` when the path is longer than a 32-byte key can
+/// need or descends past bit 256.
+fn path_positions(path: &[Step], out: &mut [(u16, u16); MAX_PROOF_STEPS]) -> Option<u16> {
     if path.len() > MAX_PROOF_STEPS {
         return None;
     }
     let mut depth: u32 = 0;
-    let mut out = Vec::with_capacity(path.len());
     // The path runs leaf → root; walk it backwards to accumulate depths, so
-    // `out` comes out in root → leaf order.
-    for s in path.iter().rev() {
+    // `out[..path.len()]` comes out in root → leaf order.
+    for (idx, s) in path.iter().rev().enumerate() {
         let bp = depth + s.skip as u32;
         if bp >= 256 {
             return None;
         }
-        out.push((bp as u16, depth as u16));
+        out[idx] = (bp as u16, depth as u16);
         depth = bp + 1;
     }
-    Some((out, depth as u16))
+    Some(depth as u16)
 }
 
-/// Does the path follow the key's own bits?
-///
-/// At every branch the path must turn the way the key's bit at that branch's
-/// position turns. The root hash already pins the path's *shape*, but not the
-/// key it belongs to: without this check a proof for one key could be
-/// replayed as a proof for another.
-fn path_follows_key(path: &[Step], key: &Key) -> bool {
-    let (positions, _) = match path_positions(path) {
-        Some(p) => p,
-        None => return false,
-    };
+fn path_follows_key_with_positions(path: &[Step], key: &Key, positions: &[(u16, u16)]) -> bool {
     // `positions` is root → leaf; `path` is leaf → root.
     for (i, s) in path.iter().enumerate() {
         let (bp, _) = positions[path.len() - 1 - i];
@@ -926,6 +924,20 @@ fn path_follows_key(path: &[Step], key: &Key) -> bool {
         }
     }
     true
+}
+
+/// Does the path follow the key's own bits?
+///
+/// At every branch the path must turn the way the key's bit at that branch's
+/// position turns. The root hash already pins the path's *shape*, but not the
+/// key it belongs to: without this check a proof for one key could be
+/// replayed as a proof for another.
+fn path_follows_key(path: &[Step], key: &Key) -> bool {
+    let mut positions = [(0u16, 0u16); MAX_PROOF_STEPS];
+    if path_positions(path, &mut positions).is_none() {
+        return false;
+    }
+    path_follows_key_with_positions(path, key, &positions[..path.len()])
 }
 
 /// Fold a leaf hash up a leaf → root path.
@@ -1005,10 +1017,12 @@ pub fn verify_exclusion_proof(root: &[u8; 32], key: &Key, proof: &MerkleProof) -
     if &fold_path(&proof.leaf_hash, &proof.path) != root {
         return false;
     }
-    let (positions, leaf_depth) = match path_positions(&proof.path) {
-        Some(p) => p,
+    let mut positions = [(0u16, 0u16); MAX_PROOF_STEPS];
+    let leaf_depth = match path_positions(&proof.path, &mut positions) {
+        Some(d) => d,
         None => return false,
     };
+    let positions = &positions[..proof.path.len()];
     let cp = common(&witness, key, 0);
     match proof.divergence {
         Some(Divergence::Leaf) => {
@@ -1018,7 +1032,7 @@ pub fn verify_exclusion_proof(root: &[u8; 32], key: &Key, proof: &MerkleProof) -
                 return false;
             }
             // Every turn on the path must be the queried key's own turn.
-            path_follows_key(&proof.path, key)
+            path_follows_key_with_positions(&proof.path, key, positions)
         }
         Some(Divergence::Branch { step }) => {
             if step >= proof.path.len() {

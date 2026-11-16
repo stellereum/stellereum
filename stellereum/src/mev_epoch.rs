@@ -66,7 +66,7 @@
 //! node-local admission bond, not as an on-chain transfer.
 
 use crate::mev_kem_registry::MevKemRegistry;
-use crate::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
+use crate::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
@@ -109,6 +109,9 @@ pub const TRANSCRIPT_DOMAIN: &[u8; 23] = b"STELL_MEV_TRANSCRIPT_V1";
 
 /// Maximum size of a sealed payload (ciphertext) accepted from the wire.
 pub const MAX_SEALED_PAYLOAD: usize = 1 << 20; // 1 MiB
+
+/// Maximum wire body size accepted by [`MevFrame::decode`] (4 MiB).
+pub const MAX_MEV_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How many heights of order commitments the node keeps.
 ///
@@ -1878,7 +1881,8 @@ pub const MEV_RESHARE_ACTIVATION_HEIGHT: u64 = u64::MAX;
 pub const MEV_RESHARE_DELTA_STAR_EPOCHS: u64 = 2;
 
 /// Whether the proactive reshare hook is active at `height`.
-#[allow(clippy::absurd_extreme_comparisons)] // GATE: `>=` is the activation semantic the lead needs once the const flips to a real height; `==` (what the lint suggests for MAX) would miss every height past activation.
+#[allow(clippy::absurd_extreme_comparisons)]
+// GATE: `>=` is the activation semantic the lead needs once the const flips to a real height; `==` (what the lint suggests for MAX) would miss every height past activation.
 #[inline]
 pub fn is_reshare_active(height: u64) -> bool {
     height >= MEV_RESHARE_ACTIVATION_HEIGHT
@@ -1997,10 +2001,7 @@ mod reshare_tests {
         reg
     }
 
-    fn run_classical_dkg(
-        committee: &EpochCommittee,
-        pairs: &[IdSecret],
-    ) -> Vec<EpochKeyMaterial> {
+    fn run_classical_dkg(committee: &EpochCommittee, pairs: &[IdSecret]) -> Vec<EpochKeyMaterial> {
         let enc: Vec<[u8; 32]> = pairs
             .iter()
             .map(|(_, s)| encryption_secret_from_ed25519(s))
@@ -2667,6 +2668,8 @@ pub const ORDER_COMMIT_PAYLOAD_MAGIC: &[u8; 4] = b"STC1";
 pub const SHARE_RELEASE_PAYLOAD_MAGIC: &[u8; 4] = b"STR1";
 /// Magic prefix of an epoch-key-announcement frame.
 pub const EPOCH_ANNOUNCE_PAYLOAD_MAGIC: &[u8; 4] = b"STE1";
+/// Magic prefix of a Falcon-authenticated PQ-transport DKG-contribution frame.
+pub const PQ_DKG_PAYLOAD_MAGIC: &[u8; 4] = b"STPQ";
 
 /// One frame of the epoch-seal gossip.
 ///
@@ -2679,6 +2682,8 @@ pub enum MevFrame {
     Sealed(SealedEnvelope),
     /// A DKG contribution (the key-share packages).
     Dkg(DkgContribution),
+    /// A Falcon-authenticated PQ-transport DKG contribution.
+    PqDkg(PqTransportEnvelope),
     /// A round's order commitment (the gate on the share release).
     OrderCommit(OrderCommitment),
     /// A share release (the decryption partials).
@@ -2693,6 +2698,7 @@ impl MevFrame {
         match self {
             MevFrame::Sealed(_) => SEALED_PAYLOAD_MAGIC,
             MevFrame::Dkg(_) => DKG_PAYLOAD_MAGIC,
+            MevFrame::PqDkg(_) => PQ_DKG_PAYLOAD_MAGIC,
             MevFrame::OrderCommit(_) => ORDER_COMMIT_PAYLOAD_MAGIC,
             MevFrame::Release(_) => SHARE_RELEASE_PAYLOAD_MAGIC,
             MevFrame::Announcement(_) => EPOCH_ANNOUNCE_PAYLOAD_MAGIC,
@@ -2704,6 +2710,7 @@ impl MevFrame {
         let body = match self {
             MevFrame::Sealed(v) => bincode::serialize(v),
             MevFrame::Dkg(v) => bincode::serialize(v),
+            MevFrame::PqDkg(v) => bincode::serialize(v),
             MevFrame::OrderCommit(v) => bincode::serialize(v),
             MevFrame::Release(v) => bincode::serialize(v),
             MevFrame::Announcement(v) => bincode::serialize(v),
@@ -2715,33 +2722,49 @@ impl MevFrame {
         Ok(out)
     }
 
-    /// Decode a frame (fail-closed: an unknown magic or a malformed body is
-    /// refused, never guessed at).
+    /// Decode a frame (fail-closed: an unknown magic, oversized/bounded body,
+    /// trailing bytes, or a malformed body is refused, never guessed at).
     pub fn decode(bytes: &[u8]) -> Result<MevFrame, String> {
+        use bincode::Options;
         if bytes.len() <= 4 {
             return Err("mev frame is too short".to_string());
         }
         let magic = &bytes[..4];
         let body = &bytes[4..];
+        if (body.len() as u64) > MAX_MEV_FRAME_BYTES {
+            return Err(format!(
+                "mev frame exceeds max wire size ({} > {MAX_MEV_FRAME_BYTES})",
+                body.len()
+            ));
+        }
+        let limit = (body.len() as u64).min(MAX_MEV_FRAME_BYTES);
+        let opts = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(limit)
+            .reject_trailing_bytes();
         let frame = match magic {
             m if m == SEALED_PAYLOAD_MAGIC => MevFrame::Sealed(
-                bincode::deserialize(body)
+                opts.deserialize(body)
                     .map_err(|e| format!("sealed envelope decode error: {e}"))?,
             ),
             m if m == DKG_PAYLOAD_MAGIC => MevFrame::Dkg(
-                bincode::deserialize(body)
+                opts.deserialize(body)
                     .map_err(|e| format!("dkg contribution decode error: {e}"))?,
             ),
+            m if m == PQ_DKG_PAYLOAD_MAGIC => MevFrame::PqDkg(
+                opts.deserialize(body)
+                    .map_err(|e| format!("pq dkg envelope decode error: {e}"))?,
+            ),
             m if m == ORDER_COMMIT_PAYLOAD_MAGIC => MevFrame::OrderCommit(
-                bincode::deserialize(body)
+                opts.deserialize(body)
                     .map_err(|e| format!("order commitment decode error: {e}"))?,
             ),
             m if m == SHARE_RELEASE_PAYLOAD_MAGIC => MevFrame::Release(
-                bincode::deserialize(body)
+                opts.deserialize(body)
                     .map_err(|e| format!("share release decode error: {e}"))?,
             ),
             m if m == EPOCH_ANNOUNCE_PAYLOAD_MAGIC => MevFrame::Announcement(
-                bincode::deserialize(body)
+                opts.deserialize(body)
                     .map_err(|e| format!("epoch announcement decode error: {e}"))?,
             ),
             _ => return Err("mev frame has an unknown magic prefix".to_string()),
@@ -2772,8 +2795,8 @@ pub fn decode_sealed_payload(bytes: &[u8]) -> Result<SealedEnvelope, String> {
     }
 }
 
-/// Whether a wire frame is ANY epoch-seal frame (sealed, DKG, commitment,
-/// release or announcement).
+/// Whether a wire frame is ANY epoch-seal frame (sealed, DKG, PQ-DKG,
+/// commitment, release or announcement).
 pub fn is_mev_frame(bytes: &[u8]) -> bool {
     if bytes.len() <= 4 {
         return false;
@@ -2781,6 +2804,7 @@ pub fn is_mev_frame(bytes: &[u8]) -> bool {
     let magic = &bytes[..4];
     magic == SEALED_PAYLOAD_MAGIC
         || magic == DKG_PAYLOAD_MAGIC
+        || magic == PQ_DKG_PAYLOAD_MAGIC
         || magic == ORDER_COMMIT_PAYLOAD_MAGIC
         || magic == SHARE_RELEASE_PAYLOAD_MAGIC
         || magic == EPOCH_ANNOUNCE_PAYLOAD_MAGIC
@@ -4126,5 +4150,30 @@ mod tests {
         assert_eq!(meta.priority_fee_per_gas, 13);
         assert_eq!(meta.source_shard, 1);
         assert_eq!(meta.target_shard, 2);
+    }
+
+    #[test]
+    fn mev_frame_decode_rejects_trailing_bytes_and_pathological_prefix() {
+        let (committee, members) = test_committee(99, 4);
+        let materials = run_dkg(&committee, &members);
+        let key = materials[0].public_key();
+        let envelope = seal_transaction(&key, b"payload", [3u8; 32], meta()).unwrap();
+        let mut wire = MevFrame::Sealed(envelope).encode().unwrap();
+        assert!(MevFrame::decode(&wire).is_ok());
+
+        // Trailing garbage must be refused.
+        wire.push(0xAA);
+        assert!(
+            MevFrame::decode(&wire).is_err(),
+            "trailing bytes must be refused"
+        );
+
+        // Pathological length prefix inside a tiny body must be refused without OOM.
+        let mut evil = SEALED_PAYLOAD_MAGIC.to_vec();
+        evil.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(
+            MevFrame::decode(&evil).is_err(),
+            "pathological length prefix must be refused"
+        );
     }
 }

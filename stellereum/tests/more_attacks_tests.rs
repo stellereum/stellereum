@@ -3,8 +3,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::orderbook::{OrderSide, OrderbookActor};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::{Block, DynamicShardManager, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, ActorMessage, InMemoryStateEngine};
 use stellereum::tokenomics::GenesisVault;
@@ -183,13 +187,13 @@ fn genesis_vault_unsupported_asset_rejected() {
 // ============================================================================
 #[test]
 fn session_key_budget_and_expiry_boundaries() {
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng);
-    let session_pub = session.verifying_key().to_bytes();
+    let master = FalconKeypair::generate_from_seed(0x41);
+    let session = FalconKeypair::generate_from_seed(0x42);
     let valid_until = 4_000_000_000u64; // far future (still > now_secs)
-    let mut auth = SessionKeyAuthorization::sign_delegation(
+    let mut auth = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        session.public_key(),
         valid_until,
         1_000,
         stellereum::zkml::SCOPE_ALL,
@@ -206,9 +210,10 @@ fn session_key_budget_and_expiry_boundaries() {
     );
 
     // Fresh key: expired exactly one second after valid_until
-    let mut auth2 = SessionKeyAuthorization::sign_delegation(
+    let mut auth2 = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        session.public_key(),
         valid_until,
         1_000,
         stellereum::zkml::SCOPE_ALL,
@@ -366,10 +371,38 @@ async fn state_transfer_conserves_total_and_creates_account() {
         priority_fee_per_gas: 0,
     };
     // apply_transaction requires a valid signature; use a real signer instead
-    let sk = SigningKey::generate(&mut OsRng);
-    let a2 = sk.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(a2, 10_000)).await;
-    let signed = Transaction::sign(&sk, newbie, 2_000, 0, 0, 1, 1);
+    let sk = FalconKeypair::generate_from_seed(0x43);
+    let a2 = derive_pq_address(PqScheme::Falcon512, sk.public_key(), &DEFAULT_SALT);
+    engine
+        .update_account(AccountState::new(a2, 10_000 + PQ_ACTIVATION_SURCHARGE_GAS))
+        .await;
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        newbie,
+        2_000,
+        0,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = sk.sign(&probe.signing_message());
+    let signed = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sk.public_key.clone(),
+        sig,
+        newbie,
+        2_000,
+        0,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
     let _ = tx; // discard unsigned example
 
     engine.apply_transaction(&signed, 0).await.unwrap();

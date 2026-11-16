@@ -80,7 +80,8 @@ async fn unanimity3_slow_honest_finalizes_with_generous_timeout() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -89,7 +90,11 @@ async fn unanimity3_slow_honest_finalizes_with_generous_timeout() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),
@@ -116,12 +121,14 @@ async fn unanimity3_tight_timeout_stalls_with_slow_voter() {
     // LIVENESS: nothing finalizes — every round's votes go stale before the
     // slow voter can join them.
     assert_eq!(
-        report.best_height, 0,
+        report.best_height,
+        0,
         "no node may finalize under unanimity while one voter is always late.\n{}",
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, 0,
+        report.common_height,
+        0,
         "the common head must not move.\n{}",
         report.diagnostics()
     );
@@ -136,7 +143,8 @@ async fn unanimity3_tight_timeout_stalls_with_slow_voter() {
             report.diagnostics()
         );
         assert_eq!(
-            n.precommit_qc_round, None,
+            n.precommit_qc_round,
+            None,
             "node {}: no precommit QC may form without unanimity.\n{}",
             n.index,
             report.diagnostics()

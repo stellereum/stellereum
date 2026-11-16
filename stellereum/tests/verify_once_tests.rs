@@ -15,10 +15,9 @@
 //! The cache is process-global, so the three tests serialize on `TEST_LOCK`
 //! and use distinct keys/nonces per test; stats are asserted as deltas.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::consensus::consensus_chain_id;
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{
     record_verified_signature, verified_signature_covers, verify_once_clear,
@@ -29,6 +28,87 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const FUND: u64 = 100_000_000;
 const TS: u64 = 1_700_000_000;
+
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+) -> ([u8; 32], Transaction) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let pk = kp.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    let tx = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    (tx.from, tx)
+}
+
+fn pq_tx_with_chain(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> ([u8; 32], Transaction) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let pk = kp.public_key.clone();
+    let probe = Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+        chain_id,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    let tx = Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+        chain_id,
+    );
+    (tx.from, tx)
+}
 
 async fn funded_engine(chain: u64, addr: &[u8; 32]) -> InMemoryStateEngine {
     let engine = InMemoryStateEngine::new().with_chain_id(chain);
@@ -43,9 +123,7 @@ async fn verify_once_happy_path_skips_second_verify() {
     verify_once_reset_stats();
 
     let chain = consensus_chain_id();
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
-    let tx = Transaction::sign(&sk, [0x77u8; 32], 1_000, 50_000, 0, 1, 1);
+    let (from, tx) = pq_tx(0x11, [0x77u8; 32], 1_000, 50_000, 0);
     assert!(tx.verify_signature(), "fixture must verify");
 
     // Mempool admission verifies and attests (the intake half of verify-once).
@@ -90,9 +168,7 @@ async fn verify_once_mutated_bytes_force_reverify_and_refuse() {
     verify_once_reset_stats();
 
     let chain = consensus_chain_id();
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
-    let tx = Transaction::sign(&sk, [0x78u8; 32], 1_000, 50_000, 0, 1, 1);
+    let (from, tx) = pq_tx(0x22, [0x78u8; 32], 1_000, 50_000, 0);
     assert!(tx.verify_signature(), "fixture must verify");
     record_verified_signature(&tx, chain);
     assert!(verified_signature_covers(&tx, chain));
@@ -119,7 +195,8 @@ async fn verify_once_mutated_bytes_force_reverify_and_refuse() {
 
     // Mutated signature byte: same treatment.
     let mut bad_sig = tx.clone();
-    bad_sig.signature[0] ^= 0xFF;
+    let last = bad_sig.signature.len() - 1;
+    bad_sig.signature[last] ^= 0xFF;
     assert!(!bad_sig.verify_signature(), "forged sig must not verify");
     assert!(
         !verified_signature_covers(&bad_sig, chain),
@@ -160,9 +237,7 @@ async fn verify_once_cross_context_replay_reverifies() {
     const CHAIN_B: u64 = 9753;
     assert_ne!(CHAIN_A, CHAIN_B);
 
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
-    let tx = Transaction::sign_with_chain_id(&sk, [0x79u8; 32], 1_000, 50_000, 0, 1, 1, CHAIN_A);
+    let (from, tx) = pq_tx_with_chain(0x33, [0x79u8; 32], 1_000, 50_000, 0, CHAIN_A);
     assert_eq!(tx.chain_id(), Some(CHAIN_A));
     assert!(tx.verify_signature(), "fixture must verify");
 

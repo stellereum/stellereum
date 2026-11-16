@@ -26,7 +26,10 @@ use stellereum::storage::{DomainSnapshot, Storage};
 // unhealed engine under the finalized height.
 #[test]
 fn heal_failure_path_refuses_instead_of_mislabeling() {
-    let src = include_str!("../src/main.rs");
+    let src = concat!(
+        include_str!("../src/node/consensus_driver.rs"),
+        include_str!("../src/node/policy.rs"),
+    );
 
     // The fail-closed decision helper drives the failure branch.
     assert!(

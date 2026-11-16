@@ -33,7 +33,16 @@ async fn main() -> Result<()> {
     let abis = std::sync::Arc::new(AbiCache::new());
 
     // Start background syncer
-    let syncer = Syncer::new_with_abis(db.clone(), node_url, rpc_url.clone(), abis.clone());
+    let sync_status = std::sync::Arc::new(tokio::sync::RwLock::new(
+        stellereum_indexer::syncer::SyncStatus::default(),
+    ));
+    let syncer = Syncer::new_with_state(
+        db.clone(),
+        node_url,
+        rpc_url.clone(),
+        abis.clone(),
+        sync_status.clone(),
+    );
     tokio::spawn(async move {
         syncer.run().await;
     });
@@ -49,6 +58,11 @@ async fn main() -> Result<()> {
         abis,
         rpc_url: rpc_url.clone(),
         verify_token,
+        sync_status,
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
     };
     let app = create_router(app_state);
 

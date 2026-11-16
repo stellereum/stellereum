@@ -8,13 +8,13 @@
 //! mod falcon_votes;
 //! ```
 use ed25519_dalek::{Signer as _, SigningKey};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use stellereum::consensus::{
     register_validator_pq_key, vote_sign_bytes, Vote, VoteKind, VOTE_FALCON_MAGIC,
     VOTE_FALCON_PART_LEN,
 };
 use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// Deterministic Ed + Falcon key sets with every Falcon key registered in
 /// the global validator-PQ registry that `Vote::verify` reads. Same seeds

@@ -22,13 +22,12 @@ pub const BLOCK_REWARD_NANO: u64 = 317_000_000;
 
 /// Height gate for the cap-exact geometric emission (report §11, Eq. 4).
 ///
-/// INACTIVE by default (`u64::MAX` — lead flips at rollout). While inactive
-/// every reachable height takes the flat branch, so live emission is
+/// INACTIVE by default (`u64::MAX` — lead flips at rollout). While set to
+/// `u64::MAX` EVERY height (including `u64::MAX`) takes the flat branch,
+/// matching `chain_spec::ActivationStatus::GatedOff`, so live emission is
 /// byte-identical to [`StakingEmissionSchedule::calculate_block_reward`]
 /// (pinned by `gated_pre_activation_pins_current_values` below and the
 /// unmodified external `flat_block_reward_is_live_and_schedule_is_dead`).
-/// The single boundary height `== u64::MAX` takes the geometric leg and is
-/// pinned by `gated_boundary_is_exact`.
 // GATE: task-mandated identifier spelling `EMISSIONCapEXACT_ACTIVATION_HEIGHT`
 // (the exact rollout knob the lead flips); casing allow is per-item, not blanket.
 #[allow(non_upper_case_globals)]
@@ -363,22 +362,35 @@ impl StakingEmissionSchedule {
     /// R0). The geometric leg is per-proposer like the live flat reward —
     /// no division by `active_validators`.
     ///
-    /// Integer dispatch only — no float in this body; the geometric float
-    /// math is sibling-owned ([`geometric_reward_at_height`]), REUSED via
-    /// delegation, never duplicated. While the activation is `u64::MAX`
-    /// every reachable height takes the flat branch: byte-identical to
-    /// [`Self::calculate_block_reward`].
+    /// Integer dispatch only — no float in this body; the geometric math is
+    /// sibling-owned ([`geometric_reward_at_height`]), REUSED via delegation,
+    /// never duplicated. While the activation is `u64::MAX`, EVERY height
+    /// (including `u64::MAX`) takes the flat branch: byte-identical to
+    /// [`Self::calculate_block_reward`] and consistent with `chain_spec::ActivationStatus::GatedOff`.
     pub fn calculate_block_reward_at_height(&self, active_validators: usize, height: u64) -> u64 {
+        self.calculate_block_reward_with_activation(
+            active_validators,
+            height,
+            EMISSIONCapEXACT_ACTIVATION_HEIGHT,
+        )
+    }
+
+    fn calculate_block_reward_with_activation(
+        &self,
+        active_validators: usize,
+        height: u64,
+        activation_height: u64,
+    ) -> u64 {
         if self.emitted >= self.total_pool || active_validators == 0 {
             return 0;
         }
-        if height < EMISSIONCapEXACT_ACTIVATION_HEIGHT {
+        if activation_height == u64::MAX || height < activation_height {
             self.calculate_block_reward(active_validators)
         } else {
             geometric_reward_at_height(
                 CAP_EXACT_R0_NANO,
                 CAP_EXACT_HALF_LIFE_BLOCKS,
-                height - EMISSIONCapEXACT_ACTIVATION_HEIGHT,
+                height - activation_height,
             )
         }
     }
@@ -407,15 +419,56 @@ pub fn geometric_schedule_r0_nano(pool_nano: u64, half_life_blocks: u64) -> u64 
     ((pool_nano as f64) * (1.0 - decay)) as u64
 }
 
-/// Geometric per-height reward (report §11, Eq. 4).
-/// Pure: R_h = R0 · 2^(−h/H), floored to whole nano-STELL. Called by the
-/// height gate ([`StakingEmissionSchedule::calculate_block_reward_at_height`])
-/// and by tests; wiring any OTHER payout path to it is a consensus change.
-pub fn geometric_reward_at_height(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
+/// Pure deterministic integer fixed-point `floor(r0_nano * 2^(-height / half_life_blocks))`.
+///
+/// Decomposes `height / half_life_blocks = whole + rem_h / half_life_blocks`:
+/// - Whole halvings (`whole`) are an exact right-shift (`>> whole`, returning
+///   `0` for `whole >= 64`).
+/// - The fractional exponent `rem_h / half_life_blocks in [0, 1)` is evaluated
+///   via 64-bit binary decomposition in Q0.64 using repeated `u128::isqrt`
+///   (`2^(-2^-i)` starting from `2^-1 = 1 << 63`).
+///
+/// Zero `f64` / `libm` dependency: bit-identical across all platforms and
+/// strictly a floor (`<=` exact real value, so emissions never exceed cap).
+fn pow_half_fixed(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
     if r0_nano == 0 || half_life_blocks == 0 {
         return 0;
     }
-    ((r0_nano as f64) * 0.5f64.powf(height as f64 / half_life_blocks as f64)) as u64
+    let whole = height / half_life_blocks;
+    if whole >= 64 {
+        return 0;
+    }
+    let rem_h = height % half_life_blocks;
+    if rem_h == 0 {
+        return r0_nano >> whole;
+    }
+
+    let h = half_life_blocks as u128;
+    let mut rem = rem_h as u128;
+    let mut s = 1u128 << 63; // 2^(-1) in Q0.64
+    let mut acc = 1u128 << 64; // 1.0 in Q64.64
+    for _ in 0..64 {
+        s = (s << 64).isqrt();
+        rem <<= 1;
+        if rem >= h {
+            rem -= h;
+            acc = (acc * s) >> 64;
+        }
+        if rem == 0 {
+            break;
+        }
+    }
+    let scaled = ((r0_nano as u128) * acc) >> 64;
+    (scaled >> whole) as u64
+}
+
+/// Geometric per-height reward (report §11, Eq. 4).
+/// Pure deterministic integer fixed-point: R_h = floor(R0 · 2^(−h/H)) in
+/// whole nano-STELL. Called by the height gate
+/// ([`StakingEmissionSchedule::calculate_block_reward_at_height`]) and by
+/// tests; wiring any OTHER payout path to it is a consensus change.
+pub fn geometric_reward_at_height(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
+    pow_half_fixed(r0_nano, half_life_blocks, height)
 }
 
 #[cfg(test)]
@@ -427,7 +480,10 @@ mod econ_truth_tests {
 
     #[test]
     fn flat_reward_and_pool_are_pinned() {
-        assert_eq!(BLOCK_REWARD_NANO, 317_000_000, "live flat reward: 0.317 STELL");
+        assert_eq!(
+            BLOCK_REWARD_NANO, 317_000_000,
+            "live flat reward: 0.317 STELL"
+        );
         let sched = StakingEmissionSchedule::default();
         assert_eq!(sched.total_pool, 350_000_000 * 1_000_000_000);
         assert_eq!(sched.annual_base_rate_bps, 700);
@@ -500,7 +556,10 @@ mod econ_truth_tests {
             sum += geometric_reward_at_height(r0, half_life_blocks, h) as u128;
         }
         let frac = sum as f64 / pool as f64;
-        assert!((frac - 0.99).abs() < 0.005, "99% by H·log2(100), got {frac}");
+        assert!(
+            (frac - 0.99).abs() < 0.005,
+            "99% by H·log2(100), got {frac}"
+        );
     }
 
     #[test]
@@ -514,10 +573,19 @@ mod econ_truth_tests {
 
     #[test]
     fn gated_pre_activation_pins_current_values() {
-        // While inactive every reachable height takes the flat branch:
-        // byte-identical to the current schedule (values locked, unmodified).
+        // While inactive (`u64::MAX`) EVERY height including `u64::MAX` takes
+        // the flat branch: byte-identical to the current schedule (values
+        // locked, unmodified) and aligned with `chain_spec::ActivationStatus::GatedOff`.
         let sched = StakingEmissionSchedule::default();
-        for &h in &[0u64, 1, 100, 1_104_100_945, 1_104_100_946, u64::MAX - 1] {
+        for &h in &[
+            0u64,
+            1,
+            100,
+            1_104_100_945,
+            1_104_100_946,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
             assert_eq!(
                 sched.calculate_block_reward_at_height(1, h),
                 BLOCK_REWARD_NANO,
@@ -582,19 +650,55 @@ mod econ_truth_tests {
     fn gated_boundary_is_exact() {
         let sched = StakingEmissionSchedule::default();
         let a = EMISSIONCapEXACT_ACTIVATION_HEIGHT;
+        if a == u64::MAX {
+            // Gated off sentinel: inactive for all heights including u64::MAX.
+            assert_eq!(
+                sched.calculate_block_reward_at_height(1, u64::MAX - 1),
+                BLOCK_REWARD_NANO,
+                "u64::MAX sentinel: u64::MAX - 1 takes flat 0.317"
+            );
+            assert_eq!(
+                sched.calculate_block_reward_at_height(1, u64::MAX),
+                BLOCK_REWARD_NANO,
+                "u64::MAX sentinel: u64::MAX also stays flat 0.317 (matches chain_spec::GatedOff)"
+            );
+        } else if a > 0 {
+            assert_eq!(
+                sched.calculate_block_reward_at_height(1, a - 1),
+                BLOCK_REWARD_NANO,
+                "just below activation: flat 0.317"
+            );
+            assert_eq!(
+                sched.calculate_block_reward_at_height(1, a),
+                CAP_EXACT_R0_NANO,
+                "boundary: exactly R0 (relative height 0)"
+            );
+        }
+
+        // Also exercise an active activation height boundary directly.
+        let active_a = 1_000_000u64;
         assert_eq!(
-            sched.calculate_block_reward_at_height(1, a - 1),
+            sched.calculate_block_reward_with_activation(1, active_a - 1, active_a),
             BLOCK_REWARD_NANO,
-            "just below activation: flat 0.317"
+            "just below active boundary: flat 0.317"
         );
         assert_eq!(
-            sched.calculate_block_reward_at_height(1, a),
+            sched.calculate_block_reward_with_activation(1, active_a, active_a),
             CAP_EXACT_R0_NANO,
-            "boundary: exactly R0 (relative height 0)"
+            "active boundary: exactly R0 (relative height 0)"
         );
         assert_eq!(
-            sched.calculate_block_reward_at_height(1, a),
+            sched.calculate_block_reward_with_activation(1, active_a, active_a),
             geometric_reward_at_height(CAP_EXACT_R0_NANO, CAP_EXACT_HALF_LIFE_BLOCKS, 0)
+        );
+        assert_eq!(
+            sched.calculate_block_reward_with_activation(
+                1,
+                active_a + CAP_EXACT_HALF_LIFE_BLOCKS,
+                active_a
+            ),
+            CAP_EXACT_R0_NANO / 2,
+            "one half-life past active boundary: exact halving"
         );
     }
 

@@ -3,8 +3,8 @@
 //! Security invariant: a stranger (user 99, no approval) must NOT be able
 //! to move tokens out of admin (user 1).
 
-use sts20_token::{balance_of, init, transfer};
 use stellereum_contract_sdk::reset_mock_state;
+use sts20_token::{balance_of, init, transfer};
 
 #[test]
 fn poc_p0_unauth_transfer_must_fail() {

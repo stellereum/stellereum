@@ -170,7 +170,12 @@ pub fn check_admission_from_env(
     chain_height: u64,
     chain_id: u64,
 ) -> Result<(), String> {
-    check_admission(is_bound, chain_height, &ChainBindingActivation::from_env(), chain_id)
+    check_admission(
+        is_bound,
+        chain_height,
+        &ChainBindingActivation::from_env(),
+        chain_id,
+    )
 }
 
 /// Split one mempool snapshot at activation: bound transactions stay queued,

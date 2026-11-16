@@ -40,11 +40,7 @@ use stellereum::contract_abi::{AbiEvent, AbiType, ContractAbi};
 /// The indexer stores addresses in one canonical form so that `0xABC…`,
 /// `abc…` and `0xabc…` all hit the same row.
 pub fn normalize_address(addr: &str) -> String {
-    let clean = addr
-        .strip_prefix("0x")
-        .or_else(|| addr.strip_prefix("0X"))
-        .unwrap_or(addr);
-    clean.trim().to_lowercase()
+    crate::db::normalize_address_info(addr).hex_clean
 }
 
 /// One contract event as the node reports it inside a receipt.

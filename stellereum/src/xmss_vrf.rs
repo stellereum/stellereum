@@ -297,10 +297,7 @@ fn wots_digits(msg: &[u8]) -> [u32; WOTS_LEN] {
         digits[2 * i] = (b >> 4) as u32;
         digits[2 * i + 1] = (b & 0x0F) as u32;
     }
-    let csum: u32 = digits[..WOTS_LEN1]
-        .iter()
-        .map(|d| (WOTS_W - 1) - d)
-        .sum();
+    let csum: u32 = digits[..WOTS_LEN1].iter().map(|d| (WOTS_W - 1) - d).sum();
     for i in 0..WOTS_LEN2 {
         let shift = 4 * (WOTS_LEN2 - 1 - i);
         digits[WOTS_LEN1 + i] = (csum >> shift) & 0x0F;
@@ -521,7 +518,11 @@ pub fn parse_refusal_evidence(bytes: &[u8]) -> Option<([u8; 32], u64, Vec<u8>)> 
     root.copy_from_slice(&bytes[ep..ep + 32]);
     let mut epoch_bytes = [0u8; 8];
     epoch_bytes.copy_from_slice(&bytes[ep + 32..ep + 40]);
-    Some((root, u64::from_be_bytes(epoch_bytes), bytes[ep + 40..].to_vec()))
+    Some((
+        root,
+        u64::from_be_bytes(epoch_bytes),
+        bytes[ep + 40..].to_vec(),
+    ))
 }
 
 /// Canonical slashable proof for two valid signatures on one leaf.
@@ -714,7 +715,11 @@ impl XmssVrf {
             }
             levels.push(next);
         }
-        let root = levels.last().and_then(|l| l.first()).copied().unwrap_or([0u8; 32]);
+        let root = levels
+            .last()
+            .and_then(|l| l.first())
+            .copied()
+            .unwrap_or([0u8; 32]);
         let capacity = leaves as u64;
         Ok(Self {
             master: Zeroizing::new(master),
@@ -788,7 +793,11 @@ impl XmssVrf {
     /// * [`XmssError::LeafReuse`] — epoch already signed (with evidence).
     /// * [`XmssError::UnexpectedEpoch`] — in-range future epoch (refused so a
     ///   skip cannot silently burn leaves).
-    pub fn sign(&mut self, epoch: u64, seed: &[u8]) -> Result<([u8; 32], XmssSignature), XmssError> {
+    pub fn sign(
+        &mut self,
+        epoch: u64,
+        seed: &[u8],
+    ) -> Result<([u8; 32], XmssSignature), XmssError> {
         let capacity = self.capacity();
         if self.next_leaf >= capacity || epoch >= capacity {
             return Err(XmssError::Exhausted { capacity, epoch });
@@ -905,7 +914,9 @@ pub fn load_counter(path: &Path) -> Result<CounterSnapshot, XmssError> {
     let height = raw[8];
     check_height(height)?;
     if raw[9..16].iter().any(|b| *b != 0) {
-        return Err(XmssError::Corrupt("counter reserved bytes must be zero".to_string()));
+        return Err(XmssError::Corrupt(
+            "counter reserved bytes must be zero".to_string(),
+        ));
     }
     let mut next_bytes = [0u8; 8];
     next_bytes.copy_from_slice(&raw[16..24]);
@@ -1041,7 +1052,14 @@ mod tests {
         assert!(!other.verify(0, b"epoch-seed", &y, &sig));
         // Stateless path agrees.
         assert!(verify_signature(&v.root(), 3, 1, b"epoch-seed", &y1, &sig1));
-        assert!(!verify_signature(&v.root(), 3, 0, b"epoch-seed", &y1, &sig1));
+        assert!(!verify_signature(
+            &v.root(),
+            3,
+            0,
+            b"epoch-seed",
+            &y1,
+            &sig1
+        ));
     }
 
     #[test]
@@ -1112,8 +1130,16 @@ mod tests {
         assert_eq!(parsed.sig_a, sig_a.to_bytes());
         assert_eq!(parsed.sig_b, sig_b.to_bytes());
         // Negative cases: same seed, swapped epoch, garbage sig, truncation.
-        assert!(verify_equivocation(&root, 3, 0, b"s", &sig_a.to_bytes(), b"s", &sig_b.to_bytes())
-            .is_none());
+        assert!(verify_equivocation(
+            &root,
+            3,
+            0,
+            b"s",
+            &sig_a.to_bytes(),
+            b"s",
+            &sig_b.to_bytes()
+        )
+        .is_none());
         assert!(verify_equivocation(
             &root,
             3,
@@ -1124,8 +1150,16 @@ mod tests {
             &sig_b.to_bytes()
         )
         .is_none());
-        assert!(verify_equivocation(&root, 3, 0, b"seed-A", b"junk", b"seed-B", &sig_b.to_bytes())
-            .is_none());
+        assert!(verify_equivocation(
+            &root,
+            3,
+            0,
+            b"seed-A",
+            b"junk",
+            b"seed-B",
+            &sig_b.to_bytes()
+        )
+        .is_none());
         let mut truncated = ev.clone();
         truncated.pop();
         assert!(parse_equivocation_evidence(&truncated).is_none());

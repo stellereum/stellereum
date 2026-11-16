@@ -17,11 +17,13 @@ use infnode::proto::Frame;
 use rand::rngs::OsRng;
 use std::time::Instant;
 use stellereum::cell::PatriciaTrie;
-use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet};
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::orderbook::{OrderSide, OrderbookActor};
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
+use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult, GAS_BASIC_TRANSFER};
 use stellereum::token::{TokenMetadata, TokenOp, ZERO_ADDRESS};
 
 fn rate(iters: u64, elapsed_secs: f64) -> f64 {
@@ -72,8 +74,8 @@ async fn main() {
     // ---- 1. Native transfer TPS -------------------------------------------
     {
         let engine = InMemoryStateEngine::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let from = sk.verifying_key().to_bytes();
+        let fk = FalconKeypair::generate();
+        let from = derive_pq_address(PqScheme::Falcon512, fk.public_key(), &DEFAULT_SALT);
         let to = [2u8; 32];
         engine
             .update_account(AccountState::new(from, u64::MAX / 2))
@@ -81,7 +83,55 @@ async fn main() {
 
         let n = 5_000u64;
         let txs: Vec<Transaction> = (0..n)
-            .map(|i| Transaction::sign(&sk, to, 1, 0, i, 1, 1))
+            .map(|i| {
+                let gas = if i == 0 {
+                    GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+                } else {
+                    GAS_BASIC_TRANSFER
+                };
+                let msg = Transaction {
+                    from,
+                    to,
+                    amount: 1,
+                    gas_limit: gas,
+                    nonce: i,
+                    source_shard: 1,
+                    target_shard: 1,
+                    signature: Vec::new(),
+                    payload: Vec::new(),
+                    priority_fee_per_gas: 0,
+                }
+                .signing_message();
+                let sig = fk.sign(&msg);
+                if i == 0 {
+                    Transaction::new_pq_explicit(
+                        PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                        sig,
+                        to,
+                        1,
+                        gas,
+                        i,
+                        1,
+                        1,
+                        Vec::new(),
+                        &DEFAULT_SALT,
+                    )
+                } else {
+                    Transaction::new_pq_implicit(
+                        from,
+                        PqScheme::Falcon512,
+                        sig,
+                        to,
+                        1,
+                        gas,
+                        i,
+                        1,
+                        1,
+                        Vec::new(),
+                    )
+                }
+            })
             .collect();
 
         let t = Instant::now();
@@ -333,21 +383,33 @@ async fn main() {
     // ---- 6. Consensus vote ingestion --------------------------------------
     {
         let n = 2_000usize;
-        let keys: Vec<SigningKey> = (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let keys: Vec<(SigningKey, FalconKeypair)> = (0..n)
+            .map(|i| {
+                let sk = SigningKey::generate(&mut OsRng);
+                let mut seed = [0x42u8; 32];
+                seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                let fk = FalconKeypair::generate_from_seed_bytes(&seed);
+                let id = sk.verifying_key().to_bytes();
+                register_validator_pq_key(id, PqScheme::Falcon512, fk.public_key.clone());
+                (sk, fk)
+            })
+            .collect();
         let vs = ValidatorSet::from_list(
             keys.iter()
-                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .map(|(sk, _)| (sk.verifying_key().to_bytes(), 1))
                 .collect(),
         );
         let votes: Vec<Vote> = keys
             .iter()
-            .map(|k| Vote::sign(k, 1, 0, VoteKind::Prevote, Some([7u8; 32])))
+            .map(|(sk, fk)| {
+                Vote::sign_with_falcon(sk, fk, 1, 0, VoteKind::Prevote, Some([7u8; 32]))
+            })
             .collect();
 
         let mut set = VoteSet::new();
         let t = Instant::now();
         for v in votes {
-            let _ = set.add(v, &vs, 1, 0, VoteKind::Prevote);
+            set.add(v, &vs, 1, 0, VoteKind::Prevote).unwrap();
         }
         let secs = t.elapsed().as_secs_f64();
         println!(
@@ -360,13 +422,18 @@ async fn main() {
     // ---- 7. Block hashing + signing ---------------------------------------
     {
         let sk = SigningKey::generate(&mut OsRng);
-        let n = 20_000u64;
+        let fk = FalconKeypair::generate();
+        let n = 5_000u64;
         let t = Instant::now();
         for i in 0..n {
-            let mut b = Block::new_for_test(MASTERCHAIN_SHARD, i, [0u8; 32], [0u8; 32], vec![])
-                .with_timestamp(i)
-                .with_proposer(sk.verifying_key().to_bytes());
-            b.sign_block(&sk);
+            let mut b = Block {
+                shard_id: MASTERCHAIN_SHARD,
+                height: i,
+                ..Block::default()
+            }
+            .with_timestamp(i)
+            .with_proposer(sk.verifying_key().to_bytes());
+            b.sign_block_with_falcon(&sk, &fk);
             let _ = b.compute_hash();
         }
         let secs = t.elapsed().as_secs_f64();

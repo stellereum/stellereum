@@ -17,23 +17,65 @@
 //!   all-valid fixture and its one-corrupt variant. Any verdict divergence
 //!   fails this test.
 
-use ed25519_dalek::SigningKey;
-use stellereum::sharding::Transaction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::svm::OpCode;
 use stellereum::zkml::effective_chain_id;
 
 const TO: [u8; 32] = [0x11u8; 32];
 const GAS: u64 = 21_000;
 
-fn det_key(i: u64) -> SigningKey {
+fn det_pq_key(i: u64) -> (FalconKeypair, [u8; 32]) {
     let mut seed = [0xA5u8; 32];
     seed[..8].copy_from_slice(&i.to_le_bytes());
-    SigningKey::from_bytes(&seed)
+    let kp = FalconKeypair::generate_from_seed_bytes(&seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+fn pq_sign(
+    i: u64,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+    chain_id: Option<u64>,
+) -> Transaction {
+    let (kp, from) = det_pq_key(i);
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    tx.signature = match chain_id {
+        Some(cid) => {
+            let msg = tx.signing_message_for_chain(cid);
+            let sig = kp.sign(&msg);
+            PqSignatureEnvelope::new_implicit_with_chain(PqScheme::Falcon512, sig, cid).encode()
+        }
+        None => {
+            let msg = tx.signing_message();
+            let sig = kp.sign(&msg);
+            PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode()
+        }
+    };
+    tx
 }
 
 fn plain_txs(n: usize, key_base: u64) -> Vec<Transaction> {
     (0..n as u64)
-        .map(|i| Transaction::sign(&det_key(key_base + i), TO, 1_000, GAS, 0, 0, 0))
+        .map(|i| pq_sign(key_base + i, TO, 1_000, GAS, 0, Vec::new(), None))
         .collect()
 }
 
@@ -41,37 +83,35 @@ fn plain_txs(n: usize, key_base: u64) -> Vec<Transaction> {
 /// SVM payload, chain-id-bound, sponsored (sponsor envelope + user sig).
 fn mixed_shapes_txs(n: usize, key_base: u64) -> Vec<Transaction> {
     (0..n as u64)
-        .map(|i| {
-            let sk = det_key(key_base + i);
-            match i % 4 {
-                0 => Transaction::sign(&sk, TO, 1_000, GAS, 0, 0, 0),
-                1 => Transaction::sign_with_payload(
-                    &sk,
-                    TO,
-                    1_000,
-                    GAS,
-                    0,
-                    0,
-                    0,
-                    vec![OpCode::Transfer {
-                        recipient: TO,
-                        amount: 1,
-                    }],
-                ),
-                2 => Transaction::sign_with_payload_and_chain_id(
-                    &sk,
-                    TO,
-                    1_000,
-                    GAS,
-                    0,
-                    0,
-                    0,
-                    Vec::new(),
-                    effective_chain_id(),
-                ),
-                _ => Transaction::sign_with_sponsor(
-                    &sk,
-                    &det_key(key_base + 1_000_000 + i),
+        .map(|i| match i % 4 {
+            0 => pq_sign(key_base + i, TO, 1_000, GAS, 0, Vec::new(), None),
+            1 => pq_sign(
+                key_base + i,
+                TO,
+                1_000,
+                GAS,
+                0,
+                vec![OpCode::Transfer {
+                    recipient: TO,
+                    amount: 1,
+                }],
+                None,
+            ),
+            2 => pq_sign(
+                key_base + i,
+                TO,
+                1_000,
+                GAS,
+                0,
+                Vec::new(),
+                Some(effective_chain_id()),
+            ),
+            _ => {
+                let (user_kp, _) = det_pq_key(key_base + i);
+                let (spon_kp, _) = det_pq_key(key_base + 1_000_000 + i);
+                Transaction::sign_with_sponsor_falcon512(
+                    &user_kp,
+                    &spon_kp,
                     TO,
                     1_000,
                     GAS,
@@ -84,7 +124,7 @@ fn mixed_shapes_txs(n: usize, key_base: u64) -> Vec<Transaction> {
                     u64::MAX,
                     Vec::new(),
                     effective_chain_id(),
-                ),
+                )
             }
         })
         .collect()

@@ -226,10 +226,24 @@ async fn certify(live: &mut ValidatorRuntime, ks: &[SigningKey], blk: &mut Block
     let bh = blk.compute_hash();
     let height = blk.height;
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
-        live.on_prevote(Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Prevote, Some(bh)))
-            .expect("prevote accepted");
-        live.on_precommit(Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(bh)))
-            .expect("precommit accepted");
+        live.on_prevote(Vote::sign_with_falcon(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .expect("prevote accepted");
+        live.on_precommit(Vote::sign_with_falcon(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(
         live.hc.try_precommit_quorum(),

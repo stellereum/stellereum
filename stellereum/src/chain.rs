@@ -1435,4 +1435,51 @@ mod tests {
         // The oldest are dropped.
         assert_eq!(cm.finalized_at_height(1), None);
     }
+
+    #[test]
+    fn validate_extension_accepts_falcon_signed_block_and_rejects_tampered_falcon() {
+        let cm = ChainManager::new(block(0, [0u8; 32], 0));
+        let g = cm.best_head();
+
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xC3);
+        let proposer = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+
+        let mut b = Block {
+            shard_id: MASTERCHAIN_SHARD,
+            height: 1,
+            prev_hash: g,
+            state_root: [0xD1; 32],
+            transactions: vec![],
+            cross_shard_out: vec![],
+            timestamp: 1,
+            proposer,
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            order_merkle_root: crate::mev::compute_order_merkle_root(&[]),
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+        };
+        let hash = b.compute_hash();
+        b.validator_signatures
+            .push((fk.validator_id(), fk.sign(&hash)));
+        assert!(
+            cm.validate_extension(&b).is_ok(),
+            "ChainManager::validate_extension must accept a Falcon-512 signed block"
+        );
+
+        let mut tampered = b.clone();
+        tampered.validator_signatures[0].1[10] ^= 0x01;
+        assert!(
+            cm.validate_extension(&tampered).is_err(),
+            "ChainManager::validate_extension must reject a tampered Falcon-512 signature"
+        );
+    }
 }

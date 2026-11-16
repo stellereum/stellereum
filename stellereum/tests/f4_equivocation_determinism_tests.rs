@@ -45,7 +45,13 @@ async fn funded(ks: &[SigningKey]) -> Arc<InMemoryStateEngine> {
     st
 }
 
-fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
+fn mkblock(
+    pkey: &SigningKey,
+    pfk: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    prev: [u8; 32],
+    root: [u8; 32],
+) -> Block {
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: h,
@@ -63,14 +69,14 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pkey);
+    b.sign_block_with_falcon(pkey, pfk);
     b
 }
 
-fn proposer_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> &'a SigningKey {
+fn proposer_idx(ks: &[SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> usize {
     let want = vs.proposer_for(h, r).expect("non-empty set has a proposer");
     ks.iter()
-        .find(|k| k.verifying_key().to_bytes() == want)
+        .position(|k| k.verifying_key().to_bytes() == want)
         .expect("schedule proposer is one of our keys")
 }
 
@@ -119,8 +125,8 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
     }
 
     let root0 = st_a.get_state_root().await;
-    let pkey = proposer_key(&ks, &vs, 1, 0).clone();
-    let block = mkblock(&pkey, 1, [0u8; 32], root0);
+    let pi = proposer_idx(&ks, &vs, 1, 0);
+    let block = mkblock(&ks[pi], &fks[pi], 1, [0u8; 32], root0);
     let bh = block.compute_hash();
     let qc = full_precommit_qc(&ks, &fks, 1, 0, bh, &[0u8; 32]);
     assert!(qc.verify(&vs), "precondition: certificate is genuine");
@@ -130,8 +136,15 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
     // other routes never see.
     let mut a = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_a.clone(), 1);
     for (i, k) in ks.iter().enumerate() {
-        a.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
-            .unwrap();
+        a.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
     }
     a.on_prevote(falcon_votes::fvote(
         &cheater,
@@ -143,8 +156,15 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
     ))
     .unwrap();
     for (i, k) in ks.iter().enumerate() {
-        a.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
-            .unwrap();
+        a.on_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .unwrap();
     }
     assert_eq!(
         a.hc.equivocations().len(),
@@ -238,16 +258,23 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     let st = funded(&ks).await;
 
     let root0 = st.get_state_root().await;
-    let pkey = proposer_key(&ks, &vs, 1, 0).clone();
-    let block = mkblock(&pkey, 1, [0u8; 32], root0);
+    let pi = proposer_idx(&ks, &vs, 1, 0);
+    let block = mkblock(&ks[pi], &fks[pi], 1, [0u8; 32], root0);
     let bh = block.compute_hash();
     let qc = full_precommit_qc(&ks, &fks, 1, 0, bh, &[0u8; 32]);
 
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st.clone(), 1);
     // A quorum prevotes the block...
     for (i, k) in ks.iter().enumerate() {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
     }
     // ...and the cheater ALSO sends a conflicting second prevote, observed
     // locally. The first prevote stays counted for quorum; the second is
@@ -266,8 +293,15 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     assert!(victim_evidence[0].1.verify() && victim_evidence[0].2.verify());
 
     for (i, k) in ks.iter().enumerate() {
-        rt.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
-            .unwrap();
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));
     rt.blocks.insert(bh, {

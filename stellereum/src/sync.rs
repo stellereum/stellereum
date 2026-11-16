@@ -1259,8 +1259,12 @@ fn find_cross_shard_snapshot(
 ) -> Result<Option<crate::sharding::CrossShardReplaySnapshot>, String> {
     for (kind, dbytes) in bundle {
         if *kind == "cross_shard" {
-            let snap: crate::sharding::CrossShardReplaySnapshot = bincode::deserialize(dbytes)
-                .map_err(|e| format!("fast sync: restore cross-shard error: {e:?}"))?;
+            let snap: crate::sharding::CrossShardReplaySnapshot =
+                crate::network::decode_wire_limited(
+                    dbytes,
+                    (dbytes.len() as u64).min(crate::network::MAX_WIRE_BLOCK_BYTES),
+                )
+                .map_err(|e| format!("fast sync: restore cross-shard error: {e}"))?;
             return Ok(Some(snap));
         }
     }
@@ -1313,8 +1317,12 @@ async fn install_bundle(
                 // blob is handled by the fail-closed gate in `fast_sync_state`
                 // (refuse unless the target is replay-empty), never by
                 // installing emptiness here.
-                let snap: crate::sharding::CrossShardReplaySnapshot = bincode::deserialize(dbytes)
-                    .map_err(|e| format!("fast sync: restore cross-shard error: {e:?}"))?;
+                let snap: crate::sharding::CrossShardReplaySnapshot =
+                    crate::network::decode_wire_limited(
+                        dbytes,
+                        (dbytes.len() as u64).min(crate::network::MAX_WIRE_BLOCK_BYTES),
+                    )
+                    .map_err(|e| format!("fast sync: restore cross-shard error: {e}"))?;
                 engine.restore_cross_shard_replay(&snap).await;
             }
             "pq_keys" => {
@@ -1860,8 +1868,11 @@ pub fn verify_replicated_body(expected_hash: &[u8; 32], block: &Block) -> Result
 /// Decode fetched bytes and verify against the committed hash in one step (the
 /// fetch-and-verify boundary the network path uses).
 pub fn verify_replicated_bytes(expected_hash: &[u8; 32], bytes: &[u8]) -> Result<Block, String> {
-    let block: Block =
-        bincode::deserialize(bytes).map_err(|e| format!("replicated body undecodable: {e:?}"))?;
+    let block: Block = crate::network::decode_wire_limited(
+        bytes,
+        (bytes.len() as u64).min(crate::network::MAX_WIRE_BLOCK_BYTES),
+    )
+    .map_err(|e| format!("replicated body undecodable: {e}"))?;
     verify_replicated_body(expected_hash, &block)?;
     Ok(block)
 }
@@ -1929,7 +1940,14 @@ mod tests {
     ) -> crate::consensus::QuorumCertificate {
         let mut set = crate::consensus::VoteSet::new();
         for (sk, fk) in keys {
-            let v = Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            let v = Vote::sign_with_falcon(
+                sk,
+                fk,
+                height,
+                round,
+                VoteKind::Precommit,
+                Some(block_hash),
+            );
             set.add(v, vs, height, round, VoteKind::Precommit)
                 .expect("falcon vote must ingest");
         }
@@ -1945,10 +1963,8 @@ mod tests {
             crate::post_quantum::PqScheme::Falcon512,
             fk.public_key.clone(),
         );
-        let vs = crate::consensus::ValidatorSet::from_list(vec![(
-            sk.verifying_key().to_bytes(),
-            1,
-        )]);
+        let vs =
+            crate::consensus::ValidatorSet::from_list(vec![(sk.verifying_key().to_bytes(), 1)]);
         let keys = vec![(sk.clone(), fk.clone())];
         let mut out = Vec::new();
         let mut prev = [0u8; 32];
@@ -2039,8 +2055,7 @@ mod tests {
                 .map(|k| (k.verifying_key().to_bytes(), 1))
                 .collect(),
         );
-        let all_keys: Vec<(SigningKey, FalconKeypair)> =
-            keys.into_iter().zip(fks).collect();
+        let all_keys: Vec<(SigningKey, FalconKeypair)> = keys.into_iter().zip(fks).collect();
         let mut out = Vec::new();
         let mut prev = [0u8; 32];
         for h in 0..=len {
@@ -2546,7 +2561,14 @@ mod tests {
             payload: Vec::new(),
             priority_fee_per_gas: 0,
         };
-        crate::sharding::CrossShardMessage::new(1, MASTERCHAIN_SHARD, tx, [0x33u8; 32], [0x44u8; 32], None)
+        crate::sharding::CrossShardMessage::new(
+            1,
+            MASTERCHAIN_SHARD,
+            tx,
+            [0x33u8; 32],
+            [0x44u8; 32],
+            None,
+        )
     }
 
     #[tokio::test]

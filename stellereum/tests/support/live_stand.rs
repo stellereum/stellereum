@@ -48,8 +48,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use stellereum::consensus::{
-    BlockHash, HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind,
-    register_validator_pq_key,
+    register_validator_pq_key, BlockHash, HeightConsensus, QuorumCertificate, ValidatorSet, Vote,
+    VoteKind,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;

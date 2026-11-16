@@ -315,11 +315,7 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
         e.oracle_read().await.feeds["STELL"].price_micro_usd,
         251_000
     );
-    assert_ne!(
-        e.get_state_root().await,
-        tripped,
-        "the feed is committed"
-    );
+    assert_ne!(e.get_state_root().await, tripped, "the feed is committed");
 }
 
 #[tokio::test]

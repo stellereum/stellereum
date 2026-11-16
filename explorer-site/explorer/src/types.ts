@@ -18,10 +18,10 @@ export interface Transaction {
   from_stl57?: string;
   to_addr: string;
   to_stl57?: string;
-  amount: number; // nano-STELL
+  amount: number | string; // nano-STELL
   gas_limit: number;
   gas_used: number;
-  fee: number; // nano-STELL
+  fee: number | string; // nano-STELL
   nonce: number;
   status: 'success' | 'failed' | 'pending';
   timestamp: number;
@@ -65,12 +65,12 @@ export interface NetworkStats {
 export interface AccountInfo {
   address: string;
   address_stl57: string;
-  balance: number; // nano-STELL
+  balance: number | string; // nano-STELL
   nonce: number;
   tx_count: number;
   is_contract: boolean;
-  staked_amount?: number;
-  reward_balance?: number;
+  staked_amount?: number | string;
+  reward_balance?: number | string;
 }
 
 // ---------------------------------------------------------------------------

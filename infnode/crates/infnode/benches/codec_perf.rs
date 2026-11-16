@@ -165,10 +165,8 @@ mod reference {
         if b.len() < HDR + 64 {
             anyhow::bail!("frame too short");
         }
-        let plen =
-            u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
-        let nlen =
-            u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow!("nlen"))?) as usize;
+        let plen = u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
+        let nlen = u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow!("nlen"))?) as usize;
         if plen > MAX_FRAME {
             anyhow::bail!("payload too large");
         }
@@ -222,13 +220,20 @@ fn timeit<R>(n: usize, mut f: impl FnMut() -> R) -> f64 {
 /// Before (reference) vs after (optimized) in one process/profile.
 #[test]
 fn perf_before_after() {
-    for (name, plen, nlen) in [("small", 32usize, 24usize), ("1KB", 1024, 24), ("64KB", 65536, 24)]
-    {
+    for (name, plen, nlen) in [
+        ("small", 32usize, 24usize),
+        ("1KB", 1024, 24),
+        ("64KB", 65536, 24),
+    ] {
         let f = fixture(plen, nlen);
         let enc = f.encode();
         let n = iters_for(plen) * 4;
-        let ref_enc = timeit(n, || std::hint::black_box(reference::ref_encode(std::hint::black_box(&f))));
-        let opt_enc = timeit(n, || std::hint::black_box(std::hint::black_box(&f).encode()));
+        let ref_enc = timeit(n, || {
+            std::hint::black_box(reference::ref_encode(std::hint::black_box(&f)))
+        });
+        let opt_enc = timeit(n, || {
+            std::hint::black_box(std::hint::black_box(&f).encode())
+        });
         let ref_dec = timeit(n, || {
             std::hint::black_box(reference::ref_decode(std::hint::black_box(&enc)).unwrap())
         });

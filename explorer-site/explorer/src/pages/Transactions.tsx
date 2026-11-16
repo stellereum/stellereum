@@ -50,7 +50,10 @@ export const Transactions: React.FC = () => {
                   </td>
                 </tr>
               )}
-              {txs.map((tx) => (
+              {txs.map((tx) => {
+                const fromAddr = tx.from_stl57 || tx.from_addr;
+                const toAddr = tx.to_stl57 || tx.to_addr;
+                return (
                 <tr key={tx.hash}>
                   <td className="mono">
                     <Link to={`/tx/${tx.hash}`} style={{ fontWeight: 600 }}>
@@ -63,14 +66,22 @@ export const Transactions: React.FC = () => {
                     </Link>
                   </td>
                   <td className="mono">
-                    <Link to={`/address/${tx.from_stl57 || tx.from_addr}`}>
-                      {truncateMiddle(tx.from_stl57 || tx.from_addr, 6, 6)}
-                    </Link>
+                    {fromAddr ? (
+                      <Link to={`/address/${fromAddr}`}>
+                        {truncateMiddle(fromAddr, 6, 6)}
+                      </Link>
+                    ) : (
+                      '—'
+                    )}
                   </td>
                   <td className="mono">
-                    <Link to={`/address/${tx.to_stl57 || tx.to_addr}`}>
-                      {truncateMiddle(tx.to_stl57 || tx.to_addr, 6, 6)}
-                    </Link>
+                    {toAddr ? (
+                      <Link to={`/address/${toAddr}`}>
+                        {truncateMiddle(toAddr, 6, 6)}
+                      </Link>
+                    ) : (
+                      '—'
+                    )}
                   </td>
                   <td style={{ fontWeight: 600, color: 'var(--primary)' }}>
                     {formatStell(tx.amount)}
@@ -85,7 +96,8 @@ export const Transactions: React.FC = () => {
                   </td>
                   <td style={{ color: 'var(--text-dim)' }}>{timeAgo(tx.timestamp)}</td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

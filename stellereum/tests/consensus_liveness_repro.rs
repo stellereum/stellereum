@@ -704,7 +704,9 @@ async fn polka_is_not_masked_by_a_newer_nil_quorum() {
 
     // Round 0: A and B prevote the block -> 2500 >= 2334 -> a POLKA.
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i],
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
             1,
             polka_round,
             VoteKind::Prevote,
@@ -722,8 +724,15 @@ async fn polka_is_not_masked_by_a_newer_nil_quorum() {
     // LATER round than the polka.
     rt.next_round();
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 1, VoteKind::Prevote, None))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            1,
+            VoteKind::Prevote,
+            None,
+        ))
+        .unwrap();
     }
     assert_eq!(
         rt.hc.try_prevote_quorum(),
@@ -765,13 +774,27 @@ async fn a_nil_precommit_does_not_suppress_the_real_one() {
 
     let block = [0xCDu8; 32];
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(block)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
     }
     rt.next_round();
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 1, VoteKind::Prevote, None))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            1,
+            VoteKind::Prevote,
+            None,
+        ))
+        .unwrap();
     }
 
     let pc = rt
@@ -807,7 +830,9 @@ async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
     // The network forms the polka in ITS round (40): A and B prevote the
     // block, so 1500 + 1000 = 2500 >= 2334.
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i],
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
             1,
             network_round,
             VoteKind::Prevote,
@@ -818,9 +843,23 @@ async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
     // We learn where the network is (its round), then drift AHEAD of it.
     // `observe_peer_vote` is the pre-existing public entry point for "a
     // verified vote told us where that peer is".
-    let peer_vote = falcon_votes::fvote(&ks[1], &fks[1], 1, network_round, VoteKind::Prevote, Some(block));
+    let peer_vote = falcon_votes::fvote(
+        &ks[1],
+        &fks[1],
+        1,
+        network_round,
+        VoteKind::Prevote,
+        Some(block),
+    );
     rt.observe_peer_vote(&peer_vote);
-    let peer_vote2 = falcon_votes::fvote(&ks[2], &fks[2], 1, network_round, VoteKind::Prevote, Some(block));
+    let peer_vote2 = falcon_votes::fvote(
+        &ks[2],
+        &fks[2],
+        1,
+        network_round,
+        VoteKind::Prevote,
+        Some(block),
+    );
     rt.observe_peer_vote(&peer_vote2);
     while rt.hc.round < network_round + 30 {
         rt.hc.next_round();
@@ -965,8 +1004,15 @@ async fn the_lock_refuses_a_conflicting_precommit() {
 
     // We lock on A at round 10.
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            10,
+            VoteKind::Prevote,
+            Some(a),
+        ))
+        .unwrap();
     }
     let pc = rt
         .make_precommit()
@@ -977,7 +1023,14 @@ async fn the_lock_refuses_a_conflicting_precommit() {
     // Now a polka for a DIFFERENT block at the SAME round must not make us
     // precommit against our lock.
     for (i, k) in ks.iter().enumerate().take(2) {
-        let _ = rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(b)));
+        let _ = rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            10,
+            VoteKind::Prevote,
+            Some(b),
+        ));
     }
     // (The vote set keeps the FIRST vote per validator, so the polka for A
     // is still the one in the set: the lock and the polka agree.)
@@ -1003,8 +1056,15 @@ async fn a_higher_round_polka_releases_the_lock() {
     let b = [0x22u8; 32];
 
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            10,
+            VoteKind::Prevote,
+            Some(a),
+        ))
+        .unwrap();
     }
     let _ = rt
         .make_precommit()
@@ -1014,8 +1074,15 @@ async fn a_higher_round_polka_releases_the_lock() {
     // A polka for B at round 12 (higher): the lock is released and the
     // node follows the network.
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 12, VoteKind::Prevote, Some(b)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            12,
+            VoteKind::Prevote,
+            Some(b),
+        ))
+        .unwrap();
     }
     let pc = rt
         .make_precommit()
@@ -1039,8 +1106,15 @@ async fn a_nil_quorum_never_unlocks_the_lock() {
 
     let a = [0x11u8; 32];
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            10,
+            VoteKind::Prevote,
+            Some(a),
+        ))
+        .unwrap();
     }
     let _ = rt
         .make_precommit()
@@ -1049,8 +1123,15 @@ async fn a_nil_quorum_never_unlocks_the_lock() {
 
     // A nil quorum in a LATER round must not release the lock.
     for (i, k) in ks.iter().enumerate().take(2) {
-        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 12, VoteKind::Prevote, None))
-            .unwrap();
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            12,
+            VoteKind::Prevote,
+            None,
+        ))
+        .unwrap();
     }
     let _ = rt.make_precommit();
     assert_eq!(

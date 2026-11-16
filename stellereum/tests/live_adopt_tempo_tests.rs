@@ -67,7 +67,7 @@ async fn live_block_for(
     let proposer = vs
         .proposer_for(h, round)
         .expect("non-empty set has a proposer");
-    let pk = ks.iter().find(|k| id(k) == proposer).unwrap();
+    let p_idx = ks.iter().position(|k| id(k) == proposer).unwrap();
     let mut b = Block {
         shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
         height: h,
@@ -98,7 +98,7 @@ async fn live_block_for(
             }
         }
     }
-    b.sign_block(pk);
+    b.sign_block_with_falcon(&ks[p_idx], &fks[p_idx]);
     let bh = b.compute_hash();
     let mut set = VoteSet::new();
     for (i, k) in ks.iter().enumerate().take(3) {

@@ -5,8 +5,17 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+/// Live sync health shared between `Syncer` and `AppState`.
+#[derive(Clone, Debug, Default)]
+pub struct SyncStatus {
+    pub node_tip_height: Option<u64>,
+    pub last_sync_at: Option<u64>,
+    pub last_error: Option<String>,
+}
 
 pub struct Syncer {
     db: Database,
@@ -16,6 +25,7 @@ pub struct Syncer {
     /// The contract ABI manifests the indexer knows about. They are what makes
     /// the indexed events DECODED instead of raw.
     abis: Arc<AbiCache>,
+    sync_status: Arc<RwLock<SyncStatus>>,
 }
 
 /// How many receipts of one block are fetched at the same time.
@@ -24,6 +34,12 @@ const RECEIPT_FETCH_CONCURRENCY: usize = 8;
 /// Upper bound on the receipts fetched per block (a pathological block cannot
 /// make the indexer open an unbounded number of connections).
 const MAX_RECEIPTS_PER_BLOCK: usize = 256;
+
+/// Maximum blocks backfilled in a single sync tick so catch-up stays bounded.
+const MAX_BACKFILL_PER_TICK: u64 = 64;
+
+/// Concurrency for RPC block fetches during backfill catch-up.
+const BACKFILL_FETCH_CONCURRENCY: usize = 8;
 
 impl Syncer {
     pub fn new(db: Database, node_url: String, rpc_url: String) -> Self {
@@ -38,6 +54,22 @@ impl Syncer {
         rpc_url: String,
         abis: Arc<AbiCache>,
     ) -> Self {
+        Self::new_with_state(
+            db,
+            node_url,
+            rpc_url,
+            abis,
+            Arc::new(RwLock::new(SyncStatus::default())),
+        )
+    }
+
+    pub fn new_with_state(
+        db: Database,
+        node_url: String,
+        rpc_url: String,
+        abis: Arc<AbiCache>,
+        sync_status: Arc<RwLock<SyncStatus>>,
+    ) -> Self {
         Self {
             db,
             client: Client::builder()
@@ -47,6 +79,7 @@ impl Syncer {
             node_url,
             rpc_url,
             abis,
+            sync_status,
         }
     }
 
@@ -55,27 +88,206 @@ impl Syncer {
         Arc::clone(&self.abis)
     }
 
+    pub fn sync_status(&self) -> Arc<RwLock<SyncStatus>> {
+        Arc::clone(&self.sync_status)
+    }
+
     pub async fn run(&self) {
         info!("Starting Stellereum Lightweight Indexer Syncer loop...");
         let mut interval = tokio::time::interval(Duration::from_millis(400));
 
         loop {
-            interval.tick().await;
-            if let Err(e) = self.sync_step().await {
-                warn!("[syncer] sync step warning: {e}");
+            match self.sync_step().await {
+                Ok(caught_up) => {
+                    if !caught_up {
+                        // Still catching up: yield and immediately run the next backfill batch.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    warn!("[syncer] sync step warning: {e}");
+                    let mut st = self.sync_status.write().await;
+                    st.last_error = Some(e.to_string());
+                }
             }
+            interval.tick().await;
         }
     }
 
-    async fn sync_step(&self) -> Result<()> {
-        // 1. Fetch recent blocks from the explorer API
+    async fn fetch_rpc_tip_height(&self) -> Option<u64> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "stell_blockNumber",
+            "params": {},
+            "id": 1
+        });
+        let resp = self
+            .client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .ok()?;
+        let data: Value = resp.json().await.ok()?;
+        let raw = data["result"].as_str()?;
+        if let Some(hex_s) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            u64::from_str_radix(hex_s, 16).ok()
+        } else {
+            raw.parse::<u64>().ok()
+        }
+    }
+
+    async fn fetch_rpc_shards(&self) -> Option<(u32, Vec<ShardHeadInfo>)> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "stell_getShards",
+            "params": {},
+            "id": 1
+        });
+        let resp = self
+            .client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .ok()?;
+        let data: Value = resp.json().await.ok()?;
+        let shards_arr = data["result"]["shards"].as_array()?;
+        let mut local_shard = 0u32;
+        let mut out = Vec::with_capacity(shards_arr.len());
+        for s in shards_arr {
+            let Some(shard_id) = s["shard_id"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                continue;
+            };
+            let tip_height = s["tip_height"].as_u64().unwrap_or(0);
+            let tip_hash = s["tip_hash"]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let state_root = s["state_root"]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let local = s["local"].as_bool().unwrap_or(false);
+            if local {
+                local_shard = shard_id;
+            }
+            out.push(ShardHeadInfo {
+                shard_id,
+                tip_height,
+                tip_hash,
+                state_root,
+                local,
+            });
+        }
+        Some((local_shard, out))
+    }
+
+    pub async fn sync_step(&self) -> Result<bool> {
+        let rpc_tip = self.fetch_rpc_tip_height().await;
+        let shards_info = self.fetch_rpc_shards().await;
+        let local_shard = shards_info.as_ref().map(|(l, _)| *l).unwrap_or(0);
+
+        // 1. Fetch recent blocks from the explorer API (optional; may fail if only RPC is reachable)
         let url = format!("{}/api/blocks", self.node_url);
-        let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Node API returned HTTP {}", resp.status());
+        let blocks_json: Vec<Value> = match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+            Ok(resp) if rpc_tip.is_some() => {
+                warn!(
+                    "[syncer] explorer /api/blocks returned HTTP {}, falling back to RPC",
+                    resp.status()
+                );
+                Vec::new()
+            }
+            Ok(resp) => anyhow::bail!("Node API returned HTTP {}", resp.status()),
+            Err(_) if rpc_tip.is_some() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        let rest_tip = blocks_json
+            .iter()
+            .filter(|b| b["shard_id"].as_u64().unwrap_or(0) as u32 == local_shard)
+            .filter_map(|b| b["height"].as_u64())
+            .max();
+        let node_tip = match (rpc_tip, rest_tip) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        // 2. Backfill any missed heights for the node's local shard via RPC (concurrently)
+        let mut backfill_progressed = false;
+        let mut more_backfill = false;
+        if let Some(target_tip) = node_tip {
+            let db_tip = self.db.get_shard_tip_height(local_shard).unwrap_or(0);
+            if db_tip < target_tip {
+                let start_h = db_tip + 1;
+                let end_h = target_tip.min(start_h.saturating_add(MAX_BACKFILL_PER_TICK - 1));
+                more_backfill = end_h < target_tip;
+                let mut fetched: Vec<RpcBlockSummary> = Vec::new();
+                let mut chunk_start = start_h;
+                while chunk_start <= end_h {
+                    let chunk_end = end_h
+                        .min(chunk_start.saturating_add(BACKFILL_FETCH_CONCURRENCY as u64 - 1));
+                    let mut set = tokio::task::JoinSet::new();
+                    for h in chunk_start..=chunk_end {
+                        let client = self.client.clone();
+                        let rpc_url = self.rpc_url.clone();
+                        set.spawn(async move {
+                            fetch_rpc_block_with(&client, &rpc_url, h, local_shard).await
+                        });
+                    }
+                    while let Some(res) = set.join_next().await {
+                        if let Ok(Some(blk)) = res {
+                            fetched.push(blk);
+                        }
+                    }
+                    chunk_start = chunk_end.saturating_add(1);
+                }
+                fetched.sort_by_key(|b| b.height);
+                for blk in fetched {
+                    let should_index = match self
+                        .db
+                        .get_block_by_shard_and_height(blk.shard_id, blk.height)?
+                    {
+                        Some(known) => known.hash != blk.hash,
+                        None => true,
+                    };
+                    if should_index {
+                        let proposer_stl57 = blk.proposer.as_deref().and_then(crate::db::to_stl57);
+                        let block_record = BlockRecord {
+                            shard_id: blk.shard_id,
+                            height: blk.height,
+                            hash: blk.hash.clone(),
+                            timestamp: blk.timestamp,
+                            tx_count: blk.tx_count,
+                            proposer: blk.proposer,
+                            proposer_stl57,
+                            state_root: blk.state_root,
+                        };
+                        self.db.insert_block(&block_record)?;
+                        backfill_progressed = true;
+                        info!(
+                            "[syncer] Backfilled Block Shard {} #{} ({} txs, {})",
+                            blk.shard_id, blk.height, blk.tx_count, blk.hash
+                        );
+                        if blk.tx_count > 0 {
+                            self.index_block_transactions_in_shard(
+                                blk.shard_id,
+                                blk.height,
+                                &blk.hash,
+                                blk.timestamp,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
 
-        let blocks_json: Vec<Value> = resp.json().await?;
+        // 3. Process recent blocks from /api/blocks (carries shard_id / proposer / state_root)
         for b in blocks_json.iter().rev() {
             let height = b["height"].as_u64().unwrap_or(0);
             let hash = b["hash"].as_str().unwrap_or("").to_string();
@@ -87,14 +299,22 @@ impl Syncer {
             }
 
             let shard_id = b["shard_id"].as_u64().unwrap_or(0) as u32;
+            let proposer = b["proposer"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| crate::db::normalize_address_info(s).hex_clean);
+            let proposer_stl57 = proposer.as_deref().and_then(crate::db::to_stl57);
+            let state_root = b["state_root"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             // Skip only the IDENTICAL block; a different hash at a known
             // (shard,height) is a reorg — re-process so insert_block
             // replaces it and dependents re-index (audit B-IDX-2).
-            if let Some(known) = self
-                .db
-                .get_block_by_shard_and_height(shard_id, height)?
-            {
+            if let Some(known) = self.db.get_block_by_shard_and_height(shard_id, height)? {
                 if known.hash == hash {
                     continue;
                 }
@@ -106,9 +326,9 @@ impl Syncer {
                 hash: hash.clone(),
                 timestamp,
                 tx_count,
-                proposer: None,
-                proposer_stl57: None,
-                state_root: None,
+                proposer,
+                proposer_stl57,
+                state_root,
             };
 
             self.db.insert_block(&block_record)?;
@@ -116,54 +336,124 @@ impl Syncer {
 
             // If block carries transactions, fetch and index them
             if tx_count > 0 {
-                self.index_block_transactions(height, &hash, timestamp)
+                self.index_block_transactions_in_shard(shard_id, height, &hash, timestamp)
                     .await;
             }
         }
 
-        Ok(())
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 4. Record committed heads for non-local shards reported by `stell_getShards`
+        //    (e.g. shard 1 when node runs with `STELL_SHARDS=0,1`).
+        if let Some((_, shards)) = shards_info {
+            for sh in shards {
+                if sh.local || sh.shard_id == local_shard || sh.tip_height == 0 {
+                    continue;
+                }
+                let Some(tip_hash) = sh.tip_hash else {
+                    continue;
+                };
+                let should_insert = match self
+                    .db
+                    .get_block_by_shard_and_height(sh.shard_id, sh.tip_height)?
+                {
+                    Some(known) => known.hash != tip_hash,
+                    None => true,
+                };
+                if should_insert {
+                    let block_record = BlockRecord {
+                        shard_id: sh.shard_id,
+                        height: sh.tip_height,
+                        hash: tip_hash.clone(),
+                        timestamp: now,
+                        tx_count: 0,
+                        proposer: None,
+                        proposer_stl57: None,
+                        state_root: sh.state_root,
+                    };
+                    self.db.insert_block(&block_record)?;
+                    info!(
+                        "[syncer] Indexed Shard {} committed head #{} ({})",
+                        sh.shard_id, sh.tip_height, tip_hash
+                    );
+                }
+            }
+        }
+
+        let mut st = self.sync_status.write().await;
+        st.node_tip_height = node_tip;
+        st.last_sync_at = Some(now);
+        st.last_error = None;
+
+        Ok(!(more_backfill && backfill_progressed))
     }
 
-    async fn index_block_transactions(&self, height: u64, _block_hash: &str, timestamp: u64) {
-        // Try eth_getBlockByNumber with full txs
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getBlockByNumber",
-            "params": [format!("0x{:x}", height), true],
-            "id": 1
-        });
+    async fn index_block_transactions_in_shard(
+        &self,
+        shard_id: u32,
+        height: u64,
+        _block_hash: &str,
+        timestamp: u64,
+    ) {
+        // Prefer native `stell_getBlockTransactions` so full 32-byte PQ
+        // addresses (`from_addr`/`to_addr` + `Stl57`), nano-STELL amounts, and
+        // true `status`/`fee_charged` are preserved without EVM 20-byte truncation.
+        let mut indexed_hashes = self
+            .index_native_block_txs(shard_id, height, timestamp)
+            .await;
 
-        let mut indexed_hashes: Vec<String> = Vec::new();
+        if indexed_hashes.is_empty() {
+            // Fallback: try eth_getBlockByNumber with full txs
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [format!("0x{:x}", height), true],
+                "id": 1
+            });
 
-        if let Ok(resp) = self.client.post(&self.rpc_url).json(&payload).send().await {
-            if let Ok(data) = resp.json::<Value>().await {
-                if let Some(txs) = data["result"]["transactions"].as_array() {
-                    for (i, tx) in txs.iter().enumerate() {
-                        let tx_hash = tx["hash"].as_str().unwrap_or("").to_string();
-                        let from_addr = tx["from"].as_str().unwrap_or("").to_string();
-                        let to_addr = tx["to"].as_str().unwrap_or("").to_string();
-                        let value = tx["value"].as_str().unwrap_or("0x0").to_string();
-                        let gas_limit = tx["gas"].as_str().unwrap_or("0x0").to_string();
-
-                        if !tx_hash.is_empty() {
-                            let from_stl57 = crate::db::to_stl57(&from_addr);
-                            let to_stl57 = crate::db::to_stl57(&to_addr);
-                            let tx_rec = TxRecord {
-                                tx_hash: tx_hash.clone(),
-                                block_height: height,
-                                tx_index: i as u32,
-                                from_addr,
-                                to_addr,
-                                from_stl57,
-                                to_stl57,
-                                amount: value,
-                                fee_charged: "370000".to_string(),
-                                gas_limit,
-                                status: "success".to_string(),
-                                timestamp,
+            if let Ok(resp) = self.client.post(&self.rpc_url).json(&payload).send().await {
+                if let Ok(data) = resp.json::<Value>().await {
+                    if let Some(txs) = data["result"]["transactions"].as_array() {
+                        for (i, tx) in txs.iter().enumerate() {
+                            let tx_hash = tx["hash"].as_str().unwrap_or("").to_string();
+                            let raw_from = tx["from"].as_str().unwrap_or("");
+                            let raw_to = tx["to"].as_str().unwrap_or("");
+                            let from_norm = crate::db::normalize_address_info(raw_from);
+                            let to_norm = crate::db::normalize_address_info(raw_to);
+                            let from_addr = if from_norm.hex_0x.is_empty() {
+                                raw_from.to_string()
+                            } else {
+                                from_norm.hex_0x
                             };
-                            let _ = self.db.insert_transaction(&tx_rec);
-                            indexed_hashes.push(tx_hash);
+                            let to_addr = if to_norm.hex_0x.is_empty() {
+                                raw_to.to_string()
+                            } else {
+                                to_norm.hex_0x
+                            };
+                            let value = tx["value"].as_str().unwrap_or("0x0").to_string();
+                            let gas_limit = tx["gas"].as_str().unwrap_or("0x0").to_string();
+
+                            if !tx_hash.is_empty() {
+                                let tx_rec = TxRecord {
+                                    tx_hash: tx_hash.clone(),
+                                    block_height: height,
+                                    tx_index: i as u32,
+                                    from_addr,
+                                    to_addr,
+                                    from_stl57: from_norm.stl57,
+                                    to_stl57: to_norm.stl57,
+                                    amount: value,
+                                    fee_charged: "0".to_string(),
+                                    gas_limit,
+                                    status: "success".to_string(),
+                                    timestamp,
+                                };
+                                let _ = self.db.insert_transaction_in_shard(shard_id, &tx_rec);
+                                indexed_hashes.push(tx_hash);
+                            }
                         }
                     }
                 }
@@ -173,25 +463,24 @@ impl Syncer {
         // Contract events: every receipt carries the events its transaction
         // emitted. They are indexed per transaction so the explorer can serve
         // them per contract, per transaction and per block range.
-        if indexed_hashes.is_empty() {
-            // The EVM-shaped block listing did not yield the transactions;
-            // fall back to the NATIVE listing, which is served from the same
-            // receipt index the events live in.
-            indexed_hashes = self.native_block_tx_hashes(height).await;
-        }
-        self.index_block_events(height, &indexed_hashes).await;
+        self.index_block_events(shard_id, height, &indexed_hashes)
+            .await;
 
         // Fallback: check receipts
-        info!("[syncer] Finished indexing txs for Block #{height}");
+        info!("[syncer] Finished indexing txs for Block Shard {shard_id} #{height}");
     }
 
-    /// The native transaction hashes of a block, from the node's own receipt
-    /// index.
-    async fn native_block_tx_hashes(&self, height: u64) -> Vec<String> {
+    /// Fetch and store native transactions of a block from `stell_getBlockTransactions`.
+    async fn index_native_block_txs(
+        &self,
+        shard_id: u32,
+        height: u64,
+        timestamp: u64,
+    ) -> Vec<String> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "stell_getBlockTransactions",
-            "params": { "height": height },
+            "params": { "height": height, "shard_id": shard_id },
             "id": 1
         });
         let resp = match self.client.post(&self.rpc_url).json(&payload).send().await {
@@ -205,18 +494,23 @@ impl Syncer {
             Ok(d) => d,
             Err(_) => return Vec::new(),
         };
-        data["result"]["txs"]
-            .as_array()
-            .map(|txs| {
-                txs.iter()
-                    .filter_map(|t| t["tx_hash"].as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(txs) = data["result"]["txs"].as_array() else {
+            return Vec::new();
+        };
+        let mut hashes = Vec::with_capacity(txs.len());
+        for (i, t) in txs.iter().enumerate() {
+            let Some(rec) = decode_native_tx_record(height, i, t, timestamp) else {
+                continue;
+            };
+            let tx_hash = rec.tx_hash.clone();
+            let _ = self.db.insert_transaction_in_shard(shard_id, &rec);
+            hashes.push(tx_hash);
+        }
+        hashes
     }
 
     /// Fetch the receipts of a block's transactions and index their events.
-    async fn index_block_events(&self, height: u64, tx_hashes: &[String]) {
+    async fn index_block_events(&self, shard_id: u32, height: u64, tx_hashes: &[String]) {
         if tx_hashes.is_empty() {
             return;
         }
@@ -227,7 +521,7 @@ impl Syncer {
                 while let Some(res) = set.join_next().await {
                     pending = pending.saturating_sub(1);
                     if let Ok(Some(events)) = res {
-                        self.store_events(height, events).await;
+                        self.store_events(shard_id, height, events).await;
                     }
                 }
             }
@@ -239,14 +533,14 @@ impl Syncer {
         }
         while let Some(res) = set.join_next().await {
             if let Ok(Some(events)) = res {
-                self.store_events(height, events).await;
+                self.store_events(shard_id, height, events).await;
             }
         }
     }
 
     /// Store the events of one receipt, decoding them with the ABI when it is
     /// known.
-    async fn store_events(&self, height: u64, events: Vec<(String, RawEvent)>) {
+    async fn store_events(&self, shard_id: u32, height: u64, events: Vec<(String, RawEvent)>) {
         if events.is_empty() {
             return;
         }
@@ -288,12 +582,13 @@ impl Syncer {
             r.log_index = *idx;
             *idx += 1;
         }
-        if let Err(e) = self.db.insert_events(&records) {
+        if let Err(e) = self.db.insert_events_in_shard(shard_id, &records) {
             warn!("[syncer] failed to store contract events: {e}");
         } else {
             info!(
-                "[syncer] Indexed {} contract events at height {}",
+                "[syncer] Indexed {} contract events in shard {} at height {}",
                 records.len(),
+                shard_id,
                 height
             );
         }
@@ -329,6 +624,166 @@ impl Syncer {
     }
 }
 
+struct ShardHeadInfo {
+    shard_id: u32,
+    tip_height: u64,
+    tip_hash: Option<String>,
+    state_root: Option<String>,
+    local: bool,
+}
+
+struct RpcBlockSummary {
+    shard_id: u32,
+    height: u64,
+    hash: String,
+    timestamp: u64,
+    tx_count: u64,
+    proposer: Option<String>,
+    state_root: Option<String>,
+}
+
+async fn fetch_rpc_block_with(
+    client: &Client,
+    rpc_url: &str,
+    height: u64,
+    default_shard_id: u32,
+) -> Option<RpcBlockSummary> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "stell_getBlock",
+        "params": { "height": height },
+        "id": 1
+    });
+    let resp = client.post(rpc_url).json(&payload).send().await.ok()?;
+    let data: Value = resp.json().await.ok()?;
+    let res = data.get("result")?;
+    if res.is_null() {
+        return None;
+    }
+    let hash = res["hash"].as_str()?.to_string();
+    if hash.is_empty() {
+        return None;
+    }
+    let shard_id = res["shard_id"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(default_shard_id);
+    let timestamp = res["timestamp"].as_u64().unwrap_or(0);
+    let tx_count = res["txs"].as_u64().unwrap_or(0);
+    let proposer = res["proposer"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::db::normalize_address_info(s).hex_clean);
+    let state_root = res["state_root"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(RpcBlockSummary {
+        shard_id,
+        height,
+        hash,
+        timestamp,
+        tx_count,
+        proposer,
+        state_root,
+    })
+}
+
+/// Decode one entry from `stell_getBlockTransactions` into a [`TxRecord`].
+///
+/// Handles both live `raw_tx` hex-encoded `bincode(Transaction)` strings (preserving
+/// full 32-byte `from`/`to` addresses, `Stl57` encoding, and nano-STELL `amount`)
+/// and structured JSON `raw_tx` objects.
+pub(crate) fn decode_native_tx_record(
+    height: u64,
+    fallback_index: usize,
+    t: &Value,
+    timestamp: u64,
+) -> Option<TxRecord> {
+    use bincode::Options;
+
+    let raw_hash = t["tx_hash"].as_str().filter(|s| !s.is_empty())?;
+    let tx_hash = if raw_hash.starts_with("0x") || raw_hash.starts_with("0X") {
+        format!("0x{}", raw_hash[2..].to_lowercase())
+    } else {
+        format!("0x{}", raw_hash.to_lowercase())
+    };
+    let tx_index = t["index"].as_u64().unwrap_or(fallback_index as u64) as u32;
+    let status = t["status"].as_str().unwrap_or("success").to_string();
+    let fee_charged = t["fee_charged"].as_str().unwrap_or("0").to_string();
+    let gas_limit = t["gas_limit"].as_str().unwrap_or("0").to_string();
+
+    let raw = &t["raw_tx"];
+    let (from_addr, to_addr, amount) = if let Some(raw_hex) = raw.as_str() {
+        let clean = raw_hex
+            .strip_prefix("0x")
+            .or_else(|| raw_hex.strip_prefix("0X"))
+            .unwrap_or(raw_hex);
+        if clean.len() <= 512 * 1024 {
+            if let Ok(bytes) = hex::decode(clean) {
+                let opts = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
+                    .with_limit(262_144);
+                if let Ok(tx) = opts.deserialize::<stellereum::sharding::Transaction>(&bytes) {
+                    (
+                        format!("0x{}", hex::encode(tx.from)),
+                        format!("0x{}", hex::encode(tx.to)),
+                        tx.amount.to_string(),
+                    )
+                } else {
+                    (String::new(), String::new(), "0".to_string())
+                }
+            } else {
+                (String::new(), String::new(), "0".to_string())
+            }
+        } else {
+            (String::new(), String::new(), "0".to_string())
+        }
+    } else {
+        let raw_from = raw["from"].as_str().unwrap_or("");
+        let raw_to = raw["to"].as_str().unwrap_or("");
+        let from_norm = crate::db::normalize_address_info(raw_from);
+        let to_norm = crate::db::normalize_address_info(raw_to);
+        let from_addr = if from_norm.hex_0x.is_empty() {
+            raw_from.to_string()
+        } else {
+            from_norm.hex_0x
+        };
+        let to_addr = if to_norm.hex_0x.is_empty() {
+            raw_to.to_string()
+        } else {
+            to_norm.hex_0x
+        };
+        let amount = raw["amount"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| raw["amount"].as_u64().map(|n| n.to_string()))
+            .unwrap_or_else(|| "0".to_string());
+        (from_addr, to_addr, amount)
+    };
+
+    let from_stl57 = crate::db::to_stl57(&from_addr);
+    let to_stl57 = crate::db::to_stl57(&to_addr);
+
+    Some(TxRecord {
+        tx_hash,
+        block_height: height,
+        tx_index,
+        from_addr,
+        to_addr,
+        from_stl57,
+        to_stl57,
+        amount,
+        fee_charged,
+        gas_limit,
+        status,
+        timestamp,
+    })
+}
+
 /// Fetch the events of one transaction's receipt.
 async fn fetch_receipt_events(
     client: &Client,
@@ -351,4 +806,138 @@ async fn fetch_receipt_events(
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_native_tx_record_preserves_32b_addresses_and_stl57() {
+        let kp = stellereum::post_quantum::FalconKeypair::generate();
+        let to = [0xA0u8; 32];
+        let tx = stellereum::sharding::Transaction::new_pq_explicit(
+            stellereum::post_quantum::PqScheme::Falcon512,
+            kp.public_key.clone(),
+            vec![0x42u8; 666],
+            to,
+            5_000_000_000,
+            325_000,
+            0,
+            0,
+            0,
+            vec![],
+            &[0u8; 16],
+        );
+        let raw_hex = hex::encode(bincode::serialize(&tx).expect("serialize tx"));
+        let entry = serde_json::json!({
+            "tx_hash": hex::encode(tx.compute_tx_hash()),
+            "index": 0,
+            "status": "success",
+            "gas_limit": "325000",
+            "fee_charged": "370000",
+            "raw_tx": raw_hex,
+        });
+        let rec = decode_native_tx_record(8, 0, &entry, 1700000000).expect("decode");
+        assert_eq!(rec.from_addr, format!("0x{}", hex::encode(tx.from)));
+        assert_eq!(rec.to_addr, format!("0x{}", hex::encode(to)));
+        assert_eq!(
+            rec.from_stl57.as_deref(),
+            Some(stellereum::address::encode_stl57_address(&tx.from).as_str())
+        );
+        assert_eq!(
+            rec.to_stl57.as_deref(),
+            Some(stellereum::address::encode_stl57_address(&to).as_str())
+        );
+        assert_eq!(rec.amount, "5000000000");
+        assert_eq!(rec.fee_charged, "370000");
+    }
+
+    #[tokio::test]
+    async fn sync_step_indexes_multi_shard_blocks_without_stalling() {
+        use axum::{routing::get, routing::post, Json, Router};
+
+        let db = Database::open(":memory:").unwrap();
+
+        let mock_rest = Router::new().route(
+            "/api/blocks",
+            get(|| async {
+                Json(serde_json::json!([
+                    { "shard_id": 0, "height": 2, "hash": "0xs0_b2", "txs": 0, "timestamp": 1792000002 },
+                    { "shard_id": 1, "height": 5, "hash": "0xs1_b5", "txs": 0, "timestamp": 1792000005 }
+                ]))
+            }),
+        );
+        let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_url = format!("http://{}", rest_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rest_listener, mock_rest).await.unwrap() });
+
+        let mock_rpc = Router::new().route(
+            "/",
+            post(|Json(body): Json<Value>| async move {
+                let method = body["method"].as_str().unwrap_or("");
+                let result = match method {
+                    "stell_blockNumber" => serde_json::json!("0x2"),
+                    "stell_getShards" => serde_json::json!({
+                        "shards": [
+                            {
+                                "shard_id": 0,
+                                "type": "masterchain",
+                                "tip_height": 2,
+                                "tip_hash": "0xs0_b2",
+                                "state_root": "0xroot0",
+                                "local": true
+                            },
+                            {
+                                "shard_id": 1,
+                                "type": "workchain",
+                                "tip_height": 7,
+                                "tip_hash": "0xs1_b7",
+                                "state_root": "0xroot1",
+                                "local": false
+                            }
+                        ],
+                        "total_shards": 2,
+                        "routing_prefix_bits": 1
+                    }),
+                    "stell_getBlock" => {
+                        let h = body["params"]["height"].as_u64().unwrap_or(0);
+                        serde_json::json!({
+                            "height": h,
+                            "hash": format!("0xs0_b{h}"),
+                            "txs": 0,
+                            "timestamp": 1792000000 + h
+                        })
+                    }
+                    _ => Value::Null,
+                };
+                Json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+            }),
+        );
+        let rpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rpc_listener, mock_rpc).await.unwrap() });
+
+        let syncer = Syncer::new(db.clone(), rest_url, rpc_url);
+        let caught_up = syncer.sync_step().await.expect("sync_step");
+        assert!(caught_up);
+
+        // Shard 0 backfilled heights 1 and 2 even though shard 1 is at height 7
+        assert_eq!(db.get_shard_tip_height(0).unwrap(), 2);
+        assert!(db.get_block_by_shard_and_height(0, 1).unwrap().is_some());
+        assert!(db.get_block_by_shard_and_height(0, 2).unwrap().is_some());
+
+        // Shard 1 indexed both REST block #5 and stell_getShards committed head #7
+        assert_eq!(db.get_shard_tip_height(1).unwrap(), 7);
+        assert_eq!(
+            db.get_block_by_shard_and_height(1, 5)
+                .unwrap()
+                .unwrap()
+                .hash,
+            "0xs1_b5"
+        );
+        let s1_head = db.get_block_by_shard_and_height(1, 7).unwrap().unwrap();
+        assert_eq!(s1_head.hash, "0xs1_b7");
+        assert_eq!(s1_head.state_root.as_deref(), Some("0xroot1"));
+    }
 }

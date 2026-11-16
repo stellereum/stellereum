@@ -7,7 +7,10 @@
 //! Conventions: balances in nano-STELL. `stell(n)` = n STELL.
 
 use ed25519_dalek::SigningKey;
-use stellereum::mempool::{Mempool, MempoolError};
+use stellereum::mempool::{Mempool, MempoolError, PQ_ACTIVATION_SURCHARGE_GAS};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::rpc::Faucet;
 use stellereum::sharding::Transaction;
 use stellereum::staking::{
@@ -28,6 +31,44 @@ fn det_key(seed: u8) -> SigningKey {
 
 fn addr(seed: u8) -> [u8; 32] {
     det_key(seed).verifying_key().to_bytes()
+}
+
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(fk: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+}
+
+fn pq_tx(fk: &FalconKeypair, to: [u8; 32], amount: u64, gas_limit: u64, nonce: u64) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -347,9 +388,13 @@ async fn faucet_caps_hold_and_treasury_stays_exact() {
             applied += 1;
         }
     }
-    // Treasury accounting exact: each drip cost amount + base-fee gas.
+    // Treasury accounting exact: each drip is a PQ-activation tx whose
+    // declared gas_limit is GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    // and whose execution adds PQ_ACTIVATION_SURCHARGE_GAS.
     let dispensed_sum: u64 = 50 * 25;
-    let expect = treasury_start - dispensed_sum - applied * GAS_BASIC_TRANSFER;
+    let expect = treasury_start
+        - dispensed_sum
+        - applied * (GAS_BASIC_TRANSFER + 2 * PQ_ACTIVATION_SURCHARGE_GAS);
     let got = engine
         .get_account(&faucet_addr)
         .await
@@ -402,27 +447,28 @@ async fn faucet_caps_hold_and_treasury_stays_exact() {
 ///  - `select_for_block` skips unexecutable transactions (bad nonce/balance).
 #[test]
 fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
-    let honest = det_key(0x51);
-    let spammer = det_key(0x52);
+    let honest = pq_key(0x51);
+    let spammer = pq_key(0x52);
     let to = [0x99u8; 32];
+    let floor = GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS;
 
     // --- (a) displacement: pool full of fee-payers, spammer arrives late. ---
     let mut mp = Mempool::new(10, 100).with_base_fee(GAS_BASIC_TRANSFER);
     let mut honest_hashes = Vec::new();
     for n in 0..10u64 {
-        let t = Transaction::sign(&honest, to, 10, GAS_BASIC_TRANSFER + 5_000 + n, n, 1, 1);
+        let t = pq_tx(&honest, to, 10, floor + 5_000 + n, n);
         honest_hashes.push(mp.add_checked(t, 10_000_000).unwrap());
     }
     assert_eq!(mp.len(), 10);
     // Minimal-gas spam via the funded path: rejected, pool full, fee too low.
-    let spam_min = Transaction::sign(&spammer, to, 10, GAS_BASIC_TRANSFER, 0, 1, 1);
+    let spam_min = pq_tx(&spammer, to, 10, floor, 0);
     assert_eq!(
         mp.add_checked(spam_min, 1_000_000),
         Err(MempoolError::Full),
         "minimal-fee spam must not evict fee-payers"
     );
     // Unchecked path with a HUGE declared fee: still rejected, never evicts.
-    let spam_fake = Transaction::sign(&spammer, to, 10, u64::MAX, 1, 1, 1);
+    let spam_fake = pq_tx(&spammer, to, 10, u64::MAX, 1);
     assert_eq!(
         mp.add(spam_fake),
         Err(MempoolError::Full),
@@ -433,7 +479,7 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
     }
     // Below-base-fee spam is refused even with room: use a fresh pool.
     let mut mp2 = Mempool::new(100, 100).with_base_fee(GAS_BASIC_TRANSFER);
-    let dust_fee = Transaction::sign(&spammer, to, 10, GAS_BASIC_TRANSFER - 1, 0, 1, 1);
+    let dust_fee = pq_tx(&spammer, to, 10, floor - 1, 0);
     assert_eq!(
         mp2.add_checked(dust_fee, 1_000_000),
         Err(MempoolError::FeeTooLow),
@@ -444,19 +490,15 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
     // NOTE: GAS_BASIC_TRANSFER is the floor, so honest fees must be
     // ABOVE it for the ordering check to be meaningful.
     let mut mp3 = Mempool::new(100, 100);
-    let mk = |fee: u64, nonce: u64| Transaction::sign(&honest, to, 10, fee, nonce, 1, 1);
+    let mk = |fee: u64, nonce: u64| pq_tx(&honest, to, 10, fee, nonce);
     // Insert low-first to prove selection is by fee, not arrival.
-    mp3.add(mk(GAS_BASIC_TRANSFER, 0)).unwrap(); // minimal but valid
-    mp3.add(mk(GAS_BASIC_TRANSFER + 5_000, 1)).unwrap();
-    mp3.add(mk(GAS_BASIC_TRANSFER + 3_000, 2)).unwrap();
+    mp3.add(mk(floor, 0)).unwrap(); // minimal but valid
+    mp3.add(mk(floor + 5_000, 1)).unwrap();
+    mp3.add(mk(floor + 3_000, 2)).unwrap();
     let picked = mp3.select(3);
     assert_eq!(
         picked.iter().map(|t| t.gas_limit).collect::<Vec<_>>(),
-        vec![
-            GAS_BASIC_TRANSFER + 5_000,
-            GAS_BASIC_TRANSFER + 3_000,
-            GAS_BASIC_TRANSFER
-        ],
+        vec![floor + 5_000, floor + 3_000, floor],
         "selection must be strictly fee-descending"
     );
 
@@ -465,52 +507,15 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
     // otherwise spam forces losing work into the block. Executable
     // floor-paying transactions sort last but are still selected.
     let mut mp4 = Mempool::new(100, 100);
-    let me = honest.verifying_key().to_bytes();
-    let spam_me = spammer.verifying_key().to_bytes();
-    mp4.add(Transaction::sign(
-        &honest,
-        to,
-        10,
-        GAS_BASIC_TRANSFER + 5_000,
-        0,
-        1,
-        1,
-    ))
-    .unwrap();
-    mp4.add(Transaction::sign(
-        &honest,
-        to,
-        10,
-        GAS_BASIC_TRANSFER + 3_000,
-        1,
-        1,
-        1,
-    ))
-    .unwrap();
-    mp4.add(Transaction::sign(
-        &honest,
-        to,
-        10,
-        GAS_BASIC_TRANSFER,
-        2,
-        1,
-        1,
-    ))
-    .unwrap();
+    let me = pq_addr(&honest);
+    let spam_me = pq_addr(&spammer);
+    mp4.add(pq_tx(&honest, to, 10, floor + 5_000, 0)).unwrap();
+    mp4.add(pq_tx(&honest, to, 10, floor + 3_000, 1)).unwrap();
+    mp4.add(pq_tx(&honest, to, 10, floor, 2)).unwrap();
     // Spammer account is at nonce 5: nonce-2 with a 1M fee is stale junk.
-    mp4.add(Transaction::sign(&spammer, to, 10, 1_000_000, 2, 1, 1))
-        .unwrap();
+    mp4.add(pq_tx(&spammer, to, 10, 1_000_000, 2)).unwrap();
     // ...while its nonce-5 floor-paying tx is executable and must be kept.
-    mp4.add(Transaction::sign(
-        &spammer,
-        to,
-        10,
-        GAS_BASIC_TRANSFER,
-        5,
-        1,
-        1,
-    ))
-    .unwrap();
+    mp4.add(pq_tx(&spammer, to, 10, floor, 5)).unwrap();
     let picked_block = mp4.select_for_block(10, u64::MAX, |t| {
         if t.from == me {
             return t.nonce <= 2; // honest account nonce 0, contiguous prefix
@@ -528,15 +533,7 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
     let mut sorted = fees.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     assert_eq!(fees, sorted, "executable selection stays fee-descending");
-    assert_eq!(
-        fees,
-        vec![
-            GAS_BASIC_TRANSFER + 5_000,
-            GAS_BASIC_TRANSFER + 3_000,
-            GAS_BASIC_TRANSFER,
-            GAS_BASIC_TRANSFER
-        ]
-    );
+    assert_eq!(fees, vec![floor + 5_000, floor + 3_000, floor, floor]);
     assert!(
         !picked_block.is_empty(),
         "executable fee-payers (incl. minimal-gas) are still selected"
@@ -556,22 +553,22 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
 #[tokio::test]
 async fn self_dealing_proposer_keeps_fee_accounting_exact() {
     let engine = InMemoryStateEngine::new();
-    let pa = addr(0x61); // proposer
-    let aa = addr(0x62);
-    let ba = addr(0x63);
+    let kp = pq_key(0x61);
+    let ka = pq_key(0x62);
+    let kb = pq_key(0x63);
+    let pa = pq_addr(&kp); // proposer
+    let aa = pq_addr(&ka);
+    let ba = pq_addr(&kb);
     let (pb, ab, bb) = (1_000_000u64, 1_000_000_000u64, 1_000_000_000u64);
     engine.update_account(AccountState::new(pa, pb)).await;
     engine.update_account(AccountState::new(aa, ab)).await;
     engine.update_account(AccountState::new(ba, bb)).await;
 
-    let kp = det_key(0x61);
-    let ka = det_key(0x62);
-    let kb = det_key(0x63);
     let txs = vec![
-        Transaction::sign(&ka, ba, 1_000, 5_000, 0, 1, 1), // honest
-        Transaction::sign(&kb, aa, 500, 4_000, 0, 1, 1),   // honest
-        Transaction::sign(&kp, pa, 0, 0, 0, 1, 1),         // proposer zero-fee self
-        Transaction::sign(&kp, pa, 10, 0, 1, 1, 1),        // proposer zero-fee self + amount
+        pq_tx(&ka, ba, 1_000, 5_000, 0), // honest
+        pq_tx(&kb, aa, 500, 4_000, 0),   // honest
+        pq_tx(&kp, pa, 0, 0, 0),         // proposer zero-fee self
+        pq_tx(&kp, pa, 10, 0, 1),        // proposer zero-fee self + amount
     ];
 
     let supply_before = pb + ab + bb;
@@ -580,9 +577,13 @@ async fn self_dealing_proposer_keeps_fee_accounting_exact() {
     assert_eq!(failed, 0);
     assert_eq!(statuses, vec![true; 4], "block verdicts: all success");
 
-    // Parallel path charges the full declared gas_limit per applied tx
-    // (src/state_engine.rs:738): 5000 + 4000 + 0 + 0.
-    assert_eq!(fees, 9_000, "zero-fee self-deals contribute exactly 0");
+    // Parallel path charges declared gas_limit + PQ_ACTIVATION_SURCHARGE_GAS per
+    // activation tx: (5000 + S) + (4000 + S) + (0 + S) + (0 + S).
+    let expected_fees = 9_000 + 4 * PQ_ACTIVATION_SURCHARGE_GAS;
+    assert_eq!(
+        fees, expected_fees,
+        "zero-fee self-deals contribute only the PQ activation surcharge"
+    );
 
     // Runtime credits the collected fees to the proposer (src/runtime.rs:785-789).
     engine.credit_native(&pa, fees).await.unwrap();
@@ -593,9 +594,13 @@ async fn self_dealing_proposer_keeps_fee_accounting_exact() {
         engine.get_account(&ba).await.unwrap().balance,
     );
     // Exact per-account deltas: fees paid == fees credited, self-deal nets 0.
-    assert_eq!(pa1, pb + 9_000, "proposer gains exactly the collected fees");
-    assert_eq!(aa1, ab - 1_000 - 5_000 + 500);
-    assert_eq!(ba1, bb - 500 - 4_000 + 1_000);
+    assert_eq!(
+        pa1,
+        pb + expected_fees - 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+        "proposer gains exactly the collected fees minus its own activation surcharges"
+    );
+    assert_eq!(aa1, ab - 1_000 - 5_000 - PQ_ACTIVATION_SURCHARGE_GAS + 500);
+    assert_eq!(ba1, bb - 500 - 4_000 - PQ_ACTIVATION_SURCHARGE_GAS + 1_000);
     assert_eq!(
         pa1 + aa1 + ba1,
         supply_before,

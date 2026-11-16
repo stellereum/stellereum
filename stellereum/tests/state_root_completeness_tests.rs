@@ -14,8 +14,12 @@
 //! subsystem that silently passes the test WITHOUT moving the root is the bug.
 
 use ed25519_dalek::SigningKey;
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::orderbook::OrderSide;
 use stellereum::pmm::PrimaryMarketMaker;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::staking::StakingLedger;
 use stellereum::state_engine::{EscrowRecord, InMemoryStateEngine};
@@ -31,12 +35,40 @@ async fn native_balance_change_moves_the_root() {
     let e = InMemoryStateEngine::new();
     let before = e.get_state_root().await;
 
-    let key = funded_key(1);
-    let addr = key.verifying_key().to_bytes();
-    e.credit_native(&addr, 1_000).await.expect("credit");
+    let key = FalconKeypair::generate_from_seed(1);
+    let addr = derive_pq_address(PqScheme::Falcon512, key.public_key(), &DEFAULT_SALT);
+    e.credit_native(&addr, 1_000 + PQ_ACTIVATION_SURCHARGE_GAS)
+        .await
+        .expect("credit");
     let seeded = e.get_state_root().await;
 
-    let tx = Transaction::sign(&key, [0xEE; 32], 10, 0, 0, 0, 0);
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xEE; 32],
+        10,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    let tx = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        sig,
+        [0xEE; 32],
+        10,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
     let (applied, failed, _, _, _) = e.apply_block_parallel_fees(&[tx], 0).await;
     assert_eq!(
         (applied, failed),
@@ -344,10 +376,10 @@ async fn session_key_registry_moves_the_root() {
     use stellereum::zkml::{SessionKeyAuthorization, SCOPE_ALL};
 
     let e = InMemoryStateEngine::new();
-    let master = funded_key(11);
-    let session = funded_key(12);
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master = FalconKeypair::generate_from_seed(11);
+    let session = FalconKeypair::generate_from_seed(12);
+    let master_pub = derive_pq_address(PqScheme::Falcon512, master.public_key(), &DEFAULT_SALT);
+    let session_pub = derive_pq_address(PqScheme::Falcon512, session.public_key(), &DEFAULT_SALT);
 
     e.credit_native(&master_pub, 1_000_000_000)
         .await
@@ -356,16 +388,27 @@ async fn session_key_registry_moves_the_root() {
 
     // FIRST USE registers the key (lazy: there is no registration tx) and
     // charges the applied transaction's gas against it.
-    let grant = SessionKeyAuthorization::sign_delegation(
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        session.public_key(),
         10_000_000,
         10_000,
         SCOPE_ALL,
         u64::MAX,
         stellereum::zkml::DEFAULT_CHAIN_ID,
     );
-    let tx = Transaction::sign_with_session(&session, grant, [1u8; 32], 10, 1_000, 0, 1, 1, vec![]);
+    let tx = Transaction::sign_with_session_falcon512(
+        &session,
+        grant,
+        [1u8; 32],
+        10,
+        1_000,
+        0,
+        1,
+        1,
+        vec![],
+    );
     let (_, _, _, status, _) = e.apply_block_parallel_fees(&[tx], 1_000).await;
     assert_eq!(status, vec![true], "the registering transaction must apply");
     assert_eq!(
@@ -705,9 +748,7 @@ async fn staking_jail_commission_and_redelegation_lock_move_the_root() {
     // 3. The redelegation lock on a position.
     {
         let mut ledger = e.staking_write().await;
-        ledger
-            .redelegation_lock
-            .insert((val, [0x55u8; 32]), 12345);
+        ledger.redelegation_lock.insert((val, [0x55u8; 32]), 12345);
     }
     assert_ne!(
         e.get_state_root().await,

@@ -11,10 +11,10 @@
 use std::collections::HashMap;
 
 use stellereum::commitment::{
-    Domain, DomainCache, assemble_cached_digest, assemble_from_cache, books_preimage,
-    bridge_preimage, contracts_preimage_cached, cross_shard_preimage, escrow_preimage,
-    governance_preimage, oracle_preimage, pmm_preimage, session_keys_preimage, staking_preimage,
-    tokens_preimage, xpc_preimage, zkml_preimage, CommitmentSnapshot,
+    assemble_cached_digest, assemble_from_cache, books_preimage, bridge_preimage,
+    contracts_preimage_cached, cross_shard_preimage, escrow_preimage, governance_preimage,
+    oracle_preimage, pmm_preimage, session_keys_preimage, staking_preimage, tokens_preimage,
+    xpc_preimage, zkml_preimage, CommitmentSnapshot, Domain, DomainCache,
 };
 
 fn populated_snapshot(
@@ -199,11 +199,12 @@ fn populated_snapshot(
             locked_quote_native: 0,
         },
     );
-    s.cross_shard_consumed.push(stellereum::sharding::CrossShardKey {
-        source_shard: 1,
-        finalized_in_block: [0x11u8; 32],
-        msg_id: [0x22u8; 32],
-    });
+    s.cross_shard_consumed
+        .push(stellereum::sharding::CrossShardKey {
+            source_shard: 1,
+            finalized_in_block: [0x11u8; 32],
+            msg_id: [0x22u8; 32],
+        });
     let xpc_tx = stellereum::sharding::Transaction::sign(
         &ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]),
         [0x43u8; 32],
@@ -256,10 +257,7 @@ fn assemble_clone(
         fill!(Domain::Escrow, escrow_preimage(&s.order_escrow)),
         fill!(Domain::Governance, governance_preimage(&s.governance)),
         fill!(Domain::Oracle, oracle_preimage(&s.oracle)),
-        fill!(
-            Domain::SessionKeys,
-            session_keys_preimage(&s.session_keys)
-        ),
+        fill!(Domain::SessionKeys, session_keys_preimage(&s.session_keys)),
         fill!(Domain::Books, books_preimage(&s.orderbooks)),
         fill!(Domain::Bridge, bridge_preimage(&s.bridge)),
         fill!(
@@ -319,10 +317,7 @@ fn zero_copy_and_clone_paths_match_streaming_over_randomized_sequences() {
             s.staking.pq_equivocation_dedup.insert(b);
             s.staking.validator_pq_keys.insert(
                 a,
-                (
-                    stellereum::post_quantum::PqScheme::Falcon512,
-                    vec![i; 32],
-                ),
+                (stellereum::post_quantum::PqScheme::Falcon512, vec![i; 32]),
             );
             s.staking.vesting_schedules.insert(
                 b,
@@ -363,7 +358,10 @@ fn zero_copy_and_clone_paths_match_streaming_over_randomized_sequences() {
         let mut gens = [3u64; 13];
         let reference = streaming_of(&s, &zkml);
         let cloned = assemble_clone(&s, &zkml, &gens, &mut cache);
-        assert_eq!(cloned, reference, "seed {seed:#x}: cold clone-path diverged");
+        assert_eq!(
+            cloned, reference,
+            "seed {seed:#x}: cold clone-path diverged"
+        );
         let zero = assemble_from_cache(&mut cache, &gens)
             .expect("seed: all-hit zero-copy assembly must succeed");
         assert_eq!(zero, reference, "seed {seed:#x}: zero-copy diverged");
@@ -474,9 +472,8 @@ fn zero_copy_and_clone_paths_match_streaming_over_randomized_sequences() {
                 cloned, reference,
                 "seed {seed:#x} step {step}: clone-path diverged from streaming"
             );
-            let zero = assemble_from_cache(&mut cache, &gens).expect(
-                "seed: cache was just filled by the clone path, zero-copy must hit",
-            );
+            let zero = assemble_from_cache(&mut cache, &gens)
+                .expect("seed: cache was just filled by the clone path, zero-copy must hit");
             assert_eq!(
                 zero, reference,
                 "seed {seed:#x} step {step}: zero-copy diverged from streaming"

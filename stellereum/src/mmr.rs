@@ -127,7 +127,8 @@ pub const CHECKPOINT_BYTES_K128_H20: u64 = 3_965;
 /// FIXES.md §2.6/§3.4: QC bytes for committee size `k` —
 /// `|QC| = 666·k + ceil(k/8)` (Falcon-512 + bitmap).
 pub const fn qc_bytes(k: u64) -> u64 {
-    k.saturating_mul(FALCON512_SIG_BYTES).saturating_add(k.div_ceil(8))
+    k.saturating_mul(FALCON512_SIG_BYTES)
+        .saturating_add(k.div_ceil(8))
 }
 
 /// FIXES.md §2.6: checkpoint bytes for committee size `k` at depth `h=20` —
@@ -567,7 +568,10 @@ impl Mmr {
         let n = self.len();
         for &i in indices {
             if i >= n {
-                return Err(MmrMultiproofError::OutOfRange { index: i, num_leaves: n });
+                return Err(MmrMultiproofError::OutOfRange {
+                    index: i,
+                    num_leaves: n,
+                });
             }
         }
         let mut sorted = indices.to_vec();
@@ -1019,8 +1023,10 @@ mod tests {
             // Compact form never exceeds the q single proofs it replaces
             // (each single carries its leaf plus its whole sibling path).
             let singles = m.prove_many(&set).expect("in range");
-            let single_hashes: usize =
-                singles.iter().map(|p| 1 + p.siblings.len() + p.peaks.len()).sum();
+            let single_hashes: usize = singles
+                .iter()
+                .map(|p| 1 + p.siblings.len() + p.peaks.len())
+                .sum();
             let multi_hashes = mp.leaves.len() + mp.helpers.len() + mp.peaks.len();
             assert!(
                 multi_hashes <= single_hashes,
@@ -1078,14 +1084,20 @@ mod tests {
             Err(MmrMultiproofError::Duplicate { index: 2 })
         );
         // Mixed peaks: 129 = 128 + 1, so 0 and 128 live on different peaks.
-        assert_eq!(m.prove_multi(&[0, 128]), Err(MmrMultiproofError::MixedPeaks));
+        assert_eq!(
+            m.prove_multi(&[0, 128]),
+            Err(MmrMultiproofError::MixedPeaks)
+        );
         assert_eq!(
             m.prove_multi(&[127, 128]),
             Err(MmrMultiproofError::MixedPeaks)
         );
         // Three peaks: 100 = 64 + 32 + 4; one leaf per peak.
         let m100 = Mmr::of(&(0..100).map(leaf).collect::<Vec<_>>());
-        assert_eq!(m100.prove_multi(&[0, 64, 96]), Err(MmrMultiproofError::MixedPeaks));
+        assert_eq!(
+            m100.prove_multi(&[0, 64, 96]),
+            Err(MmrMultiproofError::MixedPeaks)
+        );
         // Every error explains itself (rendered without allocation, so the
         // module keeps its `no_std + alloc` shape).
         struct MsgBuf {
@@ -1104,13 +1116,19 @@ mod tests {
             }
         }
         fn err_msg(e: MmrMultiproofError) -> MsgBuf {
-            let mut out = MsgBuf { buf: [0u8; 256], len: 0 };
+            let mut out = MsgBuf {
+                buf: [0u8; 256],
+                len: 0,
+            };
             core::fmt::write(&mut out, format_args!("{e}")).expect("stack buffer fits");
             out
         }
         for e in [
             MmrMultiproofError::EmptySet,
-            MmrMultiproofError::OutOfRange { index: 9, num_leaves: 3 },
+            MmrMultiproofError::OutOfRange {
+                index: 9,
+                num_leaves: 3,
+            },
             MmrMultiproofError::Duplicate { index: 9 },
             MmrMultiproofError::MixedPeaks,
         ] {
@@ -1120,7 +1138,10 @@ mod tests {
         }
         let rendered = err_msg(MmrMultiproofError::MixedPeaks);
         let msg = core::str::from_utf8(&rendered.buf[..rendered.len]).expect("UTF-8");
-        assert!(msg.contains("q·|π|"), "mixed-peak error names the q·|π| form: {msg}");
+        assert!(
+            msg.contains("q·|π|"),
+            "mixed-peak error names the q·|π| form: {msg}"
+        );
     }
 
     /// FIXES.md §2.11: a tampered multiproof refuses — same fail-closed
@@ -1163,16 +1184,12 @@ mod tests {
             let left = MmrHelper {
                 offset: h.offset,
                 size: half,
-                hash: chunk_root(
-                    &leaves[h.offset as usize..(h.offset + half) as usize],
-                ),
+                hash: chunk_root(&leaves[h.offset as usize..(h.offset + half) as usize]),
             };
             let right = MmrHelper {
                 offset: h.offset + half,
                 size: half,
-                hash: chunk_root(
-                    &leaves[(h.offset + half) as usize..(h.offset + h.size) as usize],
-                ),
+                hash: chunk_root(&leaves[(h.offset + half) as usize..(h.offset + h.size) as usize]),
             };
             bad.helpers.splice(pos..pos + 1, [left, right]);
             assert!(!bad.verify(&root), "non-maximal frontier refuses");
@@ -1263,10 +1280,15 @@ mod tests {
             let bound = max_proof_hashes(n);
             let mut max_seen = 0u64;
             for i in 0..n {
-                let p = m.prove(i).unwrap_or_else(|| panic!("leaf {i} proves at size {n}"));
+                let p = m
+                    .prove(i)
+                    .unwrap_or_else(|| panic!("leaf {i} proves at size {n}"));
                 assert!(p.verify(&root));
                 let pi = p.siblings.len() as u64 + p.peaks.len() as u64 - 1;
-                assert!(pi <= bound, "|π|={pi} exceeds bound {bound} at n={n}, i={i}");
+                assert!(
+                    pi <= bound,
+                    "|π|={pi} exceeds bound {bound} at n={n}, i={i}"
+                );
                 max_seen = max_seen.max(pi);
             }
             assert_eq!(max_seen, bound, "bound is tight at n={n}");
@@ -1287,7 +1309,9 @@ mod tests {
             *state = x;
             x
         }
-        for n in [2u64, 3, 5, 9, 33, 64, 100, 127, 128, 129, 130, 200, 255, 256] {
+        for n in [
+            2u64, 3, 5, 9, 33, 64, 100, 127, 128, 129, 130, 200, 255, 256,
+        ] {
             let leaves: Vec<[u8; 32]> = (0..n).map(leaf).collect();
             let m = Mmr::of(&leaves);
             let root = m.root();
@@ -1317,7 +1341,10 @@ mod tests {
                 set.dedup();
                 let mp = m.prove_multi(&set).expect("same-mountain set proves");
                 assert_eq!(mp.peak_index, pi);
-                assert!(mp.verify(&root), "multiproof verifies at n={n}, mountain {pi}");
+                assert!(
+                    mp.verify(&root),
+                    "multiproof verifies at n={n}, mountain {pi}"
+                );
                 assert_eq!(mp.peaks[mp.peak_index], peaks[pi]);
                 // Leaf-for-leaf agreement with the single proofs.
                 for (k, &idx) in set.iter().enumerate() {

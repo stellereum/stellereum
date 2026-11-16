@@ -56,8 +56,12 @@ fn bound_envelope_verifies_before_and_after_activation() {
     let tx = w.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, TEST_CHAIN_ID);
     assert!(tx.chain_id().is_some(), "bound fixture must carry chain id");
     assert!(
-        verify_transaction_envelope_at_height_with_activation(&tx, ACTIVATION_HEIGHT - 1, &activation)
-            .is_ok(),
+        verify_transaction_envelope_at_height_with_activation(
+            &tx,
+            ACTIVATION_HEIGHT - 1,
+            &activation
+        )
+        .is_ok(),
         "bound envelope must verify pre-activation"
     );
     assert!(
@@ -66,15 +70,29 @@ fn bound_envelope_verifies_before_and_after_activation() {
         "bound envelope must verify at activation"
     );
     assert!(
-        verify_transaction_envelope_at_height_with_activation(&tx, ACTIVATION_HEIGHT + 1, &activation)
-            .is_ok(),
+        verify_transaction_envelope_at_height_with_activation(
+            &tx,
+            ACTIVATION_HEIGHT + 1,
+            &activation
+        )
+        .is_ok(),
         "bound envelope must verify post-activation"
     );
     // Wallet-side pre-check agrees at every height.
-    for height in [0, ACTIVATION_HEIGHT - 1, ACTIVATION_HEIGHT, ACTIVATION_HEIGHT + 1] {
+    for height in [
+        0,
+        ACTIVATION_HEIGHT - 1,
+        ACTIVATION_HEIGHT,
+        ACTIVATION_HEIGHT + 1,
+    ] {
         assert!(
-            WalletAccount::check_envelope_binding_at_height(&tx, height, &activation, TEST_CHAIN_ID)
-                .is_ok(),
+            WalletAccount::check_envelope_binding_at_height(
+                &tx,
+                height,
+                &activation,
+                TEST_CHAIN_ID
+            )
+            .is_ok(),
             "wallet pre-check must pass bound envelope at height {height}"
         );
     }
@@ -88,8 +106,12 @@ fn unbound_pre_activation_verifies_compat() {
     let tx = w.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
     assert_eq!(tx.chain_id(), None, "legacy fixture must stay unbound");
     assert!(
-        verify_transaction_envelope_at_height_with_activation(&tx, ACTIVATION_HEIGHT - 1, &activation)
-            .is_ok(),
+        verify_transaction_envelope_at_height_with_activation(
+            &tx,
+            ACTIVATION_HEIGHT - 1,
+            &activation
+        )
+        .is_ok(),
         "unbound envelope must verify pre-activation (history compat)"
     );
     assert!(
@@ -125,8 +147,13 @@ fn unbound_post_activation_refuses_with_pinned_prefix() {
             err.contains(&TEST_CHAIN_ID.to_string()),
             "refusal must name the chain id to bind, got: {err}"
         );
-        let werr = WalletAccount::check_envelope_binding_at_height(&tx, height, &activation, TEST_CHAIN_ID)
-            .expect_err("wallet pre-check must refuse unbound post-activation");
+        let werr = WalletAccount::check_envelope_binding_at_height(
+            &tx,
+            height,
+            &activation,
+            TEST_CHAIN_ID,
+        )
+        .expect_err("wallet pre-check must refuse unbound post-activation");
         assert!(
             werr.starts_with(UNBOUND_REFUSED_ERR_PREFIX),
             "wallet refusal must carry the pinned prefix, got: {werr}"
@@ -142,9 +169,15 @@ fn cross_chain_replay_refuses_at_every_height() {
     // Signed bound to ANOTHER chain, verified on this one: the replay.
     let tx = w.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, OTHER_CHAIN_ID);
     assert_eq!(tx.chain_id(), Some(OTHER_CHAIN_ID));
-    for height in [0, ACTIVATION_HEIGHT - 1, ACTIVATION_HEIGHT, ACTIVATION_HEIGHT + 1] {
+    for height in [
+        0,
+        ACTIVATION_HEIGHT - 1,
+        ACTIVATION_HEIGHT,
+        ACTIVATION_HEIGHT + 1,
+    ] {
         assert!(
-            verify_transaction_envelope_at_height_with_activation(&tx, height, &activation).is_err(),
+            verify_transaction_envelope_at_height_with_activation(&tx, height, &activation)
+                .is_err(),
             "cross-chain replay must refuse at height {height}"
         );
     }
@@ -159,12 +192,18 @@ fn default_off_never_activates_unilaterally() {
     // Even at the top of the height range, the default admits unbound:
     // enforcement requires an explicitly configured height.
     assert!(
-        verify_transaction_envelope_at_height_with_activation(&unbound, u64::MAX - 1, &never).is_ok(),
+        verify_transaction_envelope_at_height_with_activation(&unbound, u64::MAX - 1, &never)
+            .is_ok(),
         "default-off activation must admit unbound at any height"
     );
     assert!(
-        WalletAccount::check_envelope_binding_at_height(&unbound, u64::MAX - 1, &never, TEST_CHAIN_ID)
-            .is_ok(),
+        WalletAccount::check_envelope_binding_at_height(
+            &unbound,
+            u64::MAX - 1,
+            &never,
+            TEST_CHAIN_ID
+        )
+        .is_ok(),
         "wallet pre-check must admit unbound while activation is unset"
     );
 }

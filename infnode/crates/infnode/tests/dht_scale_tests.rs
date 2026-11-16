@@ -125,13 +125,20 @@ fn node_info(label: &str, last_seen: i64) -> dht::NodeInfo {
 async fn wait_ping(from: &Arc<Node>, to: [u8; 20]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(25);
     loop {
-        let r = tokio::time::timeout(Duration::from_secs(8), from.request_to(to, "core.ping", vec![])).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(8),
+            from.request_to(to, "core.ping", vec![]),
+        )
+        .await;
         if let Ok(Ok(raw)) = r {
             if String::from_utf8_lossy(&raw).contains("\"pong\":true") {
                 return;
             }
         }
-        assert!(std::time::Instant::now() < deadline, "ping never succeeded (serve/dial race)");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ping never succeeded (serve/dial race)"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
@@ -147,11 +154,16 @@ async fn dht_ops_scale_table_n10_15_20() {
     assert_eq!(dht::ALPHA, 3, "lookup parallelism");
     let tmp = tmpdir("ops");
     for n in [10usize, 15, 20] {
-        let keys: Vec<NodeKeys> = (0..n).map(|i| det_keys(&format!("dhtscale-ops/{n}/{i}"))).collect();
-        let pqs: Vec<PqKeys> = (0..n).map(|i| det_pq(&format!("dhtscale-ops/{n}/{i}"))).collect();
+        let keys: Vec<NodeKeys> = (0..n)
+            .map(|i| det_keys(&format!("dhtscale-ops/{n}/{i}")))
+            .collect();
+        let pqs: Vec<PqKeys> = (0..n)
+            .map(|i| det_pq(&format!("dhtscale-ops/{n}/{i}")))
+            .collect();
         let node = Node::new(
             cfg(&format!("ops-{n}"), "127.0.0.1:0", vec![]),
-            keys[0].clone(), pqs[0].clone(),
+            keys[0].clone(),
+            pqs[0].clone(),
             tmp.join(format!("n{n}")),
             PathBuf::new(),
         )
@@ -184,8 +196,10 @@ async fn dht_ops_scale_table_n10_15_20() {
             local.iter().map(|x| x.id).collect::<Vec<_>>(),
             "N={n}: lookup == local view (0 RPCs taken)"
         );
-        let dists: Vec<[u8; 20]> =
-            got.iter().map(|x| dht::xor_distance(&x.id, &target)).collect();
+        let dists: Vec<[u8; 20]> = got
+            .iter()
+            .map(|x| dht::xor_distance(&x.id, &target))
+            .collect();
         let mut sorted = dists.clone();
         sorted.sort();
         assert_eq!(dists, sorted, "N={n}: results sorted by xor");
@@ -194,7 +208,12 @@ async fn dht_ops_scale_table_n10_15_20() {
         let mut kv = dht::KvStore::default();
         let t0 = std::time::Instant::now();
         for i in 0..n {
-            kv.store(&format!("scale:{n}:k:{i}"), "v".into(), 3_600_000, pqs[0].pq_id());
+            kv.store(
+                &format!("scale:{n}:k:{i}"),
+                "v".into(),
+                3_600_000,
+                pqs[0].pq_id(),
+            );
         }
         // Repair-candidate scan input: half-aged replicas + one dedup hint.
         let now = dht::now_ms();
@@ -207,7 +226,12 @@ async fn dht_ops_scale_table_n10_15_20() {
                 now - 450_000,
             );
         }
-        kv.store("dedup:scale:hint", "{\"nodes\":[]}".into(), dht::DEDUP_TTL_MS, pqs[0].pq_id());
+        kv.store(
+            "dedup:scale:hint",
+            "{\"nodes\":[]}".into(),
+            dht::DEDUP_TTL_MS,
+            pqs[0].pq_id(),
+        );
         let t0store = t0.elapsed();
         let t1 = std::time::Instant::now();
         for i in 0..n {
@@ -217,9 +241,15 @@ async fn dht_ops_scale_table_n10_15_20() {
         let t2 = std::time::Instant::now();
         let republish = kv.keys_to_republish(now);
         let repair_scan_ms = t2.elapsed();
-        assert_eq!(republish.len(), n, "repair scan sees aged replicas, skips dedup:*");
+        assert_eq!(
+            republish.len(),
+            n,
+            "repair scan sees aged replicas, skips dedup:*"
+        );
         assert!(
-            !republish.iter().any(|(k, _, _, _, _)| k.starts_with("dedup:")),
+            !republish
+                .iter()
+                .any(|(k, _, _, _, _)| k.starts_with("dedup:")),
             "dedup never republished"
         );
         // LWW conflict rule pinned at scale: stale replica loses.
@@ -242,7 +272,10 @@ async fn dht_ops_scale_table_n10_15_20() {
             repair_scan_ms.as_micros(),
             republish.len(),
         );
-        assert!(lookup_us < 5_000_000, "N={n}: lookup under 5 s, got {lookup_us} us");
+        assert!(
+            lookup_us < 5_000_000,
+            "N={n}: lookup under 5 s, got {lookup_us} us"
+        );
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -262,7 +295,8 @@ async fn dht_store_find_value_loopback_rtt() {
     let lb = "127.0.0.1:19351";
     let a = Node::new(
         cfg("RTT-A", la, vec![peer_of("B", &kb, &pb, lb)]),
-        ka.clone(), pa.clone(),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
@@ -270,7 +304,8 @@ async fn dht_store_find_value_loopback_rtt() {
     .expect("A");
     let b = Node::new(
         cfg("RTT-B", lb, vec![peer_of("A", &ka, &pa, la)]),
-        kb.clone(), pb.clone(),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -291,24 +326,39 @@ async fn dht_store_find_value_loopback_rtt() {
         .to_string()
         .into_bytes();
     let t0 = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(pb.pq_id(), "dht.store", p))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.request_to(pb.pq_id(), "dht.store", p),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     let store_ms = t0.elapsed().as_millis();
-    assert!(String::from_utf8_lossy(&r).contains("\"ok\":true"), "store lands");
+    assert!(
+        String::from_utf8_lossy(&r).contains("\"ok\":true"),
+        "store lands"
+    );
 
     let p = serde_json::json!({ "key": key }).to_string().into_bytes();
     let t0 = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(pb.pq_id(), "dht.find_value", p))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.request_to(pb.pq_id(), "dht.find_value", p),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     let find_ms = t0.elapsed().as_millis();
-    assert!(String::from_utf8_lossy(&r).contains("v-loop"), "value round-trips");
+    assert!(
+        String::from_utf8_lossy(&r).contains("v-loop"),
+        "value round-trips"
+    );
 
     println!("REPORT loopback dht.store_rtt_ms={store_ms} dht.find_value_rtt_ms={find_ms} msgs_per_op=1_req+1_resp");
-    assert!(store_ms < 20_000 && find_ms < 20_000, "loopback RTT bounded");
+    assert!(
+        store_ms < 20_000 && find_ms < 20_000,
+        "loopback RTT bounded"
+    );
 
     sa.abort();
     sb.abort();
@@ -332,7 +382,10 @@ async fn routing_churn_bounded_and_fresh() {
     }
     let cap = 160 * dht::K;
     let len_full = rt.len();
-    assert!(len_full <= cap, "5000 distinct IDs bounded by 160*K={cap}, got {len_full}");
+    assert!(
+        len_full <= cap,
+        "5000 distinct IDs bounded by 160*K={cap}, got {len_full}"
+    );
     // Refresh churn of known IDs grows nothing.
     for i in 0..500u32 {
         rt.insert(node_info(&format!("dhtscale-churn/{i:05}"), now + 1));
@@ -392,7 +445,11 @@ async fn routing_prune_stale_before_after() {
             last_seen: now - dht::ROUTING_STALE_AFTER_MS - 3_600_000,
         });
     }
-    assert_eq!(table.len(), 25, "fixture: 15 fresh + 10 stale, no bucket eviction");
+    assert_eq!(
+        table.len(),
+        25,
+        "fixture: 15 fresh + 10 stale, no bucket eviction"
+    );
 
     let before: Vec<[u8; 20]> = table.closest(&target, 15).iter().map(|n| n.id).collect();
     assert_eq!(before.len(), 15, "15 nearest all fresh");
@@ -407,11 +464,20 @@ async fn routing_prune_stale_before_after() {
 
     assert_eq!(evicted, 10, "all and only stale evicted");
     assert_eq!(table.len(), 15, "after: fresh set only");
-    assert_eq!(before, after, "PARITY: lookup results identical before/after");
+    assert_eq!(
+        before, after,
+        "PARITY: lookup results identical before/after"
+    );
     let remaining: HashSet<[u8; 20]> = table.all().iter().map(|n| n.id).collect();
     assert_eq!(remaining.len(), 15, "no duplicates left");
-    assert!(fresh_ids.iter().all(|id| remaining.contains(id)), "every fresh kept");
-    assert!(stale_ids.iter().all(|id| !remaining.contains(id)), "every stale gone");
+    assert!(
+        fresh_ids.iter().all(|id| remaining.contains(id)),
+        "every fresh kept"
+    );
+    assert!(
+        stale_ids.iter().all(|id| !remaining.contains(id)),
+        "every stale gone"
+    );
 
     println!("REPORT prune before_len=25 after_len=15 evicted={evicted} parity_before==after=1");
 }
@@ -444,9 +510,12 @@ async fn pubsub_fanout_loopback_dup_rate() {
 
     let tmp = tmpdir("fanout");
     let topic = "scale-fanout";
-    let keys: Vec<NodeKeys> =
-        (0..3).map(|i| det_keys(&format!("dhtscale-fanout/{i}"))).collect();
-    let pqs: Vec<PqKeys> = (0..3).map(|i| det_pq(&format!("dhtscale-fanout/{i}"))).collect();
+    let keys: Vec<NodeKeys> = (0..3)
+        .map(|i| det_keys(&format!("dhtscale-fanout/{i}")))
+        .collect();
+    let pqs: Vec<PqKeys> = (0..3)
+        .map(|i| det_pq(&format!("dhtscale-fanout/{i}")))
+        .collect();
     let listens = ["127.0.0.1:19360", "127.0.0.1:19361", "127.0.0.1:19362"];
     let mut nodes = Vec::new();
     for i in 0..3 {
@@ -455,9 +524,15 @@ async fn pubsub_fanout_loopback_dup_rate() {
             .map(|j| peer_of(&format!("n{j}"), &keys[j], &pqs[j], listens[j]))
             .collect();
         nodes.push(
-            Node::new(cfg(&format!("fanout-{i}"), listens[i], peers), keys[i].clone(), pqs[i].clone(), tmp.join(format!("n{i}")), PathBuf::new())
-                .await
-                .expect("node"),
+            Node::new(
+                cfg(&format!("fanout-{i}"), listens[i], peers),
+                keys[i].clone(),
+                pqs[i].clone(),
+                tmp.join(format!("n{i}")),
+                PathBuf::new(),
+            )
+            .await
+            .expect("node"),
         );
     }
     let ids: Vec<[u8; 20]> = pqs.iter().map(|pq| pq.pq_id()).collect();
@@ -475,11 +550,16 @@ async fn pubsub_fanout_loopback_dup_rate() {
             if i == j {
                 continue;
             }
-            let p = serde_json::json!({ "topic": topic }).to_string().into_bytes();
-            tokio::time::timeout(Duration::from_secs(20), node.request_to(*pid, "pubsub.subscribe", p))
-                .await
-                .expect("no hang")
-                .expect("subscribe ok");
+            let p = serde_json::json!({ "topic": topic })
+                .to_string()
+                .into_bytes();
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                node.request_to(*pid, "pubsub.subscribe", p),
+            )
+            .await
+            .expect("no hang")
+            .expect("subscribe ok");
         }
     }
     wait_ping(&nodes[0], ids[1]).await;
@@ -495,11 +575,17 @@ async fn pubsub_fanout_loopback_dup_rate() {
         })
         .to_string()
         .into_bytes();
-        let r = tokio::time::timeout(Duration::from_secs(20), nodes[0].request_to(ids[1], "pubsub.publish", p))
-            .await
-            .expect("no hang")
-            .expect("transport ok");
-        assert!(String::from_utf8_lossy(&r).contains("\"ok\":true"), "publish {i} accepted");
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            nodes[0].request_to(ids[1], "pubsub.publish", p),
+        )
+        .await
+        .expect("no hang")
+        .expect("transport ok");
+        assert!(
+            String::from_utf8_lossy(&r).contains("\"ok\":true"),
+            "publish {i} accepted"
+        );
     }
 
     // Poll until every node holds all 5 (or 60 rounds x 250 ms).
@@ -563,7 +649,10 @@ async fn pubsub_fanout_bounds_table() {
         // Flood depth is 2 waves for any N (direct flood + loop-back); the
         // TTL cap only needs to cover that, not the N-1 diameter.
         let waves_needed = if n > 1 { 2u64 } else { 1 };
-        assert!(waves_needed <= proto::MAX_PUBSUB_TTL, "flood waves fit the TTL cap");
+        assert!(
+            waves_needed <= proto::MAX_PUBSUB_TTL,
+            "flood waves fit the TTL cap"
+        );
         println!("REPORT fanout_bound N={n} max_relay_rpcs_per_publish={amp} ttl_cap={} outbox_cap_per_peer={}", proto::MAX_PUBSUB_TTL, proto::MAX_OUTBOX_PER_PEER);
     }
 }

@@ -61,7 +61,14 @@ async fn a_money_p0_place_order_settled_is_atomic_over_capped_quote_mint() {
     for (m, fund) in [(maker1, 1_000u64), (maker2, 1_000u64)] {
         engine.update_account(AccountState::new(m, 5 * STELL)).await;
         engine
-            .token_execute(&usdt, minter, TokenOp::Mint { to: m, amount: fund })
+            .token_execute(
+                &usdt,
+                minter,
+                TokenOp::Mint {
+                    to: m,
+                    amount: fund,
+                },
+            )
             .await
             .unwrap();
         let (oid, fills) = engine
@@ -101,7 +108,10 @@ async fn a_money_p0_place_order_settled_is_atomic_over_capped_quote_mint() {
             200,
         )
         .await;
-    assert!(res.is_err(), "second quote release must exceed the cap: {res:?}");
+    assert!(
+        res.is_err(),
+        "second quote release must exceed the cap: {res:?}"
+    );
 
     // ATOMICITY: a refused settlement moves nothing anywhere. Collect every
     // symptom before failing so one run documents the full desync.
@@ -140,7 +150,9 @@ fn a_money_p1_slash_covers_delegator_unbonding_pipeline() {
 
     let full_total: u64 = floor + delegated; // nothing left the system
     let expected_burn = ((full_total as u128) * 500u128 / 10_000u128) as u64; // 5%
-    let burned = l.slash(v, stellereum::staking::EQUIVOCATION_SLASH_BPS).unwrap();
+    let burned = l
+        .slash(v, stellereum::staking::EQUIVOCATION_SLASH_BPS)
+        .unwrap();
 
     assert_eq!(
         burned, expected_burn,

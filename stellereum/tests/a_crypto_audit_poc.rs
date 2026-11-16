@@ -2,7 +2,7 @@
 //! Read-only audit artifact (tests only).
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use stellereum::post_quantum::{PqScheme, verify_pq_signature};
+use stellereum::post_quantum::{verify_pq_signature, PqScheme};
 
 // PoC 1 (revised): weak-key forgery — small-order Ed25519 key (all-zero
 // point, order 4) accepts a forged (R, s=0) for the probe message.
@@ -27,7 +27,7 @@ fn poc_ed25519_weak_key_forgery() {
             .collect::<Vec<u8>>()
             .try_into()
             .unwrap(), // identity (y=1)
-        [0u8; 32],                            // order-4 (y=0,+)
+        [0u8; 32], // order-4 (y=0,+)
         {
             let mut b = [0u8; 32];
             b[31] = 0x80;
@@ -41,18 +41,14 @@ fn poc_ed25519_weak_key_forgery() {
         let ok_raw = verify_pq_signature(PqScheme::Ed25519, &weak_pk, msg, &sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let ok_strict = vk.verify_strict(msg, &sig).is_ok();
-        println!(
-            "R={} raw={ok_raw} strict={ok_strict}",
-            hex::encode(r)
-        );
+        println!("R={} raw={ok_raw} strict={ok_strict}", hex::encode(r));
     }
     // Grind: fixed trivial sig (R=B, s=1) verifies iff k=H(R||A||M) kills A,
     // i.e. k mod 4 == 0 — probability 1/4 per message. Grind 32 messages.
-    let b = curve25519_dalek::edwards::EdwardsPoint::mul_base(
-        &curve25519_dalek::scalar::Scalar::ONE,
-    )
-    .compress()
-    .to_bytes();
+    let b =
+        curve25519_dalek::edwards::EdwardsPoint::mul_base(&curve25519_dalek::scalar::Scalar::ONE)
+            .compress()
+            .to_bytes();
     let mut found_raw = false;
     let mut found_strict_gap = false;
     for ctr in 0u32..32 {
@@ -60,8 +56,7 @@ fn poc_ed25519_weak_key_forgery() {
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&b);
         sig_bytes[32] = 1;
-        let ok_raw =
-            verify_pq_signature(PqScheme::Ed25519, &weak_pk, msg.as_bytes(), &sig_bytes);
+        let ok_raw = verify_pq_signature(PqScheme::Ed25519, &weak_pk, msg.as_bytes(), &sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let ok_strict = vk.verify_strict(msg.as_bytes(), &sig).is_ok();
         if ok_raw {
@@ -109,7 +104,8 @@ fn poc_ed25519_smallorder_r_strict_gap() {
 // PoC 3: scheme confusion — Falcon bytes must not verify as Ed25519 and vice versa.
 #[test]
 fn poc_scheme_confusion_rejected_by_length() {
-    let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x77u8; 32]);
+    let falcon_kp =
+        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x77u8; 32]);
     let msg = b"scheme confusion";
     let falcon_sig = falcon_kp.sign(msg);
     assert_eq!(
@@ -118,7 +114,9 @@ fn poc_scheme_confusion_rejected_by_length() {
         "signing must produce a full Falcon signature (fail-closed, no env interference)"
     );
     // Truncate Falcon sig to 64 bytes and present as Ed25519: must fail.
-    let ed_pk = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key().to_bytes();
+    let ed_pk = SigningKey::from_bytes(&[0x11u8; 32])
+        .verifying_key()
+        .to_bytes();
     assert!(!verify_pq_signature(
         PqScheme::Ed25519,
         &ed_pk,
@@ -126,7 +124,10 @@ fn poc_scheme_confusion_rejected_by_length() {
         &falcon_sig[..64]
     ));
     // Ed25519 sig presented as Falcon: wrong length must fail.
-    let ed_sig = SigningKey::from_bytes(&[0x11u8; 32]).sign(msg).to_bytes().to_vec();
+    let ed_sig = SigningKey::from_bytes(&[0x11u8; 32])
+        .sign(msg)
+        .to_bytes()
+        .to_vec();
     assert!(!verify_pq_signature(
         PqScheme::Falcon512,
         falcon_kp.public_key(),
@@ -154,16 +155,19 @@ fn poc_mldsa44_node_side_refused() {
 #[test]
 fn poc_legacy_env_branch_changes_keygen() {
     let seed = [0xABu8; 32];
-    let a =
-        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed).public_key().to_vec();
-    let b =
-        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed).public_key().to_vec();
+    let a = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed)
+        .public_key()
+        .to_vec();
+    let b = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed)
+        .public_key()
+        .to_vec();
     assert_eq!(a, b, "default keygen must be deterministic");
     // SAFETY: PoC-only env toggle, restored before return.
     let prev = std::env::var("STELL_LEGACY_GENESIS_ROOT").ok();
     std::env::set_var("STELL_LEGACY_GENESIS_ROOT", "1");
-    let toggled =
-        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed).public_key().to_vec();
+    let toggled = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed)
+        .public_key()
+        .to_vec();
     match prev {
         Some(v) => std::env::set_var("STELL_LEGACY_GENESIS_ROOT", v),
         None => std::env::remove_var("STELL_LEGACY_GENESIS_ROOT"),

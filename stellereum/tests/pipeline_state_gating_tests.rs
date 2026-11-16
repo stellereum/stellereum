@@ -20,9 +20,9 @@
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use std::time::Instant;
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
-use stellereum::consensus::register_validator_pq_key;
 use stellereum::runtime::{count_block_actor_sends, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{
@@ -51,11 +51,7 @@ fn id_of(k: &SigningKey) -> [u8; 32] {
 /// is idempotent, so call sites may re-derive freely.
 fn val_fk(val_sk: &SigningKey) -> FalconKeypair {
     let fk = FalconKeypair::generate_from_seed(0x11);
-    register_validator_pq_key(
-        id_of(val_sk),
-        PqScheme::Falcon512,
-        fk.public_key.clone(),
-    );
+    register_validator_pq_key(id_of(val_sk), PqScheme::Falcon512, fk.public_key.clone());
     fk
 }
 
@@ -615,7 +611,14 @@ async fn overcap_actor_block_rejected_at_adopt() {
     assert!(err.contains("actor"), "got: {err}");
 
     // Adopt side: a genuine QC for the same body, still refused pre-execution.
-    let v = falcon_votes::fvote(&val_sk, &val_fk(&val_sk), 1, 0, VoteKind::Precommit, Some(bh));
+    let v = falcon_votes::fvote(
+        &val_sk,
+        &val_fk(&val_sk),
+        1,
+        0,
+        VoteKind::Precommit,
+        Some(bh),
+    );
     let cert = QuorumCertificate {
         height: 1,
         round: 0,

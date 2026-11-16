@@ -75,8 +75,50 @@ async fn cluster(ks: &[SigningKey], payer: ValidatorId, bal: u64) -> Vec<Validat
     out
 }
 
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn mkblock(
     proposer_key: &SigningKey,
+    proposer_fk: &stellereum::post_quantum::FalconKeypair,
     h: u64,
     prev: [u8; 32],
     root: [u8; 32],
@@ -100,7 +142,7 @@ fn mkblock(
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(proposer_key);
+    b.sign_block_with_falcon(proposer_key, proposer_fk);
     b
 }
 
@@ -169,8 +211,7 @@ fn prevote_for(
 #[tokio::test]
 async fn hunt_finding_2_finalize_without_the_block_splits_state() {
     let (ks, fks) = falcon_votes::falcon_set(N);
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(10);
     let to = [0x77u8; 32];
     let mut nodes = cluster(&ks, from, 10_000_000_000_000).await;
 
@@ -185,13 +226,14 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
         "the victim must not be the proposer this round"
     );
     let pkey = ks[proposer].clone();
+    let pfk = &fks[proposer];
     let pid = pkey.verifying_key().to_bytes();
 
     // The header must commit to the state it builds on (validate_proposal checks
     // it), and all four nodes start from byte-identical state.
     let genesis_root = nodes[0].state.get_state_root().await;
-    let tx = Transaction::sign(&user, to, 1_000, 0, 0, 1, 1);
-    let block = mkblock(&pkey, 1, [0u8; 32], genesis_root, vec![tx]);
+    let tx = pq_tx(10, to, 1_000, 0, 0, 1, 1);
+    let block = mkblock(&pkey, pfk, 1, [0u8; 32], genesis_root, vec![tx]);
     let bh = block.compute_hash();
 
     // In production the proposer keeps its own block (`propose()` inserts it).
@@ -261,12 +303,26 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
             continue;
         }
         for (j, k) in ks.iter().enumerate().take(3) {
-            n.on_prevote(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Prevote, Some(bh)))
-                .unwrap();
+            n.on_prevote(falcon_votes::fvote(
+                k,
+                &fks[j],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
         }
         for (j, k) in ks.iter().enumerate().take(3) {
-            n.on_precommit(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Precommit, Some(bh)))
-                .unwrap();
+            n.on_precommit(falcon_votes::fvote(
+                k,
+                &fks[j],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
         }
         assert_eq!(
             n.try_finalize().await,
@@ -352,8 +408,7 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
 #[tokio::test]
 async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     let (ks, fks) = falcon_votes::falcon_set(N);
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(11);
     let to = [0x88u8; 32];
     // Author each block with the validator the schedule names for its
     // (height, round): the adopt path enforces the proposer slot, so any
@@ -361,10 +416,11 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     // test is about.
     let proposer_for = |h: u64| {
         let want = vset(&ks).proposer_for(h, 0).unwrap();
-        ks.iter()
-            .find(|k| k.verifying_key().to_bytes() == want)
-            .expect("the schedule's proposer is one of our keys")
-            .clone()
+        let idx = ks
+            .iter()
+            .position(|k| k.verifying_key().to_bytes() == want)
+            .expect("the schedule's proposer is one of our keys");
+        (ks[idx].clone(), fks[idx].clone())
     };
 
     // The header must commit to the state it BUILDS ON, so we need the real
@@ -374,9 +430,9 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     let genesis_root = probe[0].state.get_state_root().await;
 
     // ---------- Height 1 (genesis child: no evidence, no attribution) ----------
-    let pkey1 = proposer_for(1);
-    let tx = Transaction::sign(&user, to, 10, 0, 0, 1, 1);
-    let block1 = mkblock(&pkey1, 1, [0u8; 32], genesis_root, vec![tx]);
+    let (pkey1, pfk1) = proposer_for(1);
+    let tx = pq_tx(11, to, 10, 0, 0, 1, 1);
+    let block1 = mkblock(&pkey1, &pfk1, 1, [0u8; 32], genesis_root, vec![tx]);
     let bh1 = block1.compute_hash();
 
     // Three of the four validators signed; validator 3 is silent.
@@ -395,11 +451,25 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     for (j, k) in ks.iter().enumerate().take(3) {
         local[0]
             .hc
-            .add_prevote(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Prevote, Some(bh1)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                &fks[j],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh1),
+            ))
             .unwrap();
         local[0]
             .hc
-            .add_precommit(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Precommit, Some(bh1)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                &fks[j],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh1),
+            ))
             .unwrap();
     }
     assert_eq!(
@@ -431,15 +501,15 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     }
 
     // ---------- Height 2 (carries the height-1 QC as canonical evidence) ----------
-    let pkey2 = proposer_for(2);
-    let mut block2 = mkblock(&pkey2, 2, bh1, root_after_1_a, vec![]);
+    let (pkey2, pfk2) = proposer_for(2);
+    let mut block2 = mkblock(&pkey2, &pfk2, 2, bh1, root_after_1_a, vec![]);
     block2.last_qc = Some(cert1.clone());
     // Re-sign: the block hash commits to the canonical evidence (among
     // other header fields), so the pre-evidence signature is stale. Clear
-    // it first: `sign_block` appends, and a stale proposer signature is
+    // it first: `sign_block_with_falcon` appends, and a stale proposer signature is
     // dead weight every verifier would trip over.
     block2.validator_signatures.clear();
-    block2.sign_block(&pkey2);
+    block2.sign_block_with_falcon(&pkey2, &pfk2);
     let bh2 = block2.compute_hash();
 
     // Both paths must agree which set decides height 2 (same committed
@@ -476,11 +546,25 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     for (j, k) in ks.iter().enumerate().take(3) {
         local[0]
             .hc
-            .add_prevote(falcon_votes::fvote(k, &fks[j], 2, 0, VoteKind::Prevote, Some(bh2)))
+            .add_prevote(falcon_votes::fvote(
+                k,
+                &fks[j],
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
             .unwrap();
         local[0]
             .hc
-            .add_precommit(falcon_votes::fvote(k, &fks[j], 2, 0, VoteKind::Precommit, Some(bh2)))
+            .add_precommit(falcon_votes::fvote(
+                k,
+                &fks[j],
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
             .unwrap();
     }
     assert_eq!(
@@ -546,23 +630,23 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
 #[tokio::test]
 async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
     let (ks, fks) = falcon_votes::falcon_set(N);
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(12);
     let to = [0x99u8; 32];
     let mut nodes = cluster(&ks, from, BONDABLE_BALANCE).await;
     // Use the validator the schedule actually names for (height 1, round 0), so this
     // test exercises the state-root binding rather than being refused earlier for
     // an unrelated reason.
     let want = nodes[0].validators.proposer_for(1, 0).unwrap();
-    let pkey = ks
+    let pidx = ks
         .iter()
-        .find(|k| k.verifying_key().to_bytes() == want)
-        .expect("the schedule's proposer is one of our keys")
-        .clone();
+        .position(|k| k.verifying_key().to_bytes() == want)
+        .expect("the schedule's proposer is one of our keys");
+    let pkey = ks[pidx].clone();
+    let pfk = &fks[pidx];
 
     // A block whose header commits to a state root that does not exist anywhere.
-    let tx = Transaction::sign(&user, to, 10, 0, 0, 1, 1);
-    let block = mkblock(&pkey, 1, [0u8; 32], [0xAB; 32], vec![tx]);
+    let tx = pq_tx(12, to, 10, 0, 0, 1, 1);
+    let block = mkblock(&pkey, pfk, 1, [0u8; 32], [0xAB; 32], vec![tx]);
     let bh = block.compute_hash();
 
     // The LIVE proposal path rejects the very same block...
@@ -611,7 +695,7 @@ async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
 
 #[tokio::test]
 async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
-    let (ks, _fks) = falcon_votes::falcon_set(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let real = vset(&ks);
     assert_eq!(real.len(), 4);
     assert_eq!(real.quorum_power(), 3, "the node's real quorum is 3 of 4");
@@ -622,7 +706,6 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
     let forged_set = ValidatorSet::from_list(vec![(attacker.verifying_key().to_bytes(), 1)]);
     assert_eq!(forged_set.quorum_power(), 1);
 
-    let user = SigningKey::generate(&mut OsRng);
     // Deterministic proposer: the schedule names exactly one proposer for
     // (height 1, round 0); the block MUST carry it or the cheap proposer gate
     // (correctly) refuses before the quorum check is ever reached. A fixed
@@ -631,16 +714,17 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
     let sched = real
         .proposer_for(1, 0)
         .expect("4-member set names a proposer");
-    let sched_key = ks
+    let sched_idx = ks
         .iter()
-        .find(|k| k.verifying_key().to_bytes() == sched)
+        .position(|k| k.verifying_key().to_bytes() == sched)
         .expect("scheduled proposer is one of ours");
     let block = mkblock(
-        sched_key,
+        &ks[sched_idx],
+        &fks[sched_idx],
         1,
         [0u8; 32],
         [0xDE; 32],
-        vec![Transaction::sign(&user, [1u8; 32], 999_999, 0, 0, 1, 1)],
+        vec![pq_tx(13, [1u8; 32], 999_999, 0, 0, 1, 1)],
     );
     let bh = block.compute_hash();
     // The attacker's own Falcon companion, registered under its id: the

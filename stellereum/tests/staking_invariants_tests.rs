@@ -30,11 +30,11 @@
 //! (balanced, 350 ops), 0x165667B19E3779F9 (slash-heavy, 200 ops).
 
 use stellereum::staking::{
-    StakingError, StakingLedger, BPS_DENOMINATOR, COMMISSION_CHANGE_COOLDOWN_HEIGHTS,
-    COMMISSION_EFFECT_DELAY_HEIGHTS, COMMISSION_MAX_DELTA_BPS, DEFAULT_COMMISSION_BPS,
-    DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, DOWNTIME_SLASH_BPS,
+    required_bond_floor_nano, StakingError, StakingLedger, BPS_DENOMINATOR,
+    COMMISSION_CHANGE_COOLDOWN_HEIGHTS, COMMISSION_EFFECT_DELAY_HEIGHTS, COMMISSION_MAX_DELTA_BPS,
+    DEFAULT_COMMISSION_BPS, DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, DOWNTIME_SLASH_BPS,
     EQUIVOCATION_SLASH_BPS, JAIL_RELEASE_DELAY_HEIGHTS, MIN_DELEGATION, MIN_VALIDATOR_BOND,
-    REWARDS_EMISSION_CAP, UNBONDING_PERIOD_SECS, required_bond_floor_nano,
+    REWARDS_EMISSION_CAP, UNBONDING_PERIOD_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -307,7 +307,10 @@ impl Runner {
         let res = self.l.process_unbonding(self.now);
         let a = self.snap();
         self.ops += 1;
-        assert!(res.is_ok(), "process_unbonding is infallible at test magnitudes");
+        assert!(
+            res.is_ok(),
+            "process_unbonding is infallible at test magnitudes"
+        );
         assert_eq!(b, a, "maturation only re-keys stake");
         self.checks += 2;
         self.check_globals();
@@ -492,12 +495,7 @@ impl Runner {
     fn op_unjail(&mut self) {
         let v = self.pick_vid(6);
         let pre_rec = self.l.jail_record(&v);
-        let pre_bond = self
-            .l
-            .validators
-            .get(&v)
-            .map(|s| s.self_bond)
-            .unwrap_or(0);
+        let pre_bond = self.l.validators.get(&v).map(|s| s.self_bond).unwrap_or(0);
         let pre_slashed = self
             .l
             .validators
@@ -542,7 +540,9 @@ impl Runner {
                 match e {
                     StakingError::NotJailed => assert!(pre_rec.is_none()),
                     StakingError::CooldownNotElapsed => {
-                        assert!(self.height < pre_rec.expect("cooldown needs record").release_height)
+                        assert!(
+                            self.height < pre_rec.expect("cooldown needs record").release_height
+                        )
                     }
                     StakingError::BondBelowMinimum => {
                         assert!(pre_bond < required_bond_floor_nano())
@@ -572,8 +572,7 @@ impl Runner {
                 let cur = pre_current.expect("success needs a validator");
                 if new_bps == cur {
                     assert!(
-                        self
-                            .l
+                        self.l
                             .commission_schedule_of(&v)
                             .and_then(|s| s.pending)
                             .is_none(),
@@ -584,8 +583,7 @@ impl Runner {
                     assert!(new_bps.abs_diff(cur) <= COMMISSION_MAX_DELTA_BPS);
                     if let Some(last) = pre_sched.and_then(|s| s.last_effective_height) {
                         assert!(
-                            self.height
-                                >= last.saturating_add(COMMISSION_CHANGE_COOLDOWN_HEIGHTS),
+                            self.height >= last.saturating_add(COMMISSION_CHANGE_COOLDOWN_HEIGHTS),
                             "announce needs the cooldown"
                         );
                     }
@@ -622,7 +620,9 @@ impl Runner {
                         let last = pre_sched
                             .and_then(|s| s.last_effective_height)
                             .expect("cooldown refusal needs a prior change");
-                        assert!(self.height < last.saturating_add(COMMISSION_CHANGE_COOLDOWN_HEIGHTS));
+                        assert!(
+                            self.height < last.saturating_add(COMMISSION_CHANGE_COOLDOWN_HEIGHTS)
+                        );
                     }
                     StakingError::NotValidator => assert!(pre_current.is_none()),
                     _ => panic!("unexpected announce error: {e:?}"),
@@ -643,7 +643,9 @@ impl Runner {
         self.ops += 1;
         match res {
             Ok(()) => {
-                let p = pre_sched.and_then(|s| s.pending).expect("success needs pending");
+                let p = pre_sched
+                    .and_then(|s| s.pending)
+                    .expect("success needs pending");
                 assert!(
                     self.height >= p.effective_height,
                     "apply only at/after the effective height"
@@ -667,9 +669,9 @@ impl Runner {
                 match e {
                     StakingError::NotValidator => assert!(!known),
                     StakingError::CommissionNotDue => {
-                        let due = pre_sched.and_then(|s| s.pending).is_some_and(|p| {
-                            self.height >= p.effective_height
-                        });
+                        let due = pre_sched
+                            .and_then(|s| s.pending)
+                            .is_some_and(|p| self.height >= p.effective_height);
                         assert!(!due, "not-due refusal needs nothing-due");
                     }
                     _ => panic!("unexpected apply error: {e:?}"),
@@ -801,14 +803,20 @@ impl Runner {
         self.checks += 1;
         // (4) commission bounds hold globally: rate capped; pending sane.
         for (id, s) in self.l.validators.iter() {
-            assert!(s.commission_bps <= BPS_DENOMINATOR, "commission capped at 100%");
+            assert!(
+                s.commission_bps <= BPS_DENOMINATOR,
+                "commission capped at 100%"
+            );
             if let Some(p) = self
                 .l
                 .commission_schedule_of(id)
                 .and_then(|sched| sched.pending)
             {
                 assert!(p.new_bps <= BPS_DENOMINATOR);
-                assert_ne!(p.new_bps, s.commission_bps, "pending differs (else cancelled)");
+                assert_ne!(
+                    p.new_bps, s.commission_bps,
+                    "pending differs (else cancelled)"
+                );
                 assert_eq!(
                     p.effective_height,
                     p.announced_height

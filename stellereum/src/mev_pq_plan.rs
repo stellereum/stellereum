@@ -134,7 +134,11 @@ pub fn pq_plan_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 pub fn pq_plan_commit(validator_id: &[u8; 32], epoch: u64, nonce: &[u8; 32]) -> [u8; 32] {
     pq_plan_digest(
         PQ_PLAN_COMMIT_DOMAIN,
-        &[validator_id.as_slice(), &epoch.to_be_bytes(), nonce.as_slice()],
+        &[
+            validator_id.as_slice(),
+            &epoch.to_be_bytes(),
+            nonce.as_slice(),
+        ],
     )
 }
 
@@ -176,11 +180,7 @@ pub fn pq_plan_transcript(epoch: u64, contributions: &[&[u8]]) -> [u8; 32] {
 }
 
 /// Verify a transcript root against the exact ordered contribution set.
-pub fn pq_plan_transcript_verify(
-    root: &[u8; 32],
-    epoch: u64,
-    contributions: &[&[u8]],
-) -> bool {
+pub fn pq_plan_transcript_verify(root: &[u8; 32], epoch: u64, contributions: &[&[u8]]) -> bool {
     pq_plan_transcript(epoch, contributions) == *root
 }
 

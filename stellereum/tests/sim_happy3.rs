@@ -21,7 +21,8 @@
 mod consensus_cluster;
 
 #[path = "support/falcon_votes.rs"]
-#[allow(dead_code)] // GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites.
+#[allow(dead_code)]
+// GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites.
 mod falcon_votes;
 
 use consensus_cluster::{ConsensusCluster, NodeProfile};
@@ -65,7 +66,11 @@ async fn happy3_steady_finalization() {
         report.ticks,
         report.best_height,
         report.common_height,
-        report.nodes.iter().map(|n| n.decide_rounds.clone()).collect::<Vec<_>>(),
+        report
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.clone())
+            .collect::<Vec<_>>(),
     );
     println!("{}", report.diagnostics());
 
@@ -76,7 +81,8 @@ async fn happy3_steady_finalization() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -95,7 +101,8 @@ async fn happy3_steady_finalization() {
                 );
             } else {
                 assert_eq!(
-                    *d, 0,
+                    *d,
+                    0,
                     "node {} decided height {} in round +{d} (expected 0).\n{}",
                     n.index,
                     k + 1,
@@ -116,7 +123,11 @@ async fn happy3_steady_finalization() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     assert!(
         report.double_votes(&[]).is_empty(),

@@ -17,18 +17,18 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::bridge::bridge_adapters as adapters;
 use stellereum::bridge::{
     BridgeIntent, BridgeState, EvmDepositEvent, EvmReleaseOrder, EvmWatcher, MultisigRelayer,
     SupportedChain, TeleportBridgeEngine, TeleportDepositEvent, TonInboundTx, TonWatcher,
     ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
 };
-use stellereum::bridge::bridge_adapters as adapters;
 use stellereum::consensus::register_validator_pq_key;
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::oracle::{
     OracleSafetyEngine, OracleState, PriceFeedUpdate, STALE_PRICE_MAX_SECS as ORACLE_STALE_MAX,
 };
 use stellereum::orderbook::PAIR_STELL_USDT;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
 fn gen_key() -> SigningKey {
     SigningKey::generate(&mut OsRng)
@@ -69,7 +69,10 @@ fn deposit_skeleton(chain: SupportedChain, hash: [u8; 32], amount: u64) -> Telep
 }
 
 /// Sign the deposit's canonical message with each key in `signers`.
-fn quorum_sigs_for(event: &TeleportDepositEvent, signers: &[&SigningKey]) -> Vec<([u8; 32], Vec<u8>)> {
+fn quorum_sigs_for(
+    event: &TeleportDepositEvent,
+    signers: &[&SigningKey],
+) -> Vec<([u8; 32], Vec<u8>)> {
     let msg = TeleportBridgeEngine::deposit_signing_message(event);
     signers.iter().map(|sk| sign_msg(sk, &msg)).collect()
 }
@@ -237,7 +240,10 @@ fn unauthorized_publisher_refused_no_state_change() {
     let err = st
         .commit_feed(&feed, 5_000)
         .expect_err("unknown publisher must be refused");
-    assert!(err.contains("not in the committed set"), "unexpected error: {err}");
+    assert!(
+        err.contains("not in the committed set"),
+        "unexpected error: {err}"
+    );
     assert_eq!(st, before, "refused feed must commit nothing");
     assert!(!st.breaker_tripped);
 
@@ -261,7 +267,10 @@ fn removed_publisher_cannot_publish() {
     );
     // ...and re-registering is observable, not silent.
     assert!(st.register_publisher(pub_of(&sk)));
-    assert!(!st.register_publisher(pub_of(&sk)), "repeat register is a no-op");
+    assert!(
+        !st.register_publisher(pub_of(&sk)),
+        "repeat register is a no-op"
+    );
 }
 
 // ============================================================================
@@ -304,12 +313,19 @@ fn absurd_price_jump_trips_breaker() {
     assert!(st.register_publisher(pub_of(&a)));
     assert!(st.register_publisher(pub_of(&b)));
     let t = 50_000u64;
-    assert!(st.commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t, &a), t).is_ok());
+    assert!(st
+        .commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t, &a), t)
+        .is_ok());
 
     // +6% from the SAME key: refused WITHOUT latching (per-publisher cap 5%).
     let drift = PriceFeedUpdate::sign("STELL", 1_060_000, t + 1, &a);
-    let err = st.commit_feed(&drift, t + 1).expect_err("same-key drift must refuse");
-    assert!(err.contains("same-publisher drift"), "unexpected error: {err}");
+    let err = st
+        .commit_feed(&drift, t + 1)
+        .expect_err("same-key drift must refuse");
+    assert!(
+        err.contains("same-publisher drift"),
+        "unexpected error: {err}"
+    );
     assert!(!st.breaker_tripped, "per-publisher refusal must not latch");
 
     // +6% from a DIFFERENT key: admitted (full 10% rule for rotation).
@@ -318,8 +334,13 @@ fn absurd_price_jump_trips_breaker() {
 
     // +20% single step (any key): breaker latches, nothing commits.
     let spike = PriceFeedUpdate::sign("STELL", 1_272_000, t + 2, &b);
-    let err = st.commit_feed(&spike, t + 2).expect_err("+20% must trip breaker");
-    assert!(err.contains("circuit breaker tripped"), "unexpected error: {err}");
+    let err = st
+        .commit_feed(&spike, t + 2)
+        .expect_err("+20% must trip breaker");
+    assert!(
+        err.contains("circuit breaker tripped"),
+        "unexpected error: {err}"
+    );
     assert!(st.breaker_tripped);
     assert_eq!(
         st.feeds.get("STELL").unwrap().price_micro_usd,
@@ -402,20 +423,24 @@ fn frozen_committed_feed_refuses_orders_via_fresh_gate() {
     let mut st = OracleState::default();
     assert!(st.register_publisher(pub_of(&sk)));
     let t0 = 40_000u64;
-    assert!(
-        st.commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t0, &sk), t0)
-            .is_ok()
-    );
+    assert!(st
+        .commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t0, &sk), t0)
+        .is_ok());
 
     // Fresh: the time-aware gate admits a sane limit price.
-    assert!(st.gate_order_at(PAIR_STELL_USDT, 1_000_000, t0 + 10).is_ok());
+    assert!(st
+        .gate_order_at(PAIR_STELL_USDT, 1_000_000, t0 + 10)
+        .is_ok());
 
     // Frozen (committed feed older than the staleness window): refuse.
     let err = st
         .gate_order_at(PAIR_STELL_USDT, 1_000_000, t0 + ORACLE_STALE_MAX + 1)
         .expect_err("frozen feed must refuse order admission");
     assert!(err.contains("frozen"), "unexpected error: {err}");
-    assert!(!st.breaker_tripped, "frozen refusal is a gate, not an alarm");
+    assert!(
+        !st.breaker_tripped,
+        "frozen refusal is a gate, not an alarm"
+    );
 
     // Missing feed still admits (nothing to be stale) — legacy semantics kept.
     let empty = OracleState::default();

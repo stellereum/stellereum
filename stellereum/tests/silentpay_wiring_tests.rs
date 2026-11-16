@@ -20,12 +20,12 @@
 
 use stellereum::address::{encode_stl57_address, parse_address};
 use stellereum::silentpay::{
-    SpNote, SpRecipient, sp_send, sp_shake256_32, sp_stealth_address, SP_CHAIN_DST, SP_CT_LEN,
+    sp_send, sp_shake256_32, sp_stealth_address, SpNote, SpRecipient, SP_CHAIN_DST, SP_CT_LEN,
     SP_GENESIS_CHAIN, SP_SPEND_DST, SP_STEALTH_DST,
 };
 use stellereum::wallet::{SilentNoteCandidate, SilentScanner};
 use stellereum::{
-    SILENT_PAY_ENABLED, silent_pay_enabled, silent_stealth_address, silent_stealth_display,
+    silent_pay_enabled, silent_stealth_address, silent_stealth_display, SILENT_PAY_ENABLED,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,8 +41,8 @@ fn kem_seed(byte: u8) -> [u8; 64] {
 
 fn ek_bytes(seed_byte: u8) -> Vec<u8> {
     use ml_kem::{
-        MlKem768,
         kem::{FromSeed, KeyExport},
+        MlKem768,
     };
     let seed: ml_kem::Seed = kem_seed(seed_byte).into();
     let (_, ek) = MlKem768::from_seed(&seed);
@@ -60,7 +60,11 @@ struct SenderMirror {
 
 impl SenderMirror {
     fn new(seed_byte: u8) -> Self {
-        Self { ek: ek_bytes(seed_byte), chain: SP_GENESIS_CHAIN, index: 0 }
+        Self {
+            ek: ek_bytes(seed_byte),
+            chain: SP_GENESIS_CHAIN,
+            index: 0,
+        }
     }
 
     fn send(&mut self, chain_id: u64, randomness: &[u8; 32]) -> SpNote {
@@ -84,10 +88,16 @@ struct FixtureNote {
 /// delivery order.
 fn build_notes(counts: &[usize], chain_id: u64) -> (Vec<[u8; 64]>, Vec<FixtureNote>) {
     let seed_bytes = [0x11u8, 0x22u8, 0x33u8];
-    let seeds: Vec<[u8; 64]> =
-        seed_bytes.iter().take(counts.len()).map(|&b| kem_seed(b)).collect();
-    let mut mirrors: Vec<SenderMirror> =
-        seed_bytes.iter().take(counts.len()).map(|&b| SenderMirror::new(b)).collect();
+    let seeds: Vec<[u8; 64]> = seed_bytes
+        .iter()
+        .take(counts.len())
+        .map(|&b| kem_seed(b))
+        .collect();
+    let mut mirrors: Vec<SenderMirror> = seed_bytes
+        .iter()
+        .take(counts.len())
+        .map(|&b| SenderMirror::new(b))
+        .collect();
     let mut remaining = counts.to_vec();
     let mut notes = Vec::new();
     let mut i = 0usize;
@@ -116,7 +126,10 @@ fn build_notes(counts: &[usize], chain_id: u64) -> (Vec<[u8; 64]>, Vec<FixtureNo
 fn as_candidates(notes: &[FixtureNote]) -> Vec<SilentNoteCandidate> {
     notes
         .iter()
-        .map(|n| SilentNoteCandidate { ct: n.ct.clone(), stealth: n.stealth })
+        .map(|n| SilentNoteCandidate {
+            ct: n.ct.clone(),
+            stealth: n.stealth,
+        })
         .collect()
 }
 
@@ -127,7 +140,10 @@ fn as_candidates(notes: &[FixtureNote]) -> Vec<SilentNoteCandidate> {
 #[test]
 fn gate_is_off_by_default() {
     // GATE: black_box defeats const-folding; pin must fail loudly if flipped.
-    assert!(!std::hint::black_box(SILENT_PAY_ENABLED), "wiring gate must default to OFF");
+    assert!(
+        !std::hint::black_box(SILENT_PAY_ENABLED),
+        "wiring gate must default to OFF"
+    );
     assert!(!silent_pay_enabled());
     let scanner = SilentScanner::new(kem_seed(0x11), CHAIN_A);
     assert!(!scanner.is_armed(), "fresh scanner must be disarmed");
@@ -147,7 +163,9 @@ fn off_scan_is_empty_even_for_the_true_owner() {
     }
     // Empty input is empty output (no panic, no allocation surprise).
     let empty: Vec<SilentNoteCandidate> = Vec::new();
-    assert!(SilentScanner::new(seeds[0], CHAIN_A).scan(&empty).is_empty());
+    assert!(SilentScanner::new(seeds[0], CHAIN_A)
+        .scan(&empty)
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +195,10 @@ fn stealth_address_matches_spec_preimage_byte_for_byte() {
         assert_eq!(pre.len(), 99, "frozen stealth-preimage length");
         // The wired helper derives exactly the spec shape (REAL wiring: the
         // `lib.rs` helper over the crate module, no copy).
-        assert_eq!(silent_stealth_address(CHAIN_A, &chain_state, &ss, index), sp_shake256_32(&pre));
+        assert_eq!(
+            silent_stealth_address(CHAIN_A, &chain_state, &ss, index),
+            sp_shake256_32(&pre)
+        );
         assert_eq!(
             silent_stealth_address(CHAIN_A, &chain_state, &ss, index),
             sp_stealth_address(CHAIN_A, &chain_state, &ss, index)
@@ -189,9 +210,15 @@ fn stealth_address_matches_spec_preimage_byte_for_byte() {
     let a1 = silent_stealth_address(CHAIN_A, &SP_GENESIS_CHAIN, &[0x5Au8; 32], 1);
     let b0 = silent_stealth_address(CHAIN_B, &SP_GENESIS_CHAIN, &[0x5Au8; 32], 0);
     assert_ne!(a0, a1, "successive notes get fresh addresses");
-    assert_ne!(a0, b0, "same material on another chain derives another address");
+    assert_ne!(
+        a0, b0,
+        "same material on another chain derives another address"
+    );
     // Determinism: same inputs reproduce the same address bit-for-bit.
-    assert_eq!(a0, silent_stealth_address(CHAIN_A, &SP_GENESIS_CHAIN, &[0x5Au8; 32], 0));
+    assert_eq!(
+        a0,
+        silent_stealth_address(CHAIN_A, &SP_GENESIS_CHAIN, &[0x5Au8; 32], 0)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +237,11 @@ fn owner_scan_finds_exactly_own_notes_zero_fp_fn() {
         assert!(scanner.is_armed());
         let hits = scanner.scan(&candidates);
         let own: Vec<&FixtureNote> = notes.iter().filter(|n| n.recipient == r).collect();
-        assert_eq!(hits.len(), own.len(), "recipient {r} must find exactly its own notes");
+        assert_eq!(
+            hits.len(),
+            own.len(),
+            "recipient {r} must find exactly its own notes"
+        );
         for (hit, note) in hits.iter().zip(own.iter()) {
             assert_eq!(hit.stealth, note.stealth);
             assert_eq!(hit.ss, note.ss_sender, "sender/recipient ss must match");
@@ -257,7 +288,12 @@ fn wrong_keys_and_tampered_ct_excluded_state_untouched() {
     // Fine-grained: the crate receive state is untouched by misses.
     for seed in [&seeds[1], &seeds[2]] {
         let mut other = SpRecipient::new(*seed, CHAIN_A);
-        assert_eq!(other.receive(&notes[0].ct, &notes[0].stealth).expect("receive"), None);
+        assert_eq!(
+            other
+                .receive(&notes[0].ct, &notes[0].stealth)
+                .expect("receive"),
+            None
+        );
         assert_eq!(other.chain(), SP_GENESIS_CHAIN);
         assert_eq!(other.next_index(), 0);
     }
@@ -267,10 +303,17 @@ fn wrong_keys_and_tampered_ct_excluded_state_untouched() {
     let mut bad = notes[0].ct.clone();
     bad[513] ^= 0x01;
     let mut rec = SpRecipient::new(seeds[0], CHAIN_A);
-    assert_eq!(rec.receive(&bad, &notes[0].stealth).expect("decap infallible"), None);
+    assert_eq!(
+        rec.receive(&bad, &notes[0].stealth)
+            .expect("decap infallible"),
+        None
+    );
     assert_eq!((rec.chain(), rec.next_index()), (SP_GENESIS_CHAIN, 0));
     // The untampered note still receives afterwards (no state corruption).
-    assert!(rec.receive(&notes[0].ct, &notes[0].stealth).expect("receive").is_some());
+    assert!(rec
+        .receive(&notes[0].ct, &notes[0].stealth)
+        .expect("receive")
+        .is_some());
 
     // Malformed ct is refused outright (fail-closed, never a false hit).
     assert!(rec.receive(&[0u8; 10], &notes[0].stealth).is_err());
@@ -319,7 +362,10 @@ fn chain_binding_enforced_on_scan() {
 fn stealth_display_roundtrips_through_stl57() {
     let (_, notes) = build_notes(&[2], CHAIN_A);
     assert_eq!(notes.len(), 2);
-    assert_ne!(notes[0].stealth, notes[1].stealth, "fresh addresses per note");
+    assert_ne!(
+        notes[0].stealth, notes[1].stealth,
+        "fresh addresses per note"
+    );
 
     // The wired display helper reproduces the genesis note's stealth through
     // the production codec (first note derives off genesis at index 0).
@@ -329,8 +375,10 @@ fn stealth_display_roundtrips_through_stl57() {
     );
 
     // The codec itself round-trips every derived stealth (unmodified path).
-    let texts: Vec<String> =
-        notes.iter().map(|n| encode_stl57_address(&n.stealth)).collect();
+    let texts: Vec<String> = notes
+        .iter()
+        .map(|n| encode_stl57_address(&n.stealth))
+        .collect();
     for (n, text) in notes.iter().zip(texts.iter()) {
         assert!(text.starts_with("Stl57"), "branded display: {text}");
         assert_eq!(parse_address(text).expect("must parse"), n.stealth);

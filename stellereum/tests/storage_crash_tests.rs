@@ -168,7 +168,11 @@ async fn torn_snapshot_truncations_refuse_cleanly() {
     assert_eq!(h, SNAP_H);
     assert_eq!(fresh.get_state_root().await, root);
     assert_eq!(
-        fresh.get_account(&probe).await.expect("probe present").balance,
+        fresh
+            .get_account(&probe)
+            .await
+            .expect("probe present")
+            .balance,
         10_000
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -266,7 +270,9 @@ async fn corrupt_tail_bitflips_refused() {
         let pos = (i * (good.len() - 1)) / 31;
         let mut bad = good.clone();
         bad[pos] ^= 0x01;
-        store.put_domains(SNAP_H, &bad).expect("put corrupted domains");
+        store
+            .put_domains(SNAP_H, &bad)
+            .expect("put corrupted domains");
         let fresh = InMemoryStateEngine::new();
         let err = load_full_state_into(&store, &fresh)
             .await
@@ -422,7 +428,8 @@ async fn restore_after_crash_equals_canonical() {
         .expect("present");
     assert_eq!(h, N, "only the newest PAIRED height may load");
     assert_eq!(
-        fresh.get_state_root().await, canonical,
+        fresh.get_state_root().await,
+        canonical,
         "restored root must equal the pre-corruption canonical root"
     );
     assert_eq!(

@@ -192,13 +192,13 @@ fn poc_active_wallet_pointer_traversal_escapes_wallets_dir() {
     // Plant escape targets so the `exists()` gates in resolve_* pass.
     let evil_sibling = base.join("evil.json");
     fs::write(&evil_sibling, b"{}").expect("plant sibling");
-    let abs_target = std::env::temp_dir().join(format!(
-        "b_wallet_pwn_{}.json",
-        std::process::id()
-    ));
+    let abs_target = std::env::temp_dir().join(format!("b_wallet_pwn_{}.json", std::process::id()));
     fs::write(&abs_target, b"{}").expect("plant abs");
     let ptr = base.join("active_wallet");
-    for payload in ["../evil", abs_target.to_string_lossy().trim_end_matches(".json")] {
+    for payload in [
+        "../evil",
+        abs_target.to_string_lossy().trim_end_matches(".json"),
+    ] {
         let payload = payload.to_string();
         fs::write(&ptr, &payload).expect("write pointer");
         let resolved = resolve_active_wallet_path(None, Some(&base));

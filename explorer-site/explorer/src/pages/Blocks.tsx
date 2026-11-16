@@ -48,8 +48,10 @@ export const Blocks: React.FC = () => {
                   </td>
                 </tr>
               )}
-              {blocks.map((b) => (
-                <tr key={b.height}>
+              {blocks.map((b) => {
+                const proposer = b.proposer_stl57 || b.proposer;
+                return (
+                <tr key={b.block_hash || `${b.shard_id}-${b.height}`}>
                   <td>
                     <Link to={`/block/${b.height}`} style={{ fontWeight: 600 }}>
                       #{b.height.toLocaleString()}
@@ -66,14 +68,19 @@ export const Blocks: React.FC = () => {
                     </Link>
                   </td>
                   <td className="mono">
-                    <Link to={`/address/${b.proposer_stl57 || b.proposer}`}>
-                      {truncateMiddle(b.proposer_stl57 || b.proposer, 7, 7)}
-                    </Link>
+                    {proposer ? (
+                      <Link to={`/address/${proposer}`}>
+                        {truncateMiddle(proposer, 7, 7)}
+                      </Link>
+                    ) : (
+                      '—'
+                    )}
                   </td>
                   <td style={{ fontWeight: 600 }}>{b.tx_count}</td>
                   <td style={{ color: 'var(--text-dim)' }}>{timeAgo(b.timestamp)}</td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

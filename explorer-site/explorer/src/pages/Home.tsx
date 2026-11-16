@@ -58,8 +58,10 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                 No blocks indexed yet
               </div>
             )}
-            {blocks.map((block) => (
-              <div key={block.height} className="feed-item">
+            {blocks.map((block) => {
+              const proposer = block.proposer_stl57 || block.proposer;
+              return (
+              <div key={block.block_hash || `${block.shard_id}-${block.height}`} className="feed-item">
                 <div className="feed-left">
                   <div className="feed-icon">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -76,9 +78,13 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                     </div>
                     <div className="feed-sub">
                       <span>Proposer: </span>
-                      <Link to={`/address/${block.proposer_stl57 || block.proposer}`} className="mono">
-                        {truncateMiddle(block.proposer_stl57 || block.proposer, 6, 6)}
-                      </Link>
+                      {proposer ? (
+                        <Link to={`/address/${proposer}`} className="mono">
+                          {truncateMiddle(proposer, 6, 6)}
+                        </Link>
+                      ) : (
+                        <span className="mono">—</span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -90,7 +96,8 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                   <div className="feed-sub">{timeAgo(block.timestamp)}</div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -110,7 +117,10 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                 No transactions indexed yet
               </div>
             )}
-            {txs.map((tx) => (
+            {txs.map((tx) => {
+              const fromAddr = tx.from_stl57 || tx.from_addr;
+              const toAddr = tx.to_stl57 || tx.to_addr;
+              return (
               <div key={tx.hash} className="feed-item">
                 <div className="feed-left">
                   <div className="feed-icon" style={{ color: 'var(--success)' }}>
@@ -129,13 +139,21 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                     </div>
                     <div className="feed-sub">
                       <span>From </span>
-                      <Link to={`/address/${tx.from_stl57 || tx.from_addr}`} className="mono">
-                        {truncateMiddle(tx.from_stl57 || tx.from_addr, 5, 5)}
-                      </Link>
+                      {fromAddr ? (
+                        <Link to={`/address/${fromAddr}`} className="mono">
+                          {truncateMiddle(fromAddr, 5, 5)}
+                        </Link>
+                      ) : (
+                        <span className="mono">—</span>
+                      )}
                       <span> to </span>
-                      <Link to={`/address/${tx.to_stl57 || tx.to_addr}`} className="mono">
-                        {truncateMiddle(tx.to_stl57 || tx.to_addr, 5, 5)}
-                      </Link>
+                      {toAddr ? (
+                        <Link to={`/address/${toAddr}`} className="mono">
+                          {truncateMiddle(toAddr, 5, 5)}
+                        </Link>
+                      ) : (
+                        <span className="mono">—</span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -147,7 +165,8 @@ export const Home: React.FC<HomeProps> = ({ isLive }) => {
                   <div className="feed-sub">{timeAgo(tx.timestamp)}</div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>

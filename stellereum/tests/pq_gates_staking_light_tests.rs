@@ -18,9 +18,7 @@ use stellereum::consensus::{
     EquivocationEvidence, QuorumCertificate, ValidatorSet, Vote, VoteKind,
 };
 use stellereum::light_client::LightHeader;
-use stellereum::post_quantum::{
-    set_pure_pq_override, FalconKeypair, PqScheme, FALCON512_SIG_LEN,
-};
+use stellereum::post_quantum::{set_pure_pq_override, FalconKeypair, PqScheme, FALCON512_SIG_LEN};
 use stellereum::staking::{
     CompactPqEquivocationEvidence, StakingError, StakingLedger, DEFAULT_COMMISSION_BPS,
 };
@@ -177,8 +175,10 @@ fn registered_key_returned_in_both_modes() {
 // --- Vote-slash path (`slash_equivocation_verified`, ~staking.rs:2321) ------
 
 #[test]
-fn vote_slash_ed_evidence_slashes_without_enforcement() {
+fn vote_slash_ed_evidence_refused_even_when_override_false() {
     let _lock = TEST_LOCK.lock().unwrap();
+    // Always-on FULL-PQ: set_pure_pq_override(Some(false)) is a no-op and
+    // Vote::verify_uncached rejects classical Ed25519 votes fail-closed.
     set_pure_pq_override(Some(false));
     clear_validator_pq_keys_for_tests();
     let sk = ed_key(0x21);
@@ -186,8 +186,8 @@ fn vote_slash_ed_evidence_slashes_without_enforcement() {
     let mut l = bonded(voter);
     let (a, b) = ed_votes(&sk, 10, 0);
     let ev = EquivocationEvidence::new(voter, a, b);
-    assert_eq!(l.slash_equivocation_verified(&ev).unwrap(), BURN_5PC);
-    assert_eq!(l.total_stake(&voter), BOND - BURN_5PC);
+    assert_eq!(l.slash_equivocation_verified(&ev).unwrap(), 0);
+    assert_eq!(l.total_stake(&voter), BOND);
     set_pure_pq_override(None);
 }
 

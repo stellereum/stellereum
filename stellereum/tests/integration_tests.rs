@@ -15,13 +15,15 @@
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
     use stellereum::cell::{BagOfCells, Cell, PatriciaTrie};
+    use stellereum::consensus::register_validator_pq_key;
     use stellereum::mev::MevPreemptionEngine;
-    use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
+    use stellereum::oracle::{pq_publisher_binding, OracleSafetyEngine, PqPriceFeedUpdate};
     use stellereum::orderbook::{OrderSide, OrderbookActor};
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
     use stellereum::sharding::{
         Block, CrossShardMessage, DynamicShardManager, SharedLiquidityHub, Transaction,
         MASTERCHAIN_SHARD,
@@ -276,15 +278,15 @@ mod tests {
 
     #[test]
     fn test_zkml_and_session_keys() {
-        let master_key = SigningKey::generate(&mut OsRng);
-        let session_key = SigningKey::generate(&mut OsRng);
-        let session_pub = session_key.verifying_key().to_bytes();
+        let master_key = FalconKeypair::generate_from_seed(0x11);
+        let session_key = FalconKeypair::generate_from_seed(0x12);
         let valid_until = 4_000_000_000;
         let max_gas = 100_000;
 
-        let mut auth = SessionKeyAuthorization::sign_delegation(
+        let mut auth = SessionKeyAuthorization::sign_delegation_falcon512(
             &master_key,
-            session_pub,
+            PqScheme::Falcon512,
+            session_key.public_key(),
             valid_until,
             max_gas,
             stellereum::zkml::SCOPE_ALL,
@@ -300,7 +302,7 @@ mod tests {
         // Test session key transaction signature verification
         let sample_tx = b"bot_arbitrage_trade_payload";
         let sig = session_key.sign(sample_tx);
-        assert!(auth.verify_session_signature(sample_tx, sig.to_bytes().as_ref()));
+        assert!(auth.verify_session_signature(sample_tx, &sig));
 
         // Real zkML Verifiable Proof test: 2-input -> 2-output Linear + ReLU layer
         let weights = vec![2, -1, 1, 3]; // [ [2, -1], [1, 3] ]
@@ -318,22 +320,22 @@ mod tests {
 
     #[test]
     fn test_oracle_3_tier_safety_network() {
-        let oracle_key = SigningKey::generate(&mut OsRng);
-        let oracle_pub = oracle_key.verifying_key().to_bytes();
+        let oracle_key = FalconKeypair::generate_from_seed(0x21);
+        let oracle_pub = pq_publisher_binding(oracle_key.public_key());
 
         let mut engine = OracleSafetyEngine::new(vec![oracle_pub]);
         engine.set_dex_twap("TON", 5_000_000); // $5.00
 
         let now = 10_000;
-        let update = PriceFeedUpdate::sign("TON", 5_100_000, now, &oracle_key);
+        let update = PqPriceFeedUpdate::sign("TON", 5_100_000, now, &oracle_key);
 
         // Tier 1 resolution
-        let resolved = engine.resolve_price(Some(&update), "TON", now).unwrap();
+        let resolved = engine.resolve_price_pq(Some(&update), "TON", now).unwrap();
         assert_eq!(resolved, 5_100_000);
 
         // Circuit breaker on depeg USDT
-        let bad_usdt = PriceFeedUpdate::sign("USDT", 920_000, now, &oracle_key); // $0.92
-        let depeg_res = engine.resolve_price(Some(&bad_usdt), "USDT", now);
+        let bad_usdt = PqPriceFeedUpdate::sign("USDT", 920_000, now, &oracle_key); // $0.92
+        let depeg_res = engine.resolve_price_pq(Some(&bad_usdt), "USDT", now);
         assert!(depeg_res.is_err());
         assert!(engine.circuit_breaker_triggered);
     }
@@ -369,6 +371,13 @@ mod tests {
         let v2_pub = val2.verifying_key().to_bytes();
         let v3_pub = val3.verifying_key().to_bytes();
 
+        let fk1 = FalconKeypair::generate_from_seed(0x31);
+        let fk2 = FalconKeypair::generate_from_seed(0x32);
+        let fk3 = FalconKeypair::generate_from_seed(0x33);
+        register_validator_pq_key(v1_pub, PqScheme::Falcon512, fk1.public_key.clone());
+        register_validator_pq_key(v2_pub, PqScheme::Falcon512, fk2.public_key.clone());
+        register_validator_pq_key(v3_pub, PqScheme::Falcon512, fk3.public_key.clone());
+
         let mut bridge = TeleportBridgeEngine::new(vec![v1_pub, v2_pub, v3_pub]);
 
         // Create deposit event from TON
@@ -389,8 +398,8 @@ mod tests {
         };
         let msg = TeleportBridgeEngine::deposit_signing_message(&proto);
 
-        let sig1 = val1.sign(&msg);
-        let sig2 = val2.sign(&msg);
+        let sig1 = fk1.sign(&msg);
+        let sig2 = fk2.sign(&msg);
 
         let deposit_event = TeleportDepositEvent {
             source_chain: SupportedChain::Ton,
@@ -398,7 +407,7 @@ mod tests {
             recipient,
             asset,
             amount,
-            validator_signatures: vec![(v1_pub, sig1.to_vec()), (v2_pub, sig2.to_vec())],
+            validator_signatures: vec![(v1_pub, sig1), (v2_pub, sig2)],
             zk_proof: None,
         };
 

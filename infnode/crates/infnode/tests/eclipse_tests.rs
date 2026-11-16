@@ -165,15 +165,19 @@ async fn raw_connect(addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
 
 /// None = refused. Some = accepted (AUTH frame back).
 async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
-    let (mut send, mut recv) =
-        tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await.ok()?.ok()?;
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .ok()?
+        .ok()?;
     send.write_all(wire).await.ok()?;
     let _ = send.finish();
     let bytes = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(65536))
         .await
         .ok()?
         .ok()?;
-    Frame::decode(&bytes).ok().filter(|f| f.kind == proto::kind::AUTH)
+    Frame::decode(&bytes)
+        .ok()
+        .filter(|f| f.kind == proto::kind::AUTH)
 }
 
 fn challenge_wire(
@@ -247,8 +251,14 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     let keys_h = NodeKeys::generate();
     let pq_h = PqKeys::generate();
     let victim = Node::new(
-        cfg("V", "127.0.0.1:19741", vec![peer_of("H", &keys_h, &pq_h, "127.0.0.1:19742", 0)], true),
-        keys_v.clone(), pq_v.clone(),
+        cfg(
+            "V",
+            "127.0.0.1:19741",
+            vec![peer_of("H", &keys_h, &pq_h, "127.0.0.1:19742", 0)],
+            true,
+        ),
+        keys_v.clone(),
+        pq_v.clone(),
         tmp.join("v"),
         PathBuf::new(),
     )
@@ -260,8 +270,14 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     });
     // Honest full node H with static route to V (for core.ping delivery rate).
     let honest = Node::new(
-        cfg("H", "127.0.0.1:19742", vec![peer_of("V", &keys_v, &pq_v, "127.0.0.1:19741", 0)], false),
-        keys_h.clone(), pq_h.clone(),
+        cfg(
+            "H",
+            "127.0.0.1:19742",
+            vec![peer_of("V", &keys_v, &pq_v, "127.0.0.1:19741", 0)],
+            false,
+        ),
+        keys_h.clone(),
+        pq_h.clone(),
         tmp.join("h"),
         PathBuf::new(),
     )
@@ -275,10 +291,13 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     let v_id = pq_v.pq_id();
 
     // Warmup: honest ping works pre-attack.
-    let r = tokio::time::timeout(Duration::from_secs(15), honest.request_to(v_id, "core.ping", vec![]))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(15),
+        honest.request_to(v_id, "core.ping", vec![]),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     assert!(resp_text(&r).contains("\"pong\":true"), "warmup ping");
 
     // Phase 1: single attacker identity, bad handshakes -> refused per
@@ -291,7 +310,9 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     for _ in 0..8 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
-            raw_handshake(&c, &det_bad_wire(&atk_keys, seed)).await.is_none(),
+            raw_handshake(&c, &det_bad_wire(&atk_keys, seed))
+                .await
+                .is_none(),
             "bad signature refused"
         );
         assert!(
@@ -313,7 +334,10 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         !victim.rep_is_throttled(&atk_id).await,
         "bad dials alone never throttle"
     );
-    assert!(!victim.rep_is_banned(&atk_id).await, "bad dials alone never ban");
+    assert!(
+        !victim.rep_is_banned(&atk_id).await,
+        "bad dials alone never ban"
+    );
 
     // Honest unaffected while the attacker is refused (raw + full-node paths).
     let h1 = NodeKeys::generate();
@@ -322,11 +346,17 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         raw_handshake(&c, &det_good_wire(&h1, 9001)).await.is_some(),
         "honest raw dial passes during throttle"
     );
-    let r = tokio::time::timeout(Duration::from_secs(15), honest.request_to(v_id, "core.ping", vec![]))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
-    assert!(resp_text(&r).contains("\"pong\":true"), "honest ping during throttle");
+    let r = tokio::time::timeout(
+        Duration::from_secs(15),
+        honest.request_to(v_id, "core.ping", vec![]),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
+    assert!(
+        resp_text(&r).contains("\"pong\":true"),
+        "honest ping during throttle"
+    );
 
     // Phase 2: 8-identity sybil burst -> every dial refused + dropped, every
     // sybil untouched (framing-impossible). Throttle-gate coverage is then
@@ -355,7 +385,10 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
             0,
             "sybil {i} untouched by its own bad dials"
         );
-        assert!(!victim.rep_is_banned(&k.id()).await, "sybil dials never ban");
+        assert!(
+            !victim.rep_is_banned(&k.id()).await,
+            "sybil dials never ban"
+        );
         // Genuine (attributed) abuse throttles the sybil at its own gate time.
         victim.rep_record_auth_failure(&k.id()).await;
         victim.rep_record_auth_failure(&k.id()).await;
@@ -363,11 +396,16 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
             victim.rep_is_throttled(&k.id()).await,
             "sybil {i} throttled once abuse is attributed"
         );
-        assert!(!victim.rep_is_banned(&k.id()).await, "sybil throttle, not ban");
+        assert!(
+            !victim.rep_is_banned(&k.id()).await,
+            "sybil throttle, not ban"
+        );
         // Gate refusal with a VALID wire, immediately (no decay gap).
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
-            raw_handshake(&c, &det_good_wire(k, 7000 + i as u64)).await.is_none(),
+            raw_handshake(&c, &det_good_wire(k, 7000 + i as u64))
+                .await
+                .is_none(),
             "throttled identity refused even when valid"
         );
         attacker_refused += 1;
@@ -391,7 +429,9 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     assert!(victim.rep_bans_total() >= 1, "ban counter bumps");
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &det_good_wire(&atk_keys, 4242)).await.is_none(),
+        raw_handshake(&c, &det_good_wire(&atk_keys, 4242))
+            .await
+            .is_none(),
         "banned identity refused even when valid"
     );
     attacker_refused += 1;
@@ -399,16 +439,21 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     // Honest delivery rate: 5/5 pings during full attack pressure.
     let mut honest_ok = 0usize;
     for _ in 0..5 {
-        let r =
-            tokio::time::timeout(Duration::from_secs(15), honest.request_to(v_id, "core.ping", vec![]))
-                .await
-                .expect("no hang")
-                .expect("transport ok");
+        let r = tokio::time::timeout(
+            Duration::from_secs(15),
+            honest.request_to(v_id, "core.ping", vec![]),
+        )
+        .await
+        .expect("no hang")
+        .expect("transport ok");
         if resp_text(&r).contains("\"pong\":true") {
             honest_ok += 1;
         }
     }
-    assert_eq!(honest_ok, 5, "honest delivery 5/5 while attacker fully throttled/banned");
+    assert_eq!(
+        honest_ok, 5,
+        "honest delivery 5/5 while attacker fully throttled/banned"
+    );
     // Attacker refuse rate: every attacker dial refused (8 bad dials phase 1,
     // 16 bad + 8 gate refusals phase 2, 1 ban refusal phase 3 => 33 total).
     assert!(
@@ -422,7 +467,10 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     );
     // IP itself never strike-banned (threshold 1000 >> our failures).
     let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    assert!(!victim.is_banned(&loopback).await, "no shared-IP blast radius");
+    assert!(
+        !victim.is_banned(&loopback).await,
+        "no shared-IP blast radius"
+    );
 
     sv.abort();
     sh.abort();
@@ -442,7 +490,8 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
     let pq_v = PqKeys::generate();
     let victim = Node::new(
         cfg("V", "127.0.0.1:19743", vec![], true),
-        keys_v.clone(), pq_v.clone(),
+        keys_v.clone(),
+        pq_v.clone(),
         tmp.join("v"),
         PathBuf::new(),
     )
@@ -476,8 +525,14 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
             banned += 1;
         }
     }
-    assert_eq!(throttled, N, "per-identity limit bites every sybil ({N}/{N})");
-    assert_eq!(banned, 0, "throttle imposes no ban: attacker ban share 0/{N}");
+    assert_eq!(
+        throttled, N,
+        "per-identity limit bites every sybil ({N}/{N})"
+    );
+    assert_eq!(
+        banned, 0,
+        "throttle imposes no ban: attacker ban share 0/{N}"
+    );
 
     // Honest identity born neutral at the same layer while sybils burn.
     let honest = PqKeys::generate().pq_id();
@@ -496,13 +551,18 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
             admitted += 1;
         }
     }
-    assert_eq!(admitted, 6, "per-IP burst bound is rate*2 = 6, then throttle");
+    assert_eq!(
+        admitted, 6,
+        "per-IP burst bound is rate*2 = 6, then throttle"
+    );
 
     // Network: honest raw dial passes while all 16 sybils are throttled.
     let hk = NodeKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &det_good_wire(&hk, 31337)).await.is_some(),
+        raw_handshake(&c, &det_good_wire(&hk, 31337))
+            .await
+            .is_some(),
         "honest passes under sybil pressure"
     );
     // Bounded attacker share: 0 banned honest, 16/16 sybils contained.
@@ -532,15 +592,31 @@ async fn eclipse_dht_poison_honest_records_persist() {
     assert!(local_sa > 0, "honest record has a clock");
     // Stale replica loses.
     assert!(
-        !kv.merge_replica("eclipse:rule", "v-evil-stale".into(), 3_600_000, [9u8; NODEID_LEN], local_sa - 60_000),
+        !kv.merge_replica(
+            "eclipse:rule",
+            "v-evil-stale".into(),
+            3_600_000,
+            [9u8; NODEID_LEN],
+            local_sa - 60_000
+        ),
         "older stored_at must not overwrite"
     );
     // Clockless replica loses against present local.
     assert!(
-        !kv.merge_replica("eclipse:rule", "v-evil-noclock".into(), 3_600_000, [9u8; NODEID_LEN], 0),
+        !kv.merge_replica(
+            "eclipse:rule",
+            "v-evil-noclock".into(),
+            3_600_000,
+            [9u8; NODEID_LEN],
+            0
+        ),
         "missing stored_at must not overwrite"
     );
-    assert_eq!(kv.get("eclipse:rule").as_deref(), Some("v-honest"), "honest persists (pure)");
+    assert_eq!(
+        kv.get("eclipse:rule").as_deref(),
+        Some("v-honest"),
+        "honest persists (pure)"
+    );
     // Newer replica wins (proves the rule direction, not attacker-favouring).
     assert!(
         kv.merge_replica(
@@ -585,16 +661,28 @@ async fn eclipse_dht_poison_honest_records_persist() {
     let kb = NodeKeys::generate();
     let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", "127.0.0.1:19744", vec![peer_of("B", &kb, &pb, "127.0.0.1:19745", 0)], false),
-        ka.clone(), pa.clone(),
+        cfg(
+            "A",
+            "127.0.0.1:19744",
+            vec![peer_of("B", &kb, &pb, "127.0.0.1:19745", 0)],
+            false,
+        ),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", "127.0.0.1:19745", vec![peer_of("A", &ka, &pa, "127.0.0.1:19744", 0)], false),
-        kb.clone(), pb.clone(),
+        cfg(
+            "B",
+            "127.0.0.1:19745",
+            vec![peer_of("A", &ka, &pa, "127.0.0.1:19744", 0)],
+            false,
+        ),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -630,7 +718,11 @@ async fn eclipse_dht_poison_honest_records_persist() {
         .await
         .expect("no hang")
         .expect("transport ok");
-    assert!(resp_text(&r).contains("\"lww\":\"local\""), "stale keeps local, got {}", resp_text(&r).chars().take(160).collect::<String>());
+    assert!(
+        resp_text(&r).contains("\"lww\":\"local\""),
+        "stale keeps local, got {}",
+        resp_text(&r).chars().take(160).collect::<String>()
+    );
 
     // Poison 2: no clock overwrite attempt -> local-present, kept.
     let p = serde_json::json!({ "key": key, "value": "v-evil-noclock", "ttl": 3600 })
@@ -648,21 +740,29 @@ async fn eclipse_dht_poison_honest_records_persist() {
 
     // Poison 3: far-future clock (skew) -> skew guard keeps local.
     let skew = infnode::dht::now_ms() + 3_600_000;
-    let p = serde_json::json!({ "key": key, "value": "v-evil-future", "ttl": 3600, "stored_at": skew })
-        .to_string()
-        .into_bytes();
+    let p =
+        serde_json::json!({ "key": key, "value": "v-evil-future", "ttl": 3600, "stored_at": skew })
+            .to_string()
+            .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.store", p))
         .await
         .expect("no hang")
         .expect("transport ok");
-    assert!(resp_text(&r).contains("\"lww\":\"skew\""), "future skew keeps local, got {}", resp_text(&r).chars().take(160).collect::<String>());
+    assert!(
+        resp_text(&r).contains("\"lww\":\"skew\""),
+        "future skew keeps local, got {}",
+        resp_text(&r).chars().take(160).collect::<String>()
+    );
 
     // Honest value persists byte-for-byte after all three poison attempts.
     let p = serde_json::json!({ "key": key }).to_string().into_bytes();
-    let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.find_value", p))
-        .await
-        .expect("no hang")
-        .expect("transport ok");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.request_to(b_id, "dht.find_value", p),
+    )
+    .await
+    .expect("no hang")
+    .expect("transport ok");
     assert!(
         resp_text(&r).contains("v1-honest"),
         "honest record persists, got {}",
@@ -677,13 +777,17 @@ async fn eclipse_dht_poison_honest_records_persist() {
             "ed_pub": hex::encode(evil_keys.verifying.to_bytes()),
         }
     });
-    let p = serde_json::json!({ "routes": routes }).to_string().into_bytes();
+    let p = serde_json::json!({ "routes": routes })
+        .to_string()
+        .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.update", p))
         .await
         .expect("no hang")
         .expect("transport ok");
     assert!(resp_text(&r).contains("\"ok\":true"), "update answered");
-    let p = serde_json::json!({ "node": poison_id, "ttl": 1 }).to_string().into_bytes();
+    let p = serde_json::json!({ "node": poison_id, "ttl": 1 })
+        .to_string()
+        .into_bytes();
     let r = tokio::time::timeout(Duration::from_secs(20), a.request_to(b_id, "dht.lookup", p))
         .await
         .expect("no hang")
@@ -750,16 +854,28 @@ async fn eclipse_churn_storm_peer_table_bounded() {
     let kb = NodeKeys::generate();
     let pb = PqKeys::generate();
     let a = Node::new(
-        cfg("A", "127.0.0.1:19746", vec![peer_of("B", &kb, &pb, "127.0.0.1:19747", 0)], false),
-        ka.clone(), pa.clone(),
+        cfg(
+            "A",
+            "127.0.0.1:19746",
+            vec![peer_of("B", &kb, &pb, "127.0.0.1:19747", 0)],
+            false,
+        ),
+        ka.clone(),
+        pa.clone(),
         tmp.join("a"),
         PathBuf::new(),
     )
     .await
     .expect("node A");
     let b = Node::new(
-        cfg("B", "127.0.0.1:19747", vec![peer_of("A", &ka, &pa, "127.0.0.1:19746", 0)], false),
-        kb.clone(), pb.clone(),
+        cfg(
+            "B",
+            "127.0.0.1:19747",
+            vec![peer_of("A", &ka, &pa, "127.0.0.1:19746", 0)],
+            false,
+        ),
+        kb.clone(),
+        pb.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )
@@ -780,17 +896,26 @@ async fn eclipse_churn_storm_peer_table_bounded() {
 
     // 30 rapid connect/use/disconnect cycles, each bounded at 15s.
     for _ in 0..30 {
-        let r = tokio::time::timeout(Duration::from_secs(15), a.request_to(b_id, "core.ping", vec![]))
-            .await
-            .expect("no hang")
-            .expect("transport ok");
+        let r = tokio::time::timeout(
+            Duration::from_secs(15),
+            a.request_to(b_id, "core.ping", vec![]),
+        )
+        .await
+        .expect("no hang")
+        .expect("transport ok");
         assert!(resp_text(&r).contains("\"pong\":true"), "ping inside churn");
         a.invalidate_peer_conn(b_id).await;
     }
     let peers_after = a.peers.read().await.len();
     let known_after = a.known_peers().await.len();
-    assert_eq!(peers_before, peers_after, "peer table constant under churn ({peers_before})");
-    assert_eq!(known_before, known_after, "known set constant under churn ({known_before})");
+    assert_eq!(
+        peers_before, peers_after,
+        "peer table constant under churn ({peers_before})"
+    );
+    assert_eq!(
+        known_before, known_after,
+        "known set constant under churn ({known_before})"
+    );
     assert!(known_after <= 8, "known set small bound, got {known_after}");
 
     // Invalid DHT-discovered records never enter the peer table (FULL-PQ:

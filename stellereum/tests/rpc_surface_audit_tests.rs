@@ -33,8 +33,7 @@ const FAUCET_SEED: [u8; 32] = [0x33u8; 32];
 fn faucet_addr() -> [u8; 32] {
     // FULL-PQ: the faucet account is the Falcon-512 address derived from the
     // seed (Faucet::account); fund that address, never a classical one.
-    let pq_key =
-        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&FAUCET_SEED);
+    let pq_key = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&FAUCET_SEED);
     stellereum::post_quantum::derive_pq_address(
         stellereum::post_quantum::PqScheme::Falcon512,
         &pq_key.public_key,
@@ -97,7 +96,9 @@ fn drip_req(address: &str) -> Value {
 }
 
 fn err_of(v: &Value) -> Option<String> {
-    v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string())
+    v.get("error")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,10 @@ async fn admin_methods_refuse_unauthenticated_when_token_configured() {
     // (method, params): every one of these mutates node state or signs with
     // the node key, so each must demand the token.
     let cases: Vec<(&str, Value)> = vec![
-        ("stell_submitProposal", json!({"title": "t", "type": "signal"})),
+        (
+            "stell_submitProposal",
+            json!({"title": "t", "type": "signal"}),
+        ),
         ("stell_vote", json!({"id": 0, "voter": addr_hex})),
         ("stell_executeProposal", json!({"id": 0})),
         ("stell_mempoolDump", json!({})),
@@ -165,7 +169,9 @@ async fn admin_methods_accept_the_configured_token() {
         .call("stell_submitProposal", json!({"token": AUTH_TOKEN}))
         .await;
     assert!(
-        err_of(&r).unwrap_or_default().contains("missing proposal title"),
+        err_of(&r)
+            .unwrap_or_default()
+            .contains("missing proposal title"),
         "gate must pass with the token: {r}"
     );
     // signMessage with the token signs.
@@ -204,10 +210,7 @@ async fn faucet_refuses_without_token_and_fails_closed_without_config() {
     );
     // Wrong token.
     let r = st
-        .call(
-            "stell_faucet",
-            json!({"address": who, "token": "guess"}),
-        )
+        .call("stell_faucet", json!({"address": who, "token": "guess"}))
         .await;
     assert!(
         err_of(&r).unwrap_or_default().contains("faucet token"),
@@ -239,7 +242,9 @@ async fn faucet_refuses_without_token_and_fails_closed_without_config() {
     });
     let r = untokened.call("stell_faucet", drip_req(&who)).await;
     assert!(
-        err_of(&r).unwrap_or_default().contains("refusing to dispense"),
+        err_of(&r)
+            .unwrap_or_default()
+            .contains("refusing to dispense"),
         "unconfigured faucet token must fail closed: {r}"
     );
     assert_eq!(untokened.mempool.read().await.len(), 0);
@@ -378,7 +383,10 @@ async fn malformed_inputs_get_clean_errors() {
         ("stell_getBalance", json!({})),
         ("stell_getBalance", json!(big_hex.clone())),
         ("stell_getBalance", json!(12345)),
-        ("stell_getProof", json!({"address": hex::encode([1u8; 32]), "storage_keys": vec!["x"; 33]})),
+        (
+            "stell_getProof",
+            json!({"address": hex::encode([1u8; 32]), "storage_keys": vec!["x"; 33]}),
+        ),
         (
             "stell_getProof",
             json!({"address": hex::encode([1u8; 32]), "storage_keys": [42]}),
@@ -409,14 +417,19 @@ async fn malformed_inputs_get_clean_errors() {
     // Oversized raw tx: 600 KB of zeros decodes as hex but is over the body
     // cap, so it is refused as too large rather than deserialized.
     let huge = format!("0x{}", "00".repeat(600_000));
-    let r = st.call("stell_sendRawTransaction", json!({"tx": huge})).await;
+    let r = st
+        .call("stell_sendRawTransaction", json!({"tx": huge}))
+        .await;
     assert!(
         err_of(&r).is_some(),
         "oversized tx must be refused, got result"
     );
     // runGetMethod reports param problems inside the result envelope.
     let r = st
-        .call("stell_runGetMethod", json!({"address": "0x", "method": "m"}))
+        .call(
+            "stell_runGetMethod",
+            json!({"address": "0x", "method": "m"}),
+        )
         .await;
     assert!(
         r.get("success") == Some(&json!(false)),
@@ -432,12 +445,20 @@ async fn oversized_reflections_are_bounded() {
     let r = st.call(&format!("stell_{huge}"), json!({})).await;
     let e = err_of(&r).unwrap_or_default();
     assert!(e.contains("method not found"), "got: {e}");
-    assert!(e.len() < 1_000, "method reflection must be bounded: {}", e.len());
+    assert!(
+        e.len() < 1_000,
+        "method reflection must be bounded: {}",
+        e.len()
+    );
     // Unknown subscription type, same rule.
     let r = st.call("stell_subscribe", json!([huge.clone()])).await;
     let e = err_of(&r).unwrap_or_default();
     assert!(e.contains("unknown subscription type"), "got: {e}");
-    assert!(e.len() < 1_000, "subscribe reflection must be bounded: {}", e.len());
+    assert!(
+        e.len() < 1_000,
+        "subscribe reflection must be bounded: {}",
+        e.len()
+    );
     // runGetMethod arg parsing echoes the offending string, truncated.
     let r = st
         .call(
@@ -460,7 +481,11 @@ async fn oversized_reflections_are_bounded() {
         .await;
     let e = err_of(&r).unwrap_or_default();
     assert!(e.contains("invalid contract address"), "got: {e}");
-    assert!(e.len() < 1_000, "address reflection must be bounded: {}", e.len());
+    assert!(
+        e.len() < 1_000,
+        "address reflection must be bounded: {}",
+        e.len()
+    );
 }
 
 #[tokio::test]
@@ -480,7 +505,10 @@ async fn subscription_topics_are_capped() {
         "over-cap topics must be refused: {r}"
     );
     // 33 topics (comma-string form) is refused too.
-    let csv = (0..33).map(|i| format!("t{i}")).collect::<Vec<_>>().join(",");
+    let csv = (0..33)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let r = st
         .call(
             "stell_subscribe",
@@ -545,20 +573,29 @@ async fn error_messages_carry_no_secret_material() {
     let seed_hex = hex::encode(FAUCET_SEED);
     let priv_hex = hex::encode([0x77u8; 32]);
     let probes: Vec<Value> = vec![
-        st.call("stell_faucet", json!({"address": hex::encode([1u8; 32])})).await,
+        st.call("stell_faucet", json!({"address": hex::encode([1u8; 32])}))
+            .await,
         st.call(
             "stell_faucet",
             json!({"address": hex::encode([1u8; 32]), "token": "wrong"}),
         )
         .await,
-        st.call("stell_faucet", json!({"address": "zz", "token": FAUCET_TOKEN})).await,
+        st.call(
+            "stell_faucet",
+            json!({"address": "zz", "token": FAUCET_TOKEN}),
+        )
+        .await,
         st.call(
             "stell_faucet",
             json!({"address": "0xzzzz", "token": FAUCET_TOKEN}),
         )
         .await,
-        authed.call("stell_mempoolDump", json!({"token": "guess"})).await,
-        authed.call("stell_deployContract", json!({"code": "0x00"})).await,
+        authed
+            .call("stell_mempoolDump", json!({"token": "guess"}))
+            .await,
+        authed
+            .call("stell_deployContract", json!({"code": "0x00"}))
+            .await,
         authed
             .call(
                 "stell_deployContract",
@@ -566,8 +603,10 @@ async fn error_messages_carry_no_secret_material() {
             )
             .await,
         st.call("stell_getBalance", json!("0xab")).await,
-        st.call("stell_sendRawTransaction", json!({"tx": "zz"})).await,
-        st.call("stell_nopeMissing", json!({"token": AUTH_TOKEN})).await,
+        st.call("stell_sendRawTransaction", json!({"tx": "zz"}))
+            .await,
+        st.call("stell_nopeMissing", json!({"token": AUTH_TOKEN}))
+            .await,
         st.call("stell_subscribe", json!(["bogus"])).await,
     ];
     let forbidden = [
@@ -743,7 +782,11 @@ async fn ws_expensive_reads_are_capped_per_message_without_dropping() {
             .expect("reply")
             .expect("frame");
         let reply: Value = serde_json::from_str(reply.to_text().expect("text")).expect("json");
-        assert_eq!(reply["result"], json!(777), "cheap read must succeed: {reply}");
+        assert_eq!(
+            reply["result"],
+            json!(777),
+            "cheap read must succeed: {reply}"
+        );
     }
     let _ = ws.close(None).await;
     server.abort();
@@ -793,11 +836,17 @@ async fn in_process_subscribe_is_attributed_to_the_local_bucket() {
     // filling it there would starve other tests' subscribes.
     let h = stellereum::rpc::SubscriptionHub::new();
     for _ in 0..stellereum::rpc::MAX_SUBSCRIPTIONS_PER_CLIENT {
-        h.subscribe_for(SubscriptionTopic::NewHeads, Some(stellereum::rpc::LOCAL_SUBSCRIBER_ID))
-            .expect("within the per-client cap");
+        h.subscribe_for(
+            SubscriptionTopic::NewHeads,
+            Some(stellereum::rpc::LOCAL_SUBSCRIBER_ID),
+        )
+        .expect("within the per-client cap");
     }
     let e = h
-        .subscribe_for(SubscriptionTopic::NewHeads, Some(stellereum::rpc::LOCAL_SUBSCRIBER_ID))
+        .subscribe_for(
+            SubscriptionTopic::NewHeads,
+            Some(stellereum::rpc::LOCAL_SUBSCRIBER_ID),
+        )
         .expect_err("the 65th local subscription must be refused");
     assert!(
         e.contains("per-client"),

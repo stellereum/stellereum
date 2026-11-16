@@ -147,11 +147,7 @@ fn actor_tx(from: &SigningKey, n_top: usize) -> Transaction {
     )
 }
 
-async fn actor_block(
-    rt: &ValidatorRuntime,
-    proposer: &SigningKey,
-    txs: Vec<Transaction>,
-) -> Block {
+async fn actor_block(rt: &ValidatorRuntime, proposer: &SigningKey, txs: Vec<Transaction>) -> Block {
     let mut b = Block::new_for_test(
         MASTERCHAIN_SHARD,
         rt.hc.height,
@@ -181,7 +177,9 @@ async fn stale_envelope_refused_and_seats_nothing() {
     let block = genuine(&rt, &sched, rt.hc.height, [0u8; 32], 1_000, None).await;
     let bh = block.compute_hash();
     assert_eq!(
-        rt.on_proposal(sid, block, r).await.expect("timely must seat"),
+        rt.on_proposal(sid, block, r)
+            .await
+            .expect("timely must seat"),
         bh
     );
     assert!(rt.hc.has_live_proposal());
@@ -298,10 +296,7 @@ async fn far_future_envelope_beyond_window_refused_without_moving() {
         rt.hc.round, r0,
         "a far claim must not move our round (align-window abuse is bounded)"
     );
-    assert!(
-        rt.hc.proposal.is_none(),
-        "a far claim must seat nothing"
-    );
+    assert!(rt.hc.proposal.is_none(), "a far claim must seat nothing");
 }
 
 // ============================================================================
@@ -436,7 +431,15 @@ async fn evidence_good_qc_accepted() {
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // 3-of-4 precommit QC for parent 0 naming the zero prev_hash: quorum.
-    let good = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let good = qc_over(
+        &ks,
+        &fks,
+        &[0, 1, 2],
+        0,
+        0,
+        VoteKind::Precommit,
+        Some([0u8; 32]),
+    );
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(good)).await;
     rt.on_proposal(sid, block, r)
         .await
@@ -451,7 +454,15 @@ async fn evidence_weak_qc_refused() {
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // 2-of-4 carries power 2 < quorum 3: an attacker QC subset.
-    let weak = qc_over(&ks, &fks, &[0, 1], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let weak = qc_over(
+        &ks,
+        &fks,
+        &[0, 1],
+        0,
+        0,
+        VoteKind::Precommit,
+        Some([0u8; 32]),
+    );
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(weak)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -472,7 +483,15 @@ async fn evidence_wrong_height_refused() {
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Names height 1, but the parent of a height-1 block is height 0.
-    let wrong_h = qc_over(&ks, &fks, &[0, 1, 2], 1, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let wrong_h = qc_over(
+        &ks,
+        &fks,
+        &[0, 1, 2],
+        1,
+        0,
+        VoteKind::Precommit,
+        Some([0u8; 32]),
+    );
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(wrong_h)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -493,7 +512,15 @@ async fn evidence_wrong_hash_refused() {
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Right height, but names a parent block that is not our prev_hash.
-    let wrong_bh = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([7u8; 32]));
+    let wrong_bh = qc_over(
+        &ks,
+        &fks,
+        &[0, 1, 2],
+        0,
+        0,
+        VoteKind::Precommit,
+        Some([7u8; 32]),
+    );
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(wrong_bh)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -514,7 +541,15 @@ async fn evidence_wrong_kind_prevote_refused() {
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Prevotes never prove finality: only a precommit QC is evidence.
-    let prevote = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Prevote, Some([0u8; 32]));
+    let prevote = qc_over(
+        &ks,
+        &fks,
+        &[0, 1, 2],
+        0,
+        0,
+        VoteKind::Prevote,
+        Some([0u8; 32]),
+    );
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(prevote)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -634,7 +669,12 @@ async fn equivocating_proposer_second_distinct_body_refused() {
     // First body seats.
     let first = genuine(&rt, &sched, rt.hc.height, [0u8; 32], 1_000, None).await;
     let h1 = first.compute_hash();
-    assert_eq!(rt.on_proposal(sid, first, r).await.expect("first must seat"), h1);
+    assert_eq!(
+        rt.on_proposal(sid, first, r)
+            .await
+            .expect("first must seat"),
+        h1
+    );
 
     // Second DISTINCT body (different timestamp => different hash, still
     // otherwise valid) is refused, and the first seating survives.
@@ -671,7 +711,12 @@ async fn identical_rebroadcast_is_idempotent_ok() {
 
     let block = genuine(&rt, &sched, rt.hc.height, [0u8; 32], 1_000, None).await;
     let bh = block.compute_hash();
-    assert_eq!(rt.on_proposal(sid, block.clone(), r).await.expect("first must seat"), bh);
+    assert_eq!(
+        rt.on_proposal(sid, block.clone(), r)
+            .await
+            .expect("first must seat"),
+        bh
+    );
     // Delayed duplicate of the SAME body: accepted again, same hash, same round.
     assert_eq!(
         rt.on_proposal(sid, block, r)

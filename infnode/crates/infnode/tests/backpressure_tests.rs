@@ -9,10 +9,9 @@
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{
-    Node, MAX_APP_SUBS_PER_TOPIC, MAX_CONN_PEERS_TOTAL, MAX_CONNS_PER_PEER,
-    MAX_MAIL_CACHE_ENTRIES, MAX_OUTBOX_FLUSH_PER_PEER, MAX_OUTBOX_PEERS_TOTAL,
-    MAX_REORDER_BUF_PER_KEY, MAX_REORDER_KEYS, MAX_ROUTES_TOTAL,
-    MAX_SESSIONLESS_GUARD_PEERS, MAX_SESSIONS_TOTAL, MAX_SUBS_PEERS_PER_TOPIC,
+    Node, MAX_APP_SUBS_PER_TOPIC, MAX_CONNS_PER_PEER, MAX_CONN_PEERS_TOTAL, MAX_MAIL_CACHE_ENTRIES,
+    MAX_OUTBOX_FLUSH_PER_PEER, MAX_OUTBOX_PEERS_TOTAL, MAX_REORDER_BUF_PER_KEY, MAX_REORDER_KEYS,
+    MAX_ROUTES_TOTAL, MAX_SESSIONLESS_GUARD_PEERS, MAX_SESSIONS_TOTAL, MAX_SUBS_PEERS_PER_TOPIC,
     MAX_SUBS_TOPICS, MAX_TOPIC_SEQ_TOPICS,
 };
 use infnode::proto::MAX_OUTBOX_PER_PEER;
@@ -289,15 +288,27 @@ async fn honest_delivery_succeeds_despite_abusive_flood() {
     let pq_b = PqKeys::generate();
     let listen_a = "127.0.0.1:21100".to_string();
     let listen_b = "127.0.0.1:21101".to_string();
-    let cfg_a = mesh_cfg("live-a", &listen_a, vec![peer_of("b", &keys_b, &pq_b, &listen_b)]);
-    let cfg_b = mesh_cfg("live-b", &listen_b, vec![peer_of("a", &keys_a, &pq_a, &listen_a)]);
+    let cfg_a = mesh_cfg(
+        "live-a",
+        &listen_a,
+        vec![peer_of("b", &keys_b, &pq_b, &listen_b)],
+    );
+    let cfg_b = mesh_cfg(
+        "live-b",
+        &listen_b,
+        vec![peer_of("a", &keys_a, &pq_a, &listen_a)],
+    );
     let dir_a = base.join("a");
     let dir_b = base.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
-    let node_a = Node::new(cfg_a, keys_a, pq_a, dir_a, PathBuf::new()).await.unwrap();
+    let node_a = Node::new(cfg_a, keys_a, pq_a, dir_a, PathBuf::new())
+        .await
+        .unwrap();
     let id_b = pq_b.pq_id();
-    let node_b = Node::new(cfg_b, keys_b, pq_b, dir_b, PathBuf::new()).await.unwrap();
+    let node_b = Node::new(cfg_b, keys_b, pq_b, dir_b, PathBuf::new())
+        .await
+        .unwrap();
     // Only B serves: A dials on demand inside flush. (Serving A too would
     // start A's background flush loop and make the counts below racy.)
     let hb = tokio::spawn({
@@ -312,11 +323,25 @@ async fn honest_delivery_succeeds_despite_abusive_flood() {
     let evil = pid(9, 9);
     for i in 0..200u64 {
         node_a
-            .bp_enqueue_outbox(evil, "t".to_string(), format!("evil{i}"), i, i, "evil".to_string())
+            .bp_enqueue_outbox(
+                evil,
+                "t".to_string(),
+                format!("evil{i}"),
+                i,
+                i,
+                "evil".to_string(),
+            )
             .await;
     }
     node_a
-        .bp_enqueue_outbox(id_b, "t".to_string(), "honest-live".to_string(), 777, 1, "a".to_string())
+        .bp_enqueue_outbox(
+            id_b,
+            "t".to_string(),
+            "honest-live".to_string(),
+            777,
+            1,
+            "a".to_string(),
+        )
         .await;
     node_a.bp_flush_outbox_once().await;
 
@@ -334,7 +359,10 @@ async fn honest_delivery_succeeds_despite_abusive_flood() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(got.is_some(), "honest message must be delivered despite flood");
+    assert!(
+        got.is_some(),
+        "honest message must be delivered despite flood"
+    );
     // Honest queue drained by delivery; evil flood bounded to one budget.
     assert_eq!(node_a.bp_outbox_len(id_b).await, 0);
     assert_eq!(
@@ -530,12 +558,9 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 /// Mint `n` real loopback QUIC connections (distinct stable_ids).
 async fn mint_conns(n: usize) -> Vec<quinn::Connection> {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert_der =
-        rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(
-        certified.key_pair.serialize_der(),
-    )
-    .unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
     let server_cfg = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der).unwrap();
     let server_ep = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server_ep.local_addr().unwrap();
@@ -549,8 +574,7 @@ async fn mint_conns(n: usize) -> Vec<quinn::Connection> {
             }
         }
     });
-    let mut client_ep =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).unwrap();
+    let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).unwrap();
     let rc = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -559,7 +583,8 @@ async fn mint_conns(n: usize) -> Vec<quinn::Connection> {
     .dangerous()
     .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny))
     .with_no_client_auth();
-    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(std::sync::Arc::new(rc)).unwrap();
+    let quic_cfg =
+        quinn::crypto::rustls::QuicClientConfig::try_from(std::sync::Arc::new(rc)).unwrap();
     client_ep.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(quic_cfg)));
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -588,7 +613,8 @@ async fn conns_tables_bounded() {
     // exercises the admission rule, not the handshake).
     let shared = conns[0].clone();
     for i in 0..(MAX_CONN_PEERS_TOTAL + 5) {
-        node.bp_conn_insert(pid_n(1_000_000 + i), shared.clone()).await;
+        node.bp_conn_insert(pid_n(1_000_000 + i), shared.clone())
+            .await;
     }
     assert!(node.bp_conns_peers().await <= MAX_CONN_PEERS_TOTAL);
 }

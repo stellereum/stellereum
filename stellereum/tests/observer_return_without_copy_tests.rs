@@ -34,9 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellereum::bootstrap;
 use stellereum::consensus::{
-    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size,
-    vote_sign_bytes, PqMicroCertificate, QuorumCertificate, ValidatorSet, VoteKind,
-    PQ_UQC_MARKER_ID,
+    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size, vote_sign_bytes,
+    PqMicroCertificate, QuorumCertificate, ValidatorSet, VoteKind, PQ_UQC_MARKER_ID,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;

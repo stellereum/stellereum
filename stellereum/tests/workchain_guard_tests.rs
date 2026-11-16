@@ -6,11 +6,11 @@
 //! (`docs/PUBLIC_TESTNET_CODE_GAPS.md §1`) unless the local soak/test hatch
 //! `STELL_EXPERIMENTAL_SHARDS=1` is set.
 
+use std::sync::Mutex;
 use stellereum::sharding::{
     check_workchain_boot_guard, check_workchain_boot_guard_with_hatch, ShardRegistry,
     EXPERIMENTAL_SHARDS_ENV, SHARD_REGISTRY_ENV, WORKCHAIN_FREEZE_DOC,
 };
-use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -61,7 +61,10 @@ fn multishard_without_hatch_refuses_naming_freeze() {
         err.contains(WORKCHAIN_FREEZE_DOC),
         "error must name the freeze doc: {err}"
     );
-    assert!(err.contains("STELL_SHARDS"), "error must name STELL_SHARDS: {err}");
+    assert!(
+        err.contains("STELL_SHARDS"),
+        "error must name STELL_SHARDS: {err}"
+    );
     assert!(
         err.contains(EXPERIMENTAL_SHARDS_ENV),
         "error must document the hatch: {err}"
@@ -88,7 +91,10 @@ fn noncanonical_single_shard_without_hatch_refuses() {
     let registry = ShardRegistry::from_ids([1]);
     let err = check_workchain_boot_guard_with_hatch(&registry, false)
         .expect_err("must refuse non-canonical single shard");
-    assert!(err.contains(WORKCHAIN_FREEZE_DOC), "must name freeze doc: {err}");
+    assert!(
+        err.contains(WORKCHAIN_FREEZE_DOC),
+        "must name freeze doc: {err}"
+    );
     assert!(check_workchain_boot_guard_with_hatch(&registry, true).is_ok());
 }
 

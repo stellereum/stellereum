@@ -3,8 +3,8 @@
 //! Anyone who knows the public admin id (1) could burn admin funds.
 //! Invariant: forged burn must fail and leave balances intact.
 
-use sts20_token::{balance_of, burn, init};
 use stellereum_contract_sdk::reset_mock_state;
+use sts20_token::{balance_of, burn, init};
 
 #[test]
 fn poc_p0_forged_admin_burn_must_fail() {

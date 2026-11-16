@@ -6,6 +6,7 @@
 //! passing PoC here = the flaw EXISTS (fail-open proven offline).
 
 use serde_json::{json, Value};
+use std::sync::Arc;
 use stellereum::consensus_net::{ConsensusMsg, MAX_BATCH_BYTES, MAX_CONSENSUS_MSG};
 use stellereum::governance::Governance;
 use stellereum::mempool::Mempool;
@@ -14,7 +15,6 @@ use stellereum::rpc::{handle_rpc_call, ReceiptIndex, RpcRequest, RpcState};
 use stellereum::sharding::{Block, ShardRegistry, Transaction};
 use stellereum::staking::StakingLedger;
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 fn test_rpc_state() -> Arc<RpcState> {
     Arc::new(RpcState {
@@ -228,9 +228,7 @@ async fn poc_negative_controls_still_fail_closed() {
     // unshield > 64 inputs refused (native dispatch, no engine state needed
     // for the length gate).
     let inputs: Vec<Value> = (0..65)
-        .map(|_| {
-            json!({"commitment": "00".repeat(32), "amount": "1", "blinding": "00".repeat(32)})
-        })
+        .map(|_| json!({"commitment": "00".repeat(32), "amount": "1", "blinding": "00".repeat(32)}))
         .collect();
     let err = native_api::dispatch(
         &st.engine,

@@ -57,8 +57,10 @@ const FAUCET_SEED_HEX: &str = "1111111111111111111111111111111111111111111111111
 /// History: `61336779...` was v1 bare-MIN unbacked genesis bond.
 /// `f473a74a...` (SEC-ECON-01 P0) transfers the genesis validator bond (1,000 STELL)
 /// from validator liquid balances to STAKING_POOL so genesis stake is fully backed.
+/// `c07880e0...` (FULL-PQ Faucet) reflects `Faucet::account()` deriving the
+/// Falcon-512 PQ address from `FAUCET_SEED_HEX` instead of an Ed25519 pubkey.
 const EXPECTED_GENESIS_ROOT: &str =
-    "f473a74aa0dbdff3f99ecbf31c65adc71af250e673e823caaf9ef1a781c27648";
+    "c07880e016dbb60dd84d9d1dd64bd141e4694d99ba919c288b9b08554f9373a5";
 
 async fn build() -> Arc<InMemoryStateEngine> {
     let engine = Arc::new(InMemoryStateEngine::new());

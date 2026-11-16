@@ -20,9 +20,7 @@ use stellereum::oracle::{
     STALE_PRICE_MAX_SECS, USDT_MIN_PEG_MICRO_USD,
 };
 use stellereum::orderbook::{OrderSide, OrderType, PAIR_STELL_USDT};
-use stellereum::post_quantum::{
-    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT,
-};
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -91,11 +89,10 @@ fn pq_tx(kp: &FalconKeypair, payload: Vec<OpCode>, nonce: u64) -> Transaction {
 /// Engine with a committed (Falcon-bound) publisher set and a funded PQ sender.
 async fn wired_engine() -> InMemoryStateEngine {
     let e = InMemoryStateEngine::new();
-    assert!(
-        e.oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
+    assert!(e
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
     e.credit_native(&sender_addr(), 1_000_000_000_000)
         .await
         .expect("fund");
@@ -199,10 +196,7 @@ async fn ed_feed_in_a_block_is_refused_fail_closed() {
         oracle.feeds.is_empty(),
         "a refused Ed feed commits no price"
     );
-    assert!(
-        !oracle.breaker_tripped,
-        "a refused Ed feed latches nothing"
-    );
+    assert!(!oracle.breaker_tripped, "a refused Ed feed latches nothing");
 }
 
 /// The PQ twin: a block carrying `SysCallSubmitPqPriceFeed` (Falcon-signed
@@ -268,7 +262,10 @@ async fn gossip_without_a_block_does_not_move_the_root() {
     let wire = bincode::serialize(&feed).expect("gossip serialization");
     let received: PqPriceFeedUpdate = bincode::deserialize(&wire).expect("gossip decode");
     assert_eq!(received.price_micro_usd, feed.price_micro_usd);
-    assert!(received.verify(), "a gossiped feed still verifies after decode");
+    assert!(
+        received.verify(),
+        "a gossiped feed still verifies after decode"
+    );
 
     assert_eq!(
         e.get_state_root().await,
@@ -338,7 +335,10 @@ fn freshness_boundaries_at_block_time() {
     // Exactly at the limit is still fresh (the rule is `age > limit`).
     let mut st = fresh_state(&sk);
     let exact = PqPriceFeedUpdate::sign("STELL", 250_000, t - STALE_PRICE_MAX_SECS, &sk);
-    assert!(st.commit_feed_pq(&exact, t).is_ok(), "age == limit is fresh");
+    assert!(
+        st.commit_feed_pq(&exact, t).is_ok(),
+        "age == limit is fresh"
+    );
 
     // One second past the limit is stale.
     let mut st = fresh_state(&sk);
@@ -363,7 +363,10 @@ fn freshness_boundaries_at_block_time() {
     let rogue = FalconKeypair::generate_from_seed_bytes(&[0x99; 32]);
     let mut st = fresh_state(&sk);
     let signed_by_rogue = PqPriceFeedUpdate::sign("STELL", 250_000, t, &rogue);
-    assert!(signed_by_rogue.verify(), "the rogue signature itself is valid");
+    assert!(
+        signed_by_rogue.verify(),
+        "the rogue signature itself is valid"
+    );
     let err = st.commit_feed_pq(&signed_by_rogue, t).unwrap_err();
     assert!(err.contains("publisher"), "{err}");
 
@@ -444,10 +447,7 @@ async fn deviation_feed_rejected_latches_breaker_and_blocks_later_feeds() {
     let after_trip = e.get_state_root().await;
     let valid_again = PqPriceFeedUpdate::sign("STELL", 251_000, BLOCK_TIME - 5, &publisher_kp());
     let (ok, _, _) = apply_feed_block(&e, valid_again, BLOCK_TIME).await;
-    assert!(
-        !ok,
-        "a latched breaker refuses even a perfectly fresh feed"
-    );
+    assert!(!ok, "a latched breaker refuses even a perfectly fresh feed");
     assert_eq!(
         e.get_state_root().await,
         after_trip,
@@ -513,11 +513,10 @@ async fn place_order_settled_cannot_bypass_the_gates() {
     let e = InMemoryStateEngine::new();
     let who = [0x11u8; 32];
     e.credit_native(&who, 100 * STELL).await.expect("fund");
-    assert!(
-        e.oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
+    assert!(e
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
 
     // Commit $0.25/STELL through the oracle (same function the syscall uses).
     {
@@ -747,11 +746,10 @@ async fn svm_mixed_block_deviating_order_does_not_poison_block_mate() {
 #[tokio::test]
 async fn oracle_state_roundtrips_through_a_domain_snapshot() {
     let e = InMemoryStateEngine::new();
-    assert!(
-        e.oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
+    assert!(e
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
     let feed = PqPriceFeedUpdate::sign("STELL", 250_000, BLOCK_TIME - 10, &publisher_kp());
     e.oracle_write()
         .await
@@ -808,12 +806,10 @@ async fn oracle_state_roundtrips_through_snapshot_domains_and_load_full_state() 
     let engine = InMemoryStateEngine::new();
     let user = [0xA1u8; 32];
     engine.update_account(AccountState::new(user, 50_000)).await;
-    assert!(
-        engine
-            .oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
+    assert!(engine
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
     let feed = PqPriceFeedUpdate::sign("STELL", 250_000, BLOCK_TIME - 10, &publisher_kp());
     engine
         .oracle_write()
@@ -910,16 +906,14 @@ async fn every_oracle_difference_is_a_root_difference() {
     // while block sync happily reports agreement.
     let a = InMemoryStateEngine::new();
     let b = InMemoryStateEngine::new();
-    assert!(
-        a.oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
-    assert!(
-        b.oracle_write()
-            .await
-            .register_pq_publisher(publisher_kp().pubkey())
-    );
+    assert!(a
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
+    assert!(b
+        .oracle_write()
+        .await
+        .register_pq_publisher(publisher_kp().pubkey()));
     assert_eq!(
         a.get_state_root().await,
         b.get_state_root().await,

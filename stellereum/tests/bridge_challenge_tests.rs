@@ -145,7 +145,6 @@ fn failing_proof(hash: [u8; 32]) -> BridgeIntent {
     }
 }
 
-
 /// Implicit Falcon-512 sender for a seed, registered globally. Pure-PQ tx
 /// admission refuses legacy `Transaction::sign_with_payload`, so the wrapping
 /// txs in these tests ride the sanctioned implicit-Falcon envelope (the same
@@ -254,7 +253,8 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
     // False challenge freezes the honest deposit.
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -268,7 +268,8 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
 
     // Suppression window passes with no confirm — then the evidence lands
     // LATE, past the deadline. Truth still beats timing: confirm + slash.
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -317,7 +318,8 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -330,7 +332,8 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
 
     // SEC-01 FIX: Submitting failing evidence past the deadline does NOT trigger
     // fraud payout. It simply defers (Path 3) without paying a single coin to the challenger.
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![
             failing_proof(hash),
@@ -394,7 +397,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // deferral cap binds after exactly MAX_RESOLVE_DEFERRALS extensions:
     // D0 = CH_T + WINDOW, cap = TS + MAX_AGE + WINDOW*(1+K).
     let challenge_at = TS + CHALLENGE_MAX_AGE_SECS - 100;
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -413,7 +417,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     let mut now = d0;
     let mut defers = 0u32;
     for _ in 0..10 {
-        let tx_r = bridge_tx(challenger_seed,
+        let tx_r = bridge_tx(
+            challenger_seed,
             nonce,
             ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
         );
@@ -459,7 +464,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // nonce), so the stale `nonce` would be refused at ADMISSION - free, and
     // it would not exercise the paid-refusal path at all.
     let challenger_before = e.get_account(&challenger_pk).await.unwrap();
-    let tx_last = bridge_tx(challenger_seed,
+    let tx_last = bridge_tx(
+        challenger_seed,
         challenger_before.nonce,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -503,7 +509,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     let resolver_seed: u8 = 0xD0;
     let resolver_pk = pq_id(resolver_seed);
     fund(&e, &resolver_pk, 10 * STELL).await;
-    let tx_rec = bridge_tx(resolver_seed,
+    let tx_rec = bridge_tx(
+        resolver_seed,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -542,7 +549,8 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(challenger_seed,
+    let tx_c = bridge_tx(
+        challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -555,7 +563,8 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
 
     // Garbage evidence while the window is still open: refused, dispute open.
     let settled = e.get_state_root().await;
-    let tx_r = bridge_tx(challenger_seed,
+    let tx_r = bridge_tx(
+        challenger_seed,
         1,
         ops_list(vec![
             failing_proof(hash),
@@ -627,7 +636,8 @@ async fn honest_relay_unaffected_by_the_truth_gate() {
     let recipient_e = [0xC2u8; 32];
     let amount_e = 55 * STELL;
     let hash_e = [0x82u8; 32];
-    let tx = bridge_tx(0x03,
+    let tx = bridge_tx(
+        0x03,
         1,
         ops_list(vec![
             quorum_proof(hash_e, recipient_e, amount_e, &vals),

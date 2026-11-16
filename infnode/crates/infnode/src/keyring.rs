@@ -324,16 +324,31 @@ impl PqKeys {
     /// The seed is retained (guarded like the key) so `save` persists it.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let (secret, public) = falcon512::keygen(seed);
-        Self { seed, secret, public }
+        Self {
+            seed,
+            secret,
+            public,
+        }
     }
 
     /// Fresh keygen from OS randomness (production path).
+    ///
+    /// `falcon-rust 0.3.1` (`falcon512::keygen`) occasionally panics on rare
+    /// seeds (`MultiwordInt too narrow`). Retry with up to 32 fresh OS seeds
+    /// while keeping [`PqKeys::from_seed`] deterministic.
     pub fn generate() -> Self {
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
-        let keys = Self::from_seed(seed);
-        seed.zeroize();
-        keys
+        const MAX_ATTEMPTS: usize = 32;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::from_seed(seed)));
+            seed.zeroize();
+            if let Ok(keys) = res {
+                return keys;
+            }
+        }
+        panic!("PqKeys::generate failed: falcon512::keygen panicked on {MAX_ATTEMPTS} fresh OsRng seeds");
     }
 
     /// Raw 897-byte Falcon-512 public key (chain pubkey layout: header 0x09).
@@ -434,9 +449,7 @@ impl PqKeys {
             let meta = std::fs::metadata(&path).map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
-                bail!(
-                    "{PQ_IDENTITY_FILE} has insecure permissions 0o{mode:03o}, expected 0o600"
-                );
+                bail!("{PQ_IDENTITY_FILE} has insecure permissions 0o{mode:03o}, expected 0o600");
             }
         }
         let raw = std::fs::read_to_string(dir.join(PQ_IDENTITY_FILE))
@@ -545,4 +558,21 @@ pub fn parse_dual_announce(ids: &[String]) -> Result<Vec<[u8; NODEID_LEN]>> {
                 .map_err(|_| anyhow!("announced id must be 20 bytes"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pq_keys_generate_batch_never_panics() {
+        let digest = [0x42u8; 32];
+        for _ in 0..32 {
+            let keys = PqKeys::generate();
+            let pub_bytes = keys.pq_pub();
+            assert_eq!(pub_bytes.len(), 897);
+            let sig = keys.sign_digest(&digest);
+            assert!(crate::proto::pq_falcon_verify(&pub_bytes, &digest, &sig));
+        }
+    }
 }

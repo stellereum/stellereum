@@ -1,0 +1,24 @@
+[Unit]
+Description=Stellereum Indexer API & Syncer
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/stellereum-indexer
+EnvironmentFile=/root/stellereum-indexer/env.indexer
+ExecStart=/root/stellereum-indexer/stellereum-indexer
+Restart=always
+RestartSec=5
+MemoryMax=1G
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stellereum-indexer
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

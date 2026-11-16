@@ -195,7 +195,9 @@ fn m02_custom_chain_verifies_under_own_id_and_mismatch_refused() {
     // 5757 bytes are now foreign and must be refused (mismatch names 1234).
     let raw5757 = sign_legacy_for(5757, 920_003);
     let d5757 = evm::parse_legacy_transaction(&raw5757).expect("decodes");
-    let err = d5757.verify_signature().expect_err("5757 refused under 1234");
+    let err = d5757
+        .verify_signature()
+        .expect_err("5757 refused under 1234");
     assert_eq!(
         err,
         evm::EvmError::ChainIdMismatch {

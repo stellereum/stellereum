@@ -215,6 +215,12 @@ impl HardenedKeystore {
             .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
             .map_err(|e| format!("Argon2 derivation error: {:?}", e))?;
 
+        if nonce.len() != 24 {
+            return Err(format!(
+                "Invalid nonce length: expected 24 bytes, got {}",
+                nonce.len()
+            ));
+        }
         let cipher = XChaCha20Poly1305::new((&derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 

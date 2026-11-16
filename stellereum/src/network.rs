@@ -453,13 +453,8 @@ pub fn peer_head_is_ahead(our_height: u64, peer_height: u64) -> bool {
 /// publisher yet because raw PQ pins are auxiliary to the state root (the
 /// accounts snapshot already commits to every pin's hash). Pinned by
 /// `tests/observer_and_recovery_tests.rs`.
-pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
-    "domains",
-    "session",
-    "bridge",
-    "zkml",
-    "cross_shard",
-];
+pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] =
+    &["domains", "session", "bridge", "zkml", "cross_shard"];
 
 /// Process-wide bound on concurrent DHT fetches (storm guard 2026-10-13).
 ///

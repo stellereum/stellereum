@@ -14,20 +14,20 @@
 //! the process env, and no other test in this file reads the env (all logic
 //! under test takes explicit parameters), so parallel execution cannot race.
 
-use infnode::node::{
-    pq_auth_bind, pq_build_transcript, pq_decapsulate, pq_encapsulate, pq_initiator_answer,
-    pq_initiator_offer, pq_responder_accept,
-};
-use infnode::proto::{
-    self, PqOfferCheck, PqTranscript, Frame, PQ_CHAN_BIND_PLACEHOLDER, PQ_DOMAIN,
-    PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION, NODEID_LEN,
-};
 use infnode::config::PeerConfig;
 use infnode::keyring::PqKeys;
 use infnode::node::{
     pq_announce_fields, pq_falcon_transcript_digest, PqBindOutcome, PqIdentityRegistry,
 };
+use infnode::node::{
+    pq_auth_bind, pq_build_transcript, pq_decapsulate, pq_encapsulate, pq_initiator_answer,
+    pq_initiator_offer, pq_responder_accept,
+};
 use infnode::node::{pq_pinned_key_check_cached, FalconPeerKeyCache};
+use infnode::proto::{
+    self, Frame, PqOfferCheck, PqTranscript, NODEID_LEN, PQ_CHAN_BIND_PLACEHOLDER, PQ_DOMAIN,
+    PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION,
+};
 use infnode::proto::{
     pq_falcon_digest, pq_falcon_policy, pq_falcon_sign, pq_falcon_verify, pq_id_from_pub,
     PQ_FALCON_PK_LEN, PQ_FALCON_SIG_LEN, PQ_SUITE_FALCON512,
@@ -152,7 +152,10 @@ fn pq_kem_tampered_ct_never_matches_and_tag_refuses() {
         // Infallible decap: tampered ct yields the implicit-rejection
         // fallback key — a *different* key, never an error or panic.
         let k_bad = dk.decapsulate(&bad);
-        assert_ne!(k_bad, k_send, "tampered ct at {at} must not yield the sender key");
+        assert_ne!(
+            k_bad, k_send,
+            "tampered ct at {at} must not yield the sender key"
+        );
         // ...which then fails transcript authentication: the refuse path.
         let bad_tag = proto::pq_auth_tag(k_bad.as_slice().try_into().unwrap(), &digest);
         assert!(
@@ -234,16 +237,10 @@ fn pq_handshake_happy_both_sides_agree() {
     let ch = challenge_frame(init_id, resp_id, ch_json.to_string().into_bytes());
     let ch_sd = ch.sign_data();
 
-    let (ct, agreed_r) = pq_responder_accept(
-        &eph_init,
-        &ch_json,
-        &ch_sd,
-        &eph_resp,
-        auth_at,
-        &resp_id,
-    )
-    .expect("responder accept")
-    .expect("offer present");
+    let (ct, agreed_r) =
+        pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
+            .expect("responder accept")
+            .expect("offer present");
     assert_eq!(ct.len(), 1088);
 
     let auth_json = serde_json::json!({
@@ -296,11 +293,10 @@ fn pq_tampered_transcript_refused_with_clear_error() {
         });
         let ch = challenge_frame(init_id, resp_id, ch_json.to_string().into_bytes());
         let ch_sd = ch.sign_data();
-        let (ct, agreed_r) = pq_responder_accept(
-            &eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id,
-        )
-        .expect("accept")
-        .expect("offer");
+        let (ct, agreed_r) =
+            pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
+                .expect("accept")
+                .expect("offer");
         let mut auth_json = serde_json::json!({
             "node": format!("inf1:{}", hex::encode(resp_id)),
             "name": "resp",
@@ -491,8 +487,15 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
         "ed": hex::encode([3u8; 32]),
     });
     let ch = challenge_frame(init_id, resp_id, plain_ch.to_string().into_bytes());
-    let got = pq_responder_accept(&eph_init, &plain_ch, &ch.sign_data(), &eph_resp, auth_at, &resp_id)
-        .expect("classical challenge must not error");
+    let got = pq_responder_accept(
+        &eph_init,
+        &plain_ch,
+        &ch.sign_data(),
+        &eph_resp,
+        auth_at,
+        &resp_id,
+    )
+    .expect("classical challenge must not error");
     assert!(got.is_none(), "no PQ offer => classical path");
 
     // Direction 2: classical initiator dials, PQ responder... responder sees
@@ -546,10 +549,7 @@ fn pq_transcript_builder_matches_manual_fields() {
     assert_eq!(built.nonce_resp, proto::pq_hash_field(&bind));
     // Binding commits to responder eph, timestamp, and responder id.
     assert_eq!(bind.len(), 32 + 8 + NODEID_LEN);
-    assert_ne!(
-        pq_auth_bind(&eph_resp, 4243, &[7u8; NODEID_LEN]),
-        bind
-    );
+    assert_ne!(pq_auth_bind(&eph_resp, 4243, &[7u8; NODEID_LEN]), bind);
 }
 
 #[test]
@@ -577,7 +577,10 @@ fn pq_transcript_tamper_anywhere_breaks_tag() {
     assert!(proto::pq_verify_tag(&sig0, &sig0));
     let mut bad_shared = shared;
     bad_shared[0] ^= 0x01;
-    assert!(!proto::pq_verify_tag(&sig0, &proto::pq_auth_tag(&bad_shared, &d0)));
+    assert!(!proto::pq_verify_tag(
+        &sig0,
+        &proto::pq_auth_tag(&bad_shared, &d0)
+    ));
     // Every field flipped changes the digest and invalidates the old tag.
     let mut cases: Vec<PqTranscript> = Vec::new();
     let mut push = |f: &dyn Fn(&mut PqTranscript)| {
@@ -596,7 +599,10 @@ fn pq_transcript_tamper_anywhere_breaks_tag() {
     for c in &cases {
         let d = c.digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_MLKEM768_HYBRID);
         assert_ne!(d, d0);
-        assert!(!proto::pq_verify_tag(&sig0, &proto::pq_auth_tag(&shared, &d)));
+        assert!(!proto::pq_verify_tag(
+            &sig0,
+            &proto::pq_auth_tag(&shared, &d)
+        ));
     }
     // Suite/version flip also changes the digest.
     assert_ne!(
@@ -688,11 +694,7 @@ fn pq_identity_save_load_roundtrip_and_perms() {
             .mode()
             & 0o777;
         assert_eq!(fmode, 0o600, "pq-identity.key must be 0600");
-        let dmode = std::fs::metadata(&d)
-            .expect("meta")
-            .permissions()
-            .mode()
-            & 0o777;
+        let dmode = std::fs::metadata(&d).expect("meta").permissions().mode() & 0o777;
         assert_eq!(dmode, 0o700, "keys dir must be 0700");
     }
     let back = PqKeys::load_opt(&d).expect("load").expect("present");
@@ -708,10 +710,8 @@ fn pq_identity_absent_is_none_classical_explicit() {
     assert!(PqKeys::load_opt(&d).expect("load").is_none());
     pq_cleanup(&d);
     // Missing dir entirely: also absent, not an error.
-    let missing = std::env::temp_dir().join(format!(
-        "infnode-pq-never-created-{}",
-        std::process::id()
-    ));
+    let missing =
+        std::env::temp_dir().join(format!("infnode-pq-never-created-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&missing);
     assert!(PqKeys::load_opt(&missing).expect("load").is_none());
 }
@@ -784,7 +784,9 @@ fn pq_peer_config_pq_pub_optional_and_pinned() {
     assert_eq!(got.as_slice(), keys.pq_pub().as_slice());
     // Present but malformed: hard error (never silent classical).
     assert!(pq_peer_cfg(Some("00".to_string())).pq_bytes().is_err());
-    assert!(pq_peer_cfg(Some(hex::encode([9u8; 32]))).pq_bytes().is_err());
+    assert!(pq_peer_cfg(Some(hex::encode([9u8; 32])))
+        .pq_bytes()
+        .is_err());
 }
 
 #[test]
@@ -817,7 +819,10 @@ fn pq_peer_config_yaml_backward_compatible() {
     let yaml = serde_yaml::to_string(&cfg).expect("ser");
     assert!(yaml.contains("pq-pub:"), "kebab-case key, got:\n{yaml}");
     let back: PeerConfig = serde_yaml::from_str(&yaml).expect("de");
-    assert_eq!(back.pq_bytes().expect("parse").expect("present").as_slice(), keys.pq_pub().as_slice());
+    assert_eq!(
+        back.pq_bytes().expect("parse").expect("present").as_slice(),
+        keys.pq_pub().as_slice()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -937,7 +942,10 @@ fn pq_registry_first_wins_sticky_and_quarantined() {
     let id_b = [9u8; NODEID_LEN];
     assert!(reg.bound_pq(&id_a).is_none());
     // First valid claim binds.
-    assert_eq!(reg.announce(&id_a, &a.pq_pub(), true), PqBindOutcome::NewBound);
+    assert_eq!(
+        reg.announce(&id_a, &a.pq_pub(), true),
+        PqBindOutcome::NewBound
+    );
     assert_eq!(reg.bound_pq(&id_a), Some(a.pq_pub().as_slice()));
     // Same key re-announced: steady state.
     assert_eq!(
@@ -962,7 +970,10 @@ fn pq_registry_first_wins_sticky_and_quarantined() {
     );
     assert!(reg.bound_pq(&id_b).is_none());
     // Independent ids bind independently.
-    assert_eq!(reg.announce(&id_b, &b.pq_pub(), true), PqBindOutcome::NewBound);
+    assert_eq!(
+        reg.announce(&id_b, &b.pq_pub(), true),
+        PqBindOutcome::NewBound
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -990,10 +1001,7 @@ fn pq_identity_absent_means_classical_both_flag_states() {
         pq_falcon_policy(false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
         proto::PqMode::Classical
     );
-    assert_eq!(
-        pq_mixed_policy_off_path(),
-        proto::PqMode::Classical
-    );
+    assert_eq!(pq_mixed_policy_off_path(), proto::PqMode::Classical);
 }
 
 fn pq_mixed_policy_off_path() -> proto::PqMode {
@@ -1048,20 +1056,34 @@ fn pq_mixed_policy_at_pre_h_delegates_unchanged() {
         proto::pq_mixed_policy_at(pre, true, None).unwrap(),
         proto::PqMode::Classical
     );
-    let verified = PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true };
+    let verified = PqOfferCheck {
+        wellformed: true,
+        suite_ok: true,
+        tag_ok: true,
+    };
     assert_eq!(
         proto::pq_mixed_policy_at(pre, true, Some(verified)).unwrap(),
         proto::PqMode::Pq
     );
-    let garbage = PqOfferCheck { wellformed: false, suite_ok: false, tag_ok: false };
+    let garbage = PqOfferCheck {
+        wellformed: false,
+        suite_ok: false,
+        tag_ok: false,
+    };
     assert_eq!(
         proto::pq_mixed_policy_at(pre, false, Some(garbage)).unwrap(),
         proto::PqMode::Classical
     );
-    for (wellformed, suite_ok, tag_ok) in
-        [(true, true, false), (true, false, false), (false, false, false)]
-    {
-        let mk = || PqOfferCheck { wellformed, suite_ok, tag_ok };
+    for (wellformed, suite_ok, tag_ok) in [
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+    ] {
+        let mk = || PqOfferCheck {
+            wellformed,
+            suite_ok,
+            tag_ok,
+        };
         let legacy = proto::pq_mixed_policy(true, Some(mk()));
         let gated = proto::pq_mixed_policy_at(pre, true, Some(mk()));
         assert_eq!(legacy.unwrap_err(), gated.unwrap_err());
@@ -1097,39 +1119,69 @@ fn pq_mixed_policy_at_post_h_classical_refused() {
     // Classical-only local node refused even with a verified offer.
     assert_eq!(
         proto::pq_mixed_policy_at(
-            h, false,
-            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true })
-        ).unwrap_err(),
+            h,
+            false,
+            Some(PqOfferCheck {
+                wellformed: true,
+                suite_ok: true,
+                tag_ok: true
+            })
+        )
+        .unwrap_err(),
         "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
     );
     // Malformed/suite/tag arms keep their specific fail-closed errors.
     assert_eq!(
         proto::pq_mixed_policy_at(
-            h, true,
-            Some(PqOfferCheck { wellformed: false, suite_ok: false, tag_ok: false })
-        ).unwrap_err(),
+            h,
+            true,
+            Some(PqOfferCheck {
+                wellformed: false,
+                suite_ok: false,
+                tag_ok: false
+            })
+        )
+        .unwrap_err(),
         "pq fields malformed"
     );
     assert_eq!(
         proto::pq_mixed_policy_at(
-            h, true,
-            Some(PqOfferCheck { wellformed: true, suite_ok: false, tag_ok: false })
-        ).unwrap_err(),
+            h,
+            true,
+            Some(PqOfferCheck {
+                wellformed: true,
+                suite_ok: false,
+                tag_ok: false
+            })
+        )
+        .unwrap_err(),
         "unsupported pq suite/version"
     );
     assert_eq!(
         proto::pq_mixed_policy_at(
-            h, true,
-            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: false })
-        ).unwrap_err(),
+            h,
+            true,
+            Some(PqOfferCheck {
+                wellformed: true,
+                suite_ok: true,
+                tag_ok: false
+            })
+        )
+        .unwrap_err(),
         "pq transcript auth failed"
     );
     // Verified PQ offer still negotiates Pq at/after H (PQ<->PQ verified).
     assert_eq!(
         proto::pq_mixed_policy_at(
-            h, true,
-            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true })
-        ).unwrap(),
+            h,
+            true,
+            Some(PqOfferCheck {
+                wellformed: true,
+                suite_ok: true,
+                tag_ok: true
+            })
+        )
+        .unwrap(),
         proto::PqMode::Pq
     );
 }
@@ -1162,7 +1214,8 @@ fn pq_falcon_policy_at_pre_h_delegates_post_h_refuses() {
     );
     // Post-H: classical-only local refused even with a valid offered tag.
     assert_eq!(
-        proto::pq_falcon_policy_at(h, false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap_err(),
+        proto::pq_falcon_policy_at(h, false, Some(&keys.pq_pub()), &digest, Some(&sig))
+            .unwrap_err(),
         "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
     );
     // Post-H: malformed key and mistag keep their specific fail-closed errors.
@@ -1173,7 +1226,8 @@ fn pq_falcon_policy_at_pre_h_delegates_post_h_refuses() {
     let other = PqKeys::from_seed([0x3Bu8; 32]);
     let cross = other.sign_digest(&digest);
     assert_eq!(
-        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&cross)).unwrap_err(),
+        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&cross))
+            .unwrap_err(),
         "pq falcon tag failed"
     );
     // Post-H: PQ<->PQ verified still works.
@@ -1204,11 +1258,7 @@ fn pq_identity_load_or_generate_creates_0600_and_reloads() {
             .mode()
             & 0o777;
         assert_eq!(fmode, 0o600, "auto-generated pq-identity.key must be 0600");
-        let dmode = std::fs::metadata(&d)
-            .expect("meta")
-            .permissions()
-            .mode()
-            & 0o777;
+        let dmode = std::fs::metadata(&d).expect("meta").permissions().mode() & 0o777;
         assert_eq!(dmode, 0o700, "keys dir must be 0700");
     }
     // Second boot loads the SAME identity (no regeneration).
@@ -1284,7 +1334,10 @@ fn pq_longterm_cache_rotation_reverifies_not_stale() {
     assert_eq!(c.len(), 1);
     // Rotation: different bytes => miss => fresh verify of the NEW key
     // (proves no stale-key-after-rotation hit).
-    assert!(c.get(&pk_b).is_none(), "rotated key must miss before verify");
+    assert!(
+        c.get(&pk_b).is_none(),
+        "rotated key must miss before verify"
+    );
     assert!(c.check(&pk_b));
     assert_eq!(c.len(), 2);
     assert_eq!(c.get(&pk_a), Some(true));
@@ -1293,7 +1346,10 @@ fn pq_longterm_cache_rotation_reverifies_not_stale() {
     assert!(c.invalidate(&pk_a));
     assert!(c.get(&pk_a).is_none());
     assert!(c.check(&pk_a), "re-verify after invalidate must pass again");
-    assert!(!c.invalidate(&vec![0x00u8; 897]), "unknown bytes invalidate=false");
+    assert!(
+        !c.invalidate(&vec![0x00u8; 897]),
+        "unknown bytes invalidate=false"
+    );
 }
 
 #[test]
@@ -1329,9 +1385,12 @@ fn pq_longterm_cache_tampered_at_rotate_fails() {
     let mut tampered = pk_a.clone();
     tampered[10] ^= 0x01;
     assert_ne!(tampered, pk_a);
-    assert!(c.get(&tampered).is_none(), "tampered bytes must miss, never stale-hit");
+    assert!(
+        c.get(&tampered).is_none(),
+        "tampered bytes must miss, never stale-hit"
+    );
     let _ = c.check(&tampered); // cache the tampered bytes' own parse verdict
-    // Honest entry untouched by the tampered check.
+                                // Honest entry untouched by the tampered check.
     assert_eq!(c.get(&pk_a), Some(true));
     // Full per-handshake tag verify refuses the tampered key either way.
     let digest = pq_falcon_digest(&fixed_transcript());
@@ -1384,11 +1443,10 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
     });
     let ch = challenge_frame(init_id, resp_id, ch_json.to_string().into_bytes());
     let ch_sd = ch.sign_data();
-    let (ct, agreed_r) = pq_responder_accept(
-        &eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id,
-    )
-    .expect("accept")
-    .expect("offer");
+    let (ct, agreed_r) =
+        pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
+            .expect("accept")
+            .expect("offer");
     assert_eq!(ct.len(), 1088);
     // Flip one ct byte in the AUTH answer: initiator must refuse with a
     // clear transcript-auth error even though the static key is cache-valid.
@@ -1422,7 +1480,10 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
 fn pq_accept_gate_absent_is_classical_no_entry() {
     let mut c = FalconPeerKeyCache::new();
     assert!(!pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(None)).expect("absent"));
-    assert!(c.is_empty(), "classical-explicit peer must not populate the cache");
+    assert!(
+        c.is_empty(),
+        "classical-explicit peer must not populate the cache"
+    );
 }
 
 #[test]
@@ -1464,7 +1525,10 @@ fn pq_accept_gate_rotation_reverifies_not_stale() {
     let mut c = FalconPeerKeyCache::new();
     assert!(pq_pinned_key_check_cached(&mut c, &cfg_a).expect("a"));
     // Rotation: the new bytes miss before verify (proves no stale hit).
-    assert!(c.get(&b.pq_pub()).is_none(), "rotated key must miss before verify");
+    assert!(
+        c.get(&b.pq_pub()).is_none(),
+        "rotated key must miss before verify"
+    );
     assert!(pq_pinned_key_check_cached(&mut c, &cfg_b).expect("b"));
     assert_eq!(c.len(), 2);
     // Exact invalidation of the old pin forces fresh re-verify.

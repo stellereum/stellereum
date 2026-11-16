@@ -47,13 +47,17 @@ use consensus_cluster::{Byzantine, ConsensusCluster, NodeProfile};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use stellereum::consensus::{
-    EquivocationEvidence, QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind,
+    register_validator_pq_key, EquivocationEvidence, QuorumCertificate, ValidatorId, ValidatorSet,
+    Vote, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{
-    DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS, EQUIVOCATION_SLASH_BPS, JAIL_RELEASE_DELAY_HEIGHTS,
-    MIN_VALIDATOR_BOND, STAKING_POOL,
+    DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS, EQUIVOCATION_SLASH_BPS,
+    JAIL_RELEASE_DELAY_HEIGHTS, MIN_VALIDATOR_BOND, STAKING_POOL,
 };
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::OpCode;
@@ -72,6 +76,24 @@ fn det_key(i: u8) -> SigningKey {
     bytes[0] = i.wrapping_add(1);
     bytes[31] = 0x5A;
     SigningKey::from_bytes(&bytes)
+}
+
+fn det_keys_with_falcon(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    let ks: Vec<SigningKey> = (0..n as u8).map(det_key).collect();
+    let fks: Vec<FalconKeypair> = ks
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed((i as u8).wrapping_add(0x5A));
+            register_validator_pq_key(id_of(k), PqScheme::Falcon512, fk.public_key.clone());
+            fk
+        })
+        .collect();
+    (ks, fks)
+}
+
+fn pq_id_of(fk: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
 }
 
 fn id_of(k: &SigningKey) -> ValidatorId {
@@ -94,30 +116,54 @@ fn expected_downtime_burn() -> u64 {
 }
 
 /// A genuine conflicting vote pair by `offender` at consensus height 1.
-fn double_sign(offender: &SigningKey) -> EquivocationEvidence {
-    let a = Vote::sign(offender, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
-    let b = Vote::sign(offender, 1, 0, VoteKind::Prevote, Some([0x22u8; 32]));
+fn double_sign(offender: &SigningKey, fk: &FalconKeypair) -> EquivocationEvidence {
+    let a = Vote::sign_with_falcon(offender, fk, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
+    let b = Vote::sign_with_falcon(offender, fk, 1, 0, VoteKind::Prevote, Some([0x22u8; 32]));
     assert!(a.verify() && b.verify(), "precondition: both votes verify");
     EquivocationEvidence::new(id_of(offender), a, b)
 }
 
-fn report_tx(reporter: &SigningKey, nonce: u64, evidence: EquivocationEvidence) -> Transaction {
-    Transaction::sign_with_payload(
-        reporter,
-        [0u8; 32],
+fn report_tx(
+    reporter_fk: &FalconKeypair,
+    nonce: u64,
+    evidence: EquivocationEvidence,
+) -> Transaction {
+    let payload = vec![OpCode::SysCallReportEquivocation {
+        evidence: Box::new(evidence),
+    }];
+    let from = pq_id_of(reporter_fk);
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        reporter_fk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        from,
         0,
         REPORT_GAS,
         nonce,
         1,
         1,
-        vec![OpCode::SysCallReportEquivocation {
-            evidence: Box::new(evidence),
-        }],
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = reporter_fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        reporter_fk.public_key.clone(),
+        sig,
+        from,
+        0,
+        REPORT_GAS,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
 fn mk_block(
     proposer: &SigningKey,
+    proposer_fk: &FalconKeypair,
     height: u64,
     prev: [u8; 32],
     root: [u8; 32],
@@ -141,15 +187,23 @@ fn mk_block(
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    blk.sign_block(proposer);
+    blk.sign_block_with_falcon(proposer, proposer_fk);
     blk
 }
 
-fn scheduled_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> &'a SigningKey {
+fn scheduled_key<'a>(
+    ks: &'a [SigningKey],
+    fks: &'a [FalconKeypair],
+    vs: &ValidatorSet,
+    h: u64,
+    r: u32,
+) -> (&'a SigningKey, &'a FalconKeypair) {
     let want = vs.proposer_for(h, r).expect("non-empty set has a proposer");
-    ks.iter()
-        .find(|k| id_of(k) == want)
-        .expect("schedule proposer is one of our keys")
+    let idx = ks
+        .iter()
+        .position(|k| id_of(k) == want)
+        .expect("schedule proposer is one of our keys");
+    (&ks[idx], &fks[idx])
 }
 
 /// Drive a FULL (4-of-4) precommit quorum for `bh` so the downtime leg burns
@@ -157,14 +211,29 @@ fn scheduled_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) ->
 fn certify_full(
     rt: &mut ValidatorRuntime,
     ks: &[SigningKey],
+    fks: &[FalconKeypair],
     height: u64,
     bh: [u8; 32],
 ) -> QuorumCertificate {
-    for k in ks.iter() {
-        rt.on_prevote(Vote::sign(k, height, 0, VoteKind::Prevote, Some(bh)))
-            .expect("prevote accepted");
-        rt.on_precommit(Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh)))
-            .expect("precommit accepted");
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        rt.on_prevote(Vote::sign_with_falcon(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .expect("prevote accepted");
+        rt.on_precommit(Vote::sign_with_falcon(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(
         rt.hc.try_precommit_quorum(),
@@ -257,7 +326,8 @@ async fn double_vote_equivocation_recorded_and_slashed_via_wired_path() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -276,10 +346,15 @@ async fn double_vote_equivocation_recorded_and_slashed_via_wired_path() {
     // (Same functions the production finalize path calls:
     // try_finalize -> apply_block_transition (step 5b) ->
     // apply_equivocation_slash -> StakingLedger::slash_equivocation_verified.)
-    let ks: Vec<SigningKey> = (0..4).map(det_key).collect();
+    let (ks, fks) = det_keys_with_falcon(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
+    let reporter_fk = FalconKeypair::generate_from_seed(0xEE);
     let engine = bonded_engine(&ks).await;
+    engine
+        .credit_native(&pq_id_of(&reporter_fk), BAL)
+        .await
+        .expect("fund PQ reporter");
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine.clone(), 1);
 
     let burn = expected_equivocation_burn();
@@ -292,17 +367,18 @@ async fn double_vote_equivocation_recorded_and_slashed_via_wired_path() {
     let pool_before = pool_of(&engine).await;
     let burned_before = engine.staking_read().await.total_burned;
 
-    let evidence = double_sign(&ks[3]);
+    let evidence = double_sign(&ks[3], &fks[3]);
     let root = engine.get_state_root().await;
     let mut blk = mk_block(
         &ks[0],
+        &fks[0],
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, evidence)],
+        vec![report_tx(&reporter_fk, 0, evidence)],
     );
     let bh = blk.compute_hash();
-    blk.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bh));
+    blk.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh));
     rt.blocks.insert(bh, blk.clone());
     assert_eq!(rt.try_finalize().await, Some(bh), "must finalize height 1");
 
@@ -337,7 +413,7 @@ async fn double_vote_equivocation_recorded_and_slashed_via_wired_path() {
 
 #[tokio::test]
 async fn sustained_downtime_slash_ejects_below_min_with_power_change_at_h1() {
-    let ks: Vec<SigningKey> = (0..4).map(det_key).collect();
+    let (ks, fks) = det_keys_with_falcon(4);
     let vs = vset(&ks);
     let victim = id_of(&ks[3]);
     let engine = bonded_engine(&ks).await;
@@ -362,15 +438,29 @@ async fn sustained_downtime_slash_ejects_below_min_with_power_change_at_h1() {
 
     // Height 1 on 3 honest votes (victim silent). Genesis child: no canonical
     // evidence yet, so the streak is untouched.
-    let pkey = scheduled_key(&ks, &vs, 1, 0).clone();
+    let (pkey, pfk) = scheduled_key(&ks, &fks, &vs, 1, 0);
     let root = engine.get_state_root().await;
-    let blk = mk_block(&pkey, 1, [0u8; 32], root, vec![]);
+    let blk = mk_block(pkey, pfk, 1, [0u8; 32], root, vec![]);
     let bh1 = blk.compute_hash();
     for &i in &[0usize, 1, 2] {
-        rt.on_prevote(Vote::sign(&ks[i], 1, 0, VoteKind::Prevote, Some(bh1)))
-            .unwrap();
-        rt.on_precommit(Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh1)))
-            .unwrap();
+        rt.on_prevote(Vote::sign_with_falcon(
+            &ks[i],
+            &fks[i],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh1),
+        ))
+        .unwrap();
+        rt.on_precommit(Vote::sign_with_falcon(
+            &ks[i],
+            &fks[i],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh1),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh1));
     let cert1 = rt.hc.precommit_qc.clone().expect("height-1 QC exists");
@@ -388,18 +478,34 @@ async fn sustained_downtime_slash_ejects_below_min_with_power_change_at_h1() {
     // slash fires through the real block path.
     let burned_before = engine.staking_read().await.total_burned;
     let pool_before = pool_of(&engine).await;
-    let pkey2 = scheduled_key(&ks, &rt.validators, 2, 0).clone();
+    let (pkey2, pfk2) = scheduled_key(&ks, &fks, &rt.validators, 2, 0);
+    let pkey2 = pkey2.clone();
+    let pfk2 = pfk2.clone();
     let root2 = engine.get_state_root().await;
-    let mut blk2 = mk_block(&pkey2, 2, bh1, root2, vec![]);
+    let mut blk2 = mk_block(&pkey2, &pfk2, 2, bh1, root2, vec![]);
     blk2.last_qc = Some(cert1);
     blk2.validator_signatures.clear();
-    blk2.sign_block(&pkey2);
+    blk2.sign_block_with_falcon(&pkey2, &pfk2);
     let bh2 = blk2.compute_hash();
     for &i in &[0usize, 1, 2] {
-        rt.on_prevote(Vote::sign(&ks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
-            .unwrap();
-        rt.on_precommit(Vote::sign(&ks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
-            .unwrap();
+        rt.on_prevote(Vote::sign_with_falcon(
+            &ks[i],
+            &fks[i],
+            2,
+            0,
+            VoteKind::Prevote,
+            Some(bh2),
+        ))
+        .unwrap();
+        rt.on_precommit(Vote::sign_with_falcon(
+            &ks[i],
+            &fks[i],
+            2,
+            0,
+            VoteKind::Precommit,
+            Some(bh2),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh2));
     rt.blocks.insert(bh2, blk2);
@@ -460,30 +566,37 @@ async fn sustained_downtime_slash_ejects_below_min_with_power_change_at_h1() {
          jail release at {}",
         1 + JAIL_RELEASE_DELAY_HEIGHTS,
     );
-    assert_ne!(q_after, q_before, "quorum_power must move with the new stake");
-    assert_ne!(total_after, total_before, "total power must move with the new stake");
-    assert!(
-        total_after >= q_after,
-        "remainder must still be quorate"
+    assert_ne!(
+        q_after, q_before,
+        "quorum_power must move with the new stake"
     );
+    assert_ne!(
+        total_after, total_before,
+        "total power must move with the new stake"
+    );
+    assert!(total_after >= q_after, "remainder must still be quorate");
 
     // The remainder can still certify: a survivor-only QC verifies against the
     // rotated H+1 set.
     let h_next = rt.height();
     let probe_hash = [0x77u8; 32];
-    let qc = QuorumCertificate {
-        height: h_next,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(probe_hash),
-        signatures: [0usize, 1, 2]
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(&ks[i], h_next, 0, VoteKind::Precommit, Some(probe_hash));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    let mut vote_set = VoteSet::new();
+    for &i in &[0usize, 1, 2] {
+        let v = Vote::sign_with_falcon(
+            &ks[i],
+            &fks[i],
+            h_next,
+            0,
+            VoteKind::Precommit,
+            Some(probe_hash),
+        );
+        vote_set
+            .add(v, &rt.validators, h_next, 0, VoteKind::Precommit)
+            .expect("survivor vote admits");
+    }
+    let qc = vote_set
+        .certificate(Some(probe_hash), &rt.validators, &bh2)
+        .expect("3-of-3 survivors reach quorum");
     assert!(
         qc.verify(&rt.validators),
         "survivor-only QC must verify against the rotated set"
@@ -496,17 +609,23 @@ async fn sustained_downtime_slash_ejects_below_min_with_power_change_at_h1() {
 
 #[tokio::test]
 async fn evidence_verification_unit_level_and_harness_gap() {
-    let ks: Vec<SigningKey> = (0..4).map(det_key).collect();
+    let (ks, fks) = det_keys_with_falcon(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
+    let reporter_fk = FalconKeypair::generate_from_seed(0xEF);
 
     // ---- (a) fail-closed: a single vote repeated is NOT equivocation ----
     // (Same ledger function the transition calls; nothing burns, and through
     // the block path the reporter's transaction reverts.)
     let engine = bonded_engine(&ks).await;
+    engine
+        .credit_native(&pq_id_of(&reporter_fk), BAL)
+        .await
+        .expect("fund PQ reporter");
     {
         let mut l = engine.staking_write().await;
-        let a = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
+        let a =
+            Vote::sign_with_falcon(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
         let non_pair = EquivocationEvidence::new(offender, a.clone(), a);
         assert_eq!(
             l.slash_equivocation_verified(&non_pair).unwrap(),
@@ -518,18 +637,20 @@ async fn evidence_verification_unit_level_and_harness_gap() {
     let pool_before = pool_of(&engine).await;
     let root = engine.get_state_root().await;
     let repeated = {
-        let a = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
+        let a =
+            Vote::sign_with_falcon(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
         EquivocationEvidence::new(offender, a.clone(), a)
     };
     let mut bad = mk_block(
         &ks[0],
+        &fks[0],
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, repeated)],
+        vec![report_tx(&reporter_fk, 0, repeated)],
     );
     let bad_hash = bad.compute_hash();
-    bad.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bad_hash));
+    bad.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bad_hash));
     rt.blocks.insert(bad_hash, bad);
     assert_eq!(rt.try_finalize().await, Some(bad_hash));
     assert_eq!(
@@ -554,18 +675,24 @@ async fn evidence_verification_unit_level_and_harness_gap() {
         "no observations => empty feed"
     );
     let burned_before = engine2.staking_read().await.total_burned;
-    rt2
-        .on_prevote(Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0xABu8; 32])))
-        .unwrap();
-    rt2
-        .on_prevote(Vote::sign(
-            &ks[3],
-            1,
-            0,
-            VoteKind::Prevote,
-            Some([0xCDu8; 32]),
-        ))
-        .unwrap();
+    rt2.on_prevote(Vote::sign_with_falcon(
+        &ks[3],
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0xABu8; 32]),
+    ))
+    .unwrap();
+    rt2.on_prevote(Vote::sign_with_falcon(
+        &ks[3],
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0xCDu8; 32]),
+    ))
+    .unwrap();
     assert_eq!(rt2.hc.equivocations().len(), 1, "evidence must be observed");
     let feed = rt2.equivocation_feed_evidence();
     assert_eq!(feed.len(), 1, "one offense => one envelope");

@@ -16,12 +16,17 @@
 //! directions at once.
 
 use ed25519_dalek::SigningKey;
-use stellereum::consensus::ValidatorSet;
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+fn falcon_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
 }
 
 fn set_of(ids: &[[u8; 32]]) -> ValidatorSet {
@@ -36,12 +41,14 @@ fn set_of(ids: &[[u8; 32]]) -> ValidatorSet {
 /// also accept.
 async fn runtime() -> ValidatorRuntime {
     let k = key(1);
+    let fk = falcon_key(1);
     let addr = k.verifying_key().to_bytes();
+    register_validator_pq_key(addr, PqScheme::Falcon512, fk.public_key.clone());
     let engine = Arc::new(InMemoryStateEngine::new());
     engine
         .update_account(AccountState::new(addr, 1_000_000))
         .await;
-    ValidatorRuntime::new(k, set_of(&[addr]), engine, 1)
+    ValidatorRuntime::new(k, set_of(&[addr]), engine, 1).with_falcon_key(fk)
 }
 
 use std::sync::Arc;
@@ -52,6 +59,8 @@ fn block_at(
     proposer: [u8; 32],
     k: &SigningKey,
 ) -> stellereum::sharding::Block {
+    let fk = falcon_key(1);
+    register_validator_pq_key(proposer, PqScheme::Falcon512, fk.public_key.clone());
     let mut b = stellereum::sharding::Block {
         shard_id: 1,
         height,
@@ -69,7 +78,7 @@ fn block_at(
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
     };
-    b.sign_block(k);
+    b.sign_block_with_falcon(k, &fk);
     b
 }
 

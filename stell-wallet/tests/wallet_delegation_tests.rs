@@ -19,19 +19,25 @@ mod rpc;
 mod security;
 
 #[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
+#[path = "../src/pq.rs"]
+mod pq;
+
+#[allow(dead_code)] // GATE: test vendors lib module via #[path]; items unused by this test binary are expected
 #[path = "../src/client.rs"]
 mod client;
 
 use client::LightClient;
+use pq::{PqKeyPair, PqScheme, DEFAULT_SALT};
 use rpc::{RpcConfig, TxFinality};
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::svm::{
     OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
 };
-use stellereum::wallet::WalletAccount;
+use stellereum::zkml::DEFAULT_CHAIN_ID;
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(19800);
 
@@ -99,12 +105,19 @@ async fn rpc_client(node: &LiveNode) -> LightClient {
         .expect("connect_rpc")
 }
 
-fn test_account(seed_byte: u8) -> WalletAccount {
+struct PqTestAccount {
+    kp: PqKeyPair,
+    address: [u8; 32],
+}
+
+fn test_account(seed_byte: u8) -> PqTestAccount {
     let mut seed = [0u8; 32];
     seed[0] = seed_byte;
     seed[1] = 0xBD;
     seed[2] = 0x99;
-    WalletAccount::from_seed(&seed)
+    let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &seed);
+    let address = kp.derive_address(&DEFAULT_SALT);
+    PqTestAccount { kp, address }
 }
 
 async fn fund_account(node: &LiveNode, addr: [u8; 32], balance: u64) {
@@ -266,25 +279,21 @@ fn test_tx_construction_delegate() {
     let amount_nano = 250_000_000_000u64; // 250 STELL
     let nonce = 5;
 
-    // Direct construction via helper
-    let tx1 = LightClient::build_delegate_tx(&delegator, validator, amount_nano, nonce);
-
-    // Direct construction via WalletAccount::create_payload_transaction
-    let tx2 = delegator.create_payload_transaction(
-        vec![OpCode::SysCallDelegate {
-            validator,
-            amount: amount_nano,
-        }],
-        GAS_STAKE_BOND + GAS_BASIC_TRANSFER,
+    let tx1 = LightClient::build_pq_delegate_tx(
+        &delegator.kp,
+        validator,
+        amount_nano,
         nonce,
+        DEFAULT_CHAIN_ID,
     );
 
-    assert_eq!(tx1.compute_tx_hash(), tx2.compute_tx_hash());
     assert_eq!(tx1.from, delegator.address);
     assert_eq!(tx1.to, delegator.address);
     assert_eq!(tx1.amount, 0); // Native transfer amount is 0; delegated amount is in payload
-    assert_eq!(tx1.gas_limit, GAS_STAKE_BOND + GAS_BASIC_TRANSFER);
-    assert_eq!(tx1.gas_limit, 2_000 + 280_000);
+    assert_eq!(
+        tx1.gas_limit,
+        GAS_STAKE_BOND + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    );
     assert_eq!(tx1.nonce, nonce);
     assert!(tx1.verify_signature(), "signature must verify locally");
 
@@ -309,11 +318,19 @@ fn test_tx_construction_begin_unbond() {
     let amount_nano = 100_000_000_000u64; // 100 STELL
     let nonce = 12;
 
-    let tx = LightClient::build_begin_unbond_tx(&delegator, validator, amount_nano, nonce);
+    let tx = LightClient::build_pq_begin_unbond_tx(
+        &delegator.kp,
+        validator,
+        amount_nano,
+        nonce,
+        DEFAULT_CHAIN_ID,
+    );
 
     assert_eq!(tx.from, delegator.address);
-    assert_eq!(tx.gas_limit, GAS_STAKE_UNBOND + GAS_BASIC_TRANSFER);
-    assert_eq!(tx.gas_limit, 800 + 280_000);
+    assert_eq!(
+        tx.gas_limit,
+        GAS_STAKE_UNBOND + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    );
     assert_eq!(tx.nonce, nonce);
     assert!(tx.verify_signature());
 
@@ -336,11 +353,14 @@ fn test_tx_construction_withdraw_unbond() {
     let validator = [0xCCu8; 32];
     let nonce = 15;
 
-    let tx = LightClient::build_withdraw_unbond_tx(&delegator, validator, nonce);
+    let tx =
+        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, nonce, DEFAULT_CHAIN_ID);
 
     assert_eq!(tx.from, delegator.address);
-    assert_eq!(tx.gas_limit, GAS_STAKE_UNBOND + GAS_BASIC_TRANSFER);
-    assert_eq!(tx.gas_limit, 800 + 280_000);
+    assert_eq!(
+        tx.gas_limit,
+        GAS_STAKE_UNBOND + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    );
     assert_eq!(tx.nonce, nonce);
     assert!(tx.verify_signature());
 
@@ -360,10 +380,18 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
     let nonce = 22;
 
     // Case 1: Validator claiming its own validator rewards (SysCallClaimRewards)
-    let tx_val = LightClient::build_claim_rewards_tx(&account, account.address, false, nonce);
+    let tx_val = LightClient::build_pq_claim_rewards_tx(
+        &account.kp,
+        account.address,
+        false,
+        nonce,
+        DEFAULT_CHAIN_ID,
+    );
     assert_eq!(tx_val.from, account.address);
-    assert_eq!(tx_val.gas_limit, GAS_STAKE_CLAIM + GAS_BASIC_TRANSFER);
-    assert_eq!(tx_val.gas_limit, 600 + 280_000);
+    assert_eq!(
+        tx_val.gas_limit,
+        GAS_STAKE_CLAIM + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    );
     assert!(tx_val.verify_signature());
     assert_eq!(tx_val.payload.len(), 1);
     match &tx_val.payload[0] {
@@ -374,10 +402,18 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
     }
 
     // Case 2: Delegator claiming accrued rewards from a third-party validator (SysCallClaimDelegatorRewards)
-    let tx_del = LightClient::build_claim_rewards_tx(&account, other_validator, true, nonce + 1);
+    let tx_del = LightClient::build_pq_claim_rewards_tx(
+        &account.kp,
+        other_validator,
+        true,
+        nonce + 1,
+        DEFAULT_CHAIN_ID,
+    );
     assert_eq!(tx_del.from, account.address);
-    assert_eq!(tx_del.gas_limit, GAS_STAKE_CLAIM + GAS_BASIC_TRANSFER);
-    assert_eq!(tx_del.gas_limit, 600 + 280_000);
+    assert_eq!(
+        tx_del.gas_limit,
+        GAS_STAKE_CLAIM + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
+    );
     assert!(tx_del.verify_signature());
     assert_eq!(tx_del.payload.len(), 1);
     match &tx_del.payload[0] {
@@ -386,16 +422,6 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
         }
         other => panic!("expected SysCallClaimDelegatorRewards, got {other:?}"),
     }
-
-    // Case 3: Explicit build_claim_delegator_rewards_tx helper
-    let tx_del_explicit =
-        LightClient::build_claim_delegator_rewards_tx(&account, other_validator, nonce + 1);
-    assert_eq!(tx_del.compute_tx_hash(), tx_del_explicit.compute_tx_hash());
-
-    // Case 4: Explicit build_claim_validator_rewards_tx helper
-    let tx_val_explicit =
-        LightClient::build_claim_validator_rewards_tx(&account, account.address, nonce);
-    assert_eq!(tx_val.compute_tx_hash(), tx_val_explicit.compute_tx_hash());
 }
 
 // -----------------------------------------------------------------------------
@@ -495,7 +521,13 @@ async fn test_delegate_tx_admission_and_receipt_confirmation() {
     fund_account(&node, delegator.address, 100_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_delegate_tx(&delegator, validator, 10_000_000_000, 0);
+    let tx = LightClient::build_pq_delegate_tx(
+        &delegator.kp,
+        validator,
+        10_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
 
     // Broadcast: admitted to mempool, reports Pending before block finalization
     let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast delegate");
@@ -530,7 +562,13 @@ async fn test_begin_unbond_admission_and_receipt_confirmation() {
     fund_account(&node, delegator.address, 100_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_begin_unbond_tx(&delegator, validator, 5_000_000_000, 0);
+    let tx = LightClient::build_pq_begin_unbond_tx(
+        &delegator.kp,
+        validator,
+        5_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -566,7 +604,8 @@ async fn test_withdraw_unbond_admission_and_receipt_confirmation() {
     fund_account(&node, delegator.address, 50_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_withdraw_unbond_tx(&delegator, validator, 0);
+    let tx =
+        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, 0, DEFAULT_CHAIN_ID);
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -601,7 +640,8 @@ async fn test_claim_rewards_admission_and_receipt_confirmation() {
     fund_account(&node, delegator.address, 50_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_claim_delegator_rewards_tx(&delegator, validator, 0);
+    let tx =
+        LightClient::build_pq_claim_rewards_tx(&delegator.kp, validator, true, 0, DEFAULT_CHAIN_ID);
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -640,7 +680,13 @@ async fn test_receipt_polling_rejection_marks_failed_not_confirmed() {
     fund_account(&node, delegator.address, 50_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_delegate_tx(&delegator, validator, 5_000_000_000, 0);
+    let tx = LightClient::build_pq_delegate_tx(
+        &delegator.kp,
+        validator,
+        5_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
     let (tx_hash, _) = client.broadcast_tx(&tx).await.unwrap();
 
     // Node reports receipt with success=false (SVM execution reverted)
@@ -675,7 +721,13 @@ async fn test_node_rejection_mempool_insufficient_funds() {
     let validator = [0x77u8; 32];
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_delegate_tx(&broke_delegator, validator, 1_000_000_000, 0);
+    let tx = LightClient::build_pq_delegate_tx(
+        &broke_delegator.kp,
+        validator,
+        1_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
 
     // Node mempool admission rejects transactions with balance < gas_limit
     let res = client.broadcast_tx(&tx).await;
@@ -695,7 +747,13 @@ async fn test_node_rejection_corrupted_signature() {
     fund_account(&node, delegator.address, 50_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let mut tx = LightClient::build_delegate_tx(&delegator, validator, 1_000_000_000, 0);
+    let mut tx = LightClient::build_pq_delegate_tx(
+        &delegator.kp,
+        validator,
+        1_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
 
     // Tamper with signature
     tx.signature[0] ^= 0xFF;
@@ -716,7 +774,13 @@ async fn test_receipt_polling_timeout_honestly_returns_pending() {
     fund_account(&node, delegator.address, 50_000_000_000).await;
 
     let client = rpc_client(&node).await;
-    let tx = LightClient::build_delegate_tx(&delegator, validator, 1_000_000_000, 0);
+    let tx = LightClient::build_pq_delegate_tx(
+        &delegator.kp,
+        validator,
+        1_000_000_000,
+        0,
+        DEFAULT_CHAIN_ID,
+    );
     let (tx_hash, _) = client.broadcast_tx(&tx).await.unwrap();
 
     let cfg = client.rpc.clone().unwrap();

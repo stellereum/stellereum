@@ -428,10 +428,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(res.is_err(), "evil prefix must be cleanly refused");
         // Generous time bound: the guard returns before any large allocation.
-        assert!(
-            elapsed.as_secs() < 5,
-            "refusal took too long: {elapsed:?}"
-        );
+        assert!(elapsed.as_secs() < 5, "refusal took too long: {elapsed:?}");
     }
 
     #[test]

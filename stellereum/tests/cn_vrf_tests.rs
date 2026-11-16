@@ -6,20 +6,18 @@
 use std::collections::BTreeMap;
 
 use stellereum::cn_vrf::{
-    BETA_PREIMAGE_LEN, COMMIT_CARRIER_LEN, COMMIT_PREIMAGE_LEN, CNVRF_BETA_DST,
-    CNVRF_COMMIT_DST, CNVRF_OPEN_DST, CNVRF_PI_LEN, EPOCH_LEN, OPEN_MESSAGE_LEN,
-    REVEAL_CARRIER_LEN, CommitError, CommitOutcome, cnvrf_beta, cnvrf_commit,
-    cnvrf_commit_state, cnvrf_draw_absence, cnvrf_expire_before,
-    cnvrf_mark_revealed, cnvrf_open, cnvrf_verify, cnvrf_verify_carrier,
-    cnvrf_verify_with_resolver, commit_hash, commit_preimage_bytes,
-    epoch_of_height, epoch_start_height, first_usable_epoch,
+    cnvrf_beta, cnvrf_commit, cnvrf_commit_state, cnvrf_commit_verified_state, cnvrf_draw_absence,
+    cnvrf_expire_before, cnvrf_mark_revealed, cnvrf_open, cnvrf_verify, cnvrf_verify_carrier,
+    cnvrf_verify_commit, cnvrf_verify_with_resolver, commit_hash, commit_preimage_bytes,
+    commit_sig_message_bytes, epoch_of_height, epoch_start_height, first_usable_epoch,
     load_cnvrf_nonce_from_file, open_message_bytes, parse_cnvrf_nonce_hex,
-    save_cnvrf_nonce_to_file, shake256_32, shake256_xof,
+    save_cnvrf_nonce_to_file, shake256_32, shake256_xof, CnVrfError, CommitError, CommitOutcome,
+    BETA_PREIMAGE_LEN, CNVRF_BETA_DST, CNVRF_COMMIT_DST, CNVRF_COMMIT_SIG_DST, CNVRF_OPEN_DST,
+    CNVRF_PI_LEN, COMMIT_CARRIER_LEN, COMMIT_PREIMAGE_LEN, COMMIT_SIG_MESSAGE_LEN, EPOCH_LEN,
+    OPEN_MESSAGE_LEN, REVEAL_CARRIER_LEN,
 };
-use stellereum::post_quantum::{
-    FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN, FalconKeypair,
-};
-use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS, StakingLedger};
+use stellereum::post_quantum::{FalconKeypair, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN};
+use stellereum::staking::{StakingLedger, DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS};
 
 const CHAIN_MAIN: u64 = 5757;
 const CHAIN_ALT: u64 = 777;
@@ -79,6 +77,8 @@ fn cnvrf_group1_determinism_pi_varies_beta_fixed() {
     // two commit carriers for the same inputs differ in `sig` while `c` is
     // fixed. Both must verify.
     assert_ne!(c1.sig, c2.sig, "commit sig randomized like pi");
+    assert_eq!(cnvrf_verify_commit(&c1, CHAIN_MAIN, sk.pubkey()), Ok(()));
+    assert_eq!(cnvrf_verify_commit(&c2, CHAIN_MAIN, sk.pubkey()), Ok(()));
 
     let r1 = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
     let r2 = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
@@ -139,40 +139,234 @@ fn cnvrf_group2_binding_mutations_6x2() {
     assert!(ok().is_some(), "baseline must verify");
 
     // Commit-side (stored c vs mutated coordinate → check-1 or check-2 None).
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN + 1, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none(), "chain commit-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN + 1,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal.pi
+        )
+        .is_none(),
+        "chain commit-side"
+    );
     let vid2 = flip(VID);
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &vid2, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none(), "validator commit-side");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH + 1, &ALPHA, &NONCE, &reveal.pi).is_none(), "epoch commit-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &vid2,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal.pi
+        )
+        .is_none(),
+        "validator commit-side"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH + 1,
+            &ALPHA,
+            &NONCE,
+            &reveal.pi
+        )
+        .is_none(),
+        "epoch commit-side"
+    );
     let nonce2 = flip(NONCE);
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &nonce2, &reveal.pi).is_none(), "nonce commit-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &nonce2,
+            &reveal.pi
+        )
+        .is_none(),
+        "nonce commit-side"
+    );
     let alpha2 = flip(ALPHA);
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &alpha2, &NONCE, &reveal.pi).is_none(), "alpha commit-side (sig refusal)");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &alpha2,
+            &NONCE,
+            &reveal.pi
+        )
+        .is_none(),
+        "alpha commit-side (sig refusal)"
+    );
     let mut bad_pre = commit_preimage_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE);
     bad_pre[..CNVRF_OPEN_DST.len()].copy_from_slice(CNVRF_OPEN_DST);
     let bad_c = shake256_32(&bad_pre);
     assert_ne!(bad_c, commit.c, "domain swap must change c");
-    assert!(cnvrf_verify(sk.pubkey(), &bad_c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none(), "domain commit-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &bad_c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal.pi
+        )
+        .is_none(),
+        "domain commit-side"
+    );
 
     // Open-side (mutated reveal input → None). Sanity first: a carrier pair
     // freshly built under the mutated chain verifies (mutations must be
     // tested against the ORIGINAL pair, not a mixed one).
     let commit_b = cnvrf_commit(&sk, CHAIN_MAIN + 1, &VID, EPOCH, &NONCE);
     let reveal_b = cnvrf_open(&sk, CHAIN_MAIN + 1, &VID, EPOCH, &NONCE, &ALPHA);
-    assert!(cnvrf_verify(sk.pubkey(), &commit_b.c, CHAIN_MAIN + 1, &VID, EPOCH, &ALPHA, &NONCE, &reveal_b.pi).is_some(), "sanity: re-committed chain verifies");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &sk.sign(&open_message_bytes(CHAIN_MAIN + 1, &VID, EPOCH, &NONCE, &ALPHA))).is_none(), "chain open-side");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &sk.sign(&open_message_bytes(CHAIN_MAIN, &vid2, EPOCH, &NONCE, &ALPHA))).is_none(), "validator open-side");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &sk.sign(&open_message_bytes(CHAIN_MAIN, &VID, EPOCH + 1, &NONCE, &ALPHA))).is_none(), "epoch open-side");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &sk.sign(&open_message_bytes(CHAIN_MAIN, &VID, EPOCH, &nonce2, &ALPHA))).is_none(), "nonce open-side");
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &sk.sign(&open_message_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha2))).is_none(), "alpha open-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit_b.c,
+            CHAIN_MAIN + 1,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal_b.pi
+        )
+        .is_some(),
+        "sanity: re-committed chain verifies"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &sk.sign(&open_message_bytes(
+                CHAIN_MAIN + 1,
+                &VID,
+                EPOCH,
+                &NONCE,
+                &ALPHA
+            ))
+        )
+        .is_none(),
+        "chain open-side"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &sk.sign(&open_message_bytes(
+                CHAIN_MAIN, &vid2, EPOCH, &NONCE, &ALPHA
+            ))
+        )
+        .is_none(),
+        "validator open-side"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &sk.sign(&open_message_bytes(
+                CHAIN_MAIN,
+                &VID,
+                EPOCH + 1,
+                &NONCE,
+                &ALPHA
+            ))
+        )
+        .is_none(),
+        "epoch open-side"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &sk.sign(&open_message_bytes(
+                CHAIN_MAIN, &VID, EPOCH, &nonce2, &ALPHA
+            ))
+        )
+        .is_none(),
+        "nonce open-side"
+    );
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &sk.sign(&open_message_bytes(
+                CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha2
+            ))
+        )
+        .is_none(),
+        "alpha open-side"
+    );
     // Domain open-side: pi over a DST-swapped message + beta DST-swap check.
     let mut swapped = open_message_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
     swapped[..CNVRF_COMMIT_DST.len()].copy_from_slice(CNVRF_COMMIT_DST);
     let pi_swapped = sk.sign(&swapped);
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &pi_swapped).is_none(), "domain open-side");
+    assert!(
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &pi_swapped
+        )
+        .is_none(),
+        "domain open-side"
+    );
     assert_ne!(
         cnvrf_beta(&NONCE, &ALPHA, &VID, EPOCH),
         shake256_32(
-            &[CNVRF_COMMIT_DST, &NONCE[..], &ALPHA[..], &VID[..], &EPOCH.to_le_bytes()[..]].concat()
+            &[
+                CNVRF_COMMIT_DST,
+                &NONCE[..],
+                &ALPHA[..],
+                &VID[..],
+                &EPOCH.to_le_bytes()[..]
+            ]
+            .concat()
         ),
         "beta DST swap must change beta"
     );
@@ -183,16 +377,62 @@ fn cnvrf_group2_binding_mutations_6x2() {
     pi_short.truncate(CNVRF_PI_LEN - 1);
     let mut pi_long = reveal.pi.to_vec();
     pi_long.push(0x00);
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &pi_short).is_none());
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &pi_long).is_none());
-    assert!(cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &[]).is_none());
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &ALPHA,
+        &NONCE,
+        &pi_short
+    )
+    .is_none());
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &ALPHA,
+        &NONCE,
+        &pi_long
+    )
+    .is_none());
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &ALPHA,
+        &NONCE,
+        &[]
+    )
+    .is_none());
     let mut pk_short = sk.pubkey().to_vec();
     pk_short.truncate(FALCON512_PUBKEY_LEN - 1);
     let mut pk_long = sk.pubkey().to_vec();
     pk_long.push(0x00);
-    assert!(cnvrf_verify(&pk_short, &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none());
-    assert!(cnvrf_verify(&pk_long, &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none());
-    assert!(cnvrf_verify(&[], &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi).is_none());
+    assert!(cnvrf_verify(
+        &pk_short, &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi
+    )
+    .is_none());
+    assert!(
+        cnvrf_verify(&pk_long, &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal.pi)
+            .is_none()
+    );
+    assert!(cnvrf_verify(
+        &[],
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &ALPHA,
+        &NONCE,
+        &reveal.pi
+    )
+    .is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -209,21 +449,48 @@ fn cnvrf_group3_signature_substitution() {
     let foreign_pi = other.sign(&msg);
     assert_eq!(foreign_pi.len(), FALCON512_SIG_LEN);
     assert!(
-        cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &foreign_pi).is_none(),
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &foreign_pi
+        )
+        .is_none(),
         "foreign-key pi must refuse (A1 end-to-end)"
     );
     // Valid pi over a DIFFERENT alpha with the same nonce.
     let alpha_other = [0x99u8; 32];
-    let reveal_other =
-        cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha_other);
+    let reveal_other = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha_other);
     assert!(
-        cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal_other.pi).is_none(),
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal_other.pi
+        )
+        .is_none(),
         "pi for another alpha must refuse (check 2 binds alpha)"
     );
     // Sanity: that same pi verifies under its own alpha.
-    assert!(
-        cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &alpha_other, &NONCE, &reveal_other.pi).is_some()
-    );
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &alpha_other,
+        &NONCE,
+        &reveal_other.pi
+    )
+    .is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -237,11 +504,29 @@ fn cnvrf_group4_cross_epoch_replay() {
     let reveal = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
     // Same bytes re-submitted in epoch N+1 ⇒ refuse (guard 4a).
     assert!(
-        cnvrf_verify_carrier(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH + 1, &reveal, &ALPHA).is_none(),
+        cnvrf_verify_carrier(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH + 1,
+            &reveal,
+            &ALPHA
+        )
+        .is_none(),
         "epoch N reveal must refuse in N+1"
     );
     assert!(
-        cnvrf_verify_carrier(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &reveal, &ALPHA).is_some(),
+        cnvrf_verify_carrier(
+            sk.pubkey(),
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &reveal,
+            &ALPHA
+        )
+        .is_some(),
         "baseline carrier verifies in N"
     );
     // Commitment for N re-submitted as commitment for N+1 ⇒ different c.
@@ -250,9 +535,17 @@ fn cnvrf_group4_cross_epoch_replay() {
         commit_hash(CHAIN_MAIN, &VID, EPOCH + 1, &NONCE)
     );
     // Crypto-level: epoch is bound even without the carrier guard.
-    assert!(
-        cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH + 1, &ALPHA, &NONCE, &reveal.pi).is_none()
-    );
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH + 1,
+        &ALPHA,
+        &NONCE,
+        &reveal.pi
+    )
+    .is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -266,21 +559,49 @@ fn cnvrf_group5_cross_chain_replay() {
     let reveal_main = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
     // Same bytes under the alt chain ⇒ refuse both directions (guard 4b).
     assert!(
-        cnvrf_verify(sk.pubkey(), &commit_main.c, CHAIN_ALT, &VID, EPOCH, &ALPHA, &NONCE, &reveal_main.pi).is_none(),
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit_main.c,
+            CHAIN_ALT,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal_main.pi
+        )
+        .is_none(),
         "mainnet bytes must refuse on alt chain"
     );
     let commit_alt = cnvrf_commit(&sk, CHAIN_ALT, &VID, EPOCH, &NONCE);
     let reveal_alt = cnvrf_open(&sk, CHAIN_ALT, &VID, EPOCH, &NONCE, &ALPHA);
     assert!(
-        cnvrf_verify(sk.pubkey(), &commit_alt.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal_alt.pi).is_none(),
+        cnvrf_verify(
+            sk.pubkey(),
+            &commit_alt.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            &ALPHA,
+            &NONCE,
+            &reveal_alt.pi
+        )
+        .is_none(),
         "alt-chain bytes must refuse on main chain"
     );
     assert_ne!(commit_main.c, commit_alt.c, "commitments differ per chain");
     // Beta itself is chain-agnostic by shape (§1.4 has no chain_id) — the
     // chain binding lives in checks 1+2, already asserted above.
-    assert!(
-        cnvrf_verify(sk.pubkey(), &commit_main.c, CHAIN_MAIN, &VID, EPOCH, &ALPHA, &NONCE, &reveal_main.pi).is_some()
-    );
+    assert!(cnvrf_verify(
+        sk.pubkey(),
+        &commit_main.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &ALPHA,
+        &NONCE,
+        &reveal_main.pi
+    )
+    .is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +611,7 @@ fn cnvrf_group5_cross_chain_replay() {
 #[test]
 fn cnvrf_group6_abort_path_downtime_math() {
     // Caller-side absence predicate (unit level, no ledger).
-    let empty: BTreeMap<([u8; 32], u64), stellereum::cn_vrf::CommitmentRecord> =
-        BTreeMap::new();
+    let empty: BTreeMap<([u8; 32], u64), stellereum::cn_vrf::CommitmentRecord> = BTreeMap::new();
     assert!(cnvrf_draw_absence(&empty, &VID, EPOCH));
     let mut store = empty;
     let c = commit_hash(CHAIN_MAIN, &VID, EPOCH, &NONCE);
@@ -349,14 +669,41 @@ fn cnvrf_group7_fork_reuse() {
     let alpha_b = [0xBBu8; 32];
     let ra = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha_a);
     let rb = cnvrf_open(&sk, CHAIN_MAIN, &VID, EPOCH, &NONCE, &alpha_b);
-    let beta_a = cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &alpha_a, &NONCE, &ra.pi)
-        .expect("fork A verifies");
-    let beta_b = cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &alpha_b, &NONCE, &rb.pi)
-        .expect("fork B verifies");
+    let beta_a = cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &alpha_a,
+        &NONCE,
+        &ra.pi,
+    )
+    .expect("fork A verifies");
+    let beta_b = cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &alpha_b,
+        &NONCE,
+        &rb.pi,
+    )
+    .expect("fork B verifies");
     assert_ne!(beta_a, beta_b, "distinct fork alphas ⇒ independent betas");
     // Identical parent hash on both forks ⇒ identical beta (agreement, not bug).
-    let beta_a2 = cnvrf_verify(sk.pubkey(), &commit.c, CHAIN_MAIN, &VID, EPOCH, &alpha_a, &NONCE, &ra.pi)
-        .expect("same alpha re-verifies");
+    let beta_a2 = cnvrf_verify(
+        sk.pubkey(),
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &alpha_a,
+        &NONCE,
+        &ra.pi,
+    )
+    .expect("same alpha re-verifies");
     assert_eq!(beta_a, beta_a2);
 }
 
@@ -391,11 +738,33 @@ fn cnvrf_group8_rotation_interplay() {
         }
     };
     assert!(
-        cnvrf_verify_with_resolver(&resolver, &commit.c, CHAIN_MAIN, &VID, EPOCH, draw_old, &ALPHA, &NONCE, &reveal_old.pi).is_some(),
+        cnvrf_verify_with_resolver(
+            &resolver,
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            draw_old,
+            &ALPHA,
+            &NONCE,
+            &reveal_old.pi
+        )
+        .is_some(),
         "pre-effective draws verify under the old key"
     );
     assert!(
-        cnvrf_verify_with_resolver(&resolver, &commit.c, CHAIN_MAIN, &VID, EPOCH, draw_old, &ALPHA, &NONCE, &reveal_new.pi).is_none(),
+        cnvrf_verify_with_resolver(
+            &resolver,
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            draw_old,
+            &ALPHA,
+            &NONCE,
+            &reveal_new.pi
+        )
+        .is_none(),
         "new-key reveal refuses pre-effective"
     );
     // Post-effective, the commitment was made under the old key, so the old
@@ -403,11 +772,33 @@ fn cnvrf_group8_rotation_interplay() {
     // a reveal authorized by the new key verifies (same nonce binding).
     let commit_new = cnvrf_commit(&new, CHAIN_MAIN, &VID, EPOCH, &NONCE);
     assert!(
-        cnvrf_verify_with_resolver(&resolver, &commit.c, CHAIN_MAIN, &VID, EPOCH, draw_new, &ALPHA, &NONCE, &reveal_old.pi).is_none(),
+        cnvrf_verify_with_resolver(
+            &resolver,
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            draw_new,
+            &ALPHA,
+            &NONCE,
+            &reveal_old.pi
+        )
+        .is_none(),
         "superseded-key reveal refuses post-effective"
     );
     assert!(
-        cnvrf_verify_with_resolver(&resolver, &commit_new.c, CHAIN_MAIN, &VID, EPOCH, draw_new, &ALPHA, &NONCE, &reveal_new.pi).is_some(),
+        cnvrf_verify_with_resolver(
+            &resolver,
+            &commit_new.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            draw_new,
+            &ALPHA,
+            &NONCE,
+            &reveal_new.pi
+        )
+        .is_some(),
         "post-effective draws verify under the new key"
     );
     // History depth 2: a resolver keeping only the two newest keys refuses
@@ -415,17 +806,46 @@ fn cnvrf_group8_rotation_interplay() {
     let resolver2 = |_: [u8; 32], _: u64| -> Option<Vec<u8>> { Some(third_pk.clone()) };
     let reveal_third = cnvrf_open(&third, CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA);
     assert!(
-        cnvrf_verify_with_resolver(&resolver2, &commit.c, CHAIN_MAIN, &VID, EPOCH, draw_new, &ALPHA, &NONCE, &reveal_old.pi).is_none(),
+        cnvrf_verify_with_resolver(
+            &resolver2,
+            &commit.c,
+            CHAIN_MAIN,
+            &VID,
+            EPOCH,
+            draw_new,
+            &ALPHA,
+            &NONCE,
+            &reveal_old.pi
+        )
+        .is_none(),
         "retired key (beyond history depth) refuses"
     );
-    assert!(
-        cnvrf_verify_with_resolver(&resolver2, &commit_hash(CHAIN_MAIN, &VID, EPOCH, &NONCE), CHAIN_MAIN, &VID, EPOCH, draw_new, &ALPHA, &NONCE, &reveal_third.pi).is_some()
-    );
+    assert!(cnvrf_verify_with_resolver(
+        &resolver2,
+        &commit_hash(CHAIN_MAIN, &VID, EPOCH, &NONCE),
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        draw_new,
+        &ALPHA,
+        &NONCE,
+        &reveal_third.pi
+    )
+    .is_some());
     // Unresolvable key ⇒ None (fail-closed).
     let resolver_none = |_: [u8; 32], _: u64| -> Option<Vec<u8>> { None };
-    assert!(
-        cnvrf_verify_with_resolver(&resolver_none, &commit.c, CHAIN_MAIN, &VID, EPOCH, draw_new, &ALPHA, &NONCE, &reveal_old.pi).is_none()
-    );
+    assert!(cnvrf_verify_with_resolver(
+        &resolver_none,
+        &commit.c,
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        draw_new,
+        &ALPHA,
+        &NONCE,
+        &reveal_old.pi
+    )
+    .is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -437,15 +857,37 @@ fn cnvrf_group9_kat_sizes() {
     assert_eq!(FALCON512_PUBKEY_LEN, 897);
     assert_eq!(FALCON512_SIG_LEN, 666);
     assert_eq!(CNVRF_PI_LEN, 666);
-    assert_eq!(CNVRF_COMMIT_DST.len(), 21, "normative tag value, not the spec's 20 B print");
-    assert_eq!(CNVRF_OPEN_DST.len(), 19, "normative tag value, not the spec's 18 B print");
-    assert_eq!(CNVRF_BETA_DST.len(), 19, "normative tag value, not the spec's 18 B print");
+    assert_eq!(
+        CNVRF_COMMIT_DST.len(),
+        21,
+        "normative tag value, not the spec's 20 B print"
+    );
+    assert_eq!(
+        CNVRF_COMMIT_SIG_DST.len(),
+        25,
+        "commit-sig domain separation tag"
+    );
+    assert_eq!(
+        CNVRF_OPEN_DST.len(),
+        19,
+        "normative tag value, not the spec's 18 B print"
+    );
+    assert_eq!(
+        CNVRF_BETA_DST.len(),
+        19,
+        "normative tag value, not the spec's 18 B print"
+    );
     assert_eq!(COMMIT_PREIMAGE_LEN, 101);
+    assert_eq!(COMMIT_SIG_MESSAGE_LEN, 105);
     assert_eq!(OPEN_MESSAGE_LEN, 131);
     assert_eq!(BETA_PREIMAGE_LEN, 123);
     assert_eq!(
         commit_preimage_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE).len(),
         101
+    );
+    assert_eq!(
+        commit_sig_message_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE).len(),
+        105
     );
     assert_eq!(
         open_message_bytes(CHAIN_MAIN, &VID, EPOCH, &NONCE, &ALPHA).len(),
@@ -526,8 +968,14 @@ fn cnvrf_state_machine_o7_o10() {
     assert_eq!(store[&(VID, EPOCH)].c, c);
     assert_eq!(store[&(VID, EPOCH)].commit_height, 10);
     // O3: same-block reveal allowed — mark in the same epoch, no lead time.
-    assert!(!cnvrf_mark_revealed(&mut store, &VID, EPOCH, EPOCH + 1), "wrong epoch never marks");
-    assert!(!cnvrf_mark_revealed(&mut store, &[0xFF; 32], EPOCH, EPOCH), "unknown validator never marks");
+    assert!(
+        !cnvrf_mark_revealed(&mut store, &VID, EPOCH, EPOCH + 1),
+        "wrong epoch never marks"
+    );
+    assert!(
+        !cnvrf_mark_revealed(&mut store, &[0xFF; 32], EPOCH, EPOCH),
+        "unknown validator never marks"
+    );
     assert!(cnvrf_mark_revealed(&mut store, &VID, EPOCH, EPOCH));
     assert!(store[&(VID, EPOCH)].revealed);
     // Expiry: epoch N ends ⇒ EXPIRED; only older entries removed.
@@ -536,8 +984,16 @@ fn cnvrf_state_machine_o7_o10() {
         cnvrf_commit_state(&mut store, &VID, EPOCH + 1, &c_next, 20, EPOCH),
         Ok(CommitOutcome::Accepted)
     );
-    assert_eq!(cnvrf_expire_before(&mut store, EPOCH), 0, "current epoch kept");
-    assert_eq!(cnvrf_expire_before(&mut store, EPOCH + 1), 1, "past epoch expired");
+    assert_eq!(
+        cnvrf_expire_before(&mut store, EPOCH),
+        0,
+        "current epoch kept"
+    );
+    assert_eq!(
+        cnvrf_expire_before(&mut store, EPOCH + 1),
+        1,
+        "past epoch expired"
+    );
     assert!(!store.contains_key(&(VID, EPOCH)));
     assert!(store.contains_key(&(VID, EPOCH + 1)));
     assert_eq!(cnvrf_expire_before(&mut store, EPOCH + 1), 0, "idempotent");
@@ -545,10 +1001,7 @@ fn cnvrf_state_machine_o7_o10() {
 
 #[test]
 fn cnvrf_nonce_file_custody_o6() {
-    let dir = std::env::temp_dir().join(format!(
-        "cnvrf_test_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("cnvrf_test_{}", std::process::id()));
     let path = dir.join("epoch5.nonce");
     let _ = std::fs::remove_dir_all(&dir);
     // Roundtrip with temp dir only.
@@ -564,8 +1017,7 @@ fn cnvrf_nonce_file_custody_o6() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("chmod");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(
             load_cnvrf_nonce_from_file(&path).is_err(),
             "0644 must refuse"
@@ -589,9 +1041,265 @@ fn cnvrf_nonce_file_custody_o6() {
 #[test]
 fn cnvrf_domain_tags_distinct() {
     assert_eq!(CNVRF_COMMIT_DST, b"STELL_CNVRF_COMMIT_V1");
+    assert_eq!(CNVRF_COMMIT_SIG_DST, b"STELL_CNVRF_COMMIT_SIG_V1");
     assert_eq!(CNVRF_OPEN_DST, b"STELL_CNVRF_OPEN_V1");
     assert_eq!(CNVRF_BETA_DST, b"STELL_CNVRF_BETA_V1");
+    assert_ne!(CNVRF_COMMIT_DST, CNVRF_COMMIT_SIG_DST);
     assert_ne!(CNVRF_COMMIT_DST, CNVRF_OPEN_DST);
     assert_ne!(CNVRF_COMMIT_DST, CNVRF_BETA_DST);
+    assert_ne!(CNVRF_COMMIT_SIG_DST, CNVRF_OPEN_DST);
+    assert_ne!(CNVRF_COMMIT_SIG_DST, CNVRF_BETA_DST);
     assert_ne!(CNVRF_OPEN_DST, CNVRF_BETA_DST);
+}
+
+#[test]
+fn cnvrf_verify_commit_epoch_n_minus_1_and_anti_squatting() {
+    let validator_sk = key(0xC1);
+    let attacker_sk = key(0xC2);
+    // In epoch N-1, verifier has ONLY (carrier, chain_id, pk) — never `nonce`.
+    let carrier = cnvrf_commit(&validator_sk, CHAIN_MAIN, &VID, EPOCH, &NONCE);
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_MAIN, validator_sk.pubkey()),
+        Ok(()),
+        "valid CommitCarrier verifies in epoch N-1 without knowing nonce"
+    );
+
+    // Tampered commitment `c` fails closed.
+    let mut bad_c = carrier.clone();
+    bad_c.c = flip(bad_c.c);
+    assert_eq!(
+        cnvrf_verify_commit(&bad_c, CHAIN_MAIN, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "tampered commitment must fail closed"
+    );
+
+    // Tampered `epoch_n` fails closed.
+    let mut bad_epoch = carrier.clone();
+    bad_epoch.epoch_n += 1;
+    assert_eq!(
+        cnvrf_verify_commit(&bad_epoch, CHAIN_MAIN, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "tampered epoch_n must fail closed"
+    );
+
+    // Tampered `validator_id` fails closed.
+    let mut bad_vid = carrier.clone();
+    bad_vid.validator_id = flip(bad_vid.validator_id);
+    assert_eq!(
+        cnvrf_verify_commit(&bad_vid, CHAIN_MAIN, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "tampered validator_id must fail closed"
+    );
+
+    // Wrong `chain_id` fails closed.
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_ALT, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "wrong chain_id must fail closed"
+    );
+
+    // Tampered `sig` fails closed.
+    let mut bad_sig = carrier.clone();
+    bad_sig.sig[0] ^= 0x01;
+    assert_eq!(
+        cnvrf_verify_commit(&bad_sig, CHAIN_MAIN, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "tampered sig must fail closed"
+    );
+
+    // Empty / all-zero `sig` fails closed.
+    let mut zero_sig = carrier.clone();
+    zero_sig.sig = [0u8; FALCON512_SIG_LEN];
+    assert_eq!(
+        cnvrf_verify_commit(&zero_sig, CHAIN_MAIN, validator_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "all-zero sig must fail closed"
+    );
+
+    // Foreign key fails closed.
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_MAIN, attacker_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature),
+        "wrong public key must fail closed"
+    );
+
+    // Bad public key lengths fail closed.
+    let mut pk_short = validator_sk.pubkey().to_vec();
+    pk_short.truncate(FALCON512_PUBKEY_LEN - 1);
+    let mut pk_long = validator_sk.pubkey().to_vec();
+    pk_long.push(0x00);
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_MAIN, &pk_short),
+        Err(CnVrfError::InvalidPublicKeyLength)
+    );
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_MAIN, &pk_long),
+        Err(CnVrfError::InvalidPublicKeyLength)
+    );
+    assert_eq!(
+        cnvrf_verify_commit(&carrier, CHAIN_MAIN, &[]),
+        Err(CnVrfError::InvalidPublicKeyLength)
+    );
+
+    // Anti-squatting: attacker tries to squat (VID, EPOCH) with forged/foreign-signed
+    // carriers BEFORE the real validator commits.
+    let mut store = BTreeMap::new();
+    let forged_by_attacker = cnvrf_commit(&attacker_sk, CHAIN_MAIN, &VID, EPOCH, &[0x99; 32]);
+    assert_eq!(
+        cnvrf_commit_verified_state(
+            &mut store,
+            &forged_by_attacker,
+            CHAIN_MAIN,
+            validator_sk.pubkey(),
+            100,
+            EPOCH - 1,
+        ),
+        Err(CnVrfError::InvalidCommitSignature),
+        "foreign-signed carrier must not squat slot"
+    );
+    assert!(store.is_empty(), "failed verify must leave store untouched");
+
+    assert_eq!(
+        cnvrf_commit_verified_state(
+            &mut store,
+            &bad_c,
+            CHAIN_MAIN,
+            validator_sk.pubkey(),
+            100,
+            EPOCH - 1,
+        ),
+        Err(CnVrfError::InvalidCommitSignature),
+        "tampered commitment must not squat slot"
+    );
+    assert!(store.is_empty());
+
+    // State transition rules still apply after signature verification.
+    assert_eq!(
+        cnvrf_commit_verified_state(
+            &mut store,
+            &carrier,
+            CHAIN_MAIN,
+            validator_sk.pubkey(),
+            100,
+            EPOCH,
+        ),
+        Err(CnVrfError::CommitState(CommitError::StaleOrCurrent))
+    );
+    assert!(store.is_empty());
+
+    // Legitimate validator commits successfully into the un-squatted slot.
+    assert_eq!(
+        cnvrf_commit_verified_state(
+            &mut store,
+            &carrier,
+            CHAIN_MAIN,
+            validator_sk.pubkey(),
+            101,
+            EPOCH - 1,
+        ),
+        Ok(CommitOutcome::Accepted)
+    );
+    assert_eq!(store[&(VID, EPOCH)].c, carrier.c);
+    assert_eq!(store[&(VID, EPOCH)].commit_height, 101);
+
+    // Duplicate valid commit is ignored without mutating the record.
+    let carrier2 = cnvrf_commit(&validator_sk, CHAIN_MAIN, &VID, EPOCH, &NONCE);
+    assert_eq!(
+        cnvrf_commit_verified_state(
+            &mut store,
+            &carrier2,
+            CHAIN_MAIN,
+            validator_sk.pubkey(),
+            102,
+            EPOCH - 1,
+        ),
+        Ok(CommitOutcome::IgnoredDuplicate)
+    );
+    assert_eq!(store[&(VID, EPOCH)].commit_height, 101);
+}
+
+#[test]
+fn cnvrf_nonce_file_rejects_symlinks_and_loose_perms() {
+    let dir = std::env::temp_dir().join(format!("cnvrf_custody_sec_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+
+    let real_path = dir.join("real.nonce");
+    save_cnvrf_nonce_to_file(&real_path, &NONCE).expect("save must succeed");
+    assert_eq!(
+        load_cnvrf_nonce_from_file(&real_path).expect("load 0600"),
+        NONCE
+    );
+
+    // Overwrite existing file atomically and confirm no leftover temp files.
+    let nonce2 = [0x44u8; 32];
+    save_cnvrf_nonce_to_file(&real_path, &nonce2).expect("atomic overwrite must succeed");
+    assert_eq!(
+        load_cnvrf_nonce_from_file(&real_path).expect("load overwritten"),
+        nonce2
+    );
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["real.nonce".to_string()]);
+
+    // Directory path refused on load and save.
+    assert!(load_cnvrf_nonce_from_file(&dir).is_err());
+    assert!(save_cnvrf_nonce_to_file(&dir, &NONCE).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        // Symlink pointing to a valid 0600 nonce file must be refused on load AND save.
+        let link_path = dir.join("link.nonce");
+        symlink(&real_path, &link_path).expect("create symlink");
+        assert!(
+            load_cnvrf_nonce_from_file(&link_path).is_err(),
+            "symlink must be refused on nonce load"
+        );
+        assert!(
+            save_cnvrf_nonce_to_file(&link_path, &NONCE).is_err(),
+            "symlink must be refused on nonce save"
+        );
+        // Target must remain untouched (`nonce2`, not overwritten with `NONCE`).
+        assert_eq!(
+            load_cnvrf_nonce_from_file(&real_path).expect("target untouched"),
+            nonce2
+        );
+
+        // Symlinked parent directory must be refused on save.
+        let dir_link = dir.join("sub_link");
+        let real_sub = dir.join("real_sub");
+        std::fs::create_dir_all(&real_sub).expect("create subdir");
+        symlink(&real_sub, &dir_link).expect("create dir symlink");
+        assert!(
+            save_cnvrf_nonce_to_file(&dir_link.join("child.nonce"), &NONCE).is_err(),
+            "symlinked parent dir must be refused on save"
+        );
+
+        // Loose permissions (any group/other bits: 0o640, 0o604, 0o644, 0o610, 0o601) refused.
+        for bad_mode in [0o640u32, 0o604, 0o644, 0o610, 0o601] {
+            std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(bad_mode))
+                .expect("chmod bad");
+            assert!(
+                load_cnvrf_nonce_from_file(&real_path).is_err(),
+                "mode 0o{bad_mode:03o} must be refused"
+            );
+        }
+
+        // Strict owner-only 0o400 and 0o600 accepted.
+        for ok_mode in [0o400u32, 0o600] {
+            std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(ok_mode))
+                .expect("chmod ok");
+            assert_eq!(
+                load_cnvrf_nonce_from_file(&real_path).expect("owner-only mode accepted"),
+                nonce2
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

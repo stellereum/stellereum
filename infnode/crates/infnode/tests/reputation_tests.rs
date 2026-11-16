@@ -85,7 +85,8 @@ async fn fresh_node(tag: &str) -> (std::sync::Arc<Node>, PathBuf) {
     let pq = PqKeys::generate();
     let node = Node::new(
         cfg("S", "127.0.0.1:0", vec![], false),
-        keys, pq,
+        keys,
+        pq,
         tmp.join("s"),
         PathBuf::new(),
     )
@@ -104,13 +105,23 @@ async fn rep_good_peer_unaffected() {
     let (node, tmp) = fresh_node("good").await;
     let good = NodeKeys::generate().id();
     // Unknown identity: neutral score, no throttle, no ban.
-    assert_eq!(node.rep_score(&good).await, 0, "unknown identity is neutral");
-    assert!(!node.rep_is_throttled(&good).await, "neutral is not throttled");
+    assert_eq!(
+        node.rep_score(&good).await,
+        0,
+        "unknown identity is neutral"
+    );
+    assert!(
+        !node.rep_is_throttled(&good).await,
+        "neutral is not throttled"
+    );
     assert!(!node.rep_is_banned(&good).await, "neutral is not banned");
     // Valid handshake/message credits (clamped, never a gate trip).
     node.rep_record_valid(&good).await;
     assert!(node.rep_score(&good).await > 0, "valid activity credits");
-    assert!(!node.rep_is_throttled(&good).await, "good peer not throttled");
+    assert!(
+        !node.rep_is_throttled(&good).await,
+        "good peer not throttled"
+    );
     assert!(!node.rep_is_banned(&good).await, "good peer not banned");
     assert_eq!(node.rep_bans_total(), 0, "no ban imposed");
     assert_eq!(node.rep_ban_count(&good).await, 0, "no escalation memory");
@@ -257,7 +268,10 @@ async fn rep_bans_do_not_touch_other_peers() {
     assert!(node.rep_is_banned(&bad).await, "offender banned");
     for pid in [&good, &stranger] {
         assert_eq!(node.rep_score(pid).await, 0, "other peer stays neutral");
-        assert!(!node.rep_is_throttled(pid).await, "other peer not throttled");
+        assert!(
+            !node.rep_is_throttled(pid).await,
+            "other peer not throttled"
+        );
         assert!(!node.rep_is_banned(pid).await, "other peer not banned");
         assert_eq!(node.rep_ban_count(pid).await, 0, "no escalation spill");
     }
@@ -438,15 +452,19 @@ async fn raw_connect(addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
 
 /// None = refused (connection closed / timeout / non-AUTH). Some = accepted.
 async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
-    let (mut send, mut recv) =
-        tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await.ok()?.ok()?;
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .ok()?
+        .ok()?;
     send.write_all(wire).await.ok()?;
     let _ = send.finish();
     let bytes = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(65536))
         .await
         .ok()?
         .ok()?;
-    Frame::decode(&bytes).ok().filter(|f| f.kind == proto::kind::AUTH)
+    Frame::decode(&bytes)
+        .ok()
+        .filter(|f| f.kind == proto::kind::AUTH)
 }
 
 fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
@@ -506,7 +524,8 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     let pq_b = PqKeys::generate();
     let b = Node::new(
         cfg("B", "127.0.0.1:19931", vec![], true),
-        keys_b.clone(), pq_b.clone(),
+        keys_b.clone(),
+        pq_b.clone(),
         tmp.join("b"),
         PathBuf::new(),
     )

@@ -63,9 +63,7 @@ async fn serve_ws(st: Arc<RpcState>) -> (std::net::SocketAddr, tokio::task::Join
 
 async fn connect(
     addr: std::net::SocketAddr,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
         .expect("websocket handshake");
@@ -75,7 +73,10 @@ async fn connect(
 async fn recv_json<S>(ws: &mut S) -> Value
 where
     S: StreamExt<
-            Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
         > + Unpin,
 {
     let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
@@ -124,9 +125,9 @@ async fn ws_subscriptions_capped_per_connection_fail_closed() {
         .await
         .expect("send subscribe");
         let reply = recv_json(&mut ws).await;
-        let sid = reply["result"].as_str().unwrap_or_else(|| {
-            panic!("subscribe {i} must succeed within the caps: {reply}")
-        });
+        let sid = reply["result"]
+            .as_str()
+            .unwrap_or_else(|| panic!("subscribe {i} must succeed within the caps: {reply}"));
         assert_eq!(sid.len(), 32, "subscription id shape: {reply}");
         ids.push(sid.to_string());
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -158,7 +159,11 @@ async fn ws_subscriptions_capped_per_connection_fail_closed() {
     .await
     .expect("send cheap read");
     let reply = recv_json(&mut ws).await;
-    assert_eq!(reply["result"], json!(777), "socket survives refusal: {reply}");
+    assert_eq!(
+        reply["result"],
+        json!(777),
+        "socket survives refusal: {reply}"
+    );
     // Closing drops the connection's subscriptions: no leak.
     let _ = ws.close(None).await;
     poll_until(
@@ -199,7 +204,11 @@ async fn ws_oversize_message_refused_socket_survives() {
     .await
     .expect("send cheap read");
     let reply = recv_json(&mut ws).await;
-    assert_eq!(reply["result"], json!(777), "socket survives refusal: {reply}");
+    assert_eq!(
+        reply["result"],
+        json!(777),
+        "socket survives refusal: {reply}"
+    );
     // Just under the cap parses (proves the bound, not a freeze): an unknown
     // method echoes "method not found" rather than "too large".
     let almost = "y".repeat(WS_MAX_MESSAGE_BYTES - 512);
@@ -272,11 +281,9 @@ async fn ws_active_connection_not_reaped_while_talking() {
     // A client that keeps talking (a cheap read every 300 ms, well inside
     // the 1 s idle deadline) must NOT be reaped.
     let mut ws = connect(addr).await;
-    poll_until(
-        "session counted live",
-        Duration::from_secs(10),
-        || ws_live_connections() == baseline + 1,
-    )
+    poll_until("session counted live", Duration::from_secs(10), || {
+        ws_live_connections() == baseline + 1
+    })
     .await;
     for i in 0..6 {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(

@@ -7,10 +7,15 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+};
 use stellereum::runtime::{Cluster, ValidatorRuntime};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -54,7 +59,7 @@ fn quorum_threshold_is_two_thirds_plus_one() {
 // ============================================================================
 #[test]
 fn safety_no_conflicting_quorum_with_one_byzantine() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs.clone());
 
@@ -62,8 +67,8 @@ fn safety_no_conflicting_quorum_with_one_byzantine() {
     let b = bh(2);
 
     // 3 validators prevote A (2 honest + 1 that will equivocate)
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     assert_eq!(
@@ -73,8 +78,8 @@ fn safety_no_conflicting_quorum_with_one_byzantine() {
     );
 
     // Now the same 3 validators (equivocators) + the 4th try to build quorum on B
-    for k in &ks {
-        let _ = hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(b)));
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let _ = hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(b)));
     }
 
     let set = hc.prevote_set(0).unwrap();
@@ -241,14 +246,14 @@ async fn liveness_with_two_silent_of_seven() {
 // ============================================================================
 #[test]
 fn view_change_recovers_liveness() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs.clone());
     let a = bh(1);
 
     // Round 0: only 2 prevote (below quorum 3) -> no quorum
-    for k in ks.iter().take(2) {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(2) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     assert_eq!(hc.try_prevote_quorum(), None, "no quorum in round 0");
@@ -259,8 +264,8 @@ fn view_change_recovers_liveness() {
     assert!(hc.proposal.is_none());
 
     // Round 1: 3 prevote -> quorum
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, Some(a)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 1, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     assert_eq!(
@@ -275,11 +280,25 @@ fn view_change_recovers_liveness() {
 // ============================================================================
 #[test]
 fn equivocation_evidence_collected() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs);
-    let _ = hc.add_prevote(Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(1))));
-    let _ = hc.add_prevote(Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(2))));
+    let _ = hc.add_prevote(falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(1)),
+    ));
+    let _ = hc.add_prevote(falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(2)),
+    ));
     let ev = hc.equivocations();
     assert_eq!(ev.len(), 1);
     assert_eq!(ev[0].0, ks[0].verifying_key().to_bytes());
@@ -314,24 +333,24 @@ fn qc_rejects_duplicate_signers() {
 // ============================================================================
 #[test]
 fn qc_rejects_tampered_block_hash() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let a = bh(9);
-    let sigs: Vec<([u8; 32], Vec<u8>)> = ks
-        .iter()
-        .take(3)
-        .map(|k| {
-            let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(a));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let mut qc = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(a),
-        signatures: sigs,
-    };
+    let mut vset_votes = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        vset_votes
+            .add(
+                falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(a)),
+                &vs,
+                1,
+                0,
+                VoteKind::Precommit,
+            )
+            .expect("genuine vote admits");
+    }
+    let mut qc = vset_votes
+        .certificate(Some(a), &vs, &[0u8; 32])
+        .expect("3-of-4 reaches quorum");
     assert!(qc.verify(&vs));
     qc.block_hash = Some(bh(8)); // tamper
     assert!(!qc.verify(&vs), "tampered QC must fail");

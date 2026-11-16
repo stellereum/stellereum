@@ -34,7 +34,8 @@ export const Address: React.FC = () => {
   }, [address]);
 
   const displayAddr = account?.address_stl57 || account?.address || address || '';
-  const stellBal = (account?.balance ?? 0) / 1_000_000_000;
+  const hexAddr = account?.address && account.address !== displayAddr ? account.address : '';
+  const stellBal = Number(account?.balance ?? 0) / 1_000_000_000;
   const usdVal = (stellBal * 0.25).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 
   return (
@@ -59,6 +60,11 @@ export const Address: React.FC = () => {
                 {copied ? 'Copied!' : 'Copy'}
               </button>
             </div>
+            {hexAddr && (
+              <div className="mono" style={{ fontSize: '0.78rem', color: 'var(--text-dim)', marginTop: 4, wordBreak: 'break-all' }}>
+                Hex: {hexAddr}
+              </div>
+            )}
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>Nonce</div>
@@ -149,7 +155,10 @@ export const Address: React.FC = () => {
                     </td>
                   </tr>
                 )}
-                {txs.map((t) => (
+                {txs.map((t) => {
+                  const fromAddr = t.from_stl57 || t.from_addr;
+                  const toAddr = t.to_stl57 || t.to_addr;
+                  return (
                   <tr key={t.hash}>
                     <td className="mono">
                       <Link to={`/tx/${t.hash}`} style={{ fontWeight: 600 }}>
@@ -162,14 +171,22 @@ export const Address: React.FC = () => {
                       </Link>
                     </td>
                     <td className="mono">
-                      <Link to={`/address/${t.from_stl57 || t.from_addr}`}>
-                        {truncateMiddle(t.from_stl57 || t.from_addr, 6, 6)}
-                      </Link>
+                      {fromAddr ? (
+                        <Link to={`/address/${fromAddr}`}>
+                          {truncateMiddle(fromAddr, 6, 6)}
+                        </Link>
+                      ) : (
+                        '—'
+                      )}
                     </td>
                     <td className="mono">
-                      <Link to={`/address/${t.to_stl57 || t.to_addr}`}>
-                        {truncateMiddle(t.to_stl57 || t.to_addr, 6, 6)}
-                      </Link>
+                      {toAddr ? (
+                        <Link to={`/address/${toAddr}`}>
+                          {truncateMiddle(toAddr, 6, 6)}
+                        </Link>
+                      ) : (
+                        '—'
+                      )}
                     </td>
                     <td style={{ fontWeight: 600, color: 'var(--primary)' }}>
                       {formatStell(t.amount)}
@@ -184,7 +201,8 @@ export const Address: React.FC = () => {
                     </td>
                     <td style={{ color: 'var(--text-dim)' }}>{timeAgo(t.timestamp)}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

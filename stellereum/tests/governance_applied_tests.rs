@@ -498,7 +498,13 @@ fn gov_param_bounds_reject_chain_breaking_values() {
         // REPLACE the stored action with the chain-breaking one: exactly the
         // "smuggled proposal" shape the execute-time backstop exists for.
         let id = gov
-            .propose(&mut ledger, ids[0], "t".into(), GovAction::SetMinGasLimit(1), 0)
+            .propose(
+                &mut ledger,
+                ids[0],
+                "t".into(),
+                GovAction::SetMinGasLimit(1),
+                0,
+            )
             .expect("propose");
         gov.proposals.get_mut(&id).expect("proposal").action = action;
         for v in &ids {

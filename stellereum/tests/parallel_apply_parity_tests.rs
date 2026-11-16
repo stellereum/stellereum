@@ -78,7 +78,14 @@ fn det_ed_key(i: u64) -> ed25519_dalek::SigningKey {
 /// FULL-PQ replacement for `Transaction::sign{,_with_payload}` in fixtures:
 /// implicit Falcon-512 (registered globally; no surcharge), so fee/balance
 /// assertions match the old classical fixtures exactly.
-fn pq_tx(id: u64, to: [u8; 32], amount: u64, gas: u64, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+fn pq_tx(
+    id: u64,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
     let (from, pk) = det_addrs(id);
     let kp = FalconKeypair::generate_from_seed_bytes(&det_seed(id));
     debug_assert_eq!(kp.public_key, pk);
@@ -106,11 +113,7 @@ fn new_engine(parallel: bool) -> InMemoryStateEngine {
     e
 }
 
-async fn fund(
-    e: &InMemoryStateEngine,
-    winners: &[(u64, u64)],
-    sponsor: Option<(u64, u64)>,
-) {
+async fn fund(e: &InMemoryStateEngine, winners: &[(u64, u64)], sponsor: Option<(u64, u64)>) {
     for &(id, bal) in winners {
         e.update_account(AccountState::new(addr_of(id), bal)).await;
     }

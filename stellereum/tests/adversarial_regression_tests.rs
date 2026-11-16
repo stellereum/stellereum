@@ -16,7 +16,11 @@ use std::sync::Arc;
 use stellereum::consensus::{
     HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
 };
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::orderbook::{OrderSide, OrderType};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
@@ -55,8 +59,38 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
 
-fn svm_tx(key: &SigningKey, nonce: u64, gas: u64, payload: Vec<OpCode>) -> Transaction {
-    Transaction::sign_with_payload(key, [0xEE; 32], 0, gas, nonce, 0, 1, payload)
+fn pq_id(fk: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, fk.public_key(), &DEFAULT_SALT)
+}
+
+fn svm_tx(key: &FalconKeypair, nonce: u64, gas: u64, payload: Vec<OpCode>) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xEE; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        sig,
+        [0xEE; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 async fn bal(e: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
@@ -82,6 +116,34 @@ fn mkblock(signer: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
     };
     b.sign_block(signer);
+    b
+}
+
+fn mkblock_falcon(
+    signer: &SigningKey,
+    fk: &FalconKeypair,
+    h: u64,
+    prev: [u8; 32],
+    root: [u8; 32],
+) -> Block {
+    let mut b = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: h,
+        prev_hash: prev,
+        state_root: root,
+        transactions: vec![],
+        cross_shard_out: vec![],
+        timestamp: 1_000,
+        proposer: id(signer),
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        order_merkle_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+    };
+    b.sign_block_with_falcon(signer, fk);
     b
 }
 
@@ -131,13 +193,16 @@ fn precommit_qc(
 #[tokio::test]
 async fn adv_stranger_cannot_claim_anothers_rewards() {
     let e = InMemoryStateEngine::new();
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = id(&victim);
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = id(&attacker);
+    let victim = FalconKeypair::generate_from_seed(0x11);
+    let victim_addr = pq_id(&victim);
+    let attacker = FalconKeypair::generate_from_seed(0x12);
+    let attacker_addr = pq_id(&attacker);
 
-    e.update_account(AccountState::new(victim_addr, stell(10_000) + 10_000))
-        .await;
+    e.update_account(AccountState::new(
+        victim_addr,
+        stell(10_000) + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     e.apply_transaction(
         &svm_tx(
             &victim,
@@ -198,8 +263,8 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
     );
     assert_eq!(
         before - after,
-        10_000,
-        "the failure fee is the declared gas limit"
+        10_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        "the failure fee is the declared gas limit plus PQ activation surcharge"
     );
     assert_eq!(
         bal(&e, &STAKING_POOL).await,
@@ -243,13 +308,16 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
 #[tokio::test]
 async fn adv_stranger_cannot_force_unbond() {
     let e = InMemoryStateEngine::new();
-    let honest = SigningKey::generate(&mut OsRng);
-    let honest_addr = id(&honest);
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = id(&attacker);
+    let honest = FalconKeypair::generate_from_seed(0x21);
+    let honest_addr = pq_id(&honest);
+    let attacker = FalconKeypair::generate_from_seed(0x22);
+    let attacker_addr = pq_id(&attacker);
 
-    e.update_account(AccountState::new(honest_addr, floor() + 20_000))
-        .await;
+    e.update_account(AccountState::new(
+        honest_addr,
+        floor() + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     e.apply_transaction(
         &svm_tx(
             &honest,
@@ -271,8 +339,11 @@ async fn adv_stranger_cannot_force_unbond() {
         .validators
         .contains_key(&honest_addr));
 
-    e.update_account(AccountState::new(attacker_addr, 20_000))
-        .await;
+    e.update_account(AccountState::new(
+        attacker_addr,
+        20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     let err = e
         .apply_transaction(
             &svm_tx(
@@ -325,15 +396,18 @@ async fn adv_stranger_cannot_force_unbond() {
 #[tokio::test]
 async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     let e = InMemoryStateEngine::new();
-    let honest = SigningKey::generate(&mut OsRng);
-    let honest_addr = id(&honest);
-    let fresh = SigningKey::generate(&mut OsRng);
-    let fresh_addr = id(&fresh);
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = id(&attacker);
+    let honest = FalconKeypair::generate_from_seed(0x31);
+    let honest_addr = pq_id(&honest);
+    let fresh = FalconKeypair::generate_from_seed(0x32);
+    let fresh_addr = pq_id(&fresh);
+    let attacker = FalconKeypair::generate_from_seed(0x33);
+    let attacker_addr = pq_id(&attacker);
 
-    e.update_account(AccountState::new(honest_addr, floor() + 100_000))
-        .await;
+    e.update_account(AccountState::new(
+        honest_addr,
+        floor() + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     e.apply_transaction(
         &svm_tx(
             &honest,
@@ -356,11 +430,11 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
         .contains_key(&honest_addr));
 
     // A delegator rides along, so rotation must carry foreign positions too.
-    let delegator = SigningKey::generate(&mut OsRng);
-    let delegator_addr = id(&delegator);
+    let delegator = FalconKeypair::generate_from_seed(0x34);
+    let delegator_addr = pq_id(&delegator);
     e.update_account(AccountState::new(
         delegator_addr,
-        MIN_VALIDATOR_BOND + 20_000,
+        MIN_VALIDATOR_BOND + 20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
     e.apply_transaction(
@@ -378,8 +452,11 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     .await
     .unwrap();
 
-    e.update_account(AccountState::new(attacker_addr, 20_000))
-        .await;
+    e.update_account(AccountState::new(
+        attacker_addr,
+        20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     let err = e
         .apply_transaction(
             &svm_tx(
@@ -431,10 +508,13 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     }
 
     // Rotating onto an existing validator refuses (no merging, ever).
-    let other = SigningKey::generate(&mut OsRng);
-    let other_addr = id(&other);
-    e.update_account(AccountState::new(other_addr, floor() + 20_000))
-        .await;
+    let other = FalconKeypair::generate_from_seed(0x35);
+    let other_addr = pq_id(&other);
+    e.update_account(AccountState::new(
+        other_addr,
+        floor() + 20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     e.apply_transaction(
         &svm_tx(
             &other,
@@ -450,8 +530,11 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     .await
     .unwrap();
     // The rotated key needs gas money of its own to transact.
-    e.update_account(AccountState::new(fresh_addr, 100_000))
-        .await;
+    e.update_account(AccountState::new(
+        fresh_addr,
+        100_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+    ))
+    .await;
     let err = e
         .apply_transaction(
             &svm_tx(
@@ -501,10 +584,10 @@ async fn adv_stranger_cannot_cancel_anothers_order() {
         .unwrap();
     e.pmm_init_usdt(usdt, 1_000_000_000_000).await;
 
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = id(&victim);
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = id(&attacker);
+    let victim = FalconKeypair::generate_from_seed(0x36);
+    let victim_addr = pq_id(&victim);
+    let attacker = FalconKeypair::generate_from_seed(0x37);
+    let attacker_addr = pq_id(&attacker);
     e.update_account(AccountState::new(victim_addr, 1_000 * NANO))
         .await;
     e.update_account(AccountState::new(attacker_addr, 10 * NANO))
@@ -633,10 +716,16 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
 
     // Variant B (literal membership attack): attacker forges its own "QC" whose
     // signers are all non-members. Power counted = 0 < quorum.
+    let atk_fk0 = FalconKeypair::generate_from_seed(0xE9);
+    stellereum::consensus::register_validator_pq_key(
+        id(&atk[0]),
+        PqScheme::Falcon512,
+        atk_fk0.public_key.clone(),
+    );
     let mut prev = our_last;
     let mut chain_b = vec![];
     for i in 0..4u64 {
-        let mut b = mkblock(&atk[0], 8 + i, prev, root);
+        let mut b = mkblock_falcon(&atk[0], &atk_fk0, 8 + i, prev, root);
         let bh = b.compute_hash();
         b.precommit_qc = Some(QuorumCertificate {
             height: 8 + i,
@@ -676,7 +765,7 @@ async fn adv_sync_refuses_power_below_quorum() {
     let mut prev = our_last;
     let mut chain = vec![];
     for i in 0..3u64 {
-        let mut b = mkblock(&ks[0], 8 + i, prev, root);
+        let mut b = mkblock_falcon(&ks[0], &fks[0], 8 + i, prev, root);
         let bh = b.compute_hash();
         // Only ONE genuine member signed: power 1 < quorum 3.
         b.precommit_qc = Some(precommit_qc(&ks, &fks, &[0], 8 + i, bh, &prev));
@@ -694,11 +783,12 @@ async fn adv_sync_refuses_power_below_quorum() {
     for i in 0..3u64 {
         let h = 8 + i;
         let sched = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let signer = ks
+        let (signer, signer_fk) = ks
             .iter()
-            .find(|k| id(k) == sched)
+            .zip(fks.iter())
+            .find(|(k, _)| id(k) == sched)
             .expect("proposer is a member");
-        let mut b = mkblock(signer, h, prev, root);
+        let mut b = mkblock_falcon(signer, signer_fk, h, prev, root);
         let bh = b.compute_hash();
         b.precommit_qc = Some(precommit_qc(&ks, &fks, &[0, 1, 2], h, bh, &prev));
         prev = b.compute_hash();
@@ -929,14 +1019,21 @@ fn adv_five_hundred_far_future_rounds_buy_at_most_500() {
 // Adopt-path helpers: a valid height-1 block + genuine 3-of-4 precommit QC.
 // ===========================================================================
 
-async fn adopt_fixture(ks: &[SigningKey]) -> (ValidatorRuntime, Block, [u8; 32]) {
+async fn adopt_fixture(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+) -> (ValidatorRuntime, Block, [u8; 32]) {
     let vs = vset(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st.clone(), 1);
     let proposer_id = vs.proposer_for(1, 0).unwrap();
-    let pk = ks.iter().find(|k| id(k) == proposer_id).unwrap().clone();
-    let block = mkblock(&pk, 1, [0u8; 32], st.get_state_root().await);
+    let (pk, pfk) = ks
+        .iter()
+        .zip(fks.iter())
+        .find(|(k, _)| id(k) == proposer_id)
+        .unwrap();
+    let block = mkblock_falcon(pk, pfk, 1, [0u8; 32], st.get_state_root().await);
     let hash = block.compute_hash();
     let _ = &mut rt;
     (rt, block, hash)
@@ -946,7 +1043,7 @@ async fn adopt_fixture(ks: &[SigningKey]) -> (ValidatorRuntime, Block, [u8; 32])
 #[tokio::test]
 async fn adv_adopt_refuses_prevote_kind_cert() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let (mut rt, block, hash) = adopt_fixture(&ks).await;
+    let (mut rt, block, hash) = adopt_fixture(&ks, &fks).await;
     // FULL-PQ: a QC verifies only with the PQ envelope, so the (genuine,
     // prevote-kind) cert is compiled by the committee path production uses.
     let vs = vset(&ks);
@@ -977,7 +1074,7 @@ async fn adv_adopt_refuses_prevote_kind_cert() {
 #[tokio::test]
 async fn adv_adopt_refuses_wrong_height_cert() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let (mut rt, block, hash) = adopt_fixture(&ks).await;
+    let (mut rt, block, hash) = adopt_fixture(&ks, &fks).await;
     // FULL-PQ: the (genuine, height-999) cert is compiled by the committee
     // path production uses, so it verifies and the height binding is what
     // refuses the adoption.
@@ -1014,8 +1111,18 @@ async fn adv_adopt_refuses_non_scheduled_proposer() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st.clone(), 1);
 
     let real = vs.proposer_for(1, 0).unwrap();
-    let imposter = ks.iter().find(|k| id(k) != real).unwrap().clone();
-    let block = mkblock(&imposter, 1, [0u8; 32], st.get_state_root().await);
+    let (imposter, imposter_fk) = ks
+        .iter()
+        .zip(fks.iter())
+        .find(|(k, _)| id(k) != real)
+        .unwrap();
+    let block = mkblock_falcon(
+        imposter,
+        imposter_fk,
+        1,
+        [0u8; 32],
+        st.get_state_root().await,
+    );
     let hash = block.compute_hash();
     let cert = precommit_qc(&ks, &fks, &[0, 1, 2], 1, hash, &[0u8; 32]);
     assert!(cert.verify(&vs));
@@ -1029,13 +1136,17 @@ async fn adv_adopt_refuses_non_scheduled_proposer() {
 #[tokio::test]
 async fn adv_adopt_refuses_fabricated_state_root() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let (mut rt, mut block, hash) = adopt_fixture(&ks).await;
+    let (mut rt, mut block, hash) = adopt_fixture(&ks, &fks).await;
     block.state_root = [0xABu8; 32];
     // Re-sign after mutating the header so the failure is the root, not the sig.
     let proposer = block.proposer;
-    let pk = ks.iter().find(|k| id(k) == proposer).unwrap().clone();
+    let (pk, pfk) = ks
+        .iter()
+        .zip(fks.iter())
+        .find(|(k, _)| id(k) == proposer)
+        .unwrap();
     block.validator_signatures.clear();
-    block.sign_block(&pk);
+    block.sign_block_with_falcon(pk, pfk);
     let hash2 = block.compute_hash();
     let _ = hash;
     let cert = precommit_qc(&ks, &fks, &[0, 1, 2], 1, hash2, &[0u8; 32]);
@@ -1050,7 +1161,7 @@ async fn adv_adopt_refuses_fabricated_state_root() {
 //     self.validators; no set parameter exists).
 #[tokio::test]
 async fn adv_adopt_uses_only_the_local_validator_set() {
-    let (ks, _fks) = falcon_votes::falcon_set(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let real = vset(&ks);
     // Fresh attacker key, distinct from the committee (as before); its Falcon
     // companion is registered so the 1-of-1 cert below genuinely verifies
@@ -1068,8 +1179,12 @@ async fn adv_adopt_uses_only_the_local_validator_set() {
     fund_genesis(&st, &real, 1_000_000_000_000_000).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), real.clone(), st.clone(), 1);
     let proposer_id = real.proposer_for(1, 0).unwrap();
-    let pk = ks.iter().find(|k| id(k) == proposer_id).unwrap().clone();
-    let block = mkblock(&pk, 1, [0u8; 32], st.get_state_root().await);
+    let (pk, pfk) = ks
+        .iter()
+        .zip(fks.iter())
+        .find(|(k, _)| id(k) == proposer_id)
+        .unwrap();
+    let block = mkblock_falcon(pk, pfk, 1, [0u8; 32], st.get_state_root().await);
     let hash = block.compute_hash();
     // FULL-PQ: the attacker's 1-of-1 cert is compiled by the committee path
     // under the FORGED set, so it genuinely verifies there (and only there).
@@ -1290,14 +1405,14 @@ async fn adv_faucet_without_token_dispenses_nothing() {
 
 #[tokio::test]
 async fn adv_grafted_vote_signatures_are_not_a_decision_proof() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let our_last = [0x11u8; 32];
     let root = InMemoryStateEngine::new().get_state_root().await;
 
     // Direct unit fact: a real quorum's vote signatures do NOT verify as block
     // signatures, because the signed message differs.
-    let probe = mkblock(&ks[0], 8, our_last, root);
+    let probe = mkblock_falcon(&ks[0], &fks[0], 8, our_last, root);
     let probe_hash = probe.compute_hash();
     let mut grafted = probe.clone();
     // Keep the proposer's genuine block signature (so the proposer check passes
@@ -1319,7 +1434,7 @@ async fn adv_grafted_vote_signatures_are_not_a_decision_proof() {
         let mut m = HashMap::new();
         let mut prev = our_last;
         for i in 0..4u64 {
-            let mut g = mkblock(&ks[0], 8 + i, prev, root);
+            let mut g = mkblock_falcon(&ks[0], &fks[0], 8 + i, prev, root);
             let h = g.compute_hash();
             // NEGATIVE-PATH (forgery, same as above): do not convert.
             for k in ks.iter().take(3) {

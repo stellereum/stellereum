@@ -30,7 +30,8 @@ use stellereum::sharding::{
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 #[path = "support/falcon_votes.rs"]
-#[allow(dead_code)] // GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites (realism preserved).
+#[allow(dead_code)]
+// GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites (realism preserved).
 mod falcon_votes;
 
 const SHARD0: u32 = MASTERCHAIN_SHARD;
@@ -203,7 +204,8 @@ async fn det_run_height(sc: &mut ShardedCluster, validator: &SigningKey, ts: u64
     let bh = block.compute_hash();
     // Single-node Falcon index is 0 (see `Cluster::new_sharded`).
     let fk = FalconKeypair::generate_from_seed(0);
-    let pv = falcon_votes::fvote_deterministic(0, validator, &fk, h, r, VoteKind::Prevote, Some(bh));
+    let pv =
+        falcon_votes::fvote_deterministic(0, validator, &fk, h, r, VoteKind::Prevote, Some(bh));
     let _ = cluster.nodes[0].on_prevote(pv);
     let pc =
         falcon_votes::fvote_deterministic(0, validator, &fk, h, r, VoteKind::Precommit, Some(bh));

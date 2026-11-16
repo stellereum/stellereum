@@ -19,13 +19,12 @@
 
 use infnode::config::NodeConfig;
 use infnode::keyring::{NodeKeys, PqKeys};
+use infnode::node::Node;
 use infnode::node::{
-    circuit_backoff_secs, circuit_probe_endpoint, circuit_should_park,
-    CIRCUIT_BACKOFF_FIRST_SECS, CIRCUIT_BACKOFF_MAX_SECS,
-    CIRCUIT_BACKOFF_SECOND_SECS, CIRCUIT_FAIL_THRESHOLD,
+    circuit_backoff_secs, circuit_probe_endpoint, circuit_should_park, CIRCUIT_BACKOFF_FIRST_SECS,
+    CIRCUIT_BACKOFF_MAX_SECS, CIRCUIT_BACKOFF_SECOND_SECS, CIRCUIT_FAIL_THRESHOLD,
     CIRCUIT_RECONNECT_INTERVAL_SECS, MAX_CIRCUIT_PEERS,
 };
-use infnode::node::Node;
 use infnode::proto::NODEID_LEN;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,10 +52,7 @@ fn cfg(name: &str) -> NodeConfig {
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "infnode-circuit-{tag}-{}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("infnode-circuit-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("tmpdir");
     d
@@ -157,7 +153,11 @@ async fn stored_backoff_escalates_per_failed_probe() {
     assert_eq!(node.circuit_parks_total(), 1);
     node.circuit_record_failure(pid);
     assert_eq!(node.circuit_current_backoff_secs(&pid), 1800);
-    assert_eq!(node.circuit_parks_total(), 1, "escalation is not a new park");
+    assert_eq!(
+        node.circuit_parks_total(),
+        1,
+        "escalation is not a new park"
+    );
     node.circuit_record_failure(pid);
     assert_eq!(
         node.circuit_current_backoff_secs(&pid),
@@ -305,7 +305,10 @@ fn storm_rate_bound_10_virtual_min() {
     // 5 initial dials + probes at t=100 (20s park) and t=400 (5min park);
     // the next probe (30min park) lands past the 10min window.
     assert_eq!(new_dials, 7, "5 dials + 2 probes in 10 virtual min");
-    assert!(new_dials < 10, "storm bound: {new_dials} < 10 (was {old_dials})");
+    assert!(
+        new_dials < 10,
+        "storm bound: {new_dials} < 10 (was {old_dials})"
+    );
     assert!(
         new_dials * 10 < old_dials,
         ">10x reduction: {new_dials} vs {old_dials}"

@@ -21,31 +21,38 @@ fi
 echo -e "\033[1;34m[stell-observer]\033[0m Setting up Observer Node in $NODE_DIR..."
 mkdir -p "$NODE_DIR/data"
 
-# Generate observer configuration
-cat << 'YAML' > "$NODE_DIR/observer.yaml"
+# Generate observer configuration if not already provided
+if [[ ! -f "$NODE_DIR/observer.yaml" ]]; then
+    if [[ -n "${STELL_OBSERVER_PEERS_FILE:-}" && -f "$STELL_OBSERVER_PEERS_FILE" ]]; then
+        {
+            echo "name: observer"
+            echo 'listen: "0.0.0.0:9411"'
+            echo "validators: []"
+            echo "peers:"
+            cat "$STELL_OBSERVER_PEERS_FILE"
+        } > "$NODE_DIR/observer.yaml"
+    else
+        cat << 'YAML' > "$NODE_DIR/observer.yaml"
 name: observer
 listen: "0.0.0.0:9411"
 validators: []
+# FULL-PQ: populate `ed-pub` + 897-byte `pq-pub` from `stellereum keys peer-stanza`
+# on your bootstrap validator(s). Legacy `node-id:` / `x-pub:` fields are rejected.
 peers:
   - name: nodeA
-    node-id: "inf1:56d7b3a5570626a6822b992041367bb7e2b7298a"
     ed-pub: "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361"
-    x-pub: "04fe590d752cecec371dd3f98943ca241ad0e6f741db5e7feb20326ec899fc7c"
+    pq-pub: "<REPLACE_WITH_897_BYTE_FALCON512_PUBKEY_HEX>"
     endpoints: ["212.113.103.105:9410"]
     allow: ["*"]
-  - name: nodeC
-    node-id: "inf1:ba7f458a343b41706c4a26754db0a4f935cf58ed"
-    ed-pub: "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694"
-    x-pub: "96a844dfcba2a2028fbcfc33498e6a1874b0f7d7eadd164e3237f8a7f0cb9878"
-    endpoints: ["77.110.96.68:9410"]
-    allow: ["*"]
-  - name: nodeD
-    node-id: "inf1:2a74bfe487f2b5e4f1e9913bc99d90d42b6e2e45"
-    ed-pub: "eddf81632831d8e9747dc38edbb2c88a835e246a0310d74c8b12b8df6e32e4cc"
-    x-pub: "cd38330338732ba62d3228bd0e02326c85f400dee53b530a898d97338b81e42a"
-    endpoints: ["138.124.102.200:9410"]
-    allow: ["*"]
 YAML
+    fi
+fi
+
+if grep -q '<REPLACE_WITH_897_BYTE_FALCON512_PUBKEY_HEX>' "$NODE_DIR/observer.yaml"; then
+    echo -e "\033[1;31m[ERROR]\033[0m $NODE_DIR/observer.yaml still has placeholder pq-pub." >&2
+    echo "        Replace it using 'stellereum keys peer-stanza' output or pass STELL_OBSERVER_PEERS_FILE=/path/to/peers.yaml" >&2
+    exit 1
+fi
 
 # Environment for Observer
 cat << 'ENV' > "$NODE_DIR/env.observer"

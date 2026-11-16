@@ -127,10 +127,24 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
     // ---- Node A: the peer ALSO gossips an equivocating pair from validator #4.
     let mut node_a = ValidatorRuntime::new(ksa[0].clone(), vs_a.clone(), st_a.clone(), 1);
     node_a
-        .on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+        .on_prevote(falcon_votes::fvote(
+            &victim,
+            &fks[3],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh(0xA1)),
+        ))
         .unwrap();
     node_a
-        .on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
+        .on_prevote(falcon_votes::fvote(
+            &victim,
+            &fks[3],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh(0xA2)),
+        ))
         .unwrap();
     // Node A genuinely holds the double-vote evidence...
     assert_eq!(
@@ -209,14 +223,32 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
         .await
         .map(|a| a.balance);
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
-    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
-        .unwrap();
-    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
-        .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &victim,
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(0xA1)),
+    ))
+    .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &victim,
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(0xA2)),
+    ))
+    .unwrap();
     assert_eq!(rt.hc.equivocations().len(), 1, "evidence recorded locally");
-    rt.adopt_committed(1, blk, precommit_cert(&ks, &fks, &vset, 3, 1, block_hash, &[0u8; 32]))
-        .await
-        .unwrap();
+    rt.adopt_committed(
+        1,
+        blk,
+        precommit_cert(&ks, &fks, &vset, 3, 1, block_hash, &[0u8; 32]),
+    )
+    .await
+    .unwrap();
 
     let pool_after = st
         .get_account(&stellereum::staking::STAKING_POOL)
@@ -263,8 +295,15 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
 
     // Three validators precommit B. Nobody prevoted anything at all.
     for (i, k) in ks.iter().enumerate().take(3) {
-        rt.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
-            .unwrap();
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh(0xB2)),
+        ))
+        .unwrap();
     }
     assert!(rt.hc.prevote_qc.is_empty(), "no prevote QC exists");
     // Give the node the block, so this exercises the prevote-precondition path and
@@ -362,16 +401,30 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
         // Finalising now requires a prevote quorum for the same block, so the
         // test drives a real round instead of only precommitting.
         for (i, k) in ks.iter().enumerate().take(3) {
-            rt.on_prevote(falcon_votes::fvote(k, &fks[i], h, 0, VoteKind::Prevote, Some(bhash)))
-                .unwrap();
+            rt.on_prevote(falcon_votes::fvote(
+                k,
+                &fks[i],
+                h,
+                0,
+                VoteKind::Prevote,
+                Some(bhash),
+            ))
+            .unwrap();
         }
         assert!(
             rt.hc.try_prevote_quorum().is_some(),
             "prevote quorum at height {h}"
         );
         for (i, k) in ks.iter().enumerate().take(3) {
-            rt.on_precommit(falcon_votes::fvote(k, &fks[i], h, 0, VoteKind::Precommit, Some(bhash)))
-                .unwrap();
+            rt.on_precommit(falcon_votes::fvote(
+                k,
+                &fks[i],
+                h,
+                0,
+                VoteKind::Precommit,
+                Some(bhash),
+            ))
+            .unwrap();
         }
         assert_eq!(rt.try_finalize().await, Some(bhash), "height {h} finalized");
     }

@@ -17,8 +17,8 @@
 //! the consensus engine, so a forged vote is dropped there.
 
 use crate::consensus::{
-    PqMicroCertificate, QuorumCertificate, ValidatorSet, Vote, VoteKind,
-    decode_pq_micro_envelope, encode_pq_micro_envelope, PQ_UQC_MARKER_ID,
+    decode_pq_micro_envelope, encode_pq_micro_envelope, PqMicroCertificate, QuorumCertificate,
+    ValidatorSet, Vote, VoteKind, PQ_UQC_MARKER_ID,
 };
 use crate::network::P2pNetworkAdapter;
 use crate::sharding::{Block, ShardRegistry};
@@ -679,9 +679,7 @@ pub fn dial_backoff_ms(consec_fails: u32, base_ms: u64, cap_ms: u64) -> u64 {
     }
     let base = base_ms.max(1);
     let cap = cap_ms.max(1);
-    let shift = consec_fails
-        .saturating_sub(PEER_SKIP_THRESHOLD)
-        .min(20);
+    let shift = consec_fails.saturating_sub(PEER_SKIP_THRESHOLD).min(20);
     base.saturating_mul(1u64 << shift).min(cap)
 }
 
@@ -707,18 +705,13 @@ pub fn peer_dial_suppressed(
     backoff_until: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    peer_in_cooldown(fails, last_fail, now)
-        || backoff_until.is_some_and(|t| now < t)
+    peer_in_cooldown(fails, last_fail, now) || backoff_until.is_some_and(|t| now < t)
 }
 
 /// Pure global-budget decision (unit-tested): at most `per_sec` dials per
 /// second process-wide, enforced as a min-interval gate
 /// (`interval = 1000/per_sec` ms). `None` (no dial yet) always allows.
-pub fn dial_budget_should_allow(
-    last_ms: Option<u64>,
-    now_ms: u64,
-    per_sec: u32,
-) -> bool {
+pub fn dial_budget_should_allow(last_ms: Option<u64>, now_ms: u64, per_sec: u32) -> bool {
     let interval = 1000u64 / u64::from(per_sec.max(1));
     match last_ms {
         None => true,
@@ -792,12 +785,7 @@ fn peer_backoff_until(now: std::time::Instant, fails: u32) -> Option<std::time::
     if backoff == 0 {
         None
     } else {
-        Some(
-            now + Duration::from_millis(dial_backoff_jittered_ms(
-                backoff,
-                rand::random::<u64>(),
-            )),
-        )
+        Some(now + Duration::from_millis(dial_backoff_jittered_ms(backoff, rand::random::<u64>())))
     }
 }
 
@@ -1031,7 +1019,11 @@ impl ConsensusNetwork {
     /// known-dead peers (a streak already at/above the threshold logs at
     /// debug) while the ledger itself keeps exactly one loud line per
     /// transition (warn healthy->failing here, info failing->healthy here).
-    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) -> u32 {
+    fn record_health(
+        health: &Mutex<HashMap<[u8; 20], PeerHealth>>,
+        pid: [u8; 20],
+        ok: bool,
+    ) -> u32 {
         let now = std::time::Instant::now();
         match health.lock() {
             Ok(mut h) => {
@@ -2381,7 +2373,9 @@ impl TxGossip {
             Ok(Err(e)) => {
                 Self::record_health(&health, pid, false);
                 if loud_attempt {
-                    tracing::warn!("[txgossip] broadcast to {hexid} transport-err in {elapsed:?}: {e}");
+                    tracing::warn!(
+                        "[txgossip] broadcast to {hexid} transport-err in {elapsed:?}: {e}"
+                    );
                 } else {
                     tracing::debug!("[txgossip] broadcast to {hexid} transport-err in {elapsed:?} (known-dead peer): {e}");
                 }
@@ -2403,7 +2397,11 @@ impl TxGossip {
     /// returns the pre-update failure streak; exactly one loud line per
     /// transition (warn healthy->failing, info failing->healthy), debug
     /// per backoff-level change afterwards.
-    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) -> u32 {
+    fn record_health(
+        health: &Mutex<HashMap<[u8; 20], PeerHealth>>,
+        pid: [u8; 20],
+        ok: bool,
+    ) -> u32 {
         let now = std::time::Instant::now();
         match health.lock() {
             Ok(mut h) => {
@@ -2870,7 +2868,7 @@ pub fn parse_tx_incoming(raw: &str) -> Option<crate::sharding::Transaction> {
     if bytes.is_empty() || bytes.len() > MAX_TX_MSG {
         return None;
     }
-    bincode::deserialize(&bytes).ok()
+    crate::network::decode_wire_limited(&bytes, (bytes.len() as u64).min(MAX_TX_MSG as u64)).ok()
 }
 
 /// What a transaction-gossip frame carries.
@@ -2904,7 +2902,9 @@ pub fn parse_tx_gossip_payload(raw: &str) -> Option<TxGossipPayload> {
         let frame = crate::mev_epoch::MevFrame::decode(&bytes).ok()?;
         return Some(TxGossipPayload::Mev(frame));
     }
-    let tx: crate::sharding::Transaction = bincode::deserialize(&bytes).ok()?;
+    let tx: crate::sharding::Transaction =
+        crate::network::decode_wire_limited(&bytes, (bytes.len() as u64).min(MAX_TX_MSG as u64))
+            .ok()?;
     Some(TxGossipPayload::Plain(tx))
 }
 
@@ -3077,7 +3077,11 @@ mod tests {
         );
         let sum: f64 = text
             .lines()
-            .find(|l| l.starts_with(&format!("stell_peer_latency_seconds_sum{{peer=\"{peer}\"}}")))
+            .find(|l| {
+                l.starts_with(&format!(
+                    "stell_peer_latency_seconds_sum{{peer=\"{peer}\"}}"
+                ))
+            })
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
             .expect("latency _sum sample must be present");
@@ -3134,8 +3138,14 @@ mod tests {
         assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD - 1, 2000, 300_000), 0);
         // At threshold: base; then doubling per consecutive failure.
         assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD, 2000, 300_000), 2_000);
-        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 2000, 300_000), 4_000);
-        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD + 2, 2000, 300_000), 8_000);
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 2000, 300_000),
+            4_000
+        );
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 2, 2000, 300_000),
+            8_000
+        );
         assert_eq!(
             dial_backoff_ms(PEER_SKIP_THRESHOLD + 3, 2000, 300_000),
             16_000
@@ -3148,10 +3158,7 @@ mod tests {
         assert_eq!(dial_backoff_ms(u32::MAX, 2000, 300_000), 300_000);
         // Custom knobs are honored (env parsing below pins the defaults).
         assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD, 500, 10_000), 500);
-        assert_eq!(
-            dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 500, 10_000),
-            1_000
-        );
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 500, 10_000), 1_000);
         assert_eq!(
             dial_backoff_ms(PEER_SKIP_THRESHOLD + 10, 500, 10_000),
             10_000
@@ -3175,8 +3182,9 @@ mod tests {
         // Zero backoff stays zero (healthy peers never wait).
         assert_eq!(dial_backoff_jittered_ms(0, 999), 0);
         // The seed actually spreads: not every seed maps to the same delay.
-        let spread: std::collections::HashSet<u64> =
-            (0..32).map(|s| dial_backoff_jittered_ms(2_000, s)).collect();
+        let spread: std::collections::HashSet<u64> = (0..32)
+            .map(|s| dial_backoff_jittered_ms(2_000, s))
+            .collect();
         assert!(
             spread.len() > 1,
             "jitter must desynchronize retries, got a single value"
@@ -3192,18 +3200,12 @@ mod tests {
         assert_eq!(parse_dial_backoff_base_ms(Some("garbage".into())), 2_000);
         assert_eq!(parse_dial_backoff_base_ms(Some("0".into())), 2_000);
         assert_eq!(parse_dial_backoff_base_ms(Some("500".into())), 500);
-        assert_eq!(
-            parse_dial_backoff_max_ms(None),
-            DIAL_BACKOFF_MAX_MS_DEFAULT
-        );
+        assert_eq!(parse_dial_backoff_max_ms(None), DIAL_BACKOFF_MAX_MS_DEFAULT);
         assert_eq!(parse_dial_backoff_max_ms(Some("nope".into())), 300_000);
         assert_eq!(parse_dial_backoff_max_ms(Some("0".into())), 300_000);
         assert_eq!(parse_dial_backoff_max_ms(Some("60_000".into())), 300_000);
         assert_eq!(parse_dial_backoff_max_ms(Some("60000".into())), 60_000);
-        assert_eq!(
-            parse_dial_budget_per_sec(None),
-            DIAL_BUDGET_PER_SEC_DEFAULT
-        );
+        assert_eq!(parse_dial_budget_per_sec(None), DIAL_BUDGET_PER_SEC_DEFAULT);
         assert_eq!(parse_dial_budget_per_sec(Some("junk".into())), 4);
         assert_eq!(parse_dial_budget_per_sec(Some("0".into())), 4);
         assert_eq!(parse_dial_budget_per_sec(Some("10".into())), 10);
@@ -3269,7 +3271,12 @@ mod tests {
             "the fixed cooldown must have aged out here"
         );
         assert!(
-            peer_dial_suppressed(entry.fails, entry.last_fail, entry.backoff_until, past_cooldown),
+            peer_dial_suppressed(
+                entry.fails,
+                entry.last_fail,
+                entry.backoff_until,
+                past_cooldown
+            ),
             "but the exponential backoff must still suppress the dial"
         );
         // Success resets to zero: the ledger entry is gone, dials resume.
@@ -3290,8 +3297,7 @@ mod tests {
             2u32
         });
         let t0 = Instant::now();
-        let (done, detached) =
-            join_with_timeout(vec![fast, slow], Duration::from_millis(50)).await;
+        let (done, detached) = join_with_timeout(vec![fast, slow], Duration::from_millis(50)).await;
         let elapsed = t0.elapsed();
         assert_eq!(done, vec![1u32], "the fast peer must still join");
         assert_eq!(detached, 1, "the dead peer must detach, not block");
@@ -4610,8 +4616,9 @@ mod tests {
         let res: Result<OldConsensusMsg, _> = bincode::deserialize(&frame);
         assert!(res.is_err(), "old decoder must reject the new frame");
         // Same at the pubsub framing layer: the old path ignores it.
-        let raw = serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
-            .to_string();
+        let raw =
+            serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
+                .to_string();
         assert!(
             parse_incoming(&raw).is_none(),
             "old inbound path must ignore the new frame"
@@ -4641,8 +4648,8 @@ mod tests {
         // structural, never crypto).
         let mut flipped = frame.clone();
         flipped[frame.len() / 2] ^= 0x01;
-        let tampered = decode_compact_qc_gossip(&flipped)
-            .expect("payload flip stays structurally valid");
+        let tampered =
+            decode_compact_qc_gossip(&flipped).expect("payload flip stays structurally valid");
         let orig = decode_compact_qc_gossip(&frame).expect("must decode");
         assert_ne!(tampered, orig, "payload mutation must change the QC");
         assert_eq!(decode_compact_qc_gossip(&frame[..frame.len() - 1]), None);
@@ -4694,8 +4701,9 @@ mod tests {
             _ => unreachable!(),
         };
         let frame = encode_compact_qc_gossip(cert).expect("codec itself is ungated");
-        let raw = serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
-            .to_string();
+        let raw =
+            serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
+                .to_string();
         assert!(
             parse_compact_qc_incoming(&raw).is_none(),
             "admission stays off until the flip"
@@ -5355,10 +5363,7 @@ impl SendRateLimiter {
 
     /// Production shape from the in-code consts (no env knobs).
     pub fn with_defaults() -> Self {
-        Self::new(
-            SEND_RATE_PER_PEER_BYTES_PER_SEC,
-            SEND_BURST_PER_PEER_BYTES,
-        )
+        Self::new(SEND_RATE_PER_PEER_BYTES_PER_SEC, SEND_BURST_PER_PEER_BYTES)
     }
 
     /// Over-budget send drops for one peer so far (monotonic).

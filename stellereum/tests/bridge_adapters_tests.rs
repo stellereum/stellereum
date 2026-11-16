@@ -12,8 +12,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use stellereum::bridge::bridge_adapters::{
     binary_proof_for, build_binary_merkle_root, evm_receipt_encoding, evm_receipt_key,
     solana_leaf_encoding, ton_leaf_encoding, verify_binary_merkle_proof, verify_evidence,
-    BinaryMerkleProof, ChainAdapter, DepositClaim, DepositEvidence, EvmAdapter,
-    HeaderStore, SolanaAdapter, StoredHeader, TonAdapter, SOLANA_FINALITY_SLOTS,
+    BinaryMerkleProof, ChainAdapter, DepositClaim, DepositEvidence, EvmAdapter, HeaderStore,
+    SolanaAdapter, StoredHeader, TonAdapter, SOLANA_FINALITY_SLOTS,
 };
 use stellereum::bridge::{
     SupportedChain, ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
@@ -600,7 +600,8 @@ fn evm_adapter_rejects_every_tampering() {
     // ... while the Arbitrum adapter (32 confirmations) accepts it.
     // FIXES §1.1: the header carries a 2/3 DISTINCT Falcon quorum, so the
     // Arbitrum-header bundle verifies through the dispatcher.
-    verify_evidence(&arb, &ev, &pks).expect("Arbitrum evidence must verify under the Falcon quorum");
+    verify_evidence(&arb, &ev, &pks)
+        .expect("Arbitrum evidence must verify under the Falcon quorum");
 }
 
 // ===========================================================================
@@ -732,11 +733,9 @@ fn dispatcher_routes_by_claim_chain_and_rejects_mismatches() {
     // FIXES §1.1: each chain's own evidence carries a 2/3 DISTINCT Falcon
     // quorum and verifies. Chain namespacing itself is unchanged — mismatches
     // still refuse.
-    for (claim, ev) in [
-        (&ton, &ton_ev),
-        (&evm, &evm_ev),
-    ] {
-        verify_evidence(claim, ev, &pks).expect("own-chain evidence must verify under the Falcon quorum");
+    for (claim, ev) in [(&ton, &ton_ev), (&evm, &evm_ev)] {
+        verify_evidence(claim, ev, &pks)
+            .expect("own-chain evidence must verify under the Falcon quorum");
     }
     let sol = sol_claim();
     let (sol_ev, _) = valid_sol_evidence(&sol, &keys, None);

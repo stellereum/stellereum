@@ -19,13 +19,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use stellereum::cell::PatriciaTrie;
-use stellereum::crypto_privacy::{ConfidentialTransfer, StealthAddress};
 use stellereum::network::P2pNetworkAdapter;
 use stellereum::orderbook::{OrderSide, OrderType, OrderbookManager};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::token::TokenOp;
-use stellereum::wallet::WalletAccount;
 
 /// Trait for key types that can authorize post-quantum transactions
 pub trait PqSigner {
@@ -182,9 +180,10 @@ impl LightClient {
                 let node_cfg = node_config::load(path)
                     .map_err(|e| format!("Failed to parse config {:?}: {e}", path))?;
                 let keys = infnode::keyring::NodeKeys::generate();
+                let pq_keys = infnode::keyring::PqKeys::generate();
                 let data_dir = PathBuf::from("./wallet_data");
                 let keys_dir = PathBuf::from("./wallet_keys");
-                let node = Node::new(node_cfg, keys, data_dir, keys_dir)
+                let node = Node::new(node_cfg, keys, pq_keys, keys_dir, data_dir)
                     .await
                     .map_err(|e| format!("Failed to initialize infnode: {e}"))?;
                 return Ok(Some(Arc::new(P2pNetworkAdapter::new(node))));
@@ -559,388 +558,6 @@ impl LightClient {
         Ok((tx_hash, finality))
     }
 
-    /// Broadcast zero-knowledge confidential transfer (legacy local-only demo
-    /// path kept for compatibility). Records an explicitly SIMULATED status:
-    /// nothing here is chain-finalized. Prefer `broadcast_confidential_tx`.
-    #[allow(dead_code)]
-    pub async fn broadcast_confidential(
-        &self,
-        transfer: &ConfidentialTransfer,
-    ) -> Result<[u8; 32], String> {
-        if !transfer.verify_balance_conservation() {
-            return Err("Homomorphic balance conservation check failed".to_string());
-        }
-
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(transfer.fee.to_be_bytes());
-        for c in &transfer.input_commitments {
-            hasher.update(c.commitment);
-        }
-        for c in &transfer.output_commitments {
-            hasher.update(c.commitment);
-        }
-        use sha2::Digest;
-        let tx_hash: [u8; 32] = hasher.finalize().into();
-
-        self.record_tx(TxRecord {
-            timestamp: now_secs(),
-            tx_hash: hex::encode(tx_hash),
-            from: "Confidential".to_string(),
-            to: "Stealth One-Time".to_string(),
-            amount_stell: 0.0,
-            fee_stell: (transfer.fee as f64) / 1_000_000_000.0,
-            is_confidential: true,
-            status: "Simulated locally (NOT chain-finalized; use confidential-pay --rpc-url)"
-                .to_string(),
-        });
-
-        Ok(tx_hash)
-    }
-
-    /// Build a real stealth payment transaction: derives a one-time stealth address
-    /// using recipient's view and spend public keys and signs the transfer.
-    /// The ephemeral public key `stealth.ephemeral_pub` is carried on-chain in `tx.payload`
-    /// via `SysCallPatriciaLookup` so the recipient can detect the payment when scanning.
-    /// Returns the signed transaction and the derived StealthAddress.
-    pub fn build_stealth_pay_tx(
-        sender: &WalletAccount,
-        recipient_view_pub: &[u8; 32],
-        recipient_spend_pub: &[u8; 32],
-        amount_nano: u64,
-        nonce: u64,
-        shard: u32,
-    ) -> Result<(Transaction, StealthAddress), String> {
-        let stealth = StealthAddress::generate(recipient_view_pub, recipient_spend_pub)
-            .ok_or_else(|| {
-                "Failed to derive StealthAddress from view and spend keys".to_string()
-            })?;
-        let payload = vec![stellereum::svm::OpCode::SysCallPatriciaLookup(
-            stealth.ephemeral_pub,
-        )];
-        let gas_limit = 10_000 + stellereum::svm::GAS_PATRICIA_LOOKUP;
-        let tx = Transaction::sign_with_payload(
-            &sender.signing_key,
-            stealth.one_time_pub,
-            amount_nano,
-            gas_limit,
-            nonce,
-            shard,
-            shard,
-            payload,
-        );
-        Ok((tx, stealth))
-    }
-
-    /// Extract 32-byte ephemeral public key from transaction payload if present.
-    pub fn extract_ephemeral_pub(payload: &[stellereum::svm::OpCode]) -> Option<[u8; 32]> {
-        for op in payload {
-            if let stellereum::svm::OpCode::SysCallPatriciaLookup(bytes) = op {
-                return Some(*bytes);
-            }
-        }
-        if payload.len() == 4 {
-            if let (
-                stellereum::svm::OpCode::Push(w0),
-                stellereum::svm::OpCode::Push(w1),
-                stellereum::svm::OpCode::Push(w2),
-                stellereum::svm::OpCode::Push(w3),
-            ) = (&payload[0], &payload[1], &payload[2], &payload[3])
-            {
-                let mut bytes = [0u8; 32];
-                bytes[0..8].copy_from_slice(&w0.to_le_bytes());
-                bytes[8..16].copy_from_slice(&w1.to_le_bytes());
-                bytes[16..24].copy_from_slice(&w2.to_le_bytes());
-                bytes[24..32].copy_from_slice(&w3.to_le_bytes());
-                return Some(bytes);
-            }
-        }
-        None
-    }
-
-    /// Build and sign a transaction spending from a stealth one-time address using the
-    /// derived one-time private key (Schnorr signature over Ristretto255).
-    pub fn build_stealth_spend_tx(
-        one_time_priv: &curve25519_dalek::scalar::Scalar,
-        one_time_pub: [u8; 32],
-        to: [u8; 32],
-        amount_nano: u64,
-        gas_limit: u64,
-        nonce: u64,
-        shard: u32,
-    ) -> Transaction {
-        let payload = Vec::new();
-        let mut tx = Transaction {
-            from: one_time_pub,
-            to,
-            amount: amount_nano,
-            gas_limit,
-            nonce,
-            source_shard: shard,
-            target_shard: shard,
-            signature: Vec::new(),
-            payload,
-            // No explicit priority bid (legacy behaviour: order by gas_limit).
-            priority_fee_per_gas: 0,
-        };
-        let msg = tx.signing_message();
-        let sig = stellereum::crypto_privacy::sign_stealth_message(one_time_priv, &msg);
-        tx.signature = sig.to_vec();
-        tx
-    }
-
-    /// Scan blocks / transactions for stealth payments matching the recipient's viewing key and spend pubkey.
-    /// Returns a list of detected stealth transactions: (StealthAddress, amount_nano, height, tx_hash).
-    pub async fn scan_stealth_payments(
-        &self,
-        view_priv: &curve25519_dalek::scalar::Scalar,
-        spend_pub: &[u8; 32],
-    ) -> Result<Vec<(StealthAddress, u64, u64, [u8; 32])>, String> {
-        let mut detected = Vec::new();
-        if let Some(cfg) = &self.rpc {
-            let blocks = rpc::latest_blocks(cfg)?;
-            for block in blocks {
-                let tx_records = rpc::get_block_transactions(cfg, block.height).unwrap_or_default();
-                for r in tx_records {
-                    let raw_opt = r
-                        .raw_tx
-                        .or_else(|| rpc::get_transaction_raw(cfg, &r.tx_hash).unwrap_or(None));
-                    if let Some(raw_hex) = raw_opt {
-                        if let Ok(raw_bytes) = hex::decode(raw_hex) {
-                            if let Ok(tx) = bincode::deserialize::<Transaction>(&raw_bytes) {
-                                if let Some(ephem_bytes) = Self::extract_ephemeral_pub(&tx.payload)
-                                {
-                                    let stealth = StealthAddress {
-                                        one_time_pub: tx.to,
-                                        ephemeral_pub: ephem_bytes,
-                                    };
-                                    if stealth.is_for_recipient(view_priv, spend_pub) == Some(true)
-                                    {
-                                        let tx_hash = tx.compute_tx_hash();
-                                        if !detected.iter().any(|(_, _, _, h)| *h == tx_hash) {
-                                            detected.push((
-                                                stealth,
-                                                tx.amount,
-                                                block.height,
-                                                tx_hash,
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Local mode: scan transactions submitted in this session
-            let local_txs = self.recent_local_txs.lock().unwrap().clone();
-            for tx in local_txs {
-                if let Some(ephem_bytes) = Self::extract_ephemeral_pub(&tx.payload) {
-                    let stealth = StealthAddress {
-                        one_time_pub: tx.to,
-                        ephemeral_pub: ephem_bytes,
-                    };
-                    if stealth.is_for_recipient(view_priv, spend_pub) == Some(true) {
-                        let tx_hash = tx.compute_tx_hash();
-                        if !detected.iter().any(|(_, _, _, h)| *h == tx_hash) {
-                            detected.push((stealth, tx.amount, 0, tx_hash));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(detected)
-    }
-
-    /// Build + submit a real confidential transfer: ONE tx carrying
-    /// [Shield, Transfer2] (audit 2026-10-06 F-A) — atomic funding + spend,
-    /// the only shape the enforced pool accepts. Conservation AND range
-    /// proofs are built and checked before signing, then the tx goes through
-    /// `broadcast_tx` (RPC polling / honest local simulation).
-    #[allow(clippy::too_many_arguments)] // GATE: confidential-tx builder needs full proof+fee context
-    pub async fn broadcast_confidential_tx(
-        &self,
-        signing_key: &SigningKey,
-        recipient: [u8; 32],
-        transfer: ConfidentialTransfer,
-        amount: u64,
-        fee: u64,
-        blinding: [u8; 32],
-        nonce: u64,
-        shard: u32,
-    ) -> Result<([u8; 32], TxFinality), String> {
-        use curve25519_dalek::scalar::Scalar;
-        use stellereum::crypto_privacy::RangeProof;
-        if !transfer.verify_balance_conservation() {
-            return Err("Homomorphic balance conservation check failed".to_string());
-        }
-        let r = Scalar::from_canonical_bytes(blinding)
-            .into_option()
-            .ok_or_else(|| "bad blinding for confidential transfer".to_string())?;
-        let in_val = amount
-            .checked_add(fee)
-            .ok_or_else(|| "confidential amount+fee overflows".to_string())?;
-        // Auto width per commitment (audit: speed): 32 bits below 2^32
-        // (halves bytes + verify work), 64 above. Mixed widths verify fine.
-        // (Old comment retired: fixed 32-bit panicked on 5 STELL = 5e9 nano;
-        // auto-select makes that class impossible.)
-        let prove_one = |c: &stellereum::crypto_privacy::PedersenCommitment, v: u64| {
-            RangeProof::prove_auto(c, v, &r)
-        };
-        let input_ranges: Vec<RangeProof> = transfer
-            .input_commitments
-            .iter()
-            .map(|c| prove_one(c, in_val))
-            .collect();
-        let output_ranges: Vec<RangeProof> = transfer
-            .output_commitments
-            .iter()
-            .map(|c| prove_one(c, amount))
-            .collect();
-        if !transfer.verify_balanced_with_ranges(&input_ranges, &output_ranges) {
-            return Err("Range proofs failed locally — refusing to submit".to_string());
-        }
-        let shield_in = transfer.input_commitments.first().cloned().ok_or_else(|| {
-            "confidential transfer needs at least one input (shield entry)".to_string()
-        })?;
-        // Real charge, not max() padding (audit: speed): shield base +
-        // exact per-proof cost from the proofs just built. Still floored by
-        // the base transfer fee (admission floor).
-        let gas = stellereum::svm::GAS_CONFIDENTIAL_SHIELD
-            .saturating_add(stellereum::svm::confidential_transfer2_gas(
-                &input_ranges,
-                &output_ranges,
-            ))
-            .max(stellereum::svm::GAS_BASIC_TRANSFER);
-        let tx = Transaction::sign_with_payload(
-            signing_key,
-            recipient,
-            0,
-            gas.max(fee),
-            nonce,
-            shard,
-            shard,
-            vec![
-                stellereum::svm::OpCode::SysCallConfidentialShield {
-                    commitment: shield_in.commitment,
-                    amount: in_val,
-                    blinding,
-                },
-                stellereum::svm::OpCode::SysCallConfidentialTransfer2 {
-                    recipient,
-                    transfer: Box::new(transfer.clone()),
-                    input_ranges,
-                    output_ranges,
-                },
-            ],
-        );
-        let (hash, finality) = self.broadcast_tx(&tx).await?;
-        // Mark the history row as confidential with the viewing hint.
-        let mut history = self.get_tx_history();
-        if let Some(row) = history.first_mut() {
-            row.is_confidential = true;
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&history) {
-            let _ = std::fs::write(&self.history_path, json);
-        }
-        Ok((hash, finality))
-    }
-
-    /// Build + submit a shield entry (`SysCallConfidentialShield`).
-    /// Returns (tx hash, finality, commitment hex). The caller MUST persist
-    /// the blinding: without it the coin can never be transferred or exited.
-    pub async fn broadcast_shield_tx(
-        &self,
-        signing_key: &SigningKey,
-        amount: u64,
-        blinding: [u8; 32],
-        nonce: u64,
-        shard: u32,
-    ) -> Result<([u8; 32], TxFinality, String), String> {
-        use curve25519_dalek::scalar::Scalar;
-        use stellereum::crypto_privacy::PedersenCommitment;
-        let r = Scalar::from_canonical_bytes(blinding)
-            .into_option()
-            .ok_or_else(|| "bad blinding (not canonical)".to_string())?;
-        let c = PedersenCommitment::commit(amount, &r);
-        let gas = stellereum::svm::GAS_CONFIDENTIAL_SHIELD.max(stellereum::svm::GAS_BASIC_TRANSFER);
-        let tx = Transaction::sign_with_payload(
-            signing_key,
-            signing_key.verifying_key().to_bytes(),
-            0,
-            gas,
-            nonce,
-            shard,
-            shard,
-            vec![stellereum::svm::OpCode::SysCallConfidentialShield {
-                commitment: c.commitment,
-                amount,
-                blinding,
-            }],
-        );
-        let (hash, finality) = self.broadcast_tx(&tx).await?;
-        Ok((hash, finality, hex::encode(c.commitment)))
-    }
-
-    /// Build + submit an unshield exit (`SysCallConfidentialUnshield`).
-    /// Lengths of commitments/amounts/blindings must match.
-    pub async fn broadcast_unshield_tx(
-        &self,
-        signing_key: &SigningKey,
-        commitments: Vec<[u8; 32]>,
-        amounts: Vec<u64>,
-        blindings: Vec<[u8; 32]>,
-        nonce: u64,
-        shard: u32,
-    ) -> Result<([u8; 32], TxFinality), String> {
-        use stellereum::crypto_privacy::UnshieldInput;
-        if commitments.len() != amounts.len()
-            || amounts.len() != blindings.len()
-            || commitments.is_empty()
-        {
-            return Err(
-                "commitments/amounts/blindings must be non-empty and same length".to_string(),
-            );
-        }
-        let inputs = commitments
-            .into_iter()
-            .zip(amounts)
-            .zip(blindings)
-            .map(|((commitment, amount), blinding)| UnshieldInput {
-                commitment,
-                amount,
-                blinding,
-            })
-            .collect::<Vec<_>>();
-        // Local pre-check: every opening must recompute (cheap, saves a fee).
-        for inp in &inputs {
-            if !stellereum::crypto_privacy::ConfidentialState::verify_opening(
-                &inp.commitment,
-                inp.amount,
-                &inp.blinding,
-            ) {
-                return Err("local opening check failed — refusing to submit".to_string());
-            }
-        }
-        let gas = stellereum::svm::GAS_CONFIDENTIAL_UNSHIELD
-            .saturating_add(
-                (inputs.len() as u64)
-                    .saturating_mul(stellereum::svm::GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT),
-            )
-            .max(stellereum::svm::GAS_BASIC_TRANSFER);
-        let tx = Transaction::sign_with_payload(
-            signing_key,
-            signing_key.verifying_key().to_bytes(),
-            0,
-            gas,
-            nonce,
-            shard,
-            shard,
-            vec![stellereum::svm::OpCode::SysCallConfidentialUnshield { inputs }],
-        );
-        self.broadcast_tx(&tx).await
-    }
-
     // ---------------- tokens (STS standard) ----------------
 
     /// Native token balance: on-chain in RPC mode, local registry otherwise.
@@ -1237,68 +854,74 @@ impl LightClient {
         tx
     }
 
-    /// Build a token-transfer transaction (`SysCallTokenTransfer`).
-    /// Native `amount` is 0; value moves inside the token registry.
-    /// `to_native` is the tx-level recipient (conventionally self).
-    pub fn build_token_transfer_tx(
-        signing_key: &SigningKey,
+    /// Build a PQ-signed token-transfer transaction (`SysCallTokenTransfer`).
+    pub fn build_pq_token_transfer_tx<K: PqSigner>(
+        signer: &K,
         token_id: [u8; 32],
         to: [u8; 32],
         amount: u64,
         nonce: u64,
         shard: u32,
+        chain_id: u64,
     ) -> Transaction {
-        let from = signing_key.verifying_key().to_bytes();
-        let gas = stellereum::token::GAS_TOKEN_TRANSFER.max(stellereum::svm::GAS_BASIC_TRANSFER);
-        Transaction::sign_with_payload(
-            signing_key,
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = stellereum::token::GAS_TOKEN_TRANSFER
+            .max(stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
             from,
             0,
             gas,
             nonce,
             shard,
             shard,
+            true,
             vec![stellereum::svm::OpCode::SysCallTokenTransfer {
                 token_id,
                 to,
                 amount,
             }],
+            chain_id,
         )
     }
 
-    /// Build a token-approve transaction (`SysCallTokenApprove`).
-    pub fn build_token_approve_tx(
-        signing_key: &SigningKey,
+    /// Build a PQ-signed token-approve transaction (`SysCallTokenApprove`).
+    pub fn build_pq_token_approve_tx<K: PqSigner>(
+        signer: &K,
         token_id: [u8; 32],
         spender: [u8; 32],
         amount: u64,
         nonce: u64,
         shard: u32,
+        chain_id: u64,
     ) -> Transaction {
-        let from = signing_key.verifying_key().to_bytes();
-        let gas = stellereum::token::GAS_TOKEN_APPROVE.max(stellereum::svm::GAS_BASIC_TRANSFER);
-        Transaction::sign_with_payload(
-            signing_key,
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = stellereum::token::GAS_TOKEN_APPROVE
+            .max(stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
             from,
             0,
             gas,
             nonce,
             shard,
             shard,
+            true,
             vec![stellereum::svm::OpCode::SysCallTokenApprove {
                 token_id,
                 spender,
                 amount,
             }],
+            chain_id,
         )
     }
 
-    /// Build a token-create transaction (`SysCallTokenCreate`). Caller
-    /// becomes minter, credited the full initial supply. Gas floor is the
-    /// base transfer fee (280k dominates the 5k create charge).
+    /// Build a PQ-signed token-create transaction (`SysCallTokenCreate`).
     #[allow(clippy::too_many_arguments)] // GATE: token-create builder needs full mint context
-    pub fn build_token_create_tx(
-        signing_key: &SigningKey,
+    pub fn build_pq_token_create_tx<K: PqSigner>(
+        signer: &K,
         name: String,
         symbol: String,
         decimals: u8,
@@ -1306,17 +929,21 @@ impl LightClient {
         max_supply: Option<u64>,
         nonce: u64,
         shard: u32,
+        chain_id: u64,
     ) -> Transaction {
-        let from = signing_key.verifying_key().to_bytes();
-        let gas = stellereum::token::GAS_TOKEN_CREATE.max(stellereum::svm::GAS_BASIC_TRANSFER);
-        Transaction::sign_with_payload(
-            signing_key,
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = stellereum::token::GAS_TOKEN_CREATE
+            .max(stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
             from,
             0,
             gas,
             nonce,
             shard,
             shard,
+            true,
             vec![stellereum::svm::OpCode::SysCallTokenCreate {
                 name,
                 symbol,
@@ -1324,89 +951,111 @@ impl LightClient {
                 initial_supply,
                 max_supply,
             }],
+            chain_id,
         )
     }
 
-    /// Build a delegation transaction (`SysCallDelegate`).
-    pub fn build_delegate_tx(
-        account: &WalletAccount,
+    /// Build a PQ-signed delegation transaction (`SysCallDelegate`).
+    pub fn build_pq_delegate_tx<K: PqSigner>(
+        signer: &K,
         validator: [u8; 32],
         amount: u64,
         nonce: u64,
+        chain_id: u64,
     ) -> Transaction {
-        account.create_payload_transaction(
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = (stellereum::svm::GAS_STAKE_BOND + stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
+            from,
+            0,
+            gas,
+            nonce,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            true,
             vec![stellereum::svm::OpCode::SysCallDelegate { validator, amount }],
-            stellereum::svm::GAS_STAKE_BOND + stellereum::svm::GAS_BASIC_TRANSFER,
-            nonce,
+            chain_id,
         )
     }
 
-    /// Build a begin-unbond transaction (`SysCallBeginUndelegate`).
-    pub fn build_begin_unbond_tx(
-        account: &WalletAccount,
+    /// Build a PQ-signed begin-unbond transaction (`SysCallBeginUndelegate`).
+    pub fn build_pq_begin_unbond_tx<K: PqSigner>(
+        signer: &K,
         validator: [u8; 32],
         amount: u64,
         nonce: u64,
+        chain_id: u64,
     ) -> Transaction {
-        account.create_payload_transaction(
-            vec![stellereum::svm::OpCode::SysCallBeginUndelegate { validator, amount }],
-            stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER,
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
+            from,
+            0,
+            gas,
             nonce,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            true,
+            vec![stellereum::svm::OpCode::SysCallBeginUndelegate { validator, amount }],
+            chain_id,
         )
     }
 
-    /// Build a withdraw-unbond transaction (`SysCallUndelegate`).
-    pub fn build_withdraw_unbond_tx(
-        account: &WalletAccount,
+    /// Build a PQ-signed withdraw-unbond transaction (`SysCallUndelegate`).
+    pub fn build_pq_withdraw_unbond_tx<K: PqSigner>(
+        signer: &K,
         validator: [u8; 32],
         nonce: u64,
+        chain_id: u64,
     ) -> Transaction {
-        account.create_payload_transaction(
-            vec![stellereum::svm::OpCode::SysCallUndelegate { validator }],
-            stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER,
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        Self::build_pq_payload_tx_bound(
+            signer,
+            from,
+            0,
+            gas,
             nonce,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            true,
+            vec![stellereum::svm::OpCode::SysCallUndelegate { validator }],
+            chain_id,
         )
     }
 
-    /// Build a claim-rewards transaction (`SysCallClaimRewards` when claiming
-    /// validator rewards, or `SysCallClaimDelegatorRewards` when claiming
-    /// delegator rewards from a validator).
-    pub fn build_claim_rewards_tx(
-        account: &WalletAccount,
+    /// Build a PQ-signed claim-rewards transaction.
+    pub fn build_pq_claim_rewards_tx<K: PqSigner>(
+        signer: &K,
         validator: [u8; 32],
         is_delegator: bool,
         nonce: u64,
+        chain_id: u64,
     ) -> Transaction {
-        if is_delegator {
-            Self::build_claim_delegator_rewards_tx(account, validator, nonce)
+        let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
+        let gas = (stellereum::svm::GAS_STAKE_CLAIM + stellereum::svm::GAS_BASIC_TRANSFER)
+            .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+        let op = if is_delegator {
+            stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator }
         } else {
-            Self::build_claim_validator_rewards_tx(account, validator, nonce)
-        }
-    }
-
-    /// Build a claim-delegator-rewards transaction (`SysCallClaimDelegatorRewards`).
-    pub fn build_claim_delegator_rewards_tx(
-        account: &WalletAccount,
-        validator: [u8; 32],
-        nonce: u64,
-    ) -> Transaction {
-        account.create_payload_transaction(
-            vec![stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator }],
-            stellereum::svm::GAS_STAKE_CLAIM + stellereum::svm::GAS_BASIC_TRANSFER,
+            stellereum::svm::OpCode::SysCallClaimRewards { validator }
+        };
+        Self::build_pq_payload_tx_bound(
+            signer,
+            from,
+            0,
+            gas,
             nonce,
-        )
-    }
-
-    /// Build a claim-validator-rewards transaction (`SysCallClaimRewards`).
-    pub fn build_claim_validator_rewards_tx(
-        account: &WalletAccount,
-        validator: [u8; 32],
-        nonce: u64,
-    ) -> Transaction {
-        account.create_payload_transaction(
-            vec![stellereum::svm::OpCode::SysCallClaimRewards { validator }],
-            stellereum::svm::GAS_STAKE_CLAIM + stellereum::svm::GAS_BASIC_TRANSFER,
-            nonce,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            stellereum::sharding::MASTERCHAIN_SHARD,
+            true,
+            vec![op],
+            chain_id,
         )
     }
 

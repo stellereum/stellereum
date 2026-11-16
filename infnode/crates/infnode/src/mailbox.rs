@@ -97,10 +97,12 @@ impl MailKeys {
                 bail!("legacy x25519 mailbox key refused (FULL-PQ wipe: re-register mailbox)");
             }
         }
-        let kem_bytes = hex::decode(kem_hex.ok_or_else(|| anyhow!("kem seed отсутствует"))?.trim())?;
-        let kb: [u8; KEM_SEED_LEN] = kem_bytes
-            .try_into()
-            .map_err(|_| anyhow!("kem seed 64"))?;
+        let kem_bytes = hex::decode(
+            kem_hex
+                .ok_or_else(|| anyhow!("kem seed отсутствует"))?
+                .trim(),
+        )?;
+        let kb: [u8; KEM_SEED_LEN] = kem_bytes.try_into().map_err(|_| anyhow!("kem seed 64"))?;
         let eb: [u8; 32] =
             hex::decode(ed_hex.ok_or_else(|| anyhow!("ed seed отсутствует"))?.trim())?
                 .try_into()

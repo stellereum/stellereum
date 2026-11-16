@@ -63,9 +63,19 @@ row contracts-node-side        stellereum 600 -- --test ecosystem_contracts_test
 row clob-settle                stellereum 600 -- --test clob_settlement_tests
 row one-call-order             stellereum 300 -- --test one_call_order_placement_tests
 row bridge-attest              stellereum 600 -- --test bridge_onchain_tests
-# ---- privacy ----
-row shielded                   stellereum 600 -- --test privacy_live_tests
-row confidential-solvent       stellereum 600 -- --test confidential_solvency_tests
+# ---- privacy (conditional: Ristretto privacy excised in aa3b9dcfe) ----
+if [ -f "$ROOT/stellereum/tests/privacy_live_tests.rs" ]; then
+  row shielded stellereum 600 -- --test privacy_live_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "shielded" "stellereum" "SKIP" "0" "privacy_live_tests.rs excised (Ristretto removal)" >> "$TSV"
+  echo "[matrix] shielded -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/confidential_solvency_tests.rs" ]; then
+  row confidential-solvent stellereum 600 -- --test confidential_solvency_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "confidential-solvent" "stellereum" "SKIP" "0" "confidential_solvency_tests.rs excised (Ristretto removal)" >> "$TSV"
+  echo "[matrix] confidential-solvent -> SKIP (file absent)"
+fi
 # ---- consensus ----
 row halt-not-fork              stellereum 300 -- --test p3_byzantine_pentest p3_diverge
 row liveness-harness           stellereum 300 -- --test consensus_liveness_harness

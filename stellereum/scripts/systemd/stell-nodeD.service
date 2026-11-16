@@ -1,0 +1,26 @@
+[Unit]
+Description=Stellereum node D (shard 1, RPC 127.0.0.1:8545, P2P UDP 9410)
+Documentation=file:/root/stellereum/scripts/backup/BACKUP.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/nodeD
+EnvironmentFile=/root/nodeD/env.D
+ExecStart=/root/nodeD/stellereum run --config node.yaml --shard 1
+Restart=always
+RestartSec=5
+MemoryMax=2G
+CPUQuota=80%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stell-nodeD
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -192,7 +192,10 @@ fn batched_writes_survive_reopen() {
         assert_eq!(got.height, 3);
         assert_eq!(st.finalized().unwrap().unwrap(), (3, bh_final));
         assert_eq!(st.consensus().unwrap().unwrap().finalized_height, 3);
-        let r = st.get_receipt(&rcpt_hash).unwrap().expect("receipt survives");
+        let r = st
+            .get_receipt(&rcpt_hash)
+            .unwrap()
+            .expect("receipt survives");
         assert_eq!(r.height, 3);
         assert_eq!(r.block_hash, bh_final);
         assert_eq!(r.index, 2);
@@ -242,10 +245,7 @@ fn prune_batch_matches_sequential() {
             "height {h}"
         );
     }
-    assert_eq!(
-        new_st.block_count().unwrap(),
-        old_st.block_count().unwrap()
-    );
+    assert_eq!(new_st.block_count().unwrap(), old_st.block_count().unwrap());
     std::fs::remove_dir_all(&dir_new).ok();
     std::fs::remove_dir_all(&dir_old).ok();
 }
@@ -273,8 +273,7 @@ fn receipts_prune_batch_matches_sequential() {
         .iter()
         .filter_map(|kv| kv.ok())
         .filter_map(|(k, v)| {
-            let r: stellereum::storage::StoredReceipt =
-                bincode::deserialize(&v).ok()?;
+            let r: stellereum::storage::StoredReceipt = bincode::deserialize(&v).ok()?;
             (r.height < 6).then_some(k)
         })
         .collect();

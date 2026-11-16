@@ -602,9 +602,8 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
             .try_into()
             .map_err(|_| anyhow!("identity seed must be 32 bytes"))?,
     );
-    let e2e_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
-        hex::decode(e2e_str).map_err(|e| anyhow!("e2e key hex: {e}"))?,
-    );
+    let e2e_bytes: Zeroizing<Vec<u8>> =
+        Zeroizing::new(hex::decode(e2e_str).map_err(|e| anyhow!("e2e key hex: {e}"))?);
     if e2e_bytes.len() == 32 {
         // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
         // refused loudly, never silently accepted as KEM material.
@@ -704,6 +703,117 @@ pub fn load_or_generate_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKe
         let k = infnode::keyring::NodeKeys::generate();
         save_node_keys(dir, &k)?;
         Ok(k)
+    }
+}
+
+/// Unified bundle of all 4 node key artifacts (`identity.key`, `e2e.key`,
+/// `pq-identity.key`, and `falcon.key`), providing unambiguous accessors for
+/// P2P transport identity vs. consensus validator identity.
+#[derive(Clone)]
+pub struct NodeKeyBundle {
+    /// `identity.key` (Ed25519 signing/verifying) + `e2e.key` (ML-KEM-768 seed/ek).
+    pub node_keys: infnode::keyring::NodeKeys,
+    /// `pq-identity.key` (Falcon-512 keypair for infnode P2P transport).
+    pub pq_identity: infnode::keyring::PqKeys,
+    /// `falcon.key` or explicit `falcon_path` (Falcon-512 keypair for consensus).
+    pub falcon: crate::post_quantum::FalconKeypair,
+}
+
+impl NodeKeyBundle {
+    /// Load or generate all 4 node key artifacts (`identity.key`, `e2e.key`,
+    /// `pq-identity.key`, and `falcon_path`).
+    pub fn load_or_generate(keys_dir: &Path, falcon_path: &Path) -> Result<Self> {
+        let node_keys = load_or_generate_node_keys(keys_dir)?;
+        let pq_identity = infnode::keyring::PqKeys::load_or_generate(keys_dir)?;
+        let falcon = load_or_generate_falcon_key(falcon_path)?;
+        Ok(Self {
+            node_keys,
+            pq_identity,
+            falcon,
+        })
+    }
+
+    /// Fail-closed loader: requires all 4 key artifacts to already exist on
+    /// disk with valid permissions and decryption. Never generates new keys.
+    pub fn load(keys_dir: &Path, falcon_path: &Path) -> Result<Self> {
+        let node_keys = load_node_keys(keys_dir)?;
+        let pq_identity = infnode::keyring::PqKeys::load_opt(keys_dir)?.ok_or_else(|| {
+            anyhow!(
+                "pq-identity.key missing in {} (run `stellereum keys init --keys-dir {}` first)",
+                keys_dir.display(),
+                keys_dir.display()
+            )
+        })?;
+        let falcon = load_falcon_key(falcon_path)?;
+        Ok(Self {
+            node_keys,
+            pq_identity,
+            falcon,
+        })
+    }
+
+    /// Validator Ed25519-derived `inf1:` id (`node_keys.id_hex()`), used in
+    /// `validators:` and `build_validator_set`.
+    pub fn validator_ed_id_hex(&self) -> String {
+        self.node_keys.id_hex()
+    }
+
+    /// P2P transport Falcon-512 `inf1:` id (`pq_identity.pq_id_hex()`).
+    pub fn p2p_pq_id_hex(&self) -> String {
+        self.pq_identity.pq_id_hex()
+    }
+
+    /// P2P transport Falcon-512 public key hex (`pq_identity.pq_pub_hex()`).
+    pub fn p2p_pq_pub_hex(&self) -> String {
+        self.pq_identity.pq_pub_hex()
+    }
+
+    /// Ed25519 public key hex (`node_keys.ed_hex()`).
+    pub fn ed_pub_hex(&self) -> String {
+        self.node_keys.ed_hex()
+    }
+
+    /// ML-KEM-768 encapsulation key hex (`node_keys.kem_ek_hex()`).
+    pub fn kem_ek_hex(&self) -> String {
+        self.node_keys.kem_ek_hex()
+    }
+
+    /// Consensus Falcon-512 public key hex (`hex::encode(&self.falcon.public_key)`).
+    pub fn consensus_falcon_pub_hex(&self) -> String {
+        hex::encode(&self.falcon.public_key)
+    }
+
+    /// Canonical single-line summary of all node public keys.
+    pub fn identity_line(&self) -> String {
+        format!(
+            "NODE IDENTITY: id={} ed={} kem_ek={} pq_pub={} falcon={}",
+            self.validator_ed_id_hex(),
+            self.ed_pub_hex(),
+            self.kem_ek_hex(),
+            self.p2p_pq_pub_hex(),
+            self.consensus_falcon_pub_hex(),
+        )
+    }
+
+    /// Canonical YAML peer stanza block matching `stellereum keys peer-stanza`.
+    pub fn peer_stanza(&self, name: &str, endpoint: &str) -> String {
+        let id_hex = self.validator_ed_id_hex();
+        let ed_hex = self.ed_pub_hex();
+        let pq_pub_hex = self.p2p_pq_pub_hex();
+        let falcon_hex = self.consensus_falcon_pub_hex();
+        [
+            "# === STELLEREUM PEER STANZA (send this block to the network admin) ===".to_string(),
+            format!("  - name: {name}"),
+            format!("    ed-pub: \"{ed_hex}\""),
+            format!("    pq-pub: \"{pq_pub_hex}\""),
+            format!("    endpoints: [\"{endpoint}\"]"),
+            "    allow: [\"*\"]".to_string(),
+            "# validators entry (admin adds the id to every node's `validators:`):".to_string(),
+            format!("  - \"{id_hex}\""),
+            "# PQ mapping for STELL_PEER_PQ_KEYS (admin appends, comma-separated):".to_string(),
+            format!("# {ed_hex}:{falcon_hex}"),
+        ]
+        .join("\n")
     }
 }
 
@@ -1292,6 +1402,136 @@ mod tests {
             format!("{err:#}").contains("0o644") || format!("{err:#}").contains("insecure"),
             "the error must name the insecure mode: {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_key_bundle_load_or_generate_and_load_roundtrip() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+        std::env::set_var(ENV_PASSPHRASE, "bundle-roundtrip-passphrase");
+
+        let dir = temp_dir("bundle_rt");
+        let falcon_path = dir.join("falcon.key");
+
+        let generated =
+            NodeKeyBundle::load_or_generate(&dir, &falcon_path).expect("load_or_generate bundle");
+        assert!(dir.join("identity.key").exists());
+        assert!(dir.join("e2e.key").exists());
+        assert!(dir.join("pq-identity.key").exists());
+        assert!(falcon_path.exists());
+
+        let loaded = NodeKeyBundle::load(&dir, &falcon_path).expect("load bundle");
+        assert_eq!(
+            loaded.validator_ed_id_hex(),
+            generated.validator_ed_id_hex()
+        );
+        assert_eq!(loaded.p2p_pq_id_hex(), generated.p2p_pq_id_hex());
+        assert_eq!(loaded.p2p_pq_pub_hex(), generated.p2p_pq_pub_hex());
+        assert_eq!(loaded.ed_pub_hex(), generated.ed_pub_hex());
+        assert_eq!(loaded.kem_ek_hex(), generated.kem_ek_hex());
+        assert_eq!(
+            loaded.consensus_falcon_pub_hex(),
+            generated.consensus_falcon_pub_hex()
+        );
+        assert_eq!(loaded.identity_line(), generated.identity_line());
+        assert_eq!(
+            loaded.peer_stanza("node-1", "127.0.0.1:9000"),
+            generated.peer_stanza("node-1", "127.0.0.1:9000")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_key_bundle_load_fails_closed_without_pq_identity() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+        std::env::set_var(ENV_PASSPHRASE, "bundle-no-pq-passphrase");
+
+        let dir = temp_dir("bundle_no_pq");
+        let falcon_path = dir.join("falcon.key");
+
+        load_or_generate_node_keys(&dir).expect("generate node_keys");
+        load_or_generate_falcon_key(&falcon_path).expect("generate falcon.key");
+        assert!(!dir.join("pq-identity.key").exists());
+
+        let err = match NodeKeyBundle::load(&dir, &falcon_path) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail closed when pq-identity.key is missing"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pq-identity.key"),
+            "error must mention pq-identity.key: {msg}"
+        );
+        assert!(
+            msg.contains("stellereum keys init"),
+            "error must reference `stellereum keys init`: {msg}"
+        );
+        assert!(
+            !dir.join("pq-identity.key").exists(),
+            "fail-closed load must not create pq-identity.key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_key_bundle_peer_stanza_separates_p2p_pq_pub_and_consensus_falcon_pub() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+        std::env::set_var(ENV_PASSPHRASE, "bundle-stanza-passphrase");
+
+        let dir = temp_dir("bundle_stanza");
+        let falcon_path = dir.join("falcon.key");
+
+        let bundle =
+            NodeKeyBundle::load_or_generate(&dir, &falcon_path).expect("load_or_generate bundle");
+        let ed_hex = bundle.ed_pub_hex();
+        let id_hex = bundle.validator_ed_id_hex();
+        let kem_ek_hex = bundle.kem_ek_hex();
+        let p2p_pq_pub_hex = bundle.p2p_pq_pub_hex();
+        let consensus_falcon_pub_hex = bundle.consensus_falcon_pub_hex();
+
+        assert_ne!(
+            p2p_pq_pub_hex, consensus_falcon_pub_hex,
+            "P2P pq-identity.key and consensus falcon.key must be distinct keypairs"
+        );
+        assert_ne!(
+            id_hex,
+            bundle.p2p_pq_id_hex(),
+            "validator Ed-derived id and P2P PQ id must be distinct"
+        );
+
+        let identity_line = bundle.identity_line();
+        assert_eq!(
+            identity_line,
+            format!(
+                "NODE IDENTITY: id={id_hex} ed={ed_hex} kem_ek={kem_ek_hex} pq_pub={p2p_pq_pub_hex} falcon={consensus_falcon_pub_hex}"
+            )
+        );
+
+        let stanza = bundle.peer_stanza("validator-1", "10.0.0.1:4242");
+        let expected = [
+            "# === STELLEREUM PEER STANZA (send this block to the network admin) ===".to_string(),
+            "  - name: validator-1".to_string(),
+            format!("    ed-pub: \"{ed_hex}\""),
+            format!("    pq-pub: \"{p2p_pq_pub_hex}\""),
+            "    endpoints: [\"10.0.0.1:4242\"]".to_string(),
+            "    allow: [\"*\"]".to_string(),
+            "# validators entry (admin adds the id to every node's `validators:`):".to_string(),
+            format!("  - \"{id_hex}\""),
+            "# PQ mapping for STELL_PEER_PQ_KEYS (admin appends, comma-separated):".to_string(),
+            format!("# {ed_hex}:{consensus_falcon_pub_hex}"),
+        ]
+        .join("\n");
+        assert_eq!(stanza, expected);
+        assert!(
+            !stanza.contains(&format!("pq-pub: \"{consensus_falcon_pub_hex}\"")),
+            "pq-pub must never emit consensus falcon pubkey"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

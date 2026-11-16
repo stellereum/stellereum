@@ -171,9 +171,11 @@ pub fn check_http_token_policy(url: &str, api_token: Option<&str>) -> Result<(),
     if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "::1" {
         return Ok(());
     }
-    Err("refusing to send API token over cleartext http to a non-loopback host: \
+    Err(
+        "refusing to send API token over cleartext http to a non-loopback host: \
          use https or unset the token"
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Raw HTTP/1.1 POST with HTTPS and HTTP support.
@@ -300,6 +302,7 @@ pub fn is_syncing(cfg: &RpcConfig) -> Result<bool, String> {
         .ok_or_else(|| format!("node returned bad syncing: {v}"))
 }
 
+#[allow(dead_code)] // GATE: public RPC block summary struct retained for wallet queries
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RpcBlockSummary {
     pub height: u64,
@@ -308,6 +311,7 @@ pub struct RpcBlockSummary {
     pub timestamp: u64,
 }
 
+#[allow(dead_code)] // GATE: public RPC block tx struct retained for wallet queries
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RpcBlockTx {
     pub tx_hash: String,
@@ -320,6 +324,7 @@ pub struct RpcBlockTx {
 }
 
 /// `stell_latestBlocks` -> list of latest blocks
+#[allow(dead_code)] // GATE: public RPC helper retained for wallet queries
 pub fn latest_blocks(cfg: &RpcConfig) -> Result<Vec<RpcBlockSummary>, String> {
     let v = rpc_call(cfg, "stell_latestBlocks", serde_json::json!({}))?;
     let arr = v
@@ -346,6 +351,7 @@ pub fn latest_blocks(cfg: &RpcConfig) -> Result<Vec<RpcBlockSummary>, String> {
 }
 
 /// `stell_getBlockTransactions` -> list of transactions for a block height
+#[allow(dead_code)] // GATE: public RPC helper retained for wallet queries
 pub fn get_block_transactions(cfg: &RpcConfig, height: u64) -> Result<Vec<RpcBlockTx>, String> {
     let v = rpc_call(
         cfg,
@@ -402,6 +408,7 @@ pub fn get_block_transactions(cfg: &RpcConfig, height: u64) -> Result<Vec<RpcBlo
 }
 
 /// Fetch raw transaction for a hash from `stell_getTransactionReceipt`
+#[allow(dead_code)] // GATE: public RPC helper retained for wallet queries
 pub fn get_transaction_raw(cfg: &RpcConfig, tx_hash: &str) -> Result<Option<String>, String> {
     let v = rpc_call(
         cfg,

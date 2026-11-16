@@ -129,13 +129,27 @@ fn client_at_tip2(
         anchor_hash,
         [0u8; 32],
         [0xA0u8; 32],
-        cert(&old_keys[..3], &old_fks[..3], &validators, 1, anchor_hash, &[0u8; 32]),
+        cert(
+            &old_keys[..3],
+            &old_fks[..3],
+            &validators,
+            1,
+            anchor_hash,
+            &[0u8; 32],
+        ),
     );
     let mut lc = LightClient::new(validators.clone(), anchor).expect("anchor verifies");
     assert_eq!(lc.validator_set_height(), 1);
     let tip_hash = hash_of(0x20);
-    lc.apply_header(header(2, anchor_hash, tip_hash, &old_keys[..3], &old_fks[..3], &validators))
-        .expect("same-set advance verifies");
+    lc.apply_header(header(
+        2,
+        anchor_hash,
+        tip_hash,
+        &old_keys[..3],
+        &old_fks[..3],
+        &validators,
+    ))
+    .expect("same-set advance verifies");
     (lc, tip_hash)
 }
 
@@ -149,8 +163,15 @@ fn same_set_advance_verifies() {
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
     assert_eq!(lc.tip_height(), 2);
     let next_hash = hash_of(0x21);
-    lc.apply_header(header(3, tip_hash, next_hash, &old_keys[1..], &old_fks[1..], &old_vs))
-        .expect("a quorum of the anchored set advances the chain");
+    lc.apply_header(header(
+        3,
+        tip_hash,
+        next_hash,
+        &old_keys[1..],
+        &old_fks[1..],
+        &old_vs,
+    ))
+    .expect("a quorum of the anchored set advances the chain");
     assert_eq!(lc.tip_height(), 3);
     assert_eq!(lc.tip_hash(), next_hash);
     assert_eq!(lc.validator_set_height(), 1);
@@ -166,7 +187,14 @@ fn forged_header_is_refused() {
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
     let outsiders = keys_from(0xF0, 4);
     let outsider_fks = pq_for(&outsiders, 0xA2);
-    let forged = header(3, tip_hash, hash_of(0xFF), &outsiders, &outsider_fks, &old_vs);
+    let forged = header(
+        3,
+        tip_hash,
+        hash_of(0xFF),
+        &outsiders,
+        &outsider_fks,
+        &old_vs,
+    );
     assert!(
         lc.apply_header(forged).is_err(),
         "an outsider-certified header must never advance the client"
@@ -189,7 +217,14 @@ fn rotation_with_old_quorum_is_accepted() {
 
     let rotation_hash = hash_of(0x30);
     let rotation = ValidatorSetRotation::new(
-        header(3, tip_hash, rotation_hash, &old_keys[..3], &old_fks[..3], &old_vs),
+        header(
+            3,
+            tip_hash,
+            rotation_hash,
+            &old_keys[..3],
+            &old_fks[..3],
+            &old_vs,
+        ),
         new_vs.clone(),
     );
     assert_eq!(rotation.effective_height(), 3);
@@ -202,8 +237,15 @@ fn rotation_with_old_quorum_is_accepted() {
 
     // The chain continues: a header certified by the NEW set verifies.
     let next_hash = hash_of(0x31);
-    lc.apply_header(header(4, rotation_hash, next_hash, &new_keys[..3], &new_fks[..3], &new_vs))
-        .expect("post-rotation headers verify under the new set");
+    lc.apply_header(header(
+        4,
+        rotation_hash,
+        next_hash,
+        &new_keys[..3],
+        &new_fks[..3],
+        &new_vs,
+    ))
+    .expect("post-rotation headers verify under the new set");
     assert_eq!(lc.tip_height(), 4);
 }
 
@@ -220,7 +262,14 @@ fn rotation_without_old_supermajority_is_refused() {
     let before_set = lc.validators.clone();
 
     let rotation = ValidatorSetRotation::new(
-        header(3, tip_hash, hash_of(0x30), &old_keys[..1], &old_fks[..1], &old_vs),
+        header(
+            3,
+            tip_hash,
+            hash_of(0x30),
+            &old_keys[..1],
+            &old_fks[..1],
+            &old_vs,
+        ),
         set_of(&new_keys),
     );
     assert!(
@@ -245,7 +294,14 @@ fn rotation_signed_by_the_new_set_for_itself_is_refused() {
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
 
     let rotation = ValidatorSetRotation::new(
-        header(3, tip_hash, hash_of(0x30), &new_keys[..3], &new_fks[..3], &old_vs),
+        header(
+            3,
+            tip_hash,
+            hash_of(0x30),
+            &new_keys[..3],
+            &new_fks[..3],
+            &old_vs,
+        ),
         set_of(&new_keys),
     );
     assert!(
@@ -272,12 +328,26 @@ fn stale_set_header_is_refused_after_rotation() {
 
     let rotation_hash = hash_of(0x30);
     lc.rotate_validator_set(ValidatorSetRotation::new(
-        header(3, tip_hash, rotation_hash, &old_keys[..3], &old_fks[..3], &old_vs),
+        header(
+            3,
+            tip_hash,
+            rotation_hash,
+            &old_keys[..3],
+            &old_fks[..3],
+            &old_vs,
+        ),
         new_vs.clone(),
     ))
     .expect("rotation must succeed first");
 
-    let stale = header(4, rotation_hash, hash_of(0x99), &old_keys[..3], &old_fks[..3], &new_vs);
+    let stale = header(
+        4,
+        rotation_hash,
+        hash_of(0x99),
+        &old_keys[..3],
+        &old_fks[..3],
+        &new_vs,
+    );
     assert!(
         lc.apply_header(stale).is_err(),
         "a header certified only by the superseded set must be refused after rotation"

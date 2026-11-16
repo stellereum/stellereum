@@ -15,7 +15,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use infnode::node::{e2e_decrypt, e2e_encrypt};
 use infnode::proto::{
-    self, Frame, PqTranscript, PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION, NODEID_LEN,
+    self, Frame, PqTranscript, NODEID_LEN, PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,9 @@ fn pq_session_bodies_decrypt_verify() {
     assert_eq!(dec.nonce, NONCE24.to_vec());
 
     // AEAD open recovers the body under the same session.
-    let aad2 = proto::kex_frame_aad(dec.kind, dec.seq, dec.ts, &dec.src, &dec.dst, dec.svc, &digest);
+    let aad2 = proto::kex_frame_aad(
+        dec.kind, dec.seq, dec.ts, &dec.src, &dec.dst, dec.svc, &digest,
+    );
     assert_eq!(aad2, aad, "AAD must rebuild byte-identical from the frame");
     let back = proto::kex_frame_open(&key, &dec.nonce, &aad2, &dec.payload).expect("open");
     assert_eq!(back, PLAIN);
@@ -188,7 +190,10 @@ fn pq_tampered_body_refused() {
     assert!(f.verify(&vk));
     let mut tampered = f.clone();
     tampered.payload[0] ^= 0x01;
-    assert!(!tampered.verify(&vk), "retagged body must break the frame sig");
+    assert!(
+        !tampered.verify(&vk),
+        "retagged body must break the frame sig"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +330,9 @@ fn pq_frame_loop_req_resp_round_trip() {
         nonce: n_req.clone(),
         sig: [0u8; 64],
     };
-    freq.sig = sk.sign(blake3::hash(&freq.sign_data()).as_bytes()).to_bytes();
+    freq.sig = sk
+        .sign(blake3::hash(&freq.sign_data()).as_bytes())
+        .to_bytes();
     let wire = freq.encode();
     let got = Frame::decode(&wire).expect("decode req");
     assert!(got.verify(&vk), "sealed REQ must verify");
@@ -341,15 +348,7 @@ fn pq_frame_loop_req_resp_round_trip() {
     // RESP direction (frame_loop seals, dialer opens): kind=RESP, echo seq,
     // swapped src/dst, fresh ts — a distinct AAD from the REQ above.
     let ts_resp = TS + 1;
-    let aad_resp = proto::kex_frame_aad(
-        proto::kind::RESP,
-        SEQ,
-        ts_resp,
-        &dst,
-        &src,
-        SVC,
-        &digest,
-    );
+    let aad_resp = proto::kex_frame_aad(proto::kind::RESP, SEQ, ts_resp, &dst, &src, SVC, &digest);
     assert_ne!(aad_resp, aad_req, "directions must bind distinct AADs");
     let (ct_resp, n_resp) = proto::kex_frame_seal_rand(&key, &aad_resp, PLAIN);
     let mut fresp = Frame {
@@ -374,8 +373,7 @@ fn pq_frame_loop_req_resp_round_trip() {
     );
     assert_eq!(aad_resp2, aad_resp, "RESP AAD must rebuild from the frame");
     assert_eq!(
-        proto::kex_frame_open(&key, &got2.nonce, &aad_resp2, &got2.payload)
-            .expect("open resp"),
+        proto::kex_frame_open(&key, &got2.nonce, &aad_resp2, &got2.payload).expect("open resp"),
         PLAIN
     );
 
@@ -491,7 +489,10 @@ fn pq_mixed_sessions_coexist_and_classical_untouched() {
     assert_eq!(ct_c.len(), PLAIN.len() + 16);
     assert_ne!(ct_c, ct_a, "classical and PQ arms must differ on the wire");
     assert_ne!(ct_c, ct_b, "classical and PQ arms must differ on the wire");
-    assert_eq!(e2e_decrypt(&CLASSICAL, &n_c, &ct_c).expect("classical open"), PLAIN);
+    assert_eq!(
+        e2e_decrypt(&CLASSICAL, &n_c, &ct_c).expect("classical open"),
+        PLAIN
+    );
     // Classical ct never opens under a PQ session (and back): no silent cross.
     assert!(proto::kex_frame_open(&key_a, &n_c, &aad_a, &ct_c).is_err());
     assert!(e2e_decrypt(&CLASSICAL, &n_a, &ct_a).is_err());

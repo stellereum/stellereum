@@ -236,16 +236,30 @@ fn hunt_finding_1c_quorum_at_the_victims_round_now_finalises() {
         .expect("honest proposal for the victim's own round is accepted");
 
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        v.hc.add_prevote(falcon_votes::fvote(k, fk, 1, r, VoteKind::Prevote, Some(bh(r as u8))))
-            .unwrap();
+        v.hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            r,
+            VoteKind::Prevote,
+            Some(bh(r as u8)),
+        ))
+        .unwrap();
     }
     assert!(
         v.hc.try_prevote_quorum().is_some(),
         "a real 4/4 prevote quorum is visible at the round the node is in"
     );
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        v.hc.add_precommit(falcon_votes::fvote(k, fk, 1, r, VoteKind::Precommit, Some(bh(r as u8))))
-            .unwrap();
+        v.hc.add_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            r,
+            VoteKind::Precommit,
+            Some(bh(r as u8)),
+        ))
+        .unwrap();
     }
     let qc =
         v.hc.try_precommit_quorum()

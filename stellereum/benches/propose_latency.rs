@@ -25,15 +25,17 @@
 //!   unseal gate, order root, actor cap, block struct, pre-gossip encode,
 //!   order commitment). Clamped at zero; labels say derived.
 
-use ed25519_dalek::SigningKey;
 use ed25519_dalek::Signer;
+use ed25519_dalek::SigningKey;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::runtime::{PackFilterCtx, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS};
-use stellereum::sharding::ShardId;
+use stellereum::sharding::{ShardId, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::GAS_BASIC_TRANSFER;
 use stellereum::zkml::SessionSpendSim;
@@ -51,6 +53,24 @@ fn det_key(i: u64) -> SigningKey {
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+fn pq_seed(i: u64) -> [u8; 32] {
+    let mut seed = [0x51u8; 32];
+    seed[..8].copy_from_slice(&i.to_le_bytes());
+    seed
+}
+
+fn pq_keypair(i: u64) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed_bytes(&pq_seed(i));
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let _ = Transaction::global_implicit_registry().register(
+        addr,
+        PqScheme::Falcon512,
+        &kp.public_key,
+        &DEFAULT_SALT,
+    );
+    (kp, addr)
 }
 
 fn medal(nanos: f64) -> String {
@@ -78,30 +98,45 @@ fn bid(seq: u64) -> u64 {
     (seq.wrapping_mul(7919) % 1000) + 1
 }
 
-fn wide_tx(sk: &SigningKey, seq: u64) -> stellereum::sharding::Transaction {
-    stellereum::sharding::Transaction::sign_with_priority(
-        sk,
+fn make_pq_tx(kp: &FalconKeypair, from: [u8; 32], nonce: u64, seq: u64) -> Transaction {
+    let priority = bid(seq);
+    let gas_limit = GAS_BASIC_TRANSFER + priority;
+    let skeleton = Transaction {
+        from,
+        to: RECIPIENT,
+        amount: 1,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: priority,
+    };
+    let msg = skeleton.signing_message();
+    let sig = kp.sign_with_seed(&msg, &pq_seed(9_000_000 + seq));
+    let mut tx = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
         RECIPIENT,
         1,
-        GAS_BASIC_TRANSFER + bid(seq),
-        0,
-        1,
-        1,
-        bid(seq),
-    )
-}
-
-fn deep_tx(sk: &SigningKey, nonce: u64, seq: u64) -> stellereum::sharding::Transaction {
-    stellereum::sharding::Transaction::sign_with_priority(
-        sk,
-        RECIPIENT,
-        1,
-        GAS_BASIC_TRANSFER + bid(seq),
+        gas_limit,
         nonce,
         1,
         1,
-        bid(seq),
-    )
+        Vec::new(),
+    );
+    tx.priority_fee_per_gas = priority;
+    tx
+}
+
+fn wide_tx(kp: &FalconKeypair, from: [u8; 32], seq: u64) -> Transaction {
+    make_pq_tx(kp, from, 0, seq)
+}
+
+fn deep_tx(kp: &FalconKeypair, from: [u8; 32], nonce: u64, seq: u64) -> Transaction {
+    make_pq_tx(kp, from, nonce, seq)
 }
 
 struct Fixture {
@@ -115,28 +150,41 @@ fn setup_fixture(kind: &'static str) -> Fixture {
     rt_block_on(async {
         let engine = Arc::new(InMemoryStateEngine::new());
         let mut pool = Mempool::new(20_000, 10_000);
-        let mut seq = 0u64;
         if kind == "wide" {
-            for i in 0..10_000u64 {
-                let sk = det_key(100_000 + i);
-                engine
-                    .update_account(AccountState::new(id_of(&sk), BAL))
-                    .await;
-                pool.add_checked(wide_tx(&sk, seq), BAL)
+            let items: Vec<([u8; 32], Transaction)> = (0..10_000u64)
+                .into_par_iter()
+                .map(|i| {
+                    let (kp, from) = pq_keypair(100_000 + i);
+                    let tx = wide_tx(&kp, from, i);
+                    (from, tx)
+                })
+                .collect();
+            for (from, tx) in items {
+                engine.update_account(AccountState::new(from, BAL)).await;
+                pool.add_checked(tx, BAL)
                     .expect("funded admission must succeed");
-                seq += 1;
             }
         } else {
-            for i in 0..100u64 {
-                let sk = det_key(i);
-                engine
-                    .update_account(AccountState::new(id_of(&sk), BAL))
-                    .await;
-                for nonce in 0..100u64 {
-                    pool.add_checked(deep_tx(&sk, nonce, seq), BAL)
-                        .expect("funded admission must succeed");
-                    seq += 1;
-                }
+            let accounts: Vec<(FalconKeypair, [u8; 32])> =
+                (0..100u64).into_par_iter().map(pq_keypair).collect();
+            let txs: Vec<Transaction> = (0..100u64)
+                .into_par_iter()
+                .flat_map(|i| {
+                    let (ref kp, from) = accounts[i as usize];
+                    (0..100u64)
+                        .map(|nonce| {
+                            let seq = i * 100 + nonce;
+                            deep_tx(kp, from, nonce, seq)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (_, from) in &accounts {
+                engine.update_account(AccountState::new(*from, BAL)).await;
+            }
+            for tx in txs {
+                pool.add_checked(tx, BAL)
+                    .expect("funded admission must succeed");
             }
         }
         assert_eq!(pool.len(), 10_000);
@@ -256,7 +304,9 @@ fn bench_propose_total_row(kind: &'static str) {
             1,
         )
         .with_mempool(fx.pool.clone());
-        let b = rt.block_on(rt_propose.propose(TS)).expect("propose must succeed");
+        let b = rt
+            .block_on(rt_propose.propose(TS))
+            .expect("propose must succeed");
         b.transactions.len()
     };
     assert!(expect_txs > 0 && expect_txs <= MAX_BLOCK_TXS);
@@ -272,9 +322,15 @@ fn bench_propose_total_row(kind: &'static str) {
         )
         .with_mempool(fx.pool.clone());
         let t = Instant::now();
-        let b = rt.block_on(rt_propose.propose(TS)).expect("propose must succeed");
+        let b = rt
+            .block_on(rt_propose.propose(TS))
+            .expect("propose must succeed");
         samples.push(t.elapsed().as_secs_f64());
-        assert_eq!(b.transactions.len(), expect_txs, "propose must be deterministic");
+        assert_eq!(
+            b.transactions.len(),
+            expect_txs,
+            "propose must be deterministic"
+        );
     }
     let med = median_secs(samples);
     println!(
@@ -322,6 +378,28 @@ fn sign_ed25519() {
     let med = median_secs(samples);
     println!(
         "[bench][propose_latency][sign_ed25519] time={} per sign",
+        medal(med * 1e9),
+    );
+}
+
+#[test]
+fn sign_falcon512() {
+    let fk = FalconKeypair::generate_from_seed_bytes(&pq_seed(7_777_777));
+    let msg = [0x53u8; 32];
+    // Warmup.
+    for _ in 0..10 {
+        std::hint::black_box(fk.sign(&msg));
+    }
+    let repeats = 200usize;
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let t = Instant::now();
+        std::hint::black_box(fk.sign(&msg));
+        samples.push(t.elapsed().as_secs_f64());
+    }
+    let med = median_secs(samples);
+    println!(
+        "[bench][propose_latency][sign_falcon512] time={} per sign",
         medal(med * 1e9),
     );
 }

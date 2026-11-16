@@ -25,8 +25,8 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{DomainSnapshot, DomainSnapshotV1};
 use stellereum::sync::{
     check_snapshot_set_binding, collect_missing_blocks, fast_sync_state_with_set_binding,
-    genesis_light_anchor, validate_sync_chain_for_shard_with_sets, verify_snapshot_anchor_with_sets,
-    walked_head_anchor, HeaderLink,
+    genesis_light_anchor, validate_sync_chain_for_shard_with_sets,
+    verify_snapshot_anchor_with_sets, walked_head_anchor, HeaderLink,
 };
 
 // ==================== deterministic fixtures ====================
@@ -146,6 +146,7 @@ fn honest_window(keys: &[SigningKey], vs: &ValidatorSet, n: u64) -> Vec<HeaderLi
 /// Honest body chain `1..=n` on the masterchain shard, deterministic:
 /// proposer = schedule winner at (height, 0), signed + quorum QC attached.
 fn honest_blocks(keys: &[SigningKey], vs: &ValidatorSet, n: u64, root: [u8; 32]) -> Vec<Block> {
+    reg_all(keys);
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
     for h in 1..=n {
@@ -171,7 +172,7 @@ fn honest_blocks(keys: &[SigningKey], vs: &ValidatorSet, n: u64, root: [u8; 32])
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(proposer);
+        b.sign_block_with_falcon(proposer, &fk_for(proposer));
         let bh = b.compute_hash();
         b.precommit_qc = Some(qc_for(keys, vs, h, bh, prev));
         prev = bh;
@@ -238,43 +239,31 @@ async fn a1_snapshot_anchor_refuses_broken_linkage_and_forged_qc() {
     let window = honest_window(&ks, &vs, 4);
 
     // Happy path first: the honest window verifies.
-    let ok = verify_snapshot_anchor_with_sets(
-        None,
-        [0u8; 32],
-        4,
-        |_| Some(vs.clone()),
-        1_000_000,
-        {
+    let ok =
+        verify_snapshot_anchor_with_sets(None, [0u8; 32], 4, |_| Some(vs.clone()), 1_000_000, {
             let w = window.clone();
             move |h: u64| {
                 let hit = w.iter().find(|l| l.height == h).cloned();
                 async move { hit }
             }
-        },
-    )
-    .await
-    .expect("honest window must verify");
+        })
+        .await
+        .expect("honest window must verify");
     assert_eq!(ok.state_root, [4u8; 32]);
 
     // Forged linkage: height 3 names an attacker parent.
     let mut forged = window.clone();
     forged[2].prev_hash = [0xEEu8; 32];
-    let err = verify_snapshot_anchor_with_sets(
-        None,
-        [0u8; 32],
-        4,
-        |_| Some(vs.clone()),
-        1_000_000,
-        {
+    let err =
+        verify_snapshot_anchor_with_sets(None, [0u8; 32], 4, |_| Some(vs.clone()), 1_000_000, {
             let w = forged.clone();
             move |h: u64| {
                 let hit = w.iter().find(|l| l.height == h).cloned();
                 async move { hit }
             }
-        },
-    )
-    .await
-    .expect_err("broken linkage must be refused");
+        })
+        .await
+        .expect_err("broken linkage must be refused");
     assert!(
         err.contains("does not link to parent"),
         "refusal names linkage, got: {err}"
@@ -284,23 +273,23 @@ async fn a1_snapshot_anchor_refuses_broken_linkage_and_forged_qc() {
     let mut no_quorum = window.clone();
     let liar = key(0xF0);
     let lprev = no_quorum[2].prev_hash;
-    no_quorum[2].qc = qc_for(std::slice::from_ref(&liar), &vs, 3, no_quorum[2].block_hash, lprev);
-    let err = verify_snapshot_anchor_with_sets(
-        None,
-        [0u8; 32],
-        4,
-        |_| Some(vs.clone()),
-        1_000_000,
-        {
+    no_quorum[2].qc = qc_for(
+        std::slice::from_ref(&liar),
+        &vs,
+        3,
+        no_quorum[2].block_hash,
+        lprev,
+    );
+    let err =
+        verify_snapshot_anchor_with_sets(None, [0u8; 32], 4, |_| Some(vs.clone()), 1_000_000, {
             let w = no_quorum.clone();
             move |h: u64| {
                 let hit = w.iter().find(|l| l.height == h).cloned();
                 async move { hit }
             }
-        },
-    )
-    .await
-    .expect_err("single-signer QC must be refused");
+        })
+        .await
+        .expect_err("single-signer QC must be refused");
     assert!(
         err.contains("no schedule slot") || err.contains("quorum"),
         "refusal is fail-closed, got: {err}"
@@ -417,12 +406,8 @@ async fn a4_snapshot_sync_refuses_legacy_blob() {
     let legacy = bincode::serialize(&old).expect("legacy serialize");
 
     // Direct binding gate refuses the legacy shape.
-    let err = check_snapshot_set_binding(
-        7,
-        &[("domains", legacy.clone())],
-        &anchor_set,
-    )
-    .expect_err("legacy blob must be refused");
+    let err = check_snapshot_set_binding(7, &[("domains", legacy.clone())], &anchor_set)
+        .expect_err("legacy blob must be refused");
     assert!(
         err.contains("legacy or unknown version"),
         "legacy refusal is explicit, got: {err}"
@@ -472,18 +457,15 @@ async fn b1_walk_refuses_wrong_height_gap_without_stall() {
     // Peer skips height 3: a gap the walk must refuse, not skip.
     let mut gapped = blocks.clone();
     gapped.remove(2);
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            validate_sync_chain_for_shard_with_sets(
-                &gapped,
-                1,
-                [0u8; 32],
-                &|_| Some(vs.clone()),
-                MASTERCHAIN_SHARD,
-            )
-        },
-    )
+    let res = tokio::time::timeout(Duration::from_secs(10), async {
+        validate_sync_chain_for_shard_with_sets(
+            &gapped,
+            1,
+            [0u8; 32],
+            &|_| Some(vs.clone()),
+            MASTERCHAIN_SHARD,
+        )
+    })
     .await
     .expect("walk verdict is bounded");
     let err = res.expect_err("height gap must be refused");
@@ -503,32 +485,25 @@ async fn b2_walk_refuses_future_height_and_head_desync_without_stall() {
     // Future height: peer serves a block above the advertised head's chain.
     let mut future = blocks.clone();
     future.last_mut().expect("non-empty").height = 99;
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            validate_sync_chain_for_shard_with_sets(
-                &future,
-                1,
-                [0u8; 32],
-                &|_| Some(vs.clone()),
-                MASTERCHAIN_SHARD,
-            )
-        },
-    )
+    let res = tokio::time::timeout(Duration::from_secs(10), async {
+        validate_sync_chain_for_shard_with_sets(
+            &future,
+            1,
+            [0u8; 32],
+            &|_| Some(vs.clone()),
+            MASTERCHAIN_SHARD,
+        )
+    })
     .await
     .expect("future-height verdict is bounded");
-    assert!(
-        res.is_err(),
-        "future height must be refused, got: {res:?}"
-    );
+    assert!(res.is_err(), "future height must be refused, got: {res:?}");
 
     // Advertised-head desync: walked head does not hash to the advertised head.
     let walked = honest_blocks(&ks, &vs, 4, root);
     let peer_hash = [0xABu8; 32];
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        async { walked_head_anchor(&walked, peer_hash, 4) },
-    )
+    let res = tokio::time::timeout(Duration::from_secs(10), async {
+        walked_head_anchor(&walked, peer_hash, 4)
+    })
     .await
     .expect("head-anchor verdict is bounded");
     let err = res.expect_err("head desync must be refused");
@@ -560,18 +535,15 @@ async fn b3_walk_refuses_conflicting_qcs_without_stall() {
         b.precommit_qc = Some(qc_for(&liars, &vs, b.height, bh, prev));
     }
     let before_root = root;
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        async {
-            validate_sync_chain_for_shard_with_sets(
-                &blocks,
-                1,
-                [0u8; 32],
-                &|_| Some(vs.clone()),
-                MASTERCHAIN_SHARD,
-            )
-        },
-    )
+    let res = tokio::time::timeout(Duration::from_secs(10), async {
+        validate_sync_chain_for_shard_with_sets(
+            &blocks,
+            1,
+            [0u8; 32],
+            &|_| Some(vs.clone()),
+            MASTERCHAIN_SHARD,
+        )
+    })
     .await
     .expect("conflicting-QC verdict is bounded");
     let err = res.expect_err("outsider QCs must be refused");
@@ -611,6 +583,8 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
     let root = [0x42u8; 32];
 
     // Heights 1..3 under the old set, 4..6 under the new set.
+    let all: Vec<SigningKey> = [0x80u8, 0x81, 0x82, 0x83].map(key).to_vec();
+    reg_all(&all);
     let mut blocks: Vec<Block> = Vec::new();
     let mut prev = [0u8; 32];
     for h in 1..=6u64 {
@@ -620,7 +594,6 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
             (&new_set, &new_keys)
         };
         let proposer_id = set.proposer_for(h, 0).expect("fixture set non-empty");
-        let all: Vec<SigningKey> = [0x80u8, 0x81, 0x82, 0x83].map(key).to_vec();
         let proposer = all
             .iter()
             .find(|k| k.verifying_key().to_bytes() == proposer_id)
@@ -644,7 +617,7 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
         };
         // Sign with the rotation-correct proposer; QC from the height's set.
         b.validator_signatures.clear();
-        b.sign_block(proposer);
+        b.sign_block_with_falcon(proposer, &fk_for(proposer));
         let bh = b.compute_hash();
         b.precommit_qc = Some(qc_for(signers, set, h, bh, prev));
         prev = bh;
@@ -654,18 +627,13 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
     // Per-height resolver threads the rotation: the walk verifies.
     let old_c = old_set.clone();
     let new_c = new_set.clone();
-    stellereum::sync::validate_sync_chain_with_sets(
-        &blocks,
-        1,
-        [0u8; 32],
-        &|h| {
-            if h <= 3 {
-                Some(old_c.clone())
-            } else {
-                Some(new_c.clone())
-            }
-        },
-    )
+    stellereum::sync::validate_sync_chain_with_sets(&blocks, 1, [0u8; 32], &|h| {
+        if h <= 3 {
+            Some(old_c.clone())
+        } else {
+            Some(new_c.clone())
+        }
+    })
     .expect("rotation-aware walk must verify");
 
     // Legacy single-set entries fail closed on the rotated half (and vice versa).

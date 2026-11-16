@@ -1075,8 +1075,10 @@ async fn api_finals(
         None => DEFAULT_FINALS_LIMIT,
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n >= 1 => n.min(MAX_FINALS_LIMIT),
-            _ => return (StatusCode::BAD_REQUEST, "limit must be an integer 1..=100")
-                .into_response(),
+            _ => {
+                return (StatusCode::BAD_REQUEST, "limit must be an integer 1..=100")
+                    .into_response()
+            }
         },
     };
     let blocks: Vec<crate::rpc::BlockSummary> = {
@@ -1390,7 +1392,11 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
         Op::SysCallCancelOrder { order_id } => format!("cancel-order {order_id}"),
         Op::SysCallVerifyZkMl => "verify-zkml-legacy".to_string(),
         Op::SysCallPatriciaLookup(_) => "patricia-lookup".to_string(),
-        Op::SysCallTokenTransfer { token_id, to, amount } => format!(
+        Op::SysCallTokenTransfer {
+            token_id,
+            to,
+            amount,
+        } => format!(
             "token-transfer token={} to={} amount={amount}",
             hex::encode(token_id),
             hex::encode(to)
@@ -1450,10 +1456,9 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             hex::encode(contract),
             truncate_text(&String::from_utf8_lossy(method), 64)
         ),
-        Op::SysCallStake { validator, amount } => format!(
-            "stake validator={} amount={amount}",
-            hex::encode(validator)
-        ),
+        Op::SysCallStake { validator, amount } => {
+            format!("stake validator={} amount={amount}", hex::encode(validator))
+        }
         Op::SysCallUnbond { validator, amount } => format!(
             "unbond validator={} amount={amount}",
             hex::encode(validator)
@@ -1513,7 +1518,9 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             "token-create {}({}) decimals={decimals} supply={initial_supply} max={}",
             truncate_text(name, 64),
             truncate_text(symbol, 64),
-            max_supply.map(|m| m.to_string()).unwrap_or_else(|| "none".to_string())
+            max_supply
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "none".to_string())
         ),
         Op::SysCallRotateValidatorKey {
             old_validator,
@@ -1542,10 +1549,9 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             message.len(),
             signature.len()
         ),
-        Op::SysCallWithdrawSelfBond { validator } => format!(
-            "withdraw-self-bond validator={}",
-            hex::encode(validator)
-        ),
+        Op::SysCallWithdrawSelfBond { validator } => {
+            format!("withdraw-self-bond validator={}", hex::encode(validator))
+        }
         Op::SysCallReportEquivocation { .. } => "report-equivocation".to_string(),
         Op::SysCallReportPqEquivocation { .. } => "report-pq-equivocation".to_string(),
         Op::SysCallCallContractArgs {
@@ -1560,9 +1566,7 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             args.len(),
             calldata.len()
         ),
-        Op::SysCallReportProposalEquivocation { .. } => {
-            "report-proposal-equivocation".to_string()
-        }
+        Op::SysCallReportProposalEquivocation { .. } => "report-proposal-equivocation".to_string(),
         Op::SysCallStakeWithCommission {
             validator,
             amount,
@@ -1586,10 +1590,10 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             choice,
             ..
         } => format!("gov-vote id={proposal_id} choice={choice:?}"),
-        Op::Reserved33ConfidentialTransfer
-        | Op::Reserved40ConfidentialTransfer2
-        | Op::Reserved41ConfidentialShield
-        | Op::Reserved42ConfidentialUnshield => "reserved-removed-confidential".to_string(),
+        Op::Reserved33ConfidentialTransfer(_)
+        | Op::Reserved40ConfidentialTransfer2(_)
+        | Op::Reserved41ConfidentialShield(_)
+        | Op::Reserved42ConfidentialUnshield(_) => "reserved-removed-confidential".to_string(),
     }
 }
 
@@ -1606,9 +1610,7 @@ fn capped_intent_ops(payload: &[crate::svm::OpCode]) -> (Vec<String>, bool) {
 }
 
 /// First `MAX_TXDETAIL_EVENTS` receipt events plus whether more were indexed.
-fn capped_tx_events(
-    events: &[crate::contract::ContractEvent],
-) -> (Vec<serde_json::Value>, bool) {
+fn capped_tx_events(events: &[crate::contract::ContractEvent]) -> (Vec<serde_json::Value>, bool) {
     let truncated = events.len() > MAX_TXDETAIL_EVENTS;
     let rows = events
         .iter()
@@ -1726,21 +1728,40 @@ async fn api_tx_detail(
     } else {
         describe_intent_op(&tx.payload[0])
     };
-    let (status, height, block_hash, index, fee_charged, return_value, gas_used, contract_address, events) =
-        match receipt {
-            Some(r) => (
-                if r.success { "success" } else { "failed" },
-                Some(r.height),
-                Some(hex::encode(r.block_hash)),
-                Some(r.index),
-                Some(r.fee_charged.to_string()),
-                r.return_value,
-                r.gas_used,
-                r.contract_address.map(hex::encode),
-                r.events,
-            ),
-            None => ("pending", None, None, None, None, None, None, None, Vec::new()),
-        };
+    let (
+        status,
+        height,
+        block_hash,
+        index,
+        fee_charged,
+        return_value,
+        gas_used,
+        contract_address,
+        events,
+    ) = match receipt {
+        Some(r) => (
+            if r.success { "success" } else { "failed" },
+            Some(r.height),
+            Some(hex::encode(r.block_hash)),
+            Some(r.index),
+            Some(r.fee_charged.to_string()),
+            r.return_value,
+            r.gas_used,
+            r.contract_address.map(hex::encode),
+            r.events,
+        ),
+        None => (
+            "pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        ),
+    };
     let (events, events_truncated) = capped_tx_events(&events);
     Json(json!({
         "tx_hash": hex::encode(hash),
@@ -1813,8 +1834,7 @@ async fn api_block_detail(
         Key::Height(h) => rows.iter().find(|b| b.height == *h).cloned(),
         Key::Hash(h) => {
             let hx = hex::encode(h);
-            rows
-                .iter()
+            rows.iter()
                 .find(|b| b.hash.eq_ignore_ascii_case(&hx))
                 .cloned()
         }
@@ -1826,7 +1846,9 @@ async fn api_block_detail(
         .read()
         .await
         .iter()
-        .find(|r| r.height == row.height && hex::encode(r.block_hash).eq_ignore_ascii_case(&row.hash))
+        .find(|r| {
+            r.height == row.height && hex::encode(r.block_hash).eq_ignore_ascii_case(&row.hash)
+        })
         .cloned();
     let latency = rows
         .iter()

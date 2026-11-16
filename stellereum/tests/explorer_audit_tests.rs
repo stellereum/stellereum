@@ -82,7 +82,12 @@ async fn rpc_state(
         auth_token: auth_token.map(|s| s.to_string()),
         tx_broadcast: None,
         faucet: if faucet {
-            Some(Arc::new(Faucet::new(FAUCET_SEED, 1, 10_000_000_000, 100_000_000_000)))
+            Some(Arc::new(Faucet::new(
+                FAUCET_SEED,
+                1,
+                10_000_000_000,
+                100_000_000_000,
+            )))
         } else {
             None
         },
@@ -95,12 +100,7 @@ async fn rpc_state(
 
 struct DenyAll;
 impl CaptchaVerifier for DenyAll {
-    fn verify(
-        &self,
-        _secret: &str,
-        _token: &str,
-        _remote_ip: Option<IpAddr>,
-    ) -> CaptchaVerdict {
+    fn verify(&self, _secret: &str, _token: &str, _remote_ip: Option<IpAddr>) -> CaptchaVerdict {
         CaptchaVerdict::Rejected {
             error_codes: vec!["audit-deny".to_string()],
         }
@@ -149,11 +149,7 @@ async fn http_get(addr: SocketAddr, path: &str) -> (String, String) {
     http_get_with(addr, path, &[]).await
 }
 
-async fn http_get_with(
-    addr: SocketAddr,
-    path: &str,
-    extra: &[(&str, &str)],
-) -> (String, String) {
+async fn http_get_with(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> (String, String) {
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     for (k, v) in extra {
         req.push_str(&format!("{k}: {v}\r\n"));
@@ -235,7 +231,11 @@ async fn token_faucet_refuses_unauthenticated_and_wrong_token() {
 
     // No token at all -> 401.
     let (head, body) = http_post(addr, &format!("/api/faucet/{who}"), "").await;
-    assert_eq!(status_code(&head), 401, "anonymous drip must be 401: {head}");
+    assert_eq!(
+        status_code(&head),
+        401,
+        "anonymous drip must be 401: {head}"
+    );
     assert_no_secrets("faucet 401 body", &body);
 
     // Wrong token -> 401 (and the wrong value is not echoed back).
@@ -252,7 +252,11 @@ async fn token_faucet_refuses_unauthenticated_and_wrong_token() {
         &[("Authorization", &format!("Bearer {FAUCET_CANARY}"))],
     )
     .await;
-    assert_eq!(status_code(&head), 200, "header token drip failed: {head} {body}");
+    assert_eq!(
+        status_code(&head),
+        200,
+        "header token drip failed: {head} {body}"
+    );
     assert!(body.contains("10000000000"), "must credit 10 STELL: {body}");
     assert_no_secrets("faucet 200 body", &body);
 }
@@ -270,7 +274,11 @@ async fn token_faucet_fails_closed_without_token_configured() {
         &[("Authorization", "Bearer anything")],
     )
     .await;
-    assert_eq!(status_code(&head), 503, "tokenless faucet must be 503: {head} {body}");
+    assert_eq!(
+        status_code(&head),
+        503,
+        "tokenless faucet must be 503: {head} {body}"
+    );
     assert_no_secrets("faucet 503 body", &body);
 }
 
@@ -279,10 +287,23 @@ async fn disabled_faucet_reports_not_found() {
     let st = rpc_state(Some(AUTH_CANARY), Some(FAUCET_CANARY), false).await;
     let addr = spawn(st, 1000).await;
     let who = hex::encode([9u8; 32]);
-    let (head, _) = http_post(addr, &format!("/api/faucet/{who}?token={FAUCET_CANARY}"), "").await;
-    assert_eq!(status_code(&head), 404, "disabled faucet must be 404: {head}");
+    let (head, _) = http_post(
+        addr,
+        &format!("/api/faucet/{who}?token={FAUCET_CANARY}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status_code(&head),
+        404,
+        "disabled faucet must be 404: {head}"
+    );
     let (head, _) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert_eq!(status_code(&head), 404, "disabled public faucet must be 404: {head}");
+    assert_eq!(
+        status_code(&head),
+        404,
+        "disabled public faucet must be 404: {head}"
+    );
 }
 
 #[tokio::test]
@@ -316,7 +337,15 @@ async fn pending_tx_full_view_requires_auth_token() {
         Some(hash_hex.as_str())
     );
     assert!(v.get("nonce").is_some(), "redacted view keeps the nonce");
-    for key in ["sender", "recipient", "to", "from", "amount", "payload_ops", "gas_limit"] {
+    for key in [
+        "sender",
+        "recipient",
+        "to",
+        "from",
+        "amount",
+        "payload_ops",
+        "gas_limit",
+    ] {
         assert!(
             v.get(key).is_none(),
             "redacted pending view must not contain {key:?}: {body}"
@@ -327,7 +356,10 @@ async fn pending_tx_full_view_requires_auth_token() {
     let (head, body) = http_get(addr, &format!("/api/tx/{hash_hex}?token=wrong")).await;
     assert_eq!(status_code(&head), 200);
     let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
-    assert!(v.get("sender").is_none(), "wrong token must stay redacted: {body}");
+    assert!(
+        v.get("sender").is_none(),
+        "wrong token must stay redacted: {body}"
+    );
 
     // Correct token via header: full view.
     let (head, body) = http_get_with(
@@ -336,9 +368,16 @@ async fn pending_tx_full_view_requires_auth_token() {
         &[("Authorization", &format!("Bearer {AUTH_CANARY}"))],
     )
     .await;
-    assert_eq!(status_code(&head), 200, "authed tx view failed: {head} {body}");
+    assert_eq!(
+        status_code(&head),
+        200,
+        "authed tx view failed: {head} {body}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).expect("full view is JSON");
-    assert!(v.get("sender").is_some(), "authed view must render the payload: {body}");
+    assert!(
+        v.get("sender").is_some(),
+        "authed view must render the payload: {body}"
+    );
     assert_no_secrets("authed tx view", &body);
 
     // Correct token via query (compat): full view, canary never echoed raw
@@ -346,7 +385,10 @@ async fn pending_tx_full_view_requires_auth_token() {
     let (head, body) = http_get(addr, &format!("/api/tx/{hash_hex}?token={AUTH_CANARY}")).await;
     assert_eq!(status_code(&head), 200);
     let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
-    assert!(v.get("sender").is_some(), "query-token view must render: {body}");
+    assert!(
+        v.get("sender").is_some(),
+        "query-token view must render: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -391,13 +433,17 @@ async fn traversal_and_garbage_params_are_rejected_bounded() {
     }
     // Faucet paths validate the address first and never mint on garbage.
     for e in &["../", "%00", "zz", &big[..]] {
-        let (head, body) = http_post(addr, &format!("/api/faucet/{e}?token={FAUCET_CANARY}"), "").await;
+        let (head, body) =
+            http_post(addr, &format!("/api/faucet/{e}?token={FAUCET_CANARY}"), "").await;
         let code = status_code(&head);
         assert!(
             code == 400 || code == 404 || code == 414 || code == 503,
             "evil faucet param {e:?} must not dispense, got {code}"
         );
-        assert!(!body.contains("credited_nano"), "no mint on garbage: {body}");
+        assert!(
+            !body.contains("credited_nano"),
+            "no mint on garbage: {body}"
+        );
         let (head, _) = http_post(addr, &format!("/api/faucet-public/{e}"), "").await;
         let code = status_code(&head);
         assert!(
@@ -431,9 +477,15 @@ async fn contracts_pagination_is_clamped_and_wellformed() {
         let (head, body) = http_get(addr, &format!("/api/contracts?{q}")).await;
         assert_eq!(status_code(&head), 200, "contracts?q={q} failed: {head}");
         let v: serde_json::Value = serde_json::from_str(&body).expect("contracts is JSON");
-        let list = v.get("contracts").and_then(|c| c.as_array()).expect("contracts array");
+        let list = v
+            .get("contracts")
+            .and_then(|c| c.as_array())
+            .expect("contracts array");
         assert!(list.len() <= 1000, "limit must clamp to <=1000 for q={q}");
-        assert!(v.get("total").is_some() && v.get("offset").is_some(), "shape kept: {body}");
+        assert!(
+            v.get("total").is_some() && v.get("offset").is_some(),
+            "shape kept: {body}"
+        );
         assert_no_secrets("contracts", &body);
     }
 }
@@ -456,12 +508,27 @@ async fn faucet_public_validates_before_any_costly_work() {
         )),
     ));
     let addr = spawn_gw(gw).await;
-    let (head, _) = http_get(addr, &format!("/api/faucet-public/{}", hex::encode([1u8; 32]))).await;
-    assert_eq!(status_code(&head), 405, "public faucet GET must be 405: {head}");
+    let (head, _) = http_get(
+        addr,
+        &format!("/api/faucet-public/{}", hex::encode([1u8; 32])),
+    )
+    .await;
+    assert_eq!(
+        status_code(&head),
+        405,
+        "public faucet GET must be 405: {head}"
+    );
     for bad in ["zz", "%00"] {
         let (head, body) = http_post(addr, &format!("/api/faucet-public/{bad}"), "").await;
-        assert_eq!(status_code(&head), 400, "garbage public drip {bad:?} must be 400: {head}");
-        assert!(!body.contains("captcha"), "validation must precede captcha: {body}");
+        assert_eq!(
+            status_code(&head),
+            400,
+            "garbage public drip {bad:?} must be 400: {head}"
+        );
+        assert!(
+            !body.contains("captcha"),
+            "validation must precede captcha: {body}"
+        );
     }
     // Multi-segment traversal can never match the single-segment `:address`
     // route: 404 without touching any faucet logic is the correct answer.
@@ -472,7 +539,10 @@ async fn faucet_public_validates_before_any_costly_work() {
             code == 404 || code == 400,
             "traversal public drip {bad:?} must be refused, got {code}: {head}"
         );
-        assert!(!body.contains("credited_nano"), "no mint on traversal: {body}");
+        assert!(
+            !body.contains("credited_nano"),
+            "no mint on traversal: {body}"
+        );
     }
     // Well-formed address without a token is refused (captcha on) and the
     // refusal names no secret material.
@@ -503,8 +573,16 @@ async fn error_bodies_are_bounded_and_secret_free() {
         ("GET", format!("/api/balance/{big}"), ""),
         ("GET", format!("/api/tx/{big}"), ""),
         ("GET", format!("/api/confidential/{big}"), ""),
-        ("POST", format!("/api/faucet/{big}?token={FAUCET_CANARY}"), ""),
-        ("POST", format!("/api/faucet/{who}?token=wrong-canary-value"), ""),
+        (
+            "POST",
+            format!("/api/faucet/{big}?token={FAUCET_CANARY}"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/api/faucet/{who}?token=wrong-canary-value"),
+            "",
+        ),
         ("POST", format!("/api/faucet/{who}"), ""),
         ("GET", format!("/api/spv/0x{big}"), ""),
     ];
@@ -515,7 +593,10 @@ async fn error_bodies_are_bounded_and_secret_free() {
             http_post(addr, path, body).await
         };
         let code = status_code(&head);
-        assert!((400..500).contains(&code) || code == 503, "must refuse {path}: {head}");
+        assert!(
+            (400..500).contains(&code) || code == 503,
+            "must refuse {path}: {head}"
+        );
         assert!(resp.len() < 2048, "error body must stay bounded for {path}");
         assert_no_secrets(path, &resp);
     }
@@ -537,7 +618,10 @@ async fn cors_never_reflects_origin_or_enables_credentials() {
         let (head, _) = http_get_with(
             addr,
             path,
-            &[("Origin", "https://evil.example"), ("Authorization", "Bearer x")],
+            &[
+                ("Origin", "https://evil.example"),
+                ("Authorization", "Bearer x"),
+            ],
         )
         .await;
         let low = head.to_lowercase();
@@ -563,8 +647,21 @@ async fn cors_never_reflects_origin_or_enables_credentials() {
 /// Secret-class vocabulary that must never appear as an exposition identifier.
 /// (`tokens_total` is fine: tokenization splits on `_`, so `tokens` != `token`.)
 const FORBIDDEN_METRIC_WORDS: &[&str] = &[
-    "secret", "private", "password", "passwd", "seed", "mnemonic", "auth", "bearer", "cookie",
-    "session", "apikey", "api_key", "faucet_token", "auth_token", "credentials",
+    "secret",
+    "private",
+    "password",
+    "passwd",
+    "seed",
+    "mnemonic",
+    "auth",
+    "bearer",
+    "cookie",
+    "session",
+    "apikey",
+    "api_key",
+    "faucet_token",
+    "auth_token",
+    "credentials",
 ];
 
 fn assert_exposition_discipline(where_: &str, text: &str) {
@@ -618,9 +715,15 @@ fn render_metrics_vocabulary_has_no_secret_class_names() {
     let registry = stellereum::metrics::Registry::new();
     let text = stellereum::explorer::render_metrics_with_readiness(&registry, 7, 3, 1, 2, true);
     assert_exposition_discipline("render_metrics_with_readiness", &text);
-    assert!(text.contains("stell_ready 1"), "ready gauge renders: {text}");
+    assert!(
+        text.contains("stell_ready 1"),
+        "ready gauge renders: {text}"
+    );
     let text = stellereum::explorer::render_metrics_with_readiness(&registry, 7, 3, 1, 2, false);
-    assert!(text.contains("stell_ready 0"), "not-ready renders fail-closed 0");
+    assert!(
+        text.contains("stell_ready 0"),
+        "not-ready renders fail-closed 0"
+    );
 }
 
 #[tokio::test]
@@ -640,7 +743,10 @@ async fn version_and_stats_expose_no_secrets() {
     // The MEV epoch-key commitment is a public commitment, and the epoch key
     // itself must never appear here.
     let low = body.to_lowercase();
-    assert!(!low.contains("secret"), "stats must not name secrets: {body}");
+    assert!(
+        !low.contains("secret"),
+        "stats must not name secrets: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -649,12 +755,7 @@ async fn version_and_stats_expose_no_secrets() {
 
 struct OkVerifier;
 impl CaptchaVerifier for OkVerifier {
-    fn verify(
-        &self,
-        _secret: &str,
-        _token: &str,
-        _remote_ip: Option<IpAddr>,
-    ) -> CaptchaVerdict {
+    fn verify(&self, _secret: &str, _token: &str, _remote_ip: Option<IpAddr>) -> CaptchaVerdict {
         CaptchaVerdict::Success
     }
 }
@@ -709,10 +810,17 @@ async fn readyz_reports_shaped_fail_closed_json() {
     let st = rpc_state(None, None, false).await;
     let addr = spawn(st, 1000).await;
     let (head, body) = http_get(addr, "/readyz").await;
-    assert_eq!(status_code(&head), 503, "fresh node must be unready: {head} {body}");
+    assert_eq!(
+        status_code(&head),
+        503,
+        "fresh node must be unready: {head} {body}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).expect("readyz is JSON");
     assert_eq!(v.get("ready").and_then(|r| r.as_bool()), Some(false));
-    let checks = v.get("failed_checks").and_then(|c| c.as_array()).expect("failed_checks");
+    let checks = v
+        .get("failed_checks")
+        .and_then(|c| c.as_array())
+        .expect("failed_checks");
     assert!(!checks.is_empty(), "must name the failed checks: {body}");
     assert_no_secrets("readyz", &body);
 }

@@ -8,10 +8,12 @@
 //! path and is not reachable from integration tests — covered by inspection
 //! plus the existing `bootstrap` preflight tests; see the item note below.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
 
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::staking::{STAKING_POOL, UNBONDING_PERIOD_SECS};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_STAKE_UNBOND};
@@ -19,15 +21,43 @@ use stellereum::svm::{OpCode, GAS_STAKE_UNBOND};
 mod support;
 use support::{assert_refused_tx_paid_failure_fee, failure_fee};
 
+fn pq_addr(key: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &key.public_key, &DEFAULT_SALT)
+}
+
 fn tx_of(
-    key: &SigningKey,
+    key: &FalconKeypair,
     nonce: u64,
     gas_limit: u64,
     payload: Vec<OpCode>,
 ) -> stellereum::sharding::Transaction {
-    let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, from, 0, gas_limit, nonce, 1, 1, payload,
+    let from = pq_addr(key);
+    let probe = stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        from,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        key.public_key.clone(),
+        sig,
+        from,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -47,13 +77,13 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     let floor = MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER;
 
     let engine = InMemoryStateEngine::new();
-    let validator = SigningKey::generate(&mut OsRng);
-    let vaddr = validator.verifying_key().to_bytes();
+    let validator = FalconKeypair::generate_from_seed(0x41);
+    let vaddr = pq_addr(&validator);
     // Floor for the bond plus gas headroom for bond/unbond/withdraw
     // (bond burns 2000, unbond/withdraw 800 each) AND for the FAILURE FEES:
     // a refused transaction is attributable, so it pays its DECLARED limit
-    // (100_000 here) and consumes its nonce (F-01 / SEC-07 - a free failure
-    // is a free DoS and a free replay).
+    // (100_000 + PQ_ACTIVATION_SURCHARGE_GAS here) and consumes its nonce
+    // (F-01 / SEC-07 - a free failure is a free DoS and a free replay).
     engine
         .update_account(AccountState::new(vaddr, floor + 5_000_000))
         .await;
@@ -129,10 +159,13 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     );
 
     // A stranger cannot take it even now that funds are available.
-    let attacker = SigningKey::generate(&mut OsRng);
-    let aaddr = attacker.verifying_key().to_bytes();
+    let attacker = FalconKeypair::generate_from_seed(0x42);
+    let aaddr = pq_addr(&attacker);
     engine
-        .update_account(AccountState::new(aaddr, 20_000))
+        .update_account(AccountState::new(
+            aaddr,
+            20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        ))
         .await;
     let steal = tx_of(
         &attacker,
@@ -177,8 +210,8 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     );
     assert_eq!(
         bal(&engine, &vaddr).await,
-        mine_before + floor - GAS_STAKE_UNBOND,
-        "validator credited minus exactly the withdraw gas"
+        mine_before + floor - GAS_STAKE_UNBOND - PQ_ACTIVATION_SURCHARGE_GAS,
+        "validator credited minus exactly the withdraw gas and activation surcharge"
     );
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&vaddr),
@@ -314,8 +347,37 @@ async fn persist_queue_full_counts_drops() {
 fn insert_enforces_nonce_gap_from_context() {
     use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
     use stellereum::sharding::Transaction;
-    let sk = SigningKey::generate(&mut OsRng);
-    let mk = |nonce: u64| Transaction::sign(&sk, [1u8; 32], 10, 1_000, nonce, 1, 1);
+    let sk = FalconKeypair::generate_from_seed(0x43);
+    let mk = |nonce: u64| {
+        let gas = 1_000 + PQ_ACTIVATION_SURCHARGE_GAS;
+        let probe = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            sk.public_key.clone(),
+            vec![0u8; FALCON512_SIG_LEN],
+            [1u8; 32],
+            10,
+            gas,
+            nonce,
+            1,
+            1,
+            Vec::new(),
+            &DEFAULT_SALT,
+        );
+        let sig = sk.sign(&probe.signing_message());
+        Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            sk.public_key.clone(),
+            sig,
+            [1u8; 32],
+            10,
+            gas,
+            nonce,
+            1,
+            1,
+            Vec::new(),
+            &DEFAULT_SALT,
+        )
+    };
 
     let mut mp = Mempool::new(100, 100);
     let ctx = AdmissionCtx::wall_now().with_onchain_nonce(0);

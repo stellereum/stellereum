@@ -24,8 +24,8 @@ use std::time::Instant;
 use ed25519_dalek::{Signer, SigningKey};
 
 use stellereum::consensus::{
-    encode_pq_micro_envelope, vote_sign_bytes, PQ_UQC_MARKER_ID, PqMicroCertificate,
-    QuorumCertificate, ValidatorSet, VoteKind,
+    encode_pq_micro_envelope, vote_sign_bytes, PqMicroCertificate, QuorumCertificate, ValidatorSet,
+    VoteKind, PQ_UQC_MARKER_ID,
 };
 use stellereum::mempool::{Mempool, PQ_ACTIVATION_SURCHARGE_GAS};
 use stellereum::post_quantum::{
@@ -174,7 +174,10 @@ fn pq_envelope_sizes_by_scheme() {
     let falcon_exp_len = falcon_exp_tx.signature.len();
     let falcon_exp_formula = 3 + 1 + 1 + 2 + 897 + 16 + 2 + 666;
     assert_eq!(falcon_exp_len, falcon_exp_formula);
-    assert!(falcon_exp_tx.pq_envelope().is_some(), "envelope must roundtrip");
+    assert!(
+        falcon_exp_tx.pq_envelope().is_some(),
+        "envelope must roundtrip"
+    );
 
     // Falcon implicit (key omitted from the wire).
     let kp = FalconKeypair::generate_from_seed_bytes(&pq_seed(61_001));
@@ -182,18 +185,35 @@ fn pq_envelope_sizes_by_scheme() {
     let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
     let msg = skeleton_tx(from).signing_message();
     let sig = kp.sign_with_seed(&msg, &pq_seed(61_002));
-    let falcon_imp_tx =
-        Transaction::new_pq_implicit(from, PqScheme::Falcon512, sig, RECIPIENT, 1, PQ_GAS, 0, 1, 1, Vec::new());
+    let falcon_imp_tx = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        RECIPIENT,
+        1,
+        PQ_GAS,
+        0,
+        1,
+        1,
+        Vec::new(),
+    );
     let falcon_imp_len = falcon_imp_tx.signature.len();
     let falcon_imp_formula = 3 + 1 + 1 + 2 + 2 + 666;
     assert_eq!(falcon_imp_len, falcon_imp_formula);
     assert!(falcon_imp_tx.is_pq_implicit());
-    assert!(falcon_imp_tx.pq_envelope().is_some(), "envelope must roundtrip");
+    assert!(
+        falcon_imp_tx.pq_envelope().is_some(),
+        "envelope must roundtrip"
+    );
 
     // Hybrid explicit: ed sig || falcon sig over the same message.
     let hed_sk = det_ed_key(71_001);
     let hkp = FalconKeypair::generate_from_seed_bytes(&pq_seed(71_002));
-    let hybrid_pk = [hed_sk.verifying_key().to_bytes().as_slice(), hkp.public_key.as_slice()].concat();
+    let hybrid_pk = [
+        hed_sk.verifying_key().to_bytes().as_slice(),
+        hkp.public_key.as_slice(),
+    ]
+    .concat();
     assert_eq!(hybrid_pk.len(), 929);
     let hfrom = derive_pq_address(PqScheme::Hybrid, &hybrid_pk, &DEFAULT_SALT);
     let hmsg = skeleton_tx(hfrom).signing_message();
@@ -213,7 +233,10 @@ fn pq_envelope_sizes_by_scheme() {
         Vec::new(),
         &DEFAULT_SALT,
     );
-    assert!(hybrid_exp_tx.verify_signature(), "Hybrid fixture must verify");
+    assert!(
+        hybrid_exp_tx.verify_signature(),
+        "Hybrid fixture must verify"
+    );
     let hybrid_exp_len = hybrid_exp_tx.signature.len();
     let hybrid_exp_formula = 3 + 1 + 1 + 2 + 929 + 16 + 2 + 730;
     assert_eq!(hybrid_exp_len, hybrid_exp_formula);
@@ -272,7 +295,10 @@ struct PqRow {
 
 async fn measure_pq_n(txs: &[Transaction], senders: &[[u8; 32]]) -> PqRow {
     let n = txs.len();
-    assert!(is_pure_pq_enforced(), "PQ block timing must run under pure-PQ");
+    assert!(
+        is_pure_pq_enforced(),
+        "PQ block timing must run under pure-PQ"
+    );
 
     let mut propose = Vec::with_capacity(REPS);
     for _ in 0..REPS {
@@ -320,7 +346,10 @@ async fn measure_pq_n(txs: &[Transaction], senders: &[[u8; 32]]) -> PqRow {
         total_ms: 0.0,
     };
     let total = row.propose_ms + row.intake_ms + row.apply_ms;
-    PqRow { total_ms: total, ..row }
+    PqRow {
+        total_ms: total,
+        ..row
+    }
 }
 
 #[tokio::test]
@@ -336,7 +365,10 @@ async fn pq_block_times_propose_verify_apply() {
         txs_all.push(tx);
         senders_all.push(from);
     }
-    println!("pq fixture build (1000 keygen+sign, untimed): {:.2}ms", ms(t_fix.elapsed()));
+    println!(
+        "pq fixture build (1000 keygen+sign, untimed): {:.2}ms",
+        ms(t_fix.elapsed())
+    );
 
     let mut rows = Vec::new();
     for n in [100usize, 428, 1000] {
@@ -358,7 +390,10 @@ async fn pq_block_times_propose_verify_apply() {
     println!("{}", line("TOTAL           ", |r| r.total_ms));
     for (k, n) in [100usize, 428, 1000].iter().enumerate() {
         let per_tx_ns = rows[k].total_ms * 1_000_000.0 / (*n as f64);
-        println!("per-tx @N={n:<4} = {per_tx_ns:.0} ns (TOTAL {:.2}ms / {n})", rows[k].total_ms);
+        println!(
+            "per-tx @N={n:<4} = {per_tx_ns:.0} ns (TOTAL {:.2}ms / {n})",
+            rows[k].total_ms
+        );
     }
     let r428 = &rows[1];
     let headroom = PROGRAM_06S_MS - r428.total_ms;
@@ -402,19 +437,33 @@ fn pq_qc_sizes_vs_classical() {
         let mut vs = ValidatorSet::new();
         let mut fkeys: Vec<([u8; 32], FalconKeypair)> = Vec::with_capacity(n);
         for i in 0..n {
-            let fk = FalconKeypair::generate_from_seed_bytes(&pq_seed(80_000 + n as u64 * 1000 + i as u64));
+            let fk = FalconKeypair::generate_from_seed_bytes(&pq_seed(
+                80_000 + n as u64 * 1000 + i as u64,
+            ));
             let id = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
             vs.add(id, 10);
-            stellereum::consensus::register_validator_pq_key(id, PqScheme::Falcon512, fk.public_key.clone());
+            stellereum::consensus::register_validator_pq_key(
+                id,
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
             fkeys.push((id, fk));
         }
         let height = 42u64;
         let round = 1u32;
         let parent = [0x9u8; 32];
         let committee_size = stellereum::consensus::micro_committee_size(vs.len());
-        assert_eq!(committee_size as usize, n, "committee must be the whole set for N<=64");
-        let committee =
-            stellereum::consensus::derive_sortition_committee(&vs, height, round, committee_size, &parent);
+        assert_eq!(
+            committee_size as usize, n,
+            "committee must be the whole set for N<=64"
+        );
+        let committee = stellereum::consensus::derive_sortition_committee(
+            &vs,
+            height,
+            round,
+            committee_size,
+            &parent,
+        );
         assert_eq!(committee.len(), n);
         let kind = VoteKind::Precommit;
         let block_hash = Some([0xBBu8; 32]);
@@ -422,7 +471,10 @@ fn pq_qc_sizes_vs_classical() {
         let mut signatures = Vec::with_capacity(n);
         let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
         for (i, val_id) in committee.iter().enumerate() {
-            let (_, fk) = fkeys.iter().find(|(id, _)| id == val_id).expect("committee member must have a key");
+            let (_, fk) = fkeys
+                .iter()
+                .find(|(id, _)| id == val_id)
+                .expect("committee member must have a key");
             signatures.push(fk.sign_with_seed(&msg, &pq_seed(88_000 + n as u64 * 1000 + i as u64)));
             bitmask[i / 8] |= 1 << (i % 8);
         }
@@ -439,7 +491,11 @@ fn pq_qc_sizes_vs_classical() {
         // Deterministic envelope formula: 73 B header + bitmask + N*(4+666).
         let bitmask_len = (committee_size as usize).div_ceil(8);
         let formula = 73 + bitmask_len + n * (4 + 666);
-        assert_eq!(payload.len(), formula, "uQC envelope must match the pinned formula");
+        assert_eq!(
+            payload.len(),
+            formula,
+            "uQC envelope must match the pinned formula"
+        );
         let pq_qc = QuorumCertificate {
             height,
             round,

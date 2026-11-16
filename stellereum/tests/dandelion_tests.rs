@@ -17,9 +17,9 @@
 mod dandelion;
 
 use dandelion::{
-    geometric_mean, geometric_mean_capped, geometric_pmf, pick_alive_stem_peer, pick_uniform_peer, txid_from_u64,
-    DandelionRelay, NodeRng, PeerId, RelayAction, TxHash, DEFAULT_P_CONTINUE, MAX_SEEN_ENTRIES,
-    MAX_STEM_ENTRIES, MAX_STEM_HOPS,
+    geometric_mean, geometric_mean_capped, geometric_pmf, pick_alive_stem_peer, pick_uniform_peer,
+    txid_from_u64, DandelionRelay, NodeRng, PeerId, RelayAction, TxHash, DEFAULT_P_CONTINUE,
+    MAX_SEEN_ENTRIES, MAX_STEM_ENTRIES, MAX_STEM_HOPS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -103,18 +103,20 @@ impl SimNet {
 
         let cands = self.candidates(origin);
         let is_alive = |p: PeerId| self.alive.contains(&p);
-        let action = self.relays.get_mut(&origin).expect("origin relay").originate(
-            rng,
-            tx,
-            &cands,
-            origin,
-            &is_alive,
-        );
+        let action = self
+            .relays
+            .get_mut(&origin)
+            .expect("origin relay")
+            .originate(rng, tx, &cands, origin, &is_alive);
         self.apply_origin_action(rng, origin, tx, action, &mut queue, &mut out);
 
         while let Some(msg) = queue.pop_front() {
             match msg {
-                Msg::Stem { from, to, hops_left } => {
+                Msg::Stem {
+                    from,
+                    to,
+                    hops_left,
+                } => {
                     if kill_on_delivery == Some(to) {
                         self.alive.remove(&to);
                     }
@@ -326,8 +328,14 @@ fn geometric_distribution_matches_theory() {
     println!("[dandelion][geo] P(H>=6)={p_ge6:.4} (theory {theory_ge6:.4}, capped tail)");
     println!("[dandelion][geo] hist={hist:?}");
 
-    assert!((mean - theory_mean).abs() < 0.30, "mean {mean:.3} vs theory {theory_mean:.3}");
-    assert!((p0 - theory_p0).abs() < 0.025, "P(H=0) {p0:.4} vs theory {theory_p0:.4}");
+    assert!(
+        (mean - theory_mean).abs() < 0.30,
+        "mean {mean:.3} vs theory {theory_mean:.3}"
+    );
+    assert!(
+        (p0 - theory_p0).abs() < 0.025,
+        "P(H=0) {p0:.4} vs theory {theory_p0:.4}"
+    );
     assert!(
         (p_ge6 - theory_ge6).abs() < 0.04,
         "tail P(H>=6) {p_ge6:.4} vs theory {theory_ge6:.4}"
@@ -368,7 +376,10 @@ fn peer_selection_is_uniform_alive_and_bounded() {
     println!("[dandelion][pick] uniform counts={counts:?} over 400 seeds");
     for c in counts {
         let frac = c as f64 / 400.0;
-        assert!((frac - 0.25).abs() < 0.05, "pick share {frac:.3} far from 0.25");
+        assert!(
+            (frac - 0.25).abs() < 0.05,
+            "pick share {frac:.3} far from 0.25"
+        );
     }
 }
 
@@ -405,7 +416,10 @@ fn stem_path_anonymity_on_mesh() {
     let frac_ge1 = lens.iter().filter(|l| **l >= 1).count() as f64 / RUNS as f64;
     let frac_ge2 = lens.iter().filter(|l| **l >= 2).count() as f64 / RUNS as f64;
     let frac_origin = origin_fluffed as f64 / RUNS as f64;
-    println!("[dandelion][anon] mesh N={N} runs={RUNS} mean_stem={mean:.3} (capped theory {:.3})", geometric_mean_capped(DEFAULT_P_CONTINUE, MAX_STEM_HOPS));
+    println!(
+        "[dandelion][anon] mesh N={N} runs={RUNS} mean_stem={mean:.3} (capped theory {:.3})",
+        geometric_mean_capped(DEFAULT_P_CONTINUE, MAX_STEM_HOPS)
+    );
     println!(
         "[dandelion][anon] P(len>=1)={frac_ge1:.3} (theory 0.80) P(len>=2)={frac_ge2:.3} (theory 0.64)"
     );
@@ -418,17 +432,33 @@ fn stem_path_anonymity_on_mesh() {
         (mean - geometric_mean_capped(DEFAULT_P_CONTINUE, MAX_STEM_HOPS)).abs() < 1.0,
         "mean stem length {mean:.3}"
     );
-    assert!(frac_ge1 >= 0.70, "origin must usually be hidden (P>=1 = {frac_ge1:.3})");
-    assert!(frac_ge2 >= 0.50, "multi-hop stems must dominate (P>=2 = {frac_ge2:.3})");
+    assert!(
+        frac_ge1 >= 0.70,
+        "origin must usually be hidden (P>=1 = {frac_ge1:.3})"
+    );
+    assert!(
+        frac_ge2 >= 0.50,
+        "multi-hop stems must dominate (P>=2 = {frac_ge2:.3})"
+    );
     // The origin fluffs first in two cases: immediate fluff (P(H=0) = 0.20)
     // AND walks that return to the origin exactly as the budget expires
     // (frequent on small dense graphs via one-step backtracks). Both are
     // honest diffusion — the bound below covers their sum with margin; the
     // SHARP anonymity invariant is P(len>=1) ≈ 0.80 (the walk left).
-    assert!(frac_origin <= 0.40, "origin fluffs too often: {frac_origin:.3}");
-    assert!(frac_origin >= 0.08, "origin must sometimes fluff (H=0): {frac_origin:.3}");
+    assert!(
+        frac_origin <= 0.40,
+        "origin fluffs too often: {frac_origin:.3}"
+    );
+    assert!(
+        frac_origin >= 0.08,
+        "origin must sometimes fluff (H=0): {frac_origin:.3}"
+    );
     // Anonymity set: the observer's first-fluff vantage point varies widely.
-    assert!(fluffers.len() >= 5, "only {} distinct first-fluffers", fluffers.len());
+    assert!(
+        fluffers.len() >= 5,
+        "only {} distinct first-fluffers",
+        fluffers.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +534,10 @@ fn dead_stem_peer_reroutes_and_still_delivers() {
         alive.len()
     );
     assert_eq!(out.received, alive);
-    assert_eq!(out.failover_events, 0, "known-dead peers are never selected");
+    assert_eq!(
+        out.failover_events, 0,
+        "known-dead peers are never selected"
+    );
 
     // Case 2 — STALE liveness (peer dies mid-stem): probe an all-alive run
     // for a seed whose walk visits a third node, then replay the seed while
@@ -514,7 +547,10 @@ fn dead_stem_peer_reroutes_and_still_delivers() {
         .find(|r| {
             let mut net = SimNet::new(adj.clone(), all_alive(&adj));
             let mut rng = NodeRng::new(0xDEAD_1000 + r);
-            net.run_tx(&mut rng, 1, txid_from_u64(7000 + r)).stem_path.len() >= 3
+            net.run_tx(&mut rng, 1, txid_from_u64(7000 + r))
+                .stem_path
+                .len()
+                >= 3
         })
         .expect("a walk of length >= 3 within 20 fixed seeds");
     let mut probe = SimNet::new(adj.clone(), all_alive(&adj));
@@ -539,7 +575,10 @@ fn dead_stem_peer_reroutes_and_still_delivers() {
         out.received.len(),
         survivors.len()
     );
-    assert!(out.failover_events >= 1, "killing the stem target must trigger failover");
+    assert!(
+        out.failover_events >= 1,
+        "killing the stem target must trigger failover"
+    );
     assert_eq!(out.received, survivors, "survivors must still complete");
     assert!(out.first_fluffer.is_some());
 }
@@ -596,7 +635,10 @@ fn partition_is_fail_closed_and_timeout_recovers() {
         out.stem_path, out.first_fluffer, out.received
     );
     assert_eq!(out.received, left, "reachable component must be complete");
-    assert!(!out.received.contains(&6), "partition must hold: node 6 unreachable");
+    assert!(
+        !out.received.contains(&6),
+        "partition must hold: node 6 unreachable"
+    );
 
     // Held stems (nodes still waiting on the severed path) recover via the
     // specified fluff timeout instead of blackholing.
@@ -604,18 +646,18 @@ fn partition_is_fail_closed_and_timeout_recovers() {
     for id in alive {
         let entry = net.relays.get(&id).expect("relay").stem_entry(&tx);
         if entry.is_some() {
-            let fired = net
-                .relays
-                .get_mut(&id)
-                .expect("relay")
-                .fluff_timeout(&tx);
+            let fired = net.relays.get_mut(&id).expect("relay").fluff_timeout(&tx);
             assert_eq!(fired, Some(RelayAction::FluffBroadcast));
             timed_out += 1;
         }
     }
     println!("[dandelion][partition] fluff-timeout fired on {timed_out} held stem(s)");
     for (id, relay) in &net.relays {
-        assert_eq!(relay.stem_len(), 0, "node {id} still holds stem after timeout");
+        assert_eq!(
+            relay.stem_len(),
+            0,
+            "node {id} still holds stem after timeout"
+        );
     }
     // Timeout on a non-held tx is a no-op.
     assert_eq!(
@@ -660,7 +702,10 @@ fn duplicate_handling_fluff_wins_and_loops_terminate() {
     // First fluff sighting of a stem-held tx wins: it is relayed onward
     // exactly once and the stem state is dropped.
     assert_eq!(relay.on_fluff_receive(tx), RelayAction::FluffBroadcast);
-    assert!(relay.stem_entry(&tx).is_none(), "fluff must drop stem state");
+    assert!(
+        relay.stem_entry(&tx).is_none(),
+        "fluff must drop stem state"
+    );
     assert!(relay.is_fluffed(&tx));
     // Repeats of the fluff are ignored (storm termination); each node relays
     // a given fluff at most once.
@@ -716,7 +761,9 @@ fn stem_map_stays_bounded_under_flood_with_oldest_eviction() {
     let mut inserted: Vec<TxHash> = Vec::new();
     for i in 0..FLOOD {
         let tx = txid_from_u64(1_000_000 + i);
-        if relay.originate(&mut rng, tx, &[9], 1, &all_alive) == (RelayAction::StemForward { to: 9 }) {
+        if relay.originate(&mut rng, tx, &[9], 1, &all_alive)
+            == (RelayAction::StemForward { to: 9 })
+        {
             inserted.push(tx);
         }
     }
@@ -726,11 +773,24 @@ fn stem_map_stays_bounded_under_flood_with_oldest_eviction() {
         relay.stem_len(),
         relay.seen_len()
     );
-    assert!(inserted.len() > MAX_STEM_ENTRIES, "flood must exceed the cap");
-    assert_eq!(relay.stem_len(), MAX_STEM_ENTRIES, "stem map must sit AT the cap");
-    assert!(relay.seen_len() <= MAX_SEEN_ENTRIES, "seen-set must stay bounded");
+    assert!(
+        inserted.len() > MAX_STEM_ENTRIES,
+        "flood must exceed the cap"
+    );
+    assert_eq!(
+        relay.stem_len(),
+        MAX_STEM_ENTRIES,
+        "stem map must sit AT the cap"
+    );
+    assert!(
+        relay.seen_len() <= MAX_SEEN_ENTRIES,
+        "seen-set must stay bounded"
+    );
     // Oldest-first eviction: the held set is exactly the most recent inserts.
-    let want: HashSet<TxHash> = inserted[inserted.len() - MAX_STEM_ENTRIES..].iter().copied().collect();
+    let want: HashSet<TxHash> = inserted[inserted.len() - MAX_STEM_ENTRIES..]
+        .iter()
+        .copied()
+        .collect();
     let held: HashSet<TxHash> = {
         let mut h = HashSet::new();
         for tx in &inserted {
@@ -764,8 +824,11 @@ fn deterministic_replay_is_identical() {
         a.received.len()
     );
     let c = run(0xBE5E_0002);
-    assert_ne!((a.stem_path, a.first_fluffer), (c.stem_path, c.first_fluffer),
-        "different seeds should diverge (sanity: rng is wired in)");
+    assert_ne!(
+        (a.stem_path, a.first_fluffer),
+        (c.stem_path, c.first_fluffer),
+        "different seeds should diverge (sanity: rng is wired in)"
+    );
 }
 
 // ---------------------------------------------------------------------------

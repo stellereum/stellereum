@@ -53,10 +53,7 @@ pub fn pubsub_data_ok(data: &str) -> bool {
 /// hard-bounded so a flood of distinct nonces cannot grow memory without
 /// limit (at the cap the handshake is refused — fail closed).
 pub fn claim_nonce(seen: &mut HashMap<String, i64>, nonce: &str, now: i64) -> bool {
-    if nonce.len() < 8
-        || nonce.len() > 128
-        || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if nonce.len() < 8 || nonce.len() > 128 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
     // Prune on every claim: handshakes are rare (not per-request), so an O(n)
@@ -247,9 +244,7 @@ impl Frame {
             ts: i64::from_le_bytes([b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13]]),
             src,
             dst,
-            svc: u64::from_le_bytes([
-                b[54], b[55], b[56], b[57], b[58], b[59], b[60], b[61],
-            ]),
+            svc: u64::from_le_bytes([b[54], b[55], b[56], b[57], b[58], b[59], b[60], b[61]]),
             payload: b[68..68 + plen].to_vec(),
             nonce: b[68 + plen..68 + plen + nlen].to_vec(),
             sig,
@@ -569,8 +564,7 @@ pub fn pq_falcon_digest(t: &PqTranscript) -> [u8; 32] {
 /// Malformed secret = hard error (fail closed, never an empty tag).
 pub fn pq_falcon_sign(sk_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>> {
     use falcon_rust::falcon512;
-    let sk =
-        falcon512::SecretKey::from_bytes(sk_bytes).map_err(|_| anyhow!("pq sk malformed"))?;
+    let sk = falcon512::SecretKey::from_bytes(sk_bytes).map_err(|_| anyhow!("pq sk malformed"))?;
     Ok(falcon512::sign(digest, &sk).to_bytes())
 }
 
@@ -726,9 +720,8 @@ pub fn kex_frame_aad(
     svc: u64,
     session_digest: &[u8; 32],
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(
-        KEX_FRAME_DOMAIN.len() + 1 + 4 + 8 + NODEID_LEN + NODEID_LEN + 8 + 32,
-    );
+    let mut v =
+        Vec::with_capacity(KEX_FRAME_DOMAIN.len() + 1 + 4 + 8 + NODEID_LEN + NODEID_LEN + 8 + 32);
     v.extend_from_slice(KEX_FRAME_DOMAIN);
     v.push(kind);
     v.extend_from_slice(&seq.to_le_bytes());
@@ -754,7 +747,10 @@ pub fn kex_frame_seal(
     cipher
         .encrypt(
             XNonce::from_slice(nonce),
-            Payload { msg: plaintext, aad },
+            Payload {
+                msg: plaintext,
+                aad,
+            },
         )
         .expect("kex frame seal")
 }
@@ -787,10 +783,7 @@ pub fn kex_frame_open(
     }
     let cipher = XChaCha20Poly1305::new(Key::from_slice(session_key));
     cipher
-        .decrypt(
-            XNonce::from_slice(nonce),
-            Payload { msg: ct, aad },
-        )
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
         .map_err(|_| anyhow!("kex frame open failed (tamper/wrong key/session?)"))
 }
 

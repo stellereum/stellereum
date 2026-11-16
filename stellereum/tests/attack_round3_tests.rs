@@ -8,8 +8,12 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine};
 use stellereum::cell::PatriciaTrie;
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::orderbook::{OrderSide, OrderbookActor};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::{
     Block, CrossShardMessage, SharedLiquidityHub, Transaction, MASTERCHAIN_SHARD,
 };
@@ -194,12 +198,12 @@ fn trie_non_inclusion_returns_none() {
 // ============================================================================
 #[test]
 fn session_key_cross_master_replay_rejected() {
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng);
-    let session_pub = session.verifying_key().to_bytes();
-    let mut auth = SessionKeyAuthorization::sign_delegation(
+    let master = FalconKeypair::generate_from_seed(0x51);
+    let session = FalconKeypair::generate_from_seed(0x52);
+    let mut auth = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        session.public_key(),
         4_000_000_000,
         1_000,
         stellereum::zkml::SCOPE_ALL,
@@ -304,14 +308,43 @@ fn genesis_vault_zero_deposit_mints_nothing() {
 #[tokio::test]
 async fn duplicate_signed_tx_rejected() {
     let engine = InMemoryStateEngine::new();
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let sk = FalconKeypair::generate_from_seed(0x61);
+    let from = derive_pq_address(PqScheme::Falcon512, sk.public_key(), &DEFAULT_SALT);
     let to = addr(2);
     engine
-        .update_account(stellereum::state_engine::AccountState::new(from, 10_000))
+        .update_account(stellereum::state_engine::AccountState::new(
+            from,
+            10_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        ))
         .await;
 
-    let tx = Transaction::sign(&sk, to, 1_000, 0, 0, 1, 1);
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        1_000,
+        0,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = sk.sign(&probe.signing_message());
+    let tx = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        sk.public_key.clone(),
+        sig,
+        to,
+        1_000,
+        0,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
     assert!(engine.apply_transaction(&tx, 0).await.is_ok());
     // Same tx again -> nonce already advanced
     assert!(

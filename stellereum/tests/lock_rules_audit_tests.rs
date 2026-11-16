@@ -376,7 +376,8 @@ fn lock_does_not_survive_height_advance() {
 
 async fn funded_state(owner: [u8; 32]) -> Arc<InMemoryStateEngine> {
     let st = Arc::new(InMemoryStateEngine::new());
-    st.update_account(AccountState::new(owner, 10_000_000)).await;
+    st.update_account(AccountState::new(owner, 10_000_000))
+        .await;
     st
 }
 
@@ -423,9 +424,7 @@ async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
     for (k, fk) in ks.iter().zip(fks.iter()) {
         rt.on_prevote(prevote(k, fk, h, 2, Some(Y))).unwrap();
     }
-    let pc = rt
-        .make_precommit()
-        .expect("higher polka must be followed");
+    let pc = rt.make_precommit().expect("higher polka must be followed");
     assert_eq!(pc.block_hash, Some(Y));
     assert_eq!(pc.round, 2, "stamped with the polka's round");
     assert_eq!(rt.hc.locked, Some((Y, 2)));

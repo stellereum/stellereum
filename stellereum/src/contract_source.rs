@@ -282,33 +282,176 @@ pub fn register_message(contract: &[u8; 32], source_hash: &[u8; 32]) -> Vec<u8> 
     m
 }
 
-/// Verify the creator's ed25519 signature authorising a `source_hash`
-/// registration. The creator address IS the ed25519 pubkey (chain address
-/// convention), so no key lookup is needed — but the signature MUST verify,
-/// otherwise anyone could pin a false "verified" label on someone else's
-/// contract.
+fn strip_hex_prefix(s: &str) -> &str {
+    let trimmed = s.trim();
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+}
+
+fn verify_pq_register_sig(
+    scheme: crate::post_quantum::PqScheme,
+    pk: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), String> {
+    let ok = if scheme == crate::post_quantum::PqScheme::Falcon512 {
+        crate::consensus::verify_falcon_signature(pk, msg, sig)
+    } else {
+        crate::post_quantum::verify_pq_signature(scheme, pk, msg, sig)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("signature does not verify against the contract creator".to_string())
+    }
+}
+
+/// Verify the creator's signature authorising a `source_hash` registration.
+///
+/// Supports post-quantum Falcon-512 / Hybrid signatures (a `PQ1` envelope —
+/// explicit or implicit via the global PQ key registry — raw `pubkey || sig`,
+/// or a raw 666-byte Falcon signature with implicit/explicit key lookup) as
+/// well as legacy 64-byte Ed25519 signatures where `creator` is the Ed25519
+/// verifying key.
 pub fn verify_register_signature(
     creator: &[u8; 32],
     contract: &[u8; 32],
     source_hash: &[u8; 32],
     signature_hex: &str,
 ) -> Result<(), String> {
+    verify_register_signature_with_pubkey(creator, contract, source_hash, signature_hex, None)
+}
+
+/// Same as [`verify_register_signature`], optionally accepting an explicit
+/// Falcon-512 public key hex string (for callers supplying raw 666-byte
+/// Falcon signatures without wrapping them in a `PQ1` envelope).
+pub fn verify_register_signature_with_pubkey(
+    creator: &[u8; 32],
+    contract: &[u8; 32],
+    source_hash: &[u8; 32],
+    signature_hex: &str,
+    pubkey_hex: Option<&str>,
+) -> Result<(), String> {
+    use crate::post_quantum::{
+        derive_pq_address, PqScheme, DEFAULT_SALT, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+    };
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let clean = signature_hex
-        .trim()
-        .strip_prefix("0x")
-        .or_else(|| signature_hex.trim().strip_prefix("0X"))
-        .unwrap_or(signature_hex.trim());
-    let bytes = hex::decode(clean).map_err(|e| format!("invalid signature hex: {e}"))?;
-    let arr: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| "invalid signature: expected 64 bytes".to_string())?;
+
+    let bytes = hex::decode(strip_hex_prefix(signature_hex))
+        .map_err(|e| format!("invalid signature hex: {e}"))?;
+    let msg = register_message(contract, source_hash);
+
+    if let Some(pk_hex) = pubkey_hex {
+        let pk = hex::decode(strip_hex_prefix(pk_hex))
+            .map_err(|e| format!("invalid pubkey hex: {e}"))?;
+        if pk.len() != FALCON512_PUBKEY_LEN {
+            return Err(format!(
+                "invalid pubkey length: expected {FALCON512_PUBKEY_LEN}, got {}",
+                pk.len()
+            ));
+        }
+        let derived = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        if derived != *creator {
+            return Err("creator address does not match Falcon-512 public key".to_string());
+        }
+        if bytes.starts_with(b"PQ1") {
+            let env = crate::sharding::PqSignatureEnvelope::decode(&bytes)?;
+            if !env.scheme.is_post_quantum() {
+                return Err("non-PQ scheme refused in PQ1 envelope".to_string());
+            }
+            if let Some(ref epk) = env.pubkey {
+                if epk.as_slice() != pk.as_slice() {
+                    return Err("PQ1 envelope public key mismatches pubkey parameter".to_string());
+                }
+                if derive_pq_address(env.scheme, epk, &env.salt) != *creator {
+                    return Err("creator address does not match PQ1 public key".to_string());
+                }
+            }
+            return verify_pq_register_sig(env.scheme, &pk, &msg, &env.signature_bytes);
+        }
+        if bytes.len() != FALCON512_SIG_LEN {
+            return Err(format!(
+                "invalid Falcon-512 signature: expected {FALCON512_SIG_LEN} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        return verify_pq_register_sig(PqScheme::Falcon512, &pk, &msg, &bytes);
+    }
+
+    if bytes.starts_with(b"PQ1") {
+        let env = crate::sharding::PqSignatureEnvelope::decode(&bytes)?;
+        if !env.scheme.is_post_quantum() {
+            return Err("non-PQ scheme refused in PQ1 envelope".to_string());
+        }
+        if env.signature_bytes.len() != env.scheme.signature_size() {
+            return Err(format!(
+                "invalid PQ signature length for {}: expected {}, got {}",
+                env.scheme.name(),
+                env.scheme.signature_size(),
+                env.signature_bytes.len()
+            ));
+        }
+        if !env.is_implicit {
+            let pk = env
+                .pubkey
+                .as_deref()
+                .ok_or_else(|| "missing public key in explicit PQ1 envelope".to_string())?;
+            if pk.len() != env.scheme.pubkey_size() {
+                return Err(format!(
+                    "invalid PQ public key length for {}: expected {}, got {}",
+                    env.scheme.name(),
+                    env.scheme.pubkey_size(),
+                    pk.len()
+                ));
+            }
+            let derived = derive_pq_address(env.scheme, pk, &env.salt);
+            if derived != *creator {
+                return Err("creator address does not match PQ1 public key".to_string());
+            }
+            return verify_pq_register_sig(env.scheme, pk, &msg, &env.signature_bytes);
+        } else {
+            let (scheme, pk) = crate::sharding::Transaction::global_implicit_registry()
+                .lookup(creator)
+                .ok_or_else(|| {
+                    "implicit PQ1 signature requires a registered creator public key".to_string()
+                })?;
+            if scheme != env.scheme {
+                return Err("implicit PQ1 scheme does not match registered creator key".to_string());
+            }
+            return verify_pq_register_sig(scheme, &pk, &msg, &env.signature_bytes);
+        }
+    }
+
+    if bytes.len() == FALCON512_PUBKEY_LEN + FALCON512_SIG_LEN {
+        let (pk, sig) = bytes.split_at(FALCON512_PUBKEY_LEN);
+        let derived = derive_pq_address(PqScheme::Falcon512, pk, &DEFAULT_SALT);
+        if derived != *creator {
+            return Err("creator address does not match Falcon-512 public key".to_string());
+        }
+        return verify_pq_register_sig(PqScheme::Falcon512, pk, &msg, sig);
+    }
+
+    if bytes.len() == FALCON512_SIG_LEN {
+        let (scheme, pk) = crate::sharding::Transaction::global_implicit_registry()
+            .lookup(creator)
+            .ok_or_else(|| {
+                "raw Falcon-512 signature requires pubkey parameter or registered creator key"
+                    .to_string()
+            })?;
+        if scheme != PqScheme::Falcon512 {
+            return Err("registered creator key is not Falcon-512".to_string());
+        }
+        return verify_pq_register_sig(scheme, &pk, &msg, &bytes);
+    }
+
+    let arr: [u8; 64] = bytes.try_into().map_err(|_| {
+        "invalid signature: expected PQ1 envelope, Falcon-512 pubkey+signature, Falcon-512 signature, or 64-byte Ed25519 signature".to_string()
+    })?;
     let key = VerifyingKey::from_bytes(creator).map_err(|e| format!("invalid creator key: {e}"))?;
-    key.verify(
-        &register_message(contract, source_hash),
-        &Signature::from_bytes(&arr),
-    )
-    .map_err(|_| "signature does not verify against the contract creator".to_string())
+    key.verify(&msg, &Signature::from_bytes(&arr))
+        .map_err(|_| "signature does not verify against the contract creator".to_string())
 }
 
 #[cfg(test)]
@@ -431,5 +574,73 @@ mod tests {
             &hex::encode(sig.to_bytes())
         )
         .is_err());
+    }
+
+    #[test]
+    fn pq_falcon512_register_signature_round_trip() {
+        use crate::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+        use crate::sharding::{PqSignatureEnvelope, Transaction};
+
+        let kp = FalconKeypair::generate_from_seed(0x4A);
+        let creator = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        let contract = [3u8; 32];
+        let shash = source_hash(b"pq-src");
+        let msg = register_message(&contract, &shash);
+        let sig = kp.sign(&msg);
+
+        // 1. Explicit PQ1 envelope
+        let explicit_env = PqSignatureEnvelope::new_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig.clone(),
+        )
+        .encode();
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&explicit_env))
+            .expect("explicit PQ1 registration signature verifies");
+
+        // Wrong creator is refused.
+        assert!(verify_register_signature(
+            &[9u8; 32],
+            &contract,
+            &shash,
+            &hex::encode(&explicit_env)
+        )
+        .is_err());
+
+        // Wrong contract is refused.
+        assert!(verify_register_signature(
+            &creator,
+            &[4u8; 32],
+            &shash,
+            &hex::encode(&explicit_env)
+        )
+        .is_err());
+
+        // 2. Raw pubkey || signature
+        let mut combined = kp.public_key.clone();
+        combined.extend_from_slice(&sig);
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&combined))
+            .expect("raw pubkey+sig registration verifies");
+
+        // 3. Raw signature + explicit pubkey parameter
+        verify_register_signature_with_pubkey(
+            &creator,
+            &contract,
+            &shash,
+            &hex::encode(&sig),
+            Some(&hex::encode(&kp.public_key)),
+        )
+        .expect("raw sig with pubkey param verifies");
+
+        // 4. Implicit PQ1 envelope via global implicit registry
+        Transaction::global_implicit_registry()
+            .register(creator, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+            .expect("register creator PQ key");
+        let implicit_env =
+            PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig.clone()).encode();
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&implicit_env))
+            .expect("implicit PQ1 registration signature verifies");
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&sig))
+            .expect("raw implicit Falcon signature verifies");
     }
 }

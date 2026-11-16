@@ -608,7 +608,11 @@ impl OracleState {
     /// Returns the committed price, or `Err` with no price committed. A `Err`
     /// for the peg/deviation cases also latches `breaker_tripped`, exactly
     /// like [`Self::commit_feed`].
-    pub fn commit_feed_pq(&mut self, feed: &PqPriceFeedUpdate, block_time: u64) -> Result<u64, String> {
+    pub fn commit_feed_pq(
+        &mut self,
+        feed: &PqPriceFeedUpdate,
+        block_time: u64,
+    ) -> Result<u64, String> {
         // 0. Breaker latch: once tripped nothing gets through.
         if self.breaker_tripped {
             return Err("Circuit breaker is currently active. Trades paused.".to_string());
@@ -830,12 +834,12 @@ impl OracleState {
     /// over-age committed feed refuses. Pure: latches nothing, commits
     /// nothing.
     pub fn is_feed_fresh_at(&self, asset: &str, block_time: u64) -> Result<(), String> {
-        let feed = self.feeds.get(asset).ok_or_else(|| {
-            format!("no committed price feed for asset '{asset}'")
-        })?;
-        check_freshness(feed.timestamp, block_time).map_err(|e| {
-            format!("frozen oracle feed for {asset}: {e}")
-        })
+        let feed = self
+            .feeds
+            .get(asset)
+            .ok_or_else(|| format!("no committed price feed for asset '{asset}'"))?;
+        check_freshness(feed.timestamp, block_time)
+            .map_err(|e| format!("frozen oracle feed for {asset}: {e}"))
     }
 
     /// Time-aware admission gate: [`OracleState::gate_order`] plus the
@@ -1392,9 +1396,30 @@ mod sprt_tier3_gate_tests {
         assert!(!sprt_tier3_active_at(u64::MAX - 1));
 
         // 9% under → pass; exactly 10% → pass (rule is strict `>`); 11% → trip.
-        assert!(!tier3_breaker_tripped(1_090_000, 1_000_000, 0, &[], 0.01, 0.005));
-        assert!(!tier3_breaker_tripped(1_100_000, 1_000_000, 0, &[], 0.01, 0.005));
-        assert!(tier3_breaker_tripped(1_110_000, 1_000_000, 0, &[], 0.01, 0.005));
+        assert!(!tier3_breaker_tripped(
+            1_090_000,
+            1_000_000,
+            0,
+            &[],
+            0.01,
+            0.005
+        ));
+        assert!(!tier3_breaker_tripped(
+            1_100_000,
+            1_000_000,
+            0,
+            &[],
+            0.01,
+            0.005
+        ));
+        assert!(tier3_breaker_tripped(
+            1_110_000,
+            1_000_000,
+            0,
+            &[],
+            0.01,
+            0.005
+        ));
         // A maximally alarming SPRT history must NOT trip pre-activation:
         // the fixed branch ignores residuals entirely.
         assert!(!tier3_breaker_tripped(
@@ -1508,7 +1533,12 @@ mod sprt_tier3_gate_tests {
                 let quiet_history = vec![j; trip_at - 1];
                 assert!(
                     !tier3_breaker_tripped(
-                        1_000_000, 1_000_000, u64::MAX, &quiet_history, j, sigma
+                        1_000_000,
+                        1_000_000,
+                        u64::MAX,
+                        &quiet_history,
+                        j,
+                        sigma
                     ),
                     "J={j} σ={sigma}: {} samples must stay silent",
                     trip_at - 1
@@ -1517,14 +1547,7 @@ mod sprt_tier3_gate_tests {
             // Flat market: zeros score pure negative drift, never trip —
             // even over a long window.
             assert!(
-                !tier3_breaker_tripped(
-                    1_000_000,
-                    1_000_000,
-                    u64::MAX,
-                    &[0.0; 64],
-                    j,
-                    sigma
-                ),
+                !tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &[0.0; 64], j, sigma),
                 "J={j} σ={sigma}: flat residuals must never trip"
             );
         }
@@ -1592,8 +1615,7 @@ mod sprt_tier3_gate_tests {
     fn wired_gate_is_deterministic() {
         let residuals = [0.01, 0.005, -0.002, 0.012, 0.008];
         let fixed_a = tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005);
-        let sprt_a =
-            tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005);
+        let sprt_a = tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005);
         for _ in 0..16 {
             assert_eq!(
                 tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005),
@@ -1665,9 +1687,7 @@ mod pq_gate_tests {
                 "valid ed feed must NOT verify under FULL-PQ"
             );
             let mut enforced_state = OracleState::default();
-            enforced_state
-                .publishers
-                .insert(feed.publisher_pubkey);
+            enforced_state.publishers.insert(feed.publisher_pubkey);
             assert!(
                 enforced_state.commit_feed(&feed, 1_001).is_err(),
                 "ed feed must not commit under FULL-PQ"
@@ -1731,7 +1751,10 @@ mod pq_feed_tests {
         // Swap the embedded key: the signature no longer matches the claimed
         // publisher, so verification must fail.
         feed.publisher_falcon_pubkey = other.pubkey().to_vec();
-        assert!(!feed.verify(), "signature under a different key must NOT verify");
+        assert!(
+            !feed.verify(),
+            "signature under a different key must NOT verify"
+        );
     }
 
     #[test]
@@ -1826,7 +1849,10 @@ mod pq_feed_tests {
         let err = s
             .commit_feed_pq(&signed("STELL", 250_000, 1_000, &kp), 1_001)
             .expect_err("an unregistered PQ publisher must be refused");
-        assert!(err.contains("publisher"), "refusal must name the set: {err}");
+        assert!(
+            err.contains("publisher"),
+            "refusal must name the set: {err}"
+        );
         assert!(s.feeds.is_empty());
         assert!(!s.breaker_tripped);
 

@@ -491,7 +491,10 @@ fn micro_committee_100_percent_burn_is_exact_and_conserving() {
     l.undelegate(del(2), vid(1), stell(200), 0).unwrap(); // in-flight stake
     let slashable_before = active_stake(&l) + unbonding_sum(&l) + withdrawable_sum(&l);
     let burned = l.slash(vid(1), MICRO_COMMITTEE_SLASH_BPS).unwrap();
-    assert_eq!(burned as u128, slashable_before, "100% burns the whole base");
+    assert_eq!(
+        burned as u128, slashable_before,
+        "100% burns the whole base"
+    );
     assert_eq!(active_stake(&l), 0);
     assert_eq!(unbonding_sum(&l), 0);
     assert_eq!(l.total_burned, burned);
@@ -526,7 +529,11 @@ fn adversarial_unbonding_stack_never_panics_and_conserves() {
     let bonded_in = 2 * u64::MAX as u128;
     let burned = l.slash(vid(1), 10_000).unwrap();
     assert_eq!(burned, u64::MAX, "saturated base MAX → burn MAX");
-    assert_eq!(l.unbonding.len(), 1, "only burn-covered entries are consumed");
+    assert_eq!(
+        l.unbonding.len(),
+        1,
+        "only burn-covered entries are consumed"
+    );
     assert_eq!(
         active_stake(&l) + unbonding_sum(&l) + withdrawable_sum(&l) + burned as u128,
         bonded_in,
@@ -847,13 +854,27 @@ fn slash_bps_boundaries_pass_identical() {
     // asserts above; the 100% arm is exactly the denominator.
     assert_eq!(MICRO_COMMITTEE_SLASH_BPS, BPS_DENOMINATOR);
     // Boundary sweep on fresh ledgers: exact floor, 1:1 burn tracking.
-    for bps in [0u64, 1, 10, DOWNTIME_SLASH_BPS, 100, EQUIVOCATION_SLASH_BPS, 1000, 5000, 9999, 10_000] {
+    for bps in [
+        0u64,
+        1,
+        10,
+        DOWNTIME_SLASH_BPS,
+        100,
+        EQUIVOCATION_SLASH_BPS,
+        1000,
+        5000,
+        9999,
+        10_000,
+    ] {
         let mut l = StakingLedger::new();
         let bond = stell(2000) + 7; // +7 dust so floors are load-bearing
         l.bond(vid(1), bond, DEFAULT_COMMISSION_BPS).unwrap();
         let expected = (bond as u128 * bps as u128 / BPS_DENOMINATOR as u128) as u64;
         let burned = l.slash(vid(1), bps).unwrap();
-        assert_eq!(burned, expected, "bps {bps}: burn must equal the exact floor");
+        assert_eq!(
+            burned, expected,
+            "bps {bps}: burn must equal the exact floor"
+        );
         assert_eq!(l.total_stake(&vid(1)), bond - burned);
         assert_eq!(l.total_burned, burned);
     }

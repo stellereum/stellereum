@@ -575,8 +575,7 @@ pub fn pq_equivocation_dedup_key(
 /// ([`crate::consensus::PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN`]), and PQ arms,
 /// so XMSS offense keys can share the [`StakingLedger::equivocation_dedup`]
 /// set without ever colliding with them.
-pub const XMSS_EQUIVOCATION_OFFENSE_DOMAIN: &[u8] =
-    b"STELLEREUM_XMSS_EQUIVOCATION_OFFENSE_V1";
+pub const XMSS_EQUIVOCATION_OFFENSE_DOMAIN: &[u8] = b"STELLEREUM_XMSS_EQUIVOCATION_OFFENSE_V1";
 
 /// Hard cap on one XMSS equivocation evidence envelope's wire size
 /// (fail-closed: larger is refused, never truncated).
@@ -4051,7 +4050,8 @@ mod tests {
         let other_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE4);
         let a = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         // Framing with another key's vote burns nothing (Finding 12 fixed).
-        let framed = Vote::sign_with_falcon(&other, &other_fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let framed =
+            Vote::sign_with_falcon(&other, &other_fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a.clone(), framed);
         assert_eq!(l.slash_equivocation_verified(&ev).unwrap(), 0);
         // Zeroed signatures burn nothing.
@@ -4075,8 +4075,22 @@ mod tests {
             crate::post_quantum::PqScheme::Falcon512,
             outsider_fk.public_key.clone(),
         );
-        let oa = Vote::sign_with_falcon(&outsider, &outsider_fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let ob = Vote::sign_with_falcon(&outsider, &outsider_fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let oa = Vote::sign_with_falcon(
+            &outsider,
+            &outsider_fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some([1u8; 32]),
+        );
+        let ob = Vote::sign_with_falcon(
+            &outsider,
+            &outsider_fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some([2u8; 32]),
+        );
         let ev_out = EquivocationEvidence::new(oid, oa, ob);
         assert_eq!(
             l.slash_equivocation_verified(&ev_out),
@@ -4131,7 +4145,10 @@ mod tests {
         assert_eq!(l.validators[&offender].total_slashed, burned);
         assert_eq!(l.total_burned, burned);
         // Replay of the same offense burns 0, stake untouched.
-        assert_eq!(l.slash_xmss_equivocation_verified(offender, &ev).unwrap(), 0);
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(offender, &ev).unwrap(),
+            0
+        );
         assert_eq!(l.total_burned, burned);
         assert_eq!(l.total_stake(&offender), stell(2000) - burned);
     }
@@ -4165,10 +4182,7 @@ mod tests {
             0
         );
         // Framing with another key's proof burns nothing (root mismatch).
-        assert_eq!(
-            l.slash_xmss_equivocation_verified(vid(9), &ev).unwrap(),
-            0
-        );
+        assert_eq!(l.slash_xmss_equivocation_verified(vid(9), &ev).unwrap(), 0);
         // Nothing moved anywhere.
         assert_eq!(l.total_stake(&offender), stell(2000));
         assert_eq!(l.total_burned, 0);

@@ -299,7 +299,8 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     );
 
     // Full maturation then per-delegator withdraw of exact post-slash figures.
-    l.process_unbonding(BASE + 24 * STEP + UNBONDING_PERIOD_SECS).unwrap();
+    l.process_unbonding(BASE + 24 * STEP + UNBONDING_PERIOD_SECS)
+        .unwrap();
     assert!(l.unbonding.is_empty(), "all staggered entries must mature");
     for j in &exiting {
         let got = l

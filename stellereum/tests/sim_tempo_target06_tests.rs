@@ -117,8 +117,7 @@ fn cell_metrics(report: &consensus_cluster::ClusterReport) -> CellMetrics {
     };
     // Incident signature lives on the fast pair (nodes 0,1): the slow member
     // is BEHIND, so its own arrivals name newer rounds, never stale ones.
-    let stale_fast =
-        (report.nodes[0].stale_share() + report.nodes[1].stale_share()) / 2.0;
+    let stale_fast = (report.nodes[0].stale_share() + report.nodes[1].stale_share()) / 2.0;
     let total_vc: u64 = report.nodes.iter().map(|n| n.view_changes).sum();
     let vc_per_final = total_vc as f64 / finals.max(1) as f64;
     let grace_total: u64 = report.nodes.iter().map(|n| n.grace_extends).sum();
@@ -246,14 +245,9 @@ async fn tempo_sweep_table() {
 #[tokio::test]
 async fn tempo_target06_recommended_pinned() {
     for &seed in &REC_SEEDS {
-        let mut c = ConsensusCluster::build(
-            3,
-            sweep_profiles(REC_LINK_MS),
-            seed,
-            TICK_MS,
-            REC_BASE_MS,
-        )
-        .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, CAP_MS, FRESHNESS_MS));
+        let mut c =
+            ConsensusCluster::build(3, sweep_profiles(REC_LINK_MS), seed, TICK_MS, REC_BASE_MS)
+                .with_straggler_policy(StragglerPolicy::fixed(GRACE_MS, CAP_MS, FRESHNESS_MS));
         assert_eq!(c.validators().quorum_power(), 3);
         assert_eq!(c.validators().total_power(), 3);
         c.seed_transactions(3).await;
@@ -272,7 +266,11 @@ async fn tempo_target06_recommended_pinned() {
             "[sim][tempo06][pinned] seed=0x{seed:x} finals={finals} per_hour={per_hour} \
              mean_ms={mean_ms} vc/final={vc_per_final:.2} grace={total_grace} \
              decide_head={:?}",
-            report.nodes[0].decide_rounds.iter().take(8).collect::<Vec<_>>(),
+            report.nodes[0]
+                .decide_rounds
+                .iter()
+                .take(8)
+                .collect::<Vec<_>>(),
         );
         println!("{}", report.diagnostics());
 
@@ -300,7 +298,8 @@ async fn tempo_target06_recommended_pinned() {
         for n in &report.nodes {
             for (k, d) in n.decide_rounds.iter().enumerate().skip(1) {
                 assert_eq!(
-                    *d, 0,
+                    *d,
+                    0,
                     "seed 0x{seed:x} node {} height {} decided in round +{d}.\n{}",
                     n.index,
                     k + 1,

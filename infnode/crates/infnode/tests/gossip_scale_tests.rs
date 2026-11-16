@@ -157,9 +157,15 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("tmpdir");
 
-    let keys: Vec<NodeKeys> = (0..n).map(|i| det_keys(&format!("gossip-scale/{tag}/{i}"))).collect();
-    let pqs: Vec<PqKeys> = (0..n).map(|i| det_pq(&format!("gossip-scale/{tag}/{i}"))).collect();
-    let listens: Vec<String> = (0..n).map(|i| format!("127.0.0.1:{}", base_port + i as u16)).collect();
+    let keys: Vec<NodeKeys> = (0..n)
+        .map(|i| det_keys(&format!("gossip-scale/{tag}/{i}")))
+        .collect();
+    let pqs: Vec<PqKeys> = (0..n)
+        .map(|i| det_pq(&format!("gossip-scale/{tag}/{i}")))
+        .collect();
+    let listens: Vec<String> = (0..n)
+        .map(|i| format!("127.0.0.1:{}", base_port + i as u16))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
@@ -169,7 +175,8 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
             .collect();
         let node = Node::new(
             cfg(&format!("{tag}-{i}"), &listens[i], peers),
-            keys[i].clone(), pqs[i].clone(),
+            keys[i].clone(),
+            pqs[i].clone(),
             tmp.join(format!("n{i}")),
             PathBuf::new(),
         )
@@ -208,7 +215,9 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
         let mut jobs = tokio::task::JoinSet::new();
         for &(i, pid) in chunk {
             let node = nodes[i].clone();
-            let payload = serde_json::json!({ "topic": topic }).to_string().into_bytes();
+            let payload = serde_json::json!({ "topic": topic })
+                .to_string()
+                .into_bytes();
             jobs.spawn(async move {
                 let mut last_err = String::new();
                 for attempt in 1..=5 {
@@ -228,7 +237,10 @@ async fn build_mesh(tag: &str, base_port: u16, n: usize, topic: &str) -> Mesh {
                     }
                     tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                 }
-                panic!("subscribe {i}->{pid_hex} failed after retries: {last_err}", pid_hex = hex::encode(pid));
+                panic!(
+                    "subscribe {i}->{pid_hex} failed after retries: {last_err}",
+                    pid_hex = hex::encode(pid)
+                );
             });
         }
         while jobs.join_next().await.is_some() {}
@@ -358,7 +370,15 @@ async fn gossip_all_to_all_no_storm_collapse() {
     let t0 = std::time::Instant::now();
     for i in 0..n {
         let exec = (i + 1) % n;
-        let resp = publish_via(&mesh, i, exec, topic, &format!("chatter-{i}"), 0xC4A7_0000u64 + i as u64).await;
+        let resp = publish_via(
+            &mesh,
+            i,
+            exec,
+            topic,
+            &format!("chatter-{i}"),
+            0xC4A7_0000u64 + i as u64,
+        )
+        .await;
         assert_eq!(resp["ok"], true, "publish {i} must be accepted: {resp}");
     }
 
@@ -390,7 +410,11 @@ async fn gossip_all_to_all_no_storm_collapse() {
         }
         // Every chatter message loops back to its origin, so inbox i holds
         // all N distinct messages. Either way: exactly N distinct, zero dupes.
-        assert_eq!(seen.len(), n, "node {i} inbox distinct franchises: {seen:?}");
+        assert_eq!(
+            seen.len(),
+            n,
+            "node {i} inbox distinct franchises: {seen:?}"
+        );
         assert_eq!(dupes, 0, "node {i} received duplicates (dedup broken)");
         total_unique += seen.len();
         total_dupes += dupes;
@@ -402,7 +426,10 @@ async fn gossip_all_to_all_no_storm_collapse() {
         (n - 1) * (n - 1)
     );
     assert_eq!(total_unique, n * n, "delivery rate must be 100%");
-    assert!(elapsed.as_secs() < 120, "storm collapse: all-to-all took too long");
+    assert!(
+        elapsed.as_secs() < 120,
+        "storm collapse: all-to-all took too long"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -417,8 +444,17 @@ async fn gossip_byzantine_spam_contained() {
     let mut mesh = build_mesh("byz", 19850, n, topic).await;
     let byz: Vec<usize> = ((n - n_byz)..n).collect();
     let honest: Vec<usize> = (0..(n - n_byz)).collect();
-    assert_eq!(n_byz * 5, n, "20% of {n} nodes are byzantine (n_byz={n_byz})");
-    println!("REPORT byz consts MAX_PUBSUB_DATA_LEN={} MAX_PUBSUB_TTL={} MAX_SEEN_IDS={}", proto::MAX_PUBSUB_DATA_LEN, proto::MAX_PUBSUB_TTL, proto::MAX_SEEN_IDS);
+    assert_eq!(
+        n_byz * 5,
+        n,
+        "20% of {n} nodes are byzantine (n_byz={n_byz})"
+    );
+    println!(
+        "REPORT byz consts MAX_PUBSUB_DATA_LEN={} MAX_PUBSUB_TTL={} MAX_SEEN_IDS={}",
+        proto::MAX_PUBSUB_DATA_LEN,
+        proto::MAX_PUBSUB_TTL,
+        proto::MAX_SEEN_IDS
+    );
 
     // (a) Oversize flood: every attempt refused fail-closed, nothing delivered.
     let big = "X".repeat(proto::MAX_PUBSUB_DATA_LEN + 1);
@@ -487,11 +523,22 @@ async fn gossip_byzantine_spam_contained() {
     let inboxes = mesh.drain_all();
     for (i, inbox) in inboxes.iter().enumerate() {
         let c = inbox.iter().filter(|(d, _)| d == "spam-dup").count();
-        assert!(c <= 1, "node {i} got spam-dup {c}x (dedup must deliver at most once)");
+        assert!(
+            c <= 1,
+            "node {i} got spam-dup {c}x (dedup must deliver at most once)"
+        );
     }
 
     // (c) Honest delivery unaffected by the spam above.
-    let resp = publish_via(&mesh, honest[0], honest[1], topic, "honest-after-spam", 0xBEEF_0007u64).await;
+    let resp = publish_via(
+        &mesh,
+        honest[0],
+        honest[1],
+        topic,
+        "honest-after-spam",
+        0xBEEF_0007u64,
+    )
+    .await;
     assert_eq!(resp["ok"], true, "honest publish accepted: {resp}");
     let (rounds, inboxes) = poll_rounds(&mut mesh, 40, &|_len, got| {
         honest
@@ -535,13 +582,25 @@ async fn gossip_byzantine_spam_contained() {
             mesh.nodes[observer].rep_record_oversize(&pid).await;
             to_ban += 1;
         }
-        assert!(mesh.nodes[observer].rep_is_banned(&pid).await, "spammer {s} must ban");
-        println!("REPORT byz spammer={s} debits_to_throttle<={to_throttle} debits_to_ban<={}  ", to_throttle + to_ban);
+        assert!(
+            mesh.nodes[observer].rep_is_banned(&pid).await,
+            "spammer {s} must ban"
+        );
+        println!(
+            "REPORT byz spammer={s} debits_to_throttle<={to_throttle} debits_to_ban<={}  ",
+            to_throttle + to_ban
+        );
     }
     for &h in &honest {
         let pid = mesh.ids[h];
-        assert!(!mesh.nodes[observer].rep_is_banned(&pid).await, "honest {h} must not be banned");
-        assert!(!mesh.nodes[observer].rep_is_throttled(&pid).await, "honest {h} must not be throttled");
+        assert!(
+            !mesh.nodes[observer].rep_is_banned(&pid).await,
+            "honest {h} must not be banned"
+        );
+        assert!(
+            !mesh.nodes[observer].rep_is_throttled(&pid).await,
+            "honest {h} must not be throttled"
+        );
     }
     assert!(
         mesh.nodes[observer].rep_bans_total() >= n_byz as u64,
@@ -569,7 +628,9 @@ async fn gossip_partition_heal_converges() {
         (0..len).all(|i| got[i].iter().any(|(d, _)| d == "pre-split"))
     })
     .await;
-    assert!(inboxes.iter().all(|v| v.iter().any(|(d, _)| d == "pre-split")));
+    assert!(inboxes
+        .iter()
+        .all(|v| v.iter().any(|(d, _)| d == "pre-split")));
     let _ = mesh.drain_all();
 
     // Partition: sever the cross-half peer links on BOTH sides (real
@@ -609,12 +670,24 @@ async fn gossip_partition_heal_converges() {
     tokio::time::sleep(Duration::from_millis(3000)).await;
     let inboxes = mesh.drain_all();
     for &a in &side_a {
-        assert!(inboxes[a].iter().any(|(d, _)| d == "only-A"), "side A node {a} missed in-half message");
-        assert!(!inboxes[a].iter().any(|(d, _)| d == "only-B"), "partition leaked B->A at node {a}");
+        assert!(
+            inboxes[a].iter().any(|(d, _)| d == "only-A"),
+            "side A node {a} missed in-half message"
+        );
+        assert!(
+            !inboxes[a].iter().any(|(d, _)| d == "only-B"),
+            "partition leaked B->A at node {a}"
+        );
     }
     for &b in &side_b {
-        assert!(inboxes[b].iter().any(|(d, _)| d == "only-B"), "side B node {b} missed in-half message");
-        assert!(!inboxes[b].iter().any(|(d, _)| d == "only-A"), "partition leaked A->B at node {b}");
+        assert!(
+            inboxes[b].iter().any(|(d, _)| d == "only-B"),
+            "side B node {b} missed in-half message"
+        );
+        assert!(
+            !inboxes[b].iter().any(|(d, _)| d == "only-A"),
+            "partition leaked A->B at node {b}"
+        );
     }
     println!("REPORT part N={n} split contained (A-only and B-only stayed in-half)");
 
@@ -638,13 +711,30 @@ async fn gossip_partition_heal_converges() {
     // everywhere, so post-heal coverage gates the mesh heal, not backfill.
     let heal_a_exec = side_a[side_a.len() - 1];
     let heal_b_exec = side_b[side_b.len() - 1];
-    let resp = publish_via(&mesh, side_a[0], heal_a_exec, topic, "healed-A", 0x9A27_0EA1u64).await;
+    let resp = publish_via(
+        &mesh,
+        side_a[0],
+        heal_a_exec,
+        topic,
+        "healed-A",
+        0x9A27_0EA1u64,
+    )
+    .await;
     assert_eq!(resp["ok"], true);
-    let resp = publish_via(&mesh, side_b[0], heal_b_exec, topic, "healed-B", 0x9A27_0EB1u64).await;
+    let resp = publish_via(
+        &mesh,
+        side_b[0],
+        heal_b_exec,
+        topic,
+        "healed-B",
+        0x9A27_0EB1u64,
+    )
+    .await;
     assert_eq!(resp["ok"], true);
     let (rounds, inboxes) = poll_rounds(&mut mesh, 60, &|len, got| {
         (0..len).all(|i| {
-            got[i].iter().any(|(d, _)| d == "healed-A") && got[i].iter().any(|(d, _)| d == "healed-B")
+            got[i].iter().any(|(d, _)| d == "healed-A")
+                && got[i].iter().any(|(d, _)| d == "healed-B")
         })
     })
     .await;
@@ -653,9 +743,16 @@ async fn gossip_partition_heal_converges() {
     for (i, inbox) in inboxes.iter().enumerate() {
         let mut got = HashSet::new();
         for (d, _) in inbox.iter().filter(|(d, _)| d.starts_with("healed-")) {
-            assert!(got.insert(d.clone()), "node {i} duplicate post-heal delivery of {d}");
+            assert!(
+                got.insert(d.clone()),
+                "node {i} duplicate post-heal delivery of {d}"
+            );
         }
-        assert_eq!(got.len(), 2, "node {i} post-heal set diverged (fork): {got:?}");
+        assert_eq!(
+            got.len(),
+            2,
+            "node {i} post-heal set diverged (fork): {got:?}"
+        );
     }
     println!("REPORT part N={n} heal_rounds={rounds} converged=1 fork=0");
 }

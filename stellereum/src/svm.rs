@@ -352,15 +352,13 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // PQ excision: confidential ops removed with Ristretto; RESERVED placeholders
         // below preserve discriminants 33/40/41/42 and always revert.
         // Reserved placeholders decode (to preserve indices) but never execute.
-        OpCode::Reserved33ConfidentialTransfer
-        | OpCode::Reserved40ConfidentialTransfer2
-        | OpCode::Reserved41ConfidentialShield
-        | OpCode::Reserved42ConfidentialUnshield => GAS_HALT,
+        OpCode::Reserved33ConfidentialTransfer(_)
+        | OpCode::Reserved40ConfidentialTransfer2(_)
+        | OpCode::Reserved41ConfidentialShield(_)
+        | OpCode::Reserved42ConfidentialUnshield(_) => GAS_HALT,
         OpCode::SysCallTokenBalanceOf { .. } => GAS_TOKEN_BALANCE,
         OpCode::SysCallDeployContract { code } => contract_deploy_gas(code.len()),
-        OpCode::SysCallCallContract { method, .. } => {
-            contract_call_gas(method.len(), 1, 0)
-        }
+        OpCode::SysCallCallContract { method, .. } => contract_call_gas(method.len(), 1, 0),
         OpCode::SysCallCallContractArgs {
             method,
             args,
@@ -437,6 +435,26 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallGovPropose { .. } => GAS_GOV_PROPOSE,
         OpCode::SysCallGovVote { .. } => GAS_GOV_VOTE,
         OpCode::Halt => GAS_HALT,
+    }
+}
+
+/// Zero-size marker for excised confidential opcodes (discriminants 33/40/41/42).
+/// Serializes as 0 bytes (so test fixtures can construct payloads), and ALWAYS
+/// fails deserialization so reserved discriminants refuse at decode time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedOpcodeMarker;
+
+impl Serialize for ReservedOpcodeMarker {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_unit()
+    }
+}
+
+impl<'de> Deserialize<'de> for ReservedOpcodeMarker {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "reserved/excised confidential opcode discriminant refused at decode",
+        ))
     }
 }
 
@@ -612,9 +630,8 @@ pub enum OpCode {
     /// the committed domain and the BLOCK timestamp; see `bridge.rs`.
     SysCallBridge(Box<crate::bridge::BridgeIntent>),
     // RESERVED (PQ excision): SysCallConfidentialTransfer discriminant — never reuse.
-    // Unit placeholder keeps bincode index 33 stable so `SysCallActorSend` stays 34.
-    // Decodes but always reverts in the handler (fail-closed).
-    Reserved33ConfidentialTransfer = 33,
+    // Preserves bincode index 33 so `SysCallActorSend` stays 34, and refuses at decode time.
+    Reserved33ConfidentialTransfer(ReservedOpcodeMarker) = 33,
     // APPEND, never insert above: same bincode-discriminant rule as every
     // variant above (see the comment on `SysCallSubmitPriceFeed`). This is
     // §1 of the actor mailbox: it enqueues an asynchronous message into the
@@ -807,11 +824,10 @@ pub enum OpCode {
         max_supply: Option<u64>,
     },
     // RESERVED (PQ excision): SysCallConfidentialTransfer2/Shield/Unshield discriminants — never reuse.
-    // Unit placeholders keep bincode indices 40/41/42 stable so later opcodes never shift.
-    // Each decodes but always reverts in the handler (fail-closed).
-    Reserved40ConfidentialTransfer2 = 40,
-    Reserved41ConfidentialShield = 41,
-    Reserved42ConfidentialUnshield = 42,
+    // Preserves bincode indices 40/41/42 so later opcodes never shift, and refuses at decode time.
+    Reserved40ConfidentialTransfer2(ReservedOpcodeMarker) = 40,
+    Reserved41ConfidentialShield(ReservedOpcodeMarker) = 41,
+    Reserved42ConfidentialUnshield(ReservedOpcodeMarker) = 42,
     // APPEND, never insert above: same bincode-discriminant rule.
     /// Rotate a validator's consensus key (foreign-validator operations):
     /// move the entire staking record from `old_validator` to
@@ -2354,7 +2370,9 @@ impl Svm {
                     match oracle.commit_feed_pq(feed, ctx.timestamp) {
                         Ok(price) => state.stack.push(price),
                         Err(e) => {
-                            return VmExecutionResult::Reverted(format!("pq price feed rejected: {e}"))
+                            return VmExecutionResult::Reverted(format!(
+                                "pq price feed rejected: {e}"
+                            ))
                         }
                     }
                 }
@@ -2571,10 +2589,10 @@ impl Svm {
                     state.stack.push(1);
                 }
                 // PQ excision: RESERVED discriminants 33/40/41/42 decode but never execute (fail-closed).
-                OpCode::Reserved33ConfidentialTransfer
-                | OpCode::Reserved40ConfidentialTransfer2
-                | OpCode::Reserved41ConfidentialShield
-                | OpCode::Reserved42ConfidentialUnshield => {
+                OpCode::Reserved33ConfidentialTransfer(_)
+                | OpCode::Reserved40ConfidentialTransfer2(_)
+                | OpCode::Reserved41ConfidentialShield(_)
+                | OpCode::Reserved42ConfidentialUnshield(_) => {
                     charge!(GAS_HALT);
                     return VmExecutionResult::Reverted(
                         "reserved opcode (removed confidential op): refused".to_string(),

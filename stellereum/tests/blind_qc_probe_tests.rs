@@ -114,8 +114,7 @@ async fn blind_qc_probe_walk_accepts_genuine_qc() {
     assert_eq!(qc.height, 1);
     assert!(qc.verify(&vs), "canned QC must verify under the test set");
 
-    let map: HashMap<[u8; 32], Block> =
-        [(head_hash, block.clone())].into_iter().collect();
+    let map: HashMap<[u8; 32], Block> = [(head_hash, block.clone())].into_iter().collect();
     let blocks = collect_missing_blocks(head_hash, our_tip, 256, |h| {
         let b = map.get(&h).cloned();
         async move { b }
@@ -129,8 +128,14 @@ async fn blind_qc_probe_walk_accepts_genuine_qc() {
         .expect("walked head must anchor on the advertised tip+1");
     assert_eq!(next, 2);
 
-    validate_sync_chain_for_shard_with_sets(&blocks, 1, our_tip, &|_| Some(vs.clone()), MASTERCHAIN_SHARD)
-        .expect("genuine height-bound QC must validate");
+    validate_sync_chain_for_shard_with_sets(
+        &blocks,
+        1,
+        our_tip,
+        &|_| Some(vs.clone()),
+        MASTERCHAIN_SHARD,
+    )
+    .expect("genuine height-bound QC must validate");
 }
 
 /// NEGATIVE: the same walk shape but the QC is forged (signed by keys outside
@@ -164,17 +169,12 @@ async fn blind_qc_probe_refuses_forged_qc() {
         signatures: forged_sigs,
     });
     assert!(
-        !block
-            .precommit_qc
-            .clone()
-            .expect("QC present")
-            .verify(&vs),
+        !block.precommit_qc.clone().expect("QC present").verify(&vs),
         "forged QC must NOT verify under the test set"
     );
 
     let head_hash = block.compute_hash();
-    let map: HashMap<[u8; 32], Block> =
-        [(head_hash, block.clone())].into_iter().collect();
+    let map: HashMap<[u8; 32], Block> = [(head_hash, block.clone())].into_iter().collect();
     let blocks = collect_missing_blocks(head_hash, our_tip, 256, |h| {
         let b = map.get(&h).cloned();
         async move { b }

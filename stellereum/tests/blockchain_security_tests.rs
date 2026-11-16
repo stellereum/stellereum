@@ -17,32 +17,70 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine};
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::mev::{MevPreemptionEngine, ShamirSecretSharing};
-use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
+use stellereum::oracle::{pq_publisher_binding, OracleSafetyEngine, PqPriceFeedUpdate};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::{
     Block, CrossShardMessage, SharedLiquidityHub, Transaction, MASTERCHAIN_SHARD,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof};
 
+fn pq_tx(fk: &FalconKeypair, to: [u8; 32], amount: u64, gas_limit: u64, nonce: u64) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
+}
+
 #[tokio::test]
 async fn attack_test_double_spending_and_nonce_replay() {
     let state_engine = InMemoryStateEngine::new();
-    let alice_sk = SigningKey::generate(&mut OsRng);
-    let bob_sk = SigningKey::generate(&mut OsRng);
-    let charlie_sk = SigningKey::generate(&mut OsRng);
+    let alice_sk = FalconKeypair::generate_from_seed(0x01);
+    let bob_sk = FalconKeypair::generate_from_seed(0x02);
+    let charlie_sk = FalconKeypair::generate_from_seed(0x03);
 
-    let alice_addr = alice_sk.verifying_key().to_bytes();
-    let bob_addr = bob_sk.verifying_key().to_bytes();
-    let charlie_addr = charlie_sk.verifying_key().to_bytes();
+    let alice_addr = derive_pq_address(PqScheme::Falcon512, alice_sk.public_key(), &DEFAULT_SALT);
+    let bob_addr = derive_pq_address(PqScheme::Falcon512, bob_sk.public_key(), &DEFAULT_SALT);
+    let charlie_addr =
+        derive_pq_address(PqScheme::Falcon512, charlie_sk.public_key(), &DEFAULT_SALT);
 
-    // Alice has exactly 100 STELL (100_000_000_000 nano-STELL)
+    // Alice has 100 STELL plus activation surcharge headroom
     state_engine
-        .update_account(AccountState::new(alice_addr, 100_000_000_000))
+        .update_account(AccountState::new(
+            alice_addr,
+            100_000_000_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        ))
         .await;
 
     // Tx1: Alice sends 80 STELL to Bob (nonce 0)
-    let tx1 = Transaction::sign(&alice_sk, bob_addr, 80_000_000_000, 560, 0, 1, 1);
+    let tx1 = pq_tx(&alice_sk, bob_addr, 80_000_000_000, 560, 0);
     let res1 = state_engine.apply_transaction(&tx1, 0).await;
     assert!(res1.is_ok(), "First transaction should succeed");
 
@@ -55,7 +93,7 @@ async fn attack_test_double_spending_and_nonce_replay() {
 
     // Attack 2: Double-spend! Alice tries to send another 80 STELL to Charlie (nonce 1)
     // Alice only has ~20 STELL remaining, so spending 80 STELL must fail!
-    let tx2 = Transaction::sign(&alice_sk, charlie_addr, 80_000_000_000, 560, 1, 1, 1);
+    let tx2 = pq_tx(&alice_sk, charlie_addr, 80_000_000_000, 560, 1);
     let res2 = state_engine.apply_transaction(&tx2, 0).await;
     assert!(
         res2.is_err(),
@@ -72,18 +110,19 @@ async fn attack_test_double_spending_and_nonce_replay() {
 #[tokio::test]
 async fn attack_test_forged_signature_rejected() {
     let state_engine = InMemoryStateEngine::new();
-    let victim_sk = SigningKey::generate(&mut OsRng);
-    let mallory_sk = SigningKey::generate(&mut OsRng);
+    let victim_sk = FalconKeypair::generate_from_seed(0x04);
+    let mallory_sk = FalconKeypair::generate_from_seed(0x05);
 
-    let victim_addr = victim_sk.verifying_key().to_bytes();
-    let mallory_addr = mallory_sk.verifying_key().to_bytes();
+    let victim_addr = derive_pq_address(PqScheme::Falcon512, victim_sk.public_key(), &DEFAULT_SALT);
+    let mallory_addr =
+        derive_pq_address(PqScheme::Falcon512, mallory_sk.public_key(), &DEFAULT_SALT);
 
     state_engine
         .update_account(AccountState::new(victim_addr, 50_000_000_000))
         .await;
 
-    // Mallory creates a tx purporting to be from Victim, but signs it with Mallory's key
-    let mut forged_tx = Transaction::sign(&mallory_sk, mallory_addr, 50_000_000_000, 560, 0, 1, 1);
+    // Mallory creates a PQ1 tx purporting to be from Victim, but signs it with Mallory's key
+    let mut forged_tx = pq_tx(&mallory_sk, mallory_addr, 50_000_000_000, 560, 0);
     forged_tx.from = victim_addr; // Spoof sender address
 
     let res = state_engine.apply_transaction(&forged_tx, 0).await;
@@ -211,8 +250,8 @@ fn attack_test_cross_shard_merkle_forgery_rejected() {
 
 #[test]
 fn attack_test_oracle_manipulation_and_circuit_breaker() {
-    let trusted_oracle_sk = SigningKey::generate(&mut OsRng);
-    let trusted_pub = trusted_oracle_sk.verifying_key().to_bytes();
+    let trusted_oracle_fk = FalconKeypair::generate_from_seed(0x11);
+    let trusted_pub = pq_publisher_binding(trusted_oracle_fk.public_key());
 
     let mut oracle = OracleSafetyEngine::new(vec![trusted_pub]);
     oracle.set_dex_twap("TON", 5_000_000); // 30-min TWAP = $5.00
@@ -221,15 +260,15 @@ fn attack_test_oracle_manipulation_and_circuit_breaker() {
 
     // Attack 1: Stale price attack (timestamp 16 minutes old)
     let stale_time = current_time - (16 * 60);
-    let stale_feed = PriceFeedUpdate::sign("TON", 5_050_000, stale_time, &trusted_oracle_sk);
-    let stale_res = oracle.resolve_price(Some(&stale_feed), "TON", current_time);
+    let stale_feed = PqPriceFeedUpdate::sign("TON", 5_050_000, stale_time, &trusted_oracle_fk);
+    let stale_res = oracle.resolve_price_pq(Some(&stale_feed), "TON", current_time);
     // Stale feed is skipped, falls back to TWAP ($5.00)
     assert_eq!(stale_res.unwrap(), 5_000_000);
 
     // Attack 2: Flash loan price manipulation: sudden 15% spike to $5.75 (>10% allowed deviation)
     let manipulated_feed =
-        PriceFeedUpdate::sign("TON", 5_750_000, current_time, &trusted_oracle_sk);
-    let manipulation_res = oracle.resolve_price(Some(&manipulated_feed), "TON", current_time);
+        PqPriceFeedUpdate::sign("TON", 5_750_000, current_time, &trusted_oracle_fk);
+    let manipulation_res = oracle.resolve_price_pq(Some(&manipulated_feed), "TON", current_time);
     assert!(
         manipulation_res.is_err(),
         "15% price deviation MUST trip circuit breaker!"
@@ -237,7 +276,7 @@ fn attack_test_oracle_manipulation_and_circuit_breaker() {
     assert!(oracle.circuit_breaker_triggered);
 
     // Once circuit breaker is tripped, all trades MUST be halted!
-    let paused_res = oracle.resolve_price(None, "TON", current_time);
+    let paused_res = oracle.resolve_price_pq(None, "TON", current_time);
     assert!(
         paused_res.is_err(),
         "All price resolutions must be paused when circuit breaker is active!"
@@ -245,8 +284,8 @@ fn attack_test_oracle_manipulation_and_circuit_breaker() {
 
     // Attack 3: Stablecoin USDT depeg attack (USDT falls to $0.93 < $0.95 threshold)
     let mut oracle2 = OracleSafetyEngine::new(vec![trusted_pub]);
-    let depeg_usdt = PriceFeedUpdate::sign("USDT", 930_000, current_time, &trusted_oracle_sk);
-    let depeg_res = oracle2.resolve_price(Some(&depeg_usdt), "USDT", current_time);
+    let depeg_usdt = PqPriceFeedUpdate::sign("USDT", 930_000, current_time, &trusted_oracle_fk);
+    let depeg_res = oracle2.resolve_price_pq(Some(&depeg_usdt), "USDT", current_time);
     assert!(
         depeg_res.is_err(),
         "USDT depeg MUST trigger circuit breaker!"

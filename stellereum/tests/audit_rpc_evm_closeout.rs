@@ -907,9 +907,17 @@ fn light_client_is_wired_into_the_sync_path() {
     // tripwire is INVERTED: the day the node stops depending on it, this
     // test fails.
     const SYNC_RS: &str = include_str!("../src/sync.rs");
-    const MAIN_RS: &str = include_str!("../src/main.rs");
-    const RUNTIME_RS: &str = include_str!("../src/runtime.rs");
-    const RPC_RS: &str = include_str!("../src/rpc.rs");
+    const MAIN_RS: &str = concat!(
+        include_str!("../src/main.rs"),
+        include_str!("../src/cli/args.rs"),
+        include_str!("../src/cli/handlers.rs"),
+        include_str!("../src/node/consensus_driver.rs"),
+    );
+    const RUNTIME_RS: &str = include_str!("../src/runtime/mod.rs");
+    const RPC_RS: &str = concat!(
+        include_str!("../src/rpc/mod.rs"),
+        include_str!("../src/rpc/reads.rs"),
+    );
 
     // 1. The sync path verifies peer blocks against the trusted anchor.
     assert!(

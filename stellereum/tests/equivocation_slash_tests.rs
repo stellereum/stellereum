@@ -88,23 +88,55 @@ fn single_vote_repeated(
     EquivocationEvidence::new(id_of(offender), a.clone(), a)
 }
 
-fn report_tx(reporter: &SigningKey, nonce: u64, evidence: EquivocationEvidence) -> Transaction {
-    Transaction::sign_with_payload(
-        reporter,
-        [0u8; 32],
+fn pq_id_of(fk: &stellereum::post_quantum::FalconKeypair) -> [u8; 32] {
+    stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &fk.public_key,
+        &stellereum::post_quantum::DEFAULT_SALT,
+    )
+}
+
+fn report_tx(
+    reporter_fk: &stellereum::post_quantum::FalconKeypair,
+    nonce: u64,
+    evidence: EquivocationEvidence,
+) -> Transaction {
+    let payload = vec![OpCode::SysCallReportEquivocation {
+        evidence: Box::new(evidence),
+    }];
+    let from = pq_id_of(reporter_fk);
+    let probe = Transaction::new_pq_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        reporter_fk.public_key.clone(),
+        vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
+        from,
         0,
         REPORT_GAS,
         nonce,
         1,
         1,
-        vec![OpCode::SysCallReportEquivocation {
-            evidence: Box::new(evidence),
-        }],
+        payload.clone(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
+    let sig = reporter_fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        reporter_fk.public_key.clone(),
+        sig,
+        from,
+        0,
+        REPORT_GAS,
+        nonce,
+        1,
+        1,
+        payload,
+        &stellereum::post_quantum::DEFAULT_SALT,
     )
 }
 
 fn mk_block(
     proposer: &SigningKey,
+    proposer_fk: &stellereum::post_quantum::FalconKeypair,
     height: u64,
     prev: [u8; 32],
     root: [u8; 32],
@@ -128,14 +160,18 @@ fn mk_block(
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    blk.sign_block(proposer);
+    blk.sign_block_with_falcon(proposer, proposer_fk);
     blk
 }
 
 /// Two engines with byte-identical pre-state: genesis validators plus an
 /// identically funded staking pool (so the pool debit is exact and
-/// comparable on both).
-async fn mirrored_engines(vs: &ValidatorSet, n: usize) -> Vec<Arc<InMemoryStateEngine>> {
+/// comparable on both) and any extra PQ reporter accounts.
+async fn mirrored_engines(
+    vs: &ValidatorSet,
+    extra_funded: &[[u8; 32]],
+    n: usize,
+) -> Vec<Arc<InMemoryStateEngine>> {
     let mut out = Vec::new();
     for _ in 0..n {
         let e = Arc::new(InMemoryStateEngine::new());
@@ -143,6 +179,11 @@ async fn mirrored_engines(vs: &ValidatorSet, n: usize) -> Vec<Arc<InMemoryStateE
         e.credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND)
             .await
             .expect("pool credit");
+        for addr in extra_funded {
+            e.credit_native(addr, BAL)
+                .await
+                .expect("extra account credit");
+        }
         out.push(e);
     }
     let root0 = out[0].get_state_root().await;
@@ -210,7 +251,7 @@ async fn double_sign_slashed_exactly_five_percent() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
-    let engines = mirrored_engines(&vs, 1).await;
+    let engines = mirrored_engines(&vs, &[pq_id_of(&fks[0])], 1).await;
     let engine = engines[0].clone();
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine.clone(), 1);
 
@@ -230,10 +271,11 @@ async fn double_sign_slashed_exactly_five_percent() {
     let root = engine.get_state_root().await;
     let mut blk = mk_block(
         &ks[0],
+        &fks[0],
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, evidence)],
+        vec![report_tx(&fks[0], 0, evidence)],
     );
     let bh = blk.compute_hash();
     blk.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh));
@@ -279,7 +321,7 @@ async fn repeat_offense_slashed_once() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
-    let engines = mirrored_engines(&vs, 1).await;
+    let engines = mirrored_engines(&vs, &[pq_id_of(&fks[0])], 1).await;
     let engine = engines[0].clone();
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine.clone(), 1);
     let burn = expected_burn();
@@ -290,12 +332,13 @@ async fn repeat_offense_slashed_once() {
     let root = engine.get_state_root().await;
     let mut blk1 = mk_block(
         &ks[0],
+        &fks[0],
         1,
         [0u8; 32],
         root,
         vec![
-            report_tx(&ks[0], 0, evidence.clone()),
-            report_tx(&ks[0], 1, evidence.clone()),
+            report_tx(&fks[0], 0, evidence.clone()),
+            report_tx(&fks[0], 1, evidence.clone()),
         ],
     );
     let bh1 = blk1.compute_hash();
@@ -324,7 +367,14 @@ async fn repeat_offense_slashed_once() {
     // three survivors only.
     let survivors = &ks[0..3];
     let root2 = engine.get_state_root().await;
-    let mut blk2 = mk_block(&ks[0], 2, bh1, root2, vec![report_tx(&ks[0], 2, evidence)]);
+    let mut blk2 = mk_block(
+        &ks[0],
+        &fks[0],
+        2,
+        bh1,
+        root2,
+        vec![report_tx(&fks[0], 2, evidence)],
+    );
     let bh2 = blk2.compute_hash();
     for (i, k) in survivors.iter().enumerate() {
         rt.on_prevote(falcon_votes::fvote(
@@ -387,7 +437,7 @@ async fn single_vote_repeated_burns_nothing() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
-    let engines = mirrored_engines(&vs, 1).await;
+    let engines = mirrored_engines(&vs, &[pq_id_of(&fks[0])], 1).await;
     let engine = engines[0].clone();
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine.clone(), 1);
 
@@ -395,10 +445,11 @@ async fn single_vote_repeated_burns_nothing() {
     let root = engine.get_state_root().await;
     let mut blk = mk_block(
         &ks[0],
+        &fks[0],
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, single_vote_repeated(&ks[3], &fks[3]))],
+        vec![report_tx(&fks[0], 0, single_vote_repeated(&ks[3], &fks[3]))],
     );
     let bh = blk.compute_hash();
     blk.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh));
@@ -432,7 +483,7 @@ async fn two_engines_same_block_same_root() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
-    let engines = mirrored_engines(&vs, 2).await;
+    let engines = mirrored_engines(&vs, &[pq_id_of(&fks[0])], 2).await;
     let (engine_a, engine_b) = (engines[0].clone(), engines[1].clone());
     let mut a = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine_a.clone(), 1);
     let mut b = ValidatorRuntime::new(ks[1].clone(), vs.clone(), engine_b.clone(), 1);
@@ -451,10 +502,11 @@ async fn two_engines_same_block_same_root() {
     let root = engine_a.get_state_root().await;
     let mut blk = mk_block(
         &ks[pi],
+        &fks[pi],
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, evidence)],
+        vec![report_tx(&fks[0], 0, evidence)],
     );
     let bh = blk.compute_hash();
     let qc = certify_full(&mut a, &ks, &fks, 1, bh);
@@ -495,7 +547,7 @@ async fn two_engines_same_block_same_root() {
 async fn feed_converts_local_observations_without_touching_state() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
-    let engines = mirrored_engines(&vs, 1).await;
+    let engines = mirrored_engines(&vs, &[], 1).await;
     let engine = engines[0].clone();
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine.clone(), 1);
 

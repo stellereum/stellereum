@@ -234,9 +234,7 @@ fn bench_prune_blocks() {
         let t0 = Instant::now();
         let removed = st.prune_blocks_below(2500).unwrap();
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        println!(
-            "[bench][state_commit] prune_blocks removed={removed} rep={rep} total_ms={ms:.2}"
-        );
+        println!("[bench][state_commit] prune_blocks removed={removed} rep={rep} total_ms={ms:.2}");
         rm(&dir);
     }
 }

@@ -17,16 +17,12 @@ use stellereum::bootstrap;
 use stellereum::consensus::{
     register_validator_pq_key, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::governance::Governance;
-use stellereum::sharding::{
-    Block, CrossShardKey, CrossShardReplaySnapshot, MASTERCHAIN_SHARD,
-};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::sharding::{Block, CrossShardKey, CrossShardReplaySnapshot, MASTERCHAIN_SHARD};
 use stellereum::staking::StakingLedger;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::storage::{
-    decode_domain_snapshot, load_full_state_into, DomainSnapshot, Storage,
-};
+use stellereum::storage::{decode_domain_snapshot, load_full_state_into, DomainSnapshot, Storage};
 use stellereum::sync;
 use stellereum::token::{TokenMetadata, ZERO_ADDRESS};
 
@@ -114,7 +110,9 @@ fn qc_from(
 /// so the F8 proposer-slot gate passes).
 fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
     assert!(n >= 1 && n_keys >= 2, "need a real chain and a real quorum");
-    let keys: Vec<SigningKey> = (0..n_keys).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let keys: Vec<SigningKey> = (0..n_keys)
+        .map(|_| SigningKey::generate(&mut OsRng))
+        .collect();
     let fks = fks_for(n_keys);
     let vs = ValidatorSet::from_list(
         keys.iter()
@@ -308,8 +306,12 @@ async fn torn_state_without_domains_is_refused_not_frankensteined() {
     // Crash between the two snapshot jobs: state landed, domains never did.
     let snap = engine.create_snapshot().await;
     store.put_state(100, &snap).unwrap();
-    let h0 = store.put_block(&mkblock(100, [0u8; 32], [0xEEu8; 32])).unwrap();
-    let h1 = store.put_block(&mkblock(101, h0, engine.get_state_root().await)).unwrap();
+    let h0 = store
+        .put_block(&mkblock(100, [0u8; 32], [0xEEu8; 32]))
+        .unwrap();
+    let h1 = store
+        .put_block(&mkblock(101, h0, engine.get_state_root().await))
+        .unwrap();
     store.set_finalized(101, &h1).unwrap();
 
     let fresh = InMemoryStateEngine::new();
@@ -384,18 +386,17 @@ fn walk_refuses_gaps_forks_empty_and_wrong_shard() {
 
     // Another shard's blocks cannot ride our anchor.
     assert!(
-        sync::validate_sync_chain_for_shard_with_sets(&blocks, 1, [0u8; 32], &resolve, 999).is_err()
+        sync::validate_sync_chain_for_shard_with_sets(&blocks, 1, [0u8; 32], &resolve, 999)
+            .is_err()
     );
-    assert!(
-        sync::validate_sync_chain_for_shard_with_sets(
-            &blocks,
-            1,
-            [0u8; 32],
-            &resolve,
-            MASTERCHAIN_SHARD
-        )
-        .is_ok()
-    );
+    assert!(sync::validate_sync_chain_for_shard_with_sets(
+        &blocks,
+        1,
+        [0u8; 32],
+        &resolve,
+        MASTERCHAIN_SHARD
+    )
+    .is_ok());
 
     // Duplicate height is a gap in disguise.
     gapped = blocks.clone();
@@ -455,8 +456,7 @@ async fn walk_fetch_boundary_binds_body_to_requested_hash() {
     // Tampered body served under the requested hash: refused before any link walk.
     let mut evil = blocks[2].clone();
     evil.state_root = [0xBBu8; 32];
-    let evil_map: HashMap<[u8; 32], Block> =
-        [(head, evil)].into_iter().collect();
+    let evil_map: HashMap<[u8; 32], Block> = [(head, evil)].into_iter().collect();
     let err = sync::collect_missing_blocks(head, [0u8; 32], 100, |h| {
         let b = evil_map.get(&h).cloned();
         async move { b }
@@ -542,9 +542,7 @@ fn finality_gate_rejects_every_qc_mismatch() {
     assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.proposer, &wrong).is_err());
 
     // Non-member proposer holds no schedule slot.
-    assert!(
-        sync::verify_finality_for_header(&vs, b.height, &hash, &[0x5Eu8; 32], &qc).is_err()
-    );
+    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &[0x5Eu8; 32], &qc).is_err());
 
     // Sub-quorum signatures: one of four votes cannot decide.
     let mut thin = qc.clone();
@@ -574,50 +572,42 @@ async fn snapshot_anchor_tail_proves_chain_and_refuses_forgery() {
     // Missing header in the window: refuse, never skip.
     let mut missing = links.clone();
     missing.remove(&5);
-    assert!(
-        sync::verify_snapshot_anchor_tail(6, &vs, |h| {
-            let l = missing.get(&h).cloned();
-            async move { l }
-        })
-        .await
-        .is_err()
-    );
+    assert!(sync::verify_snapshot_anchor_tail(6, &vs, |h| {
+        let l = missing.get(&h).cloned();
+        async move { l }
+    })
+    .await
+    .is_err());
 
     // Broken linkage: a forked header inside the window.
     let mut forked = links.clone();
     forked.get_mut(&5).unwrap().prev_hash = [0xF0u8; 32];
-    assert!(
-        sync::verify_snapshot_anchor_tail(6, &vs, |h| {
-            let l = forked.get(&h).cloned();
-            async move { l }
-        })
-        .await
-        .is_err()
-    );
+    assert!(sync::verify_snapshot_anchor_tail(6, &vs, |h| {
+        let l = forked.get(&h).cloned();
+        async move { l }
+    })
+    .await
+    .is_err());
 
     // Misreported height: the header is not the height it claims.
     let mut lied = links.clone();
     lied.get_mut(&5).unwrap().height = 99;
-    assert!(
-        sync::verify_snapshot_anchor_tail(6, &vs, |h| {
-            let l = lied.get(&h).cloned();
-            async move { l }
-        })
-        .await
-        .is_err()
-    );
+    assert!(sync::verify_snapshot_anchor_tail(6, &vs, |h| {
+        let l = lied.get(&h).cloned();
+        async move { l }
+    })
+    .await
+    .is_err());
 
     // Stripped QC: linkage alone never suffices.
     let mut noqc = links.clone();
     noqc.get_mut(&5).unwrap().qc.signatures.clear();
-    assert!(
-        sync::verify_snapshot_anchor_tail(6, &vs, |h| {
-            let l = noqc.get(&h).cloned();
-            async move { l }
-        })
-        .await
-        .is_err()
-    );
+    assert!(sync::verify_snapshot_anchor_tail(6, &vs, |h| {
+        let l = noqc.get(&h).cloned();
+        async move { l }
+    })
+    .await
+    .is_err());
 
     // Genesis edge: no height 0 to anchor on.
     assert!(sync::verify_snapshot_anchor_tail(0, &vs, |h| {
@@ -655,21 +645,20 @@ async fn fast_sync_rejects_empty_corrupt_and_wrong_root_blobs() {
     // Truncated valid encoding.
     let target = InMemoryStateEngine::new();
     let cut = snap.clone();
-    assert!(
-        sync::fast_sync_state(
-            &target,
-            root,
-            || async { Some(cut[..cut.len() / 2].to_vec()) },
-            |_| async { None }
-        )
-        .await
-        .is_err()
-    );
+    assert!(sync::fast_sync_state(
+        &target,
+        root,
+        || async { Some(cut[..cut.len() / 2].to_vec()) },
+        |_| async { None }
+    )
+    .await
+    .is_err());
     assert!(target.get_account(&user).await.is_none());
 
     // Right shape, wrong state (poisoned snapshot vs the anchored root).
     let evil = InMemoryStateEngine::new();
-    evil.update_account(AccountState::new(user, 999_999_999)).await;
+    evil.update_account(AccountState::new(user, 999_999_999))
+        .await;
     let poisoned = evil.create_snapshot().await;
     let target = InMemoryStateEngine::new();
     let err = sync::fast_sync_state(
@@ -691,7 +680,9 @@ async fn fast_sync_rejects_empty_corrupt_and_wrong_root_blobs() {
 async fn fast_sync_accepts_full_bundle_and_converges_roots() {
     let source = InMemoryStateEngine::new();
     let user = [0x66u8; 32];
-    source.update_account(AccountState::new(user, 1_000_000)).await;
+    source
+        .update_account(AccountState::new(user, 1_000_000))
+        .await;
     let _tid = source.create_token(user, token_meta(), 500).await.unwrap();
     let root = source.get_state_root().await;
     let snap = source.create_snapshot().await;
@@ -699,8 +690,7 @@ async fn fast_sync_accepts_full_bundle_and_converges_roots() {
     let gov = source.governance_read().await.clone();
     let dom = DomainSnapshot::capture(&source, &staking, &gov).await;
     let dbytes = bincode::serialize(&dom).unwrap();
-    let bundle: HashMap<String, Vec<u8>> =
-        [("domains".to_string(), dbytes)].into_iter().collect();
+    let bundle: HashMap<String, Vec<u8>> = [("domains".to_string(), dbytes)].into_iter().collect();
 
     let target = InMemoryStateEngine::new();
     sync::fast_sync_state(
@@ -750,7 +740,8 @@ async fn fast_sync_replay_gate_refuses_to_drop_local_replay_state() {
     .expect_err("dropping local replay must be refused");
     assert!(err.contains("cross_shard"), "got: {err}");
     assert_eq!(
-        target.get_state_root().await, before,
+        target.get_state_root().await,
+        before,
         "refused sync must not mutate the target"
     );
 
@@ -762,8 +753,9 @@ async fn fast_sync_replay_gate_refuses_to_drop_local_replay_state() {
     let root2 = seeded.get_state_root().await;
     let snap2 = seeded.create_snapshot().await;
     let incoming = bincode::serialize(&local).unwrap();
-    let bundle: HashMap<String, Vec<u8>> =
-        [("cross_shard".to_string(), incoming)].into_iter().collect();
+    let bundle: HashMap<String, Vec<u8>> = [("cross_shard".to_string(), incoming)]
+        .into_iter()
+        .collect();
     let target2 = InMemoryStateEngine::new();
     target2.restore_cross_shard_replay(&local).await;
     sync::fast_sync_state(
@@ -829,7 +821,10 @@ async fn prune_then_serve_retained_verifies_and_pruned_honestly_misses() {
     for h in [9u64, 10, 11, 12] {
         let hashes = store.hashes_at_height(h).unwrap();
         assert_eq!(hashes.len(), 1, "retained height {h} must resolve");
-        let body = store.committed_body(h, &hashes[0]).unwrap().expect("body present");
+        let body = store
+            .committed_body(h, &hashes[0])
+            .unwrap()
+            .expect("body present");
         assert_eq!(body.compute_hash(), hashes[0]);
     }
     // Pruned heights are honest misses, never fabrications.
@@ -909,8 +904,18 @@ fn keep_window_covers_walk_retro_and_prune_boundaries() {
     let retro = sync::ADOPT_REPL_RETRO_DEPTH;
     assert!(sync::height_is_replicable(tip, tip, keep, retro));
     assert!(sync::height_is_replicable(tip - retro, tip, keep, retro));
-    assert!(!sync::height_is_replicable(tip - retro - 1, tip, keep, retro));
-    assert!(!sync::height_is_replicable(tip - keep - 1, tip, keep, retro));
+    assert!(!sync::height_is_replicable(
+        tip - retro - 1,
+        tip,
+        keep,
+        retro
+    ));
+    assert!(!sync::height_is_replicable(
+        tip - keep - 1,
+        tip,
+        keep,
+        retro
+    ));
     assert!(!sync::height_is_replicable(tip + 1, tip, keep, retro));
 
     // Backfill plans tip-ward windows of replicable heights only.
@@ -932,7 +937,10 @@ fn keep_window_covers_walk_retro_and_prune_boundaries() {
     store.prune_blocks_below(6).unwrap();
     assert_eq!(store.hashes_at_height(5).unwrap().len(), 1);
     assert!(store.hashes_at_height(4).unwrap().is_empty());
-    assert!(!store.has_blocks_below(6).unwrap(), "second pass must be a no-op");
+    assert!(
+        !store.has_blocks_below(6).unwrap(),
+        "second pass must be a no-op"
+    );
     let _ = prev;
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -990,9 +998,13 @@ async fn height_zero_mismatch_refuses_without_purging_evidence() {
     let snap = engine.create_snapshot().await;
     let dom = DomainSnapshot::capture(&engine, &StakingLedger::new(), &Governance::new()).await;
     store.put_state(0, &snap).unwrap();
-    store.put_domains(0, &bincode::serialize(&dom).unwrap()).unwrap();
+    store
+        .put_domains(0, &bincode::serialize(&dom).unwrap())
+        .unwrap();
     // The finalized chain disagrees with the genesis snapshot bytes.
-    let h1 = store.put_block(&mkblock(1, [0u8; 32], [0xEEu8; 32])).unwrap();
+    let h1 = store
+        .put_block(&mkblock(1, [0u8; 32], [0xEEu8; 32]))
+        .unwrap();
     store.set_finalized(1, &h1).unwrap();
 
     let fresh = InMemoryStateEngine::new();
@@ -1016,8 +1028,12 @@ async fn tip_without_anchor_loads_but_below_tip_without_anchor_refuses() {
     let snap = engine.create_snapshot().await;
     let dom = DomainSnapshot::capture(&engine, &StakingLedger::new(), &Governance::new()).await;
     store.put_state(77, &snap).unwrap();
-    store.put_domains(77, &bincode::serialize(&dom).unwrap()).unwrap();
-    let hb = store.put_block(&mkblock(77, [0u8; 32], [0xEEu8; 32])).unwrap();
+    store
+        .put_domains(77, &bincode::serialize(&dom).unwrap())
+        .unwrap();
+    let hb = store
+        .put_block(&mkblock(77, [0u8; 32], [0xEEu8; 32]))
+        .unwrap();
     store.set_finalized(77, &hb).unwrap();
     let fresh = InMemoryStateEngine::new();
     let (h, _, _) = load_full_state_into(&store, &fresh)
@@ -1033,8 +1049,12 @@ async fn tip_without_anchor_loads_but_below_tip_without_anchor_refuses() {
     let dir = tmpdir("tip-refuse");
     let store = Storage::open(&dir).unwrap();
     store.put_state(77, &snap).unwrap();
-    store.put_domains(77, &bincode::serialize(&dom).unwrap()).unwrap();
-    store.put_block(&mkblock(77, [0u8; 32], [0xEEu8; 32])).unwrap();
+    store
+        .put_domains(77, &bincode::serialize(&dom).unwrap())
+        .unwrap();
+    store
+        .put_block(&mkblock(77, [0u8; 32], [0xEEu8; 32]))
+        .unwrap();
     store.set_finalized(80, &[0xABu8; 32]).unwrap();
     let fresh = InMemoryStateEngine::new();
     let err = load_full_state_into(&store, &fresh)
@@ -1099,7 +1119,10 @@ fn bootstrap_boundary_selection_never_outruns_the_probe_window() {
     assert_eq!(bootstrap::select_bootstrap_boundary(50, 0, None), None);
     assert_eq!(bootstrap::select_bootstrap_boundary(100, 0, None), None);
     // Newest 100-boundary below the tip.
-    assert_eq!(bootstrap::select_bootstrap_boundary(72704, 0, None), Some(72700));
+    assert_eq!(
+        bootstrap::select_bootstrap_boundary(72704, 0, None),
+        Some(72700)
+    );
     // Sane exact pointer wins; insane pointers are ignored, never trusted.
     assert_eq!(
         bootstrap::select_bootstrap_boundary(78620, 0, Some(78519)),
@@ -1114,8 +1137,14 @@ fn bootstrap_boundary_selection_never_outruns_the_probe_window() {
     assert_eq!(bootstrap::select_bootstrap_boundary(90, 100, None), None);
 
     // Stale-boundary stepping retries, then steps down, then refuses loudly.
-    assert_eq!(bootstrap::next_boundary_after_stale(72700, 0, 0), Some(72700));
-    assert_eq!(bootstrap::next_boundary_after_stale(72700, 3, 0), Some(72600));
+    assert_eq!(
+        bootstrap::next_boundary_after_stale(72700, 0, 0),
+        Some(72700)
+    );
+    assert_eq!(
+        bootstrap::next_boundary_after_stale(72700, 3, 0),
+        Some(72600)
+    );
     assert_eq!(bootstrap::next_boundary_after_stale(100, 3, 0), None);
     assert!(bootstrap::bootstrap_retry_delay_ms(1, 0) >= 100);
 }
@@ -1129,7 +1158,10 @@ fn retry_backoff_never_hurries_and_budgets_stay_bounded() {
     assert_eq!(sync::fetch_retry_backoff_ms(0), 100);
     assert_eq!(sync::fetch_retry_backoff_ms(1), 100);
     assert_eq!(sync::fetch_retry_backoff_ms(2), 200);
-    assert_eq!(sync::fetch_retry_backoff_ms(100), sync::FETCH_RETRY_MAX_BACKOFF_MS);
+    assert_eq!(
+        sync::fetch_retry_backoff_ms(100),
+        sync::FETCH_RETRY_MAX_BACKOFF_MS
+    );
     // Jitter only delays (clamped), never hurries.
     assert_eq!(
         sync::fetch_retry_backoff_with_jitter_ms(1, 10_000),
@@ -1137,7 +1169,10 @@ fn retry_backoff_never_hurries_and_budgets_stay_bounded() {
     );
     // Snapshot blob budget: floored for small blobs, capped for huge ones.
     assert_eq!(sync::snapshot_blob_budget_ms(0), 60_000);
-    assert_eq!(sync::snapshot_blob_budget_ms(1_000_000), sync::SNAPSHOT_BLOB_TIMEOUT_MS);
+    assert_eq!(
+        sync::snapshot_blob_budget_ms(1_000_000),
+        sync::SNAPSHOT_BLOB_TIMEOUT_MS
+    );
     // Probe pacing is linear then capped.
     assert_eq!(sync::snapshot_probe_pace_ms(0), 0);
     assert_eq!(
@@ -1165,7 +1200,11 @@ async fn chunk_assembly_resumes_and_names_the_failed_chunk() {
     // One chunk permanently missing: loud failure naming the chunk, with the
     // per-chunk attempt budget spent (max_retries + 1 tries).
     let err = sync::assemble_chunks_resumable(3, 2, |i| async move {
-        if i == 1 { None } else { Some(vec![i as u8]) }
+        if i == 1 {
+            None
+        } else {
+            Some(vec![i as u8])
+        }
     })
     .await
     .expect_err("missing chunk must fail closed");

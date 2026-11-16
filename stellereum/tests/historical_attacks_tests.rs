@@ -23,10 +23,42 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
 use stellereum::cell::{MerkleProof, MerkleStep, PatriciaTrie};
-use stellereum::oracle::OracleSafetyEngine;
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::oracle::{pq_publisher_binding, OracleSafetyEngine, PqPriceFeedUpdate};
+use stellereum::post_quantum::{FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN};
 use stellereum::sharding::{CrossShardMessage, SharedLiquidityHub, Transaction};
 use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
 use stellereum::token::{TokenError, TokenMetadata, TokenOp, TokenRegistry, ZERO_ADDRESS};
+
+fn pq_tx(fk: &FalconKeypair, to: [u8; 32], amount: u64, gas_limit: u64, nonce: u64) -> Transaction {
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = fk.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
+}
 
 fn addr(n: u8) -> [u8; 32] {
     [n; 32]
@@ -161,8 +193,8 @@ fn bec_integer_overflow_rejected() {
 // ============================================================================
 #[test]
 fn etc_cross_shard_replay_rejected() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let tx = Transaction::sign(&sk, addr(2), 1_000, 560, 0, 1, 1);
+    let sk = FalconKeypair::generate_from_seed(0x31);
+    let tx = pq_tx(&sk, addr(2), 1_000, 560, 0);
     assert!(tx.verify_signature());
 
     // Replay on another source shard -> signature no longer valid
@@ -198,6 +230,12 @@ fn ronin_bridge_subquorum_rejected() {
         v2.verifying_key().to_bytes(),
         v3.verifying_key().to_bytes(),
     ];
+    let fk1 = FalconKeypair::generate_from_seed(0x41);
+    let fk2 = FalconKeypair::generate_from_seed(0x42);
+    let fk3 = FalconKeypair::generate_from_seed(0x43);
+    register_validator_pq_key(pubs[0], PqScheme::Falcon512, fk1.public_key.clone());
+    register_validator_pq_key(pubs[1], PqScheme::Falcon512, fk2.public_key.clone());
+    register_validator_pq_key(pubs[2], PqScheme::Falcon512, fk3.public_key.clone());
     let mut bridge = TeleportBridgeEngine::new(pubs.clone());
 
     let source_tx = [7u8; 32];
@@ -218,14 +256,14 @@ fn ronin_bridge_subquorum_rejected() {
     let msg = TeleportBridgeEngine::deposit_signing_message(&proto);
 
     // Only ONE validator signs (quorum is 2 of 3) -> must be rejected
-    let sig1 = ed25519_dalek::Signer::sign(&v1, &msg);
+    let sig1 = fk1.sign(&msg);
     let event = TeleportDepositEvent {
         source_chain: SupportedChain::Ton,
         source_tx_hash: source_tx,
         recipient,
         asset: asset.clone(),
         amount,
-        validator_signatures: vec![(pubs[0], sig1.to_vec())],
+        validator_signatures: vec![(pubs[0], sig1.clone())],
         zk_proof: None,
     };
     assert!(
@@ -234,14 +272,14 @@ fn ronin_bridge_subquorum_rejected() {
     );
 
     // Two validators sign -> accepted
-    let sig2 = ed25519_dalek::Signer::sign(&v2, &msg);
+    let sig2 = fk2.sign(&msg);
     let event2 = TeleportDepositEvent {
         source_chain: SupportedChain::Ton,
         source_tx_hash: source_tx,
         recipient,
         asset,
         amount,
-        validator_signatures: vec![(pubs[0], sig1.to_vec()), (pubs[1], sig2.to_vec())],
+        validator_signatures: vec![(pubs[0], sig1), (pubs[1], sig2)],
         zk_proof: None,
     };
     assert!(bridge.process_deposit(&event2).is_ok());
@@ -558,19 +596,19 @@ fn oracle_flashloan_and_no_source_rejected() {
     // No trusted publisher and no TWAP -> no price source at all
     let mut oracle = OracleSafetyEngine::new(vec![]);
     assert!(
-        oracle.resolve_price(None, "TON", 1_000).is_err(),
+        oracle.resolve_price_pq(None, "TON", 1_000).is_err(),
         "oracle with no source must not invent a price"
     );
 
     // With a trusted oracle and a TWAP baseline, a signed 20% manipulated spike
     // must trip the circuit breaker.
-    let oracle_sk = SigningKey::generate(&mut OsRng);
-    let oracle_pub = oracle_sk.verifying_key().to_bytes();
+    let oracle_fk = FalconKeypair::generate_from_seed(0x51);
+    let oracle_pub = pq_publisher_binding(oracle_fk.public_key());
     let mut oracle2 = OracleSafetyEngine::new(vec![oracle_pub]);
     oracle2.set_dex_twap("TON", 5_000_000);
-    let feed = stellereum::oracle::PriceFeedUpdate::sign("TON", 6_000_000, 1_000, &oracle_sk); // +20%
+    let feed = PqPriceFeedUpdate::sign("TON", 6_000_000, 1_000, &oracle_fk); // +20%
     assert!(
-        oracle2.resolve_price(Some(&feed), "TON", 1_000).is_err(),
+        oracle2.resolve_price_pq(Some(&feed), "TON", 1_000).is_err(),
         "20% deviation must trip the circuit breaker"
     );
     assert!(oracle2.circuit_breaker_triggered);
@@ -578,15 +616,17 @@ fn oracle_flashloan_and_no_source_rejected() {
     // A forged (unsigned) feed is ignored and falls back to TWAP (not an exploit).
     let mut oracle3 = OracleSafetyEngine::new(vec![]);
     oracle3.set_dex_twap("TON", 5_000_000);
-    let forged = stellereum::oracle::PriceFeedUpdate {
+    let forged = PqPriceFeedUpdate {
         asset: "TON".to_string(),
         price_micro_usd: 99_000_000,
         timestamp: 1_000,
-        publisher_pubkey: [0u8; 32],
-        signature: vec![],
+        publisher_falcon_pubkey: vec![],
+        falcon_sig: vec![],
     };
     assert_eq!(
-        oracle3.resolve_price(Some(&forged), "TON", 1_000).unwrap(),
+        oracle3
+            .resolve_price_pq(Some(&forged), "TON", 1_000)
+            .unwrap(),
         5_000_000,
         "forged feed must be ignored; TWAP is used instead"
     );
@@ -597,10 +637,11 @@ fn oracle_flashloan_and_no_source_rejected() {
 // ============================================================================
 #[test]
 fn corrupted_signature_rejected() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mut tx = Transaction::sign(&sk, addr(2), 1_000, 560, 0, 1, 1);
+    let sk = FalconKeypair::generate_from_seed(0x52);
+    let mut tx = pq_tx(&sk, addr(2), 1_000, 560, 0);
     assert!(tx.verify_signature());
-    tx.signature[0] ^= 0x01;
+    let last = tx.signature.len() - 1;
+    tx.signature[last] ^= 0x01;
     assert!(
         !tx.verify_signature(),
         "corrupted signature must be rejected"
@@ -635,6 +676,8 @@ fn cross_shard_replay_dedup() {
 fn bridge_deposit_replay_rejected() {
     let v = SigningKey::generate(&mut OsRng);
     let pubk = v.verifying_key().to_bytes();
+    let fk = FalconKeypair::generate_from_seed(0x53);
+    register_validator_pq_key(pubk, PqScheme::Falcon512, fk.public_key.clone());
     let mut bridge = TeleportBridgeEngine::new(vec![pubk]);
 
     let source_tx = [3u8; 32];
@@ -652,7 +695,7 @@ fn bridge_deposit_replay_rejected() {
         zk_proof: None,
     };
     let msg = TeleportBridgeEngine::deposit_signing_message(&proto);
-    let sig = ed25519_dalek::Signer::sign(&v, &msg);
+    let sig = fk.sign(&msg);
 
     let event = TeleportDepositEvent {
         source_chain: SupportedChain::Ton,
@@ -660,7 +703,7 @@ fn bridge_deposit_replay_rejected() {
         recipient,
         asset,
         amount,
-        validator_signatures: vec![(pubk, sig.to_vec())],
+        validator_signatures: vec![(pubk, sig)],
         zk_proof: None,
     };
 

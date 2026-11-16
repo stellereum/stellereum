@@ -661,64 +661,89 @@ pub(crate) fn keccak_f1600(state: &mut [u64; 25]) {
 
 struct Shake256Reader {
     state: [u64; 25],
-    buffer: Vec<u8>,
+    buffer: [u8; 136],
     buf_pos: usize,
 }
 
 impl Shake256Reader {
-    fn new(data: &[u8]) -> Self {
+    fn from_parts(part1: &[u8], part2: &[u8]) -> Self {
         const RATE: usize = 136;
         let mut state = [0u64; 25];
-        let mut offset = 0;
-        while offset + RATE <= data.len() {
-            for i in 0..(RATE / 8) {
-                let chunk = &data[offset + i * 8..offset + i * 8 + 8];
-                let val = u64::from_le_bytes(chunk.try_into().unwrap());
-                state[i] ^= val;
+        let mut block = [0u8; RATE];
+        let mut pos = 0usize;
+
+        for slice in [part1, part2] {
+            let mut off = 0usize;
+            if pos > 0 {
+                let take = (RATE - pos).min(slice.len());
+                block[pos..pos + take].copy_from_slice(&slice[..take]);
+                pos += take;
+                off += take;
+                if pos == RATE {
+                    for i in 0..(RATE / 8) {
+                        let val = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+                        state[i] ^= val;
+                    }
+                    keccak_f1600(&mut state);
+                    pos = 0;
+                }
             }
-            keccak_f1600(&mut state);
-            offset += RATE;
+            while off + RATE <= slice.len() {
+                for i in 0..(RATE / 8) {
+                    let chunk = &slice[off + i * 8..off + i * 8 + 8];
+                    let val = u64::from_le_bytes(chunk.try_into().unwrap());
+                    state[i] ^= val;
+                }
+                keccak_f1600(&mut state);
+                off += RATE;
+            }
+            let rem = slice.len() - off;
+            if rem > 0 {
+                block[..rem].copy_from_slice(&slice[off..]);
+                pos = rem;
+            }
         }
 
-        let mut padded = data[offset..].to_vec();
-        padded.push(0x1F);
-        while padded.len() < RATE {
-            padded.push(0);
-        }
-        padded[RATE - 1] |= 0x80;
+        block[pos..].fill(0);
+        block[pos] = 0x1F;
+        block[RATE - 1] |= 0x80;
 
         for i in 0..(RATE / 8) {
-            let chunk = &padded[i * 8..i * 8 + 8];
-            let val = u64::from_le_bytes(chunk.try_into().unwrap());
+            let val = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
             state[i] ^= val;
         }
         keccak_f1600(&mut state);
 
         let mut reader = Self {
             state,
-            buffer: Vec::with_capacity(RATE),
+            buffer: [0u8; RATE],
             buf_pos: 0,
         };
         reader.refill();
         reader
     }
 
+    #[cfg(test)]
+    fn new(data: &[u8]) -> Self {
+        Self::from_parts(data, &[])
+    }
+
     fn refill(&mut self) {
-        self.buffer.clear();
         for i in 0..(136 / 8) {
-            self.buffer.extend_from_slice(&self.state[i].to_le_bytes());
+            self.buffer[i * 8..i * 8 + 8].copy_from_slice(&self.state[i].to_le_bytes());
         }
         keccak_f1600(&mut self.state);
         self.buf_pos = 0;
     }
 
+    #[inline(always)]
     fn next_u16_be(&mut self) -> u16 {
-        if self.buf_pos >= self.buffer.len() {
+        if self.buf_pos >= 136 {
             self.refill();
         }
         let b0 = self.buffer[self.buf_pos];
         self.buf_pos += 1;
-        if self.buf_pos >= self.buffer.len() {
+        if self.buf_pos >= 136 {
             self.refill();
         }
         let b1 = self.buffer[self.buf_pos];
@@ -729,7 +754,7 @@ impl Shake256Reader {
     /// Squeeze one byte from the sponge (big-endian output order).
     #[cfg(test)]
     fn next_byte(&mut self) -> u8 {
-        if self.buf_pos >= self.buffer.len() {
+        if self.buf_pos >= 136 {
             self.refill();
         }
         let b = self.buffer[self.buf_pos];
@@ -749,10 +774,7 @@ impl Shake256Reader {
 }
 
 fn hash_to_point(nonce: &[u8; 40], message: &[u8]) -> [u16; 512] {
-    let mut input = Vec::with_capacity(40 + message.len());
-    input.extend_from_slice(nonce);
-    input.extend_from_slice(message);
-    let mut reader = Shake256Reader::new(&input);
+    let mut reader = Shake256Reader::from_parts(nonce, message);
     let mut c = [0u16; 512];
     let mut count = 0;
     while count < 512 {
@@ -940,73 +962,156 @@ fn mod_inv(a: u32) -> u32 {
     mod_pow(a, FALCON_MODULUS_Q - 2)
 }
 
-fn bit_rev(mut x: usize) -> usize {
-    let mut y = 0;
-    for _ in 0..9 {
-        y = (y << 1) | (x & 1);
-        x >>= 1;
+const fn build_bit_rev() -> [u16; 512] {
+    let mut out = [0u16; 512];
+    let mut i = 0usize;
+    while i < 512 {
+        let mut x = i;
+        let mut y = 0usize;
+        let mut k = 0;
+        while k < 9 {
+            y = (y << 1) | (x & 1);
+            x >>= 1;
+            k += 1;
+        }
+        out[i] = y as u16;
+        i += 1;
     }
-    y
+    out
+}
+
+const fn build_pow_table(base: u32, init: u32) -> [u16; 512] {
+    let mut out = [0u16; 512];
+    let mut cur = init % FALCON_MODULUS_Q;
+    let mut i = 0;
+    while i < 512 {
+        out[i] = cur as u16;
+        cur = (cur * base) % FALCON_MODULUS_Q;
+        i += 1;
+    }
+    out
+}
+
+const fn build_twiddle_table(root: u32) -> [[u16; 256]; 9] {
+    let mut out = [[0u16; 256]; 9];
+    let mut stage = 0usize;
+    let mut step = 2usize;
+    while stage < 9 {
+        let half = step / 2;
+        let w_step = mod_pow(root, (FALCON_N / step) as u32);
+        let mut w_cur = 1u32;
+        let mut j = 0usize;
+        while j < half {
+            out[stage][j] = w_cur as u16;
+            w_cur = (w_cur * w_step) % FALCON_MODULUS_Q;
+            j += 1;
+        }
+        stage += 1;
+        step *= 2;
+    }
+    out
+}
+
+const BIT_REV_512: [u16; 512] = build_bit_rev();
+const PSI_POWS_512: [u16; 512] = build_pow_table(PSI, 1);
+const INV_PSI_N_POWS_512: [u16; 512] = build_pow_table(INV_PSI, INV_N);
+const NTT_TWIDDLES: [[u16; 256]; 9] = build_twiddle_table(OMEGA);
+const INTT_TWIDDLES: [[u16; 256]; 9] = build_twiddle_table(INV_OMEGA);
+
+/// Exact division-free Barrett reduction modulo `q = FALCON_MODULUS_Q (12289)`.
+///
+/// With `k = 32` and `mu = floor(2^32 / 12289) = 349_496`:
+/// `2^32 = 349_496 * 12289 + 10_952`, so for any `x: u32` (including all
+/// products `x < 12289 * 12289 = 151_019_521`):
+/// `x/q - (x / 2^32) * (10_952 / q) <= x * mu / 2^32 <= x / q`.
+/// Because `(x / 2^32) * (10_952 / 12289) < 0.8913 < 1`, the integer quotient
+/// estimate `t = (x * mu) >> 32` satisfies `floor(x / q) - 1 <= t <= floor(x / q)`,
+/// hence `0 <= x - t * q < 2 * q`, and a single conditional subtraction yields
+/// the exact `x % q` for all `x: u32`.
+#[inline(always)]
+const fn barrett_reduce_q(x: u32) -> u16 {
+    const BARRETT_MU: u64 = (1u64 << 32) / (FALCON_MODULUS_Q as u64);
+    let t = (((x as u64) * BARRETT_MU) >> 32) as u32;
+    let mut r = x - t * FALCON_MODULUS_Q;
+    if r >= FALCON_MODULUS_Q {
+        r -= FALCON_MODULUS_Q;
+    }
+    r as u16
 }
 
 fn ntt(a: &mut [u16; 512]) {
-    let mut cur_psi = 1u32;
-    for v in a.iter_mut() {
-        *v = ((*v as u32 * cur_psi) % FALCON_MODULUS_Q) as u16;
-        cur_psi = (cur_psi * PSI) % FALCON_MODULUS_Q;
+    for (v, &psi) in a.iter_mut().zip(PSI_POWS_512.iter()) {
+        *v = barrett_reduce_q(*v as u32 * psi as u32);
     }
-    for i in 0..FALCON_N {
-        let j = bit_rev(i);
+    for (i, &j) in BIT_REV_512.iter().enumerate() {
+        let j = j as usize;
         if i < j {
             a.swap(i, j);
         }
     }
-    let mut step = 2;
+    let mut stage = 0usize;
+    let mut step = 2usize;
     while step <= FALCON_N {
         let half = step / 2;
-        let w_step = mod_pow(OMEGA, (FALCON_N / step) as u32);
+        let twiddles = &NTT_TWIDDLES[stage][..half];
         for i in (0..FALCON_N).step_by(step) {
-            let mut w_cur = 1u32;
-            for j in 0..half {
+            for (j, &w_cur) in twiddles.iter().enumerate() {
                 let u = a[i + j] as u32;
-                let v = (a[i + j + half] as u32 * w_cur) % FALCON_MODULUS_Q;
-                a[i + j] = ((u + v) % FALCON_MODULUS_Q) as u16;
-                a[i + j + half] = ((u + FALCON_MODULUS_Q - v) % FALCON_MODULUS_Q) as u16;
-                w_cur = (w_cur * w_step) % FALCON_MODULUS_Q;
+                let v = barrett_reduce_q(a[i + j + half] as u32 * w_cur as u32) as u32;
+                let sum = u + v;
+                a[i + j] = if sum >= FALCON_MODULUS_Q {
+                    (sum - FALCON_MODULUS_Q) as u16
+                } else {
+                    sum as u16
+                };
+                let diff = if u >= v {
+                    u - v
+                } else {
+                    u + FALCON_MODULUS_Q - v
+                };
+                a[i + j + half] = diff as u16;
             }
         }
+        stage += 1;
         step *= 2;
     }
 }
 
 fn intt(a: &mut [u16; 512]) {
-    for i in 0..FALCON_N {
-        let j = bit_rev(i);
+    for (i, &j) in BIT_REV_512.iter().enumerate() {
+        let j = j as usize;
         if i < j {
             a.swap(i, j);
         }
     }
-    let mut step = 2;
+    let mut stage = 0usize;
+    let mut step = 2usize;
     while step <= FALCON_N {
         let half = step / 2;
-        let w_step = mod_pow(INV_OMEGA, (FALCON_N / step) as u32);
+        let twiddles = &INTT_TWIDDLES[stage][..half];
         for i in (0..FALCON_N).step_by(step) {
-            let mut w_cur = 1u32;
-            for j in 0..half {
+            for (j, &w_cur) in twiddles.iter().enumerate() {
                 let u = a[i + j] as u32;
-                let v = (a[i + j + half] as u32 * w_cur) % FALCON_MODULUS_Q;
-                a[i + j] = ((u + v) % FALCON_MODULUS_Q) as u16;
-                a[i + j + half] = ((u + FALCON_MODULUS_Q - v) % FALCON_MODULUS_Q) as u16;
-                w_cur = (w_cur * w_step) % FALCON_MODULUS_Q;
+                let v = barrett_reduce_q(a[i + j + half] as u32 * w_cur as u32) as u32;
+                let sum = u + v;
+                a[i + j] = if sum >= FALCON_MODULUS_Q {
+                    (sum - FALCON_MODULUS_Q) as u16
+                } else {
+                    sum as u16
+                };
+                let diff = if u >= v {
+                    u - v
+                } else {
+                    u + FALCON_MODULUS_Q - v
+                };
+                a[i + j + half] = diff as u16;
             }
         }
+        stage += 1;
         step *= 2;
     }
-    let mut cur_inv_psi = 1u32;
-    for v in a.iter_mut() {
-        let val = (*v as u32 * INV_N) % FALCON_MODULUS_Q;
-        *v = ((val * cur_inv_psi) % FALCON_MODULUS_Q) as u16;
-        cur_inv_psi = (cur_inv_psi * INV_PSI) % FALCON_MODULUS_Q;
+    for (v, &inv_psi_n) in a.iter_mut().zip(INV_PSI_N_POWS_512.iter()) {
+        *v = barrett_reduce_q(*v as u32 * inv_psi_n as u32);
     }
 }
 
@@ -1017,7 +1122,7 @@ fn poly_mul_ntt(a: &[u16; 512], b: &[u16; 512]) -> [u16; 512] {
     ntt(&mut b_ntt);
     let mut c_ntt = [0u16; 512];
     for i in 0..512 {
-        c_ntt[i] = ((a_ntt[i] as u32 * b_ntt[i] as u32) % FALCON_MODULUS_Q) as u16;
+        c_ntt[i] = barrett_reduce_q(a_ntt[i] as u32 * b_ntt[i] as u32);
     }
     intt(&mut c_ntt);
     c_ntt
@@ -1538,7 +1643,6 @@ fn warn_legacy_ntru_key_once(repaired: bool, address: [u8; 32]) {
     }
 }
 
-
 /// Authentic NIST FIPS 206 Falcon-512 keypair.
 #[derive(Clone)]
 pub struct FalconKeypair {
@@ -1820,7 +1924,6 @@ impl FalconKeypair {
     /// (`f*G - g*F = q`), not the zero-filled placeholder the old code left
     /// behind.
     pub fn generate_from_seed_bytes(seed: &[u8; 32]) -> Self {
-
         // The reference implementation draws 48 bytes of randomness to seed
         // its NTRU key generation; derive them deterministically from the
         // caller's 32-byte seed so the key stays reproducible.
@@ -1966,7 +2069,25 @@ impl FalconKeypair {
         let mut randomizer = Zeroizing::new([0u8; 88]);
         xof.fill(&mut *randomizer);
         zeroize::Zeroize::zeroize(&mut os_entropy);
+        self.sign_with_randomizer(message, &randomizer)
+    }
 
+    /// Deterministic Falcon-512 signing strictly for reproducible simulation
+    /// harnesses (`ConsensusCluster`). Production callers MUST use [`Self::sign`].
+    pub fn sign_deterministic_for_sim(&self, message: &[u8], seed: &[u8; 32]) -> Vec<u8> {
+        if !falcon_ntru_partner_matches(&self.capital_f, &self.capital_g, &self.h) {
+            return Vec::new();
+        }
+        let mut hasher = blake3::Hasher::new_derive_key("FALCON512_SIM_SIGN_V1");
+        hasher.update(seed);
+        hasher.update(message);
+        let mut xof = hasher.finalize_xof();
+        let mut randomizer = Zeroizing::new([0u8; 88]);
+        xof.fill(&mut *randomizer);
+        self.sign_with_randomizer(message, &randomizer)
+    }
+
+    fn sign_with_randomizer(&self, message: &[u8], randomizer: &[u8; 88]) -> Vec<u8> {
         let mut nonce = [0u8; 40];
         nonce.copy_from_slice(&randomizer[..40]);
         if nonce.iter().all(|&b| b == 0) {
@@ -2021,6 +2142,11 @@ impl FalconKeypair {
     }
 }
 
+const FALCON_PUBKEY_CACHE_CAP: usize = 4096;
+
+static FALCON_PUBKEY_CACHE: std::sync::LazyLock<RwLock<HashMap<[u8; 32], [u16; 512]>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
 fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
     if pubkey.len() != FALCON512_PUBKEY_LEN {
         return None;
@@ -2031,9 +2157,26 @@ fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
     if pubkey[0] != 0x09 {
         return None;
     }
+    let key = *blake3::hash(pubkey).as_bytes();
+    if let Some(&h) = FALCON_PUBKEY_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Some(h);
+    }
     let mut h = [0u16; 512];
     if !modq_decode(&mut h, &pubkey[1..]) {
         return None;
+    }
+    {
+        let mut cache = FALCON_PUBKEY_CACHE
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= FALCON_PUBKEY_CACHE_CAP && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, h);
     }
     Some(h)
 }
@@ -2819,10 +2962,7 @@ mod tests {
             err.contains("Unknown"),
             "refusal must be unknown-scheme: {err}"
         );
-        assert!(
-            err.contains('3'),
-            "refusal must name the scheme id: {err}"
-        );
+        assert!(err.contains('3'), "refusal must name the scheme id: {err}");
 
         // Verify-level refusal: even well-formed 0x03 material MUST NOT verify
         // (no verifier exists — refusal is unconditional, not length-dependent).
@@ -3422,5 +3562,60 @@ mod tests {
             sig.is_empty(),
             "signing with a destroyed G must refuse (empty Vec)"
         );
+    }
+
+    #[test]
+    fn test_barrett_reduce_q_exact_for_all_products() {
+        use rayon::prelude::*;
+        const MAX_PRODUCT: u32 = FALCON_MODULUS_Q * FALCON_MODULUS_Q; // 151_019_521
+        const CHUNK: u32 = 1_000_000;
+        let num_chunks = MAX_PRODUCT.div_ceil(CHUNK);
+        (0..num_chunks).into_par_iter().for_each(|c| {
+            let start = c * CHUNK;
+            let end = (start + CHUNK).min(MAX_PRODUCT);
+            for x in start..end {
+                assert_eq!(
+                    barrett_reduce_q(x),
+                    (x % FALCON_MODULUS_Q) as u16,
+                    "barrett_reduce_q mismatch at x={x}"
+                );
+            }
+        });
+        // Also verify u32::MAX boundary values above q^2.
+        for x in [MAX_PRODUCT, MAX_PRODUCT + 1, u32::MAX - 1, u32::MAX] {
+            assert_eq!(
+                barrett_reduce_q(x),
+                (x % FALCON_MODULUS_Q) as u16,
+                "barrett_reduce_q boundary mismatch at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_falcon_pubkey_cache_hit_and_bounded() {
+        let kp = FalconKeypair::generate_from_seed(0x6C);
+        let h1 = unpack_falcon_pubkey(kp.pubkey()).expect("valid pubkey must unpack");
+        let h2 = unpack_falcon_pubkey(kp.pubkey()).expect("cached pubkey must unpack");
+        assert_eq!(h1, kp.h);
+        assert_eq!(h2, kp.h);
+
+        let key = *blake3::hash(kp.pubkey()).as_bytes();
+        {
+            let cache = FALCON_PUBKEY_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(cache.get(&key), Some(&kp.h));
+            assert!(cache.len() <= FALCON_PUBKEY_CACHE_CAP);
+        }
+
+        // Invalid pubkey (bad header) must not decode or enter cache.
+        let mut bad_pk = kp.pubkey().to_vec();
+        bad_pk[0] = 0x19;
+        assert!(unpack_falcon_pubkey(&bad_pk).is_none());
+        let bad_key = *blake3::hash(&bad_pk).as_bytes();
+        assert!(!FALCON_PUBKEY_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&bad_key));
     }
 }

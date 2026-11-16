@@ -86,8 +86,8 @@ use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use stellereum::consensus::{
-    BlockHash, Height, HeightConsensus, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote,
-    VoteKind, register_validator_pq_key,
+    register_validator_pq_key, BlockHash, Height, HeightConsensus, QuorumCertificate, Round,
+    ValidatorId, ValidatorSet, Vote, VoteKind,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
@@ -929,15 +929,18 @@ impl ConsensusCluster {
             let key = key_at(seed, i as u64);
             let id = key.verifying_key().to_bytes();
             let profile = profile.clone();
-            let falcon = FalconKeypair::generate_from_seed(i as u8);
+            let mut fseed = [0u8; 32];
+            fseed[0] = i as u8;
+            fseed[31] = (i as u8).wrapping_mul(79);
+            let falcon = FalconKeypair::generate_from_seed_bytes(&fseed);
             register_validator_pq_key(id, PqScheme::Falcon512, falcon.public_key.clone());
 
             // Every node gets its OWN state engine (nodes do not share
             // mutable state in reality).
             let state = Arc::new(InMemoryStateEngine::new());
-            let mut rt =
-                ValidatorRuntime::new(key.clone(), validators.clone(), state, 1)
-                    .with_falcon_key(falcon.clone());
+            let mut rt = ValidatorRuntime::new(key.clone(), validators.clone(), state, 1)
+                .with_falcon_key(falcon.clone())
+                .with_deterministic_sim_signing();
             // The base round of the cluster. A late node starts behind it.
             let mut hc = HeightConsensus::new(1, validators.clone());
             hc.round = base_round.saturating_sub(profile.late_rounds);

@@ -20,8 +20,6 @@ use security::{
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[allow(unused_imports)]
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment, StealthAddress};
 use stellereum::orderbook::{OrderSide, OrderType};
 use stellereum::tokenomics::GenesisVault;
 use stellereum::wallet::{Mnemonic, WalletAccount};
@@ -874,21 +872,32 @@ enum TradeCommands {
     },
 }
 
-/// Guard for staking-lifecycle commands that only speak classical Ed25519
-/// today (`unbond`, `delegate`, `begin-unbond`, `withdraw-unbond`,
-/// `claim-rewards`, `rotate-key`). A PQ keystore would otherwise build a
-/// classical transaction from the WRONG (Ed25519) address with the wrong
-/// nonce — a confusing failure deep in the node. Fail loudly instead.
-/// (`stake` and `pay` already have PQ1 branches.)
-fn require_classical_keystore(keystore: &HardenedKeystore, op: &str) -> anyhow::Result<()> {
-    if keystore.scheme != "ed25519" {
+/// Derive the PQ signing keypair and address for a PQ keystore (`falcon512` / `hybrid`).
+/// Refuses `mldsa44` (unsupported by the node) and classical `ed25519` (rejected on Pure-PQ).
+fn pq_keypair_for_keystore(
+    keystore: &HardenedKeystore,
+    secret: &[u8; 32],
+    op: &str,
+) -> anyhow::Result<(pq::PqKeyPair, [u8; 32])> {
+    if keystore.scheme == "mldsa44" {
         anyhow::bail!(
-            "PQ wallet (scheme '{}'): '{}' is not supported for post-quantum wallets yet on Pure-PQ networks. Use 'stake'/'pay', or run this command from a classical ed25519 wallet.",
-            keystore.scheme,
+            "PQ wallet (scheme 'mldsa44'): '{}' is not supported (ML-DSA-44 is refused by the node). Use a falcon512 or hybrid wallet.",
             op
         );
     }
-    Ok(())
+    if keystore.scheme == "ed25519" {
+        anyhow::bail!(
+            "Classical ed25519 wallet: '{}' requires a post-quantum wallet (Pure-PQ network refuses Ed25519). Generate or migrate to a falcon512 wallet.",
+            op
+        );
+    }
+    let pq_scheme = match keystore.scheme.as_str() {
+        "hybrid" => pq::PqScheme::Hybrid,
+        _ => pq::PqScheme::Falcon512,
+    };
+    let kp = pq::PqKeyPair::from_seed(pq_scheme, secret);
+    let addr = kp.derive_address(&pq::DEFAULT_SALT);
+    Ok((kp, addr))
 }
 
 /// E1b: build the stake opcode for a bond — plain `SysCallStake`
@@ -1115,6 +1124,7 @@ pub fn parse_hex32_list(csv: &str, what: &str) -> anyhow::Result<Vec<[u8; 32]>> 
         .collect()
 }
 
+#[allow(dead_code)] // GATE: retained CLI CSV parser helper
 fn parse_u64_list(csv: &str, what: &str) -> anyhow::Result<Vec<u64>> {
     csv.split(',')
         .map(|s| {
@@ -1284,16 +1294,6 @@ async fn execute_command(
             if let Some(pk_hex) = &pubkey_hex_opt {
                 println!("• PQ Public Key Size:   {} bytes", pk_hex.len() / 2);
                 println!("• PQ Public Key:        {}", pk_hex.cyan());
-            } else {
-                let account = WalletAccount::from_seed(&sec_secret.bytes);
-                println!(
-                    "• Stealth One-Time Pub: {}",
-                    hex::encode(account.stealth_address.one_time_pub).magenta()
-                );
-                println!(
-                    "• Viewing Public Key:   {}",
-                    hex::encode(account.viewing_key.view_pub).blue()
-                );
             }
 
             println!(
@@ -1513,7 +1513,7 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let _account = WalletAccount::from_seed(&sec_secret.bytes);
 
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║                    📥 RECEIVE STELL (L1)                      ║");
@@ -1521,18 +1521,6 @@ async fn execute_command(
             println!(
                 "• Address: {}",
                 format_address_with_visual_checksum(&keystore.address_hex)
-            );
-            println!(
-                "• Viewing Key: {}",
-                hex::encode(account.viewing_key.view_pub).magenta()
-            );
-            println!(
-                "• Spending Key: {}",
-                hex::encode(account.spend_pub).magenta()
-            );
-            println!(
-                "• Stealth One-Time: {}",
-                hex::encode(account.stealth_address.one_time_pub).magenta()
             );
 
             // Render crisp ASCII QR Code using primary Stl57 address
@@ -1842,24 +1830,32 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "unbond")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, from_addr) = pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "unbond")?;
             let val = match validator {
                 Some(v) => parse_hex32(&v, "validator key")?,
-                None => account.address,
+                None => from_addr,
             };
             let nano = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = account.create_payload_transaction(
+            let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
+                .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+            let tx = LightClient::build_pq_payload_tx_bound(
+                &kp,
+                from_addr,
+                0,
+                gas,
+                nonce,
+                stellereum::sharding::MASTERCHAIN_SHARD,
+                stellereum::sharding::MASTERCHAIN_SHARD,
+                true,
                 vec![stellereum::svm::OpCode::SysCallUnbond {
                     validator: val,
                     amount: nano,
                 }],
-                stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER,
-                nonce,
+                client.chain_id(),
             );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
@@ -1894,14 +1890,14 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "delegate")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-            let val = val_opt.unwrap_or(account.address);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "delegate")?;
+            let val = val_opt.unwrap_or(from_addr);
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_delegate_tx(&account, val, nano, nonce);
+            let tx = LightClient::build_pq_delegate_tx(&kp, val, nano, nonce, client.chain_id());
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -1935,14 +1931,15 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "begin-unbond")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-            let val = val_opt.unwrap_or(account.address);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "begin-unbond")?;
+            let val = val_opt.unwrap_or(from_addr);
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_begin_unbond_tx(&account, val, nano, nonce);
+            let tx =
+                LightClient::build_pq_begin_unbond_tx(&kp, val, nano, nonce, client.chain_id());
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -1974,14 +1971,14 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "withdraw-unbond")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-            let val = val_opt.unwrap_or(account.address);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "withdraw-unbond")?;
+            let val = val_opt.unwrap_or(from_addr);
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_withdraw_unbond_tx(&account, val, nonce);
+            let tx = LightClient::build_pq_withdraw_unbond_tx(&kp, val, nonce, client.chain_id());
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2010,15 +2007,21 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "claim-rewards")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-            let val = val_opt.unwrap_or(account.address);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "claim-rewards")?;
+            let val = val_opt.unwrap_or(from_addr);
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let is_delegator = delegator || val != account.address;
-            let tx = LightClient::build_claim_rewards_tx(&account, val, is_delegator, nonce);
+            let is_delegator = delegator || val != from_addr;
+            let tx = LightClient::build_pq_claim_rewards_tx(
+                &kp,
+                val,
+                is_delegator,
+                nonce,
+                client.chain_id(),
+            );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2049,20 +2052,29 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            require_classical_keystore(&keystore, "rotate-key")?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "rotate-key")?;
             let new_val = parse_hex32(&new_key, "new validator key")?;
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = account.create_payload_transaction(
+            let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
+                .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+            let tx = LightClient::build_pq_payload_tx_bound(
+                &kp,
+                from_addr,
+                0,
+                gas,
+                nonce,
+                stellereum::sharding::MASTERCHAIN_SHARD,
+                stellereum::sharding::MASTERCHAIN_SHARD,
+                true,
                 vec![stellereum::svm::OpCode::SysCallRotateValidatorKey {
-                    old_validator: account.address,
+                    old_validator: from_addr,
                     new_validator: new_val,
                 }],
-                stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER,
-                nonce,
+                client.chain_id(),
             );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
@@ -2070,7 +2082,7 @@ async fn execute_command(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
                 "• Rotate:       {} -> {}",
-                hex::encode(account.address).yellow(),
+                hex::encode(from_addr).yellow(),
                 hex::encode(new_val).green().bold()
             );
             println!("• Tx Hash:      {}", hex::encode(tx_hash).yellow().bold());
@@ -2452,493 +2464,20 @@ async fn execute_command(
             }
         }
 
-        Commands::StealthPay {
-            view_key,
-            spend_key,
-            to,
-            arg2,
-            arg3,
-            amount,
-            fee: _,
-            password,
-            shard,
-        } => {
-            let (view_str, spend_str, amount_str) = match (&view_key, &spend_key) {
-                (Some(v), Some(s)) => {
-                    let amt = amount.clone().or_else(|| to.clone()).ok_or_else(|| {
-                        anyhow::anyhow!("Amount in STELL is required. Usage: stell stealth-pay --view-key <VIEW_HEX> --spend-key <SPEND_HEX> <AMOUNT>")
-                    })?;
-                    (v.clone(), s.clone(), amt)
-                }
-                _ => {
-                    if let (Some(v), Some(s), Some(a)) = (&to, &arg2, &arg3) {
-                        (v.clone(), s.clone(), a.clone())
-                    } else if let (Some(meta), Some(a)) = (&to, &arg2) {
-                        if meta.contains(':') {
-                            let parts: Vec<&str> = meta.split(':').collect();
-                            if parts.len() == 2 {
-                                (parts[0].to_string(), parts[1].to_string(), a.clone())
-                            } else {
-                                anyhow::bail!("Invalid stealth meta-address format. Expected <view_hex>:<spend_hex> or separate arguments");
-                            }
-                        } else {
-                            anyhow::bail!("Both view key and spend key are required to derive StealthAddress. Usage: stell stealth-pay <VIEW_PUB> <SPEND_PUB> <AMOUNT> or --view-key <VIEW> --spend-key <SPEND> <AMOUNT>");
-                        }
-                    } else {
-                        anyhow::bail!("Both view key and spend key are required to derive StealthAddress. Usage: stell stealth-pay <VIEW_PUB> <SPEND_PUB> <AMOUNT> or --view-key <VIEW> --spend-key <SPEND> <AMOUNT>");
-                    }
-                }
-            };
-
-            let view_bytes = parse_hex32(&view_str, "Recipient viewing key")?;
-            let spend_bytes = parse_hex32(&spend_str, "Recipient spending key")?;
-
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found at {:?}: {e}", wallet_path))?;
-            let pass =
-                prompt_password_safely(password, "Enter keystore password to unlock and sign")?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-
-            let nano_amount =
-                parse_stell_to_nano(&amount_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let nonce = client
-                .nonce_of(&account.address)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let (tx, stealth) = LightClient::build_stealth_pay_tx(
-                &account,
-                &view_bytes,
-                &spend_bytes,
-                nano_amount,
-                nonce,
-                shard,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (tx_hash, finality) = client
-                .broadcast_tx(&tx)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🔒 STEALTH PAYMENT BROADCAST                     ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:                 {}", client.mode_line().yellow());
-            println!(
-                "• Tx Hash:              {}",
-                hex::encode(tx_hash).yellow().bold()
-            );
-            println!(
-                "• Destination Stealth:  {}",
-                hex::encode(stealth.one_time_pub).magenta().bold()
-            );
-            println!(
-                "• Ephemeral PubKey:     {}",
-                hex::encode(stealth.ephemeral_pub).cyan().bold()
-            );
-            println!(
-                "• Amount:               {} STELL ({} nano-STELL)",
-                amount_str.green().bold(),
-                nano_amount
-            );
-            println!(
-                "• From:                 {}",
-                format_address_with_visual_checksum(&keystore.address_hex)
-            );
-            println!("• Recipient View Pub:   {}", hex::encode(view_bytes).blue());
-            println!(
-                "• Recipient Spend Pub:  {}",
-                hex::encode(spend_bytes).blue()
-            );
-            println!(
-                "• Finality:             {}",
-                display_finality(client, &finality).bold()
-            );
-            println!("• Note:                 {}", "Real transaction broadcast on-chain to one-time stealth address. Receiver derives spending key using view and spend keys.".green());
-            if !client.is_rpc() {
-                println!("• Note:                 {}", "local simulation only — NOT chain-finalized. Use --rpc-url to broadcast for real.".yellow());
-            }
+        Commands::StealthPay { .. } => {
+            anyhow::bail!("Ristretto stealth payments were excised in the PQ migration; ML-KEM stealth comes with HashPool (separate track)");
         }
 
-        Commands::StealthScan { password } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(
-                password,
-                "Enter keystore password to scan stealth payments",
-            )?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-
-            let view_priv = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(
-                account.viewing_key.view_priv,
-            );
-            let spend_pub = account.spend_pub;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🔍 STEALTH PAYMENTS SCANNER                      ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:            {}", client.mode_line().yellow());
-            println!(
-                "• Account Address: {}",
-                format_address_with_visual_checksum(&keystore.address_hex)
-            );
-            println!(
-                "• Viewing PubKey:  {}",
-                hex::encode(account.viewing_key.view_pub).blue()
-            );
-            println!("• Spend PubKey:    {}", hex::encode(spend_pub).blue());
-
-            let detected = client
-                .scan_stealth_payments(&view_priv, &spend_pub)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let stealth_path = notes::stealth_path_for_wallet(wallet_path);
-            let mut new_count = 0;
-
-            for (stealth, amount_nano, height, tx_hash) in &detected {
-                use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-                use curve25519_dalek::ristretto::CompressedRistretto;
-                use sha2::{Digest, Sha256};
-
-                let ephem_pt = match CompressedRistretto(stealth.ephemeral_pub).decompress() {
-                    Some(pt) => pt,
-                    None => continue,
-                };
-                let shared_secret = ephem_pt * view_priv;
-                let s_hash = Sha256::digest(shared_secret.compress().as_bytes());
-                let mut s_bytes = [0u8; 32];
-                s_bytes.copy_from_slice(&s_hash);
-                let s_scalar = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(s_bytes);
-
-                let spend_pt = match CompressedRistretto(spend_pub).decompress() {
-                    Some(pt) => pt,
-                    None => continue,
-                };
-                let one_time_pt = spend_pt + (RISTRETTO_BASEPOINT_POINT * s_scalar);
-                let recovered_one_time_pub = one_time_pt.compress().to_bytes();
-
-                let output = notes::StealthOutput {
-                    one_time_pub: hex::encode(recovered_one_time_pub),
-                    ephemeral_pub: hex::encode(stealth.ephemeral_pub),
-                    shared_secret: hex::encode(s_bytes),
-                    amount: *amount_nano,
-                    height: *height,
-                    tx_hash: hex::encode(tx_hash),
-                    spent: false,
-                };
-
-                // Secret-bound stealth store (XChaCha20-Poly1305, atomic .tmp -> sync_all ->
-                // rename 0600): the outputs carry viewing shared secrets, so they must never
-                // rest in cleartext. `load_stealth_outputs_with_secret` transparently migrates
-                // legacy plaintext / wallet-bound files forward on first write.
-                let is_new =
-                    notes::add_stealth_output_with_secret(&stealth_path, output, &sec_secret.bytes)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                if is_new {
-                    new_count += 1;
-                }
-            }
-
-            let all_unspent =
-                notes::get_unspent_stealth_outputs_with_secret(&stealth_path, &sec_secret.bytes)
-                    .unwrap_or_default();
-
-            println!(
-                "\n• Scan Result:     Found {} stealth output(s) on-chain ({} new)",
-                detected.len(),
-                new_count
-            );
-            println!("• Store File:      {:?}", stealth_path);
-            println!("• Unspent Outputs: {}", all_unspent.len());
-
-            if all_unspent.is_empty() {
-                println!("• Details:         No unspent stealth outputs found.");
-            } else {
-                println!("• Unspent Stealth Outputs:");
-                for (i, out) in all_unspent.iter().enumerate() {
-                    let s_amt = (out.amount as f64) / 1_000_000_000.0;
-                    println!(
-                        "  ↳ [{}] One-Time: {} | {} STELL ({} nano) [Block: #{}]",
-                        i + 1,
-                        out.one_time_pub.magenta().bold(),
-                        format!("{:.6}", s_amt).green().bold(),
-                        out.amount,
-                        out.height
-                    );
-                    println!("       Ephemeral: {}", out.ephemeral_pub.cyan());
-                    println!("       Tx Hash:   {}", out.tx_hash.yellow());
-                }
-            }
+        Commands::StealthScan { .. } => {
+            anyhow::bail!("Ristretto stealth scanning was excised in the PQ migration; ML-KEM stealth comes with HashPool (separate track)");
         }
 
-        Commands::StealthSpend {
-            one_time_pub,
-            to,
-            amount,
-            password,
-            shard,
-        } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found at {:?}: {e}", wallet_path))?;
-            let pass = prompt_password_safely(
-                password,
-                "Enter keystore password to spend stealth output",
-            )?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-
-            let view_priv = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(
-                account.viewing_key.view_priv,
-            );
-            let spend_priv = account.spend_priv;
-
-            let stealth_path = notes::stealth_path_for_wallet(wallet_path);
-            let unspent =
-                notes::get_unspent_stealth_outputs_with_secret(&stealth_path, &sec_secret.bytes)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let target_output = match one_time_pub {
-                Some(ref target_hex) => unspent
-                    .iter()
-                    .find(|o| o.one_time_pub.eq_ignore_ascii_case(target_hex))
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No unspent stealth output matching {} in {:?}",
-                            target_hex,
-                            stealth_path
-                        )
-                    })?,
-                None => {
-                    let mut funded = None;
-                    for o in unspent.iter().rev() {
-                        if let Ok(pub_bytes) = parse_hex32(&o.one_time_pub, "One-time public key") {
-                            if let Ok((b, _, _)) = client.get_balance_spv(&pub_bytes, shard).await {
-                                if b > 0 {
-                                    funded = Some(o.clone());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    funded.or_else(|| unspent.last().cloned())
-                        .ok_or_else(|| anyhow::anyhow!("No unspent stealth outputs found in {:?}. Run `stell stealth-scan` first.", stealth_path))?
-                }
-            };
-
-            let one_time_pub_bytes =
-                parse_hex32(&target_output.one_time_pub, "One-time public key")?;
-            let ephem_bytes = parse_hex32(&target_output.ephemeral_pub, "Ephemeral public key")?;
-            let stealth = stellereum::crypto_privacy::StealthAddress {
-                one_time_pub: one_time_pub_bytes,
-                ephemeral_pub: ephem_bytes,
-            };
-
-            let one_time_priv = stealth
-                .derive_one_time_private_key(&view_priv, &spend_priv)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Failed to derive one-time private key (invalid curve points)")
-                })?;
-
-            let derived_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT
-                * one_time_priv)
-                .compress()
-                .to_bytes();
-            if derived_pub != stealth.one_time_pub {
-                anyhow::bail!("Derived one-time private key does not correspond to one_time_pub");
-            }
-
-            let dest_addr = match to {
-                Some(ref t) => parse_hex32(t, "Destination address")?,
-                None => account.address,
-            };
-
-            let (onchain_bal, nonce, _) = client
-                .get_balance_spv(&stealth.one_time_pub, shard)
-                .await
-                .unwrap_or((0, 0, false));
-            let effective_bal = if onchain_bal > 0 {
-                onchain_bal
-            } else {
-                target_output.amount
-            };
-            let gas_limit = 10_000u64;
-
-            let nano_spend = match amount {
-                Some(ref a) => parse_stell_to_nano(a).map_err(|e| anyhow::anyhow!("{e}"))?,
-                None => {
-                    if effective_bal <= gas_limit {
-                        anyhow::bail!(
-                            "Balance {} nano-STELL too small to cover {} gas limit fee",
-                            effective_bal,
-                            gas_limit
-                        );
-                    }
-                    effective_bal - gas_limit
-                }
-            };
-
-            if nano_spend == 0 || nano_spend + gas_limit > effective_bal {
-                anyhow::bail!("Insufficient balance on stealth address: has {} nano, cannot spend {} with {} fee", effective_bal, nano_spend, gas_limit);
-            }
-
-            let tx = LightClient::build_stealth_spend_tx(
-                &one_time_priv,
-                stealth.one_time_pub,
-                dest_addr,
-                nano_spend,
-                gas_limit,
-                nonce,
-                shard,
-            );
-            if !tx.verify_signature() {
-                anyhow::bail!("Generated stealth spend transaction failed signature verification");
-            }
-
-            let (tx_hash, finality) = client
-                .broadcast_tx(&tx)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let _ = notes::mark_stealth_output_spent_with_secret(
-                &stealth_path,
-                &target_output.one_time_pub,
-                &sec_secret.bytes,
-            );
-
-            let spend_stell = (nano_spend as f64) / 1_000_000_000.0;
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              💸 STEALTH OUTPUT SPENT & BROADCAST              ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:           {}", client.mode_line().yellow());
-            println!(
-                "• From (Stealth): {}",
-                hex::encode(stealth.one_time_pub).magenta().bold()
-            );
-            println!(
-                "• To Destination: {}",
-                format_address_with_visual_checksum(&hex::encode(dest_addr))
-            );
-            println!(
-                "• Amount Sent:    {} STELL ({} nano-STELL)",
-                format!("{:.6}", spend_stell).green().bold(),
-                nano_spend
-            );
-            println!("• Micro-Gas Fee:  {} nano-STELL", gas_limit);
-            println!("• Tx Hash:        {}", hex::encode(tx_hash).yellow().bold());
-            println!(
-                "• Finality:       {}",
-                display_finality(client, &finality).bold()
-            );
-            println!(
-                "• Note Store:     Marked output as spent in {:?}",
-                stealth_path
-            );
-            if !client.is_rpc() {
-                println!("• Note:           {}", "local simulation only — NOT chain-finalized. Use --rpc-url to broadcast for real.".yellow());
-            }
+        Commands::StealthSpend { .. } => {
+            anyhow::bail!("Ristretto stealth spending was excised in the PQ migration; ML-KEM stealth comes with HashPool (separate track)");
         }
 
-        Commands::ConfidentialShield {
-            amount,
-            blinding,
-            password,
-            shard,
-        } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass =
-                prompt_password_safely(password, "Enter keystore password to unlock and sign")?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-
-            let nano_amount = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let notes_path = notes::notes_path_for_wallet(wallet_path);
-            // Audit B-WALLET-2: migrate legacy store, then read secret-bound.
-            // (Counter must match the write path below or blindings repeat.)
-            let _ = notes::migrate_notes_to_secret(&notes_path, &sec_secret.bytes);
-            let note_counter = notes::load_notes_with_secret(&notes_path, &sec_secret.bytes)
-                .map(|n| n.len() as u64)
-                .unwrap_or(0);
-
-            let blind: [u8; 32] = match blinding {
-                Some(b) => parse_hex32(&b, "Blinding")?,
-                None => notes::derive_blinding_factor(&sec_secret.bytes, note_counter),
-            };
-            let nonce = client
-                .nonce_of(&account.address)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (tx_hash, finality, commitment) = client
-                .broadcast_shield_tx(&account.signing_key, nano_amount, blind, nonce, shard)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            // Automatically record note in the per-wallet shielded notes store.
-            // NOTE: this keeps the legacy wallet-bound container so that the password-less
-            // `shield-balance` reader stays working (fail-closed when no wallet keystore is
-            // bound — never a salt-only key). Callers that gate on a password should prefer
-            // `add_note_with_secret` / `load_notes_with_secret`, bound to the master secret.
-            let height = if client.is_rpc() {
-                client
-                    .rpc
-                    .as_ref()
-                    .and_then(|c| rpc::chain_height(c).ok())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let note = notes::ShieldedNote {
-                commitment: commitment.clone(),
-                amount: nano_amount,
-                blinding: hex::encode(blind),
-                height,
-                spent: false,
-            };
-            if let Err(e) = notes::add_note_with_secret(&notes_path, note, &sec_secret.bytes) {
-                eprintln!(
-                    "{}",
-                    format!("Warning: failed to record note in {:?}: {e}", notes_path).yellow()
-                );
-            }
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║                   🛡️  SHIELDED (SUBMITTED)                   ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:       {}", client.mode_line().yellow());
-            println!("• Tx Hash:    {}", hex::encode(tx_hash).yellow().bold());
-            println!(
-                "• Amount:     {} STELL ({} nano)",
-                amount.green().bold(),
-                nano_amount
-            );
-            println!("• Commitment: {}", commitment.cyan().bold());
-            println!("• Blinding:   {}", hex::encode(blind).red().bold());
-            println!("• Note Store: Saved to {:?}", notes_path);
-            println!(
-                "• Finality:   {}",
-                display_finality(client, &finality).bold()
-            );
-            println!(
-                "• SAVE:       {}",
-                "the blinding is the ONLY way to transfer or exit this coin"
-                    .red()
-                    .bold()
-            );
-            if !client.is_rpc() {
-                println!("• Note:       {}", "local simulation only — NOT chain-finalized. Use --rpc-url to submit for real.".yellow());
-            }
+        Commands::ConfidentialShield { .. } => {
+            anyhow::bail!("Ristretto confidential shield was excised in the PQ migration");
         }
 
         Commands::ShieldBalance { password } => {
@@ -2948,8 +2487,10 @@ async fn execute_command(
             // password unlock; passwordless reads are gone for good.
             let keystore = HardenedKeystore::load(wallet_path)
                 .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass =
-                prompt_password_safely(password, "Enter keystore password to view shielded balance")?;
+            let pass = prompt_password_safely(
+                password,
+                "Enter keystore password to view shielded balance",
+            )?;
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2958,9 +2499,8 @@ async fn execute_command(
             if migrated {
                 println!("• Migrated legacy notes store to secret-bound encryption.");
             }
-            let unspent =
-                notes::get_unspent_notes_with_secret(&notes_path, &sec_secret.bytes)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let unspent = notes::get_unspent_notes_with_secret(&notes_path, &sec_secret.bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let total = notes::calculate_shielded_balance(&unspent);
 
             println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -2992,228 +2532,12 @@ async fn execute_command(
             );
         }
 
-        Commands::ConfidentialUnshield {
-            amount,
-            commitments,
-            amounts,
-            blindings,
-            password,
-            shard,
-        } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass =
-                prompt_password_safely(password, "Enter keystore password to unlock and sign")?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-            let notes_path = notes::notes_path_for_wallet(wallet_path);
-
-            let (cs, ams, bs, auto_selected) = match (commitments, amounts, blindings) {
-                (Some(c_str), Some(a_str), Some(b_str)) => {
-                    let cs = parse_hex32_list(&c_str, "Commitment")?;
-                    let ams = parse_u64_list(&a_str, "Amount")?;
-                    let bs = parse_hex32_list(&b_str, "Blinding")?;
-                    (cs, ams, bs, None)
-                }
-                (None, None, None) => {
-                    let amt_str = amount.ok_or_else(|| {
-                        anyhow::anyhow!("Either --amount <STELL> (for automated note unshielding) or --commitments, --amounts, --blindings must be provided")
-                    })?;
-                    let target_nano =
-                        parse_stell_to_nano(&amt_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let selected = notes::select_notes_for_unshield_with_secret(
-                        &notes_path,
-                        target_nano,
-                        &sec_secret.bytes,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let cs = selected
-                        .iter()
-                        .map(|n| parse_hex32(&n.commitment, "Commitment"))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    let ams = selected.iter().map(|n| n.amount).collect::<Vec<_>>();
-                    let bs = selected
-                        .iter()
-                        .map(|n| parse_hex32(&n.blinding, "Blinding"))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    (cs, ams, bs, Some(selected))
-                }
-                _ => {
-                    anyhow::bail!("Manual unshielding requires all three: --commitments, --amounts, and --blindings. Or pass --amount <STELL> alone for automatic note selection.");
-                }
-            };
-
-            let nonce = client
-                .nonce_of(&account.address)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (tx_hash, finality) = client
-                .broadcast_unshield_tx(
-                    &account.signing_key,
-                    cs.clone(),
-                    ams.clone(),
-                    bs.clone(),
-                    nonce,
-                    shard,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            // Mark spent in note store (secret-bound).
-            let spent_hexes: Vec<String> = cs.iter().map(hex::encode).collect();
-            let _ = notes::mark_notes_spent_with_secret(
-                &notes_path,
-                &spent_hexes,
-                &sec_secret.bytes,
-            );
-
-            let total_unshielded_nano: u64 = ams.iter().sum();
-            let total_stell = (total_unshielded_nano as f64) / 1_000_000_000.0;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║                   🔓 UNSHIELDED (SUBMITTED)                   ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:       {}", client.mode_line().yellow());
-            println!("• Tx Hash:    {}", hex::encode(tx_hash).yellow().bold());
-            println!(
-                "• Unshielded: {} STELL ({} nano across {} note(s))",
-                format!("{:.6}", total_stell).green().bold(),
-                total_unshielded_nano,
-                cs.len()
-            );
-            if let Some(ref sel) = auto_selected {
-                for (i, note) in sel.iter().enumerate() {
-                    let s_amt = (note.amount as f64) / 1_000_000_000.0;
-                    println!(
-                        "  ↳ [{}] {} : {} STELL ({} nano)",
-                        i + 1,
-                        note.commitment.cyan(),
-                        format!("{:.6}", s_amt).green(),
-                        note.amount
-                    );
-                }
-                println!(
-                    "• Note Store: Marked {} note(s) spent in {:?}",
-                    sel.len(),
-                    notes_path
-                );
-            } else {
-                println!(
-                    "• Note Store: Marked {} note(s) spent in {:?}",
-                    cs.len(),
-                    notes_path
-                );
-            }
-            println!(
-                "• Finality:   {}",
-                display_finality(client, &finality).bold()
-            );
-            println!(
-                "• Note:       {}",
-                "amounts are public from here on — privacy ends at exit by design.".yellow()
-            );
-            if !client.is_rpc() {
-                println!("• Note:       {}", "local simulation only — NOT chain-finalized. Use --rpc-url to submit for real.".yellow());
-            }
+        Commands::ConfidentialUnshield { .. } => {
+            anyhow::bail!("Ristretto confidential unshield was excised in the PQ migration");
         }
 
-        Commands::ConfidentialPay {
-            to,
-            amount,
-            fee,
-            password,
-            shard,
-        } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass =
-                prompt_password_safely(password, "Enter keystore password to unlock and sign")?;
-            let sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
-
-            let recipient = parse_hex32(&to, "Recipient shielded address")?;
-            let nano_amount = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
-            nano_amount
-                .checked_add(fee)
-                .ok_or_else(|| anyhow::anyhow!("amount+fee overflows"))?;
-            let (transfer, blinding) = account.create_confidential_transfer(nano_amount, fee);
-            if !transfer.verify_balance_conservation() {
-                anyhow::bail!("local conservation check failed — refusing to build");
-            }
-
-            let nonce = client
-                .nonce_of(&account.address)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (tx_hash, finality) = client
-                .broadcast_confidential_tx(
-                    &account.signing_key,
-                    recipient,
-                    transfer.clone(),
-                    nano_amount,
-                    fee,
-                    blinding.to_bytes(),
-                    nonce,
-                    shard,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🔒 CONFIDENTIAL TRANSFER SUBMITTED               ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Mode:                {}", client.mode_line().yellow());
-            println!(
-                "• Tx Hash:             {}",
-                hex::encode(tx_hash).yellow().bold()
-            );
-            println!("• Recipient (shielded): {}", to.magenta());
-            println!(
-                "• Hidden amount:       {} STELL ({} nano, commitment only)",
-                amount.green().bold(),
-                nano_amount
-            );
-            // Honest gas (audit 2026-10-06): the fee PARAM is floored by the
-            // base transfer fee, so the charged gas_limit is the max.
-            let actual_gas = fee
-                .max(stellereum::svm::GAS_BASIC_TRANSFER)
-                .max(stellereum::svm::GAS_CONFIDENTIAL_SHIELD)
-                .max(stellereum::svm::GAS_CONFIDENTIAL_TRANSFER2);
-            println!(
-                "• Fee param:           {} nano-STELL (charged gas_limit: {})",
-                fee, actual_gas
-            );
-            println!(
-                "• Finality:            {}",
-                display_finality(client, &finality).bold()
-            );
-            println!(
-                "• Auditor viewing key: {}",
-                hex::encode(account.viewing_key.view_pub).blue()
-            );
-            println!(
-                "• Auditor blinding r:  {}",
-                hex::encode(blinding.to_bytes()).cyan()
-            );
-            println!(
-                "• Output commitment:   {}",
-                hex::encode(
-                    transfer
-                        .output_commitments
-                        .first()
-                        .map(|c| c.commitment)
-                        .unwrap_or([0u8; 32])
-                )
-                .cyan()
-            );
-            println!("• Note:                {}", "share the viewing key + blinding factor with YOUR auditor only; the amount stays hidden on chain.".yellow());
-            if !client.is_rpc() {
-                println!("• Note:                {}", "local simulation only — NOT chain-finalized. Use --rpc-url to submit for real.".yellow());
-            }
+        Commands::ConfidentialPay { .. } => {
+            anyhow::bail!("Ristretto confidential pay was excised in the PQ migration");
         }
 
         Commands::TokenBalance { token, account } => {
@@ -3291,21 +2615,23 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "token-send")?;
 
             let token_id = parse_hex32(&token, "Token ID")?;
             let to_arr = parse_hex32(&to, "Recipient")?;
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_token_transfer_tx(
-                &account.signing_key,
+            let tx = LightClient::build_pq_token_transfer_tx(
+                &kp,
                 token_id,
                 to_arr,
                 amount,
                 nonce,
                 shard,
+                client.chain_id(),
             );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
@@ -3351,21 +2677,23 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "token-approve")?;
 
             let token_id = parse_hex32(&token, "Token ID")?;
             let spender_arr = parse_hex32(&spender, "Spender")?;
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_token_approve_tx(
-                &account.signing_key,
+            let tx = LightClient::build_pq_token_approve_tx(
+                &kp,
                 token_id,
                 spender_arr,
                 amount,
                 nonce,
                 shard,
+                client.chain_id(),
             );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
@@ -3416,7 +2744,8 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "token-create")?;
 
             let cap = if max_supply == 0 {
                 None
@@ -3424,11 +2753,11 @@ async fn execute_command(
                 Some(max_supply)
             };
             let nonce = client
-                .nonce_of(&account.address)
+                .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_token_create_tx(
-                &account.signing_key,
+            let tx = LightClient::build_pq_token_create_tx(
+                &kp,
                 name.clone(),
                 symbol.clone(),
                 decimals,
@@ -3436,6 +2765,7 @@ async fn execute_command(
                 cap,
                 nonce,
                 shard,
+                client.chain_id(),
             );
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
@@ -3462,7 +2792,7 @@ async fn execute_command(
                 // Pending/Failed there is no token yet, and an eager resolve
                 // could print a STALE same-name token as success.
                 if finality.is_confirmed() {
-                    match client.token_resolve(&account.address, &name, &symbol) {
+                    match client.token_resolve(&from_addr, &name, &symbol) {
                         Ok(tid) => println!("• Token ID: {}", tid.green().bold()),
                         Err(e) => println!("• Token ID: {} ({})", "unresolved".red(), e),
                     }
@@ -3593,15 +2923,15 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let account = WalletAccount::from_seed(&sec_secret.bytes);
+            let (kp, master_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "session")?;
 
-            let session_bytes = hex::decode(&session_pub)
+            let clean_session_hex = session_pub
+                .trim()
+                .strip_prefix("0x")
+                .unwrap_or(session_pub.trim());
+            let session_bytes = hex::decode(clean_session_hex)
                 .map_err(|e| anyhow::anyhow!("Invalid session pub: {e}"))?;
-            if session_bytes.len() != 32 {
-                anyhow::bail!("Session key must be 32 bytes");
-            }
-            let mut session_arr = [0u8; 32];
-            session_arr.copy_from_slice(&session_bytes);
 
             // Chain id 0 = auto-detect from the node in RPC mode (audit
             // 2026-10-06: the old 7777 default was indistinguishable from an
@@ -3615,18 +2945,70 @@ async fn execute_command(
             } else {
                 chain_id
             };
+            let auth = match kp.scheme() {
+                pq::PqScheme::Falcon512 => {
+                    let mut hasher = blake3::Hasher::new_derive_key("STELL_PQ_FALCON512_SEED_V4");
+                    hasher.update(&sec_secret.bytes);
+                    let falcon_seed = zeroize::Zeroizing::new(*hasher.finalize().as_bytes());
+                    let wallet_kp = stellereum::wallet::WalletKeyMaterial::from_seed(&falcon_seed);
+                    wallet_kp
+                        .delegate_bot_session_falcon512(
+                            &session_bytes,
+                            max_gas,
+                            duration,
+                            scope,
+                            max_value,
+                            chain_id,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                }
+                pq::PqScheme::Hybrid => {
+                    if session_bytes.len() != stellereum::post_quantum::FALCON512_PUBKEY_LEN {
+                        anyhow::bail!(
+                            "invalid Falcon-512 session public key: expected {} bytes, got {}",
+                            stellereum::post_quantum::FALCON512_PUBKEY_LEN,
+                            session_bytes.len()
+                        );
+                    }
+                    let mut ed_hasher =
+                        blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_ED25519_V4");
+                    ed_hasher.update(&sec_secret.bytes);
+                    let ed_seed = zeroize::Zeroizing::new(*ed_hasher.finalize().as_bytes());
+                    let ed_sk = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+                    let mut f_hasher =
+                        blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_FALCON512_V4");
+                    f_hasher.update(&sec_secret.bytes);
+                    let f_seed = zeroize::Zeroizing::new(*f_hasher.finalize().as_bytes());
+                    let falcon_kp =
+                        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&f_seed);
+                    let valid_until = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        + duration;
+                    stellereum::zkml::SessionKeyAuthorization::sign_delegation_hybrid(
+                        &ed_sk,
+                        &falcon_kp,
+                        stellereum::post_quantum::PqScheme::Falcon512,
+                        &session_bytes,
+                        valid_until,
+                        max_gas,
+                        scope,
+                        max_value,
+                        chain_id,
+                    )
+                }
+                other => {
+                    anyhow::bail!(
+                        "session delegation requires a Falcon-512 or Hybrid wallet, got {:?}",
+                        other
+                    );
+                }
+            };
             // The grant must not delegate to ourselves (audit 2026-10-06).
-            if session_arr == account.address {
+            if auth.session_pubkey == master_addr {
                 anyhow::bail!("session key must differ from the master address");
             }
-            let auth = account.delegate_bot_session(
-                session_arr,
-                max_gas,
-                duration,
-                scope,
-                max_value,
-                chain_id,
-            );
 
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║              🔑 SESSION KEY DELEGATION                        ║");
@@ -3649,22 +3031,25 @@ async fn execute_command(
                 hex::encode(&auth.master_signature).green()
             );
             if publish {
-                use stellereum::sharding::Transaction;
                 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER, GAS_PUBLISH_SESSION_GRANT};
-                let master_addr = account.address;
                 let nonce = client
                     .nonce_of(&master_addr)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let ptx = Transaction::sign_with_payload(
-                    &account.signing_key,
+                let gas = GAS_BASIC_TRANSFER
+                    .max(GAS_PUBLISH_SESSION_GRANT)
+                    .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+                let ptx = LightClient::build_pq_payload_tx_bound(
+                    &kp,
                     master_addr,
                     0,
-                    GAS_BASIC_TRANSFER.max(GAS_PUBLISH_SESSION_GRANT),
+                    gas,
                     nonce,
                     shard,
                     shard,
+                    true,
                     vec![OpCode::SysCallPublishSessionGrant(Box::new(auth.clone()))],
+                    chain_id,
                 );
                 let (tx_hash, finality) = client
                     .broadcast_tx(&ptx)
@@ -3919,9 +3304,7 @@ async fn execute_command(
             // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (node never
             // verifies it) — refuse generation so no unusable keys are minted.
             if scheme == pq::PqScheme::MlDsa44 {
-                anyhow::bail!(
-                    "ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid"
-                );
+                anyhow::bail!("ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid");
             }
             let salt_bytes = match salt {
                 Some(s) => parse_hex16(&s, "salt")?,

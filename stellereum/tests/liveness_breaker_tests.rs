@@ -45,9 +45,10 @@ mod consensus_cluster;
 
 use consensus_cluster::{key_at, Byzantine, ConsensusCluster, NodeProfile, StragglerPolicy};
 use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind, NIL_CIRCUIT_BREAKER_K, REPHASE_SCAN_WINDOW,
-    ROUND_LOOKBACK,
+    register_validator_pq_key, HeightConsensus, ValidatorSet, Vote, VoteKind,
+    NIL_CIRCUIT_BREAKER_K, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
 /// Virtual tick quantum (matches the harness default).
 const TICK_MS: u64 = 100;
@@ -70,6 +71,8 @@ fn vset(n: u64) -> ValidatorSet {
     let mut vs = ValidatorSet::new();
     for i in 0..n {
         let id = key_at(SEED, i).verifying_key().to_bytes();
+        let fk = FalconKeypair::generate_from_seed(0x80u8.wrapping_add(i as u8));
+        register_validator_pq_key(id, PqScheme::Falcon512, fk.public_key.clone());
         vs.add(id, 1);
     }
     vs
@@ -281,10 +284,25 @@ async fn flapping_proposer_never_commits_nil() {
     let r = hc2.round;
     for i in 0..3 {
         let k = key_at(SEED, i);
-        hc2.add_prevote(Vote::sign(&k, H, r, VoteKind::Prevote, None))
-            .unwrap();
-        hc2.add_precommit(Vote::sign(&k, H, r, VoteKind::Precommit, None))
-            .unwrap();
+        let fk = FalconKeypair::generate_from_seed(0x80u8.wrapping_add(i as u8));
+        hc2.add_prevote(Vote::sign_with_falcon(
+            &k,
+            &fk,
+            H,
+            r,
+            VoteKind::Prevote,
+            None,
+        ))
+        .unwrap();
+        hc2.add_precommit(Vote::sign_with_falcon(
+            &k,
+            &fk,
+            H,
+            r,
+            VoteKind::Precommit,
+            None,
+        ))
+        .unwrap();
     }
     // A nil prevote QC may be observable...
     assert_eq!(

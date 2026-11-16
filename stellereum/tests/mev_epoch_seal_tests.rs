@@ -715,8 +715,36 @@ fn the_plain_path_still_works_alongside_the_sealed_one() {
     let mut pool = Mempool::new(64, 16);
     pool.set_sealed_epoch(14);
 
-    // A plain transaction: the historical path.
-    let plain = Transaction::sign(&members[0].signing, [0x22; 32], 500, 0, 0, 1, 1);
+    // A plain (unsealed) transaction: the non-sealed mempool path under FULL-PQ.
+    let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x41);
+    let pk = kp.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
+        [0x22; 32],
+        500,
+        50_000,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    let plain = Transaction::new_pq_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        pk,
+        sig,
+        [0x22; 32],
+        500,
+        50_000,
+        0,
+        1,
+        1,
+        Vec::new(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
     let plain_hash = plain.compute_tx_hash();
     pool.add_checked(plain, 1_000_000)
         .expect("the plain tx is admitted");

@@ -334,8 +334,14 @@ fn verification_pins_stay_5757_under_custom_env() {
     let raw_old = sign_5757_legacy(41, 7);
     let decoded_old = evm::parse_legacy_transaction(&raw_old).expect("decodes");
     assert_eq!(decoded_old.chain_id, Some(5757));
-    assert!(decoded_old.verify_signature().is_err(), "foreign-chain tx refused");
-    assert!(evm::eth_send_raw_transaction_bytes(&raw_old).is_err(), "gate refuses it");
+    assert!(
+        decoded_old.verify_signature().is_err(),
+        "foreign-chain tx refused"
+    );
+    assert!(
+        evm::eth_send_raw_transaction_bytes(&raw_old).is_err(),
+        "gate refuses it"
+    );
     let raw = sign_legacy(1234, 41, 7);
     let decoded = evm::parse_legacy_transaction(&raw).expect("decodes");
     assert_eq!(decoded.chain_id, Some(1234));

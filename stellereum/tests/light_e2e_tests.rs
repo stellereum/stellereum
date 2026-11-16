@@ -24,12 +24,12 @@
 //! dirs; no network is touched; everything is deterministic.
 
 use ed25519_dalek::SigningKey;
+use std::path::{Path, PathBuf};
 use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
 use stellereum::light_client::{
     Checkpoint, GenesisAnchor, LightAnchor, LightClient, LightHeader, ProofAnswer,
     StorageProofAnswer, ValidatorSetRotation,
 };
-use std::path::{Path, PathBuf};
 
 // This file uses `fvote` with file-local keys (`pq_for` below); `falcon_set`
 // in the shared helper covers the fixed-seed case and is unused here.
@@ -165,11 +165,7 @@ fn fresh_dir(tag: &str) -> PathBuf {
 
 fn write_json_file(dir: &Path, name: &str, value: &impl serde::Serialize) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(value).expect("json"),
-    )
-    .expect("write");
+    std::fs::write(&path, serde_json::to_string_pretty(value).expect("json")).expect("write");
     path
 }
 
@@ -374,10 +370,7 @@ fn build_chain() -> E2eChain {
     let answer = proof_answer_for(
         &trie,
         &ACCOUNT,
-        &[
-            (SLOT, Some(b"slot-v2".to_vec())),
-            (MISSING, None),
-        ],
+        &[(SLOT, Some(b"slot-v2".to_vec())), (MISSING, None)],
     );
     assert_eq!(answer.state_root, r3);
 
@@ -416,7 +409,10 @@ fn light_e2e_third_party_verify_flow() {
         .verify_proof_answer(&chain.answer)
         .expect("proof under the new anchor must verify");
     assert_eq!(proven.address, ACCOUNT);
-    assert_eq!(proven.balance, 500_000, "proven balance must come from the leaf");
+    assert_eq!(
+        proven.balance, 500_000,
+        "proven balance must come from the leaf"
+    );
     assert_eq!(proven.nonce, 5);
     assert!(proven.exists);
     assert_eq!(proven.height, 6, "client reports the height IT finalized");
@@ -435,7 +431,11 @@ fn light_e2e_third_party_verify_flow() {
     let reloaded: LightAnchor =
         serde_json::from_str(&std::fs::read_to_string(&anchor_path).expect("read anchor"))
             .expect("anchor round-trip");
-    assert_eq!(&reloaded, client.anchor(), "anchor must survive a round-trip");
+    assert_eq!(
+        &reloaded,
+        client.anchor(),
+        "anchor must survive a round-trip"
+    );
 
     // Export the tip as a checkpoint file plus the NEW validator set file,
     // then bootstrap a fresh client purely from those files (the offline CLI
@@ -459,11 +459,11 @@ fn light_e2e_third_party_verify_flow() {
     let show = stellereum::light_client_cli::anchor_show(&validators_path, &checkpoint_path)
         .expect("anchor show");
     assert!(show.contains("anchor height: 6"), "report: {show}");
-    eprintln!("step 7: anchor round-trip ok; fresh client bootstrapped at height 6 and re-verified");
-
     eprintln!(
-        "e2e complete: anchor=genesis(0) tip=6 rotation@4 proven_balance=500000 nonce=5"
+        "step 7: anchor round-trip ok; fresh client bootstrapped at height 6 and re-verified"
     );
+
+    eprintln!("e2e complete: anchor=genesis(0) tip=6 rotation@4 proven_balance=500000 nonce=5");
     let _ = chain.old_set;
     let _ = chain.new_set;
 }

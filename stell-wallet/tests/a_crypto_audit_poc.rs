@@ -26,7 +26,10 @@ fn poc_wallet_refuses_mldsa44_like_node() {
     let wallet = PqScheme::from_id(3);
     println!("wallet from_id(3)={wallet:?}");
     // Fails on current code: wallet accepts 0x03.
-    assert!(wallet.is_err(), "POC-REAL: wallet PqScheme::from_id(3) accepts disabled scheme");
+    assert!(
+        wallet.is_err(),
+        "POC-REAL: wallet PqScheme::from_id(3) accepts disabled scheme"
+    );
 }
 
 // Wallet can generate + sign with the disabled scheme; node never verifies.

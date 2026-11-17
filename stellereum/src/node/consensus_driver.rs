@@ -843,6 +843,11 @@ pub(crate) async fn run_consensus_node(
         std::collections::VecDeque::new();
     // Times an over-budget Batch was deferred (limiter pacing, not loss).
     let mut inbound_defer_count: u64 = 0;
+    // Compact-gossip frames refused by the inbound drain. Activation is frozen
+    // OFF (`COMPACT_GOSSIP_ACTIVATION_HEIGHT = u64::MAX`), so a compact frame
+    // is either a pre-activation probe or junk: refused LOUDLY and dropped,
+    // never reinterpreted as a full proposal.
+    let mut inbound_compact_refused: u64 = 0;
     // Liveness probe timer (see probe_peers).
     let mut last_probe = std::time::Instant::now() - Duration::from_secs(60);
     // Mempool persistence timer (see the periodic save below).
@@ -2108,6 +2113,69 @@ pub(crate) async fn run_consensus_node(
                     }
                     match msg {
                         ConsensusMsg::Batch(_) => {}
+                        // Compact proposal gossip (`CompactProposal` / `BodyPull`
+                        // / `Body`): activation is frozen OFF at
+                        // `COMPACT_GOSSIP_ACTIVATION_HEIGHT = u64::MAX`, and the
+                        // receiver wiring lands with the lead's gate flip. Below
+                        // the gate these frames MUST be refused loudly and
+                        // dropped — never reinterpreted as a full proposal, never
+                        // a panic. `ConsensusMsg::decode` already rejects them
+                        // pre-activation; these arms are defense in depth for a
+                        // frame that decoded while the gate says off.
+                        ConsensusMsg::CompactProposal { proposal } => {
+                            inbound_compact_refused += 1;
+                            if inbound_compact_refused % 20 == 1 {
+                                tracing::warn!(
+                                    "[consensus] REFUSED compact proposal #{} r{} ({} short ids, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
+                                    proposal.height,
+                                    proposal.round,
+                                    proposal.short_ids.len(),
+                                    if stellereum::consensus_net::compact_gossip_active(
+                                        proposal.height
+                                    ) {
+                                        "receiver wiring not installed"
+                                    } else {
+                                        "gate inactive"
+                                    },
+                                );
+                            }
+                        }
+                        ConsensusMsg::BodyPull { pull } => {
+                            inbound_compact_refused += 1;
+                            if inbound_compact_refused % 20 == 1 {
+                                tracing::warn!(
+                                    "[consensus] REFUSED compact body pull #{} r{} ({} ids, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
+                                    pull.height,
+                                    pull.round,
+                                    pull.ids.len(),
+                                    if stellereum::consensus_net::compact_gossip_active(
+                                        pull.height
+                                    ) {
+                                        "receiver wiring not installed"
+                                    } else {
+                                        "gate inactive"
+                                    },
+                                );
+                            }
+                        }
+                        ConsensusMsg::Body { body } => {
+                            inbound_compact_refused += 1;
+                            if inbound_compact_refused % 20 == 1 {
+                                tracing::warn!(
+                                    "[consensus] REFUSED compact body #{} r{} ({} txs, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
+                                    body.height,
+                                    body.round,
+                                    body.txs.len(),
+                                    if stellereum::consensus_net::compact_gossip_active(
+                                        body.height
+                                    ) {
+                                        "receiver wiring not installed"
+                                    } else {
+                                        "gate inactive"
+                                    },
+                                );
+                            }
+                        }
                         ConsensusMsg::Proposal {
                             round: r, block, ..
                         } => {

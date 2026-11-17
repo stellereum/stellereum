@@ -535,6 +535,7 @@ impl super::InMemoryStateEngine {
                     bincode::serialize(&super::StateSnapshotV2 {
                         accounts: states,
                         penalty,
+                        total_minted_nano: self.total_minted_nano(),
                     })
                     .unwrap_or_default(),
                 );
@@ -565,7 +566,11 @@ impl super::InMemoryStateEngine {
     pub async fn restore_snapshot_chunked(&self, chunks: &[Vec<u8>]) -> Result<(), String> {
         // Phase 1 (validate): decode every chunk with no locks held and
         // no mutation. Any failure returns with live state untouched.
-        let (decoded, penalty) = Self::decode_snapshot_chunks(chunks)?;
+        let (decoded, penalty, total_minted_nano) = Self::decode_snapshot_chunks(chunks)?;
+        // The minted-supply counter is COMMITTED and travels with the first
+        // chunk: install the snapshot's value, never a balance-sum rebase
+        // (which would count the pre-mined genesis allocation as emission).
+        self.set_total_minted_from_snapshot(total_minted_nano);
         // Phase 2 (commit): all chunks are known-good; install.
         // The replay sets below are CLEARED (a committed domain), so this
         // is a domain bump, not a bare global one.
@@ -609,7 +614,11 @@ impl super::InMemoryStateEngine {
         &self,
         chunks: &[Vec<u8>],
     ) -> Result<(), String> {
-        let (decoded, penalty) = Self::decode_snapshot_chunks(chunks)?;
+        let (decoded, penalty, total_minted_nano) = Self::decode_snapshot_chunks(chunks)?;
+        // The minted-supply counter is COMMITTED and travels with the first
+        // chunk: install the snapshot's value, never a balance-sum rebase
+        // (which would count the pre-mined genesis allocation as emission).
+        self.set_total_minted_from_snapshot(total_minted_nano);
         // Same generation bump as the reorg twin; NO replay-set clear, so
         // only the global moves (committed subsystem state is unchanged:
         // the next root read replays every cached preimage).

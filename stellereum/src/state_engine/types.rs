@@ -650,4 +650,38 @@ pub struct StateSnapshotV2 {
     pub accounts: Vec<AccountState>,
     /// The D2 consensus penalty map (sender -> penalty).
     pub penalty: HashMap<[u8; 32], u64>,
+    /// The engine's GLOBAL post-genesis minted-supply counter.
+    ///
+    /// It is COMMITTED (`commitment::assemble_cached_digest_with_cnvrf_and_minted`
+    /// mixes it in when non-zero), so a snapshot MUST carry it: restoring a
+    /// snapshot without it rebased the counter to the sum of balances, which
+    /// counts the PRE-MINED genesis allocation as emission and moves the root
+    /// of every later block. Trailing + EOF-tolerant, so a snapshot written
+    /// before the field existed still decodes (and reads as 0 = "nothing has
+    /// been minted since genesis yet").
+    #[serde(default, deserialize_with = "de_total_minted_nano")]
+    pub total_minted_nano: u64,
+}
+
+/// Bincode-tolerant reader for the trailing `total_minted_nano` field: a blob
+/// persisted before it existed ends one field early, which means "no
+/// post-genesis mint recorded" (the pre-field behaviour).
+fn de_total_minted_nano<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match u64::deserialize(d) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("end of file")
+                || msg.contains("failed to fill whole buffer")
+                || msg.contains("UnexpectedEOF")
+            {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }

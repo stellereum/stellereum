@@ -1684,7 +1684,10 @@ impl ValidatorRuntime {
                                 crate::xshard2pc::SourceAction::Idle => continue,
                             }
                         } else if rec.target_shard == my_shard {
-                            match crate::xshard2pc::target_action(&rec) {
+                            // Height-aware cadence: one ACK per window while
+                            // Prepared, none after Committed, one abort
+                            // authorisation after Aborted.
+                            match crate::xshard2pc::target_action_at(&rec, self.hc.height) {
                                 crate::xshard2pc::TargetAction::PrepareAck => (
                                     crate::xshard2pc::XPC_PREPARE_ACK,
                                     rec.target_shard,

@@ -3,6 +3,9 @@
   (import "host" "sload" (func $sload (param i64) (result i64)))
   (import "host" "sstore" (func $sstore (param i64 i64)))
   (import "host" "emit" (func $emit (param i64 i64)))
+  ;; CT-P0 (audit KI-38): authenticated transaction sender.
+  (import "host" "caller" (func $caller (param i32)))
+  (memory (export "memory") 1)
 
   ;; Storage Layout:
   ;; Global config:
@@ -10,6 +13,7 @@
   ;; Slot 1: Auction Base Duration in seconds (e.g. 3600s = 1hr in testnet, 604800s = 7d in mainnet)
   ;; Slot 2: Anti-sniping prolongation window (e.g. 600s = 10 min)
   ;; Slot 3: Minimum bid increment BPS (500 = 5%)
+  ;; Slots 4..8: AUTHENTICATED registry owner address (32 bytes, four i64 words)
   ;;
   ;; Per-Domain State (Base = 1000 * domain_id):
   ;; base + 0: status (0 = Available, 1 = Auction, 2 = Active/Owned, 3 = Expired)
@@ -30,12 +34,48 @@
   ;; Topic 35: Domain Transferred (new_owner)
   ;; Topic 36: Domain Renewed (new_expiry)
 
+  ;; CT-P0: bind the authenticated host.caller into four consecutive slots.
+  (func $bind_caller (param $base i64)
+    (call $caller (i32.const 0))
+    (call $sstore (local.get $base) (i64.load (i32.const 0)))
+    (call $sstore (i64.add (local.get $base) (i64.const 1)) (i64.load (i32.const 8)))
+    (call $sstore (i64.add (local.get $base) (i64.const 2)) (i64.load (i32.const 16)))
+    (call $sstore (i64.add (local.get $base) (i64.const 3)) (i64.load (i32.const 24)))
+  )
+
+  ;; CT-P0: 1 iff the authenticated caller is the address bound at `$base`.
+  (func $caller_is_owner (param $base i64) (result i32)
+    (call $caller (i32.const 0))
+    (if (i64.ne (i64.load (i32.const 0)) (call $sload (local.get $base)))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 8)) (call $sload (i64.add (local.get $base) (i64.const 1))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 16)) (call $sload (i64.add (local.get $base) (i64.const 2))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 24)) (call $sload (i64.add (local.get $base) (i64.const 3))))
+      (then (return (i32.const 0))))
+    (i32.const 1)
+  )
+
+  (func $require_owner
+    (if (i32.eqz (call $caller_is_owner (i64.const 4)))
+      (then (unreachable)) ;; fail closed: the tx is reverted
+    )
+  )
+
   ;; 1. Initialize Registry: init(treasury_id) -> returns treasury_id
+  ;; CT-P0: binds the initializer address as the authenticated registry owner.
   (func (export "init") (param $treasury_id i64) (result i64)
+    ;; CT-P0: never rebind the authenticated owner after initialization.
+    (if (i64.ne (call $sload (i64.const 8)) (i64.const 0))
+      (then (unreachable))
+    )
     (call $sstore (i64.const 0) (local.get $treasury_id))
     (call $sstore (i64.const 1) (i64.const 3600))  ;; 1 hour auction duration for testnet
     (call $sstore (i64.const 2) (i64.const 600))   ;; 10 minutes anti-sniping extension
     (call $sstore (i64.const 3) (i64.const 500))   ;; 5% (500 bps) minimum bid step
+    (call $bind_caller (i64.const 4))
+    (call $sstore (i64.const 8) (i64.const 1)) ;; initialized
     (local.get $treasury_id)
   )
 
@@ -318,6 +358,9 @@
     (if (i64.ne (local.get $caller_id) (local.get $owner))
       (then (unreachable))
     )
+    ;; CT-P0: the public owner id is not a credential. The authenticated
+    ;; host.caller must also be the bound registry owner address.
+    (call $require_owner)
 
     (call $sstore (i64.add (local.get $base) (i64.const 4)) (local.get $new_target))
     (call $emit (i64.const 34) (local.get $new_target))
@@ -344,6 +387,8 @@
     (if (i64.ne (local.get $caller_id) (local.get $owner))
       (then (unreachable))
     )
+    ;; CT-P0: bind the NFT-style transfer to the authenticated caller too.
+    (call $require_owner)
 
     (call $sstore (i64.add (local.get $base) (i64.const 1)) (local.get $new_owner))
     (call $emit (i64.const 35) (local.get $new_owner))

@@ -16,11 +16,13 @@
 //!  - The engine is height-scoped; `ConsensusDriver` pipelines heights.
 
 mod engine;
+mod qc_split;
 mod rotation;
 mod sortition;
 mod types;
 
 pub use engine::*;
+pub use qc_split::*;
 pub use rotation::*;
 pub use sortition::*;
 pub use types::*;
@@ -46,3 +48,7 @@ mod decoder_fuzz_regressions;
 #[cfg(test)]
 #[path = "tests/post_quantum_uqc_tests.rs"]
 mod post_quantum_uqc_tests;
+
+#[cfg(test)]
+#[path = "tests/qc_split_producer_tests.rs"]
+mod qc_split_producer_tests;

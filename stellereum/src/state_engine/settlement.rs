@@ -1243,6 +1243,11 @@ impl InMemoryStateEngine {
         buyer: [u8; 32],
         usdt_micro: u64,
     ) -> Result<crate::pmm::BuyReceipt, String> {
+        // ATOMIC PMM TRANSITION: hold the op mutex across read-clone-commit so
+        // two concurrent calls cannot both pass the reserve/supply check
+        // against the same clone (reproduced reserve-cap violation; see
+        // `pmm_op` in `state_engine/mod.rs`).
+        let _pmm_op = self.pmm_op.lock().await;
         let usdt_id = self
             .pmm_usdt_token
             .read()
@@ -1327,6 +1332,11 @@ impl InMemoryStateEngine {
         seller: [u8; 32],
         stell_nano: u64,
     ) -> Result<crate::pmm::SellReceipt, String> {
+        // ATOMIC PMM TRANSITION: hold the op mutex across read-clone-commit so
+        // two concurrent calls cannot both pass the reserve/supply check
+        // against the same clone (reproduced reserve-cap violation; see
+        // `pmm_op` in `state_engine/mod.rs`).
+        let _pmm_op = self.pmm_op.lock().await;
         let usdt_id = self
             .pmm_usdt_token
             .read()

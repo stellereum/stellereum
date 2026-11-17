@@ -79,6 +79,13 @@ impl VictimLoop {
                 }
             }
             ConsensusMsg::Committed { .. } => {}
+            // Compact-gossip frames are activation-gated (`u64::MAX`): this
+            // historical replay path must never see one.
+            ConsensusMsg::CompactProposal { .. }
+            | ConsensusMsg::BodyPull { .. }
+            | ConsensusMsg::Body { .. } => {
+                panic!("compact gossip must stay gated off in this path")
+            }
             // P3-H4: the production drain flattens a Batch to its inners in
             // sender order; the PoC mirrors that so batched inners exercise
             // the same per-message control flow.

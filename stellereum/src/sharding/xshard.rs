@@ -3,9 +3,11 @@ use super::envelope::global_implicit_key_registry;
 use super::topology::{ShardId, MASTERCHAIN_SHARD};
 use super::transaction::Transaction;
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 /// Cross-shard atomic transfer message with tight-coupling cryptographic proof
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,6 +336,98 @@ pub struct CrossShardKey {
     pub finalized_in_block: [u8; 32],
     pub msg_id: [u8; 32],
 }
+/// Snapshot schema version of the durable finalized-header registry blob.
+///
+/// Bump ONLY with a decoder that still accepts the previous version: a node
+/// that cannot decode its own blob starts with an EMPTY registry (fail closed,
+/// see [`FinalizedHeaderRegistry::restore_from_bytes`]), and every cross-shard
+/// message produced before that restart becomes unverifiable until re-anchored.
+const REGISTRY_SNAPSHOT_VERSION: u32 = 1;
+
+/// How many non-genesis `(shard, block_hash) -> root` anchors are retained PER
+/// SHARD, both in memory and in the persisted blob.
+///
+/// The anchor map would otherwise grow forever (one entry per finalized block
+/// per shard). A cross-shard message names the source head its producing block
+/// extends and is consumed within a couple of heights in the honest flow, so a
+/// few hundred heights of history is ample; a target that lags further re-syncs
+/// and re-adopts the source blocks (which re-anchors them). The bound is a
+/// pure function of the retained heights, so two nodes at the same finalized
+/// height retain the same window (see [`FinalizedHeaderRegistry::prune_anchors`]).
+pub const REGISTRY_ANCHOR_WINDOW: usize = 512;
+
+/// How many height-0 (genesis) anchors are retained per shard. Genesis anchors
+/// are exempt from the height window because the first cross-shard messages of
+/// every chain name the genesis parent and no later finalize event re-records
+/// it. In normal operation there is exactly one per shard; the cap only keeps a
+/// locally misbehaving caller from growing the snapshot without bound.
+pub const REGISTRY_GENESIS_ANCHORS_PER_SHARD: usize = 16;
+
+/// Hard upper bounds applied to a decoded blob (a corrupt or hostile-length
+/// blob must fail closed, not allocate without limit).
+const REGISTRY_MAX_ANCHORS: usize = 1_000_000;
+const REGISTRY_MAX_SHARDS: usize = 4096;
+/// Maximum accepted encoded registry blob (bincode limit).
+const REGISTRY_BLOB_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Durable sink for registry snapshots.
+///
+/// Implemented by the node's [`crate::storage::AsyncPersistence`] so the
+/// finalize path only ENQUEUES a bounded `Vec<u8>` and never touches disk.
+/// The trait lives here (not a direct storage dependency) so the sharding layer
+/// does not depend on the storage implementation.
+pub trait FinalizedHeaderSink: Send + Sync {
+    /// Persist one complete, self-contained registry snapshot. Later calls
+    /// replace earlier ones: the registry blob is latest-state, not a journal.
+    fn persist_finalized_headers(&self, bytes: Vec<u8>);
+}
+
+/// `(shard, block hash)` key of one anchor.
+type AnchorKey = (ShardId, [u8; 32]);
+
+/// One anchor entry: the root the message is checked against plus the height
+/// of the block it belongs to (height 0 = genesis / caller without a height).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnchorEntry {
+    root: crate::cell::CellHash,
+    height: u64,
+}
+
+/// Wire/serialized form of a registry (or of a delta between two registries).
+///
+/// `anchors` are sorted by `(shard, block_hash)` and `latest` by `shard`, so
+/// the bincode bytes are deterministic: two nodes holding the same anchors and
+/// heads serialize byte-identically regardless of insertion order.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FinalizedHeaderDelta {
+    pub anchors: Vec<(ShardId, [u8; 32], u64, crate::cell::CellHash)>,
+    pub latest: Vec<ShardHeaderCommitment>,
+}
+
+/// Bincode envelope. Self-describing version first, then a SHA-256 checksum of
+/// the version+payload and the encoded payload itself.
+///
+/// The checksum is what makes corruption FAIL CLOSED: a bit flip in any anchor
+/// root would otherwise still decode as a perfectly-shaped (but forged-looking)
+/// registry. The decode path refuses a mismatch, and hydration then clears the
+/// registry instead of trusting it.
+#[derive(Serialize, Deserialize)]
+struct RegistrySnapshotV1 {
+    version: u32,
+    checksum: [u8; 32],
+    payload: Vec<u8>,
+}
+
+/// Inner payload of [`RegistrySnapshotV1`].
+#[derive(Serialize, Deserialize)]
+struct RegistryPayloadV1 {
+    anchors: Vec<(ShardId, [u8; 32], u64, crate::cell::CellHash)>,
+    latest: Vec<ShardHeaderCommitment>,
+}
+
+/// Domain tag mixed into the registry snapshot checksum.
+const REGISTRY_SNAPSHOT_TAG: &[u8] = b"STELLEREUM_XSHARD_HEADERS_V1";
+
 /// Process-local registry of finalized block headers, shared by every shard
 /// runtime in the process (C1 anchor). Maps (shard, source block hash) to the
 /// state root THIS process committed to — keyed by PAIR because different
@@ -347,25 +441,54 @@ pub struct CrossShardKey {
 /// no finalize event ever records). NEVER populated from gossip, RPC, or DHT
 /// blobs: only block-application paths write here, so an attacker cannot
 /// plant a root.
-#[derive(Clone, Debug, Default)]
+///
+/// DURABILITY: the registry is snapshotted to its own `xshard_headers` sled
+/// tree through an [`FinalizedHeaderSink`] (the same `AsyncPersistence` queue
+/// every other domain uses) after each mutation, and is hydrated again at
+/// startup. Without this, every anchor died with the process and a restart
+/// made all older cross-shard messages unverifiable. The blob carries only the
+/// latest heads plus the bounded anchor window above; restoring it can ADD
+/// anchors but never accepts a root from the network — the bytes come solely
+/// from this node's own disk, written by block-application paths.
+#[derive(Clone, Default)]
 pub struct FinalizedHeaderRegistry {
-    headers: std::collections::BTreeMap<(ShardId, [u8; 32]), crate::cell::CellHash>,
+    headers: BTreeMap<AnchorKey, AnchorEntry>,
     /// The latest finalized header of every shard this process finalized
     /// (TON `shard_hashes` model): what a masterchain block publishes.
     /// Written ONLY by the block-application paths (finalize / adopt), never
     /// from gossip, RPC or DHT blobs, so an attacker cannot plant a head.
-    latest: std::collections::BTreeMap<ShardId, ShardHeaderCommitment>,
+    latest: BTreeMap<ShardId, ShardHeaderCommitment>,
+    /// Durable sinks. Never serialized (a sink is runtime plumbing, not
+    /// registry state) and never populated from decoded bytes.
+    sinks: Vec<Arc<dyn FinalizedHeaderSink>>,
+}
+
+impl std::fmt::Debug for FinalizedHeaderRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalizedHeaderRegistry")
+            .field("anchors", &self.headers.len())
+            .field("latest", &self.latest)
+            .field("sinks", &self.sinks.len())
+            .finish()
+    }
 }
 
 impl FinalizedHeaderRegistry {
     /// Record a finalized block. Idempotent (same hash = same header).
+    ///
+    /// A caller that knows the block height (the finalize/adopt paths do)
+    /// should use [`Self::note_finalized_anchor_at`]; this height-less form
+    /// records the anchor as a genesis-height entry, which the window prune
+    /// always retains.
     pub fn note_finalized(
         &mut self,
         shard: ShardId,
         block_hash: [u8; 32],
         state_root: crate::cell::CellHash,
     ) {
-        self.headers.insert((shard, block_hash), state_root);
+        self.upsert_anchor((shard, block_hash), state_root, 0);
+        self.prune_anchors();
+        self.persist();
     }
 
     /// Record the ANCHOR root of a finalized block: the state root the shard
@@ -392,13 +515,45 @@ impl FinalizedHeaderRegistry {
         block_hash: [u8; 32],
         post_apply_root: crate::cell::CellHash,
     ) {
-        self.headers.insert((shard, block_hash), post_apply_root);
+        // No height available at this legacy entry point: record it as a
+        // genesis-height anchor, which is never evicted by the height window.
+        self.note_finalized_anchor_at(shard, 0, block_hash, post_apply_root);
+    }
+
+    /// [`Self::note_finalized_anchor`] WITH the block height, so the bounded
+    /// window can prune by height deterministically instead of by insertion
+    /// order (which differs between a live node and a syncing one).
+    pub fn note_finalized_anchor_at(
+        &mut self,
+        shard: ShardId,
+        height: u64,
+        block_hash: [u8; 32],
+        post_apply_root: crate::cell::CellHash,
+    ) {
+        self.upsert_anchor((shard, block_hash), post_apply_root, height);
+        self.prune_anchors();
+        self.persist();
+    }
+
+    /// Insert/update one anchor. The root follows the caller (the runtime
+    /// overwrites the declared root with the post-apply root), while the height
+    /// only ever moves FORWARD: a height-less legacy note must never downgrade
+    /// a real finalize height and thereby change which window is pruned.
+    fn upsert_anchor(&mut self, key: AnchorKey, root: crate::cell::CellHash, height: u64) {
+        let entry = self
+            .headers
+            .entry(key)
+            .or_insert(AnchorEntry { root, height });
+        entry.root = root;
+        if height > entry.height {
+            entry.height = height;
+        }
     }
 
     /// Look up a source block hash. Returns the state root this process
     /// committed to — `None` means "not finalized here (yet)".
     pub fn lookup(&self, shard: ShardId, block_hash: &[u8; 32]) -> Option<crate::cell::CellHash> {
-        self.headers.get(&(shard, *block_hash)).copied()
+        self.headers.get(&(shard, *block_hash)).map(|e| e.root)
     }
 
     /// Mirror of [`CrossShardMessage::verify_anchored`] for callers that only
@@ -424,9 +579,34 @@ impl FinalizedHeaderRegistry {
     /// The anchor map is updated exactly as [`Self::note_finalized`] does, so
     /// recording a full header is a strict superset of the anchor-only note.
     pub fn note_finalized_commitment(&mut self, commitment: ShardHeaderCommitment) {
-        self.headers.insert(
+        self.apply_commitment(commitment, commitment.state_root);
+        self.prune_anchors();
+        self.persist();
+    }
+
+    /// Record a finalized header AND its post-apply anchor root in ONE
+    /// mutation: the runtime's normal finalize/adopt path. Persists once
+    /// (instead of the two snapshots a separate commitment + anchor note would
+    /// enqueue), and leaves the map in the exact state a restart must see.
+    pub fn note_finalized_commitment_with_anchor(
+        &mut self,
+        commitment: ShardHeaderCommitment,
+        post_apply_root: crate::cell::CellHash,
+    ) {
+        self.apply_commitment(commitment, post_apply_root);
+        self.prune_anchors();
+        self.persist();
+    }
+
+    fn apply_commitment(
+        &mut self,
+        commitment: ShardHeaderCommitment,
+        anchor_root: crate::cell::CellHash,
+    ) {
+        self.upsert_anchor(
             (commitment.shard_id, commitment.block_hash),
-            commitment.state_root,
+            anchor_root,
+            commitment.height,
         );
         let replace = match self.latest.get(&commitment.shard_id) {
             Some(prev) => commitment.height >= prev.height,
@@ -455,6 +635,358 @@ impl FinalizedHeaderRegistry {
             .cloned()
             .collect()
     }
+
+    /// Number of retained `(shard, block_hash) -> root` anchors (bounded by
+    /// [`REGISTRY_ANCHOR_WINDOW`] + the latest-head anchor + the genesis cap,
+    /// per shard).
+    pub fn anchor_count(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// Drop every anchor and head, keeping the attached sinks. Used ONLY to
+    /// fail closed (a corrupt persisted blob must not leave a partially
+    /// hydrated registry that could accept a forged anchor).
+    pub fn clear_anchors(&mut self) {
+        self.headers.clear();
+        self.latest.clear();
+    }
+
+    /// Attach a durable sink and immediately persist the current snapshot.
+    ///
+    /// Called at startup, after the store is open and (on restart) after the
+    /// blob has been hydrated, so the first post-attach finalize extends the
+    /// restored state instead of overwriting it with an empty one.
+    pub fn attach_persistence(&mut self, sink: Arc<dyn FinalizedHeaderSink>) {
+        if !self.sinks.iter().any(|s| Arc::ptr_eq(s, &sink)) {
+            self.sinks.push(sink);
+        }
+        self.persist();
+    }
+
+    /// Deterministic anchor prune.
+    ///
+    /// Per shard, retain:
+    ///   * all `REGISTRY_GENESIS_ANCHORS_PER_SHARD` lowest-hash height-0
+    ///     anchors (plus the shard's latest head anchor even when it is
+    ///     height 0) — genesis anchors are referenced by the first messages and
+    ///     are never re-recorded;
+    ///   * the `REGISTRY_ANCHOR_WINDOW` highest `(height, block_hash)` anchors.
+    ///
+    /// The rule reads only heights and hashes, never insertion order, so two
+    /// nodes that finalized/adopted the same headers prune to byte-identical
+    /// state even if they saw the blocks in a different order.
+    pub fn prune_anchors(&mut self) {
+        if self.headers.is_empty() {
+            return;
+        }
+        let latest_hash: BTreeMap<ShardId, [u8; 32]> = self
+            .latest
+            .iter()
+            .map(|(shard, c)| (*shard, c.block_hash))
+            .collect();
+        let mut by_shard: BTreeMap<ShardId, Vec<(AnchorKey, u64)>> = BTreeMap::new();
+        for (key, entry) in &self.headers {
+            by_shard
+                .entry(key.0)
+                .or_default()
+                .push((*key, entry.height));
+        }
+        let mut keep: BTreeSet<AnchorKey> = BTreeSet::new();
+        for (shard, entries) in by_shard {
+            let mut genesis: Vec<(AnchorKey, u64)> = entries
+                .iter()
+                .filter(|(_, height)| *height == 0)
+                .cloned()
+                .collect();
+            genesis.sort_by(|a, b| a.0 .1.cmp(&b.0 .1));
+            let anchor_of_latest = latest_hash.get(&shard).copied();
+            for (idx, (key, _)) in genesis.iter().enumerate() {
+                if idx < REGISTRY_GENESIS_ANCHORS_PER_SHARD || anchor_of_latest == Some(key.1) {
+                    keep.insert(*key);
+                }
+            }
+            let mut live: Vec<(AnchorKey, u64)> = entries
+                .into_iter()
+                .filter(|(_, height)| *height > 0)
+                .collect();
+            live.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0 .1.cmp(&a.0 .1)));
+            for (key, _) in live.into_iter().take(REGISTRY_ANCHOR_WINDOW) {
+                keep.insert(key);
+            }
+            if let Some(hash) = anchor_of_latest {
+                keep.insert((shard, hash));
+            }
+        }
+        self.headers.retain(|key, _| keep.contains(key));
+    }
+
+    /// This registry's complete retained state as a delta (sorted, so the
+    /// bytes and any later merge are deterministic).
+    pub fn to_delta(&self) -> FinalizedHeaderDelta {
+        FinalizedHeaderDelta {
+            anchors: self
+                .headers
+                .iter()
+                .map(|((shard, hash), entry)| (*shard, *hash, entry.height, entry.root))
+                .collect(),
+            latest: self.latest.values().copied().collect(),
+        }
+    }
+
+    /// Apply a delta. Explicit conflict semantics (fail closed, no partial
+    /// mutation):
+    ///   * same `(shard, block_hash)` with a DIFFERENT root is an error — two
+    ///     roots for one finalized block is exactly the forgery this registry
+    ///     exists to refuse;
+    ///   * same key with the same root keeps the greater height (a height-less
+    ///     legacy note never erases the height a real finalize recorded);
+    ///   * a head at a greater height replaces the older one, an older head
+    ///     never rolls the head back, and a head at the SAME height with
+    ///     different bytes is an error (two different heads for one height).
+    pub fn apply_delta(&mut self, delta: FinalizedHeaderDelta) -> Result<(), String> {
+        self.apply_delta_inner(delta, true)
+    }
+
+    fn apply_delta_inner(
+        &mut self,
+        delta: FinalizedHeaderDelta,
+        persist: bool,
+    ) -> Result<(), String> {
+        // Validate BEFORE mutating: a conflict must leave the registry as it
+        // was (fail closed), never half-merged.
+        for (shard, hash, _, root) in &delta.anchors {
+            if let Some(prev) = self.headers.get(&(*shard, *hash)) {
+                if &prev.root != root {
+                    return Err(format!(
+                        "conflicting anchor for shard {shard} block {}: stored root differs from the applied one",
+                        hex32(hash)
+                    ));
+                }
+            }
+        }
+        for c in &delta.latest {
+            if let Some(prev) = self.latest.get(&c.shard_id) {
+                if prev.height == c.height && prev != c {
+                    return Err(format!(
+                        "conflicting finalized head for shard {} at height {}: two different headers",
+                        c.shard_id, c.height
+                    ));
+                }
+            }
+        }
+        for (shard, hash, height, root) in delta.anchors {
+            match self.headers.get_mut(&(shard, hash)) {
+                Some(entry) => {
+                    entry.root = root;
+                    if height > entry.height {
+                        entry.height = height;
+                    }
+                }
+                None => {
+                    self.headers
+                        .insert((shard, hash), AnchorEntry { root, height });
+                }
+            }
+        }
+        for c in delta.latest {
+            let replace = match self.latest.get(&c.shard_id) {
+                Some(prev) => c.height > prev.height,
+                None => true,
+            };
+            if replace {
+                self.latest.insert(c.shard_id, c);
+            }
+        }
+        self.prune_anchors();
+        if persist {
+            self.persist();
+        }
+        Ok(())
+    }
+
+    /// Merge another registry's retained state. Same semantics as
+    /// [`Self::apply_delta`].
+    pub fn merge(&mut self, other: &FinalizedHeaderRegistry) -> Result<(), String> {
+        self.apply_delta(other.to_delta())
+    }
+
+    /// Encode the registry as deterministic bincode bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        let payload = RegistryPayloadV1 {
+            anchors: self.to_delta().anchors,
+            latest: self.latest.values().copied().collect(),
+        };
+        let payload_bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(REGISTRY_BLOB_LIMIT)
+            .serialize(&payload)
+            .map_err(|e| format!("encode finalized-header registry payload: {e}"))?;
+        let checksum = registry_checksum(REGISTRY_SNAPSHOT_VERSION, &payload_bytes);
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(REGISTRY_BLOB_LIMIT)
+            .serialize(&RegistrySnapshotV1 {
+                version: REGISTRY_SNAPSHOT_VERSION,
+                checksum,
+                payload: payload_bytes,
+            })
+            .map_err(|e| format!("encode finalized-header registry: {e}"))
+    }
+
+    /// Decode a registry snapshot written by [`Self::to_bytes`].
+    ///
+    /// Any structural violation (unknown version, checksum mismatch, duplicate
+    /// key/head, out-of-bound count, truncated/garbage bytes) is an error. The
+    /// caller must treat the error as FAIL CLOSED:
+    /// [`Self::restore_from_bytes`] does so by clearing the registry.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() {
+            return Err("empty finalized-header registry blob".to_string());
+        }
+        if bytes.len() as u64 > REGISTRY_BLOB_LIMIT {
+            return Err(format!(
+                "finalized-header registry blob of {} bytes exceeds the {} byte limit",
+                bytes.len(),
+                REGISTRY_BLOB_LIMIT
+            ));
+        }
+        let snapshot: RegistrySnapshotV1 = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(REGISTRY_BLOB_LIMIT)
+            .deserialize(bytes)
+            .map_err(|e| format!("decode finalized-header registry: {e}"))?;
+        if snapshot.version != REGISTRY_SNAPSHOT_VERSION {
+            return Err(format!(
+                "unsupported finalized-header registry version {} (this node speaks {})",
+                snapshot.version, REGISTRY_SNAPSHOT_VERSION
+            ));
+        }
+        let expected = registry_checksum(snapshot.version, &snapshot.payload);
+        if expected != snapshot.checksum {
+            return Err(
+                "finalized-header registry checksum mismatch (corrupt or forged blob)".to_string(),
+            );
+        }
+        let payload: RegistryPayloadV1 = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(REGISTRY_BLOB_LIMIT)
+            .deserialize(&snapshot.payload)
+            .map_err(|e| format!("decode finalized-header registry payload: {e}"))?;
+        if payload.anchors.len() > REGISTRY_MAX_ANCHORS {
+            return Err(format!(
+                "finalized-header registry carries {} anchors (limit {})",
+                payload.anchors.len(),
+                REGISTRY_MAX_ANCHORS
+            ));
+        }
+        if payload.latest.len() > REGISTRY_MAX_SHARDS {
+            return Err(format!(
+                "finalized-header registry carries {} shard heads (limit {})",
+                payload.latest.len(),
+                REGISTRY_MAX_SHARDS
+            ));
+        }
+        let mut headers: BTreeMap<AnchorKey, AnchorEntry> = BTreeMap::new();
+        for (shard, hash, height, root) in payload.anchors {
+            if headers
+                .insert((shard, hash), AnchorEntry { root, height })
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate finalized-header anchor for shard {shard} block {}",
+                    hex32(&hash)
+                ));
+            }
+        }
+        let mut latest: BTreeMap<ShardId, ShardHeaderCommitment> = BTreeMap::new();
+        for commitment in payload.latest {
+            if latest.insert(commitment.shard_id, commitment).is_some() {
+                return Err(format!(
+                    "duplicate finalized head for shard {}",
+                    commitment.shard_id
+                ));
+            }
+        }
+        let mut registry = Self {
+            headers,
+            latest,
+            sinks: Vec::new(),
+        };
+        // A blob written by a future/other build may exceed this node's bound;
+        // re-pruning keeps memory and every later snapshot inside it.
+        registry.prune_anchors();
+        Ok(registry)
+    }
+
+    /// Hydrate from persisted bytes, FAIL CLOSED: on any decode/merge error the
+    /// registry is left EMPTY (loudly, by the caller) rather than keeping a
+    /// partial state that could accept a forged anchor.
+    pub fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match Self::from_bytes(bytes) {
+            Ok(snapshot) => {
+                // Merge into a sink-less copy so a rejected merge cannot have
+                // already enqueued a snapshot of the half-merged state.
+                let mut merged = Self {
+                    headers: self.headers.clone(),
+                    latest: self.latest.clone(),
+                    sinks: Vec::new(),
+                };
+                match merged.apply_delta_inner(snapshot.to_delta(), false) {
+                    Ok(()) => {
+                        self.headers = merged.headers;
+                        self.latest = merged.latest;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.clear_anchors();
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                self.clear_anchors();
+                Err(e)
+            }
+        }
+    }
+
+    fn persist(&self) {
+        if self.sinks.is_empty() {
+            return;
+        }
+        match self.to_bytes() {
+            Ok(bytes) => {
+                for sink in &self.sinks {
+                    sink.persist_finalized_headers(bytes.clone());
+                }
+            }
+            // Never write an empty/replacement blob on an encode failure: the
+            // previous (good) snapshot stays valid and the next finalize
+            // retries.
+            Err(e) => eprintln!("[xshard] refusing to persist finalized-header registry: {e}"),
+        }
+    }
+}
+
+/// SHA-256 checksum binding the schema version to one encoded payload.
+fn registry_checksum(version: u32, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REGISTRY_SNAPSHOT_TAG);
+    hasher.update(version.to_be_bytes());
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+/// Short hex rendering for conflict diagnostics (no logging crate dependency
+/// in the sharding layer).
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Process-shared finalized-header registry (C1 anchor plumbing). Every

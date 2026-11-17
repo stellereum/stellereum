@@ -53,7 +53,9 @@ pub async fn fund_genesis(engine: &InMemoryStateEngine, validators: &ValidatorSe
             // path unconditionally.
             let _ = engine.debit_native(v, bond).await;
             let _ = engine
-                .credit_native(&crate::staking::STAKING_POOL, bond)
+                // GENESIS ALLOCATION (pre-mined): the staking pool is funded
+                // from the fixed allocation, not from emission headroom.
+                .credit_native_transfer(&crate::staking::STAKING_POOL, bond)
                 .await;
         }
     }

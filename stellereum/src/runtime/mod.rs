@@ -12,8 +12,176 @@ use crate::sharding::{
 };
 use crate::state_engine::InMemoryStateEngine;
 use ed25519_dalek::SigningKey;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+// =============================================================================
+// Masterchain validator-set activation stamps
+// =============================================================================
+//
+// A workchain has no staking registry of its own (its ledger is empty by
+// design), so it derives its consensus set from the MASTERCHAIN's registry,
+// shared process-wide through [`ValidatorRuntime::master_staking`]. The set
+// alone is not enough: the workchain must also know AT WHICH HEIGHT that set
+// becomes in force, and its own height is the wrong answer — the masterchain
+// height at which the rotation was adopted is unrelated to the workchain's tip,
+// so two shards that observed the same rotation at different local heights
+// staged it at different boundaries and then disagreed about the proposer
+// ("wrong proposer" on every round, no height ever advanced to heal it).
+//
+// The stamp below is the deterministic datum: the MASTERCHAIN publishes
+// `(fingerprint of the set it derived, its own W10.5 activation height for that
+// set)` on its own set-install path (which runs on apply, adopt, walk, restore
+// and repair). The activation height is the height the masterchain block that
+// adopted the rotation was finalized at, plus one — a pure function of the
+// masterchain chain, identical on every node that applied it. A workchain binds
+// the set it derived to the stamp with the matching fingerprint and uses the
+// stamped boundary verbatim (see [`workchain_set_activation_height`]).
+
+/// Where the MASTERCHAIN's consensus set became in force — the deterministic
+/// datum a workchain binds a rotation to.
+///
+/// * [`set_fingerprint`] identifies the elected set (validator -> power).
+/// * `activation_height` is the masterchain's own W10.5 activation height for
+///   that set (`master ledger height + 1`): the masterchain block that adopted
+///   the rotation, plus one.
+///
+/// Every node derives the same `(fingerprint, activation)` from the same
+/// masterchain block, so every workchain stages and installs the rotation at
+/// the same boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MasterSetStamp {
+    /// [`set_fingerprint`] of the set this stamp describes.
+    pub(crate) set_fingerprint: [u8; 32],
+    /// Masterchain height at/after which that set is in force, expressed as the
+    /// W10.5 activation boundary (`master ledger height + 1`).
+    pub(crate) activation_height: u64,
+}
+
+/// Deterministic fingerprint of a consensus validator set.
+///
+/// Domain-separated SHA-256 over the canonical `(validator id, voting power)`
+/// pairs. `ValidatorSet::validators` is a `BTreeMap`, so the iteration order is
+/// identical on every node: two nodes that derived the same set from the same
+/// master ledger compute the same 32 bytes. Binding on CONTENT (not on a read
+/// timestamp) is what lets a workchain prove WHICH master state defined its set:
+/// a shared ledger that moved past the masterchain's last derivation produces a
+/// different fingerprint, so the older stamp cannot be paired with it.
+pub(crate) fn set_fingerprint(set: &ValidatorSet) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"STELL-MASTER-SET-STAMP-V1");
+    h.update((set.validators.len() as u32).to_be_bytes());
+    for (id, power) in &set.validators {
+        h.update(id);
+        h.update(power.to_be_bytes());
+    }
+    h.finalize().into()
+}
+
+/// The boundary a workchain uses for a set the masterchain derived at
+/// `master_ledger_height`.
+///
+/// DETERMINISTIC RULE (the workchain half of W10.5): `activation = master
+/// ledger height + 1` — the masterchain's own activation boundary, published in
+/// [`MasterSetStamp`] and used VERBATIM in the workchain's height space. It is
+/// a pure function of the masterchain block that adopted the rotation, so two
+/// workchain nodes at different local heights stage the same rotation at the
+/// same activation height. A workchain below that boundary keeps its previous
+/// set until it reaches it (it never runs ahead of the master's set); one
+/// already past it installs immediately (the set is already in force on the
+/// masterchain, so waiting would be a needless fork) — the recorded activation
+/// is identical either way.
+///
+/// Re-basing the boundary per node (for example by adding the local
+/// `workchain_tip - master_tip` offset) would reintroduce exactly the
+/// per-observer divergence this rule removes.
+///
+/// The shard-head commitment path carries workchain heads MASTERCHAIN ->
+/// workchain; the reverse datum (the masterchain height a workchain block was
+/// built against) is not in the block commitment, and adding it is a wire-format
+/// change (frozen). Until that path exists, the masterchain's own activation
+/// boundary is the deterministic datum, and a workchain that cannot obtain it
+/// fail-closes to observer instead of guessing.
+pub fn workchain_set_activation_height(master_ledger_height: u64) -> u64 {
+    master_ledger_height.saturating_add(1)
+}
+
+/// Bound on the per-process stamp table. One entry per live master ledger
+/// handle (a process runs one masterchain, plus one independent cluster per
+/// test), so this is generous; the bound only keeps a long test run from
+/// growing it without limit.
+const MASTER_SET_STAMP_CAP: usize = 64;
+
+fn master_set_stamps() -> &'static std::sync::Mutex<BTreeMap<usize, MasterSetStamp>> {
+    static STAMPS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<usize, MasterSetStamp>>> =
+        std::sync::OnceLock::new();
+    STAMPS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Identity of a shared master ledger handle. `Arc::as_ptr` is stable for the
+/// lifetime of the handle, and every shard runtime of a process receives the
+/// SAME `Arc` clone, so the masterchain and its workchains agree on the key
+/// without extra plumbing.
+fn master_handle_key(handle: &MasterStakingLedger) -> usize {
+    Arc::as_ptr(handle) as *const () as usize
+}
+
+/// Publish the stamp of the set the MASTERCHAIN derived from this ledger.
+///
+/// Called from the masterchain's own set-install path with the set it derived
+/// and that set's W10.5 activation height. The update is IDEMPOTENT PER SET:
+/// publishing the SAME fingerprint again keeps the originally published
+/// activation, so a long-lived unchanged set is never re-dated to a later
+/// master height (that would make the workchain's boundary depend on when the
+/// master happened to refresh). A DIFFERENT fingerprint always overwrites,
+/// because that is a real rotation (or a rotation back) with a new boundary.
+///
+/// Returns the stamp now in force for `handle`.
+pub(crate) fn publish_master_set_stamp(
+    handle: &MasterStakingLedger,
+    fingerprint: [u8; 32],
+    activation_height: u64,
+) -> MasterSetStamp {
+    let key = master_handle_key(handle);
+    let mut table = match master_set_stamps().lock() {
+        Ok(t) => t,
+        // A poisoned lock means another thread panicked while publishing.
+        // Recover the data (stamps are `Copy` and never partially applied);
+        // the reader only ever trusts a full fingerprint match.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = table.get(&key) {
+        if existing.set_fingerprint == fingerprint {
+            return *existing;
+        }
+    }
+    while table.len() >= MASTER_SET_STAMP_CAP && !table.contains_key(&key) {
+        let Some(oldest) = table.keys().next().copied() else {
+            break;
+        };
+        table.remove(&oldest);
+    }
+    let stamp = MasterSetStamp {
+        set_fingerprint: fingerprint,
+        activation_height,
+    };
+    table.insert(key, stamp);
+    stamp
+}
+
+/// The stamp the masterchain published for `handle`, if any.
+///
+/// `None` means "this process never saw the masterchain derive a set from this
+/// ledger" — a workchain that would have to adopt a DIFFERENT set must then
+/// fail closed (observer, no votes) rather than invent a boundary.
+pub(crate) fn master_set_stamp(handle: &MasterStakingLedger) -> Option<MasterSetStamp> {
+    let table = match master_set_stamps().lock() {
+        Ok(t) => t,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    table.get(&master_handle_key(handle)).copied()
+}
 
 mod anchors;
 mod apply;
@@ -362,6 +530,12 @@ pub struct ValidatorRuntime {
     /// and after every refresh). The quorum threshold for a height in
     /// progress therefore never jumps under a running round, and every node
     /// that applied the same prefix switches at the same agreed height.
+    ///
+    /// A WORKCHAIN's activation is NOT its own `height + 1`: it is the
+    /// MASTERCHAIN's activation boundary for the same rotation, carried by
+    /// [`MasterSetStamp`] (see [`workchain_set_activation_height`]), so two
+    /// shards that observed the rotation at different local tips stage it for
+    /// the SAME height instead of diverging on the proposer schedule.
     pub pending_validators: Option<(u64, ValidatorSet)>,
     /// Activation history of the in-force consensus set, oldest first:
     /// `(activation_height, set)` — the set took effect when the node

@@ -3,12 +3,16 @@
   (import "host" "sload" (func $sload (param i64) (result i64)))
   (import "host" "sstore" (func $sstore (param i64 i64)))
   (import "host" "emit" (func $emit (param i64 i64)))
+  ;; CT-P0 (audit KI-38): authenticated transaction sender.
+  (import "host" "caller" (func $caller (param i32)))
+  (memory (export "memory") 1)
 
   ;; Storage Layout:
   ;; Slot 0: Total LP Shares
   ;; Slot 1: Reserve Token A (e.g. STELL nano)
   ;; Slot 2: Reserve Token B (e.g. USDT micro)
   ;; Slot 3: Swap Fee BPS (e.g. 30 = 0.3%)
+  ;; Slots 4..8: AUTHENTICATED pool owner address (32 bytes, four i64 words)
   ;; Slot 1000 + user_id: User LP Shares Balance
 
   ;; Event topics:
@@ -16,12 +20,48 @@
   ;; Topic 11: Withdraw (shares burned)
   ;; Topic 12: Swap (amount out)
 
+  ;; CT-P0: bind the authenticated host.caller into four consecutive slots.
+  (func $bind_caller (param $base i64)
+    (call $caller (i32.const 0))
+    (call $sstore (local.get $base) (i64.load (i32.const 0)))
+    (call $sstore (i64.add (local.get $base) (i64.const 1)) (i64.load (i32.const 8)))
+    (call $sstore (i64.add (local.get $base) (i64.const 2)) (i64.load (i32.const 16)))
+    (call $sstore (i64.add (local.get $base) (i64.const 3)) (i64.load (i32.const 24)))
+  )
+
+  ;; CT-P0: 1 iff the authenticated caller is the address bound at `$base`.
+  (func $caller_is_owner (param $base i64) (result i32)
+    (call $caller (i32.const 0))
+    (if (i64.ne (i64.load (i32.const 0)) (call $sload (local.get $base)))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 8)) (call $sload (i64.add (local.get $base) (i64.const 1))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 16)) (call $sload (i64.add (local.get $base) (i64.const 2))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 24)) (call $sload (i64.add (local.get $base) (i64.const 3))))
+      (then (return (i32.const 0))))
+    (i32.const 1)
+  )
+
+  (func $require_owner
+    (if (i32.eqz (call $caller_is_owner (i64.const 4)))
+      (then (unreachable)) ;; fail closed: the tx is reverted
+    )
+  )
+
   ;; 1. Initialize Pool: init(fee_bps) -> returns fee_bps
+  ;; CT-P0: binds the initializer address as the authenticated owner.
   (func (export "init") (param $fee_bps i64) (result i64)
+    ;; CT-P0: never rebind the authenticated owner after initialization.
+    (if (i64.ne (call $sload (i64.const 8)) (i64.const 0))
+      (then (unreachable))
+    )
     (call $sstore (i64.const 0) (i64.const 0))  ;; Total shares = 0
     (call $sstore (i64.const 1) (i64.const 0))  ;; Reserve A = 0
     (call $sstore (i64.const 2) (i64.const 0))  ;; Reserve B = 0
     (call $sstore (i64.const 3) (local.get $fee_bps)) ;; Fee BPS
+    (call $bind_caller (i64.const 4))
+    (call $sstore (i64.const 8) (i64.const 1)) ;; initialized
     (local.get $fee_bps)
   )
 
@@ -59,6 +99,9 @@
     (local $user_shares i64)
     (local $share_a i64)
     (local $share_b i64)
+
+    ;; CT-P0: only the authenticated owner may move pool value.
+    (call $require_owner)
 
     ;; Decode packed argument
     (local.set $user_id (i64.div_u (local.get $packed) (i64.const 10000000000)))
@@ -120,6 +163,9 @@
     (local $user_slot i64)
     (local $user_shares i64)
 
+    ;; CT-P0: only the authenticated owner may burn pool shares.
+    (call $require_owner)
+
     (local.set $user_id (i64.div_u (local.get $packed) (i64.const 1000000)))
     (local.set $shares (i64.rem_u (local.get $packed) (i64.const 1000000)))
 
@@ -177,6 +223,9 @@
     (local $dy i64)
     (local $x i64)
     (local $y i64)
+
+    ;; CT-P0: only the authenticated owner may move the reserves.
+    (call $require_owner)
 
     (local.set $dy (call $swap_quote (local.get $dx)))
     (if (i64.eqz (local.get $dy))

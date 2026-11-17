@@ -273,6 +273,17 @@ async fn shard2_soak_rotation_propagates_to_workchain() {
         .bond(validator_addr, floor, 0)
         .expect("masterchain bond must be accepted");
 
+    // The MASTERCHAIN derives the post-rotation set at its own height and
+    // publishes the activation stamp. A workchain binds the rotation to that
+    // datum (masterchain boundary), never to its own tip — otherwise the same
+    // rotation stages at different heights on differently-lagging shards.
+    assert!(
+        sc.shard_mut(SHARD0).nodes[0]
+            .refresh_validator_set_from_staking()
+            .await,
+        "the masterchain must derive and publish the rotated set"
+    );
+
     // The masterchain itself is a silent no-op for the workchain repair.
     assert!(
         !sc.shard_mut(SHARD0).nodes[0]

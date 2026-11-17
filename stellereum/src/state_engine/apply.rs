@@ -2508,9 +2508,12 @@ impl InMemoryStateEngine {
         let _actor_delivered = self.apply_actor_messages_at(block).await;
 
         // 2. Pay the collected fees to the proposer. The fees were already
-        //    debited from senders in step 1, so this is a transfer, not a mint.
+        //    debited from senders in step 1, so this is a transfer, not a mint
+        //    — and it deliberately uses the UNCAPPED credit: a block whose
+        //    rewards filled the global supply cap must still be able to pay
+        //    its proposer fees collected from existing balances.
         if fees > 0 {
-            let _ = self.credit_native(&block.proposer, fees).await;
+            let _ = self.credit_native_transfer(&block.proposer, fees).await;
         }
 
         // 3. Block reward to the proposer out of the staking emission (paid as
@@ -2520,28 +2523,38 @@ impl InMemoryStateEngine {
         //    ledger's rewards pool (fail-closed over REWARDS_EMISSION_CAP);
         //    the native leg mints the SAME amount into REWARDS_POOL, so every
         //    later claim is backed 1:1 and bonded principal in STAKING_POOL is
-        //    never touched. Mint native ONLY on Ok: a refused distribution
-        //    (cap reached, unknown proposer) must not create coins.
-        if block_reward > 0 {
+        //    never touched.
+        //
+        //    GLOBAL CAP FIRST (order is load-bearing): the engine reserves the
+        //    mint headroom BEFORE the ledger leg. When the 1B supply cap is
+        //    reached the block pays NO reward and the staking ledger is left
+        //    byte-identical — critically, no `pending_rewards` was split, so
+        //    there is nothing to unwind. Reversed (distribute-then-mint), a
+        //    cap refusal would leave the validator's pending counter credited
+        //    against a pool that holds no coins.
+        if block_reward > 0 && self.reserve_mint_nano(block_reward).is_ok() {
             let distributed = self
                 .staking_write()
                 .await
                 .distribute_reward(block.proposer, block_reward)
                 .is_ok();
-            if distributed {
-                // Practically infallible (pool + reward < 2^64 by the cap),
-                // but the two legs must stay 1:1: if the native mint ever
-                // failed, the ledger mint is rolled back so a later claim
-                // can never observe backing that has no coins.
-                if self
-                    .credit_native(&crate::staking::REWARDS_POOL, block_reward)
-                    .await
-                    .is_err()
-                {
-                    let mut l = self.staking_write().await;
-                    l.rewards_pool = l.rewards_pool.saturating_sub(block_reward);
-                    l.rewards_minted = l.rewards_minted.saturating_sub(block_reward);
-                }
+            if !distributed {
+                // Ledger refused (its own 350M cap, jailed or unknown
+                // proposer): the coin was never created, give the global
+                // headroom back.
+                self.release_mint_nano(block_reward);
+            } else if self
+                .credit_reserved_native(&crate::staking::REWARDS_POOL, block_reward)
+                .await
+                .is_err()
+            {
+                // Defensive only: while the reservation above holds and the
+                // REWARDS_POOL balance is supply-bounded (it is credited 1:1
+                // by this same leg), the pool credit cannot overflow. Keep
+                // the two legs 1:1 if it ever does.
+                let mut l = self.staking_write().await;
+                l.rewards_pool = l.rewards_pool.saturating_sub(block_reward);
+                l.rewards_minted = l.rewards_minted.saturating_sub(block_reward);
             }
         }
 

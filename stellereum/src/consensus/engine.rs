@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::qc_split::produce_decision_certificate;
 use super::rotation::pq_key_at_height;
 use super::sortition::{derive_sortition_committee, micro_committee_size, pq_micro_required_power};
 use super::types::{
@@ -711,6 +712,40 @@ impl VoteSet {
             .filter(|v| v.block_hash == target)
             .filter_map(|v| v.falcon_signature().map(|sig| (v.voter, sig.to_vec())))
             .collect()
+    }
+
+    /// The `(height, round, kind)` scope shared by every admitted vote.
+    ///
+    /// Admission (`add` / `add_verified`) refuses out-of-scope votes, so the
+    /// whole set has exactly one scope; `None` only for an empty set. The
+    /// field values are identical across votes, so picking any entry is
+    /// deterministic even though the backing map's iteration order is not.
+    pub fn scope(&self) -> Option<(Height, Round, VoteKind)> {
+        self.votes
+            .values()
+            .next()
+            .map(|v| (v.height, v.round, v.kind))
+    }
+
+    /// Falcon-512 signatures of the votes for `target`, in CANONICAL order.
+    ///
+    /// Sorted by voter id (the same order the epoch/CEC certificate
+    /// canonicalizes its full-set bitmask in), so building a certificate from
+    /// this list is byte-identical across nodes regardless of the order votes
+    /// arrived in. The unsorted [`Self::collect_falcon_signatures`] is kept
+    /// for callers that only inspect the set.
+    pub fn falcon_signatures_for_target(
+        &self,
+        target: Option<BlockHash>,
+    ) -> Vec<(ValidatorId, Vec<u8>)> {
+        let mut out: Vec<(ValidatorId, Vec<u8>)> = self
+            .votes
+            .values()
+            .filter(|v| v.block_hash == target)
+            .filter_map(|v| v.falcon_signature().map(|sig| (v.voter, sig.to_vec())))
+            .collect();
+        out.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        out
     }
 
     /// Build a quorum certificate for `target` from the collected votes.
@@ -1547,9 +1582,12 @@ impl HeightConsensus {
                 continue;
             };
             if found.is_none() {
-                if let Some(qc) =
-                    set.certificate_with_parent(target, &self.validators, self.sortition_parent())
-                {
+                if let Some(qc) = produce_decision_certificate(
+                    set,
+                    target,
+                    &self.validators,
+                    self.sortition_parent(),
+                ) {
                     self.prevote_qc.insert(round, qc);
                 }
                 found = Some((round, target));
@@ -1630,9 +1668,12 @@ impl HeightConsensus {
             let Some(Some(target)) = set.quorum_target(&self.validators) else {
                 continue;
             };
-            if let Some(qc) =
-                set.certificate_with_parent(Some(target), &self.validators, self.sortition_parent())
-            {
+            if let Some(qc) = produce_decision_certificate(
+                set,
+                Some(target),
+                &self.validators,
+                self.sortition_parent(),
+            ) {
                 self.prevote_qc.insert(round, qc);
             }
             return Some((round, target));
@@ -1667,8 +1708,12 @@ impl HeightConsensus {
         if self.observed_polka.map(|(r, _)| r > round).unwrap_or(false) {
             return; // an older polka never supersedes a newer one
         }
-        let qc =
-            set.certificate_with_parent(Some(target), &self.validators, self.sortition_parent());
+        let qc = produce_decision_certificate(
+            set,
+            Some(target),
+            &self.validators,
+            self.sortition_parent(),
+        );
         if let Some(qc) = qc {
             self.prevote_qc.insert(round, qc);
         }
@@ -1755,7 +1800,7 @@ impl HeightConsensus {
         }
 
         if let Some(qc) =
-            set.certificate_with_parent(target, &self.validators, self.sortition_parent())
+            produce_decision_certificate(set, target, &self.validators, self.sortition_parent())
         {
             self.precommit_qc = Some(qc);
         }

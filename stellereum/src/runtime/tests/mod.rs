@@ -2286,6 +2286,13 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
         .bond(me, bond, 0)
         .expect("the masterchain bond must be accepted");
 
+    // The MASTERCHAIN derives the bonded set at its own height and publishes
+    // the activation stamp the workchain binds to: the rotation's boundary is
+    // a masterchain datum, never the workchain tip.
+    assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the bond rotation"
+    );
     // 1. The workchain STAGES the masterchain's set (its config-defined
     //    set stays in force for the height in progress).
     let h = workchain.hc.height;
@@ -2321,8 +2328,9 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
     advance_test_height(&mut workchain);
     assert_eq!(workchain.validators.validators.get(&me), Some(&bond));
     assert_eq!(workchain.hc.validators.validators.get(&me), Some(&bond));
-    // The masterchain itself derives exactly the same set.
-    assert!(master.refresh_validator_set_from_staking().await);
+    // The masterchain itself derives exactly the same set (already staged
+    // above: a second refresh is an idempotent no-op).
+    assert!(!master.refresh_validator_set_from_staking().await);
     advance_test_height(&mut master);
     assert_eq!(
         master.validators.validators,
@@ -2336,6 +2344,10 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
         .await
         .bond(newcomer, bond, 0)
         .expect("the newcomer bond must be accepted");
+    assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the newcomer bond"
+    );
     let h = workchain.hc.height;
     assert!(
         workchain.refresh_validator_set_from_staking().await,
@@ -2359,7 +2371,7 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
         Some(&bond)
     );
     assert_eq!(workchain.validators.total_power(), 2 * bond);
-    assert!(master.refresh_validator_set_from_staking().await);
+    assert!(!master.refresh_validator_set_from_staking().await);
     advance_test_height(&mut master);
     assert_eq!(
         master.validators.validators,
@@ -2374,6 +2386,10 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
         .unbond(newcomer, bond, 0)
         .expect("the unbond must be accepted");
     assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the unbond"
+    );
+    assert!(
         workchain.refresh_validator_set_from_staking().await,
         "a masterchain unbond must rotate the workchain's set"
     );
@@ -2382,6 +2398,8 @@ async fn workchain_adopts_the_masterchain_bond_and_unbond_rotation() {
         "the unbonded validator stays in force until the boundary"
     );
     advance_test_height(&mut workchain);
+    // Keep the masterchain in lockstep: both shards advance at boundaries.
+    advance_test_height(&mut master);
     assert!(
         !workchain.validators.validators.contains_key(&newcomer),
         "the unbonded validator must leave the workchain's set"
@@ -2409,7 +2427,7 @@ async fn workchain_adopts_the_masterchain_slash_rotation() {
     let me = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
     let newcomer = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
     let bond = crate::staking::required_bond_floor_nano();
-    let (master_engine, _handle, _master, mut workchain) =
+    let (master_engine, _handle, mut master, mut workchain) =
         masterchain_and_workchain(me, newcomer).await;
 
     master_engine
@@ -2422,6 +2440,11 @@ async fn workchain_adopts_the_masterchain_slash_rotation() {
         .await
         .bond(newcomer, bond, 0)
         .expect("the newcomer bond must be accepted");
+    assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the bonded set before the workchain adopts it"
+    );
+    advance_test_height(&mut master);
     assert!(workchain.refresh_validator_set_from_staking().await);
     advance_test_height(&mut workchain);
     assert_eq!(workchain.validators.total_power(), 2 * bond);
@@ -2435,6 +2458,11 @@ async fn workchain_adopts_the_masterchain_slash_rotation() {
         .slash(newcomer, 1_000)
         .expect("the slash must be accepted");
     assert!(burned > 0, "the slash must burn stake");
+    assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the post-slash set"
+    );
+    advance_test_height(&mut master);
     assert!(
         workchain.refresh_validator_set_from_staking().await,
         "a masterchain slash must rotate the workchain's set"
@@ -2478,6 +2506,12 @@ async fn workchain_periodic_master_reread_converges_without_any_finalize() {
         .await
         .bond(me, bond, 0)
         .expect("the masterchain bond must be accepted");
+    // The masterchain derives the rotation at its own height and publishes the
+    // activation stamp the wedged workchain binds to.
+    assert!(
+        master.refresh_validator_set_from_staking().await,
+        "the masterchain must derive the bond rotation"
+    );
     let wedged_height = workchain.hc.height;
 
     // The periodic repair — no height-advance path involved — stages the

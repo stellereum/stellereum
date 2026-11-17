@@ -3,12 +3,18 @@
   (import "host" "sload" (func $sload (param i64) (result i64)))
   (import "host" "sstore" (func $sstore (param i64 i64)))
   (import "host" "emit" (func $emit (param i64 i64)))
+  ;; CT-P0 (audit KI-38): the authenticated transaction sender. This is the
+  ;; ONLY identity that may authorize a value-moving action; the integer
+  ;; `from`/`admin` fields below are public routing keys, never credentials.
+  (import "host" "caller" (func $caller (param i32)))
+  (memory (export "memory") 1)
 
   ;; Storage slots layout:
   ;; Slot 0: Total Supply
   ;; Slot 1: Tax BPS (e.g. 50 = 0.5%)
   ;; Slot 2: Treasury Account (e.g. 99)
   ;; Slot 3: Admin Account (e.g. 1)
+  ;; Slots 4..8: Admin/owner AUTHENTICATED address (32 bytes, four i64 words)
   ;; Slot 1000 + account_id: Account Balance
 
   ;; Event topics:
@@ -16,9 +22,46 @@
   ;; Topic 2: Mint (amount)
   ;; Topic 3: Burn (amount)
 
+  ;; CT-P0: bind the authenticated host.caller (32 bytes written to memory 0)
+  ;; into four consecutive i64 slots starting at `$base`.
+  (func $bind_caller (param $base i64)
+    (call $caller (i32.const 0))
+    (call $sstore (local.get $base) (i64.load (i32.const 0)))
+    (call $sstore (i64.add (local.get $base) (i64.const 1)) (i64.load (i32.const 8)))
+    (call $sstore (i64.add (local.get $base) (i64.const 2)) (i64.load (i32.const 16)))
+    (call $sstore (i64.add (local.get $base) (i64.const 3)) (i64.load (i32.const 24)))
+  )
+
+  ;; CT-P0: 1 iff the authenticated caller is the address bound at `$base`.
+  ;; A forged integer id can never satisfy this: the id is not the caller.
+  (func $caller_is_owner (param $base i64) (result i32)
+    (call $caller (i32.const 0))
+    (if (i64.ne (i64.load (i32.const 0)) (call $sload (local.get $base)))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 8)) (call $sload (i64.add (local.get $base) (i64.const 1))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 16)) (call $sload (i64.add (local.get $base) (i64.const 2))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 24)) (call $sload (i64.add (local.get $base) (i64.const 3))))
+      (then (return (i32.const 0))))
+    (i32.const 1)
+  )
+
+  (func $require_owner
+    (if (i32.eqz (call $caller_is_owner (i64.const 4)))
+      (then (unreachable)) ;; fail closed: the tx is reverted
+    )
+  )
+
   ;; 1. Initialize Token: init(initial_supply) -> returns initial_supply
-  ;; Sets Total Supply, allocates initial supply to Admin (Account 1), sets default tax 50 bps
+  ;; Sets Total Supply, allocates initial supply to Admin (Account 1), sets default tax 50 bps.
+  ;; CT-P0: binds the deployer/initializer address as the authenticated owner.
   (func (export "init") (param $initial_supply i64) (result i64)
+    ;; CT-P0: never rebind the authenticated owner after initialization —
+    ;; otherwise a late caller could re-init and seize the token.
+    (if (i64.ne (call $sload (i64.const 8)) (i64.const 0))
+      (then (unreachable))
+    )
     ;; Slot 0 = initial_supply
     (call $sstore (i64.const 0) (local.get $initial_supply))
     ;; Slot 1 = 50 (tax bps = 0.5%)
@@ -27,6 +70,9 @@
     (call $sstore (i64.const 2) (i64.const 99))
     ;; Slot 3 = 1 (admin account)
     (call $sstore (i64.const 3) (i64.const 1))
+    ;; CT-P0: the authenticated owner address (slots 4..8).
+    (call $bind_caller (i64.const 4))
+    (call $sstore (i64.const 8) (i64.const 1)) ;; initialized
     ;; Slot 1001 = initial_supply (admin balance)
     (call $sstore (i64.const 1001) (local.get $initial_supply))
     ;; Emit Mint event
@@ -45,14 +91,15 @@
   )
 
   ;; 4. Set Transfer Tax in BPS: set_tax(tax_bps) -> new_tax
+  ;; CT-P0: only the authenticated owner may change the fee.
   (func (export "set_tax") (param $tax_bps i64) (result i64)
+    (call $require_owner)
     (call $sstore (i64.const 1) (local.get $tax_bps))
     (local.get $tax_bps)
   )
 
   ;; 5. Transfer tokens: transfer(packed_arg) -> returns net_received
-  ;; Argument packed format: (from_id * 1,000,000,000,000) + (to_id * 1,000,000) + amount
-  ;; For simplified integer ABI: transfer_amount
+  ;; Argument packed format: (from_id * 100,000,000) + (to_id * 100,000) + amount
   (func $transfer_direct (export "transfer_direct") (param $from_id i64) (param $to_id i64) (param $amount i64) (result i64)
     (local $from_slot i64)
     (local $to_slot i64)
@@ -63,6 +110,13 @@
     (local $net_amount i64)
     (local $treasury_slot i64)
     (local $treasury_bal i64)
+
+    ;; CT-P0: the authenticated owner must be the source of the funds. A
+    ;; stranger replaying the public `from_id` is refused (trap -> revert).
+    (call $require_owner)
+    (if (i64.ne (local.get $from_id) (call $sload (i64.const 3)))
+      (then (unreachable)) ;; only the admin account holds the supply
+    )
 
     (local.set $from_slot (i64.add (i64.const 1000) (local.get $from_id)))
     (local.set $to_slot (i64.add (i64.const 1000) (local.get $to_id)))
@@ -116,12 +170,14 @@
 
   ;; 7. Burn tokens: burn(amount) -> new_total_supply
   ;; Burns from admin account (Account 1)
+  ;; CT-P0: only the authenticated owner may burn.
   (func (export "burn") (param $amount i64) (result i64)
     (local $admin_slot i64)
     (local $admin_bal i64)
     (local $cur_supply i64)
     (local $new_supply i64)
 
+    (call $require_owner)
     (local.set $admin_slot (i64.const 1001))
     (local.set $admin_bal (call $sload (local.get $admin_slot)))
     (if (i64.lt_u (local.get $admin_bal) (local.get $amount))
@@ -142,12 +198,14 @@
 
   ;; 8. Mint new tokens: mint(amount) -> new_total_supply
   ;; Mints to admin account (Account 1) and increases total supply
+  ;; CT-P0: only the authenticated owner may mint.
   (func (export "mint") (param $amount i64) (result i64)
     (local $admin_slot i64)
     (local $admin_bal i64)
     (local $cur_supply i64)
     (local $new_supply i64)
 
+    (call $require_owner)
     (local.set $admin_slot (i64.const 1001))
     (local.set $admin_bal (call $sload (local.get $admin_slot)))
     (call $sstore (local.get $admin_slot) (i64.add (local.get $admin_bal) (local.get $amount)))

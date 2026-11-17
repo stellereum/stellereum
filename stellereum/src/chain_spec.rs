@@ -13,6 +13,7 @@ use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
 use crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT;
+use crate::xshard2pc::XPC_ACTIVATION_HEIGHT;
 use crate::zkml::DEFAULT_CHAIN_ID;
 
 /// Activation status derived from a height-gated `u64` constant.
@@ -154,6 +155,12 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
                 "MEV DKG Falcon-authenticated ML-KEM-768 transport cutoff",
             ),
+            ActivationGate::new(
+                "XPC_ACTIVATION_HEIGHT",
+                "stellereum::xshard2pc",
+                XPC_ACTIVATION_HEIGHT,
+                "Cross-shard two-phase commit (frozen off: legacy one-way flow)",
+            ),
         ],
     }
 }
@@ -238,6 +245,7 @@ mod tests {
                 "PQ_TRANSPORT_H_ACTIVATION_HEIGHT",
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
             ),
+            ("XPC_ACTIVATION_HEIGHT", XPC_ACTIVATION_HEIGHT),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());
@@ -292,6 +300,32 @@ mod tests {
             genesis_schedule.is_active("GENESIS_GATE", u64::MAX),
             Some(true)
         );
+    }
+
+    #[test]
+    fn xpc_gate_matches_the_runtime_switch() {
+        let schedule = current_activation_schedule();
+        let gate = schedule
+            .gates
+            .iter()
+            .find(|g| g.name == "XPC_ACTIVATION_HEIGHT")
+            .expect("the 2PC gate must be registered in the chain spec");
+        assert_eq!(gate.activation_height, XPC_ACTIVATION_HEIGHT);
+        assert_eq!(gate.module, "stellereum::xshard2pc");
+        // Frozen sentinel: GatedOff at every reachable height.
+        assert_eq!(gate.status, ActivationStatus::GatedOff);
+        for height in [0, 1, u64::MAX - 1, u64::MAX] {
+            assert_eq!(
+                schedule.is_active("XPC_ACTIVATION_HEIGHT", height),
+                Some(false)
+            );
+        }
+        // The production switch derived from the SAME constant is Disabled,
+        // so the gate can never be half-armed.
+        let activation = crate::xshard2pc::XpcActivation::from_chain_spec();
+        assert_eq!(activation, crate::xshard2pc::XpcActivation::Disabled);
+        assert_eq!(activation.boundary(), None);
+        assert_eq!(gate.is_active_at(0), activation.is_active_at(0));
     }
 
     #[test]

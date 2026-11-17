@@ -884,8 +884,8 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
         "the target must not prepare without the PREPARE"
     );
 
-    // The source re-publishes the PREPARE (one height after the prepare, then
-    // every 8 heights) - this time with the proof of its own PREPARED leaf.
+    // The source re-publishes the PREPARE once per prepare window (one height
+    // after the prepare) - this time with the proof of its own PREPARED leaf.
     cluster.run_height(SHARD0, TS + 2).await;
     let mailbox = cluster.transport.fetch_cross_shard_inbound(SHARD1).await;
     assert!(
@@ -920,6 +920,108 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
         initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
         "the escrow was released, not refunded"
     );
+}
+
+// ===========================================================================
+// 7b-2. A STUCK prepare is retried at most ONCE per prepare window.
+// ===========================================================================
+
+/// The source re-derives the PREPARE from its committed state on every
+/// height, so without a bound a transfer whose target never answers would put
+/// one PREPARE on the wire per block for the whole window. The bound is the
+/// protocol's: exactly one retry per [`XPC_PREPARE_TIMEOUT_HEIGHTS`] window,
+/// after which the abort path takes over.
+#[tokio::test]
+async fn a_stuck_prepare_is_retried_at_most_once_per_window() {
+    use stellereum::xshard2pc::XPC_PREPARE_TIMEOUT_HEIGHTS;
+
+    let validator = key(43);
+    let (sender, sender_addr) = pq_sender(44);
+    let recipient = key(45);
+    let recipient_addr = recipient.verifying_key().to_bytes();
+
+    let initial = 5_000_000_000u64;
+    let amount = 1_000_000_000u64;
+    let fee = 280_000u64;
+
+    let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx_hash = tx.compute_tx_hash();
+    cluster.broadcast_tx(tx.clone()).await;
+
+    // Height 1: the OPENING PREPARE (it escrows the value).
+    cluster.run_height(SHARD0, TS).await;
+    // The target never runs, so the PREPARE is never answered.
+
+    // Heights 2..=TIMEOUT: at most ONE retry across the whole window.
+    let mut retries = 0usize;
+    for i in 1..XPC_PREPARE_TIMEOUT_HEIGHTS {
+        let bh = cluster.run_height(SHARD0, TS + i).await;
+        let block = cluster.shard(SHARD0).nodes[0]
+            .blocks
+            .get(&bh)
+            .cloned()
+            .expect("source block retained");
+        let published = block
+            .cross_shard_out
+            .iter()
+            .filter(|m| m.is_prepare() && m.tx.compute_tx_hash() == tx_hash)
+            .count();
+        assert!(
+            published <= 1,
+            "at most one PREPARE per transfer per height (height {})",
+            block.height
+        );
+        retries += published;
+    }
+    assert_eq!(
+        retries, 1,
+        "the PREPARE retry must be bounded to one per window (got {retries})"
+    );
+
+    // At the timeout the source stops PREPAREs and asks the target to abort.
+    let bh = cluster
+        .run_height(SHARD0, TS + XPC_PREPARE_TIMEOUT_HEIGHTS)
+        .await;
+    let block = cluster.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&bh)
+        .cloned()
+        .expect("source block retained");
+    assert!(
+        !block
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_prepare() && m.tx.compute_tx_hash() == tx_hash),
+        "no PREPARE may be retried after the window"
+    );
+    assert!(
+        block
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_abort_request() && m.tx.compute_tx_hash() == tx_hash),
+        "the timeout path must request the abort"
+    );
+
+    // ... and it never goes back to PREPARE on later heights.
+    for i in 0..8 {
+        let bh = cluster
+            .run_height(SHARD0, TS + XPC_PREPARE_TIMEOUT_HEIGHTS + 1 + i)
+            .await;
+        let block = cluster.shard(SHARD0).nodes[0]
+            .blocks
+            .get(&bh)
+            .cloned()
+            .expect("source block retained");
+        assert!(
+            !block
+                .cross_shard_out
+                .iter()
+                .any(|m| m.is_prepare() && m.tx.compute_tx_hash() == tx_hash),
+            "the PREPARE is never revived after the abort path starts (height {})",
+            block.height
+        );
+    }
 }
 
 // ===========================================================================
@@ -1074,6 +1176,17 @@ async fn the_activation_boundary_switches_the_protocol() {
         amount,
         "the legacy flow must keep working after the switch is armed"
     );
+    assert!(
+        cluster.shard(SHARD0).nodes[0]
+            .state
+            .is_cross_shard_completed(&legacy_hash)
+            .await,
+        "a below-boundary transfer must FINISH on the legacy flow (ack committed)"
+    );
+    assert!(
+        xpc_record(&cluster, SHARD1, &legacy_hash).await.is_none(),
+        "the legacy transfer never gains 2PC state"
+    );
 
     // ---- height 2+: the 2PC. ----
     let xpc_tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 1, SHARD0, SHARD1);
@@ -1099,6 +1212,43 @@ async fn the_activation_boundary_switches_the_protocol() {
             .map(|r| r.phase),
         Some(XpcPhase::Prepared)
     );
+
+    // ---- The boundary is EXACT on every block of both shards: one transfer
+    // never carries records of both flows (no half-legacy/half-2PC). ----
+    run_2pc_to_completion(&mut cluster, 6).await;
+    for shard in [SHARD0, SHARD1] {
+        for block in cluster.shard(shard).nodes[0].blocks.values() {
+            for msg in &block.cross_shard_out {
+                let tx_hash = msg.tx.compute_tx_hash();
+                if tx_hash == legacy_hash {
+                    assert!(
+                        !msg.is_xpc(),
+                        "a below-boundary transfer must never carry a 2PC record: {msg:?}"
+                    );
+                }
+                if tx_hash == xpc_hash {
+                    assert!(
+                        !msg.is_transfer() && !msg.is_ack() && !msg.is_bounce(),
+                        "an at-boundary transfer must never carry a legacy record: {msg:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- The PRODUCTION switch is the chain-spec sentinel: frozen OFF and
+    // derived deterministically, never from an operator knob. ----
+    assert_eq!(
+        stellereum::xshard2pc::XPC_ACTIVATION_HEIGHT,
+        u64::MAX,
+        "the frozen public protocol pins the 2PC off"
+    );
+    assert_eq!(
+        XpcActivation::from_chain_spec(),
+        XpcActivation::Disabled,
+        "production activation comes from the chain spec only"
+    );
+    assert_eq!(XpcActivation::from_chain_spec().boundary(), None);
 }
 
 // ===========================================================================

@@ -231,6 +231,17 @@ async fn shard2_n3_weighted_quorum_survives_single_loss() {
         st.bond(idb, f, 0).expect("bond B must be accepted");
         st.bond(idc, f, 0).expect("bond C must be accepted");
     }
+    // Each MASTERCHAIN node derives the weighted set at its own height and
+    // publishes the activation stamp; the workchains bind the rotation to that
+    // masterchain datum (never to their own tip).
+    for i in 0..3 {
+        assert!(
+            sc.shard_mut(SHARD0).nodes[i]
+                .refresh_validator_set_from_staking()
+                .await,
+            "master node{i} must derive and publish the weighted set"
+        );
+    }
     // Masterchain repair is a silent no-op on the masterchain itself.
     for i in 0..3 {
         assert!(
@@ -600,6 +611,18 @@ async fn shard2_n3_rotation_propagates_to_both_shards() {
             st.bond(*a, floor, 0)
                 .expect("masterchain bond must be accepted");
         }
+    }
+    // Each MASTERCHAIN node derives the post-rotation set from its own ledger
+    // and publishes the activation stamp. The workchain nodes are wired to
+    // node 0's handle, so that datum is the boundary they bind to — the
+    // masterchain's, not their own tip.
+    for i in 0..3 {
+        assert!(
+            sc.shard_mut(SHARD0).nodes[i]
+                .refresh_validator_set_from_staking()
+                .await,
+            "master node{i} must derive and publish the rotated set"
+        );
     }
     // Masterchain repair is a no-op on all 3 master nodes.
     for i in 0..3 {

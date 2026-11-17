@@ -62,11 +62,32 @@
 //!
 //! * The legacy outbox/inbox/ack/bounce flow is untouched and still runs for
 //!   transfers produced before the activation height
-//!   ([`XpcActivation`]).
+//!   ([`XpcActivation`]). The switch is NOT an operator knob: it comes from
+//!   the compile-time chain spec ([`XPC_ACTIVATION_HEIGHT`] /
+//!   [`XpcActivation::from_chain_spec`]).
 //! * The liveness cost is real and deliberate: a transfer whose target shard
 //!   is unreachable stays ESCROWED (the value is neither credited nor
 //!   refunded) until the target answers. That is the price of not letting the
 //!   source decide unilaterally.
+//!
+//! # Bounded re-emission
+//!
+//! Both sides re-derive their pending records from the committed state at
+//! every height, so a stuck transfer would otherwise put one PREPARE / ACK on
+//! the wire per block forever. The re-emission is capped three ways, all as
+//! PURE functions of the committed record and the height (so every node
+//! derives the same set):
+//!
+//! * [`should_reprepare`] publishes at most
+//!   [`XPC_REPREPARE_RETRY_LIMIT`] PREPARE retries per transfer per
+//!   [`XPC_PREPARE_TIMEOUT_HEIGHTS`] window;
+//! * [`target_action_at`] publishes at most one PREPARE-ACK / ABORT-ACK per
+//!   transfer per [`XPC_ACK_REEMIT_INTERVAL`] window, never after the record
+//!   is COMMITTED, and never again after the single ABORT-ACK that carries the
+//!   abort authorisation;
+//! * [`bounded_reemit_plan`] truncates the WHOLE per-height re-emission set to
+//!   [`XPC_MAX_REEMITS_PER_HEIGHT`], with a deterministic height rotation so a
+//!   busy shard cannot starve the tail.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,6 +124,17 @@ pub const XPC_ABORT_ACK: u8 = 5;
 /// abort unsafe, because the abort additionally requires the target's
 /// ABORT-ACK.
 pub const XPC_PREPARE_TIMEOUT_HEIGHTS: u64 = 64;
+
+/// The chain-spec activation height of the cross-shard 2PC.
+///
+/// FROZEN SENTINEL: `u64::MAX` (reported as `GatedOff` by
+/// [`crate::chain_spec`]) keeps the public protocol on the legacy one-way
+/// flow. This constant — and only this constant — is the production source of
+/// [`XpcActivation`] (see [`XpcActivation::from_chain_spec`]): the protocol
+/// freeze forbids env-driven protocol switches, so an operator variable can
+/// never arm the 2PC on a running chain. Flipping it is a protocol change and
+/// ships together with this gate in a release.
+pub const XPC_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 /// The phase of one 2PC transfer, as recorded by the shard that owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -201,6 +233,33 @@ impl XpcRecord {
     pub fn amount(&self) -> u64 {
         self.tx.amount
     }
+
+    /// The structural invariant of a committed 2PC record.
+    ///
+    /// A record whose bytes disagree with themselves can never be trusted as
+    /// a proof base (its state-trie leaf would bind a phase to a transaction
+    /// it does not describe), so [`XpcRecord`] construction paths fail closed
+    /// on `false` instead of "repairing" it:
+    ///
+    /// * the source and target shards are distinct and equal to the carried
+    ///   transaction's own shard ids;
+    /// * the stored transaction hash really is the carried transaction's;
+    /// * `Prepared` has no decision height, and a decided phase was decided no
+    ///   earlier than it was prepared.
+    pub fn is_consistent(&self) -> bool {
+        self.source_shard != self.target_shard
+            && self.source_shard == self.tx.source_shard
+            && self.target_shard == self.tx.target_shard
+            && self.tx.compute_tx_hash() == self.tx_hash
+            && match self.phase {
+                XpcPhase::Prepared => self.decided_height == 0,
+                XpcPhase::Committed | XpcPhase::Aborted => {
+                    // `0` is the "not decided" sentinel: a decided phase must
+                    // carry a real height, and it cannot predate the prepare.
+                    self.decided_height != 0 && self.decided_height >= self.prepared_height
+                }
+            }
+    }
 }
 
 /// The trie key of the 2PC state leaf of one transfer.
@@ -238,16 +297,39 @@ pub fn xpc_state_value(phase: XpcPhase, tx_hash: &[u8; 32]) -> Vec<u8> {
 /// height `h` or later to the 2PC; transfers produced before `h` keep
 /// running the legacy flow to completion, so the two never interleave on one
 /// transfer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XpcActivation {
     /// The 2PC is off (legacy flow only).
-    #[default]
     Disabled,
     /// The 2PC is on for transfers produced at height >= the boundary.
     FromHeight(u64),
 }
 
+impl Default for XpcActivation {
+    /// The default is the CHAIN SPEC value, not a hard-coded `Disabled`: the
+    /// production switch has exactly one source ([`Self::from_chain_spec`]).
+    fn default() -> Self {
+        Self::from_chain_spec()
+    }
+}
+
 impl XpcActivation {
+    /// The PRODUCTION switch: derived from the compile-time chain spec gate
+    /// [`XPC_ACTIVATION_HEIGHT`].
+    ///
+    /// `u64::MAX` is the frozen "off" sentinel and maps to [`Self::Disabled`]
+    /// — never to `FromHeight(u64::MAX)`, which would report a boundary at the
+    /// last representable height and let a node treat the gate as "armed".
+    /// This constructor is the ONLY production source of the switch; test
+    /// code may build [`Self::FromHeight`] directly to exercise the boundary.
+    pub const fn from_chain_spec() -> Self {
+        if XPC_ACTIVATION_HEIGHT == u64::MAX {
+            XpcActivation::Disabled
+        } else {
+            XpcActivation::FromHeight(XPC_ACTIVATION_HEIGHT)
+        }
+    }
+
     /// True when a transfer produced at `height` must use the 2PC.
     pub fn is_active_at(&self, height: u64) -> bool {
         match *self {
@@ -411,45 +493,49 @@ pub enum SourceAction {
     AbortRequest,
 }
 
+/// How many times a source may RE-PUBLISH the PREPARE of one transfer inside
+/// one [`XPC_PREPARE_TIMEOUT_HEIGHTS`] window.
+///
+/// The opening PREPARE is published exactly once, by the block that escrows
+/// the value. One retry covers the only case the retry exists for (the
+/// opening record never reached the target); further retries are amplification
+/// and buy nothing, because the target answers a PREPARE with a PREPARE-ACK
+/// and the source re-derives that answer from its committed state.
+pub const XPC_REPREPARE_RETRY_LIMIT: u64 = 1;
+
 /// The cadence of the PREPARE re-publication, in heights.
 ///
-/// The OPENING PREPARE is published by the block that carries the transfer
-/// (it is the record that escrows the value), so it is published exactly
-/// once. If that message never reaches the target - the source crashed
-/// between the finalization of that block and the publication, or the
-/// transport lost it - the transfer would wait for the whole prepare window
-/// before the abort path refunds it. The source therefore RE-PUBLISHES the
-/// PREPARE while it waits, on this cadence, so the target gets the request
-/// again.
-///
-/// The re-published record proves the source's PREPARED state (the escrow)
-/// instead of the sender's account leaf: after the escrow the sender's
-/// balance no longer covers the amount, so the opening proof (which says
-/// "the sender had the funds") can no longer be produced - and it does not
-/// need to be: the PREPARED leaf IS the escrow, written by the source in
-/// the very block that debited the sender.
-pub const XPC_REPREPARE_INTERVAL: u64 = 8;
+/// One retry per prepare window: the retry fires one height after the prepare
+/// and the next would land after [`XPC_PREPARE_TIMEOUT_HEIGHTS`], where the
+/// abort path takes over and no further PREPARE is published.
+pub const XPC_REPREPARE_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
 
 /// True when the source must re-publish the PREPARE of this record at
 /// `height`.
 ///
 /// A PURE function of the committed record and the height (no clock, no
 /// node-local state), so every node of the source shard derives the same
-/// answer and the published set is deterministic.
+/// answer and the published set is deterministic. The retry is BOUNDED: at
+/// most [`XPC_REPREPARE_RETRY_LIMIT`] per transfer per
+/// [`XPC_PREPARE_TIMEOUT_HEIGHTS`] window, so a transfer that has to wait out
+/// the window puts one extra PREPARE on the wire, not one per block.
 pub fn should_reprepare(record: &XpcRecord, height: u64) -> bool {
     if record.phase != XpcPhase::Prepared {
         return false;
     }
-    if height
-        >= record
-            .prepared_height
-            .saturating_add(XPC_PREPARE_TIMEOUT_HEIGHTS)
-    {
+    let Some(elapsed) = height.checked_sub(record.prepared_height) else {
+        return false;
+    };
+    if elapsed == 0 {
         return false;
     }
-    // The first re-publication is one height after the prepare, then every
-    // `XPC_REPREPARE_INTERVAL` heights.
-    height.saturating_sub(record.prepared_height) % XPC_REPREPARE_INTERVAL == 1
+    if elapsed >= XPC_PREPARE_TIMEOUT_HEIGHTS {
+        return false;
+    }
+    // The retry slot inside the current window: the first retry one height
+    // after the prepare, then one per XPC_REPREPARE_INTERVAL heights.
+    let slot = elapsed % XPC_REPREPARE_INTERVAL;
+    slot != 0 && slot <= XPC_REPREPARE_RETRY_LIMIT
 }
 
 /// What the SOURCE shard must do for one of its 2PC records at `height`.
@@ -484,12 +570,137 @@ pub enum TargetAction {
 }
 
 /// What the TARGET shard must do for one of its 2PC records.
+///
+/// This is the UNBOUNDED view: it says what the record owes the source at
+/// all. Emission goes through [`target_action_at`], which adds the per-window
+/// bound and the terminal rules.
 pub fn target_action(record: &XpcRecord) -> TargetAction {
     match record.phase {
         XpcPhase::Prepared => TargetAction::PrepareAck,
         XpcPhase::Committed => TargetAction::Idle,
         XpcPhase::Aborted => TargetAction::AbortAck,
     }
+}
+
+/// The cadence of an ACK re-publication, in heights.
+///
+/// The ACK is the target's vote: one record is enough to complete a healthy
+/// exchange, and a LOST one must be recoverable without a per-block flood.
+/// So the target emits it one height after the phase was recorded, then at
+/// most once per window of this many heights.
+pub const XPC_ACK_REEMIT_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
+
+/// The hard cap on the number of 2PC/control records a shard may re-emit in
+/// ONE block, across every transfer it owns.
+///
+/// Without it, `N` stuck transfers would put `N` records in every block —
+/// amplification that grows with the backlog. The cap is part of the
+/// deterministic plan ([`bounded_reemit_plan`]), not a node-local policy, so
+/// two honest proposers derive the same block content.
+pub const XPC_MAX_REEMITS_PER_HEIGHT: usize = 16;
+
+/// True when the target must (re-)publish an ACK for this record at
+/// `height`.
+///
+/// A PURE function of the committed record and the height:
+///
+/// * `Prepared` — one ACK one height after the prepare, then at most one per
+///   [`XPC_ACK_REEMIT_INTERVAL`] window while the source has not decided;
+/// * `Committed` — NEVER (the transfer is decided; the target owes nothing);
+/// * `Aborted` — exactly ONCE, one height after the abort decision. That
+///   record IS the source's authorisation to refund; a copy is a duplicate
+///   that the source's idempotent `source_on_abort_ack` refuses, so it is
+///   never re-emitted afterwards.
+pub fn should_reemit_ack(record: &XpcRecord, height: u64) -> bool {
+    match record.phase {
+        XpcPhase::Prepared => {
+            let Some(elapsed) = height.checked_sub(record.prepared_height) else {
+                return false;
+            };
+            elapsed != 0 && elapsed % XPC_ACK_REEMIT_INTERVAL == 1
+        }
+        XpcPhase::Committed => false,
+        XpcPhase::Aborted => height == record.decided_height.saturating_add(1),
+    }
+}
+
+/// What the TARGET shard must emit for one of its 2PC records at `height`.
+///
+/// The BOUNDED view of [`target_action`]: an ACK is emitted at most once per
+/// [`XPC_ACK_REEMIT_INTERVAL`] window, never after COMMIT, and never again
+/// after the single abort authorisation. Unknown phase bytes fail closed to
+/// [`TargetAction::Idle`].
+pub fn target_action_at(record: &XpcRecord, height: u64) -> TargetAction {
+    if !should_reemit_ack(record, height) {
+        return TargetAction::Idle;
+    }
+    match record.phase {
+        XpcPhase::Prepared => TargetAction::PrepareAck,
+        XpcPhase::Aborted => TargetAction::AbortAck,
+        XpcPhase::Committed => TargetAction::Idle,
+    }
+}
+
+/// One record a source or target shard should publish at a height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XpcReemit {
+    /// The stable 2PC identity of the transfer.
+    pub tx_hash: [u8; 32],
+    /// The wire phase ([`XPC_PREPARE`], [`XPC_PREPARE_ACK`],
+    /// [`XPC_COMMIT`], [`XPC_ABORT_REQUEST`] or [`XPC_ABORT_ACK`]).
+    pub phase: u8,
+}
+
+/// The deterministic, BOUNDED re-emission plan of one shard at `height`.
+///
+/// Applies the same rules the protocol uses — [`source_action`] plus
+/// [`should_reprepare`] on the source side, [`target_action_at`] on the
+/// target side — to every record the shard owns, sorts the result by
+/// transaction hash for determinism, rotates by `height` so a busy shard does
+/// not starve the same tail every block, and truncates it to
+/// [`XPC_MAX_REEMITS_PER_HEIGHT`].
+///
+/// The truncation is the amplification cap: a shard with a thousand stuck
+/// transfers still publishes at most [`XPC_MAX_REEMITS_PER_HEIGHT`] records
+/// per block, and the height rotation guarantees every transfer is served.
+pub fn bounded_reemit_plan(records: &[XpcRecord], shard: ShardId, height: u64) -> Vec<XpcReemit> {
+    let mut plan: Vec<XpcReemit> = records
+        .iter()
+        .filter_map(|rec| {
+            let phase = if rec.source_shard == shard {
+                match source_action(rec, height) {
+                    SourceAction::Commit => XPC_COMMIT,
+                    SourceAction::AbortRequest => XPC_ABORT_REQUEST,
+                    SourceAction::Reprepare => {
+                        if !should_reprepare(rec, height) {
+                            return None;
+                        }
+                        XPC_PREPARE
+                    }
+                    SourceAction::Idle => return None,
+                }
+            } else if rec.target_shard == shard {
+                match target_action_at(rec, height) {
+                    TargetAction::PrepareAck => XPC_PREPARE_ACK,
+                    TargetAction::AbortAck => XPC_ABORT_ACK,
+                    TargetAction::Idle => return None,
+                }
+            } else {
+                return None;
+            };
+            Some(XpcReemit {
+                tx_hash: rec.tx_hash,
+                phase,
+            })
+        })
+        .collect();
+    plan.sort_by_key(|r| r.tx_hash);
+    if plan.len() > XPC_MAX_REEMITS_PER_HEIGHT {
+        let offset = (height as usize) % plan.len();
+        plan.rotate_left(offset);
+        plan.truncate(XPC_MAX_REEMITS_PER_HEIGHT);
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -566,13 +777,18 @@ mod tests {
     #[test]
     fn the_reprepare_cadence_is_deterministic_and_bounded() {
         let r = rec(XpcPhase::Prepared); // prepared at height 10
-                                         // The first re-publication is one height after the prepare...
+                                         // Exactly ONE retry inside the whole prepare window: at most
+                                         // XPC_REPREPARE_RETRY_LIMIT per XPC_PREPARE_TIMEOUT_HEIGHTS window.
+        let retries: Vec<u64> = (10..10 + XPC_PREPARE_TIMEOUT_HEIGHTS)
+            .filter(|height| should_reprepare(&r, *height))
+            .collect();
+        assert_eq!(
+            retries,
+            vec![11],
+            "the PREPARE retry must be bounded to one per window, got {retries:?}"
+        );
         assert!(!should_reprepare(&r, 10), "the prepare height itself");
-        assert!(should_reprepare(&r, 11));
-        // ... then every XPC_REPREPARE_INTERVAL heights.
-        assert!(!should_reprepare(&r, 12));
-        assert!(!should_reprepare(&r, 18));
-        assert!(should_reprepare(&r, 19));
+        assert!(!should_reprepare(&r, 9), "before the prepare");
         // It never fires past the prepare window (the abort path takes over).
         let window = 10 + XPC_PREPARE_TIMEOUT_HEIGHTS;
         assert!(!should_reprepare(&r, window));
@@ -584,6 +800,179 @@ mod tests {
         let mut aborted = rec(XpcPhase::Aborted);
         aborted.prepared_height = 10;
         assert!(!should_reprepare(&aborted, 11));
+    }
+
+    #[test]
+    fn the_ack_cadence_is_bounded_and_terminal() {
+        let prepared = rec(XpcPhase::Prepared); // prepared at height 10
+                                                // The unbounded view still says the record owes a vote; the bounded
+                                                // view emits it one height after the prepare, then once per window.
+        assert_eq!(target_action(&prepared), TargetAction::PrepareAck);
+        assert_eq!(target_action_at(&prepared, 10), TargetAction::Idle);
+        assert_eq!(target_action_at(&prepared, 11), TargetAction::PrepareAck);
+        assert_eq!(target_action_at(&prepared, 12), TargetAction::Idle);
+        let acks: Vec<u64> = (10..10 + 4 * XPC_ACK_REEMIT_INTERVAL)
+            .filter(|height| target_action_at(&prepared, *height) == TargetAction::PrepareAck)
+            .collect();
+        assert_eq!(acks.len(), 4, "at most one ACK per window: {acks:?}");
+
+        // COMMITTED: the transfer is decided, the target never re-emits.
+        let mut committed = rec(XpcPhase::Committed);
+        committed.decided_height = 20;
+        assert!(committed.is_consistent());
+        for height in [10, 11, 21, 10_000] {
+            assert_eq!(target_action_at(&committed, height), TargetAction::Idle);
+        }
+
+        // ABORTED: exactly one authorisation, then never again.
+        let mut aborted = rec(XpcPhase::Aborted);
+        aborted.decided_height = 20;
+        assert!(aborted.is_consistent());
+        assert_eq!(target_action_at(&aborted, 20), TargetAction::Idle);
+        assert_eq!(target_action_at(&aborted, 21), TargetAction::AbortAck);
+        for height in [22, 23, 84, 10_000] {
+            assert_eq!(
+                target_action_at(&aborted, height),
+                TargetAction::Idle,
+                "the abort authorisation is emitted once at {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reemit_plan_is_capped_and_deterministic() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let total = XPC_MAX_REEMITS_PER_HEIGHT * 3;
+        let mut records = Vec::new();
+        for nonce in 0..total as u64 {
+            let tx = crate::sharding::Transaction::sign(
+                &signer,
+                [(nonce & 0xff) as u8; 32],
+                100,
+                280_000,
+                nonce,
+                0,
+                1,
+            );
+            records.push(XpcRecord::prepared(tx, 0, 1, 10));
+        }
+        // Every record is due for its single retry at height 11.
+        let plan = bounded_reemit_plan(&records, 0, 11);
+        assert_eq!(
+            plan.len(),
+            XPC_MAX_REEMITS_PER_HEIGHT,
+            "the per-height cap must bound the whole set"
+        );
+        assert!(plan.iter().all(|r| r.phase == XPC_PREPARE));
+        assert_eq!(plan, bounded_reemit_plan(&records, 0, 11), "deterministic");
+
+        // The height rotation serves a DIFFERENT subset on the next retry
+        // window, so the cap cannot starve the tail.
+        let next = bounded_reemit_plan(&records, 0, 11 + XPC_PREPARE_TIMEOUT_HEIGHTS);
+        assert_eq!(next.len(), XPC_MAX_REEMITS_PER_HEIGHT);
+        assert_ne!(plan, next, "the plan rotates with the height");
+
+        // Every transfer is served within ceil(total / cap) windows.
+        let windows = total.div_ceil(XPC_MAX_REEMITS_PER_HEIGHT);
+        let mut served = std::collections::HashSet::new();
+        for window in 0..windows {
+            let height = 11 + window as u64 * XPC_PREPARE_TIMEOUT_HEIGHTS;
+            for reemit in bounded_reemit_plan(&records, 0, height) {
+                served.insert(reemit.tx_hash);
+            }
+        }
+        assert_eq!(
+            served.len(),
+            total,
+            "the rotation must serve every transfer"
+        );
+
+        // A shard that does not own the records never emits for them.
+        assert!(bounded_reemit_plan(&records, 9, 11).is_empty());
+    }
+
+    #[test]
+    fn the_activation_gate_comes_from_the_chain_spec() {
+        // The frozen sentinel is the ONLY production source of the switch.
+        assert_eq!(XPC_ACTIVATION_HEIGHT, u64::MAX);
+        assert_eq!(XpcActivation::from_chain_spec(), XpcActivation::Disabled);
+        assert_eq!(XpcActivation::default(), XpcActivation::from_chain_spec());
+        assert_eq!(XpcActivation::from_chain_spec().boundary(), None);
+        assert!(!XpcActivation::from_chain_spec().is_active_at(0));
+        assert!(!XpcActivation::from_chain_spec().is_active_at(u64::MAX));
+    }
+
+    #[test]
+    fn unknown_phase_codes_fail_closed() {
+        for code in [0u8, 4, 5, 7, 255] {
+            assert_eq!(
+                XpcPhase::from_code(code),
+                None,
+                "phase code {code} must not decode"
+            );
+        }
+        for phase in [XpcPhase::Prepared, XpcPhase::Committed, XpcPhase::Aborted] {
+            assert_eq!(XpcPhase::from_code(phase.code()), Some(phase));
+        }
+    }
+
+    #[test]
+    fn duplicate_records_are_refused_not_advanced() {
+        // A replayed transition is either a no-op (already applied) or a
+        // refusal (would move a decided record); it NEVER advances the phase.
+        let prepared = rec(XpcPhase::Prepared);
+        assert_eq!(source_prepare(Some(&prepared)), XpcTransition::Noop);
+        assert_eq!(target_prepare(Some(&prepared)), XpcTransition::Noop);
+        assert_eq!(
+            source_on_prepare_ack(Some(&prepared)),
+            XpcTransition::Advanced(XpcPhase::Committed)
+        );
+        assert_eq!(
+            target_on_abort_request(None),
+            XpcTransition::Advanced(XpcPhase::Aborted),
+            "only a target with NO record can abort"
+        );
+        // The applied records reject the replayed record.
+        let mut committed = rec(XpcPhase::Committed);
+        committed.decided_height = 11;
+        assert_eq!(source_on_prepare_ack(Some(&committed)), XpcTransition::Noop);
+        assert_eq!(target_on_commit(Some(&committed)), XpcTransition::Noop);
+        let mut aborted = rec(XpcPhase::Aborted);
+        aborted.decided_height = 11;
+        assert_eq!(target_on_abort_request(Some(&aborted)), XpcTransition::Noop);
+    }
+
+    #[test]
+    fn inconsistent_records_are_recognised() {
+        let good = rec(XpcPhase::Prepared);
+        assert!(good.is_consistent());
+
+        let mut decided = rec(XpcPhase::Committed);
+        decided.decided_height = 11;
+        assert!(decided.is_consistent());
+
+        let mut prepared_with_decision = rec(XpcPhase::Prepared);
+        prepared_with_decision.decided_height = 5;
+        assert!(!prepared_with_decision.is_consistent());
+
+        let mut decided_before_prepared = rec(XpcPhase::Aborted);
+        decided_before_prepared.decided_height = 9;
+        assert!(!decided_before_prepared.is_consistent());
+
+        let mut decided_at_zero = rec(XpcPhase::Committed);
+        decided_at_zero.decided_height = 0;
+        assert!(
+            !decided_at_zero.is_consistent(),
+            "zero is the 'not decided' sentinel"
+        );
+
+        let mut wrong_target = rec(XpcPhase::Prepared);
+        wrong_target.target_shard = 7;
+        assert!(!wrong_target.is_consistent());
+
+        let mut wrong_hash = rec(XpcPhase::Prepared);
+        wrong_hash.tx_hash = [0u8; 32];
+        assert!(!wrong_hash.is_consistent());
     }
 
     #[test]

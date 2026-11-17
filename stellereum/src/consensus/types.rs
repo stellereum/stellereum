@@ -1673,6 +1673,17 @@ impl QuorumCertificate {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> Option<(Vec<ValidatorId>, Vec<ValidatorId>)> {
+        // C1 split (FIXES §1.7), fail-closed at the SHARED choke point: at/
+        // after `QC_SPLIT_ACTIVATION_HEIGHT` the µQC is advisory-only, so it
+        // names no signers and carries no power. `verify_micro_cert_with_beacon`
+        // already refuses it; gating here as well makes ATTRIBUTION
+        // (`signers_set` → `qc_signed_power` → `qc_meets_quorum`) refuse it
+        // too. Without this, a decision boundary that counts power through
+        // attribution (the recommended primitive) would accept the very
+        // certificate the verifier refuses — the split would be bypassed.
+        if qc_split_active_at(self.height) {
+            return None;
+        }
         if cert.height != self.height || cert.round != self.round {
             return None;
         }
@@ -2042,6 +2053,13 @@ impl QuorumCertificate {
     /// FULL-PQ (nodes wiped): classical Ed25519 entries are inert — skipped,
     /// never attributed. Attribution mirrors verification: only signers
     /// `verify` accepts are named.
+    ///
+    /// C1 split: at/after `QC_SPLIT_ACTIVATION_HEIGHT` a µQC is
+    /// advisory-only, so it attributes NOBODY here (the gate lives in
+    /// `micro_cert_valid_signers_and_committee_with_beacon`). That keeps
+    /// `qc_signed_power` / `qc_meets_quorum` fail-closed for the same
+    /// certificate `verify` refuses — a decision boundary cannot promote a
+    /// µQC through power accounting.
     ///
     /// Attribution MUST mirror verification: only signers `verify` accepts
     /// are named. Every envelope path requires the SAME cryptographic checks

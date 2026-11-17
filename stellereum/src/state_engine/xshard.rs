@@ -168,10 +168,24 @@ impl InMemoryStateEngine {
         if records.is_empty() {
             return;
         }
+        let mut refused = 0usize;
         let installed: Vec<crate::xshard2pc::XpcRecord> = {
             let mut map = self.cross_shard_xpc.write().await;
             records
                 .iter()
+                .filter(|rec| {
+                    // FAIL CLOSED: a record whose own bytes disagree (wrong
+                    // shard pair, wrong tx hash, a decision before the
+                    // prepare, a decision height on a PREPARED record) is
+                    // never installed. Installing it would re-open a decided
+                    // transfer with a phase the chain never committed to.
+                    if rec.is_consistent() {
+                        true
+                    } else {
+                        refused += 1;
+                        false
+                    }
+                })
                 .map(|rec| {
                     map.entry(rec.tx_hash)
                         .or_insert_with(|| rec.clone())
@@ -179,6 +193,12 @@ impl InMemoryStateEngine {
                 })
                 .collect()
         };
+        if refused > 0 {
+            tracing::warn!("[xpc] refused {refused} inconsistent 2PC record(s) on restore");
+        }
+        if installed.is_empty() {
+            return;
+        }
         {
             let mut trie = self.state_trie.write().await;
             for rec in &installed {
@@ -196,8 +216,18 @@ impl InMemoryStateEngine {
     ///
     /// The two are written together so the leaf can never disagree with the
     /// map: a peer that proves the leaf proves the map's phase, and the map
-    /// is what the commitment digest covers.
-    pub(crate) async fn write_xpc_record(&self, rec: &crate::xshard2pc::XpcRecord) {
+    /// is what the commitment digest covers. An INCONSISTENT record (see
+    /// [`crate::xshard2pc::XpcRecord::is_consistent`]) is refused outright:
+    /// writing it would bind a state leaf to a transaction it does not
+    /// describe. Returns `true` only when the record was committed.
+    pub(crate) async fn write_xpc_record(&self, rec: &crate::xshard2pc::XpcRecord) -> bool {
+        if !rec.is_consistent() {
+            tracing::warn!(
+                "[xpc] refusing to write an inconsistent 2PC record (tx {:?})",
+                rec.tx_hash
+            );
+            return false;
+        }
         {
             let mut map = self.cross_shard_xpc.write().await;
             map.insert(rec.tx_hash, rec.clone());
@@ -209,6 +239,7 @@ impl InMemoryStateEngine {
             trie.insert(&key, &value);
         }
         self.bump_domain_generation(crate::commitment::Domain::Xpc);
+        true
     }
 
     /// True once an ack or bounce for `tx_hash` committed on this chain.
@@ -410,6 +441,20 @@ impl InMemoryStateEngine {
             .collect();
         inbound.sort_by_key(|m| crate::sharding::CrossShardKey::of(m));
 
+        // §9 COEXISTENCE GUARD: a transaction this block (or this shard)
+        // already treats as a 2PC transfer can never be credited through the
+        // legacy one-way path. The production gate picks exactly one flow per
+        // produced transfer, so a block that carries both is Byzantine; the
+        // legacy credit is refused in EITHER order (pre-scan, not order
+        // dependent), and a record committed by an earlier block refuses it
+        // too. Nothing here "upgrades" a legacy transfer into a 2PC one.
+        let xpc_in_block: HashSet<[u8; 32]> = block
+            .cross_shard_out
+            .iter()
+            .filter(|m| m.is_xpc())
+            .map(|m| m.tx.compute_tx_hash())
+            .collect();
+
         let mut credited = 0usize;
         for msg in inbound {
             let key = crate::sharding::CrossShardKey::of(msg);
@@ -469,6 +514,15 @@ impl InMemoryStateEngine {
                 continue;
             }
             if self.is_cross_shard_consumed(&key).await {
+                continue;
+            }
+            // §9 COEXISTENCE GUARD (see above): a 2PC record for this
+            // transaction — in this block or committed earlier — refuses the
+            // legacy credit, so one transfer can never be half-legacy.
+            let tx_hash = msg.tx.compute_tx_hash();
+            if xpc_in_block.contains(&tx_hash)
+                || self.cross_shard_xpc.read().await.contains_key(&tx_hash)
+            {
                 continue;
             }
             // ANCHORED + SIGNED credit (cross-shard integrity hardening): the
@@ -565,6 +619,19 @@ impl InMemoryStateEngine {
             }
             let tx = &msg.tx;
             let tx_hash = tx.compute_tx_hash();
+            // §9 COEXISTENCE GUARD: a transfer already produced through the
+            // LEGACY outbound path is never re-opened as a 2PC transfer. The
+            // two flows must not coexist on one transfer, so a PREPARE for a
+            // transaction this shard already published as a plain transfer is
+            // refused (no escrow record, no peer-facing 2PC state).
+            if self
+                .cross_shard_produced
+                .read()
+                .await
+                .contains_key(&tx_hash)
+            {
+                continue;
+            }
             // The escrow transaction must be in this block AND must have
             // applied. A PREPARE without its transaction is refused (the
             // proposal path refuses it too), and a transaction that was
@@ -664,6 +731,35 @@ impl InMemoryStateEngine {
         let tx = &msg.tx;
         let tx_hash = tx.compute_tx_hash();
         let existing = self.xpc_record(&tx_hash).await;
+        // FAIL CLOSED on a mismatched or self-inconsistent PHASE record: the
+        // record this shard owns can only be advanced by a message travelling
+        // the record's OWN direction, and a record whose bytes disagree with
+        // themselves is refused before it is used as a proof base. Neither
+        // ever advances silently.
+        if let Some(rec) = existing.as_ref() {
+            if !rec.is_consistent() {
+                return false;
+            }
+            let direction_matches = match msg.kind() {
+                CrossShardKind::Prepare | CrossShardKind::Commit | CrossShardKind::AbortRequest => {
+                    rec.source_shard == msg.source_shard && rec.target_shard == msg.target_shard
+                }
+                CrossShardKind::PrepareAck | CrossShardKind::AbortAck => {
+                    rec.source_shard == msg.target_shard && rec.target_shard == msg.source_shard
+                }
+                _ => false,
+            };
+            if !direction_matches {
+                return false;
+            }
+            // A decision cannot predate the prepare: a record that would be
+            // written with `decided_height < prepared_height` is refused
+            // BEFORE any value moves (the credit/refund below must never
+            // happen for a record the shard will not commit to).
+            if height < rec.prepared_height {
+                return false;
+            }
+        }
         match msg.kind() {
             // TARGET side: the source escrowed the value and asks us to
             // prepare. The proof is EITHER the SOURCE's account leaf (the
@@ -959,5 +1055,218 @@ mod tests {
             Some(XpcPhase::Prepared),
             "signed XPC_PREPARE must be accepted"
         );
+    }
+
+    /// A record whose own bytes disagree (decided phase with no decision
+    /// height) is refused on BOTH the write and the restore path. It is never
+    /// "repaired" into a phase the chain did not commit to.
+    #[tokio::test]
+    async fn inconsistent_xpc_records_are_refused() {
+        let engine = InMemoryStateEngine::new();
+        engine.enable_cross_shard();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let tx = Transaction::sign(&signer, [1u8; 32], 10, 280_000, 0, 0, 1);
+        let mut rec = crate::xshard2pc::XpcRecord::prepared(tx, 0, 1, 5);
+        rec.phase = XpcPhase::Committed; // decided_height is still 0
+        assert!(!rec.is_consistent(), "precondition: the record is broken");
+
+        assert!(
+            !engine.write_xpc_record(&rec).await,
+            "an inconsistent record must be refused at write time"
+        );
+        assert!(engine.xpc_record(&rec.tx_hash).await.is_none());
+        assert_eq!(engine.xpc_len().await, 0);
+
+        engine.restore_xpc_records(&[rec.clone()]).await;
+        assert!(
+            engine.xpc_record(&rec.tx_hash).await.is_none(),
+            "an inconsistent record must be refused at restore time"
+        );
+    }
+
+    /// A transfer that was produced through the LEGACY outbound path is never
+    /// re-opened as a 2PC transfer: the PREPARE is refused and no PREPARED
+    /// record appears.
+    #[tokio::test]
+    async fn a_legacy_produced_transfer_cannot_be_reopened_as_2pc() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let tx = Transaction::sign(&signer, [2u8; 32], 1_000, 280_000, 0, 0, 1);
+        let tx_hash = tx.compute_tx_hash();
+
+        let engine = InMemoryStateEngine::new();
+        engine.enable_cross_shard();
+
+        // Height 1: the transfer is published the LEGACY way (outbound from
+        // shard 0), which records it in `cross_shard_produced`.
+        let legacy = CrossShardMessage::new(0, 1, tx.clone(), [0u8; 32], [0u8; 32], None);
+        let legacy_block = Block {
+            shard_id: 0,
+            height: 1,
+            prev_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![legacy],
+            timestamp: 1_770_000_000,
+            proposer: [0x11; 32],
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+        };
+        engine.apply_cross_shard_consumptions(&legacy_block).await;
+        assert_eq!(engine.cross_shard_produced_len().await, 1);
+
+        // Height 2: a Byzantine proposer tries to escrow the SAME transfer as
+        // a 2PC PREPARE (with the escrow transaction in the block).
+        let prepare =
+            CrossShardMessage::new_xpc(XPC_PREPARE, 0, 1, tx.clone(), [0u8; 32], [0u8; 32], None);
+        let prepare_block = Block {
+            shard_id: 0,
+            height: 2,
+            transactions: vec![tx.clone()],
+            cross_shard_out: vec![prepare],
+            ..legacy_block
+        };
+        assert_eq!(
+            engine
+                .apply_xpc_source_prepares(&prepare_block, &[true])
+                .await,
+            0,
+            "a legacy-produced transfer must not be re-opened as 2PC"
+        );
+        assert!(engine.xpc_record(&tx_hash).await.is_none());
+
+        // Control: the same PREPARE on a fresh engine DOES create the record.
+        let fresh = InMemoryStateEngine::new();
+        fresh.enable_cross_shard();
+        assert_eq!(
+            fresh
+                .apply_xpc_source_prepares(&prepare_block, &[true])
+                .await,
+            1
+        );
+    }
+
+    /// The legacy credit path refuses a transaction the shard already holds a
+    /// 2PC record for, even when the legacy message carries a fully valid
+    /// proof and anchor. This is the coexistence gate: one transfer is never
+    /// half-legacy/half-2PC.
+    #[tokio::test]
+    async fn a_legacy_credit_is_refused_when_a_2pc_record_exists() {
+        let kp = FalconKeypair::generate_from_seed(45);
+        let sender_addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        let recipient = [0x5Au8; 32];
+        let amount = 1_000_000u64;
+        let initial_bal = 5_000_000_000u64;
+
+        let source = InMemoryStateEngine::new();
+        source
+            .update_account(AccountState::new(sender_addr, initial_bal))
+            .await;
+        source
+            .pin_pubkey(
+                sender_addr,
+                PqScheme::Falcon512,
+                &kp.public_key,
+                &DEFAULT_SALT,
+            )
+            .await
+            .expect("pin pq key");
+        let source_root = source.get_state_root().await;
+        let proof = source.get_account_proof(&sender_addr).await;
+        let pk_hash = source
+            .get_account(&sender_addr)
+            .await
+            .and_then(|a| a.pubkey_hash)
+            .expect("pinned pq pubkey hash");
+        let anchor_block = [0xCDu8; 32];
+        let reg = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+        reg.write()
+            .unwrap()
+            .note_finalized(0, anchor_block, source_root);
+
+        let probe = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            vec![0u8; FALCON512_SIG_LEN],
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let sig = kp.sign(&probe.signing_message());
+        let signed_tx = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig,
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let tx_hash = signed_tx.compute_tx_hash();
+        let legacy =
+            CrossShardMessage::new(0, 1, signed_tx.clone(), source_root, anchor_block, proof)
+                .with_source_balance(initial_bal)
+                .with_sender_pubkey_hash(PqScheme::Falcon512.id(), pk_hash);
+        let block = Block {
+            shard_id: 1,
+            height: 5,
+            prev_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![legacy],
+            timestamp: 1_770_000_000,
+            proposer: [0x11; 32],
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+        };
+
+        // Control: a target with no 2PC record credits the legacy transfer.
+        let clean = InMemoryStateEngine::new();
+        clean.enable_cross_shard();
+        clean.with_finalized_headers(reg.clone());
+        clean.apply_cross_shard_consumptions(&block).await;
+        assert_eq!(
+            clean.get_account(&recipient).await.map(|a| a.balance),
+            Some(amount),
+            "precondition: the legacy message itself is valid"
+        );
+
+        // Armed: the SAME message is refused because a 2PC record exists.
+        let armed = InMemoryStateEngine::new();
+        armed.enable_cross_shard();
+        armed.with_finalized_headers(reg);
+        assert!(
+            armed
+                .write_xpc_record(&crate::xshard2pc::XpcRecord::prepared(signed_tx, 0, 1, 1))
+                .await
+        );
+        armed.apply_cross_shard_consumptions(&block).await;
+        assert_eq!(
+            armed.get_account(&recipient).await.map(|a| a.balance),
+            None,
+            "a 2PC transaction must never be credited as a legacy transfer"
+        );
+        assert_eq!(armed.cross_shard_consumed_len().await, 0);
+        assert!(armed.xpc_record(&tx_hash).await.is_some());
     }
 }

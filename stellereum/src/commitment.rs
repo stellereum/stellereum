@@ -2007,12 +2007,32 @@ pub fn assemble_cached_digest(domains: [&[u8]; 13]) -> [u8; 32] {
 ///
 /// Byte-identical to [`assemble_cached_digest`] when `cnvrf` is empty.
 pub fn assemble_cached_digest_with_cnvrf(domains: [&[u8]; 13], cnvrf: &[u8]) -> [u8; 32] {
+    assemble_cached_digest_with_cnvrf_and_minted(domains, cnvrf, 0)
+}
+
+/// [`assemble_cached_digest_with_cnvrf`] plus the engine's GLOBAL MINTED
+/// SUPPLY counter.
+///
+/// The counter joins the digest ONLY when non-zero, exactly like the zkML and
+/// CN-VRF domains: a chain that has never minted keeps its pre-field root (the
+/// genesis KAT stays pinned). The first mint moves the root, which is what
+/// makes "two nodes disagree about minted supply" a visible divergence instead
+/// of a silent one — the reason `state_engine` enforces `TOTAL_SUPPLY_CAP`
+/// through this scalar.
+pub fn assemble_cached_digest_with_cnvrf_and_minted(
+    domains: [&[u8]; 13],
+    cnvrf: &[u8],
+    total_minted_nano: u64,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
     for bytes in domains {
         h.update(bytes);
     }
     h.update(cnvrf);
+    if total_minted_nano != 0 {
+        put_u64(&mut h, b"total_minted_nano", total_minted_nano);
+    }
     h.finalize().into()
 }
 
@@ -2029,11 +2049,25 @@ pub fn assemble_cached_digest_with_cnvrf(domains: [&[u8]; 13], cnvrf: &[u8]) -> 
 /// Bit-for-bit equality with the streaming digest follows from the same
 /// argument as `assemble_cached_digest` (same concatenation ⇒ same hash).
 pub fn assemble_from_cache(cache: &mut DomainCache, generations: &[u64; 13]) -> Option<[u8; 32]> {
+    assemble_from_cache_with_minted(cache, generations, 0)
+}
+
+/// [`assemble_from_cache`] plus the conditional global minted-supply scalar
+/// (see [`assemble_cached_digest_with_cnvrf_and_minted`] for why it is
+/// conditional).
+pub fn assemble_from_cache_with_minted(
+    cache: &mut DomainCache,
+    generations: &[u64; 13],
+    total_minted_nano: u64,
+) -> Option<[u8; 32]> {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
     for d in Domain::ALL {
         let bytes = cache.get_ref(d, generations[d.index()])?;
         h.update(bytes);
+    }
+    if total_minted_nano != 0 {
+        put_u64(&mut h, b"total_minted_nano", total_minted_nano);
     }
     Some(h.finalize().into())
 }

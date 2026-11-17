@@ -189,6 +189,14 @@ pub struct InMemoryStateEngine {
     /// On-chain primary market maker (bonding curve). Minted STELL is real
     /// native balance; the USDT side is the bridged wUSDT token.
     pmm: Arc<RwLock<crate::pmm::PrimaryMarketMaker>>,
+    /// Serializes PMM buy/sell transitions. Cheap market ops take a read lock,
+    /// run the curve on a CLONE, move value, then overwrite under a write lock;
+    /// without this mutex two concurrent calls both pass the reserve check
+    /// against the same clone and both pay out (a real, reproduced reserve-cap
+    /// violation: 8 concurrent sells drained more wUSDT than the usable
+    /// reserve). PMM ops are rare relative to block rate, so a single mutex
+    /// costs nothing measurable and makes the transition atomic per engine.
+    pmm_op: Arc<tokio::sync::Mutex<()>>,
     /// Token id of the bridged USDT used as the PMM's quote asset.
     pmm_usdt_token: Arc<RwLock<Option<[u8; 32]>>>,
     /// Address holding the PMM's wUSDT liquidity (quote reserve). Buyers pay
@@ -272,6 +280,31 @@ pub struct InMemoryStateEngine {
     /// Stored as `generation + 1` so the derived `Default` value (0) means
     /// "nothing committed yet" and the first root read always recomputes.
     committed_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative nano-STELL ever created by the engine's mint primitive.
+    ///
+    /// THE GLOBAL SUPPLY INVARIANT. Every mint ([`Self::mint_native`], and
+    /// therefore [`Self::credit_native`], which delegates to it) atomically
+    /// RESERVES `amount` from this counter and fails closed when the total
+    /// would exceed [`crate::tokenomics::TOTAL_SUPPLY_CAP`]. Local caps
+    /// (`REWARDS_EMISSION_CAP`, `BRIDGE_MINT_CAP_NANO`, `GENESIS_VAULT_CAP`)
+    /// each bound one subsystem; this one bounds their SUM.
+    ///
+    /// Monotone by construction: burns ([`Self::debit_native`], PMM sells,
+    /// slashes) do NOT restore headroom, so "minted" is gross-lifetime and a
+    /// chain cannot mint, burn, and mint again forever. Transfers never touch
+    /// it ([`Self::transfer_native`] / [`Self::credit_native_transfer`]).
+    ///
+    /// `Arc<AtomicU64>` (not a plain `u64`) so a shallow `Clone` — which
+    /// shares every subsystem `Arc` — shares the counter too, while
+    /// [`Self::clone_for_simulation`] deep-copies its VALUE so a sandbox can
+    /// never consume the live engine's headroom.
+    ///
+    /// NOT YET IN THE STATE ROOT: `commitment.rs` is outside this change's
+    /// scope. The getter the commitment must fold in is
+    /// [`Self::total_minted_nano`]; until that lands, two nodes that disagree
+    /// about minted supply still agree on the root (see the wiring note on
+    /// the getter).
+    total_minted_nano: Arc<std::sync::atomic::AtomicU64>,
     /// Per-domain content-generation counters (see
     /// [`crate::commitment::DomainGenerations`]).
     ///

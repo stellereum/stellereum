@@ -307,6 +307,32 @@ pub enum ConsensusMsg {
     /// [`MAX_BATCH_ITEMS`] messages / [`MAX_BATCH_BYTES`] bytes. Batches
     /// never nest: an inner `Batch` is rejected on decode.
     Batch(Vec<ConsensusMsg>),
+    // ------------------------------------------------------------------
+    // Compact PROPOSAL gossip variants. Deliberately APPENDED after
+    // `Batch`: bincode encodes the declaration index, so appending keeps
+    // every pre-existing variant (and therefore the whole pre-activation
+    // wire format) byte-identical. Inserting these anywhere earlier would
+    // renumber `Vote`/`Committed`/`Batch` and break old peers.
+    // ------------------------------------------------------------------
+    /// Compact announcement of a proposal: the full header + one 6-byte short
+    /// id per body slot instead of the body itself.
+    ///
+    /// GATED: only decodable/emittable once
+    /// [`COMPACT_GOSSIP_ACTIVATION_HEIGHT`] is reached at the message's
+    /// height. Below the gate this variant never appears on the wire, so the
+    /// existing [`ConsensusMsg::Proposal`] path stays byte-identical. The
+    /// receiver resolves the ids against its mempool, pulls the misses with a
+    /// bounded [`ConsensusMsg::BodyPull`], and prevotes ONLY on a fully
+    /// resolved body whose hash matches `proposal.block_hash`.
+    CompactProposal {
+        proposal: compact_prop::CompactProposal,
+    },
+    /// Bounded request for the short ids of a compact proposal that were not
+    /// in the receiver's mempool (gated like [`ConsensusMsg::CompactProposal`]).
+    BodyPull { pull: compact_prop::BodyPull },
+    /// Response to a [`ConsensusMsg::BodyPull`]: the requested txs, each bound
+    /// to the id it answers (gated like [`ConsensusMsg::CompactProposal`]).
+    Body { body: compact_prop::Body },
 }
 
 /// True when a single message is large enough to flush the gossip outbox
@@ -359,10 +385,18 @@ pub fn send_outcome_records_health(fire_and_forget: bool) -> bool {
 /// [`ConsensusMsg::Committed`] keeps the acknowledged form: it is the catch-up
 /// path (a full block + QC) and its ACK is the sender's proof that the peer
 /// really got the block. It is also rare, so it costs nothing to wait for it.
+///
+/// Compact gossip: `CompactProposal` and `BodyPull` are latency-critical and
+/// idempotent (a re-send is harmless and bounded), so they ride the same
+/// fire-and-forget path. `Body` keeps the acknowledged form: it is a bulk
+/// answer whose delivery the puller's attempt budget cares about.
 pub fn message_is_fire_and_forget(msg: &ConsensusMsg) -> bool {
     matches!(
         msg,
-        ConsensusMsg::Vote { .. } | ConsensusMsg::Proposal { .. }
+        ConsensusMsg::Vote { .. }
+            | ConsensusMsg::Proposal { .. }
+            | ConsensusMsg::CompactProposal { .. }
+            | ConsensusMsg::BodyPull { .. }
     )
 }
 
@@ -399,6 +433,64 @@ impl ConsensusMsg {
         if items.iter().any(|m| matches!(m, ConsensusMsg::Batch(_))) {
             return Err("nested consensus batch".to_string());
         }
+        // Compact gossip riding in a batch is still compact gossip: the same
+        // activation gate and the same structural caps apply per inner.
+        for m in items {
+            Self::check_compact_gate(m)?;
+        }
+        Ok(())
+    }
+
+    /// The height a compact-gossip message is bound to, or `None` for every
+    /// pre-existing variant. Used by the activation gate and by callers that
+    /// route compact traffic separately.
+    pub fn compact_gossip_height(&self) -> Option<u64> {
+        match self {
+            ConsensusMsg::CompactProposal { proposal } => Some(proposal.height),
+            ConsensusMsg::BodyPull { pull } => Some(pull.height),
+            ConsensusMsg::Body { body } => Some(body.height),
+            _ => None,
+        }
+    }
+
+    /// True for the activation-gated compact-gossip variants.
+    pub fn is_compact_gossip(&self) -> bool {
+        self.compact_gossip_height().is_some()
+    }
+
+    /// Fail-closed admission for compact-gossip messages: activation gate at
+    /// the message's height PLUS the structural caps of each payload.
+    ///
+    /// `Body` is only structurally checked here (its id↔tx binding needs the
+    /// answering proposal's salt, which lives in the resolver via
+    /// [`open_compact_proposal`]). Pre-activation every compact message is
+    /// refused, so the wire is byte-identical and no work is done on one.
+    pub fn check_compact_gate(msg: &Self) -> Result<(), String> {
+        match msg {
+            ConsensusMsg::CompactProposal { proposal } => {
+                if !compact_gossip_admits(proposal.height) {
+                    return Err("compact gossip inactive".to_string());
+                }
+                proposal
+                    .validate()
+                    .map_err(|e| format!("compact proposal: {e}"))?;
+            }
+            ConsensusMsg::BodyPull { pull } => {
+                if !compact_gossip_admits(pull.height) {
+                    return Err("compact gossip inactive".to_string());
+                }
+                pull.validate()
+                    .map_err(|e| format!("compact body pull: {e}"))?;
+            }
+            ConsensusMsg::Body { body } => {
+                if !compact_gossip_admits(body.height) {
+                    return Err("compact gossip inactive".to_string());
+                }
+                body.validate_structure()
+                    .map_err(|e| format!("compact body: {e}"))?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -408,6 +500,12 @@ impl ConsensusMsg {
     pub fn is_large(&self) -> bool {
         match self {
             ConsensusMsg::Proposal { .. } | ConsensusMsg::Committed { .. } => true,
+            // Compact gossip frames are consensus-critical (a proposal/flush or
+            // a body answer must not wait for the batching window), so they
+            // take the same immediate-flush path as a full proposal.
+            ConsensusMsg::CompactProposal { .. }
+            | ConsensusMsg::BodyPull { .. }
+            | ConsensusMsg::Body { .. } => true,
             ConsensusMsg::Batch(..) => true,
             ConsensusMsg::Vote { .. } => {
                 self.encode().map(|b| b.len() >= 64 * 1024).unwrap_or(false)
@@ -459,6 +557,7 @@ impl ConsensusMsg {
         if let Self::Batch(items) = &msg {
             Self::check_batch(items, bytes.len())?;
         }
+        Self::check_compact_gate(&msg)?;
         Ok(msg)
     }
 }
@@ -1892,17 +1991,65 @@ pub fn parse_incoming(raw: &str) -> Option<ConsensusMsg> {
 #[path = "compact_prop.rs"]
 pub mod compact_prop;
 
-/// First height whose finality may gossip in compact form. `u64::MAX` =
-/// INACTIVE by default: `compact_gossip_active` is false for every realistic
-/// height, so emission and admission both stay off and the wire is
-/// byte-identical. The lead flips this const (plus the two call sites above)
-/// to arm compact gossip — never any other edit.
+/// First height whose proposals AND finality may gossip in compact form.
+/// `u64::MAX` = INACTIVE by default: `compact_gossip_active` is false for
+/// every realistic height, so emission and admission both stay off and the
+/// wire is byte-identical. The lead flips this const (plus the reported
+/// emitter/receiver call sites) to arm compact gossip — never any other edit.
 pub const COMPACT_GOSSIP_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
-/// True once compact-µQC gossip is live for `height`.
+/// Test-only activation override (never set on the live path).
+///
+/// `u64::MAX` means "unset ⇒ use [`COMPACT_GOSSIP_ACTIVATION_HEIGHT`]". The
+/// compact-gossip suite drives the REAL emitter/decoder/receiver through
+/// [`with_compact_gossip_gate`] while the production const stays frozen.
+/// No production code path writes this (grep-proof: only the helper below and
+/// tests touch it), so the live gate remains the const.
+static COMPACT_GOSSIP_TEST_GATE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Effective gate: the frozen const unless a test override is installed.
+fn compact_gossip_gate() -> u64 {
+    let over = COMPACT_GOSSIP_TEST_GATE.load(Ordering::SeqCst);
+    if over == u64::MAX {
+        COMPACT_GOSSIP_ACTIVATION_HEIGHT
+    } else {
+        over
+    }
+}
+
+/// True once compact gossip (proposals and µQC) is live for `height`.
 #[allow(clippy::absurd_extreme_comparisons)] // GATE: `>= MAX` is the intentional INACTIVE gate; `>=` (not `==`) stays correct after the lead flips to a real height.
 pub fn compact_gossip_active(height: u64) -> bool {
-    height >= COMPACT_GOSSIP_ACTIVATION_HEIGHT
+    height >= compact_gossip_gate()
+}
+
+/// Admission predicate for compact-gossip FRAMES: [`compact_gossip_active`]
+/// plus the explicit exclusion of the frozen-gate sentinel.
+///
+/// `compact_gossip_active` uses `>=` (so the lead's flip to a real height
+/// keeps working), which means the single value `u64::MAX` compares as
+/// "active" while the const is frozen at `u64::MAX`. No real proposal exists
+/// at that height, so admission must never let a frame named `u64::MAX` slip
+/// past a frozen gate.
+fn compact_gossip_admits(height: u64) -> bool {
+    height != u64::MAX && compact_gossip_active(height)
+}
+
+/// Run `f` with a temporary compact-gossip activation height.
+///
+/// Test-only override for the REAL gate: serialized on a process-wide mutex
+/// (parallel tests in one binary would otherwise race the global), and always
+/// restored, so a panic inside `f` cannot leak an armed gate into the next
+/// test. The frozen production const is never written.
+pub fn with_compact_gossip_gate<T>(gate: u64, f: impl FnOnce() -> T) -> T {
+    static GATE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = GATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = COMPACT_GOSSIP_TEST_GATE.swap(gate, Ordering::SeqCst);
+    let out = f();
+    COMPACT_GOSSIP_TEST_GATE.store(previous, Ordering::SeqCst);
+    out
 }
 
 /// Encode a live QC as a compact gossip frame.
@@ -2021,6 +2168,85 @@ pub fn parse_compact_qc_incoming(raw: &str) -> Option<QuorumCertificate> {
         return None;
     }
     Some(qc)
+}
+
+// ---------------------------------------------------------------------------
+// Compact PROPOSAL gossip (LIVE-PATH WIRING — INACTIVE, activation-gated).
+//
+// Proposal gossip used to ship the full `Block` (`ConsensusMsg::Proposal`):
+// `366 + 176*N` bytes, i.e. 75_694 B for a 428-tx block. This section wires
+// the compact alternative: `CompactProposal { header, block_hash, short_ids }`
+// (`366 + 6*N`, ~2_934 B for the same block — measured, see
+// `compact_prop` §1/§3), then a bounded `BodyPull`/`Body` exchange for the
+// ids a receiver's mempool did not have.
+//
+// Safety (fail-closed, every step):
+// * the announced `block_hash` is the hash of the FULL block; the receiver
+//   rebuilds the body in announced slot order and REFUSES a body that does
+//   not hash to it (`compact_prop::CompactResolver::complete`);
+// * a short-id collision resolves to a MISS, never a guess, so it can only
+//   cost a body pull;
+// * ids per pull, attempts, response size and the frame ceiling are all
+//   bounded (`COMPACT_PULL_*`, `COMPACT_MAX_BYTES` == `MAX_CONSENSUS_MSG`);
+// * a proposal whose misses exceed the pull budget falls back to the plain
+//   full-proposal fetch — only a FULLY resolved body reaches prevote.
+//
+// Reported (NOT edited here — runtime/node ownership): the emitter call site
+// (`src/node/consensus_driver.rs:1800`, replace `ConsensusMsg::Proposal` with
+// `compact_proposal_from_block(&block, round)`'s `Some` on the compact path,
+// keeping the full proposal as the `None`/fallback), the inbound arm
+// (`src/node/consensus_driver.rs:2111`), the responder for `BodyPull`, and the
+// puller for `Body`; also the exhaustive matches at
+// `src/node/consensus_driver.rs:2110` and `src/bin_tests.rs:579` need the
+// three new arms.
+// ---------------------------------------------------------------------------
+
+/// Emitter: the compact announcement for `block`, or `None` when compact
+/// gossip is inactive at its height (caller MUST send the plain `Proposal`
+/// then — wire byte-identical) or the block is not compressible.
+pub fn compact_proposal_from_block(block: &Block, round: u32) -> Option<ConsensusMsg> {
+    compact_proposal_from_block_with_full(block, round, &[])
+}
+
+/// Emitter for blocks whose `full_slots` (sealed/private txs peers cannot
+/// resolve) must travel inline. Same gate/fallback contract as
+/// [`compact_proposal_from_block`].
+pub fn compact_proposal_from_block_with_full(
+    block: &Block,
+    round: u32,
+    full_slots: &[u32],
+) -> Option<ConsensusMsg> {
+    if !compact_gossip_admits(block.height) {
+        return None;
+    }
+    compact_prop::CompactProposal::for_block(block, round, full_slots)
+        .ok()
+        .map(|proposal| ConsensusMsg::CompactProposal { proposal })
+}
+
+/// Receiver: open the resolver for a decoded announcement.
+///
+/// Checks the activation gate again (defense in depth: `ConsensusMsg::decode`
+/// already refuses compact frames below the gate) and every structural bound.
+pub fn open_compact_proposal(
+    proposal: compact_prop::CompactProposal,
+) -> Result<compact_prop::CompactResolver, String> {
+    if !compact_gossip_admits(proposal.height) {
+        return Err("compact gossip inactive".to_string());
+    }
+    compact_prop::CompactResolver::new(proposal).map_err(|e| format!("compact proposal: {e}"))
+}
+
+/// Receiver: the mempool short-id index for a proposal header.
+///
+/// `txs` is the caller's local view of the mempool (`Mempool::all()` at the
+/// reported call site); the salt is derived from the announced header, so the
+/// caller never invents one.
+pub fn short_id_index_for(
+    header: &Block,
+    txs: impl IntoIterator<Item = crate::sharding::Transaction>,
+) -> compact_prop::ShortIdIndex {
+    compact_prop::ShortIdIndex::from_txs(compact_prop::salt_for_header(header), txs)
 }
 
 // ---------------------------------------------------------------------------

@@ -178,13 +178,58 @@ pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: 
 /// existing QC pins running green unmodified.
 pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
+// TEST-ONLY override of the C1 activation height, scoped to the calling
+// thread.
+//
+// The frozen constant stays `u64::MAX`, so a process that never calls
+// [`set_qc_split_activation_override`] behaves byte-identically to before
+// (the gate is inert). Tests need to exercise the ACTIVE branch — a
+// producer/verifier round trip at a reachable activation height — without
+// shipping a reachable default. Thread-scoped for the same reason as the
+// chain-id and pure-PQ overrides: the test binary runs tests in parallel and
+// one test's activation window must not change an unrelated test's verdict.
+//
+// Release builds have no override at all (`debug_assertions` is off), so the
+// knob cannot be reached by a production node even in principle.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static QC_SPLIT_ACTIVATION_OVERRIDE: std::cell::Cell<Option<Height>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY C1 activation-height override for
+/// the CALLING THREAD.
+///
+/// Mirrors [`crate::post_quantum::set_pure_pq_override`]: available in test
+/// and debug builds, nonexistent in release builds. `Some(h)` makes
+/// [`qc_split_active_at`] true exactly for heights `>= h`, which is how the
+/// producer/verifier test suites drive the ACTIVE branch without changing
+/// [`QC_SPLIT_ACTIVATION_HEIGHT`] (still `u64::MAX`, frozen off).
+#[cfg(any(test, debug_assertions))]
+pub fn set_qc_split_activation_override(activation: Option<Height>) {
+    QC_SPLIT_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// The C1 activation height in force for the calling thread.
+///
+/// The frozen [`QC_SPLIT_ACTIVATION_HEIGHT`] unless a test/debug caller
+/// installed [`set_qc_split_activation_override`].
+pub fn qc_split_activation_height() -> Height {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if let Some(activation) = QC_SPLIT_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+            return activation;
+        }
+    }
+    QC_SPLIT_ACTIVATION_HEIGHT
+}
+
 /// True once the C1 advisory/finality split is active at `height`.
-#[allow(clippy::absurd_extreme_comparisons)]
-// GATE: `QC_SPLIT_ACTIVATION_HEIGHT` is deliberately `u64::MAX` (INACTIVE
-// default, flipped only by the lead); `>=` is the correct activation
-// semantics once it names a reachable height.
-pub(super) fn qc_split_active_at(height: Height) -> bool {
-    height >= QC_SPLIT_ACTIVATION_HEIGHT
+///
+/// Reads [`qc_split_activation_height`] (the frozen constant in production),
+/// so the `>=` comparison is the only activation semantics there is.
+pub fn qc_split_active_at(height: Height) -> bool {
+    height >= qc_split_activation_height()
 }
 
 /// Advisory µQC threshold (sketch §4.1): `floor(2*W_committee/3) + 1`.

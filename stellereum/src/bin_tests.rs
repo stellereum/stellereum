@@ -591,6 +591,13 @@ mod gossip_batch_tests {
                 }
                 ConsensusMsg::Batch(_) => panic!("flatten must never yield Batch"),
                 ConsensusMsg::Committed { .. } => {}
+                // Compact-gossip frames are activation-gated (`u64::MAX`): this
+                // test path must never observe one, so panic if one appears.
+                ConsensusMsg::CompactProposal { .. }
+                | ConsensusMsg::BodyPull { .. }
+                | ConsensusMsg::Body { .. } => {
+                    panic!("compact gossip must stay gated off in this path")
+                }
             }
         }
         assert!(accepted, "vote-then-proposal must accept the proposal");
@@ -1630,6 +1637,13 @@ mod cli_tx_builder_tests {
 
         // (c) local stand fallback: `run` loads and bonds THIS key, so it is
         //     the one a solo stand's quorum counts.
+        //
+        // Test-local key-storage policy: generating a consensus key requires
+        // either a passphrase or the explicit plaintext opt-out (the hardened
+        // default refuses to write an unencrypted private key). This fixture
+        // writes into a throwaway temp dir, so opting out is correct here and
+        // keeps the harness independent of the operator's environment.
+        std::env::set_var("STELL_KEY_PLAINTEXT", "1");
         let consensus = stellereum::node_keys::load_or_generate_consensus_key(&dir)
             .expect("create the consensus key");
         let keys = resolve_attest_keys(&[], &dir).expect("consensus-key fallback");

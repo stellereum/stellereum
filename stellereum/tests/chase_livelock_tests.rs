@@ -792,6 +792,13 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
             }
             ConsensusMsg::Batch(_) => panic!("flatten must never yield Batch"),
             ConsensusMsg::Committed { .. } => {}
+            // Compact-gossip frames are activation-gated (`u64::MAX`), so this
+            // historical-path test must never observe one.
+            ConsensusMsg::CompactProposal { .. }
+            | ConsensusMsg::BodyPull { .. }
+            | ConsensusMsg::Body { .. } => {
+                panic!("compact gossip must stay gated off in this path")
+            }
         }
     }
     assert!(

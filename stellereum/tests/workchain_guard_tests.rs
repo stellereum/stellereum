@@ -1,15 +1,17 @@
 //! Workchain boot-guard tests (fail-closed text + hatch only).
 //!
 //! Pins [`stellereum::sharding::check_workchain_boot_guard`]: the default
-//! single-shard `{0}` registry boots unchanged, any other registry
-//! (`STELL_SHARDS != {0}`) refuses with an error naming the freeze doc
+//! single-shard `{0}` registry boots unchanged, and so does the FIXED public
+//! two-shard pair `PUBLIC_SHARD_PAIR` (`{0,1}`) — that pair is now the
+//! supported public multi-shard configuration. Any OTHER registry (`{1}`,
+//! `{2}`, `{0,1,2}`, ...) refuses with an error naming the freeze doc
 //! (`docs/PUBLIC_TESTNET_CODE_GAPS.md §1`) unless the local soak/test hatch
 //! `STELL_EXPERIMENTAL_SHARDS=1` is set.
 
 use std::sync::Mutex;
 use stellereum::sharding::{
     check_workchain_boot_guard, check_workchain_boot_guard_with_hatch, ShardRegistry,
-    EXPERIMENTAL_SHARDS_ENV, SHARD_REGISTRY_ENV, WORKCHAIN_FREEZE_DOC,
+    EXPERIMENTAL_SHARDS_ENV, PUBLIC_SHARD_PAIR, SHARD_REGISTRY_ENV, WORKCHAIN_FREEZE_DOC,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -48,11 +50,32 @@ fn default_single_registry_boots_unchanged() {
     restore_env(saved);
 }
 
+/// The fixed public pair `{0,1}` boots WITHOUT the hatch — that is the
+/// documented public shard configuration now (pinned by the two-shard suites).
+/// The guard is order-independent: `STELL_SHARDS=1,0` is the same registry.
+#[test]
+fn fixed_public_pair_boots_without_hatch() {
+    let pair = ShardRegistry::from_ids(PUBLIC_SHARD_PAIR.iter().copied());
+    assert!(check_workchain_boot_guard_with_hatch(&pair, false).is_ok());
+    assert!(check_workchain_boot_guard_with_hatch(&pair, true).is_ok());
+
+    let _g = lock_env();
+    let saved = save_env();
+    std::env::set_var(SHARD_REGISTRY_ENV, "1,0");
+    std::env::remove_var(EXPERIMENTAL_SHARDS_ENV);
+    let reversed = ShardRegistry::from_env_or(0);
+    assert_eq!(reversed, pair, "order must canonicalise to the same pair");
+    assert!(check_workchain_boot_guard(&reversed).is_ok());
+    restore_env(saved);
+}
+
+/// Three shards are still parked: `{0,1,2}` refuses without the hatch. The
+/// error must name the supported pair.
 #[test]
 fn multishard_without_hatch_refuses_naming_freeze() {
     let _g = lock_env();
     let saved = save_env();
-    std::env::set_var(SHARD_REGISTRY_ENV, "0,1");
+    std::env::set_var(SHARD_REGISTRY_ENV, "0,1,2");
     std::env::remove_var(EXPERIMENTAL_SHARDS_ENV);
     let registry = ShardRegistry::from_env_or(0);
     assert!(registry.is_sharded());
@@ -69,6 +92,10 @@ fn multishard_without_hatch_refuses_naming_freeze() {
         err.contains(EXPERIMENTAL_SHARDS_ENV),
         "error must document the hatch: {err}"
     );
+    assert!(
+        err.contains("0,1"),
+        "error must name the supported pair: {err}"
+    );
     restore_env(saved);
 }
 
@@ -76,7 +103,8 @@ fn multishard_without_hatch_refuses_naming_freeze() {
 fn multishard_with_hatch_boots() {
     let _g = lock_env();
     let saved = save_env();
-    std::env::set_var(SHARD_REGISTRY_ENV, "0,1");
+    // Beyond the fixed public pair the hatch is still the only way in.
+    std::env::set_var(SHARD_REGISTRY_ENV, "0,1,2");
     std::env::set_var(EXPERIMENTAL_SHARDS_ENV, "1");
     let registry = ShardRegistry::from_env_or(0);
     assert!(registry.is_sharded());
@@ -86,8 +114,8 @@ fn multishard_with_hatch_boots() {
 
 #[test]
 fn noncanonical_single_shard_without_hatch_refuses() {
-    // `STELL_SHARDS != {0}` is the refusal condition: even a lone workchain
-    // `{1}` is not the canonical registry.
+    // The hatch-free set is EXACTLY `{0}` plus the fixed public pair `{0,1}`:
+    // a lone workchain `{1}` is neither, so it still refuses.
     let registry = ShardRegistry::from_ids([1]);
     let err = check_workchain_boot_guard_with_hatch(&registry, false)
         .expect_err("must refuse non-canonical single shard");
@@ -100,7 +128,8 @@ fn noncanonical_single_shard_without_hatch_refuses() {
 
 #[test]
 fn hatch_flag_is_exact_match_only() {
-    let multi = ShardRegistry::from_ids([0, 1]);
+    // A set BEYOND the fixed public pair: only hatch=true passes.
+    let multi = ShardRegistry::from_ids([0, 1, 2]);
     // Pure core: only hatch=true passes.
     assert!(check_workchain_boot_guard_with_hatch(&multi, false).is_err());
     assert!(check_workchain_boot_guard_with_hatch(&multi, true).is_ok());

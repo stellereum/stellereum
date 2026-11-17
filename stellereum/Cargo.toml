@@ -67,6 +67,12 @@ opt-level = 3
 
 [profile.test]
 debug = 0
+# The suite is CRYPTO-heavy and the crypto lives in THIS crate (Falcon-verify,
+# SHAKE-256, BLAKE3 chain, MinRoot field arithmetic). At opt-level 0 those
+# tests ran ~3x slower than optimized code, which is why the full gate took
+# 20+ minutes. Level 2 keeps our own debug info off (debug = 0 above) while
+# executing the same math the release binary runs.
+opt-level = 2
 
 [profile.test.package."*"]
 opt-level = 3

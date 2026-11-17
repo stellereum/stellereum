@@ -23,6 +23,7 @@ impl InMemoryStateEngine {
             orderbooks: Arc::new(RwLock::new(crate::orderbook::OrderbookManager::new())),
             contracts: Arc::new(RwLock::new(crate::contract::ContractRegistry::new())),
             pmm: Arc::new(RwLock::new(crate::pmm::PrimaryMarketMaker::new())),
+            pmm_op: Arc::new(tokio::sync::Mutex::new(())),
             pmm_usdt_token: Arc::new(RwLock::new(None)),
             pmm_treasury: Arc::new(RwLock::new([0u8; 32])),
             order_escrow: Arc::new(RwLock::new(HashMap::new())),
@@ -33,6 +34,7 @@ impl InMemoryStateEngine {
             zkml_models: Arc::new(RwLock::new(crate::zkml::ZkMlModelRegistry::default())),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_minted_nano: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             domain_gens: Arc::new(crate::commitment::DomainGenerations::default()),
             domain_cache: Arc::new(std::sync::Mutex::new(
                 crate::commitment::DomainCache::default(),
@@ -122,6 +124,7 @@ impl InMemoryStateEngine {
             orderbooks: Arc::new(RwLock::new(orderbooks)),
             contracts: Arc::new(RwLock::new(contracts)),
             pmm: Arc::new(RwLock::new(pmm)),
+            pmm_op: Arc::new(tokio::sync::Mutex::new(())),
             pmm_usdt_token: Arc::new(RwLock::new(pmm_usdt_token)),
             pmm_treasury: Arc::new(RwLock::new(pmm_treasury)),
             order_escrow: Arc::new(RwLock::new(order_escrow)),
@@ -136,6 +139,14 @@ impl InMemoryStateEngine {
             )),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.committed_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            // DEEP COPY of the mint counter (never share it with the parent):
+            // the sandbox must be free to mint against its own headroom
+            // without consuming the live engine's, and the live engine's
+            // counter must not move when the sandbox is discarded.
+            total_minted_nano: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.total_minted_nano
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
             // FORK SAFETY: the deep copy holds equal state at equal
@@ -868,7 +879,7 @@ impl InMemoryStateEngine {
             }
         };
 
-        crate::commitment::assemble_cached_digest_with_cnvrf(
+        crate::commitment::assemble_cached_digest_with_cnvrf_and_minted(
             [
                 &tokens,
                 &staking,
@@ -885,6 +896,7 @@ impl InMemoryStateEngine {
                 &zkml,
             ],
             &cnvrf,
+            self.total_minted_nano(),
         )
     }
 
@@ -1720,11 +1732,97 @@ impl InMemoryStateEngine {
         write_contract_trie_entries(&mut trie, &contracts);
     }
 
-    /// Credit native STELL to an account (mint) and commit to the trie.
-    pub async fn credit_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
-        if amount == 0 {
-            return Ok(());
+    /// Cumulative nano-STELL ever minted by the engine (gross lifetime, never
+    /// reduced by burns).
+    ///
+    /// WIRING REQUIRED (out of scope here, `commitment.rs`): this value is NOT
+    /// yet folded into the consensus commitment. To commit it, add an
+    /// APPENDED, self-gating domain (the zkML precedent) —
+    /// `put_u64(h, b"total_minted_nano", v)` written from
+    /// `InMemoryStateEngine::commit_consensus_domains_cached`
+    /// (`state_engine/accounts.rs`) after the existing 13 domains — and
+    /// extend `Domain::ALL` / `assemble_cached_digest_with_cnvrf` /
+    /// `assemble_from_cache` in `commitment.rs`. Until then two nodes that
+    /// disagree about minted supply can still report the same root.
+    pub fn total_minted_nano(&self) -> u64 {
+        self.total_minted_nano
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Nano-STELL still mintable under [`crate::tokenomics::TOTAL_SUPPLY_CAP`].
+    pub fn remaining_mint_headroom_nano(&self) -> u64 {
+        crate::tokenomics::TOTAL_SUPPLY_CAP.saturating_sub(self.total_minted_nano())
+    }
+
+    /// Fail-closed global-supply reservation for one mint.
+    ///
+    /// CAS loop on the counter: concurrent mints can never both see the same
+    /// headroom and overshoot. The reservation is taken BEFORE the balance
+    /// credit and released by the caller if the credit itself fails, so the
+    /// counter always bounds "value the engine committed to create".
+    ///
+    /// `pub(super)` because the block-reward leg in `apply.rs` must reserve
+    /// BEFORE it mutates the staking ledger: when the global cap is reached
+    /// the ledger must never be touched (so there is no per-validator
+    /// `pending_rewards` split to unwind).
+    pub(super) fn reserve_mint_nano(&self, amount: u64) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
+        let mut current = self.total_minted_nano.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(amount)
+                .ok_or_else(|| "global supply counter overflows u64: refusing mint".to_string())?;
+            if next > cap {
+                return Err(format!(
+                    "global supply cap exceeded: minting {amount} nano-STELL would take total minted past {cap} (currently {current}, headroom {})",
+                    cap.saturating_sub(current)
+                ));
+            }
+            match self.total_minted_nano.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
         }
+    }
+
+    /// Undo a reservation when the balance credit it paid for failed.
+    pub(super) fn release_mint_nano(&self, amount: u64) {
+        self.total_minted_nano
+            .fetch_sub(amount, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Credit a balance against an ALREADY-RESERVED mint.
+    ///
+    /// The caller took the global-supply reservation with
+    /// [`Self::reserve_mint_nano`]. On a balance failure the reservation is
+    /// released here, so headroom is never leaked.
+    pub(super) async fn credit_reserved_native(
+        &self,
+        addr: &[u8; 32],
+        amount: u64,
+    ) -> Result<(), String> {
+        match self.credit_balance_native(addr, amount).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.release_mint_nano(amount);
+                Err(e)
+            }
+        }
+    }
+
+    /// Credit a balance + trie leaf WITHOUT touching the mint counter.
+    ///
+    /// Private on purpose: value-creating callers must go through
+    /// [`Self::mint_native`]; value-moving callers through
+    /// [`Self::credit_native_transfer`] / [`Self::transfer_native`]. This is
+    /// the shared body so the two can never diverge on overflow behaviour.
+    async fn credit_balance_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
         let mut map = self.accounts.write().await;
         let acc = map
             .entry(*addr)
@@ -1737,7 +1835,107 @@ impl InMemoryStateEngine {
         Ok(())
     }
 
+    /// Credit native STELL to an account (**mint**) and commit to the trie.
+    ///
+    /// GLOBAL SUPPLY CAP: this is the ONE engine-level mint primitive. The
+    /// amount is atomically reserved against [`crate::tokenomics::TOTAL_SUPPLY_CAP`]
+    /// and the call fails closed (no balance change, no counter change) when
+    /// the global total would exceed it. Local caps
+    /// (`REWARDS_EMISSION_CAP`, `BRIDGE_MINT_CAP_NANO`, `GENESIS_VAULT_CAP`)
+    /// remain the per-subsystem first line; this is the sum.
+    ///
+    /// Callers that are moving value that ALREADY exists (fee payout to the
+    /// proposer, a refund from escrow, a pool payout, a cross-shard credit
+    /// backed by a source-shard debit) must use
+    /// [`Self::credit_native_transfer`] instead — a transfer must never be
+    /// capped.
+    pub async fn credit_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
+        self.mint_native(addr, amount).await
+    }
+
+    /// Mint `amount` nano-STELL into `addr`, fail-closed over the global cap.
+    ///
+    /// Same behaviour as [`Self::credit_native`]; the explicit name exists so
+    /// mint intent is greppable at the call site.
+    pub async fn mint_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.reserve_mint_nano(amount)?;
+        self.credit_reserved_native(addr, amount).await
+    }
+
+    /// Credit value that ALREADY exists on chain, without minting.
+    ///
+    /// For the credit half of a transfer whose debit already happened
+    /// elsewhere (fees collected in `apply_block_transition`, escrow refunds,
+    /// pool payouts). Not counted against [`crate::tokenomics::TOTAL_SUPPLY_CAP`]:
+    /// capping a transfer is exactly the bug this split exists to prevent.
+    /// Overflow is still refused fail-closed.
+    pub async fn credit_native_transfer(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.credit_balance_native(addr, amount).await
+    }
+
+    /// Atomically move existing nano-STELL between two accounts.
+    ///
+    /// A TRANSFER, not a mint: the global mint counter is untouched (the
+    /// whole point — a transfer near the supply cap must still work), and the
+    /// sender's debit and recipient's credit are validated BEFORE either is
+    /// applied, so a refused transfer moves nothing. Both trie leaves are
+    /// rewritten under the same post-lock batch.
+    ///
+    /// The recipient account is created on first credit (same as
+    /// [`Self::credit_native`]); `from == to` is a no-op.
+    pub async fn transfer_native(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        amount: u64,
+    ) -> Result<(), String> {
+        if amount == 0 || from == to {
+            return Ok(());
+        }
+        let mut map = self.accounts.write().await;
+        let from_balance = map
+            .get(from)
+            .map(|a| a.balance)
+            .ok_or_else(|| "account does not exist".to_string())?;
+        if from_balance < amount {
+            return Err("Insufficient native STELL balance".to_string());
+        }
+        let to_balance = map.get(to).map(|a| a.balance).unwrap_or(0);
+        let new_to = to_balance
+            .checked_add(amount)
+            .ok_or_else(|| "native overflow".to_string())?;
+
+        let from_snap = {
+            let acc = map
+                .get_mut(from)
+                .ok_or_else(|| "account does not exist".to_string())?;
+            acc.balance = from_balance - amount;
+            acc.to_trie_bytes()
+        };
+        let to_snap = {
+            let acc = map.entry(*to).or_insert_with(|| AccountState::new(*to, 0));
+            acc.balance = new_to;
+            acc.to_trie_bytes()
+        };
+        drop(map);
+
+        let mut trie = self.state_trie.write().await;
+        trie.insert(to, &to_snap);
+        trie.insert(from, &from_snap);
+        Ok(())
+    }
+
     /// Debit native STELL from an account (burn) and commit to the trie.
+    ///
+    /// A burn does NOT restore headroom: [`Self::total_minted_nano`] is gross
+    /// lifetime minting, so a burn-then-mint cycle can never create more than
+    /// the cap over the life of the chain.
     pub async fn debit_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
         let mut map = self.accounts.write().await;
         let acc = map
@@ -1939,7 +2137,11 @@ impl InMemoryStateEngine {
         // iteration order, or two nodes capturing the same state could write
         // different bytes (and a restore would not reproduce the root).
         accounts.sort_by_key(|a| a.address);
-        StateSnapshotV2 { accounts, penalty }
+        StateSnapshotV2 {
+            accounts,
+            penalty,
+            total_minted_nano: self.total_minted_nano(),
+        }
     }
 
     /// Fast flush / snapshot serialization for async persistence
@@ -1955,7 +2157,12 @@ impl InMemoryStateEngine {
     }
 
     pub async fn restore_snapshot(&self, bytes: &[u8]) -> Result<(), String> {
-        let (snapshot, penalty) = Self::parse_account_snapshot(bytes)?;
+        let (snapshot, penalty, total_minted_nano) = Self::parse_account_snapshot(bytes)?;
+        // The restored snapshot is the WHOLE supply view a reorg replays from:
+        // rebase the global mint counter to it before any block is re-applied,
+        // so replayed mints are counted exactly once and a restarted node
+        // cannot mint a second full cap from zero.
+        self.set_total_minted_from_snapshot(total_minted_nano);
         // The penalty is restored BEFORE the accounts lock is taken: the
         // documented lock order is penalty/governance -> accounts, and the
         // reverse order here would be an ABBA deadlock against `commit_native`
@@ -2021,7 +2228,10 @@ impl InMemoryStateEngine {
     /// call site is exactly how a future caller silently picks the wrong
     /// semantics and re-opens the double mint.
     pub async fn restore_snapshot_preserve_replay_sets(&self, bytes: &[u8]) -> Result<(), String> {
-        let (snapshot, penalty) = Self::parse_account_snapshot(bytes)?;
+        let (snapshot, penalty, total_minted_nano) = Self::parse_account_snapshot(bytes)?;
+        // Same rebase as `restore_snapshot`: the global mint counter tracks
+        // the restored supply, not the pre-restore engine's.
+        self.set_total_minted_from_snapshot(total_minted_nano);
         // The penalty travels with the state (see `create_snapshot`): install
         // it BEFORE the accounts lock (documented lock order).
         *self.consensus_penalty.write().await = penalty;
@@ -2070,6 +2280,25 @@ impl InMemoryStateEngine {
         Ok(())
     }
 
+    /// Rebase the global mint counter to the TOTAL BALANCE of a snapshot.
+    ///
+    /// Used by both accounts restore paths. Without this, a node that
+    /// restarts (or rewinds to a reorg checkpoint) would carry a counter of
+    /// zero — or a stale higher value — while the accounts already hold the
+    /// chain's supply, and could mint up to a second `TOTAL_SUPPLY_CAP` on
+    /// top of it. Rebased to the restored supply, the headroom is exactly
+    /// `CAP - supply`.
+    ///
+    /// Summed in `u128` and clamped to `u64::MAX`, so a corrupt/absurd
+    /// snapshot saturates (every later mint fails closed) instead of
+    /// wrapping to a tiny counter. `restore_snapshot_chunked*` lives in
+    /// `memory_bounds.rs` (outside this change's scope) and must adopt the
+    /// same rebase — reported as a follow-up.
+    pub(super) fn set_total_minted_from_snapshot(&self, total_minted_nano: u64) {
+        self.total_minted_nano
+            .store(total_minted_nano, std::sync::atomic::Ordering::Release);
+    }
+
     /// Shared accounts-snapshot decoder for both restore methods (current
     /// shape, legacy fallback). One decoder so the two restore paths can never
     /// disagree on what bytes mean.
@@ -2087,7 +2316,7 @@ impl InMemoryStateEngine {
     // GATE: snapshot decoder returns full state tuple; alias would churn restore paths.
     fn parse_account_snapshot(
         bytes: &[u8],
-    ) -> Result<(Vec<AccountState>, HashMap<[u8; 32], u64>), String> {
+    ) -> Result<(Vec<AccountState>, HashMap<[u8; 32], u64>, u64), String> {
         // V2 FIRST: the legacy blob is a bare `Vec<AccountState>`, which
         // decodes as V2 only if the trailing penalty map happens to be
         // present - it never is, so a legacy blob fails here and falls
@@ -2095,10 +2324,10 @@ impl InMemoryStateEngine {
         if let Ok(v2) =
             bincode_deserialize_limited::<StateSnapshotV2>(bytes, MAX_SNAPSHOT_DECODE_BYTES)
         {
-            return Ok((v2.accounts, v2.penalty));
+            return Ok((v2.accounts, v2.penalty, v2.total_minted_nano));
         }
         match bincode_deserialize_limited(bytes, MAX_SNAPSHOT_DECODE_BYTES) {
-            Ok(s) => Ok((s, HashMap::new())),
+            Ok(s) => Ok((s, HashMap::new(), 0)),
             Err(_) => {
                 #[derive(Deserialize)]
                 struct LegacyAccountState {
@@ -2131,6 +2360,7 @@ impl InMemoryStateEngine {
                         })
                         .collect(),
                     HashMap::new(),
+                    0,
                 ))
             }
         }
@@ -2148,9 +2378,10 @@ impl InMemoryStateEngine {
     // GATE: chunk decoder returns full state tuple; alias would churn restore paths.
     pub(super) fn decode_snapshot_chunks(
         chunks: &[Vec<u8>],
-    ) -> Result<(Vec<Vec<AccountState>>, HashMap<[u8; 32], u64>), String> {
+    ) -> Result<(Vec<Vec<AccountState>>, HashMap<[u8; 32], u64>, u64), String> {
         let mut decoded: Vec<Vec<AccountState>> = Vec::with_capacity(chunks.len());
         let mut penalty: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut total_minted_nano = 0u64;
         for (i, raw) in chunks.iter().enumerate() {
             if i == 0 {
                 if let Ok(v2) =
@@ -2158,6 +2389,7 @@ impl InMemoryStateEngine {
                 {
                     decoded.push(v2.accounts);
                     penalty = v2.penalty;
+                    total_minted_nano = v2.total_minted_nano;
                     continue;
                 }
             }
@@ -2166,7 +2398,7 @@ impl InMemoryStateEngine {
                     .map_err(|e| format!("restore snapshot chunk {i} failed: {e:?}"))?;
             decoded.push(states);
         }
-        Ok((decoded, penalty))
+        Ok((decoded, penalty, total_minted_nano))
     }
 }
 

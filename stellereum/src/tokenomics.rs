@@ -7,6 +7,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// GLOBAL hard cap: 1,000,000,000 STELL, in nano-STELL (9 decimals).
+///
+/// ENFORCED BY THE STATE ENGINE (not only by the per-subsystem allocations):
+/// every engine mint ([`crate::state_engine::InMemoryStateEngine::mint_native`],
+/// and therefore `credit_native`, which delegates to it) atomically reserves
+/// against a monotone `total_minted_nano` counter and fails closed when the
+/// sum would exceed this value. The local caps ([`GENESIS_VAULT_CAP`],
+/// `staking::REWARDS_EMISSION_CAP`, `bridge::BRIDGE_MINT_CAP_NANO`) each bound
+/// ONE pool; the engine counter bounds their sum. Transfers are never capped.
+/// Hard cap on all STELL that can ever exist, in nano-STELL (9 decimals).
+///
+/// ENFORCED IN THE ENGINE: `InMemoryStateEngine` keeps a minted-supply counter
+/// that every POST-GENESIS mint goes through (`mint_native`, rewards, bridge,
+/// faucet drips) and fails closed one nano past this cap. The genesis
+/// allocation itself is PRE-MINTED (fixed by [`TokenAllocation`]) and is not
+/// counted, so the counter starts at zero and `assemble_cached_digest_*`
+/// stays byte-identical on a chain that has not minted anything yet.
 pub const TOTAL_SUPPLY_CAP: u64 = 1_000_000_000 * 1_000_000_000; // in nano-STELL (9 decimals)
 pub const GENESIS_VAULT_CAP: u64 = 250_000_000 * 1_000_000_000;
 pub const BASE_STELL_PRICE_MICRO_USD: u64 = 250_000; // $0.25 USD (6 decimals)

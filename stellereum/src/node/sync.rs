@@ -695,16 +695,20 @@ pub(crate) async fn walk_chain(
     // forever without converging. Fix = unblock N3–N5, not this bound. If
     // this eprintln fires every round for hours while the peer tip advances,
     // the node is snapshot-stranded, not walk-limited: check N3/N4/N5 first.
-    if peer_height.saturating_sub(expected_first_height) > 256 {
+    // The cap tracks the snapshot cadence (`policy::max_walk_gap`): a node that
+    // restored at boundary B must be able to walk to the next snapshot even
+    // when finality has stopped and no newer snapshot will ever appear.
+    let walk_cap = crate::node::policy::max_walk_gap();
+    if peer_height.saturating_sub(expected_first_height) > walk_cap {
         tracing::debug!(
-            "[sync] gap (peer={peer_height} ours={}) > 256 blocks; body walk skipped in favor of snapshot-sync",
+            "[sync] gap (peer={peer_height} ours={}) > {walk_cap} blocks; body walk skipped in favor of snapshot-sync",
             expected_first_height.saturating_sub(1)
         );
         return None;
     }
     let fetch_adapter = adapter.clone();
     let mut blocks =
-        match stellereum::sync::collect_missing_blocks(peer_hash, our_last, 256, move |h| {
+        match stellereum::sync::collect_missing_blocks(peer_hash, our_last, walk_cap, move |h| {
             let a = fetch_adapter.clone();
             async move { a.fetch_block(&h).await }
         })

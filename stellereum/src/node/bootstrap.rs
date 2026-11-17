@@ -15,6 +15,53 @@ use stellereum::orderbook::OrderbookManager;
 use stellereum::sharding::{Block, ShardRegistry};
 use stellereum::state_engine::InMemoryStateEngine;
 
+/// Hydrate the process-shared C1 anchor registry from this shard's store and
+/// arm it with the node's persistence queue.
+///
+/// Must run BEFORE the shard's runtime starts voting or syncing: a restarted
+/// node has to be able to verify cross-shard messages produced before the
+/// restart. A corrupt blob FAILS CLOSED (loud error, registry left empty) —
+/// never a silently accepted anchor.
+fn hydrate_finalized_header_registry(
+    header_registry: &Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
+    storage: &stellereum::storage::Storage,
+    persistence: &Arc<stellereum::storage::AsyncPersistence>,
+    label: &str,
+    arm_sink: bool,
+) {
+    match header_registry.write() {
+        Ok(mut r) => {
+            if let Err(e) = storage.hydrate_finalized_headers(&mut r) {
+                eprintln!(
+                    "[xshard] {label}: finalized-header registry hydration FAILED CLOSED: {e}; \
+                     starting with an EMPTY registry (older cross-shard messages will not verify \
+                     until they are re-anchored by a re-sync)"
+                );
+                tracing::error!(
+                    "[xshard] {label}: finalized-header registry hydration FAILED CLOSED: {e} \
+                     (registry left empty)"
+                );
+            }
+            // The registry is process-shared, so ONE sink (the main store)
+            // persists every shard's anchors; attaching one per shard would
+            // multiply the same bounded snapshot by the shard count without
+            // adding durability. Workchain stores are still hydrated so an
+            // older snapshot there cannot be silently ignored.
+            if arm_sink {
+                // Arm persistence AFTER hydration so the first snapshot
+                // extends the restored state instead of replacing it with an
+                // empty one.
+                let sink: Arc<dyn stellereum::sharding::FinalizedHeaderSink> = persistence.clone();
+                r.attach_persistence(sink);
+            }
+        }
+        Err(e) => {
+            eprintln!("[xshard] {label}: finalized-header registry lock poisoned: {e}");
+            tracing::error!("[xshard] {label}: finalized-header registry lock poisoned: {e}");
+        }
+    }
+}
+
 /// Start consensus for a NON-masterchain shard inside the same process and over
 /// the same infnode `Node` as the masterchain.
 ///
@@ -132,6 +179,17 @@ pub(crate) async fn start_workchain_shard(
     }
     let persistence = Arc::new(stellereum::storage::AsyncPersistence::start(storage));
     persistence.enqueue_block(genesis_block);
+    // C1 anchor durability: hydrate anchors written before a restart. Runs
+    // BEFORE `run_consensus_node` below, so the runtime never verifies against
+    // a cold registry. The shared registry already has a sink armed by the
+    // masterchain bootstrap (one sink persists every shard's anchors).
+    hydrate_finalized_header_registry(
+        &header_registry,
+        &persistence.storage(),
+        &persistence,
+        &format!("shard {shard}"),
+        false,
+    );
 
     let shared_staking = state_engine.staking_handle();
     let shared_gov = state_engine.governance_handle();
@@ -453,8 +511,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         tracing::error!("{e}");
         anyhow::bail!("{e}");
     }
-    if registry != ShardRegistry::single() {
-        // Hatch path only (guard above refused the non-hatch case).
+    if registry != ShardRegistry::single() && !stellereum::sharding::is_public_shard_pair(&registry)
+    {
+        // Hatch path only: the guard above refuses every set except the
+        // supported `{0,1}` pair, so this branch now covers ONLY the
+        // experimental hatch (and never mislabels the public pair).
         tracing::warn!(
             "[workchain-guard] EXPERIMENTAL multishard boot: shards {{{}}} \
              allowed only by {}=1 (local soak/tests, NOT public protocol; \
@@ -716,7 +777,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         });
         if let Some(faucet_addr) = faucet_key {
             let _ = state_engine
-                .credit_native(&faucet_addr, GENESIS_FAUCET_BALANCE)
+                // GENESIS ALLOCATION (pre-mined): the faucet balance is part of
+                // the fixed 1B allocation, so it is credited with the UNCAPPED
+                // transfer primitive and does NOT advance the post-genesis
+                // emission counter. `TOTAL_SUPPLY_CAP` bounds everything minted
+                // AFTER genesis (rewards, bridge, faucet drips).
+                .credit_native_transfer(&faucet_addr, GENESIS_FAUCET_BALANCE)
                 .await;
             info!(
                 "Genesis: funded faucet account {} with {} STELL",
@@ -844,6 +910,16 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         }
         let persistence = Arc::new(stellereum::storage::AsyncPersistence::start(storage));
         persistence.enqueue_block(genesis_block.clone());
+        // C1 anchor durability: hydrate anchors written before a restart, then
+        // arm the async persistence sink. The consensus runtime is spawned
+        // later, so it never starts voting/syncing against a cold registry.
+        hydrate_finalized_header_registry(
+            &header_registry,
+            &persistence.storage(),
+            &persistence,
+            "masterchain",
+            true,
+        );
         // Graceful shutdown: persistence is a background queue, and a
         // SIGTERM used to drop queued bodies/snapshots on the floor --
         // the next start then missed bodies it had finalized (observed:

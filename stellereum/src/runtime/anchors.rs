@@ -1120,14 +1120,19 @@ impl ValidatorRuntime {
         if let Some(reg) = self.finalized_headers.as_ref() {
             if let Ok(mut r) = reg.write() {
                 let block_hash = block.compute_hash();
-                r.note_finalized_commitment(crate::sharding::ShardHeaderCommitment {
-                    shard_id: block.shard_id,
-                    height: block.height,
-                    block_hash,
-                    state_root: block.state_root,
-                    timestamp: block.timestamp,
-                });
-                r.note_finalized_anchor(block.shard_id, block_hash, post_apply_root);
+                // ONE mutation (and therefore one durable snapshot): the head
+                // commitment AND its post-apply anchor land together, so a
+                // restart sees the exact pair the runtime verified against.
+                r.note_finalized_commitment_with_anchor(
+                    crate::sharding::ShardHeaderCommitment {
+                        shard_id: block.shard_id,
+                        height: block.height,
+                        block_hash,
+                        state_root: block.state_root,
+                        timestamp: block.timestamp,
+                    },
+                    post_apply_root,
+                );
             }
         }
     }
@@ -1446,6 +1451,34 @@ impl ValidatorRuntime {
         use crate::sharding::CrossShardKind;
         use crate::xshard2pc::XpcPhase;
         let tx_hash = msg.tx.compute_tx_hash();
+        // BOUNDED RE-EMIT: a shard may publish at most
+        // `XPC_MAX_REEMITS_PER_HEIGHT` 2PC control messages per block, chosen
+        // deterministically. Validation enforces the same bound on the
+        // incoming block, so an over-eager proposer cannot amplify traffic.
+        if matches!(
+            msg.kind(),
+            CrossShardKind::Prepare
+                | CrossShardKind::PrepareAck
+                | CrossShardKind::AbortRequest
+                | CrossShardKind::AbortAck
+        ) {
+            let control = block
+                .cross_shard_out
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m.kind(),
+                        CrossShardKind::Prepare
+                            | CrossShardKind::PrepareAck
+                            | CrossShardKind::AbortRequest
+                            | CrossShardKind::AbortAck
+                    )
+                })
+                .count();
+            if control > crate::xshard2pc::XPC_MAX_REEMITS_PER_HEIGHT {
+                return false;
+            }
+        }
         // The OPENING record (the PREPARE) is the one 2PC record that is NOT
         // derived from an already-committed 2PC state: the source's PREPARED
         // record is created by the APPLICATION of this very block, so at

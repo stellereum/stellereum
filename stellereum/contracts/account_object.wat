@@ -3,12 +3,16 @@
   (import "host" "sload" (func $sload (param i64) (result i64)))
   (import "host" "sstore" (func $sstore (param i64 i64)))
   (import "host" "emit" (func $emit (param i64 i64)))
+  ;; CT-P0 (audit KI-38): authenticated transaction sender.
+  (import "host" "caller" (func $caller (param i32)))
+  (memory (export "memory") 1)
 
   ;; Storage Layout:
   ;; Slot 0: Owner ID (master key)
   ;; Slot 1: Guardian ID (social recovery / rotation guardian)
   ;; Slot 2: Creation Fee Paid (2 STELL = 2,000,000,000 nano-STELL)
   ;; Slot 3: Total Sessions Count
+  ;; Slots 4..8: AUTHENTICATED owner address (32 bytes, four i64 words)
   ;;
   ;; Per-Session Slots (base = 1000 * session_id):
   ;; base + 0: service_id (domain or service identifier)
@@ -26,13 +30,49 @@
   ;; Topic 23: Session Revoked (session_id)
   ;; Topic 24: Guardian Rotated (new_guardian)
 
+  ;; CT-P0: bind the authenticated host.caller into four consecutive slots.
+  (func $bind_caller (param $base i64)
+    (call $caller (i32.const 0))
+    (call $sstore (local.get $base) (i64.load (i32.const 0)))
+    (call $sstore (i64.add (local.get $base) (i64.const 1)) (i64.load (i32.const 8)))
+    (call $sstore (i64.add (local.get $base) (i64.const 2)) (i64.load (i32.const 16)))
+    (call $sstore (i64.add (local.get $base) (i64.const 3)) (i64.load (i32.const 24)))
+  )
+
+  ;; CT-P0: 1 iff the authenticated caller is the address bound at `$base`.
+  (func $caller_is_owner (param $base i64) (result i32)
+    (call $caller (i32.const 0))
+    (if (i64.ne (i64.load (i32.const 0)) (call $sload (local.get $base)))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 8)) (call $sload (i64.add (local.get $base) (i64.const 1))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 16)) (call $sload (i64.add (local.get $base) (i64.const 2))))
+      (then (return (i32.const 0))))
+    (if (i64.ne (i64.load (i32.const 24)) (call $sload (i64.add (local.get $base) (i64.const 3))))
+      (then (return (i32.const 0))))
+    (i32.const 1)
+  )
+
+  (func $require_owner
+    (if (i32.eqz (call $caller_is_owner (i64.const 4)))
+      (then (unreachable)) ;; fail closed: the tx is reverted
+    )
+  )
+
   ;; 1. Initialize Account Object: init(owner_id) -> returns owner_id
   ;; Creation cost: 2 STELL (fixed consensus fee, recorded in slot 2)
+  ;; CT-P0: binds the initializer address as the authenticated owner.
   (func (export "init") (param $owner_id i64) (result i64)
+    ;; CT-P0: never rebind the authenticated owner after initialization.
+    (if (i64.ne (call $sload (i64.const 8)) (i64.const 0))
+      (then (unreachable))
+    )
     (call $sstore (i64.const 0) (local.get $owner_id))
     (call $sstore (i64.const 1) (i64.const 0)) ;; No guardian initially
     (call $sstore (i64.const 2) (i64.const 2000000000)) ;; 2 STELL creation anti-spam fee
     (call $sstore (i64.const 3) (i64.const 0)) ;; 0 sessions initially
+    (call $bind_caller (i64.const 4))
+    (call $sstore (i64.const 8) (i64.const 1)) ;; initialized
 
     ;; Emit Account Created event
     (call $emit (i64.const 20) (local.get $owner_id))
@@ -50,7 +90,9 @@
   )
 
   ;; 4. Set/Rotate Guardian: rotate_guardian(new_guardian_id) -> returns new_guardian_id
+  ;; CT-P0: only the authenticated owner may rotate the guardian.
   (func (export "rotate_guardian") (param $new_guardian i64) (result i64)
+    (call $require_owner)
     (call $sstore (i64.const 1) (local.get $new_guardian))
     (call $emit (i64.const 24) (local.get $new_guardian))
     (local.get $new_guardian)
@@ -67,6 +109,7 @@
     (result i64)
 
     (local $base i64)
+    (call $require_owner)
     (local.set $base (i64.mul (local.get $session_id) (i64.const 1000)))
 
     (call $sstore (i64.add (local.get $base) (i64.const 0)) (local.get $service_id))
@@ -93,6 +136,7 @@
     (local $service_id i64)
     (local $budget i64)
 
+    (call $require_owner)
     (local.set $session_id (i64.div_u (local.get $packed) (i64.const 10000000000)))
     (local.set $service_id (i64.div_u (i64.rem_u (local.get $packed) (i64.const 10000000000)) (i64.const 100000)))
     (local.set $budget (i64.rem_u (local.get $packed) (i64.const 100000)))
@@ -109,6 +153,7 @@
 
   ;; 7. Spend with Session: spend_with_session(packed) -> remaining_budget
   ;; packed: (session_id * 1,000,000) + amount
+  ;; CT-P0: value leaves the account, so the authenticated owner must drive it.
   (func (export "spend_with_session") (param $packed i64) (result i64)
     (local $session_id i64)
     (local $amount i64)
@@ -118,6 +163,7 @@
     (local $spent i64)
     (local $new_spent i64)
 
+    (call $require_owner)
     (local.set $session_id (i64.div_u (local.get $packed) (i64.const 1000000)))
     (local.set $amount (i64.rem_u (local.get $packed) (i64.const 1000000)))
     (local.set $base (i64.mul (local.get $session_id) (i64.const 1000)))
@@ -148,8 +194,10 @@
   )
 
   ;; 8. Revoke Session: revoke_session(session_id) -> 1
+  ;; CT-P0: only the authenticated owner may revoke a session.
   (func (export "revoke_session") (param $session_id i64) (result i64)
     (local $base i64)
+    (call $require_owner)
     (local.set $base (i64.mul (local.get $session_id) (i64.const 1000)))
     (call $sstore (i64.add (local.get $base) (i64.const 6)) (i64.const 1)) ;; revoked = 1
     (call $emit (i64.const 23) (local.get $session_id))

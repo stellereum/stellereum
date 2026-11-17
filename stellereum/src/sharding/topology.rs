@@ -8,6 +8,23 @@ pub type ShardId = u32;
 pub const MASTERCHAIN_SHARD: ShardId = 0;
 pub const BASE_WORKCHAIN_SHARD_INITIAL: ShardId = 1;
 
+/// The fixed, SUPPORTED public multi-shard configuration: the masterchain plus
+/// the base workchain (`MASTERCHAIN_SHARD` and [`BASE_WORKCHAIN_SHARD_INITIAL`],
+/// i.e. `{0,1}`).
+///
+/// This is the one MULTI-shard registry the public protocol supports today. It
+/// boots WITHOUT the local soak/test hatch, because it is the exact pair the
+/// two-shard suites prove end to end
+/// (`tests/two_shard_fixed_pair_tests.rs`, `tests/two_shard_soak_tests.rs`).
+/// Every other multi-shard set (`{1,2}`, `{0,1,2}`, `{2}`, any set over
+/// [`MAX_SHARDS`]) still refuses startup unless the experimental hatch is set.
+///
+/// The pair is FIXED on purpose. The dynamic split/merge topology exists in
+/// this module, but no split has ever been performed on a live network, so the
+/// public configuration pins exactly the two chains that have been demonstrated:
+/// the masterchain (`{0}`) and the masterchain + base workchain (`{0,1}`).
+pub const PUBLIC_SHARD_PAIR: &[ShardId] = &[MASTERCHAIN_SHARD, 1];
+
 /// Environment variable listing the shards a single process runs, comma
 /// separated (e.g. `STELL_SHARDS=0,1`). Unset/empty keeps the process on the
 /// one shard it was started with, which is the pre-sharding behaviour.
@@ -28,18 +45,32 @@ pub fn experimental_shards_hatch_enabled() -> bool {
     matches!(std::env::var(EXPERIMENTAL_SHARDS_ENV).as_deref(), Ok("1"))
 }
 
-/// Boot guard: single-shard `{0}` canonical for public launch (protocol
-/// freeze, see [`WORKCHAIN_FREEZE_DOC`]).
+/// True when `registry` is EXACTLY [`PUBLIC_SHARD_PAIR`], in any input order.
+///
+/// [`ShardRegistry`] is backed by a `BTreeSet`, so `STELL_SHARDS=0,1` and
+/// `STELL_SHARDS=1,0` build the same canonical (ascending) registry: this check
+/// is order-independent by construction, and an extra id (`{0,1,2}`) or a
+/// different id (`{1}`, `{2}`) never matches.
+pub fn is_public_shard_pair(registry: &ShardRegistry) -> bool {
+    registry.len() == PUBLIC_SHARD_PAIR.len()
+        && PUBLIC_SHARD_PAIR.iter().all(|s| registry.contains(*s))
+}
+
+/// Boot guard: the supported public configurations are single-shard `{0}` and
+/// the fixed two-shard pair [`PUBLIC_SHARD_PAIR`] (`{0,1}`); everything else is
+/// parked (protocol freeze, see [`WORKCHAIN_FREEZE_DOC`]).
 ///
 /// * `Ok(())` — registry is exactly `{MASTERCHAIN_SHARD}` (default path,
-///   byte-identical), or the experimental hatch is enabled AND the registry
-///   is a VALID configured set (see [`ShardRegistry::validate`]: every
-///   multi-shard set names the masterchain and stays within the shard cap).
-/// * `Err(msg)` — any other registry (`STELL_SHARDS != {0}`, i.e. any
-///   multishard request or any non-canonical single shard) without the hatch,
-///   or an INVALID registry (missing masterchain, over the cap) even WITH the
-///   hatch: the hatch allows the CONFIGURED set, not just any set.
-///   The message names the freeze doc, both env vars, and the recovery.
+///   byte-identical), or exactly [`PUBLIC_SHARD_PAIR`] (the fixed public
+///   two-shard configuration, NO hatch required), or the experimental hatch is
+///   enabled AND the registry is a VALID configured set (see
+///   [`ShardRegistry::validate`]: every multi-shard set names the masterchain
+///   and stays within the shard cap).
+/// * `Err(msg)` — any other registry (`{1}`, `{2}`, `{0,1,2}`, ...) without the
+///   hatch, or an INVALID registry (missing masterchain, over the cap) even WITH
+///   the hatch: the hatch allows the CONFIGURED set, not just any set.
+///   The message names the supported configurations, the freeze doc, both env
+///   vars, and the recovery.
 ///
 /// Pure except for the hatch env read; use
 /// [`check_workchain_boot_guard_with_hatch`] for deterministic tests.
@@ -50,9 +81,11 @@ pub fn check_workchain_boot_guard(registry: &ShardRegistry) -> Result<(), String
 /// Deterministic core of [`check_workchain_boot_guard`]: `hatch` is the
 /// already-resolved `STELL_EXPERIMENTAL_SHARDS=1` flag.
 ///
-/// The hatch allows the CONFIGURED set, not just any set: a registry that
-/// fails [`ShardRegistry::validate`] (multi-shard without the masterchain,
-/// or over the shard cap) is refused even with the hatch set, fail-closed.
+/// The fixed public pair ([`PUBLIC_SHARD_PAIR`]) and the default single shard
+/// are accepted WITHOUT the hatch. Everything else still needs it, and the
+/// hatch allows the CONFIGURED set, not just any set: a registry that fails
+/// [`ShardRegistry::validate`] (multi-shard without the masterchain, or over
+/// the shard cap) is refused even with the hatch set, fail-closed.
 pub fn check_workchain_boot_guard_with_hatch(
     registry: &ShardRegistry,
     hatch: bool,
@@ -60,18 +93,32 @@ pub fn check_workchain_boot_guard_with_hatch(
     if *registry == ShardRegistry::single() {
         return Ok(());
     }
+    // Fixed public two-shard configuration: `{0,1}` boots without the hatch.
+    // `validate()` is still applied so the constant itself can never widen the
+    // guard into an invalid set by accident.
+    if is_public_shard_pair(registry) {
+        registry.validate()?;
+        return Ok(());
+    }
     registry.validate()?;
     if hatch {
         return Ok(());
     }
     Err(format!(
-        "REFUSING startup: STELL_SHARDS {{{}}} is not single-shard canonical {{0}} \
-         (protocol freeze {doc}). Multishard boot is parked until live-soak + flag-day. \
-         For local soak/tests only, set {hatch_env}=1 (loudly logged). \
-         Requested shards: {{{}}}",
+        "REFUSING startup: STELL_SHARDS {{{}}} is not a supported public registry \
+         (supported: single-shard {{{}}} or the fixed two-shard pair {{{pair}}}; \
+         protocol freeze {doc}). Multishard boot beyond the fixed pair is parked \
+         until live-soak + flag-day. For local soak/tests only, set {hatch_env}=1 \
+         (loudly logged). Requested shards: {{{}}}",
+        MASTERCHAIN_SHARD,
         MASTERCHAIN_SHARD,
         registry
             .ids()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        pair = PUBLIC_SHARD_PAIR
+            .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join(","),
@@ -1916,4 +1963,137 @@ pub fn route_shard(topology: &ShardTopology, address: &ShardAddress) -> ShardId 
 /// that is the single source of truth.
 pub fn route_address(address: &[u8; 32]) -> ShardId {
     DynamicShardManager::new().route_address(address)
+}
+
+/// Pins the boot-guard contract for the FIXED two-shard public configuration:
+/// `{0,1}` boots without the hatch; everything else still needs it.
+#[cfg(test)]
+mod boot_guard_tests {
+    use super::*;
+
+    fn reg(ids: impl IntoIterator<Item = ShardId>) -> ShardRegistry {
+        ShardRegistry::from_ids(ids)
+    }
+
+    /// The constant names exactly the masterchain + base workchain, is a valid
+    /// registry, and is canonical under any input order.
+    #[test]
+    fn public_pair_constant_is_the_canonical_two_shard_set() {
+        assert_eq!(PUBLIC_SHARD_PAIR.len(), 2);
+        assert!(PUBLIC_SHARD_PAIR.contains(&MASTERCHAIN_SHARD));
+        assert!(PUBLIC_SHARD_PAIR.contains(&BASE_WORKCHAIN_SHARD_INITIAL));
+
+        let ascending = reg([MASTERCHAIN_SHARD, BASE_WORKCHAIN_SHARD_INITIAL]);
+        let reversed = reg([BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD]);
+        assert_eq!(
+            ascending, reversed,
+            "the BTreeSet backing canonicalises order"
+        );
+        assert_eq!(ascending.ids().collect::<Vec<_>>(), vec![0, 1]);
+        assert!(is_public_shard_pair(&ascending));
+        assert!(is_public_shard_pair(&reversed));
+
+        // The fixed pair is a CONFIGURED set: valid independent of the hatch.
+        ascending.validate().expect("the public pair must validate");
+    }
+
+    /// The fixed pair boots without the hatch; the default `{0}` is unchanged.
+    #[test]
+    fn guard_accepts_public_pair_without_hatch() {
+        let pair = reg(PUBLIC_SHARD_PAIR.iter().copied());
+        check_workchain_boot_guard_with_hatch(&pair, false)
+            .expect("the fixed public pair must boot without the hatch");
+        check_workchain_boot_guard_with_hatch(&pair, true)
+            .expect("hatch is irrelevant on the pair");
+
+        for single in [ShardRegistry::single(), reg([MASTERCHAIN_SHARD])] {
+            check_workchain_boot_guard_with_hatch(&single, false)
+                .expect("single-shard {0} must boot unchanged");
+        }
+    }
+
+    /// Every set that is not `{0}` and not the fixed pair is refused without
+    /// the hatch; the freeze text names the supported pair.
+    #[test]
+    fn guard_refuses_every_other_set_without_hatch_and_names_the_pair() {
+        let refused = [
+            reg([BASE_WORKCHAIN_SHARD_INITIAL]), // {1}
+            reg([2]),                            // {2}
+            reg([MASTERCHAIN_SHARD, 2]),         // {0,2}
+            reg([MASTERCHAIN_SHARD, 1, 2]),      // {0,1,2}
+        ];
+        for registry in refused {
+            assert!(
+                !is_public_shard_pair(&registry),
+                "{registry:?} must not match the fixed pair"
+            );
+            let err = check_workchain_boot_guard_with_hatch(&registry, false)
+                .expect_err("only {0} and the fixed pair are hatch-free");
+            assert!(
+                err.contains("0,1"),
+                "refusal must name the supported pair: {err}"
+            );
+        }
+
+        // A MALFORMED set is refused by `validate` BEFORE the freeze text: the
+        // masterchain rule is what it names, and the hatch cannot unlock it.
+        let no_masterchain = reg([1, 2]);
+        assert!(!is_public_shard_pair(&no_masterchain));
+        let err = check_workchain_boot_guard_with_hatch(&no_masterchain, false)
+            .expect_err("{1,2} has no masterchain");
+        assert!(
+            err.contains("without the masterchain") || err.contains("must include"),
+            "malformed set must name the masterchain rule: {err}"
+        );
+        assert!(check_workchain_boot_guard_with_hatch(&no_masterchain, true).is_err());
+
+        // Over the cap: validated first, refused even WITH the hatch.
+        let over_cap = reg(0..=MAX_SHARDS as ShardId);
+        assert!(!is_public_shard_pair(&over_cap));
+        let err = check_workchain_boot_guard_with_hatch(&over_cap, false)
+            .expect_err("over-cap set must be refused");
+        assert!(
+            err.contains("shard cap") || err.contains(&MAX_SHARDS.to_string()),
+            "over-cap set must name the cap: {err}"
+        );
+        assert!(check_workchain_boot_guard_with_hatch(&over_cap, true).is_err());
+    }
+
+    /// `{1}`, `{2}`, `{0,1,2}` and `{0,2}` are refused without the hatch; the
+    /// hatch still only allows VALID configured sets.
+    #[test]
+    fn guard_pair_is_the_only_hatch_free_multishard_set() {
+        let cases: &[&[ShardId]] = &[&[1], &[2], &[0, 1, 2], &[0, 2]];
+        for ids in cases {
+            let registry = reg(ids.iter().copied());
+            assert!(!is_public_shard_pair(&registry));
+            let err = check_workchain_boot_guard_with_hatch(&registry, false)
+                .expect_err("only the fixed pair is hatch-free");
+            assert!(
+                err.contains("0,1"),
+                "refusal must name the supported pair: {err}"
+            );
+            assert!(
+                err.contains(WORKCHAIN_FREEZE_DOC),
+                "refusal must name the freeze doc: {err}"
+            );
+            assert!(
+                err.contains(EXPERIMENTAL_SHARDS_ENV),
+                "refusal must name the hatch: {err}"
+            );
+            // A valid configured set (masterchain present, within the cap) is
+            // allowed by the hatch; a lone non-masterchain shard is valid too
+            // (only the freeze refuses it), so the hatch allows it as well.
+            check_workchain_boot_guard_with_hatch(&registry, true)
+                .expect("hatch allows every VALID configured set");
+        }
+
+        // INVALID sets stay refused even WITH the hatch, fail-closed.
+        let over_cap = reg(0..=MAX_SHARDS as ShardId);
+        assert!(check_workchain_boot_guard_with_hatch(&over_cap, true).is_err());
+        let no_masterchain = reg([1, 2]);
+        assert!(check_workchain_boot_guard_with_hatch(&no_masterchain, true).is_err());
+        assert!(!is_public_shard_pair(&over_cap));
+        assert!(!is_public_shard_pair(&no_masterchain));
+    }
 }

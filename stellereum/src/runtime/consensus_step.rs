@@ -1,5 +1,6 @@
 use super::lanes::{block_actor_sends_exceed_cap, count_block_actor_sends};
 use super::{
+    master_set_stamp, publish_master_set_stamp, set_fingerprint, workchain_set_activation_height,
     BlockHash, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS, MAX_COMMIT_CERT_SIGNERS,
     MAX_TIMESTAMP_JUMP_SECS, PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS,
     VALIDATOR_SET_HISTORY_CAP,
@@ -1488,25 +1489,44 @@ impl ValidatorRuntime {
             self.mark_validator_set_stale(state_height, ledger_height, reason);
             return false;
         }
-        self.install_validator_set_from_ledger(ledger, state_height, ledger_height)
-            .await
+        self.install_validator_set_from_ledger(
+            ledger,
+            state_height,
+            ledger_height,
+            crate::sharding::validator_set_adoption_height(ledger_height),
+        )
+        .await
     }
 
     /// Install the validator set derived from `ledger` (already known to be
     /// acceptable) into the runtime AND the height consensus.
     ///
-    /// W10.5 ACTIVATION BOUNDARY: a set derived from the ledger at
-    /// ledger-height L takes effect at height L+1, NEVER immediately. The
-    /// derived set is STAGED in [`Self::pending_validators`]; it becomes the
-    /// in-force consensus set when the node advances to the activation
-    /// height ([`Self::install_due_validator_set`], called on every
-    /// finalize/adopt advance and after every refresh). Deriving the same
-    /// ledger at the same ledger-height stages the same activation on every
-    /// node, so the whole network switches quorums at the same agreed height
-    /// instead of each node jumping its threshold mid-flight whenever it
-    /// happens to refresh (the 2026-10-23 #292785/#292786 stall: one node
-    /// finalized unilaterally under a stale quorum while the rest had already
-    /// moved on, and the quorum certificates never reconciled).
+    /// W10.5 ACTIVATION BOUNDARY: the STAGED set becomes the in-force
+    /// consensus set only when the node reaches `activation`
+    /// ([`Self::install_due_validator_set`], called on every finalize/adopt
+    /// advance and after every refresh), never mid-flight. The boundary itself
+    /// is supplied by the caller because it is NOT always `ledger_height + 1`
+    /// in this node's own height space:
+    ///
+    ///  * the MASTERCHAIN (and every single-chain node) derives it from its own
+    ///    ledger: `validator_set_adoption_height(ledger_height)`;
+    ///  * a WORKCHAIN derives it from the masterchain stamp of the derived set
+    ///    (see [`super::MasterSetStamp`]) — the masterchain's own
+    ///    activation height for that rotation, identical on every node.
+    ///
+    /// Staging at a boundary derived from the *workchain's* tip was the
+    /// rotation wedge: two shards that observed the same masterchain rotation
+    /// at different local heights staged it at different heights, disagreed
+    /// about the proposer and never advanced again. The caller-supplied
+    /// boundary is a pure function of the chain that adopted the rotation.
+    ///
+    /// MASTERCHAIN AUTHORITY: when this runtime IS the masterchain, the same
+    /// call publishes the stamp a workchain binds to (see
+    /// [`publish_master_set_stamp`]), keyed by the derived set's fingerprint.
+    /// Publishing here — on the masterchain's own set-install path, which runs
+    /// on apply, restore and repair — is what makes the datum a property of
+    /// the masterchain block that adopted the rotation instead of a local
+    /// observation of it.
     ///
     /// Split out of [`Self::refresh_validator_set_from_ledger`] so the
     /// masterchain-registry path (a workchain reading the masterchain's
@@ -1521,8 +1541,42 @@ impl ValidatorRuntime {
         ledger: &crate::staking::StakingLedger,
         state_height: u64,
         ledger_height: u64,
+        activation: u64,
     ) -> bool {
         let vs = ledger.to_validator_set();
+        // MASTERCHAIN: publish the deterministic datum BEFORE any early return,
+        // so an unchanged set also (re)publishes/keeps its stamp. The boundary
+        // published for a set that is ALREADY in force is the one recorded when
+        // it took effect (`validator_set_history`), never the current height:
+        // re-dating a live set on every refresh would make the workchain's
+        // adoption height depend on when the masterchain last refreshed.
+        if self.shard_id == crate::sharding::MASTERCHAIN_SHARD {
+            let published_activation = if vs.validators == self.validators.validators {
+                if self.validator_set_history.is_empty() {
+                    // The set this runtime was CONSTRUCTED with is in force
+                    // from genesis; that is its true boundary.
+                    0
+                } else {
+                    self.validator_set_history
+                        .iter()
+                        .rev()
+                        .find(|(_, set)| set.validators == vs.validators)
+                        .map(|(h, _)| *h)
+                        // Not in the bounded history: publish the conservative
+                        // (later) boundary rather than an early one.
+                        .unwrap_or_else(|| workchain_set_activation_height(ledger_height))
+                }
+            } else {
+                // A rotation: the masterchain's own W10.5 boundary for the
+                // ledger height it derived the new set at.
+                workchain_set_activation_height(ledger_height)
+            };
+            publish_master_set_stamp(
+                &self.state.staking_handle(),
+                set_fingerprint(&vs),
+                published_activation,
+            );
+        }
         // Re-entry hysteresis (local policy + visibility ONLY — the derived
         // set `vs` below is installed or compared verbatim, never filtered).
         // урок валидатора C: an ejected-then-topped-up validator silently
@@ -1547,7 +1601,22 @@ impl ValidatorRuntime {
             self.install_due_validator_set();
             return false;
         }
-        let activation = ledger_height.saturating_add(1);
+        // IDEMPOTENCE (repair-timer contract): the exact transition
+        // `(activation, vs)` is already staged. Re-staging it would re-WARN on
+        // every timer tick without changing anything, so only refresh the
+        // freshness bookkeeping and let `install_due_validator_set` install it
+        // if the boundary has arrived. Never re-stage a set already in force:
+        // that case is the unchanged-set branch above.
+        if matches!(
+            &self.pending_validators,
+            Some((staged_at, staged)) if *staged_at == activation && staged.validators == vs.validators
+        ) {
+            self.clear_validator_set_stale();
+            self.validator_set_state_height = Some(state_height);
+            self.validator_set_ledger_height = Some(ledger_height);
+            self.install_due_validator_set();
+            return false;
+        }
         let fmt = |m: &std::collections::BTreeMap<ValidatorId, u64>| {
             m.iter()
                 .map(|(k, p)| format!("{}:{}", hex::encode(&k[..4]), p))
@@ -1555,11 +1624,11 @@ impl ValidatorRuntime {
                 .join(",")
         };
         tracing::warn!(
-            "validator set change staged at ledger height {}: [{}] -> [{}] (takes effect at height {})",
+            "validator set change staged at ledger height {} (activation {}): [{}] -> [{}]",
             ledger_height,
+            activation,
             fmt(&self.validators.validators),
             fmt(&vs.validators),
-            activation,
         );
         eprintln!(
             "[validator-set] shard {} staged a validator-set change at ledger height {} (in force from height {}): [{}] -> [{}]",
@@ -1744,26 +1813,81 @@ impl ValidatorRuntime {
     /// the master's ledger, shared process-wide through
     /// [`Self::master_staking`].
     ///
-    /// NO cross-chain height comparison here: the two heights belong to
-    /// DIFFERENT chains (the workchain's and the masterchain's), so the
-    /// freshness gate of [`Self::refresh_validator_set_from_ledger`] does not
-    /// apply. What that gate protects against, a restored ledger that lags the
-    /// state by more than the snapshot window, is the masterchain runtime's own
-    /// business: it is the one that restores the ledger and the one that knows
-    /// whether it is fresh (see [`Self::refresh_validator_set_from_staking_checked`]
-    /// on the masterchain side, and the fail-closed observer mode it arms).
+    /// DETERMINISTIC ACTIVATION: the set is bound to the masterchain's
+    /// published [`super::MasterSetStamp`] — the masterchain height
+    /// at which the block that adopted the rotation was finalized, expressed as
+    /// that rotation's `master ledger height + 1` (see
+    /// [`super::workchain_set_activation_height`]). The workchain
+    /// does NOT use its own tip to date the rotation: the stamp is a property
+    /// of the rotation, so two workchains at different local heights stage it
+    /// at the SAME activation height.
+    ///
+    /// FAIL CLOSED: when the derived set has no matching stamp (the
+    /// masterchain never published one for this content, or the shared ledger
+    /// already moved past the last published set), this node cannot prove
+    /// which masterchain block defined the set. It then arms the stale gate
+    /// (observer, no votes — see [`Self::effective_can_vote`]) and stages
+    /// NOTHING rather than inventing a boundary. Guessing `tip + 1` here is
+    /// exactly the per-shard divergence ("wrong proposer", no finality) this
+    /// binding removes.
+    ///
+    /// NO cross-chain height comparison: the two heights belong to DIFFERENT
+    /// chains (the workchain's and the masterchain's), so the freshness gate
+    /// of [`Self::refresh_validator_set_from_ledger`] does not apply. What that
+    /// gate protects against, a restored ledger that lags the state by more
+    /// than the snapshot window, is the masterchain runtime's own business: it
+    /// is the one that restores the ledger and the one that knows whether it is
+    /// fresh (see [`Self::refresh_validator_set_from_staking_checked`] on the
+    /// masterchain side, and the fail-closed observer mode it arms).
     ///
     /// The shared ledger is written by the masterchain runtime under the SAME
     /// lock this read takes, so the read is atomic and never torn: the
     /// workchain installs either the pre-rotation or the post-rotation set,
-    /// never a mixture.
+    /// never a mixture. The stamp is bound to the snapshot by the set's
+    /// CONTENT fingerprint, so a ledger that changed after the masterchain
+    /// last derived it cannot pair with the older stamp.
     pub async fn refresh_validator_set_from_master_ledger(
         &mut self,
         ledger: &crate::staking::StakingLedger,
-        height: u64,
     ) -> bool {
-        self.install_validator_set_from_ledger(ledger, height, height)
-            .await
+        let Some(master) = self.master_staking.clone() else {
+            self.mark_validator_set_stale(
+                self.hc.height,
+                self.hc.height,
+                "masterchain set activation unavailable: no master ledger handle wired".to_string(),
+            );
+            return false;
+        };
+        let derived = ledger.to_validator_set();
+        if derived.is_empty() {
+            // Nobody bonded on the masterchain (yet): the config-defined set
+            // stays in force, and there is no rotation to date.
+            return false;
+        }
+        let fingerprint = set_fingerprint(&derived);
+        let Some(stamp) = master_set_stamp(&master).filter(|s| s.set_fingerprint == fingerprint)
+        else {
+            self.mark_validator_set_stale(
+                self.hc.height,
+                self.hc.height,
+                format!(
+                    "masterchain set {} has no published activation stamp: cannot prove which masterchain block defined it (fail-closed observer, no votes)",
+                    hex::encode(&fingerprint[..8])
+                ),
+            );
+            return false;
+        };
+        // The stamp carries the masterchain's activation boundary. The
+        // freshness bookkeeping stays in WORKCHAIN height space (this node's
+        // state and its own (empty) registry are what it describes); the
+        // cross-chain datum lives in the activation height.
+        self.install_validator_set_from_ledger(
+            ledger,
+            self.hc.height,
+            self.hc.height,
+            stamp.activation_height,
+        )
+        .await
     }
 
     /// The MASTERCHAIN registry, when this runtime must take its consensus
@@ -1808,9 +1932,7 @@ impl ValidatorRuntime {
         ledger_height: u64,
     ) -> bool {
         if let Some(ledger) = self.master_registry().await {
-            return self
-                .refresh_validator_set_from_master_ledger(&ledger, self.hc.height)
-                .await;
+            return self.refresh_validator_set_from_master_ledger(&ledger).await;
         }
         let ledger = self.state.staking_read().await.clone();
         self.refresh_validator_set_from_ledger(&ledger, state_height, ledger_height)
@@ -1839,9 +1961,7 @@ impl ValidatorRuntime {
         ledger_height: u64,
     ) -> Result<bool, String> {
         if let Some(ledger) = self.master_registry().await {
-            return Ok(self
-                .refresh_validator_set_from_master_ledger(&ledger, self.hc.height)
-                .await);
+            return Ok(self.refresh_validator_set_from_master_ledger(&ledger).await);
         }
         let snap = crate::storage::decode_domain_snapshot(domain_bytes).map_err(|e| {
             format!("validator-set refresh: domain snapshot at {ledger_height} undecodable: {e}")
@@ -1863,9 +1983,14 @@ impl ValidatorRuntime {
     ///
     /// WORKCHAIN: the registry is the MASTERCHAIN's, shared process-wide (see
     /// [`Self::master_staking`]). A masterchain rotation is therefore adopted
-    /// here at the height boundary, and the new set is in force from
-    /// `height + 1` (see [`crate::sharding::validator_set_adoption_height`]) —
-    /// no node restart, no separate registry to reconcile.
+    /// here at the rotation's OWN activation boundary — the masterchain height
+    /// at which the adopting block was finalized, plus one, carried by the
+    /// [`super::MasterSetStamp`] — never at this node's `height + 1`.
+    /// Two shards at different local heights therefore switch quorums at the
+    /// same agreed height; no node restart, no separate registry to reconcile.
+    /// A workchain that cannot obtain the stamp for the derived set fail-closes
+    /// to observer instead of guessing (see
+    /// [`Self::refresh_validator_set_from_master_ledger`]).
     ///
     /// Apply-path wrapper: the ledger just came out of the transition at the
     /// current height, so state and ledger heights coincide (always fresh).
@@ -1887,40 +2012,35 @@ impl ValidatorRuntime {
     /// that re-reads the master ledger WITHOUT requiring any height advance:
     /// it routes through [`Self::refresh_validator_set_from_staking`] (so a
     /// workchain with the master handle wired derives from
-    /// [`Self::master_registry`], stages the change at the W10.5 activation
-    /// boundary and clears/sets the stale gate exactly like the finalize
-    /// path), then installs whatever is due. No-op (`false`, nothing touched)
-    /// for the masterchain and single-shard nodes, so the consensus loop can
-    /// call it unconditionally on a timer.
+    /// [`Self::master_registry`], binds the change to the masterchain's
+    /// published activation stamp and clears/sets the stale gate exactly like
+    /// the finalize path), then installs whatever is due. No-op (`false`,
+    /// nothing touched) for the masterchain and single-shard nodes, so the
+    /// consensus loop can call it unconditionally on a timer.
+    ///
+    /// IDEMPOTENT: the installer reports `false` when the derived transition is
+    /// already staged for the same activation, or already in force, so a
+    /// converged timer tick is silent (no re-stage, no repeated WARN). Note
+    /// that the repair does NOT move the height: a rotation whose activation
+    /// boundary is already behind the wedged height is installed in place
+    /// (`install_due_validator_set`), which is what lets the shard resume
+    /// finalizing the height it is stuck on.
     ///
     /// The repair unblocks the wedge transitively: once the CURRENT master set
     /// is staged, the next walk verifies block H+1 against
     /// [`Self::validator_set_for_height`] (which answers pending sets at/above
     /// their activation), applies it, advances, and installs the set due —
     /// the same convergence the finalize path performs, without needing a
-    /// finalize to start it.
+    /// finalize to start it. When the masterchain has not published the stamp
+    /// for the derived set, the refresh fail-closes (observer, no votes): the
+    /// timer keeps retrying until the masterchain's next finalize publishes it,
+    /// and never guesses a boundary in the meantime.
     pub async fn refresh_workchain_set_from_master(&mut self) -> bool {
         if !crate::sharding::ValidatorSetSource::for_shard(self.shard_id).uses_masterchain() {
             return false;
         }
         if self.master_staking.is_none() {
             return false;
-        }
-        // Idempotence for the timer: an unchanged master registry re-derives
-        // the same set every interval, and the installer below re-stages (and
-        // re-WARNs) on every call. When the pending set already stages exactly
-        // what the registry derives for the same activation, there is nothing
-        // to stage — install whatever is due and report quiet.
-        let h = self.hc.height;
-        if let Some((activation, pending)) = self.pending_validators.clone() {
-            if activation == h.saturating_add(1) {
-                if let Some(ledger) = self.master_registry().await {
-                    if pending.validators == ledger.to_validator_set().validators {
-                        self.install_due_validator_set();
-                        return false;
-                    }
-                }
-            }
         }
         let changed = self.refresh_validator_set_from_staking().await;
         self.install_due_validator_set();

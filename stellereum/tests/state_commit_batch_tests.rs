@@ -59,9 +59,16 @@ fn det_block(height: u64, ntx: usize) -> Block {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
+    // Process-unique AND test-unique: a monotonic counter removes the
+    // thread-id/nanosecond collision that let two tests in this binary open
+    // the SAME sled directory under `--test-threads > 1` (sled then refuses
+    // the second open with "could not acquire lock").
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "stell_state_commit_diff_{tag}_{}_{}",
+        "stell_state_commit_diff_{tag}_{}_{}_{}",
         std::process::id(),
+        n,
         rand_suffix()
     ))
 }

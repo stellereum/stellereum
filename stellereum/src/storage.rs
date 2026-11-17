@@ -19,6 +19,7 @@
 //!   "zkml_models" : height(8B BE) -> bincode(ZkMlModelRegistry)  [audit F-B]
 //!   "cross_shard" : height(8B BE) -> bincode(CrossShardReplaySnapshot) [audit F-I]
 //!   "cnvrf_v3"    : height(8B BE) -> bincode(CnVrfV3EngineSnapshot)
+//!   "xshard_headers": b"latest" -> bincode(FinalizedHeaderRegistry snapshot) [durable C1 anchors]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
 //!   "pq_keys"     : b"a:"+address (32B) -> bincode(scheme, pubkey, salt) / b"h:"+pk_hash (32B) -> pubkey
 //!
@@ -37,7 +38,7 @@
 //! paired across restarts; an absent entry simply means "empty", which is what
 //! both conditional digest domains hash as.
 
-use crate::sharding::Block;
+use crate::sharding::{Block, FinalizedHeaderRegistry, FinalizedHeaderSink};
 use crate::state_engine::InMemoryStateEngine;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,16 @@ pub struct Storage {
     /// the same reason as `session_keys`/`bridge`/`zkml_models`: `DomainSnapshot`
     /// is frozen, and an absent/empty entry means `CnVrfV3EngineSnapshot::default()`.
     cnvrf_v3: sled::Tree,
+    /// Durable cross-shard finalized-header registry
+    /// ([`crate::sharding::FinalizedHeaderRegistry`]): the latest shard heads
+    /// plus the bounded `(shard, block_hash) -> post-apply root` anchor window.
+    ///
+    /// ONE latest-state row (`b"latest"`), not a height-keyed history: the blob
+    /// is self-contained and already bounded by `REGISTRY_ANCHOR_WINDOW`, so a
+    /// single row both bounds disk and makes hydration one atomic read. Without
+    /// this tree every anchor died with the process and a restart made every
+    /// cross-shard message produced before it unverifiable.
+    xshard_headers: sled::Tree,
     /// Execution receipts, keyed by tx hash. NEW tree (additive only): existing
     /// trees are untouched, so pre-existing data directories open unchanged and
     /// simply report no receipts until heights are adopted/replicated.
@@ -423,6 +434,7 @@ impl Storage {
         let zkml_models = db.open_tree("zkml_models")?;
         let cross_shard = db.open_tree("cross_shard")?;
         let cnvrf_v3 = db.open_tree("cnvrf_v3")?;
+        let xshard_headers = db.open_tree("xshard_headers")?;
         let receipts = db.open_tree("receipts_v1")?;
         let pq_keys = db.open_tree("pq_keys")?;
         let this = Self {
@@ -438,6 +450,7 @@ impl Storage {
             zkml_models,
             cross_shard,
             cnvrf_v3,
+            xshard_headers,
             receipts,
             pq_keys,
         };
@@ -1362,6 +1375,55 @@ impl Storage {
             removed += 1;
         }
         Ok(removed)
+    }
+
+    // ---------- Durable cross-shard finalized-header registry ----------
+
+    /// The single row holding the latest registry snapshot.
+    const XSHARD_HEADERS_KEY: &'static [u8] = b"latest";
+
+    /// Write one complete registry snapshot. Additive tree: an older data
+    /// directory simply has no row and hydrates as an empty registry, exactly
+    /// like a fresh process.
+    pub fn put_xshard_headers(&self, bytes: &[u8]) -> Result<()> {
+        self.xshard_headers
+            .insert(Self::XSHARD_HEADERS_KEY, bytes)?;
+        Ok(())
+    }
+
+    /// The latest persisted registry blob, if any. `None` means "never
+    /// written" (fresh directory / single-shard chain), which hydrates as the
+    /// empty registry — the same fail-closed start a cold process has.
+    pub fn xshard_headers(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .xshard_headers
+            .get(Self::XSHARD_HEADERS_KEY)?
+            .map(|v| v.to_vec()))
+    }
+
+    /// Hydrate `registry` from this store BEFORE the runtime starts voting or
+    /// syncing. Called at startup.
+    ///
+    /// FAIL CLOSED: a corrupt blob (or an I/O error) clears the registry and
+    /// returns the error, so the node starts with NO anchors — it can re-anchor
+    /// blocks it finalizes from now on, but it never accepts an anchor it could
+    /// not verify from disk. The caller logs the error loudly; silence would
+    /// hide the difference between "restart lost history" and "restart trusted
+    /// forged history".
+    pub fn hydrate_finalized_headers(&self, registry: &mut FinalizedHeaderRegistry) -> Result<()> {
+        let bytes = match self.xshard_headers() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                registry.clear_anchors();
+                return Err(anyhow!("read xshard_headers: {e}"));
+            }
+        };
+        let Some(bytes) = bytes else {
+            return Ok(());
+        };
+        registry
+            .restore_from_bytes(&bytes)
+            .map_err(|e| anyhow!("xshard_headers blob rejected (registry left EMPTY): {e}"))
     }
 
     /// The trusted state root a snapshot at `snapshot_height` must hash to.
@@ -2960,6 +3022,13 @@ pub enum PersistJob {
         height: u64,
         bytes: Vec<u8>,
     },
+    /// Complete cross-shard finalized-header registry snapshot (latest shard
+    /// heads + bounded anchor window). Latest-state, so a later job replaces an
+    /// earlier one; enqueued from the registry's finalize path, never read from
+    /// the network.
+    XshardHeaders {
+        bytes: Vec<u8>,
+    },
     Consensus(Box<ConsensusCheckpoint>),
     Finalized {
         height: u64,
@@ -3078,6 +3147,7 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_bridge(height, &bridge))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
+                    PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
                     PersistJob::Receipts {
@@ -3292,6 +3362,14 @@ impl AsyncPersistence {
         self.push(PersistJob::CnVrfV3 { height, bytes });
     }
 
+    /// Non-blocking: enqueue a complete cross-shard finalized-header registry
+    /// snapshot. Latest-state (a later job replaces an earlier one), so the
+    /// queue-under-pressure drop of one snapshot is recovered by the next
+    /// finalize; `BoundedWait` keeps that window as small as the disk allows.
+    pub fn enqueue_xshard_headers(&self, bytes: Vec<u8>) {
+        self.push(PersistJob::XshardHeaders { bytes });
+    }
+
     /// Capture + enqueue the full domain snapshot (A9), plus the session-key
     /// registry AND the committed bridge domain captured from the SAME engine
     /// in the SAME job.
@@ -3448,6 +3526,15 @@ impl AsyncPersistence {
         let accounts = clone_account_snapshot(engine).await;
         let snap = serialize_off_tick(accounts).await.unwrap_or_default();
         self.enqueue_state(height, snap);
+    }
+}
+
+/// Durability sink for the process-shared cross-shard finalized-header
+/// registry: the registry hands us one complete snapshot per mutation and we
+/// only ENQUEUE it, so the finalize path never touches disk.
+impl FinalizedHeaderSink for AsyncPersistence {
+    fn persist_finalized_headers(&self, bytes: Vec<u8>) {
+        self.enqueue_xshard_headers(bytes);
     }
 }
 

@@ -252,6 +252,21 @@ pub fn snapshot_interval() -> u64 {
         .max(50)
 }
 
+/// Largest body gap the sequential back-walk may cover.
+///
+/// The walk cap exists to bound WAN work (an unbounded walk is a DoS vector),
+/// but a FIXED 256 stranded any node whose newest snapshot was further back:
+/// snapshots are published every `snapshot_interval()` heights (default 1000),
+/// so a node that restored at boundary B could face a gap of up to
+/// `interval + cadence_slack` > 256, and with finality stopped (two nodes
+/// wiped) no newer snapshot is ever produced — the cluster could not
+/// self-recover. The bound therefore tracks the snapshot cadence: a node always
+/// has a walkable path to the next snapshot, while the ceiling keeps the DoS
+/// property (never unbounded, never more than a few thousand blocks).
+pub fn max_walk_gap() -> u64 {
+    snapshot_interval().saturating_add(64).clamp(256, 4096)
+}
+
 /// Whether the CURRENT round's propose-timeout should be capped at
 /// [`down_proposer_timeout_ms`] instead of growing with the round backoff.
 ///
@@ -851,37 +866,37 @@ pub(crate) fn is_parallel_exec_active(
     env_parallel || has_cli_flag || state_enabled
 }
 
-/// The live BFT consensus loop: propose, prevote, precommit, finalize — all over
-/// the infnode pubsub transport. Runs until the process is killed.
-/// §9 CROSS-SHARD 2PC activation, read from the environment.
+/// The §9 CROSS-SHARD 2PC activation, derived from the CHAIN SPEC.
 ///
-/// `STELL_XPC_ACTIVATION_HEIGHT=<h>` makes every cross-shard transfer
-/// PRODUCED at height `h` or later run the two-phase commit (prepare /
-/// vote / commit). Unset or empty keeps the legacy outbox/inbox/ack/bounce
-/// flow, which is the mode the already-deployed chain state runs in and the
-/// mode the pre-2PC integration tests exercise.
+/// The protocol freeze (`docs/PUBLIC_TESTNET_CODE_GAPS.md`) forbids
+/// env-driven protocol switches, so the operator variable this function used
+/// to read (`STELL_XPC_ACTIVATION_HEIGHT`) is DEPRECATED: it is never
+/// consulted for the decision. The only production source of
+/// [`stellereum::xshard2pc::XpcActivation`] is the compile-time gate
+/// [`stellereum::xshard2pc::XPC_ACTIVATION_HEIGHT`] (registered in
+/// `chain_spec`), which keeps the frozen public protocol on the legacy
+/// outbox/inbox/ack/bounce flow.
 ///
-/// The height is a chain-height BOUNDARY, not a per-node switch: it decides
-/// which protocol a transfer takes, so it is consensus-visible and every
-/// node of a shard must be configured with the same value. `0` means "from
-/// genesis" (a fresh chain).
+/// A variable left in a supervisor unit is logged loudly and IGNORED, so an
+/// operator can never half-arm the 2PC on one node of a shard (which would
+/// make two nodes classify the same transfer differently — a consensus
+/// split). Test code that needs the boundary constructs
+/// `XpcActivation::FromHeight(h)` directly and injects it through
+/// `with_xpc_activation`.
 pub(crate) fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation {
-    let raw = std::env::var("STELL_XPC_ACTIVATION_HEIGHT")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    match raw {
-        None => stellereum::xshard2pc::XpcActivation::Disabled,
-        Some(v) => match v.parse::<u64>() {
-            Ok(h) => stellereum::xshard2pc::XpcActivation::FromHeight(h),
-            Err(_) => {
-                tracing::warn!(
-                    "[xpc] STELL_XPC_ACTIVATION_HEIGHT={v:?} is not a height: the 2PC stays INACTIVE"
-                );
-                stellereum::xshard2pc::XpcActivation::Disabled
-            }
-        },
+    if let Ok(raw) = std::env::var("STELL_XPC_ACTIVATION_HEIGHT") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            tracing::warn!(
+                "[xpc] STELL_XPC_ACTIVATION_HEIGHT={raw:?} is DEPRECATED and IGNORED: \
+                 the 2PC activation comes from the chain spec \
+                 (XPC_ACTIVATION_HEIGHT), never from the environment"
+            );
+        }
     }
+    let activation = stellereum::xshard2pc::XpcActivation::from_chain_spec();
+    tracing::info!("[xpc] 2PC activation from the chain spec: {:?}", activation);
+    activation
 }
 
 /// Startup-heal retry budget: missing bodies are transient (a peer that just

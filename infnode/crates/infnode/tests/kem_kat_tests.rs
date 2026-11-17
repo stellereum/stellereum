@@ -1,10 +1,8 @@
 //! ML-KEM (FIPS 203) Known-Answer Tests — vendored implementation pin.
 //!
-//! STATUS: UNWIRED. These tests pin the vendored `ml-kem` crate (RustCrypto,
-//! pure-Rust FIPS 203 implementation) at the KAT level only. The infnode
-//! transport still uses X25519; wiring ML-KEM into `node.rs`/handshake is a
-//! separate lead decision and is NOT done here. No `src/` file is touched by
-//! this change (crate dependency + this test file only).
+//! These tests pin the vendored `ml-kem` crate (RustCrypto, pure-Rust FIPS 203
+//! implementation) at the KAT level. ML-KEM-768 IS the live KEX (KEM-only
+//! sessions, FULL-PQ); these vectors keep the primitive pinned.
 //!
 //! Crate: `ml-kem 0.3.4` (RustCrypto `KEMs` repo, `https://github.com/RustCrypto/KEMs`).
 //! Chosen because: (a) audited RustCrypto lineage, (b) pure-Rust FIPS 203 with no

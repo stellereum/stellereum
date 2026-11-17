@@ -554,11 +554,11 @@ pub fn load_or_generate_falcon_key(path: &Path) -> Result<crate::post_quantum::F
     }
 }
 
-/// Load infnode NodeKeys (identity.key and e2e.key) with strict permission checks and decryption.
+/// Load infnode NodeKeys (`e2e.key`) with strict permission checks and decryption.
 ///
 /// OPERATIONAL (audit open risk #4): the returned `NodeKeys` (an `infnode`
 /// type with NO `Zeroize` bound — outside this module's reach) holds the
-/// Ed25519 identity seed and the ML-KEM-768 seed in process heap. There is
+/// ML-KEM-768 seed in process heap. There is
 /// no PFS claim on the KEM channel: a heap disclosure (core dump, swap,
 /// `/proc/<pid>/mem`) exposes both long-term secrets. Operators MUST disable
 /// core dumps and encrypted-swap-or-no-swap on validators; treat the KEM
@@ -577,31 +577,29 @@ pub fn load_or_generate_falcon_key(path: &Path) -> Result<crate::post_quantum::F
 /// hard error: the node must not start with a fallback identity.
 pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
     verify_dir_perms(dir)?;
-    let id_path = dir.join("identity.key");
+    // FULL-PQ: a legacy `identity.key` is NOT a node identity any more.
+    // Its seed is migrated ONCE into the consensus-only `validator.key`
+    // (the frozen consensus `ValidatorId` is Ed-keyed) and the file is
+    // renamed to `identity.key.migrated`; infnode transport never sees it.
+    // Node identity is `pq-identity.key` (Falcon-512); this loader owns only
+    // the ML-KEM mailbox seed.
+    if dir.join("identity.key").exists() {
+        let _ = load_or_generate_consensus_key(dir)?;
+    }
     let e2e_path = dir.join("e2e.key");
-    verify_file_perms(&id_path)?;
     verify_file_perms(&e2e_path)?;
 
-    let id_raw = std::fs::read(&id_path).map_err(|e| anyhow!("identity.key: {e}"))?;
     let e2e_raw = std::fs::read(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
 
     let pass = Zeroizing::new(get_passphrase());
-    let id_plain = Zeroizing::new(decrypt_bytes(&id_raw, pass.as_deref())?);
     let e2e_plain = Zeroizing::new(decrypt_bytes(&e2e_raw, pass.as_deref())?);
 
     // Transparent upgrade: plaintext key files are re-encrypted in place as
     // soon as a passphrase is available (best-effort, never fatal). It runs
     // AFTER the key material has been parsed and validated, so a corrupt
     // file is reported as such instead of being encrypted first.
-    let id_str = std::str::from_utf8(&id_plain)?.trim();
     let e2e_str = std::str::from_utf8(&e2e_plain)?.trim();
 
-    let id_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        hex::decode(id_str)
-            .map_err(|e| anyhow!("identity key hex: {e}"))?
-            .try_into()
-            .map_err(|_| anyhow!("identity seed must be 32 bytes"))?,
-    );
     let e2e_bytes: Zeroizing<Vec<u8>> =
         Zeroizing::new(hex::decode(e2e_str).map_err(|e| anyhow!("e2e key hex: {e}"))?);
     if e2e_bytes.len() == 32 {
@@ -617,40 +615,97 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
         .map_err(|_| anyhow!("e2e kem seed must be 64 bytes"))?;
     let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
 
-    for (path, raw, plain) in [
-        (&id_path, &id_raw, &id_plain),
-        (&e2e_path, &e2e_raw, &e2e_plain),
-    ] {
-        match upgrade_plaintext_key_to_encrypted(path, raw, plain.as_slice()) {
-            Ok(true) => {
-                tracing::info!("upgraded {} to the encrypted enc2: format", path.display());
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "could not re-encrypt {} in place: {e} (key left as-is, still usable)",
-                    path.display()
-                );
-                eprintln!(
-                    "[WARN] could not re-encrypt {} in place: {e} (key left as-is, still usable)",
-                    path.display()
-                );
-            }
-        }
+    if let Err(e) = upgrade_plaintext_key_to_encrypted(&e2e_path, &e2e_raw, e2e_plain.as_slice()) {
+        tracing::warn!(
+            "could not re-encrypt {} in place: {e} (key left as-is, still usable)",
+            e2e_path.display()
+        );
+        eprintln!(
+            "[WARN] could not re-encrypt {} in place: {e} (key left as-is, still usable)",
+            e2e_path.display()
+        );
     }
 
-    let signing = ed25519_dalek::SigningKey::from_bytes(&id_bytes);
-    let verifying = signing.verifying_key();
-
-    Ok(infnode::keyring::NodeKeys {
-        signing,
-        verifying,
-        kem_seed,
-        kem_ek,
-    })
+    Ok(infnode::keyring::NodeKeys { kem_seed, kem_ek })
 }
 
-/// Save infnode NodeKeys (identity.key and e2e.key) with 0700 dir and 0600 files.
+/// Consensus-only Ed25519 validator key file (NOT a transport identity).
+/// The frozen consensus `ValidatorId` is `[u8; 32]` and its signing interface
+/// is Ed25519; infnode transport/identity never reads this key.
+pub const CONSENSUS_KEY_FILE: &str = "validator.key";
+
+/// Load the consensus validator key, generating it on first boot.
+///
+/// FULL-PQ migration: if `validator.key` is absent but a legacy
+/// `identity.key` exists, its 32-byte Ed25519 seed is moved into
+/// `validator.key` (same encryption policy) and the legacy file is renamed to
+/// `identity.key.migrated`. That preserves the consensus identity while
+/// removing the classical key from the node-identity/transport path.
+/// The returned key is consensus-only: no infnode frame/TLS/auth code uses it.
+pub fn load_or_generate_consensus_key(dir: &Path) -> Result<ed25519_dalek::SigningKey> {
+    ensure_secure_dir(dir)?;
+    let path = dir.join(CONSENSUS_KEY_FILE);
+    if path.exists() {
+        verify_file_perms(&path)?;
+        let raw = std::fs::read(&path).map_err(|e| anyhow!("{CONSENSUS_KEY_FILE}: {e}"))?;
+        let pass = Zeroizing::new(get_passphrase());
+        let plain = Zeroizing::new(decrypt_bytes(&raw, pass.as_deref())?);
+        let seed: [u8; 32] = hex::decode(std::str::from_utf8(&plain)?.trim())
+            .map_err(|e| anyhow!("consensus key hex: {e}"))?
+            .try_into()
+            .map_err(|_| anyhow!("consensus seed must be 32 bytes"))?;
+        return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
+    }
+
+    // One-time migration of the legacy Ed25519 identity seed.
+    let legacy = dir.join("identity.key");
+    let (key, mut seed, was_legacy) = if legacy.exists() {
+        verify_file_perms(&legacy)?;
+        let raw = std::fs::read(&legacy).map_err(|e| anyhow!("identity.key: {e}"))?;
+        let pass = Zeroizing::new(get_passphrase());
+        let plain = Zeroizing::new(decrypt_bytes(&raw, pass.as_deref())?);
+        let seed: [u8; 32] = hex::decode(std::str::from_utf8(&plain)?.trim())
+            .map_err(|e| anyhow!("identity key hex: {e}"))?
+            .try_into()
+            .map_err(|_| anyhow!("identity seed must be 32 bytes"))?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        (key, seed, true)
+    } else {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let seed = key.to_bytes();
+        (key, seed, false)
+    };
+
+    // Persist under the same policy as the other node keys: encrypted when a
+    // passphrase is available, plaintext only with the explicit override.
+    let seed_hex = Zeroizing::new(hex::encode(seed));
+    zeroize::Zeroize::zeroize(&mut seed);
+    let blob: Zeroizing<Vec<u8>> =
+        if plaintext_keys_allowed() || (was_legacy && get_passphrase().is_none()) {
+            Zeroizing::new(seed_hex.as_bytes().to_vec())
+        } else {
+            let pass = passphrase_for_write("consensus key")?;
+            Zeroizing::new(encrypt_bytes(seed_hex.as_bytes(), pass.as_str())?.into_bytes())
+        };
+    atomic_write_private(&path, blob.as_slice())?;
+
+    if was_legacy {
+        let migrated = dir.join("identity.key.migrated");
+        std::fs::rename(&legacy, &migrated)
+            .map_err(|e| anyhow!("could not retire legacy identity.key: {e}"))?;
+        tracing::warn!(
+            "migrated legacy Ed25519 identity.key -> {} (consensus-only; node identity is pq-identity.key)",
+            CONSENSUS_KEY_FILE
+        );
+        eprintln!(
+            "[MIGRATE] identity.key is now consensus-only {} (renamed identity.key.migrated); PQ node identity is pq-identity.key",
+            CONSENSUS_KEY_FILE
+        );
+    }
+    Ok(key)
+}
+
+/// Save infnode NodeKeys (`e2e.key`) with 0700 dir and 0600 file.
 ///
 /// ENCRYPTED BY DEFAULT: both files are written as `enc2:` (Argon2id +
 /// XChaCha20-Poly1305) using the passphrase from the environment. If no
@@ -664,29 +719,22 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
 /// would come back with a DIFFERENT identity, or refuse to start).
 pub fn save_node_keys(dir: &Path, keys: &infnode::keyring::NodeKeys) -> Result<()> {
     ensure_secure_dir(dir)?;
-    let id_hex = Zeroizing::new(hex::encode(keys.signing.to_bytes()));
     let e2e_hex = Zeroizing::new(hex::encode(keys.kem_seed));
 
-    let (id_blob, e2e_blob): (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) = if plaintext_keys_allowed()
-    {
+    let e2e_blob: Zeroizing<Vec<u8>> = if plaintext_keys_allowed() {
         tracing::warn!(
             "{} set: saving node keys in PLAINTEXT",
             std::env::var(ENV_PLAINTEXT).unwrap_or_default()
         );
         eprintln!("[WARN] {}=1: saving node keys in PLAINTEXT", ENV_PLAINTEXT);
-        (
-            Zeroizing::new(id_hex.as_bytes().to_vec()),
-            Zeroizing::new(e2e_hex.as_bytes().to_vec()),
-        )
+        Zeroizing::new(e2e_hex.as_bytes().to_vec())
     } else {
         let pass = passphrase_for_write("node keys")?;
-        (
-            Zeroizing::new(encrypt_bytes(id_hex.as_bytes(), pass.as_str())?.into_bytes()),
-            Zeroizing::new(encrypt_bytes(e2e_hex.as_bytes(), pass.as_str())?.into_bytes()),
-        )
+        Zeroizing::new(encrypt_bytes(e2e_hex.as_bytes(), pass.as_str())?.into_bytes())
     };
 
-    atomic_write_private(&dir.join("identity.key"), id_blob.as_slice())?;
+    // FULL-PQ: only the KEM seed is persisted; `identity.key` (classical
+    // Ed25519) is never written.
     atomic_write_private(&dir.join("e2e.key"), e2e_blob.as_slice())?;
     Ok(())
 }
@@ -697,7 +745,11 @@ pub fn save_node_keys(dir: &Path, keys: &infnode::keyring::NodeKeys) -> Result<(
 /// falls back to a freshly generated identity. A brand-new key is written
 /// encrypted (or refused, when no passphrase is available).
 pub fn load_or_generate_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
-    if dir.join("identity.key").exists() {
+    // Migrates/loads the consensus-only Ed key (see
+    // `load_or_generate_consensus_key`) so a legacy identity.key never blocks
+    // the PQ keystore.
+    let _ = load_or_generate_consensus_key(dir)?;
+    if dir.join("e2e.key").exists() {
         load_node_keys(dir)
     } else {
         let k = infnode::keyring::NodeKeys::generate();
@@ -706,12 +758,13 @@ pub fn load_or_generate_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKe
     }
 }
 
-/// Unified bundle of all 4 node key artifacts (`identity.key`, `e2e.key`,
-/// `pq-identity.key`, and `falcon.key`), providing unambiguous accessors for
-/// P2P transport identity vs. consensus validator identity.
+/// Unified bundle of the node key artifacts (`e2e.key`, `pq-identity.key`,
+/// and `falcon.key`), providing unambiguous accessors for P2P transport
+/// identity vs. consensus validator identity. FULL-PQ: there is no
+/// `identity.key` (Ed25519) artifact any more.
 #[derive(Clone)]
 pub struct NodeKeyBundle {
-    /// `identity.key` (Ed25519 signing/verifying) + `e2e.key` (ML-KEM-768 seed/ek).
+    /// `e2e.key` (ML-KEM-768 seed/ek).
     pub node_keys: infnode::keyring::NodeKeys,
     /// `pq-identity.key` (Falcon-512 keypair for infnode P2P transport).
     pub pq_identity: infnode::keyring::PqKeys,
@@ -752,10 +805,10 @@ impl NodeKeyBundle {
         })
     }
 
-    /// Validator Ed25519-derived `inf1:` id (`node_keys.id_hex()`), used in
-    /// `validators:` and `build_validator_set`.
-    pub fn validator_ed_id_hex(&self) -> String {
-        self.node_keys.id_hex()
+    /// Canonical validator `inf1:` id (PQ: `pq_identity.pq_id_hex()`), used
+    /// in `validators:` and `build_validator_set`.
+    pub fn validator_id_hex(&self) -> String {
+        self.pq_identity.pq_id_hex()
     }
 
     /// P2P transport Falcon-512 `inf1:` id (`pq_identity.pq_id_hex()`).
@@ -766,11 +819,6 @@ impl NodeKeyBundle {
     /// P2P transport Falcon-512 public key hex (`pq_identity.pq_pub_hex()`).
     pub fn p2p_pq_pub_hex(&self) -> String {
         self.pq_identity.pq_pub_hex()
-    }
-
-    /// Ed25519 public key hex (`node_keys.ed_hex()`).
-    pub fn ed_pub_hex(&self) -> String {
-        self.node_keys.ed_hex()
     }
 
     /// ML-KEM-768 encapsulation key hex (`node_keys.kem_ek_hex()`).
@@ -786,9 +834,8 @@ impl NodeKeyBundle {
     /// Canonical single-line summary of all node public keys.
     pub fn identity_line(&self) -> String {
         format!(
-            "NODE IDENTITY: id={} ed={} kem_ek={} pq_pub={} falcon={}",
-            self.validator_ed_id_hex(),
-            self.ed_pub_hex(),
+            "NODE IDENTITY: id={} kem_ek={} pq_pub={} falcon={}",
+            self.validator_id_hex(),
             self.kem_ek_hex(),
             self.p2p_pq_pub_hex(),
             self.consensus_falcon_pub_hex(),
@@ -797,21 +844,19 @@ impl NodeKeyBundle {
 
     /// Canonical YAML peer stanza block matching `stellereum keys peer-stanza`.
     pub fn peer_stanza(&self, name: &str, endpoint: &str) -> String {
-        let id_hex = self.validator_ed_id_hex();
-        let ed_hex = self.ed_pub_hex();
+        let id_hex = self.validator_id_hex();
         let pq_pub_hex = self.p2p_pq_pub_hex();
         let falcon_hex = self.consensus_falcon_pub_hex();
         [
             "# === STELLEREUM PEER STANZA (send this block to the network admin) ===".to_string(),
             format!("  - name: {name}"),
-            format!("    ed-pub: \"{ed_hex}\""),
             format!("    pq-pub: \"{pq_pub_hex}\""),
             format!("    endpoints: [\"{endpoint}\"]"),
             "    allow: [\"*\"]".to_string(),
             "# validators entry (admin adds the id to every node's `validators:`):".to_string(),
             format!("  - \"{id_hex}\""),
             "# PQ mapping for STELL_PEER_PQ_KEYS (admin appends, comma-separated):".to_string(),
-            format!("# {ed_hex}:{falcon_hex}"),
+            format!("# {pq_pub_hex}:{falcon_hex}"),
         ]
         .join("\n")
     }
@@ -933,22 +978,18 @@ mod tests {
 
         let dir = temp_dir("gen_enc");
         let keys = load_or_generate_node_keys(&dir).expect("generate node keys");
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
-        let id_hex = hex::encode(keys.signing.to_bytes());
+        let e2e_hex = hex::encode(keys.kem_seed);
 
-        let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
-        assert!(raw.starts_with("enc2:"), "identity.key must be enc2:");
-        assert!(
-            !raw.contains(&id_hex),
-            "identity.key must not leak the seed"
-        );
+        let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
+        assert!(raw.starts_with("enc2:"), "e2e.key must be enc2:");
+        assert!(!raw.contains(&e2e_hex), "e2e.key must not leak the seed");
 
         let raw_e2e = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
         assert!(raw_e2e.starts_with("enc2:"), "e2e.key must be enc2:");
 
         // And it round-trips through the loader.
         let reloaded = load_node_keys(&dir).expect("reload encrypted node keys");
-        assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(reloaded.kem_ek, keys.kem_ek);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -963,9 +1004,8 @@ mod tests {
 
         let dir = temp_dir("alias");
         let keys = load_or_generate_node_keys(&dir).expect("generate with alias env var");
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
         let reloaded = load_node_keys(&dir).expect("reload");
-        assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(reloaded.kem_ek, keys.kem_ek);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -990,7 +1030,7 @@ mod tests {
             "error must document the plaintext escape hatch: {msg}"
         );
         assert!(
-            !dir.join("identity.key").exists(),
+            !dir.join("e2e.key").exists(),
             "no key file may be written when the write is refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1005,7 +1045,6 @@ mod tests {
 
         let dir = temp_dir("fail_closed");
         let keys = load_or_generate_node_keys(&dir).expect("generate encrypted keys");
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
 
         // Passphrase disappears (e.g. systemd unit without the env file).
         std::env::remove_var(ENV_PASSPHRASE);
@@ -1026,13 +1065,13 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("encrypted"));
         // The key file on disk is untouched and still encrypted.
-        let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+        let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
         assert!(raw.starts_with("enc2:"), "key file must stay encrypted");
 
         // With the passphrase back, the same identity is returned.
         std::env::set_var(ENV_PASSPHRASE, "temp-passphrase");
         let reloaded = load_node_keys(&dir).expect("reload with passphrase");
-        assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(reloaded.kem_ek, keys.kem_ek);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1048,18 +1087,15 @@ mod tests {
 
         let dir = temp_dir("plain_compat");
         let keys = infnode::keyring::NodeKeys::generate();
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
-        let id_hex = hex::encode(keys.signing.to_bytes());
         let e2e_hex = hex::encode(keys.kem_seed);
 
         // Exactly what the live nodes have on disk: raw hex, 0600.
-        write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         write_plaintext_key(&dir.join("e2e.key"), e2e_hex.as_bytes());
 
         // No passphrase: the plaintext key still loads (backward compatibility).
         let loaded = load_node_keys(&dir).expect("plaintext key must still load");
-        assert_eq!(loaded.signing.verifying_key().to_bytes(), pub_bytes);
-        let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+        assert_eq!(loaded.kem_ek, keys.kem_ek);
+        let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
         assert!(
             !raw.starts_with("enc2:"),
             "without a passphrase the file must be left alone"
@@ -1068,11 +1104,11 @@ mod tests {
         // With a passphrase: transparent in-place upgrade to enc2:.
         std::env::set_var(ENV_PASSPHRASE, "upgrade-passphrase");
         let loaded = load_node_keys(&dir).expect("plaintext key must load and be upgraded");
-        assert_eq!(loaded.signing.verifying_key().to_bytes(), pub_bytes);
-        let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+        assert_eq!(loaded.kem_ek, keys.kem_ek);
+        let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
         assert!(raw.starts_with("enc2:"), "key must be upgraded to enc2:");
         assert!(
-            !raw.contains(&id_hex),
+            !raw.contains(&e2e_hex),
             "upgraded key must not leak the seed"
         );
         let raw_e2e = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
@@ -1083,7 +1119,7 @@ mod tests {
 
         // And it still loads as the very same identity.
         let reloaded = load_node_keys(&dir).expect("reload upgraded key");
-        assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(reloaded.kem_ek, keys.kem_ek);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1098,9 +1134,6 @@ mod tests {
         let _env = EnvGuard::new();
 
         let dir = temp_dir("legacy_refuse");
-        let keys = infnode::keyring::NodeKeys::generate();
-        let id_hex = hex::encode(keys.signing.to_bytes());
-        write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         // Pre-PQ shape: 32-byte X25519 static secret, raw hex.
         write_plaintext_key(&dir.join("e2e.key"), hex::encode([0x77u8; 32]).as_bytes());
 
@@ -1148,23 +1181,22 @@ mod tests {
 
         let dir = temp_dir("plain_opt");
         let keys = infnode::keyring::NodeKeys::generate();
-        let id_hex = hex::encode(keys.signing.to_bytes());
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
+        let e2e_hex = hex::encode(keys.kem_seed);
 
         save_node_keys(&dir, &keys).expect("save with plaintext override");
-        let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+        let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
         assert!(
             !raw.starts_with("enc2:"),
             "plaintext override must not encrypt"
         );
         assert!(
-            raw.contains(&id_hex),
+            raw.contains(&e2e_hex),
             "plaintext override must write raw hex"
         );
 
         // And it loads back.
         let loaded = load_node_keys(&dir).expect("load plaintext key");
-        assert_eq!(loaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(loaded.kem_ek, keys.kem_ek);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1186,6 +1218,48 @@ mod tests {
             Ok(_) => panic!("must not decrypt without a passphrase"),
         };
         assert!(format!("{err:#}").contains("encrypted"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FULL-PQ: a leftover Ed25519 `identity.key` is never the node identity;
+    /// it is migrated once into the consensus-only `validator.key` (and the
+    /// file renamed `.migrated`). The node id is `pq-identity.key`.
+    #[test]
+    fn legacy_identity_key_is_migrated_to_consensus_only() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+
+        let dir = temp_dir("legacy_identity");
+        let keys = infnode::keyring::NodeKeys::generate();
+        write_plaintext_key(&dir.join("e2e.key"), hex::encode(keys.kem_seed).as_bytes());
+        write_plaintext_key(
+            &dir.join("identity.key"),
+            hex::encode([0x33u8; 32]).as_bytes(),
+        );
+
+        // FULL-PQ: the legacy seed is NOT a node identity. It is moved ONCE
+        // into the consensus-only validator.key and the file is renamed, so
+        // transport never sees it (fail-closed for identity, continuity for
+        // the frozen Ed-keyed consensus set).
+        let loaded = load_node_keys(&dir).expect("legacy key must migrate");
+        assert_eq!(loaded.kem_seed, keys.kem_seed);
+        assert!(dir.join("validator.key").exists(), "consensus key created");
+        assert!(
+            !dir.join("identity.key").exists(),
+            "legacy identity.key must be retired"
+        );
+        assert!(
+            dir.join("identity.key.migrated").exists(),
+            "legacy bytes preserved, not deleted"
+        );
+        let consensus = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let loaded_consensus = load_or_generate_consensus_key(&dir).expect("consensus load");
+        assert_eq!(
+            loaded_consensus.to_bytes(),
+            consensus.to_bytes(),
+            "consensus identity must survive the migration"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1229,7 +1303,7 @@ mod tests {
         let _g = env_lock();
         let _env = EnvGuard::new();
         let dir = temp_dir("atomic_write");
-        let path = dir.join("identity.key");
+        let path = dir.join("e2e.key");
         write_plaintext_key(&path, b"OLD-CONTENT");
 
         atomic_write_private(&path, b"NEW-CONTENT").expect("atomic write");
@@ -1248,7 +1322,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".identity.key"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".e2e.key"))
             .collect();
         assert!(leftovers.is_empty(), "the temp file must be renamed away");
 
@@ -1299,16 +1373,16 @@ mod tests {
 
         let dir = temp_dir("migrate");
         let keys = infnode::keyring::NodeKeys::generate();
-        let pub_bytes = keys.signing.verifying_key().to_bytes();
-        let id_hex = hex::encode(keys.signing.to_bytes());
         let e2e_hex = hex::encode(keys.kem_seed);
-        write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         write_plaintext_key(&dir.join("e2e.key"), e2e_hex.as_bytes());
 
         let loaded = load_node_keys(&dir).expect("load + migrate");
-        assert_eq!(loaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(loaded.kem_ek, keys.kem_ek);
 
-        for f in ["identity.key", "e2e.key"] {
+        {
+            // FULL-PQ: `e2e.key` is the ONLY node key file left (the classical
+            // `identity.key` is retired), so this check covers the whole set.
+            let f = "e2e.key";
             let raw = std::fs::read_to_string(dir.join(f)).unwrap();
             assert!(raw.starts_with("enc2:"), "{f} must be fully migrated");
             assert!(raw.contains(':'), "{f} must carry the salt/nonce/ct fields");
@@ -1339,7 +1413,7 @@ mod tests {
 
         // And the migrated identity still loads.
         let reloaded = load_node_keys(&dir).expect("reload migrated keys");
-        assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+        assert_eq!(reloaded.kem_ek, keys.kem_ek);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1381,18 +1455,13 @@ mod tests {
 
         let dir = temp_dir("perms");
         let keys = infnode::keyring::NodeKeys::generate();
-        let id_hex = hex::encode(keys.signing.to_bytes());
         let e2e_hex = hex::encode(keys.kem_seed);
-        write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         write_plaintext_key(&dir.join("e2e.key"), e2e_hex.as_bytes());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                dir.join("identity.key"),
-                std::fs::Permissions::from_mode(0o644),
-            )
-            .unwrap();
+            std::fs::set_permissions(dir.join("e2e.key"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
         }
         let err = match load_node_keys(&dir) {
             Err(e) => e,
@@ -1416,19 +1485,18 @@ mod tests {
 
         let generated =
             NodeKeyBundle::load_or_generate(&dir, &falcon_path).expect("load_or_generate bundle");
-        assert!(dir.join("identity.key").exists());
         assert!(dir.join("e2e.key").exists());
+        assert!(
+            !dir.join("identity.key").exists(),
+            "no classical identity.key may be written"
+        );
         assert!(dir.join("pq-identity.key").exists());
         assert!(falcon_path.exists());
 
         let loaded = NodeKeyBundle::load(&dir, &falcon_path).expect("load bundle");
-        assert_eq!(
-            loaded.validator_ed_id_hex(),
-            generated.validator_ed_id_hex()
-        );
+        assert_eq!(loaded.validator_id_hex(), generated.validator_id_hex());
         assert_eq!(loaded.p2p_pq_id_hex(), generated.p2p_pq_id_hex());
         assert_eq!(loaded.p2p_pq_pub_hex(), generated.p2p_pq_pub_hex());
-        assert_eq!(loaded.ed_pub_hex(), generated.ed_pub_hex());
         assert_eq!(loaded.kem_ek_hex(), generated.kem_ek_hex());
         assert_eq!(
             loaded.consensus_falcon_pub_hex(),
@@ -1488,8 +1556,7 @@ mod tests {
 
         let bundle =
             NodeKeyBundle::load_or_generate(&dir, &falcon_path).expect("load_or_generate bundle");
-        let ed_hex = bundle.ed_pub_hex();
-        let id_hex = bundle.validator_ed_id_hex();
+        let id_hex = bundle.validator_id_hex();
         let kem_ek_hex = bundle.kem_ek_hex();
         let p2p_pq_pub_hex = bundle.p2p_pq_pub_hex();
         let consensus_falcon_pub_hex = bundle.consensus_falcon_pub_hex();
@@ -1498,17 +1565,17 @@ mod tests {
             p2p_pq_pub_hex, consensus_falcon_pub_hex,
             "P2P pq-identity.key and consensus falcon.key must be distinct keypairs"
         );
-        assert_ne!(
+        assert_eq!(
             id_hex,
             bundle.p2p_pq_id_hex(),
-            "validator Ed-derived id and P2P PQ id must be distinct"
+            "validator id IS the canonical PQ node id"
         );
 
         let identity_line = bundle.identity_line();
         assert_eq!(
             identity_line,
             format!(
-                "NODE IDENTITY: id={id_hex} ed={ed_hex} kem_ek={kem_ek_hex} pq_pub={p2p_pq_pub_hex} falcon={consensus_falcon_pub_hex}"
+                "NODE IDENTITY: id={id_hex} kem_ek={kem_ek_hex} pq_pub={p2p_pq_pub_hex} falcon={consensus_falcon_pub_hex}"
             )
         );
 
@@ -1516,14 +1583,13 @@ mod tests {
         let expected = [
             "# === STELLEREUM PEER STANZA (send this block to the network admin) ===".to_string(),
             "  - name: validator-1".to_string(),
-            format!("    ed-pub: \"{ed_hex}\""),
             format!("    pq-pub: \"{p2p_pq_pub_hex}\""),
             "    endpoints: [\"10.0.0.1:4242\"]".to_string(),
             "    allow: [\"*\"]".to_string(),
             "# validators entry (admin adds the id to every node's `validators:`):".to_string(),
             format!("  - \"{id_hex}\""),
             "# PQ mapping for STELL_PEER_PQ_KEYS (admin appends, comma-separated):".to_string(),
-            format!("# {ed_hex}:{consensus_falcon_pub_hex}"),
+            format!("# {p2p_pq_pub_hex}:{consensus_falcon_pub_hex}"),
         ]
         .join("\n");
         assert_eq!(stanza, expected);

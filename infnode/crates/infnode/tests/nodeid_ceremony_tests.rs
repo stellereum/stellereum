@@ -31,7 +31,7 @@ const EXPECTED_PQ_ID_HEX: &str = "a2b41ccbd40e4454d025ce9d4587bc8f7af739d8";
 fn peer_cfg(pq_pub: Option<String>) -> PeerConfig {
     PeerConfig {
         name: "p".to_string(),
-        ed_pub: hex::encode([2u8; 32]),
+        consensus_pub: None,
         pq_pub,
         endpoints: vec![],
         allow: vec!["*".to_string()],
@@ -114,16 +114,15 @@ fn ceremony_02_pq_announce_single_id() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Rebinding refused: honest ed binds first; attacker cannot rebind the
-//    honest classical id to its own PQ key (first-PQ-wins sticks).
+// 3. Rebinding refused: honest PQ identity binds first; attacker cannot
+//    rebind it to its own PQ key (first-PQ-wins sticks).
 // ---------------------------------------------------------------------------
 
 #[test]
 fn ceremony_03_rebinding_refused_first_pq_wins() {
-    let honest_ed = NodeKeys::generate();
     let honest_pq = fixed_pq();
     let attacker_pq = PqKeys::from_seed([0x3Bu8; 32]);
-    let classical = honest_ed.id();
+    let classical = honest_pq.pq_id();
 
     let mut reg = PqIdentityRegistry::new();
 
@@ -137,7 +136,7 @@ fn ceremony_03_rebinding_refused_first_pq_wins() {
     assert_eq!(
         reg.announce(&classical, &attacker_pq.pq_pub(), true),
         PqBindOutcome::Quarantined,
-        "attacker must not rebind honest ed to own pq"
+        "attacker must not rebind an honest PQ id to its own pq key"
     );
     assert_eq!(
         reg.bound_pq(&classical),
@@ -167,18 +166,13 @@ fn ceremony_03_rebinding_refused_first_pq_wins() {
 fn ceremony_04_classical_only_refused() {
     // Only the PQ kind exists.
     assert_eq!(NodeIdKind::Pq.label(), "PQ");
-    // Legacy classical id is NOT a NodeId: no resolve path accepts it
-    // (resolve requires `&PqKeys` at the type level — there is no `None`
-    // arm to test). The classical `blake3(ed)[..20]` helper remains only
-    // for frozen route/TLS-pin call sites, never as identity.
+    // There is no classical id arm at all: `NodeKeys` carries no Ed25519
+    // key, and the resolver requires `&PqKeys` at the type level.
     let ed = NodeKeys::generate();
     let pq = fixed_pq();
-    assert_ne!(
-        ed.id(),
-        pq.pq_id(),
-        "classical helper must differ from PQ id"
-    );
     assert_eq!(ceremony_local_id(&ed, &pq), pq.pq_id());
+    // The KEM-only NodeKeys cannot produce an identity.
+    assert_eq!(resolve_node_id(&ed, &pq).id, pq.pq_id());
 
     // PeerConfig without pq_pub (code-constructed dynamic): refused.
     // Parsed configs without `pq_pub` fail LOUDLY at parse (see
@@ -238,10 +232,30 @@ peers:
         "migration error must be clear, got: {msg2}"
     );
 
-    // New shape (ed + pq) parses and derives the PQ id (same property as
+    // New shape (PQ-only) parses and derives the PQ id (same property as
     // `ceremony_02`, PQ materials).
     let pq = fixed_pq();
     let yaml_new = format!(
+        r#"
+name: newnode
+listen: "0.0.0.0:9400"
+peers:
+  - name: pal
+    pq-pub: "{}"
+    endpoints: []
+"#,
+        pq.pq_pub_hex()
+    );
+    let cfg: infnode::config::NodeConfig =
+        serde_yaml::from_str(&yaml_new).expect("pq config parses");
+    assert_eq!(cfg.peers.len(), 1);
+    assert!(cfg.peers[0].pq_pub.is_some());
+    assert_eq!(cfg.peers[0].primary_id().expect("primary"), pq.pq_id());
+
+    // `ed-pub` is accepted ONLY as the consensus-only Ed25519 validator key
+    // (`consensus-pub` alias): it is NOT a transport identity, auth key or
+    // TLS pin. The PQ id still derives from `pq-pub`.
+    let yaml_consensus = format!(
         r#"
 name: newnode
 listen: "0.0.0.0:9400"
@@ -253,9 +267,12 @@ peers:
 "#,
         pq.pq_pub_hex()
     );
-    let cfg: infnode::config::NodeConfig =
-        serde_yaml::from_str(&yaml_new).expect("pq config parses");
-    assert_eq!(cfg.peers.len(), 1);
-    assert!(cfg.peers[0].pq_pub.is_some());
-    assert_eq!(cfg.peers[0].primary_id().expect("primary"), pq.pq_id());
+    let cfg3: infnode::config::NodeConfig =
+        serde_yaml::from_str(&yaml_consensus).expect("consensus-pin config parses");
+    assert_eq!(cfg3.peers[0].primary_id().expect("primary"), pq.pq_id());
+    assert_eq!(
+        cfg3.peers[0].consensus_bytes().expect("consensus"),
+        Some([2u8; 32]),
+        "ed-pub is retained as the consensus validator key only"
+    );
 }

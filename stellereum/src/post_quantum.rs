@@ -1,12 +1,15 @@
 //! Post-Quantum Cryptography & Address Architecture for Stellereum L1
 //!
 //! Implements the Stellereum PQ-BFT v4 specification (`docs/handoff/STELLEREUM_PQ_BFT_V4.txt`):
-//! - Multi-scheme typings: Ed25519 (0x01), Falcon-512 (0x02), ML-DSA-44 (0x03), Hybrid (0x04)
+//! - Signature-scheme typings: Falcon-512 (0x02) and ML-DSA-44 (0x03,
+//!   fail-closed: no FIPS-204 verifier exists in-tree, so it is never
+//!   admitted or verified). Classical Ed25519 (0x01) and Hybrid (0x04) are
+//!   REMOVED — this node is pure post-quantum.
 //! - 32-byte address derivation using domain-separated BLAKE3:
 //!   `derive_pq_address(scheme, pubkey, salt)`
 //! - Stateful Implicit Key Registry saving 60-70% bandwidth on the hot path
 //! - Universal `PqSignatureEnvelope` with `PQ1` framing compatible with wire envelopes
-//! - Constant-time signature verification and Hybrid multi-algorithm safety
+//! - Constant-time Falcon-512 signature verification
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -113,17 +116,25 @@ pub const PQ_ENVELOPE_MAGIC: &[u8; 3] = b"PQ1";
 /// Default 16-byte zero salt for standard address derivation
 pub const DEFAULT_SALT: [u8; 16] = [0u8; 16];
 
-/// Canonical public key byte sizes
+/// Size of a validator identity key (Ed25519 verifying key / node signing
+/// key) in bytes.
+///
+/// IDENTITY ONLY: Ed25519 is not a transaction, vote or envelope signature
+/// scheme in this node any more (0x01 is refused by [`PqScheme::from_id`]).
+/// This constant survives because the 32-byte validator id / node key type
+/// is still Ed25519-shaped.
 pub const ED25519_PUBKEY_LEN: usize = 32;
 pub const FALCON512_PUBKEY_LEN: usize = 897;
 pub const MLDSA44_PUBKEY_LEN: usize = 1312;
-pub const HYBRID_PUBKEY_LEN: usize = ED25519_PUBKEY_LEN + FALCON512_PUBKEY_LEN; // 929 bytes
 
 /// Canonical signature byte sizes
+///
+/// `ED25519_SIG_LEN` is a WIRE-SIZE constant only: legacy `SK1` session
+/// envelopes and legacy 64-byte sponsor blobs are recognised (and then
+/// refused) by length. There is no Ed25519 verification left in this crate.
 pub const ED25519_SIG_LEN: usize = 64;
 pub const FALCON512_SIG_LEN: usize = 666;
 pub const MLDSA44_SIG_LEN: usize = 2420;
-pub const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + FALCON512_SIG_LEN; // 730 bytes
 
 /// Falcon-512 lattice parameters (NIST FIPS 206 / FN-DSA)
 pub const FALCON_MODULUS_Q: u32 = 12289;
@@ -131,65 +142,67 @@ pub const FALCON_N: usize = 512;
 pub const FALCON_NORM_BOUND_SQ: i64 = 34034726;
 
 /// Cryptographic signature scheme identifiers defined in Stellereum PQ-BFT v4
+///
+/// PURE PQ: this enum carries ONLY post-quantum schemes. Classical Ed25519
+/// (0x01) and the Ed25519+Falcon Hybrid (0x04) were REMOVED from the enum —
+/// [`PqScheme::from_id`] refuses both by name, so no decode path can
+/// reconstruct them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PqScheme {
-    /// Classic fast Ed25519 (32-byte public key, 64-byte signature)
-    Ed25519 = 1,
     /// Post-quantum lattice-based Falcon-512 (897-byte public key, 666-byte signature, NIST Level 1)
     Falcon512 = 2,
     /// post-quantum lattice-based ML-DSA-44 (1312-byte public key, 2420-byte signature, FIPS 204)
     ///
-    /// UNKNOWN (KI-01 lead decision, fail-closed): the `verify_mldsa44` stub
-    /// was DELETED (it was not real FIPS-204 math), so there is no verifier
-    /// for 0x03 in this codebase. `from_id(3)` refuses as unknown
+    /// UNKNOWN (KI-01 lead decision, fail-closed): there is no FIPS-204
+    /// verifier in this codebase. `from_id(3)` refuses it as unknown
     /// (admission-level) and `verify_pq_signature` returns `false` for it
-    /// (verify-level). The variant is KEPT (not removed) so every `match`
-    /// over `PqScheme` stays exhaustive and every 0x03 code path keeps
-    /// compiling to a refusal — grep shows `MlDsa44` arms in `zkml.rs`,
-    /// `wallet_signing.rs`, `state_engine.rs`, plus `is_disabled()` gates in
-    /// `consensus.rs`, `staking.rs`, `pq_registry.rs`, `light_client.rs`.
-    /// Re-enable ONLY behind a real FIPS-204 implementation + coordinated
-    /// all-validators upgrade.
+    /// (verify-level). The variant is KEPT so every `match` over `PqScheme`
+    /// stays exhaustive and every 0x03 code path keeps compiling to a
+    /// refusal. Re-enable ONLY behind a real FIPS-204 implementation +
+    /// coordinated all-validators upgrade.
     MlDsa44 = 3,
-    /// Hybrid dual-signature combining Ed25519 and Falcon-512 (929-byte public key, 730-byte signature)
-    Hybrid = 4,
 }
 
 impl PqScheme {
-    /// Numeric identifier for the scheme (0x01 .. 0x04)
+    /// Numeric identifier for the scheme (0x02 or 0x03)
     pub const fn id(&self) -> u8 {
         *self as u8
     }
 
     /// Construct scheme from byte identifier.
     ///
-    /// FAIL-CLOSED (KI-01): scheme `0x03` has no verifier in this codebase
-    /// (stub deleted), so it resolves as UNKNOWN here with the same error as
-    /// any unknown id. Every byte-driven admission path (PQ1 envelope decode,
-    /// session-grant decode, SVM opcode dispatch, storage reads) rejects 0x03
-    /// at parse time. All `Err` arms at those call sites already refuse
-    /// (verified: `?`-propagation, `if let Ok` skips, `Err(_) => false`).
+    /// FAIL-CLOSED: only Falcon-512 (0x02) is accepted. The removed
+    /// classical ids — Ed25519 `0x01` and Hybrid `0x04` — are refused LOUDLY
+    /// by name, and `0x03` (ML-DSA-44) has no verifier so it resolves as
+    /// UNKNOWN with the same error as any other unknown id.
+    ///
+    /// Every byte-driven admission path (PQ1 envelope decode, session-grant
+    /// decode, SVM opcode dispatch, storage reads) therefore rejects 0x01,
+    /// 0x03 and 0x04 at parse time. All `Err` arms at those call sites
+    /// refuse (`?`-propagation, `if let Ok` skips, `Err(_) => false`).
     pub fn from_id(id: u8) -> Result<Self, String> {
         match id {
-            1 => Ok(Self::Ed25519),
             2 => Ok(Self::Falcon512),
-            4 => Ok(Self::Hybrid),
-            other => Err(format!("Unknown post-quantum scheme ID: {other}")),
+            // Removed classical schemes: name them explicitly. Falling back
+            // to "unknown" here would hide that these ids used to be valid.
+            1 | 4 => Err(format!(
+                "Refused classical post-quantum scheme ID {id}: Ed25519 (0x01) and \
+                 Hybrid (0x04) are REMOVED; only Falcon-512 (0x02) is accepted"
+            )),
+            other => Err(format!(
+                "Unknown post-quantum scheme ID: {other} (only Falcon-512 (0x02) is accepted)"
+            )),
         }
     }
 
     /// Whether this scheme is currently refused fail-closed (KI-01).
     ///
     /// Today this is true only for [`PqScheme::MlDsa44`] (0x03): it has no
-    /// verifier (stub deleted, `from_id(3)` is unknown), so every admission
-    /// path must refuse it. Operator call sites that construct a
-    /// [`PqScheme`] directly from the enum (NOT via [`PqScheme::from_id`]) —
-    /// SVM opcode dispatch, storage reads, state-engine pinning — must check
-    /// this (or route through `from_id`) before admitting a key or signature.
-    /// Kept (not removed): `is_disabled()` gates exist in `consensus.rs`,
-    /// `staking.rs`, `pq_registry.rs`, `light_client.rs`, `wallet_signing.rs`,
-    /// `state_engine.rs` — deleting this would break those crates.
+    /// verifier (`from_id(3)` is unknown), so every admission path must
+    /// refuse it. Operator call sites that construct a [`PqScheme`] directly
+    /// from the enum (NOT via [`PqScheme::from_id`]) must check this before
+    /// admitting a key or signature.
     pub const fn is_disabled(&self) -> bool {
         matches!(self, Self::MlDsa44)
     }
@@ -197,46 +210,36 @@ impl PqScheme {
     /// Human-readable scheme name
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Ed25519 => "Ed25519",
             Self::Falcon512 => "Falcon-512",
             Self::MlDsa44 => "ML-DSA-44",
-            Self::Hybrid => "Hybrid (Ed25519 + Falcon-512)",
         }
     }
 
     /// Expected canonical public key length in bytes
     pub const fn pubkey_size(&self) -> usize {
         match self {
-            Self::Ed25519 => ED25519_PUBKEY_LEN,
             Self::Falcon512 => FALCON512_PUBKEY_LEN,
             Self::MlDsa44 => MLDSA44_PUBKEY_LEN,
-            Self::Hybrid => HYBRID_PUBKEY_LEN,
         }
     }
 
     /// Expected canonical signature length in bytes
     pub const fn signature_size(&self) -> usize {
         match self {
-            Self::Ed25519 => ED25519_SIG_LEN,
             Self::Falcon512 => FALCON512_SIG_LEN,
             Self::MlDsa44 => MLDSA44_SIG_LEN,
-            Self::Hybrid => HYBRID_SIG_LEN,
         }
     }
 
     /// Whether this scheme provides quantum resistance
     ///
-    /// NOTE (KI-01): [`PqScheme::MlDsa44`] reports `true` here as taxonomy —
-    /// it *is* a post-quantum scheme family — but it has no verifier (stub
-    /// deleted, see [`PqScheme::is_disabled`]): [`verify_pq_signature`]
-    /// refuses it and [`PqScheme::from_id`] rejects byte 0x03 as unknown.
-    /// Policy gates must NOT treat `is_post_quantum()` as admission; a `true`
-    /// here never implies "safe to verify". In pure-PQ mode a 0x03 envelope
-    /// is rejected downstream (decode refuses it before this is ever consulted).
+    /// NOTE (KI-01): both remaining variants are post-quantum families, so
+    /// this is `true` for all of them — but it is TAXONOMY, not admission.
+    /// [`PqScheme::MlDsa44`] has no verifier, so policy gates MUST also check
+    /// [`PqScheme::is_disabled`] (or route through [`PqScheme::from_id`]).
     pub const fn is_post_quantum(&self) -> bool {
         match self {
-            Self::Ed25519 => false,
-            Self::Falcon512 | Self::MlDsa44 | Self::Hybrid => true,
+            Self::Falcon512 | Self::MlDsa44 => true,
         }
     }
 }
@@ -308,7 +311,7 @@ impl StatefulImplicitKeyRegistry {
         if scheme.is_disabled() {
             return Err(
                 "Unknown post-quantum scheme ID: 3 (registry refuses 0x03: no verifier; \
-                 submit with Falcon-512 (0x02) or Hybrid (0x04))"
+                 submit with Falcon-512 (0x02))"
                     .to_string(),
             );
         }
@@ -518,15 +521,16 @@ impl PqSignatureEnvelope {
     }
 }
 
-/// Verifies a post-quantum, classic, or hybrid signature.
+/// Verifies a post-quantum signature.
 ///
 /// Implements deterministic verification:
-/// - `Ed25519`: Standard RFC 8032 Ed25519 verification.
 /// - `Falcon512`: Standard NIST Round 3 Falcon-512 lattice verification.
-/// - `MlDsa44`: UNKNOWN (KI-01, fail-closed) — always returns `false`. The
-///   stub verifier was deleted (no FIPS-204 math in this codebase), so any
-///   0x03 signature is refused rather than checked.
-/// - `Hybrid`: Both Ed25519 and Falcon-512 must verify on the same message.
+/// - `MlDsa44`: UNKNOWN (KI-01, fail-closed) — always returns `false`. No
+///   FIPS-204 verifier exists in this codebase, so any 0x03 signature is
+///   refused rather than checked.
+///
+/// There is NO classical branch: Ed25519 and Hybrid are not [`PqScheme`]
+/// values any more (`from_id(1)` / `from_id(4)` refuse).
 pub fn verify_pq_signature(
     scheme: PqScheme,
     pubkey: &[u8],
@@ -538,45 +542,11 @@ pub fn verify_pq_signature(
     }
 
     match scheme {
-        PqScheme::Ed25519 => verify_ed25519(pubkey, message, signature),
         PqScheme::Falcon512 => verify_falcon512(pubkey, message, signature),
         // UNKNOWN (KI-01): no verifier — refuse. Kept so the match stays
-        // exhaustive (other crates match on `MlDsa44`); any re-enabling is
-        // forced to touch this exact arm.
+        // exhaustive; any re-enabling is forced to touch this exact arm.
         PqScheme::MlDsa44 => false,
-        PqScheme::Hybrid => {
-            let ed_pk = &pubkey[..ED25519_PUBKEY_LEN];
-            let falcon_pk = &pubkey[ED25519_PUBKEY_LEN..];
-            let ed_sig = &signature[..ED25519_SIG_LEN];
-            let falcon_sig = &signature[ED25519_SIG_LEN..];
-
-            verify_ed25519(ed_pk, message, ed_sig)
-                && verify_falcon512(falcon_pk, message, falcon_sig)
-        }
     }
-}
-
-/// Internal Ed25519 verification using ed25519-dalek.
-fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, VerifyingKey};
-
-    let Ok(vk_bytes) = <[u8; 32]>::try_from(pubkey) else {
-        return false;
-    };
-    let Ok(vk) = VerifyingKey::from_bytes(&vk_bytes) else {
-        return false;
-    };
-    // Audit HIGH-1: strict verification + small-order refusal. `verify`
-    // accepts malleable/small-order signatures that consensus (`verify_strict`)
-    // refuses — one path must not accept what the other rejects.
-    if vk.is_weak() {
-        return false;
-    }
-    let Ok(sig_bytes) = <[u8; 64]>::try_from(signature) else {
-        return false;
-    };
-    let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify_strict(message, &sig).is_ok()
 }
 
 pub(crate) fn keccak_f1600(state: &mut [u64; 25]) {
@@ -2281,13 +2251,6 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Signer;
-
-    fn sample_ed25519() -> (ed25519_dalek::SigningKey, [u8; 32]) {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
-        let pk = sk.verifying_key().to_bytes();
-        (sk, pk)
-    }
 
     fn sample_falcon512(seed: u8) -> (Vec<u8>, Vec<u8>) {
         let kp = FalconKeypair::generate_from_seed(seed);
@@ -2441,19 +2404,10 @@ mod tests {
             !verify_pq_signature(PqScheme::Falcon512, pk, msg, &fake),
             "the production verifier must reject a non-lattice pseudo-signature"
         );
-        // ... and the same for the hybrid path.
-        let mut hybrid_pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-        hybrid_pk.extend_from_slice(&[0u8; 32]);
-        hybrid_pk.extend_from_slice(pk);
-        let mut hybrid_sig = Vec::with_capacity(HYBRID_SIG_LEN);
-        hybrid_sig.extend_from_slice(&[0u8; 64]);
-        hybrid_sig.extend_from_slice(&fake);
-        assert!(!verify_pq_signature(
-            PqScheme::Hybrid,
-            &hybrid_pk,
-            msg,
-            &hybrid_sig
-        ));
+        // Removed classical/hybrid ids are refused at parse time, so a
+        // hybrid-shaped blob can never reach (or pass) verification.
+        assert!(PqScheme::from_id(1).is_err());
+        assert!(PqScheme::from_id(4).is_err());
 
         // The REAL signature verifies, so the check above is not vacuous.
         let real = kp.sign(msg);
@@ -2515,23 +2469,26 @@ mod tests {
 
     #[test]
     fn address_derivation_determinism_and_domain_separation() {
-        let (_, ed_pk) = sample_ed25519();
+        let (falcon_pk, _) = sample_falcon512(0x11);
         let salt = [7u8; 16];
 
-        let addr1 = derive_pq_address(PqScheme::Ed25519, &ed_pk, &salt);
-        let addr2 = derive_pq_address(PqScheme::Ed25519, &ed_pk, &salt);
+        let addr1 = derive_pq_address(PqScheme::Falcon512, &falcon_pk, &salt);
+        let addr2 = derive_pq_address(PqScheme::Falcon512, &falcon_pk, &salt);
         assert_eq!(
             addr1, addr2,
             "Address derivation must be strictly deterministic"
         );
 
-        let addr_other_scheme = derive_pq_address(PqScheme::Falcon512, &ed_pk, &salt);
+        // The only other scheme value is the fail-closed ML-DSA-44 tag; it is
+        // still domain-separated at the derivation level (derivation is a
+        // hash, admission/verification is what refuses 0x03).
+        let addr_other_scheme = derive_pq_address(PqScheme::MlDsa44, &falcon_pk, &salt);
         assert_ne!(
             addr1, addr_other_scheme,
             "Different schemes must yield disjoint addresses (domain separation)"
         );
 
-        let addr_other_salt = derive_pq_address(PqScheme::Ed25519, &ed_pk, &[8u8; 16]);
+        let addr_other_salt = derive_pq_address(PqScheme::Falcon512, &falcon_pk, &[8u8; 16]);
         assert_ne!(
             addr1, addr_other_salt,
             "Different salts must yield disjoint addresses"
@@ -2592,31 +2549,33 @@ mod tests {
         assert_eq!(decoded_imp.pubkey, None);
     }
 
+    /// FULL-PQ: a GENUINELY VALID classical Ed25519 signature is refused.
+    ///
+    /// The old assertion ("an Ed25519 signature verifies as
+    /// `PqScheme::Ed25519`") describes behaviour that no longer exists: the
+    /// variant and its verifier are deleted. Inverted to the fail-closed
+    /// contract — 0x01 is not a scheme value, and classical material can
+    /// never pass the Falcon-512 verifier.
     #[test]
-    fn signature_verification_ed25519() {
-        let (sk, pk) = sample_ed25519();
+    fn classical_ed25519_signature_is_refused_fail_closed() {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
         let msg = b"Stellereum L1 Transaction";
         let sig = sk.sign(msg).to_bytes().to_vec();
 
-        assert!(verify_pq_signature(PqScheme::Ed25519, &pk, msg, &sig));
+        // Admission level: the scheme id itself is refused by name.
+        let err = PqScheme::from_id(1).expect_err("0x01 must be refused");
+        assert!(err.contains("Ed25519"), "refusal must name Ed25519: {err}");
 
-        // Tampered message
-        assert!(!verify_pq_signature(
-            PqScheme::Ed25519,
-            &pk,
-            b"Tampered Message",
-            &sig
-        ));
-
-        // Tampered signature
-        let mut bad_sig = sig.clone();
-        bad_sig[0] ^= 0xFF;
-        assert!(!verify_pq_signature(PqScheme::Ed25519, &pk, msg, &bad_sig));
+        // Verify level: even real classical material cannot verify under the
+        // only admitted scheme (wrong key/signature sizes, no classical arm).
+        assert!(!verify_pq_signature(PqScheme::Falcon512, &pk, msg, &sig));
+        assert!(!verify_pq_signature(PqScheme::MlDsa44, &pk, msg, &sig));
     }
 
     #[test]
-    fn signature_verification_falcon512_and_hybrid() {
-        let (ed_sk, ed_pk) = sample_ed25519();
+    fn signature_verification_falcon512() {
         let (falcon_pk, falcon_sig) = sample_falcon512(0x55);
         let msg = b"sample";
 
@@ -2628,41 +2587,20 @@ mod tests {
             &falcon_sig
         ));
 
-        // Hybrid combination: Ed25519 + Falcon-512
-        let ed_sig = ed_sk.sign(msg).to_bytes().to_vec();
-        let mut hybrid_pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-        hybrid_pk.extend_from_slice(&ed_pk);
-        hybrid_pk.extend_from_slice(&falcon_pk);
-
-        let mut hybrid_sig = Vec::with_capacity(HYBRID_SIG_LEN);
-        hybrid_sig.extend_from_slice(&ed_sig);
-        hybrid_sig.extend_from_slice(&falcon_sig);
-
-        assert!(verify_pq_signature(
-            PqScheme::Hybrid,
-            &hybrid_pk,
-            msg,
-            &hybrid_sig
-        ));
-
-        // Tampering Ed25519 portion breaks hybrid verification
-        let mut broken_ed = hybrid_sig.clone();
-        broken_ed[0] ^= 0xFF;
+        // Tampered message / signature are refused.
         assert!(!verify_pq_signature(
-            PqScheme::Hybrid,
-            &hybrid_pk,
-            msg,
-            &broken_ed
+            PqScheme::Falcon512,
+            &falcon_pk,
+            b"other message",
+            &falcon_sig
         ));
-
-        // Tampering Falcon portion breaks hybrid verification
-        let mut broken_falcon = hybrid_sig.clone();
-        broken_falcon[ED25519_SIG_LEN] ^= 0xFF;
+        let mut broken = falcon_sig.clone();
+        broken[0] ^= 0xFF;
         assert!(!verify_pq_signature(
-            PqScheme::Hybrid,
-            &hybrid_pk,
+            PqScheme::Falcon512,
+            &falcon_pk,
             msg,
-            &broken_falcon
+            &broken
         ));
     }
 
@@ -2887,68 +2825,42 @@ mod tests {
         }
     }
 
+    /// FULL-PQ: hybrid (Ed25519 + Falcon-512) material is refused.
+    ///
+    /// The old test proved a genuine Hybrid signature verified and every
+    /// tampered half failed. Hybrid (0x04) is REMOVED, so the assertion is
+    /// inverted: the id is refused at parse time, and 929-byte key /
+    /// 730-byte signature blobs cannot verify as Falcon-512 (length gate) or
+    /// enter the implicit-key registry.
     #[test]
-    fn test_hybrid_verification_requiring_both_valid_signatures() {
-        let (ed_sk, ed_pk) = sample_ed25519();
+    fn test_legacy_hybrid_material_is_refused_fail_closed() {
         let falcon_kp = FalconKeypair::generate_from_seed(0x3C);
         let msg = b"Hybrid L1 Settlement Authorization";
 
-        let mut hybrid_pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-        hybrid_pk.extend_from_slice(&ed_pk);
+        let err = PqScheme::from_id(4).expect_err("0x04 must be refused");
+        assert!(err.contains("Hybrid"), "refusal must name Hybrid: {err}");
+        assert!(err.contains("REMOVED"));
+
+        // 929-byte hybrid-shaped key, 730-byte hybrid-shaped signature.
+        let mut hybrid_pk = Vec::with_capacity(ED25519_PUBKEY_LEN + FALCON512_PUBKEY_LEN);
+        hybrid_pk.extend_from_slice(&[0x11u8; ED25519_PUBKEY_LEN]);
         hybrid_pk.extend_from_slice(falcon_kp.pubkey());
+        let mut hybrid_sig = Vec::with_capacity(ED25519_SIG_LEN + FALCON512_SIG_LEN);
+        hybrid_sig.extend_from_slice(&[0x22u8; ED25519_SIG_LEN]);
+        hybrid_sig.extend_from_slice(&falcon_kp.sign(msg));
 
-        let ed_sig = ed_sk.sign(msg).to_bytes().to_vec();
-        let falcon_sig = falcon_kp.sign(msg);
-
-        let mut hybrid_sig = Vec::with_capacity(HYBRID_SIG_LEN);
-        hybrid_sig.extend_from_slice(&ed_sig);
-        hybrid_sig.extend_from_slice(&falcon_sig);
-
-        // 1. Both valid signatures pass
         assert!(
-            verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &hybrid_sig),
-            "Genuine Hybrid signature must verify"
+            !verify_pq_signature(PqScheme::Falcon512, &hybrid_pk, msg, &hybrid_sig),
+            "hybrid-shaped material must never verify as Falcon-512"
         );
 
-        // 2. Tampering Ed25519 portion fails
-        let mut broken_ed = hybrid_sig.clone();
-        broken_ed[10] ^= 0xAA;
-        assert!(
-            !verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &broken_ed),
-            "Tampered Ed25519 portion must fail Hybrid verification"
-        );
-
-        // 3. Tampering Falcon portion fails
-        let mut broken_falcon = hybrid_sig.clone();
-        broken_falcon[ED25519_SIG_LEN + 15] ^= 0x55;
-        assert!(
-            !verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &broken_falcon),
-            "Tampered Falcon portion must fail Hybrid verification"
-        );
-
-        // 4. Tampering message fails
-        assert!(
-            !verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, b"Forged message", &hybrid_sig),
-            "Tampered message must fail Hybrid verification"
-        );
-
-        // 5. Wrong Ed25519 key fails
-        let mut wrong_ed_pk = hybrid_pk.clone();
-        wrong_ed_pk[0] ^= 0x01;
-        assert!(
-            !verify_pq_signature(PqScheme::Hybrid, &wrong_ed_pk, msg, &hybrid_sig),
-            "Wrong Ed25519 public key must fail Hybrid verification"
-        );
-
-        // 6. Wrong Falcon key fails
-        let other_falcon = FalconKeypair::generate_from_seed(0x99);
-        let mut wrong_falcon_pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-        wrong_falcon_pk.extend_from_slice(&ed_pk);
-        wrong_falcon_pk.extend_from_slice(other_falcon.pubkey());
-        assert!(
-            !verify_pq_signature(PqScheme::Hybrid, &wrong_falcon_pk, msg, &hybrid_sig),
-            "Wrong Falcon public key must fail Hybrid verification"
-        );
+        // Registry admission is length-gated too: neither the hybrid blob nor
+        // the Falcon half can be smuggled in under any live scheme.
+        let registry = StatefulImplicitKeyRegistry::new();
+        let addr = derive_pq_address(PqScheme::Falcon512, &hybrid_pk, &DEFAULT_SALT);
+        assert!(registry
+            .register(addr, PqScheme::Falcon512, &hybrid_pk, &DEFAULT_SALT)
+            .is_err());
     }
 
     #[test]

@@ -124,8 +124,6 @@ pub const FUEL_SHA256_PER_BYTE: u64 = 1;
 pub const FUEL_BLAKE3_BASE: u64 = 20;
 /// Fuel charged per byte hashed with BLAKE3.
 pub const FUEL_BLAKE3_PER_BYTE: u64 = 1;
-/// Fuel charged for Ed25519 signature verification.
-pub const FUEL_ED25519_VERIFY: u64 = 500;
 /// Base fuel charged for Falcon-512 post-quantum signature verification.
 pub const FUEL_FALCON512_VERIFY: u64 = 2_000;
 /// Base fuel charged for setting return data.
@@ -1347,38 +1345,6 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
     );
     let _ = linker.func_wrap(
         "host",
-        "ed25519_verify",
-        |mut caller: wasmi::Caller<'_, HostState>,
-         pubkey_ptr: i32,
-         msg_ptr: i32,
-         msg_len: i32,
-         sig_ptr: i32|
-         -> Result<i32, wasmi::Error> {
-            if msg_len < 0 {
-                return Err(wasmi::Error::new(
-                    "negative message length for ed25519_verify",
-                ));
-            }
-            let mlen = msg_len as usize;
-            if mlen > MAX_CONTRACT_MEMORY {
-                return Err(wasmi::Error::new("message length exceeds maximum memory"));
-            }
-            let fuel = FUEL_ED25519_VERIFY
-                .saturating_add(32)
-                .saturating_add(mlen as u64)
-                .saturating_add(64);
-            HostState::charge(&mut caller, fuel)?;
-            let _pk_bytes = read_wasm_memory(&mut caller, pubkey_ptr, 32)?;
-            let _msg_bytes = read_wasm_memory(&mut caller, msg_ptr, mlen)?;
-            let _sig_bytes = read_wasm_memory(&mut caller, sig_ptr, 64)?;
-            // FULL-PQ: classical ed25519 host verification is REMOVED.
-            // Fuel + memory effects above stay identical (no free-call
-            // oracle); the cryptographic verdict is always false.
-            Ok(0)
-        },
-    );
-    let _ = linker.func_wrap(
-        "host",
         "falcon512_verify",
         |mut caller: wasmi::Caller<'_, HostState>,
          msg_ptr: i32,
@@ -1655,7 +1621,7 @@ fn call_export_exact(
 
 /// Execute an exported method in a fully sandboxed, metered store with
 /// host storage (sload/sstore), event emission (emit), outbound messages (send_message),
-/// and contextual/crypto host functions (caller, value, block_time, block_hash, sha256, blake3, ed25519_verify, falcon512_verify, return_data).
+/// and contextual/crypto host functions (caller, value, block_time, block_hash, sha256, blake3, falcon512_verify, return_data).
 ///
 /// The method may take up to [`MAX_CONTRACT_CALL_ARGS`] `i64` parameters.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -2592,97 +2558,59 @@ mod tests {
 
     #[test]
     fn test_host_ed25519_verify_valid_and_invalid() {
-        use ed25519_dalek::Signer;
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let pk = sk.verifying_key().to_bytes();
-        let msg = b"contract payload verification";
-        let sig = sk.sign(msg).to_bytes();
-
-        let wat_src = format!(
+        // FULL-PQ: the classical `ed25519_verify` host function is DELETED
+        // (not stubbed). A contract that imports it fails to deploy exactly
+        // like any other unknown host function — even when the signature
+        // bytes would have been valid under the old ABI.
+        let wasm = wat::parse_str(
             r#"(module
                  (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
                  (memory (export "memory") 1)
-                 (data (i32.const 0) "{}")
-                 (data (i32.const 32) "{}")
-                 (data (i32.const 64) "{}")
-                 (func (export "verify_sig") (param $corrupt i64) (result i64)
-                   (if (i64.ne (local.get $corrupt) (i64.const 0))
-                     (then
-                       (i32.store8 (i32.const 64) (i32.xor (i32.load8_u (i32.const 64)) (i32.const 0xff)))))
-                   (i64.extend_i32_u
-                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const {}) (i32.const 64))))
-                 (func (export "verify_oob") (param $dummy i64) (result i64)
-                   (i64.extend_i32_u
-                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const 4) (i32.const 70000)))))"#,
-            escape_wat_bytes(&pk),
-            escape_wat_bytes(msg),
-            escape_wat_bytes(&sig),
-            msg.len()
-        );
-
-        let wasm = wat::parse_str(&wat_src).unwrap();
-        let mut reg = ContractRegistry::new();
-        let addr = reg.deploy([1u8; 32], wasm, 0).unwrap();
-
-        // FULL-PQ: even a VALID classical signature is refused (0).
-        // Valid signature -> returns 0 (classical host removed)
-        let (valid_res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-        assert_eq!(valid_res, 0);
-
-        // Corrupted signature -> returns 0
-        let (corrupt_res, ..) = reg.call(&addr, "verify_sig", 1, 100_000).unwrap();
-        assert_eq!(corrupt_res, 0);
-
-        // Out-of-bounds pointer -> traps
-        let oob_err = reg.call(&addr, "verify_oob", 0, 100_000).unwrap_err();
-        assert!(matches!(oob_err, ContractError::Trapped));
-
-        // Fuel check
-        let fuel_err = reg.call(&addr, "verify_sig", 0, 10).unwrap_err();
-        assert!(matches!(fuel_err, ContractError::OutOfFuel));
-    }
-
-    /// FULL-PQ: classical `ed25519_verify` host is REMOVED — a VALID ed25519
-    /// signature is always refused (0). Fuel/memory effects still apply.
-    #[test]
-    fn test_host_ed25519_verify_refused_under_pure_pq() {
-        use ed25519_dalek::Signer;
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let pk = sk.verifying_key().to_bytes();
-        let msg = b"contract pq gate pin";
-        let sig = sk.sign(msg).to_bytes();
-
-        let wat_src = format!(
-            r#"(module
-                 (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
-                 (memory (export "memory") 1)
-                 (data (i32.const 0) "{}")
-                 (data (i32.const 32) "{}")
-                 (data (i32.const 64) "{}")
                  (func (export "verify_sig") (param $dummy i64) (result i64)
                    (i64.extend_i32_u
-                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const {}) (i32.const 64)))))"#,
-            escape_wat_bytes(&pk),
-            escape_wat_bytes(msg),
-            escape_wat_bytes(&sig),
-            msg.len()
-        );
-        let wasm = wat::parse_str(&wat_src).unwrap();
+                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const 4) (i32.const 64)))))"#,
+        )
+        .unwrap();
 
-        // FULL-PQ always-on: the SAME valid sig is refused (fail-closed 0).
+        let mut reg = ContractRegistry::new();
+        let err = reg
+            .deploy([1u8; 32], wasm, 0)
+            .expect_err("a contract importing ed25519_verify must not deploy");
+        assert!(
+            matches!(err, ContractError::UnresolvableImports),
+            "unknown host import must fail like any other: {err:?}"
+        );
+    }
+
+    /// FULL-PQ: classical `ed25519_verify` host is REMOVED — the import is
+    /// unresolvable with or without the pure-PQ override (always-on).
+    #[test]
+    fn test_host_ed25519_verify_refused_under_pure_pq() {
+        let wat_src = r#"(module
+                 (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (func (export "verify_sig") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const 4) (i32.const 64)))))"#;
+        let wasm = wat::parse_str(wat_src).unwrap();
+
+        // With the (no-op) pure-PQ override set.
         {
             crate::post_quantum::set_pure_pq_override(Some(true));
             let mut reg = ContractRegistry::new();
-            let addr = reg.deploy([3u8; 32], wasm.clone(), 0).unwrap();
-            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-            assert_eq!(res, 0, "valid ed sig must be refused under FULL-PQ");
+            let err = reg
+                .deploy([3u8; 32], wasm.clone(), 0)
+                .expect_err("unknown host import must fail to deploy");
+            assert!(matches!(err, ContractError::UnresolvableImports));
+            crate::post_quantum::set_pure_pq_override(None);
         }
-        // Still refused without the override (always-on).
+        // Still absent without the override (always-on removal).
         {
             let mut reg = ContractRegistry::new();
-            let addr = reg.deploy([3u8; 32], wasm, 0).unwrap();
-            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-            assert_eq!(res, 0, "FULL-PQ always-on: valid ed sig refused");
+            let err = reg
+                .deploy([3u8; 32], wasm, 0)
+                .expect_err("unknown host import must fail to deploy");
+            assert!(matches!(err, ContractError::UnresolvableImports));
         }
     }
 
@@ -2852,7 +2780,6 @@ mod tests {
                  (import "host" "block_hash" (func $block_hash (param i32)))
                  (import "host" "sha256" (func $sha256 (param i32 i32 i32)))
                  (import "host" "blake3" (func $blake3 (param i32 i32 i32)))
-                 (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
                  (import "host" "falcon512_verify" (func $falcon512_verify (param i32 i32 i32 i32 i32 i32) (result i32)))
                  (import "host" "return_data" (func $return_data (param i32 i32)))
                  (memory (export "memory") 1)
@@ -2866,7 +2793,6 @@ mod tests {
                    (call $return_data (i32.const 64) (i32.const 32))
                    (drop (call $value))
                    (drop (call $block_time))
-                   (drop (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const 10) (i32.const 64)))
                    (drop (call $falcon512_verify (i32.const 0) (i32.const 10) (i32.const 64) (i32.const 32) (i32.const 128) (i32.const 32)))
                    (i64.const 123)))"#,
         )

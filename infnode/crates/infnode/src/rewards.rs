@@ -247,7 +247,7 @@ pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
         // Автодобавление нод (П.3.2, задача 3): собираем ВСЕ известные ноды из routing +
         // конфигурированные. Новая нода, приславшая dht.update (самопрезентация), попадает
         // в routing автоматически и участвует в rewards без ручного внесения в конфиг.
-        // Фильтр безопасности: нода должна иметь ed_pub (подтверждённая Ed25519-идентичность)
+        // Фильтр безопасности: нода должна иметь pq_pub (подтверждённая PQ-идентичность)
         // и живые last_seen — иначе не начисляем (нельзя надуть вес фейковой нодой).
         let known = node.known_peers().await;
         // Данные всех нод за этот раунд (проход 1): нужно собрать подтверждённые чанки
@@ -257,8 +257,8 @@ pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
         let mut collected: Vec<(String, f64, u64, usize, usize, u64, Vec<(String, u64)>)> =
             Vec::new();
         for p in &known {
-            // только ноды с подтверждённым публичным ключом (не "фантомы" без ed_pub)
-            if p.ed_hex.is_empty() {
+            // только ноды с подтверждённым PQ-ключом (не "фантомы" без pq_pub)
+            if p.pq_hex.is_empty() {
                 continue;
             }
             let key = format!("inf1:{}", hex::encode(p.id));

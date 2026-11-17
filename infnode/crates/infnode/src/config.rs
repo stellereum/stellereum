@@ -24,19 +24,22 @@ fn default_unknown_allow() -> Vec<String> {
 #[serde(rename_all = "kebab-case")]
 pub struct PeerConfig {
     pub name: String,
-    /// Pinned Ed25519 key (32 bytes hex). Retained for frozen handshake-auth
-    /// (`PinnedVerifier`, signature `VerifyingKey` checks) and TLS SPKI pin.
-    /// NOT identity in FULL-PQ (identity is PQ-only via `pq_pub`/`primary_id`).
-    /// Auth/TLS policy is frozen (sibling owns); this pin stays until the
-    /// Falcon-TLS/auth follow-up migrates those call sites.
-    pub ed_pub: String,
+    /// CONSENSUS-ONLY Ed25519 validator key (32 bytes, hex). This is NOT
+    /// transport identity, auth or a TLS pin — infnode never reads it. It is
+    /// retained because the frozen consensus validator set
+    /// (`ValidatorId = [u8; 32]`) is Ed-keyed; the YAML key stays `ed-pub`
+    /// for existing configs (`consensus-pub` is the new canonical name).
+    /// A peer without it simply does not contribute a consensus key.
+    #[serde(default)]
+    pub consensus_pub: Option<String>,
     /// Falcon-512 long-term PQ public key (897 bytes, hex). MANDATORY in
     /// FULL-PQ (a peer without it is refused by `primary_id` /
     /// `dual_announce_ids`). `Option` in the in-memory shape only so
     /// dynamically discovered (DHT/TOFU) peers — constructed in code, never
-    /// parsed — can exist without a pin (they fail closed at `primary_id`
-    /// and at the KEM-only handshake); parsed operator configs MUST carry
-    /// it (see manual `Deserialize` impl: missing/legacy fails LOUDLY).
+    /// parsed — can exist without a pin until the CHALLENGE teaches it (they
+    /// fail closed at `primary_id` and at the KEM-only handshake); parsed
+    /// operator configs MUST carry it (see manual `Deserialize` impl:
+    /// missing/legacy fails LOUDLY).
     pub pq_pub: Option<String>,
     pub endpoints: Vec<String>,
     #[serde(default = "default_allow")]
@@ -53,12 +56,12 @@ pub struct PeerConfig {
 }
 
 // Manual `Deserialize` for FULL-PQ wipe (nodes wiped, no compat):
-// - `node_id` / `x_pub` REMOVED (identity is PQ-only via `pq_pub`;
-//   X3DH leg cut by sibling — no static X25519 remains).
-//   Presence fails LOUDLY with a migration error (never silent, never
-//   ignored via `deny_unknown_fields` generic message).
+// - `node_id` / `x_pub` REMOVED (identity is PQ-only via `pq_pub`; the
+//   classical Ed25519 identity, X3DH leg and Ed TLS pin are gone). Presence
+//   fails LOUDLY with a migration error.
+// - `ed-pub` is still accepted, but ONLY as the consensus validator key
+//   (canonical name `consensus-pub`); it is never a transport identity.
 // - `pq_pub` MANDATORY for parsed configs: absent fails LOUDLY.
-// - `ed_pub` REQUIRED (frozen auth/TLS pin, sibling owns).
 impl<'de> serde::Deserialize<'de> for PeerConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -70,7 +73,11 @@ impl<'de> serde::Deserialize<'de> for PeerConfig {
             name: String,
             #[serde(default)]
             node_id: Option<String>,
+            // `ed-pub` is the historical name of the CONSENSUS key field.
+            #[serde(default)]
             ed_pub: Option<String>,
+            #[serde(default)]
+            consensus_pub: Option<String>,
             #[serde(default)]
             x_pub: Option<String>,
             #[serde(default)]
@@ -95,16 +102,33 @@ impl<'de> serde::Deserialize<'de> for PeerConfig {
         }
         if h.x_pub.is_some() {
             return Err(serde::de::Error::custom(format!(
-                "peer '{}' uses removed field `x-pub`: FULL-PQ wipe (X3DH leg cut, no static X25519) — delete `node-id`/`x-pub`, keep `ed-pub` (frozen auth/TLS pin) + set mandatory `pq-pub`; nodes wiped, no compat",
+                "peer '{}' uses removed field `x-pub`: FULL-PQ wipe (X3DH leg cut, no static X25519) — delete `node-id`/`x-pub`/`ed-pub`, set mandatory `pq-pub`; nodes wiped, no compat",
                 h.name
             )));
         }
-        let ed_pub = h.ed_pub.ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "peer '{}' missing `ed-pub` (frozen auth/TLS pin, still required)",
-                h.name
-            ))
-        })?;
+        // Ed25519 is accepted ONLY as the consensus validator key; it is
+        // never a transport identity/TLS pin. `consensus-pub` is canonical,
+        // `ed-pub` is the historical alias.
+        let consensus_pub = h
+            .consensus_pub
+            .or(h.ed_pub)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let b = hex::decode(&s).map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        "peer '{}' has malformed `consensus-pub`/`ed-pub` (must be 32 bytes hex)",
+                        h.name
+                    ))
+                })?;
+                if b.len() != 32 {
+                    return Err(serde::de::Error::custom(format!(
+                        "peer '{}' has malformed `consensus-pub`/`ed-pub` (must be 32 bytes hex)",
+                        h.name
+                    )));
+                }
+                Ok(s)
+            })
+            .transpose()?;
         let pq_pub = h.pq_pub.filter(|s| !s.is_empty());
         let Some(pq_pub) = pq_pub else {
             return Err(serde::de::Error::custom(format!(
@@ -127,7 +151,7 @@ impl<'de> serde::Deserialize<'de> for PeerConfig {
         }
         Ok(PeerConfig {
             name: h.name,
-            ed_pub,
+            consensus_pub,
             pq_pub: Some(pq_pub),
             endpoints: h.endpoints,
             allow: h.allow,
@@ -154,17 +178,18 @@ impl PeerConfig {
         out
     }
 
-    pub fn ed_bytes(&self) -> Result<[u8; 32]> {
-        let b = hex::decode(&self.ed_pub)?;
+    /// Consensus-only Ed25519 validator key, if pinned. Never used by
+    /// infnode transport/auth (the `ValidatorId` type is frozen at 32 bytes).
+    pub fn consensus_bytes(&self) -> Result<Option<[u8; 32]>> {
+        let Some(s) = self.consensus_pub.as_deref() else {
+            return Ok(None);
+        };
+        let b = hex::decode(s)?;
         b.try_into()
-            .map_err(|_| anyhow!("ed_pub должен быть 32 байта"))
+            .map(Some)
+            .map_err(|_| anyhow!("consensus_pub должен быть 32 байта"))
     }
 
-    /// Raw Falcon-512 public key, or `None` when absent (absent = refused
-    /// by `primary_id`/`dual_announce_ids`, never silently classical).
-    /// A present-but-malformed value is a hard error (fail closed).
-    /// `None` only occurs for code-constructed dynamic (DHT/TOFU) peers;
-    /// parsed configs always carry `Some` (enforced at parse).
     pub fn pq_bytes(&self) -> Result<Option<[u8; crate::proto::PQ_FALCON_PK_LEN]>> {
         let Some(s) = self.pq_pub.as_deref() else {
             return Ok(None);

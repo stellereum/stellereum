@@ -305,14 +305,14 @@ async fn sign_and_verify_message_round_trip() {
     )
     .await;
     assert!(signed.get("error").is_none(), "sign must succeed: {signed}");
-    // The node signs with its own key: seed 0x42, whose address is pinned
-    // by the wallet_signing test vector.
-    assert_eq!(
-        signed["address"],
-        json!("2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12")
-    );
-    assert_eq!(signed["scheme"], json!("Ed25519"));
-    assert_eq!(signed["scheme_id"], json!(1));
+    // The node signs with its own key: seed 0x42, Falcon-512 only. The
+    // address is the zero-salt PQ derivation, and the envelope is the
+    // 1569-byte Falcon shape (no classical 102-byte Ed vector any more).
+    let expected_addr =
+        crate::wallet_signing::WalletSigningKey::falcon_from_seed(&[0x42u8; 32]).address();
+    assert_eq!(signed["address"], json!(hex::encode(expected_addr)));
+    assert_eq!(signed["scheme"], json!("Falcon-512"));
+    assert_eq!(signed["scheme_id"], json!(2));
     assert_eq!(signed["chain_id"], json!(777));
     let sig = signed["signature"]
         .as_str()
@@ -609,10 +609,11 @@ async fn typed_data_is_canonical_over_rpc() {
     let a = sign(args_a).await;
     let b = sign(args_b).await;
     assert!(a.get("error").is_none(), "{a}");
-    // The node signs Ed25519 deterministically: identical content in
-    // different key order yields the SAME signature and canonical JSON.
-    assert_eq!(a["signature"], b["signature"]);
+    // Canonical content is deterministic; Falcon-512 signatures are
+    // RANDOMIZED, so different key order still yields the SAME canonical
+    // JSON (and both signatures verify it), but not the same signature bytes.
     assert_eq!(a["canonical"], b["canonical"]);
+    assert_ne!(a["signature"], b["signature"]);
     assert_eq!(
         a["canonical"],
         json!(format!(
@@ -1197,7 +1198,7 @@ async fn submit_proposal_reaches_every_action_and_refuses_an_unknown_type() {
     // The proposer is a real signing key: the handler binds the envelope
     // to the claimed staking address, so an arbitrary 0xA1 address can no
     // longer propose.
-    let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+    let proposer_key = TestGovKey::falcon_from_seed(&[0xA1u8; 32]);
     let proposer_addr = proposer_key.address();
     let proposer = hex::encode(proposer_addr);
 
@@ -4392,10 +4393,16 @@ const VERIFY_WAT: &str = r#"(module
 
 #[tokio::test]
 async fn verify_contract_source_round_trip() {
-    use ed25519_dalek::Signer;
     let st = test_state().await;
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[0xABu8; 32]);
-    let creator = sk.verifying_key().to_bytes();
+    // FULL-PQ: the creator is a Falcon-512 key and the registration envelope
+    // is an explicit PQ1 envelope. The legacy 64-byte Ed25519 branch is gone
+    // and its refusal is pinned by `contract_source`'s own unit test.
+    let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0xAB);
+    let creator = crate::post_quantum::derive_pq_address(
+        crate::post_quantum::PqScheme::Falcon512,
+        &kp.public_key,
+        &crate::post_quantum::DEFAULT_SALT,
+    );
     let wasm = wat::parse_str(VERIFY_WAT).unwrap();
     let addr = st.engine.deploy_contract(creator, wasm, 0).await.unwrap();
     let addr_hex = hex::encode(addr);
@@ -4473,7 +4480,7 @@ async fn verify_contract_source_round_trip() {
         r["error"].is_string(),
         "missing signature must be refused: {r}"
     );
-    let bad_sig = hex::encode([0u8; 64]);
+    let bad_sig = hex::encode([0u8; crate::post_quantum::FALCON512_SIG_LEN]);
     let r = call(
         &st,
         "stell_registerContractSource",
@@ -4490,11 +4497,17 @@ async fn verify_contract_source_round_trip() {
     let mut shash = [0u8; 32];
     shash.copy_from_slice(&shash_bytes);
     let msg = crate::contract_source::register_message(&addr, &shash);
-    let sig = sk.sign(&msg);
+    let sig = kp.sign(&msg);
+    let envelope = crate::sharding::PqSignatureEnvelope::new_explicit(
+        crate::post_quantum::PqScheme::Falcon512,
+        kp.public_key.clone(),
+        sig,
+    )
+    .encode();
     let r = call(
         &st,
         "stell_registerContractSource",
-        json!({ "contract": addr_hex, "source_hash": source_hash, "signature": hex::encode(sig.to_bytes()) }),
+        json!({ "contract": addr_hex, "source_hash": source_hash, "signature": hex::encode(&envelope) }),
     )
     .await;
     assert_eq!(
@@ -7364,7 +7377,7 @@ async fn gov_writes_require_token_on_every_bind() {
         set_test_bind_loopback(mock);
         // 3a. Solo direct: propose + self-vote record end to end.
         let st = test_state_with_token().await;
-        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+        let proposer_key = TestGovKey::falcon_from_seed(&[0xA1u8; 32]);
         let proposer = proposer_key.address();
         {
             let mut ledger = st.engine.staking_write().await;
@@ -7478,11 +7491,11 @@ async fn gov_writes_require_operator_signatures() {
     // gate passes, then the operator-signature checks fire.
     let st = test_state_with_token().await;
     let chain = st.chain_id;
-    let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+    let proposer_key = TestGovKey::falcon_from_seed(&[0xA1u8; 32]);
     let proposer = proposer_key.address();
-    let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
+    let voter_key = TestGovKey::falcon_from_seed(&[0xB2u8; 32]);
     let voter = voter_key.address();
-    let lone_key = TestGovKey::ed25519([0xC3u8; 32]);
+    let lone_key = TestGovKey::falcon_from_seed(&[0xC3u8; 32]);
     let lone = lone_key.address();
     // Block-carried update (HDAE-GOV): the direct form below mutates in
     // this process only, so this matrix runs on a SOLO set (the proposer
@@ -7863,7 +7876,7 @@ async fn gov_direct_writes_refuse_on_multi_node() {
     use crate::governance::{GovAction, VoteChoice, GOV_MULTINODE_WRITES_ENV};
     std::env::set_var(GOV_MULTINODE_WRITES_ENV, "0");
     let st = test_state_with_token().await;
-    let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+    let proposer_key = TestGovKey::falcon_from_seed(&[0xA1u8; 32]);
     let proposer = proposer_key.address();
     {
         let mut ledger = st.engine.staking_write().await;

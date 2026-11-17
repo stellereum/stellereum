@@ -1,17 +1,22 @@
 //! A-CRYPTO PoC: strictness / confusion / disabled-scheme probes.
 //! Read-only audit artifact (tests only).
+//!
+//! FULL-PQ: classical Ed25519 verification is REMOVED from the node
+//! (`PqScheme::Ed25519` and `verify_ed25519` are deleted, `from_id(1)`
+//! refuses). The PoCs below therefore pin that the classical verifier is
+//! UNREACHABLE through `verify_pq_signature`, while still documenting the
+//! underlying Ed25519 primitive with `ed25519-dalek` directly.
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use stellereum::post_quantum::{verify_pq_signature, PqScheme};
 
 // PoC 1 (revised): weak-key forgery — small-order Ed25519 key (all-zero
-// point, order 4) accepts a forged (R, s=0) for the probe message.
-// Raw verify (used by verify_pq_signature) does NOT check small-order;
-// verify_strict does. If any (R,s=0) with small-order R verifies via raw,
-// the wallet/PQ path accepts a forgery that consensus (strict) refuses
-// (or vice versa) — a strictness gap with key-registration impact.
+// point, order 4). The node no longer has an Ed25519 verification path:
+// scheme 0x01 is refused at decode (`from_id(1)`), and any 32-byte key /
+// 64-byte signature is rejected by the Falcon-512 length gate. The direct
+// `verify_strict` probe stays as documentation of the classical primitive.
 #[test]
-fn poc_ed25519_weak_key_forgery() {
+fn poc_classical_ed25519_verifier_is_unreachable() {
     let weak_pk = [0u8; 32]; // y=0 torsion point (order 4), parses OK
     assert!(
         VerifyingKey::from_bytes(&weak_pk).is_ok(),
@@ -38,7 +43,10 @@ fn poc_ed25519_weak_key_forgery() {
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(r);
         // s = 0
-        let ok_raw = verify_pq_signature(PqScheme::Ed25519, &weak_pk, msg, &sig_bytes);
+        // FULL-PQ: the classical scheme value does not exist; the only
+        // admitted verifier is Falcon-512 and these lengths never pass it.
+        assert!(PqScheme::from_id(1).is_err(), "0x01 must be refused");
+        let ok_raw = verify_pq_signature(PqScheme::Falcon512, &weak_pk, msg, &sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let ok_strict = vk.verify_strict(msg, &sig).is_ok();
         println!("R={} raw={ok_raw} strict={ok_strict}", hex::encode(r));
@@ -56,7 +64,7 @@ fn poc_ed25519_weak_key_forgery() {
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&b);
         sig_bytes[32] = 1;
-        let ok_raw = verify_pq_signature(PqScheme::Ed25519, &weak_pk, msg.as_bytes(), &sig_bytes);
+        let ok_raw = verify_pq_signature(PqScheme::Falcon512, &weak_pk, msg.as_bytes(), &sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let ok_strict = vk.verify_strict(msg.as_bytes(), &sig).is_ok();
         if ok_raw {
@@ -75,14 +83,17 @@ fn poc_ed25519_weak_key_forgery() {
 }
 
 // PoC 2: honest-path parity (raw vs strict agree on honest + zero-R).
+// FULL-PQ: the "raw path" (`verify_pq_signature` Ed25519) is deleted, so an
+// honest classical signature must be refused by the live verifier.
 #[test]
 fn poc_ed25519_smallorder_r_strict_gap() {
     let sk = SigningKey::from_bytes(&[0x42u8; 32]);
     let pk = sk.verifying_key().to_bytes();
     let msg = b"strict gap probe";
     let sig = sk.sign(msg).to_bytes();
-    // Sanity: honest sig verifies on both paths.
-    assert!(verify_pq_signature(PqScheme::Ed25519, &pk, msg, &sig));
+    // FULL-PQ: honest classical sig is NOT accepted by the live verifier
+    // (wrong scheme/lengths; scheme 0x01 is unrepresentable).
+    assert!(!verify_pq_signature(PqScheme::Falcon512, &pk, msg, &sig));
     let vk = VerifyingKey::from_bytes(&pk).unwrap();
     assert!(vk
         .verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig))
@@ -93,7 +104,7 @@ fn poc_ed25519_smallorder_r_strict_gap() {
     // At minimum assert parity on honest + zero-R (both must refuse zero-R).
     let mut zero_r = sig;
     zero_r[..32].copy_from_slice(&[0u8; 32]);
-    let raw_zero = verify_pq_signature(PqScheme::Ed25519, &pk, msg, &zero_r);
+    let raw_zero = verify_pq_signature(PqScheme::Falcon512, &pk, msg, &zero_r);
     let strict_zero = vk
         .verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&zero_r))
         .is_ok();
@@ -113,12 +124,14 @@ fn poc_scheme_confusion_rejected_by_length() {
         stellereum::post_quantum::FALCON512_SIG_LEN,
         "signing must produce a full Falcon signature (fail-closed, no env interference)"
     );
-    // Truncate Falcon sig to 64 bytes and present as Ed25519: must fail.
+    // Truncate Falcon sig to 64 bytes: no scheme accepts it. The classical
+    // scheme id is refused outright, and Falcon-512 refuses the length.
+    assert!(PqScheme::from_id(1).is_err(), "0x01 must be refused");
     let ed_pk = SigningKey::from_bytes(&[0x11u8; 32])
         .verifying_key()
         .to_bytes();
     assert!(!verify_pq_signature(
-        PqScheme::Ed25519,
+        PqScheme::Falcon512,
         &ed_pk,
         msg,
         &falcon_sig[..64]

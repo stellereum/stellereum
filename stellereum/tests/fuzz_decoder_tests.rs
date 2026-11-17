@@ -66,7 +66,7 @@ fn valid_frame() -> Vec<u8> {
         svc: 42,
         payload: b"hello-consensus".to_vec(),
         nonce: vec![0u8; 12],
-        sig: [9u8; 64],
+        sig: vec![9u8; infnode::proto::PQ_FALCON_SIG_LEN],
     };
     f.encode()
 }
@@ -292,8 +292,15 @@ fn frame_oversized_lengths_rejected_without_panic() {
     let mut m = valid.clone();
     m[0] = 0xFF;
     cases.push(m);
+    // FULL-PQ: the classical wire version (1) is REFUSED outright, and any
+    // version other than the live one must be rejected without panicking.
+    for bad_version in [1u8, 3u8] {
+        let mut m = valid.clone();
+        m[0] = bad_version;
+        cases.push(m);
+    }
     let mut m = valid;
-    m[0] = 2;
+    m[0] = m[0].wrapping_add(1);
     cases.push(m);
 
     for c in &cases {

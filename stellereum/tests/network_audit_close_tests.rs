@@ -399,36 +399,36 @@ fn f7_breaker_is_per_lane_not_overlay_global() {
 
 // --- F10/F-eclipse: DNS peers never mint consensus power ---------------------
 
-fn ed_of(seed: u8) -> [u8; 32] {
+fn _ed_of(seed: u8) -> [u8; 32] {
     [seed; 32]
 }
 
-fn id_of(ed: &[u8; 32]) -> String {
-    let h = blake3::hash(ed);
-    format!("inf1:{}", hex::encode(&h.as_bytes()[..20]))
+fn pq_of(seed: u8) -> infnode::keyring::PqKeys {
+    infnode::keyring::PqKeys::from_seed([seed; 32])
 }
 
 #[test]
 fn dns_records_enforce_binding_cap_and_charset() {
     // Spoofed id (victim id + attacker key) rejected.
-    let ed = ed_of(0x31);
-    let other = id_of(&ed_of(0x32));
+    let pq = pq_of(0x31);
+    let other = pq_of(0x32).pq_id_hex();
     assert!(parse_txt_record(&format!(
-        "stellereum/v1 node_id={other} ed={} host=n.example port=9411",
-        hex::encode(ed)
+        "stellereum/v1 node_id={other} pq={} host=n.example port=9411",
+        pq.pq_pub_hex()
     ))
     .is_none());
     // Privileged ports rejected; sane record parses.
-    let id = id_of(&ed);
+    let id = pq.pq_id_hex();
     assert!(parse_txt_record(&format!(
-        "stellereum/v1 node_id={id} ed={} host=n.example port=80",
-        hex::encode(ed)
+        "stellereum/v1 node_id={id} pq={} host=n.example port=80",
+        pq.pq_pub_hex()
     ))
     .is_none());
+    let pq51 = pq_of(0x51);
     let rec = format!(
-        "stellereum/v1 node_id={} ed={} host=node.example port=9411",
-        id_of(&ed_of(0x51)),
-        hex::encode(ed_of(0x51))
+        "stellereum/v1 node_id={} pq={} host=node.example port=9411",
+        pq51.pq_id_hex(),
+        pq51.pq_pub_hex()
     );
     assert!(parse_txt_record(&rec).is_some());
     // Seed-domain parsing lowercases, drops junk, never panics.
@@ -441,12 +441,15 @@ fn dns_records_enforce_binding_cap_and_charset() {
 #[test]
 fn dns_merge_never_overflows_and_dedups_validator_ids() {
     // 50 records cap at 32; validator-id/keys dedup as duplicates.
-    let mk = |seed: u8| stellereum::dns_seeds::DiscoveredPeer {
-        node_id: id_of(&ed_of(seed)),
-        ed_pub: ed_of(seed),
-        kem_ek_hash: None,
-        host: "n.example".into(),
-        port: 9411,
+    let mk = |seed: u8| {
+        let pq = pq_of(seed);
+        stellereum::dns_seeds::DiscoveredPeer {
+            node_id: pq.pq_id_hex(),
+            pq_pub: pq.pq_pub(),
+            kem_ek_hash: None,
+            host: "n.example".into(),
+            port: 9411,
+        }
     };
     let many: Vec<_> = (0..50u8).map(mk).collect();
     let r = merge_seeds(&[], many);
@@ -454,12 +457,12 @@ fn dns_merge_never_overflows_and_dedups_validator_ids() {
     assert_eq!(r.new_peers.len(), 32);
     assert_eq!(r.over_cap, 18);
     // A discovered record reusing a known ed key is a duplicate, never new.
+    let pq77 = pq_of(0x77);
     let cfg_peer = infnode::config::PeerConfig {
         name: "validator".into(),
-        ed_pub: hex::encode(ed_of(0x77)),
-        // No PQ pin: `primary_id` refuses it, so the spoof below dedups via
-        // the ed leg — same as the live DNS path (DNS pins ed + kem_hash only).
-        pq_pub: None,
+        consensus_pub: None,
+        // PQ pin: the DNS clone of this identity dedups by node id.
+        pq_pub: Some(pq77.pq_pub_hex()),
         endpoints: vec!["127.0.0.1:9411".into()],
         allow: vec!["*".into()],
         rate_limit_per_sec: 0,

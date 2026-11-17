@@ -43,6 +43,17 @@
 //! threat model (what it protects against and what it does NOT) is written
 //! down in `docs/MEV.md`; read it before claiming that this chain hides
 //! anything from a mempool snooper.
+//!
+//! # Classical primitives in THIS module (not the epoch-sealing path)
+//!
+//! `Scalar` here is FIELD ARITHMETIC ONLY (Shamir over the Curve25519 scalar
+//! field); no curve point, no Diffie-Hellman and no X25519 is involved. The
+//! order-commitment signatures are Ed25519 because this engine is the
+//! pre-existing node-local tamper check, not the post-quantum epoch path.
+//! The epoch path's transport is ML-KEM-768 + Falcon-512 in
+//! [`crate::mev_epoch`]. Migrating this engine's commitment signatures to
+//! Falcon is a separate, wallet/consensus-visible change and is NOT part of
+//! the transport removal.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};

@@ -1,34 +1,29 @@
-//! MEV DKG PQ-TRANSPORT FALLBACK STEP — Falcon-authenticated framing around
-//! the X25519 share-package leg.
+//! MEV DKG PQ TRANSPORT — ML-KEM-768 share packages in a Falcon-512 envelope.
 //!
-//! CONTEXT: the full RANK-1 swap (PQ-KEM encaps in place of the X25519 DH of
-//! `encrypt/decrypt_share_package`) is BLOCKED — `ml-kem` is a direct
-//! dependency of the sibling `infnode` crate only and is not addressable
-//! from `stellereum` without a new dependency (forbidden). What these tests
-//! pin is the fallback step: every `DkgContribution` travels in a
-//! `PqTransportEnvelope` carrying the contributor's Falcon-512 signature
-//! over the canonical bytes, and the authenticated ingest path refuses
-//! anything that does not verify.
+//! FULL-PQ (2026-11-17): the classical X25519 leg is DELETED, so every
+//! `DkgContribution` carries ML-KEM-768 packages (1136 bytes) inside a
+//! `PqTransportEnvelope` with the contributor's Falcon-512 signature over
+//! the canonical bytes. There is no flag, no pre-activation window and no
+//! fallback: a 48-byte (classical-shaped) package is refused at every height.
 //!
-//! What is pinned (extension only — no existing test is modified):
+//! What is pinned:
 //! 1. seal/verify round-trip, with fixed vectors (seeded Falcon keypair
 //!    public key, auth-message determinism and domain framing);
 //! 2. tampering anywhere (signature, key, contribution bytes) is refused,
 //!    at verify AND at ingest;
-//! 3. the classical fallback is unchanged: with the default-off flag the
-//!    swapped entry point finalizes byte-identical material (same epoch
-//!    key, same transcript root, same shares);
+//! 3. no classical fallback exists: a classical-shaped contribution is
+//!    refused at every height, and the KEM entry point refuses the shape;
 //! 4. the threshold shape is intact end-to-end through the authenticated
-//!    path: full DKG, same `P_e` as the classical run, seal, `t` partials
-//!    unseal, `t - 1` do not.
+//!    ML-KEM path: full DKG, same `P_e` as the direct KEM run, seal,
+//!    `t` partials unseal, `t - 1` do not.
 
 use ed25519_dalek::SigningKey;
 use stellereum::mev_epoch::{
-    combine_partials, compute_partial, encryption_public_key_from_ed25519,
-    encryption_secret_from_ed25519, is_pq_transport_active, pq_transport_auth_message,
-    pq_transport_seal, pq_transport_verify, seal_transaction, unseal_transaction, CommitteeMember,
-    DecryptionPartial, DkgContribution, EpochCommittee, EpochDkg, EpochKeyMaterial,
-    PqTransportEnvelope, PQ_TRANSPORT_H_ACTIVATION_HEIGHT, PQ_TRANSPORT_SIG_DOMAIN,
+    combine_partials, compute_partial, is_pq_transport_active, kem_member_tag, pq_kem_ek_from_seed,
+    pq_transport_auth_message, pq_transport_seal, pq_transport_verify, seal_transaction,
+    unseal_transaction, CommitteeMember, DecryptionPartial, DkgContribution, EpochCommittee,
+    EpochDkg, EpochKeyMaterial, PqTransportEnvelope, PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
+    PQ_TRANSPORT_SIG_DOMAIN,
 };
 use stellereum::post_quantum::FalconKeypair;
 
@@ -40,28 +35,38 @@ use stellereum::post_quantum::FalconKeypair;
 struct Member {
     id: [u8; 32],
     secret: [u8; 32],
-    enc_secret: [u8; 32],
     enc_pk: [u8; 32],
     falcon: FalconKeypair,
     falcon_pk: Vec<u8>,
+    kem_seed: [u8; 64],
 }
 
 fn member(ed_seed: [u8; 32], falcon_seed: [u8; 32]) -> Member {
     let signing = SigningKey::from_bytes(&ed_seed);
-    let secret = signing.to_bytes();
-    let enc_secret = encryption_secret_from_ed25519(&secret);
-    let enc_pk = encryption_public_key_from_ed25519(&signing.verifying_key().to_bytes())
-        .expect("a fixed ed25519 key converts");
     let falcon = FalconKeypair::generate_from_seed_bytes(&falcon_seed);
     let falcon_pk = falcon.public_key().to_vec();
+    // Deterministic per-member KEM seed (test-only key sourcing).
+    let mut kem_seed = [0u8; 64];
+    for (i, b) in kem_seed.iter_mut().enumerate() {
+        *b = ed_seed[i % 32] ^ (i as u8).wrapping_mul(0x5B);
+    }
     Member {
         id: signing.verifying_key().to_bytes(),
-        secret,
-        enc_secret,
-        enc_pk,
+        secret: signing.to_bytes(),
+        enc_pk: kem_member_tag(&pq_kem_ek_from_seed(&kem_seed)),
         falcon,
         falcon_pk,
+        kem_seed,
     }
+}
+
+/// The KEM seed of `id` (the transport-key source).
+fn kem_seed_of<'a>(members: &'a [Member], id: &[u8; 32]) -> &'a [u8; 64] {
+    &members
+        .iter()
+        .find(|m| &m.id == id)
+        .expect("member exists")
+        .kem_seed
 }
 
 fn four_members() -> Vec<Member> {
@@ -92,24 +97,23 @@ fn falcon_pk_of(members: &[Member], id: &[u8; 32]) -> Vec<u8> {
         .clone()
 }
 
-/// Build every contributor's contribution once (shared across runs so the
-/// classical and swapped paths ingest byte-identical contributions).
+/// Build every contributor's PQ contribution once (shared across runs so the
+/// direct and authenticated paths ingest byte-identical contributions).
 fn build_contributions(
     committee: &EpochCommittee,
     members: &[Member],
 ) -> Vec<(DkgContribution, Vec<u8>)> {
-    let mut dkgs: Vec<EpochDkg> = members
-        .iter()
-        .map(|m| EpochDkg::new(committee.clone(), m.id))
-        .collect();
+    let parties = kem_parties(members);
+    let ek_map = kem_ek_map(committee, &parties);
     let mut out = Vec::new();
-    for (i, m) in members.iter().enumerate() {
+    for m in members {
         let index = committee.index_of(&m.id).expect("member has an index");
         if !committee.is_contributor(index) {
             continue;
         }
-        let contribution = dkgs[i]
-            .contribution(m.id, &m.secret, &m.enc_secret)
+        let mut dkg = EpochDkg::new(committee.clone(), m.id);
+        let contribution = dkg
+            .contribution_pq(m.id, &m.secret, &ek_map)
             .expect("a contributor builds its contribution");
         out.push((contribution, m.falcon_pk.clone()));
     }
@@ -121,11 +125,30 @@ fn build_contributions(
     out
 }
 
-fn run_classical(
+/// A CLASSICAL-SHAPED contribution: a real PQ contribution with its carrier
+/// truncated to the removed 48-byte shape. Pins the refusal without any X25519
+/// code existing in the tree.
+fn build_classical_shaped(
+    committee: &EpochCommittee,
+    members: &[Member],
+) -> Vec<(DkgContribution, Vec<u8>)> {
+    let mut out = build_contributions(committee, members);
+    for (c, _) in &mut out {
+        for p in &mut c.packages {
+            p.ciphertext.truncate(48);
+            assert_eq!(p.ciphertext.len(), 48, "classical shape is 48 bytes");
+        }
+    }
+    out
+}
+
+fn run_pq_direct(
     committee: &EpochCommittee,
     members: &[Member],
     contributions: &[(DkgContribution, Vec<u8>)],
 ) -> Vec<EpochKeyMaterial> {
+    let parties = kem_parties(members);
+    let ek_map = kem_ek_map(committee, &parties);
     let mut dkgs: Vec<EpochDkg> = members
         .iter()
         .map(|m| EpochDkg::new(committee.clone(), m.id))
@@ -136,14 +159,14 @@ fn run_classical(
         let index = committee.index_of(&m.id).expect("member has an index");
         if committee.is_contributor(index) {
             dkgs[i]
-                .contribution(m.id, &m.secret, &m.enc_secret)
+                .contribution_pq(m.id, &m.secret, &ek_map)
                 .expect("a contributor builds its contribution");
         }
     }
     for (i, m) in members.iter().enumerate() {
         for (c, _) in contributions {
             dkgs[i]
-                .ingest(c.clone(), &m.enc_secret)
+                .ingest_pq(c.clone(), &m.kem_seed)
                 .unwrap_or_else(|e| panic!("member {i} must accept a contribution: {e}"));
         }
     }
@@ -173,6 +196,8 @@ fn run_swapped(
             pq_transport_seal(falcon, c.clone())
         })
         .collect();
+    let parties = kem_parties(members);
+    let ek_map = kem_ek_map(committee, &parties);
     let mut dkgs: Vec<EpochDkg> = members
         .iter()
         .map(|m| EpochDkg::new(committee.clone(), m.id))
@@ -181,7 +206,7 @@ fn run_swapped(
         let index = committee.index_of(&m.id).expect("member has an index");
         if committee.is_contributor(index) {
             dkgs[i]
-                .contribution(m.id, &m.secret, &m.enc_secret)
+                .contribution_pq(m.id, &m.secret, &ek_map)
                 .expect("a contributor builds its contribution");
         }
     }
@@ -189,16 +214,18 @@ fn run_swapped(
         for e in &envelopes {
             let expected = falcon_pk_of(members, &e.contribution.validator_id);
             let res = if authenticated {
-                dkgs[i].ingest_authenticated(e, &m.enc_secret, &expected)
+                dkgs[i].ingest_authenticated_pq(e, &m.kem_seed, &expected)
             } else {
-                dkgs[i].ingest_pq_transport(e, &m.enc_secret, &expected)
+                dkgs[i]
+                    .ingest_pq(e.contribution.clone(), &m.kem_seed)
+                    .map_err(|err| format!("direct ingest: {err}"))
             };
             res.unwrap_or_else(|e| panic!("member {i} must accept an envelope: {e}"));
         }
     }
     assert!(
         dkgs.iter().all(|d| d.can_finalize()),
-        "every member finalizes through the swapped path"
+        "every member finalizes through the ML-KEM path"
     );
     dkgs.iter_mut()
         .map(|d| d.finalize().expect("finalize succeeds"))
@@ -364,7 +391,7 @@ fn pq_transport_tamper_is_refused() {
     // (it never reaches the VSS/package checks with forged bytes).
     let mut dkg = EpochDkg::new(committee, members[1].id);
     let err = dkg
-        .ingest_authenticated(&bad_sig, &members[1].enc_secret, expected)
+        .ingest_authenticated_pq(&bad_sig, &members[1].kem_seed, expected)
         .expect_err("tampered envelope must not ingest");
     assert!(
         err.contains("falcon"),
@@ -388,7 +415,7 @@ fn pq_transport_fallback_is_byte_identical() {
     let committee = committee_of(5, &members);
     let contributions = build_contributions(&committee, &members);
 
-    let classical = run_classical(&committee, &members, &contributions);
+    let classical = run_pq_direct(&committee, &members, &contributions);
     // Default-off: the swapped entry point takes the classical branch and
     // must finalize the SAME material (same key, same transcript, same
     // shares) from the same contributions.
@@ -423,7 +450,7 @@ fn pq_transport_threshold_shape_end_to_end() {
     // Full DKG with every contribution verified-then-ingested.
     let materials = run_swapped(&committee, &members, &contributions, true);
     // Same epoch key as the classical run over the same contributions.
-    let classical = run_classical(&committee, &members, &contributions);
+    let classical = run_pq_direct(&committee, &members, &contributions);
     for m in &materials {
         assert_eq!(
             m.public_key, classical[0].public_key,
@@ -477,31 +504,32 @@ fn pq_transport_threshold_shape_end_to_end() {
 // 5. REAL PQ-KEM LEG (RANK-1): ML-KEM-768 package encryption + Falcon auth
 // ===========================================================================
 //
-// CONTEXT: `ml-kem 0.3` is now a direct dependency of THIS crate (same
-// audited lineage infnode pins in `kem_kat_tests.rs`), so the full RANK-1
-// swap lands here — additively. `EncryptedShare`/`DkgContribution` and the
-// Falcon envelope are UNCHANGED shapes: PQ-KEM packages are `kem_ct ||
-// aead_ct` (1136 bytes vs classical 48), sealed/verified with the SAME
-// `pq_transport_seal`/`verify`, ingested via the new `contribution_pq` /
-// `ingest_pq` / `ingest_authenticated_pq` / const-gated
-// `ingest_pq_kem_transport` (default-off → classical, byte-identical).
-// Feldman VSS + Ristretto math untouched: the PQ run below derives the SAME
-// `P_e` and the SAME shares as the classical run (only the transcript root
-// differs — it binds the encryption-randomized package bytes).
+// CONTEXT: `ml-kem 0.3` is a direct dependency of THIS crate (same audited
+// lineage infnode pins in `kem_kat_tests.rs`). FULL-PQ: this is the ONLY
+// transport leg; the classical X25519 leg and the pre-activation window are
+// deleted. `EncryptedShare`/`DkgContribution` and the Falcon envelope are
+// UNCHANGED shapes: ML-KEM-768 packages are `kem_ct || aead_ct` (1136
+// bytes; the classical 48-byte shape is refused everywhere),
+// sealed/verified with `pq_transport_seal`/`verify`, ingested via
+// `contribution_pq` / `ingest_pq` / `ingest_authenticated_pq` (and the
+// `*_from_registry` variants). Feldman VSS + Ristretto math untouched: the
+// PQ run below derives the SAME `P_e` and the SAME shares as the direct KEM
+// run (only the transcript root differs — it binds the encryption-randomized
+// package bytes).
 //
-// What is pinned (extension only — no existing test above is modified):
+// What is pinned:
 // 5. KEM primitive fixed vectors (Wycheproof ML-KEM-768 seed->ek, c->K)
 //    plus deterministic encap round-trip through the new wrappers;
 // 6. tampered-ct implicit rejection at the primitive layer (infallible
 //    decap returns a DIFFERENT key, never an error);
-// 7. package round-trip, wrong-recipient refusal, cross-leg refusal;
+// 7. package round-trip, wrong-recipient refusal, cross-shape refusal;
 // 8. tampered-ct implicit-rejection end-to-end (re-sealed tamper dies at
 //    the AEAD open, never at VSS);
-// 9. default-off fallback of the NEW entry point is byte-identical;
+// 9. the removed classical entry point refuses everything (no fallback);
 // 10. threshold shape intact end-to-end over the PQ leg.
 
 use stellereum::mev_epoch::{
-    decrypt_share_package_pq, encrypt_share_package_pq, pq_kem_decapsulate, pq_kem_ek_from_seed,
+    decrypt_share_package_pq, encrypt_share_package_pq, pq_kem_decapsulate,
     pq_kem_encapsulate_deterministic, PQ_KEM_CT_LEN, PQ_KEM_EK_LEN, PQ_KEM_PACKAGE_CT_LEN,
 };
 
@@ -586,12 +614,6 @@ const PQ_KEM_WYCHE_C_HEX: &str = concat!(
 );
 const PQ_KEM_WYCHE_K_HEX: &str = "e7184a0975ee3470878d2d159ec83129c8aec253d4ee17b4810311d198cd0368";
 
-/// Deterministic per-position KEM seed (test-only key sourcing; production
-/// reads registry keys — the leg takes them as explicit arguments either way).
-fn pq_kem_seed_of(position: u8) -> [u8; 64] {
-    [0xC0u8.wrapping_add(position); 64]
-}
-
 struct KemParty {
     validator_id: [u8; 32],
     kem_seed: [u8; 64],
@@ -601,9 +623,8 @@ struct KemParty {
 fn kem_parties(members: &[Member]) -> Vec<KemParty> {
     members
         .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let kem_seed = pq_kem_seed_of(i as u8);
+        .map(|m| {
+            let kem_seed = m.kem_seed;
             let kem_ek = pq_kem_ek_from_seed(&kem_seed);
             assert_eq!(kem_ek.len(), PQ_KEM_EK_LEN, "ML-KEM-768 ek is 1184 bytes");
             KemParty {
@@ -627,14 +648,6 @@ fn kem_ek_map(
         map.insert(index, p.kem_ek.clone());
     }
     map
-}
-
-fn kem_seed_of<'a>(parties: &'a [KemParty], validator_id: &[u8; 32]) -> &'a [u8; 64] {
-    &parties
-        .iter()
-        .find(|p| &p.validator_id == validator_id)
-        .expect("kem party exists")
-        .kem_seed
 }
 
 /// Build every contributor's PQ-KEM contribution, Falcon-sealed (the RANK-1
@@ -702,7 +715,7 @@ fn run_pq_kem(
         }
     }
     for i in 0..members.len() {
-        let seed = kem_seed_of(parties, &members[i].id);
+        let seed = kem_seed_of(members, &members[i].id);
         for e in envelopes {
             let expected = falcon_pk_of(members, &e.contribution.validator_id);
             dkgs[i]
@@ -837,7 +850,7 @@ fn pq_kem_package_roundtrip_and_refusals() {
     );
     // Cross-leg: the PQ decryptor refuses the classical 48-byte shape.
     let committee = committee_of(5, &members);
-    let classical = build_contributions(&committee, &members);
+    let classical = build_classical_shaped(&committee, &members);
     let classical_pkg = classical[0].0.packages[0].clone();
     let err = decrypt_share_package_pq(&parties[1].kem_seed, &classical_pkg)
         .expect_err("classical package must be refused by the PQ decryptor");
@@ -852,12 +865,14 @@ fn pq_kem_package_roundtrip_and_refusals() {
         .find(|e| e.contribution.validator_id != members[1].id)
         .expect("another contributor exists");
     let mut dkg = EpochDkg::new(committee, members[1].id);
+    // FULL-PQ: the removed classical entry point is an unconditional refusal
+    // (it is not a shape check any more — no classical code exists).
     let err = dkg
-        .ingest(foreign.contribution.clone(), &members[1].enc_secret)
-        .expect_err("classical ingest must refuse PQ packages");
+        .ingest_classical_at_h(foreign.contribution.clone(), 0)
+        .expect_err("classical ingest is removed and must refuse");
     assert!(
-        err.contains("ciphertext length"),
-        "the refusal names the shape mismatch: {err}"
+        err.contains("FULL-PQ"),
+        "the refusal names the removal: {err}"
     );
 }
 
@@ -876,7 +891,7 @@ fn pq_kem_tampered_ct_refused_end_to_end() {
         .iter()
         .find(|m| m.id != contributor_id)
         .expect("another member exists");
-    let victim_seed = kem_seed_of(&parties, &victim.id);
+    let victim_seed = kem_seed_of(&members, &victim.id);
     let expected = falcon_pk_of(&members, &contributor_id);
     // Flip a KEM-ct byte in the VICTIM's package, then RE-SEAL with the
     // contributor's Falcon key so Falcon passes and the KEM/AEAD layer is
@@ -921,7 +936,7 @@ fn pq_kem_tampered_ct_refused_end_to_end() {
         .iter()
         .find(|m| m.id != contributor_id && m.id != victim.id)
         .expect("a third member exists");
-    let wrong_seed = kem_seed_of(&parties, &other.id);
+    let wrong_seed = kem_seed_of(&members, &other.id);
     let mut dkg3 = EpochDkg::new(committee.clone(), victim.id);
     let err = dkg3
         .ingest_authenticated_pq(&envelopes[0], wrong_seed, &expected)
@@ -946,10 +961,9 @@ fn pq_kem_transport_fallback_is_byte_identical() {
     );
     let members = four_members();
     let committee = committee_of(5, &members);
-    let parties = kem_parties(&members);
-    let contributions = build_contributions(&committee, &members);
-    // Classical envelopes are refused by the KEM entry (no byte-identical
-    // fallback exists).
+    let contributions = build_classical_shaped(&committee, &members);
+    // Classical-shaped envelopes are refused by the KEM entry (no
+    // byte-identical fallback exists).
     let envelopes: Vec<PqTransportEnvelope> = contributions
         .iter()
         .map(|(c, _)| {
@@ -962,10 +976,10 @@ fn pq_kem_transport_fallback_is_byte_identical() {
         })
         .collect();
     let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
-    let seed = kem_seed_of(&parties, &members[1].id);
+    let seed = kem_seed_of(&members, &members[1].id);
     let expected = falcon_pk_of(&members, &envelopes[0].contribution.validator_id);
     let err = dkg
-        .ingest_pq_kem_transport(&envelopes[0], &members[1].enc_secret, seed, &expected)
+        .ingest_pq_kem_transport_at_h(&envelopes[0], seed, &expected, 0)
         .expect_err("classical envelope must be refused by KEM entry");
     assert!(
         err.contains("FULL-PQ") || err.contains("PQ-KEM"),
@@ -991,7 +1005,7 @@ fn pq_kem_threshold_shape_end_to_end() {
     // same shares. Only the transcript differs — it binds the KEM package
     // bytes (encryption-randomized, like the classical X25519 ones).
     let classical_contribs = build_contributions(&committee, &members);
-    let classical = run_classical(&committee, &members, &classical_contribs);
+    let classical = run_pq_direct(&committee, &members, &classical_contribs);
     for m in &materials {
         assert_eq!(
             m.public_key, classical[0].public_key,
@@ -1077,9 +1091,18 @@ fn pq_h_gate_boundary_is_pinned() {
         PQ_TRANSPORT_H_ACTIVATION_HEIGHT, 10_000,
         "H is pinned: moving flag day is a lead decision"
     );
+    // FULL-PQ (2026-11-17): the classical X25519 leg is DELETED, so the
+    // predicate is true at EVERY height. The old pre-H assertion ("classical
+    // still admitted") is inverted deliberately: no height admits a 48-byte
+    // package any more, and the ingest entry points refuse at every height
+    // (pinned by the two `pq_h_gate_classical_*` tests below).
     assert!(
-        !is_pq_transport_active(PQ_H - 1),
-        "H-1 is pre-H: classical still admitted (with WARN)"
+        is_pq_transport_active(0),
+        "genesis is PQ-only: no pre-H classical window exists"
+    );
+    assert!(
+        is_pq_transport_active(PQ_H - 1),
+        "H-1 is PQ-only: the pre-H classical path was removed"
     );
     assert!(
         is_pq_transport_active(PQ_H),
@@ -1088,6 +1111,10 @@ fn pq_h_gate_boundary_is_pinned() {
     assert!(
         is_pq_transport_active(PQ_H + 1),
         "above H is post-H: classical refused"
+    );
+    assert!(
+        is_pq_transport_active(u64::MAX),
+        "the predicate does not fall back at the top of the range"
     );
 }
 
@@ -1116,11 +1143,11 @@ fn pq_h_gate_pq_session_happy_post_h() {
         }
     }
     for i in 0..members.len() {
-        let seed = kem_seed_of(&parties, &members[i].id);
+        let seed = kem_seed_of(&members, &members[i].id);
         for e in &envelopes {
             let expected = falcon_pk_of(&members, &e.contribution.validator_id);
             dkgs[i]
-                .ingest_pq_kem_transport_at_h(e, &members[i].enc_secret, seed, &expected, PQ_H)
+                .ingest_pq_kem_transport_at_h(e, seed, &expected, PQ_H)
                 .unwrap_or_else(|err| panic!("member {i} must accept a PQ envelope at H: {err}"));
         }
     }
@@ -1132,10 +1159,10 @@ fn pq_h_gate_pq_session_happy_post_h() {
         .iter_mut()
         .map(|d| d.finalize().expect("finalize succeeds"))
         .collect();
-    // Same epoch key and shares as the classical run over the same secrets
+    // Same epoch key and shares as the direct KEM run over the same secrets
     // (only the transcript binds the transport bytes, so it differs).
     let classical_contribs = build_contributions(&committee, &members);
-    let classical = run_classical(&committee, &members, &classical_contribs);
+    let classical = run_pq_direct(&committee, &members, &classical_contribs);
     for m in &materials {
         assert_eq!(
             m.public_key, classical[0].public_key,
@@ -1148,12 +1175,12 @@ fn pq_h_gate_pq_session_happy_post_h() {
 }
 
 /// FULL-PQ: no pre-H classical fallback exists. The gated entries refuse
-/// X25519 packages at ANY height (including pre-H) fail-closed.
+/// classical-shaped packages at ANY height (including pre-H) fail-closed.
 #[test]
 fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
     let members = four_members();
     let committee = committee_of(5, &members);
-    let contributions = build_contributions(&committee, &members);
+    let contributions = build_classical_shaped(&committee, &members);
 
     // Gated KEM entry pre-H: sealed classical envelopes are refused.
     let envelopes: Vec<PqTransportEnvelope> = contributions
@@ -1167,30 +1194,22 @@ fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
             pq_transport_seal(falcon, c.clone())
         })
         .collect();
-    let parties = kem_parties(&members);
     let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
-    let seed = kem_seed_of(&parties, &members[1].id);
+    let seed = kem_seed_of(&members, &members[1].id);
     let expected = falcon_pk_of(&members, &envelopes[0].contribution.validator_id);
     let err = dkg
-        .ingest_pq_kem_transport_at_h(
-            &envelopes[0],
-            &members[1].enc_secret,
-            seed,
-            &expected,
-            PQ_H - 1,
-        )
+        .ingest_pq_kem_transport_at_h(&envelopes[0], seed, &expected, PQ_H - 1)
         .expect_err("classical pre-H must be refused under FULL-PQ");
     assert!(
         err.contains("FULL-PQ") || err.contains("PQ-KEM"),
         "refusal must name FULL-PQ/KEM: {err}"
     );
 
-    // Direct classical entry pre-H: refused as well.
+    // Direct classical entry pre-H: refused as well (no contribution needs
+    // to be built — the entry point is an unconditional refusal).
     let mut solo = EpochDkg::new(committee.clone(), members[1].id);
-    solo.contribution(members[1].id, &members[1].secret, &members[1].enc_secret)
-        .expect("own contribution builds");
     let err = solo
-        .ingest_classical_at_h(contributions[0].0.clone(), &members[1].enc_secret, PQ_H - 1)
+        .ingest_classical_at_h(contributions[0].0.clone(), PQ_H - 1)
         .expect_err("classical pre-H must be refused under FULL-PQ");
     assert!(err.contains("FULL-PQ"), "refusal must name FULL-PQ: {err}");
 }
@@ -1201,8 +1220,7 @@ fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
 fn pq_h_gate_classical_post_h_refused() {
     let members = four_members();
     let committee = committee_of(5, &members);
-    let contributions = build_contributions(&committee, &members);
-    let parties = kem_parties(&members);
+    let contributions = build_classical_shaped(&committee, &members);
     let (first_contribution, _) = &contributions[0];
     let contributor = members
         .iter()
@@ -1213,15 +1231,9 @@ fn pq_h_gate_classical_post_h_refused() {
     for height in [PQ_H, PQ_H + 1] {
         // Gated KEM entry refuses the classical (48-byte) envelope.
         let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
-        let seed = kem_seed_of(&parties, &members[1].id);
+        let seed = kem_seed_of(&members, &members[1].id);
         let err = dkg
-            .ingest_pq_kem_transport_at_h(
-                &envelope,
-                &members[1].enc_secret,
-                seed,
-                &contributor.falcon_pk,
-                height,
-            )
+            .ingest_pq_kem_transport_at_h(&envelope, seed, &contributor.falcon_pk, height)
             .expect_err("classical envelope must be refused under FULL-PQ");
         assert!(
             err.contains("FULL-PQ") || err.contains("refused"),
@@ -1231,7 +1243,7 @@ fn pq_h_gate_classical_post_h_refused() {
         // Direct classical entry refuses too.
         let mut solo = EpochDkg::new(committee.clone(), members[1].id);
         let err = solo
-            .ingest_classical_at_h(first_contribution.clone(), &members[1].enc_secret, height)
+            .ingest_classical_at_h(first_contribution.clone(), height)
             .expect_err("classical ingest must be refused under FULL-PQ");
         assert!(err.contains("FULL-PQ"), "the refusal names FULL-PQ: {err}");
     }
@@ -1349,10 +1361,12 @@ async fn validator_runtime_on_mev_frame_accepts_valid_pq_dkg_and_rejects_tampere
     let id1 = sk1.verifying_key().to_bytes();
     let fk0 = FalconKeypair::generate_from_seed_bytes(&[0xE1; 32]);
     let fk1 = FalconKeypair::generate_from_seed_bytes(&[0xE2; 32]);
+    let fk0_pk = fk0.public_key().to_vec();
 
     let validators = ValidatorSet::from_list(vec![(id0, 100), (id1, 100)]);
     let st0 = Arc::new(InMemoryStateEngine::new());
-    let mut rt0 = ValidatorRuntime::new(sk0.clone(), validators, st0, 1).with_falcon_key(fk0);
+    let mut rt0 =
+        ValidatorRuntime::new(sk0.clone(), validators, st0, 1).with_falcon_key(fk0.clone());
 
     // Register contributor 1's Falcon key via a runtime (mirrors node startup).
     let st1 = Arc::new(InMemoryStateEngine::new());
@@ -1372,11 +1386,32 @@ async fn validator_runtime_on_mev_frame_accepts_valid_pq_dkg_and_rejects_tampere
     );
 
     // Build contributor 1's contribution and Falcon-seal it into MevFrame::PqDkg.
+    // The runtime has NO MEV KEM registry wiring (out of this module's scope),
+    // so the contribution is built with the explicit registry-shaped API here.
     let ids = vec![id0, id1];
-    let mut mgr1 = EpochSealManager::new();
-    let c1 = mgr1
-        .sync_epoch(0, &ids, id1, &sk1.to_bytes())
-        .expect("epoch sync succeeds")
+    let mut reg = stellereum::mev_kem_registry::MevKemRegistry::new();
+    let mut kem0 = [0u8; 64];
+    kem0[0] = 0xD1;
+    let mut kem1 = [0u8; 64];
+    kem1[0] = 0xD2;
+    reg.register(id0, pq_kem_ek_from_seed(&kem0), 0, 0, true)
+        .expect("id0 registers");
+    reg.register(id1, pq_kem_ek_from_seed(&kem1), 0, 0, true)
+        .expect("id1 registers");
+    let committee =
+        EpochSealManager::committee_from_registry(0, &ids, &reg, 0).expect("committee builds");
+    let mut ek_map = std::collections::BTreeMap::new();
+    ek_map.insert(
+        committee.index_of(&id0).expect("id0 index"),
+        pq_kem_ek_from_seed(&kem0),
+    );
+    ek_map.insert(
+        committee.index_of(&id1).expect("id1 index"),
+        pq_kem_ek_from_seed(&kem1),
+    );
+    let mut dkg1 = EpochDkg::new(committee.clone(), id1);
+    let c1 = dkg1
+        .contribution_pq(id1, &sk1.to_bytes(), &ek_map)
         .expect("validator 1 contributes in 2-of-2 committee");
     let valid_env = pq_transport_seal(&fk1, c1.clone());
 
@@ -1400,7 +1435,7 @@ async fn validator_runtime_on_mev_frame_accepts_valid_pq_dkg_and_rejects_tampere
 
     // 3. Swapped self-carried Falcon key (signed by attacker's own key) must be rejected.
     let attacker_fk = FalconKeypair::generate_from_seed_bytes(&[0xE9; 32]);
-    let forged_env = pq_transport_seal(&attacker_fk, c1);
+    let forged_env = pq_transport_seal(&attacker_fk, c1.clone());
     rt0.on_mev_frame(MevFrame::PqDkg(forged_env)).await;
     assert!(
         rt0.mempool.read().await.mev_seal.material().is_none(),
@@ -1418,14 +1453,37 @@ async fn validator_runtime_on_mev_frame_accepts_valid_pq_dkg_and_rejects_tampere
         "unregistered contributor must be refused"
     );
 
-    // 5. Valid MevFrame::PqDkg round-tripped through wire decode is accepted and finalizes DKG.
+    // 5. The VALID envelope is still well-formed and IS accepted by the
+    // registry-wired manager path (Falcon verify + KEM open + VSS), but the
+    // runtime itself has no registry wiring: it must stay FAIL-CLOSED rather
+    // than fall back to the removed classical transport.
     let wire = MevFrame::PqDkg(valid_env.clone())
         .encode()
         .expect("pq dkg encodes");
     let decoded = MevFrame::decode(&wire).expect("pq dkg decodes");
-    rt0.on_mev_frame(decoded).await;
+    let decoded = match decoded {
+        MevFrame::PqDkg(env) => env,
+        other => panic!("expected PqDkg, got {other:?}"),
+    };
+    // Positive control: the manager path accepts it (a full 2-of-2 DKG).
+    let mut mgr0 = EpochSealManager::new();
+    let own0 = mgr0
+        .sync_epoch_pq(0, &ids, id0, &sk0.to_bytes(), &kem0, &reg, 0)
+        .expect("registry-wired sync")
+        .expect("id0 contributes");
+    let env0 = pq_transport_seal(&fk0, own0);
+    mgr0.ingest_contribution_pq(&env0, &kem0, &id0, &fk0_pk, &reg, 0)
+        .expect("own contribution is accepted");
+    mgr0.ingest_contribution_pq(&decoded, &kem0, &id0, fk1.public_key(), &reg, 0)
+        .expect("the valid peer envelope is accepted");
     assert!(
-        rt0.mempool.read().await.mev_seal.material().is_some(),
-        "valid MevFrame::PqDkg must verify and finalize epoch DKG"
+        mgr0.material().is_some(),
+        "positive control: the registry-wired manager finalizes the 2-of-2 DKG"
+    );
+    // Fail-closed runtime: no registry wiring -> no node-side DKG key.
+    rt0.on_mev_frame(MevFrame::PqDkg(decoded)).await;
+    assert!(
+        rt0.mempool.read().await.mev_seal.material().is_none(),
+        "FULL-PQ: the runtime must refuse node-side DKG without the MEV KEM registry          (classical X25519 transport removed), never fall back"
     );
 }

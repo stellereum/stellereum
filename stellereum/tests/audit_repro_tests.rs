@@ -2,7 +2,7 @@
 //! Proves and verifies the specific edge cases, attack vectors, and fixes
 //! identified by the security audit.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::cell::PatriciaTrie;
 use stellereum::consensus::{ValidatorSet, VoteKind, VoteSet};
@@ -182,12 +182,18 @@ fn repro_3_pure_pq_mode_rejects_envelope_wrapped_ed25519() {
         priority_fee_per_gas: 0,
     };
 
-    let msg = tx.signing_message();
-    let ed_sig = sk.sign(&msg).to_bytes().to_vec();
-
-    // Wrap Ed25519 inside PQ1 envelope
-    let env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk.to_vec(), ed_sig);
-    tx.signature = env.encode();
+    // FULL-PQ: wrapping classical material in PQ1 is refused at DECODE
+    // (scheme 0x01 removed), so the blob is hand-built; the mempool then
+    // reports the generic classical rejection.
+    let mut env_bytes = Vec::new();
+    env_bytes.extend_from_slice(stellereum::post_quantum::PQ_ENVELOPE_MAGIC);
+    env_bytes.push(1); // removed Ed25519 scheme id
+    env_bytes.push(0);
+    env_bytes.extend_from_slice(&(ed_pk.len() as u16).to_le_bytes());
+    env_bytes.extend_from_slice(&ed_pk);
+    env_bytes.extend_from_slice(&64u16.to_le_bytes());
+    env_bytes.extend_from_slice(&[0x22u8; 64]);
+    tx.signature = env_bytes;
     assert!(tx.is_pq());
 
     // Submit to mempool under Pure PQ mode
@@ -195,8 +201,8 @@ fn repro_3_pure_pq_mode_rejects_envelope_wrapped_ed25519() {
     match res {
         Err(MempoolError::Malformed(msg)) => {
             assert!(
-                msg.contains("scheme must be post-quantum"),
-                "Error message must specify that wrapped classical scheme is rejected: {msg}"
+                msg.contains("classical non-PQ transactions rejected"),
+                "Error message must specify that wrapped classical material is rejected: {msg}"
             );
         }
         other => panic!(

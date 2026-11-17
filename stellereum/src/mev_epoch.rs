@@ -4,15 +4,23 @@
 //! key lives in ONE process, so it hides nothing from that process) with a
 //! scheme whose secret is SHARED by the validator committee:
 //!
-//! * **Epoch key.** Every epoch (128 blocks) has an X25519-family *epoch
-//!   public key* `P_e` (a Ristretto255 point) and a matching secret `x_e`
-//!   that is split with Shamir over the epoch committee. The public key is
-//!   the AGGREGATE of the committee members' public key material: every
-//!   member contributes a Feldman commitment to its share polynomial, and
-//!   `P_e` is the sum of the constant-term commitments.
+//! * **Epoch key.** Every epoch (128 blocks) has an *epoch public key* `P_e`
+//!   (a Ristretto255 point) and a matching secret `x_e` that is split with
+//!   Shamir over the epoch committee. The public key is the AGGREGATE of the
+//!   committee members' public key material: every member contributes a
+//!   Feldman commitment to its share polynomial, and `P_e` is the sum of the
+//!   constant-term commitments. THIS LAYER IS CLASSICAL (see
+//!   "Post-quantum transport status" below): it is retained only as the
+//!   wallet-facing sealing API and is NOT reachable from a node until an
+//!   audited threshold-KEM replacement lands.
 //! * **Sealing.** A wallet encrypts its transaction to `P_e` (an ephemeral
 //!   Diffie-Hellman + XChaCha20-Poly1305). The ciphertext — not the
 //!   plaintext — is what the mempool stores and what the gossip carries.
+//! * **Transport.** DKG share packages are transported ONLY as
+//!   Falcon-512-authenticated ML-KEM-768 encapsulations. The classical
+//!   X25519 package leg and the Edwards-to-Montgomery transport-key
+//!   derivation have been REMOVED at every height (fail-closed, no
+//!   pre-activation window, no silent fallback).
 //! * **Ordering first, reveal second.** The proposer commits to the ORDER of
 //!   the sealed transactions (an order Merkle root over the sealed
 //!   transaction hashes) BEFORE any decryption material is released. Only
@@ -46,14 +54,97 @@
 //! HOLDERS: they receive the contributors' evaluations, they release
 //! decryption partials, and they count towards the unsealing threshold.
 //!
-//! # Why Ristretto255 and not raw X25519
+//! # Post-quantum transport status (FULL-PQ, 2026-11-17)
 //!
-//! X25519 clamps its scalar input, and clamping is NOT a linear map: the
-//! Shamir reconstruction `sum(lambda_i * x_i)` would not survive it. The
-//! threshold arithmetic therefore runs in the prime-order Ristretto255 group
-//! (the cofactorless group underlying Ed25519), where scalar multiplication
-//! is exactly linear. X25519 is still used for the one place that needs a
-//! raw Diffie-Hellman (the encrypted key-share packages of the DKG).
+//! ## What runs
+//!
+//! DKG share-package transport is ML-KEM-768 + Falcon-512 ONLY:
+//!
+//! ```text
+//! package = ML-KEM-768.Encaps(ek_recipient; m) = (kem_ct, ss)   (FIPS 203)
+//! key     = SHA-256(SEAL_KDF_DOMAIN || len(ss) || ss || epoch || tx_hash)
+//! cipher  = XChaCha20-Poly1305(key, nonce; share_eval)  = 32 + 16 tag = 48
+//! wire    = kem_ct (1088) || cipher (48)            = 1136 bytes
+//! envelope= Falcon-512.Sign(sk_contributor, PQ_TRANSPORT_SIG_DOMAIN
+//!                            || len(canonical) || canonical(contribution))
+//! ```
+//!
+//! A recipient's transport key is the ML-KEM-768 encapsulation key registered
+//! for its validator id in [`MevKemRegistry`]; [`CommitteeMember::enc_pk`] is
+//! its 32-byte BLAKE3 commitment
+//! `tag_i = BLAKE3(MEV_KEM_TAG_DOMAIN || ek_i)`, so the committee hash binds
+//! every transport key while the wire stays 32 bytes per member. Both
+//! contribution building and ingest verify the tag against the registry key,
+//! so a swapped key is refused before any secret is touched.
+//!
+//! ## What does NOT run (fail-closed)
+//!
+//! * `EpochSealManager::sync_epoch` and `ingest_contribution` refuse: a
+//!   node-side DKG needs the MEV KEM registry and a 64-byte ML-KEM seed, and
+//!   neither is derivable from an Ed25519 long-term seed. The failure is an
+//!   explicit `Err` (logged by the runtime), never a classical fallback.
+//!   [`EpochSealManager::sync_epoch_pq`] /
+//!   [`EpochSealManager::ingest_contribution_pq`] are the registry-wired
+//!   entry points a future wiring step must call.
+//! * `ingest_classical_at_h` always refuses classical (48-byte) packages, at
+//!   every height. [`PQ_TRANSPORT_H_ACTIVATION_HEIGHT`] is retained only as
+//!   the historical schedule value; it no longer selects a transport.
+//! * X25519 appears NOWHERE in this module: no ephemeral DH, no
+//!   Ed25519-to-X25519 birational map, no X25519 key derivation.
+//!
+//! ## Security argument for the delivered transport
+//!
+//! * **Confidentiality.** The share evaluation `f_j(i)` is 32 bytes. Its
+//!   ML-KEM-768 ciphertext is IND-CCA2 under the Module-LWE assumption; the
+//!   AEAD adds a second, independent authenticator over the same plaintext.
+//!   An adversary without `dk_i` learns `ss` only with ML-KEM advantage, and
+//!   the derived key is a fresh SHA-256 output.
+//! * **Authenticity / non-malleability.** The Falcon envelope signs
+//!   `canonical(contribution)`, which includes every commitment and every
+//!   package byte. Any mutation invalidates the signature before ingest.
+//!   ML-KEM implicit rejection (FIPS 203 §7.2) turns a tampered `kem_ct` into
+//!   a pseudorandom `ss`, so the AEAD open fails — the refusal is identical
+//!   for "wrong recipient" and "tampered ct" (no distinguisher).
+//! * **Verifiable shares are UNCHANGED.** Feldman VSS is still checked
+//!   (`g^{f(i)} == prod_k C_k^{i^k}`), so the PQ transport swap does not
+//!   weaken share verification, threshold reconstruction, or the
+//!   no-trusted-dealer property. Only the package carrier changed.
+//! * **No downgrade.** Package shape alone distinguishes options and BOTH
+//!   directions refuse: the KEM ingest requires exactly
+//!   [`PQ_KEM_PACKAGE_CT_LEN`] bytes, and the classical entry point is an
+//!   unconditional `Err`.
+//!
+//! ## Why the Feldman/sealing layer was not replaced in the same step
+//!
+//! A hash-only commitment cannot replace Feldman VSS while preserving a
+//! PUBLIC encryption key. Feldman needs a prime-order group because
+//! `P_e = Σ g^{a_{j,0}}` is homomorphic: any verifier can evaluate
+//! `prod_k C_k^{i^k}` and compare it with `g^{f(i)}`. Replacing `g^x` by
+//! `H(x)` destroys exactly that equation — `H(x+y)` is not a function of
+//! `H(x)` and `H(y)` — so shares could no longer be verified against a public
+//! commitment, and sealing to `P_e` would need the secret in the clear.
+//! Threshold ML-KEM decapsulation is also not Shamir-linear (NTT,
+//! compression and message rounding are non-linear), so a one-step swap
+//! would either be unaudited crypto or a silent security downgrade.
+//!
+//! ## What an audited replacement MUST provide
+//!
+//! 1. A threshold KEM whose decapsulation is a function of `t`-of-`n` shares
+//!    (lattice threshold decryption with audited MPC, or the wallet-side
+//!    construction in (2)), with an IND-CCA2 proof under MLWE.
+//! 2. OR wallet-side per-ciphertext sharing: the wallet samples a fresh AEAD
+//!    key `k`, Shamir-splits `k` over a prime field, ML-KEM-encapsulates
+//!    share `i` to member `i`, and publishes the `n` packages with the
+//!    ciphertext. `t` released shares reconstruct `k`; `t-1` learn nothing
+//!    (Shamir + IND-CCA2). This changes the wallet, RPC and wire shape —
+//!    touched files deliberately NOT changed here.
+//! 3. Public verifiability of the sharing without a pairing/group: either a
+//!    lattice VSS with an audited proof system, or a hash commitment to each
+//!    share plus an audited dispute/attribution protocol (hash-only VSS is
+//!    not publicly verifiable and must say so).
+//! 4. A KAT + differential test that the replacement produces the same
+//!    accept/refuse decisions for every adversarial case pinned in
+//!    `tests/mev_pq_transport_tests.rs` and `tests/pentest_mev_kem.rs`.
 //!
 //! # What this does and does not protect against
 //!
@@ -77,8 +168,7 @@ use ml_kem::kem::{Decapsulate, FromSeed, KeyExport};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+use sha2::{Digest, Sha256};
 
 /// Blocks per MEV epoch. The epoch key rotates every this many blocks.
 ///
@@ -106,6 +196,9 @@ pub const EPOCH_ANNOUNCE_SIG_DOMAIN: &[u8; 29] = b"STELL_MEV_EPOCH_ANNOUNCE_SIG1
 pub const ORDER_COMMIT_SIG_DOMAIN: &[u8; 27] = b"STELL_MEV_ORDER_COMMIT_SIG1";
 /// Domain separator of the DKG transcript root.
 pub const TRANSCRIPT_DOMAIN: &[u8; 23] = b"STELL_MEV_TRANSCRIPT_V1";
+/// Domain separator of the committee transport-key tag
+/// `BLAKE3(DOMAIN || ML-KEM-768 ek)`.
+pub const MEV_KEM_TAG_DOMAIN: &[u8; 23] = b"STELL_MEV_KEM_EK_TAG_V1";
 
 /// Maximum size of a sealed payload (ciphertext) accepted from the wire.
 pub const MAX_SEALED_PAYLOAD: usize = 1 << 20; // 1 MiB
@@ -238,10 +331,31 @@ fn decompress_point(bytes: &[u8; 32]) -> Option<RistrettoPoint> {
 pub struct CommitteeMember {
     /// The validator's consensus identity (its Ed25519 public key).
     pub validator_id: [u8; 32],
-    /// The member's X25519 encryption key (the DKG share packages are
-    /// encrypted to it). Derived deterministically from the validator's
-    /// long-term Ed25519 secret; published in the DKG contribution.
+    /// The 32-byte BLAKE3 commitment to the member's ML-KEM-768 transport
+    /// key: `BLAKE3(MEV_KEM_TAG_DOMAIN || ek)`, see [`kem_member_tag`].
+    ///
+    /// WHY A TAG AND NOT THE KEY: an ML-KEM-768 encapsulation key is 1184
+    /// bytes; the committee hash and the wire carry 32 bytes per member. The
+    /// tag keeps the committee hash binding every transport key, while the
+    /// key itself is resolved from [`MevKemRegistry`] at the epoch height.
+    /// A tag that does not match the registry key is refused fail-closed by
+    /// [`EpochDkg::contribution_pq`] /
+    /// [`EpochDkg::ingest_pq_from_registry`].
+    ///
+    /// This field used to carry an X25519 key derived from the validator's
+    /// Ed25519 key. That derivation is GONE (classical transport removed).
     pub enc_pk: [u8; 32],
+}
+
+/// The committee tag of an ML-KEM-768 encapsulation key.
+///
+/// `tag = BLAKE3(MEV_KEM_TAG_DOMAIN || ek)`.
+///
+/// BLAKE3 is collision- and preimage-resistant, so a 32-byte tag commits to
+/// the 1184-byte key: a contributor cannot substitute another recipient key
+/// without changing the tag the committee hash binds.
+pub fn kem_member_tag(ek: &[u8]) -> [u8; 32] {
+    hash_parts(MEV_KEM_TAG_DOMAIN, &[ek])
 }
 
 /// The ordered committee of one MEV epoch.
@@ -521,15 +635,23 @@ pub fn epoch_key_commitment(
 // ===========================================================================
 
 /// One encrypted key-share package of the DKG.
+///
+/// WIRE SHAPE IS FROZEN (bincode, position-based). The only live carrier is
+/// the ML-KEM-768 package: `ciphertext = kem_ct (1088) || aead_ct (48)`.
+/// `ephemeral_pk` is retained for wire compatibility and is ALWAYS
+/// `[0u8; 32]` — a KEM needs no Diffie-Hellman ephemeral.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedShare {
     /// The 1-based committee index of the recipient.
     pub recipient_index: u32,
-    /// The ephemeral X25519 public key of the package.
+    /// Reserved wire slot. Always zero in an ML-KEM package (no DH ephemeral
+    /// exists); a non-zero value is ignored but is never emitted by this
+    /// module.
     pub ephemeral_pk: [u8; 32],
     /// The XChaCha20-Poly1305 nonce.
     pub nonce: [u8; 24],
-    /// The encrypted Shamir evaluation (32 bytes + 16 bytes of tag).
+    /// The KEM ciphertext followed by the AEAD ciphertext (1136 bytes) — the
+    /// 32-byte Shamir evaluation plus 16 bytes of tag.
     pub ciphertext: Vec<u8>,
 }
 
@@ -541,7 +663,8 @@ pub struct DkgContribution {
     pub validator_id: [u8; 32],
     /// The contributor's 1-based committee index (its Shamir abscissa).
     pub index: u32,
-    /// The contributor's X25519 encryption key.
+    /// The contributor's committee transport-key tag
+    /// ([`kem_member_tag`] of its ML-KEM-768 key).
     pub enc_pk: [u8; 32],
     /// Feldman commitments to the contributor's share polynomial:
     /// `commitments[k] = a_k * B`, for `k` in `0..threshold`.
@@ -670,220 +793,6 @@ impl EpochDkg {
                 )
             })
             .collect()
-    }
-
-    /// Build our DKG contribution.
-    ///
-    /// `long_term_secret` is the member's Ed25519 secret key (32 bytes);
-    /// `enc_secret` is its X25519 encryption secret (32 bytes), derived by
-    /// [`encryption_secret_from_ed25519`].
-    pub fn contribution(
-        &mut self,
-        validator_id: [u8; 32],
-        long_term_secret: &[u8; 32],
-        enc_secret: &[u8; 32],
-    ) -> Result<DkgContribution, String> {
-        let index = self
-            .committee
-            .index_of(&validator_id)
-            .ok_or_else(|| "validator is not a member of this epoch committee".to_string())?;
-        if self.committee.threshold == 0 {
-            return Err("committee has no threshold (empty committee)".to_string());
-        }
-        if !self.committee.is_contributor(index) {
-            // Only the DERIVED contributor set defines the epoch key. A
-            // non-contributor holds a share (it receives the contributors'
-            // evaluations) and can release decryption partials, but it does
-            // not contribute: accepting contributions from an arbitrary
-            // subset is exactly what would let two nodes derive DIFFERENT
-            // epoch keys.
-            return Err(
-                "this member is not a contributor of this epoch (it holds a share, not a contribution)"
-                    .to_string(),
-            );
-        }
-        let coeffs = self.polynomial(long_term_secret);
-        let mut commitments = Vec::with_capacity(coeffs.len());
-        for c in &coeffs {
-            commitments.push((RISTRETTO_BASEPOINT_POINT * c).compress().to_bytes());
-        }
-        // The evaluation of our polynomial at every OTHER member's index,
-        // encrypted to that member's X25519 key.
-        let mut packages = Vec::new();
-        for (i, member) in self.committee.members.iter().enumerate() {
-            let recipient_index = i as u32 + 1;
-            if recipient_index == index {
-                continue;
-            }
-            let eval = eval_polynomial(&coeffs, recipient_index as u64);
-            let package = encrypt_share_package(enc_secret, &member.enc_pk, &eval.to_bytes())?;
-            packages.push(EncryptedShare {
-                recipient_index,
-                ephemeral_pk: package.0,
-                nonce: package.1,
-                ciphertext: package.2,
-            });
-        }
-        let contribution = DkgContribution {
-            epoch: self.committee.epoch,
-            validator_id,
-            index,
-            enc_pk: self
-                .committee
-                .member_at(index)
-                .map(|m| m.enc_pk)
-                .unwrap_or([0u8; 32]),
-            commitments,
-            packages,
-        };
-        // Remember our own evaluation: the aggregate share must include our
-        // own contribution.
-        self.own_eval = Some(eval_polynomial(&coeffs, index as u64));
-        self.own = Some(contribution.clone());
-        Ok(contribution)
-    }
-
-    /// Ingest and VERIFY a contribution from the network.
-    ///
-    /// Fails closed: the contributor must be a committee member at the index
-    /// it claims, its encryption key must match the committee's, it must
-    /// publish exactly `threshold` commitments, it must send exactly one
-    /// package to every other member, and the package addressed to US must
-    /// decrypt to an evaluation consistent with the published commitments.
-    pub fn ingest(
-        &mut self,
-        contribution: DkgContribution,
-        enc_secret: &[u8; 32],
-    ) -> Result<(), String> {
-        if contribution.epoch != self.committee.epoch {
-            return Err(format!(
-                "dkg contribution for epoch {} does not match epoch {}",
-                contribution.epoch, self.committee.epoch
-            ));
-        }
-        if self.contributions.contains_key(&contribution.index) {
-            return Err(format!(
-                "duplicate dkg contribution for committee index {}",
-                contribution.index
-            ));
-        }
-        let contribution_index = contribution.index;
-        let member = self
-            .committee
-            .member_at(contribution.index)
-            .ok_or_else(|| "dkg contribution claims an index outside the committee".to_string())?;
-        if !self.committee.is_contributor(contribution.index) {
-            // Only the DERIVED contributor set defines the epoch key. A
-            // contribution from anybody else would change the aggregate and
-            // desynchronise the nodes.
-            return Err(
-                "dkg contribution comes from a member that is not a contributor of this epoch"
-                    .to_string(),
-            );
-        }
-        if member.validator_id != contribution.validator_id {
-            return Err("dkg contribution identity does not match the committee".to_string());
-        }
-        let is_own = contribution.index == self.our_index.unwrap_or(0);
-        if is_own && contribution.validator_id != self.our_validator_id {
-            return Err("dkg contribution claims our committee index".to_string());
-        }
-        if member.enc_pk != contribution.enc_pk {
-            return Err("dkg contribution encryption key does not match the committee".to_string());
-        }
-        if contribution.commitments.len() != self.committee.threshold {
-            return Err(format!(
-                "dkg contribution has {} commitments, expected {}",
-                contribution.commitments.len(),
-                self.committee.threshold
-            ));
-        }
-        // Every commitment must be a valid group element.
-        let mut commitment_points = Vec::with_capacity(contribution.commitments.len());
-        for c in &contribution.commitments {
-            let point = decompress_point(c)
-                .ok_or_else(|| "dkg commitment is not a valid curve point".to_string())?;
-            commitment_points.push(point);
-        }
-        // Exactly one package per other member, and one for us.
-        let mut seen = std::collections::HashSet::new();
-        let mut our_package: Option<&EncryptedShare> = None;
-        for p in &contribution.packages {
-            if !seen.insert(p.recipient_index) {
-                return Err("duplicate dkg share package".to_string());
-            }
-            let target = self
-                .committee
-                .member_at(p.recipient_index)
-                .ok_or_else(|| "dkg share package targets a non-member".to_string())?;
-            if target.validator_id == contribution.validator_id {
-                return Err("dkg share package targets the contributor itself".to_string());
-            }
-            if p.recipient_index == contribution.index {
-                return Err("dkg share package targets the contributor itself".to_string());
-            }
-            if p.ciphertext.len() != 48 {
-                return Err("dkg share package has the wrong ciphertext length".to_string());
-            }
-            if self.our_index() == Some(p.recipient_index) {
-                our_package = Some(p);
-            }
-        }
-        // Every other member must have received a package.
-        for i in 1..=self.committee.members.len() as u32 {
-            if i == contribution.index {
-                continue;
-            }
-            if !seen.contains(&i) {
-                return Err(format!(
-                    "dkg contribution is missing the share package for committee index {}",
-                    i
-                ));
-            }
-        }
-        if is_own {
-            // Our OWN contribution: the evaluation is the one we computed
-            // from our own polynomial (we do not send ourselves a package).
-            // It is still VERIFIED against the published commitments, so a
-            // contribution that does not match what we published is refused.
-            let eval = self
-                .own_eval
-                .ok_or_else(|| "dkg contribution for our index arrived before ours".to_string())?;
-            let expected = eval_point(&commitment_points, contribution.index as u64);
-            if expected != RISTRETTO_BASEPOINT_POINT * eval {
-                return Err(
-                    "our own dkg contribution does not match the commitments we published"
-                        .to_string(),
-                );
-            }
-            self.contributions.insert(contribution.index, contribution);
-            self.evaluations.insert(contribution_index, eval);
-            return Ok(());
-        }
-        let Some(package) = our_package else {
-            // A contribution that does not include our package is still
-            // structurally valid, but we cannot use it: our share would be
-            // incomplete. Refuse it (the epoch needs every member's
-            // evaluation to reconstruct our own share).
-            return Err("dkg contribution does not carry our share package".to_string());
-        };
-        let our_index = self
-            .our_index
-            .ok_or_else(|| "this node is not a member of the epoch committee".to_string())?;
-        let eval_bytes = decrypt_share_package(enc_secret, package)?;
-        let eval = Option::<Scalar>::from(Scalar::from_canonical_bytes(eval_bytes))
-            .ok_or_else(|| "dkg share evaluation is not a canonical scalar".to_string())?;
-        // VERIFIABLE SECRET SHARING CHECK: the decrypted evaluation must
-        // match the published commitments at our index.
-        let expected = eval_point(&commitment_points, our_index as u64);
-        if expected != RISTRETTO_BASEPOINT_POINT * eval {
-            return Err(
-                "dkg share evaluation does not match the published commitments".to_string(),
-            );
-        }
-        self.contributions.insert(contribution.index, contribution);
-        self.evaluations.insert(contribution_index, eval);
-        Ok(())
     }
 
     /// Our own 1-based committee index (if we are a member).
@@ -1053,144 +962,47 @@ fn eval_point(commitments: &[RistrettoPoint], x: u64) -> RistrettoPoint {
     acc
 }
 
-/// Derive the X25519 encryption secret from an Ed25519 long-term SEED.
-///
-/// The standard Ed25519 -> X25519 conversion: the Ed25519 secret scalar is
-/// `SHA512(seed)[0..32]`, clamped exactly as Ed25519 and X25519 clamp it.
-/// The conversion is the one NaCl/libsodium use, so the resulting X25519
-/// key pair is a genuine Diffie-Hellman pair AND its public half is
-/// derivable from the Ed25519 public key alone (see
-/// [`encryption_public_key_from_ed25519`]).
-///
-/// WHY THIS MATTERS: the committee's encryption keys must be known BEFORE
-/// the DKG starts, otherwise the key-share packages would have nowhere to
-/// be addressed. Deriving them from the PUBLIC validator keys keeps the
-/// whole DKG to ONE round (no separate key announcement round).
-pub fn encryption_secret_from_ed25519(ed25519_seed: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha512::new();
-    hasher.update(ed25519_seed);
-    let out = hasher.finalize();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&out[..32]);
-    // The Ed25519/X25519 clamp (idempotent: x25519-dalek clamps again).
-    secret[0] &= 248;
-    secret[31] &= 127;
-    secret[31] |= 64;
-    secret
-}
-
-/// The X25519 public key of an Ed25519 public key (the birational map).
-///
-/// Returns `None` for a public key that is not a valid Ed25519 point (or
-/// the exceptional identity), so a malformed validator key is refused
-/// instead of producing an unusable encryption key.
-pub fn encryption_public_key_from_ed25519(ed25519_public: &[u8; 32]) -> Option<[u8; 32]> {
-    let point = curve25519_dalek::edwards::CompressedEdwardsY::from_slice(ed25519_public)
-        .ok()?
-        .decompress()?;
-    Some(point.to_montgomery().to_bytes())
-}
-
-/// The X25519 public key of an encryption secret.
-pub fn encryption_public_key(enc_secret: &[u8; 32]) -> [u8; 32] {
-    let secret = XStaticSecret::from(*enc_secret);
-    XPublicKey::from(&secret).to_bytes()
-}
-
-/// Encrypt one DKG share package to a recipient's X25519 key.
-#[allow(clippy::type_complexity)]
-// GATE: DKG share encryption returns (ephemeral-pk, nonce, ciphertext) triple by protocol definition.
-fn encrypt_share_package(
-    enc_secret: &[u8; 32],
-    recipient_pk: &[u8; 32],
-    plaintext: &[u8; 32],
-) -> Result<([u8; 32], [u8; 24], Vec<u8>), String> {
-    let _secret = XStaticSecret::from(*enc_secret);
-    let ephemeral = XStaticSecret::random_from_rng(OsRng);
-    let ephemeral_pk = XPublicKey::from(&ephemeral).to_bytes();
-    let shared = ephemeral.diffie_hellman(&XPublicKey::from(*recipient_pk));
-    let key = derive_seal_key(shared.as_bytes(), &[0u8; 32], 0);
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-    let cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| format!("seal cipher init failed: {e}"))?;
-    let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
-        .map_err(|e| format!("share package encryption failed: {e}"))?;
-    Ok((ephemeral_pk, nonce, ciphertext))
-}
-
-/// Decrypt one DKG share package.
-fn decrypt_share_package(
-    enc_secret: &[u8; 32],
-    package: &EncryptedShare,
-) -> Result<[u8; 32], String> {
-    let secret = XStaticSecret::from(*enc_secret);
-    let shared = secret.diffie_hellman(&XPublicKey::from(package.ephemeral_pk));
-    let key = derive_seal_key(shared.as_bytes(), &[0u8; 32], 0);
-    let cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| format!("seal cipher init failed: {e}"))?;
-    let plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&package.nonce),
-            package.ciphertext.as_ref(),
-        )
-        .map_err(|_| "share package decryption failed".to_string())?;
-    if plaintext.len() != 32 {
-        return Err("share package plaintext has the wrong length".to_string());
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&plaintext);
-    Ok(out)
-}
-
 // ===========================================================================
-// PQ transport leg — RANK-1 fallback step: Falcon-authenticated framing
-// around the X25519 share-package leg.
+// PQ transport leg — ML-KEM-768 package encryption + Falcon-512 authentication
 // ===========================================================================
 //
-// STATUS: the Falcon-authenticated fallback step above is wired and pinned by
-// `tests/mev_pq_transport_tests.rs`. The full RANK-1 swap below it is WIRED
-// FULL-PQ: the PQ-KEM + Falcon transport leg is the ONLY leg (no classical
-// fallback, no flag, no pre-H window). `ingest_pq_kem_transport` always
-// takes the KEM leg; `ingest_classical_at_h` always refuses; H-gate helpers
-// below are retained for height plumbing but classical is refused at any
-// height.
+// STATUS (FULL-PQ, 2026-11-17): the KEM leg is the ONLY leg. The classical
+// X25519 package encryption, the Edwards-to-Montgomery key derivation and
+// the unauthenticated `EpochDkg::ingest` entry point are DELETED. There is
+// no flag, no pre-activation window and no fallback: a 48-byte package is
+// refused by every live entry point, and `ingest_classical_at_h` is an
+// unconditional `Err` kept as an explicit fail-closed pin.
 //
-// SHAPE PRESERVED: Feldman VSS, the Ristretto threshold arithmetic, the
-// X25519 package encryption, `DkgContribution`/`EncryptedShare` (wire
-// format untouched — the legs are distinguished by ciphertext LENGTH only),
-// `ingest`, `finalize`, and the sealing path are all UNCHANGED. The new code
-// is purely additive: classical 48-byte packages keep working everywhere,
-// PQ-KEM 1136-byte packages are refused by the classical ingest
-// fail-closed (and vice versa).
+// SHAPE PRESERVED: Feldman VSS, the Ristretto threshold arithmetic,
+// `DkgContribution`/`EncryptedShare` (wire format untouched — KEM packages
+// are recognised by their 1136-byte ciphertext length), `finalize`, the
+// sealing path and the share-release protocol are UNCHANGED.
 //
-// ACTIVATION: FULL-PQ wipe — route gossip through `ingest_pq_kem_transport`
-// with the contributor's Falcon-512 key from the validator registry and the
-// recipient KEM keys from the PQ registry. Never silent: a contribution
-// without a valid Falcon envelope or without a KEM package for us is
-// refused, exactly as a contribution without our share package is refused today.
+// ACTIVATION: route gossip through `ingest_authenticated_pq` (or
+// `ingest_authenticated_pq_from_registry`) with the contributor's Falcon-512
+// key from the validator registry and the recipient ML-KEM-768 keys from
+// [`MevKemRegistry`]. Never silent: a contribution without a valid Falcon
+// envelope, without a KEM package for us, or whose committee tag does not
+// match the registry key is refused before any secret is touched.
 
-/// PQ transport H-gate: chain height at/above which DKG share-package
-/// transport MUST be post-quantum (Falcon-authenticated ML-KEM-768).
+/// Historical PQ-transport flag-day height (10_000).
 ///
-/// H-gate philosophy (mirrors the activation-height precedent of
-/// the XPC/VRF/chain-binding height gates):
-/// a plain documented const, no env knob, no silent fallback. Pre-H the
-/// height-gated entry points below take the classical X25519 branch
-/// (byte-identical to [`EpochDkg::ingest`], with an operator WARN); post-H
-/// every classical X25519 package leg is refused fail-closed and only the
-/// Falcon + ML-KEM-768 leg ingests. The pre-H default is byte-identical so
-/// existing suites run unmodified; the compat break AT H (48-byte classical
-/// vs 1136-byte KEM packages, distinguished by length only — no wire-enum
-/// change) is pinned by `tests/mev_pq_transport_tests.rs`.
+/// RETAINED ONLY FOR THE FROZEN SCHEDULE (`chain_spec.rs` records it as an
+/// activation gate). It no longer selects a transport: the classical X25519
+/// leg is deleted, so [`is_pq_transport_active`] is true at EVERY height and
+/// classical packages are refused at every height. Removing the const would
+/// change the frozen activation schedule, which is a separate spec step.
 pub const PQ_TRANSPORT_H_ACTIVATION_HEIGHT: u64 = 10_000;
 
-/// Height-gate predicate for the PQ transport leg:
-/// true at/above [`PQ_TRANSPORT_H_ACTIVATION_HEIGHT`].
+/// Whether the PQ transport is active at `height`.
+///
+/// ALWAYS TRUE: the classical X25519 leg no longer exists, so there is no
+/// height at which a classical package could be admitted. The `height`
+/// argument is kept to preserve the call shape for the frozen schedule.
 #[inline]
 pub fn is_pq_transport_active(height: u64) -> bool {
-    height >= PQ_TRANSPORT_H_ACTIVATION_HEIGHT
+    let _ = height;
+    true
 }
 
 /// Domain separator of the PQ-transport Falcon signature preimage.
@@ -1198,11 +1010,11 @@ pub const PQ_TRANSPORT_SIG_DOMAIN: &[u8; 26] = b"STELL_MEV_PQ_TRANSPORT_SG1";
 
 /// One Falcon-authenticated DKG contribution for the PQ transport leg.
 ///
-/// The `contribution` is the UNCHANGED classical contribution (same
-/// `canonical_bytes`, same wire form); `falcon_pk`/`falcon_sig` are the
-/// contributor's Falcon-512 public key (897 bytes) and signature (666
-/// bytes) over [`pq_transport_auth_message`]. Kept OUT of
-/// `DkgContribution` so the classical wire format is byte-identical.
+/// `contribution` is the ML-KEM contribution (same `canonical_bytes` framing
+/// as before); `falcon_pk`/`falcon_sig` are the contributor's Falcon-512
+/// public key (897 bytes) and signature (666 bytes) over
+/// [`pq_transport_auth_message`]. Kept OUT of `DkgContribution` so the
+/// contribution wire shape is unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PqTransportEnvelope {
     pub contribution: DkgContribution,
@@ -1264,56 +1076,25 @@ pub fn pq_transport_verify(
     Ok(())
 }
 
-impl EpochDkg {
-    /// Ingest a Falcon-authenticated contribution: verify first, then run
-    /// the UNCHANGED classical ingest (Feldman VSS + X25519 package
-    /// decrypt). Always verifies, regardless of the transport flag — this
-    /// is the Falcon-authenticated fallback leg (X25519 packages; the
-    /// RANK-1 KEM leg is `ingest_authenticated_pq`).
-    pub fn ingest_authenticated(
-        &mut self,
-        envelope: &PqTransportEnvelope,
-        enc_secret: &[u8; 32],
-        expected_falcon_pk: &[u8],
-    ) -> Result<(), String> {
-        pq_transport_verify(envelope, expected_falcon_pk)?;
-        self.ingest(envelope.contribution.clone(), enc_secret)
-    }
-
-    /// The transport-swapped ingest entry point.
-    ///
-    /// FULL-PQ: always Falcon-authenticated ingest. The classical
-    /// unauthenticated `ingest` fallback is deleted (no compat).
-    pub fn ingest_pq_transport(
-        &mut self,
-        envelope: &PqTransportEnvelope,
-        enc_secret: &[u8; 32],
-        expected_falcon_pk: &[u8],
-    ) -> Result<(), String> {
-        self.ingest_authenticated(envelope, enc_secret, expected_falcon_pk)
-    }
-}
-
 // ===========================================================================
 // PQ-KEM transport leg — RANK-1: ML-KEM-768 package encryption + Falcon auth
 // ===========================================================================
 //
 // MECHANICS: per share package, encapsulate to the recipient's ML-KEM-768
 // key (`pq_kem_encapsulate_deterministic`) -> 32-byte shared secret ->
-// `derive_seal_key` (the SAME KDF as the classical leg, with the same
-// all-zero salt/epoch binding) -> XChaCha20-Poly1305 of the 32-byte share
-// evaluation. The carrier is the UNCHANGED `EncryptedShare`:
+// `derive_seal_key` (domain-separated SHA-256) -> XChaCha20-Poly1305 of the
+// 32-byte share evaluation. The carrier is the UNCHANGED `EncryptedShare`:
 // `ephemeral_pk` is zeroed (a KEM needs no DH ephemeral), `nonce` is a fresh
 // XChaCha nonce, and `ciphertext = kem_ct (1088) || aead_ct (48)` = 1136
-// bytes. Length alone distinguishes the legs (classical: 48), and each
-// ingest refuses the other's shape fail-closed before touching any secret.
+// bytes. Shape alone distinguishes a KEM package from a removed classical
+// one (48 bytes); every live entry point refuses the 48-byte shape.
 //
 // KEY SOURCING: recipient KEM keys travel as explicit arguments
 // (`recipient_index -> 1184-byte ek` map for building, 64-byte seed for
-// opening). NO new committee wire field: `CommitteeMember` keeps only the
-// X25519 `enc_pk`, so the classical path and its hashes are byte-identical.
-// Registry wiring (which on-chain key feeds these arguments) is a lead
-// decision and deliberately NOT done here.
+// opening), or are resolved from [`MevKemRegistry`] by validator id at the
+// epoch height (the `*_from_registry` entry points). `CommitteeMember.enc_pk`
+// is the 32-byte tag of that ek, so the committee hash binds every transport
+// key and a swapped key is refused by the tag check.
 //
 // IMPLICIT REJECTION (FIPS 203 s7.2, same pin as infnode's KATs):
 // `decapsulate` is INFALLIBLE — a tampered but well-formed `kem_ct` yields
@@ -1453,16 +1234,18 @@ pub fn decrypt_share_package_pq(
 }
 
 impl EpochDkg {
-    /// Build our DKG contribution with PQ-KEM-encrypted packages (RANK-1).
+    /// Build our DKG contribution with ML-KEM-768-encrypted packages.
     ///
-    /// Identical to [`Self::contribution`] except the per-recipient packages
-    /// are ML-KEM-768 encapsulations (via [`encrypt_share_package_pq`]) to
-    /// the caller-supplied recipient keys (`recipient_index -> 1184-byte
-    /// ek`). The deterministic polynomial, the Feldman commitments, the
-    /// `enc_pk` committee binding, and the own-evaluation bookkeeping are
-    /// UNCHANGED — so the epoch key and every share match the classical run
-    /// over the same secrets (only the transcript root differs: it binds
-    /// the package bytes, which are encryption-randomized anyway).
+    /// Per-recipient packages are ML-KEM-768 encapsulations (via
+    /// [`encrypt_share_package_pq`]) to the caller-supplied recipient keys
+    /// (`recipient_index -> 1184-byte ek`). Each key is checked against the
+    /// recipient's committee tag ([`kem_member_tag`], bound into the
+    /// committee hash): a key that does not match the committee's binding is
+    /// refused BEFORE it receives a share. The deterministic polynomial, the
+    /// Feldman commitments, the `enc_pk` committee binding, and the
+    /// own-evaluation bookkeeping are unchanged — so the epoch key and every
+    /// share are the same for the same long-term secrets (only the transcript
+    /// root differs: it binds the encryption-randomized package bytes).
     pub fn contribution_pq(
         &mut self,
         validator_id: [u8; 32],
@@ -1477,8 +1260,7 @@ impl EpochDkg {
             return Err("committee has no threshold (empty committee)".to_string());
         }
         if !self.committee.is_contributor(index) {
-            // Same gate as `contribution`: only the DERIVED contributor set
-            // defines the epoch key.
+            // Only the DERIVED contributor set defines the epoch key.
             return Err(
                 "this member is not a contributor of this epoch (it holds a share, not a contribution)"
                     .to_string(),
@@ -1490,7 +1272,9 @@ impl EpochDkg {
             commitments.push((RISTRETTO_BASEPOINT_POINT * c).compress().to_bytes());
         }
         // The evaluation of our polynomial at every OTHER member's index,
-        // KEM-encapsulated to that member's PQ transport key.
+        // KEM-encapsulated to that member's PQ transport key. The key must
+        // match the committee tag: otherwise the committee hash does not bind
+        // the key we are about to encrypt to.
         let mut packages = Vec::new();
         for recipient_index in 1..=self.committee.members.len() as u32 {
             if recipient_index == index {
@@ -1501,6 +1285,15 @@ impl EpochDkg {
                     "pq kem transport is missing the recipient key for committee index {recipient_index}"
                 )
             })?;
+            let member = self.committee.member_at(recipient_index).ok_or_else(|| {
+                "pq kem transport recipient is not a committee member".to_string()
+            })?;
+            if kem_member_tag(ek) != member.enc_pk {
+                return Err(format!(
+                    "pq kem transport key for committee index {recipient_index} does not match \
+                     the committee tag: refusing (never encrypt to an unbound key)"
+                ));
+            }
             let eval = eval_polynomial(&coeffs, recipient_index as u64);
             packages.push(encrypt_share_package_pq(
                 recipient_index,
@@ -1521,20 +1314,21 @@ impl EpochDkg {
             packages,
         };
         // Remember our own evaluation: the aggregate share must include our
-        // own contribution (same as `contribution`).
+        // own contribution.
         self.own_eval = Some(eval_polynomial(&coeffs, index as u64));
         self.own = Some(contribution.clone());
         Ok(contribution)
     }
 
-    /// Ingest and VERIFY a PQ-KEM contribution (companion to [`Self::ingest`]).
+    /// Ingest and VERIFY an ML-KEM-768 contribution.
     ///
     /// The SAME fail-closed gates (epoch, contributor set, identity,
     /// commitments, package coverage, Feldman VSS at our index) — only the
-    /// package open differs: ML-KEM decapsulation with `own_kem_seed`
-    /// instead of the X25519 DH. Classical (48-byte) packages are refused
-    /// here by length, exactly as PQ-KEM (1136-byte) packages are refused
-    /// by `ingest`.
+    /// package open is ML-KEM decapsulation with `own_kem_seed`. A 48-byte
+    /// (removed classical) package is refused by length BEFORE any secret is
+    /// touched. Our own committee tag must match the key derived from
+    /// `own_kem_seed`, so a stale or foreign seed is refused before opening
+    /// anything.
     pub fn ingest_pq(
         &mut self,
         contribution: DkgContribution,
@@ -1571,7 +1365,23 @@ impl EpochDkg {
             return Err("dkg contribution claims our committee index".to_string());
         }
         if member.enc_pk != contribution.enc_pk {
-            return Err("dkg contribution encryption key does not match the committee".to_string());
+            return Err(
+                "dkg contribution transport-key tag does not match the committee".to_string(),
+            );
+        }
+        // Our own tag must match the key derived from `own_kem_seed`: a
+        // foreign or stale seed would fail every package open anyway, but the
+        // refusal here names the real cause before any secret is touched.
+        let own_ek = pq_kem_ek_from_seed(own_kem_seed);
+        let our_member_tag = self
+            .committee
+            .member_at(self.our_index.unwrap_or(0))
+            .map(|m| m.enc_pk)
+            .unwrap_or([0u8; 32]);
+        if kem_member_tag(&own_ek) != our_member_tag {
+            return Err(
+                "pq kem seed does not match our committee transport-key tag: refusing".to_string(),
+            );
         }
         if contribution.commitments.len() != self.committee.threshold {
             return Err(format!(
@@ -1623,7 +1433,7 @@ impl EpochDkg {
             }
         }
         if is_own {
-            // Same own-evaluation VSS check as `ingest`.
+            // Own-evaluation VSS check: our own polynomial must verify.
             let eval = self
                 .own_eval
                 .ok_or_else(|| "dkg contribution for our index arrived before ours".to_string())?;
@@ -1662,7 +1472,7 @@ impl EpochDkg {
 
     /// Ingest a Falcon-authenticated PQ-KEM contribution: verify first, then
     /// run the PQ-KEM ingest (Feldman VSS + KEM package decrypt). Always
-    /// verifies, regardless of the transport flag — this is the RANK-1 leg.
+    /// verifies — this is the only transport leg.
     pub fn ingest_authenticated_pq(
         &mut self,
         envelope: &PqTransportEnvelope,
@@ -1673,63 +1483,42 @@ impl EpochDkg {
         self.ingest_pq(envelope.contribution.clone(), own_kem_seed)
     }
 
-    /// FULL-PQ: always the PQ-KEM leg. The classical `ingest` fallback is
-    /// deleted (no compat). `enc_secret` is retained in signature for
-    /// call-site compat but ignored (KEM leg uses `own_kem_seed`).
-    pub fn ingest_pq_kem_transport(
-        &mut self,
-        envelope: &PqTransportEnvelope,
-        enc_secret: &[u8; 32],
-        own_kem_seed: &[u8; 64],
-        expected_falcon_pk: &[u8],
-    ) -> Result<(), String> {
-        let _ = enc_secret;
-        // Same fail-closed shape pre-check as `ingest_pq_kem_transport_at_h`:
-        // refuse classical (48-byte) packages before Falcon verify, naming
-        // the FULL-PQ removal (never silently downgraded).
-        let classical = envelope
-            .contribution
-            .packages
-            .iter()
-            .any(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN);
-        if classical {
-            return Err(format!(
-                "FULL-PQ: classical X25519 DKG transport removed: \
-                 PQ-KEM packages must be {PQ_KEM_PACKAGE_CT_LEN} bytes (kem_ct || aead_ct)"
-            ));
-        }
-        self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
-    }
-
-    /// FULL-PQ: classical X25519 transport is always refused, at any height.
-    /// Callers must route through [`Self::ingest_pq_kem_transport_at_h`].
+    /// FULL-PQ: classical transport is refused at EVERY height.
+    ///
+    /// Kept as an explicit fail-closed pin instead of silently deleting the
+    /// name: a caller that still holds a classical-shaped contribution gets a
+    /// clear refusal naming the removal (never a shape-confusion error and
+    /// never a downgrade). `height` is included in the refusal because the old
+    /// API was height-gated; the answer no longer depends on it.
     pub fn ingest_classical_at_h(
         &mut self,
         contribution: DkgContribution,
-        enc_secret: &[u8; 32],
         height: u64,
     ) -> Result<(), String> {
-        let _ = (contribution, enc_secret);
         Err(format!(
             "FULL-PQ: classical X25519 DKG transport removed (chain height {height}): \
-             re-ingest through the Falcon + ML-KEM-768 leg"
+             contribution for committee index {} has {} package(s); re-ingest through the \
+             Falcon + ML-KEM-768 leg",
+            contribution.index,
+            contribution.packages.len()
         ))
     }
 
-    /// FULL-PQ: always the PQ-KEM leg. A contribution whose packages are not
-    /// ALL ML-KEM-768-shaped (`{PQ_KEM_PACKAGE_CT_LEN}` bytes) is refused
-    /// fail-closed (never silently downgraded), otherwise the Falcon envelope
-    /// is verified and KEM packages ingested via
-    /// [`Self::ingest_authenticated_pq`]. No pre-H classical fallback exists.
+    /// FULL-PQ height-gated entry point: the ML-KEM-768 leg, at any height.
+    ///
+    /// A contribution whose packages are not ALL ML-KEM-768-shaped
+    /// (`{PQ_KEM_PACKAGE_CT_LEN}` bytes) is refused fail-closed before the
+    /// Falcon check (never silently downgraded); otherwise the Falcon
+    /// envelope is verified and the KEM packages are ingested via
+    /// [`Self::ingest_authenticated_pq`]. No pre-H classical fallback exists,
+    /// so `height` is only echoed in the refusal text.
     pub fn ingest_pq_kem_transport_at_h(
         &mut self,
         envelope: &PqTransportEnvelope,
-        enc_secret: &[u8; 32],
         own_kem_seed: &[u8; 64],
         expected_falcon_pk: &[u8],
         height: u64,
     ) -> Result<(), String> {
-        let _ = (enc_secret, height);
         let classical = envelope
             .contribution
             .packages
@@ -1737,7 +1526,7 @@ impl EpochDkg {
             .any(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN);
         if classical {
             return Err(format!(
-                "FULL-PQ: classical X25519 DKG transport removed: \
+                "FULL-PQ: classical X25519 DKG transport removed (chain height {height}): \
                  PQ-KEM packages must be {PQ_KEM_PACKAGE_CT_LEN} bytes (kem_ct || aead_ct)"
             ));
         }
@@ -1765,6 +1554,26 @@ impl EpochDkg {
             .committee
             .index_of(&validator_id)
             .ok_or_else(|| "validator is not a member of this epoch committee".to_string())?;
+        // Our OWN registry key must match the tag the committee hash binds:
+        // a node with a stale registration must not build a contribution that
+        // recipients resolve to a different key.
+        let own_ek = registry
+            .get_active_ek(&validator_id, height)
+            .ok_or_else(|| {
+                "mev kem registry has no active key for this validator at this height: refusing"
+                    .to_string()
+            })?;
+        let our_tag = self
+            .committee
+            .member_at(index)
+            .map(|m| m.enc_pk)
+            .unwrap_or([0u8; 32]);
+        if kem_member_tag(&own_ek) != our_tag {
+            return Err(
+                "mev kem registry key does not match our committee transport-key tag: refusing"
+                    .to_string(),
+            );
+        }
         let mut recipient_kem_pks = std::collections::BTreeMap::new();
         for (i, member) in self.committee.members.iter().enumerate() {
             let recipient_index = i as u32 + 1;
@@ -1803,6 +1612,25 @@ impl EpochDkg {
         registry: &MevKemRegistry,
         height: u64,
     ) -> Result<(), String> {
+        // EVERY committee tag must match the registry key at this height (not
+        // just ours): the committee hash must bind the actual transport keys
+        // a package can be encapsulated to.
+        for member in &self.committee.members {
+            let ek = registry
+                .get_active_ek(&member.validator_id, height)
+                .ok_or_else(|| {
+                    format!(
+                        "mev kem registry has no active key for committee member {}: refusing",
+                        hex::encode(member.validator_id)
+                    )
+                })?;
+            if kem_member_tag(&ek) != member.enc_pk {
+                return Err(format!(
+                    "mev kem registry key does not match the committee tag for {}: refusing",
+                    hex::encode(member.validator_id)
+                ));
+            }
+        }
         let expected = registry
             .get_active_ek(own_validator_id, height)
             .ok_or_else(|| {
@@ -1942,7 +1770,7 @@ pub fn reshare_transition(
         }
     }
     for m in &next.members {
-        registry
+        let ek = registry
             .get_active_ek(&m.validator_id, height)
             .ok_or_else(|| {
                 format!(
@@ -1950,6 +1778,12 @@ pub fn reshare_transition(
                     hex::encode(m.validator_id)
                 )
             })?;
+        if kem_member_tag(&ek) != m.enc_pk {
+            return Err(format!(
+                "mev kem registry key does not match the reshare committee tag for {}: refusing",
+                hex::encode(m.validator_id)
+            ));
+        }
     }
     Ok(next)
 }
@@ -1958,69 +1792,87 @@ pub fn reshare_transition(
 mod reshare_tests {
     use super::*;
 
-    /// A test validator identity: (consensus id, Ed25519 long-term secret).
-    type IdSecret = ([u8; 32], [u8; 32]);
-
-    fn test_id(seed_byte: u8) -> IdSecret {
-        let mut secret = [0u8; 32];
-        secret[0] = seed_byte;
-        secret[1] = 0xA5;
-        let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
-        let id = signing.verifying_key().to_bytes();
-        (id, secret)
+    /// A deterministic test member: consensus id, Ed25519 long-term secret,
+    /// and the 64-byte ML-KEM seed of its transport key.
+    struct TestMember {
+        id: [u8; 32],
+        secret: [u8; 32],
+        kem_seed: [u8; 64],
     }
 
-    fn committee_of(epoch: u64, n: usize) -> (EpochCommittee, Vec<IdSecret>) {
-        let mut pairs = Vec::new();
-        let mut members = Vec::new();
-        // Deterministic distinct Ed25519 seeds: [i, 0xA5, ...] is vanishingly
-        // unlikely to collide; retry on the 2^-200 event instead of hanging.
-        for i in 0..n {
-            let (id, secret) = test_id(i as u8 + 1);
-            let enc_pk =
-                encryption_public_key_from_ed25519(&id).expect("derived test id must convert");
-            members.push(CommitteeMember {
-                validator_id: id,
-                enc_pk,
-            });
-            pairs.push((id, secret));
-        }
-        (EpochCommittee::build(epoch, members), pairs)
+    fn test_members(n: usize) -> Vec<TestMember> {
+        (0..n)
+            .map(|i| {
+                let mut secret = [0u8; 32];
+                secret[0] = i as u8 + 1;
+                secret[1] = 0xA5;
+                let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
+                let mut kem_seed = [0u8; 64];
+                kem_seed[0] = i as u8 + 1;
+                kem_seed[1] = 0x5A;
+                TestMember {
+                    id: signing.verifying_key().to_bytes(),
+                    secret,
+                    kem_seed,
+                }
+            })
+            .collect()
     }
 
-    fn registry_for(committee: &EpochCommittee, height: u64) -> MevKemRegistry {
+    fn committee_of(epoch: u64, members: &[TestMember]) -> EpochCommittee {
+        EpochCommittee::build(
+            epoch,
+            members
+                .iter()
+                .map(|m| CommitteeMember {
+                    validator_id: m.id,
+                    enc_pk: kem_member_tag(&pq_kem_ek_from_seed(&m.kem_seed)),
+                })
+                .collect(),
+        )
+    }
+
+    fn registry_for(members: &[TestMember], height: u64) -> MevKemRegistry {
         let mut reg = MevKemRegistry::new();
-        for (i, m) in committee.members.iter().enumerate() {
-            let mut seed = [0u8; 64];
-            seed[0] = i as u8 + 1;
-            seed[1] = 0x5A;
-            let ek = pq_kem_ek_from_seed(&seed);
-            reg.register(m.validator_id, ek, 0, height, true)
+        for m in members {
+            reg.register(m.id, pq_kem_ek_from_seed(&m.kem_seed), 0, height, true)
                 .expect("test registration must succeed");
         }
         reg
     }
 
-    fn run_classical_dkg(committee: &EpochCommittee, pairs: &[IdSecret]) -> Vec<EpochKeyMaterial> {
-        let enc: Vec<[u8; 32]> = pairs
+    fn ek_map(
+        committee: &EpochCommittee,
+        members: &[TestMember],
+    ) -> std::collections::BTreeMap<u32, Vec<u8>> {
+        let mut map = std::collections::BTreeMap::new();
+        for m in members {
+            let index = committee.index_of(&m.id).expect("member has an index");
+            map.insert(index, pq_kem_ek_from_seed(&m.kem_seed));
+        }
+        map
+    }
+
+    /// Full ML-KEM DKG over the committee (no classical leg exists).
+    fn run_pq_dkg(committee: &EpochCommittee, members: &[TestMember]) -> Vec<EpochKeyMaterial> {
+        let keys = ek_map(committee, members);
+        let mut dkgs: Vec<EpochDkg> = members
             .iter()
-            .map(|(_, s)| encryption_secret_from_ed25519(s))
-            .collect();
-        let mut dkgs: Vec<EpochDkg> = pairs
-            .iter()
-            .map(|(id, _)| EpochDkg::new(committee.clone(), *id))
+            .map(|m| EpochDkg::new(committee.clone(), m.id))
             .collect();
         let mut contributions = Vec::new();
-        for (i, (id, secret)) in pairs.iter().enumerate() {
-            if let Ok(c) = dkgs[i].contribution(*id, secret, &enc[i]) {
+        for (i, m) in members.iter().enumerate() {
+            if let Ok(c) = dkgs[i].contribution_pq(m.id, &m.secret, &keys) {
                 dkgs[i].set_own(c.clone());
                 contributions.push(c);
             }
         }
         assert_eq!(contributions.len(), committee.contributors.len());
-        for i in 0..pairs.len() {
+        for i in 0..members.len() {
             for c in &contributions {
-                dkgs[i].ingest(c.clone(), &enc[i]).expect("ingest");
+                dkgs[i]
+                    .ingest_pq(c.clone(), &members[i].kem_seed)
+                    .expect("ingest");
             }
         }
         dkgs.into_iter()
@@ -2047,8 +1899,9 @@ mod reshare_tests {
 
     #[test]
     fn reshare_transition_preserves_threshold_and_members() {
-        let (committee, _) = committee_of(7, 4);
-        let reg = registry_for(&committee, 0);
+        let members = test_members(4);
+        let committee = committee_of(7, &members);
+        let reg = registry_for(&members, 0);
         let next = reshare_transition(&committee, 9, &reg, 0).expect("transition");
         assert_eq!(next.epoch, 9);
         assert_eq!(next.threshold, committee.threshold);
@@ -2064,13 +1917,10 @@ mod reshare_tests {
         assert!(reshare_transition(&committee, 3, &reg, 0).is_err());
         // A member without a KEM key is refused (fail-closed, never fallback).
         let mut reg_missing = MevKemRegistry::new();
-        let mut seed = [0u8; 64];
-        seed[0] = 1;
-        seed[1] = 0x5A;
         reg_missing
             .register(
                 committee.members[0].validator_id,
-                pq_kem_ek_from_seed(&seed),
+                pq_kem_ek_from_seed(&members[0].kem_seed),
                 0,
                 0,
                 true,
@@ -2084,12 +1934,13 @@ mod reshare_tests {
         // Activation is INACTIVE by default; simulate the post-activation
         // world by driving the transition explicitly at a height where the
         // caller considers reshare live (the const itself stays MAX).
-        let (committee, pairs) = committee_of(20, 4);
-        let reg = registry_for(&committee, 0);
+        let members = test_members(4);
+        let committee = committee_of(20, &members);
+        let reg = registry_for(&members, 0);
         let next = reshare_transition(&committee, 20 + MEV_RESHARE_DELTA_STAR_EPOCHS, &reg, 0)
             .expect("transition");
-        let old_mats = run_classical_dkg(&committee, &pairs);
-        let new_mats = run_classical_dkg(&next, &pairs);
+        let old_mats = run_pq_dkg(&committee, &members);
+        let new_mats = run_pq_dkg(&next, &members);
         // Re-keyed: the epoch public key differs.
         assert_ne!(old_mats[0].public_key, new_mats[0].public_key);
         // A ciphertext sealed to the NEW key does not open under OLD shares:
@@ -2105,11 +1956,11 @@ mod reshare_tests {
             target_shard: 0,
         };
         let envelope = seal_transaction(&new_key, b"reshare-payload", [9u8; 32], meta).unwrap();
-        let old_partials: Vec<DecryptionPartial> = pairs
+        let old_partials: Vec<DecryptionPartial> = members
             .iter()
             .enumerate()
-            .map(|(i, _)| DecryptionPartial {
-                validator_index: committee.index_of(&pairs[i].0).unwrap(),
+            .map(|(i, m)| DecryptionPartial {
+                validator_index: committee.index_of(&m.id).unwrap(),
                 point: compute_partial(&old_mats[i].share, &envelope.ephemeral_pk).unwrap(),
             })
             .collect();
@@ -2124,11 +1975,11 @@ mod reshare_tests {
             "old shares must not unseal the reshared epoch"
         );
         // Sanity: NEW shares DO unseal the new ciphertext.
-        let new_partials: Vec<DecryptionPartial> = pairs
+        let new_partials: Vec<DecryptionPartial> = members
             .iter()
             .enumerate()
-            .map(|(i, _)| DecryptionPartial {
-                validator_index: next.index_of(&pairs[i].0).unwrap(),
+            .map(|(i, m)| DecryptionPartial {
+                validator_index: next.index_of(&m.id).unwrap(),
                 point: compute_partial(&new_mats[i].share, &envelope.ephemeral_pk).unwrap(),
             })
             .collect();
@@ -2938,37 +2789,56 @@ impl EpochSealManager {
 
     /// Build the committee of an epoch from the validator set.
     ///
-    /// The committee is derived from the validator ids ALONE (the encryption
-    /// keys are derived from the public Ed25519 keys), so every node builds
-    /// the SAME committee — and therefore the same epoch seed, the same
-    /// Shamir abscissae and the same epoch key.
+    /// FAIL-CLOSED: a validator-id-only committee can no longer exist.
+    ///
+    /// The old version derived each member's X25519 key from its public
+    /// Ed25519 key (the Edwards-to-Montgomery map). That derivation is
+    /// REMOVED: an ML-KEM-768 transport key cannot be derived from a public
+    /// validator id (anyone could then derive the secret). A committee must
+    /// therefore resolve every member's encapsulation key from
+    /// [`MevKemRegistry`] at the epoch height — see
+    /// [`Self::committee_from_registry`].
     pub fn committee_for(epoch: u64, validator_ids: &[[u8; 32]]) -> Result<EpochCommittee, String> {
+        Err(format!(
+            "FULL-PQ: validator-id-only committee for epoch {epoch} ({} id(s)) cannot derive \
+             ML-KEM transport keys; classical X25519 derivation removed: use \
+             committee_from_registry with the MEV KEM registry",
+            validator_ids.len()
+        ))
+    }
+
+    /// Build the committee with every member's ML-KEM-768 key resolved from
+    /// the MEV KEM registry at `height`.
+    ///
+    /// `enc_pk` becomes the 32-byte committee tag of that key
+    /// ([`kem_member_tag`]), so the committee hash binds the actual transport
+    /// keys. Fail-closed: an unknown validator or a member with no active key
+    /// at this height is an `Err` (never a placeholder tag).
+    pub fn committee_from_registry(
+        epoch: u64,
+        validator_ids: &[[u8; 32]],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<EpochCommittee, String> {
         let mut members = Vec::with_capacity(validator_ids.len());
         for id in validator_ids {
-            let enc_pk = encryption_public_key_from_ed25519(id)
-                .ok_or_else(|| "validator public key is not a valid curve point".to_string())?;
+            let ek = registry.get_active_ek(id, height).ok_or_else(|| {
+                format!(
+                    "mev kem registry has no active key for validator {} at height {height}: \
+                     refusing (never a classical fallback)",
+                    hex::encode(id)
+                )
+            })?;
             members.push(CommitteeMember {
                 validator_id: *id,
-                enc_pk,
+                enc_pk: kem_member_tag(&ek),
             });
         }
         Ok(EpochCommittee::build(epoch, members))
     }
 
-    /// Move the manager to `epoch`, starting the DKG when the epoch changed.
-    ///
-    /// Returns our own DKG contribution when there is one to publish (the
-    /// first call for an epoch), and `None` afterwards.
-    pub fn sync_epoch(
-        &mut self,
-        epoch: u64,
-        validator_ids: &[[u8; 32]],
-        our_id: [u8; 32],
-        our_seed: &[u8; 32],
-    ) -> Result<Option<DkgContribution>, String> {
-        if self.epoch == epoch && self.dkg.is_some() {
-            return Ok(None);
-        }
+    /// Reset the per-epoch protocol state.
+    fn reset_for_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         self.commitments.clear();
         self.received.clear();
@@ -2977,27 +2847,95 @@ impl EpochSealManager {
         self.announcement = None;
         self.committed_epoch_key = None;
         self.epoch_key_diverged = false;
-        let committee = Self::committee_for(epoch, validator_ids)?;
-        if committee.index_of(&our_id).is_none() {
-            // We are not a member of this epoch's committee: no DKG, no
-            // share, no release. The plain path keeps working.
-            self.committee = Some(committee);
-            self.dkg = None;
+        self.committee = None;
+        self.dkg = None;
+        self.our_index = None;
+    }
+
+    /// FAIL-CLOSED: node-side DKG without the MEV KEM registry is refused.
+    ///
+    /// The old version derived the transport keys from the validators' public
+    /// Ed25519 keys and encrypted share packages to them with X25519. Both are
+    /// removed. A node-side DKG needs (a) every member's ML-KEM-768
+    /// encapsulation key from [`MevKemRegistry`] and (b) this node's 64-byte
+    /// ML-KEM seed; neither is derivable from `our_seed` (an Ed25519 seed).
+    /// Use [`Self::sync_epoch_pq`] from the registry-wired call site.
+    ///
+    /// The signature is kept so out-of-scope callers keep compiling; the call
+    /// is an explicit `Err` (the runtime logs it), never a classical fallback.
+    pub fn sync_epoch(
+        &mut self,
+        epoch: u64,
+        validator_ids: &[[u8; 32]],
+        our_id: [u8; 32],
+        our_seed: &[u8; 32],
+    ) -> Result<Option<DkgContribution>, String> {
+        self.reset_for_epoch(epoch);
+        let _ = (validator_ids, our_id, our_seed);
+        Err(
+            "FULL-PQ: node-side epoch DKG requires the MEV KEM registry and a 64-byte ML-KEM \
+             seed (classical X25519 transport removed): call sync_epoch_pq"
+                .to_string(),
+        )
+    }
+
+    /// Move the manager to `epoch` and start the ML-KEM DKG (registry-wired).
+    ///
+    /// This is the only node-side DKG entry point that can produce a
+    /// contribution. It resolves every member's encapsulation key from
+    /// `registry` at `height`, binds the tags into the committee hash, checks
+    /// that `our_kem_seed` derives our registered key, and builds the
+    /// contribution with [`EpochDkg::contribution_pq_from_registry`].
+    ///
+    /// Returns our own DKG contribution when there is one to publish (the
+    /// first call for an epoch), and `None` afterwards or when we are not a
+    /// contributor (a non-contributor still receives shares and releases
+    /// partials).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: the explicit registry/seed/height arguments are the fail-closed contract (no global state, no env).
+    pub fn sync_epoch_pq(
+        &mut self,
+        epoch: u64,
+        validator_ids: &[[u8; 32]],
+        our_id: [u8; 32],
+        long_term_secret: &[u8; 32],
+        our_kem_seed: &[u8; 64],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<Option<DkgContribution>, String> {
+        if self.epoch == epoch && self.dkg.is_some() {
             return Ok(None);
         }
+        self.reset_for_epoch(epoch);
+        let committee = Self::committee_from_registry(epoch, validator_ids, registry, height)?;
+        if committee.index_of(&our_id).is_none() {
+            // Not a member: no DKG, no share, no release. The plain path
+            // keeps working.
+            self.committee = Some(committee);
+            return Ok(None);
+        }
+        // Our seed must be the one the committee (and the registry) binds.
+        let our_ek = pq_kem_ek_from_seed(our_kem_seed);
+        let our_tag = committee
+            .member_at(committee.index_of(&our_id).unwrap_or(0))
+            .map(|m| m.enc_pk)
+            .unwrap_or([0u8; 32]);
+        if kem_member_tag(&our_ek) != our_tag {
+            return Err(
+                "pq kem seed does not match our committee transport-key tag: refusing".to_string(),
+            );
+        }
         let mut dkg = EpochDkg::new(committee.clone(), our_id);
-        let enc_secret = encryption_secret_from_ed25519(our_seed);
-        // Only the DERIVED contributor set contributes. A member that is not
-        // a contributor still holds a share (it receives the contributors'
-        // evaluations) and still releases decryption partials — it simply
-        // has nothing to publish.
-        let contribution = match dkg.contribution(our_id, our_seed, &enc_secret) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::debug!("[mev-seal] epoch {epoch}: not a contributor ({e})");
-                None
-            }
-        };
+        // Only the DERIVED contributor set contributes; a non-contributor
+        // holds a share and releases partials but publishes nothing.
+        let contribution =
+            match dkg.contribution_pq_from_registry(our_id, long_term_secret, registry, height) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::debug!("[mev-seal] epoch {epoch}: not a contributor ({e})");
+                    None
+                }
+            };
         self.our_index = committee.index_of(&our_id);
         self.committee = Some(committee);
         self.dkg = Some(dkg);
@@ -3155,24 +3093,62 @@ impl EpochSealManager {
         }
     }
 
-    /// Ingest a DKG contribution from the network.
+    /// FAIL-CLOSED: unauthenticated/classical contribution ingest is refused.
     ///
-    /// Returns `true` when the contribution was accepted. A malformed or
-    /// inconsistent contribution is REFUSED (fail-closed) — it can never
-    /// become a share.
+    /// The old version decrypted X25519 share packages with a key derived from
+    /// the Ed25519 seed. That leg is REMOVED. A PQ contribution also cannot be
+    /// ingested here: this method has no Falcon expected-key argument, no
+    /// ML-KEM seed and no registry, so accepting it would bypass either the
+    /// contributor authentication or the key-rotation check. Call
+    /// [`Self::ingest_contribution_pq`] instead.
+    ///
+    /// The signature is kept so out-of-scope callers keep compiling; the call
+    /// is an explicit `Err` (the runtime logs it), never a silent fallback.
     pub fn ingest_contribution(
         &mut self,
         contribution: DkgContribution,
         our_seed: &[u8; 32],
     ) -> Result<bool, String> {
+        let _ = our_seed;
+        Err(format!(
+            "FULL-PQ: unauthenticated DKG ingest removed: contribution from committee index {} \
+             (epoch {}, {} package(s)) must arrive as a Falcon-sealed PQ envelope and be ingested \
+             through ingest_contribution_pq",
+            contribution.index,
+            contribution.epoch,
+            contribution.packages.len()
+        ))
+    }
+
+    /// Ingest a Falcon-sealed ML-KEM contribution (the registry-wired path).
+    ///
+    /// Verifies the Falcon envelope against `expected_falcon_pk`, checks the
+    /// committee tags against the registry at `height`, opens our ML-KEM
+    /// package and runs the unchanged Feldman VSS / finalization checks. A
+    /// classical (48-byte) package is refused before any secret is touched.
+    pub fn ingest_contribution_pq(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        own_kem_seed: &[u8; 64],
+        own_validator_id: &[u8; 32],
+        expected_falcon_pk: &[u8],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<bool, String> {
         let Some(dkg) = self.dkg.as_mut() else {
             return Err("no dkg in progress for this epoch".to_string());
         };
-        if contribution.epoch != self.epoch {
+        if envelope.contribution.epoch != self.epoch {
             return Err("dkg contribution is for another epoch".to_string());
         }
-        let enc_secret = encryption_secret_from_ed25519(our_seed);
-        dkg.ingest(contribution, &enc_secret)?;
+        dkg.ingest_authenticated_pq_from_registry(
+            envelope,
+            own_kem_seed,
+            own_validator_id,
+            expected_falcon_pk,
+            registry,
+            height,
+        )?;
         self.try_finalize();
         Ok(true)
     }
@@ -3396,34 +3372,24 @@ mod tests {
     use super::*;
     use crate::sharding::Transaction;
 
-    /// One test committee member: an Ed25519 identity (the validator id) and
-    /// the matching long-term secret.
+    /// One test committee member: an Ed25519 identity (the validator id),
+    /// the matching long-term secret, and the 64-byte ML-KEM-768 transport
+    /// seed.
     #[derive(Clone)]
     struct TestMember {
         id: [u8; 32],
         secret: [u8; 32],
-        enc_secret: [u8; 32],
-        enc_pk: [u8; 32],
+        kem_seed: [u8; 64],
     }
 
     fn test_member() -> TestMember {
         let signing = SigningKey::generate(&mut OsRng);
-        let secret = signing.to_bytes();
-        let enc_secret = encryption_secret_from_ed25519(&secret);
-        // The encryption public key is derivable from the PUBLIC validator
-        // key alone: that is what keeps the DKG to a single round.
-        let enc_pk = encryption_public_key_from_ed25519(&signing.verifying_key().to_bytes())
-            .expect("a valid ed25519 public key converts");
-        assert_eq!(
-            enc_pk,
-            encryption_public_key(&enc_secret),
-            "the derived public key must match the secret"
-        );
+        let mut kem_seed = [0u8; 64];
+        OsRng.fill_bytes(&mut kem_seed);
         TestMember {
             id: signing.verifying_key().to_bytes(),
-            secret,
-            enc_secret,
-            enc_pk,
+            secret: signing.to_bytes(),
+            kem_seed,
         }
     }
 
@@ -3439,17 +3405,30 @@ mod tests {
                 .iter()
                 .map(|m| CommitteeMember {
                     validator_id: m.id,
-                    enc_pk: m.enc_pk,
+                    enc_pk: kem_member_tag(&pq_kem_ek_from_seed(&m.kem_seed)),
                 })
                 .collect(),
         )
     }
 
-    /// Run the full DKG exchange and return every member's key material.
+    fn ek_map(
+        committee: &EpochCommittee,
+        members: &[TestMember],
+    ) -> std::collections::BTreeMap<u32, Vec<u8>> {
+        let mut map = std::collections::BTreeMap::new();
+        for m in members {
+            let index = committee.index_of(&m.id).expect("member has an index");
+            map.insert(index, pq_kem_ek_from_seed(&m.kem_seed));
+        }
+        map
+    }
+
+    /// Run the full ML-KEM DKG exchange and return every member's key material.
     ///
     /// Only the DERIVED contributors contribute; every member (contributor or
     /// not) ingests every contribution and ends up with a share.
     fn run_dkg(committee: &EpochCommittee, members: &[TestMember]) -> Vec<EpochKeyMaterial> {
+        let keys = ek_map(committee, members);
         let mut dkgs: Vec<EpochDkg> = members
             .iter()
             .map(|m| EpochDkg::new(committee.clone(), m.id))
@@ -3458,7 +3437,7 @@ mod tests {
         for (i, m) in members.iter().enumerate() {
             // A non-contributor contributes nothing (it still receives the
             // contributors' evaluations and holds a share).
-            if let Ok(c) = dkgs[i].contribution(m.id, &m.secret, &m.enc_secret) {
+            if let Ok(c) = dkgs[i].contribution_pq(m.id, &m.secret, &keys) {
                 dkgs[i].set_own(c.clone());
                 contributions.push(c);
             }
@@ -3473,7 +3452,7 @@ mod tests {
         for i in 0..members.len() {
             for c in contributions.iter() {
                 dkgs[i]
-                    .ingest(c.clone(), &members[i].enc_secret)
+                    .ingest_pq(c.clone(), &members[i].kem_seed)
                     .unwrap_or_else(|e| panic!("member {i} must accept a contribution: {e}"));
             }
         }
@@ -3681,13 +3660,14 @@ mod tests {
         );
 
         // A tampered DKG contribution is refused (the VSS check fails).
+        let keys = ek_map(&committee, &members);
         let mut dkgs: Vec<EpochDkg> = members
             .iter()
             .map(|m| EpochDkg::new(committee.clone(), m.id))
             .collect();
         let mut contributions = Vec::new();
         for (i, m) in members.iter().enumerate() {
-            if let Ok(c) = dkgs[i].contribution(m.id, &m.secret, &m.enc_secret) {
+            if let Ok(c) = dkgs[i].contribution_pq(m.id, &m.secret, &keys) {
                 contributions.push(c);
             }
         }
@@ -3695,7 +3675,7 @@ mod tests {
         let mut tampered = contributions[1].clone();
         tampered.commitments[0] = materials[0].public_key; // a bogus commitment
         assert!(
-            dkgs[0].ingest(tampered, &members[0].enc_secret).is_err(),
+            dkgs[0].ingest_pq(tampered, &members[0].kem_seed).is_err(),
             "a contribution whose evaluation does not match its commitments is refused"
         );
 
@@ -3812,23 +3792,45 @@ mod tests {
         assert!(ann.has_quorum(2));
     }
 
-    /// THE ENCRYPTION KEY PAIR IS A REAL DIFFIE-HELLMAN PAIR.
+    /// THE COMMITTEE TAG BINDS THE ML-KEM TRANSPORT KEY.
     ///
-    /// The committee's encryption keys are derived from the validators'
-    /// PUBLIC Ed25519 keys, so a peer that knows only the validator set can
-    /// address a key-share package to any member. The conversion must be a
-    /// genuine birational map: both sides must agree on the shared secret.
+    /// The committee no longer derives a transport key from the public
+    /// validator id (the Edwards-to-Montgomery map is removed). Instead the
+    /// 32-byte `enc_pk` is `BLAKE3(MEV_KEM_TAG_DOMAIN || ek)`, and a key that
+    /// does not match the committee tag is refused before a share is
+    /// encapsulated. This pins both the binding and the fail-closed check.
     #[test]
-    fn the_derived_encryption_keys_agree_on_a_shared_secret() {
+    fn the_committee_tag_binds_the_ml_kem_transport_key() {
         let a = test_member();
         let b = test_member();
-        let sa = XStaticSecret::from(a.enc_secret);
-        let sb = XStaticSecret::from(b.enc_secret);
-        let ab = sa.diffie_hellman(&XPublicKey::from(b.enc_pk));
-        let ba = sb.diffie_hellman(&XPublicKey::from(a.enc_pk));
-        assert_eq!(ab.as_bytes(), ba.as_bytes());
-        // And it is NOT the trivial value: the two sides differ.
-        assert_ne!(ab.as_bytes(), &a.enc_secret[..]);
+        let ek_a = pq_kem_ek_from_seed(&a.kem_seed);
+        let ek_b = pq_kem_ek_from_seed(&b.kem_seed);
+        assert_eq!(ek_a.len(), PQ_KEM_EK_LEN);
+        assert_eq!(kem_member_tag(&ek_a), kem_member_tag(&ek_a.clone()));
+        assert_ne!(
+            kem_member_tag(&ek_a),
+            kem_member_tag(&ek_b),
+            "distinct transport keys must have distinct committee tags"
+        );
+        // A committee whose tag is bound to another key refuses to build a
+        // contribution with this key: the tag is the binding, not decoration.
+        let members = [a, b];
+        let committee = build_committee(1, &members);
+        let own_index = committee.index_of(&members[0].id).expect("member index");
+        let recipient_index = committee.index_of(&members[1].id).expect("member index");
+        if committee.is_contributor(own_index) {
+            let mut wrong_map = std::collections::BTreeMap::new();
+            // Bind the recipient slot to OUR key: the tag check must refuse it.
+            wrong_map.insert(recipient_index, ek_a);
+            let mut dkg = EpochDkg::new(committee, members[0].id);
+            let err = dkg
+                .contribution_pq(members[0].id, &members[0].secret, &wrong_map)
+                .expect_err("a key that does not match the committee tag must be refused");
+            assert!(
+                err.contains("committee tag"),
+                "the refusal names the tag binding: {err}"
+            );
+        }
     }
 
     /// The committee is order-independent: the same validator set always
@@ -3898,13 +3900,14 @@ mod tests {
     #[test]
     fn the_dkg_needs_every_contributor() {
         let (committee, members) = test_committee(21, 4);
+        let keys = ek_map(&committee, &members);
         let mut dkgs: Vec<EpochDkg> = members
             .iter()
             .map(|m| EpochDkg::new(committee.clone(), m.id))
             .collect();
         let mut contributions = Vec::new();
         for (i, m) in members.iter().enumerate() {
-            if let Ok(c) = dkgs[i].contribution(m.id, &m.secret, &m.enc_secret) {
+            if let Ok(c) = dkgs[i].contribution_pq(m.id, &m.secret, &keys) {
                 contributions.push(c);
             }
         }
@@ -3916,7 +3919,7 @@ mod tests {
         for (i, m) in members.iter().enumerate() {
             for c in contributions.iter().take(contributions.len() - 1) {
                 dkgs[i]
-                    .ingest(c.clone(), &m.enc_secret)
+                    .ingest_pq(c.clone(), &m.kem_seed)
                     .expect("a verified contribution is accepted");
             }
             assert!(
@@ -3930,7 +3933,7 @@ mod tests {
         let mut materials = Vec::new();
         for (i, m) in members.iter().enumerate() {
             dkgs[i]
-                .ingest(last.clone(), &m.enc_secret)
+                .ingest_pq(last.clone(), &m.kem_seed)
                 .expect("the last contribution is accepted");
             assert!(dkgs[i].can_finalize());
             materials.push(dkgs[i].finalize().expect("finalize"));
@@ -3956,14 +3959,11 @@ mod tests {
             "the committee has non-contributors"
         );
         let idx = non_contributors[0];
+        let keys = ek_map(&committee, &members);
         let mut dkg = EpochDkg::new(committee.clone(), members[idx].id);
         assert!(
-            dkg.contribution(
-                members[idx].id,
-                &members[idx].secret,
-                &members[idx].enc_secret
-            )
-            .is_err(),
+            dkg.contribution_pq(members[idx].id, &members[idx].secret, &keys)
+                .is_err(),
             "a non-contributor must not contribute"
         );
         // ... but it DOES end up with a share (and can unseal).

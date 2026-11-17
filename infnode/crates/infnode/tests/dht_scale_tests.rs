@@ -14,7 +14,6 @@
 //! * improvement before/after: `RoutingTable::prune_stale` (24 h horizon,
 //!   wired into the 60 s `dht_refresh`) with lookup parity on fixed fixtures.
 
-use ed25519_dalek::SigningKey;
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::dht;
 use infnode::keyring::{NodeKeys, PqKeys};
@@ -30,14 +29,10 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Deterministic node keys from a label (no OsRng in topology/keys).
-/// FULL-PQ: `NodeKeys` holds ed (frozen auth/TLS pin) + deterministic KEM
-/// seed (mailbox E2E, not routing); PQ identity is separate via `det_pq`
-/// (same blake3-label idiom, `PqKeys::from_seed` — existing helper).
+/// FULL-PQ: `NodeKeys` holds only the deterministic KEM seed (mailbox E2E,
+/// not routing); PQ identity is separate via `det_pq` (same blake3-label
+/// idiom, `PqKeys::from_seed` — existing helper).
 fn det_keys(label: &str) -> NodeKeys {
-    let ed_seed = blake3::hash(format!("{label}/ed").as_bytes());
-    let ed_bytes: [u8; 32] = *ed_seed.as_bytes();
-    let signing = SigningKey::from_bytes(&ed_bytes);
-    let verifying = signing.verifying_key();
     // Deterministic KEM seed (64 bytes via two blake3 domain hashes, no OsRng).
     let k1 = blake3::hash(format!("{label}/kem1").as_bytes());
     let k2 = blake3::hash(format!("{label}/kem2").as_bytes());
@@ -45,12 +40,7 @@ fn det_keys(label: &str) -> NodeKeys {
     kem_seed[..32].copy_from_slice(k1.as_bytes());
     kem_seed[32..].copy_from_slice(k2.as_bytes());
     let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
-    NodeKeys {
-        signing,
-        verifying,
-        kem_seed,
-        kem_ek,
-    }
+    NodeKeys { kem_seed, kem_ek }
 }
 
 /// Deterministic PQ identity from a label (same blake3-label idiom as
@@ -69,10 +59,10 @@ fn fixture_id(label: &str) -> [u8; 20] {
     id
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, _keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        ed_pub: hex::encode(keys.verifying.to_bytes()),
+        consensus_pub: None,
         pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
@@ -115,7 +105,6 @@ fn node_info(label: &str, last_seen: i64) -> dht::NodeInfo {
     dht::NodeInfo {
         id: fixture_id(label),
         endpoints: vec!["127.0.0.1:1".to_string()],
-        ed_hex: String::new(),
         pq_hex: String::new(),
         last_seen,
     }
@@ -171,11 +160,10 @@ async fn dht_ops_scale_table_n10_15_20() {
         .expect("node");
         // Populate routing via the REAL validated path (FULL-PQ: pq must
         // derive id via `node_info_valid`, same fail-closed gate).
-        for (i, (k, pq)) in keys.iter().zip(pqs.iter()).enumerate().skip(1) {
+        for (i, (_k, pq)) in keys.iter().zip(pqs.iter()).enumerate().skip(1) {
             node.ensure_dht_peer(&dht::NodeInfo {
                 id: pq.pq_id(),
                 endpoints: vec!["127.0.0.1:1".to_string()],
-                ed_hex: hex::encode(k.verifying.to_bytes()),
                 pq_hex: pq.pq_pub_hex(),
                 last_seen: dht::now_ms(),
             })
@@ -426,7 +414,6 @@ async fn routing_prune_stale_before_after() {
         table.insert(dht::NodeInfo {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
-            ed_hex: String::new(),
             pq_hex: String::new(),
             last_seen: now,
         });
@@ -440,7 +427,6 @@ async fn routing_prune_stale_before_after() {
         table.insert(dht::NodeInfo {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
-            ed_hex: String::new(),
             pq_hex: String::new(),
             last_seen: now - dht::ROUTING_STALE_AFTER_MS - 3_600_000,
         });

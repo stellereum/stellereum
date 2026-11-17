@@ -10,7 +10,6 @@
 //!   6. privilege inflation — a peer cannot widen its own ACL or budget.
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
@@ -45,7 +44,7 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>, allow_unknown: bool) ->
 
 fn peer_of(
     name: &str,
-    keys: &NodeKeys,
+    __keys: &NodeKeys,
     pq: &PqKeys,
     listen: &str,
     rate: u32,
@@ -53,7 +52,7 @@ fn peer_of(
 ) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        ed_pub: hex::encode(keys.verifying.to_bytes()),
+        consensus_pub: None,
         pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
@@ -291,7 +290,7 @@ async fn audit_oversized_messages_refused() {
     );
 
     // Frame envelope itself: plen beyond MAX_FRAME never decodes.
-    let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+    let sk = PqKeys::generate();
     let mut f = Frame {
         kind: 4,
         seq: 1,
@@ -301,10 +300,10 @@ async fn audit_oversized_messages_refused() {
         svc: 0,
         payload: b"tiny".to_vec(),
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = sk.sign(d.as_bytes()).to_bytes();
+    f.sig = sk.sign_digest(d.as_bytes());
     let mut wire = f.encode();
     wire[64..68].copy_from_slice(&((proto::MAX_FRAME + 1) as u32).to_le_bytes());
     assert!(
@@ -398,12 +397,7 @@ async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
         .filter(|f| f.kind == proto::kind::AUTH)
 }
 
-fn challenge_wire(
-    signing: &SigningKey,
-    src: [u8; NODEID_LEN],
-    payload_hex: &str,
-    ts: i64,
-) -> Vec<u8> {
+fn challenge_wire(pq: &PqKeys, src: [u8; NODEID_LEN], payload_hex: &str, ts: i64) -> Vec<u8> {
     let mut f = Frame {
         kind: proto::kind::CHALLENGE,
         seq: 1,
@@ -413,21 +407,19 @@ fn challenge_wire(
         svc: 0,
         payload: payload_hex.as_bytes().to_vec(),
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = signing.sign(d.as_bytes()).to_bytes();
+    f.sig = pq.sign_digest(d.as_bytes());
     f.encode()
 }
 
-fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
-    let eph = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = x25519_dalek::PublicKey::from(&eph);
+fn tofu_payload(pq: &PqKeys, nonce_hex: &str, at: i64) -> String {
     serde_json::json!({
         "nonce": nonce_hex,
         "at": at,
-        "eph": hex::encode(eph_pub.as_bytes()),
-        "ed": hex::encode(keys.verifying.to_bytes()),
+        "fresh": hex::encode(rand::random::<[u8; 32]>()),
+        "pq_pub": pq.pq_pub_hex(),
         "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
         "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
@@ -459,9 +451,9 @@ async fn audit_forged_auth_refused() {
     let now = proto::now_ms();
 
     // --- bad signature: valid fields, one flipped sig byte.
-    let ka = NodeKeys::generate();
+    let ka = PqKeys::generate();
     let good = tofu_payload(&ka, &"ab".repeat(16), now);
-    let mut bad_sig = challenge_wire(&ka.signing, ka.id(), &good, now);
+    let mut bad_sig = challenge_wire(&ka, ka.pq_id(), &good, now);
     let last = bad_sig.len() - 1;
     bad_sig[last] ^= 0xff;
     let c = raw_connect(listen).await;
@@ -471,9 +463,9 @@ async fn audit_forged_auth_refused() {
     );
 
     // --- wrong key: claims A's id, signs with B's... (different) key.
-    let kb = NodeKeys::generate();
+    let kb = PqKeys::generate();
     let payload_a = tofu_payload(&ka, &"cd".repeat(16), now);
-    let wrong_key = challenge_wire(&kb.signing, ka.id(), &payload_a, now);
+    let wrong_key = challenge_wire(&kb, ka.pq_id(), &payload_a, now);
     let c = raw_connect(listen).await;
     assert!(
         raw_handshake(&c, &wrong_key).await.is_none(),
@@ -481,10 +473,10 @@ async fn audit_forged_auth_refused() {
     );
 
     // --- stale timestamp (frame ts and payload at, both 700s old).
-    let kc = NodeKeys::generate();
+    let kc = PqKeys::generate();
     let stale = now - 700_000;
     let stale_payload = tofu_payload(&kc, &"ef".repeat(16), stale);
-    let stale_wire = challenge_wire(&kc.signing, kc.id(), &stale_payload, stale);
+    let stale_wire = challenge_wire(&kc, kc.pq_id(), &stale_payload, stale);
     let c = raw_connect(listen).await;
     assert!(
         raw_handshake(&c, &stale_wire).await.is_none(),
@@ -494,9 +486,9 @@ async fn audit_forged_auth_refused() {
     assert!(proto::ts_ok(now), "fresh ts inside window");
 
     // --- replayed nonce: identical bytes twice on fresh connections.
-    let kd = NodeKeys::generate();
+    let kd = PqKeys::generate();
     let payload = tofu_payload(&kd, &"12".repeat(16), proto::now_ms());
-    let wire = challenge_wire(&kd.signing, kd.id(), &payload, proto::now_ms());
+    let wire = challenge_wire(&kd, kd.pq_id(), &payload, proto::now_ms());
     let c1 = raw_connect(listen).await;
     assert!(
         raw_handshake(&c1, &wire).await.is_some(),
@@ -526,7 +518,7 @@ async fn audit_forged_auth_refused() {
     );
 
     // Tampered frames never verify (signature binds the payload).
-    let vk = ka.verifying;
+    let vk = ka.pq_pub();
     let mut f = Frame {
         kind: 4,
         seq: 9,
@@ -536,18 +528,18 @@ async fn audit_forged_auth_refused() {
         svc: 0,
         payload: b"original".to_vec(),
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = ka.signing.sign(d.as_bytes()).to_bytes();
+    f.sig = ka.sign_digest(d.as_bytes());
     assert!(f.verify(&vk));
     f.payload = b"tampered".to_vec();
     assert!(!f.verify(&vk), "tampered payload must not verify");
 
     // Server still accepts a fresh honest handshake afterwards.
-    let ke = NodeKeys::generate();
+    let ke = PqKeys::generate();
     let p = tofu_payload(&ke, &"34".repeat(16), proto::now_ms());
-    let w = challenge_wire(&ke.signing, ke.id(), &p, proto::now_ms());
+    let w = challenge_wire(&ke, ke.pq_id(), &p, proto::now_ms());
     let c = raw_connect(listen).await;
     assert!(
         raw_handshake(&c, &w).await.is_some(),
@@ -645,13 +637,12 @@ async fn audit_dht_poison_refused() {
 
     // Poisoned route record: node id bound to an attacker's key is skipped,
     // so a later lookup does not resolve to attacker endpoints.
-    let evil = NodeKeys::generate();
     let evil_pq = PqKeys::generate();
     let poison_id = "inf1:".to_string() + &hex::encode([0xabu8; NODEID_LEN]);
     let routes = serde_json::json!({
         poison_id.clone(): {
             "endpoints": ["127.0.0.1:9"],
-            "ed_pub": hex::encode(evil.verifying.to_bytes()),
+            "pq_pub": evil_pq.pq_pub_hex(),
         }
     });
     let p = serde_json::json!({ "routes": routes })
@@ -683,7 +674,7 @@ async fn audit_dht_poison_refused() {
         id[..4].copy_from_slice(&i.to_le_bytes());
         big.insert(
             format!("inf1:{}", hex::encode(id)),
-            serde_json::json!({ "endpoints": [], "ed_pub": "" }),
+            serde_json::json!({ "endpoints": [], "pq_pub": "" }),
         );
     }
     assert_eq!(big.len(), 600, "test must actually send 600 routes");
@@ -700,18 +691,15 @@ async fn audit_dht_poison_refused() {
     );
 
     // Pure-function record gate pins the rule without network (FULL-PQ:
-    // `pq` must derive `id`; `ed` is the frozen auth pin, NOT identity).
-    let honest = NodeKeys::generate();
+    // `pq` must derive `id`; there is no classical pin).
     let honest_pq = PqKeys::generate();
     assert!(infnode::dht::node_info_valid(
         &honest_pq.pq_id(),
-        &hex::encode(honest.verifying.to_bytes()),
         &honest_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
     assert!(!infnode::dht::node_info_valid(
         &honest_pq.pq_id(),
-        &hex::encode(evil.verifying.to_bytes()),
         &evil_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
@@ -826,7 +814,6 @@ async fn audit_pubsub_spam_contained() {
     b2.ensure_dht_peer(&infnode::dht::NodeInfo {
         id: pa.pq_id(),
         endpoints: vec![la.to_string()],
-        ed_hex: hex::encode(ka.verifying.to_bytes()),
         pq_hex: pa.pq_pub_hex(),
         last_seen: infnode::dht::now_ms(),
     })

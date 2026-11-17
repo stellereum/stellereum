@@ -206,10 +206,11 @@ pub(crate) fn parse_wallet_address(raw: &str) -> anyhow::Result<[u8; 32]> {
 
 /// Build the wallet signing key the `sign` commands use.
 ///
-/// * `ed25519` needs `--from-key`;
-/// * `falcon` needs `--falcon-key-file` (a stored key, preferred) or
-///   `--falcon-seed` (deterministic, dev/test reproducibility);
-/// * `hybrid` needs both halves.
+/// Falcon-512 is the ONLY scheme: `--falcon-key-file` (a stored key,
+/// preferred) or `--falcon-seed` (deterministic, dev/test reproducibility).
+/// The classical `ed25519` and `hybrid` schemes are REMOVED and refused by
+/// name; `--from-key` (an Ed25519 seed) is refused too, never silently
+/// ignored.
 pub(crate) fn resolve_wallet_signing_key(
     scheme: &str,
     from_key: Option<String>,
@@ -217,6 +218,12 @@ pub(crate) fn resolve_wallet_signing_key(
     falcon_seed: Option<String>,
 ) -> anyhow::Result<stellereum::wallet_signing::WalletSigningKey> {
     use stellereum::wallet_signing::WalletSigningKey;
+    if from_key.is_some() {
+        anyhow::bail!(
+            "--from-key (classical Ed25519 seed) is REMOVED: pass Falcon-512 material \
+             with --falcon-key-file or --falcon-seed"
+        );
+    }
     let load_falcon = || -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
         if let Some(path) = falcon_key_file.as_ref() {
             return stellereum::node_keys::load_falcon_key(path)
@@ -231,28 +238,14 @@ pub(crate) fn resolve_wallet_signing_key(
         )
     };
     match scheme {
-        "ed25519" => {
-            let raw = from_key
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("scheme 'ed25519' needs --from-key"))?;
-            Ok(WalletSigningKey::ed25519(parse_wallet_seed(
-                raw,
-                "private key",
-            )?))
-        }
         "falcon" => Ok(WalletSigningKey::Falcon {
             keypair: load_falcon()?,
         }),
-        "hybrid" => {
-            let raw = from_key
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("scheme 'hybrid' needs --from-key"))?;
-            Ok(WalletSigningKey::Hybrid {
-                ed_seed: parse_wallet_seed(raw, "private key")?,
-                falcon: load_falcon()?,
-            })
-        }
-        other => anyhow::bail!("unknown scheme '{other}': expected ed25519, falcon or hybrid"),
+        "ed25519" | "hybrid" => anyhow::bail!(
+            "scheme '{scheme}' is REMOVED: classical Ed25519/Hybrid signing no longer \
+             exists; only 'falcon' is accepted"
+        ),
+        other => anyhow::bail!("unknown scheme '{other}': expected 'falcon'"),
     }
 }
 
@@ -338,16 +331,21 @@ pub(crate) fn resolve_attest_keys(
     }
 
     let mut default_err: Option<String> = None;
-    if keys.is_empty() && keys_dir.join("identity.key").exists() {
-        match stellereum::node_keys::load_node_keys(keys_dir) {
-            Ok(node_keys) => {
-                let validator_id = node_keys.signing.verifying_key().to_bytes();
+    // FULL-PQ: the default attestation key is the consensus-only Ed25519
+    // `validator.key` (migrated once from the legacy identity.key). infnode
+    // node identity is PQ and carries no Ed signing key.
+    let has_consensus_key =
+        keys_dir.join("validator.key").exists() || keys_dir.join("identity.key").exists();
+    if keys.is_empty() && has_consensus_key {
+        match stellereum::node_keys::load_or_generate_consensus_key(keys_dir) {
+            Ok(consensus_key) => {
+                let validator_id = consensus_key.verifying_key().to_bytes();
                 let falcon_path = keys_dir.join("falcon.key");
                 let falcon_res = if falcon_path.exists() {
                     stellereum::node_keys::load_falcon_key(&falcon_path)
                         .map_err(|e| format!("falcon key at {}: {e}", falcon_path.display()))
                 } else {
-                    let seed = zeroize::Zeroizing::new(node_keys.signing.to_bytes());
+                    let seed = zeroize::Zeroizing::new(consensus_key.to_bytes());
                     Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed))
                 };
                 match falcon_res {

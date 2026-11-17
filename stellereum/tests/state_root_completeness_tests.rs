@@ -519,7 +519,10 @@ async fn staking_equivocation_dedup_pq_keys_and_vesting_move_the_root() {
         ledger.validator_pq_keys.insert(
             val,
             (
-                stellereum::post_quantum::PqScheme::Ed25519,
+                // FULL-PQ: Ed25519 (0x01) is removed; the fail-closed
+                // ML-DSA-44 tag is the non-Falcon value left to pin scheme
+                // separation.
+                stellereum::post_quantum::PqScheme::MlDsa44,
                 vec![0xC3u8; 32],
             ),
         );
@@ -531,12 +534,15 @@ async fn staking_equivocation_dedup_pq_keys_and_vesting_move_the_root() {
     );
 
     // ...and so must the SCHEME (the same key bytes mean different things
-    // under Ed25519 and under the hybrid scheme).
+    // under ML-DSA-44 and under Falcon-512).
     {
         let mut ledger = e.staking_write().await;
         ledger.validator_pq_keys.insert(
             val,
-            (stellereum::post_quantum::PqScheme::Hybrid, vec![0xC3u8; 32]),
+            (
+                stellereum::post_quantum::PqScheme::Falcon512,
+                vec![0xC3u8; 32],
+            ),
         );
     }
     let after_scheme = e.get_state_root().await;

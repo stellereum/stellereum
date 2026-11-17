@@ -374,14 +374,16 @@ pub(crate) enum WalletCommands {
     /// signature, hex). The wallet signs LOCALLY — the key never leaves this
     /// machine. Never confused with a transaction signature.
     Sign {
-        /// Ed25519 seed in hex (32 bytes). Required for `ed25519`/`hybrid`.
+        /// Classical Ed25519 seed in hex. REMOVED: this flag is refused with
+        /// a migration error (use `--falcon-key-file`/`--falcon-seed`).
         #[arg(long)]
         from_key: Option<String>,
-        /// Signature scheme: `ed25519` (default), `falcon` or `hybrid`.
-        #[arg(long, default_value = "ed25519")]
+        /// Signature scheme: `falcon` (the only accepted value; `ed25519`
+        /// and `hybrid` are REMOVED and refused by name).
+        #[arg(long, default_value = "falcon")]
         scheme: String,
-        /// Falcon-512 key file (as written by `keys init`). Required for
-        /// `falcon`/`hybrid` unless `--falcon-seed` is given.
+        /// Falcon-512 key file (as written by `keys init`). Required unless
+        /// `--falcon-seed` is given.
         #[arg(long)]
         falcon_key_file: Option<PathBuf>,
         /// Falcon-512 seed in hex (32 bytes, deterministic — for dev/test
@@ -422,14 +424,15 @@ pub(crate) enum WalletCommands {
     /// the canonical JSON of `{contract, method, args, value, nonce, chain_id}`
     /// is displayed AND signed, so the user sees exactly what they authorize.
     SignTypedData {
-        /// Ed25519 seed in hex (32 bytes). Required for `ed25519`/`hybrid`.
+        /// Classical Ed25519 seed in hex. REMOVED: this flag is refused with
+        /// a migration error (use `--falcon-key-file`/`--falcon-seed`).
         #[arg(long)]
         from_key: Option<String>,
-        /// Signature scheme: `ed25519` (default), `falcon` or `hybrid`.
-        #[arg(long, default_value = "ed25519")]
+        /// Signature scheme: `falcon` (the only accepted value; `ed25519`
+        /// and `hybrid` are REMOVED and refused by name).
+        #[arg(long, default_value = "falcon")]
         scheme: String,
-        /// Falcon-512 key file. Required for `falcon`/`hybrid` unless
-        /// `--falcon-seed` is given.
+        /// Falcon-512 key file. Required unless `--falcon-seed` is given.
         #[arg(long)]
         falcon_key_file: Option<PathBuf>,
         /// Falcon-512 seed in hex (32 bytes, deterministic).

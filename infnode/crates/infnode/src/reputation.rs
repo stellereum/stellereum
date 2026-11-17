@@ -1,12 +1,12 @@
-//! Per-peer (ed25519-identity) reputation for the QUIC accept path.
+//! Per-peer (PQ-identity) reputation for the QUIC accept path.
 //!
 //! F8 residual (`docs/PENTEST_NET_API.md` M2): the accept path already gates
 //! on source IP (pre-auth deadline, per-IP handshake buckets, failed-auth
 //! strikes with cooldown). IP gates have a shared-IP blast radius (loopback:
 //! one abusive peer bans `127.0.0.1` for everyone on a local cluster) and no
 //! memory of *which identity* misbehaved. This layer scores the peer
-//! **identity** instead — the node id (`[u8; 20]`, `blake3(ed25519_pub)[..20]`,
-//! 1:1 with the ed25519 key — "ed25519 identity, not just IP") — so a ban
+//! **identity** instead — the canonical PQ node id (`[u8; 20]`,
+//! `pq_id_from_pub(falcon_pk)`, "PQ identity, not just IP") — so a ban
 //! follows the offender across IPs and never touches well-behaved peers that
 //! happen to share an address.
 //!

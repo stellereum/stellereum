@@ -517,40 +517,43 @@ fn assert_owner_only_perms(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Default scheme for NEW wallet keys: Falcon-512 (PQ-first write).
-/// Legacy Ed25519 keys keep loading and signing (dual-read); nothing here
-/// changes the Ed25519 wire shape.
+/// Default scheme for NEW wallet keys: Falcon-512. It is the ONLY scheme a
+/// wallet key file may hold — the classical Ed25519/Hybrid variants were
+/// removed with the PQ excision and their files are refused on load.
 pub fn default_wallet_key_scheme() -> crate::post_quantum::PqScheme {
     crate::post_quantum::PqScheme::Falcon512
 }
 
-/// In-memory wallet key material: either a post-quantum Falcon-512 keypair
-/// (the default for new keys) or a legacy Ed25519 signing key.
+/// Why a classical wallet key file is refused, verbatim.
 ///
-/// The sign path dispatches on the LOADED key and refuses cross-scheme
-/// requests fail-closed ([`Self::sign_transfer_as`]); legacy Ed25519 flows
-/// keep their exact historical bytes and verification.
+/// Wallet key material is Falcon-only: a legacy Ed25519 (or Hybrid) key can
+/// never be loaded, signed with, or silently upgraded. The file owner must
+/// create a Falcon-512 key and move the funds, because a classical address
+/// cannot authorise a transaction on this chain.
+pub const CLASSICAL_WALLET_KEY_REFUSAL: &str = "refusing legacy classical wallet key: Ed25519/Hybrid wallet keys were REMOVED in the post-quantum migration and are never upgraded or accepted silently. Migrate by creating a new Falcon-512 wallet key (wallet::WalletKeyMaterial::from_seed) or importing a Falcon-512 key file, then move the funds from the old classical address (which can no longer sign on this chain).";
+
+/// In-memory wallet key material. Falcon-512 is the ONLY variant: the
+/// classical `Ed25519` and `Hybrid` variants were removed with the PQ
+/// excision, so there is no loadable key that can produce a classical
+/// signature.
+///
+/// The sign path dispatches on the loaded key and refuses cross-scheme
+/// requests fail-closed ([`Self::sign_transfer_as`]); a key file carrying a
+/// classical scheme is refused at load time ([`load_wallet_key`]).
 pub enum WalletKeyMaterial {
     Falcon {
         keypair: Box<crate::post_quantum::FalconKeypair>,
-    },
-    Ed25519 {
-        signing_key: Box<SigningKey>,
     },
 }
 
 impl Clone for WalletKeyMaterial {
     fn clone(&self) -> Self {
-        match self {
-            Self::Falcon { keypair } => Self::Falcon {
-                keypair: Box::new(
-                    crate::post_quantum::FalconKeypair::from_bytes(&keypair.to_bytes())
-                        .expect("Falcon keypair round-trips through its byte encoding"),
-                ),
-            },
-            Self::Ed25519 { signing_key } => Self::Ed25519 {
-                signing_key: Box::new(SigningKey::from_bytes(&signing_key.to_bytes())),
-            },
+        let Self::Falcon { keypair } = self;
+        Self::Falcon {
+            keypair: Box::new(
+                crate::post_quantum::FalconKeypair::from_bytes(&keypair.to_bytes())
+                    .expect("Falcon keypair round-trips through its byte encoding"),
+            ),
         }
     }
 }
@@ -575,22 +578,18 @@ struct WalletKeyFileV1 {
 }
 
 /// Save wallet key material, creating parent directories. The file is
-/// owner-only (0600) on unix.
+/// owner-only (0600) on unix. Only Falcon-512 material can be saved (the
+/// classical variants are gone from [`WalletKeyMaterial`]).
 pub fn save_wallet_key(path: &Path, key: &WalletKeyMaterial) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
         }
     }
-    let file = match key {
-        WalletKeyMaterial::Falcon { keypair } => WalletKeyFileV1 {
-            scheme: "falcon512".to_string(),
-            key_hex: hex::encode(keypair.to_bytes()),
-        },
-        WalletKeyMaterial::Ed25519 { signing_key } => WalletKeyFileV1 {
-            scheme: "ed25519".to_string(),
-            key_hex: hex::encode(signing_key.to_bytes()),
-        },
+    let WalletKeyMaterial::Falcon { keypair } = key;
+    let file = WalletKeyFileV1 {
+        scheme: "falcon512".to_string(),
+        key_hex: hex::encode(keypair.to_bytes()),
     };
     let json =
         serde_json::to_string_pretty(&file).map_err(|e| format!("Json serialize error: {e}"))?;
@@ -604,11 +603,16 @@ pub fn save_wallet_key(path: &Path, key: &WalletKeyMaterial) -> Result<(), Strin
     Ok(())
 }
 
-/// Load wallet key material with dual-read auto-detect (PQ preferred):
-/// tagged JSON first, then schemeless raw/hex with Falcon tried before
-/// Ed25519. Unknown schemes, truncated blobs and empty files are refused
-/// fail-closed (never guessed, never downgraded). Group/world-readable
-/// files are refused on unix.
+/// Load wallet key material. The on-disk format is a tagged JSON file
+/// (`{"scheme":"falcon512","key_hex":"..."}`); schemeless raw/hex Falcon
+/// blobs are still accepted for backward compatibility.
+///
+/// FAIL-CLOSED (FULL-PQ): a file carrying the removed classical Ed25519/Hybrid
+/// scheme — tagged, or a bare/hex 32-byte seed — is REFUSED with
+/// [`CLASSICAL_WALLET_KEY_REFUSAL`]. It is never auto-detected, never upgraded
+/// to Falcon and never accepted. Unknown schemes, truncated blobs and empty
+/// files are refused the same way (never guessed). Group/world-readable files
+/// are refused on unix.
 pub fn load_wallet_key(path: &Path) -> Result<WalletKeyMaterial, String> {
     assert_owner_only_perms(path)?;
     let raw = fs::read(path).map_err(|e| format!("Failed to read key file: {e}"))?;
@@ -625,30 +629,19 @@ pub fn load_wallet_key(path: &Path) -> Result<WalletKeyMaterial, String> {
                         keypair: Box::new(keypair),
                     })
                     .ok_or_else(|| {
-                        "corrupt Falcon-512 key blob: refusing to downgrade to Ed25519".to_string()
+                        "corrupt Falcon-512 key blob: refusing to guess or downgrade".to_string()
                     })
             }
-            "ed25519" | "ed" => {
-                let bytes = hex::decode(file.key_hex.trim())
-                    .map_err(|e| format!("Invalid Ed25519 key hex: {e}"))?;
-                if bytes.len() != 32 {
-                    return Err("corrupt Ed25519 key blob: expected 32 bytes".to_string());
-                }
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(&bytes);
-                Ok(WalletKeyMaterial::Ed25519 {
-                    signing_key: Box::new(SigningKey::from_bytes(&seed)),
-                })
-            }
+            // REMOVED classical schemes: refuse by name, never upgrade.
+            "ed25519" | "ed" | "hybrid" => Err(CLASSICAL_WALLET_KEY_REFUSAL.to_string()),
             other => Err(format!(
                 "unknown wallet key scheme '{other}': refusing to guess"
             )),
         };
     }
     // Schemeless fallback: hex text decodes to a candidate, otherwise the
-    // raw bytes are the candidate. Falcon is tried BEFORE Ed25519 (PQ
-    // preferred); a truncated Falcon blob (wrong length for both shapes)
-    // is refused, never downgraded.
+    // raw bytes are the candidate. Falcon is the ONLY accepted shape; a bare
+    // 32-byte seed is a REMOVED classical key and is refused loudly.
     let trimmed = String::from_utf8_lossy(&raw);
     let trimmed = trimmed.trim();
     let hex_candidate: Option<Vec<u8>> =
@@ -669,23 +662,15 @@ pub fn load_wallet_key(path: &Path) -> Result<WalletKeyMaterial, String> {
             keypair: Box::new(keypair),
         });
     }
-    if let Some(bytes) = hex_candidate {
-        if bytes.len() == 32 {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&bytes);
-            return Ok(WalletKeyMaterial::Ed25519 {
-                signing_key: Box::new(SigningKey::from_bytes(&seed)),
-            });
-        }
+    // A 32-byte seed (raw or hex) is exactly the removed classical key shape.
+    if raw.len() == 32
+        || hex_candidate
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() == 32)
+    {
+        return Err(CLASSICAL_WALLET_KEY_REFUSAL.to_string());
     }
-    if raw.len() == 32 {
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&raw);
-        return Ok(WalletKeyMaterial::Ed25519 {
-            signing_key: Box::new(SigningKey::from_bytes(&seed)),
-        });
-    }
-    Err("unrecognized key file: refusing to guess (expected tagged JSON, hex seed, raw 32-byte seed, or Falcon blob)".to_string())
+    Err("unrecognized key file: refusing to guess (expected tagged JSON, hex Falcon blob, or raw Falcon blob)".to_string())
 }
 
 fn is_hex_text(s: &str) -> bool {
@@ -693,7 +678,7 @@ fn is_hex_text(s: &str) -> bool {
 }
 
 impl WalletKeyMaterial {
-    /// New PQ-first key, deterministically derived from a 32-byte seed
+    /// New Falcon-512 key, deterministically derived from a 32-byte seed
     /// (same raw derivation the faucet uses, so test seeds reproduce the
     /// same address; production callers generate the seed with OS entropy).
     pub fn from_seed(seed: &[u8; 32]) -> Self {
@@ -702,43 +687,35 @@ impl WalletKeyMaterial {
         }
     }
 
-    /// Legacy Ed25519 key from a 32-byte seed. The address matches the
-    /// historical [`WalletAccount::from_seed`] derivation byte-for-byte.
-    pub fn ed25519_from_seed(seed: &[u8; 32]) -> Self {
-        Self::Ed25519 {
-            signing_key: Box::new(SigningKey::from_bytes(seed)),
-        }
+    /// The Falcon-512 keypair behind this material.
+    pub fn keypair(&self) -> &crate::post_quantum::FalconKeypair {
+        let Self::Falcon { keypair } = self;
+        keypair
     }
 
-    /// Which scheme this key signs with.
+    /// Which scheme this key signs with (always Falcon-512).
     pub fn scheme(&self) -> crate::post_quantum::PqScheme {
-        match self {
-            Self::Falcon { .. } => crate::post_quantum::PqScheme::Falcon512,
-            Self::Ed25519 { .. } => crate::post_quantum::PqScheme::Ed25519,
-        }
+        let Self::Falcon { .. } = self;
+        crate::post_quantum::PqScheme::Falcon512
     }
 
-    /// Whether this key provides quantum resistance.
+    /// Whether this key provides quantum resistance (always true: Falcon-only).
     pub fn is_post_quantum(&self) -> bool {
         self.scheme().is_post_quantum()
     }
 
-    /// The 32-byte account address: zero-salt Falcon derivation for PQ keys,
-    /// the verifying key for legacy Ed25519 keys.
+    /// The 32-byte account address: zero-salt Falcon derivation.
     pub fn address(&self) -> [u8; 32] {
-        match self {
-            Self::Falcon { keypair } => crate::post_quantum::derive_pq_address(
-                crate::post_quantum::PqScheme::Falcon512,
-                &keypair.public_key,
-                &crate::post_quantum::DEFAULT_SALT,
-            ),
-            Self::Ed25519 { signing_key } => signing_key.verifying_key().to_bytes(),
-        }
+        let Self::Falcon { keypair } = self;
+        crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &keypair.public_key,
+            &crate::post_quantum::DEFAULT_SALT,
+        )
     }
 
     /// Sign an unbound transfer with this key's own scheme: the PQ faucet
-    /// shape (always-explicit PQ1 envelope, no chain binding) for Falcon
-    /// keys, the exact legacy ed25519 bytes for Ed25519 keys.
+    /// shape (always-explicit PQ1 envelope, no chain binding).
     #[allow(clippy::too_many_arguments)]
     // GATE: transfer signing needs the full tx fields; callers pass them explicitly.
     pub fn sign_transfer(
@@ -750,50 +727,38 @@ impl WalletKeyMaterial {
         source_shard: u32,
         target_shard: u32,
     ) -> Transaction {
-        match self {
-            Self::Falcon { keypair } => {
-                let probe = Transaction::new_pq_explicit(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
-                    to,
-                    amount,
-                    gas_limit,
-                    nonce,
-                    source_shard,
-                    target_shard,
-                    Vec::new(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                );
-                let sig = keypair.sign(&probe.signing_message());
-                assert!(
-                    sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
-                    "Falcon-512 signing failed closed"
-                );
-                Transaction::new_pq_explicit(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    sig,
-                    to,
-                    amount,
-                    gas_limit,
-                    nonce,
-                    source_shard,
-                    target_shard,
-                    Vec::new(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                )
-            }
-            Self::Ed25519 { signing_key } => Transaction::sign(
-                signing_key,
-                to,
-                amount,
-                gas_limit,
-                nonce,
-                source_shard,
-                target_shard,
-            ),
-        }
+        let Self::Falcon { keypair } = self;
+        let probe = Transaction::new_pq_explicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            Vec::new(),
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        let sig = keypair.sign(&probe.signing_message());
+        assert!(
+            sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
+            "Falcon-512 signing failed closed"
+        );
+        Transaction::new_pq_explicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            sig,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            Vec::new(),
+            &crate::post_quantum::DEFAULT_SALT,
+        )
     }
 
     /// Sign a chain-bound transfer with this key's own scheme (anti
@@ -810,53 +775,40 @@ impl WalletKeyMaterial {
         target_shard: u32,
         chain_id: u64,
     ) -> Transaction {
-        match self {
-            Self::Falcon { keypair } => {
-                let probe = Transaction::new_pq_explicit_with_chain(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
-                    to,
-                    amount,
-                    gas_limit,
-                    nonce,
-                    source_shard,
-                    target_shard,
-                    Vec::new(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                    chain_id,
-                );
-                let sig = keypair.sign(&probe.signing_message());
-                assert!(
-                    sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
-                    "Falcon-512 signing failed closed"
-                );
-                Transaction::new_pq_explicit_with_chain(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    sig,
-                    to,
-                    amount,
-                    gas_limit,
-                    nonce,
-                    source_shard,
-                    target_shard,
-                    Vec::new(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                    chain_id,
-                )
-            }
-            Self::Ed25519 { signing_key } => Transaction::sign_with_chain_id(
-                signing_key,
-                to,
-                amount,
-                gas_limit,
-                nonce,
-                source_shard,
-                target_shard,
-                chain_id,
-            ),
-        }
+        let Self::Falcon { keypair } = self;
+        let probe = Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            Vec::new(),
+            &crate::post_quantum::DEFAULT_SALT,
+            chain_id,
+        );
+        let sig = keypair.sign(&probe.signing_message());
+        assert!(
+            sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
+            "Falcon-512 signing failed closed"
+        );
+        Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            sig,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            Vec::new(),
+            &crate::post_quantum::DEFAULT_SALT,
+            chain_id,
+        )
     }
 
     /// Sign a syscall-carrying transfer (self-send, zero native amount) with
@@ -867,55 +819,39 @@ impl WalletKeyMaterial {
         gas_limit: u64,
         nonce: u64,
     ) -> Transaction {
-        match self {
-            Self::Falcon { keypair } => {
-                let from = self.address();
-                let probe = Transaction::new_pq_explicit(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload.clone(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                );
-                let sig = keypair.sign(&probe.signing_message());
-                assert!(
-                    sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
-                    "Falcon-512 signing failed closed"
-                );
-                Transaction::new_pq_explicit(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    sig,
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload,
-                    &crate::post_quantum::DEFAULT_SALT,
-                )
-            }
-            Self::Ed25519 { signing_key } => {
-                let from = signing_key.verifying_key().to_bytes();
-                Transaction::sign_with_payload(
-                    signing_key,
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload,
-                )
-            }
-        }
+        let Self::Falcon { keypair } = self;
+        let from = self.address();
+        let probe = Transaction::new_pq_explicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            from,
+            0,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload.clone(),
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        let sig = keypair.sign(&probe.signing_message());
+        assert!(
+            sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
+            "Falcon-512 signing failed closed"
+        );
+        Transaction::new_pq_explicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            sig,
+            from,
+            0,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload,
+            &crate::post_quantum::DEFAULT_SALT,
+        )
     }
 
     /// Sign a chain-bound syscall-carrying transfer with this key's own scheme.
@@ -926,58 +862,41 @@ impl WalletKeyMaterial {
         nonce: u64,
         chain_id: u64,
     ) -> Transaction {
-        match self {
-            Self::Falcon { keypair } => {
-                let from = self.address();
-                let probe = Transaction::new_pq_explicit_with_chain(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload.clone(),
-                    &crate::post_quantum::DEFAULT_SALT,
-                    chain_id,
-                );
-                let sig = keypair.sign(&probe.signing_message());
-                assert!(
-                    sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
-                    "Falcon-512 signing failed closed"
-                );
-                Transaction::new_pq_explicit_with_chain(
-                    crate::post_quantum::PqScheme::Falcon512,
-                    keypair.public_key.clone(),
-                    sig,
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload,
-                    &crate::post_quantum::DEFAULT_SALT,
-                    chain_id,
-                )
-            }
-            Self::Ed25519 { signing_key } => {
-                let from = signing_key.verifying_key().to_bytes();
-                Transaction::sign_with_payload_and_chain_id(
-                    signing_key,
-                    from,
-                    0,
-                    gas_limit,
-                    nonce,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    crate::sharding::MASTERCHAIN_SHARD,
-                    payload,
-                    chain_id,
-                )
-            }
-        }
+        let Self::Falcon { keypair } = self;
+        let from = self.address();
+        let probe = Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            from,
+            0,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload.clone(),
+            &crate::post_quantum::DEFAULT_SALT,
+            chain_id,
+        );
+        let sig = keypair.sign(&probe.signing_message());
+        assert!(
+            sig.len() == crate::post_quantum::FALCON512_SIG_LEN,
+            "Falcon-512 signing failed closed"
+        );
+        Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            keypair.public_key.clone(),
+            sig,
+            from,
+            0,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload,
+            &crate::post_quantum::DEFAULT_SALT,
+            chain_id,
+        )
     }
 
     /// Scheme-pinned transfer: signs only when `scheme` is this key's own
@@ -1017,10 +936,9 @@ impl WalletKeyMaterial {
     /// the master's signed message, domain-separated with
     /// `STELL_SESSKEY_V1`).
     ///
-    /// Fail-closed: an Ed25519 wallet key refuses (`Err`) instead of minting
-    /// an Ed grant — Ed delegations stay refused chain-wide, so emitting one
-    /// would only produce a transaction nobody can verify. A malformed
-    /// session public key is refused the same way.
+    /// Fail-closed: there is no non-Falcon wallet key left, so this is a
+    /// plain destructure, never a cross-scheme signature. A malformed session
+    /// public key is refused below.
     pub fn delegate_bot_session_falcon512(
         &self,
         session_pubkey: &[u8],
@@ -1030,13 +948,7 @@ impl WalletKeyMaterial {
         max_value_per_tx: u64,
         chain_id: u64,
     ) -> Result<SessionKeyAuthorization, String> {
-        let Self::Falcon { keypair } = self else {
-            return Err(format!(
-                "wallet key scheme mismatch: session delegation requires a Falcon-512 master key, \
-                 this wallet holds {} (Ed25519 grants are refused chain-wide)",
-                self.scheme()
-            ));
-        };
+        let Self::Falcon { keypair } = self;
         if session_pubkey.len() != crate::post_quantum::FALCON512_PUBKEY_LEN {
             return Err(format!(
                 "invalid Falcon-512 session public key: expected {} bytes, got {}",
@@ -1386,35 +1298,25 @@ impl WalletAccount {
         )
     }
 
-    /// Delegate session key for AI bots with gas spending cap and time validity.
-    ///
-    /// `scope` is the operation bitmask (`zkml::SCOPE_*`), `max_value_per_tx`
-    /// caps the native amount of any single transaction, and `chain_id` binds
-    /// the grant to the chain it was minted for (part of the master's signed
-    /// message, domain-separated with `STELL_SESSKEY_V1`).
+    /// REMOVED classical session delegation: `WalletAccount` holds an Ed25519
+    /// key, and Ed25519 session grants no longer exist chain-wide. This path is
+    /// kept only to fail closed with a migration error — it NEVER mints a
+    /// session grant. Use
+    /// [`WalletKeyMaterial::delegate_bot_session_falcon512`] with a Falcon-512
+    /// wallet key instead.
     pub fn delegate_bot_session(
         &self,
-        session_pub: [u8; 32],
-        max_gas: u64,
-        duration_secs: u64,
-        scope: u64,
-        max_value_per_tx: u64,
-        chain_id: u64,
-    ) -> SessionKeyAuthorization {
-        let valid_until = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + duration_secs;
-
-        SessionKeyAuthorization::sign_delegation(
-            &self.signing_key,
-            session_pub,
-            valid_until,
-            max_gas,
-            scope,
-            max_value_per_tx,
-            chain_id,
+        _session_pub: [u8; 32],
+        _max_gas: u64,
+        _duration_secs: u64,
+        _scope: u64,
+        _max_value_per_tx: u64,
+        _chain_id: u64,
+    ) -> Result<SessionKeyAuthorization, String> {
+        Err(
+            "Ed25519 session delegation is REMOVED: use a Falcon-512 wallet key and \
+             WalletKeyMaterial::delegate_bot_session_falcon512"
+                .to_string(),
         )
     }
 
@@ -1441,22 +1343,16 @@ impl WalletAccount {
             return true;
         }
 
-        // 2. Pinned 49-byte leaf with wallet's native Ed25519 public key hash
-        let ed_pk_hash = blake3::hash(&self.address);
-        let mut ed_pq_bytes = Vec::with_capacity(crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
-        ed_pq_bytes.extend_from_slice(&expected_bytes);
-        ed_pq_bytes.push(crate::post_quantum::PqScheme::Ed25519.id());
-        ed_pq_bytes.extend_from_slice(ed_pk_hash.as_bytes());
-
-        if PatriciaTrie::verify_merkle_proof(state_root, &self.address, &ed_pq_bytes, merkle_proof)
-        {
-            return true;
-        }
-
-        // 3. Pinned 49-byte leaf with public key registered in global implicit registry
+        // 2. Pinned 49-byte leaf with the public key registered in the global
+        //    implicit PQ registry. CLASSICAL (0x01/0x04) pinned leaves are NOT
+        //    accepted: those schemes were removed and their bytes must not
+        //    verify here either (the registry only carries live PQ schemes).
         if let Some((scheme, pk)) =
             crate::sharding::global_implicit_key_registry().lookup(&self.address)
         {
+            if scheme.is_disabled() {
+                return false;
+            }
             let pk_hash = blake3::hash(&pk);
             let mut reg_pq_bytes = Vec::with_capacity(crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
             reg_pq_bytes.extend_from_slice(&expected_bytes);
@@ -1471,21 +1367,6 @@ impl WalletAccount {
             ) {
                 return true;
             }
-        }
-
-        // 4. Pinned 49-byte leaf where pubkey_hash is direct address bytes
-        let mut direct_pq_bytes = Vec::with_capacity(crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
-        direct_pq_bytes.extend_from_slice(&expected_bytes);
-        direct_pq_bytes.push(crate::post_quantum::PqScheme::Ed25519.id());
-        direct_pq_bytes.extend_from_slice(&self.address);
-
-        if PatriciaTrie::verify_merkle_proof(
-            state_root,
-            &self.address,
-            &direct_pq_bytes,
-            merkle_proof,
-        ) {
-            return true;
         }
 
         false
@@ -1657,21 +1538,21 @@ mod tests {
         assert!(!wallet.verify_spv_balance(9_999, 1, &root_unpinned, &proof_unpinned));
         assert!(!wallet.verify_spv_balance_pq(9_999, 1, &root_unpinned, &proof_unpinned));
 
-        // 2. Pinned 49-byte leaf (Ed25519 scheme with blake3 pubkey hash)
+        // 2. INVERTED (FULL-PQ): a pre-excision PINNED leaf carrying the
+        //    REMOVED Ed25519 scheme id (0x01) must never verify again. The
+        //    old assertion that this leaf verified is now a fail-closed pin.
         let pk_hash = blake3::hash(&address);
-        let pinned_leaf =
-            AccountLeaf::new_pinned(15_000, 4, PqScheme::Ed25519.id(), *pk_hash.as_bytes())
-                .encode();
-        assert_eq!(pinned_leaf.len(), 49);
+        let legacy_ed_pinned =
+            AccountLeaf::new_pinned(15_000, 4, 0x01, *pk_hash.as_bytes()).encode();
+        assert_eq!(legacy_ed_pinned.len(), 49);
 
         let mut trie_pinned = PatriciaTrie::new();
-        trie_pinned.insert(&address, &pinned_leaf);
+        trie_pinned.insert(&address, &legacy_ed_pinned);
         let root_pinned = trie_pinned.root_hash();
         let proof_pinned = trie_pinned.generate_merkle_proof(&address).expect("proof");
 
-        // Both methods verify pinned leaf seamlessly
-        assert!(wallet.verify_spv_balance(15_000, 4, &root_pinned, &proof_pinned));
-        assert!(wallet.verify_spv_balance_pq(15_000, 4, &root_pinned, &proof_pinned));
+        assert!(!wallet.verify_spv_balance(15_000, 4, &root_pinned, &proof_pinned));
+        assert!(!wallet.verify_spv_balance_pq(15_000, 4, &root_pinned, &proof_pinned));
 
         // 3. Pinned 49-byte leaf via implicit registry for a PQ-addressed wallet
         let falcon_pk = Transaction::sample_falcon512_pubkey(0x88);
@@ -1803,8 +1684,9 @@ mod tests {
 
     /// Falcon session delegation: the PQ-wallet builder mints a live
     /// Falcon-master/Falcon-session grant (verifies, and authorizes a real
-    /// Falcon-signed session transaction); the Ed wallet key refuses
-    /// fail-closed instead of minting a dead Ed grant.
+    /// Falcon-signed session transaction). A classical master cannot even be
+    /// loaded any more; the key-file loader refuses it with the migration
+    /// message instead of minting a dead Ed grant.
     #[test]
     fn falcon_session_delegation_builder() {
         let master = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
@@ -1849,20 +1731,30 @@ mod tests {
         assert!(tx.is_session_keyed());
         assert!(tx.verify_signature());
 
-        // Ed wallet key refuses instead of minting a dead grant.
-        let ed = WalletKeyMaterial::ed25519_from_seed(&[0x53u8; 32]);
-        assert!(
-            ed.delegate_bot_session_falcon512(
-                session_fk.public_key(),
-                50_000,
-                3600,
-                crate::zkml::SCOPE_TRANSFER,
-                1_000,
-                TEST_CHAIN_ID,
-            )
-            .is_err(),
-            "Ed master must refuse: Ed grants are refused chain-wide"
-        );
+        // A classical master cannot be loaded: the Ed25519 variant is gone and
+        // the loader refuses such a file loudly (never an auto-upgrade).
+        let dir =
+            std::env::temp_dir().join(format!("stell-wallet-legacy-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ed.key");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"scheme":"ed25519","key_hex":"{}"}}"#,
+                hex::encode([0x53u8; 32])
+            ),
+        )
+        .expect("write legacy key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod legacy key file");
+        }
+        let err = load_wallet_key(&path).expect_err("a classical master key file must be refused");
+        assert!(err.contains("REMOVED"), "{err}");
+        assert!(err.contains("Falcon-512"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
         // Malformed session pubkey refuses.
         assert!(
             master

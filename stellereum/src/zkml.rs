@@ -14,7 +14,6 @@
 //! actually checks, and [`zkml_capabilities`] for the machine-readable
 //! statement of it (served over RPC as `stell_zkmlCapabilities`).
 
-use ed25519_dalek::{Signer, SigningKey};
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,7 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::post_quantum::{
     derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, DEFAULT_SALT,
-    FALCON512_PUBKEY_LEN, HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN,
 };
 
 // ===========================================================================
@@ -172,33 +170,6 @@ pub fn sign_falcon512(fk: &FalconKeypair, message: &[u8]) -> Vec<u8> {
     fk.sign(message)
 }
 
-/// Helper to construct a Hybrid public key from Ed25519 verifying key and Falcon-512 public key.
-pub fn make_hybrid_pubkey(ed_pk: &[u8; 32], falcon_pk: &[u8]) -> Vec<u8> {
-    assert_eq!(
-        falcon_pk.len(),
-        FALCON512_PUBKEY_LEN,
-        "Falcon-512 public key must be {} bytes",
-        FALCON512_PUBKEY_LEN
-    );
-    let mut pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-    pk.extend_from_slice(ed_pk);
-    pk.extend_from_slice(falcon_pk);
-    pk
-}
-
-/// Hybrid signature combining Ed25519 and Falcon-512 signatures.
-///
-/// Both halves are real: the Ed25519 half from `ed_sk`, the Falcon-512 half
-/// from `fk`. Verification (`verify_pq_signature(Hybrid, ..)`) requires both to
-/// be genuine.
-pub fn sign_hybrid(ed_sk: &SigningKey, fk: &FalconKeypair, message: &[u8]) -> Vec<u8> {
-    let mut sig = Vec::with_capacity(HYBRID_SIG_LEN);
-    let ed_sig = ed_sk.sign(message);
-    sig.extend_from_slice(&ed_sig.to_bytes());
-    sig.extend_from_slice(&fk.sign(message));
-    sig
-}
-
 /// Domain separator for session-key delegation grants (protocol v1). Every
 /// grant signature covers `SESSION_KEY_DOMAIN || chain_id || ...`, so a grant
 /// is unambiguous about both the protocol version and the chain it was made
@@ -298,7 +269,9 @@ pub const SCOPE_ALL: u64 = u64::MAX;
 /// persisted blocks). The delegation therefore rides INSIDE the transaction's
 /// existing `signature: Vec<u8>` as an envelope; this struct itself is only
 /// ever serialized inside that envelope, which no pre-envelope block contains.
-/// Existing Ed25519 grants encode byte-identically to legacy formats.
+/// FULL-PQ: grants are Falcon-512 only. A deserialized legacy grant that
+/// omitted the scheme field is mapped to the disabled ML-DSA-44 tag and
+/// refused by every verifier (it is never silently reinterpreted).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionKeyAuthorization {
     pub master_address: [u8; 32],
@@ -316,17 +289,19 @@ pub struct SessionKeyAuthorization {
     pub max_value_per_tx: u64,
     /// Chain this grant was minted for, bound into the master's signature.
     pub chain_id: u64,
-    /// Ed25519 signature from master_address over the domain-separated grant
-    /// message (see [`SessionKeyAuthorization::grant_message`]).
+    /// Falcon-512 signature from the master key over the domain-separated
+    /// grant message (see [`SessionKeyAuthorization::grant_message`]).
     pub master_signature: Vec<u8>,
 
-    /// Cryptographic scheme of the master (delegating) key: Ed25519, Falcon-512, or Hybrid.
+    /// Cryptographic scheme of the master (delegating) key: Falcon-512 (or
+    /// ML-DSA-44, which is refused fail-closed for lack of a verifier).
     pub master_scheme: PqScheme,
-    /// Cryptographic scheme of the session key: Ed25519, Falcon-512, or Hybrid.
+    /// Cryptographic scheme of the session key: Falcon-512 (or ML-DSA-44,
+    /// refused fail-closed).
     pub session_scheme: PqScheme,
-    /// Full master public key bytes when master is post-quantum or hybrid (None for Ed25519).
+    /// Full master public key bytes (always present for a live grant).
     pub master_pubkey: Option<Vec<u8>>,
-    /// Full session public key bytes when session key is post-quantum or hybrid (None for Ed25519).
+    /// Full session public key bytes (always present for a live grant).
     pub session_pubkey_bytes: Option<Vec<u8>>,
 }
 
@@ -368,18 +343,6 @@ impl Serialize for SessionKeyAuthorization {
                 session_pubkey_bytes: &self.session_pubkey_bytes,
             };
             hr.serialize(serializer)
-        } else if self.is_pure_ed25519() {
-            let mut state = serializer.serialize_struct("SessionKeyAuthorization", 9)?;
-            state.serialize_field("master_address", &self.master_address)?;
-            state.serialize_field("session_pubkey", &self.session_pubkey)?;
-            state.serialize_field("valid_until", &self.valid_until)?;
-            state.serialize_field("max_gas_spend", &self.max_gas_spend)?;
-            state.serialize_field("gas_spent", &self.gas_spent)?;
-            state.serialize_field("scope", &self.scope)?;
-            state.serialize_field("max_value_per_tx", &self.max_value_per_tx)?;
-            state.serialize_field("chain_id", &self.chain_id)?;
-            state.serialize_field("master_signature", &self.master_signature)?;
-            state.end()
         } else {
             let mut state = serializer.serialize_struct("SessionKeyAuthorization", 13)?;
             state.serialize_field("master_address", &self.master_address)?;
@@ -428,8 +391,12 @@ impl<'de> Deserialize<'de> for SessionKeyAuthorization {
                 #[serde(default)]
                 session_pubkey_bytes: Option<Vec<u8>>,
             }
+            /// FULL-PQ: a human-readable grant that omits the scheme field was
+            /// a legacy classical (Ed25519) grant. Default to the disabled
+            /// ML-DSA-44 tag so it is refused by every verifier instead of
+            /// being reinterpreted as a live Falcon-512 grant.
             fn default_scheme() -> PqScheme {
-                PqScheme::Ed25519
+                PqScheme::MlDsa44
             }
             let hr = HumanReadable::deserialize(deserializer)?;
             Ok(SessionKeyAuthorization {
@@ -494,7 +461,12 @@ impl<'de> Deserialize<'de> for SessionKeyAuthorization {
                     };
                     let (master_scheme, session_scheme, master_pubkey, session_pubkey_bytes) =
                         match master_scheme_id {
-                            None => (PqScheme::Ed25519, PqScheme::Ed25519, None, None),
+                            // FULL-PQ: legacy 9-field grants that omitted the
+                            // scheme were classical Ed25519. They are mapped
+                            // to the fail-closed ML-DSA-44 tag (no verifier)
+                            // so such a grant can never verify again; it is
+                            // NOT silently reinterpreted as Falcon-512.
+                            None => (PqScheme::MlDsa44, PqScheme::MlDsa44, None, None),
                             Some(mid) => {
                                 let master_scheme =
                                     PqScheme::from_id(mid).map_err(serde::de::Error::custom)?;
@@ -559,27 +531,17 @@ impl<'de> Deserialize<'de> for SessionKeyAuthorization {
 }
 
 impl SessionKeyAuthorization {
-    /// True when this grant uses the legacy pure Ed25519 scheme without extensions.
-    pub fn is_pure_ed25519(&self) -> bool {
-        self.master_scheme == PqScheme::Ed25519
-            && self.session_scheme == PqScheme::Ed25519
-            && self.master_pubkey.is_none()
-            && self.session_pubkey_bytes.is_none()
-    }
-
-    /// True when either the master key or the session key is post-quantum / hybrid.
-    pub fn is_post_quantum(&self) -> bool {
-        self.master_scheme.is_post_quantum() || self.session_scheme.is_post_quantum()
-    }
-
-    /// Master public key bytes (or 32-byte address for Ed25519).
+    /// Master public key bytes (falls back to the 32-byte address only for a
+    /// legacy grant that never carried the key bytes; such a grant cannot
+    /// verify — see [`Self::verify_signature`]).
     pub fn master_pubkey(&self) -> &[u8] {
         self.master_pubkey
             .as_deref()
             .unwrap_or(&self.master_address)
     }
 
-    /// Session public key bytes (or 32-byte session pubkey for Ed25519).
+    /// Session public key bytes (same legacy fallback as
+    /// [`Self::master_pubkey`]).
     pub fn session_pubkey_bytes(&self) -> &[u8] {
         self.session_pubkey_bytes
             .as_deref()
@@ -610,48 +572,15 @@ impl SessionKeyAuthorization {
         msg
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn sign_delegation(
-        master_key: &SigningKey,
-        session_pubkey: [u8; 32],
-        valid_until: u64,
-        max_gas_spend: u64,
-        scope: u64,
-        max_value_per_tx: u64,
-        chain_id: u64,
-    ) -> Self {
-        let master_pub = master_key.verifying_key().to_bytes();
-        let msg = Self::grant_message(
-            &master_pub,
-            &session_pubkey,
-            valid_until,
-            max_gas_spend,
-            scope,
-            max_value_per_tx,
-            chain_id,
-        );
-
-        let sig = master_key.sign(&msg);
-
-        Self {
-            master_address: master_pub,
-            session_pubkey,
-            valid_until,
-            max_gas_spend,
-            gas_spent: 0,
-            scope,
-            max_value_per_tx,
-            chain_id,
-            master_signature: sig.to_vec(),
-            master_scheme: PqScheme::Ed25519,
-            session_scheme: PqScheme::Ed25519,
-            master_pubkey: None,
-            session_pubkey_bytes: None,
-        }
-    }
-
     /// Sign a delegation grant where master key is a Falcon-512 post-quantum key.
+    ///
+    /// FULL-PQ: this is the ONLY delegation-grant constructor. The classical
+    /// `sign_delegation` (bare Ed25519 master) and `sign_delegation_hybrid`
+    /// (Ed25519 + Falcon-512 master) constructors are DELETED together with
+    /// the removed schemes — there is no constructor that can mint a
+    /// classical grant.
     #[allow(clippy::too_many_arguments)]
+    // GATE: the grant preimage has eight independent fields by wire definition; a params struct would churn every call site.
     pub fn sign_delegation_falcon512(
         master_fk: &FalconKeypair,
         session_scheme: PqScheme,
@@ -664,14 +593,12 @@ impl SessionKeyAuthorization {
     ) -> Self {
         let master_pubkey = master_fk.public_key();
         let master_address = derive_pq_address(PqScheme::Falcon512, master_pubkey, &DEFAULT_SALT);
-        let (session_pubkey, session_pubkey_bytes) = if session_scheme == PqScheme::Ed25519 {
-            let addr = <[u8; 32]>::try_from(session_pubkey_raw)
-                .expect("Ed25519 session pubkey must be 32 bytes");
-            (addr, None)
-        } else {
-            let addr = derive_pq_address(session_scheme, session_pubkey_raw, &DEFAULT_SALT);
-            (addr, Some(session_pubkey_raw.to_vec()))
-        };
+        // The session key is always scheme-tagged PQ material; the old
+        // 32-byte bare-Ed25519 branch is gone, so a 32-byte input under
+        // Falcon-512 derives an address but can never verify its signature
+        // (the length gate in `verify_session_signature` refuses it).
+        let session_pubkey = derive_pq_address(session_scheme, session_pubkey_raw, &DEFAULT_SALT);
+        let session_pubkey_bytes = Some(session_pubkey_raw.to_vec());
 
         let msg = Self::grant_message(
             &master_address,
@@ -701,110 +628,7 @@ impl SessionKeyAuthorization {
         }
     }
 
-    /// Sign a delegation grant where master key is a Hybrid (Ed25519 + Falcon-512) key.
-    #[allow(clippy::too_many_arguments)]
-    pub fn sign_delegation_hybrid(
-        master_ed_sk: &SigningKey,
-        master_fk: &FalconKeypair,
-        session_scheme: PqScheme,
-        session_pubkey_raw: &[u8],
-        valid_until: u64,
-        max_gas_spend: u64,
-        scope: u64,
-        max_value_per_tx: u64,
-        chain_id: u64,
-    ) -> Self {
-        let ed_pk = master_ed_sk.verifying_key().to_bytes();
-        let hybrid_pk = make_hybrid_pubkey(&ed_pk, master_fk.public_key());
-        let master_address = derive_pq_address(PqScheme::Hybrid, &hybrid_pk, &DEFAULT_SALT);
-        let (session_pubkey, session_pubkey_bytes) = if session_scheme == PqScheme::Ed25519 {
-            let addr = <[u8; 32]>::try_from(session_pubkey_raw)
-                .expect("Ed25519 session pubkey must be 32 bytes");
-            (addr, None)
-        } else {
-            let addr = derive_pq_address(session_scheme, session_pubkey_raw, &DEFAULT_SALT);
-            (addr, Some(session_pubkey_raw.to_vec()))
-        };
-
-        let msg = Self::grant_message(
-            &master_address,
-            &session_pubkey,
-            valid_until,
-            max_gas_spend,
-            scope,
-            max_value_per_tx,
-            chain_id,
-        );
-        let master_signature = sign_hybrid(master_ed_sk, master_fk, &msg);
-
-        Self {
-            master_address,
-            session_pubkey,
-            valid_until,
-            max_gas_spend,
-            gas_spent: 0,
-            scope,
-            max_value_per_tx,
-            chain_id,
-            master_signature,
-            master_scheme: PqScheme::Hybrid,
-            session_scheme,
-            master_pubkey: Some(hybrid_pk),
-            session_pubkey_bytes,
-        }
-    }
-
-    /// Sign a delegation grant where master key is Ed25519 and session key is post-quantum or hybrid.
-    #[allow(clippy::too_many_arguments)]
-    pub fn sign_delegation_ed25519_master(
-        master_key: &SigningKey,
-        session_scheme: PqScheme,
-        session_pubkey_raw: &[u8],
-        valid_until: u64,
-        max_gas_spend: u64,
-        scope: u64,
-        max_value_per_tx: u64,
-        chain_id: u64,
-    ) -> Self {
-        let master_pub = master_key.verifying_key().to_bytes();
-        let (session_pubkey, session_pubkey_bytes) = if session_scheme == PqScheme::Ed25519 {
-            let addr = <[u8; 32]>::try_from(session_pubkey_raw)
-                .expect("Ed25519 session pubkey must be 32 bytes");
-            (addr, None)
-        } else {
-            let addr = derive_pq_address(session_scheme, session_pubkey_raw, &DEFAULT_SALT);
-            (addr, Some(session_pubkey_raw.to_vec()))
-        };
-
-        let msg = Self::grant_message(
-            &master_pub,
-            &session_pubkey,
-            valid_until,
-            max_gas_spend,
-            scope,
-            max_value_per_tx,
-            chain_id,
-        );
-        let master_signature = master_key.sign(&msg).to_vec();
-
-        Self {
-            master_address: master_pub,
-            session_pubkey,
-            valid_until,
-            max_gas_spend,
-            gas_spent: 0,
-            scope,
-            max_value_per_tx,
-            chain_id,
-            master_signature,
-            master_scheme: PqScheme::Ed25519,
-            session_scheme,
-            master_pubkey: None,
-            session_pubkey_bytes,
-        }
-    }
-
-    /// General constructor for constructing PQ or hybrid grants directly.
+    /// General constructor for constructing PQ grants directly.
     #[allow(clippy::too_many_arguments)]
     pub fn new_pq(
         master_scheme: PqScheme,
@@ -841,10 +665,11 @@ impl SessionKeyAuthorization {
     /// Verify the master's grant signature only (no time/scope/budget check).
     /// Covers domain separator, chain id, session pubkey, validity window and
     /// both caps — flipping ANY of those fields invalidates it.
-    /// Supports Ed25519, Falcon-512, and Hybrid master keys.
+    /// The only live scheme is Falcon-512; ML-DSA-44 is refused (no verifier).
     pub fn verify_signature(&self) -> bool {
-        // FULL-PQ: non-PQ schemes are always refused (no classical fallback).
-        if !self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum() {
+        // FULL-PQ: a disabled scheme (ML-DSA-44) is always refused — no
+        // classical fallback exists any more.
+        if self.master_scheme.is_disabled() || self.session_scheme.is_disabled() {
             return false;
         }
 
@@ -859,11 +684,7 @@ impl SessionKeyAuthorization {
         );
 
         match self.master_scheme {
-            PqScheme::Ed25519 => {
-                // FULL-PQ: classical master scheme removed.
-                false
-            }
-            PqScheme::Falcon512 | PqScheme::Hybrid | PqScheme::MlDsa44 => {
+            PqScheme::Falcon512 => {
                 let Some(pk) = &self.master_pubkey else {
                     return false;
                 };
@@ -873,6 +694,8 @@ impl SessionKeyAuthorization {
                 }
                 verify_pq_signature(self.master_scheme, pk, &msg, &self.master_signature)
             }
+            // UNKNOWN (KI-01): no verifier — refuse.
+            PqScheme::MlDsa44 => false,
         }
     }
 
@@ -925,19 +748,16 @@ impl SessionKeyAuthorization {
     }
 
     /// Verify a transaction payload signed by this session key.
-    /// Supports Ed25519, Falcon-512, and Hybrid session keys.
+    /// The only live scheme is Falcon-512; ML-DSA-44 is refused.
     pub fn verify_session_signature(&self, message: &[u8], signature_bytes: &[u8]) -> bool {
-        // FULL-PQ: non-PQ schemes are always refused (no classical fallback).
-        if !self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum() {
+        // FULL-PQ: a disabled scheme (ML-DSA-44) is always refused — no
+        // classical fallback exists any more.
+        if self.master_scheme.is_disabled() || self.session_scheme.is_disabled() {
             return false;
         }
 
         match self.session_scheme {
-            PqScheme::Ed25519 => {
-                // FULL-PQ: classical session scheme removed.
-                false
-            }
-            PqScheme::Falcon512 | PqScheme::Hybrid | PqScheme::MlDsa44 => {
+            PqScheme::Falcon512 => {
                 let Some(pk) = &self.session_pubkey_bytes else {
                     return false;
                 };
@@ -947,6 +767,8 @@ impl SessionKeyAuthorization {
                 }
                 verify_pq_signature(self.session_scheme, pk, message, signature_bytes)
             }
+            // UNKNOWN (KI-01): no verifier — refuse.
+            PqScheme::MlDsa44 => false,
         }
     }
 }

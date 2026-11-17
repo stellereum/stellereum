@@ -3,7 +3,6 @@ use super::envelope::global_implicit_key_registry;
 use super::topology::{ShardId, MASTERCHAIN_SHARD};
 use super::transaction::Transaction;
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
-use crate::post_quantum::PqScheme;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -290,34 +289,12 @@ impl CrossShardMessage {
             }
         }
 
-        // Support pinned Ed25519 accounts where pubkey_hash = blake3(from)
-        let ed_pk_hash = blake3::hash(&self.tx.from);
-        let mut ed_pq_leaf = Vec::with_capacity(49);
-        ed_pq_leaf.extend_from_slice(&account_value);
-        ed_pq_leaf.push(PqScheme::Ed25519.id());
-        ed_pq_leaf.extend_from_slice(ed_pk_hash.as_bytes());
-        if PatriciaTrie::verify_merkle_proof(
-            &self.source_state_root,
-            &self.tx.from,
-            &ed_pq_leaf,
-            proof,
-        ) {
-            return true;
-        }
-
-        // Support pinned Ed25519 accounts where pubkey_hash = from
-        let mut direct_pq_leaf = Vec::with_capacity(49);
-        direct_pq_leaf.extend_from_slice(&account_value);
-        direct_pq_leaf.push(PqScheme::Ed25519.id());
-        direct_pq_leaf.extend_from_slice(&self.tx.from);
-        if PatriciaTrie::verify_merkle_proof(
-            &self.source_state_root,
-            &self.tx.from,
-            &direct_pq_leaf,
-            proof,
-        ) {
-            return true;
-        }
+        // FULL-PQ: the legacy pinned-Ed25519 branches were DELETED. They
+        // accepted a 49-byte leaf carrying scheme id 0x01 with
+        // `pubkey_hash = blake3(from)` or `pubkey_hash = from`, i.e. a
+        // classical account shape that no longer exists (scheme 0x01 is
+        // refused by `PqScheme::from_id`). A proof for such a leaf is now
+        // simply not verifiable — the message fails closed here.
 
         false
     }

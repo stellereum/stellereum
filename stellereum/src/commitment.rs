@@ -2189,11 +2189,13 @@ mod tests {
         );
 
         // The SCHEME is part of the commitment: the same key bytes mean
-        // different things under Falcon512 and under the hybrid scheme.
+        // different things under Falcon-512 and under the (disabled)
+        // ML-DSA-44 tag. The hybrid scheme is removed; ML-DSA-44 is the only
+        // other enum value left to prove scheme separation.
         let mut other = empty_snapshot();
         other.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Hybrid, vec![0xAB; 32]),
+            (crate::post_quantum::PqScheme::MlDsa44, vec![0xAB; 32]),
         );
         assert_ne!(
             digest_of(&other),

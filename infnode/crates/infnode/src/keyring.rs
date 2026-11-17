@@ -1,6 +1,17 @@
+//! Node keystore.
+//!
+//! FULL-PQ: node identity is the Falcon-512 key in [`PqKeys`]
+//! (`NodeId = pq_id_from_pub(falcon_pk)`); there is no Ed25519 identity and
+//! no classical signing key in this module. [`NodeKeys`] holds only the
+//! long-term ML-KEM-768 secret (mailbox E2E), derived from `e2e.key`.
+//!
+//! `ed25519-dalek` is NOT a dependency of this crate any more: legacy
+//! `identity.key` files (32-byte Ed25519 seed) are REFUSED loudly by
+//! [`NodeKeys::load`] rather than decoded — a silent "keep using the old
+//! identity" path would defeat the wipe.
+
 use crate::proto::NODEID_LEN;
 use anyhow::{anyhow, bail, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use falcon_rust::falcon512;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -154,8 +165,6 @@ pub fn secure_dir(dir: &Path) -> Result<()> {
 
 #[derive(Clone)]
 pub struct NodeKeys {
-    pub signing: SigningKey,
-    pub verifying: VerifyingKey,
     /// Long-term ML-KEM-768 seed (64 bytes, `d || z`); the sole secret input
     /// for the KEM encapsulation key below.
     /// FULL-PQ: replaces the X25519 static secret (wipe — no ECDH material
@@ -167,39 +176,10 @@ pub struct NodeKeys {
 
 impl NodeKeys {
     pub fn generate() -> Self {
-        let mut csprng = OsRng;
-        let signing = SigningKey::generate(&mut csprng);
-        let verifying = signing.verifying_key();
         let mut kem_seed = [0u8; crate::mailbox::KEM_SEED_LEN];
         OsRng.fill_bytes(&mut kem_seed);
         let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
-        Self {
-            signing,
-            verifying,
-            kem_seed,
-            kem_ek,
-        }
-    }
-
-    pub fn id(&self) -> [u8; NODEID_LEN] {
-        // NON-CANONICAL helper: classical `blake3(ed_pub)[..20]`.
-        // FULL-PQ: this is NOT a NodeId and is never honored as one.
-        // Canonical NodeId is PQ-only (`resolve_node_id`, `PqKeys::pq_id`).
-        // Retained only for pre-existing route/TLS-pin call sites outside
-        // this zone (handshake-auth policy frozen); new code must not use it
-        // for identity.
-        let h = blake3::hash(self.verifying.as_bytes());
-        let mut id = [0u8; NODEID_LEN];
-        id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
-        id
-    }
-
-    pub fn id_hex(&self) -> String {
-        format!("inf1:{}", hex::encode(self.id()))
-    }
-
-    pub fn ed_hex(&self) -> String {
-        hex::encode(self.verifying.as_bytes())
+        Self { kem_seed, kem_ek }
     }
 
     /// Hex of the ML-KEM-768 encapsulation key (1184 bytes).
@@ -210,16 +190,23 @@ impl NodeKeys {
     pub fn save(&self, dir: &Path) -> Result<()> {
         secure_dir(dir)?;
         // Шифруем (если задана пассфраза) и пишем с правами 0600.
-        let mut id_hex = hex::encode(self.signing.to_bytes());
+        // FULL-PQ: only the KEM seed is persisted; `identity.key` (classical
+        // Ed25519) is never written.
         let mut kem_hex = hex::encode(self.kem_seed);
-        write_private(&dir.join("identity.key"), &protect(id_hex.as_bytes()))?;
         write_private(&dir.join("e2e.key"), &protect(kem_hex.as_bytes()))?;
-        id_hex.zeroize();
         kem_hex.zeroize();
         Ok(())
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
+        // Fail closed on a leftover classical identity: it is NOT an identity
+        // and silently ignoring it would hide a half-wiped keystore.
+        let legacy_identity = dir.join("identity.key");
+        if legacy_identity.exists() {
+            bail!(
+                "identity.key: legacy Ed25519 identity refused (FULL-PQ wipe: delete identity.key; node identity is pq-identity.key/Falcon-512)"
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -233,15 +220,6 @@ impl NodeKeys {
                     dir_mode
                 );
             }
-            let id_path = dir.join("identity.key");
-            let id_meta = std::fs::metadata(&id_path).map_err(|e| anyhow!("identity.key: {e}"))?;
-            let id_mode = id_meta.permissions().mode() & 0o777;
-            if id_mode != 0o600 {
-                bail!(
-                    "identity.key has insecure permissions 0o{:03o}, expected 0o600",
-                    id_mode
-                );
-            }
             let e2e_path = dir.join("e2e.key");
             let e2e_meta = std::fs::metadata(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
             let e2e_mode = e2e_meta.permissions().mode() & 0o777;
@@ -252,15 +230,9 @@ impl NodeKeys {
                 );
             }
         }
-        let id = std::fs::read_to_string(dir.join("identity.key"))
-            .map_err(|e| anyhow!("identity.key: {e}"))?;
         let e2e =
             std::fs::read_to_string(dir.join("e2e.key")).map_err(|e| anyhow!("e2e.key: {e}"))?;
-        let mut id_plain = unprotect(id.trim())?;
         let mut kem_plain = unprotect(e2e.trim())?;
-        let id_bytes: [u8; 32] = hex::decode(id_plain.trim())?
-            .try_into()
-            .map_err(|_| anyhow!("identity seed должен быть 32 байта"))?;
         let kem_bytes = hex::decode(kem_plain.trim())?;
         if kem_bytes.len() == 32 {
             // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
@@ -274,17 +246,9 @@ impl NodeKeys {
             .try_into()
             .map_err(|_| anyhow!("e2e kem seed должен быть 64 байта"))?;
         // Стереть промежуточные plaintext-строки из памяти
-        id_plain.zeroize();
         kem_plain.zeroize();
-        let signing = SigningKey::from_bytes(&id_bytes);
-        let verifying = signing.verifying_key();
         let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
-        Ok(Self {
-            signing,
-            verifying,
-            kem_seed,
-            kem_ek,
-        })
+        Ok(Self { kem_seed, kem_ek })
     }
 }
 
@@ -359,6 +323,12 @@ impl PqKeys {
     /// Hex of the raw public key (wire/`PeerConfig.pq_pub` form).
     pub fn pq_pub_hex(&self) -> String {
         hex::encode(self.pq_pub())
+    }
+
+    /// Hex of the 32-byte keygen seed (persisted by `save`; also used by the
+    /// mailbox keystore). Guard it like the secret key.
+    pub fn seed_hex(&self) -> String {
+        hex::encode(self.seed)
     }
 
     /// Raw 1281-byte secret-key encoding (for `proto::pq_falcon_sign`).
@@ -471,12 +441,9 @@ impl PqKeys {
 // hashing logic lives here).
 //
 // No migration window, no legacy alias: the classical `blake3(ed_pub)[..20]`
-// (`NodeKeys::id`) is NOT a NodeId and is never honored as one. Callers
-// requiring the canonical id use `resolve_node_id` (PQ-only) or
-// `ceremony_local_id`. `NodeKeys::id` remains only as a non-canonical
-// helper for pre-existing route/TLS-pin call sites outside this zone
-// (handshake-auth policy is frozen); it must NOT be used for new identity
-// logic.
+// identity is GONE (the Ed25519 key no longer exists in the node; see
+// [`NodeKeys`]). Callers requiring the canonical id use `resolve_node_id`
+// (PQ-only) or `ceremony_local_id`.
 // ---------------------------------------------------------------------------
 
 /// Which arm of the re-ceremony derivation produced a `NodeId`.

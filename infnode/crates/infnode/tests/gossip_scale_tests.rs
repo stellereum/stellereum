@@ -29,7 +29,6 @@
 //!   the second relay wave looping back through the trigger node. Full
 //!   coverage of one publish is therefore `N` app receipts, each exactly once.
 
-use ed25519_dalek::SigningKey;
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, PeerLink};
@@ -52,25 +51,17 @@ const SUITE_TTL: u64 = 4;
 // Deterministic helpers (no OS randomness in topology / keys / msg ids).
 // ---------------------------------------------------------------------------
 
-/// Deterministic node keys from a label: `blake3(label)` seeds both the
-/// ed25519 signing key and (domain-separated) the x25519 secret.
+/// Deterministic node keys from a label (no OsRng in topology/keys).
+/// FULL-PQ: only the deterministic KEM seed (mailbox E2E); PQ identity is
+/// separate via `det_pq` (`PqKeys::from_seed`).
 fn det_keys(label: &str) -> NodeKeys {
-    let ed_seed = blake3::hash(format!("{label}/ed").as_bytes());
-    let ed_bytes: [u8; 32] = *ed_seed.as_bytes();
-    let signing = SigningKey::from_bytes(&ed_bytes);
-    let verifying = signing.verifying_key();
     let k1 = blake3::hash(format!("{label}/kem1").as_bytes());
     let k2 = blake3::hash(format!("{label}/kem2").as_bytes());
     let mut kem_seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
     kem_seed[..32].copy_from_slice(k1.as_bytes());
     kem_seed[32..].copy_from_slice(k2.as_bytes());
     let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
-    NodeKeys {
-        signing,
-        verifying,
-        kem_seed,
-        kem_ek,
-    }
+    NodeKeys { kem_seed, kem_ek }
 }
 
 /// Deterministic PQ identity from a label (same blake3-label idiom).
@@ -81,10 +72,10 @@ fn det_pq(label: &str) -> PqKeys {
     PqKeys::from_seed(b)
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, _keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        ed_pub: hex::encode(keys.verifying.to_bytes()),
+        consensus_pub: None,
         pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
@@ -403,9 +394,11 @@ async fn gossip_all_to_all_no_storm_collapse() {
     for (i, inbox) in inboxes.iter().enumerate() {
         let mut seen = HashSet::new();
         let mut dupes = 0usize;
+        let mut dupe_data: Vec<String> = Vec::new();
         for (d, _) in inbox.iter().filter(|(d, _)| d.starts_with("chatter-")) {
             if !seen.insert(d.clone()) {
                 dupes += 1;
+                dupe_data.push(d.clone());
             }
         }
         // Every chatter message loops back to its origin, so inbox i holds
@@ -415,7 +408,10 @@ async fn gossip_all_to_all_no_storm_collapse() {
             n,
             "node {i} inbox distinct franchises: {seen:?}"
         );
-        assert_eq!(dupes, 0, "node {i} received duplicates (dedup broken)");
+        assert_eq!(
+            dupes, 0,
+            "node {i} received duplicates (dedup broken): {dupe_data:?}"
+        );
         total_unique += seen.len();
         total_dupes += dupes;
     }

@@ -137,13 +137,15 @@ fn assert_never_panics(name: &str, inputs: Vec<Vec<u8>>, f: impl Fn(&[u8])) {
 /// A well-formed µQC envelope, so the round-trip property is actually
 /// exercised (not just the "never panics" property).
 fn valid_uqc_envelope() -> Vec<u8> {
+    // FULL-PQ: Falcon-512 is the only live certificate scheme (Ed25519 is
+    // removed); signatures are canonical Falcon-sized.
     let cert = stellereum::consensus::PqMicroCertificate::new(
-        stellereum::post_quantum::PqScheme::Ed25519,
+        stellereum::post_quantum::PqScheme::Falcon512,
         42,
         7,
         8,
         vec![0b1010_1010, 0b0101_0101],
-        vec![vec![7u8; 64], vec![9u8; 64]],
+        vec![vec![7u8; 666], vec![9u8; 666]],
         [3u8; 32],
     );
     encode_pq_micro_envelope(&cert)

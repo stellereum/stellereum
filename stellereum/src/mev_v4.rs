@@ -1,12 +1,28 @@
-//! Post-Quantum MEV-Preemption Module v4/v5
+//! MEV-Preemption prototype v4/v5 (PARKED — the arithmetic is CLASSICAL)
+//!
+//! ⚠ NOT POST-QUANTUM. Despite the `Pq*` names and the 1184-byte
+//! "ML-KEM-768" framing, the secrecy in this module is Ristretto255
+//! Diffie-Hellman (`SharedPoint = r * Q_master`) and the "encapsulation"
+//! buffer is a Ristretto point plus a BLAKE3 mask, NOT an ML-KEM-768
+//! ciphertext. A quantum adversary breaks it. The names/framing are kept
+//! ONLY because the module is a parked prototype and its `Block`-shaped
+//! golden tests pin those bytes; they are not a security claim.
+//!
+//! The LIVE MEV epoch-sealing path is `crate::mev_epoch` (ML-KEM-768 +
+//! Falcon-512 transport). This module has no caller in the node and is
+//! gated OFF (see STATUS below). Any future wiring MUST first replace the
+//! Ristretto DH with a real KEM (or delete the module) — do NOT enable it
+//! as-is and do NOT describe it as post-quantum.
 //!
 //! Implements Section 4 of Stellereum PQ-BFT v5 Master Spec:
 //! "MEV-PREEMPTION: ЗАЩИТА СТАКАНА CLOB БЕЗ TEE И БЕЗ ИНТЕРАКТИВНОГО DKG"
 //!
-//! Features:
+//! Features (PROTOTYPE shape, classical primitives):
 //! 1. Asynchronous Proactive Epoch DKG (PEDKG):
-//!    Generates epoch master public key (1184-byte ML-KEM-768 framing) and threshold secret shares
-//!    off the block hot path (0 ms consensus tick overhead).
+//!    Generates an epoch master public value in an ML-KEM-768-SHAPED
+//!    1184-byte framing around a Ristretto255 point (NOT a real ML-KEM key)
+//!    and threshold secret shares off the block hot path (0 ms consensus tick
+//!    overhead).
 //! 2. User Order Sealing:
 //!    Order payload is encrypted with XChaCha20-Poly1305 using an ephemeral symmetric key.
 //!    The symmetric key is encapsulated under the active epoch public key and target block slot.
@@ -49,6 +65,8 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+// CLASSICAL (parked prototype, NOT post-quantum): Ristretto255 group
+// arithmetic. Replaced by ML-KEM-768 in the live `crate::mev_epoch` path.
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
@@ -782,6 +800,9 @@ impl PqMevPreemptionEngine {
     }
 
     /// User seals transaction payload for block slot under active epoch (§4.1.2)
+    ///
+    /// CLASSICAL (parked): the "encapsulation" is `r * Q_slot` Ristretto DH,
+    /// not an ML-KEM encapsulation. See the module header.
     pub fn seal_transaction(
         &self,
         slot: u64,

@@ -29,39 +29,44 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use stellereum::mempool::Mempool;
 use stellereum::mev_epoch::{
-    combine_partials, compute_partial, decode_sealed_payload, encryption_public_key_from_ed25519,
-    encryption_secret_from_ed25519, epoch_key_commitment, seal_transaction, DecryptionPartial,
-    EpochCommittee, EpochDkg, EpochSealManager, MevFrame, OrderCommitment, SealedEnvelope,
+    combine_partials, compute_partial, decode_sealed_payload, epoch_key_commitment, kem_member_tag,
+    pq_kem_ek_from_seed, pq_transport_seal, seal_transaction, DecryptionPartial, EpochCommittee,
+    EpochDkg, EpochSealManager, MevFrame, OrderCommitment, PqTransportEnvelope, SealedEnvelope,
     TransparentMeta,
 };
+use stellereum::mev_kem_registry::MevKemRegistry;
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::sharding::Transaction;
 
 // ===========================================================================
 // Test harness
 // ===========================================================================
 
-/// One committee member: the consensus identity, the long-term secret and
-/// the derived encryption key pair.
+/// One committee member: the consensus identity, the long-term secret, a
+/// Falcon-512 transport key and the 64-byte ML-KEM-768 transport seed.
 #[derive(Clone)]
 struct Member {
     id: [u8; 32],
     secret: [u8; 32],
-    enc_secret: [u8; 32],
+    falcon: FalconKeypair,
+    falcon_pk: Vec<u8>,
+    kem_seed: [u8; 64],
     enc_pk: [u8; 32],
     signing: SigningKey,
 }
 
 fn member() -> Member {
     let signing = SigningKey::generate(&mut OsRng);
-    let secret = signing.to_bytes();
-    let enc_secret = encryption_secret_from_ed25519(&secret);
-    let enc_pk = encryption_public_key_from_ed25519(&signing.verifying_key().to_bytes())
-        .expect("a valid ed25519 public key converts");
+    let mut kem_seed = [0u8; 64];
+    OsRng.fill_bytes(&mut kem_seed);
+    let falcon = FalconKeypair::generate();
     Member {
         id: signing.verifying_key().to_bytes(),
-        secret,
-        enc_secret,
-        enc_pk,
+        secret: signing.to_bytes(),
+        enc_pk: kem_member_tag(&pq_kem_ek_from_seed(&kem_seed)),
+        falcon_pk: falcon.public_key().to_vec(),
+        falcon,
+        kem_seed,
         signing,
     }
 }
@@ -79,8 +84,29 @@ fn committee(epoch: u64, members: &[Member]) -> EpochCommittee {
     )
 }
 
+fn registry(members: &[Member]) -> MevKemRegistry {
+    let mut reg = MevKemRegistry::new();
+    for m in members {
+        reg.register(m.id, pq_kem_ek_from_seed(&m.kem_seed), 0, 0, true)
+            .expect("test registration must succeed");
+    }
+    reg
+}
+
+fn kem_ek_map(
+    committee: &EpochCommittee,
+    members: &[Member],
+) -> std::collections::BTreeMap<u32, Vec<u8>> {
+    let mut map = std::collections::BTreeMap::new();
+    for m in members {
+        let index = committee.index_of(&m.id).expect("member has an index");
+        map.insert(index, pq_kem_ek_from_seed(&m.kem_seed));
+    }
+    map
+}
+
 /// Run the DKG over the whole committee THROUGH THE MANAGER (the real
-/// path) and return every member's key material.
+/// registry-wired path) and return every member's key material.
 ///
 /// The contributors are the DERIVED set (see `EpochCommittee::contributors`):
 /// only they contribute, everybody ends up with a share. The managers are
@@ -95,30 +121,37 @@ fn run_dkg(
     Vec<EpochSealManager>,
 ) {
     let committee = committee(epoch, members);
+    let reg = registry(members);
     let ids: Vec<[u8; 32]> = members.iter().map(|m| m.id).collect();
     let mut managers: Vec<EpochSealManager> = Vec::with_capacity(members.len());
-    let mut contributions = Vec::new();
+    let mut envelopes: Vec<PqTransportEnvelope> = Vec::new();
     for m in members.iter() {
         let mut manager = EpochSealManager::new();
         let own = manager
-            .sync_epoch(epoch, &ids, m.id, &m.secret)
+            .sync_epoch_pq(epoch, &ids, m.id, &m.secret, &m.kem_seed, &reg, 0)
             .expect("the epoch is synced");
         if let Some(c) = own {
-            contributions.push(c);
+            envelopes.push(pq_transport_seal(&m.falcon, c));
         }
         managers.push(manager);
     }
     assert_eq!(
-        contributions.len(),
+        envelopes.len(),
         committee.contributors.len(),
         "exactly the derived contributor set contributes"
     );
-    // Everybody ingests EVERY contribution (its own included): the epoch
-    // key is the aggregate over the whole contributor set.
+    // Everybody ingests EVERY Falcon-sealed contribution (its own included):
+    // the epoch key is the aggregate over the whole contributor set.
     for (i, m) in members.iter().enumerate() {
-        for c in contributions.iter() {
+        for env in envelopes.iter() {
+            let expected = members
+                .iter()
+                .find(|x| x.id == env.contribution.validator_id)
+                .expect("contributor is a member")
+                .falcon_pk
+                .clone();
             managers[i]
-                .ingest_contribution(c.clone(), &m.secret)
+                .ingest_contribution_pq(&env.clone(), &m.kem_seed, &m.id, &expected, &reg, 0)
                 .unwrap_or_else(|e| panic!("member {i} must accept a contribution: {e}"));
         }
     }
@@ -595,7 +628,7 @@ fn a_malformed_seal_is_rejected_fail_closed() {
 /// truncated body never becomes a transaction.
 #[test]
 fn a_malformed_frame_is_refused() {
-    assert!(decode_sealed_payload(b"XXXXjunk").is_err());
+    assert!(decode_sealed_payload(b"JUNKjunk").is_err());
     assert!(decode_sealed_payload(b"STX1").is_err());
     assert!(decode_sealed_payload(b"").is_err());
     let good = MevFrame::OrderCommit(OrderCommitment::sign(
@@ -970,14 +1003,11 @@ fn a_contribution_from_a_non_contributor_is_refused() {
         .map(|(_, m)| m)
         .expect("the committee has non-contributors");
 
+    let keys = kem_ek_map(&committee, &members);
     let mut dkg = EpochDkg::new(committee.clone(), non_contributor.id);
     assert!(
-        dkg.contribution(
-            non_contributor.id,
-            &non_contributor.secret,
-            &non_contributor.enc_secret
-        )
-        .is_err(),
+        dkg.contribution_pq(non_contributor.id, &non_contributor.secret, &keys)
+            .is_err(),
         "a non-contributor must not be able to contribute"
     );
 }

@@ -528,24 +528,33 @@ async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
 
 #[test]
 fn hunt_finding_12_fixed_pq_equivocation_verifies_signatures_and_deduplicates() {
-    use ed25519_dalek::Signer;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
     use stellereum::staking::{CompactPqEquivocationEvidence, StakingError};
 
+    // FULL-PQ (classical fallback removed): equivocation evidence is verified
+    // ONLY against a registered Falcon-512 key, so the fixtures sign with
+    // Falcon — an Ed25519 signature can never burn stake any more.
     let mut l = StakingLedger::new();
     let a_key = SigningKey::generate(&mut OsRng);
     let b_key = SigningKey::generate(&mut OsRng);
     let aid = a_key.verifying_key().to_bytes();
     let bid = b_key.verifying_key().to_bytes();
+    let a_fk = FalconKeypair::generate_from_seed(0x5Au8);
+    let b_fk = FalconKeypair::generate_from_seed(0x5Bu8);
     l.bond(aid, 10 * MIN_VALIDATOR_BOND, 0).unwrap();
     l.bond(bid, 10 * MIN_VALIDATOR_BOND, 0).unwrap();
+    l.validator_pq_keys
+        .insert(aid, (PqScheme::Falcon512, a_fk.public_key.clone()));
+    l.validator_pq_keys
+        .insert(bid, (PqScheme::Falcon512, b_fk.public_key.clone()));
 
     let target_a = Some([1u8; 32]);
     let target_b = Some([2u8; 32]);
     let msg_a = stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &target_a);
     let msg_b = stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &target_b);
 
-    let sig_a = a_key.sign(&msg_a).to_bytes().to_vec();
-    let sig_b = b_key.sign(&msg_b).to_bytes().to_vec();
+    let sig_a = a_fk.sign(&msg_a);
+    let sig_b = b_fk.sign(&msg_b);
 
     // Finding 12 attack: presenting B's signature as evidence against A.
     // In legacy `slash_equivocation`, this burned A's stake.
@@ -585,7 +594,7 @@ fn hunt_finding_12_fixed_pq_equivocation_verifies_signatures_and_deduplicates() 
     );
 
     // Legitimate equivocation by A (A actually signed both votes):
-    let real_sig_b = a_key.sign(&msg_b).to_bytes().to_vec();
+    let real_sig_b = a_fk.sign(&msg_b);
     let real_evidence = CompactPqEquivocationEvidence {
         voter: aid,
         height: 1,
@@ -609,8 +618,8 @@ fn hunt_finding_12_fixed_pq_equivocation_verifies_signatures_and_deduplicates() 
     // Micro-committee 100% slash and eviction test on B:
     let b_msg_a = stellereum::consensus::vote_sign_bytes(2, 0, VoteKind::Precommit, &target_a);
     let b_msg_b = stellereum::consensus::vote_sign_bytes(2, 0, VoteKind::Precommit, &target_b);
-    let b_sig_a = b_key.sign(&b_msg_a).to_bytes().to_vec();
-    let b_sig_b = b_key.sign(&b_msg_b).to_bytes().to_vec();
+    let b_sig_a = b_fk.sign(&b_msg_a);
+    let b_sig_b = b_fk.sign(&b_msg_b);
     let b_evidence = CompactPqEquivocationEvidence {
         voter: bid,
         height: 2,

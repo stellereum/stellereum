@@ -184,10 +184,10 @@ async fn m03_restore_pq_keys_refuses_invalid_entries_fail_closed() {
 }
 
 #[tokio::test]
-async fn test_ml_dsa_44_and_hybrid_and_ed25519_pinning() {
+async fn test_ml_dsa_44_refused_and_falcon_pinning_succeeds() {
     let engine = InMemoryStateEngine::new();
 
-    // ML-DSA-44 DISABLED (forgeable verifier): pinning refuses fail-closed.
+    // ML-DSA-44 DISABLED (no verifier): pinning refuses fail-closed.
     let scheme_mldsa = PqScheme::MlDsa44;
     let pk_mldsa = vec![0xa1u8; scheme_mldsa.pubkey_size()];
     let salt_mldsa = [0x12u8; 16];
@@ -199,32 +199,26 @@ async fn test_ml_dsa_44_and_hybrid_and_ed25519_pinning() {
         .is_err());
     assert_eq!(engine.get_pinned_pubkey(&addr_mldsa), None);
 
-    // Hybrid
-    let scheme_hybrid = PqScheme::Hybrid;
-    let pk_hybrid = vec![0xb2u8; scheme_hybrid.pubkey_size()];
-    let salt_hybrid = [0x34u8; 16];
-    let addr_hybrid = derive_pq_address(scheme_hybrid, &pk_hybrid, &salt_hybrid);
-    engine.credit_native(&addr_hybrid, 2_000).await.unwrap();
+    // FULL-PQ: the removed classical schemes (0x01 Ed25519, 0x04 Hybrid) are
+    // not enum values any more, so they are refused at parse time. The old
+    // "Hybrid pins" / "Ed25519 pins" assertions are inverted to refusals.
+    assert!(PqScheme::from_id(1).is_err(), "Ed25519 id must be refused");
+    assert!(PqScheme::from_id(4).is_err(), "Hybrid id must be refused");
+
+    // Positive control: a second Falcon-512 key (different salt) still pins.
+    let scheme_falcon = PqScheme::Falcon512;
+    let pk_falcon = vec![0xb2u8; scheme_falcon.pubkey_size()];
+    let salt_falcon = [0x34u8; 16];
+    let addr_falcon = derive_pq_address(scheme_falcon, &pk_falcon, &salt_falcon);
+    engine.credit_native(&addr_falcon, 2_000).await.unwrap();
     engine
-        .pin_pubkey(addr_hybrid, scheme_hybrid, &pk_hybrid, &salt_hybrid)
+        .pin_pubkey(addr_falcon, scheme_falcon, &pk_falcon, &salt_falcon)
         .await
         .unwrap();
     assert_eq!(
-        engine.get_pinned_pubkey(&addr_hybrid),
-        Some((scheme_hybrid, pk_hybrid))
+        engine.get_pinned_pubkey(&addr_falcon),
+        Some((scheme_falcon, pk_falcon))
     );
-
-    // Ed25519
-    let scheme_ed = PqScheme::Ed25519;
-    let pk_ed = vec![0xc3u8; scheme_ed.pubkey_size()];
-    let salt_ed = [0x56u8; 16];
-    let addr_ed = derive_pq_address(scheme_ed, &pk_ed, &salt_ed);
-    engine.credit_native(&addr_ed, 3_000).await.unwrap();
-    engine
-        .pin_pubkey(addr_ed, scheme_ed, &pk_ed, &salt_ed)
-        .await
-        .unwrap();
-    assert_eq!(engine.get_pinned_pubkey(&addr_ed), Some((scheme_ed, pk_ed)));
 }
 
 #[tokio::test]
@@ -332,7 +326,10 @@ async fn test_get_pinned_pubkey_returns_exact_registered_key_after_reattaching_s
     let salt_mldsa = [0x4du8; 16];
     let addr_mldsa = derive_pq_address(scheme_mldsa, &pk_mldsa, &salt_mldsa);
 
-    let scheme_ed = PqScheme::Ed25519;
+    // FULL-PQ: Ed25519 is removed; the second persistent key is another
+    // Falcon-512 key (different salt) so the multi-key persistence check
+    // still covers two distinct entries.
+    let scheme_ed = PqScheme::Falcon512;
     let pk_ed = vec![0x5eu8; scheme_ed.pubkey_size()];
     let salt_ed = [0x6fu8; 16];
     let addr_ed = derive_pq_address(scheme_ed, &pk_ed, &salt_ed);
@@ -379,7 +376,7 @@ async fn test_get_pinned_pubkey_returns_exact_registered_key_after_reattaching_s
 
     let got_ed = fresh_engine
         .get_pinned_pubkey(&addr_ed)
-        .expect("ed25519 key must be retrieved");
+        .expect("second Falcon key must be retrieved");
     assert_eq!(got_ed, (scheme_ed, pk_ed));
 
     // Unregistered address returns None

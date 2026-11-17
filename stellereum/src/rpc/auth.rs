@@ -335,7 +335,10 @@ pub(super) fn handle_sign_message(
         Ok(m) => m,
         Err(e) => return err(id, -32602, e),
     };
-    let key = crate::wallet_signing::WalletSigningKey::ed25519(seed);
+    // FULL-PQ: the node's dev-mode message signer is Falcon-512, derived
+    // deterministically from the configured seed. There is no classical
+    // Ed25519 arm left to fall back to.
+    let key = crate::wallet_signing::WalletSigningKey::falcon_from_seed(&seed);
     let sig = match key.sign_message(chain_id, &message) {
         Ok(s) => s,
         Err(e) => return err(id, -32602, e),
@@ -344,7 +347,7 @@ pub(super) fn handle_sign_message(
         id,
         json!({
             "address": hex::encode(key.address()),
-            "scheme": "Ed25519",
+            "scheme": sig.scheme.name(),
             "scheme_id": sig.scheme.id(),
             "signature": sig.to_hex(),
             "preimage": hex::encode(crate::wallet_signing::message_preimage(chain_id, &message)),
@@ -422,7 +425,9 @@ pub(super) fn handle_sign_typed_data(
         Ok(d) => d,
         Err(e) => return err(id, -32602, e),
     };
-    let key = crate::wallet_signing::WalletSigningKey::ed25519(seed);
+    // FULL-PQ: node-side typed-data signing is Falcon-512 only (see
+    // `handle_sign_message`).
+    let key = crate::wallet_signing::WalletSigningKey::falcon_from_seed(&seed);
     let (sig, canonical) = match key.sign_typed_data(&data) {
         Ok(r) => r,
         Err(e) => return err(id, -32602, e),
@@ -432,7 +437,7 @@ pub(super) fn handle_sign_typed_data(
         id,
         json!({
             "address": hex::encode(key.address()),
-            "scheme": "Ed25519",
+            "scheme": sig.scheme.name(),
             "scheme_id": sig.scheme.id(),
             "signature": sig.to_hex(),
             "canonical": canonical,

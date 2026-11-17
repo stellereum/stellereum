@@ -3413,9 +3413,10 @@ mod epoch_tests {
 // return attacker-chosen identities — the first step of an eclipse.
 //
 // Rule enforced here: IDENTITY comes from the local static config (`peers:`
-// entries, whose ed-pub is pinned and TLS-verified); the network may only
-// supply fresh ENDPOINTS for those already-pinned identities. Discovery can
-// therefore never introduce a new key into any path the node trusts.
+// entries, whose Falcon-512 pq-pub is pinned and TLS-verified); the network
+// may only supply fresh ENDPOINTS for those already-pinned identities.
+// Discovery can therefore never introduce a new key into any path the node
+// trusts.
 
 /// Cap on retained per-endpoint freshness records.
 ///
@@ -3430,45 +3431,48 @@ pub const MAX_ENDPOINT_RECORDS: usize = 512;
 /// `PeerEndpointTable::preferred_order` until a success resets it.
 pub const ENDPOINT_BACKOFF_THRESHOLD: u32 = 5;
 
-/// Normalize an Ed25519 transport identity (hex ed-pub) for comparison.
+/// Normalize a PQ transport identity (hex Falcon-512 pq-pub) for comparison.
 ///
 /// Hex case is not canonical across producers (config files vs DHT gossip),
 /// so comparison is case-insensitive. Empty/whitespace input normalizes to an
 /// empty string, which `pinned_identity_set` never contains — a discovered
 /// record with no key is therefore always dropped, never admitted.
-pub fn canonical_ed_pub(ed_hex: &str) -> String {
-    ed_hex.trim().to_ascii_lowercase()
+pub fn canonical_pq_pub(pq_hex: &str) -> String {
+    pq_hex.trim().to_ascii_lowercase()
 }
 
-/// Build the set of pinned transport identities from the local static config.
+/// Build the set of pinned PQ transport identities from the local static
+/// config.
 ///
-/// This is the ONLY source of trusted identity: every entry's ed-pub is pinned
-/// into the TLS verifier at startup, so a peer presenting a different key for
-/// one of these endpoints fails the handshake.
+/// This is the ONLY source of trusted identity: every entry's Falcon-512
+/// `pq-pub` is pinned into the TLS verifier at startup, so a peer presenting
+/// a different key for one of these endpoints fails the handshake.
 pub fn pinned_identity_set(
     peers: &[infnode::config::PeerConfig],
 ) -> std::collections::HashSet<String> {
     peers
         .iter()
-        .map(|p| canonical_ed_pub(&p.ed_pub))
+        .filter_map(|p| p.pq_pub.as_deref())
+        .map(canonical_pq_pub)
         .filter(|s| !s.is_empty())
         .collect()
 }
 
 /// Filter DHT-discovered peers down to already-pinned identities.
 ///
-/// Returns the subset of `discovered` whose ed-pub is in `pinned_ed_pub`,
-/// preserving each record (including any NEW endpoints the network reported
-/// for that identity). Everything else — unknown keys, empty/malformed keys —
-/// is dropped. Pure function over data so it is unit-testable without a live
-/// DHT; `discover_peers_filtered` is the thin live wrapper over it.
+/// Returns the subset of `discovered` whose Falcon-512 `pq-pub` is in
+/// `pinned_pq_pub`, preserving each record (including any NEW endpoints the
+/// network reported for that identity). Everything else — unknown keys,
+/// empty/malformed keys — is dropped. Pure function over data so it is
+/// unit-testable without a live DHT; `discover_peers_filtered` is the thin live
+/// wrapper over it.
 pub fn filter_discovered_to_pinned(
     discovered: Vec<infnode::dht::NodeInfo>,
-    pinned_ed_pub: &std::collections::HashSet<String>,
+    pinned_pq_pub: &std::collections::HashSet<String>,
 ) -> Vec<infnode::dht::NodeInfo> {
     discovered
         .into_iter()
-        .filter(|n| pinned_ed_pub.contains(&canonical_ed_pub(&n.ed_hex)))
+        .filter(|n| pinned_pq_pub.contains(&canonical_pq_pub(&n.pq_hex)))
         .collect()
 }
 
@@ -3652,7 +3656,7 @@ impl P2pNetworkAdapter {
     /// Like `discover_peers`, but the DHT view (`known_peers`) may only
     /// contribute ENDPOINTS for identities already pinned in the local static
     /// config — never new identities. Static config endpoints are pinned by
-    /// definition and always included; discovered records for unknown ed-pubs
+    /// definition and always included; discovered records for unknown PQ keys
     /// (the exact thing a poisoned DHT view or a TOFU stranger would supply)
     /// are dropped by `filter_discovered_to_pinned`.
     pub async fn discover_peers_filtered(&self) -> Vec<String> {

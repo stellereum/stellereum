@@ -12,10 +12,11 @@
 //! `P2pNetworkAdapter` holds an `Arc<infnode::node::Node>`, which cannot be
 //! constructed in a test):
 //!
-//! 1. `filter_discovered_to_pinned` NEVER admits an unknown ed-pub — not even a
-//!    record with an empty/missing key (legacy gossip carries none).
-//! 2. A KNOWN identity (ed-pub pinned in the local `peers:` config) with a NEW
-//!    endpoint from the network IS admitted — discovery still learns routes.
+//! 1. `filter_discovered_to_pinned` NEVER admits an unknown PQ identity — not
+//!    even a record with an empty/missing key (legacy gossip carries none).
+//! 2. A KNOWN identity (Falcon-512 `pq-pub` pinned in the local `peers:` config)
+//!    with a NEW endpoint from the network IS admitted — discovery still
+//!    learns routes.
 //! 3. The `PeerEndpointTable` freshness table is bounded: adversarial endpoint
 //!    floods cannot grow memory without limit.
 //! 4. A peer that fails N times is deprioritized (sorts last, reports backed
@@ -30,23 +31,20 @@ fn ed(hex_char: char) -> String {
     std::iter::repeat_n(hex_char, 64).collect()
 }
 
-fn node_info(id_byte: u8, ed_pub: &str, endpoints: &[&str]) -> infnode::dht::NodeInfo {
+fn node_info(id_byte: u8, pq_pub: &str, endpoints: &[&str]) -> infnode::dht::NodeInfo {
     infnode::dht::NodeInfo {
         id: [id_byte; 20],
         endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
-        ed_hex: ed_pub.to_string(),
-        // The filter under test keys on ed only; pq is unused here.
-        pq_hex: String::new(),
+        pq_hex: pq_pub.to_string(),
         last_seen: 0,
     }
 }
 
-fn peer_config(name: &str, ed_pub: &str, endpoints: &[&str]) -> infnode::config::PeerConfig {
+fn peer_config(name: &str, pq_pub: &str, endpoints: &[&str]) -> infnode::config::PeerConfig {
     infnode::config::PeerConfig {
         name: name.to_string(),
-        ed_pub: ed_pub.to_string(),
-        // The filter under test keys on the ed pin; pq is unused here.
-        pq_pub: None,
+        consensus_pub: None,
+        pq_pub: Some(pq_pub.to_string()),
         endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -58,17 +56,17 @@ fn peer_config(name: &str, ed_pub: &str, endpoints: &[&str]) -> infnode::config:
 #[test]
 fn unknown_identity_is_never_admitted_by_the_filter() {
     // Local config pins exactly one peer identity.
-    let pinned_ed = ed('a');
-    let peers = vec![peer_config("honest", &pinned_ed, &["10.0.0.1:9410"])];
+    let pinned_pq = ed('a');
+    let peers = vec![peer_config("honest", &pinned_pq, &["10.0.0.1:9410"])];
     let pinned = pinned_identity_set(&peers);
     assert_eq!(pinned.len(), 1);
 
     // The network view claims: the honest peer (moved address), an attacker's
     // fresh key, and a legacy gossip record with no key at all.
-    let attacker_ed = ed('b');
+    let attacker_pq = ed('b');
     let discovered = vec![
-        node_info(0x01, &pinned_ed, &["10.0.0.9:9410"]),
-        node_info(0x02, &attacker_ed, &["10.9.9.9:9410"]),
+        node_info(0x01, &pinned_pq, &["10.0.0.9:9410"]),
+        node_info(0x02, &attacker_pq, &["10.9.9.9:9410"]),
         node_info(0x03, "", &["10.9.9.10:9410"]),
     ];
 
@@ -76,7 +74,7 @@ fn unknown_identity_is_never_admitted_by_the_filter() {
 
     // Only the pinned identity survives, with its new endpoint.
     assert_eq!(kept.len(), 1, "exactly the pinned identity must survive");
-    assert_eq!(kept[0].ed_hex, pinned_ed);
+    assert_eq!(kept[0].pq_hex, pinned_pq);
     assert!(kept[0].endpoints.contains(&"10.0.0.9:9410".to_string()));
     // The attacker's endpoint must appear NOWHERE in the output.
     let all_eps: Vec<&str> = kept
@@ -96,14 +94,14 @@ fn unknown_identity_is_never_admitted_by_the_filter() {
 #[test]
 fn known_identity_with_a_new_endpoint_is_admitted() {
     // Identity comes from config (one pinned ed-pub, one static endpoint)...
-    let pinned_ed = ed('e');
-    let peers = vec![peer_config("peer", &pinned_ed, &["10.0.0.1:9410"])];
+    let pinned_pq = ed('e');
+    let peers = vec![peer_config("peer", &pinned_pq, &["10.0.0.1:9410"])];
     let pinned = pinned_identity_set(&peers);
 
     // ...endpoints may come from the network, even in different hex case.
     let discovered = vec![node_info(
         0x07,
-        &pinned_ed.to_ascii_uppercase(),
+        &pinned_pq.to_ascii_uppercase(),
         &["10.0.0.2:9411"],
     )];
 

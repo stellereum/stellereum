@@ -1,9 +1,13 @@
 //! PQ TRANSPORT MIGRATION — design doc + KAT-level prototype. UNWIRED BY DESIGN.
 //!
-//! STATUS: UNWIRED. This file is intentionally NOT referenced by `lib.rs`,
-//! `node.rs`, or any build target. Proof: `grep -rn "pq_transport\|PqPlan"
-//! crates/infnode/src/` returns hits ONLY inside this file (the `PqPlan`
-//! prefix is grep-proof: zero hits existed before this file was created).
+//! STATUS: UNWIRED HISTORICAL DESIGN DOC. This file is intentionally NOT
+//! referenced by `lib.rs`, `node.rs`, or any build target. It records the
+//! PRE-WIPE migration plan only. Every classical (Ed25519/X25519) shape and
+//! every `x25519` label below is HISTORICAL and UNREACHABLE: the live crate
+//! has no classical identity/auth/KEX/TLS path at all (FULL-PQ wipe), and
+//! `PQ_CLASSICAL_REFUSE_AFTER_HEIGHT` / the mixed window were deleted.
+//! Proof: `grep -rn "pq_transport\|PqPlan" crates/infnode/src/` returns hits
+//! ONLY inside this file (the `PqPlan` prefix is grep-proof).
 //! All executable content lives in `#[cfg(test)]` (see `#![cfg(test)]`
 //! below), so even a future accidental `mod pq_transport;` compiles to an
 //! empty module in production builds. Production behavior is byte-identical:
@@ -115,17 +119,16 @@ mod pq_plan_proto {
     // uses blake3 (already vendored) + Falcon-512 (lead-vendored later).
     // ------------------------------------------------------------------
     const PQPLAN_K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
 
     struct PqPlanSha256 {
@@ -139,8 +142,8 @@ mod pq_plan_proto {
         fn pqplan_new() -> Self {
             Self {
                 h: [
-                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f,
-                    0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+                    0x1f83d9ab, 0x5be0cd19,
                 ],
                 buf: [0u8; 64],
                 buf_len: 0,
@@ -158,19 +161,17 @@ mod pq_plan_proto {
                 ]);
             }
             for i in 16..64 {
-                let s0 = w[i - 15].rotate_right(7)
-                    ^ w[i - 15].rotate_right(18)
-                    ^ (w[i - 15] >> 3);
-                let s1 = w[i - 2].rotate_right(17)
-                    ^ w[i - 2].rotate_right(19)
-                    ^ (w[i - 2] >> 10);
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
                 w[i] = w[i - 16]
                     .wrapping_add(s0)
                     .wrapping_add(w[i - 7])
                     .wrapping_add(s1);
             }
-            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-                (self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6], self.h[7]);
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = (
+                self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6],
+                self.h[7],
+            );
             for i in 0..64 {
                 let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
                 let ch = (e & f) ^ ((!e) & g);
@@ -224,7 +225,11 @@ mod pq_plan_proto {
                 }
                 // pad with zeros; 56 is reachable within one block here
                 // because buf_len < 64 always holds at this point.
-                let room = if self.buf_len < 56 { 56 - self.buf_len } else { 64 - self.buf_len + 56 };
+                let room = if self.buf_len < 56 {
+                    56 - self.buf_len
+                } else {
+                    64 - self.buf_len + 56
+                };
                 let zeros = [0u8; 64];
                 let take = room.min(64 - self.buf_len);
                 self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&zeros[..take]);
@@ -423,7 +428,8 @@ mod pq_plan_proto {
             classical_only: true,
             available_offline: true,
             rank: u8::MAX,
-            note: "REJECTED: no PSK distribution story for TOFU strangers; fragility for zero PQ gain",
+            note:
+                "REJECTED: no PSK distribution story for TOFU strangers; fragility for zero PQ gain",
         },
     ];
 
@@ -435,8 +441,9 @@ mod pq_plan_proto {
         fn pqplan_label(&self) -> &'static str;
     }
 
-    /// Interim backend: ephemeral X25519 under Falcon peer auth.
-    /// CLASSICAL KEX — the name and flag make that unmissable.
+    /// HISTORICAL, UNREACHABLE: ephemeral X25519 under Falcon peer auth was
+    /// the pre-wipe interim. The live transport is KEM-only; this type is a
+    /// test-only plan artifact and is never constructed by any build target.
     pub struct PqPlanX25519ClassicalBackend;
 
     impl PqPlanKexMethod for PqPlanX25519ClassicalBackend {
@@ -570,7 +577,9 @@ mod pq_plan_proto {
         fn kat_sign_verify_vector() {
             let t = pqplan_kat_transcript();
             let d = t.pqplan_digest();
-            let mac = PqPlanTestOnlyMac { key: pqplan_kat_key() };
+            let mac = PqPlanTestOnlyMac {
+                key: pqplan_kat_key(),
+            };
             let sig = mac.pqplan_sign(&d);
             assert_eq!(pqplan_hex(&sig), EXPECTED_SIG);
             assert!(mac.pqplan_verify(&d, &sig));
@@ -580,7 +589,9 @@ mod pq_plan_proto {
         fn tamper_anywhere_rejected() {
             let base = pqplan_kat_transcript();
             let d0 = base.pqplan_digest();
-            let mac = PqPlanTestOnlyMac { key: pqplan_kat_key() };
+            let mac = PqPlanTestOnlyMac {
+                key: pqplan_kat_key(),
+            };
             let sig0 = mac.pqplan_sign(&d0);
             // Flip one byte in every bound field + version + suite: each must
             // change the digest AND fail verification against the old sig.
@@ -616,15 +627,23 @@ mod pq_plan_proto {
             for c in &cases {
                 let d = c.pqplan_digest();
                 assert_ne!(d, d0, "tampered transcript must change digest");
-                assert!(!mac.pqplan_verify(&d, &sig0), "old sig must fail on new digest");
-                assert!(!mac.pqplan_verify(&d0, &mac.pqplan_sign(&d)), "cross sig must fail");
+                assert!(
+                    !mac.pqplan_verify(&d, &sig0),
+                    "old sig must fail on new digest"
+                );
+                assert!(
+                    !mac.pqplan_verify(&d0, &mac.pqplan_sign(&d)),
+                    "cross sig must fail"
+                );
             }
         }
 
         #[test]
         fn wrong_key_and_truncation_rejected() {
             let d = pqplan_kat_transcript().pqplan_digest();
-            let mac = PqPlanTestOnlyMac { key: pqplan_kat_key() };
+            let mac = PqPlanTestOnlyMac {
+                key: pqplan_kat_key(),
+            };
             let sig = mac.pqplan_sign(&d);
             let mut bad_key = pqplan_kat_key();
             bad_key[0] ^= 0x01;
@@ -640,26 +659,41 @@ mod pq_plan_proto {
         fn kex_verdict_is_honest() {
             // Rank 1 (full-PQ) must be unavailable; every available backend
             // must advertise itself as classical-only.
-            let top = PQPLAN_KEX_OPTIONS.iter().find(|o| o.rank == 1).expect("rank 1 exists");
+            let top = PQPLAN_KEX_OPTIONS
+                .iter()
+                .find(|o| o.rank == 1)
+                .expect("rank 1 exists");
             assert!(top.label.contains("ml-kem"), "rank 1 must be ML-KEM");
-            assert!(!top.available_offline, "ML-KEM must be flagged unavailable offline");
+            assert!(
+                !top.available_offline,
+                "ML-KEM must be flagged unavailable offline"
+            );
             assert!(!top.classical_only, "ML-KEM must be flagged full-PQ");
             for o in PQPLAN_KEX_OPTIONS.iter().filter(|o| o.available_offline) {
-                assert!(o.classical_only, "available backend '{}' must admit classical-only", o.label);
+                assert!(
+                    o.classical_only,
+                    "available backend '{}' must admit classical-only",
+                    o.label
+                );
             }
             // The interim backend carries the classical flag in its type.
             assert!(PqPlanX25519ClassicalBackend::PQPLAN_CLASSICAL);
-            assert!(
-                PqPlanX25519ClassicalBackend
-                    .pqplan_label()
-                    .contains("CLASSICAL")
-            );
+            assert!(PqPlanX25519ClassicalBackend
+                .pqplan_label()
+                .contains("CLASSICAL"));
             // Rejected option stays rejected (rank MAX, never selectable).
-            let rej = PQPLAN_KEX_OPTIONS.iter().find(|o| o.rank == u8::MAX).expect("rejected exists");
+            let rej = PQPLAN_KEX_OPTIONS
+                .iter()
+                .find(|o| o.rank == u8::MAX)
+                .expect("rejected exists");
             assert!(rej.label.contains("PSK"));
             // Every option carries a human-readable rationale (field is live).
             for o in PQPLAN_KEX_OPTIONS.iter() {
-                assert!(!o.note.is_empty(), "option '{}' must document its rationale", o.label);
+                assert!(
+                    !o.note.is_empty(),
+                    "option '{}' must document its rationale",
+                    o.label
+                );
             }
         }
 
@@ -684,14 +718,20 @@ mod pq_plan_proto {
         #[test]
         fn migration_classical_stable() {
             let v = pqplan_view(1, None, None);
-            assert_eq!(v.classical_id[0], 1, "view must carry the classical id through");
+            assert_eq!(
+                v.classical_id[0], 1,
+                "view must carry the classical id through"
+            );
             assert_eq!(pqplan_resolve(&v), PqPlanEffective::Classical);
         }
 
         #[test]
         fn migration_first_pq_wins_in_window() {
             // No prior binding + valid in-window claim => promote.
-            assert_eq!(pqplan_resolve(&pqplan_view(1, Some(7), None)), PqPlanEffective::Pq);
+            assert_eq!(
+                pqplan_resolve(&pqplan_view(1, Some(7), None)),
+                PqPlanEffective::Pq
+            );
         }
 
         #[test]
@@ -709,9 +749,15 @@ mod pq_plan_proto {
         #[test]
         fn migration_sticky_and_key_change_quarantined() {
             // Known PQ peer, no claim in this message => stays PQ (sticky).
-            assert_eq!(pqplan_resolve(&pqplan_view(1, None, Some(7))), PqPlanEffective::Pq);
+            assert_eq!(
+                pqplan_resolve(&pqplan_view(1, None, Some(7))),
+                PqPlanEffective::Pq
+            );
             // Same key re-announced with valid sig => PQ.
-            assert_eq!(pqplan_resolve(&pqplan_view(1, Some(7), Some(7))), PqPlanEffective::Pq);
+            assert_eq!(
+                pqplan_resolve(&pqplan_view(1, Some(7), Some(7))),
+                PqPlanEffective::Pq
+            );
             // DIFFERENT key without rollback => Quarantined (fail closed).
             assert_eq!(
                 pqplan_resolve(&pqplan_view(1, Some(9), Some(7))),

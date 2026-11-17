@@ -16,7 +16,6 @@
 //! cooldown 6s) so they finish in seconds. All tests in this file use the
 //! SAME env values, so parallel execution cannot race on env.
 
-use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, RateBucket};
@@ -147,7 +146,7 @@ async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
         .filter(|f| f.kind == proto::kind::AUTH)
 }
 
-fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
+fn challenge_wire(pq: &PqKeys, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
     let mut f = Frame {
         kind: proto::kind::CHALLENGE,
         seq: 1,
@@ -157,26 +156,24 @@ fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts
         svc: 0,
         payload: payload.as_bytes().to_vec(),
         nonce: vec![],
-        sig: [0; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = signing.sign(d.as_bytes()).to_bytes();
+    f.sig = pq.sign_digest(d.as_bytes());
     f.encode()
 }
 
-fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
-    let eph = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = x25519_dalek::PublicKey::from(&eph);
-    // FULL-PQ: CHALLENGE carries ephemeral ML-KEM `pq_ek` (KEM-only session,
-    // X3DH leg cut — sibling). Without `pq_*` the responder fails closed
-    // (`pq handshake required`). Same construction as production
+fn tofu_payload(pq: &PqKeys, nonce_hex: &str, at: i64) -> String {
+    // FULL-PQ: 32-byte hello freshness nonce (no ECDH) + the Falcon-512 key
+    // that must derive `src`; CHALLENGE carries ephemeral ML-KEM `pq_ek`
+    // (KEM-only session). Same construction as production
     // `connect_with_auth` (reuse `pq_initiator_offer`, no new crypto).
     let offer = infnode::node::pq_initiator_offer().expect("pq offer");
     serde_json::json!({
         "nonce": nonce_hex,
         "at": at,
-        "eph": hex::encode(eph_pub.as_bytes()),
-        "ed": hex::encode(keys.verifying.to_bytes()),
+        "fresh": hex::encode(rand::random::<[u8; 32]>()),
+        "pq_pub": pq.pq_pub_hex(),
         "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
         "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
@@ -302,10 +299,10 @@ async fn harden_slow_handshake_rain_deadline_closes() {
     // Permits are free: a fresh legit handshake is accepted immediately.
     // (Bucket refilled while we waited, so admission passes.)
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let ke = NodeKeys::generate();
+    let ke = PqKeys::generate();
     let nonce: String = hex::encode(rand::random::<[u8; 16]>());
     let p = tofu_payload(&ke, &nonce, proto::now_ms());
-    let w = challenge_wire(&ke.signing, ke.id(), &p, proto::now_ms());
+    let w = challenge_wire(&ke, ke.pq_id(), &p, proto::now_ms());
     let c = raw_connect(listen)
         .await
         .expect("permits free after deadline");
@@ -402,18 +399,18 @@ async fn harden_strikes_cooldown_recovery() {
     // Spacing (600ms) stays under the 3/s handshake bucket so refusals below
     // prove strike logic, not bucket throttling.
     let bad_once = |nonce: &str| {
-        let k = NodeKeys::generate();
+        let k = PqKeys::generate();
         let good = tofu_payload(&k, nonce, proto::now_ms());
-        let mut wire = challenge_wire(&k.signing, k.id(), &good, proto::now_ms());
+        let mut wire = challenge_wire(&k, k.pq_id(), &good, proto::now_ms());
         let last = wire.len() - 1;
         wire[last] ^= 0xff;
         wire
     };
     let good_wire = || {
-        let k = NodeKeys::generate();
+        let k = PqKeys::generate();
         let nonce: String = hex::encode(rand::random::<[u8; 16]>());
         let p = tofu_payload(&k, &nonce, proto::now_ms());
-        challenge_wire(&k.signing, k.id(), &p, proto::now_ms())
+        challenge_wire(&k, k.pq_id(), &p, proto::now_ms())
     };
 
     // 2 failures (< threshold 3): honest handshake still passes and resets.
@@ -487,10 +484,10 @@ async fn harden_legit_handshake_unaffected() {
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let ke = NodeKeys::generate();
+    let ke = PqKeys::generate();
     let nonce: String = hex::encode(rand::random::<[u8; 16]>());
     let p = tofu_payload(&ke, &nonce, proto::now_ms());
-    let w = challenge_wire(&ke.signing, ke.id(), &p, proto::now_ms());
+    let w = challenge_wire(&ke, ke.pq_id(), &p, proto::now_ms());
     let c = raw_connect(listen).await.expect("connect passes");
     assert!(
         raw_handshake(&c, &w).await.is_some(),

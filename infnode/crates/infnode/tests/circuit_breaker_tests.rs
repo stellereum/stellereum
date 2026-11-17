@@ -69,7 +69,15 @@ async fn fresh_node(tag: &str) -> (Arc<Node>, PathBuf) {
 }
 
 fn dead_pid() -> [u8; NODEID_LEN] {
-    NodeKeys::generate().id()
+    // Distinct cheap fixture id: the breaker never inspects key material, and
+    // a real Falcon keygen per flood entry would dominate the test runtime.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let h = blake3::hash(format!("dead-peer/{n}").as_bytes());
+    let mut id = [0u8; NODEID_LEN];
+    id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
+    id
 }
 
 // ---------------------------------------------------------------------------

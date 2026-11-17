@@ -76,7 +76,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::ValidatorId;
-use crate::post_quantum::{PqScheme, HYBRID_PUBKEY_LEN};
+use crate::post_quantum::{PqScheme, MLDSA44_PUBKEY_LEN};
 
 // ============================================================================
 // Constants (consts in code — never env)
@@ -111,15 +111,18 @@ pub const PQ_KEY_HISTORY_LIMIT: usize = 2;
 
 /// Hard cap on any tracked PQ public key, in bytes.
 ///
-/// Equals [`crate::post_quantum::HYBRID_PUBKEY_LEN`] (929 = 32-byte Ed25519 +
-/// 897-byte Falcon-512), the largest canonical key in
-/// [`crate::post_quantum`]. Every admission path additionally requires the
-/// EXACT per-scheme size (`scheme.pubkey_size()`), so this cap is the outer
-/// bound and the exact check is the inner one.
-pub const PQ_MAX_KEY_BYTES: usize = HYBRID_PUBKEY_LEN;
+/// Equals [`crate::post_quantum::MLDSA44_PUBKEY_LEN`] (1312 bytes), the
+/// largest canonical key among the schemes in [`crate::post_quantum`].
+/// ML-DSA-44 is disabled fail-closed (no verifier), so Falcon-512 (897) is
+/// the only key size that can actually be registered today; the cap stays at
+/// the enum-wide maximum so a future FIPS-204 verifier needs no cap change.
+/// Every admission path additionally requires the EXACT per-scheme size
+/// (`scheme.pubkey_size()`), so this cap is the outer bound and the exact
+/// check is the inner one.
+pub const PQ_MAX_KEY_BYTES: usize = MLDSA44_PUBKEY_LEN;
 
 /// Domain tag for the rotation-announcement preimage signed by the
-/// validator's consensus (ed25519) key.
+/// validator's consensus identity key.
 pub const PQ_ROTATION_ANNOUNCE_DST: &[u8] = b"STELL_PQ_ROTATE_V1";
 
 // ============================================================================
@@ -171,7 +174,7 @@ impl std::fmt::Display for PqRegistryError {
                 "PQ key bytes do not match the scheme's canonical size: refusing"
             }
             PqRegistryError::DisabledScheme => {
-                "PQ scheme is disabled fail-closed (ML-DSA-44): submit Falcon-512 or Hybrid"
+                "PQ scheme is disabled fail-closed (ML-DSA-44): submit Falcon-512"
             }
             PqRegistryError::NoPendingRotation => "no PQ rotation is pending: nothing to apply",
             PqRegistryError::RotationNotDue => {
@@ -569,16 +572,14 @@ fn validate_key_bytes(scheme: PqScheme, pubkey: &[u8]) -> Result<(), PqRegistryE
 // Validator-signed announcement (future transaction path)
 // ============================================================================
 
-/// Preimage the validator's CONSENSUS (ed25519) key signs to authorize a PQ
+/// Preimage a validator's consensus identity key would sign to authorize a PQ
 /// key announcement: `DST || validator_id(32) || scheme_id(1) || pubkey ||
 /// effective_height(8le)`.
 ///
-/// Signed with the consensus key (whose bytes ARE the validator id), NOT the
-/// current PQ key: rotation must survive PQ-key compromise, and a validator
-/// with no PQ key yet (Ed25519 fallback) can still announce its first one.
-/// The opcode handler verifies this signature and then calls the staking
-/// hook — the hooks themselves take the validator id as the authenticated
-/// caller (the `rotate_key` auth precedent).
+/// The consensus identity key (whose bytes ARE the validator id) is an
+/// Ed25519 key, used for IDENTITY only. Classical signature verification is
+/// removed from this node, so [`verify_rotation_announcement`] refuses every
+/// announcement fail-closed until a PQ-signed announcement is specified.
 pub fn pq_rotation_announcement_preimage(
     validator_id: &[u8; 32],
     scheme: PqScheme,
@@ -594,9 +595,16 @@ pub fn pq_rotation_announcement_preimage(
     out
 }
 
-/// Verify a rotation-announcement signature against the validator's consensus
-/// (ed25519) key. Thin alias over the standard ed25519 path — provided for
-/// the future announcement opcode and pinned by tests here.
+/// Verify a rotation-announcement signature.
+///
+/// FULL-PQ REFUSAL: the announcement was designed to be signed by the
+/// validator's consensus (Ed25519) key, but classical signature verification
+/// is removed from this node (`PqScheme::Ed25519` and its verifier are
+/// deleted). There is no specified PQ-signed announcement yet, so every
+/// announcement is REFUSED here — never silently accepted. A future
+/// announcement opcode must define a Falcon-512-signed preimage (over the
+/// validator's registered PQ key) and replace this refusal with that
+/// verification.
 pub fn verify_rotation_announcement(
     consensus_id: &[u8; 32],
     scheme: PqScheme,
@@ -604,10 +612,8 @@ pub fn verify_rotation_announcement(
     effective_height: u64,
     ed_sig: &[u8],
 ) -> bool {
-    crate::post_quantum::verify_pq_signature(
-        crate::post_quantum::PqScheme::Ed25519,
-        consensus_id,
-        &pq_rotation_announcement_preimage(consensus_id, scheme, pubkey, effective_height),
-        ed_sig,
-    )
+    // Bind every input so the refusal stays visibly total (nothing is
+    // partially validated and then accepted).
+    let _ = (consensus_id, scheme, pubkey, effective_height, ed_sig);
+    false
 }

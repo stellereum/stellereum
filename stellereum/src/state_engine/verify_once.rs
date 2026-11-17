@@ -177,7 +177,7 @@ pub(super) fn require_pq_tx_envelope(tx: &crate::sharding::Transaction) -> Resul
     };
     if !env.scheme.is_post_quantum() {
         return Err(
-            "Pure PQ mode: scheme must be post-quantum (Falcon-512, ML-DSA-44, or Hybrid)"
+            "Pure PQ mode: scheme must be post-quantum (Falcon-512; ML-DSA-44 has no verifier)"
                 .to_string(),
         );
     }

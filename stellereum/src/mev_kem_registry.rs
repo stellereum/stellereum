@@ -38,8 +38,8 @@
 //! * ONE key kind only (ML-KEM-768, [`MEV_KEM_EK_LEN`] bytes): no
 //!   scheme tag, no disabled-scheme gate — there is nothing else to track.
 //! * NO legacy adoption: a KEM key never predates tracking (the classical
-//!   X25519 leg has no KEM key to adopt), so every member registers
-//!   explicitly and an unknown id is fail-closed, never a classical fallback.
+//!   X25519 leg is REMOVED and has no KEM key to adopt), so every member
+//!   registers explicitly and an unknown id is fail-closed, never a fallback.
 //!
 //! # MEV read path (lead wiring — `mev_epoch.rs` only)
 //!
@@ -125,8 +125,9 @@ pub enum MevKemRegistryError {
     /// `announce_rotation` with `now` before the current key's activation
     /// (history must never be rewritten).
     ActivationInPast,
-    /// Key bytes are not exactly [`MEV_KEM_EK_LEN`] (a classical X25519 key
-    /// or any other shape is refused here — never silently encapsulated to).
+    /// Key bytes are not exactly [`MEV_KEM_EK_LEN`] (a removed classical
+    /// X25519 key or any other shape is refused here — never silently
+    /// encapsulated to).
     MalformedKey,
     /// `apply_rotation` with nothing pending.
     NoPendingRotation,
@@ -473,8 +474,8 @@ fn truncate_history(history: &mut Vec<SupersededMevKemKey>) {
 }
 
 /// Fail-closed KEM admission: the bytes must be EXACTLY the ML-KEM-768
-/// encapsulation size ([`MEV_KEM_EK_LEN`]) — a classical X25519 key or any
-/// other shape is refused here, never silently encapsulated to.
+/// encapsulation size ([`MEV_KEM_EK_LEN`]) — a removed classical X25519 key
+/// or any other shape is refused here, never silently encapsulated to.
 fn validate_ek_bytes(ek: &[u8]) -> Result<(), MevKemRegistryError> {
     if ek.len() != MEV_KEM_EK_LEN {
         return Err(MevKemRegistryError::MalformedKey);

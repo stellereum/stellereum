@@ -14,7 +14,6 @@ use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
 use crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT;
 use crate::zkml::DEFAULT_CHAIN_ID;
-use infnode::proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
 
 /// Activation status derived from a height-gated `u64` constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,12 +154,6 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
                 "MEV DKG Falcon-authenticated ML-KEM-768 transport cutoff",
             ),
-            ActivationGate::new(
-                "PQ_CLASSICAL_REFUSE_AFTER_HEIGHT",
-                "infnode::proto",
-                PQ_CLASSICAL_REFUSE_AFTER_HEIGHT,
-                "Fail-closed refusal of classical infnode handshake fallback",
-            ),
         ],
     }
 }
@@ -245,10 +238,6 @@ mod tests {
                 "PQ_TRANSPORT_H_ACTIVATION_HEIGHT",
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
             ),
-            (
-                "PQ_CLASSICAL_REFUSE_AFTER_HEIGHT",
-                PQ_CLASSICAL_REFUSE_AFTER_HEIGHT,
-            ),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());
@@ -284,21 +273,6 @@ mod tests {
             schedule.is_active(
                 "PQ_TRANSPORT_H_ACTIVATION_HEIGHT",
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-            ),
-            Some(true)
-        );
-
-        assert_eq!(
-            schedule.is_active(
-                "PQ_CLASSICAL_REFUSE_AFTER_HEIGHT",
-                PQ_CLASSICAL_REFUSE_AFTER_HEIGHT.saturating_sub(1)
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            schedule.is_active(
-                "PQ_CLASSICAL_REFUSE_AFTER_HEIGHT",
-                PQ_CLASSICAL_REFUSE_AFTER_HEIGHT
             ),
             Some(true)
         );

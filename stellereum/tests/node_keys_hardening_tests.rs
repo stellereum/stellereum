@@ -1,4 +1,4 @@
-//! Security hardening tests for Stellereum node keys (`identity.key`, `falcon.key`, `e2e.key`).
+//! Security hardening tests for Stellereum node keys (`e2e.key`, `falcon.key`, `e2e.key`).
 //! Verifies:
 //! - Strict POSIX permissions (0600 on files, 0700 on directories) enforced at load time.
 //! - Rejection of insecure permissions (e.g. 0644 or 0755).
@@ -51,7 +51,7 @@ fn test_node_keys_plaintext_permissions_and_roundtrip() {
 
     let dir = temp_keystore_dir("plain_roundtrip");
     let keys = infnode::keyring::NodeKeys::generate();
-    let id_bytes = keys.signing.verifying_key().to_bytes();
+    let id_bytes = keys.kem_ek.clone();
 
     save_node_keys(&dir, &keys).expect("save_node_keys");
 
@@ -59,12 +59,12 @@ fn test_node_keys_plaintext_permissions_and_roundtrip() {
     let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "directory must be 0700");
 
-    let id_mode = std::fs::metadata(dir.join("identity.key"))
+    let id_mode = std::fs::metadata(dir.join("e2e.key"))
         .unwrap()
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(id_mode, 0o600, "identity.key must be 0600");
+    assert_eq!(id_mode, 0o600, "e2e.key must be 0600");
 
     let e2e_mode = std::fs::metadata(dir.join("e2e.key"))
         .unwrap()
@@ -74,7 +74,7 @@ fn test_node_keys_plaintext_permissions_and_roundtrip() {
     assert_eq!(e2e_mode, 0o600, "e2e.key must be 0600");
 
     // The opt-out really means plaintext on disk.
-    let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(
         !raw.starts_with("enc2:"),
         "STELL_KEY_PLAINTEXT=1 must write plaintext keys"
@@ -82,7 +82,7 @@ fn test_node_keys_plaintext_permissions_and_roundtrip() {
 
     // Plaintext load must succeed
     let loaded = load_node_keys(&dir).expect("load_node_keys");
-    assert_eq!(loaded.signing.verifying_key().to_bytes(), id_bytes);
+    assert_eq!(loaded.kem_ek, id_bytes);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -95,12 +95,12 @@ fn test_new_node_keys_are_encrypted_by_default() {
 
     let dir = temp_keystore_dir("default_encrypted");
     let keys = infnode::keyring::NodeKeys::generate();
-    let id_pub = keys.signing.verifying_key().to_bytes();
-    let id_hex = hex::encode(keys.signing.to_bytes());
+    let id_pub = keys.kem_ek.clone();
+    let id_hex = hex::encode(keys.kem_seed);
 
     save_node_keys(&dir, &keys).expect("save_node_keys");
 
-    let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(
         raw.starts_with("enc2:"),
         "new keys must be encrypted by default"
@@ -111,7 +111,7 @@ fn test_new_node_keys_are_encrypted_by_default() {
     );
 
     let loaded = load_node_keys(&dir).expect("load_node_keys");
-    assert_eq!(loaded.signing.verifying_key().to_bytes(), id_pub);
+    assert_eq!(loaded.kem_ek, id_pub);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -135,7 +135,7 @@ fn test_no_passphrase_refuses_to_write_new_key() {
         "error must document the plaintext escape hatch: {msg}"
     );
     assert!(
-        !dir.join("identity.key").exists(),
+        !dir.join("e2e.key").exists(),
         "no key file may be written when the write is refused"
     );
 
@@ -195,27 +195,19 @@ fn test_strict_permissions_rejection_on_node_keys() {
     // Restore dir to 0700
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    // 2. Insecure identity.key permissions (0644)
-    std::fs::set_permissions(
-        dir.join("identity.key"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
+    // 2. Insecure e2e.key permissions (0644)
+    std::fs::set_permissions(dir.join("e2e.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
     let err = match load_node_keys(&dir) {
         Err(e) => e,
-        Ok(_) => panic!("must reject 0644 identity.key"),
+        Ok(_) => panic!("must reject 0644 e2e.key"),
     };
     assert!(
         err.to_string().contains("insecure"),
         "error must mention insecure perms: {err}"
     );
 
-    // Restore identity.key to 0600
-    std::fs::set_permissions(
-        dir.join("identity.key"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    // Restore e2e.key to 0600
+    std::fs::set_permissions(dir.join("e2e.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
 
     // 3. Insecure e2e.key permissions (0644)
     std::fs::set_permissions(dir.join("e2e.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -265,13 +257,13 @@ fn test_encrypted_node_keys_roundtrip_and_passphrase_rejection() {
 
     let dir = temp_keystore_dir("enc_node");
     let keys = infnode::keyring::NodeKeys::generate();
-    let id_pub = keys.signing.verifying_key().to_bytes();
-    let id_hex = hex::encode(keys.signing.to_bytes());
+    let id_pub = keys.kem_ek.clone();
+    let id_hex = hex::encode(keys.kem_seed);
 
     save_node_keys(&dir, &keys).expect("save encrypted node keys");
 
     // File content must be encrypted with enc2: prefix and not leak plaintext hex
-    let raw_id = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    let raw_id = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(
         raw_id.starts_with("enc2:"),
         "must use enc2: Argon2id format"
@@ -286,7 +278,7 @@ fn test_encrypted_node_keys_roundtrip_and_passphrase_rejection() {
 
     // 1. Correct passphrase decrypts
     let loaded = load_node_keys(&dir).expect("load with correct passphrase");
-    assert_eq!(loaded.signing.verifying_key().to_bytes(), id_pub);
+    assert_eq!(loaded.kem_ek, id_pub);
 
     // 2. Wrong passphrase fails
     std::env::set_var(ENV_PASSPHRASE, "wrong-password");
@@ -366,31 +358,28 @@ fn test_existing_plaintext_key_still_loads_and_is_upgraded() {
 
     let dir = temp_keystore_dir("plain_compat");
     let keys = infnode::keyring::NodeKeys::generate();
-    let id_pub = keys.signing.verifying_key().to_bytes();
-    let id_hex = hex::encode(keys.signing.to_bytes());
+    let id_pub = keys.kem_ek.clone();
     let e2e_hex = hex::encode(keys.kem_seed);
 
     // Exactly what the live nodes have: raw hex, 0600, in a 0700 dir.
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    stellereum::node_keys::write_private_file(&dir.join("identity.key"), id_hex.as_bytes())
-        .unwrap();
     stellereum::node_keys::write_private_file(&dir.join("e2e.key"), e2e_hex.as_bytes()).unwrap();
 
     // No passphrase: the plaintext key still loads.
     let loaded = load_node_keys(&dir).expect("plaintext key must still load");
-    assert_eq!(loaded.signing.verifying_key().to_bytes(), id_pub);
-    let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    assert_eq!(loaded.kem_ek, id_pub);
+    let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(!raw.starts_with("enc2:"), "no passphrase -> file untouched");
 
     // With a passphrase: transparent in-place upgrade.
     std::env::set_var(ENV_PASSPHRASE, "upgrade-passphrase");
     let loaded = load_node_keys(&dir).expect("plaintext key must load and be upgraded");
-    assert_eq!(loaded.signing.verifying_key().to_bytes(), id_pub);
-    let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    assert_eq!(loaded.kem_ek, id_pub);
+    let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(raw.starts_with("enc2:"), "key must be upgraded to enc2:");
     assert!(
-        !raw.contains(&id_hex),
+        !raw.contains(&e2e_hex),
         "upgraded key must not leak the seed"
     );
     let raw_e2e = std::fs::read_to_string(dir.join("e2e.key")).unwrap();

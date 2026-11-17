@@ -361,16 +361,17 @@ fn attack_test_zkml_proof_forgery_and_session_abuse() {
     );
 
     // 2. Session key gas limit abuse attack
-    let master_sk = SigningKey::generate(&mut OsRng);
-    let session_sk = SigningKey::generate(&mut OsRng);
-    let session_pub = session_sk.verifying_key().to_bytes();
+    // FULL-PQ: the grant is Falcon-512 (Ed25519 delegation is deleted).
+    let master_fk = FalconKeypair::generate_from_seed(0x21);
+    let session_fk = FalconKeypair::generate_from_seed(0x22);
 
     let valid_until = 20_000;
     let max_gas = 10_000;
 
-    let mut auth = SessionKeyAuthorization::sign_delegation(
-        &master_sk,
-        session_pub,
+    let mut auth = SessionKeyAuthorization::sign_delegation_falcon512(
+        &master_fk,
+        PqScheme::Falcon512,
+        session_fk.public_key(),
         valid_until,
         max_gas,
         stellereum::zkml::SCOPE_ALL,

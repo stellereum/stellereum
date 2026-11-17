@@ -638,10 +638,11 @@ fn router(state: WebState) -> Router {
 // ─────────────────────────────────────────────────────────────
 
 fn derive_jwt_secret(node: &Node) -> [u8; 32] {
-    let seed = node.keys.signing.to_bytes();
+    // FULL-PQ: the node has no Ed25519 secret any more; derive the web
+    // session secret from the long-term KEM seed (persisted, node-unique).
     let mut h = blake3::Hasher::new();
     h.update(b"infnode-web-jwt-v1");
-    h.update(&seed);
+    h.update(&node.keys.kem_seed);
     let mut k = [0u8; 32];
     k.copy_from_slice(&h.finalize().as_bytes()[..32]);
     k

@@ -312,9 +312,9 @@ fn verify_pq_register_sig(
 ///
 /// Supports post-quantum Falcon-512 / Hybrid signatures (a `PQ1` envelope —
 /// explicit or implicit via the global PQ key registry — raw `pubkey || sig`,
-/// or a raw 666-byte Falcon signature with implicit/explicit key lookup) as
-/// well as legacy 64-byte Ed25519 signatures where `creator` is the Ed25519
-/// verifying key.
+/// or a raw 666-byte Falcon signature with implicit/explicit key lookup).
+/// The legacy 64-byte Ed25519 branch is REMOVED: such a signature is refused
+/// with an explicit migration error (never accepted, never guessed).
 pub fn verify_register_signature(
     creator: &[u8; 32],
     contract: &[u8; 32],
@@ -337,7 +337,6 @@ pub fn verify_register_signature_with_pubkey(
     use crate::post_quantum::{
         derive_pq_address, PqScheme, DEFAULT_SALT, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
     };
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let bytes = hex::decode(strip_hex_prefix(signature_hex))
         .map_err(|e| format!("invalid signature hex: {e}"))?;
@@ -446,12 +445,15 @@ pub fn verify_register_signature_with_pubkey(
         return verify_pq_register_sig(scheme, &pk, &msg, &bytes);
     }
 
-    let arr: [u8; 64] = bytes.try_into().map_err(|_| {
-        "invalid signature: expected PQ1 envelope, Falcon-512 pubkey+signature, Falcon-512 signature, or 64-byte Ed25519 signature".to_string()
-    })?;
-    let key = VerifyingKey::from_bytes(creator).map_err(|e| format!("invalid creator key: {e}"))?;
-    key.verify(&msg, &Signature::from_bytes(&arr))
-        .map_err(|_| "signature does not verify against the contract creator".to_string())
+    if bytes.len() == 64 {
+        return Err(
+            "legacy 64-byte Ed25519 registration signatures are REMOVED: sign the \
+             registration with Falcon-512 (PQ1 envelope, or pubkey||signature)"
+                .to_string(),
+        );
+    }
+
+    Err("invalid signature: expected PQ1 envelope, Falcon-512 pubkey+signature, or Falcon-512 signature".to_string())
 }
 
 #[cfg(test)]
@@ -557,6 +559,10 @@ mod tests {
 
     #[test]
     fn register_signature_round_trip() {
+        // INVERTED (FULL-PQ): a GENUINE 64-byte Ed25519 registration
+        // signature — valid under the old creator-key rule — is REFUSED with
+        // the explicit removal error. Classical signatures never register
+        // contract source any more.
         use ed25519_dalek::Signer;
         use ed25519_dalek::SigningKey;
         let sk = SigningKey::from_bytes(&[9u8; 32]);
@@ -564,16 +570,11 @@ mod tests {
         let contract = [1u8; 32];
         let shash = source_hash(b"src");
         let sig = sk.sign(&register_message(&contract, &shash));
-        verify_register_signature(&creator, &contract, &shash, &hex::encode(sig.to_bytes()))
-            .expect("valid registration signature verifies");
-        // Wrong contract: the same signature must NOT verify.
-        assert!(verify_register_signature(
-            &creator,
-            &[2u8; 32],
-            &shash,
-            &hex::encode(sig.to_bytes())
-        )
-        .is_err());
+        let err =
+            verify_register_signature(&creator, &contract, &shash, &hex::encode(sig.to_bytes()))
+                .expect_err("a 64-byte classical registration signature must be refused");
+        assert!(err.contains("REMOVED"), "{err}");
+        assert!(err.contains("Falcon-512"), "{err}");
     }
 
     #[test]

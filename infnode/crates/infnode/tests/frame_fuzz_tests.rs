@@ -7,9 +7,8 @@
 //!   2. mutations of a valid frame (bit flips, truncation, length tampering)
 //!   3. adversarial length fields (huge plen/nlen, off-by-one boundaries)
 
-use ed25519_dalek::{Signer, SigningKey};
+use infnode::keyring::PqKeys;
 use infnode::proto::{Frame, MAX_FRAME};
-use rand::rngs::OsRng;
 
 /// Minimal deterministic PRNG (xorshift64) for reproducible fuzzing.
 struct Rng(u64);
@@ -36,7 +35,7 @@ impl Rng {
 
 /// A valid signed frame for mutation testing.
 fn valid_frame() -> Vec<u8> {
-    let sk = SigningKey::generate(&mut OsRng);
+    let pq = PqKeys::generate();
     let mut f = Frame {
         kind: 4,
         seq: 1,
@@ -46,10 +45,10 @@ fn valid_frame() -> Vec<u8> {
         svc: 123,
         payload: b"hello".to_vec(),
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = sk.sign(d.as_bytes()).to_bytes();
+    f.sig = pq.sign_digest(d.as_bytes());
     f.encode()
 }
 
@@ -154,22 +153,26 @@ fn decoded_frames_round_trip() {
     assert_eq!(f.payload, f2.payload);
 }
 
-/// A frame with version != 1 must be rejected.
+/// A frame with version != 2 (including the removed classical v1) must be
+/// rejected; v2 decodes.
 #[test]
 fn fuzz_bad_version_rejected() {
     let valid = valid_frame();
-    for v in [0u8, 2, 3, 255] {
+    let mut ok = valid.clone();
+    ok[0] = 2;
+    assert!(Frame::decode(&ok).is_ok(), "v2 must decode");
+    for v in [0u8, 1, 3, 255] {
         let mut b = valid.clone();
         b[0] = v;
         assert!(Frame::decode(&b).is_err(), "version {v} must be rejected");
     }
 }
 
-/// A valid frame verifies; a tampered payload does not.
+/// A valid Falcon-signed frame verifies; a tampered payload does not.
 #[test]
 fn signature_binds_payload() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let vk = sk.verifying_key();
+    let pq = PqKeys::generate();
+    let pk = pq.pq_pub();
     let mut f = Frame {
         kind: 4,
         seq: 1,
@@ -179,15 +182,15 @@ fn signature_binds_payload() {
         svc: 0,
         payload: b"original".to_vec(),
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = sk.sign(d.as_bytes()).to_bytes();
-    assert!(f.verify(&vk));
+    f.sig = pq.sign_digest(d.as_bytes());
+    assert!(f.verify(&pk));
 
     // tamper the payload after signing
     f.payload = b"tampered".to_vec();
-    assert!(!f.verify(&vk), "tampered payload must fail verification");
+    assert!(!f.verify(&pk), "tampered payload must fail verification");
 }
 
 /// DIFFERENTIAL codec==codec: reference implementation (verbatim pre-opt
@@ -197,8 +200,8 @@ mod reference {
     use super::*;
 
     pub fn ref_encode(f: &Frame) -> Vec<u8> {
-        let mut v = Vec::with_capacity(68 + f.payload.len() + f.nonce.len());
-        v.push(1);
+        let mut v = Vec::with_capacity(68 + f.payload.len() + f.nonce.len() + 2 + f.sig.len());
+        v.push(2);
         v.push(f.kind);
         v.extend_from_slice(&f.seq.to_le_bytes());
         v.extend_from_slice(&f.ts.to_le_bytes());
@@ -209,6 +212,7 @@ mod reference {
         v.extend_from_slice(&(f.payload.len() as u32).to_le_bytes());
         v.extend_from_slice(&f.payload);
         v.extend_from_slice(&f.nonce);
+        v.extend_from_slice(&(f.sig.len() as u16).to_le_bytes());
         v.extend_from_slice(&f.sig);
         v
     }
@@ -216,7 +220,7 @@ mod reference {
     pub fn ref_decode(b: &[u8]) -> anyhow::Result<Frame> {
         use anyhow::anyhow;
         const HDR: usize = 68;
-        if b.len() < HDR + 64 {
+        if b.len() < HDR + 2 {
             anyhow::bail!("frame too short");
         }
         let plen = u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
@@ -227,18 +231,22 @@ mod reference {
         if nlen > 1024 {
             anyhow::bail!("nonce too large");
         }
-        let total = HDR
+        let sig_off = HDR
             .checked_add(plen)
             .and_then(|x| x.checked_add(nlen))
-            .and_then(|x| x.checked_add(64));
-        let total = match total {
-            Some(t) => t,
-            None => anyhow::bail!("frame length overflow"),
-        };
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
+        if sig_off + 2 > b.len() {
+            anyhow::bail!("frame too short");
+        }
+        let sig_len = u16::from_le_bytes([b[sig_off], b[sig_off + 1]]) as usize;
+        let total = sig_off
+            .checked_add(2)
+            .and_then(|x| x.checked_add(sig_len))
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
         if total != b.len() {
             anyhow::bail!("frame length mismatch");
         }
-        let sig: [u8; 64] = b[b.len() - 64..].try_into().map_err(|_| anyhow!("sig"))?;
+        let sig = b[sig_off + 2..].to_vec();
         let f = Frame {
             kind: b[1],
             seq: u32::from_le_bytes(b[2..6].try_into().map_err(|_| anyhow!("seq"))?),
@@ -250,8 +258,8 @@ mod reference {
             nonce: b[68 + plen..68 + plen + nlen].to_vec(),
             sig,
         };
-        if b[0] != 1 {
-            anyhow::bail!("unsupported version");
+        if b[0] != 2 {
+            anyhow::bail!("unsupported version (classical frame refused)");
         }
         if f.nonce.len() != nlen || f.payload.len() != plen {
             anyhow::bail!("internal mismatch");
@@ -284,7 +292,7 @@ fn random_frame(rng: &mut Rng) -> Frame {
     }
     let mut src = [0u8; 20];
     let mut dst = [0u8; 20];
-    let mut sig = [0u8; 64];
+    let mut sig = vec![0u8; infnode::proto::PQ_FALCON_SIG_LEN];
     for b in src.iter_mut() {
         *b = rng.byte();
     }
@@ -443,20 +451,21 @@ fn batch_and_incremental_encode_match() {
     assert_eq!(empty, vec![1u8, 2, 3]);
 }
 
-/// Streaming verify path agrees with the classical sign-then-hash on all
+/// Streaming verify path agrees with the Falcon sign-then-hash on all
 /// corpus sizes, including a 64KB frame (the case that used to allocate).
 #[test]
 fn verify_matches_reference_digest() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let vk = sk.verifying_key();
+    let pq = PqKeys::generate();
+    let pk = pq.pq_pub();
     let mut rng = diff_rng(0x5EED_5EED_5EED_5EED);
     for _ in 0..50 {
         let mut f = random_frame(&mut rng);
         let d = blake3::hash(&f.sign_data());
-        f.sig = sk.sign(d.as_bytes()).to_bytes();
-        assert!(f.verify(&vk));
+        f.sig = pq.sign_digest(d.as_bytes());
+        assert!(f.verify(&pk));
         // sign_data() is the exact signed prefix of encode()
+        let sig_len = f.sig.len();
         let enc = f.encode();
-        assert_eq!(&enc[..enc.len() - 64], f.sign_data().as_slice());
+        assert_eq!(&enc[..enc.len() - 2 - sig_len], f.sign_data().as_slice());
     }
 }

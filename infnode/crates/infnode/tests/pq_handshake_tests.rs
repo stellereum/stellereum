@@ -65,8 +65,8 @@ fn fixed_transcript() -> PqTranscript {
     PqTranscript {
         pq_init: f(0xA0),
         pq_resp: f(0xB0),
-        eph_init: f(0xC0),
-        eph_resp: f(0xD0),
+        fresh_init: f(0xC0),
+        fresh_resp: f(0xD0),
         chan_bind: f(0xE0),
         nonce_init: f(0x01),
         nonce_resp: f(0x21),
@@ -82,25 +82,24 @@ const TRANSCRIPT_DIGEST_KAT: &str =
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pq_flag_defaults_off_and_parses_only_exact_1() {
+fn pq_flag_is_mandatory_and_ignores_env() {
+    // FULL-PQ: there is no opt-out. The legacy env name is accepted but never
+    // changes the answer — PQ is active for every value, including "0".
     let saved = std::env::var("STELL_INF_PQ_HANDSHAKE").ok();
     unsafe {
         std::env::remove_var("STELL_INF_PQ_HANDSHAKE");
     }
-    assert!(!proto::pq_handshake_enabled(), "unset must be OFF");
-    for off in ["0", "", "true", "TRUE", "2", " 1", "1 "] {
+    assert!(proto::pq_handshake_active(), "unset must be PQ-active");
+    for v in ["0", "", "true", "TRUE", "2", " 1", "1 "] {
         unsafe {
-            std::env::set_var("STELL_INF_PQ_HANDSHAKE", off);
+            std::env::set_var("STELL_INF_PQ_HANDSHAKE", v);
         }
         assert!(
-            !proto::pq_handshake_enabled(),
-            "value {off:?} must be OFF (exact \"1\" only)"
+            proto::pq_handshake_active(),
+            "value {v:?} must still be PQ-active (no classical opt-out)"
         );
+        assert!(proto::pq_handshake_active_for(Some(v)));
     }
-    unsafe {
-        std::env::set_var("STELL_INF_PQ_HANDSHAKE", "1");
-    }
-    assert!(proto::pq_handshake_enabled(), "\"1\" must be ON");
     unsafe {
         match saved {
             Some(v) => std::env::set_var("STELL_INF_PQ_HANDSHAKE", v),
@@ -108,10 +107,6 @@ fn pq_flag_defaults_off_and_parses_only_exact_1() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 2. ML-KEM-768 KATs (the KEX the PQ handshake runs).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn pq_kem_wycheproof_kat_keygen_prefix_and_decap() {
@@ -197,7 +192,7 @@ fn challenge_frame(src: [u8; NODEID_LEN], dst: [u8; NODEID_LEN], payload: Vec<u8
         svc: 0,
         payload,
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     }
 }
 
@@ -211,7 +206,7 @@ fn auth_frame(src: [u8; NODEID_LEN], dst: [u8; NODEID_LEN], payload: Vec<u8>) ->
         svc: 0,
         payload,
         nonce: vec![],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     }
 }
 
@@ -228,8 +223,7 @@ fn pq_handshake_happy_both_sides_agree() {
     let ch_json = serde_json::json!({
         "nonce": "abcdef0123456789",
         "at": auth_at,
-        "eph": hex::encode(eph_init),
-        "ed": hex::encode([3u8; 32]),
+        "fresh": hex::encode(eph_init),
         "pq_ver": PQ_TRANSCRIPT_VERSION,
         "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
@@ -239,24 +233,22 @@ fn pq_handshake_happy_both_sides_agree() {
 
     let (ct, agreed_r) =
         pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
-            .expect("responder accept")
-            .expect("offer present");
+            .expect("responder accept");
     assert_eq!(ct.len(), 1088);
 
     let auth_json = serde_json::json!({
         "node": format!("inf1:{}", hex::encode(resp_id)),
         "name": "resp",
         "at": auth_at,
-        "eph": hex::encode(eph_resp),
+        "fresh": hex::encode(eph_resp),
         "pq_ver": PQ_TRANSCRIPT_VERSION,
         "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ct": hex::encode(&ct),
         "pq_tag": hex::encode(agreed_r.tag),
     });
     let auth = auth_frame(resp_id, init_id, auth_json.to_string().into_bytes());
-    let agreed_i = pq_initiator_answer(&Some(offer), &ch_sd, &eph_init, &auth)
-        .expect("initiator answer")
-        .expect("agreement");
+    let agreed_i =
+        pq_initiator_answer(&Some(offer), &ch_sd, &eph_init, &auth).expect("initiator answer");
     assert_eq!(agreed_i.shared, agreed_r.shared);
     assert_eq!(agreed_i.digest, agreed_r.digest);
 
@@ -285,9 +277,8 @@ fn pq_tampered_transcript_refused_with_clear_error() {
         let ch_json = serde_json::json!({
             "nonce": "abcdef0123456789",
             "at": auth_at,
-            "eph": hex::encode(eph_init),
-            "ed": hex::encode([3u8; 32]),
-            "pq_ver": PQ_TRANSCRIPT_VERSION,
+            "fresh": hex::encode(eph_init),
+                "pq_ver": PQ_TRANSCRIPT_VERSION,
             "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
             "pq_ek": hex::encode(&offer.ek),
         });
@@ -295,13 +286,12 @@ fn pq_tampered_transcript_refused_with_clear_error() {
         let ch_sd = ch.sign_data();
         let (ct, agreed_r) =
             pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
-                .expect("accept")
-                .expect("offer");
+                .expect("accept");
         let mut auth_json = serde_json::json!({
             "node": format!("inf1:{}", hex::encode(resp_id)),
             "name": "resp",
             "at": auth_at,
-            "eph": hex::encode(eph_resp),
+            "fresh": hex::encode(eph_resp),
             "pq_ver": PQ_TRANSCRIPT_VERSION,
             "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
             "pq_ct": hex::encode(&ct),
@@ -322,11 +312,11 @@ fn pq_tampered_transcript_refused_with_clear_error() {
         v[k] = serde_json::Value::String(hex::encode(b));
     };
 
-    // Tampered ct / tag / responder eph / at: every binding is covered.
+    // Tampered ct / tag / responder freshness / at: every binding is covered.
     let e1 = run(&|v| flip_hex(v, "pq_ct", 0));
     let e2 = run(&|v| flip_hex(v, "pq_ct", 1087));
     let e3 = run(&|v| flip_hex(v, "pq_tag", 31));
-    let e4 = run(&|v| flip_hex(v, "eph", 5));
+    let e4 = run(&|v| flip_hex(v, "fresh", 5));
     for (i, e) in [e1, e2, e3, e4].iter().enumerate() {
         assert!(
             e.contains("pq transcript auth failed"),
@@ -396,36 +386,35 @@ fn pq_wrong_key_refused() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pq_mixed_mode_window_both_directions() {
-    // No PQ fields offered: classical in both flag states (window tolerance).
+fn pq_policy_has_no_classical_arm() {
+    // Absent offer: refused (never classical), regardless of local state.
     assert_eq!(
-        proto::pq_mixed_policy(false, None).unwrap(),
-        proto::PqMode::Classical
+        proto::pq_mixed_policy(false, None).unwrap_err(),
+        "pq offer required (classical refused)"
     );
     assert_eq!(
-        proto::pq_mixed_policy(true, None).unwrap(),
-        proto::PqMode::Classical
+        proto::pq_mixed_policy(true, None).unwrap_err(),
+        "pq offer required (classical refused)"
     );
-    // Classical-only node ignores even well-formed PQ offers: never an error.
+    // A local node without a PQ identity cannot negotiate at all, even with
+    // a well-formed offer.
     let valid = PqOfferCheck {
         wellformed: true,
         suite_ok: true,
         tag_ok: true,
     };
     assert_eq!(
-        proto::pq_mixed_policy(false, Some(valid)).unwrap(),
-        proto::PqMode::Classical
+        proto::pq_mixed_policy(false, Some(valid)).unwrap_err(),
+        "pq identity required (classical refused)"
     );
-    // Classical-only node ignores even garbage PQ fields (plan §5: additive
-    // JSON is never an error for a node that does not speak PQ).
     let garbage = PqOfferCheck {
         wellformed: false,
         suite_ok: false,
         tag_ok: false,
     };
     assert_eq!(
-        proto::pq_mixed_policy(false, Some(garbage)).unwrap(),
-        proto::PqMode::Classical
+        proto::pq_mixed_policy(false, Some(garbage)).unwrap_err(),
+        "pq identity required (classical refused)"
     );
     // PQ node with a verified offer: PQ mode.
     assert_eq!(
@@ -471,35 +460,33 @@ fn pq_mixed_mode_window_both_directions() {
 }
 
 #[test]
-fn pq_mixed_mode_protocol_fallback_both_directions() {
+fn pq_protocol_requires_pq_fields_both_directions() {
     let init_id = [9u8; NODEID_LEN];
     let resp_id = [7u8; NODEID_LEN];
-    let eph_init = [0x11u8; 32];
-    let eph_resp = [0x22u8; 32];
+    let fresh_init = [0x11u8; 32];
+    let fresh_resp = [0x22u8; 32];
     let auth_at = 1_700_000_000_001i64;
 
-    // Direction 1: PQ initiator offers, classical responder answers (no pq_*).
-    // Responder side: no PQ fields in CHALLENGE => Ok(None), pure classical.
+    // Direction 1: a CHALLENGE without PQ fields is REFUSED (no classical
+    // responder path).
     let plain_ch = serde_json::json!({
         "nonce": "abcdef0123456789",
         "at": auth_at,
-        "eph": hex::encode(eph_init),
-        "ed": hex::encode([3u8; 32]),
+        "fresh": hex::encode(fresh_init),
     });
     let ch = challenge_frame(init_id, resp_id, plain_ch.to_string().into_bytes());
-    let got = pq_responder_accept(
-        &eph_init,
+    let err = pq_responder_accept(
+        &fresh_init,
         &plain_ch,
         &ch.sign_data(),
-        &eph_resp,
+        &fresh_resp,
         auth_at,
         &resp_id,
     )
-    .expect("classical challenge must not error");
-    assert!(got.is_none(), "no PQ offer => classical path");
+    .expect_err("classical challenge must be refused");
+    assert_eq!(err.to_string(), "pq offer required (classical refused)");
 
-    // Direction 2: classical initiator dials, PQ responder... responder sees
-    // no offer => classical AUTH (no pq_*); initiator falls back.
+    // Direction 2: an AUTH without PQ fields is REFUSED (no fallback).
     let offer = pq_initiator_offer().expect("offer");
     let ch2 = challenge_frame(init_id, resp_id, plain_ch.to_string().into_bytes());
     let ch2_sd = ch2.sign_data();
@@ -507,26 +494,20 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
         "node": format!("inf1:{}", hex::encode(resp_id)),
         "name": "resp",
         "at": auth_at,
-        "eph": hex::encode(eph_resp),
+        "fresh": hex::encode(fresh_resp),
     });
     let auth = auth_frame(resp_id, init_id, plain_auth.to_string().into_bytes());
-    let answer = pq_initiator_answer(&Some(offer), &ch2_sd, &eph_init, &auth)
-        .expect("classical AUTH must not error");
-    assert!(answer.is_none(), "no PQ answer => classical fallback");
+    let err2 = pq_initiator_answer(&Some(offer), &ch2_sd, &fresh_init, &auth)
+        .expect_err("classical AUTH must be refused");
+    assert_eq!(err2.to_string(), "pq answer required (classical refused)");
 
-    // Classical AUTH with junk pq-adjacent fields but no pq_ct: still fallback.
+    // Junk pq-adjacent fields without pq_ct: still refused.
     let mut junk = plain_auth.clone();
     junk["note"] = serde_json::Value::String("pq_ct is not here".to_string());
     let auth_junk = auth_frame(resp_id, init_id, junk.to_string().into_bytes());
     let offer2 = pq_initiator_offer().expect("offer");
-    let answer2 = pq_initiator_answer(&Some(offer2), &ch2_sd, &eph_init, &auth_junk)
-        .expect("unknown fields must not error");
-    assert!(answer2.is_none());
+    assert!(pq_initiator_answer(&Some(offer2), &ch2_sd, &fresh_init, &auth_junk).is_err());
 }
-
-// ---------------------------------------------------------------------------
-// 8. KEM-only session-key properties + transcript tamper coverage at the digest layer.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn pq_transcript_builder_matches_manual_fields() {
@@ -542,8 +523,8 @@ fn pq_transcript_builder_matches_manual_fields() {
     let built = pq_build_transcript(&ek_full, &ct_full, &eph_init, &eph_resp, ch_sd, &bind);
     assert_eq!(built.pq_init, proto::pq_hash_field(&ek_full));
     assert_eq!(built.pq_resp, proto::pq_hash_field(&ct_full));
-    assert_eq!(built.eph_init, eph_init);
-    assert_eq!(built.eph_resp, eph_resp);
+    assert_eq!(built.fresh_init, eph_init);
+    assert_eq!(built.fresh_resp, eph_resp);
     assert_eq!(built.chan_bind, PQ_CHAN_BIND_PLACEHOLDER);
     assert_eq!(built.nonce_init, proto::pq_hash_field(ch_sd));
     assert_eq!(built.nonce_resp, proto::pq_hash_field(&bind));
@@ -590,8 +571,8 @@ fn pq_transcript_tamper_anywhere_breaks_tag() {
     };
     push(&|v| v.pq_init[0] ^= 0x01);
     push(&|v| v.pq_resp[31] ^= 0x80);
-    push(&|v| v.eph_init[7] ^= 0x01);
-    push(&|v| v.eph_resp[0] ^= 0x01);
+    push(&|v| v.fresh_init[7] ^= 0x01);
+    push(&|v| v.fresh_resp[0] ^= 0x01);
     push(&|v| v.chan_bind[15] ^= 0x01);
     push(&|v| v.nonce_init[0] ^= 0x01);
     push(&|v| v.nonce_resp[31] ^= 0x01);
@@ -759,7 +740,7 @@ fn pq_identity_wrong_perms_fail_closed() {
 fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
     PeerConfig {
         name: "p".to_string(),
-        ed_pub: hex::encode([2u8; 32]),
+        consensus_pub: None,
         pq_pub,
         endpoints: vec![],
         allow: vec!["*".to_string()],
@@ -981,266 +962,62 @@ fn pq_registry_first_wins_sticky_and_quarantined() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pq_identity_absent_means_classical_both_flag_states() {
+fn pq_identity_absent_is_refused_not_classical() {
     let digest = pq_falcon_digest(&fixed_transcript());
     let keys = PqKeys::from_seed([0x5Au8; 32]);
     let sig = keys.sign_digest(&digest);
-    // No PQ offered: classical in both local states (window tolerance).
+    // No PQ offered: REFUSED (never classical), regardless of local state.
     assert_eq!(
-        pq_falcon_policy(false, None, &digest, None).unwrap(),
-        proto::PqMode::Classical
+        pq_falcon_policy(false, None, &digest, None).unwrap_err(),
+        "pq identity required (classical refused)"
     );
     assert_eq!(
-        pq_falcon_policy(true, None, &digest, None).unwrap(),
-        proto::PqMode::Classical
+        pq_falcon_policy(true, None, &digest, None).unwrap_err(),
+        "pq identity required (classical refused)"
     );
-    // Classical-only local node ignores even a VALID offered tag: never an
-    // error (plan §5 — additive fields are not errors for a node that does
-    // not speak PQ). This is the exact branch the flag-OFF callers take.
+    // A local node without a PQ identity cannot negotiate even a valid tag.
     assert_eq!(
-        pq_falcon_policy(false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
-        proto::PqMode::Classical
+        pq_falcon_policy(false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap_err(),
+        "pq identity required (classical refused)"
     );
-    assert_eq!(pq_mixed_policy_off_path(), proto::PqMode::Classical);
-}
-
-fn pq_mixed_policy_off_path() -> proto::PqMode {
-    // Flag OFF callers pass `local_pq = false` with no offer material.
-    proto::pq_mixed_policy(false, None).unwrap()
-}
-
-// ---------------------------------------------------------------------------
-// 15. Default-ON gate (PQ 9.1): inverted flag, H const, WARN + counter.
-// Env-safety: NO env mutation here — `pq_handshake_active_for` is the pure
-// core, so parallel execution still cannot race with the legacy flag test.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn pq_default_on_active_for_exact_zero_only() {
-    // Unset/empty/legacy-"1"/anything-else = PQ active (default-ON).
-    assert!(proto::pq_handshake_active_for(None));
-    assert!(proto::pq_handshake_active_for(Some("")));
-    assert!(proto::pq_handshake_active_for(Some("1")));
-    assert!(proto::pq_handshake_active_for(Some("true")));
-    assert!(proto::pq_handshake_active_for(Some(" 0")));
-    assert!(proto::pq_handshake_active_for(Some("00")));
-    // ONLY exact "0" opts out (explicit classical, honored pre-H only).
-    assert!(!proto::pq_handshake_active_for(Some("0")));
-}
-
-#[test]
-fn pq_classical_refuse_height_boundary() {
-    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
-    // H is far future vs every height pinned in-repo (kv fixtures "42000",
-    // live comment 71587, VRF staging 1_000_000): documents the choice.
-    assert_eq!(h, 300_000);
-    assert!(!proto::pq_classical_refused_at(0));
-    assert!(!proto::pq_classical_refused_at(42_000));
-    assert!(!proto::pq_classical_refused_at(71_587));
-    assert!(!proto::pq_classical_refused_at(h - 1));
-    assert!(proto::pq_classical_refused_at(h));
-    assert!(proto::pq_classical_refused_at(h + 1));
-    assert!(proto::pq_classical_refused_at(u64::MAX));
-}
-
-#[test]
-fn pq_mixed_policy_at_pre_h_delegates_unchanged() {
-    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
-    let pre = h - 1;
-    // Pre-H is byte-behavior-identical to the legacy policy on every arm.
+    // There is no height window and no fallback counter to advance.
+    assert!(proto::pq_handshake_active());
     assert_eq!(
-        proto::pq_mixed_policy_at(pre, false, None).unwrap(),
-        proto::pq_mixed_policy(false, None).unwrap()
-    );
-    assert_eq!(
-        proto::pq_mixed_policy_at(pre, true, None).unwrap(),
-        proto::PqMode::Classical
-    );
-    let verified = PqOfferCheck {
-        wellformed: true,
-        suite_ok: true,
-        tag_ok: true,
-    };
-    assert_eq!(
-        proto::pq_mixed_policy_at(pre, true, Some(verified)).unwrap(),
-        proto::PqMode::Pq
-    );
-    let garbage = PqOfferCheck {
-        wellformed: false,
-        suite_ok: false,
-        tag_ok: false,
-    };
-    assert_eq!(
-        proto::pq_mixed_policy_at(pre, false, Some(garbage)).unwrap(),
-        proto::PqMode::Classical
-    );
-    for (wellformed, suite_ok, tag_ok) in [
-        (true, true, false),
-        (true, false, false),
-        (false, false, false),
-    ] {
-        let mk = || PqOfferCheck {
-            wellformed,
-            suite_ok,
-            tag_ok,
-        };
-        let legacy = proto::pq_mixed_policy(true, Some(mk()));
-        let gated = proto::pq_mixed_policy_at(pre, true, Some(mk()));
-        assert_eq!(legacy.unwrap_err(), gated.unwrap_err());
-    }
-    // Current-chain-scale heights are pre-H: classical warns-but-works.
-    assert_eq!(
-        proto::pq_mixed_policy_at(71_587, true, None).unwrap(),
-        proto::PqMode::Classical
+        proto::pq_mixed_policy(true, None).unwrap_err(),
+        "pq offer required (classical refused)"
     );
 }
 
 #[test]
-fn pq_classical_fallback_warns_loud_and_counts() {
-    let before = proto::pq_classical_fallback_total();
-    proto::pq_warn_classical_fallback("test");
-    assert_eq!(proto::pq_classical_fallback_total(), before + 1);
-    proto::pq_warn_classical_fallback("test");
-    assert_eq!(proto::pq_classical_fallback_total(), before + 2);
-}
-
-#[test]
-fn pq_mixed_policy_at_post_h_classical_refused() {
-    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
-    // Absent offer (classical-explicit) refused — no silent window past H.
-    assert_eq!(
-        proto::pq_mixed_policy_at(h, true, None).unwrap_err(),
-        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
-    );
-    assert_eq!(
-        proto::pq_mixed_policy_at(h, false, None).unwrap_err(),
-        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
-    );
-    // Classical-only local node refused even with a verified offer.
-    assert_eq!(
-        proto::pq_mixed_policy_at(
-            h,
-            false,
-            Some(PqOfferCheck {
-                wellformed: true,
-                suite_ok: true,
-                tag_ok: true
-            })
-        )
-        .unwrap_err(),
-        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
-    );
-    // Malformed/suite/tag arms keep their specific fail-closed errors.
-    assert_eq!(
-        proto::pq_mixed_policy_at(
-            h,
-            true,
-            Some(PqOfferCheck {
-                wellformed: false,
-                suite_ok: false,
-                tag_ok: false
-            })
-        )
-        .unwrap_err(),
-        "pq fields malformed"
-    );
-    assert_eq!(
-        proto::pq_mixed_policy_at(
-            h,
-            true,
-            Some(PqOfferCheck {
-                wellformed: true,
-                suite_ok: false,
-                tag_ok: false
-            })
-        )
-        .unwrap_err(),
-        "unsupported pq suite/version"
-    );
-    assert_eq!(
-        proto::pq_mixed_policy_at(
-            h,
-            true,
-            Some(PqOfferCheck {
-                wellformed: true,
-                suite_ok: true,
-                tag_ok: false
-            })
-        )
-        .unwrap_err(),
-        "pq transcript auth failed"
-    );
-    // Verified PQ offer still negotiates Pq at/after H (PQ<->PQ verified).
-    assert_eq!(
-        proto::pq_mixed_policy_at(
-            h,
-            true,
-            Some(PqOfferCheck {
-                wellformed: true,
-                suite_ok: true,
-                tag_ok: true
-            })
-        )
-        .unwrap(),
-        proto::PqMode::Pq
-    );
-}
-
-#[test]
-fn pq_falcon_policy_at_pre_h_delegates_post_h_refuses() {
-    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
-    let pre = h - 1;
-    let digest = pq_falcon_digest(&fixed_transcript());
+fn pq_falcon_policy_is_pq_only() {
     let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let digest = pq_falcon_digest(&fixed_transcript());
     let sig = keys.sign_digest(&digest);
-    // Pre-H: absent identity = classical-explicit (both local states).
+    // Verified tag: the ONLY accepted outcome.
     assert_eq!(
-        proto::pq_falcon_policy_at(pre, false, None, &digest, None).unwrap(),
-        proto::PqMode::Classical
-    );
-    assert_eq!(
-        proto::pq_falcon_policy_at(pre, true, None, &digest, None).unwrap(),
-        proto::PqMode::Classical
-    );
-    // Pre-H: verified offer negotiates Pq.
-    assert_eq!(
-        proto::pq_falcon_policy_at(pre, true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
         proto::PqMode::Pq
     );
-    // Post-H: absent identity refused (no classical-explicit past H).
+    // Absent identity, stripped tag, malformed key, wrong tag: all refused.
     assert_eq!(
-        proto::pq_falcon_policy_at(h, true, None, &digest, None).unwrap_err(),
-        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+        pq_falcon_policy(true, None, &digest, None).unwrap_err(),
+        "pq identity required (classical refused)"
     );
-    // Post-H: classical-only local refused even with a valid offered tag.
     assert_eq!(
-        proto::pq_falcon_policy_at(h, false, Some(&keys.pq_pub()), &digest, Some(&sig))
-            .unwrap_err(),
-        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, None).unwrap_err(),
+        "pq falcon tag failed"
     );
-    // Post-H: malformed key and mistag keep their specific fail-closed errors.
     assert_eq!(
-        proto::pq_falcon_policy_at(h, true, Some(&[9u8; 32]), &digest, Some(&sig)).unwrap_err(),
+        pq_falcon_policy(true, Some(&[9u8; 32]), &digest, Some(&sig)).unwrap_err(),
         "pq identity malformed"
     );
     let other = PqKeys::from_seed([0x3Bu8; 32]);
     let cross = other.sign_digest(&digest);
     assert_eq!(
-        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&cross))
-            .unwrap_err(),
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, Some(&cross)).unwrap_err(),
         "pq falcon tag failed"
     );
-    // Post-H: PQ<->PQ verified still works.
-    assert_eq!(
-        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
-        proto::PqMode::Pq
-    );
 }
-
-// ---------------------------------------------------------------------------
-// 16. First-boot auto-generation: absent -> generate (0600) + reload;
-// corrupt -> hard error, never silent classical downgrade.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn pq_identity_load_or_generate_creates_0600_and_reloads() {
@@ -1437,7 +1214,7 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
     let offer = pq_initiator_offer().expect("offer");
     let ch_json = serde_json::json!({
         "nonce": "abcdef0123456789", "at": auth_at,
-        "eph": hex::encode(eph_init), "ed": hex::encode([3u8; 32]),
+        "fresh": hex::encode(eph_init), "ed": hex::encode([3u8; 32]),
         "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
     });
@@ -1445,8 +1222,7 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
     let ch_sd = ch.sign_data();
     let (ct, agreed_r) =
         pq_responder_accept(&eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id)
-            .expect("accept")
-            .expect("offer");
+            .expect("accept");
     assert_eq!(ct.len(), 1088);
     // Flip one ct byte in the AUTH answer: initiator must refuse with a
     // clear transcript-auth error even though the static key is cache-valid.
@@ -1454,7 +1230,7 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
     bad_ct[0] ^= 0x01;
     let bad_auth_json = serde_json::json!({
         "node": format!("inf1:{}", hex::encode(resp_id)), "name": "resp", "at": auth_at,
-        "eph": hex::encode(eph_resp), "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
+        "fresh": hex::encode(eph_resp), "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ct": hex::encode(&bad_ct), "pq_tag": hex::encode(agreed_r.tag),
     });
     let bad_auth = auth_frame(resp_id, init_id, bad_auth_json.to_string().into_bytes());

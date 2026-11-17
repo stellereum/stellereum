@@ -17,17 +17,15 @@ fn keystore_hardening_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
     std::env::remove_var("INFNODE_KEY_PASSPHRASE");
 
-    // ---- 1. Plaintext mode: still must enforce 0600 / 0700 ----
+    // ---- 1. Plaintext mode: KEM seed only, still 0600 / 0700 ----
     let keys = infnode::keyring::NodeKeys::generate();
-    let id_hex = keys.id_hex();
     keys.save(&dir).unwrap();
 
-    let file_mode = std::fs::metadata(dir.join("identity.key"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(file_mode, 0o600, "identity.key must be owner-only (0600)");
+    // FULL-PQ: the classical Ed25519 identity file is never written.
+    assert!(
+        !dir.join("identity.key").exists(),
+        "identity.key must not be produced (PQ-only keystore)"
+    );
     let e2e_mode = std::fs::metadata(dir.join("e2e.key"))
         .unwrap()
         .permissions()
@@ -38,26 +36,42 @@ fn keystore_hardening_roundtrip() {
     assert_eq!(dir_mode, 0o700, "keystore dir must be owner-only (0700)");
 
     let loaded = infnode::keyring::NodeKeys::load(&dir).unwrap();
-    assert_eq!(loaded.id_hex(), id_hex, "identity must round-trip");
+    assert_eq!(loaded.kem_ek, keys.kem_ek, "KEM ek must round-trip");
+
+    // A leftover classical identity is refused loudly (fail closed, no
+    // silent "keep the old Ed25519 identity" path).
+    std::fs::write(dir.join("identity.key"), "deadbeef").unwrap();
+    let legacy = match infnode::keyring::NodeKeys::load(&dir) {
+        Ok(_) => panic!("legacy identity.key must be refused"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        legacy.contains("legacy Ed25519 identity refused"),
+        "clear migration error, got: {legacy}"
+    );
+    let _ = std::fs::remove_file(dir.join("identity.key"));
 
     // ---- 2. Encrypted mode: Argon2id `enc2:` format + wrong-passphrase rejection ----
     std::env::set_var("INFNODE_KEY_PASSPHRASE", "correct-horse-battery");
     let keys2 = infnode::keyring::NodeKeys::generate();
-    let id2 = keys2.id_hex();
+    let kem_hex = hex::encode(keys2.kem_seed);
     keys2.save(&dir).unwrap();
 
-    let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
+    let raw = std::fs::read_to_string(dir.join("e2e.key")).unwrap();
     assert!(
         raw.starts_with("enc2:"),
         "encrypted key must use the Argon2id enc2 format"
     );
     assert!(
-        !raw.contains(&id2),
+        !raw.contains(&kem_hex),
         "plaintext must never leak into the encrypted file"
     );
 
     let loaded2 = infnode::keyring::NodeKeys::load(&dir).unwrap();
-    assert_eq!(loaded2.id_hex(), id2, "encrypted identity must round-trip");
+    assert_eq!(
+        loaded2.kem_ek, keys2.kem_ek,
+        "encrypted KEM must round-trip"
+    );
 
     std::env::set_var("INFNODE_KEY_PASSPHRASE", "wrong-password");
     assert!(
@@ -65,10 +79,10 @@ fn keystore_hardening_roundtrip() {
         "wrong passphrase must be rejected (AEAD integrity)"
     );
 
-    // ---- 3. Mailbox keys: encrypted + 0600 ----
+    // ---- 3. Mailbox keys: Falcon-512 signer + KEM, encrypted + 0600 ----
     std::env::set_var("INFNODE_KEY_PASSPHRASE", "mail-passphrase");
     let mk = infnode::mailbox::MailKeys::generate();
-    let ed = mk.ed_hex();
+    let sig_pub = mk.sig_pub_hex();
     mk.save(&dir, "alice@example.com").unwrap();
 
     let mk_path = dir.join("alice@example.com.key");
@@ -76,15 +90,35 @@ fn keystore_hardening_roundtrip() {
     assert_eq!(mk_mode, 0o600, "mailbox key must be owner-only (0600)");
     let mk_raw = std::fs::read_to_string(&mk_path).unwrap();
     assert!(mk_raw.starts_with("enc2:"), "mailbox key must be encrypted");
-    assert!(!mk_raw.contains(&ed), "mailbox plaintext key must not leak");
+    assert!(
+        !mk_raw.contains(&sig_pub),
+        "mailbox plaintext key must not leak"
+    );
 
     let mk2 = infnode::mailbox::MailKeys::load(&dir, "alice@example.com").unwrap();
-    assert_eq!(mk2.ed_hex(), ed, "mailbox identity must round-trip");
+    assert_eq!(
+        mk2.sig_pub_hex(),
+        sig_pub,
+        "mailbox Falcon-512 identity must round-trip"
+    );
     // FULL-PQ: KEM seal/open round-trip (X25519 removed).
     let msg = b"pq mailbox round-trip";
     let blob = infnode::mailbox::seal(&mk2.kem_ek, msg).expect("kem seal");
     let back = infnode::mailbox::open(&mk2, &blob).expect("kem open");
     assert_eq!(back, msg);
+
+    // Mailbox signatures are Falcon-512 and verify only with the right key.
+    let sig = mk2.sign(msg);
+    assert!(infnode::mailbox::MailKeys::verify(
+        &hex::decode(mk2.sig_pub_hex()).unwrap(),
+        msg,
+        &sig
+    ));
+    assert!(!infnode::mailbox::MailKeys::verify(
+        &hex::decode(mk2.sig_pub_hex()).unwrap(),
+        b"other",
+        &sig
+    ));
 
     std::env::remove_var("INFNODE_KEY_PASSPHRASE");
     let _ = std::fs::remove_dir_all(&dir);

@@ -10,11 +10,10 @@
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::ValidatorId;
 use stellereum::mev_epoch::{
-    combine_partials, compute_partial, encryption_public_key_from_ed25519,
-    encryption_secret_from_ed25519, pq_kem_ek_from_seed, pq_transport_seal, seal_transaction,
-    unseal_transaction, CommitteeMember, DecryptionPartial, DkgContribution, EpochCommittee,
-    EpochDkg, EpochKeyMaterial, PqTransportEnvelope, PQ_KEM_EK_LEN, PQ_KEM_PACKAGE_CT_LEN,
-    PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
+    combine_partials, compute_partial, kem_member_tag, pq_kem_ek_from_seed, pq_transport_seal,
+    seal_transaction, unseal_transaction, CommitteeMember, DecryptionPartial, DkgContribution,
+    EpochCommittee, EpochDkg, EpochKeyMaterial, PqTransportEnvelope, PQ_KEM_EK_LEN,
+    PQ_KEM_PACKAGE_CT_LEN, PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
 };
 use stellereum::mev_kem_registry::{
     MevKemRegistry, MevKemRegistryError, MEV_KEM_EK_LEN, MEV_KEM_HISTORY_LIMIT,
@@ -31,7 +30,6 @@ use stellereum::pq_registry::{PQ_KEY_HISTORY_LIMIT, PQ_ROTATION_DELAY_HEIGHTS};
 struct Member {
     id: [u8; 32],
     secret: [u8; 32],
-    enc_secret: [u8; 32],
     enc_pk: [u8; 32],
     falcon: FalconKeypair,
     falcon_pk: Vec<u8>,
@@ -42,9 +40,6 @@ struct Member {
 fn member(ed_seed: [u8; 32], falcon_seed: [u8; 32], kem_fill: u8) -> Member {
     let signing = SigningKey::from_bytes(&ed_seed);
     let secret = signing.to_bytes();
-    let enc_secret = encryption_secret_from_ed25519(&secret);
-    let enc_pk = encryption_public_key_from_ed25519(&signing.verifying_key().to_bytes())
-        .expect("a fixed ed25519 key converts");
     let falcon = FalconKeypair::generate_from_seed_bytes(&falcon_seed);
     let falcon_pk = falcon.public_key().to_vec();
     let kem_seed = [kem_fill; 64];
@@ -53,8 +48,7 @@ fn member(ed_seed: [u8; 32], falcon_seed: [u8; 32], kem_fill: u8) -> Member {
     Member {
         id: signing.verifying_key().to_bytes(),
         secret,
-        enc_secret,
-        enc_pk,
+        enc_pk: kem_member_tag(&kem_ek),
         falcon,
         falcon_pk,
         kem_seed,
@@ -126,15 +120,24 @@ fn member_by_id<'a>(members: &'a [Member], id: &[u8; 32]) -> &'a Member {
     members.iter().find(|m| &m.id == id).expect("member exists")
 }
 
-/// Full classical DKG (for the P_e / share-equality comparison only).
-fn run_classical(committee: &EpochCommittee, members: &[Member]) -> Vec<EpochKeyMaterial> {
+/// Full PQ DKG through the DIRECT map API (no registry) — the comparison
+/// baseline for the registry-wired path: the deterministic polynomials depend
+/// only on (epoch seed, index, long-term secret), so P_e and every share must
+/// be identical; only the encryption-randomized package bytes (and therefore
+/// the transcript root) differ.
+fn run_pq_direct(committee: &EpochCommittee, members: &[Member]) -> Vec<EpochKeyMaterial> {
+    let mut keys = std::collections::BTreeMap::new();
+    for m in members {
+        let index = committee.index_of(&m.id).expect("member has an index");
+        keys.insert(index, m.kem_ek.clone());
+    }
     let mut dkgs: Vec<EpochDkg> = members
         .iter()
         .map(|m| EpochDkg::new(committee.clone(), m.id))
         .collect();
     let mut contributions = Vec::new();
     for (i, m) in members.iter().enumerate() {
-        if let Ok(c) = dkgs[i].contribution(m.id, &m.secret, &m.enc_secret) {
+        if let Ok(c) = dkgs[i].contribution_pq(m.id, &m.secret, &keys) {
             dkgs[i].set_own(c.clone());
             contributions.push(c);
         }
@@ -147,7 +150,7 @@ fn run_classical(committee: &EpochCommittee, members: &[Member]) -> Vec<EpochKey
     for (i, m) in members.iter().enumerate() {
         for c in &contributions {
             dkgs[i]
-                .ingest(c.clone(), &m.enc_secret)
+                .ingest_pq(c.clone(), &m.kem_seed)
                 .unwrap_or_else(|e| panic!("member {i} must accept a contribution: {e}"));
         }
     }
@@ -340,9 +343,24 @@ fn kem_rotated_key_enforced_post_delay() {
         )
         .expect("pre-delay ingest with the old seed must succeed");
 
-    // Post-delay the registry demands the NEW key: old seed refused
-    // (mismatch), new seed accepted.
-    let mut builder_dkg2 = EpochDkg::new(committee.clone(), builder.id);
+    // Post-delay the registry demands the NEW key. The committee is rebuilt
+    // at the rotation's effective height (the committee hash binds the
+    // transport-key tags), then the old seed is refused (mismatch) and the
+    // new seed accepted.
+    let post_members: Vec<CommitteeMember> = committee
+        .members
+        .iter()
+        .map(|m| CommitteeMember {
+            validator_id: m.validator_id,
+            enc_pk: if m.validator_id == rotated.id {
+                kem_member_tag(&new_ek)
+            } else {
+                m.enc_pk
+            },
+        })
+        .collect();
+    let committee_post = EpochCommittee::build(5, post_members);
+    let mut builder_dkg2 = EpochDkg::new(committee_post.clone(), builder.id);
     let post = builder_dkg2
         .contribution_pq_from_registry(builder.id, &builder.secret, &reg, effective)
         .expect("post-delay contribution builds");
@@ -353,7 +371,7 @@ fn kem_rotated_key_enforced_post_delay() {
         "registry-built packages are always KEM-shaped"
     );
     let post_env = seal_envelope(builder, post);
-    let mut victim_old = EpochDkg::new(committee.clone(), rotated.id);
+    let mut victim_old = EpochDkg::new(committee_post.clone(), rotated.id);
     let err = victim_old
         .ingest_authenticated_pq_from_registry(
             &post_env,
@@ -368,7 +386,7 @@ fn kem_rotated_key_enforced_post_delay() {
         err.contains("mismatch") && err.contains("post-delay"),
         "refusal names the rotation enforcement: {err}"
     );
-    let mut victim_new = EpochDkg::new(committee.clone(), rotated.id);
+    let mut victim_new = EpochDkg::new(committee_post.clone(), rotated.id);
     victim_new
         .ingest_authenticated_pq_from_registry(
             &post_env,
@@ -416,19 +434,23 @@ fn kem_classical_contribution_refused_end_to_end() {
     let committee = committee_of(5, &members);
     let reg = registered_registry(&members, 0);
 
-    // A classical contribution builds fine (shape check target) ...
-    let mut classical_dkg = EpochDkg::new(committee.clone(), members[0].id);
-    let classical = classical_dkg
-        .contribution(members[0].id, &members[0].secret, &members[0].enc_secret)
-        .expect("classical contribution builds");
+    // A CLASSICAL-SHAPED contribution is constructed by truncating the
+    // AEAD/KEM carrier to the removed 48-byte shape. This pins the refusal
+    // without any X25519 code existing in the tree.
+    let contributors = contributor_ids(&committee, &members);
+    let contributor = member_by_id(&members, &contributors[0]);
+    let mut pq_dkg = EpochDkg::new(committee.clone(), contributor.id);
+    let mut classical = pq_dkg
+        .contribution_pq_from_registry(contributor.id, &contributor.secret, &reg, 0)
+        .expect("PQ contribution builds");
+    for p in &mut classical.packages {
+        p.ciphertext.truncate(48);
+    }
     assert!(
-        classical
-            .packages
-            .iter()
-            .all(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN),
-        "classical packages are X25519-shaped, never KEM-shaped"
+        classical.packages.iter().all(|p| p.ciphertext.len() == 48),
+        "the fixture is classical-shaped (48 bytes)"
     );
-    // ... but is refused at ANY height, naming FULL-PQ (never ingested).
+    // ... and is refused at ANY height, naming FULL-PQ (never ingested).
     for height in [
         0u64,
         PQ_TRANSPORT_H_ACTIVATION_HEIGHT - 1,
@@ -436,17 +458,23 @@ fn kem_classical_contribution_refused_end_to_end() {
     ] {
         let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
         let err = dkg
-            .ingest_classical_at_h(classical.clone(), &members[1].enc_secret, height)
+            .ingest_classical_at_h(classical.clone(), height)
             .expect_err("classical ingest must be refused under FULL-PQ");
         assert!(
             err.contains("FULL-PQ"),
             "refusal names FULL-PQ at height {height}: {err}"
         );
+        // The live KEM entry point refuses the same shape too.
+        let err = dkg
+            .ingest_pq(classical.clone(), &members[1].kem_seed)
+            .expect_err("PQ ingest must refuse a classical-shaped package");
+        assert!(
+            err.contains("pq kem"),
+            "refusal names the pq kem leg at height {height}: {err}"
+        );
     }
 
     // ... while the registry path NEVER emits classical bytes.
-    let contributors = contributor_ids(&committee, &members);
-    let contributor = member_by_id(&members, &contributors[0]);
     let mut dkg = EpochDkg::new(committee, contributor.id);
     let built = dkg
         .contribution_pq_from_registry(contributor.id, &contributor.secret, &reg, 0)
@@ -506,16 +534,17 @@ fn kem_threshold_flow_intact_over_pq_leg() {
         materials.push(dkg.finalize().expect("finalize succeeds"));
     }
 
-    // Same epoch key and shares as the classical run over the same secrets
-    // (only the transcript binds the transport bytes, so it differs).
-    let classical = run_classical(&committee, &members);
+    // Same epoch key and shares as the DIRECT PQ run over the same secrets
+    // (only the transcript binds the encryption-randomized transport bytes,
+    // so it differs).
+    let direct = run_pq_direct(&committee, &members);
     for m in &materials {
         assert_eq!(
-            m.public_key, classical[0].public_key,
+            m.public_key, direct[0].public_key,
             "the registry PQ leg derives the same P_e"
         );
     }
-    for (i, (a, b)) in materials.iter().zip(classical.iter()).enumerate() {
+    for (i, (a, b)) in materials.iter().zip(direct.iter()).enumerate() {
         assert_eq!(a.share, b.share, "member {i}: same share across legs");
     }
 

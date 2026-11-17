@@ -929,9 +929,11 @@ fn test_cross_shard_verification_target_shard_pinned_pq_account() {
         "Tampered sender_pubkey_hash must be rejected"
     );
 
-    // (b) Tampered sender_scheme must fail proof verification
+    // (b) Tampered sender_scheme must fail proof verification.
+    // FULL-PQ: the other remaining scheme tag (ML-DSA-44, 0x03) is used as
+    // the tampered value; 0x01 is no longer a `PqScheme`.
     let mut tampered_scheme_msg = received_msg.clone();
-    tampered_scheme_msg.sender_scheme = Some(PqScheme::Ed25519.id());
+    tampered_scheme_msg.sender_scheme = Some(PqScheme::MlDsa44.id());
     assert!(
         !tampered_scheme_msg.verify_inclusion(),
         "Tampered sender_scheme must be rejected"

@@ -2255,9 +2255,9 @@ mod tests {
     fn propose_signed_binds_key_chain_action_and_nonce() {
         use crate::wallet_signing::WalletSigningKey;
         const CHAIN: u64 = 777;
-        let key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let key = WalletSigningKey::falcon_from_seed(&[0xA1u8; 32]);
         let addr = key.address();
-        let other = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let other = WalletSigningKey::falcon_from_seed(&[0xB2u8; 32]);
         let mut l = StakingLedger::new();
         l.bond(addr, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
         let mut g = Governance::new();
@@ -2362,7 +2362,7 @@ mod tests {
             Err(GovError::BadSignature)
         );
         // Stakeless key with a PERFECTLY valid signature: NotStaker, not Open.
-        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone = WalletSigningKey::falcon_from_seed(&[0xC3u8; 32]);
         let lone_addr = lone.address();
         let lone_msg = Governance::gov_propose_message(CHAIN, &lone_addr, &title, &action, 1);
         let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
@@ -2379,9 +2379,9 @@ mod tests {
     fn vote_signed_binds_key_chain_proposal_and_choice() {
         use crate::wallet_signing::WalletSigningKey;
         const CHAIN: u64 = 777;
-        let voter_key = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let voter_key = WalletSigningKey::falcon_from_seed(&[0xB2u8; 32]);
         let voter = voter_key.address();
-        let proposer_key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let proposer_key = WalletSigningKey::falcon_from_seed(&[0xA1u8; 32]);
         let proposer = proposer_key.address();
         let mut l = StakingLedger::new();
         l.bond(proposer, stell(10_000), DEFAULT_COMMISSION_BPS)
@@ -2445,7 +2445,7 @@ mod tests {
             Err(GovError::BadSignature)
         );
         // Stakeless key, valid signature: NotStaker (binding is not theater).
-        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone = WalletSigningKey::falcon_from_seed(&[0xC3u8; 32]);
         let lone_addr = lone.address();
         let lone_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &lone_addr);
         let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
@@ -2462,7 +2462,7 @@ mod tests {
     fn check_envelope_helpers_agree_with_signed_paths() {
         use crate::wallet_signing::WalletSigningKey;
         const CHAIN: u64 = 777;
-        let key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let key = WalletSigningKey::falcon_from_seed(&[0xA1u8; 32]);
         let addr = key.address();
         let mut l = StakingLedger::new();
         l.bond(addr, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();

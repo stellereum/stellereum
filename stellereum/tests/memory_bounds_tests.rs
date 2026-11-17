@@ -124,11 +124,12 @@ async fn pq_fallback_is_bounded_without_disk() {
     let engine = InMemoryStateEngine::new();
     let salt = [7u8; 16];
     for i in 0u64..24 {
-        let mut pk = [0u8; 32];
+        // FULL-PQ: Falcon-512 is the only pinnable scheme (Ed25519 removed).
+        let mut pk = vec![0u8; PqScheme::Falcon512.pubkey_size()];
         pk[..8].copy_from_slice(&i.to_le_bytes());
-        let addr = derive_pq_address(PqScheme::Ed25519, &pk, &salt);
+        let addr = derive_pq_address(PqScheme::Falcon512, &pk, &salt);
         engine
-            .pin_pubkey(addr, PqScheme::Ed25519, &pk, &salt)
+            .pin_pubkey(addr, PqScheme::Falcon512, &pk, &salt)
             .await
             .unwrap();
     }
@@ -156,11 +157,12 @@ async fn pq_disk_serves_entries_skipped_by_fallback() {
     let salt = [9u8; 16];
     let mut pinned = Vec::new();
     for i in 0u64..6 {
-        let mut pk = [0xABu8; 32];
+        // FULL-PQ: Falcon-512 is the only pinnable scheme (Ed25519 removed).
+        let mut pk = vec![0xABu8; PqScheme::Falcon512.pubkey_size()];
         pk[..8].copy_from_slice(&i.to_le_bytes());
-        let addr = derive_pq_address(PqScheme::Ed25519, &pk, &salt);
+        let addr = derive_pq_address(PqScheme::Falcon512, &pk, &salt);
         engine
-            .pin_pubkey(addr, PqScheme::Ed25519, &pk, &salt)
+            .pin_pubkey(addr, PqScheme::Falcon512, &pk, &salt)
             .await
             .unwrap();
         pinned.push((addr, pk));
@@ -171,7 +173,7 @@ async fn pq_disk_serves_entries_skipped_by_fallback() {
         let got = engine.get_pinned_pubkey(addr);
         assert_eq!(
             got,
-            Some((PqScheme::Ed25519, pk.to_vec())),
+            Some((PqScheme::Falcon512, pk.to_vec())),
             "disk serves all"
         );
     }

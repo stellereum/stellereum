@@ -6,8 +6,9 @@
 //!    - Verify that tampered message, tampered signature, or wrong public key FAILS.
 //!    - Verify that random noise payloads FAIL with zero false-positives.
 //! 2. `audit_test_mempool_pure_pq_blocks_envelope_wrapped_ed25519`:
-//!    - When Pure PQ mode is active, submit an envelope with `scheme = PqScheme::Ed25519`.
-//!    - Assert it is REJECTED with Malformed error ("scheme must be post-quantum").
+//!    - When Pure PQ mode is active, submit a PQ1 blob claiming the removed
+//!      classical scheme id 0x01.
+//!    - Assert it is REJECTED with a Malformed error (classical envelope refused).
 //! 3. `audit_test_activation_gas_surcharge_bypass_prevented`:
 //!    - Submit activation transaction with insufficient gas.
 //!    - Assert it is rejected for `FeeTooLow`.
@@ -26,7 +27,7 @@
 //! - Genesis KAT untouched.
 //! - Offline only.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::{Arc, Mutex, RwLock};
 use stellereum::commitment::COMMITMENT_VERSION;
@@ -241,24 +242,32 @@ fn audit_test_mempool_pure_pq_blocks_envelope_wrapped_ed25519() {
 
     let ed_sk = SigningKey::generate(&mut OsRng);
     let ed_pk = ed_sk.verifying_key().to_bytes().to_vec();
-    let from = derive_pq_address(PqScheme::Ed25519, &ed_pk, &DEFAULT_SALT);
 
-    let mut tx = Transaction {
-        from,
+    // FULL-PQ: a classical PQ1 envelope is refused at DECODE (scheme 0x01 is
+    // not a PqScheme value), so the blob is hand-built — `new_explicit` can
+    // no longer represent it. The mempool then reports the generic classical
+    // rejection instead of the old "scheme must be post-quantum" wording.
+    let mut env_bytes = Vec::new();
+    env_bytes.extend_from_slice(stellereum::post_quantum::PQ_ENVELOPE_MAGIC);
+    env_bytes.push(1); // removed Ed25519 scheme id
+    env_bytes.push(0);
+    env_bytes.extend_from_slice(&(ed_pk.len() as u16).to_le_bytes());
+    env_bytes.extend_from_slice(&ed_pk);
+    env_bytes.extend_from_slice(&64u16.to_le_bytes());
+    env_bytes.extend_from_slice(&[0x22u8; 64]);
+
+    let tx = Transaction {
+        from: [0x44u8; 32],
         to: [7u8; 32],
         amount: 500,
         gas_limit: 100_000,
         nonce: 0,
         source_shard: 1,
         target_shard: 1,
-        signature: Vec::new(),
+        signature: env_bytes,
         payload: Vec::new(),
         priority_fee_per_gas: 0,
     };
-    let msg = tx.signing_message();
-    let sig = ed_sk.sign(&msg).to_bytes().to_vec();
-    let env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, sig);
-    tx.signature = env.encode();
 
     assert!(tx.is_pq());
     let mut mp = Mempool::new(100, 50);
@@ -267,8 +276,8 @@ fn audit_test_mempool_pure_pq_blocks_envelope_wrapped_ed25519() {
     match result {
         Err(MempoolError::Malformed(ref err_msg)) => {
             assert!(
-                err_msg.contains("scheme must be post-quantum"),
-                "Expected rejection containing 'scheme must be post-quantum', got: {err_msg}"
+                err_msg.contains("classical non-PQ transactions rejected"),
+                "Expected classical-envelope rejection, got: {err_msg}"
             );
         }
         other => panic!("Expected MempoolError::Malformed, got: {other:?}"),

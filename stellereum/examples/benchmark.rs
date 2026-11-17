@@ -12,7 +12,7 @@
 //!   - Block hashing + signing (blocks/sec)
 //!   - Wire protocol: frame sign/verify + encode/decode (frames/sec)
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use infnode::proto::Frame;
 use rand::rngs::OsRng;
 use std::time::Instant;
@@ -446,8 +446,8 @@ async fn main() {
 
     // ---- 8. Wire protocol (frame sign/verify/encode/decode) ---------------
     {
-        let sk = SigningKey::generate(&mut OsRng);
-        let vk = sk.verifying_key();
+        let pq = infnode::keyring::PqKeys::from_seed([0x5Au8; 32]);
+        let vk = pq.pq_pub();
         let n = 20_000u64;
         let payload = vec![0u8; 1024];
         let t = Instant::now();
@@ -461,10 +461,10 @@ async fn main() {
                 svc: 0,
                 payload: payload.clone(),
                 nonce: vec![],
-                sig: [0u8; 64],
+                sig: vec![0u8; infnode::proto::PQ_FALCON_SIG_LEN],
             };
             let d = blake3::hash(&f.sign_data());
-            f.sig = sk.sign(d.as_bytes()).to_bytes();
+            f.sig = pq.sign_digest(d.as_bytes());
             let bytes = f.encode();
             let dec = Frame::decode(&bytes).unwrap();
             assert!(dec.verify(&vk));

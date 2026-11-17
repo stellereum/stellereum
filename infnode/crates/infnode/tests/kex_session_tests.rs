@@ -12,7 +12,7 @@
 //! (`stable_id -> [u8;32]`); re-key = reconnect (fresh ephemeral + fresh
 //! ML-KEM encap). No mid-connection rotation is in scope.
 
-use ed25519_dalek::{Signer, SigningKey};
+use infnode::keyring::PqKeys;
 use infnode::node::{e2e_decrypt, e2e_encrypt};
 use infnode::proto::{
     self, Frame, PqTranscript, NODEID_LEN, PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION,
@@ -33,8 +33,8 @@ fn transcript_a() -> PqTranscript {
     PqTranscript {
         pq_init: f(0xA0),
         pq_resp: f(0xB0),
-        eph_init: f(0xC0),
-        eph_resp: f(0xD0),
+        fresh_init: f(0xC0),
+        fresh_resp: f(0xD0),
         chan_bind: f(0xE0),
         nonce_init: f(0x01),
         nonce_resp: f(0x21),
@@ -77,7 +77,7 @@ fn src_dst() -> ([u8; NODEID_LEN], [u8; NODEID_LEN]) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. PQ-session bodies decrypt+verify (AEAD open + ed25519 Frame verify +
+// 1. PQ-session bodies decrypt+verify (AEAD open + Falcon-512 Frame verify +
 //    codec round-trip).
 // ---------------------------------------------------------------------------
 
@@ -92,8 +92,8 @@ fn pq_session_bodies_decrypt_verify() {
     assert_eq!(ct.len(), PLAIN.len() + 16);
 
     // Full frame: sealed body rides as payload, signed like every frame.
-    let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
-    let vk = sk.verifying_key();
+    let pq = PqKeys::from_seed([0x5Au8; 32]);
+    let pk = pq.pq_pub();
     let mut f = Frame {
         kind: KIND,
         seq: SEQ,
@@ -103,16 +103,16 @@ fn pq_session_bodies_decrypt_verify() {
         svc: SVC,
         payload: ct.clone(),
         nonce: NONCE24.to_vec(),
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = sk.sign(d.as_bytes()).to_bytes();
-    assert!(f.verify(&vk), "sealed frame must verify");
+    f.sig = pq.sign_digest(d.as_bytes());
+    assert!(f.verify(&pk), "sealed frame must verify");
 
     // Wire round-trip preserves the sealed body.
     let enc = f.encode();
     let dec = Frame::decode(&enc).expect("decode sealed frame");
-    assert!(dec.verify(&vk), "decoded sealed frame must verify");
+    assert!(dec.verify(&pk), "decoded sealed frame must verify");
     assert_eq!(dec.payload, ct);
     assert_eq!(dec.nonce, NONCE24.to_vec());
 
@@ -171,9 +171,9 @@ fn pq_tampered_body_refused() {
     assert!(proto::kex_frame_open(&key, &bad_nonce, &aad, &ct).is_err());
     assert!(proto::kex_frame_open(&key, &[0u8; 8], &aad, &ct).is_err());
 
-    // Frame-sig layer: retagging the sealed payload breaks ed25519 verify.
-    let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
-    let vk = sk.verifying_key();
+    // Frame-sig layer: retagging the sealed payload breaks the Falcon-512 verify.
+    let pq = PqKeys::from_seed([0x5Au8; 32]);
+    let pk = pq.pq_pub();
     let mut f = Frame {
         kind: KIND,
         seq: SEQ,
@@ -183,21 +183,21 @@ fn pq_tampered_body_refused() {
         svc: SVC,
         payload: ct.clone(),
         nonce: NONCE24.to_vec(),
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = sk.sign(d.as_bytes()).to_bytes();
-    assert!(f.verify(&vk));
+    f.sig = pq.sign_digest(d.as_bytes());
+    assert!(f.verify(&pk));
     let mut tampered = f.clone();
     tampered.payload[0] ^= 0x01;
     assert!(
-        !tampered.verify(&vk),
+        !tampered.verify(&pk),
         "retagged body must break the frame sig"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 3. KEM-only session vectors: deterministic KDF pin + unchanged frame auth.
+// 3. KEM-only session vectors: deterministic KDF pin + Falcon-512 frame auth.
 //    The classical X3DH KDFs are deleted; this pins the KEM-only replacement
 //    on the same fixed fixtures (same properties, KEM materials).
 // ---------------------------------------------------------------------------
@@ -210,8 +210,8 @@ fn kem_session_vectors_and_frame_auth_unchanged() {
         hex::encode(k),
         "f30ff66edf2b9ae8703eda331622c43f37ee768b8dd26750ba42111955d08818"
     );
-    // Pinned classical wire bytes: kind=REQ seq=7 ts=1700000000000
-    // src=01*20 dst=02*20 svc=0 payload="ping" nonce=8x00 sig=64x00.
+    // Pinned v2 wire bytes: kind=REQ seq=7 ts=1700000000000
+    // src=01*20 dst=02*20 svc=0 payload="ping" nonce=8x00, empty tag.
     let f = Frame {
         kind: proto::kind::REQ,
         seq: 7,
@@ -221,14 +221,14 @@ fn kem_session_vectors_and_frame_auth_unchanged() {
         svc: 0,
         payload: b"ping".to_vec(),
         nonce: vec![0u8; 8],
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
     assert_eq!(
         hex::encode(f.encode()),
-        "0104070000000068e5cf8b01000001010101010101010101010101010101010101010202020202020202020202020202020202020202000000000000000008000400000070696e67000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        "0204070000000068e5cf8b01000001010101010101010101010101010101010101010202020202020202020202020202020202020202000000000000000008000400000070696e6700000000000000000000"
     );
     // Codec round-trip still exact (length formula + decode invert encode).
-    assert_eq!(f.encoded_len(), 68 + 4 + 8 + 64);
+    assert_eq!(f.encoded_len(), 68 + 4 + 8 + 2);
     let back = Frame::decode(&f.encode()).expect("decode");
     assert_eq!(back.payload, b"ping");
     assert_eq!(back.nonce, vec![0u8; 8]);
@@ -310,8 +310,8 @@ fn pq_replay_across_sessions_refused() {
 fn pq_frame_loop_req_resp_round_trip() {
     let (key, digest) = session_a();
     let (src, dst) = src_dst();
-    let sk = SigningKey::from_bytes(&[0x5Au8; 32]);
-    let vk = sk.verifying_key();
+    let pq = PqKeys::from_seed([0x5Au8; 32]);
+    let pk = pq.pq_pub();
 
     // REQ direction (dialer seals, frame_loop opens).
     let aad_req = proto::kex_frame_aad(KIND, SEQ, TS, &src, &dst, SVC, &digest);
@@ -328,14 +328,12 @@ fn pq_frame_loop_req_resp_round_trip() {
         svc: SVC,
         payload: ct_req.clone(),
         nonce: n_req.clone(),
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
-    freq.sig = sk
-        .sign(blake3::hash(&freq.sign_data()).as_bytes())
-        .to_bytes();
+    freq.sig = pq.sign_digest(blake3::hash(&freq.sign_data()).as_bytes());
     let wire = freq.encode();
     let got = Frame::decode(&wire).expect("decode req");
-    assert!(got.verify(&vk), "sealed REQ must verify");
+    assert!(got.verify(&pk), "sealed REQ must verify");
     let aad_req2 = proto::kex_frame_aad(
         got.kind, got.seq, got.ts, &got.src, &got.dst, got.svc, &digest,
     );
@@ -360,14 +358,12 @@ fn pq_frame_loop_req_resp_round_trip() {
         svc: SVC,
         payload: ct_resp,
         nonce: n_resp,
-        sig: [0u8; 64],
+        sig: Vec::new(),
     };
-    fresp.sig = sk
-        .sign(blake3::hash(&fresp.sign_data()).as_bytes())
-        .to_bytes();
+    fresp.sig = pq.sign_digest(blake3::hash(&fresp.sign_data()).as_bytes());
     let wire2 = fresp.encode();
     let got2 = Frame::decode(&wire2).expect("decode resp");
-    assert!(got2.verify(&vk), "sealed RESP must verify");
+    assert!(got2.verify(&pk), "sealed RESP must verify");
     let aad_resp2 = proto::kex_frame_aad(
         got2.kind, got2.seq, got2.ts, &got2.src, &got2.dst, got2.svc, &digest,
     );

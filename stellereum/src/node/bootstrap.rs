@@ -245,9 +245,11 @@ pub(crate) async fn start_workchain_shard(
 /// Derive this node's validator set from its config, and whether we are in it.
 ///
 /// # The convention
-/// `validators:` is a list of node ids, where a node id is `blake3(ed25519_pub)`
-/// truncated to 20 bytes (infnode's `NodeKeys::id`). Two shapes are supported, and
-/// they must not be mixed across a network:
+/// `validators:` is a list of CONSENSUS ids, where an id is
+/// `blake3(consensus_pub)[..20]` (the frozen Ed-keyed validator set).
+/// Transport identity is the separate PQ `NodeId`
+/// (`proto::pq_id_from_pub(falcon_pk)`), never this list.
+/// Two shapes are supported, and they must not be mixed across a network:
 ///
 ///   * **all members listed** -- `validators:` names EVERY validator including this
 ///     node. Preferred: the set is then a pure function of the file, and a node whose
@@ -266,16 +268,20 @@ pub(crate) fn build_validator_set(
     self_node_id_hex: &str,
     observer: bool,
 ) -> (ValidatorSet, bool) {
-    // Peers whose ed-derived id is listed in `validators:`, with the id
-    // computed as infnode used to (`blake3(ed_pub)[..20]`). FULL-PQ: peer
-    // configs no longer carry a declared `node-id` (identity is PQ-only via
-    // `pq_pub`), so there is nothing to lie about — the id is DERIVED from
-    // the pinned key, never declared. The validator set itself still pins the
-    // frozen auth key (ed): a peer contributes its key iff its derived id is
+    // Peers whose consensus-key-derived id is listed in `validators:`
+    // (`blake3(consensus_pub)[..20]`). FULL-PQ: peer configs no longer carry
+    // a declared `node-id` (transport identity is PQ-only via `pq_pub`), so
+    // there is nothing to lie about. The frozen validator set is Ed-keyed:
+    // a peer contributes its `consensus-pub`/`ed-pub` iff its derived id is
     // listed. A malformed peer is skipped.
     let mut from_peers: Vec<[u8; 32]> = Vec::new();
     for p in &cfg.peers {
-        let Ok(ed) = p.ed_bytes() else { continue };
+        // `consensus-pub`/`ed-pub` is the consensus-only Ed25519 validator
+        // key — NOT transport identity. Peers without it simply contribute
+        // no consensus key.
+        let Some(ed) = p.consensus_bytes().ok().flatten() else {
+            continue;
+        };
         let computed = blake3::hash(&ed);
         let raw_hex = hex::encode(&computed.as_bytes()[..20]);
         let listed = cfg
@@ -283,10 +289,7 @@ pub(crate) fn build_validator_set(
             .iter()
             .any(|v| v.strip_prefix("inf1:").unwrap_or(v) == raw_hex);
         if listed {
-            // F6 binding (structural now): the listed id MUST be blake3(ed_pub)[..20].
-            // A typo (or a doctored config) naming the wrong id would
-            // otherwise install a stranger's key into the validator set
-            // — or silently drop a real validator. Fail-closed: skip loudly.
+            // F6 binding: the listed id MUST be blake3(consensus_pub)[..20].
             if ed == self_ed {
                 continue; // a peer entry for ourselves; handled below
             }
@@ -301,7 +304,7 @@ pub(crate) fn build_validator_set(
         let known: HashSet<String> = cfg
             .peers
             .iter()
-            .filter_map(|p| p.ed_bytes().ok())
+            .filter_map(|p| p.consensus_bytes().ok().flatten())
             .map(|ed| hex::encode(&blake3::hash(&ed).as_bytes()[..20]))
             .collect();
         for v in &cfg.validators {
@@ -480,9 +483,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     // commitment the finalize path verifies (see `mempool::Mempool`).
     let mev_engine = MevPreemptionEngine::new();
 
-    // Persistent node identity: load if present, else generate and save.
-    // The SAME ed25519 key is the consensus validator key, so the validator
-    // set is stable across restarts and matches the infnode identity.
+    // Persistent keys: PQ node identity/transport (`pq-identity.key`) plus
+    // the consensus-only Ed25519 validator key (`validator.key`, migrated
+    // once from a legacy identity.key). The consensus key never touches
+    // infnode transport/auth.
     let data_dir = PathBuf::from("./data");
     let keys_dir = PathBuf::from("./keys");
     let falcon_path = std::env::var("STELL_FALCON_KEY_FILE")
@@ -492,8 +496,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         stellereum::node_keys::NodeKeyBundle::load_or_generate(&keys_dir, &falcon_path)?;
     let keys = key_bundle.node_keys;
     let pq_keys = key_bundle.pq_identity;
-    let validator_key = keys.signing.clone();
-    let validator_pub = keys.verifying.to_bytes();
+    let validator_key = stellereum::node_keys::load_or_generate_consensus_key(&keys_dir)?;
+    let validator_pub = validator_key.verifying_key().to_bytes();
     // NOTE: genesis accounts are funded AFTER the validator set is known
     // (see below), so every node credits exactly the same accounts.
 
@@ -525,9 +529,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         // 1184B key is never printed — it travels the protocol, not logs).
         let kem_fp = hex::encode(&blake3::hash(&adapter.node.keys.kem_ek).as_bytes()[..8]);
         info!(
-            "NODE IDENTITY: id={} ed={} kem_fp={} listen={}",
+            "NODE IDENTITY: id={} pq_pub={} kem_fp={} listen={}",
             adapter.node.id_hex,
-            adapter.node.keys.ed_hex(),
+            adapter.node.pq.pq_pub_hex(),
             kem_fp,
             adapter.node.cfg.listen
         );
@@ -626,10 +630,16 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         // every validator the same fixed balance. All nodes with the same
         // config therefore compute an identical state root.
         let self_ed = validator_key.verifying_key().to_bytes();
+        // `validators:` entries are consensus ids (`blake3(ed_pub)[..20]`),
+        // NOT the PQ transport id.
+        let self_consensus_id = format!(
+            "inf1:{}",
+            hex::encode(&blake3::hash(&self_ed).as_bytes()[..20])
+        );
         let (vset, is_validator) = build_validator_set(
             &adapter.node.cfg,
             self_ed,
-            &adapter.node.keys.id_hex(),
+            &self_consensus_id,
             std::env::var("STELL_OBSERVER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),

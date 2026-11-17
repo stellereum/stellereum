@@ -21,6 +21,7 @@
 use ed25519_dalek::SigningKey;
 use stellereum::bridge::BridgeIntent;
 use stellereum::oracle::PriceFeedUpdate;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::svm::OpCode;
 use stellereum::zkml::SessionKeyAuthorization;
@@ -161,9 +162,13 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
 /// silently changed every already-signed payload's bytes. Pinning each index
 /// by name means no insertion - here, or anywhere in the first 34 - can hide.
 fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
-    let grant = SessionKeyAuthorization::sign_delegation(
-        &SigningKey::from_bytes(&[7u8; 32]),
-        [9u8; 32],
+    // FULL-PQ: the fixture grant is Falcon-512 (`sign_delegation` is gone).
+    let master_fk = FalconKeypair::generate_from_seed(7);
+    let session_fk = FalconKeypair::generate_from_seed(9);
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
+        &master_fk,
+        PqScheme::Falcon512,
+        session_fk.public_key(),
         1_500_000_000,
         1_000_000,
         u64::MAX,

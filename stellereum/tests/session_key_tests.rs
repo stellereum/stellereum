@@ -17,16 +17,16 @@ use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError, PQ_ACTIVATION_SURCHARGE_GAS};
 use stellereum::post_quantum::{
-    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN, HYBRID_PUBKEY_LEN,
-    HYBRID_SIG_LEN,
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_PUBKEY_LEN,
+    FALCON512_SIG_LEN,
 };
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, SessionPolicyError, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 use stellereum::zkml::{
-    make_hybrid_pubkey, sign_falcon512, sign_hybrid, SessionKeyAuthorization, SessionKeyRegistry,
-    SessionRegistryError, SessionSpendSim, SCOPE_ALL, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
+    sign_falcon512, SessionKeyAuthorization, SessionKeyRegistry, SessionRegistryError,
+    SessionSpendSim, SCOPE_ALL, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
 };
 
 // ============================================================================
@@ -84,25 +84,6 @@ fn golden_key() -> SigningKey {
 
 fn key() -> SigningKey {
     SigningKey::generate(&mut OsRng)
-}
-
-fn grant(
-    master: &SigningKey,
-    session: &SigningKey,
-    valid_until: u64,
-    max_gas_spend: u64,
-    scope: u64,
-    max_value_per_tx: u64,
-) -> SessionKeyAuthorization {
-    SessionKeyAuthorization::sign_delegation(
-        master,
-        session.verifying_key().to_bytes(),
-        valid_until,
-        max_gas_spend,
-        scope,
-        max_value_per_tx,
-        CHAIN_ID,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -207,17 +188,6 @@ fn pq_plain_tx(
         payload,
         &DEFAULT_SALT,
     )
-}
-
-/// Re-encode a mutated grant into an existing envelope, keeping the leading
-/// 64-byte session signature: exactly what a middleman on the wire can do.
-fn rewrap(tx: &Transaction, d: &SessionKeyAuthorization) -> Transaction {
-    let mut t = tx.clone();
-    let mut sig = tx.signature[..64].to_vec();
-    sig.extend_from_slice(b"SK1");
-    sig.extend_from_slice(&bincode::serialize(d).expect("grant serializes"));
-    t.signature = sig;
-    t
 }
 
 /// A modelled PRE-session-key node: one 64-byte Ed25519 signature by
@@ -742,12 +712,14 @@ fn flipping_any_delegation_field_breaks_verification() {
 
 #[test]
 fn legacy_messages_and_hashes_carry_no_delegation_commitment() {
-    let master = key();
-    let session = key();
-    let legacy = Transaction::sign(&master, [1u8; 32], 10, 1_000, 0, 1, 1);
-    let envelope = session_tx(
+    // FULL-PQ: the envelope leg is a Falcon-512 session grant; the legacy leg
+    // is the same tx fields/sender carrying a bare 64-byte (classical-shape)
+    // signature, so the comparison isolates the delegation commitment.
+    let master = FalconKeypair::generate_from_seed(0x71);
+    let session = FalconKeypair::generate_from_seed(0x72);
+    let envelope = pq_session_tx(
         &session,
-        grant(
+        pq_grant(
             &master,
             &session,
             4_000_000_000,
@@ -760,6 +732,18 @@ fn legacy_messages_and_hashes_carry_no_delegation_commitment() {
         0,
         vec![],
     );
+    let legacy = Transaction {
+        from: envelope.from,
+        to: [1u8; 32],
+        amount: 10,
+        gas_limit: 1_000,
+        nonce: 0,
+        source_shard: 1,
+        target_shard: 1,
+        signature: vec![0u8; 64],
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
     assert_eq!(legacy.from, envelope.from, "same fields, same sender");
 
     // Conditional commitment: the legacy message/hash are untouched, the
@@ -778,8 +762,8 @@ fn legacy_messages_and_hashes_carry_no_delegation_commitment() {
 
     // Swapping the grant for another one (even minted to the SAME session
     // key) changes the signed message, so the session signature dies.
-    let d2 = grant(&master, &session, 4_000_000_000, 9_999, SCOPE_ALL, u64::MAX);
-    let swapped = rewrap(&envelope, &d2);
+    let d2 = pq_grant(&master, &session, 4_000_000_000, 9_999, SCOPE_ALL, u64::MAX);
+    let swapped = rewrap_falcon(&envelope, &d2);
     assert!(
         !swapped.verify_signature(),
         "a swapped grant must invalidate the signature"
@@ -1474,8 +1458,10 @@ fn test_falcon512_signed_session_grant_creation_and_verification() {
 
     assert_eq!(grant.master_scheme, PqScheme::Falcon512);
     assert_eq!(grant.session_scheme, PqScheme::Falcon512);
-    assert!(grant.is_post_quantum());
-    assert!(!grant.is_pure_ed25519());
+    // FULL-PQ: the classical scheme ids are refused outright (the grant
+    // accessors `is_post_quantum` / `is_pure_ed25519` were deleted with them).
+    assert!(PqScheme::from_id(1).is_err());
+    assert!(PqScheme::from_id(4).is_err());
     assert_eq!(grant.master_pubkey(), falcon_master_fk.public_key());
     assert_eq!(grant.session_pubkey, falcon_addr(&falcon_session_fk));
     assert_eq!(grant.session_pubkey_bytes(), session_pk);
@@ -1538,74 +1524,47 @@ fn test_falcon512_signed_session_grant_creation_and_verification() {
     assert!(!bad_pk.verify_signature());
 }
 
+/// FULL-PQ: the Hybrid (0x04) master constructor is deleted. This replaces
+/// the old "genuine hybrid grant verifies" test with its fail-closed inverse:
+/// a hybrid-shaped grant can be built only through the raw `new_pq` path and
+/// must never verify, and the scheme id itself is refused.
 #[test]
-fn test_hybrid_signed_session_grant_creation_and_verification() {
-    let ed_master = key();
+fn test_legacy_hybrid_grant_is_refused_fail_closed() {
     let falcon_master_fk = FalconKeypair::generate_from_seed(0x22);
     let falcon_session_fk = FalconKeypair::generate_from_seed(0x23);
-    let session_pk = falcon_session_fk.public_key();
     let now = 1_000_000u64;
 
-    // Create a Hybrid (Ed25519 + Falcon-512) master signed grant with Falcon-512 session key
-    let grant = SessionKeyAuthorization::sign_delegation_hybrid(
-        &ed_master,
-        &falcon_master_fk,
+    assert!(PqScheme::from_id(4).is_err(), "Hybrid id must be refused");
+
+    // 929-byte hybrid-shaped key + 730-byte signature, tagged disabled.
+    let mut hybrid_pk = vec![0x11u8; 32];
+    hybrid_pk.extend_from_slice(falcon_master_fk.public_key());
+    assert_eq!(hybrid_pk.len(), 32 + FALCON512_PUBKEY_LEN);
+    let mut hybrid_sig = vec![0x22u8; 64];
+    hybrid_sig.extend_from_slice(&falcon_master_fk.sign(b"hybrid grant"));
+    assert_eq!(hybrid_sig.len(), 64 + FALCON512_SIG_LEN);
+
+    let grant = SessionKeyAuthorization::new_pq(
+        PqScheme::MlDsa44,
+        derive_pq_address(PqScheme::MlDsa44, &hybrid_pk, &DEFAULT_SALT),
+        Some(hybrid_pk),
         PqScheme::Falcon512,
-        session_pk,
+        falcon_addr(&falcon_session_fk),
+        Some(falcon_session_fk.public_key().to_vec()),
         now + 5_000,
         100_000,
+        0,
         SCOPE_TRANSFER,
         500,
         CHAIN_ID,
+        hybrid_sig,
     );
-
-    assert_eq!(grant.master_scheme, PqScheme::Hybrid);
-    assert_eq!(grant.session_scheme, PqScheme::Falcon512);
-    assert!(grant.is_post_quantum());
-    assert!(!grant.is_pure_ed25519());
-    assert_eq!(grant.master_pubkey().len(), HYBRID_PUBKEY_LEN);
-    assert_eq!(grant.master_signature.len(), HYBRID_SIG_LEN);
+    assert_eq!(grant.master_scheme, PqScheme::MlDsa44);
     assert!(
-        grant.verify_signature(),
-        "Hybrid master signature must verify"
+        !grant.verify_signature(),
+        "hybrid-shaped master must never verify"
     );
-    assert!(grant.verify_at(now));
-
-    // Bincode serialize and deserialize roundtrip
-    let bytes = bincode::serialize(&grant).expect("hybrid grant must serialize");
-    let back: SessionKeyAuthorization =
-        bincode::deserialize(&bytes).expect("hybrid grant must deserialize");
-    assert_eq!(grant, back);
-    assert!(
-        back.verify_signature(),
-        "deserialized Hybrid grant signature must verify"
-    );
-
-    // Tampering Ed25519 part of signature (first 64 bytes) breaks verification
-    let mut bad_ed_sig = grant.clone();
-    bad_ed_sig.master_signature[0] ^= 0xFF;
-    assert!(
-        !bad_ed_sig.verify_signature(),
-        "corrupted ed25519 half of hybrid sig must fail"
-    );
-
-    // Tampering Falcon-512 part of signature (subsequent 666 bytes) breaks verification
-    let mut bad_f_sig = grant.clone();
-    bad_f_sig.master_signature[64] ^= 0xFF;
-    assert!(
-        !bad_f_sig.verify_signature(),
-        "corrupted falcon half of hybrid sig must fail"
-    );
-
-    // Tampering master_address breaks verification
-    let mut bad_addr = grant.clone();
-    bad_addr.master_address[0] ^= 0xFF;
-    assert!(!bad_addr.verify_signature());
-
-    // Tampering valid_until breaks verification
-    let mut bad_time = grant.clone();
-    bad_time.valid_until += 1;
-    assert!(!bad_time.verify_signature());
+    assert!(!grant.verify_at(now), "and never become valid");
 }
 
 #[test]
@@ -1811,20 +1770,22 @@ fn test_revocation_of_pq_session_keys() {
     );
 }
 
+/// FULL-PQ: the Hybrid (0x04) session constructor/helpers are deleted. The
+/// old "hybrid session signature verifies" test becomes a refusal test: a
+/// Falcon master grant whose session is tagged disabled accepts no session
+/// signature at all.
 #[test]
-fn test_hybrid_session_key_signing_and_verification() {
+fn test_legacy_hybrid_session_key_is_refused_fail_closed() {
     let falcon_master_fk = FalconKeypair::generate_from_seed(0x87);
-    let ed_session = key();
     let falcon_session_fk = FalconKeypair::generate_from_seed(0x88);
-    let hybrid_session_pk = make_hybrid_pubkey(
-        &ed_session.verifying_key().to_bytes(),
-        falcon_session_fk.public_key(),
-    );
     let now = 1_000_000u64;
+
+    let mut hybrid_session_pk = vec![0x11u8; 32];
+    hybrid_session_pk.extend_from_slice(falcon_session_fk.public_key());
 
     let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &falcon_master_fk,
-        PqScheme::Hybrid,
+        PqScheme::MlDsa44,
         &hybrid_session_pk,
         now + 1_000,
         10_000,
@@ -1832,54 +1793,58 @@ fn test_hybrid_session_key_signing_and_verification() {
         1_000,
         CHAIN_ID,
     );
-
     assert_eq!(grant.master_scheme, PqScheme::Falcon512);
-    assert_eq!(grant.session_scheme, PqScheme::Hybrid);
-    assert!(grant.verify_signature());
+    assert_eq!(grant.session_scheme, PqScheme::MlDsa44);
+    assert!(
+        !grant.verify_signature(),
+        "a disabled session scheme must refuse the grant"
+    );
 
     let msg = b"Transaction signed by hybrid session key";
-    let hybrid_sig = sign_hybrid(&ed_session, &falcon_session_fk, msg);
-    assert!(grant.verify_session_signature(msg, &hybrid_sig));
-
-    // Tampering either half of hybrid session sig fails
-    let mut bad_ed = hybrid_sig.clone();
-    bad_ed[0] ^= 0xFF;
-    assert!(!grant.verify_session_signature(msg, &bad_ed));
-
-    let mut bad_falcon = hybrid_sig.clone();
-    bad_falcon[64] ^= 0xFF;
-    assert!(!grant.verify_session_signature(msg, &bad_falcon));
+    let mut hybrid_sig = vec![0x22u8; 64];
+    hybrid_sig.extend_from_slice(&falcon_session_fk.sign(msg));
+    assert!(
+        !grant.verify_session_signature(msg, &hybrid_sig),
+        "hybrid-shaped session material must never verify"
+    );
 }
 
+/// FULL-PQ: the legacy 9-field (scheme-less, classical) grant encoding still
+/// DECODES — persisted session envelopes must not become undecodable — but it
+/// maps to the disabled ML-DSA-44 tag and never verifies. The old test
+/// asserted the 184-byte Ed25519 grant round-tripped and verified false; that
+/// assertion is preserved and strengthened (the tag is now explicit).
 #[test]
-fn test_ed25519_grant_bincode_encoding_backward_compatibility() {
-    let master = key();
+fn test_legacy_ed25519_grant_bincode_decodes_but_never_verifies() {
     let session = key();
-    let d = grant(
-        &master,
-        &session,
-        4_000_000_000,
-        10_000,
-        SCOPE_ALL,
-        u64::MAX,
-    );
-    assert!(d.is_pure_ed25519());
-    assert!(!d.is_post_quantum());
-
-    let ser = bincode::serialize(&d).expect("serialization succeeds");
-    let size = bincode::serialized_size(&d).expect("size check succeeds");
-    assert_eq!(ser.len(), size as usize);
-    assert_eq!(ser.len(), 184); // 32 + 32 + 8*6 + 8 + 64 = 184 bytes
+    let session_pub = session.verifying_key().to_bytes();
+    let mut ser = Vec::new();
+    ser.extend_from_slice(&[1u8; 32]); // master_address
+    ser.extend_from_slice(&session_pub); // session_pubkey
+    for v in [
+        4_000_000_000u64, // valid_until
+        10_000,           // max_gas_spend
+        0,                // gas_spent
+        SCOPE_ALL,        // scope
+        u64::MAX,         // max_value_per_tx
+        CHAIN_ID,         // chain_id
+    ] {
+        ser.extend_from_slice(&v.to_le_bytes());
+    }
+    ser.extend_from_slice(&(64u64).to_le_bytes()); // master_signature len
+    ser.extend_from_slice(&[0u8; 64]); // classical Ed25519 signature bytes
+    assert_eq!(ser.len(), 184); // 32 + 32 + 8*6 + 8 + 64
 
     let back: SessionKeyAuthorization =
-        bincode::deserialize(&ser).expect("deserialization succeeds");
-    assert_eq!(d, back);
-    assert!(back.is_pure_ed25519());
-    // Pure PQ mode refuses classical Ed25519 grants and SK1 session transactions.
+        bincode::deserialize(&ser).expect("legacy 9-field grant must stay decodable");
+    assert_eq!(back.master_scheme, PqScheme::MlDsa44);
+    assert_eq!(back.session_scheme, PqScheme::MlDsa44);
     assert!(!back.verify_signature());
 
-    let tx = session_tx(&session, d, 10, 1_000, 0, vec![]);
-    assert!(tx.is_session_keyed());
+    // Re-emitting the grant under the disabled tag is refused at DECODE, so
+    // the legacy SK1 transaction is not session-keyed and cannot verify.
+    let tx = session_tx(&session, back, 10, 1_000, 0, vec![]);
+    assert!(tx.delegation().is_none());
     assert!(!tx.verify_signature());
 }
 

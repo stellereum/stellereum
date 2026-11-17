@@ -31,13 +31,12 @@ pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 pub const ROUTING_STALE_AFTER_MS: i64 = 24 * 3600 * 1000;
 
 /// Узел в таблице маршрутизации (FULL-PQ: `id` is the PQ id via
-/// `proto::pq_id_from_pub`; `ed_hex` is the frozen auth/TLS pin (NOT
-/// identity); `pq_hex` is the pinned Falcon-512 key that MUST derive `id`).
+/// `proto::pq_id_from_pub`; `pq_hex` is the pinned Falcon-512 key that MUST
+/// derive `id`. There is no classical identity field any more).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct NodeInfo {
     pub id: [u8; NODEID_LEN],
     pub endpoints: Vec<String>,
-    pub ed_hex: String,
     pub pq_hex: String,
     pub last_seen: i64,
 }
@@ -54,24 +53,9 @@ pub fn endpoint_ok(ep: &str) -> bool {
 /// Fail-closed gate for routing records arriving over the network
 /// (`dht.update`, `dht.find_node` answers, `dht.find_value` hints):
 /// FULL-PQ — `id` MUST equal `pq_id_from_pub(pq)` (otherwise anyone could
-/// bind an honest PQ id to their own key and hijack discovery); `ed_hex`
-/// must be a valid 32-byte hex key (frozen auth/TLS pin, NOT identity —
-/// verified separately at handshake/TLS, never for identity); endpoints are
-/// filtered to dialable ones.
-pub fn node_info_valid(
-    id: &[u8; NODEID_LEN],
-    ed_hex: &str,
-    pq_hex: &str,
-    endpoints: &[String],
-) -> bool {
-    let ed: [u8; 32] = match hex::decode(ed_hex) {
-        Ok(b) => match b.try_into() {
-            Ok(k) => k,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-    let _ = ed;
+/// bind an honest PQ id to their own key and hijack discovery); endpoints
+/// are filtered to dialable ones.
+pub fn node_info_valid(id: &[u8; NODEID_LEN], pq_hex: &str, endpoints: &[String]) -> bool {
     let pq: Vec<u8> = match hex::decode(pq_hex) {
         Ok(b) => b,
         Err(_) => return false,

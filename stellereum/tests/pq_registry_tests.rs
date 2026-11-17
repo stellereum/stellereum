@@ -5,9 +5,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use stellereum::consensus::ValidatorId;
-use stellereum::post_quantum::{
-    FalconKeypair, PqScheme, ED25519_PUBKEY_LEN, FALCON512_PUBKEY_LEN, HYBRID_PUBKEY_LEN,
-};
+use stellereum::post_quantum::{FalconKeypair, PqScheme, FALCON512_PUBKEY_LEN, MLDSA44_PUBKEY_LEN};
 use stellereum::pq_registry::{
     verify_rotation_announcement, PqRegistry, PqRegistryError, PQ_KEY_HISTORY_LIMIT,
     PQ_MAX_KEY_BYTES, PQ_ROTATION_DELAY_HEIGHTS,
@@ -55,8 +53,10 @@ fn rotation_delay_matches_commission_exit_window_philosophy() {
         "rotation and commission delays must move together (same exit-window philosophy)"
     );
     assert_eq!(PQ_KEY_HISTORY_LIMIT, 2);
-    assert_eq!(PQ_MAX_KEY_BYTES, HYBRID_PUBKEY_LEN);
-    assert_eq!(PQ_MAX_KEY_BYTES, 929);
+    // FULL-PQ: the cap is the largest remaining canonical key (ML-DSA-44);
+    // the Hybrid size (929) is gone with the scheme.
+    assert_eq!(PQ_MAX_KEY_BYTES, MLDSA44_PUBKEY_LEN);
+    assert_eq!(PQ_MAX_KEY_BYTES, 1312);
 }
 
 // ---- registration happy path ----
@@ -275,13 +275,14 @@ fn refusals_unknown_double_pending_past_oversize_disabled_not_due() {
         ledger.pq_register_key(&mut reg, id, PqScheme::MlDsa44, vec![0u8; 1312], 0, 0),
         Err(PqRegistryError::DisabledScheme)
     );
-    // ... and Hybrid must be exactly 929 bytes.
+    // ... and Falcon-512 must be exactly 897 bytes: the ML-DSA-44-sized
+    // blob is over-size for the only live scheme.
     assert_eq!(
         ledger.pq_register_key(
             &mut reg,
             id,
-            PqScheme::Hybrid,
-            vec![0u8; FALCON512_PUBKEY_LEN],
+            PqScheme::Falcon512,
+            vec![0u8; MLDSA44_PUBKEY_LEN],
             0,
             0
         ),
@@ -291,8 +292,8 @@ fn refusals_unknown_double_pending_past_oversize_disabled_not_due() {
         .pq_register_key(
             &mut reg,
             id,
-            PqScheme::Hybrid,
-            vec![0u8; HYBRID_PUBKEY_LEN],
+            PqScheme::Falcon512,
+            vec![0u8; FALCON512_PUBKEY_LEN],
             0,
             0
         )
@@ -445,17 +446,18 @@ fn announce_adopts_legacy_committed_key_without_changing_authority() {
 }
 
 #[test]
-fn announce_adopts_ed25519_fallback_for_keyless_validator() {
+fn announce_refuses_keyless_validator_without_classical_fallback() {
     let id = vid(1);
     let mut ledger = bonded_ledger(&[id]);
     let mut reg = PqRegistry::new();
-    ledger
-        .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, falcon_key(2), 0)
-        .unwrap();
-    let rec = reg.record_of(&id).expect("adopted record must exist");
-    assert_eq!(rec.scheme, PqScheme::Ed25519);
-    assert_eq!(rec.pubkey, id.to_vec());
-    assert_eq!(rec.pubkey.len(), ED25519_PUBKEY_LEN);
+    // FULL-PQ: `get_pq_key` has no Ed25519 fallback, so there is nothing to
+    // adopt for a validator with no registered PQ key. The old assertion
+    // ("announce adopts an Ed25519 fallback record") is inverted: refused.
+    assert_eq!(
+        ledger.pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, falcon_key(2), 0),
+        Err(PqRegistryError::UnknownValidator)
+    );
+    assert!(reg.record_of(&id).is_none(), "nothing was adopted");
 }
 
 #[test]
@@ -516,7 +518,7 @@ fn pq_record_travels_with_consensus_key_rotation() {
 // ---- validator-signed announcement helper ----
 
 #[test]
-fn rotation_announcement_signature_verifies_under_consensus_key() {
+fn rotation_announcement_signature_refused_fail_closed() {
     use stellereum::pq_registry::pq_rotation_announcement_preimage;
 
     let sk = SigningKey::from_bytes(&[0x42u8; 32]);
@@ -524,15 +526,17 @@ fn rotation_announcement_signature_verifies_under_consensus_key() {
     let key = falcon_key(0xA5);
     let eff = 7_300u64;
     let preimage = pq_rotation_announcement_preimage(&id, PqScheme::Falcon512, &key, eff);
+    // A GENUINELY VALID classical signature over the exact preimage.
     let sig = sk.sign(&preimage).to_bytes();
 
-    assert!(verify_rotation_announcement(
-        &id,
-        PqScheme::Falcon512,
-        &key,
-        eff,
-        &sig
-    ));
+    // FULL-PQ: the announcement verifier used the deleted Ed25519 path, so it
+    // now REFUSES every announcement (the old assertion "valid Ed signature
+    // verifies" is inverted). There is no silent accept.
+    assert!(PqScheme::from_id(1).is_err(), "Ed25519 id must be refused");
+    assert!(
+        !verify_rotation_announcement(&id, PqScheme::Falcon512, &key, eff, &sig),
+        "classical announcement verification is removed: must refuse"
+    );
     // Wrong consensus key refuses.
     let other = SigningKey::from_bytes(&[0x43u8; 32])
         .verifying_key()

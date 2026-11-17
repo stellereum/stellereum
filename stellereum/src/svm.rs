@@ -8,8 +8,8 @@ use crate::cell::{CellHash, PatriciaTrie};
 pub use crate::contract::{
     Contract, ContractCallContext, ContractError, ContractEvent, ContractOutcome, ContractRegistry,
     FUEL_BLAKE3_BASE, FUEL_BLAKE3_PER_BYTE, FUEL_BLOCK_HASH, FUEL_BLOCK_TIME, FUEL_CALLER,
-    FUEL_ED25519_VERIFY, FUEL_EMIT, FUEL_RETURN_DATA_BASE, FUEL_RETURN_DATA_PER_BYTE,
-    FUEL_SHA256_BASE, FUEL_SHA256_PER_BYTE, FUEL_SLOAD, FUEL_SSTORE, FUEL_VALUE,
+    FUEL_EMIT, FUEL_RETURN_DATA_BASE, FUEL_RETURN_DATA_PER_BYTE, FUEL_SHA256_BASE,
+    FUEL_SHA256_PER_BYTE, FUEL_SLOAD, FUEL_SSTORE, FUEL_VALUE,
 };
 use crate::orderbook::{ClobEvent, OrderSide, OrderType, OrderbookActor, TradeExecution};
 pub use crate::token::{
@@ -3206,7 +3206,6 @@ impl Svm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Signer;
 
     #[test]
     fn test_svm_contract_call_with_host_functions() {
@@ -3447,13 +3446,12 @@ mod tests {
         }
     }
 
-    /// A PQ equivocation envelope whose BOTH signatures verify under `sk`.
+    /// A PQ equivocation envelope whose BOTH signatures verify under `fk`.
     ///
-    /// The validator has NO registered post-quantum key, so the ledger falls
-    /// back to Ed25519 with the validator id as the public key - the same
-    /// resolution the live path uses.
+    /// FULL-PQ: the ledger has no Ed25519 fallback, so the voter is a
+    /// Falcon-512 validator and the evidence is Falcon-signed.
     fn signed_pq_evidence(
-        sk: &ed25519_dalek::SigningKey,
+        fk: &crate::post_quantum::FalconKeypair,
         height: u64,
         round: u32,
         kind: crate::consensus::VoteKind,
@@ -3463,14 +3461,14 @@ mod tests {
         let msg_a = crate::consensus::vote_sign_bytes(height, round, kind, &target_a);
         let msg_b = crate::consensus::vote_sign_bytes(height, round, kind, &target_b);
         crate::staking::CompactPqEquivocationEvidence {
-            voter: sk.verifying_key().to_bytes(),
+            voter: fk.validator_id(),
             height,
             round,
             kind,
             block_hash_a: target_a,
-            signature_a: sk.sign(&msg_a).to_bytes().to_vec(),
+            signature_a: fk.sign(&msg_a),
             block_hash_b: target_b,
-            signature_b: sk.sign(&msg_b).to_bytes().to_vec(),
+            signature_b: fk.sign(&msg_b),
         }
     }
 
@@ -3480,16 +3478,23 @@ mod tests {
     #[test]
     fn pq_equivocation_report_slashes_the_validator() {
         const NANO: u64 = 1_000_000_000;
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let voter = sk.verifying_key().to_bytes();
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x07);
+        let voter = fk.validator_id();
 
         let mut ledger = crate::staking::StakingLedger::new();
         ledger.bond(voter, 1_100 * NANO, 0).unwrap();
+        ledger
+            .register_pq_key(
+                voter,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key().to_vec(),
+            )
+            .unwrap();
         let before = ledger.validators[&voter].self_bond;
         let expected = before * 500 / 10_000; // EQUIVOCATION_SLASH_BPS = 5%
 
         let evidence = signed_pq_evidence(
-            &sk,
+            &fk,
             42,
             1,
             crate::consensus::VoteKind::Prevote,
@@ -3539,16 +3544,23 @@ mod tests {
     #[test]
     fn pq_equivocation_report_rejects_invalid_evidence_fail_closed() {
         const NANO: u64 = 1_000_000_000;
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let voter = sk.verifying_key().to_bytes();
-        let other_sk = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x09);
+        let other_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x0A);
+        let voter = fk.validator_id();
 
         let mut ledger = crate::staking::StakingLedger::new();
         ledger.bond(voter, 1_100 * NANO, 0).unwrap();
+        ledger
+            .register_pq_key(
+                voter,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key().to_vec(),
+            )
+            .unwrap();
         let before = ledger.validators[&voter].self_bond;
 
         let good = signed_pq_evidence(
-            &sk,
+            &fk,
             7,
             0,
             crate::consensus::VoteKind::Prevote,
@@ -3564,7 +3576,7 @@ mod tests {
             crate::consensus::VoteKind::Prevote,
             &Some([0x02u8; 32]),
         );
-        forged.signature_b = other_sk.sign(&msg_b).to_bytes().to_vec();
+        forged.signature_b = other_fk.sign(&msg_b);
 
         // 2. The SAME target twice (not an equivocation at all).
         let mut same_target = good.clone();
@@ -3575,11 +3587,11 @@ mod tests {
             crate::consensus::VoteKind::Prevote,
             &Some([0x01u8; 32]),
         );
-        same_target.signature_b = sk.sign(&msg_same).to_bytes().to_vec();
+        same_target.signature_b = fk.sign(&msg_same);
 
         // 3. An UNKNOWN voter (not in the ledger).
         let mut unknown = good.clone();
-        unknown.voter = other_sk.verifying_key().to_bytes();
+        unknown.voter = other_fk.validator_id();
 
         for (label, ev) in [
             ("forged signature", forged),
@@ -3616,9 +3628,9 @@ mod tests {
     /// membership against.
     #[test]
     fn pq_equivocation_report_without_a_ledger_reverts() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x0B);
         let evidence = signed_pq_evidence(
-            &sk,
+            &fk,
             3,
             0,
             crate::consensus::VoteKind::Precommit,
@@ -3643,9 +3655,9 @@ mod tests {
     /// PQ report (the same contract the other priced opcodes hold).
     #[test]
     fn pq_equivocation_report_gas_matches_the_priced_table() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x0D);
         let evidence = signed_pq_evidence(
-            &sk,
+            &fk,
             1,
             0,
             crate::consensus::VoteKind::Prevote,

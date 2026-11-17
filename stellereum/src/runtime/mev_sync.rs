@@ -527,17 +527,11 @@ impl ValidatorRuntime {
                     );
                     return;
                 };
+                // FULL-PQ: Hybrid (0x04) is removed; a registered PQ key is
+                // either Falcon-512 (verify directly) or ML-DSA-44 (disabled
+                // fail-closed — refuse).
                 let expected_falcon_pk: &[u8] = match scheme {
                     crate::post_quantum::PqScheme::Falcon512 => &pk,
-                    crate::post_quantum::PqScheme::Hybrid => {
-                        if pk.len() <= crate::post_quantum::ED25519_PUBKEY_LEN {
-                            tracing::warn!(
-                                "[mev-seal] pq dkg envelope refused: malformed registered hybrid key"
-                            );
-                            return;
-                        }
-                        &pk[crate::post_quantum::ED25519_PUBKEY_LEN..]
-                    }
                     _ => {
                         tracing::warn!(
                             "[mev-seal] pq dkg envelope refused: unsupported registered PQ scheme {:?}",

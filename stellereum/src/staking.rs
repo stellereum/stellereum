@@ -2910,6 +2910,9 @@ impl StakingLedger {
     }
 
     /// Register or update a post-quantum public key and scheme for an active validator.
+    ///
+    /// Refuses a disabled scheme (ML-DSA-44: no verifier) outright, so an
+    /// unverifiable key can never enter the committed `validator_pq_keys` map.
     pub fn register_pq_key(
         &mut self,
         validator: ValidatorId,
@@ -2919,40 +2922,34 @@ impl StakingLedger {
         if !self.validators.contains_key(&validator) {
             return Err(StakingError::NotValidator);
         }
-        if pubkey.len() != scheme.pubkey_size() {
+        if scheme.is_disabled() || pubkey.len() != scheme.pubkey_size() {
             return Err(StakingError::InvalidSignature);
         }
         self.validator_pq_keys.insert(validator, (scheme, pubkey));
         Ok(())
     }
 
-    /// Retrieve the registered post-quantum key and scheme for a validator, if any,
-    /// falling back to Ed25519 (with the 32-byte `ValidatorId` as public key) if the
-    /// validator exists in the ledger.
+    /// Retrieve the registered post-quantum key and scheme for a validator.
     ///
-    /// GATE-FIRST P2-10 (pure-PQ fail-closed): when
-    /// [`crate::post_quantum::is_pure_pq_enforced`] is on, the Ed25519 fallback
-    /// is REFUSED (`None`) — an unregistered validator surfaces as a loud
-    /// caller-side refusal instead of yielding classical key material. With
-    /// enforcement off the fallback is byte-identical to before.
+    /// FULL-PQ: there is NO classical fallback. A validator with no
+    /// registered PQ key yields `None` (with a loud WARN), regardless of the
+    /// pure-PQ override — Ed25519 (0x01) is no longer a scheme value and its
+    /// verifier is deleted, so returning the 32-byte validator id as
+    /// "classical key material" would hand callers an unverifiable key.
     pub fn get_pq_key(
         &self,
         validator: &ValidatorId,
     ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
         if let Some((s, pk)) = self.validator_pq_keys.get(validator) {
-            Some((*s, pk.clone()))
-        } else if self.validators.contains_key(validator) {
-            if crate::post_quantum::is_pure_pq_enforced() {
-                tracing::warn!(
-                    "PQ key REFUSED (pure-PQ: no registered PQ key) for {}: refusing classical Ed25519 fallback",
-                    hex::encode(validator),
-                );
-                return None;
-            }
-            Some((crate::post_quantum::PqScheme::Ed25519, validator.to_vec()))
-        } else {
-            None
+            return Some((*s, pk.clone()));
         }
+        if self.validators.contains_key(validator) {
+            tracing::warn!(
+                "PQ key REFUSED for {}: no registered PQ key (classical Ed25519 fallback removed)",
+                hex::encode(validator),
+            );
+        }
+        None
     }
 
     /// On-chain PQ key registry hooks (see `crate::pq_registry`).
@@ -3169,30 +3166,22 @@ impl StakingLedger {
             return Err(StakingError::NotValidator);
         }
 
-        // 3. Registered key resolution (GATE-FIRST P2-11: NO classical
-        // fallback under pure-PQ — unregistered validators yield
-        // `InvalidSignature`, never an Ed25519 key the evidence could verify
-        // against; likewise a registered classical/disabled scheme is refused).
-        let (scheme, pubkey) = if let Some((s, pk)) = self.validator_pq_keys.get(&evidence.voter) {
-            (*s, pk.clone())
-        } else if crate::post_quantum::is_pure_pq_enforced() {
+        // 3. Registered key resolution: FULL-PQ, NO classical fallback.
+        // An unregistered validator yields `InvalidSignature` (never an
+        // Ed25519 key), and ML-DSA-44 (no verifier) is refused outright.
+        let Some((scheme, pubkey)) = self.validator_pq_keys.get(&evidence.voter) else {
             tracing::warn!(
-                "PQ equivocation REFUSED (pure-PQ: no registered PQ key) for {}: refusing classical fallback",
+                "PQ equivocation REFUSED for {}: no registered PQ key (classical Ed25519 fallback removed)",
                 hex::encode(evidence.voter),
             );
             return Err(StakingError::InvalidSignature);
-        } else {
-            (
-                crate::post_quantum::PqScheme::Ed25519,
-                evidence.voter.to_vec(),
-            )
         };
-        if crate::post_quantum::is_pure_pq_enforced()
-            && (!scheme.is_post_quantum() || scheme.is_disabled())
-        {
+        let (scheme, pubkey) = (*scheme, pubkey.clone());
+        if scheme.is_disabled() {
             tracing::warn!(
-                "PQ equivocation REFUSED (pure-PQ: classical scheme evidence) for {}: refusing to slash",
+                "PQ equivocation REFUSED for {}: scheme {} has no verifier",
                 hex::encode(evidence.voter),
+                scheme.name(),
             );
             return Err(StakingError::InvalidSignature);
         }
@@ -3211,21 +3200,10 @@ impl StakingLedger {
             &evidence.block_hash_b,
         );
 
-        // Strip the Falcon envelope when present on standard Ed25519 signatures
-        let sig_a = if scheme == crate::post_quantum::PqScheme::Ed25519
-            && evidence.signature_a.len() != 64
-        {
-            crate::consensus::ed25519_sig_bytes(&evidence.signature_a)
-        } else {
-            evidence.signature_a.as_slice()
-        };
-        let sig_b = if scheme == crate::post_quantum::PqScheme::Ed25519
-            && evidence.signature_b.len() != 64
-        {
-            crate::consensus::ed25519_sig_bytes(&evidence.signature_b)
-        } else {
-            evidence.signature_b.as_slice()
-        };
+        // The evidence carries the scheme's raw signature bytes; Ed25519
+        // envelope stripping is gone with the classical scheme.
+        let sig_a = evidence.signature_a.as_slice();
+        let sig_b = evidence.signature_b.as_slice();
 
         // 5. Signature verification:
         let valid_a = crate::post_quantum::verify_pq_signature(scheme, &pubkey, &msg_a, sig_a);
@@ -4060,7 +4038,8 @@ impl StakingLedgerV3 {
 mod tests {
     use super::*;
     use crate::consensus::{Vote, VoteKind};
-    use ed25519_dalek::{Signer, SigningKey};
+    use crate::post_quantum::{FalconKeypair, PqScheme};
+    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
     fn vid(n: u8) -> ValidatorId {
@@ -6092,9 +6071,13 @@ mod tests {
     #[test]
     fn test_pq_equivocation_valid_evidence_slashes_bonded_validator() {
         let mut l = StakingLedger::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: slash_pq_equivocation has no Ed fallback, so the voter is a
+        // Falcon-registered validator and the evidence is Falcon-signed.
+        let fk = FalconKeypair::generate_from_seed(97);
+        let vid = fk.validator_id();
         l.bond(vid, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.register_pq_key(vid, PqScheme::Falcon512, fk.public_key().to_vec())
+            .unwrap();
         l.delegate(del(1), vid, stell(1000)).unwrap();
         // Total stake = 3000 STELL
 
@@ -6106,8 +6089,8 @@ mod tests {
 
         let msg_a = crate::consensus::vote_sign_bytes(h, r, kind, &target_a);
         let msg_b = crate::consensus::vote_sign_bytes(h, r, kind, &target_b);
-        let sig_a = sk.sign(&msg_a).to_bytes().to_vec();
-        let sig_b = sk.sign(&msg_b).to_bytes().to_vec();
+        let sig_a = fk.sign(&msg_a);
+        let sig_b = fk.sign(&msg_b);
 
         let evidence = CompactPqEquivocationEvidence {
             voter: vid,
@@ -6131,9 +6114,13 @@ mod tests {
     #[test]
     fn test_pq_equivocation_micro_committee_100_percent_and_evicts() {
         let mut l = StakingLedger::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: slash_pq_equivocation has no Ed fallback, so the voter is a
+        // Falcon-registered validator and the evidence is Falcon-signed.
+        let fk = FalconKeypair::generate_from_seed(98);
+        let vid = fk.validator_id();
         l.bond(vid, stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+        l.register_pq_key(vid, PqScheme::Falcon512, fk.public_key().to_vec())
+            .unwrap();
         l.delegate(del(1), vid, stell(1000)).unwrap();
         // Total stake = 2100 STELL
 
@@ -6145,8 +6132,8 @@ mod tests {
 
         let msg_a = crate::consensus::vote_sign_bytes(h, r, kind, &target_a);
         let msg_b = crate::consensus::vote_sign_bytes(h, r, kind, &target_b);
-        let sig_a = sk.sign(&msg_a).to_bytes().to_vec();
-        let sig_b = sk.sign(&msg_b).to_bytes().to_vec();
+        let sig_a = fk.sign(&msg_a);
+        let sig_b = fk.sign(&msg_b);
 
         let evidence = CompactPqEquivocationEvidence {
             voter: vid,
@@ -6172,9 +6159,13 @@ mod tests {
     #[test]
     fn test_pq_equivocation_non_conflicting_targets_rejected() {
         let mut l = StakingLedger::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: slash_pq_equivocation has no Ed fallback, so the voter is a
+        // Falcon-registered validator and the evidence is Falcon-signed.
+        let fk = FalconKeypair::generate_from_seed(99);
+        let vid = fk.validator_id();
         l.bond(vid, stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+        l.register_pq_key(vid, PqScheme::Falcon512, fk.public_key().to_vec())
+            .unwrap();
 
         let h = 5;
         let r = 0;
@@ -6182,7 +6173,7 @@ mod tests {
         let target = Some([0x42; 32]);
 
         let msg = crate::consensus::vote_sign_bytes(h, r, kind, &target);
-        let sig = sk.sign(&msg).to_bytes().to_vec();
+        let sig = fk.sign(&msg);
 
         // Target A == Target B -> non-conflicting
         let evidence = CompactPqEquivocationEvidence {
@@ -6203,7 +6194,7 @@ mod tests {
 
         // Also both None -> non-conflicting
         let msg_nil = crate::consensus::vote_sign_bytes(h, r, kind, &None);
-        let sig_nil = sk.sign(&msg_nil).to_bytes().to_vec();
+        let sig_nil = fk.sign(&msg_nil);
         let evidence_nil = CompactPqEquivocationEvidence {
             voter: vid,
             height: h,
@@ -6222,9 +6213,13 @@ mod tests {
     #[test]
     fn test_pq_equivocation_invalid_signature_rejected_with_error() {
         let mut l = StakingLedger::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: slash_pq_equivocation has no Ed fallback, so the voter is a
+        // Falcon-registered validator and the evidence is Falcon-signed.
+        let fk = FalconKeypair::generate_from_seed(100);
+        let vid = fk.validator_id();
         l.bond(vid, stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+        l.register_pq_key(vid, PqScheme::Falcon512, fk.public_key().to_vec())
+            .unwrap();
 
         let h = 5;
         let r = 0;
@@ -6234,8 +6229,8 @@ mod tests {
 
         let msg_a = crate::consensus::vote_sign_bytes(h, r, kind, &target_a);
         let msg_b = crate::consensus::vote_sign_bytes(h, r, kind, &target_b);
-        let sig_a = sk.sign(&msg_a).to_bytes().to_vec();
-        let sig_b = sk.sign(&msg_b).to_bytes().to_vec();
+        let sig_a = fk.sign(&msg_a);
+        let sig_b = fk.sign(&msg_b);
 
         // 1. Tampered signature B
         let mut bad_sig_b = sig_b.clone();
@@ -6276,8 +6271,8 @@ mod tests {
         );
 
         // 3. Forged signature by another validator
-        let other_sk = SigningKey::generate(&mut OsRng);
-        let forged_sig_b = other_sk.sign(&msg_b).to_bytes().to_vec();
+        let other_fk = FalconKeypair::generate_from_seed(0x0A);
+        let forged_sig_b = other_fk.sign(&msg_b);
         let evidence_forged = CompactPqEquivocationEvidence {
             voter: vid,
             height: h,
@@ -6297,9 +6292,13 @@ mod tests {
     #[test]
     fn test_pq_equivocation_deduplication_prevents_double_slashing() {
         let mut l = StakingLedger::new();
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: slash_pq_equivocation has no Ed fallback, so the voter is a
+        // Falcon-registered validator and the evidence is Falcon-signed.
+        let fk = FalconKeypair::generate_from_seed(101);
+        let vid = fk.validator_id();
         l.bond(vid, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.register_pq_key(vid, PqScheme::Falcon512, fk.public_key().to_vec())
+            .unwrap();
 
         let h = 100;
         let r = 2;
@@ -6309,8 +6308,8 @@ mod tests {
 
         let msg_a = crate::consensus::vote_sign_bytes(h, r, kind, &target_a);
         let msg_b = crate::consensus::vote_sign_bytes(h, r, kind, &target_b);
-        let sig_a = sk.sign(&msg_a).to_bytes().to_vec();
-        let sig_b = sk.sign(&msg_b).to_bytes().to_vec();
+        let sig_a = fk.sign(&msg_a);
+        let sig_b = fk.sign(&msg_b);
 
         let evidence = CompactPqEquivocationEvidence {
             voter: vid,
@@ -6342,7 +6341,7 @@ mod tests {
         // Third vote on the same (voter, height, round, kind) is also deduplicated
         let target_c = Some([0x03; 32]);
         let msg_c = crate::consensus::vote_sign_bytes(h, r, kind, &target_c);
-        let sig_c = sk.sign(&msg_c).to_bytes().to_vec();
+        let sig_c = fk.sign(&msg_c);
         let evidence_c = CompactPqEquivocationEvidence {
             voter: vid,
             height: h,
@@ -6675,8 +6674,9 @@ mod tests {
     /// instead of truncating it).
     #[test]
     fn pq_evidence_wire_len_is_measured_and_bounded() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let vid = sk.verifying_key().to_bytes();
+        // FULL-PQ: the live evidence shape is Falcon-512 (Ed25519 removed).
+        let fk = FalconKeypair::generate_from_seed(0x6A);
+        let vid = fk.validator_id();
         let h = 5u64;
         let r = 0u32;
         let kind = VoteKind::Prevote;
@@ -6690,15 +6690,15 @@ mod tests {
             round: r,
             kind,
             block_hash_a: target_a,
-            signature_a: sk.sign(&msg_a).to_bytes().to_vec(),
+            signature_a: fk.sign(&msg_a),
             block_hash_b: target_b,
-            signature_b: sk.sign(&msg_b).to_bytes().to_vec(),
+            signature_b: fk.sign(&msg_b),
         };
         let len = ev.wire_len();
         assert!(len > 0, "the envelope must have a measurable size");
         assert!(
             len <= MAX_PQ_EQUIVOCATION_EVIDENCE_BYTES,
-            "an Ed25519 envelope ({len} bytes) must fit the cap"
+            "a Falcon-512 envelope ({len} bytes) must fit the cap"
         );
         // The dedup key is the per-offense identity: same (voter, height,
         // round, kind) -> same key, so the same offense cannot burn twice.

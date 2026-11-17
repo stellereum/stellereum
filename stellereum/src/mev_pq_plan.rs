@@ -1,80 +1,99 @@
-//! MEV PQ migration PLAN — design + KAT prototype, UNWIRED.
+//! MEV PQ migration — DELIVERED TRANSPORT + REMAINING AUDITED REPLACEMENT.
 //!
-//! UNWIRED: this file is NOT declared in `lib.rs` (`mod mev_pq_plan` does not
-//! exist) and NOTHING in production calls it. The `_pq_plan` suffix marks
-//! plan-only code. To run the KATs: `rustc --edition 2021 --test
-//! stellereum/src/mev_pq_plan.rs -o /tmp/mev_pq_plan_kat && /tmp/mev_pq_plan_kat`.
-//! No new dependencies: `std` only. Production keeps using BLAKE3 (`TRANSCRIPT_DOMAIN`),
-//! SHA-256 (`derive_seal_key`), Falcon-512 (`crate::post_quantum`) — named, not imported.
+//! STATUS (2026-11-17, FULL-PQ transport): the DKG share-package transport is
+//! ML-KEM-768 + Falcon-512 ONLY. The classical X25519 leg, the
+//! Edwards-to-Montgomery transport-key derivation and the unauthenticated
+//! `EpochDkg::ingest` entry point are DELETED. There is no pre-activation
+//! window and no silent fallback.
 //!
-//! # 1. Audit (read-only): what the MEV DKG produces, who consumes it, X25519's role
+//! This module is compiled ONLY under `#[cfg(test)]` (declared in `lib.rs` as
+//! `#[cfg(test)] mod mev_pq_plan;`) and is a MECHANICS MODEL for the epoch
+//! randomness commit/reveal shape. Nothing in production calls it. The KATs
+//! run in `cargo test --lib mev`.
+//!
+//! # 1. Delivered state (what the MEV epoch path does today)
 //!
 //! DKG PRODUCES (all in `stellereum/src/mev_epoch.rs`):
-//! * `EpochPublicKey` (`EpochPublicKey` in mev_epoch.rs): epoch `P_e`, a Ristretto255 point that is the
-//!   AGGREGATE of contributors' constant-term Feldman commitments (`EpochDkg::finalize`).
-//! * `EpochKeyMaterial` (`EpochKeyMaterial` in mev_epoch.rs): per-member Shamir share = sum of contributors'
-//!   evaluations at our index, plus `transcript_root` binding every accepted
-//!   contribution, plus `committee_hash` + `threshold`.
-//! * DKG inputs: `EpochCommittee` (mev_epoch.rs) with DERIVED contributor set (`contributor_set`);
-//!   `DkgContribution` carries Feldman `commitments` + per-recipient `EncryptedShare`
-//!   packages; `EpochDkg::{contribution, ingest, finalize}` enforce
-//!   Feldman VSS + exact-contributor-set finalization (`can_finalize`).
+//! * `EpochPublicKey`: epoch `P_e`, a Ristretto255 point that is the AGGREGATE
+//!   of contributors' constant-term Feldman commitments
+//!   (`EpochDkg::finalize`). This layer is CLASSICAL and is the outstanding
+//!   audited-replacement item (see §3).
+//! * `EpochKeyMaterial`: per-member Shamir share = sum of contributors'
+//!   evaluations at our index, plus `transcript_root`, `committee_hash` and
+//!   `threshold`.
+//! * DKG inputs: `EpochCommittee` (derived contributor set); `DkgContribution`
+//!   carries Feldman `commitments` + per-recipient `EncryptedShare` packages;
+//!   `EpochDkg::{contribution_pq, ingest_pq, finalize}` enforce Feldman VSS +
+//!   exact-contributor-set finalization.
 //!
-//! CONSUMERS of the DKG output:
-//! * Wallet sealing: `seal_transaction` (mev_epoch.rs — ephemeral Ristretto DH `e * P_e`)
-//!   + XChaCha20-Poly1305; entry via `seal_transaction_for_epoch` (wallet.rs).
+//! TRANSPORT (delivered, PQ-only):
+//! * `EncryptedShare.ciphertext = ML-KEM-768.Encaps(ek_recipient) || AEAD(share)`
+//!   = 1136 bytes. `ephemeral_pk` is always zero (no DH ephemeral).
+//! * Key = SHA-256(SEAL_KDF_DOMAIN || len(ss) || ss || epoch || tx_hash);
+//!   AEAD = XChaCha20-Poly1305; implicit rejection surfaces as an AEAD tag
+//!   failure (no distinguisher).
+//! * Falcon-512 signs the canonical contribution bytes
+//!   (`pq_transport_seal` / `pq_transport_verify`); a mutation anywhere fails
+//!   verification before ingest.
+//! * Key sourcing: `MevKemRegistry` (validator id -> ML-KEM-768 ek, delayed
+//!   rotation). `CommitteeMember.enc_pk` is the 32-byte BLAKE3 tag of the ek
+//!   (`kem_member_tag`), so the committee hash binds every transport key.
+//!
+//! CONSUMERS of the DKG output (unchanged):
+//! * Wallet sealing: `seal_transaction` (ephemeral Ristretto DH `e * P_e`) +
+//!   XChaCha20-Poly1305; entry via `seal_transaction_for_epoch` (wallet.rs).
 //! * Threshold unseal: `compute_partial` (`C^x_i`), `combine_partials`
-//!   (Lagrange-in-the-exponent), `unseal_transaction` (mev_epoch.rs); called by the proposer path
-//!   (`propose` in runtime.rs), partial release (`EpochSealManager::release_partial`,
-//!   mev_epoch.rs), gossip `MevFrame::Dkg` (runtime.rs), sealed pool
-//!   (`sealed`/`sealed_epoch` in mempool.rs), broadcast (`broadcast_mev_frame` in consensus_net.rs).
-//! * Chain binding: `epoch_key_commitment` (mev_epoch.rs) carried by the block, checked by
+//!   (Lagrange-in-the-exponent), `unseal_transaction`; proposer path and
+//!   `EpochSealManager::release_partial`.
+//! * Chain binding: `epoch_key_commitment` carried by the block, checked by
 //!   `verify_epoch_key_against_block` (light_client.rs).
 //!
-//! X25519'S EXACT ROLE — transport encryption of DKG share packages ONLY:
-//! * `encrypt_share_package` (mev_epoch.rs): ephemeral `XStaticSecret::random_from_rng` + DH
-//!   `ephemeral.diffie_hellman(recipient_pk)`, key via `derive_seal_key`, XChaCha seal.
-//! * `decrypt_share_package` (mev_epoch.rs): `secret.diffie_hellman(ephemeral_pk)`.
-//! * Key derivation: `encryption_secret_from_ed25519` (mev_epoch.rs), `encryption_public_key_from_ed25519`
-//!   (birational map, keeps DKG to ONE round), `encryption_public_key`;
-//!   `CommitteeMember.enc_pk`, `committee_for` derives `enc_pk` (mev_epoch.rs).
-//! * X25519 is NOT the sealing primitive (sealing is Ristretto DH + XChaCha, `seal_transaction`),
-//!   NOT the threshold arithmetic (Ristretto is linear, X25519 clamping is not — `:49-56`),
-//!   and NOT the E2E transport (`e2e.key` in node_keys.rs is a separate channel).
+//! FAIL-CLOSED node wiring:
+//! * `EpochSealManager::sync_epoch` and `ingest_contribution` are explicit
+//!   `Err`s: a node-side DKG needs the KEM registry and a 64-byte ML-KEM seed
+//!   (not derivable from an Ed25519 seed). The registry-wired entry points are
+//!   `sync_epoch_pq` / `ingest_contribution_pq`; the runtime is not wired to
+//!   them yet, so no node derives an epoch key today. That is the deliberate
+//!   no-fallback state, not a silent downgrade.
+//! * `ingest_classical_at_h` is an unconditional `Err` at every height;
+//!   `is_pq_transport_active` is true at every height.
+//! * X25519 appears NOWHERE in the MEV epoch path.
 //!
-//! # 2. Design: ranked PQ replacement (honest fit assessment)
+//! # 2. Why the Feldman/sealing layer was NOT replaced in the same step
 //!
-//! The DKG's production/consumption shape is THRESHOLD DECRYPTION: `t`-of-`n` partials must
-//! reconstruct the SAME DH shared point for an arbitrary wallet-chosen ephemeral `C`
-//! (`combine_partials`, `:1351`). Any replacement must preserve that shape.
+//! Feldman VSS needs a prime-order group because verification is the
+//! homomorphic equation `prod_k C_k^{i^k} == g^{f(i)}` and the public key is
+//! `P_e = sum_j g^{a_{j,0}}`. Replacing `g^x` with `H(x)` destroys it:
+//! `H(x+y)` is not a function of `H(x)`, `H(y)`, so shares cannot be verified
+//! against a public commitment and sealing to `P_e` would need the secret in
+//! the clear. Threshold ML-KEM decapsulation is not Shamir-linear either (NTT,
+//! compression and message rounding are non-linear). A one-step swap would be
+//! unaudited crypto or a security downgrade, so it is NOT done here.
 //!
-//! * RANK 1 (fits): Falcon-authenticated PQ-KEM transport swap. Keep Feldman VSS + Ristretto
-//!   threshold exactly as-is; replace ONLY the X25519 package encryption (`:1094-1136`) with a
-//!   PQ KEM encaps (e.g. ML-KEM-768) to each recipient's PQ transport key, and sign each
-//!   `DkgContribution` with the contributor's Falcon-512 key over the contribution
-//!   bytes (the old `VrfBinding::verify` pattern was deleted with ECVRF;
-//!   keygen `FalconKeypair::generate_from_seed_bytes` in post_quantum.rs).
-//!   Production/consumption unchanged: same `P_e`, same partials, same `unseal_transaction`.
-//! * RANK 2 (partial fit): Falcon-signed commit-reveal per the CN-VRF pattern (`cn_vrf.rs` header +
-//!   `cnvrf_commit`/`cnvrf_open`/`cnvrf_verify`, domains `CNVRF_COMMIT_DST`/`CNVRF_OPEN_DST`)
-//!   for the EPOCH SEED / public randomness only (replacing `EPOCH_SEED_DOMAIN` +
-//!   `DKG_POLY_DOMAIN` determinism). It removes DKG input bias surface but has NO threshold
-//!   decryption property: alone it CANNOT unseal wallet ciphertexts.
-//! * RANK 3 / REJECTED for this path: pure hash-DRB replacing the DKG. A DRB outputs public
-//!   randomness, not a threshold-shared secret; it cannot produce `t`-of-`n` decryption partials
-//!   for arbitrary ephemerals, so the sealed-mempool liveness/fail-closed semantics die with it.
+//! # 3. What an audited replacement MUST provide
 //!
-//! This file prototypes the RANK-2 mechanics shape (commit/reveal/verify + transcript binding)
-//! because that is what is KAT-testable in `std` today; RANK-1 needs the PQ KEM primitive + audit
-//! before any code lands (see `docs/MEV_PQ_PLAN.md`).
+//! 1. A threshold KEM whose decapsulation is a function of `t`-of-`n` shares
+//!    (lattice threshold decryption with audited MPC), IND-CCA2 under MLWE.
+//! 2. OR wallet-side per-ciphertext sharing: sample a fresh AEAD key `k`,
+//!    Shamir-split `k` over a prime field, ML-KEM-encapsulate share `i` to
+//!    member `i`, and publish the `n` packages with the ciphertext. `t`
+//!    released shares reconstruct `k`; `t-1` learn nothing. This changes
+//!    wallet/RPC/wire shapes (deliberately untouched here).
+//! 3. Public verifiability without a pairing/group: an audited lattice VSS, or
+//!    hash commitments to each share plus an audited dispute/attribution
+//!    protocol. Hash-only VSS is NOT publicly verifiable and must say so.
+//! 4. A KAT + differential test that the replacement preserves every
+//!    accept/refuse decision pinned in `tests/mev_pq_transport_tests.rs` and
+//!    `tests/pentest_mev_kem.rs`.
 //!
-//! # 3. Prototype scope
+//! # 4. Prototype scope in THIS file
 //!
-//! `pq_plan_digest` is a MECHANICS MODEL (FNV-1a-64 x4 lanes, `std` only) — NOT production crypto.
-//! At wiring time it is replaced 1:1 by BLAKE3 (`TRANSCRIPT_DOMAIN` pattern, `:101`) / SHAKE-256
-//! (`cn_vrf.rs` O8 pattern) and the open message gains a Falcon-512 signature. What the KATs pin
-//! is the SHAPE: domain separation, length-prefix framing, order sensitivity, verify binding.
-
+//! `pq_plan_digest` is a MECHANICS MODEL (FNV-1a-64 x4 lanes, `std` only) —
+//! NOT production crypto. At wiring time it is replaced 1:1 by BLAKE3
+//! (`TRANSCRIPT_DOMAIN` pattern) / SHAKE-256 and the open message gains a
+//! Falcon-512 signature. What the KATs pin is the SHAPE: domain separation,
+//! length-prefix framing, order sensitivity, verify binding.
+//!
 // ---------------------------------------------------------------------------
 // Domains (mirroring the production `*_DOMAIN` pattern, plan-only tags)
 // ---------------------------------------------------------------------------

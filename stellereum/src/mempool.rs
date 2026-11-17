@@ -1913,7 +1913,7 @@ impl Mempool {
             };
             if !env.scheme.is_post_quantum() {
                 return Err(MempoolError::Malformed(
-                    "Pure PQ mode: scheme must be post-quantum (Falcon-512, ML-DSA-44, or Hybrid)"
+                    "Pure PQ mode: scheme must be post-quantum (Falcon-512; ML-DSA-44 has no verifier)"
                         .to_string(),
                 ));
             }
@@ -4134,16 +4134,30 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_pq_rejects_envelope_wrapped_ed25519_with_malformed() {
-        use crate::post_quantum::{PqScheme, PqSignatureEnvelope};
-        use ed25519_dalek::Signer;
+    fn test_pure_pq_rejects_envelope_wrapped_classical_scheme_with_malformed() {
+        use crate::post_quantum::PqSignatureEnvelope;
 
-        // Classical key on purpose: this test proves an Ed25519 scheme id in
-        // a PQ1 envelope is refused (not admitted, not verified).
-        let esk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let pk_bytes = esk.verifying_key().to_bytes().to_vec();
+        // FULL-PQ: scheme id 0x01 (Ed25519) is refused by
+        // `PqScheme::from_id`, i.e. at envelope DECODE, before any crypto.
+        // The blob is built by hand because `new_explicit` can no longer
+        // represent a classical scheme at all.
+        let mut env_bytes = Vec::new();
+        env_bytes.extend_from_slice(crate::post_quantum::PQ_ENVELOPE_MAGIC);
+        env_bytes.push(1); // removed Ed25519 scheme id
+        env_bytes.push(0); // explicit key
+        env_bytes.extend_from_slice(&32u16.to_le_bytes());
+        env_bytes.extend_from_slice(&[0x11u8; 32]);
+        env_bytes.extend_from_slice(&64u16.to_le_bytes());
+        env_bytes.extend_from_slice(&[0x22u8; 64]);
 
-        let mut tx = Transaction {
+        let err = PqSignatureEnvelope::decode(&env_bytes)
+            .expect_err("scheme 0x01 must be refused at decode");
+        assert!(
+            err.contains("Ed25519"),
+            "decode refusal must name the removed scheme: {err}"
+        );
+
+        let tx = Transaction {
             from: [0x33; 32],
             to: [0x44; 32],
             amount: 50,
@@ -4151,16 +4165,10 @@ mod tests {
             nonce: 0,
             source_shard: 1,
             target_shard: 1,
-            signature: Vec::new(),
+            signature: env_bytes,
             payload: Vec::new(),
             priority_fee_per_gas: 0,
         };
-        let msg = tx.signing_message();
-        let sig = esk.sign(&msg).to_bytes().to_vec();
-
-        // Classical Ed25519 wrapped in PQ1 envelope
-        let env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, pk_bytes, sig);
-        tx.signature = env.encode();
 
         let mut mp = Mempool::new(10, 10).with_pure_pq(true);
         let res = mp.add(tx);
@@ -4168,8 +4176,8 @@ mod tests {
         match res {
             Err(MempoolError::Malformed(reason)) => {
                 assert!(
-                    reason.contains("Pure PQ mode: scheme must be post-quantum"),
-                    "Expected scheme must be post-quantum rejection, got: {reason}"
+                    reason.contains("classical non-PQ transactions rejected"),
+                    "Expected classical-envelope rejection, got: {reason}"
                 );
             }
             other => panic!("Expected Malformed error, got: {:?}", other),

@@ -432,13 +432,13 @@ fn price_feed() -> stellereum::oracle::PriceFeedUpdate {
 }
 
 fn session_grant() -> stellereum::zkml::SessionKeyAuthorization {
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
-    stellereum::zkml::SessionKeyAuthorization::sign_delegation(
+    // FULL-PQ: grants are Falcon-512 only (`sign_delegation` is deleted).
+    let master = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x11);
+    let session = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x12);
+    stellereum::zkml::SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        session.public_key(),
         2_000_000_000,
         1_000_000,
         stellereum::zkml::SCOPE_ALL,

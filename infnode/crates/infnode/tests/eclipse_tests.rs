@@ -24,7 +24,6 @@
 //!   reconnect churn of a fixed peer set leaves tables constant plus
 //!   `RoutingTable` K-bucket capping under 5000 distinct IDs.
 
-use ed25519_dalek::Signer;
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::{Node, RateBucket};
@@ -79,10 +78,10 @@ fn cfg(name: &str, listen: &str, peers: Vec<PeerConfig>, allow_unknown: bool) ->
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str, rate: u32) -> PeerConfig {
+fn peer_of(name: &str, _keys: &NodeKeys, pq: &PqKeys, listen: &str, rate: u32) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        ed_pub: hex::encode(keys.verifying.to_bytes()),
+        consensus_pub: None,
         pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
@@ -180,12 +179,7 @@ async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
         .filter(|f| f.kind == proto::kind::AUTH)
 }
 
-fn challenge_wire(
-    signing: &ed25519_dalek::SigningKey,
-    src: [u8; NODEID_LEN],
-    payload: &str,
-    ts: i64,
-) -> Vec<u8> {
+fn challenge_wire(pq: &PqKeys, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
     let mut f = Frame {
         kind: proto::kind::CHALLENGE,
         seq: 1,
@@ -195,24 +189,24 @@ fn challenge_wire(
         svc: 0,
         payload: payload.as_bytes().to_vec(),
         nonce: vec![],
-        sig: [0; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = signing.sign(d.as_bytes()).to_bytes();
+    f.sig = pq.sign_digest(d.as_bytes());
     f.encode()
 }
 
-/// Deterministic TOFU payload: fixed hex nonce + fixed eph derived from seed.
-/// Avoids OsRng in test logic (outcome identical every run).
-fn det_payload(keys: &NodeKeys, seed: u64, at: i64) -> String {
+/// Deterministic TOFU payload: fixed hex nonce + fixed freshness nonce
+/// derived from seed. Avoids OsRng in test logic (outcome identical every run).
+fn det_payload(pq: &PqKeys, seed: u64, at: i64) -> String {
     let nonce = format!("{seed:032x}");
-    // Deterministic 32-byte eph stand-in (format-only; server only checks presence).
-    let eph = format!("{seed:064x}");
+    // Deterministic 32-byte hello freshness stand-in (no ECDH).
+    let fresh = format!("{seed:064x}");
     serde_json::json!({
         "nonce": nonce,
         "at": at,
-        "eph": eph,
-        "ed": hex::encode(keys.verifying.to_bytes()),
+        "fresh": fresh,
+        "pq_pub": pq.pq_pub_hex(),
         "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
         "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
@@ -220,14 +214,14 @@ fn det_payload(keys: &NodeKeys, seed: u64, at: i64) -> String {
     .to_string()
 }
 
-fn det_good_wire(keys: &NodeKeys, seed: u64) -> Vec<u8> {
+fn det_good_wire(pq: &PqKeys, seed: u64) -> Vec<u8> {
     let now = proto::now_ms();
-    let p = det_payload(keys, seed, now);
-    challenge_wire(&keys.signing, keys.id(), &p, now)
+    let p = det_payload(pq, seed, now);
+    challenge_wire(pq, pq.pq_id(), &p, now)
 }
 
-fn det_bad_wire(keys: &NodeKeys, seed: u64) -> Vec<u8> {
-    let mut w = det_good_wire(keys, seed);
+fn det_bad_wire(pq: &PqKeys, seed: u64) -> Vec<u8> {
+    let mut w = det_good_wire(pq, seed);
     let last = w.len() - 1;
     w[last] ^= 0xff;
     w
@@ -303,14 +297,14 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     // Phase 1: single attacker identity, bad handshakes -> refused per
     // connection AND dropped, with no identity trace (framing-impossible:
     // pre-auth failures are never attributed to the claimed id).
-    let atk_keys = NodeKeys::generate();
-    let atk_id = atk_keys.id();
+    let atk_pq = PqKeys::generate();
+    let atk_id = atk_pq.pq_id();
     let mut attacker_refused = 0usize;
     let mut seed = 100u64;
     for _ in 0..8 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
-            raw_handshake(&c, &det_bad_wire(&atk_keys, seed))
+            raw_handshake(&c, &det_bad_wire(&atk_pq, seed))
                 .await
                 .is_none(),
             "bad signature refused"
@@ -340,7 +334,7 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     );
 
     // Honest unaffected while the attacker is refused (raw + full-node paths).
-    let h1 = NodeKeys::generate();
+    let h1 = PqKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
         raw_handshake(&c, &det_good_wire(&h1, 9001)).await.is_some(),
@@ -364,7 +358,7 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     // wire, proving the gate still bites once attribution is genuine.
     let mut sybils = Vec::new();
     for s in 0..8u64 {
-        let k = NodeKeys::generate();
+        let k = PqKeys::generate();
         sybils.push((k, 200 + s * 100));
     }
     let refused_before = victim.rep_refusals_total();
@@ -381,23 +375,23 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
             tokio::time::sleep(Duration::from_millis(120)).await;
         }
         assert_eq!(
-            victim.rep_score(&k.id()).await,
+            victim.rep_score(&k.pq_id()).await,
             0,
             "sybil {i} untouched by its own bad dials"
         );
         assert!(
-            !victim.rep_is_banned(&k.id()).await,
+            !victim.rep_is_banned(&k.pq_id()).await,
             "sybil dials never ban"
         );
         // Genuine (attributed) abuse throttles the sybil at its own gate time.
-        victim.rep_record_auth_failure(&k.id()).await;
-        victim.rep_record_auth_failure(&k.id()).await;
+        victim.rep_record_auth_failure(&k.pq_id()).await;
+        victim.rep_record_auth_failure(&k.pq_id()).await;
         assert!(
-            victim.rep_is_throttled(&k.id()).await,
+            victim.rep_is_throttled(&k.pq_id()).await,
             "sybil {i} throttled once abuse is attributed"
         );
         assert!(
-            !victim.rep_is_banned(&k.id()).await,
+            !victim.rep_is_banned(&k.pq_id()).await,
             "sybil throttle, not ban"
         );
         // Gate refusal with a VALID wire, immediately (no decay gap).
@@ -429,7 +423,7 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     assert!(victim.rep_bans_total() >= 1, "ban counter bumps");
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &det_good_wire(&atk_keys, 4242))
+        raw_handshake(&c, &det_good_wire(&atk_pq, 4242))
             .await
             .is_none(),
         "banned identity refused even when valid"
@@ -507,17 +501,17 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
     const N: usize = 16;
     let mut sybils = Vec::new();
     for _ in 0..N {
-        sybils.push(NodeKeys::generate());
+        sybils.push(PqKeys::generate());
     }
     for k in &sybils {
-        let id = k.id();
+        let id = k.pq_id();
         victim.rep_record_auth_failure(&id).await;
         victim.rep_record_auth_failure(&id).await;
     }
     let mut throttled = 0usize;
     let mut banned = 0usize;
     for k in &sybils {
-        let id = k.id();
+        let id = k.pq_id();
         if victim.rep_is_throttled(&id).await {
             throttled += 1;
         }
@@ -557,7 +551,7 @@ async fn eclipse_sybil_burst_per_ip_and_per_identity_limits() {
     );
 
     // Network: honest raw dial passes while all 16 sybils are throttled.
-    let hk = NodeKeys::generate();
+    let hk = PqKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
         raw_handshake(&c, &det_good_wire(&hk, 31337))
@@ -631,21 +625,17 @@ async fn eclipse_dht_poison_honest_records_persist() {
     assert_eq!(kv.get("eclipse:rule").as_deref(), Some("v-honest-v2"));
 
     // Route-record gate (FULL-PQ): honest PQ binding valid, forged binding
-    // refused (`pq` must derive `id`; `ed` is the frozen auth pin, NOT identity).
-    let honest_keys = NodeKeys::generate();
+    // refused (`pq` must derive `id`; there is no classical pin).
     let honest_keys_pq = PqKeys::generate();
-    let evil_keys = NodeKeys::generate();
     let evil_keys_pq = PqKeys::generate();
     assert!(infnode::dht::node_info_valid(
         &honest_keys_pq.pq_id(),
-        &hex::encode(honest_keys.verifying.to_bytes()),
         &honest_keys_pq.pq_pub_hex(),
         &["127.0.0.1:1".to_string()],
     ));
     assert!(
         !infnode::dht::node_info_valid(
             &honest_keys_pq.pq_id(),
-            &hex::encode(evil_keys.verifying.to_bytes()),
             &evil_keys_pq.pq_pub_hex(),
             &["127.0.0.1:1".to_string()],
         ),
@@ -774,7 +764,7 @@ async fn eclipse_dht_poison_honest_records_persist() {
     let routes = serde_json::json!({
         poison_id.clone(): {
             "endpoints": ["127.0.0.1:9"],
-            "ed_pub": hex::encode(evil_keys.verifying.to_bytes()),
+            "pq_pub": evil_keys_pq.pq_pub_hex(),
         }
     });
     let p = serde_json::json!({ "routes": routes })
@@ -821,7 +811,6 @@ async fn eclipse_churn_storm_peer_table_bounded() {
         rt.insert(infnode::dht::NodeInfo {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
-            ed_hex: String::new(),
             pq_hex: String::new(),
             last_seen: 1,
         });
@@ -840,7 +829,6 @@ async fn eclipse_churn_storm_peer_table_bounded() {
         rt.insert(infnode::dht::NodeInfo {
             id,
             endpoints: vec!["127.0.0.1:1".to_string()],
-            ed_hex: String::new(),
             pq_hex: String::new(),
             last_seen: 2,
         });
@@ -920,7 +908,7 @@ async fn eclipse_churn_storm_peer_table_bounded() {
 
     // Invalid DHT-discovered records never enter the peer table (FULL-PQ:
     // `pq` must derive `id`; forged `fake` ids with attacker `pq` are refused).
-    let evil = NodeKeys::generate();
+    let _evil = NodeKeys::generate();
     let evil_pq = PqKeys::generate();
     let peers_pre_poison = b.peers.read().await.len();
     for i in 0..20u32 {
@@ -930,7 +918,6 @@ async fn eclipse_churn_storm_peer_table_bounded() {
             .ensure_dht_peer(&infnode::dht::NodeInfo {
                 id: fake,
                 endpoints: vec!["127.0.0.1:9".to_string()],
-                ed_hex: hex::encode(evil.verifying.to_bytes()),
                 pq_hex: evil_pq.pq_pub_hex(),
                 last_seen: infnode::dht::now_ms(),
             })

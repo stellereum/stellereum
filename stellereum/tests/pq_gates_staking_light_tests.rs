@@ -122,20 +122,27 @@ fn light_header(block_hash: [u8; 32], sigs: Vec<([u8; 32], Vec<u8>)>) -> LightHe
     }
 }
 
-// --- P2-10: `get_pq_key` ED-fallback ----------------------------------------
+// --- P2-10: `get_pq_key` has NO classical fallback -------------------------
 
 #[test]
-fn ed_fallback_present_without_enforcement() {
+fn ed_fallback_removed_in_both_modes() {
     let _lock = TEST_LOCK.lock().unwrap();
-    set_pure_pq_override(Some(false));
-    clear_validator_pq_keys_for_tests();
-    let l = bonded([0x11; 32]);
-    assert_eq!(
-        l.get_pq_key(&[0x11; 32]),
-        Some((PqScheme::Ed25519, [0x11; 32].to_vec()))
-    );
-    // Unknown validator: None in both modes (no fallback for non-members).
-    assert_eq!(l.get_pq_key(&[0xFF; 32]), None);
+    // FULL-PQ: the Ed25519 fallback is DELETED (scheme 0x01 is not a value
+    // any more and its verifier is gone), so a member with no registered PQ
+    // key resolves to `None` with enforcement OFF as well. This inverts the
+    // old "fallback present without enforcement" assertion.
+    for enforced in [false, true] {
+        set_pure_pq_override(Some(enforced));
+        clear_validator_pq_keys_for_tests();
+        let l = bonded([0x11; 32]);
+        assert_eq!(
+            l.get_pq_key(&[0x11; 32]),
+            None,
+            "unregistered member must have no classical key (enforced={enforced})"
+        );
+        // Unknown validator: None in both modes.
+        assert_eq!(l.get_pq_key(&[0xFF; 32]), None);
+    }
     set_pure_pq_override(None);
 }
 
@@ -235,16 +242,25 @@ fn vote_slash_falcon_evidence_slashes_in_both_modes() {
 // --- PQ-slash path (`slash_pq_equivocation`, ~staking.rs:2698) --------------
 
 #[test]
-fn pq_slash_ed_fallback_slashes_without_enforcement() {
+fn pq_slash_ed_fallback_refused_in_both_modes() {
     let _lock = TEST_LOCK.lock().unwrap();
-    set_pure_pq_override(Some(false));
-    clear_validator_pq_keys_for_tests();
-    let sk = ed_key(0x31);
-    let voter = sk.verifying_key().to_bytes();
-    let mut l = bonded(voter);
-    let ev = compact_ed_evidence(&sk, 20, 0);
-    assert_eq!(l.slash_pq_equivocation(&ev, false).unwrap(), BURN_5PC);
-    assert_eq!(l.total_stake(&voter), BOND - BURN_5PC);
+    // FULL-PQ: unregistered validators have no classical fallback, so
+    // classical evidence is refused with enforcement OFF too. This inverts
+    // the old "fallback slashes without enforcement" assertion.
+    for enforced in [false, true] {
+        set_pure_pq_override(Some(enforced));
+        clear_validator_pq_keys_for_tests();
+        let sk = ed_key(0x31);
+        let voter = sk.verifying_key().to_bytes();
+        let mut l = bonded(voter);
+        let ev = compact_ed_evidence(&sk, 20, 0);
+        assert_eq!(
+            l.slash_pq_equivocation(&ev, false),
+            Err(StakingError::InvalidSignature),
+            "classical evidence must be refused (enforced={enforced})"
+        );
+        assert_eq!(l.total_stake(&voter), BOND);
+    }
     set_pure_pq_override(None);
 }
 
@@ -290,27 +306,29 @@ fn pq_slash_falcon_happy_in_both_modes() {
 }
 
 #[test]
-fn pq_slash_registered_classical_refused_only_under_pure_pq() {
+fn pq_slash_disabled_scheme_registration_refused_in_both_modes() {
     let _lock = TEST_LOCK.lock().unwrap();
+    // FULL-PQ: classical registration is impossible (0x01 is not a scheme
+    // value), and a disabled scheme (0x03, no verifier) is refused by
+    // `register_pq_key` outright. Evidence under it can never slash.
     for enforced in [false, true] {
         set_pure_pq_override(Some(enforced));
         clear_validator_pq_keys_for_tests();
         let sk = ed_key(0x34);
         let voter = sk.verifying_key().to_bytes();
         let mut l = bonded(voter);
-        // Explicit classical registration (not the unregistered fallback).
-        l.register_pq_key(voter, PqScheme::Ed25519, voter.to_vec())
-            .unwrap();
+        let mldsa_pk = vec![0x77u8; PqScheme::MlDsa44.pubkey_size()];
+        assert_eq!(
+            l.register_pq_key(voter, PqScheme::MlDsa44, mldsa_pk),
+            Err(StakingError::InvalidSignature),
+            "disabled scheme must never be registered (enforced={enforced})"
+        );
         let ev = compact_ed_evidence(&sk, 20, 0);
-        if enforced {
-            assert_eq!(
-                l.slash_pq_equivocation(&ev, false),
-                Err(StakingError::InvalidSignature)
-            );
-            assert_eq!(l.total_stake(&voter), BOND);
-        } else {
-            assert_eq!(l.slash_pq_equivocation(&ev, false).unwrap(), BURN_5PC);
-        }
+        assert_eq!(
+            l.slash_pq_equivocation(&ev, false),
+            Err(StakingError::InvalidSignature)
+        );
+        assert_eq!(l.total_stake(&voter), BOND);
     }
     set_pure_pq_override(None);
 }

@@ -198,7 +198,11 @@ pub(crate) async fn run_consensus_node(
         let custody_dir = std::env::var("STELL_CNVRF_V3_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("data/cnvrf_v3"));
-        rt.configure_cnvrf_v3_custody(custody_dir, stellereum::zkml::DEFAULT_CHAIN_ID);
+        // The chain id MUST be the one the state engine commits to: the
+        // commit-signature message and the beacon seed bind it, so pinning the
+        // default constant instead would make a chain running a different
+        // `STELL_CHAIN_ID` reject its own commitments.
+        rt.configure_cnvrf_v3_custody(custody_dir, state.chain_id);
         rt.sync_cnvrf_v3_on_boot().await;
     }
     // P2 shard gate (pool level, defense in depth): the runtime and the RPC

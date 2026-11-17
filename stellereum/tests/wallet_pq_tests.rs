@@ -1,9 +1,10 @@
 //! Phase-2 wallet track: PQ-first signing in the wallet library.
 //!
 //! * keygen defaults to Falcon-512 (deterministic-from-seed preserved);
-//! * key files accept both PQ and legacy Ed25519 (auto-detect, PQ preferred);
-//! * the sign path dispatches on the loaded key and refuses cross-scheme
-//!   requests fail-closed (legacy Ed25519 flows unchanged);
+//! * key files are Falcon-512 only; a legacy Ed25519/Hybrid key file is
+//!   REFUSED loudly with a migration message (never auto-detected/upgraded);
+//! * the sign path is Falcon-only and refuses any other live-but-disabled
+//!   scheme fail-closed (no cross-scheme signature, no fallback);
 //! * key files (and the keystore) are owner-only (0600).
 //!
 //! No wire change: the PQ shape asserted here is the `send-pq` / faucet
@@ -11,8 +12,7 @@
 
 use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
 use stellereum::wallet::{
-    default_wallet_key_scheme, load_wallet_key, save_wallet_key, Keystore, WalletAccount,
-    WalletKeyMaterial,
+    default_wallet_key_scheme, load_wallet_key, save_wallet_key, Keystore, WalletKeyMaterial,
 };
 
 const TEST_CHAIN_ID: u64 = 5757;
@@ -86,114 +86,75 @@ fn pq_keygen_sign_verify_round_trip() {
 }
 
 // ============================================================================
-// 2. Legacy Ed25519 still loads and signs (no flag-day).
+// 2. Classical wallet key files are REFUSED loudly (never upgraded).
 // ============================================================================
 
 #[test]
-fn legacy_ed_still_loads_and_signs() {
-    let ed = WalletKeyMaterial::ed25519_from_seed(&[0x42u8; 32]);
-    assert_eq!(ed.scheme(), PqScheme::Ed25519);
-    assert!(!ed.is_post_quantum());
-    // Same address the historical wallet derives from this seed.
-    assert_eq!(
-        ed.address(),
-        WalletAccount::from_seed(&[0x42u8; 32]).address
-    );
-
-    // File round-trip preserves the legacy key.
+fn legacy_ed_key_files_are_refused_loudly() {
     let dir = scratch_dir("legacy-ed");
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("ed.key");
-    save_wallet_key(&path, &ed).expect("save");
-    let back = load_wallet_key(&path).expect("load");
-    assert_eq!(back.scheme(), PqScheme::Ed25519);
-    assert_eq!(back.address(), ed.address());
 
-    // Legacy hex fallback: a bare 32-byte seed in hex loads as Ed25519.
-    let hex_path = dir.join("legacy-hex.key");
-    std::fs::write(&hex_path, hex::encode([0x42u8; 32])).expect("write");
-    #[cfg(unix)]
-    chmod(&hex_path, 0o600);
-    let hex_back = load_wallet_key(&hex_path).expect("legacy hex loads");
-    assert_eq!(hex_back.scheme(), PqScheme::Ed25519);
-    assert_eq!(hex_back.address(), ed.address());
-
-    // Raw 32-byte fallback loads as Ed25519 too.
-    let raw_path = dir.join("legacy-raw.key");
-    std::fs::write(&raw_path, [0x42u8; 32]).expect("write");
-    #[cfg(unix)]
-    chmod(&raw_path, 0o600);
-    let raw_back = load_wallet_key(&raw_path).expect("legacy raw loads");
-    assert_eq!(raw_back.address(), ed.address());
-
-    // Legacy signing is byte-shape-identical: 64-byte signature, and
-    // always-on Pure-PQ refuses classical Ed25519 verification fail-closed.
-    let tx = back.sign_transfer([0x99u8; 32], 1_000, 50_000, 0, 0, 0);
-    assert!(!tx.is_pq());
-    assert_eq!(tx.signature.len(), 64);
-    assert_eq!(tx.from, ed.address());
-    assert!(
-        !tx.verify_signature(),
-        "always-on Pure-PQ must refuse classical Ed25519 transaction"
-    );
-    let btx = back.sign_bound_transfer([0x99u8; 32], 1_000, 50_000, 0, 0, 0, TEST_CHAIN_ID);
-    assert!(!btx.is_pq());
-    assert!(btx.is_chain_id_bound());
-    assert!(
-        !btx.verify_signature_for_chain(TEST_CHAIN_ID, true),
-        "always-on Pure-PQ must refuse classical chain-bound Ed25519 transaction"
-    );
+    let seed = [0x42u8; 32];
+    let cases: [(&str, Vec<u8>); 4] = [
+        (
+            "ed-tagged.key",
+            format!(
+                r#"{{"scheme":"ed25519","key_hex":"{}"}}"#,
+                hex::encode(seed)
+            )
+            .into_bytes(),
+        ),
+        (
+            "hybrid-tagged.key",
+            format!(r#"{{"scheme":"hybrid","key_hex":"{}"}}"#, hex::encode(seed)).into_bytes(),
+        ),
+        ("ed-hex.key", hex::encode(seed).into_bytes()),
+        ("ed-raw.key", seed.to_vec()),
+    ];
+    for (name, bytes) in cases {
+        let path = dir.join(name);
+        std::fs::write(&path, &bytes).expect("write");
+        #[cfg(unix)]
+        chmod(&path, 0o600);
+        let err = load_wallet_key(&path).expect_err(&format!(
+            "{name}: a classical wallet key file must be refused"
+        ));
+        assert!(
+            err.contains("REMOVED") && err.contains("Falcon-512"),
+            "{name}: refusal must name the removal and the migration path, got: {err}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ============================================================================
-// 3. Mixed wallet: each key signs with its own correct scheme.
+// 3. Falcon-only wallet: every key signs with Falcon-512.
 // ============================================================================
 
 #[test]
 fn mixed_wallet_signs_with_correct_scheme_per_key() {
     let keys = [
         WalletKeyMaterial::from_seed(&[0xA1u8; 32]),
-        WalletKeyMaterial::ed25519_from_seed(&[0xB2u8; 32]),
         WalletKeyMaterial::from_seed(&[0xC3u8; 32]),
-        WalletKeyMaterial::ed25519_from_seed(&[0xD4u8; 32]),
     ];
     for (i, key) in keys.iter().enumerate() {
         let to = [i as u8; 32];
+        assert_eq!(key.scheme(), PqScheme::Falcon512, "key {i} must be Falcon");
+        assert!(key.is_post_quantum());
         let tx = key.sign_transfer(to, 500 + i as u64, 50_000, i as u64, 0, 0);
         assert_eq!(tx.from, key.address(), "key {i} must sign as itself");
-        match key.scheme() {
-            PqScheme::Falcon512 => {
-                assert!(tx.is_pq(), "Falcon key {i} must build the PQ envelope");
-                assert!(
-                    tx.verify_signature(),
-                    "Falcon key {i} signature must verify"
-                );
-            }
-            PqScheme::Ed25519 => {
-                assert!(!tx.is_pq(), "Ed25519 key {i} must stay legacy");
-                assert_eq!(tx.signature.len(), 64);
-                assert!(
-                    !tx.verify_signature(),
-                    "always-on Pure-PQ must refuse classical Ed25519 key {i}"
-                );
-            }
-            PqScheme::MlDsa44 | PqScheme::Hybrid => {
-                panic!("mixed-wallet fixture uses only live wallet schemes")
-            }
-        }
-        // The scheme-pinned entry point accepts the key's own scheme and
-        // refuses the other one fail-closed.
+        assert!(tx.is_pq(), "Falcon key {i} must build the PQ envelope");
+        assert!(
+            tx.verify_signature(),
+            "Falcon key {i} signature must verify"
+        );
+        // The scheme-pinned entry point accepts Falcon and refuses the
+        // verifier-less ML-DSA-44 (0x03) fail-closed.
         assert!(key
-            .sign_transfer_as(key.scheme(), to, 500, 50_000, 0, 0, 0)
+            .sign_transfer_as(PqScheme::Falcon512, to, 500, 50_000, 0, 0, 0)
             .is_ok());
-        let other = if key.scheme() == PqScheme::Falcon512 {
-            PqScheme::Ed25519
-        } else {
-            PqScheme::Falcon512
-        };
         assert!(key
-            .sign_transfer_as(other, to, 500, 50_000, 0, 0, 0)
+            .sign_transfer_as(PqScheme::MlDsa44, to, 500, 50_000, 0, 0, 0)
             .is_err());
     }
 }
@@ -208,10 +169,7 @@ fn wallet_key_files_are_owner_only_0600() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     for (name, key) in [
         ("pq.key", WalletKeyMaterial::from_seed(&[0x51u8; 32])),
-        (
-            "ed.key",
-            WalletKeyMaterial::ed25519_from_seed(&[0x52u8; 32]),
-        ),
+        ("pq2.key", WalletKeyMaterial::from_seed(&[0x52u8; 32])),
     ] {
         let path = dir.join(name);
         save_wallet_key(&path, &key).expect("save");
@@ -253,10 +211,7 @@ fn wallet_key_files_are_owner_only_0600() {
 #[test]
 fn pq_encoding_is_preferred_on_autodetect() {
     let pq = WalletKeyMaterial::from_seed(&[0x61u8; 32]);
-    let keypair_bytes = match &pq {
-        WalletKeyMaterial::Falcon { keypair } => keypair.to_bytes(),
-        WalletKeyMaterial::Ed25519 { .. } => panic!("fixture must be Falcon"),
-    };
+    let keypair_bytes = pq.keypair().to_bytes();
     let dir = scratch_dir("autodetect");
     std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -293,10 +248,7 @@ fn send_pq_shape_matches_the_faucet_convention() {
     // the message is the unbound signing message (no chain binding unless
     // the bound constructor is used).
     let pq = WalletKeyMaterial::from_seed(&[0x11u8; 32]);
-    let pubkey = match &pq {
-        WalletKeyMaterial::Falcon { keypair } => keypair.public_key.clone(),
-        WalletKeyMaterial::Ed25519 { .. } => panic!("fixture must be Falcon"),
-    };
+    let pubkey = pq.keypair().public_key.clone();
     let tx = pq.sign_transfer([0xABu8; 32], 1_000_000_000, 325_000, 0, 0, 0);
     assert_eq!(
         tx.from,

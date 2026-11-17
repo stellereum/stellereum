@@ -30,14 +30,17 @@ fn mldsa_scheme_byte_refused_at_admission() {
     assert!(!err.is_empty(), "refusal must be loud: {err}");
     // Neighbouring ids still work; unknown ids still rejected.
     assert_eq!(PqScheme::from_id(2).unwrap(), PqScheme::Falcon512);
-    assert_eq!(PqScheme::from_id(4).unwrap(), PqScheme::Hybrid);
+    // FULL-PQ: 0x04 (Hybrid) and 0x01 (Ed25519) are REMOVED, so both are
+    // refused loudly instead of mapping to a variant.
+    let hybrid_err = PqScheme::from_id(4).expect_err("0x04 must be refused");
+    assert!(hybrid_err.contains("Hybrid"), "loud refusal: {hybrid_err}");
+    let ed_err = PqScheme::from_id(1).expect_err("0x01 must be refused");
+    assert!(ed_err.contains("Ed25519"), "loud refusal: {ed_err}");
     assert!(PqScheme::from_id(0).is_err());
     assert!(PqScheme::from_id(5).is_err());
     // The disabled helper agrees with the admission gate.
     assert!(PqScheme::MlDsa44.is_disabled());
     assert!(!PqScheme::Falcon512.is_disabled());
-    assert!(!PqScheme::Hybrid.is_disabled());
-    assert!(!PqScheme::Ed25519.is_disabled());
 }
 
 #[test]
@@ -293,17 +296,23 @@ fn pq_envelope_strict_single_layout() {
     );
     assert!(PqSignatureEnvelope::decode(&bad_sig.encode()).is_err());
 
-    // Ed25519 envelope: exact sizes enforced both sides.
-    let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-    let ed_pk = ed_sk.verifying_key().to_bytes().to_vec();
-    let ed_sig = ed_sk.sign(msg).to_bytes().to_vec();
-    assert_eq!(ed_pk.len(), ED25519_PUBKEY_LEN);
-    assert_eq!(ed_sig.len(), ED25519_SIG_LEN);
-    let ed_env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, ed_sig);
-    assert_eq!(
-        PqSignatureEnvelope::decode(&ed_env.encode()).unwrap(),
-        ed_env
-    );
+    // FULL-PQ: a classical (0x01) envelope no longer decodes at all — the
+    // scheme id is refused by `from_id`, so the old "Ed25519 envelope
+    // round-trips" assertion is inverted. The blob is hand-built because
+    // `new_explicit` cannot represent a removed scheme.
+    let ed_pk = vec![0x11u8; ED25519_PUBKEY_LEN];
+    let ed_sig = vec![0x22u8; ED25519_SIG_LEN];
+    let mut classical = Vec::new();
+    classical.extend_from_slice(stellereum::post_quantum::PQ_ENVELOPE_MAGIC);
+    classical.push(1); // removed Ed25519 scheme id
+    classical.push(0); // explicit key
+    classical.extend_from_slice(&(ED25519_PUBKEY_LEN as u16).to_le_bytes());
+    classical.extend_from_slice(&ed_pk);
+    classical.extend_from_slice(&(ED25519_SIG_LEN as u16).to_le_bytes());
+    classical.extend_from_slice(&ed_sig);
+    let err = PqSignatureEnvelope::decode(&classical)
+        .expect_err("classical envelope must be refused at decode");
+    assert!(err.contains("Ed25519"), "loud refusal: {err}");
 }
 
 // ============================================================================
@@ -461,8 +470,13 @@ fn node_key_files_enforce_perms_and_roundtrip() {
     // Encrypted roundtrips.
     let nk = load_or_generate_node_keys(&dir).expect("generate node keys");
     let nk2 = load_or_generate_node_keys(&dir).expect("reload node keys");
-    assert_eq!(nk.signing.to_bytes(), nk2.signing.to_bytes());
+    // FULL-PQ: NodeKeys carries only the KEM seed; the consensus-only
+    // Ed25519 key lives in validator.key.
     assert_eq!(nk.kem_seed, nk2.kem_seed);
+    let ck1 = stellereum::node_keys::load_or_generate_consensus_key(&dir).expect("consensus key");
+    let ck2 =
+        stellereum::node_keys::load_or_generate_consensus_key(&dir).expect("reload consensus key");
+    assert_eq!(ck1.to_bytes(), ck2.to_bytes());
     let falcon_path = dir.join("falcon.key");
     let fk = load_or_generate_falcon_key(&falcon_path).expect("generate falcon key");
     let fk2 = load_or_generate_falcon_key(&falcon_path).expect("reload falcon key");

@@ -154,10 +154,13 @@ async fn main() {
         if !proof.verify_inference() {
             fail("zkml");
         }
-        let master = SigningKey::generate(&mut OsRng);
-        let mut auth = SessionKeyAuthorization::sign_delegation(
+        // FULL-PQ: Falcon-512 master + session (classical delegation removed).
+        let master = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x51);
+        let session = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x52);
+        let mut auth = SessionKeyAuthorization::sign_delegation_falcon512(
             &master,
-            [8u8; 32],
+            stellereum::post_quantum::PqScheme::Falcon512,
+            session.public_key(),
             4_000_000_000,
             1000,
             stellereum::zkml::SCOPE_ALL,

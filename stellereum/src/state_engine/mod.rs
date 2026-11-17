@@ -90,8 +90,15 @@ pub const HASH_POOL_ENABLED: bool = false;
 /// path); production opens it only by flipping this const.
 pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
+/// Default scheme tag for an account that has not pinned a public key.
+///
+/// FULL-PQ: this used to be Ed25519. Classical schemes are removed, so an
+/// unpinned account is tagged with the fail-closed ML-DSA-44 value (no
+/// verifier). The tag is metadata only until `pin_pubkey` writes the real
+/// scheme; tagging it with a live scheme (Falcon-512) would imply a key that
+/// was never proven.
 fn default_account_scheme() -> crate::post_quantum::PqScheme {
-    crate::post_quantum::PqScheme::Ed25519
+    crate::post_quantum::PqScheme::MlDsa44
 }
 
 /// Actor representing an Account or Smart Contract state
@@ -122,7 +129,7 @@ impl AccountState {
             storage_root: None,
             inbox: VecDeque::new(),
             outbox: VecDeque::new(),
-            scheme: crate::post_quantum::PqScheme::Ed25519,
+            scheme: default_account_scheme(),
             pubkey_hash: None,
         }
     }

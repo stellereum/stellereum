@@ -48,7 +48,7 @@ fn fixture(plen: usize, nlen: usize) -> Frame {
         svc: 0xDEAD_BEEF_CAFE_0001,
         payload,
         nonce,
-        sig: [0x5Au8; 64],
+        sig: vec![0x5Au8; infnode::proto::PQ_FALCON_SIG_LEN],
     }
 }
 
@@ -162,7 +162,7 @@ mod reference {
     pub fn ref_decode(b: &[u8]) -> anyhow::Result<Frame> {
         use anyhow::anyhow;
         const HDR: usize = 68;
-        if b.len() < HDR + 64 {
+        if b.len() < HDR + 2 {
             anyhow::bail!("frame too short");
         }
         let plen = u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow!("plen"))?) as usize;
@@ -173,18 +173,22 @@ mod reference {
         if nlen > MAX_NONCE_LEN {
             anyhow::bail!("nonce too large");
         }
-        let total = HDR
+        let sig_off = HDR
             .checked_add(plen)
             .and_then(|x| x.checked_add(nlen))
-            .and_then(|x| x.checked_add(64));
-        let total = match total {
-            Some(t) => t,
-            None => anyhow::bail!("frame length overflow"),
-        };
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
+        if sig_off + 2 > b.len() {
+            anyhow::bail!("frame too short");
+        }
+        let sig_len = u16::from_le_bytes([b[sig_off], b[sig_off + 1]]) as usize;
+        let total = sig_off
+            .checked_add(2)
+            .and_then(|x| x.checked_add(sig_len))
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
         if total != b.len() {
             anyhow::bail!("frame length mismatch");
         }
-        let sig: [u8; 64] = b[b.len() - 64..].try_into().map_err(|_| anyhow!("sig"))?;
+        let sig = b[sig_off + 2..].to_vec();
         let f = Frame {
             kind: b[1],
             seq: u32::from_le_bytes(b[2..6].try_into().map_err(|_| anyhow!("seq"))?),
@@ -196,7 +200,7 @@ mod reference {
             nonce: b[68 + plen..68 + plen + nlen].to_vec(),
             sig,
         };
-        if b[0] != 1 {
+        if b[0] != 2 {
             anyhow::bail!("unsupported version");
         }
         if f.nonce.len() != nlen || f.payload.len() != plen {

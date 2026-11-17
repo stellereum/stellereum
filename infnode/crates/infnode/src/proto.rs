@@ -1,10 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signature, VerifyingKey};
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NODEID_LEN: usize = 20;
@@ -127,22 +125,29 @@ pub struct Frame {
     pub svc: u64,
     pub payload: Vec<u8>,
     pub nonce: Vec<u8>,
-    pub sig: [u8; 64],
+    /// Falcon-512 tag over `blake3(sign_data)` (FULL-PQ: the Ed25519 trailer
+    /// is gone; a 64-byte / empty value never verifies).
+    pub sig: Vec<u8>,
 }
 
+/// Fixed prefix length through `payload_len` (version..payload_len).
 const HDR: usize = 68;
+/// Wire version. v1 carried a 64-byte Ed25519 trailer and is REFUSED: there
+/// is no classical frame path in FULL-PQ.
+pub const FRAME_VERSION: u8 = 2;
 
 impl Frame {
-    /// Exact wire length of `encode()` output.
+    /// Exact wire length of `encode()` output: prefix + payload + nonce +
+    /// `sig_len` u16 + Falcon tag.
     pub fn encoded_len(&self) -> usize {
-        HDR + self.payload.len() + self.nonce.len() + 64
+        HDR + self.payload.len() + self.nonce.len() + 2 + self.sig.len()
     }
 
-    /// Append the signed prefix (everything except the trailing 64-byte sig).
+    /// Append the signed prefix (everything except `sig_len || sig`).
     /// Single pass, no return-alloc: `encode`, `encode_into` and `sign_data`
     /// all funnel here so the byte layout has exactly one definition.
     pub fn sign_data_into(&self, v: &mut Vec<u8>) {
-        v.push(1); // version
+        v.push(FRAME_VERSION);
         v.push(self.kind);
         v.extend_from_slice(&self.seq.to_le_bytes());
         v.extend_from_slice(&self.ts.to_le_bytes());
@@ -165,7 +170,7 @@ impl Frame {
     /// `blake3::hash(&self.sign_data())` with no intermediate Vec.
     fn sign_digest(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
-        h.update(&[1]); // version
+        h.update(&[FRAME_VERSION]);
         h.update(&[self.kind]);
         h.update(&self.seq.to_le_bytes());
         h.update(&self.ts.to_le_bytes());
@@ -179,10 +184,11 @@ impl Frame {
         *h.finalize().as_bytes()
     }
 
-    /// Append one full frame (prefix + sig) with a single reserve.
+    /// Append one full frame (prefix + sig_len + sig) with a single reserve.
     pub fn encode_into(&self, b: &mut Vec<u8>) {
         b.reserve(self.encoded_len());
         self.sign_data_into(b);
+        b.extend_from_slice(&(self.sig.len() as u16).to_le_bytes());
         b.extend_from_slice(&self.sig);
     }
 
@@ -198,12 +204,15 @@ impl Frame {
         // Exact capacity: the trailing sig fits without a second alloc.
         let mut b = Vec::with_capacity(self.encoded_len());
         self.sign_data_into(&mut b);
+        b.extend_from_slice(&(self.sig.len() as u16).to_le_bytes());
         b.extend_from_slice(&self.sig);
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<Frame> {
-        if b.len() < HDR + 64 {
+        // HDR + sig_len(2); the Falcon tag itself is variable-length on the
+        // wire (a zero-length tag is decodable but never verifies).
+        if b.len() < HDR + 2 {
             bail!("frame too short");
         }
         // Manual LE loads: slices are in-bounds (checked above), so no
@@ -221,19 +230,22 @@ impl Frame {
             bail!("nonce too large");
         }
         // проверяем что сумма длин не переполняет usize и точно совпадает с длиной
-        let total = HDR
+        let sig_len_off = HDR
             .checked_add(plen)
             .and_then(|x| x.checked_add(nlen))
-            .and_then(|x| x.checked_add(64));
-        let total = match total {
-            Some(t) => t,
-            None => bail!("frame length overflow"),
-        };
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
+        if sig_len_off + 2 > b.len() {
+            bail!("frame too short");
+        }
+        let sig_len = u16::from_le_bytes([b[sig_len_off], b[sig_len_off + 1]]) as usize;
+        let total = sig_len_off
+            .checked_add(2)
+            .and_then(|x| x.checked_add(sig_len))
+            .ok_or_else(|| anyhow!("frame length overflow"))?;
         if total != b.len() {
             bail!("frame length mismatch");
         }
-        let mut sig = [0u8; 64];
-        sig.copy_from_slice(&b[b.len() - 64..]);
+        let sig = b[sig_len_off + 2..].to_vec();
         let mut src = [0u8; NODEID_LEN];
         let mut dst = [0u8; NODEID_LEN];
         src.copy_from_slice(&b[14..34]);
@@ -249,9 +261,9 @@ impl Frame {
             nonce: b[68 + plen..68 + plen + nlen].to_vec(),
             sig,
         };
-        // version check
-        if b[0] != 1 {
-            bail!("unsupported version");
+        // version check (v1 = classical Ed25519 trailer: refused, no fallback)
+        if b[0] != FRAME_VERSION {
+            bail!("unsupported version (classical frame refused)");
         }
         // не допускаем переполнения индексов для нечётких пакетов
         if f.nonce.len() != nlen || f.payload.len() != plen {
@@ -260,106 +272,48 @@ impl Frame {
         Ok(f)
     }
 
-    pub fn verify(&self, pk: &VerifyingKey) -> bool {
-        // sign-then-hash: подпись над blake3-дайджестом всего фрейма (быстро для больших payload)
-        let d = self.sign_digest();
-        pk.verify_strict(&d, &Signature::from_bytes(&self.sig))
-            .is_ok()
+    /// FULL-PQ frame authentication: Falcon-512 over
+    /// `blake3(sign_data)`, verified against the peer's PQ identity.
+    /// Malformed keys/tags return false (fail closed, never a classical
+    /// Ed25519 fallback).
+    pub fn verify(&self, pq_pub: &[u8]) -> bool {
+        if self.sig.len() != PQ_FALCON_SIG_LEN {
+            return false;
+        }
+        pq_falcon_verify(pq_pub, &self.sign_digest(), &self.sig)
     }
 }
 
-// PQ HANDSHAKE (default-ON since PQ 9.1; opt-out `STELL_INF_PQ_HANDSHAKE=0` pre-H only;
-// additive only — mirrors pq_transport.rs + docs/PQ_TRANSPORT_PLAN.md §3/§5).
-// KEX ephemeral ML-KEM-768; auth INTERIM keyed-hash MAC (NOT Falcon, plan §7), verified BEFORE
-// session derivation (fail closed); malformed PQ REFUSED (no silent downgrade); binding zeroed till exporter pinned.
+// PQ HANDSHAKE (MANDATORY, FULL-PQ wipe).
+// KEX ephemeral ML-KEM-768; the transcript is authenticated by the long-term
+// Falcon-512 key (see `pq_falcon_*` below) before any session key is derived
+// (fail closed). Classical offers, absent PQ identity, malformed PQ and bad
+// tags are REFUSED at every height — there is no mixed-mode window and no
+// env opt-out.
 
-/// Env gate for the PQ handshake (shared name for both reads below; no new
-/// env knobs — the opt-out reuses this same variable, inverted).
+/// Legacy env name kept for log/CLI text only. It is NOT read: an opt-out
+/// would be a classical fallback, which FULL-PQ does not allow.
 pub const PQ_HANDSHAKE_ENV: &str = "STELL_INF_PQ_HANDSHAKE";
 
-/// Legacy opt-in read: true exactly when `STELL_INF_PQ_HANDSHAKE=1`.
-/// Kept byte-for-byte for compatibility (pinned by
-/// `pq_flag_defaults_off_and_parses_only_exact_1`); live handshake paths
-/// use `pq_handshake_active` (default-ON) instead.
-pub fn pq_handshake_enabled() -> bool {
-    std::env::var(PQ_HANDSHAKE_ENV)
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// Default-ON read (PQ 9.1): PQ is attempted first unless the operator
-/// explicitly opts out with `STELL_INF_PQ_HANDSHAKE=0` (exact `"0"`).
-/// Unset, empty, or any other value (including the legacy `"1"`) = PQ
-/// active. There was no pre-existing classical opt-out flag — the same
-/// variable is now read inverted, so old `=1` configs keep working and only
-/// an explicit `=0` opts out. The opt-out is honored ONLY while
-/// `!pq_classical_refused_at(height)`; at/after
-/// [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused fail-closed
-/// regardless of this flag.
+/// Always true (FULL-PQ). Kept so call sites/tests that ask "is PQ active?"
+/// still have a single answer; there is no classical mode.
 pub fn pq_handshake_active() -> bool {
-    pq_handshake_active_for(std::env::var(PQ_HANDSHAKE_ENV).ok().as_deref())
+    true
 }
 
-/// Pure core of [`pq_handshake_active`] (env-free so tests stay race-free:
-/// only the legacy `pq_flag_defaults_off_...` test touches the process env).
-/// `Some("0")` = explicit classical opt-out; anything else = PQ active.
-pub fn pq_handshake_active_for(value: Option<&str>) -> bool {
-    !matches!(value, Some("0"))
+/// Pure core of [`pq_handshake_active`]: PQ is mandatory regardless of the
+/// (ignored) value, including the old `STELL_INF_PQ_HANDSHAKE=0` opt-out.
+pub fn pq_handshake_active_for(_value: Option<&str>) -> bool {
+    true
 }
 
-// HEIGHT-GATED CLASSICAL DEATH (PQ 9.1, default-ON).
+// CLASSICAL IS REFUSED AT EVERY HEIGHT (FULL-PQ wipe).
 //
-// Shape mirrors the `STELL_VRF_ACTIVATION_HEIGHT` precedent
-// (`stellereum/src/vrf.rs`: `VrfActivation::Disabled` default,
-// `FromHeight(h)` arms refusal for heights `>= h` via `is_active_at`, same
-// boundary carried + logged at startup): pre-H the mixed window tolerates
-// classical (WARN + counter, fail-open with noise); at/after H classical is
-// refused fail-closed (`pq_mixed_policy_at` / `pq_falcon_policy_at`).
-// Unlike VRF there is NO env override here on purpose: a single binary-wide
-// const keeps every node on the identical boundary with no per-node drift.
-// To adjust, the lead changes the const below (one line) and redeploys
-// uniformly — same rollout discipline as a VRF H change.
-//
-// H choice: infnode-observed heights are tens of thousands (kv fixtures pin
-// `"stell:height:*" = "42000:..."`; `node.rs` cites live height 71587),
-// VRF activation tests stage at `ACTIVATION_H = 1_000_000`. `300_000` is
-// current-chain-scale (≈42k–72k) + ~200k headroom, rounded up — far future,
-// comfortably pre-activation for every live/test height, far below any
-// planned flag-day. Revisit well before the chain approaches H.
-pub const PQ_CLASSICAL_REFUSE_AFTER_HEIGHT: u64 = 300_000;
-
-/// True when a handshake at `height` must refuse classical (height `>= H`).
-/// Pre-H (`false`) = legacy window behavior, byte-identical.
-pub fn pq_classical_refused_at(height: u64) -> bool {
-    height >= PQ_CLASSICAL_REFUSE_AFTER_HEIGHT
-}
-
-/// Monotonic count of classical fallbacks taken while PQ was active (pre-H
-/// window only; post-H there are no fallbacks — only refusals). Lives here
-/// (not `metrics.rs`) to keep the change inside the handshake zone; the
-/// lead may mirror it into the Prometheus render as a follow-up.
-static PQ_CLASSICAL_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Record one classical fallback; returns the new total.
-pub fn pq_record_classical_fallback() -> u64 {
-    PQ_CLASSICAL_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Classical fallbacks so far (fail-closed counting, like `auth_bans_hit`).
-pub fn pq_classical_fallback_total() -> u64 {
-    PQ_CLASSICAL_FALLBACK_TOTAL.load(Ordering::Relaxed)
-}
-
-/// Loud WARN for a classical fallback (call on every pre-H fallback, dial
-/// and accept sides). Never silent: prints the running fallback count and
-/// the refusal height so operators see the window closing.
-pub fn pq_warn_classical_fallback(side: &str) {
-    let n = pq_record_classical_fallback();
-    eprintln!(
-        "[WARN] PQ handshake fell back to classical ({side}, fallback #{n}): peer is classical-only or offered no pq_* (pre-H window). Classical will be REFUSED at/after height {} — provision pq-identity.key on both ends.",
-        PQ_CLASSICAL_REFUSE_AFTER_HEIGHT
-    );
-}
+// The former height-gated mixed window (`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`,
+// `pq_classical_refused_at`, fallback counter + WARN) is GONE: there is no
+// pre-H tolerance and no counter, because no classical offer is ever
+// accepted. `pq_mixed_policy` / `pq_falcon_policy` below refuse an absent or
+// classical offer unconditionally.
 
 /// Wire version of the PQ handshake transcript.
 pub const PQ_TRANSCRIPT_VERSION: u16 = 1;
@@ -384,10 +338,10 @@ pub struct PqTranscript {
     pub pq_init: [u8; 32],
     /// `blake3` of the full responder KEM ciphertext (1088 B).
     pub pq_resp: [u8; 32],
-    /// Initiator ephemeral X25519 pub.
-    pub eph_init: [u8; 32],
-    /// Responder ephemeral X25519 pub.
-    pub eph_resp: [u8; 32],
+    /// Initiator 32-byte hello freshness nonce (no ECDH; KEM provides FS).
+    pub fresh_init: [u8; 32],
+    /// Responder 32-byte hello freshness nonce (no ECDH).
+    pub fresh_resp: [u8; 32],
     /// Channel binding (currently [`PQ_CHAN_BIND_PLACEHOLDER`]).
     pub chan_bind: [u8; 32],
     /// `blake3` of the CHALLENGE frame `sign_data` (binds the whole frame).
@@ -410,8 +364,8 @@ impl PqTranscript {
         v.push(suite);
         Self::push(&mut v, &self.pq_init);
         Self::push(&mut v, &self.pq_resp);
-        Self::push(&mut v, &self.eph_init);
-        Self::push(&mut v, &self.eph_resp);
+        Self::push(&mut v, &self.fresh_init);
+        Self::push(&mut v, &self.fresh_resp);
         Self::push(&mut v, &self.chan_bind);
         Self::push(&mut v, &self.nonce_init);
         Self::push(&mut v, &self.nonce_resp);
@@ -444,13 +398,11 @@ pub fn pq_verify_tag(expected: &[u8; 32], got: &[u8; 32]) -> bool {
     d == 0
 }
 
-/// Negotiated handshake mode after applying the mixed-mode window policy.
+/// Negotiated handshake mode. FULL-PQ: the only possible outcome is `Pq`;
+/// the enum is kept (single variant) so call sites/tests stay type-stable.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PqMode {
-    /// Classical X3DH handshake (peer offered no PQ, or local node is
-    /// classical-only and ignores offered `pq_*` fields per plan §5).
-    Classical,
-    /// PQ-hybrid handshake (offer verified, hybrid session key).
+    /// PQ handshake (offer verified, KEM-only session key).
     Pq,
 }
 
@@ -465,23 +417,18 @@ pub struct PqOfferCheck {
     pub tag_ok: bool,
 }
 
-/// Mixed-mode window policy, exactly per `docs/PQ_TRANSPORT_PLAN.md` §5:
-/// window builds verify dual-or-classical and route by classical id;
-/// classical-only nodes NEVER see PQ fields as errors. Fails closed with a
-/// clear error when PQ is explicitly offered but invalid (malformed fields,
-/// unknown suite/version, bad tag) — this "refuse, never silently downgrade"
-/// arm is the deliberate choice for the case the plan leaves implicit
-/// (downgrade resistance during the window).
+/// PQ-only KEM policy (FULL-PQ wipe): an absent offer, a local node without
+/// a PQ identity, malformed fields, an unknown suite/version or a bad tag are
+/// ALL refusals at every height. Nothing falls back to classical.
 pub fn pq_mixed_policy(
     local_pq: bool,
     offer: Option<PqOfferCheck>,
 ) -> Result<PqMode, &'static str> {
     let Some(o) = offer else {
-        return Ok(PqMode::Classical);
+        return Err("pq offer required (classical refused)");
     };
     if !local_pq {
-        // Classical-only node: PQ fields are additive JSON, ignored, never an error.
-        return Ok(PqMode::Classical);
+        return Err("pq identity required (classical refused)");
     }
     if !o.wellformed {
         return Err("pq fields malformed");
@@ -495,17 +442,15 @@ pub fn pq_mixed_policy(
     Ok(PqMode::Pq)
 }
 
-// PQ FALCON TAG (default-ON since PQ 9.1 — same `pq_handshake_active` gate
-// as the KEM path; explicit `STELL_INF_PQ_HANDSHAKE=0` opts out pre-H only).
-// Additive only: nothing above is modified; opted-out (or PQ-identity
-// absent) leaves the handshake byte-identical to the ML-KEM-hybrid/classical
-// paths.
+// PQ FALCON TAG (MANDATORY — FULL-PQ wipe; there is no opt-out).
+// Every CHALLENGE/AUTH frame and the transcript itself are authenticated by
+// the long-term Falcon-512 key; an absent PQ identity or a missing/bad tag is
+// refused at every height.
 //
 // Backend: `falcon-rust 0.3.1` (already vendored in `Cargo.toml` — no new
 // crypto lineage). What the tag is: Falcon-512 over the FINALIZED transcript
 // digest by the LONG-TERM PQ key (`keyring::PqKeys`), verified against the
-// peer's pinned `pq_pub` BEFORE any session key is derived (fail closed,
-// same ordering discipline as the classical sig-before-session gate).
+// peer's pinned `pq_pub` BEFORE any session key is derived (fail closed).
 //
 // Blocker resolutions (see task report):
 // (a) fixed vectors: Falcon signing is randomized (fresh 40-byte nonce per
@@ -538,11 +483,9 @@ pub const PQ_FALCON_SIG_LEN: usize = 666;
 /// Domain for the PQ long-term id (binding helper only — NOT `NodeId`).
 pub const PQ_ID_DOMAIN: &[u8] = b"infnode-pqid-v1";
 
-/// PQ binding id: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`, announced
-/// alongside the classical id with first-PQ-wins stickiness
-/// (`node::PqIdentityRegistry`). Display/binding helper ONLY — promoting it
-/// to canonical `NodeId` is a flag-day follow-up (would fork
-/// DHT/pins/TLS/federation); see `keyring::NodeKeys::id`.
+/// Canonical PQ `NodeId`: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`.
+/// This IS the only node identity (FULL-PQ wipe: no classical id exists);
+/// DHT ids, TLS pins and federation records all bind to it.
 pub fn pq_id_from_pub(pk: &[u8]) -> [u8; NODEID_LEN] {
     let mut h = blake3::Hasher::new();
     h.update(PQ_ID_DOMAIN);
@@ -581,12 +524,9 @@ pub fn pq_falcon_verify(pk_bytes: &[u8], digest: &[u8; 32], sig_bytes: &[u8]) ->
     falcon512::verify(digest, &sig, &pk)
 }
 
-/// Falcon-tag window policy, mirroring `pq_mixed_policy` (plan §5):
-/// identity-absent peers are classical-EXPLICIT (`Ok(Classical)` — the
-/// `PeerConfig.pq_pub = None` case); a classical-only local node ignores
-/// offered PQ identity (never an error); explicitly offered PQ identity that
-/// is malformed or mistagged is REFUSED with a clear error (no silent
-/// downgrade, same fail-closed arm as the KEM path).
+/// PQ-only Falcon-tag policy (FULL-PQ wipe): an absent peer identity, a local
+/// node without a PQ identity, a malformed/mistagged Falcon key and a missing
+/// tag are ALL refusals at every height.
 pub fn pq_falcon_policy(
     local_has_pq: bool,
     peer_pq: Option<&[u8]>,
@@ -594,77 +534,10 @@ pub fn pq_falcon_policy(
     sig: Option<&[u8]>,
 ) -> Result<PqMode, &'static str> {
     let Some(pk) = peer_pq else {
-        return Ok(PqMode::Classical);
+        return Err("pq identity required (classical refused)");
     };
     if !local_has_pq {
-        return Ok(PqMode::Classical);
-    }
-    if pk.len() != PQ_FALCON_PK_LEN {
-        return Err("pq identity malformed");
-    }
-    let Some(s) = sig else {
-        return Err("pq falcon tag failed");
-    };
-    if s.len() != PQ_FALCON_SIG_LEN {
-        return Err("pq falcon tag failed");
-    }
-    if !pq_falcon_verify(pk, digest, s) {
-        return Err("pq falcon tag failed");
-    }
-    Ok(PqMode::Pq)
-}
-
-/// Height-gated KEM policy (PQ 9.1): pre-H delegates to [`pq_mixed_policy`]
-/// unchanged (window tolerance, classical-explicit); at/after
-/// [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused fail-closed —
-/// even peer-absent (`None`) and even for a classical-only local node. Only
-/// a fully verified PQ offer negotiates `Pq` at/after H.
-pub fn pq_mixed_policy_at(
-    height: u64,
-    local_pq: bool,
-    offer: Option<PqOfferCheck>,
-) -> Result<PqMode, &'static str> {
-    if !pq_classical_refused_at(height) {
-        return pq_mixed_policy(local_pq, offer);
-    }
-    let Some(o) = offer else {
-        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
-    };
-    if !local_pq {
-        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
-    }
-    if !o.wellformed {
-        return Err("pq fields malformed");
-    }
-    if !o.suite_ok {
-        return Err("unsupported pq suite/version");
-    }
-    if !o.tag_ok {
-        return Err("pq transcript auth failed");
-    }
-    Ok(PqMode::Pq)
-}
-
-/// Height-gated Falcon-tag policy (PQ 9.1): pre-H delegates to
-/// [`pq_falcon_policy`] unchanged (absent identity = classical-explicit);
-/// at/after [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused
-/// fail-closed — absent identity, classical-only local, malformed key, and
-/// mistag ALL refuse. Only offered + verified PQ negotiates `Pq`.
-pub fn pq_falcon_policy_at(
-    height: u64,
-    local_has_pq: bool,
-    peer_pq: Option<&[u8]>,
-    digest: &[u8; 32],
-    sig: Option<&[u8]>,
-) -> Result<PqMode, &'static str> {
-    if !pq_classical_refused_at(height) {
-        return pq_falcon_policy(local_has_pq, peer_pq, digest, sig);
-    }
-    let Some(pk) = peer_pq else {
-        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
-    };
-    if !local_has_pq {
-        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
+        return Err("pq identity required (classical refused)");
     }
     if pk.len() != PQ_FALCON_PK_LEN {
         return Err("pq identity malformed");
@@ -805,7 +678,7 @@ mod decoder_fuzz_regressions {
             svc: 0,
             payload: b"ping".to_vec(),
             nonce: vec![0u8; 8],
-            sig: [0u8; 64],
+            sig: Vec::new(),
         };
         let enc = f.encode();
         let mut corpus = vec![vec![], enc.clone()];

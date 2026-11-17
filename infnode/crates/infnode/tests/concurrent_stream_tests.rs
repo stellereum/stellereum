@@ -46,10 +46,10 @@ fn cfg(
     }
 }
 
-fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
+fn peer_of(name: &str, _keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
     PeerConfig {
         name: name.to_string(),
-        ed_pub: hex::encode(keys.verifying.to_bytes()),
+        consensus_pub: None,
         pq_pub: Some(pq.pq_pub_hex()),
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],

@@ -15,7 +15,7 @@ use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
 use stellereum::rpc::{ReceiptIndex, RpcState};
-use stellereum::sharding::{SessionPolicyError, Transaction};
+use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::zkml::{now_secs, SessionKeyAuthorization, SCOPE_TRANSFER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -280,53 +280,68 @@ async fn budget_revoked_key_reports_revoked() {
     assert_eq!(r["remaining_gas"], serde_json::json!(4_900), "{resp}");
 }
 
-/// PQ excision proof: Ed25519 delegations stay refused at EVERY layer —
-/// grant signature, session envelope verification, stateless policy, and
-/// engine apply — while Falcon grants (above) are admitted.
+/// PQ excision proof: a legacy classical / disabled delegation stays refused
+/// at EVERY layer — grant signature, session envelope verification, stateless
+/// policy, and engine apply — while Falcon grants (above) are admitted.
+///
+/// FULL-PQ: the Ed25519 `sign_delegation` constructor is deleted, so the
+/// legacy SK1 frame is exercised with a grant whose scheme is the disabled
+/// ML-DSA-44 tag (what a legacy scheme-less grant deserializes to). That is
+/// strictly stronger than the old Ed fixture: there is no constructible
+/// classical grant left at all.
 #[tokio::test]
-async fn ed25519_grants_stay_refused_end_to_end() {
+async fn classical_and_disabled_grants_stay_refused_end_to_end() {
     let st = rpc_state().await;
-    let master = SigningKey::generate(&mut OsRng);
     let session = SigningKey::generate(&mut OsRng);
-    let master_pub = master.verifying_key().to_bytes();
     let session_pub = session.verifying_key().to_bytes();
+    let master_pub = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
     st.engine
         .update_account(AccountState::new(master_pub, 1_000_000_000_000))
         .await;
 
-    // Same fields as a live grant — only the scheme is classical.
-    let grant = SessionKeyAuthorization::sign_delegation(
-        &master,
+    // 0x01 (Ed25519) is not a scheme value any more.
+    assert!(PqScheme::from_id(1).is_err(), "Ed25519 id must be refused");
+
+    // Same fields as a live grant — only the scheme is the fail-closed tag.
+    let grant = SessionKeyAuthorization::new_pq(
+        PqScheme::MlDsa44,
+        master_pub,
+        None,
+        PqScheme::MlDsa44,
         session_pub,
+        None,
         now_secs() + 3600,
         5_000,
+        0,
         SCOPE_TRANSFER,
         1_000_000,
         CHAIN_ID,
+        Vec::new(),
     );
     assert!(
         !grant.verify_signature(),
-        "Ed master grant signature must stay refused"
+        "disabled-scheme grant signature must stay refused"
     );
     assert!(
         !grant.verify_at(now_secs()),
-        "Ed grant must stay invalid at any time"
+        "disabled-scheme grant must stay invalid at any time"
     );
 
     let tx = Transaction::sign_with_session(&session, grant, [9u8; 32], 10, 100, 0, 1, 1, vec![]);
-    assert!(tx.is_session_keyed());
+    // FULL-PQ: the disabled scheme tag is refused at grant DECODE, so the
+    // legacy SK1 frame is not even recognised as session-keyed (stronger than
+    // the old "parses then fails grant verification" assertion).
+    assert!(
+        tx.delegation().is_none(),
+        "disabled-scheme grant must be refused at decode"
+    );
     assert!(
         !tx.verify_signature(),
-        "Ed (SK1) session envelope must stay refused"
-    );
-    assert_eq!(
-        tx.check_session_policy(now_secs()),
-        Err(SessionPolicyError::BadGrant),
-        "Ed grant must fail the stateless policy as BadGrant"
+        "legacy (SK1) session envelope must stay refused"
     );
     assert!(
         st.engine.apply_transaction(&tx, now_secs()).await.is_err(),
-        "Ed session transaction must never apply"
+        "session transaction must never apply"
     );
 }
 

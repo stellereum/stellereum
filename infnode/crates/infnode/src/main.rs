@@ -26,7 +26,7 @@ enum Cmd {
         dir: PathBuf,
     },
     /// Инициализировать ноду: ключи + конфиг с ролью и авто-подключением к валидатору.
-    /// Пример: infnode init --role mail --validator 109.107.155.67:9400 --validator-pub <ed_hex>
+    /// Пример: infnode init --role mail --validator 109.107.155.67:9400 --validator-pub <falcon512_pq_pub_hex>
     /// После init: infnode serve --config node.yaml (или --role для быстрого запуска).
     Init {
         /// рабочая папка ноды (создаст keys/ + node.yaml)
@@ -346,7 +346,7 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Keygen { dir } => {
             // не перезаписываем существующие ключи (иначе реран генерирует новые)
-            let keys = if dir.join("keys").join("identity.key").exists() {
+            let keys = if dir.join("keys").join("e2e.key").exists() {
                 NodeKeys::load(&dir.join("keys"))?
             } else {
                 let k = NodeKeys::generate();
@@ -384,7 +384,6 @@ async fn main() -> Result<()> {
             }
             println!("=== InfNode node ===");
             println!("node_id: {}", pq.pq_id_hex());
-            println!("ed_pub : {}", keys.ed_hex());
             println!("pq_pub : {}", pq.pq_pub_hex());
             println!("kem_ek : {}", keys.kem_ek_hex());
             println!("keys   : {}/keys", dir.display());
@@ -392,15 +391,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Init { dir, role, validator, validator_pub, listen, advertise, web_listen, domain, wallet } => {
             // FULL-PQ: validator peer pins are PQ-only (`pq_pub` mandatory,
-            // `primary_id` derives the PQ id). `ed_pub` stays as the frozen
-            // auth/TLS pin. Old `node-id`/`x-pub` removed (nodes wiped).
-            // Federation DNS currently provides ed/ip only (no PQ) — such
-            // peers are constructed with `pq_pub: None` and fail closed at
-            // `Node::new` (`classical peer refused`); operator must add
-            // `pq-pub` to `node.yaml` manually (migration error is loud).
+            // `primary_id` derives the PQ id). `ed_pub` does not exist any
+            // more; old `node-id`/`x-pub`/`ed-pub` are refused (nodes wiped).
+            // A peer without a Falcon-512 pin cannot be added: the config
+            // parser requires `pq-pub`.
             std::fs::create_dir_all(&dir).ok();
             // ключи (не перезаписываем существующие)
-            let keys = if dir.join("keys").join("identity.key").exists() {
+            let _keys = if dir.join("keys").join("e2e.key").exists() {
                 NodeKeys::load(&dir.join("keys"))?
             } else {
                 let k = NodeKeys::generate();
@@ -429,18 +426,14 @@ async fn main() -> Result<()> {
                 if let Some(dom) = &domain {
                     println!("[federation] looking up validator of domain {dom} in DNS TXT...");
                     match infnode::federation::resolve_validator(dom).await {
-                        Ok(Some((nid, ed_pub, ip))) => {
-                            match &ed_pub {
-                                Some(ep) => {
-                                    println!("[federation] OK validator found: {nid} @ {ip} (ed_pub {})", &ep[..16]);
-                                    // FULL-PQ: federation DNS has no PQ yet —
-                                    // constructed without `pq_pub`, fails
-                                    // closed at `Node::new` until operator
-                                    // adds `pq-pub` (nodes wiped, no compat).
+                        Ok(Some((nid, pq_pub, ip))) => {
+                            match &pq_pub {
+                                Some(pq_hex) => {
+                                    println!("[federation] OK validator found: {nid} @ {ip} (pq_pub {})", &pq_hex[..16]);
                                     peers.push(infnode::config::PeerConfig {
                                         name: "validator".into(),
-                                        ed_pub: ep.clone(),
-                                        pq_pub: None,
+                                        consensus_pub: None,
+                                        pq_pub: Some(pq_hex.clone()),
                                         endpoints: vec![ip],
                                         allow: vec!["*".into()],
                                         rate_limit_per_sec: 200,
@@ -449,8 +442,8 @@ async fn main() -> Result<()> {
                                     });
                                 }
                                 None => {
-                                    // строгий режим: TXT БЕЗ ed_pub не принимается (TOFU запрещён)
-                                    println!("[federation] ERR TXT for {dom} has no ed_pub — rejected (add record: infnode announce --domain {dom} --advertise <IP:port>)");
+                                    // PQ pin is mandatory: an unverifiable TXT is refused.
+                                    println!("[federation] ERR TXT for {dom} has no pq_pub — rejected (re-publish: infnode announce --domain {dom} --advertise <IP:port>)");
                                 }
                             }
                         }
@@ -460,27 +453,37 @@ async fn main() -> Result<()> {
                 }
             }
             if let Some(vaddr) = &validator {
-                // FULL-PQ: validator peer needs `ed-pub` (frozen auth/TLS pin)
-                // + mandatory `pq-pub` (identity). `--validator-pub` gives ed
-                // only; without pq the peer fails closed at `Node::new`
-                // (`classical peer refused`) until operator adds `pq-pub`.
-                let ed_pub = validator_pub.clone().unwrap_or_default();
+                // FULL-PQ: a validator peer needs its Falcon-512 `pq-pub`
+                // (identity). `--validator-pub` carries it; without a valid
+                // 897-byte key the peer is NOT added (the config parser
+                // refuses peers without `pq-pub`).
                 let vname = if role.as_deref() == Some("validator") {
                     "self".into()
                 } else {
                     "validator".into()
                 };
                 if vname != "self" {
-                    peers.push(infnode::config::PeerConfig {
-                        name: vname,
-                        ed_pub: ed_pub.clone(),
-                        pq_pub: None,
-                        endpoints: vec![vaddr.clone()],
-                        allow: vec!["*".into()],
-                        rate_limit_per_sec: 200,
-                        role: None,
-                        storage_roles: vec![],
-                    });
+                    match validator_pub.as_deref() {
+                        Some(h)
+                            if hex::decode(h)
+                                .map(|b| b.len() == infnode::proto::PQ_FALCON_PK_LEN)
+                                .unwrap_or(false) =>
+                        {
+                            peers.push(infnode::config::PeerConfig {
+                                name: vname,
+                                consensus_pub: None,
+                                pq_pub: Some(h.to_string()),
+                                endpoints: vec![vaddr.clone()],
+                                allow: vec!["*".into()],
+                                rate_limit_per_sec: 200,
+                                role: None,
+                                storage_roles: vec![],
+                            });
+                        }
+                        _ => println!(
+                            "[init] ERR validator peer not added: --validator-pub must be a Falcon-512 pq_pub (897 bytes hex)"
+                        ),
+                    }
                 }
             }
 
@@ -510,7 +513,6 @@ async fn main() -> Result<()> {
             println!("=== InfNode node initialized ===");
             println!("role      : {}", role.as_deref().unwrap_or("network"));
             println!("node_id   : {}", _pq.pq_id_hex());
-            println!("ed_pub    : {}", keys.ed_hex());
             println!("pq_pub    : {}", _pq.pq_pub_hex());
             println!("listen    : {}", listen);
             if let Some(w) = &wallet {
@@ -533,7 +535,7 @@ async fn main() -> Result<()> {
             if !config.exists() {
                 let dir = config.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
                 std::fs::create_dir_all(&dir).ok();
-                let _keys = if dir.join("keys").join("identity.key").exists() {
+                let _keys = if dir.join("keys").join("e2e.key").exists() {
                     NodeKeys::load(&dir.join("keys"))?
                 } else {
                     let k = NodeKeys::generate();
@@ -552,25 +554,28 @@ async fn main() -> Result<()> {
                     Some("validator") => vec!["mail".into(), "files".into()],
                     _ => vec![],
                 };
-                let peers = if let Some(vaddr) = &validator {
-                    // FULL-PQ: validator needs ed (frozen auth/TLS) + pq
-                    // (identity, mandatory). No PQ yet → `pq_pub: None`,
-                    // fails closed at `Node::new` until operator adds it.
-                    let ed_pub = validator_pub.clone()
-                        .or_else(|| std::env::var("INFNODE_VALIDATOR_PUB").ok())
-                        .unwrap_or_default();
-                    vec![infnode::config::PeerConfig {
-                        name: "validator".into(),
-                        ed_pub,
-                        pq_pub: None,
-                        endpoints: vec![vaddr.clone()],
-                        allow: vec!["*".into()],
-                        rate_limit_per_sec: 200,
-                        role: None,
-                        storage_roles: vec![],
-                    }]
-                } else {
-                    vec![]
+                let peers = match (&validator, validator_pub.clone().or_else(|| std::env::var("INFNODE_VALIDATOR_PUB").ok())) {
+                    (Some(vaddr), Some(pq_hex))
+                        if hex::decode(&pq_hex)
+                            .map(|b| b.len() == infnode::proto::PQ_FALCON_PK_LEN)
+                            .unwrap_or(false) =>
+                    {
+                        vec![infnode::config::PeerConfig {
+                            name: "validator".into(),
+                            consensus_pub: None,
+                            pq_pub: Some(pq_hex),
+                            endpoints: vec![vaddr.clone()],
+                            allow: vec!["*".into()],
+                            rate_limit_per_sec: 200,
+                            role: None,
+                            storage_roles: vec![],
+                        }]
+                    }
+                    (Some(_), _) => {
+                        println!("[serve] ERR validator peer not added: a Falcon-512 pq_pub (897 bytes hex) is required via --validator-pub or INFNODE_VALIDATOR_PUB");
+                        vec![]
+                    }
+                    (None, _) => vec![],
                 };
                 let cfg = NodeConfig {
                     name,
@@ -767,7 +772,7 @@ async fn main() -> Result<()> {
             let mut target = [0u8; 20];
             target.copy_from_slice(&h.as_bytes()[..20]);
             let closest = node.dht_find_node(&target).await;
-            let val = json!({ "x_pub": keys.x_hex(), "ed_pub": keys.ed_hex() }).to_string();
+            let val = json!({ "kem_pub": keys.x_hex(), "pq_pub": keys.sig_pub_hex() }).to_string();
             let payload = json!({ "key": ukey, "value": val }).to_string().into_bytes();
             let mut saved = 0usize;
             for n in closest {
@@ -777,7 +782,7 @@ async fn main() -> Result<()> {
                     saved += 1;
                 }
             }
-            println!("registered {email} x_pub={} (saved on {saved} nodes)", keys.x_hex());
+            println!("registered {email} kem_pub={} (saved on {saved} nodes)", keys.x_hex());
         }
         Cmd::MailSend { config, to, from, dest, subject, body, dir } => {
             use serde_json::json;
@@ -810,29 +815,29 @@ async fn main() -> Result<()> {
             if rx_bytes.len() != infnode::mailbox::KEM_EK_LEN {
                 return Err(anyhow::anyhow!("bad kem_pub length"));
             }
-            // 1б) реестр отправителя: ed_pub для подписи
+            // 1б) реестр отправителя: pq_pub для подписи
             let fkey = format!("user:{from}");
             let fh = blake3::hash(fkey.as_bytes());
             let mut ft = [0u8; 20];
             ft.copy_from_slice(&fh.as_bytes()[..20]);
             let fcl = node.dht_find_node(&ft).await;
             let qf = json!({ "key": fkey }).to_string().into_bytes();
-            let mut from_ed = None;
+            let mut from_pq = None;
             for n in fcl.iter() {
-                if from_ed.is_some() { break; }
+                if from_pq.is_some() { break; }
                 if node.ensure_dht_peer(n).await.is_ok() {
                     if let Ok(resp) = node.request_to(n.id, "dht.find_value", qf.clone()).await {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                             if v["found"].as_bool().unwrap_or(false) {
                                 if let Ok(meta) = serde_json::from_str::<serde_json::Value>(v["value"].as_str().unwrap_or("")) {
-                                    from_ed = meta["ed_pub"].as_str().map(String::from);
+                                    from_pq = meta["pq_pub"].as_str().map(String::from);
                                 }
                             }
                         }
                     }
                 }
             }
-            let _from_ed = from_ed.ok_or_else(|| anyhow::anyhow!("sender {from} is not registered"))?;
+            let _from_pq = from_pq.ok_or_else(|| anyhow::anyhow!("sender {from} is not registered"))?;
             // 2) подписываем payload и шифруем к получателю
             let sender_keys = infnode::mailbox::MailKeys::load(&dir, &from)?;
             let plain = json!({ "from": from, "to": dest, "subject": subject, "body": body, "ts": infnode::proto::now_ms() })
@@ -956,15 +961,15 @@ async fn main() -> Result<()> {
             // проверка подписи отправителя по реестру
             let from = msg["from"].as_str().unwrap_or("");
             let mut verified = false;
-            if sig.len() == 64 {
-                if let Some(ed_hex) = node.user_ed_pub(from).await {
-                    if let Ok(edb) = hex::decode(&ed_hex) {
-                        if edb.len() == 32 {
-                            let mut edk = [0u8; 32];
-                            edk.copy_from_slice(&edb);
-                            let mut sigk = [0u8; 64];
-                            sigk.copy_from_slice(&sig);
-                            verified = infnode::mailbox::MailKeys::verify(&edk, payload.as_bytes(), &sigk);
+            if sig.len() == infnode::proto::PQ_FALCON_SIG_LEN {
+                if let Some(pq_hex) = node.user_pq_pub(from).await {
+                    if let Ok(pq_pub) = hex::decode(&pq_hex) {
+                        if pq_pub.len() == infnode::proto::PQ_FALCON_PK_LEN {
+                            verified = infnode::mailbox::MailKeys::verify(
+                                &pq_pub,
+                                payload.as_bytes(),
+                                &sig,
+                            );
                         }
                     }
                 }
@@ -1107,7 +1112,7 @@ async fn main() -> Result<()> {
             let t = node.resolve(&target)?;
             let nodes = node.dht_find_node(&t).await;
             for n in nodes {
-                println!("inf1:{} {} ed={}", hex::encode(n.id), n.endpoints.join(","), n.ed_hex);
+                println!("inf1:{} {} pq={}", hex::encode(n.id), n.endpoints.join(","), n.pq_hex);
             }
         }
         Cmd::DhtStore { config, to, key, value } => {
@@ -1272,7 +1277,8 @@ async fn main() -> Result<()> {
             }
             // подпись мастера (всегда своя — секрет локальный)
             let my_sig = hex::encode(
-                ed25519_dalek::Signer::sign(&node.keys.signing, state_hash.as_bytes()).to_bytes(),
+                node.pq
+                    .sign_digest(blake3::hash(state_hash.as_bytes()).as_bytes()),
             );
             let mut signatures: Vec<serde_json::Value> = vec![
                 json!({ "node_id": node.id_hex, "signature": my_sig, "who": "primary" }),
@@ -1350,17 +1356,16 @@ async fn main() -> Result<()> {
             });
         }
         Cmd::Announce { domain, advertise, config } => {
-            // Federation TXT is frozen classical (`node_id=blake3(ed)`,
-            // out of zone) — announce uses the classical id even though
-            // routing/NodeId is PQ-only.
-            let (cfg_obj, keys, _pq, _, _) = load(&config)?;
-            let node_id = keys.id_hex();
-            let ed_pub = keys.ed_hex();
+            // Federation TXT binds the PQ identity: node_id =
+            // pq_id_from_pub(falcon_pk); `pq_pub` is published in the record.
+            let (cfg_obj, _keys, pq, _, _) = load(&config)?;
+            let node_id = pq.pq_id_hex();
+            let pq_pub = pq.pq_pub_hex();
             let ip = advertise.split(':').next().unwrap_or(&advertise).to_string();
-            let msg = infnode::federation::announce_message(&node_id, &ed_pub, &domain, &ip);
+            let msg = infnode::federation::announce_message(&node_id, &pq_pub, &domain, &ip);
             println!("{}", msg);
             println!("node_id : {}", node_id);
-            println!("ed_pub  : {}", ed_pub);
+            println!("pq_pub  : {}", pq_pub);
             println!("domain  : {}", domain);
             println!("advertise: {}", advertise);
             let _ = cfg_obj;

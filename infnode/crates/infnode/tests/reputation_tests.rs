@@ -4,7 +4,7 @@
 //! The accept path already gates on source IP (pre-auth deadline, per-IP
 //! handshake buckets, failed-auth strikes — see `accept_hardening_tests.rs`,
 //! untouched here). This file covers the EXTENSION that scores the peer
-//! **identity** (`[u8; 20]` node id, 1:1 with the ed25519 key) instead:
+//! **identity** (`[u8; 20]` PQ node id, `pq_id_from_pub(falcon_pk)`) instead:
 //! credit on valid handshake/message, debit on auth failure / oversize /
 //! rate violation / protocol violation, soft throttle, escalating temp bans
 //! (never permanent), decay/forgiveness.
@@ -15,7 +15,6 @@
 //! wide open here (30/s bucket, strike threshold 1000) so every refusal
 //! below proves identity reputation, never the per-IP layer.
 
-use ed25519_dalek::{Signer, SigningKey};
 use infnode::config::{NodeConfig, PeerConfig};
 use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::node::Node;
@@ -103,7 +102,7 @@ async fn fresh_node(tag: &str) -> (std::sync::Arc<Node>, PathBuf) {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_good_peer_unaffected() {
     let (node, tmp) = fresh_node("good").await;
-    let good = NodeKeys::generate().id();
+    let good = PqKeys::generate().pq_id();
     // Unknown identity: neutral score, no throttle, no ban.
     assert_eq!(
         node.rep_score(&good).await,
@@ -137,7 +136,7 @@ async fn rep_good_peer_unaffected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_abuse_throttles_then_bans() {
     let (node, tmp) = fresh_node("throttle-ban").await;
-    let bad = NodeKeys::generate().id();
+    let bad = PqKeys::generate().pq_id();
     node.rep_record_auth_failure(&bad).await;
     assert!(
         !node.rep_is_throttled(&bad).await,
@@ -189,7 +188,7 @@ async fn rep_abuse_throttles_then_bans() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_ban_expires_with_forgiveness() {
     let (node, tmp) = fresh_node("expiry").await;
-    let bad = NodeKeys::generate().id();
+    let bad = PqKeys::generate().pq_id();
     for _ in 0..5 {
         node.rep_record_auth_failure(&bad).await;
     }
@@ -217,7 +216,7 @@ async fn rep_ban_expires_with_forgiveness() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_repeat_offenders_escalate_but_never_permanent() {
     let (node, tmp) = fresh_node("escalate").await;
-    let bad = NodeKeys::generate().id();
+    let bad = PqKeys::generate().pq_id();
     for _ in 0..5 {
         node.rep_record_auth_failure(&bad).await;
     }
@@ -259,9 +258,9 @@ async fn rep_repeat_offenders_escalate_but_never_permanent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_bans_do_not_touch_other_peers() {
     let (node, tmp) = fresh_node("isolation").await;
-    let bad = NodeKeys::generate().id();
-    let good = NodeKeys::generate().id();
-    let stranger = NodeKeys::generate().id();
+    let bad = PqKeys::generate().pq_id();
+    let good = PqKeys::generate().pq_id();
+    let stranger = PqKeys::generate().pq_id();
     for _ in 0..5 {
         node.rep_record_auth_failure(&bad).await;
     }
@@ -289,7 +288,7 @@ async fn rep_bans_do_not_touch_other_peers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_score_decays_and_recovery_resets_escalation() {
     let (node, tmp) = fresh_node("decay").await;
-    let pid = NodeKeys::generate().id();
+    let pid = PqKeys::generate().pq_id();
     node.rep_record_auth_failure(&pid).await;
     assert!(node.rep_score(&pid).await < 0, "debit lands");
     // -10 at 2/s needs 5s to fully decay; 6s gives 1s margin (oversleep is
@@ -333,7 +332,7 @@ async fn rep_score_decays_and_recovery_resets_escalation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rep_penalty_kinds_debit_and_scores_clamp() {
     let (node, tmp) = fresh_node("kinds").await;
-    let pid = NodeKeys::generate().id();
+    let pid = PqKeys::generate().pq_id();
     node.rep_record_oversize(&pid).await; // -10
     node.rep_record_rate_violation(&pid).await; // -5
     node.rep_record_protocol_violation(&pid).await; // -10
@@ -346,7 +345,7 @@ async fn rep_penalty_kinds_debit_and_scores_clamp() {
         "-25 is above the ban threshold"
     );
     // Floor: unbounded negativity is impossible (recovery stays in reach).
-    let floor = NodeKeys::generate().id();
+    let floor = PqKeys::generate().pq_id();
     for _ in 0..150 {
         node.rep_record_auth_failure(&floor).await;
     }
@@ -356,7 +355,7 @@ async fn rep_penalty_kinds_debit_and_scores_clamp() {
         "score clamps at the floor"
     );
     // Ceiling: a chatty peer banks no permanent trust.
-    let chatty = NodeKeys::generate().id();
+    let chatty = PqKeys::generate().pq_id();
     for _ in 0..300 {
         node.rep_record_valid(&chatty).await;
     }
@@ -467,7 +466,7 @@ async fn raw_handshake(conn: &quinn::Connection, wire: &[u8]) -> Option<Frame> {
         .filter(|f| f.kind == proto::kind::AUTH)
 }
 
-fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
+fn challenge_wire(pq: &PqKeys, src: [u8; NODEID_LEN], payload: &str, ts: i64) -> Vec<u8> {
     let mut f = Frame {
         kind: proto::kind::CHALLENGE,
         seq: 1,
@@ -477,21 +476,21 @@ fn challenge_wire(signing: &SigningKey, src: [u8; NODEID_LEN], payload: &str, ts
         svc: 0,
         payload: payload.as_bytes().to_vec(),
         nonce: vec![],
-        sig: [0; 64],
+        sig: Vec::new(),
     };
     let d = blake3::hash(&f.sign_data());
-    f.sig = signing.sign(d.as_bytes()).to_bytes();
+    f.sig = pq.sign_digest(d.as_bytes());
     f.encode()
 }
 
-fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
-    let eph = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = x25519_dalek::PublicKey::from(&eph);
+fn tofu_payload(pq: &PqKeys, nonce_hex: &str, at: i64) -> String {
+    // FULL-PQ: a 32-byte hello freshness nonce (no ECDH) + the Falcon-512
+    // public key that must derive `src`.
     serde_json::json!({
         "nonce": nonce_hex,
         "at": at,
-        "eph": hex::encode(eph_pub.as_bytes()),
-        "ed": hex::encode(keys.verifying.to_bytes()),
+        "fresh": hex::encode(rand::random::<[u8; 32]>()),
+        "pq_pub": pq.pq_pub_hex(),
         "pq_ver": infnode::proto::PQ_TRANSCRIPT_VERSION,
         "pq_suite": infnode::proto::PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&infnode::node::pq_initiator_offer().expect("pq offer").ek),
@@ -499,17 +498,16 @@ fn tofu_payload(keys: &NodeKeys, nonce_hex: &str, at: i64) -> String {
     .to_string()
 }
 
-fn good_wire(keys: &NodeKeys) -> Vec<u8> {
+fn good_wire(pq: &PqKeys) -> Vec<u8> {
     let nonce: String = hex::encode(rand::random::<[u8; 16]>());
-    let p = tofu_payload(keys, &nonce, proto::now_ms());
-    challenge_wire(&keys.signing, keys.id(), &p, proto::now_ms())
+    let p = tofu_payload(pq, &nonce, proto::now_ms());
+    challenge_wire(pq, pq.pq_id(), &p, proto::now_ms())
 }
 
-/// Bad-signature wire from the SAME identity: the signature (last 64 bytes of
-/// the encoding) is corrupted, so framing still decodes and the failure is
-/// attributed to the claimed identity.
-fn bad_wire(keys: &NodeKeys) -> Vec<u8> {
-    let mut w = good_wire(keys);
+/// Bad-signature wire from the SAME identity: the Falcon tag is corrupted,
+/// so framing still decodes and the failure is attributed to the claimed id.
+fn bad_wire(pq: &PqKeys) -> Vec<u8> {
+    let mut w = good_wire(pq);
     let last = w.len() - 1;
     w[last] ^= 0xff;
     w
@@ -537,14 +535,14 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let bad_keys = NodeKeys::generate();
-    let bad_id = bad_keys.id();
+    let bad_pq = PqKeys::generate();
+    let bad_id = bad_pq.pq_id();
     // Two bad handshakes: refused AND dropped, with no identity trace —
     // pre-auth failures are never attributed to the claimed id.
     for _ in 0..2 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
-            raw_handshake(&c, &bad_wire(&bad_keys)).await.is_none(),
+            raw_handshake(&c, &bad_wire(&bad_pq)).await.is_none(),
             "bad signature refused"
         );
         assert!(
@@ -570,10 +568,10 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     );
     // Same loopback IP, honest identity: passes while the offender's bad
     // handshakes are refused — no shared-IP blast radius at this layer.
-    let good_keys = NodeKeys::generate();
+    let good_pq = PqKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &good_wire(&good_keys)).await.is_some(),
+        raw_handshake(&c, &good_wire(&good_pq)).await.is_some(),
         "honest peer passes while offender throttled"
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -583,7 +581,7 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     for _ in 0..3 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
-            raw_handshake(&c, &bad_wire(&bad_keys)).await.is_none(),
+            raw_handshake(&c, &bad_wire(&bad_pq)).await.is_none(),
             "bad signature refused"
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -614,7 +612,7 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     // (fail-closed), and counted — without any extra score penalty.
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &good_wire(&bad_keys)).await.is_none(),
+        raw_handshake(&c, &good_wire(&bad_pq)).await.is_none(),
         "throttled identity refused even with a valid handshake"
     );
     assert!(
@@ -632,7 +630,7 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     // (fail-closed), and counted — without any extra score penalty.
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
-        raw_handshake(&c, &good_wire(&bad_keys)).await.is_none(),
+        raw_handshake(&c, &good_wire(&bad_pq)).await.is_none(),
         "banned identity refused even with a valid handshake"
     );
     assert!(
@@ -642,7 +640,7 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     );
     // Fresh honest identity still passes; the IP itself was never banned
     // (strike threshold 1000 >> our ~6 failures).
-    let good2 = NodeKeys::generate();
+    let good2 = PqKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
         raw_handshake(&c, &good_wire(&good2)).await.is_some(),
@@ -662,7 +660,7 @@ async fn rep_quic_ban_follows_identity_not_ip() {
         .await
         .expect("connect passes after expiry");
     assert!(
-        raw_handshake(&c, &good_wire(&bad_keys)).await.is_some(),
+        raw_handshake(&c, &good_wire(&bad_pq)).await.is_some(),
         "offender recovers after the temp ban"
     );
     sb.abort();

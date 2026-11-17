@@ -1160,11 +1160,10 @@ mod dns_seed_guard_tests {
     fn peer(name: &str, ed: [u8; 32]) -> node_config::PeerConfig {
         node_config::PeerConfig {
             name: name.to_string(),
-            ed_pub: hex::encode(ed),
-            // In-code fixture: PQ pin optional in memory (parsed operator
-            // configs must carry it). The validator-set derivation below keys
-            // on the ed pin, so fixtures stay classical-shaped here.
-            pq_pub: None,
+            consensus_pub: Some(hex::encode(ed)),
+            // PQ pin for the DNS-merge identity (the validator set itself
+            // keys on `consensus_pub`, which is consensus-only).
+            pq_pub: Some(infnode::keyring::PqKeys::from_seed(ed).pq_pub_hex()),
             endpoints: vec!["127.0.0.1:9411".to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,
@@ -1327,9 +1326,10 @@ mod dns_seed_guard_tests {
         // discovered clone of a configured peer is dropped as a duplicate.
         let validator_ed = [0xD1u8; 32];
         let configured = vec![peer("validator", validator_ed)];
+        let pq = infnode::keyring::PqKeys::from_seed(validator_ed);
         let clone_of_validator = stellereum::dns_seeds::DiscoveredPeer {
-            node_id: node_id_hex(&validator_ed),
-            ed_pub: validator_ed,
+            node_id: pq.pq_id_hex(),
+            pq_pub: pq.pq_pub(),
             kem_ek_hash: None,
             host: "evil.example".to_string(),
             port: 9411,
@@ -1630,14 +1630,14 @@ mod cli_tx_builder_tests {
 
         // (c) local stand fallback: `run` loads and bonds THIS key, so it is
         //     the one a solo stand's quorum counts.
-        let node = infnode::keyring::NodeKeys::generate();
-        node.save(&dir).expect("save the node identity");
-        let keys = resolve_attest_keys(&[], &dir).expect("identity fallback");
+        let consensus = stellereum::node_keys::load_or_generate_consensus_key(&dir)
+            .expect("create the consensus key");
+        let keys = resolve_attest_keys(&[], &dir).expect("consensus-key fallback");
         assert_eq!(keys.len(), 1);
         assert_eq!(
             keys[0].validator_id,
-            node.signing.verifying_key().to_bytes(),
-            "the fallback must be the node's signing key"
+            consensus.verifying_key().to_bytes(),
+            "the fallback must be the consensus validator key"
         );
 
         // (c2) when falcon.key exists in keys_dir, it is loaded for signing.

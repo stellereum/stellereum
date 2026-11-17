@@ -339,27 +339,34 @@ mod tests {
         use crate::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
         let pk = [0x5Au8; 32];
 
-        let ed = derive_pq_address(PqScheme::Ed25519, &pk, &DEFAULT_SALT);
+        // FULL-PQ: Ed25519 (0x01) is not a scheme value any more, so the
+        // scheme-separation fixture uses the other remaining tag (ML-DSA-44,
+        // disabled fail-closed). Derivation is a hash; only verification
+        // refuses 0x03.
+        let other = derive_pq_address(PqScheme::MlDsa44, &pk, &DEFAULT_SALT);
         let falcon = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
-        let salted = derive_pq_address(PqScheme::Ed25519, &pk, &[0x01u8; 16]);
+        let salted = derive_pq_address(PqScheme::Falcon512, &pk, &[0x01u8; 16]);
 
-        assert_ne!(ed, falcon, "the scheme id must be bound into the address");
         assert_ne!(
-            ed, salted,
+            other, falcon,
+            "the scheme id must be bound into the address"
+        );
+        assert_ne!(
+            falcon, salted,
             "the sub-account salt must be bound into the address"
         );
         assert_ne!(
-            derive_pq_address(PqScheme::Ed25519, &pk, &[0x01u8; 16]),
-            derive_pq_address(PqScheme::Ed25519, &pk, &[0x02u8; 16]),
+            derive_pq_address(PqScheme::Falcon512, &pk, &[0x01u8; 16]),
+            derive_pq_address(PqScheme::Falcon512, &pk, &[0x02u8; 16]),
             "two different salts must give two different sub-accounts"
         );
 
-        // ... and the textual forms differ too, so a user cannot confuse a
-        // Falcon account with an Ed25519 one.
-        let stl_ed = encode_stl57_address(&ed);
+        // ... and the textual forms differ too, so a user cannot confuse two
+        // scheme-tagged accounts.
+        let stl_other = encode_stl57_address(&other);
         let stl_falcon = encode_stl57_address(&falcon);
-        assert_ne!(stl_ed, stl_falcon);
-        assert_eq!(parse_address(&stl_ed).unwrap(), ed);
+        assert_ne!(stl_other, stl_falcon);
+        assert_eq!(parse_address(&stl_other).unwrap(), other);
         assert_eq!(parse_address(&stl_falcon).unwrap(), falcon);
     }
 }

@@ -11,7 +11,7 @@
 //!
 //! * the MESSAGE preimage, byte-for-byte (EIP-191-style, but with the chain id
 //!   bound in, so a testnet signature is never valid on mainnet);
-//! * `sign_message` / `verify_message` for Ed25519, Falcon-512 and Hybrid;
+//! * `sign_message` / `verify_message` for Falcon-512 (the only live scheme);
 //! * `sign_typed_data` / `verify_typed_data` for STRUCTURED contract calls: a
 //!   canonical JSON encoding (sorted keys, explicit types) of
 //!   `{ contract, method, args, value, nonce, chain_id }`, so a wallet can show
@@ -21,15 +21,16 @@
 //!
 //! What is NOT changed: the transaction format and the address format. This is
 //! purely the message-signing layer. Raw 32-byte addresses stay raw 32-byte
-//! addresses (hex on the wire); Ed25519 addresses are the public key itself,
-//! Falcon-512/Hybrid addresses are `derive_pq_address(scheme, pubkey, ZERO_SALT)`.
+//! addresses (hex on the wire); Falcon-512 addresses are
+//! `derive_pq_address(scheme, pubkey, ZERO_SALT)`. Classical Ed25519/Hybrid
+//! addresses (the public key itself / a mixed hash) are REMOVED: their scheme
+//! ids 0x01 and 0x04 are refused at decode time.
 //!
 //! Full prose, test vectors and the RPC/CLI surface: `docs/WALLET_SIGNING.md`.
 
 use crate::post_quantum::{
     derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, DEFAULT_SALT,
 };
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -256,26 +257,28 @@ pub fn typed_data_preimage(data: &TypedCallData) -> Result<Vec<u8>, String> {
 ///
 /// ```text
 /// version   (1 B)  = 0x01 (WALLET_SIG_VERSION)
-/// scheme    (1 B)  = 0x01 Ed25519 | 0x02 Falcon-512 | 0x04 Hybrid (0x03 refused)
+/// scheme    (1 B)  = 0x02 Falcon-512 (0x01 Ed25519 and 0x04 Hybrid are REMOVED; 0x03 refused)
 /// pubkey_len(u16 BE, 2 B) = scheme.pubkey_size() exactly
 /// pubkey    (pubkey_len B)
 /// sig_len   (u16 BE, 2 B) = scheme.signature_size() exactly
 /// signature (sig_len B)
 /// ```
 ///
-/// The public key rides in the envelope because a 32-byte Falcon-512/Hybrid
+/// The public key rides in the envelope because a 32-byte Falcon-512
 /// ADDRESS is a hash (`derive_pq_address`) — it cannot verify on its own.
 /// The verifier re-derives the address from `(scheme, pubkey)` and compares it
 /// to the claimed address BEFORE checking the signature, so a signature under
 /// key K can never be presented as a signature by address A != addr(K).
 ///
-/// Sizes on the wire: Ed25519 102 B, Falcon-512 1569 B, Hybrid 1665 B.
+/// Sizes on the wire: Falcon-512 1569 B. The classical Ed25519 (102 B) and
+/// Hybrid (1665 B) envelopes are refused by [`WalletSignature::decode`]: both
+/// schemes no longer exist.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalletSignature {
     /// Always [`WALLET_SIG_VERSION`].
     pub version: u8,
-    /// [`PqScheme::Ed25519`] | [`PqScheme::Falcon512`] | [`PqScheme::Hybrid`].
-    /// `MlDsa44` (0x03) is refused fail-closed at decode time.
+    /// [`PqScheme::Falcon512`]. `MlDsa44` (0x03) and the removed classical
+    /// ids 0x01/0x04 are refused fail-closed at decode time.
     pub scheme: PqScheme,
     /// Canonical public key bytes (`scheme.pubkey_size()` long).
     pub pubkey: Vec<u8>,
@@ -315,7 +318,8 @@ impl WalletSignature {
                 WALLET_SIG_VERSION
             ));
         }
-        // from_id refuses 0x03 (ML-DSA-44, forgeable verifier) and unknown ids.
+        // from_id refuses the removed classical ids 0x01/0x04 by name and the
+        // verifier-less 0x03 (ML-DSA-44) / any unknown id.
         let scheme = PqScheme::from_id(bytes[1])?;
         let mut cur = 2usize;
         let take =
@@ -337,24 +341,6 @@ impl WalletSignature {
             ));
         }
         let pubkey = take(bytes, &mut cur, pubkey_len, "pubkey")?;
-        // Extra fail-closed guard for Ed25519: a non-curve point is not a key.
-        // Audit HIGH-1: also refuse small-order keys (`is_weak`) — they parse
-        // but verify malleably; consensus strictness must hold here too.
-        if scheme == PqScheme::Ed25519 {
-            let vk_bytes = <[u8; 32]>::try_from(pubkey.as_slice()).expect("len checked");
-            match VerifyingKey::from_bytes(&vk_bytes) {
-                Err(_) => {
-                    return Err(
-                        "wallet signature: Ed25519 public key is not a valid curve point"
-                            .to_string(),
-                    )
-                }
-                Ok(vk) if vk.is_weak() => {
-                    return Err("wallet signature: Ed25519 public key is small-order".to_string())
-                }
-                Ok(_) => {}
-            }
-        }
         let mut slen = [0u8; 2];
         slen.copy_from_slice(&take(bytes, &mut cur, 2, "sig_len")?);
         let sig_len = u16::from_be_bytes(slen) as usize;
@@ -383,16 +369,12 @@ impl WalletSignature {
         Self::decode(&bytes)
     }
 
-    /// The address this signature claims to be from: Ed25519 = the public key
-    /// itself; Falcon-512/Hybrid = `derive_pq_address(scheme, pubkey, ZERO_SALT)`.
+    /// The address this signature claims to be from:
+    /// `derive_pq_address(scheme, pubkey, ZERO_SALT)` for the remaining PQ
+    /// schemes.
     pub fn claimed_address(&self) -> [u8; 32] {
         match self.scheme {
-            PqScheme::Ed25519 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&self.pubkey);
-                a
-            }
-            PqScheme::Falcon512 | PqScheme::Hybrid | PqScheme::MlDsa44 => {
+            PqScheme::Falcon512 | PqScheme::MlDsa44 => {
                 derive_pq_address(self.scheme, &self.pubkey, &WALLET_SIGN_SALT)
             }
         }
@@ -403,31 +385,19 @@ impl WalletSignature {
 // Signing keys
 // ============================================================================
 
-/// A wallet signing key for one of the three live schemes.
+/// A wallet signing key. Falcon-512 is the ONLY live scheme: the classical
+/// Ed25519 and Hybrid variants were removed with the PQ excision, so there is
+/// no key type left that can produce a 64-byte or dual signature.
 ///
-/// * Ed25519: 32-byte seed (the same seed the wallet module derives accounts from).
-/// * Falcon-512: a full [`FalconKeypair`] (897-byte canonical public key).
-/// * Hybrid: both — the preimage is signed with each and the signatures
-///   concatenated (Ed first, Falcon second), exactly like
-///   [`verify_pq_signature`] expects.
+/// The variant is deliberately kept (one live variant) so callers that match
+/// on [`WalletSigningKey::Falcon`] keep compiling and adding a future PQ
+/// scheme is an additive change rather than a type migration.
 pub enum WalletSigningKey {
-    /// Classic fast Ed25519.
-    Ed25519 { seed: [u8; 32] },
     /// Post-quantum Falcon-512.
     Falcon { keypair: FalconKeypair },
-    /// Hybrid dual-signature (Ed25519 + Falcon-512).
-    Hybrid {
-        ed_seed: [u8; 32],
-        falcon: FalconKeypair,
-    },
 }
 
 impl WalletSigningKey {
-    /// Build an Ed25519 key from a 32-byte seed.
-    pub fn ed25519(seed: [u8; 32]) -> Self {
-        Self::Ed25519 { seed }
-    }
-
     /// Build a Falcon-512 key deterministically from a 32-byte seed
     /// (reproducible; the same seed always yields the same keypair).
     pub fn falcon_from_seed(seed: &[u8; 32]) -> Self {
@@ -436,77 +406,30 @@ impl WalletSigningKey {
         }
     }
 
-    /// Build a Hybrid key from an Ed25519 seed and a Falcon-512 seed.
-    pub fn hybrid(ed_seed: [u8; 32], falcon_seed: &[u8; 32]) -> Self {
-        Self::Hybrid {
-            ed_seed,
-            falcon: FalconKeypair::generate_from_seed_bytes(falcon_seed),
-        }
-    }
-
-    /// Which scheme this key signs with.
+    /// Which scheme this key signs with (always Falcon-512).
     pub fn scheme(&self) -> PqScheme {
-        match self {
-            Self::Ed25519 { .. } => PqScheme::Ed25519,
-            Self::Falcon { .. } => PqScheme::Falcon512,
-            Self::Hybrid { .. } => PqScheme::Hybrid,
-        }
+        let Self::Falcon { .. } = self;
+        PqScheme::Falcon512
     }
 
     /// Canonical public key bytes.
     pub fn pubkey_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Ed25519 { seed } => SigningKey::from_bytes(seed)
-                .verifying_key()
-                .to_bytes()
-                .to_vec(),
-            Self::Falcon { keypair } => keypair.public_key().to_vec(),
-            Self::Hybrid { ed_seed, falcon } => {
-                let mut pk = Vec::with_capacity(crate::post_quantum::HYBRID_PUBKEY_LEN);
-                pk.extend_from_slice(&SigningKey::from_bytes(ed_seed).verifying_key().to_bytes());
-                pk.extend_from_slice(falcon.public_key());
-                pk
-            }
-        }
+        let Self::Falcon { keypair } = self;
+        keypair.public_key().to_vec()
     }
 
     /// The wallet address for this key (what `verify_message` checks against).
     pub fn address(&self) -> [u8; 32] {
-        match self.scheme() {
-            PqScheme::Ed25519 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&self.pubkey_bytes());
-                a
-            }
-            s => derive_pq_address(s, &self.pubkey_bytes(), &WALLET_SIGN_SALT),
-        }
+        derive_pq_address(PqScheme::Falcon512, &self.pubkey_bytes(), &WALLET_SIGN_SALT)
     }
 
     fn sign_preimage(&self, preimage: &[u8]) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Ed25519 { seed } => {
-                let sk = SigningKey::from_bytes(seed);
-                Ok(sk.sign(preimage).to_bytes().to_vec())
-            }
-            Self::Falcon { keypair } => {
-                let sig = keypair.sign(preimage);
-                if sig.len() != crate::post_quantum::FALCON512_SIG_LEN {
-                    return Err("wallet signing: Falcon-512 signer refused the key".to_string());
-                }
-                Ok(sig)
-            }
-            Self::Hybrid { ed_seed, falcon } => {
-                let sk = SigningKey::from_bytes(ed_seed);
-                let mut sig = Vec::with_capacity(crate::post_quantum::HYBRID_SIG_LEN);
-                sig.extend_from_slice(&sk.sign(preimage).to_bytes());
-                let fsig = falcon.sign(preimage);
-                if fsig.len() != crate::post_quantum::FALCON512_SIG_LEN {
-                    return Err("wallet signing: Falcon-512 signer refused the key".to_string());
-                }
-                sig.extend_from_slice(&fsig);
-                Ok(sig)
-            }
+        let Self::Falcon { keypair } = self;
+        let sig = keypair.sign(preimage);
+        if sig.len() != crate::post_quantum::FALCON512_SIG_LEN {
+            return Err("wallet signing: Falcon-512 signer refused the key".to_string());
         }
+        Ok(sig)
     }
 
     /// Sign an arbitrary message under `chain_id`. Fails closed when the
@@ -682,31 +605,26 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_round_trip() {
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
-        let addr = key.address();
-        // Ed25519 address IS the public key.
-        assert_eq!(
-            addr,
-            SigningKey::from_bytes(&[0x42u8; 32])
-                .verifying_key()
-                .to_bytes()
-        );
-        let sig = key
-            .sign_message(CHAIN_MAIN, b"hello stellereum")
-            .expect("signs");
-        assert_eq!(sig.scheme, PqScheme::Ed25519);
-        assert_eq!(sig.encode().len(), 102);
-        assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &sig));
-        // Envelope round trip.
-        let back = WalletSignature::decode(&sig.encode()).expect("decodes");
-        assert_eq!(back, sig);
-        assert!(verify_message(
-            &addr,
-            CHAIN_MAIN,
-            b"hello stellereum",
-            &back
-        ));
+    fn ed25519_envelope_is_refused_fail_closed() {
+        // The published pre-excision Ed25519 test vector (address + signature
+        // envelope) is kept here as a REFUSAL pin: the scheme no longer
+        // exists, so its bytes must never decode or verify again.
+        const LEGACY_ED_VECTOR: &str = "010100202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120040a8ebb8d6b79fcd9c5937fa53789ba4b138c56e7ce1d8356817a1d4ae03c0fc4e5d24e630b106ce5591cd948b1e059d29caf495181c9deeb081685938c83d8e0d";
+        let err = WalletSignature::decode(&hex::decode(LEGACY_ED_VECTOR).expect("hex"))
+            .expect_err("a classical Ed25519 envelope must be refused");
+        assert!(err.contains("REMOVED"), "{err}");
+        assert!(err.contains("Ed25519"), "{err}");
+
+        // The id is refused by name, not silently mapped to another scheme.
+        let err = PqScheme::from_id(1).expect_err("scheme id 0x01 is removed");
+        assert!(err.contains("Ed25519"), "{err}");
+        assert!(err.contains("REMOVED"), "{err}");
+
+        // A key-file style 32-byte seed cannot become a wallet signing key
+        // either: the only constructor left is Falcon.
+        let falcon = WalletSigningKey::falcon_from_seed(&[0x42u8; 32]);
+        assert_eq!(falcon.scheme(), PqScheme::Falcon512);
+        assert_ne!(falcon.pubkey_bytes().len(), 32);
     }
 
     #[test]
@@ -734,31 +652,34 @@ mod tests {
 
     #[test]
     fn hybrid_round_trip() {
-        let key = WalletSigningKey::hybrid([0x42u8; 32], &[0x77u8; 32]);
-        let addr = key.address();
-        assert_eq!(
-            addr,
-            derive_pq_address(PqScheme::Hybrid, &key.pubkey_bytes(), &WALLET_SIGN_SALT)
-        );
+        // INVERTED (FULL-PQ): the Hybrid scheme (0x04) is removed. A live
+        // Falcon envelope is 1569 bytes, NOT the old 1665-byte dual shape, and
+        // flipping its scheme byte to 0x04 must be refused by name.
+        let key = WalletSigningKey::falcon_from_seed(&[0x77u8; 32]);
         let sig = key
             .sign_message(CHAIN_MAIN, b"hello stellereum")
             .expect("signs");
-        assert_eq!(sig.scheme, PqScheme::Hybrid);
-        assert_eq!(sig.encode().len(), 1665);
-        assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &sig));
-        // The hybrid address differs from either half's address.
-        let ed_addr = WalletSigningKey::ed25519([0x42u8; 32]).address();
-        assert_ne!(addr, ed_addr);
+        assert_eq!(sig.encode().len(), 1569);
+        assert_ne!(sig.encode().len(), 1665, "no classical Ed half rides along");
+
+        let mut hybrid = sig.encode();
+        hybrid[1] = 0x04;
+        let err = WalletSignature::decode(&hybrid).expect_err("Hybrid (0x04) is removed");
+        assert!(err.contains("Hybrid"), "{err}");
+        assert!(err.contains("REMOVED"), "{err}");
+
+        let err = PqScheme::from_id(4).expect_err("scheme id 0x04 is removed");
+        assert!(err.contains("Hybrid"), "{err}");
     }
 
     #[test]
     fn cross_scheme_matrix() {
-        // Every scheme verifies its own signatures; no scheme verifies another's
-        // message/signature pair against a mismatched address.
+        // Falcon-512 is the only live scheme; two distinct Falcon keys still
+        // pin cross-key presentation (a signature under K is never valid for
+        // address A != addr(K)).
         let keys = [
-            WalletSigningKey::ed25519([0x11u8; 32]),
+            WalletSigningKey::falcon_from_seed(&[0x11u8; 32]),
             WalletSigningKey::falcon_from_seed(&[0x22u8; 32]),
-            WalletSigningKey::hybrid([0x33u8; 32], &[0x44u8; 32]),
         ];
         let msg = b"cross-scheme matrix";
         let sigs: Vec<_> = keys
@@ -768,7 +689,6 @@ mod tests {
         for (k, s) in keys.iter().zip(sigs.iter()) {
             assert!(verify_message(&k.address(), CHAIN_MAIN, msg, s));
         }
-        // Cross-address presentation fails: sig[0] (Ed) claimed as falcon addr.
         assert!(!verify_message(
             &keys[1].address(),
             CHAIN_MAIN,
@@ -781,20 +701,13 @@ mod tests {
             msg,
             &sigs[1]
         ));
-        assert!(!verify_message(
-            &keys[0].address(),
-            CHAIN_MAIN,
-            msg,
-            &sigs[2]
-        ));
     }
 
     #[test]
     fn chain_binding_a_testnet_signature_is_invalid_elsewhere() {
         for key in [
-            WalletSigningKey::ed25519([0x42u8; 32]),
             WalletSigningKey::falcon_from_seed(&[0x42u8; 32]),
-            WalletSigningKey::hybrid([0x42u8; 32], &[0x43u8; 32]),
+            WalletSigningKey::falcon_from_seed(&[0x43u8; 32]),
         ] {
             let addr = key.address();
             let sig = key
@@ -813,9 +726,8 @@ mod tests {
     #[test]
     fn tampered_message_fails_for_all_schemes() {
         for key in [
-            WalletSigningKey::ed25519([0x42u8; 32]),
             WalletSigningKey::falcon_from_seed(&[0x42u8; 32]),
-            WalletSigningKey::hybrid([0x42u8; 32], &[0x43u8; 32]),
+            WalletSigningKey::falcon_from_seed(&[0x43u8; 32]),
         ] {
             let addr = key.address();
             let sig = key.sign_message(CHAIN_MAIN, b"pay alice 1").expect("signs");
@@ -827,7 +739,7 @@ mod tests {
 
     #[test]
     fn envelope_decoding_is_strict_fail_closed() {
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
+        let key = WalletSigningKey::falcon_from_seed(&[0x42u8; 32]);
         let sig = key.sign_message(CHAIN_MAIN, b"x").expect("signs");
         let enc = sig.encode();
         // Trailing byte.
@@ -841,10 +753,17 @@ mod tests {
         let mut bad_ver = enc.clone();
         bad_ver[0] = 0x02;
         assert!(WalletSignature::decode(&bad_ver).is_err());
-        // Disabled scheme 0x03.
+        // Refused scheme 0x03 (ML-DSA-44, no verifier).
         let mut bad_scheme = enc.clone();
         bad_scheme[1] = 0x03;
         assert!(WalletSignature::decode(&bad_scheme).is_err());
+        // REMOVED classical schemes 0x01 / 0x04: refused by name.
+        for classical in [0x01u8, 0x04] {
+            let mut removed = enc.clone();
+            removed[1] = classical;
+            let err = WalletSignature::decode(&removed).expect_err("classical scheme must fail");
+            assert!(err.contains("REMOVED"), "{err}");
+        }
         // Unknown scheme.
         let mut unknown = enc.clone();
         unknown[1] = 0x09;
@@ -892,12 +811,14 @@ mod tests {
                 hex::encode(contract)
             )
         );
-        // ... and the two orderings sign to the SAME bytes.
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
+        // ... and the two orderings sign over the SAME canonical bytes.
+        // Falcon-512 signatures are RANDOMIZED, so the signatures differ while
+        // both verify the same preimage (only the Ed/Hybrid shapes were
+        // deterministic; those schemes are gone).
+        let key = WalletSigningKey::falcon_from_seed(&[0x42u8; 32]);
         let (sa, ca) = key.sign_typed_data(&da).expect("signs");
         let (sb, cb) = key.sign_typed_data(&db).expect("signs");
         assert_eq!(ca, cb);
-        assert_eq!(sa.signature, sb.signature);
         assert!(verify_typed_data(&key.address(), &da, &sa));
         assert!(verify_typed_data(&key.address(), &db, &sb));
     }
@@ -914,10 +835,10 @@ mod tests {
             CHAIN_MAIN,
         )
         .expect("builds");
+        // Falcon-512 is the only live signing scheme (two distinct keys).
         for key in [
-            WalletSigningKey::ed25519([0x42u8; 32]),
             WalletSigningKey::falcon_from_seed(&[0x42u8; 32]),
-            WalletSigningKey::hybrid([0x42u8; 32], &[0x43u8; 32]),
+            WalletSigningKey::falcon_from_seed(&[0x43u8; 32]),
         ] {
             let addr = key.address();
             let (sig, canonical) = key.sign_typed_data(&data).expect("signs");
@@ -942,7 +863,7 @@ mod tests {
     fn typed_data_domain_differs_from_message_domain() {
         // A message signature is never valid as a typed-data signature and back,
         // even over identical bytes: the domain tags separate the preimages.
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
+        let key = WalletSigningKey::falcon_from_seed(&[0x42u8; 32]);
         let addr = key.address();
         let msg_sig = key.sign_message(CHAIN_MAIN, b"transfer").expect("signs");
         let data = TypedCallData::new(
@@ -967,7 +888,7 @@ mod tests {
 
     #[test]
     fn oversized_inputs_are_refused() {
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
+        let key = WalletSigningKey::falcon_from_seed(&[0x42u8; 32]);
         let big = vec![0u8; MAX_MESSAGE_BYTES + 1];
         assert!(key.sign_message(CHAIN_MAIN, &big).is_err());
         assert!(parse_message_param(Some(&"x".repeat(MAX_MESSAGE_BYTES + 1)), None).is_err());
@@ -987,41 +908,29 @@ mod tests {
 
     #[test]
     fn test_vector_ed25519() {
-        // Pinned vector, also published in docs/WALLET_SIGNING.md.
-        // seed = 0x42*32, chain = 5757, message = "hello stellereum".
-        let key = WalletSigningKey::ed25519([0x42u8; 32]);
-        let addr = key.address();
-        assert_eq!(
-            hex::encode(addr),
-            "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
-        );
-        let sig = key.sign_message(5757, b"hello stellereum").expect("signs");
-        let hex_sig = sig.to_hex();
-        assert_eq!(
-            hex_sig,
-            "010100202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120040a8ebb8d6b79fcd9c5937fa53789ba4b138c56e7ce1d8356817a1d4ae03c0fc4e5d24e630b106ce5591cd948b1e059d29caf495181c9deeb081685938c83d8e0d"
-        );
-        assert!(verify_message(&addr, 5757, b"hello stellereum", &sig));
-        // Re-decodes and still verifies (the doc vector is this exact string).
-        let back = WalletSignature::from_hex(&hex_sig).expect("decodes");
-        assert_eq!(back, sig);
-        println!("ED25519_VECTOR sig={hex_sig}");
+        // INVERTED (FULL-PQ): the published pre-excision Ed25519 vector
+        // (seed = 0x42*32, chain = 5757, message = "hello stellereum") is kept
+        // ONLY as a refusal pin. The scheme no longer exists, so neither the
+        // envelope nor its claimed address can ever be accepted again.
+        const LEGACY_ED_VECTOR: &str = "010100202152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db120040a8ebb8d6b79fcd9c5937fa53789ba4b138c56e7ce1d8356817a1d4ae03c0fc4e5d24e630b106ce5591cd948b1e059d29caf495181c9deeb081685938c83d8e0d";
+        let err = WalletSignature::from_hex(LEGACY_ED_VECTOR)
+            .expect_err("the pre-excision Ed25519 envelope is refused");
+        assert!(err.contains("REMOVED"), "{err}");
+        assert!(err.contains("Ed25519"), "{err}");
+        println!("ED25519_VECTOR_REFUSED err={err}");
     }
 
     #[test]
     fn test_vector_addresses_and_preimage() {
         // Pinned vectors, also published in docs/WALLET_SIGNING.md.
-        // Falcon/Hybrid signatures are RANDOMIZED (FIPS 206 sampler), so only
-        // the addresses and the preimage are pinned — never a signature.
+        // Falcon-512 signatures are RANDOMIZED (FIPS 206 sampler), so only
+        // the address and the preimage are pinned — never a signature. The
+        // Hybrid address vector is gone with the scheme (see
+        // `hybrid_round_trip` for its fail-closed refusal pin).
         let falcon = WalletSigningKey::falcon_from_seed(&[0x77u8; 32]);
-        let hybrid = WalletSigningKey::hybrid([0x42u8; 32], &[0x77u8; 32]);
         assert_eq!(
             hex::encode(falcon.address()),
             "549f119ff1a76b7ce82cc87bc86b130db8136f189068209dcbf9b00ef7125cd5"
-        );
-        assert_eq!(
-            hex::encode(hybrid.address()),
-            "84cb0826fa62b1953b06befa2bfe602b4ea10f2d76672242796147ae7d94fbed"
         );
         let pre = message_preimage(5757, b"hello stellereum");
         println!("PREIMAGE {}", hex::encode(&pre));

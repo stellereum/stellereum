@@ -1,8 +1,18 @@
+//! Infnode transport: PQ-only node identity and frame authentication.
+//!
+//! TLS peer pinning residual (documented, fail-closed): the certificate's own
+//! signing key is an EPHEMERAL Ed25519 key generated per process. It provides
+//! TLS 1.3 `CertificateVerify` (proof of possession) only and is NOT the node
+//! identity. Authentication is the Falcon-512 tag over the certificate SPKI,
+//! verified against the pinned `pq-pub` — see `build_tls` (src/node.rs:8746)
+//! and `PinnedVerifier::verify_server_cert` (src/node.rs:8789). There is no
+//! Ed25519 SPKI/identity pin anywhere; a cert without a valid PQ tag is
+//! refused (`missing pq tls tag (classical peer refused)`).
+
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signer, VerifyingKey};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rand::RngCore;
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -19,7 +29,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{timeout, Instant};
-use x25519_dalek::{PublicKey as XPub, StaticSecret as XSecret};
 use x509_parser::parse_x509_certificate;
 
 use crate::config::{NodeConfig, PeerConfig};
@@ -183,18 +192,16 @@ pub struct PeerLink {
     pub rate: Arc<Mutex<RateBucket>>,
 }
 
-/// Запись маршрута для discovery (FULL-PQ: `ed_hex` is the frozen
-/// auth/TLS pin (NOT identity); PQ identity is the map key `pid` which MUST
-/// equal `pq_id_from_pub` of the pinned `pq_pub` — enforced at
-/// `PeerConfig::primary_id` / `dht::node_info_valid`, not here. Gossip
-/// poisoning is still fail-closed via `ed_hex` MITM check + `pq_hex`
-/// binding below).
+/// Запись маршрута для discovery (FULL-PQ: the map key `pid` IS the identity
+/// and MUST equal `pq_id_from_pub` of the pinned `pq_pub` — enforced at
+/// `PeerConfig::primary_id` / `dht::node_info_valid`, not here. `pq_hex` is
+/// the pinned Falcon-512 key used to verify frames; the classical `ed_hex`
+/// field is gone).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Route {
     pub endpoints: Vec<String>,
-    pub ed_hex: String,
-    /// Pinned PQ key hex (empty = unknown/classical-explicit, never trusted
-    /// for identity; validated to derive `pid` when present).
+    /// Pinned PQ key hex (empty = not learned yet, never trusted for identity;
+    /// validated to derive `pid` when present).
     #[serde(default)]
     pub pq_hex: String,
 }
@@ -667,7 +674,7 @@ impl Node {
                 .map_err(|e| anyhow!("client-listen: {e}"))?,
         )?;
         // NAT hole punching: client-сокет тоже принимает входящие (обратный пробой через NAT)
-        let (certs, key) = build_tls(&keys)?;
+        let (certs, key) = build_tls(&pq)?;
         let mut sc = quinn::ServerConfig::with_single_cert(certs, key)?;
         sc.transport_config(Arc::new(transport_config()));
         client_ep.set_server_config(Some(sc));
@@ -683,17 +690,10 @@ impl Node {
             // FULL-PQ: peer identity is PQ-only (`primary_id` — same
             // `pq_id_from_pub` construction as local `ceremony_local_id`).
             let pid = p.primary_id()?;
-            let ed = p.ed_bytes()?;
-            let rc = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedVerifier { pinned: ed }))
-            .with_no_client_auth();
-            let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rc))?;
-            let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
-            client_cfg.transport_config(Arc::new(transport_config()));
+            let pq = p
+                .pq_bytes()?
+                .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
+            let client_cfg = build_client_cfg(Some(&pq))?;
             peers.insert(
                 pid,
                 PeerLink {
@@ -713,7 +713,6 @@ impl Node {
             static_peers.insert(pid);
             routes.entry(pid).or_insert(Route {
                 endpoints: p.endpoints.clone(),
-                ed_hex: p.ed_pub.clone(),
                 pq_hex: p.pq_pub.clone().unwrap_or_default(),
             });
         }
@@ -876,8 +875,7 @@ impl Node {
 
     fn sign_frame(&self, f: &mut Frame) {
         let d = blake3::hash(&f.sign_data());
-        let sig = self.keys.signing.sign(d.as_bytes());
-        f.sig = sig.to_bytes();
+        f.sig = self.pq.sign_digest(d.as_bytes());
     }
 
     /// F8: check whether `ip` is currently strike-banned. Expired bans are
@@ -1539,26 +1537,20 @@ impl Node {
             .await
             .map_err(|_| anyhow!("handshake timeout"))??;
 
-        // Freshness: свежий эфемерный X25519 на каждое соединение (только
-        // привязка транскрипта; ECDH нет — forward secrecy даёт свежий
-        // эфемерный ML-KEM encap на каждое соединение).
-        let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-        let eph_pub = XPub::from(&eph_sec);
-        // PQ handshake offer (default-ON since PQ 9.1; explicit opt-out
-        // `STELL_INF_PQ_HANDSHAKE=0`, honored pre-H only): ephemeral
-        // ML-KEM-768 ek alongside the classical fields. Opted-out => None and
-        // the classical payload below is byte-identical to before.
-        let pq_offer = if proto::pq_handshake_active() {
-            Some(pq_initiator_offer()?)
-        } else {
-            None
-        };
+        // Freshness: a fresh 32-byte hello nonce per connection (transcript
+        // binding only — there is no ECDH; forward secrecy comes from the
+        // per-connection ephemeral ML-KEM encapsulation).
+        let mut local_fresh = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut local_fresh);
+        // PQ handshake offer (MANDATORY): ephemeral ML-KEM-768 ek. There is no
+        // classical payload variant any more.
+        let pq_offer = Some(pq_initiator_offer()?);
         let payload = if let Some(offer) = &pq_offer {
             json!({
                 "nonce": rand_hex(16),
                 "at": now_ms(),
-                "eph": hex::encode(eph_pub.as_bytes()),
-                "ed": hex::encode(self.keys.verifying.as_bytes()),
+                "fresh": hex::encode(local_fresh),
+                "pq_pub": self.pq.pq_pub_hex(),
                 "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
                 "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
                 "pq_ek": hex::encode(&offer.ek),
@@ -1566,14 +1558,7 @@ impl Node {
             .to_string()
             .into_bytes()
         } else {
-            json!({
-                "nonce": rand_hex(16),
-                "at": now_ms(),
-                "eph": hex::encode(eph_pub.as_bytes()),
-                "ed": hex::encode(self.keys.verifying.as_bytes()),
-            })
-            .to_string()
-            .into_bytes()
+            unreachable!("pq offer is mandatory")
         };
         let mut f = Frame {
             kind: proto::kind::CHALLENGE,
@@ -1584,7 +1569,7 @@ impl Node {
             svc: 0,
             payload,
             nonce: vec![],
-            sig: [0; 64],
+            sig: Vec::new(),
         };
         self.sign_frame(&mut f);
         // open_bi with no timeout hangs forever against a half-dead peer
@@ -1604,8 +1589,14 @@ impl Node {
         .await
         .map_err(|_| anyhow!("AUTH timeout"))??;
         let auth = Frame::decode(&bytes)?;
-        let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
-        if auth.kind != proto::kind::AUTH || auth.src != pid || !auth.verify(&vk) || !ts_ok(auth.ts)
+        let pq_pk = peer
+            .cfg
+            .pq_bytes()?
+            .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
+        if auth.kind != proto::kind::AUTH
+            || auth.src != pid
+            || !auth.verify(&pq_pk)
+            || !ts_ok(auth.ts)
         {
             bail!("auth failed");
         }
@@ -1626,55 +1617,43 @@ impl Node {
             if node_field != format!("inf1:{}", hex::encode(pid)) {
                 bail!("auth node mismatch");
             }
-            if hex_fixed_32(av["eph"].as_str(), "eph").is_err() {
-                bail!("auth without eph");
+            if hex_fixed_32(av["fresh"].as_str(), "fresh").is_err() {
+                bail!("auth without fresh");
             }
         }
-        // PQ handshake answer (default-ON): verify the transcript tag BEFORE
-        // session derivation; absent PQ fields => classical fallback (window,
-        // plan §5) with a loud WARN + counter while pre-H. Refusals carry
-        // clear errors, never silent downgrade.
-        let pq_agreed = if proto::pq_handshake_active() {
-            pq_initiator_answer(&pq_offer, &f.sign_data(), eph_pub.as_bytes(), &auth)?
-        } else {
-            None
-        };
-        if proto::pq_handshake_active() && pq_agreed.is_none() {
-            // PQ was attempted first (default-ON) but the responder answered
-            // classical: pre-H window fallback — loud, counted, explicit.
-            proto::pq_warn_classical_fallback("dial");
-        }
+        // PQ handshake answer (MANDATORY): verify the transcript tag BEFORE
+        // session derivation. A classical/absent answer is refused — there is
+        // no mixed-mode fallback.
+        let pq_agreed = pq_initiator_answer(&pq_offer, &f.sign_data(), &local_fresh, &auth)?;
         // KEM-only session: the key derives SOLELY from the ML-KEM shared
-        // secret + transcript digest (X3DH leg cut). No PQ agreement (opted
-        // out or classical responder) is fail-closed: without a KEM secret
-        // there is no session key (the WARN above already fired).
-        let key = match &pq_agreed {
-            Some(a) => proto::pq_session_key(&a.shared, &a.digest),
-            None => bail!("pq handshake required (X3DH session KEX removed)"),
-        };
+        // secret + transcript digest. No PQ agreement is fail-closed.
+        let key = proto::pq_session_key(&pq_agreed.shared, &pq_agreed.digest);
         // Backpressure: fail-closed when the session table is full (the dial
         // fails here instead of growing memory without bound).
         if !self.session_insert(conn.stable_id(), key).await {
             self.drop_conn(pid, Some(conn.stable_id())).await;
             bail!("sessions full");
         }
-        // KEX wiring: PQ-negotiated sessions carry their transcript digest so
-        // frame seal/open binds the AAD; classical sessions store nothing and
-        // stay on the legacy path. Digest-table-full drops the just-stored
+        // KEX wiring: PQ sessions carry their transcript digest so frame
+        // seal/open binds the AAD. Digest-table-full drops the just-stored
         // session + conn (fail-closed, never a half-PQ session).
-        if let Some(a) = &pq_agreed {
-            if !self.pq_digest_insert(conn.stable_id(), a.digest).await {
-                self.sessions.write().await.remove(&conn.stable_id());
-                self.drop_conn(pid, Some(conn.stable_id())).await;
-                bail!("pq digests full");
-            }
+        if !self
+            .pq_digest_insert(conn.stable_id(), pq_agreed.digest)
+            .await
+        {
+            self.sessions.write().await.remove(&conn.stable_id());
+            self.drop_conn(pid, Some(conn.stable_id())).await;
+            bail!("pq digests full");
         }
-        self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
-            .await;
+        self.add_route(
+            pid,
+            addr.to_string(),
+            peer.cfg.pq_pub.as_deref().unwrap_or(""),
+        )
+        .await;
         self.routing_insert(
             pid,
             &peer.cfg.endpoints,
-            &peer.cfg.ed_pub,
             peer.cfg.pq_pub.as_deref().unwrap_or(""),
         )
         .await;
@@ -2369,10 +2348,16 @@ impl Node {
         let ts = now_ms();
         let svc_id = proto::svc_id(svc);
         // KEX seal site: PQ sessions bind header+digest AAD, classical None.
-        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
+        let pq_digest = self
+            .pq_digests
+            .read()
+            .await
+            .get(&conn.stable_id())
+            .copied()
+            .ok_or_else(|| anyhow!("no pq session digest"))?;
         let (ct, nonce) = frame_seal_body(
             key,
-            pq_digest,
+            &pq_digest,
             proto::kind::REQ,
             seq,
             ts,
@@ -2390,7 +2375,7 @@ impl Node {
             svc: svc_id,
             payload: ct,
             nonce,
-            sig: [0; 64],
+            sig: Vec::new(),
         };
         self.sign_frame(&mut f);
         self.metrics.frames_out.fetch_add(1, Ordering::Relaxed);
@@ -2448,10 +2433,16 @@ impl Node {
         let ts = now_ms();
         let svc_id = proto::svc_id(svc);
         // KEX seal site: PQ sessions bind header+digest AAD, classical None.
-        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
+        let pq_digest = self
+            .pq_digests
+            .read()
+            .await
+            .get(&conn.stable_id())
+            .copied()
+            .ok_or_else(|| anyhow!("no pq session digest"))?;
         let (ct, nonce) = frame_seal_body(
             key,
-            pq_digest,
+            &pq_digest,
             proto::kind::REQ,
             seq,
             ts,
@@ -2469,7 +2460,7 @@ impl Node {
             svc: svc_id,
             payload: ct,
             nonce,
-            sig: [0; 64],
+            sig: Vec::new(),
         };
         self.sign_frame(&mut f);
         self.metrics.frames_out.fetch_add(1, Ordering::Relaxed);
@@ -2522,13 +2513,22 @@ impl Node {
             );
         }
         let resp = Frame::decode(&bytes)?;
-        let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
-        if resp.kind != proto::kind::RESP || !resp.verify(&vk) {
+        let pq_pk = peer
+            .cfg
+            .pq_bytes()?
+            .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
+        if resp.kind != proto::kind::RESP || !resp.verify(&pq_pk) {
             bail!("bad response");
         }
-        // KEX open site: PQ sessions verify the AAD-bound tag, classical None.
-        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
-        frame_open_body(key, pq_digest, &resp)
+        // KEX open site: every session is PQ, so the AAD-bound tag is required.
+        let pq_digest = self
+            .pq_digests
+            .read()
+            .await
+            .get(&conn.stable_id())
+            .copied()
+            .ok_or_else(|| anyhow!("no pq session digest"))?;
+        frame_open_body(key, &pq_digest, &resp)
     }
 
     pub async fn ping(self: &Arc<Self>, sel: &str, count: u32) -> Result<String> {
@@ -2708,7 +2708,7 @@ impl Node {
     }
 
     /// Учёт известного эндпоинта пира + персистентность.
-    async fn add_route(&self, pid: [u8; NODEID_LEN], endpoint: String, ed_hex: &str) {
+    async fn add_route(&self, pid: [u8; NODEID_LEN], endpoint: String, pq_hex: &str) {
         let mut write_now = false;
         {
             let mut routes = self.routes.write().await;
@@ -2720,9 +2720,12 @@ impl Node {
             }
             let route = routes.entry(pid).or_insert(Route {
                 endpoints: Vec::new(),
-                ed_hex: ed_hex.to_string(),
-                pq_hex: String::new(),
+                pq_hex: pq_hex.to_string(),
             });
+            if route.pq_hex.is_empty() && !pq_hex.is_empty() {
+                route.pq_hex = pq_hex.to_string();
+                write_now = true;
+            }
             if !route.endpoints.contains(&endpoint) {
                 route.endpoints.push(endpoint);
                 write_now = true;
@@ -2745,18 +2748,12 @@ impl Node {
     }
 
     /// Динамическая регистрация неизвестной ноды (TOFU): строит pinned client_cfg и PeerLink.
+    /// FULL-PQ: the client TLS pin is the learned Falcon-512 key; a peer that
+    /// has not proven a PQ identity gets a verifier that refuses every cert
+    /// (outbound redial fails closed until config pins `pq-pub`).
     async fn add_dynamic_peer(&self, pid: [u8; NODEID_LEN], pcfg: PeerConfig) -> Result<()> {
-        let ed = pcfg.ed_bytes()?;
-        let rc = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { pinned: ed }))
-        .with_no_client_auth();
-        let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rc))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
-        client_cfg.transport_config(Arc::new(transport_config()));
+        let pq = pcfg.pq_bytes()?;
+        let client_cfg = build_client_cfg(pq.as_ref().map(|b| b.as_slice()))?;
         // EXACT invalidation on key rotation: if this pid already pins a
         // DIFFERENT long-term PQ key, drop the old verdict so the next
         // handshake re-verifies fresh (never a stale hit).
@@ -2852,7 +2849,8 @@ impl Node {
         if svc == svc_id("core.health") {
             return self.handle_health().await;
         }
-        // консенсус: суб-валидатор подписывает хэш состояния своим Ed25519 ключом.
+        // консенсус: суб-валидатор подписывает хэш состояния своим
+        // Falcon-512 PQ ключом (FULL-PQ: the Ed25519 state signer is gone).
         // Доступ разрешён только пирам из cfg.validators (и самому себе).
         if svc == svc_id("consensus.sign") {
             if !self.is_consensus_signer(&from).await {
@@ -2871,12 +2869,14 @@ impl Node {
                         .into_bytes(),
                 );
             }
-            let sig = ed25519_dalek::Signer::sign(&self.keys.signing, state_hash.as_bytes());
+            let sig = self
+                .pq
+                .sign_digest(blake3::hash(state_hash.as_bytes()).as_bytes());
             return Some(
                 json!({
                     "ok": true,
                     "node_id": self.id_hex,
-                    "signature": hex::encode(sig.to_bytes()),
+                    "signature": hex::encode(sig),
                 })
                 .to_string()
                 .into_bytes(),
@@ -2961,8 +2961,18 @@ impl Node {
             // порядок: origin присваивает seq из своего per-topic счётчика
             let seq = self.next_topic_seq(&topic).await;
             let origin = self.id_hex.clone();
-            // помечаем на origin, чтобы вернувшийся по mesh relay не доставил дубликат
-            self.mark_seen(msg_id).await;
+            // Idempotent publish: `msg_id` is the origin's idempotency key.
+            // `request_to` may retry a publish whose response was lost; without
+            // this check the retry would assign a NEW seq and every subscriber
+            // would deliver the payload twice (dedup is by msg_id, not data).
+            // Marking at the origin also stops the mesh relay loop-back.
+            if self.mark_seen(msg_id).await {
+                return Some(
+                    json!({ "ok": true, "op": "published", "dup": true, "msg_id": msg_id })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
             self.metrics.msgs_published.fetch_add(1, Ordering::Relaxed);
             let exclude_conn = conn.stable_id();
             let n = self
@@ -3635,7 +3645,7 @@ impl Node {
         let known = self.routes.read().await.get(&target).cloned();
         if let Some(route) = known {
             return Some(
-                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": route.endpoints, "ed_pub": route.ed_hex, "pq_pub": route.pq_hex, "via": self.id_hex })
+                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": route.endpoints, "pq_pub": route.pq_hex, "via": self.id_hex })
                     .to_string()
                     .into_bytes(),
             );
@@ -3660,7 +3670,6 @@ impl Node {
             .to_string()
             .into_bytes();
         let mut merged: Vec<String> = Vec::new();
-        let mut found_ed: Option<String> = None;
         let mut found_pq: Option<String> = None;
         let mut handles = Vec::new();
         for pid in peers {
@@ -3681,9 +3690,6 @@ impl Node {
                                 }
                             }
                         }
-                        if let Some(ed) = rv["ed_pub"].as_str() {
-                            found_ed = Some(ed.to_string());
-                        }
                         if let Some(pq) = rv["pq_pub"].as_str() {
                             found_pq = Some(pq.to_string());
                         }
@@ -3701,7 +3707,7 @@ impl Node {
             )
         } else {
             Some(
-                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": merged, "ed_pub": found_ed, "pq_pub": found_pq, "via": self.id_hex })
+                json!({ "ok": true, "found": true, "node": target_hex, "endpoints": merged, "pq_pub": found_pq, "via": self.id_hex })
                     .to_string()
                     .into_bytes(),
             )
@@ -3734,13 +3740,10 @@ impl Node {
                     if !mine.contains_key(&pid) && mine.len() >= MAX_ROUTES_TOTAL {
                         continue;
                     }
-                    let ed_hex = rv["ed_pub"].as_str().unwrap_or("").to_string();
                     let pq_hex = rv["pq_pub"].as_str().unwrap_or("").to_string();
                     // Отравление таблицы (FULL-PQ): PQ pin MUST derive `pid`
                     // (fail-closed, no empty-unknown merge — otherwise anyone
                     // could bind an honest PQ id to attacker endpoints).
-                    // `ed_hex` — frozen auth-pin (проверяется отдельно
-                    // в handshake/TLS, здесь только сохраняется для MITM).
                     let Ok(pq) = hex::decode(&pq_hex) else {
                         continue;
                     };
@@ -3749,14 +3752,6 @@ impl Node {
                     }
                     if crate::proto::pq_id_from_pub(&pq) != pid {
                         continue;
-                    }
-                    if !ed_hex.is_empty() {
-                        let Ok(ed) = hex::decode(&ed_hex) else {
-                            continue;
-                        };
-                        if ed.len() != 32 {
-                            continue;
-                        }
                     }
                     let endpoints: Vec<String> = rv["endpoints"]
                         .as_array()
@@ -3769,11 +3764,7 @@ impl Node {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let route = Route {
-                        endpoints,
-                        ed_hex,
-                        pq_hex,
-                    };
+                    let route = Route { endpoints, pq_hex };
                     let entry = mine.entry(pid).or_insert_with(|| route.clone());
                     for e in &route.endpoints {
                         if entry.endpoints.len() >= crate::proto::MAX_ENDPOINTS_PER_NODE {
@@ -3783,10 +3774,6 @@ impl Node {
                             entry.endpoints.push(e.clone());
                             changed = true;
                         }
-                    }
-                    if entry.ed_hex.is_empty() {
-                        entry.ed_hex = route.ed_hex.clone();
-                        changed = true;
                     }
                     if entry.pq_hex.is_empty() && !route.pq_hex.is_empty() {
                         entry.pq_hex = route.pq_hex.clone();
@@ -4105,20 +4092,13 @@ impl Node {
     }
 
     /// Вставка/обновление узла в routing table + персистентность.
-    /// FULL-PQ: `ed_hex` is the frozen auth/TLS pin, `pq_hex` is the pinned
-    /// Falcon-512 key that must derive `pid` (see `dht::node_info_valid`).
-    async fn routing_insert(
-        &self,
-        pid: [u8; NODEID_LEN],
-        endpoints: &[String],
-        ed_hex: &str,
-        pq_hex: &str,
-    ) {
+    /// FULL-PQ: `pq_hex` is the pinned Falcon-512 key that must derive `pid`
+    /// (see `dht::node_info_valid`).
+    async fn routing_insert(&self, pid: [u8; NODEID_LEN], endpoints: &[String], pq_hex: &str) {
         let mut routing = self.routing.write().await;
         routing.insert(crate::dht::NodeInfo {
             id: pid,
             endpoints: endpoints.to_vec(),
-            ed_hex: ed_hex.to_string(),
             pq_hex: pq_hex.to_string(),
             last_seen: crate::dht::now_ms(),
         });
@@ -4161,7 +4141,7 @@ impl Node {
         // создания PeerLink — иначе отравленная запись давала pin на ключ
         // атакующего вместе с dial-бюджетом под его управлением.
         // FULL-PQ: `id` MUST be the PQ id derived from the pinned `pq_hex`.
-        if !crate::dht::node_info_valid(&info.id, &info.ed_hex, &info.pq_hex, &info.endpoints) {
+        if !crate::dht::node_info_valid(&info.id, &info.pq_hex, &info.endpoints) {
             bail!("invalid dht node info");
         }
         let endpoints: Vec<String> = info
@@ -4173,7 +4153,7 @@ impl Node {
             .collect();
         let pcfg = PeerConfig {
             name: format!("dht-{}", hex::encode(&info.id[..4])),
-            ed_pub: info.ed_hex.clone(),
+            consensus_pub: None,
             // DHT-discovered PQ pin (validated above to derive `info.id`).
             pq_pub: Some(info.pq_hex.clone()),
             endpoints: endpoints.clone(),
@@ -4193,41 +4173,34 @@ impl Node {
             storage_roles: vec![],
         };
         self.add_dynamic_peer(info.id, pcfg).await?;
-        self.routing_insert(info.id, &info.endpoints, &info.ed_hex, &info.pq_hex)
+        self.routing_insert(info.id, &info.endpoints, &info.pq_hex)
             .await;
         Ok(())
     }
 
     /// DNS-seed candidate registration (FULL-PQ).
     ///
-    /// A DNS TXT record pins `ed` plus the KEM-ek hash only, never a
-    /// Falcon-512 key, so a DNS candidate can NOT enter DHT routing
-    /// (`ensure_dht_peer` requires a validated pq pin deriving the id,
-    /// fail-closed). Instead the candidate is registered as a dialable
-    /// dynamic peer in the TOFU-precedent shape (ed-pinned, no PQ pin yet,
-    /// least-privilege ACL, rate-limited): the existing `reconnect_loop`
-    /// sweep dials it, the handshake authenticates via the ed pin (frozen
-    /// policy) and negotiates a KEM-only session through the ephemeral PQ
-    /// offer; the peer's real PQ key is learned over that authenticated
-    /// channel afterwards, never from DNS.
+    /// A DNS TXT record pins the Falcon-512 `pq_pub`; the id is DERIVED from
+    /// it (`pq_id_from_pub`), so the candidate enters the peers map with a
+    /// real PQ pin (no Ed identity anywhere). It is born least-privilege
+    /// (TOFU ACL) and rate-limited (PENTEST F5); routing admission still
+    /// requires `dht::node_info_valid` (id == pq_id_from_pub).
     ///
-    /// Returns the peers-map key (ed-derived, TOFU precedent, NOT a NodeId).
+    /// Returns the peers-map key (the PQ NodeId).
     /// Idempotent: re-registering a known candidate is a no-op Ok.
     pub async fn register_dns_candidate(
         &self,
-        ed_hex: &str,
+        pq_hex: &str,
         endpoints: Vec<String>,
     ) -> Result<[u8; NODEID_LEN]> {
-        let ed: [u8; 32] = hex::decode(ed_hex.trim())
-            .map_err(|_| anyhow!("dns candidate ed must be 32 bytes hex"))?
-            .try_into()
-            .map_err(|_| anyhow!("dns candidate ed must be 32 bytes hex"))?;
-        let h = blake3::hash(&ed);
-        let mut pid = [0u8; NODEID_LEN];
-        pid.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
-        // Never ourselves (DNS ids are ed-derived; the local id is PQ — so
-        // compare the key, not the id).
-        if ed == *self.keys.verifying.as_bytes() {
+        let pq = hex::decode(pq_hex.trim())
+            .map_err(|_| anyhow!("dns candidate pq_pub must be 897 bytes hex"))?;
+        if pq.len() != proto::PQ_FALCON_PK_LEN {
+            bail!("dns candidate pq_pub must be 897 bytes hex");
+        }
+        let pid = proto::pq_id_from_pub(&pq);
+        // Never ourselves (compare the key, not the derived id).
+        if pq == self.pq.pq_pub() {
             bail!("dns candidate is self");
         }
         if self.peers.read().await.contains_key(&pid) {
@@ -4241,14 +4214,12 @@ impl Node {
         if endpoints.is_empty() {
             bail!("dns candidate has no dialable endpoints");
         }
-        // TOFU-precedent trust: DNS pins the key (stronger than TOFU's
-        // nothing) but the data plane stays least-privilege until the
-        // operator promotes the peer — same ACL source as TOFU, same
-        // born-rate-limited rule (PENTEST F5).
+        // Least-privilege until the operator promotes the peer — same ACL
+        // source as TOFU, same born-rate-limited rule (PENTEST F5).
         let pcfg = PeerConfig {
             name: format!("dns-{}", hex::encode(&pid[..4])),
-            ed_pub: hex::encode(ed),
-            pq_pub: None,
+            consensus_pub: None,
+            pq_pub: Some(hex::encode(&pq)),
             endpoints,
             allow: self.unknown_allow_cfg.read().await.clone(),
             rate_limit_per_sec: DYNAMIC_PEER_RATE_LIMIT_PER_SEC,
@@ -4275,7 +4246,6 @@ impl Node {
                 let info = crate::dht::NodeInfo {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
-                    ed_hex: p.cfg.ed_pub.clone(),
                     pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 };
@@ -4388,7 +4358,6 @@ impl Node {
                 let info = crate::dht::NodeInfo {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
-                    ed_hex: p.cfg.ed_pub.clone(),
                     pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 };
@@ -4425,7 +4394,6 @@ impl Node {
                 json!({
                     "node_id": format!("inf1:{}", hex::encode(n.id)),
                     "endpoints": n.endpoints,
-                    "ed_pub": n.ed_hex,
                     "pq_pub": n.pq_hex,
                 })
             })
@@ -4621,7 +4589,6 @@ impl Node {
                 json!({
                     "node_id": format!("inf1:{}", hex::encode(n.id)),
                     "endpoints": n.endpoints,
-                    "ed_pub": n.ed_hex,
                     "pq_pub": n.pq_hex,
                 })
             })
@@ -5014,7 +4981,7 @@ impl Node {
     }
 
     /// Все известные ноды сети (routing + конфигурированные пиры). Каждая запись содержит
-    /// id/endpoints/ed_pub/pq_pub — это позволяет rewards начислять награду нодам, которые
+    /// id/endpoints/pq_pub — это позволяет rewards начислять награду нодам, которые
     /// прислали dht.update (автодобавление) без ручного внесения в конфиг валидатора.
     pub async fn known_peers(&self) -> Vec<crate::dht::NodeInfo> {
         let mut out: Vec<crate::dht::NodeInfo> = self.routing.read().await.all();
@@ -5025,7 +4992,6 @@ impl Node {
                 out.push(crate::dht::NodeInfo {
                     id: *pid,
                     endpoints: p.cfg.endpoints.clone(),
-                    ed_hex: p.cfg.ed_pub.clone(),
                     pq_hex: p.cfg.pq_pub.clone().unwrap_or_default(),
                     last_seen: crate::dht::now_ms(),
                 });
@@ -5863,10 +5829,10 @@ impl Node {
         self.store_mail_boxed(name, blob, None).await
     }
 
-    /// store_mail с Proton-моделью: если задан owner_pub (X25519 hex получателя),
-    /// ключ блоба (data_key) зашифровывается box на его публичный ключ и кладётся в
-    /// манифест как key_box вместо открытого "key" — прочитать может только владелец
-    /// приватного X25519-ключа (браузер). Сервер/ноды не видят ключ.
+    /// store_mail с Proton-моделью: если задан owner_pub (ML-KEM-768 ek hex
+    /// получателя), ключ блоба (data_key) зашифровывается box на его публичный
+    /// ключ и кладётся в манифест как key_box вместо открытого "key" — прочитать
+    /// может только владелец приватного KEM-сида (браузер). Сервер/ноды не видят ключ.
     ///
     /// ИДЕМПОТЕНТНОСТЬ: key/nonce и chunk_id выводятся из содержимого (blob_key_nonce /
     /// chunk_id_for) — повторный store того же письма перезаписывает те же файлы чанков,
@@ -6000,8 +5966,8 @@ impl Node {
         self.fetch_mail_inner(name, None).await
     }
 
-    /// Скачать Proton-письмо (манифест с key_box) — расшифровывает ключ блоба приватным
-    /// X25519-ключом владельца. Используется браузером через web-слой (владение уже проверено).
+    /// Скачать Proton-письмо (манифест с key_box) — расшифровывает ключ блоба
+    /// приватным ML-KEM-768 сидом владельца. Используется браузером через web-слой (владение уже проверено).
     pub async fn fetch_mail_owner(
         self: &Arc<Self>,
         name: &str,
@@ -6077,7 +6043,7 @@ impl Node {
         let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
         let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).ok()?;
         // ключ блоба: "key" (открытый, старая модель) либо "key_box" (Proton) —
-        // для key_box нужен приватный X25519-ключ владельца.
+        // для key_box нужен приватный ML-KEM-768 сид владельца.
         let dk: [u8; 32] = if let Some(kb) = manifest["key_box"].as_object() {
             let priv_hex = owner_priv?;
             box_unwrap_key(&serde_json::Value::Object(kb.clone()), priv_hex).ok()?
@@ -6237,8 +6203,9 @@ impl Node {
             .await
     }
 
-    /// store_blob с Proton-моделью: если owner_pub задан (X25519 hex владельца), ключ блоба
-    /// шифруется box на публичный ключ (key_box в манифесте) — прочитать может только владелец.
+    /// store_blob с Proton-моделью: если owner_pub задан (ML-KEM-768 ek hex
+    /// владельца), ключ блоба шифруется box на публичный ключ (key_box в
+    /// манифесте) — прочитать может только владелец.
     ///
     /// ИДЕМПОТЕНТНОСТЬ: key/nonce и chunk_id выводятся из содержимого (см.
     /// blob_key_nonce / chunk_id_for), поэтому повторный publish того же имени с тем же
@@ -6503,13 +6470,14 @@ impl Node {
 
     // ============ Почта (mail.*) ============
 
-    /// Получить ed_pub пользователя из реестра: локальный KV, затем прямой опрос пиров.
-    pub async fn user_ed_pub(self: &Arc<Self>, email: &str) -> Option<String> {
+    /// Получить pq_pub (Falcon-512) пользователя из реестра: локальный KV,
+    /// затем прямой опрос пиров.
+    pub async fn user_pq_pub(self: &Arc<Self>, email: &str) -> Option<String> {
         let key = format!("user:{email}");
         if let Some(v) = self.get_local_kv(&key).await {
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&v) {
-                if let Some(ed) = meta["ed_pub"].as_str() {
-                    return Some(ed.to_string());
+                if let Some(pq) = meta["pq_pub"].as_str() {
+                    return Some(pq.to_string());
                 }
             }
         }
@@ -6522,8 +6490,8 @@ impl Node {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(
                             v["value"].as_str().unwrap_or(""),
                         ) {
-                            if let Some(ed) = meta["ed_pub"].as_str() {
-                                return Some(ed.to_string());
+                            if let Some(pq) = meta["pq_pub"].as_str() {
+                                return Some(pq.to_string());
                             }
                         }
                     }
@@ -6533,13 +6501,14 @@ impl Node {
         None
     }
 
-    /// mail.list: отдаёт индекс ящика ТОЛЬКО владельцу (проверка Ed25519-подписи).
+    /// mail.list: отдаёт индекс ящика ТОЛЬКО владельцу (проверка
+    /// Falcon-512-подписи владельца).
     async fn handle_mail_list(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
         let email = v["email"].as_str().unwrap_or("").to_string();
         let ts = v["ts"].as_i64().unwrap_or(0);
         let sig = hex::decode(v["sig"].as_str().unwrap_or("")).unwrap_or_default();
         // проверка владения: подпись над "email:ts" ключом владельца
-        let ed_pub_hex = match self.user_ed_pub(&email).await {
+        let pq_pub_hex = match self.user_pq_pub(&email).await {
             Some(e) => e,
             None => {
                 return Some(
@@ -6549,29 +6518,25 @@ impl Node {
                 )
             }
         };
-        if sig.len() != 64 {
+        if sig.len() != crate::proto::PQ_FALCON_SIG_LEN {
             return Some(
                 json!({ "ok": false, "err": "bad sig" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        let edb = match hex::decode(&ed_pub_hex) {
-            Ok(b) if b.len() == 32 => b,
+        let pqk = match hex::decode(&pq_pub_hex) {
+            Ok(b) if b.len() == crate::proto::PQ_FALCON_PK_LEN => b,
             _ => {
                 return Some(
-                    json!({ "ok": false, "err": "bad ed_pub" })
+                    json!({ "ok": false, "err": "bad pq_pub" })
                         .to_string()
                         .into_bytes(),
                 )
             }
         };
-        let mut edk = [0u8; 32];
-        edk.copy_from_slice(&edb);
-        let mut sigk = [0u8; 64];
-        sigk.copy_from_slice(&sig);
         let msg = format!("{email}:{ts}");
-        if !crate::mailbox::MailKeys::verify(&edk, msg.as_bytes(), &sigk) {
+        if !crate::mailbox::MailKeys::verify(&pqk, msg.as_bytes(), &sig) {
             return Some(
                 json!({ "ok": false, "err": "not mailbox owner" })
                     .to_string()
@@ -6662,7 +6627,7 @@ impl Node {
 
     /// Серверный режим: слушаем + поддерживаем исходящие соединения.
     pub async fn serve(self: &Arc<Self>) -> Result<()> {
-        let (certs, key) = build_tls(&self.keys)?;
+        let (certs, key) = build_tls(&self.pq)?;
         let listen: SocketAddr = self.cfg.listen.parse()?;
         let sc = quinn::ServerConfig::with_single_cert(certs, key)?;
         let mut sc = sc;
@@ -7315,7 +7280,7 @@ async fn handle_stream(
         // Строгий гейт payload (fail-closed): nonce/at/eph/ed/x обязаны быть
         // на месте и свежими. Раньше проверялись только подпись фрейма и его
         // ts — повтор кадра в окне ±10 мин создавал новую сессию.
-        let (ch_nonce, ch_eph, ch_ed) = match challenge_fields(&ch) {
+        let (ch_nonce, ch_fresh, ch_pq) = match challenge_fields(&ch) {
             Ok(v) => v,
             Err(e) => {
                 return Err(e);
@@ -7336,15 +7301,16 @@ async fn handle_stream(
                 }
             };
             // Привязка payload к пинну: известный пир обязан предъявить СВОЙ
-            // ed-ключ (X3DH-нога вырезана — статическая x25519-привязка
-            // удалена; аутентификация — та же подпись ed25519).
-            let pinned_ed = match peer.cfg.ed_bytes() {
-                Ok(b) => b,
+            // Falcon-512 PQ-ключ (frame auth is PQ-only; there is no classical
+            // key to fall back to).
+            let pinned_pq = match peer.cfg.pq_bytes() {
+                Ok(Some(b)) => b,
+                Ok(None) => bail!("pq_pub is mandatory (classical-only peer refused)"),
                 Err(e) => {
                     return Err(e);
                 }
             };
-            if ch_ed != pinned_ed {
+            if ch_pq != pinned_pq {
                 bail!("challenge key mismatch");
             }
             // LONG-TERM PQ peer-key verify (cached static parse ONLY): a pinned
@@ -7365,41 +7331,34 @@ async fn handle_stream(
             }
             peer
         } else if node.cfg.allow_unknown {
-            // TOFU: неизвестная нода доказывает владение ключом подписью CHALLENGE
-            let ed_hex = hex::encode(ch_ed);
-            let ed: [u8; 32] = ch_ed;
-            let vk = match VerifyingKey::from_bytes(&ed) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(e.into());
-                }
-            };
-            if claimed != blake3::hash(vk.as_bytes()).as_bytes()[..NODEID_LEN] {
+            // TOFU: неизвестная нода доказывает владение PQ-ключом подписью
+            // CHALLENGE. The PQ public key travels in the signed payload, so
+            // the Falcon tag binds it to `src` (and `src` must derive from it).
+            let pq_hex = hex::encode(&ch_pq);
+            if claimed != proto::pq_id_from_pub(&ch_pq) {
                 bail!("claimed node id does not match public key");
             }
-            if !f.verify(&vk) {
+            if !f.verify(&ch_pq) {
                 bail!("unknown node could not sign the challenge");
             }
-            // детект MITM: если этот node_id уже видели с ДРУГИМ ключом — отказ + громкое предупреждение
+            // детект MITM: если этот node_id уже видели с ДРУГИМ PQ-ключом —
+            // отказ + громкое предупреждение
             if let Some(known) = node.routes.read().await.get(&claimed) {
-                if !known.ed_hex.is_empty() && known.ed_hex != ed_hex {
+                if !known.pq_hex.is_empty() && known.pq_hex != pq_hex {
                     eprintln!(
-                        "[{}] !! MITM-WARNING: node inf1:{} is changing keys! was ed={} now ed={} — REFUSED",
+                        "[{}] !! MITM-WARNING: node inf1:{} is changing keys! was pq={} now pq={} — REFUSED",
                         node.cfg.name,
                         hex::encode(claimed),
-                        known.ed_hex,
-                        ed_hex
+                        known.pq_hex,
+                        pq_hex
                     );
                     bail!("node key changed (possible MITM)");
                 }
             }
             let pcfg = PeerConfig {
                 name: format!("dyn-{}", hex::encode(&claimed[..4])),
-                ed_pub: ed_hex.clone(),
-                // TOFU: no pinned PQ (unknown) — `primary_id` refuses, but
-                // `pid` comes from the network `claimed` (PQ src), not from
-                // the config; PQ session still negotiates via ephemeral KEM.
-                pq_pub: None,
+                consensus_pub: None,
+                pq_pub: Some(pq_hex.clone()),
                 endpoints: vec![conn.remote_address().to_string()],
                 allow: node.unknown_allow_cfg.read().await.clone(),
                 // PENTEST F5: a TOFU identity is the least-trusted peer on the
@@ -7411,10 +7370,10 @@ async fn handle_stream(
             node.add_dynamic_peer(claimed, pcfg).await?;
             // TOFU: показываем оператору отпечаток для ручной проверки (как SSH fingerprint)
             eprintln!(
-                "[{}] !! TOFU: unknown node inf1:{} ed={} from {} accepted — verify the fingerprint!",
+                "[{}] !! TOFU: unknown node inf1:{} pq_pub={} from {} accepted — verify the fingerprint!",
                 node.cfg.name,
                 hex::encode(claimed),
-                ed_hex,
+                pq_hex,
                 conn.remote_address()
             );
             match node.peers.read().await.get(&claimed).cloned() {
@@ -7426,18 +7385,14 @@ async fn handle_stream(
         } else {
             bail!("unknown node claiming {}", hex::encode(claimed));
         };
-        let vk = match peer.cfg.ed_bytes() {
-            Ok(b) => match VerifyingKey::from_bytes(&b) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(e.into());
-                }
-            },
+        let pq_pk = match peer.cfg.pq_bytes() {
+            Ok(Some(b)) => b,
+            Ok(None) => bail!("pq_pub is mandatory (classical-only peer refused)"),
             Err(e) => {
                 return Err(e);
             }
         };
-        if !f.verify(&vk) || !ts_ok(f.ts) {
+        if !f.verify(&pq_pk) || !ts_ok(f.ts) {
             bail!("challenge bad sig/ts");
         }
         // Anti-replay: nonce одноразовый. Проверяется ПОСЛЕ подписи, чтобы
@@ -7449,94 +7404,68 @@ async fn handle_stream(
             }
         }
         // KEM-only сессия: ключ — из ML-KEM секрета + дайджест транскрипта;
-        // свой эфемерный eph отдаём в AUTH для привязки транскрипта (не ECDH).
-        let srv_eph = XSecret::random_from_rng(rand::rngs::OsRng);
-        let srv_eph_pub = XPub::from(&srv_eph);
+        // свой freshness-nonce отдаём в AUTH для привязки транскрипта (не ECDH).
+        let mut srv_fresh = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut srv_fresh);
         let auth_at = now_ms();
-        // PQ handshake offer (default-ON; explicit opt-out
-        // `STELL_INF_PQ_HANDSHAKE=0` honored pre-H only): absent PQ fields =>
-        // classical path (window tolerance, plan §5), LOUD + counted while
-        // pre-H (see `proto::pq_warn_classical_fallback` below). Present =>
-        // encapsulate now and answer below with a hybrid session key.
-        // Malformed/mis-versioned offers are refused with a clear error and
-        // the connection is dropped fail-closed (no identity debit pre-auth,
-        // same as every other failure on this path).
-        let mut pq_state: Option<(Vec<u8>, PqAgreed)> = None;
-        if proto::pq_handshake_active() {
-            match pq_responder_accept(
-                &ch_eph,
-                &ch,
-                &f.sign_data(),
-                srv_eph_pub.as_bytes(),
-                auth_at,
-                &node.id,
-            ) {
-                Ok(s) => pq_state = s,
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-        if proto::pq_handshake_active() && pq_state.is_none() {
-            // PQ active (default-ON) but the initiator offered no PQ fields:
-            // pre-H window fallback — loud, counted, explicit.
-            proto::pq_warn_classical_fallback("accept");
-        }
-        // KEM-only session (X3DH leg cut): sole inputs are the ML-KEM shared
-        // secret + transcript digest. No PQ offer (classical initiator) is
-        // fail-closed — the WARN above already fired.
-        let key = match &pq_state {
-            Some((_, a)) => proto::pq_session_key(&a.shared, &a.digest),
-            None => {
-                return Err(anyhow!("pq handshake required (X3DH session KEX removed)"));
-            }
-        };
+        // PQ handshake (MANDATORY): a CHALLENGE without PQ fields, or with
+        // malformed/mis-versioned PQ, is refused with a clear error and the
+        // connection is dropped fail-closed (no classical fallback).
+        let pq_state: (Vec<u8>, PqAgreed) = pq_responder_accept(
+            &ch_fresh,
+            &ch,
+            &f.sign_data(),
+            &srv_fresh,
+            auth_at,
+            &node.id,
+        )?;
+        // KEM-only session: sole inputs are the ML-KEM shared secret +
+        // transcript digest.
+        let key = proto::pq_session_key(&pq_state.1.shared, &pq_state.1.digest);
         // Backpressure bound on the session table (fail-closed: when full the
         // session is NOT stored, so this conn can serve no requests; the auth
         // decision above is untouched). No fitting metrics counter (follow-up).
-        let _ = node.session_insert(conn.stable_id(), key).await;
-        // KEX wiring: PQ-negotiated sessions carry their transcript digest so
-        // frame seal/open binds the AAD; classical sessions store nothing and
-        // stay on the legacy path (same best-effort discipline as above).
-        if let Some((_, a)) = &pq_state {
-            let _ = node.pq_digest_insert(conn.stable_id(), a.digest).await;
+        if !node.session_insert(conn.stable_id(), key).await {
+            bail!("sessions full");
+        }
+        // KEX wiring: every session carries its transcript digest so frame
+        // seal/open binds the AAD (fail-closed when the digest table is full).
+        if !node
+            .pq_digest_insert(conn.stable_id(), pq_state.1.digest)
+            .await
+        {
+            node.sessions.write().await.remove(&conn.stable_id());
+            bail!("pq digests full");
         }
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
         node.routing_insert(
             claimed,
             &peer.cfg.endpoints,
-            &peer.cfg.ed_pub,
             peer.cfg.pq_pub.as_deref().unwrap_or(""),
         )
         .await;
         *peer.conn.write().await = Some(conn.clone());
         node.remember_peer_addr(&peer, conn.remote_address()).await;
-        node.add_route(claimed, conn.remote_address().to_string(), &peer.cfg.ed_pub)
-            .await;
-        let payload = if let Some((ct, agreed)) = &pq_state {
-            json!({
-                "node": node.id_hex,
-                "name": node.cfg.name,
-                "at": auth_at,
-                "eph": hex::encode(srv_eph_pub.as_bytes()),
-                "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
-                "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
-                "pq_ct": hex::encode(ct),
-                "pq_tag": hex::encode(agreed.tag),
-            })
-            .to_string()
-            .into_bytes()
-        } else {
-            json!({
-                "node": node.id_hex,
-                "name": node.cfg.name,
-                "at": now_ms(),
-                "eph": hex::encode(srv_eph_pub.as_bytes()),
-            })
-            .to_string()
-            .into_bytes()
-        };
+        node.add_route(
+            claimed,
+            conn.remote_address().to_string(),
+            peer.cfg.pq_pub.as_deref().unwrap_or(""),
+        )
+        .await;
+        let payload = json!({
+            "node": node.id_hex,
+            "name": node.cfg.name,
+            "at": auth_at,
+            "fresh": hex::encode(srv_fresh),
+            "pq_pub": node.pq.pq_pub_hex(),
+            "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
+            "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
+            "pq_ct": hex::encode(&pq_state.0),
+            "pq_tag": hex::encode(pq_state.1.tag),
+        })
+        .to_string()
+        .into_bytes();
         let mut a = Frame {
             kind: proto::kind::AUTH,
             seq: node.next_seq(),
@@ -7546,7 +7475,7 @@ async fn handle_stream(
             svc: 0,
             payload,
             nonce: vec![],
-            sig: [0; 64],
+            sig: Vec::new(),
         };
         node.sign_frame(&mut a);
         send.write_all(&a.encode()).await?;
@@ -7575,8 +7504,11 @@ async fn handle_stream(
         .get(&pid)
         .cloned()
         .ok_or_else(|| anyhow!("unknown peer"))?;
-    let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
-    if !f.verify(&vk) {
+    let pq_pk = peer
+        .cfg
+        .pq_bytes()?
+        .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
+    if !f.verify(&pq_pk) {
         // F8-rep: forged frame from the proven identity.
         node.rep_record_protocol_violation(&pid).await;
         bail!("bad signature");
@@ -7656,7 +7588,7 @@ async fn handle_stream(
                 svc: 0,
                 payload: vec![],
                 nonce: vec![],
-                sig: [0; 64],
+                sig: Vec::new(),
             };
             node.sign_frame(&mut r);
             send.write_all(&r.encode()).await?;
@@ -7685,10 +7617,16 @@ async fn handle_stream(
                     .into_bytes();
                 // KEX seal site: PQ sessions bind header+digest AAD, classical None.
                 let r_ts = now_ms();
-                let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
+                let pq_digest = node
+                    .pq_digests
+                    .read()
+                    .await
+                    .get(&conn.stable_id())
+                    .copied()
+                    .ok_or_else(|| anyhow!("no pq session digest"))?;
                 let (ct, nonce) = frame_seal_body(
                     &key,
-                    pq_digest,
+                    &pq_digest,
                     proto::kind::RESP,
                     f.seq,
                     r_ts,
@@ -7706,7 +7644,7 @@ async fn handle_stream(
                     svc: f.svc,
                     payload: ct,
                     nonce,
-                    sig: [0; 64],
+                    sig: Vec::new(),
                 };
                 node.sign_frame(&mut r);
                 send.write_all(&r.encode()).await?;
@@ -7714,17 +7652,19 @@ async fn handle_stream(
                 report_stages(&f, t_proc.elapsed());
                 return Ok(None);
             }
-            // KEX open site: PQ sessions verify the AAD-bound tag and drop the
-            // frame fail-closed on failure; classical sessions use legacy open.
-            let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
-            let plain = match frame_open_body(&key, pq_digest, &f) {
+            // KEX open site: every session is PQ; the AAD-bound tag is
+            // required and a failure drops the frame fail-closed.
+            let pq_digest = node
+                .pq_digests
+                .read()
+                .await
+                .get(&conn.stable_id())
+                .copied()
+                .ok_or_else(|| anyhow!("no pq session digest"))?;
+            let plain = match frame_open_body(&key, &pq_digest, &f) {
                 Ok(p) => p,
                 Err(e) => {
-                    // KEX: PQ open failure is fail-closed + counted (existing
-                    // `reqs_errors`); the classical arm is untouched.
-                    if pq_digest.is_some() {
-                        node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
-                    }
+                    node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
                     // F8-rep: undecryptable frame from the proven identity.
                     node.rep_record_protocol_violation(&pid).await;
                     return Err(e);
@@ -7815,10 +7755,16 @@ async fn handle_stream(
             );
             // KEX seal site: PQ sessions bind header+digest AAD, classical None.
             let r_ts = now_ms();
-            let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
+            let pq_digest = node
+                .pq_digests
+                .read()
+                .await
+                .get(&conn.stable_id())
+                .copied()
+                .ok_or_else(|| anyhow!("no pq session digest"))?;
             let (ct, nonce) = frame_seal_body(
                 &key,
-                pq_digest,
+                &pq_digest,
                 proto::kind::RESP,
                 f.seq,
                 r_ts,
@@ -7836,7 +7782,7 @@ async fn handle_stream(
                 svc: f.svc,
                 payload: ct,
                 nonce,
-                sig: [0; 64],
+                sig: Vec::new(),
             };
             node.sign_frame(&mut r);
             send.write_all(&r.encode()).await?;
@@ -7878,13 +7824,12 @@ pub fn e2e_decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow!("e2e decrypt failed (tamper?)"))
 }
 
-/// KEX frame seal site (ONE swap): PQ-negotiated sessions seal bodies with
-/// `kex_frame_seal_rand` under a canonical AAD (header + session digest);
-/// classical sessions (`None`) call legacy `e2e_encrypt` byte-identical.
+/// KEX frame seal site (ONE swap): every session is PQ, so bodies are sealed
+/// with `kex_frame_seal_rand` under a canonical AAD (header + session digest).
 #[allow(clippy::too_many_arguments)] // GATE: header fields mirror Frame 1:1 for byte-identical AAD rebuild
 fn frame_seal_body(
     key: &[u8; 32],
-    pq_digest: Option<[u8; 32]>,
+    pq_digest: &[u8; 32],
     kind: u8,
     seq: u32,
     ts: i64,
@@ -7893,27 +7838,16 @@ fn frame_seal_body(
     svc: u64,
     plain: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
-    match pq_digest {
-        Some(d) => {
-            let aad = proto::kex_frame_aad(kind, seq, ts, src, dst, svc, &d);
-            proto::kex_frame_seal_rand(key, &aad, plain)
-        }
-        None => e2e_encrypt(key, plain),
-    }
+    let aad = proto::kex_frame_aad(kind, seq, ts, src, dst, svc, pq_digest);
+    proto::kex_frame_seal_rand(key, &aad, plain)
 }
 
-/// KEX frame open site (ONE swap): PQ-negotiated sessions rebuild the same
-/// canonical AAD from the received header and open with `kex_frame_open`
-/// (fail-closed: any error drops the frame, never a plaintext fallback);
-/// classical sessions (`None`) call legacy `e2e_decrypt` byte-identical.
-fn frame_open_body(key: &[u8; 32], pq_digest: Option<[u8; 32]>, f: &Frame) -> Result<Vec<u8>> {
-    match pq_digest {
-        Some(d) => {
-            let aad = proto::kex_frame_aad(f.kind, f.seq, f.ts, &f.src, &f.dst, f.svc, &d);
-            proto::kex_frame_open(key, &f.nonce, &aad, &f.payload)
-        }
-        None => e2e_decrypt(key, &f.nonce, &f.payload),
-    }
+/// KEX frame open site (ONE swap): rebuild the same canonical AAD from the
+/// received header and open with `kex_frame_open` (fail-closed: any error
+/// drops the frame, never a plaintext fallback).
+fn frame_open_body(key: &[u8; 32], pq_digest: &[u8; 32], f: &Frame) -> Result<Vec<u8>> {
+    let aad = proto::kex_frame_aad(f.kind, f.seq, f.ts, &f.src, &f.dst, f.svc, pq_digest);
+    proto::kex_frame_open(key, &f.nonce, &aad, &f.payload)
 }
 
 /// Content id блоба: blake3(плейнтекст целиком). Из него выводятся и chunk_id
@@ -8249,13 +8183,12 @@ fn load_or_create_mail_key(data_dir: &std::path::Path) -> [u8; 32] {
     k
 }
 
-/// Строгий разбор CHALLENGE-payload (fail-closed, audit 2026-11-01): все поля
-/// обязаны присутствовать и быть свежими. Раньше `nonce`/`at`/`eph` вообще не
-/// проверялись — повторяемый в пределах ±10 мин кадр создавал новую сессию.
-/// FULL-PQ: статическое поле `x` (X25519) удалено (X3DH-нога вырезана);
-/// лишнее поле `x` от старых пиров игнорируется (не читается).
-/// Parsed CHALLENGE payload: (nonce hex, eph pub, ed pub).
-type ChallengeFields = (String, [u8; 32], [u8; 32]);
+/// Строгий разбор CHALLENGE-payload (fail-closed): `nonce`/`at`/`fresh`/
+/// `pq_pub` обязаны присутствовать и быть свежими. FULL-PQ: the classical
+/// `ed` (Ed25519) and static `x` (X25519) fields are gone — a frame carrying
+/// only those has no PQ key and is refused.
+/// Parsed CHALLENGE payload: (nonce hex, freshness nonce, Falcon-512 pubkey).
+type ChallengeFields = (String, [u8; 32], Vec<u8>);
 
 fn challenge_fields(v: &serde_json::Value) -> Result<ChallengeFields> {
     let nonce = v["nonce"]
@@ -8270,9 +8203,17 @@ fn challenge_fields(v: &serde_json::Value) -> Result<ChallengeFields> {
     if !ts_ok(at) {
         bail!("stale challenge");
     }
-    let eph = hex_fixed_32(v["eph"].as_str(), "eph")?;
-    let ed = hex_fixed_32(v["ed"].as_str(), "ed")?;
-    Ok((nonce.to_string(), eph, ed))
+    let fresh = hex_fixed_32(v["fresh"].as_str(), "fresh")?;
+    let pq_pub = hex::decode(
+        v["pq_pub"]
+            .as_str()
+            .ok_or_else(|| anyhow!("challenge without pq_pub"))?,
+    )
+    .map_err(|_| anyhow!("challenge pq_pub malformed"))?;
+    if pq_pub.len() != proto::PQ_FALCON_PK_LEN {
+        bail!("challenge pq_pub malformed");
+    }
+    Ok((nonce.to_string(), fresh, pq_pub))
 }
 
 fn hex_fixed_32(s: Option<&str>, what: &str) -> Result<[u8; 32]> {
@@ -8280,20 +8221,12 @@ fn hex_fixed_32(s: Option<&str>, what: &str) -> Result<[u8; 32]> {
     b.try_into().map_err(|_| anyhow!("{what} is not 32 bytes"))
 }
 
-/// PQ HANDSHAKE helpers (default-ON since PQ 9.1 — same
-/// `proto::pq_handshake_active` gate; explicit `STELL_INF_PQ_HANDSHAKE=0`
-/// opts out pre-H only).
+/// PQ HANDSHAKE helpers (MANDATORY, FULL-PQ wipe).
 /// KEX: ephemeral ML-KEM-768 per handshake (vendored crate, no new deps).
-/// Auth (INTERIM, honest): transcript MAC keyed by the ML-KEM shared secret
-/// over the `proto::PqTranscript` digest — the same digest bytes a future
-/// Falcon-512 backend will sign (see `proto.rs` PQ docs; Falcon is
-/// lead-gated per `docs/PQ_TRANSPORT_PLAN.md` §7). Verified BEFORE any
-/// session key is derived; refusals carry clear errors and never silently
-/// downgrade. Mixed-mode window policy is `proto::pq_mixed_policy` (plan §5:
-/// verify dual-or-classical, route by classical id), height-gated by
-/// `proto::pq_mixed_policy_at` / `proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`.
-/// `NodeId` unchanged (see `keyring.rs`). Opted-out => none of this runs:
-/// payloads and KDF stay byte-identical to classical.
+/// Auth: the transcript is authenticated by the long-term Falcon-512 key
+/// (frame tags + `pq_falcon_*`), and the KEM transcript tag is verified
+/// BEFORE any session key is derived. A CHALLENGE/AUTH without PQ fields is
+/// refused — there is no classical fallback and no height window.
 pub struct PqInitOffer {
     /// Initiator ephemeral decapsulation key, kept until the AUTH answer.
     pub dk: ml_kem::DecapsulationKey768,
@@ -8302,6 +8235,7 @@ pub struct PqInitOffer {
 }
 
 /// Agreed PQ material (identical on both sides after a verified handshake).
+#[derive(Debug)]
 pub struct PqAgreed {
     /// ML-KEM shared secret (implicit-rejection fallback never reaches here:
     /// a tampered ct yields a wrong key that fails tag verification).
@@ -8370,16 +8304,16 @@ pub fn pq_decapsulate(dk: &ml_kem::DecapsulationKey768, ct_bytes: &[u8]) -> Resu
 pub fn pq_build_transcript(
     ek_full: &[u8],
     ct_full: &[u8],
-    eph_init: &[u8; 32],
-    eph_resp: &[u8; 32],
+    fresh_init: &[u8; 32],
+    fresh_resp: &[u8; 32],
     ch_sign_data: &[u8],
     auth_bind: &[u8],
 ) -> proto::PqTranscript {
     proto::PqTranscript {
         pq_init: proto::pq_hash_field(ek_full),
         pq_resp: proto::pq_hash_field(ct_full),
-        eph_init: *eph_init,
-        eph_resp: *eph_resp,
+        fresh_init: *fresh_init,
+        fresh_resp: *fresh_resp,
         chan_bind: proto::PQ_CHAN_BIND_PLACEHOLDER,
         nonce_init: proto::pq_hash_field(ch_sign_data),
         nonce_resp: proto::pq_hash_field(auth_bind),
@@ -8389,9 +8323,9 @@ pub fn pq_build_transcript(
 /// Responder-side AUTH binding: `eph_resp || at_le || resp_id`. Known before
 /// the AUTH frame is built (no circularity) and recomputable by the dialer
 /// from the received AUTH payload.
-pub fn pq_auth_bind(eph_resp: &[u8; 32], auth_at: i64, resp_id: &[u8; NODEID_LEN]) -> Vec<u8> {
+pub fn pq_auth_bind(fresh_resp: &[u8; 32], auth_at: i64, resp_id: &[u8; NODEID_LEN]) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + 8 + NODEID_LEN);
-    v.extend_from_slice(eph_resp);
+    v.extend_from_slice(fresh_resp);
     v.extend_from_slice(&auth_at.to_le_bytes());
     v.extend_from_slice(resp_id);
     v
@@ -8403,10 +8337,9 @@ fn pq_read_u64(v: &serde_json::Value, k: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("pq {k} malformed"))
 }
 
-/// Accept-side PQ offer check. `Ok(None)` = no PQ fields: pure classical
-/// (window tolerance, plan §5). `Ok(Some)` = verified offer material for the
-/// AUTH answer + hybrid key. `Err` = explicitly offered PQ that is malformed
-/// or versioned wrong: refuse with a clear error (no silent downgrade).
+/// Accept-side PQ offer check. FULL-PQ: a CHALLENGE without PQ fields is
+/// REFUSED (`Err`), never treated as classical. `Ok` carries the verified
+/// offer material for the AUTH answer + KEM-only session key.
 pub fn pq_responder_accept(
     ch_eph: &[u8; 32],
     ch: &serde_json::Value,
@@ -8414,9 +8347,9 @@ pub fn pq_responder_accept(
     srv_eph: &[u8; 32],
     auth_at: i64,
     resp_id: &[u8; NODEID_LEN],
-) -> Result<Option<(Vec<u8>, PqAgreed)>> {
+) -> Result<(Vec<u8>, PqAgreed)> {
     if ch.get("pq_ek").is_none() {
-        return Ok(None);
+        bail!("pq offer required (classical refused)");
     }
     let ver = pq_read_u64(ch, "pq_ver")?;
     let suite = pq_read_u64(ch, "pq_suite")?;
@@ -8446,29 +8379,27 @@ pub fn pq_responder_accept(
         proto::PQ_SUITE_MLKEM768_HYBRID,
     );
     let tag = proto::pq_auth_tag(&shared, &digest);
-    Ok(Some((
+    Ok((
         ct,
         PqAgreed {
             shared,
             digest,
             tag,
         },
-    )))
+    ))
 }
 
-/// Dial-side PQ answer check. `Ok(None)` = classical responder: window
-/// fallback to the X3DH key (plan §5). `Ok(Some)` = verified agreement.
-/// `Err` = fail-closed refusal: explicitly offered PQ that fails shape,
-/// suite, or tag checks, or an answer that arrives with no offer outstanding.
+/// Dial-side PQ answer check. FULL-PQ: an AUTH without PQ fields is REFUSED
+/// (`Err`), never a classical fallback. `Ok` is a fully verified agreement.
 pub fn pq_initiator_answer(
     offer: &Option<PqInitOffer>,
     ch_sign_data: &[u8],
     own_eph: &[u8; 32],
     auth: &proto::Frame,
-) -> Result<Option<PqAgreed>> {
+) -> Result<PqAgreed> {
     let av: serde_json::Value = serde_json::from_slice(&auth.payload)?;
     if av.get("pq_ct").is_none() {
-        return Ok(None);
+        bail!("pq answer required (classical refused)");
     }
     let offer = offer
         .as_ref()
@@ -8487,14 +8418,14 @@ pub fn pq_initiator_answer(
         .and_then(|x| x.as_str())
         .and_then(|s| hex::decode(s).ok())
         .unwrap_or_default();
-    let auth_eph = av
-        .get("eph")
+    let auth_fresh = av
+        .get("fresh")
         .and_then(|x| x.as_str())
         .and_then(|s| hex::decode(s).ok())
         .unwrap_or_default();
     let auth_at = av.get("at").and_then(|x| x.as_i64()).unwrap_or(-1);
     let wellformed =
-        ct.len() == 1088 && tag_raw.len() == 32 && auth_eph.len() == 32 && auth_at >= 0;
+        ct.len() == 1088 && tag_raw.len() == 32 && auth_fresh.len() == 32 && auth_at >= 0;
     let mut tag_ok = false;
     let mut agreed = PqAgreed {
         shared: [0u8; 32],
@@ -8502,16 +8433,16 @@ pub fn pq_initiator_answer(
         tag: [0u8; 32],
     };
     if wellformed && suite_ok {
-        let mut eph_resp = [0u8; 32];
-        eph_resp.copy_from_slice(&auth_eph);
+        let mut fresh_resp = [0u8; 32];
+        fresh_resp.copy_from_slice(&auth_fresh);
         let shared = pq_decapsulate(&offer.dk, &ct)?;
         let t = pq_build_transcript(
             &offer.ek,
             &ct,
             own_eph,
-            &eph_resp,
+            &fresh_resp,
             ch_sign_data,
-            &pq_auth_bind(&eph_resp, auth_at, &auth.src),
+            &pq_auth_bind(&fresh_resp, auth_at, &auth.src),
         );
         let digest = t.digest(
             proto::PQ_TRANSCRIPT_VERSION,
@@ -8534,8 +8465,7 @@ pub fn pq_initiator_answer(
             tag_ok,
         }),
     ) {
-        Ok(proto::PqMode::Pq) => Ok(Some(agreed)),
-        Ok(proto::PqMode::Classical) => Ok(None),
+        Ok(proto::PqMode::Pq) => Ok(agreed),
         Err(e) => bail!("{e}"),
     }
 }
@@ -8755,9 +8685,8 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
     // Fail-closed: ответы find_node/find_value из сети проверяются тем же
     // гейтом, что ensure_dht_peer/dht.update (иначе отравленный ответ
     // привязывал честный node_id к ключу атакующего).
-    // FULL-PQ: wire carries `pq_pub` (Falcon-512, must derive `id`);
-    // `ed_pub` is the frozen auth/TLS pin (NOT identity).
-    let ed_hex = v["ed_pub"].as_str().unwrap_or("").to_string();
+    // FULL-PQ: wire carries `pq_pub` (Falcon-512, must derive `id`); there is
+    // no classical `ed_pub` field.
     let pq_hex = v["pq_pub"].as_str().unwrap_or("").to_string();
     let endpoints: Vec<String> = v["endpoints"]
         .as_array()
@@ -8770,13 +8699,12 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
                 .collect()
         })
         .unwrap_or_default();
-    if !crate::dht::node_info_valid(&id, &ed_hex, &pq_hex, &endpoints) {
+    if !crate::dht::node_info_valid(&id, &pq_hex, &endpoints) {
         return None;
     }
     Some(crate::dht::NodeInfo {
         id,
         endpoints,
-        ed_hex,
         pq_hex,
         last_seen: crate::dht::now_ms(),
     })
@@ -8803,36 +8731,69 @@ async fn wait_session_key(node: &Node, conn: &Connection, max_wait_ms: u64) -> O
     None
 }
 
-fn build_tls(keys: &NodeKeys) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    use pkcs8::EncodePrivateKey;
-    let der = keys
-        .signing
-        .to_pkcs8_der()
-        .map_err(|e| anyhow!("pkcs8: {e}"))?;
-    let der_bytes = der.as_bytes().to_vec();
-    let pkcs8 = PrivatePkcs8KeyDer::from(der_bytes.clone());
-    let kp = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &rcgen::PKCS_ED25519)
+/// Custom X.509 extension carrying the node's Falcon-512 tag over its TLS
+/// SubjectPublicKeyInfo. The tag is what `PinnedVerifier` checks, so the TLS
+/// peer pin is the PQ identity, never an Ed25519 SPKI.
+const INFNODE_PQ_TLS_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 2, 1];
+
+/// Domain separating the Falcon tag over the TLS SPKI from every other tag
+/// this node produces.
+const INFNODE_PQ_TLS_DOMAIN: &[u8] = b"infnode-pq-tls-v1";
+
+fn pq_tls_spki_digest(spki: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(INFNODE_PQ_TLS_DOMAIN);
+    h.update(spki);
+    *h.finalize().as_bytes()
+}
+
+/// Build the QUIC/TLS certificate.
+///
+/// The certificate's own key is an EPHEMERAL Ed25519 key generated per process
+/// — it only provides TLS 1.3 CertificateVerify (proof of possession), and is
+/// NOT the node identity. The node identity is the Falcon-512 key: the cert
+/// carries `pq_falcon_sign(blake3(PQ_TLS_DOMAIN || SPKI))` in a custom
+/// extension, and clients pin that signature against the configured `pq_pub`.
+fn build_tls(pq: &PqKeys) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .map_err(|e| anyhow!("rcgen keypair: {e}"))?;
     let mut params = rcgen::CertificateParams::new(vec![])?;
-    // CN содержит hex публичного ключа ноды — используется для pinning в verifier.
+    // CN is a human-readable hint only; authentication is the PQ tag.
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        format!("infnode-{}", hex::encode(keys.verifying.as_bytes())),
+        format!("infnode-{}", hex::encode(pq.pq_id())),
     );
     params.is_ca = rcgen::IsCa::NoCa;
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(3650);
+    // Falcon-512 tag over the SPKI the peer will see; pinned by the client.
+    let spki = kp.public_key_der();
+    let tag = pq.sign_digest(&pq_tls_spki_digest(&spki));
+    params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+        INFNODE_PQ_TLS_OID,
+        tag,
+    )];
     let cert = params
         .self_signed(&kp)
         .map_err(|e| anyhow!("self_signed: {e}"))?;
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der_bytes));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(kp.serialize_der()));
     Ok((vec![cert_der], key_der))
 }
 
+/// TLS peer verifier pinned to the peer's Falcon-512 identity.
+///
+/// Residual (documented, fail-closed): the certificate signature itself is
+/// Ed25519 (TLS 1.3 needs a signable key); that key is ephemeral and proves
+/// only possession. Authentication comes from the Falcon tag in
+/// [`INFNODE_PQ_TLS_OID`] over the certificate SPKI, verified against the
+/// pinned `pq_pub` — see `verify_server_cert` at this file's `PinnedVerifier`
+/// impl. No Ed25519 SPKI pin remains.
 #[derive(Debug)]
 struct PinnedVerifier {
-    pinned: [u8; 32],
+    /// Pinned Falcon-512 public key; `None` (TOFU peer not yet pinned) refuses
+    /// every certificate — fail closed.
+    pinned_pq: Option<Vec<u8>>,
 }
 
 impl ServerCertVerifier for PinnedVerifier {
@@ -8844,7 +8805,9 @@ impl ServerCertVerifier for PinnedVerifier {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let expected = format!("infnode-{}", hex::encode(self.pinned));
+        let pinned = self.pinned_pq.as_deref().ok_or_else(|| {
+            rustls::Error::General("no pq pin (classical peer refused)".to_string())
+        })?;
         let (_, cert) = parse_x509_certificate(end_entity.as_ref())
             .map_err(|_| rustls::Error::General("bad cert".to_string()))?;
         // Срок действия: раньше `_now` игнорировался — просроченный/ещё не
@@ -8855,24 +8818,33 @@ impl ServerCertVerifier for PinnedVerifier {
         if !cert.validity().is_valid_at(now_asn1) {
             return Err(rustls::Error::General("cert not valid at now".to_string()));
         }
-        // SPKI-pinning: сравниваем СЫРОЙ ключ сертификата с пином. Раньше
-        // проверялся только CN (произвольная строка) — любой мог выпустить
-        // самоподписанный серт с чужим CN и пройти TLS-гейт.
-        let spki = cert.public_key().subject_public_key.data.as_ref();
-        if spki != self.pinned.as_slice() {
+        // PQ pin: the custom extension must carry a Falcon-512 tag over this
+        // cert's SPKI, verifiable with the pinned key. An Ed25519-only cert
+        // (no extension / bad tag) is refused.
+        let sig = cert
+            .extensions()
+            .iter()
+            .find(|e| e.oid.to_id_string() == INFNODE_PQ_TLS_OID_STRING)
+            .map(|e| e.value)
+            .ok_or_else(|| {
+                rustls::Error::General("missing pq tls tag (classical peer refused)".to_string())
+            })?;
+        let digest = pq_tls_spki_digest(cert.public_key().raw);
+        if !proto::pq_falcon_verify(pinned, &digest, sig) {
             return Err(rustls::Error::General(
-                "pinned pubkey mismatch (MITM?)".to_string(),
+                "pq tls tag mismatch (MITM?)".to_string(),
             ));
         }
+        let expected_cn = format!("infnode-{}", hex::encode(proto::pq_id_from_pub(pinned)));
         let cn = cert
             .subject()
             .iter_common_name()
             .next()
             .and_then(|v| v.as_str().ok())
             .ok_or_else(|| rustls::Error::General("no cn".to_string()))?;
-        if cn != expected {
+        if cn != expected_cn {
             return Err(rustls::Error::General(
-                "pinned pubkey mismatch (MITM?)".to_string(),
+                "pq identity cn mismatch (MITM?)".to_string(),
             ));
         }
         cert.verify_signature(None)
@@ -8909,6 +8881,30 @@ impl ServerCertVerifier for PinnedVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// `1.3.6.1.4.1.57264.2.1` (matches [`INFNODE_PQ_TLS_OID`]).
+const INFNODE_PQ_TLS_OID_STRING: &str = "1.3.6.1.4.1.57264.2.1";
+
+/// Build a QUIC client config whose TLS verifier pins `pq_pub`.
+///
+/// `None` => refuse every certificate (fail closed): a peer whose PQ key is
+/// not pinned in config cannot be authenticated, so outbound dials to it fail
+/// until the operator pins `pq-pub`.
+fn build_client_cfg(pq_pub: Option<&[u8]>) -> Result<quinn::ClientConfig> {
+    let rc = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+        pinned_pq: pq_pub.map(|p| p.to_vec()),
+    }))
+    .with_no_client_auth();
+    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rc))?;
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
+    client_cfg.transport_config(Arc::new(transport_config()));
+    Ok(client_cfg)
 }
 
 #[cfg(test)]
@@ -9070,44 +9066,41 @@ mod disk_growth_tests {
         (node, tmp)
     }
 
-    /// `register_dns_candidate`: validated, idempotent, never self, and a
-    /// PQ-less candidate NEVER enters DHT routing (fail-closed there — only
-    /// the dialable peers map; the PQ key is learned post-handshake).
+    /// `register_dns_candidate`: validated, idempotent, never self. The
+    /// candidate's id is DERIVED from the pinned Falcon-512 key (no Ed
+    /// identity); registration does not add it to DHT routing.
     #[tokio::test]
     async fn dns_candidate_registration_is_validated_idempotent_and_never_self() {
         let (node, _tmp) = test_node("dns-cand").await;
-        // Happy: foreign ed + dialable endpoint registers under the
-        // ed-derived map key (TOFU precedent, NOT a NodeId).
-        let ed = [0x51u8; 32];
+        // Happy: foreign PQ key + dialable endpoint registers under its PQ id.
+        let pq = PqKeys::from_seed([0x51u8; 32]);
         let pid = node
-            .register_dns_candidate(&hex::encode(ed), vec!["127.0.0.1:9411".into()])
+            .register_dns_candidate(&pq.pq_pub_hex(), vec!["127.0.0.1:9411".into()])
             .await
             .expect("register");
-        let want = blake3::hash(&ed);
-        assert_eq!(&pid[..], &want.as_bytes()[..crate::proto::NODEID_LEN]);
+        assert_eq!(pid, pq.pq_id());
         assert!(node.peers.read().await.contains_key(&pid));
-        // ...but NOT in DHT routing (no validated PQ pin exists for it).
+        // Not in DHT routing yet (registration only fills the peers map).
         let near = node.routing.read().await.closest(&pid, 1);
         assert!(
             !near.iter().any(|n| n.id == pid),
-            "PQ-less candidate must not enter routing"
+            "candidate is not routed until ensure_dht_peer"
         );
         // Idempotent: re-registration is Ok and adds nothing.
         let n0 = node.peers.read().await.len();
         let pid2 = node
-            .register_dns_candidate(&hex::encode(ed), vec!["127.0.0.1:9412".into()])
+            .register_dns_candidate(&pq.pq_pub_hex(), vec!["127.0.0.1:9412".into()])
             .await
             .expect("re-register");
         assert_eq!(pid, pid2);
         assert_eq!(node.peers.read().await.len(), n0);
-        // Self refused (own ed key — DNS ids are ed-derived, local id is PQ,
-        // so the check compares the key).
-        let self_ed = hex::encode(node.keys.verifying.as_bytes());
+        // Self refused (own PQ key).
+        let self_pq = node.pq.pq_pub_hex();
         assert!(node
-            .register_dns_candidate(&self_ed, vec!["127.0.0.1:9413".into()])
+            .register_dns_candidate(&self_pq, vec!["127.0.0.1:9413".into()])
             .await
             .is_err());
-        // Malformed ed refused (non-hex, wrong length).
+        // Malformed key refused (non-hex, wrong length).
         assert!(node
             .register_dns_candidate("zz", vec!["127.0.0.1:9414".into()])
             .await
@@ -9117,12 +9110,13 @@ mod disk_growth_tests {
             .await
             .is_err());
         // No dialable endpoints refused (empty, unparsable).
+        let other = PqKeys::from_seed([0x52u8; 32]);
         assert!(node
-            .register_dns_candidate(&hex::encode([0x52u8; 32]), vec![])
+            .register_dns_candidate(&other.pq_pub_hex(), vec![])
             .await
             .is_err());
         assert!(node
-            .register_dns_candidate(&hex::encode([0x52u8; 32]), vec!["not-an-endpoint".into()])
+            .register_dns_candidate(&other.pq_pub_hex(), vec!["not-an-endpoint".into()])
             .await
             .is_err());
     }
@@ -9772,10 +9766,10 @@ mod session_heal_tests {
         }
     }
 
-    fn peer_of(name: &str, keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
+    fn peer_of(name: &str, _keys: &NodeKeys, pq: &PqKeys, listen: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
-            ed_pub: hex::encode(keys.verifying.to_bytes()),
+            consensus_pub: None,
             // FULL-PQ: identity is PQ-only (`primary_id` derives the PQ id
             // from the pinned `pq_pub` — existing helper, no new logic).
             pq_pub: Some(pq.pq_pub_hex()),
@@ -10126,12 +10120,11 @@ mod pentest_net_tests {
     #[tokio::test]
     async fn verification_dht_peer_flood_is_bound_per_identity() {
         let (node, tmp) = pentest_node("dynflood").await;
-        let keys = NodeKeys::generate();
+        let _keys = NodeKeys::generate();
         let pq = PqKeys::generate();
         let info = crate::dht::NodeInfo {
             id: pq.pq_id(),
             endpoints: vec!["127.0.0.1:1".to_string()],
-            ed_hex: keys.ed_hex(),
             pq_hex: pq.pq_pub_hex(),
             last_seen: crate::dht::now_ms(),
         };

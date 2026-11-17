@@ -33,8 +33,6 @@
 //!     with a graceful fallback to the STUB when the method is missing.
 
 use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::time::Duration;
 
 use stellereum::orderbook::PAIR_STELL_USDT;
@@ -241,10 +239,24 @@ async fn main() -> Result<()> {
     }
 
     // --- 0. Identities: everything is generated at runtime, nothing is committed.
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng);
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    // FULL-PQ: both keys are Falcon-512; the addresses are scheme-tagged
+    // derivations (`derive_pq_address`), not raw Ed25519 public keys.
+    let master = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(
+        &rand::random::<[u8; 32]>(),
+    );
+    let session = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(
+        &rand::random::<[u8; 32]>(),
+    );
+    let master_pub = stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        master.public_key(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
+    let session_pub = stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        session.public_key(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
     println!("\n[0] identities (fresh keys, generated just now - no secrets on disk)");
     println!(
         "    master  (funds owner, grant signer): {}",
@@ -262,9 +274,10 @@ async fn main() -> Result<()> {
     let max_gas_spend = 5_000_000u64; // tight gas budget: a few orders, then empty
     let max_value_per_tx = 1_000u64; // tight per-tx NATIVE value cap
     let scope = SCOPE_SVM_PAYLOAD; // trade-only, see one-liners below
-    let grant = SessionKeyAuthorization::sign_delegation(
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        session.public_key(),
         valid_until,
         max_gas_spend,
         scope,
@@ -346,7 +359,7 @@ async fn main() -> Result<()> {
     // drip (100 STELL) that funds this demo on a live node.
     let order_price = 1_000_000u64;
     let order_amount = 10u64;
-    let bot_tx = Transaction::sign_with_session(
+    let bot_tx = Transaction::sign_with_session_falcon512(
         &session, // <-- the bot signs with ITS key; the master key is untouched
         grant.clone(),
         master_pub, // `to` is unused for order payloads; master keeps custody
@@ -454,8 +467,11 @@ async fn main() -> Result<()> {
     // --- d. Master revokes; bot's next attempt MUST fail.
     println!("\n[d] master revokes the grant ON CHAIN (a master-signed tx - a session key can NEVER revoke).");
     println!("    WHY on-chain + master-only: revocation must be visible to every node and unforgeable by the bot itself.");
-    let revoke_tx = Transaction::sign_with_payload(
-        &master, // <-- master key signs: proves the delegator kills its own grant
+    // FULL-PQ: the revoke is a master-signed Falcon PQ1 transaction.
+    let mut revoke_tx = Transaction::new_pq_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        master.public_key().to_vec(),
+        vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
         master_pub,
         0,
         stellereum::svm::GAS_BASIC_TRANSFER + GAS_SESSION_REVOKE,
@@ -465,7 +481,15 @@ async fn main() -> Result<()> {
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: session_pub,
         }],
+        &stellereum::post_quantum::DEFAULT_SALT,
     );
+    let revoke_msg = revoke_tx.signing_message();
+    revoke_tx.signature = stellereum::post_quantum::PqSignatureEnvelope::new_explicit(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        master.public_key().to_vec(),
+        master.sign(&revoke_msg),
+    )
+    .encode();
     if dry_run {
         println!("    (dry-run: NOT submitted. It would set revoked=true terminally - no un-revoke exists.)");
     } else if live {
@@ -478,7 +502,7 @@ async fn main() -> Result<()> {
             "revoke must be included on the live node"
         );
         println!("    revoke mined. Bot retries with the SAME grant ...");
-        let retry = Transaction::sign_with_session(
+        let retry = Transaction::sign_with_session_falcon512(
             &session,
             grant.clone(),
             master_pub,
@@ -546,7 +570,7 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow!("revoke apply failed: {e}"))?;
         println!("    revoke applied. Registry now reports revoked=true (terminal - nothing ever sets it back).");
         println!("    Bot retries with the SAME grant (stolen-key scenario) ...");
-        let retry = Transaction::sign_with_session(
+        let retry = Transaction::sign_with_session_falcon512(
             &session,
             grant.clone(),
             master_pub,

@@ -160,8 +160,9 @@ fn pq_envelope_sizes_by_scheme() {
     // Falcon canonical sizes, pinned read-only (post_quantum.rs:109/115).
     assert_eq!(PqScheme::Falcon512.pubkey_size(), 897);
     assert_eq!(PqScheme::Falcon512.signature_size(), 666);
-    assert_eq!(PqScheme::Hybrid.pubkey_size(), 929);
-    assert_eq!(PqScheme::Hybrid.signature_size(), 730);
+    // FULL-PQ: the other enum value is the fail-closed ML-DSA-44 tag.
+    assert_eq!(PqScheme::MlDsa44.pubkey_size(), 1312);
+    assert_eq!(PqScheme::MlDsa44.signature_size(), 2420);
 
     // Ed25519 legacy: bare 64-byte signature, no PQ1 envelope.
     let ed_tx = Transaction::sign(&det_ed_key(1), RECIPIENT, 1, GAS_BASIC_TRANSFER, 0, 1, 1);
@@ -206,24 +207,16 @@ fn pq_envelope_sizes_by_scheme() {
         "envelope must roundtrip"
     );
 
-    // Hybrid explicit: ed sig || falcon sig over the same message.
-    let hed_sk = det_ed_key(71_001);
-    let hkp = FalconKeypair::generate_from_seed_bytes(&pq_seed(71_002));
-    let hybrid_pk = [
-        hed_sk.verifying_key().to_bytes().as_slice(),
-        hkp.public_key.as_slice(),
-    ]
-    .concat();
-    assert_eq!(hybrid_pk.len(), 929);
-    let hfrom = derive_pq_address(PqScheme::Hybrid, &hybrid_pk, &DEFAULT_SALT);
-    let hmsg = skeleton_tx(hfrom).signing_message();
-    let mut hybrid_sig = hed_sk.sign(&hmsg).to_bytes().to_vec();
-    hybrid_sig.extend_from_slice(&hkp.sign_with_seed(&hmsg, &pq_seed(71_003)));
-    assert_eq!(hybrid_sig.len(), 730);
-    let hybrid_exp_tx = Transaction::new_pq_explicit(
-        PqScheme::Hybrid,
-        hybrid_pk,
-        hybrid_sig,
+    // ML-DSA-44 (0x03): canonical sizes are committed, but there is NO
+    // verifier, so an explicit envelope must never verify (fail-closed).
+    // The old Hybrid explicit/implicit size block is replaced by this
+    // refusal: 0x04 is removed and 0x01 is refused by `from_id`.
+    let mldsa_pk = vec![0x77u8; PqScheme::MlDsa44.pubkey_size()];
+    let mldsa_sig = vec![0x22u8; PqScheme::MlDsa44.signature_size()];
+    let mldsa_tx = Transaction::new_pq_explicit(
+        PqScheme::MlDsa44,
+        mldsa_pk,
+        mldsa_sig,
         RECIPIENT,
         1,
         PQ_GAS,
@@ -234,26 +227,26 @@ fn pq_envelope_sizes_by_scheme() {
         &DEFAULT_SALT,
     );
     assert!(
-        hybrid_exp_tx.verify_signature(),
-        "Hybrid fixture must verify"
+        !mldsa_tx.verify_signature(),
+        "0x03 has no verifier: it must NEVER verify"
     );
-    let hybrid_exp_len = hybrid_exp_tx.signature.len();
-    let hybrid_exp_formula = 3 + 1 + 1 + 2 + 929 + 16 + 2 + 730;
-    assert_eq!(hybrid_exp_len, hybrid_exp_formula);
+    let mldsa_exp_len = mldsa_tx.signature.len();
+    let mldsa_exp_formula = 3 + 1 + 1 + 2 + 1312 + 16 + 2 + 2420;
+    assert_eq!(mldsa_exp_len, mldsa_exp_formula);
 
-    // Hybrid implicit: formula only (no registry roundtrip needed for a size).
-    let hybrid_imp_formula = 3 + 1 + 1 + 2 + 2 + 730;
+    // Removed classical scheme ids are refused loudly, never decoded.
+    assert!(PqScheme::from_id(1).is_err(), "Ed25519 (0x01) removed");
+    assert!(PqScheme::from_id(4).is_err(), "Hybrid (0x04) removed");
 
     println!("scheme              | sig-wire bytes");
     println!("Ed25519 legacy      | {ed_sig_len:>14}");
     println!("Falcon-512 implicit | {falcon_imp_len:>14}");
     println!("Falcon-512 explicit | {falcon_exp_len:>14}");
-    println!("Hybrid implicit     | {hybrid_imp_formula:>14} (formula, key omitted)");
-    println!("Hybrid explicit     | {hybrid_exp_len:>14}");
+    println!("ML-DSA-44 explicit  | {mldsa_exp_len:>14} (refused at verify)");
     println!(
-        "explicit overhead vs legacy: Falcon +{} B, Hybrid +{} B",
+        "explicit overhead vs legacy: Falcon +{} B, ML-DSA-44 +{} B",
         falcon_exp_len - ed_sig_len,
-        hybrid_exp_len - ed_sig_len
+        mldsa_exp_len - ed_sig_len
     );
 }
 

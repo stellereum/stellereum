@@ -1,19 +1,14 @@
 //! Tests for SVM OpCode 46 (`SysCallVerifyPqSignature`).
 //!
-//! Verifies post-quantum, classic, and hybrid signature verification:
-//! - Ed25519 (0x01)
-//! - Falcon-512 (0x02)
-//! - ML-DSA-44 (0x03)
-//! - Hybrid dual-signature (0x04)
-//! - Unknown scheme IDs fail safely (push 0 to stack)
+//! Verifies post-quantum signature verification:
+//! - Falcon-512 (0x02): the only live scheme
+//! - ML-DSA-44 (0x03): fail-closed, no verifier (push 0)
+//! - Removed classical ids 0x01 (Ed25519) / 0x04 (Hybrid) and unknown IDs
+//!   fail safely (push 0 to stack)
 //! - Gas metering (base 1500 + per-byte charges)
 //! - Out-of-gas behavior
 
-use ed25519_dalek::Signer;
-use stellereum::post_quantum::{
-    PqScheme, ED25519_SIG_LEN, HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN, MLDSA44_PUBKEY_LEN,
-    MLDSA44_SIG_LEN,
-};
+use stellereum::post_quantum::{PqScheme, MLDSA44_PUBKEY_LEN, MLDSA44_SIG_LEN};
 use stellereum::staking::{DEFAULT_COMMISSION_BPS, MIN_VALIDATOR_BOND};
 use stellereum::svm::{
     opcode_gas, pq_verify_gas, OpCode, Svm, VmContext, VmExecutionResult, GAS_PQ_VERIFY_BASE,
@@ -42,13 +37,6 @@ fn mk_ctx(balance: u64) -> VmContext<'static> {
         payouts: Vec::new(),
         oracle: None,
     }
-}
-
-fn sample_ed25519(seed: u8, msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-    let pk = sk.verifying_key().to_bytes().to_vec();
-    let sig = sk.sign(msg).to_bytes().to_vec();
-    (pk, sig)
 }
 
 fn sample_falcon512(seed: u8, msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -87,69 +75,23 @@ fn sample_mldsa44(seed: u8, msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (pk, sig)
 }
 
-fn sample_hybrid(seed: u8, msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let (ed_pk, ed_sig) = sample_ed25519(seed, msg);
-    let (falcon_pk, falcon_sig) = sample_falcon512(seed, msg);
-    let mut pk = Vec::with_capacity(HYBRID_PUBKEY_LEN);
-    pk.extend_from_slice(&ed_pk);
-    pk.extend_from_slice(&falcon_pk);
-    let mut sig = Vec::with_capacity(HYBRID_SIG_LEN);
-    sig.extend_from_slice(&ed_sig);
-    sig.extend_from_slice(&falcon_sig);
-    (pk, sig)
-}
-
 #[test]
-fn opcode46_ed25519_execution() {
+fn opcode46_classical_scheme_id_refused() {
+    // FULL-PQ: scheme id 0x01 (Ed25519) is REMOVED; `PqScheme::from_id(1)`
+    // refuses it, so OpCode 46 pushes 0 (never a classical verification).
+    // This inverts the old "valid Ed25519 signature pushes 1" assertion.
     let msg = b"SVM Ed25519 Signature Verification";
-    let (pk, sig) = sample_ed25519(42, msg);
-
-    // Valid signature -> pushes 1
-    let op_valid = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
-        pubkey: pk.clone(),
+    let op = OpCode::SysCallVerifyPqSignature {
+        scheme_id: 1,
+        pubkey: vec![0x11u8; 32],
         message: msg.to_vec(),
-        signature: sig.clone(),
+        signature: vec![0x22u8; 64],
     };
     let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_valid], 100_000, &mut ctx);
+    let res = Svm::execute(&[op], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(1), "valid Ed25519 signature must push 1");
-        }
-        other => panic!("expected Success, got {other:?}"),
-    }
-
-    // Tampered message -> pushes 0
-    let op_bad_msg = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
-        pubkey: pk.clone(),
-        message: b"Forged message".to_vec(),
-        signature: sig.clone(),
-    };
-    let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_bad_msg], 100_000, &mut ctx);
-    match res {
-        VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered message must push 0");
-        }
-        other => panic!("expected Success, got {other:?}"),
-    }
-
-    // Tampered signature -> pushes 0
-    let mut bad_sig = sig;
-    bad_sig[0] ^= 0xFF;
-    let op_bad_sig = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
-        pubkey: pk,
-        message: msg.to_vec(),
-        signature: bad_sig,
-    };
-    let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_bad_sig], 100_000, &mut ctx);
-    match res {
-        VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered signature must push 0");
+            assert_eq!(return_value, Some(0), "removed 0x01 must push 0");
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -251,66 +193,28 @@ fn opcode46_mldsa44_execution() {
 }
 
 #[test]
-fn opcode46_hybrid_execution() {
+fn opcode46_hybrid_scheme_id_refused() {
+    // FULL-PQ: scheme id 0x04 (Hybrid) is REMOVED; even hybrid-shaped
+    // material (32-byte classical prefix + Falcon half) must push 0 because
+    // the scheme id cannot resolve.
     let msg = b"SVM Hybrid Signature Verification";
-    let (pk, sig) = sample_hybrid(0x99, msg);
+    let (falcon_pk, falcon_sig) = sample_falcon512(0x99, msg);
+    let mut pk = vec![0x11u8; 32];
+    pk.extend_from_slice(&falcon_pk);
+    let mut sig = vec![0x22u8; 64];
+    sig.extend_from_slice(&falcon_sig);
 
-    // Valid Hybrid -> pushes 1
-    let op_valid = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Hybrid.id(),
-        pubkey: pk.clone(),
-        message: msg.to_vec(),
-        signature: sig.clone(),
-    };
-    let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_valid], 100_000, &mut ctx);
-    match res {
-        VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(1), "valid Hybrid signature must push 1");
-        }
-        other => panic!("expected Success, got {other:?}"),
-    }
-
-    // Tampering Ed25519 half -> pushes 0
-    let mut bad_ed = sig.clone();
-    bad_ed[0] ^= 0xFF;
-    let op_bad_ed = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Hybrid.id(),
-        pubkey: pk.clone(),
-        message: msg.to_vec(),
-        signature: bad_ed,
-    };
-    let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_bad_ed], 100_000, &mut ctx);
-    match res {
-        VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(
-                return_value,
-                Some(0),
-                "tampered Ed25519 portion of hybrid must push 0"
-            );
-        }
-        other => panic!("expected Success, got {other:?}"),
-    }
-
-    // Tampering Falcon half -> pushes 0
-    let mut bad_falcon = sig;
-    bad_falcon[ED25519_SIG_LEN] ^= 0xFF;
-    let op_bad_falcon = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Hybrid.id(),
+    let op = OpCode::SysCallVerifyPqSignature {
+        scheme_id: 4,
         pubkey: pk,
         message: msg.to_vec(),
-        signature: bad_falcon,
+        signature: sig,
     };
     let mut ctx = mk_ctx(10_000);
-    let res = Svm::execute(&[op_bad_falcon], 100_000, &mut ctx);
+    let res = Svm::execute(&[op], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(
-                return_value,
-                Some(0),
-                "tampered Falcon portion of hybrid must push 0"
-            );
+            assert_eq!(return_value, Some(0), "removed 0x04 must push 0");
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -339,16 +243,16 @@ fn opcode46_gas_metering_and_schedule_shape() {
     let msg_short = b"short";
     let msg_long =
         b"this is a much longer message to verify per-byte gas metering in SVM opcode 46";
-    let (pk, sig) = sample_ed25519(1, msg_short);
+    let (pk, sig) = sample_falcon512(1, msg_short);
 
     let op_short = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
+        scheme_id: PqScheme::Falcon512.id(),
         pubkey: pk.clone(),
         message: msg_short.to_vec(),
         signature: sig.clone(),
     };
     let op_long = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
+        scheme_id: PqScheme::Falcon512.id(),
         pubkey: pk.clone(),
         message: msg_long.to_vec(),
         signature: sig.clone(),
@@ -391,10 +295,10 @@ fn opcode46_gas_metering_and_schedule_shape() {
 #[test]
 fn opcode46_out_of_gas_behavior() {
     let msg = b"Testing Out-Of-Gas Behavior for OpCode 46";
-    let (pk, sig) = sample_ed25519(1, msg);
+    let (pk, sig) = sample_falcon512(1, msg);
 
     let op = OpCode::SysCallVerifyPqSignature {
-        scheme_id: PqScheme::Ed25519.id(),
+        scheme_id: PqScheme::Falcon512.id(),
         pubkey: pk.clone(),
         message: msg.to_vec(),
         signature: sig.clone(),
@@ -437,16 +341,16 @@ fn opcode46_out_of_gas_behavior() {
 #[test]
 fn opcode46_multi_scheme_sequence() {
     let msg = b"Multi-Scheme Sequence";
-    let (ed_pk, ed_sig) = sample_ed25519(1, msg);
     let (fal_pk, fal_sig) = sample_falcon512(2, msg);
     let (ml_pk, ml_sig) = sample_mldsa44(3, msg);
 
     let prog = vec![
         OpCode::SysCallVerifyPqSignature {
-            scheme_id: PqScheme::Ed25519.id(),
-            pubkey: ed_pk,
+            // Removed 0x01: refused (pushes 0), still gas-metered.
+            scheme_id: 1,
+            pubkey: vec![0x11u8; 32],
             message: msg.to_vec(),
-            signature: ed_sig,
+            signature: vec![0x22u8; 64],
         },
         OpCode::SysCallVerifyPqSignature {
             scheme_id: PqScheme::Falcon512.id(),

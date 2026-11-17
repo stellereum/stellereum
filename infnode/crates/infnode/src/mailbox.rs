@@ -5,11 +5,11 @@
 //! recipient's long-term KEM key + XChaCha20-Poly1305 of the plaintext.
 //! Old `x:` (X25519) key files are refused (wipe, no compat).
 
-use crate::keyring::{protect, secure_dir, unprotect, write_private};
+use crate::keyring::{protect, secure_dir, unprotect, write_private, PqKeys};
+use crate::proto::{pq_falcon_verify, PQ_FALCON_SIG_LEN};
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use zeroize::Zeroize;
 
@@ -20,12 +20,14 @@ pub const KEM_CT_LEN: usize = 1088;
 /// ML-KEM seed (`d || z`) length.
 pub const KEM_SEED_LEN: usize = 64;
 
-/// Пара ящика: ML-KEM-768 (E2E) + Ed25519 (подпись отправителя/владельца).
+/// Пара ящика: ML-KEM-768 (E2E) + Falcon-512 (подпись отправителя/владельца).
+/// FULL-PQ: the mailbox signing identity is Falcon-512 (same PQ lineage as
+/// the node identity); legacy `ed:` (Ed25519) records are refused.
 pub struct MailKeys {
     pub kem_seed: [u8; KEM_SEED_LEN],
     pub kem_ek: Vec<u8>,
-    pub ed_sig: SigningKey,
-    pub ed_ver: VerifyingKey,
+    /// Falcon-512 mailbox signing identity (seed-backed, like `PqKeys`).
+    pub sig: PqKeys,
 }
 
 impl MailKeys {
@@ -33,28 +35,26 @@ impl MailKeys {
         let mut kem_seed = [0u8; KEM_SEED_LEN];
         rand::rngs::OsRng.fill_bytes(&mut kem_seed);
         let kem_ek = kem_ek_from_seed(&kem_seed);
-        let ed_sig = SigningKey::generate(&mut rand::rngs::OsRng);
-        let ed_ver = ed_sig.verifying_key();
+        let sig = PqKeys::generate();
         Self {
             kem_seed,
             kem_ek,
-            ed_sig,
-            ed_ver,
+            sig,
         }
     }
 
     pub fn save(&self, dir: &std::path::Path, email: &str) -> Result<()> {
         secure_dir(dir)?;
         let mut kem_hex = hex::encode(self.kem_seed);
-        let mut ed_hex = hex::encode(self.ed_sig.to_bytes());
-        let mut contents = format!("kem:{}\ned:{}", kem_hex, ed_hex);
+        let mut sig_hex = self.sig.seed_hex();
+        let mut contents = format!("kem:{}\npqsig:{}", kem_hex, sig_hex);
         // Шифруем (если задана INFNODE_KEY_PASSPHRASE) и пишем с правами 0600.
         write_private(
             &dir.join(format!("{email}.key")),
             &protect(contents.as_bytes()),
         )?;
         kem_hex.zeroize();
-        ed_hex.zeroize();
+        sig_hex.zeroize();
         contents.zeroize();
         Ok(())
     }
@@ -86,15 +86,18 @@ impl MailKeys {
         let raw = std::fs::read_to_string(dir.join(format!("{email}.key")))?;
         let mut plain = unprotect(raw.trim())?;
         let mut kem_hex = None;
-        let mut ed_hex = None;
+        let mut sig_hex = None;
         for line in plain.lines() {
             if let Some(v) = line.strip_prefix("kem:") {
                 kem_hex = Some(v.to_string());
-            } else if let Some(v) = line.strip_prefix("ed:") {
-                ed_hex = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("pqsig:") {
+                sig_hex = Some(v.to_string());
             } else if line.strip_prefix("x:").is_some() {
                 plain.zeroize();
                 bail!("legacy x25519 mailbox key refused (FULL-PQ wipe: re-register mailbox)");
+            } else if line.strip_prefix("ed:").is_some() {
+                plain.zeroize();
+                bail!("legacy Ed25519 mailbox key refused (FULL-PQ wipe: re-register mailbox)");
             }
         }
         let kem_bytes = hex::decode(
@@ -103,19 +106,20 @@ impl MailKeys {
                 .trim(),
         )?;
         let kb: [u8; KEM_SEED_LEN] = kem_bytes.try_into().map_err(|_| anyhow!("kem seed 64"))?;
-        let eb: [u8; 32] =
-            hex::decode(ed_hex.ok_or_else(|| anyhow!("ed seed отсутствует"))?.trim())?
-                .try_into()
-                .map_err(|_| anyhow!("ed seed 32"))?;
+        let sb: [u8; 32] = hex::decode(
+            sig_hex
+                .ok_or_else(|| anyhow!("pqsig seed отсутствует"))?
+                .trim(),
+        )?
+        .try_into()
+        .map_err(|_| anyhow!("pqsig seed 32"))?;
         plain.zeroize();
         let kem_ek = kem_ek_from_seed(&kb);
-        let ed_sig = SigningKey::from_bytes(&eb);
-        let ed_ver = ed_sig.verifying_key();
+        let sig = PqKeys::from_seed(sb);
         Ok(Self {
             kem_seed: kb,
             kem_ek,
-            ed_sig,
-            ed_ver,
+            sig,
         })
     }
 
@@ -124,21 +128,22 @@ impl MailKeys {
         hex::encode(&self.kem_ek)
     }
 
-    pub fn ed_hex(&self) -> String {
-        hex::encode(self.ed_ver.as_bytes())
+    /// Hex of the Falcon-512 mailbox signing key (897 bytes).
+    pub fn sig_pub_hex(&self) -> String {
+        self.sig.pq_pub_hex()
     }
 
-    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        self.ed_sig.sign(msg).to_bytes()
+    /// Falcon-512 tag over `blake3(msg)` with the mailbox key.
+    pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        self.sig.sign_digest(blake3::hash(msg).as_bytes())
     }
 
-    pub fn verify(ed_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-        VerifyingKey::from_bytes(ed_pub)
-            .map(|k| {
-                k.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig))
-                    .is_ok()
-            })
-            .unwrap_or(false)
+    /// Fail-closed Falcon-512 verification of a mailbox message.
+    pub fn verify(pq_pub: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+        if sig.len() != PQ_FALCON_SIG_LEN {
+            return false;
+        }
+        pq_falcon_verify(pq_pub, blake3::hash(msg).as_bytes(), sig)
     }
 }
 

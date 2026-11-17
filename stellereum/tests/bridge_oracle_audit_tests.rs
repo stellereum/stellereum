@@ -25,7 +25,8 @@ use stellereum::bridge::{
 };
 use stellereum::consensus::register_validator_pq_key;
 use stellereum::oracle::{
-    OracleSafetyEngine, OracleState, PriceFeedUpdate, STALE_PRICE_MAX_SECS as ORACLE_STALE_MAX,
+    pq_publisher_binding, OracleSafetyEngine, OracleState, PqPriceFeedUpdate,
+    STALE_PRICE_MAX_SECS as ORACLE_STALE_MAX,
 };
 use stellereum::orderbook::PAIR_STELL_USDT;
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
@@ -48,6 +49,16 @@ fn sign_msg(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
 /// `register_falcon` — outsiders stay unregistered and refuse fail-closed.
 fn falcon_for(sk: &SigningKey) -> FalconKeypair {
     FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+/// FULL-PQ feed publisher: the Falcon key is the publisher, and its 32-byte
+/// binding is what the committed/trusted publisher set holds.
+fn pq_feed(asset: &str, price: u64, ts: u64, kp: &FalconKeypair) -> PqPriceFeedUpdate {
+    PqPriceFeedUpdate::sign(asset, price, ts, kp)
+}
+
+fn pq_publisher(kp: &FalconKeypair) -> [u8; 32] {
+    pq_publisher_binding(&kp.public_key)
 }
 
 fn register_falcon(sk: &SigningKey) {
@@ -195,26 +206,26 @@ fn replayed_attestation_refused_engine_and_plan() {
 
 #[test]
 fn replayed_stale_oracle_feed_refused() {
-    let sk = gen_key();
+    let sk = FalconKeypair::generate_from_seed(0x31);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&sk)));
+    assert!(st.register_pq_publisher(&sk.public_key));
 
     let t0 = 1_000u64;
-    let fresh = PriceFeedUpdate::sign("STELL", 1_000_000, t0, &sk);
-    assert!(st.commit_feed(&fresh, t0).is_ok());
+    let fresh = pq_feed("STELL", 1_000_000, t0, &sk);
+    assert!(st.commit_feed_pq(&fresh, t0).is_ok());
 
     // Older timestamp for the same asset: refused even though still inside
     // the 15-minute freshness window.
-    let stale = PriceFeedUpdate::sign("STELL", 1_000_000, t0 - 10, &sk);
+    let stale = pq_feed("STELL", 1_000_000, t0 - 10, &sk);
     let err = st
-        .commit_feed(&stale, t0)
+        .commit_feed_pq(&stale, t0)
         .expect_err("older feed must be refused");
     assert!(err.contains("non-monotonic"), "unexpected error: {err}");
 
     // Equal timestamp: also refused (must strictly exceed).
-    let same = PriceFeedUpdate::sign("STELL", 1_000_000, t0, &sk);
+    let same = pq_feed("STELL", 1_000_000, t0, &sk);
     assert!(
-        st.commit_feed(&same, t0 + 1).is_err(),
+        st.commit_feed_pq(&same, t0 + 1).is_err(),
         "equal timestamp must be refused"
     );
 
@@ -229,16 +240,16 @@ fn replayed_stale_oracle_feed_refused() {
 
 #[test]
 fn unauthorized_publisher_refused_no_state_change() {
-    let admitted = gen_key();
-    let rogue = gen_key();
+    let admitted = FalconKeypair::generate_from_seed(0x41);
+    let rogue = FalconKeypair::generate_from_seed(0x42);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&admitted)));
+    assert!(st.register_pq_publisher(&admitted.public_key));
 
-    let feed = PriceFeedUpdate::sign("STELL", 2_000_000, 5_000, &rogue);
+    let feed = pq_feed("STELL", 2_000_000, 5_000, &rogue);
     assert!(feed.verify(), "rogue feed is self-consistently signed");
     let before = st.clone();
     let err = st
-        .commit_feed(&feed, 5_000)
+        .commit_feed_pq(&feed, 5_000)
         .expect_err("unknown publisher must be refused");
     assert!(
         err.contains("not in the committed set"),
@@ -248,27 +259,27 @@ fn unauthorized_publisher_refused_no_state_change() {
     assert!(!st.breaker_tripped);
 
     // Control: the admitted publisher's feed commits.
-    let good = PriceFeedUpdate::sign("STELL", 2_000_000, 5_000, &admitted);
-    assert!(st.commit_feed(&good, 5_000).is_ok());
+    let good = pq_feed("STELL", 2_000_000, 5_000, &admitted);
+    assert!(st.commit_feed_pq(&good, 5_000).is_ok());
 }
 
 #[test]
 fn removed_publisher_cannot_publish() {
-    let sk = gen_key();
+    let sk = FalconKeypair::generate_from_seed(0x43);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&sk)));
-    assert!(st.unregister_publisher(pub_of(&sk)));
+    assert!(st.register_pq_publisher(&sk.public_key));
+    assert!(st.unregister_pq_publisher(&sk.public_key));
 
     // History stays (committed feeds are never un-observed)...
-    let feed = PriceFeedUpdate::sign("STELL", 3_000_000, 6_000, &sk);
+    let feed = pq_feed("STELL", 3_000_000, 6_000, &sk);
     assert!(
-        st.commit_feed(&feed, 6_000).is_err(),
+        st.commit_feed_pq(&feed, 6_000).is_err(),
         "removed publisher must not commit new feeds"
     );
     // ...and re-registering is observable, not silent.
-    assert!(st.register_publisher(pub_of(&sk)));
+    assert!(st.register_pq_publisher(&sk.public_key));
     assert!(
-        !st.register_publisher(pub_of(&sk)),
+        !st.register_pq_publisher(&sk.public_key),
         "repeat register is a no-op"
     );
 }
@@ -280,21 +291,21 @@ fn removed_publisher_cannot_publish() {
 #[test]
 fn frozen_feed_staleness_gate_fires() {
     assert_eq!(ORACLE_STALE_MAX, stellereum::oracle::STALE_PRICE_MAX_SECS);
-    let sk = gen_key();
+    let sk = FalconKeypair::generate_from_seed(0x44);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&sk)));
+    assert!(st.register_pq_publisher(&sk.public_key));
     let now = 100_000u64;
 
     // 16 minutes old at commit time: refused.
-    let frozen = PriceFeedUpdate::sign("STELL", 1_000_000, now - ORACLE_STALE_MAX - 60, &sk);
+    let frozen = pq_feed("STELL", 1_000_000, now - ORACLE_STALE_MAX - 60, &sk);
     assert!(
-        st.commit_feed(&frozen, now).is_err(),
+        st.commit_feed_pq(&frozen, now).is_err(),
         "frozen feed must trip the staleness gate"
     );
     // From the future: refused.
-    let future = PriceFeedUpdate::sign("STELL", 1_000_000, now + 1, &sk);
+    let future = pq_feed("STELL", 1_000_000, now + 1, &sk);
     assert!(
-        st.commit_feed(&future, now).is_err(),
+        st.commit_feed_pq(&future, now).is_err(),
         "future-dated feed must be refused"
     );
     assert!(!st.feeds.contains_key("STELL"));
@@ -307,20 +318,20 @@ fn frozen_feed_staleness_gate_fires() {
 
 #[test]
 fn absurd_price_jump_trips_breaker() {
-    let a = gen_key();
-    let b = gen_key();
+    let a = FalconKeypair::generate_from_seed(0x45);
+    let b = FalconKeypair::generate_from_seed(0x46);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&a)));
-    assert!(st.register_publisher(pub_of(&b)));
+    assert!(st.register_pq_publisher(&a.public_key));
+    assert!(st.register_pq_publisher(&b.public_key));
     let t = 50_000u64;
     assert!(st
-        .commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t, &a), t)
+        .commit_feed_pq(&pq_feed("STELL", 1_000_000, t, &a), t)
         .is_ok());
 
     // +6% from the SAME key: refused WITHOUT latching (per-publisher cap 5%).
-    let drift = PriceFeedUpdate::sign("STELL", 1_060_000, t + 1, &a);
+    let drift = pq_feed("STELL", 1_060_000, t + 1, &a);
     let err = st
-        .commit_feed(&drift, t + 1)
+        .commit_feed_pq(&drift, t + 1)
         .expect_err("same-key drift must refuse");
     assert!(
         err.contains("same-publisher drift"),
@@ -329,13 +340,13 @@ fn absurd_price_jump_trips_breaker() {
     assert!(!st.breaker_tripped, "per-publisher refusal must not latch");
 
     // +6% from a DIFFERENT key: admitted (full 10% rule for rotation).
-    let rotated = PriceFeedUpdate::sign("STELL", 1_060_000, t + 1, &b);
-    assert!(st.commit_feed(&rotated, t + 1).is_ok());
+    let rotated = pq_feed("STELL", 1_060_000, t + 1, &b);
+    assert!(st.commit_feed_pq(&rotated, t + 1).is_ok());
 
     // +20% single step (any key): breaker latches, nothing commits.
-    let spike = PriceFeedUpdate::sign("STELL", 1_272_000, t + 2, &b);
+    let spike = pq_feed("STELL", 1_272_000, t + 2, &b);
     let err = st
-        .commit_feed(&spike, t + 2)
+        .commit_feed_pq(&spike, t + 2)
         .expect_err("+20% must trip breaker");
     assert!(
         err.contains("circuit breaker tripped"),
@@ -348,18 +359,18 @@ fn absurd_price_jump_trips_breaker() {
         "spike must not commit"
     );
     // Latched: everything after refuses.
-    let after = PriceFeedUpdate::sign("STELL", 1_060_000, t + 3, &b);
-    assert!(st.commit_feed(&after, t + 3).is_err());
+    let after = pq_feed("STELL", 1_060_000, t + 3, &b);
+    assert!(st.commit_feed_pq(&after, t + 3).is_err());
 }
 
 #[test]
 fn read_path_absurd_jump_trips_breaker_against_twap() {
-    let sk = gen_key();
-    let mut engine = OracleSafetyEngine::new(vec![pub_of(&sk)]);
+    let sk = FalconKeypair::generate_from_seed(0x47);
+    let mut engine = OracleSafetyEngine::new(vec![pq_publisher(&sk)]);
     engine.set_dex_twap("TON", 5_000_000);
     let now = 10_000u64;
-    let spike = PriceFeedUpdate::sign("TON", 5_750_000, now, &sk); // +15%
-    assert!(engine.resolve_price(Some(&spike), "TON", now).is_err());
+    let spike = pq_feed("TON", 5_750_000, now, &sk); // +15%
+    assert!(engine.resolve_price_pq(Some(&spike), "TON", now).is_err());
     assert!(engine.circuit_breaker_triggered);
 }
 
@@ -369,15 +380,15 @@ fn read_path_absurd_jump_trips_breaker_against_twap() {
 
 #[test]
 fn read_path_rejects_cross_asset_feed() {
-    let sk = gen_key();
-    let mut engine = OracleSafetyEngine::new(vec![pub_of(&sk)]);
+    let sk = FalconKeypair::generate_from_seed(0x48);
+    let mut engine = OracleSafetyEngine::new(vec![pq_publisher(&sk)]);
     engine.set_dex_twap("STELL", 5_000_000);
     let now = 20_000u64;
 
     // Correctly signed, fresh, trusted — but for BTC, priced as STELL.
-    let cross = PriceFeedUpdate::sign("BTC", 99_000_000, now, &sk);
+    let cross = pq_feed("BTC", 99_000_000, now, &sk);
     let price = engine
-        .resolve_price(Some(&cross), "STELL", now)
+        .resolve_price_pq(Some(&cross), "STELL", now)
         .expect("cross-asset feed must be ignored, TWAP used");
     assert_eq!(
         price, 5_000_000,
@@ -395,22 +406,22 @@ fn read_path_rejects_cross_asset_feed() {
 
 #[test]
 fn read_path_rejects_zero_price_feed() {
-    let sk = gen_key();
-    let mut engine = OracleSafetyEngine::new(vec![pub_of(&sk)]);
+    let sk = FalconKeypair::generate_from_seed(0x49);
+    let mut engine = OracleSafetyEngine::new(vec![pq_publisher(&sk)]);
     let now = 30_000u64;
 
     // No TWAP fallback: a zero price must be an error, never a committed 0.
-    let zero = PriceFeedUpdate::sign("STELL", 0, now, &sk);
+    let zero = pq_feed("STELL", 0, now, &sk);
     assert!(
-        engine.resolve_price(Some(&zero), "STELL", now).is_err(),
+        engine.resolve_price_pq(Some(&zero), "STELL", now).is_err(),
         "zero price must not resolve"
     );
     assert!(!engine.circuit_breaker_triggered);
 
     // Commit path already refuses zero; pin the parity.
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&sk)));
-    assert!(st.commit_feed(&zero, now).is_err());
+    assert!(st.register_pq_publisher(&sk.public_key));
+    assert!(st.commit_feed_pq(&zero, now).is_err());
 }
 
 // ============================================================================
@@ -419,12 +430,12 @@ fn read_path_rejects_zero_price_feed() {
 
 #[test]
 fn frozen_committed_feed_refuses_orders_via_fresh_gate() {
-    let sk = gen_key();
+    let sk = FalconKeypair::generate_from_seed(0x4A);
     let mut st = OracleState::default();
-    assert!(st.register_publisher(pub_of(&sk)));
+    assert!(st.register_pq_publisher(&sk.public_key));
     let t0 = 40_000u64;
     assert!(st
-        .commit_feed(&PriceFeedUpdate::sign("STELL", 1_000_000, t0, &sk), t0)
+        .commit_feed_pq(&pq_feed("STELL", 1_000_000, t0, &sk), t0)
         .is_ok());
 
     // Fresh: the time-aware gate admits a sane limit price.

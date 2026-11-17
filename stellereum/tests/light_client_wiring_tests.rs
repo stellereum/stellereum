@@ -814,10 +814,24 @@ fn cert_json(
 
 /// The validator set file the operator pins: the shape `stell_getValidators`
 /// serves, so it can be dumped ONCE and pinned.
-fn write_validator_set(dir: &std::path::Path, keys: &[SigningKey]) -> std::path::PathBuf {
+fn write_validator_set(
+    dir: &std::path::Path,
+    keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+) -> std::path::PathBuf {
+    // FULL-PQ: the external CLI verifies a Falcon µQC, so the pinned file MUST
+    // carry each validator's Falcon-512 public key (`pq_pubkey`). Without it a
+    // fresh process has no key material and refuses every honest certificate.
     let list: Vec<Value> = keys
         .iter()
-        .map(|k| json!({ "validator": hex::encode(k.verifying_key().to_bytes()), "power": "1" }))
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            json!({
+                "validator": hex::encode(k.verifying_key().to_bytes()),
+                "power": "1",
+                "pq_pubkey": hex::encode(&fk.public_key),
+            })
+        })
         .collect();
     let path = dir.join("validators.json");
     std::fs::write(&path, json!({ "validators": list }).to_string()).expect("the set is written");
@@ -871,7 +885,7 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
 
     let url = spawn_fake_rpc(proof, header);
     let dir = temp_dir("honest");
-    let vs_path = write_validator_set(&dir, &ks);
+    let vs_path = write_validator_set(&dir, &ks, &fks);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_stellereum"))
         .args([
@@ -910,7 +924,7 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
 #[test]
 fn the_light_client_command_detects_a_lying_server_end_to_end() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
-    let (ks, _fks) = falcon_votes::falcon_set(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let alice = [0xA1u8; 32];
 
     let (proof, header) = rt.block_on(async {
@@ -944,7 +958,7 @@ fn the_light_client_command_detects_a_lying_server_end_to_end() {
 
     let url = spawn_fake_rpc(proof, header);
     let dir = temp_dir("liar");
-    let vs_path = write_validator_set(&dir, &ks);
+    let vs_path = write_validator_set(&dir, &ks, &fks);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_stellereum"))
         .args([

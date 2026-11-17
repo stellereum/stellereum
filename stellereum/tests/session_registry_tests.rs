@@ -25,6 +25,9 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -38,20 +41,74 @@ const TS: u64 = 2_000_000;
 const VALID_UNTIL: u64 = 5_000_000;
 const BALANCE: u64 = 10_000_000;
 
-fn key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
+/// FULL-PQ master/session identity: an implicit Falcon-512 key registered
+/// globally (so a plain payload tx from it is not an activation).
+fn key() -> FalconKeypair {
+    let fk = FalconKeypair::generate();
+    let addr = addr_of(&fk);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    fk
 }
 
+/// The address a Falcon key signs for (implicit, default salt).
+fn addr_of(k: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &k.public_key, &DEFAULT_SALT)
+}
+
+/// FULL-PQ master-signed payload transaction (legacy master path).
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy constructor arity.
+fn pq_tx(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        signature: Vec::new(),
+        source_shard: 1,
+        target_shard: 1,
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, fk.sign(&msg)).encode();
+    tx
+}
+
+/// Master-signed payload tx with the fixture's fixed amount/gas/to.
+fn master_payload(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    pq_tx(fk, from, [1u8; 32], 10, 5_000, nonce, payload)
+}
+
+/// FULL-PQ delegation: Falcon master + Falcon session (classical grants are
+/// refused by `verify_signature`).
 fn grant(
-    master: &SigningKey,
-    session: &SigningKey,
+    master: &FalconKeypair,
+    session: &FalconKeypair,
     max_gas_spend: u64,
     scope: u64,
     max_value_per_tx: u64,
 ) -> SessionKeyAuthorization {
-    SessionKeyAuthorization::sign_delegation(
+    SessionKeyAuthorization::sign_delegation_falcon512(
         master,
-        session.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        &session.public_key,
         VALID_UNTIL,
         max_gas_spend,
         scope,
@@ -61,15 +118,16 @@ fn grant(
 }
 
 #[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy constructor arity.
 fn session_tx(
-    session: &SigningKey,
+    session: &FalconKeypair,
     delegation: SessionKeyAuthorization,
     amount: u64,
     gas_limit: u64,
     nonce: u64,
     payload: Vec<OpCode>,
 ) -> Transaction {
-    Transaction::sign_with_session(
+    Transaction::sign_with_session_falcon512(
         session, delegation, [1u8; 32], amount, gas_limit, nonce, 1, 1, payload,
     )
 }
@@ -93,8 +151,8 @@ async fn registry_persists_across_snapshot_and_restore() {
 
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
 
     // Post-SNAP_H state: a registered session key with real spend against it.
     let engine = funded_state(master_pub, BALANCE).await;
@@ -164,6 +222,7 @@ async fn registry_persists_across_snapshot_and_restore() {
     // Anchor: the block at SNAP_H+1 commits to the post-SNAP_H root, which is
     // what the restore verifier compares against.
     let sk = SigningKey::from_bytes(&[0x11u8; 32]);
+    let anchor_fk = FalconKeypair::generate_from_seed(0x11);
     let mut anchor = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: NEXT_H,
@@ -182,7 +241,8 @@ async fn registry_persists_across_snapshot_and_restore() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    anchor.sign_block(&sk);
+    // FULL-PQ: the proposal signature is verified Falcon-only.
+    anchor.sign_block_with_falcon(&sk, &anchor_fk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
     store
         .set_finalized(NEXT_H, &anchor_hash)
@@ -252,8 +312,8 @@ async fn registry_persists_across_snapshot_and_restore() {
 async fn budget_exhaustion_blocks_the_next_tx_on_the_live_path() {
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
     let state = funded_state(master_pub, BALANCE).await;
 
     // Budget of exactly two declared transfers of 1000 each.
@@ -309,8 +369,8 @@ async fn budget_exhaustion_blocks_the_next_tx_on_the_live_path() {
 async fn in_block_budget_accumulates_across_two_txs_of_one_grant() {
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
     let state = funded_state(master_pub, BALANCE).await;
 
     let g = || grant(&master, &session, 2_000, SCOPE_ALL, u64::MAX);
@@ -359,14 +419,11 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     let master = key();
     let session = key();
     let attacker = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
     let state = funded_state(master_pub, BALANCE).await;
     state
-        .update_account(AccountState::new(
-            attacker.verifying_key().to_bytes(),
-            BALANCE,
-        ))
+        .update_account(AccountState::new(addr_of(&attacker), BALANCE))
         .await;
 
     let g = || grant(&master, &session, 100_000, SCOPE_ALL, u64::MAX);
@@ -382,8 +439,12 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     // transaction sits in the mempool, a revoke lands, and the proposer must
     // not select it any more.
     let blocked = session_tx(&session, g(), 10, 1_000, 2, vec![]);
-    let vset = ValidatorSet::from_list(vec![(master_pub, 1)]);
-    let mut rt = ValidatorRuntime::new(master.clone(), vset, std::sync::Arc::new(state), 1);
+    // The runtime's validator ID is its Ed identity; the session/master money
+    // accounts above are PQ addresses. The pool filter under test keys off the
+    // committed registry, not the proposer id.
+    let rt_ed = SigningKey::generate(&mut OsRng);
+    let vset = ValidatorSet::from_list(vec![(rt_ed.verifying_key().to_bytes(), 1)]);
+    let mut rt = ValidatorRuntime::new(rt_ed, vset, std::sync::Arc::new(state), 1);
     rt.mempool
         .write()
         .await
@@ -394,14 +455,13 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     // 1. A third party cannot revoke what it does not own: the payload reaches
     //    the VM and REVERTS there (`only the delegator may revoke...`), so the
     //    record is untouched and the attacker's transaction is reported failed.
-    let attack = Transaction::sign_with_payload(
+    let attack = pq_tx(
         &attacker,
+        addr_of(&attacker),
         [1u8; 32],
         10,
         5_000,
         0,
-        1,
-        1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: session_pub,
         }],
@@ -418,13 +478,9 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     //    paths). Legacy tx: signed by the master key, so `tx.from` IS the
     //    delegator. (Master nonce 1 -> 2, which is exactly the nonce the
     //    pooled `blocked` transaction carries.)
-    let revoke = Transaction::sign_with_payload(
+    let revoke = master_payload(
         &master,
-        [1u8; 32],
-        10,
-        5_000,
-        1,
-        1,
+        master_pub,
         1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: session_pub,
@@ -537,7 +593,7 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
 
     // ...while the master's own (legacy) transactions are unaffected: only the
     // session key died.
-    let own = Transaction::sign(&master, [1u8; 32], 10, 1_000, 2, 1, 1);
+    let own = pq_tx(&master, master_pub, [1u8; 32], 10, 1_000, 2, vec![]);
     let (_, _, _, s_own, _) = state.apply_block_parallel_fees(&[own], TS).await;
     assert_eq!(s_own, vec![true], "revocation must not touch the master");
 }
@@ -551,9 +607,9 @@ async fn session_authorized_revoke_of_another_key_is_rejected() {
     let master = key();
     let session = key();
     let other = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
-    let other_pub = other.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
+    let other_pub = addr_of(&other);
     let state = funded_state(master_pub, BALANCE).await;
 
     // Register BOTH session keys under the SAME master (first use, nonces 0,1).
@@ -625,16 +681,12 @@ async fn session_authorized_revoke_of_another_key_is_rejected() {
     );
 
     // The master's OWN legacy revoke still works: revocation is a master right.
-    let real = Transaction::sign_with_payload(
+    let real = master_payload(
         &master,
-        [1u8; 32],
-        10,
-        5_000,
+        master_pub,
         // The refused attack above consumed the master's nonce (F-01: a failed
         // attempt is not free), so the master's own revoke carries the next one.
         3,
-        1,
-        1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: other_pub,
         }],
@@ -652,8 +704,8 @@ async fn session_authorized_revoke_of_another_key_is_rejected() {
 async fn preventive_revocation_tombstones_an_unused_grant() {
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
     let state = funded_state(master_pub, BALANCE).await;
 
     // Minted but never used: the registry is empty, so the VM revoke handler
@@ -663,14 +715,10 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
 
     // Without proof of authority the revoke leaves no tombstone: nobody can
     // pre-tombstone a key by guessing its public key.
-    let unproven = Transaction::sign_with_payload(
+    let unproven = master_payload(
         &master,
-        [1u8; 32],
-        10,
-        5_000,
+        master_pub,
         0,
-        1,
-        1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: session_pub,
         }],
@@ -681,16 +729,12 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
 
     // The master revokes the UNUSED grant in one payload that also PUBLISHES
     // the signed grant - the proof of authority. The tombstone commits.
-    let revoke = Transaction::sign_with_payload(
+    let revoke = master_payload(
         &master,
-        [1u8; 32],
-        10,
-        5_000,
+        master_pub,
         // The failed `unproven` attempt above consumed the master's nonce
         // (F-01: a failed attempt is not free), so the revoke carries the
         // next one.
-        1,
-        1,
         1,
         vec![
             OpCode::SysCallPublishSessionGrant(Box::new(g.clone())),
@@ -755,8 +799,8 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
 async fn admission_is_deterministic_and_registry_is_enforced_at_consensus() {
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
+    let session_pub = addr_of(&session);
     let state = funded_state(master_pub, BALANCE).await;
 
     // Register, then revoke, via the master's legacy transaction.
@@ -774,13 +818,9 @@ async fn admission_is_deterministic_and_registry_is_enforced_at_consensus() {
         )
         .await;
     assert_eq!(s0, vec![true]);
-    let revoke = Transaction::sign_with_payload(
+    let revoke = master_payload(
         &master,
-        [1u8; 32],
-        10,
-        5_000,
-        1,
-        1,
+        master_pub,
         1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: session_pub,
@@ -839,8 +879,7 @@ async fn admission_is_deterministic_and_registry_is_enforced_at_consensus() {
 async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() {
     let master = key();
     let session = key();
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let master_pub = addr_of(&master);
 
     // This node is chain 42; the network's default is 5757.
     let state = InMemoryStateEngine::new().with_chain_id(42);
@@ -850,9 +889,10 @@ async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() 
 
     // A grant minted for the default chain is well-signed but foreign: the
     // domain binds chain_id and the node now COMPARES it.
-    let foreign = SessionKeyAuthorization::sign_delegation(
+    let foreign = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        &session.public_key,
         VALID_UNTIL,
         100_000,
         SCOPE_ALL,
@@ -877,9 +917,10 @@ async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() 
 
     // The SAME grant for this node's chain applies (nonce 0). A second
     // transaction (nonce 1) confirms the window is open, not a fluke.
-    let native = SessionKeyAuthorization::sign_delegation(
+    let native = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        &session.public_key,
         VALID_UNTIL,
         100_000,
         SCOPE_ALL,
@@ -1091,8 +1132,7 @@ fn old_node_fails_closed_on_the_revoke_opcode() {
         "an old node must fail closed on a payload carrying the revoke opcode"
     );
 
-    let revoke_tx =
-        Transaction::sign_with_payload(&sk, [1u8; 32], 10, 5_000, 0, 1, 1, revoke_payload);
+    let revoke_tx = pq_tx(&sk, addr_of(&sk), [1u8; 32], 10, 5_000, 0, revoke_payload);
     let tx_bytes = bincode::serialize(&revoke_tx).expect("tx serializes");
     let old_tx: Result<OldTransaction, _> = bincode::deserialize(&tx_bytes);
     assert!(

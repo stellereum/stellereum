@@ -11,9 +11,11 @@
 //! transaction signed by a dust key can delete every honest validator from the
 //! consensus set.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
+// FULL-PQ: fixture transactions are Falcon-512 PQ1 envelopes; the node
+// refuses classical Ed25519 envelopes at apply admission.
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
@@ -32,15 +34,48 @@ fn floor() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
 
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
 fn tx_of(
-    key: &SigningKey,
+    key: &FalconKeypair,
     nonce: u64,
     gas_limit: u64,
     payload: Vec<OpCode>,
 ) -> stellereum::sharding::Transaction {
-    let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, from, 0, gas_limit, nonce, 1, 1, payload,
+    let from = pq_addr(key);
+    let pk = key.public_key.clone();
+    let probe = stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        from,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        from,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -48,18 +83,30 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
     engine.get_account(a).await.map(|x| x.balance).unwrap_or(0)
 }
 
+/// The engine's SUCCESS fee for a syscall that consumes `gas_used`:
+/// `max(gas_used, consensus floor) + surcharge` (same rule as `commit_native`).
+async fn success_fee(
+    engine: &InMemoryStateEngine,
+    tx: &stellereum::sharding::Transaction,
+    gas_used: u64,
+) -> u64 {
+    let (floor_base, surcharge) = engine.consensus_floor_parts(tx).await;
+    gas_used.max(floor_base).saturating_add(surcharge)
+}
+
 /// One dust-funded transaction from a stranger empties an honest validator's
 /// self-bond, silently removing it from the consensus validator set.
 #[tokio::test]
 async fn stranger_cannot_force_unbond_an_honest_validator() {
     let engine = InMemoryStateEngine::new();
-    let honest = SigningKey::generate(&mut OsRng);
-    let honest_addr = honest.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let honest = pq_key(0x31);
+    let honest_addr = pq_addr(&honest);
+    let attacker = pq_key(0x32);
+    let attacker_addr = pq_addr(&attacker);
 
+    let honest_start = floor() + 200_000;
     engine
-        .update_account(AccountState::new(honest_addr, floor() + 20_000))
+        .update_account(AccountState::new(honest_addr, honest_start))
         .await;
     let bond = tx_of(
         &honest,
@@ -71,6 +118,9 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         }],
     );
     engine.apply_transaction(&bond, 0).await.unwrap();
+    // Snapshot AFTER the successful bond: the grief below must not move a
+    // single nano of the honest validator's remaining balance.
+    let honest_after_bond = bal(&engine, &honest_addr).await;
     assert!(
         engine
             .staking_read()
@@ -81,9 +131,10 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         "precondition: honest validator is in the set"
     );
 
-    // The attacker holds 20,000 nano-STELL (0.00002 STELL) and nothing else.
+    // The attacker holds only dust: enough to clear admission (the
+    // consensus floor), nowhere near the honest validator's bond.
     engine
-        .update_account(AccountState::new(attacker_addr, 20_000))
+        .update_account(AccountState::new(attacker_addr, 100_000))
         .await;
     let t = tx_of(
         &attacker,
@@ -114,7 +165,11 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
     assert!(l.unbonding.is_empty(), "no unbonding entry was created");
     drop(l);
     // The honest validator's STELL is untouched in every respect.
-    assert_eq!(bal(&engine, &honest_addr).await, 20_000 - 2_000);
+    assert_eq!(
+        bal(&engine, &honest_addr).await,
+        honest_after_bond,
+        "the refused force-unbond moved no honest STELL"
+    );
     assert_eq!(bal(&engine, &STAKING_POOL).await, floor());
 
     // And the owner may still unbond, so the check is an auth check, not a ban.
@@ -142,16 +197,16 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
 #[tokio::test]
 async fn one_tx_cannot_capture_the_validator_set() {
     let engine = InMemoryStateEngine::new();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let attacker = pq_key(0x41);
+    let attacker_addr = pq_addr(&attacker);
 
     // 10 honest validators.
     let mut honest = Vec::new();
-    for _ in 0..10 {
-        let k = SigningKey::generate(&mut OsRng);
-        let a = k.verifying_key().to_bytes();
+    for i in 0..10u8 {
+        let k = pq_key(0x50 + i);
+        let a = pq_addr(&k);
         engine
-            .update_account(AccountState::new(a, floor() + 20_000))
+            .update_account(AccountState::new(a, floor() + 200_000))
             .await;
         let t = tx_of(
             &k,
@@ -245,15 +300,15 @@ async fn one_tx_cannot_capture_the_validator_set() {
 #[tokio::test]
 async fn delegated_stake_exits_through_begin_then_withdraw() {
     let engine = InMemoryStateEngine::new();
-    let delegator = SigningKey::generate(&mut OsRng);
-    let delegator_addr = delegator.verifying_key().to_bytes();
+    let delegator = pq_key(0x61);
+    let delegator_addr = pq_addr(&delegator);
     let validator = [0xAAu8; 32];
 
     // A validator bond paid for by a third party.
-    let funder = SigningKey::generate(&mut OsRng);
-    let funder_addr = funder.verifying_key().to_bytes();
+    let funder = pq_key(0x62);
+    let funder_addr = pq_addr(&funder);
     engine
-        .update_account(AccountState::new(funder_addr, floor() + 20_000))
+        .update_account(AccountState::new(funder_addr, floor() + 200_000))
         .await;
     engine
         .apply_transaction(
@@ -300,6 +355,7 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
             amount: stell(5_000),
         }],
     );
+    let begin_fee = success_fee(&engine, &t, GAS_STAKE_UNBOND).await;
     engine
         .apply_transaction(&t, 0)
         .await
@@ -344,6 +400,7 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
         100_000,
         vec![OpCode::SysCallUndelegate { validator }],
     );
+    let withdraw_fee = success_fee(&engine, &t, GAS_STAKE_UNBOND).await;
     engine
         .apply_transaction(&t, 0)
         .await
@@ -388,13 +445,11 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
     // FAILURE FEE - the declared limit - because a refusal is attributable
     // and must not be free (SEC-07). A failure that cost nothing would be a
     // free DoS and a free replay.
-    let gas_begin = GAS_STAKE_UNBOND;
-    let gas_withdraw = GAS_STAKE_UNBOND;
     println!("delegator ended with {final_bal} nano (position 5,000 STELL exited)");
     assert_eq!(
         final_bal,
-        after_delegate + stell(5_000) - gas_begin - early_fee - gas_withdraw - again_fee,
-        "exact conservation: 5,000 STELL back minus begin gas, the two failure fees and withdraw gas"
+        after_delegate + stell(5_000) - begin_fee - early_fee - withdraw_fee - again_fee,
+        "exact conservation: 5,000 STELL back minus the two success fees and the two failure fees"
     );
 }
 
@@ -406,8 +461,8 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
 #[tokio::test]
 async fn test_only_snark_vk_registration_reverts() {
     let engine = InMemoryStateEngine::new();
-    let key = SigningKey::generate(&mut OsRng);
-    let addr = key.verifying_key().to_bytes();
+    let key = pq_key(0x71);
+    let addr = pq_addr(&key);
     engine
         .update_account(AccountState::new(addr, stell(10) + 5_000_000))
         .await;
@@ -472,10 +527,10 @@ async fn test_only_snark_vk_registration_reverts() {
 async fn delegator_rewards_claim_through_opcode() {
     let engine = InMemoryStateEngine::new();
     let validator = [0xBBu8; 32];
-    let funder = SigningKey::generate(&mut OsRng);
-    let funder_addr = funder.verifying_key().to_bytes();
+    let funder = pq_key(0x81);
+    let funder_addr = pq_addr(&funder);
     engine
-        .update_account(AccountState::new(funder_addr, floor() + 20_000))
+        .update_account(AccountState::new(funder_addr, floor() + 200_000))
         .await;
     engine
         .apply_transaction(
@@ -493,8 +548,8 @@ async fn delegator_rewards_claim_through_opcode() {
         .await
         .unwrap();
 
-    let delegator = SigningKey::generate(&mut OsRng);
-    let delegator_addr = delegator.verifying_key().to_bytes();
+    let delegator = pq_key(0x82);
+    let delegator_addr = pq_addr(&delegator);
     engine
         .update_account(AccountState::new(delegator_addr, stell(1_000) + 5_000_000))
         .await;
@@ -537,22 +592,21 @@ async fn delegator_rewards_claim_through_opcode() {
 
     // Claim: exact payout minus exactly the claim gas.
     let before = bal(&engine, &delegator_addr).await;
+    let claim_tx = tx_of(
+        &delegator,
+        1,
+        100_000,
+        vec![OpCode::SysCallClaimDelegatorRewards { validator }],
+    );
+    let claim_fee = success_fee(&engine, &claim_tx, GAS_STAKE_CLAIM).await;
     engine
-        .apply_transaction(
-            &tx_of(
-                &delegator,
-                1,
-                100_000,
-                vec![OpCode::SysCallClaimDelegatorRewards { validator }],
-            ),
-            0,
-        )
+        .apply_transaction(&claim_tx, 0)
         .await
         .expect("delegator claim works");
     assert_eq!(
         bal(&engine, &delegator_addr).await,
-        before + expect - GAS_STAKE_CLAIM,
-        "exact claim payout minus claim gas"
+        before + expect - claim_fee,
+        "exact claim payout minus the claim fee"
     );
     // Consumed: a second claim reverts (single-claim, no double-pay).
     let again = tx_of(
@@ -566,8 +620,8 @@ async fn delegator_rewards_claim_through_opcode() {
         "a consumed reward entry cannot pay twice"
     );
     // And a stranger with no rewards gets a clear refusal, not coins.
-    let stranger = SigningKey::generate(&mut OsRng);
-    let stranger_addr = stranger.verifying_key().to_bytes();
+    let stranger = pq_key(0x83);
+    let stranger_addr = pq_addr(&stranger);
     engine
         .update_account(AccountState::new(stranger_addr, 5_000_000))
         .await;

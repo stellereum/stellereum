@@ -13,7 +13,9 @@
 //! All deterministic, fast, no `#[ignore]`. If any claim fails, the assertion
 //! message names the breakage explicitly instead of papering over it.
 
-use ed25519_dalek::SigningKey;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{BlockHash, RetentionConfig, Storage};
@@ -41,8 +43,49 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
     p
 }
 
-fn sender_key() -> SigningKey {
-    SigningKey::from_bytes(&[7u8; 32])
+fn sender_key() -> FalconKeypair {
+    FalconKeypair::generate_from_seed(7)
+}
+
+fn sender_addr() -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        sender_key().public_key(),
+        &DEFAULT_SALT,
+    )
+}
+
+/// FULL-PQ fixture: a signed Falcon envelope (bare Ed25519 transfers are
+/// refused by admission, and these blocks are re-executed for real).
+fn pq_transfer(key: &FalconKeypair, nonce: u64) -> Transaction {
+    let pk = key.public_key().to_vec();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xABu8; 32],
+        1,
+        0,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        [0xABu8; 32],
+        1,
+        0,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    )
 }
 
 /// Plain value-transfer chain with sequential nonces, so the blocks are really
@@ -53,7 +96,7 @@ fn exec_chain(store: &Storage, n: u64) -> (Vec<BlockHash>, Vec<Block>) {
     let mut out_blocks = Vec::new();
     let mut prev = [0u8; 32];
     for h in 0..n {
-        let tx = Transaction::sign(&key, [0xABu8; 32], 1, 0, h, 1, 1);
+        let tx = pq_transfer(&key, h);
         let transactions = vec![tx];
         let order_merkle_root = stellereum::mev::compute_order_merkle_root(&transactions);
         let b = Block {
@@ -90,7 +133,7 @@ fn light_chain(store: &Storage, n: u64) -> Vec<BlockHash> {
 
 async fn apply_blocks_in_order(blocks: &[Block]) -> ([u8; 32], InMemoryStateEngine) {
     let engine = InMemoryStateEngine::new();
-    let sender = sender_key().verifying_key().to_bytes();
+    let sender = sender_addr();
     engine
         .update_account(AccountState::new(sender, 1_000_000_000))
         .await;

@@ -9,9 +9,9 @@
 //!   2. minting past `REWARDS_EMISSION_CAP` is refused fail-closed: no ledger
 //!      credit, no native mint, no phantom pending rewards.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_EMISSION_CAP, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER,
@@ -28,18 +28,35 @@ use stellereum::svm::{OpCode, GAS_STAKE_CLAIM};
 const STELL: u64 = 1_000_000_000;
 const TS: u64 = 1_760_000_000;
 
-fn tx_of(key: &SigningKey, nonce: u64, gas_limit: u64, payload: Vec<OpCode>) -> Transaction {
-    let from = key.verifying_key().to_bytes();
-    Transaction::sign_with_payload(
-        key,
+/// FULL-PQ sender identity: implicit Falcon-512, registered globally.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload`.
+fn tx_of(kp: &FalconKeypair, nonce: u64, gas_limit: u64, payload: Vec<OpCode>) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
         from,
-        0,
+        to: from,
+        amount: 0,
         gas_limit,
         nonce,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
         payload,
-    )
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn block_of(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
@@ -75,8 +92,7 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
 #[tokio::test]
 async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
     let engine = InMemoryStateEngine::new();
-    let val = SigningKey::generate(&mut OsRng);
-    let val_addr = val.verifying_key().to_bytes();
+    let (val, val_addr) = pq_key(0x91);
     engine
         .update_account(AccountState::new(val_addr, bond_amount() + 5_000_000))
         .await;
@@ -166,8 +182,7 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
 async fn delegator_rewards_come_from_pool_not_principal() {
     let engine = InMemoryStateEngine::new();
     let validator = [0xCCu8; 32];
-    let funder = SigningKey::generate(&mut OsRng);
-    let funder_addr = funder.verifying_key().to_bytes();
+    let (funder, funder_addr) = pq_key(0x92);
     engine
         .update_account(AccountState::new(funder_addr, bond_amount() + 20_000))
         .await;
@@ -187,8 +202,7 @@ async fn delegator_rewards_come_from_pool_not_principal() {
         .await
         .unwrap();
 
-    let delegator = SigningKey::generate(&mut OsRng);
-    let delegator_addr = delegator.verifying_key().to_bytes();
+    let (delegator, delegator_addr) = pq_key(0x93);
     engine
         .update_account(AccountState::new(delegator_addr, 1_000 * STELL + 5_000_000))
         .await;
@@ -261,8 +275,7 @@ async fn delegator_rewards_come_from_pool_not_principal() {
 #[tokio::test]
 async fn rewards_cap_is_fail_closed_over_cap() {
     let engine = InMemoryStateEngine::new();
-    let val = SigningKey::generate(&mut OsRng);
-    let val_addr = val.verifying_key().to_bytes();
+    let (val, val_addr) = pq_key(0x94);
     engine
         .update_account(AccountState::new(val_addr, bond_amount() + 5_000_000))
         .await;

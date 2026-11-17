@@ -9,11 +9,9 @@
 //!    decide TIME priority in a price level (it used to be a dead 0, so two
 //!    orders at the same price matched in bare insertion order).
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
 use stellereum::commitment::commitment_digest;
 use stellereum::orderbook::{OrderSide, OrderType, PAIR_STELL_USDT};
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -26,16 +24,50 @@ fn native_quote(price: u64, amount: u64) -> u64 {
     price.saturating_mul(amount) / 1_000_000
 }
 
-fn buy_tx(key: &SigningKey, nonce: u64, gas_limit: u64, amount: u64) -> Transaction {
-    let from = key.verifying_key().to_bytes();
-    Transaction::sign_with_payload(
-        key,
+/// FULL-PQ (Falcon-512 only node): deterministic implicit Falcon-512
+/// identity, registered globally so admission/apply accept the envelope.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload`: same payload,
+/// nonce, gas and shards, signed with Falcon-512.
+fn pq_payload_tx(
+    kp: &FalconKeypair,
+    nonce: u64,
+    gas_limit: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    use stellereum::post_quantum::PqSignatureEnvelope;
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
         from,
-        0,
+        to: from,
+        amount: 0,
         gas_limit,
         nonce,
-        1,
-        1,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
+fn buy_tx(kp: &FalconKeypair, nonce: u64, gas_limit: u64, amount: u64) -> Transaction {
+    pq_payload_tx(
+        kp,
+        nonce,
+        gas_limit,
         vec![OpCode::SysCallPlaceOrder {
             pair_id: PAIR_STELL_USDT,
             is_buy: true,
@@ -48,7 +80,7 @@ fn buy_tx(key: &SigningKey, nonce: u64, gas_limit: u64, amount: u64) -> Transact
 /// Build the SAME starting state twice: a maker with 100 STELL resting a
 /// 10 STELL sell, a taker with 10 STELL, one wUSDT token. Deterministic, so
 /// two engines can be compared byte for byte.
-async fn base_engine(seller: &SigningKey, taker: &SigningKey) -> InMemoryStateEngine {
+async fn base_engine(seller: [u8; 32], taker: [u8; 32]) -> InMemoryStateEngine {
     let engine = InMemoryStateEngine::new();
     let minter = [0x11u8; 32];
     let meta = TokenMetadata {
@@ -64,25 +96,22 @@ async fn base_engine(seller: &SigningKey, taker: &SigningKey) -> InMemoryStateEn
     let usdt = engine.create_token(minter, meta, 0).await.unwrap();
     *engine.pmm_usdt_token_write().await = Some(usdt);
 
-    let s = seller.verifying_key().to_bytes();
-    let t = taker.verifying_key().to_bytes();
     engine
-        .update_account(AccountState::new(s, 100 * STELL))
+        .update_account(AccountState::new(seller, 100 * STELL))
         .await;
     engine
-        .update_account(AccountState::new(t, 10 * STELL))
+        .update_account(AccountState::new(taker, 10 * STELL))
         .await;
     engine
 }
 
 /// The shared start, plus the maker's 10 STELL resting sell.
-async fn build(seller: &SigningKey, taker: &SigningKey) -> InMemoryStateEngine {
+async fn build(seller: [u8; 32], taker: [u8; 32]) -> InMemoryStateEngine {
     let engine = base_engine(seller, taker).await;
-    let s = seller.verifying_key().to_bytes();
     engine
         .place_order_settled(
             PAIR_STELL_USDT,
-            s,
+            seller,
             OrderSide::Sell,
             OrderType::Limit,
             PRICE,
@@ -126,10 +155,10 @@ async fn escrow_bytes(e: &InMemoryStateEngine) -> Vec<((u32, u64), Vec<u8>)> {
 /// root, not merely "equivalent" state.
 #[tokio::test]
 async fn both_apply_paths_reach_the_identical_state_root() {
-    let seller = SigningKey::generate(&mut OsRng);
-    let taker = SigningKey::generate(&mut OsRng);
-    let a = build(&seller, &taker).await;
-    let b = build(&seller, &taker).await;
+    let (_, seller) = pq_key(0xA1);
+    let (taker_kp, taker) = pq_key(0xA2);
+    let a = build(seller, taker).await;
+    let b = build(seller, taker).await;
     assert_eq!(
         a.get_state_root().await,
         b.get_state_root().await,
@@ -140,7 +169,7 @@ async fn both_apply_paths_reach_the_identical_state_root() {
     // so the single-tx path (charges what was used) and the block path (charges
     // the declared limit) charge the same fee.
     let gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
-    let tx = buy_tx(&taker, 0, gas, 4 * STELL);
+    let tx = buy_tx(&taker_kp, 0, gas, 4 * STELL);
 
     a.apply_transaction(&tx, 42)
         .await
@@ -174,17 +203,15 @@ async fn both_apply_paths_reach_the_identical_state_root() {
         "same escrow bytes"
     );
 
-    let s = seller.verifying_key().to_bytes();
-    let t = taker.verifying_key().to_bytes();
     for e in [&a, &b] {
         // The maker was paid 1 STELL of quote for 4 STELL sold.
         assert_eq!(
-            e.get_account(&s).await.unwrap().balance,
+            e.get_account(&seller).await.unwrap().balance,
             90 * STELL + native_quote(PRICE, 4 * STELL)
         );
         // The taker paid the quote and received the collateral.
         assert_eq!(
-            e.get_account(&t).await.unwrap().balance,
+            e.get_account(&taker).await.unwrap().balance,
             10 * STELL - native_quote(PRICE, 4 * STELL) + 4 * STELL - gas
         );
         // The 6 STELL that never traded are still locked.
@@ -206,15 +233,15 @@ async fn both_apply_paths_reach_the_identical_state_root() {
 /// delta.
 #[tokio::test]
 async fn settlement_is_identical_even_when_the_fee_number_differs() {
-    let seller = SigningKey::generate(&mut OsRng);
-    let taker = SigningKey::generate(&mut OsRng);
-    let a = build(&seller, &taker).await;
-    let b = build(&seller, &taker).await;
+    let (_, seller) = pq_key(0xB1);
+    let (taker_kp, taker) = pq_key(0xB2);
+    let a = build(seller, taker).await;
+    let b = build(seller, taker).await;
 
     let gas_used = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
     let declared = 50_000u64; // declared >> consumed
     assert!(declared > gas_used);
-    let tx = buy_tx(&taker, 0, declared, 4 * STELL);
+    let tx = buy_tx(&taker_kp, 0, declared, 4 * STELL);
 
     a.apply_transaction(&tx, 7).await.expect("single-tx path");
     let (applied, failed, fees, _, _) = b.apply_block_parallel_fees(&[tx], 7).await;
@@ -235,14 +262,12 @@ async fn settlement_is_identical_even_when_the_fee_number_differs() {
     let db = commitment_digest(&b.commitment_snapshot().await);
     assert_eq!(da, db, "THE SETTLEMENT OUTCOME IS IDENTICAL");
 
-    let s = seller.verifying_key().to_bytes();
-    let t = taker.verifying_key().to_bytes();
-    let bal_a = a.get_account(&s).await.unwrap().balance;
-    let bal_b = b.get_account(&s).await.unwrap().balance;
+    let bal_a = a.get_account(&seller).await.unwrap().balance;
+    let bal_b = b.get_account(&seller).await.unwrap().balance;
     assert_eq!(bal_a, bal_b, "the maker does not care which path settled");
 
-    let taker_a = a.get_account(&t).await.unwrap().balance;
-    let taker_b = b.get_account(&t).await.unwrap().balance;
+    let taker_a = a.get_account(&taker).await.unwrap().balance;
+    let taker_b = b.get_account(&taker).await.unwrap().balance;
     assert_eq!(
         taker_a - taker_b,
         declared - gas_used,
@@ -255,11 +280,11 @@ async fn settlement_is_identical_even_when_the_fee_number_differs() {
 /// earlier is filled first even when it was inserted later.
 #[tokio::test]
 async fn block_timestamp_stamps_orders_and_decides_time_priority() {
-    let seller = SigningKey::generate(&mut OsRng);
-    let taker = SigningKey::generate(&mut OsRng);
+    let (_, seller) = pq_key(0xC1);
+    let (taker_kp, taker) = pq_key(0xC2);
     // No maker order from `build` here: this test owns the whole PRICE level.
-    let engine = base_engine(&seller, &taker).await;
-    let s = seller.verifying_key().to_bytes();
+    let engine = base_engine(seller, taker).await;
+    let s = seller;
 
     // 1) The stamp on a resting order placed through the CLOB API is `now`.
     let oid_500 = engine
@@ -276,8 +301,7 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
         .unwrap()
         .0;
     // 2) ...and one placed through the VM is the BLOCK timestamp, not 0.
-    let bot = SigningKey::generate(&mut OsRng);
-    let bot_addr = bot.verifying_key().to_bytes();
+    let (bot_kp, bot_addr) = pq_key(0xC3);
     let gas = stellereum::svm::GAS_ORDER_PLACE;
     // A SELL locks its `amount` (base), not the quote: fund the base + the fee.
     engine
@@ -285,14 +309,10 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
         .await;
     engine
         .apply_transaction(
-            &Transaction::sign_with_payload(
-                &bot,
-                bot_addr,
+            &pq_payload_tx(
+                &bot_kp,
                 0,
                 gas,
-                0,
-                1,
-                1,
                 vec![OpCode::SysCallPlaceOrder {
                     pair_id: PAIR_STELL_USDT,
                     is_buy: false,
@@ -354,22 +374,14 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
     // The taker takes the whole level: 2 STELL from the stamp-400 order.
     let fill_gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
     engine
-        .update_account(AccountState::new(
-            taker.verifying_key().to_bytes(),
-            10 * STELL,
-        ))
+        .update_account(AccountState::new(taker, 10 * STELL))
         .await;
-    let taker_addr = taker.verifying_key().to_bytes();
     engine
         .apply_transaction(
-            &Transaction::sign_with_payload(
-                &taker,
-                taker_addr,
+            &pq_payload_tx(
+                &taker_kp,
                 0,
                 fill_gas,
-                0,
-                1,
-                1,
                 vec![OpCode::SysCallPlaceOrder {
                     pair_id: PAIR_STELL_USDT,
                     is_buy: true,

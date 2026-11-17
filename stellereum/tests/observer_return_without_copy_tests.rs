@@ -178,7 +178,13 @@ async fn build_live_chain(
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&proposer);
+        // FULL-PQ: the proposer slot must carry the proposer's registered
+        // Falcon signature; an Ed-only block is refused by block sync.
+        let proposer_idx = ks
+            .iter()
+            .position(|k| k.verifying_key().to_bytes() == proposer_id)
+            .expect("proposer is a member");
+        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, fks, h, bh);
         prev = bh;

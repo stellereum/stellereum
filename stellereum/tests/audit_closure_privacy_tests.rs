@@ -6,7 +6,7 @@
 //! protocol removal: the opcodes, curves and state they covered no longer
 //! exist.
 
-use ed25519_dalek::SigningKey;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::zkml::{
     QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, SessionKeyRecord,
     SessionKeyRegistry, SessionSpendSim, MAX_ZKML_MODEL_PARAMS, SCOPE_ACTOR_SEND,
@@ -22,13 +22,17 @@ fn test_grant(
     max_gas: u64,
     max_value: u64,
     valid_until: u64,
-) -> (SigningKey, SessionKeyAuthorization, [u8; 32]) {
-    let master = SigningKey::from_bytes(&[0x11u8; 32]);
-    let session = SigningKey::from_bytes(&[0x22u8; 32]);
-    let spk = session.verifying_key().to_bytes();
-    let g = SessionKeyAuthorization::sign_delegation(
+) -> (FalconKeypair, SessionKeyAuthorization, [u8; 32]) {
+    // FULL-PQ: grants verify through the post-quantum API only (classical
+    // Ed25519 master/session schemes are refused), so both halves are Falcon.
+    let master = FalconKeypair::generate_from_seed(0x11);
+    let session = FalconKeypair::generate_from_seed(0x22);
+    let session_pk = session.public_key.clone();
+    let spk = derive_pq_address(PqScheme::Falcon512, &session_pk, &DEFAULT_SALT);
+    let g = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        spk,
+        PqScheme::Falcon512,
+        &session_pk,
         valid_until,
         max_gas,
         scope,
@@ -101,7 +105,7 @@ fn session_registry_enforces_every_dimension() {
 #[test]
 fn session_registry_record_never_widens_and_flags_terminal_states() {
     use stellereum::zkml::SessionRegistryError;
-    let (_sess, g, spk) = test_grant(SCOPE_TRANSFER, 100, 50, 10_000);
+    let (sess, g, spk) = test_grant(SCOPE_TRANSFER, 100, 50, 10_000);
     let mut reg = SessionKeyRegistry::default();
     reg.note_applied(&g, 30);
     let rec: SessionKeyRecord = reg.get(&spk).expect("registered").clone();
@@ -137,10 +141,11 @@ fn session_registry_record_never_widens_and_flags_terminal_states() {
         Err(SessionRegistryError::Expired)
     );
     // Master binding: another master's grant for the same session key.
-    let other_master = SigningKey::from_bytes(&[0x33u8; 32]);
-    let mut foreign = SessionKeyAuthorization::sign_delegation(
+    let other_master = FalconKeypair::generate_from_seed(0x33);
+    let mut foreign = SessionKeyAuthorization::sign_delegation_falcon512(
         &other_master,
-        spk,
+        PqScheme::Falcon512,
+        &sess.public_key,
         10_000,
         100,
         SCOPE_TRANSFER,

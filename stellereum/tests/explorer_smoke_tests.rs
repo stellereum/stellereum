@@ -13,13 +13,13 @@ async fn state() -> Arc<RpcState> {
     let who = [3u8; 32];
     engine.update_account(AccountState::new(who, 12_345)).await;
     let faucet_key = [0x11u8; 32];
+    let faucet =
+        stellereum::rpc::Faucet::new(faucet_key, 1, 10 * 1_000_000_000, 100 * 1_000_000_000);
+    // FULL-PQ: the faucet signs from its Falcon-512 derived PQ address, so
+    // THAT is the account genesis must fund (the old Ed25519 address is not
+    // the signer and every drip would be refused as unfunded).
     engine
-        .update_account(AccountState::new(
-            ed25519_dalek::SigningKey::from_bytes(&faucet_key)
-                .verifying_key()
-                .to_bytes(),
-            10_000_000_000_000,
-        ))
+        .update_account(AccountState::new(faucet.account(), 10_000_000_000_000))
         .await;
     let st = Arc::new(RpcState {
         engine,
@@ -41,12 +41,7 @@ async fn state() -> Arc<RpcState> {
         )),
         auth_token: None,
         tx_broadcast: None,
-        faucet: Some(Arc::new(stellereum::rpc::Faucet::new(
-            faucet_key,
-            1,
-            10 * 1_000_000_000,
-            100 * 1_000_000_000,
-        ))),
+        faucet: Some(Arc::new(faucet)),
         faucet_token: Some("smoke-token".to_string()),
         archive_store: None,
         msg_signing_seed: None,

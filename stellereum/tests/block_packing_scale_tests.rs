@@ -29,6 +29,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -47,14 +50,36 @@ const BAL: u64 = 1_000_000_000_000;
 /// Chain id every grant in this file carries (== the engine default).
 const CHAIN_ID: u64 = 5757;
 
-fn det_key(i: u64) -> SigningKey {
+/// Deterministic Falcon-512 identity for `i` (the node refuses Ed25519
+/// transactions, so every sender/session key in this file is PQ).
+fn det_key(i: u64) -> FalconKeypair {
+    let mut seed = [0xA5u8; 32];
+    seed[..8].copy_from_slice(&i.to_le_bytes());
+    FalconKeypair::generate_from_seed_bytes(&seed)
+}
+
+/// Ed25519 identity for the RUNTIME only (blocks/votes are signed by the
+/// runtime; the validator set is keyed by this id). Transaction senders are
+/// the PQ identities above.
+fn ed_key(i: u64) -> SigningKey {
     let mut seed = [0xA5u8; 32];
     seed[..8].copy_from_slice(&i.to_le_bytes());
     SigningKey::from_bytes(&seed)
 }
 
-fn id_of(k: &SigningKey) -> [u8; 32] {
-    k.verifying_key().to_bytes()
+fn id_of(k: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &k.public_key, &DEFAULT_SALT)
+}
+
+/// Register a sender's Falcon key in the implicit registry so a pubkey-less
+/// PQ1 envelope (`new_pq_implicit`) verifies without paying the explicit
+/// activation surcharge on every one of the 10k transactions.
+fn register_implicit(sk: &FalconKeypair) -> [u8; 32] {
+    let from = id_of(sk);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &sk.public_key, &DEFAULT_SALT)
+        .expect("implicit registration");
+    from
 }
 
 /// Deterministic fee scatter in 1..=1000 (total gas ~5M, well under the 30M
@@ -64,24 +89,90 @@ fn fee(i: u64) -> u64 {
     (i.wrapping_mul(7919) % 1000) + 1
 }
 
-fn legacy_tx(sk: &SigningKey, to: [u8; 32], nonce: u64, seq: u64) -> Transaction {
-    Transaction::sign(sk, to, 1, fee(seq), nonce, 1, 1)
+fn legacy_tx(sk: &FalconKeypair, to: [u8; 32], nonce: u64, seq: u64) -> Transaction {
+    let from = register_implicit(sk);
+    let probe = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        1,
+        fee(seq),
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    );
+    let sig = sk.sign(&probe.signing_message());
+    Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        to,
+        1,
+        fee(seq),
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    )
 }
 
 fn grant(
-    master: &SigningKey,
-    session: &SigningKey,
+    master: &FalconKeypair,
+    session: &FalconKeypair,
     valid_until: u64,
     max_gas_spend: u64,
 ) -> SessionKeyAuthorization {
-    SessionKeyAuthorization::sign_delegation(
+    SessionKeyAuthorization::sign_delegation_falcon512(
         master,
-        session.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        &session.public_key,
         valid_until,
         max_gas_spend,
         SCOPE_TRANSFER,
         u64::MAX,
         CHAIN_ID,
+    )
+}
+
+/// PQ payload transaction signed by `key` (explicit envelope: the revoke is
+/// a one-off with enough gas to cover the activation surcharge).
+fn pq_payload_tx(
+    key: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = key.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -92,8 +183,8 @@ async fn runtime_with_pool(
     funding: &[([u8; 32], u64)],
 ) -> ValidatorRuntime {
     // Far outside every sender/session index space used below.
-    let val_sk = det_key(42_000_000);
-    let val = id_of(&val_sk);
+    let val_sk = ed_key(42_000_000);
+    let val = val_sk.verifying_key().to_bytes();
     let engine = Arc::new(InMemoryStateEngine::new());
     engine.update_account(AccountState::new(val, BAL)).await;
     for (addr, bal) in funding {
@@ -107,8 +198,8 @@ async fn runtime_with_pool(
 const RECIPIENT: [u8; 32] = [9u8; 32];
 
 /// Fill a pool with the canonical 10k contiguous workload; returns the senders.
-fn fill_canonical(pool: &mut Mempool) -> Vec<SigningKey> {
-    let keys: Vec<SigningKey> = (0..N_SENDERS as u64).map(det_key).collect();
+fn fill_canonical(pool: &mut Mempool) -> Vec<FalconKeypair> {
+    let keys: Vec<FalconKeypair> = (0..N_SENDERS as u64).map(det_key).collect();
     let mut seq = 0u64;
     for sk in &keys {
         for nonce in 0..PER_SENDER {
@@ -213,11 +304,11 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     // plus 51..100 pooled behind the gap).
     const GAP_AT: u64 = 50;
 
-    let legacy: Vec<SigningKey> = (0..LEGACY_SENDERS as u64).map(det_key).collect();
-    let masters: Vec<SigningKey> = (0..SESSION_MASTERS as u64)
+    let legacy: Vec<FalconKeypair> = (0..LEGACY_SENDERS as u64).map(det_key).collect();
+    let masters: Vec<FalconKeypair> = (0..SESSION_MASTERS as u64)
         .map(|i| det_key(1_000_000 + i))
         .collect();
-    let sessions: Vec<SigningKey> = (0..SESSION_MASTERS as u64)
+    let sessions: Vec<FalconKeypair> = (0..SESSION_MASTERS as u64)
         .map(|i| det_key(2_000_000 + i))
         .collect();
     // Master 9 is revoked on chain before propose; its pooled session
@@ -237,17 +328,24 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     let m9 = &masters[REVOKED];
     let s9 = &sessions[REVOKED];
     let grant9 = grant(m9, s9, u64::MAX, 1_000_000);
-    let first =
-        Transaction::sign_with_session(s9, grant9.clone(), [7u8; 32], 1, 1_000, 0, 1, 1, vec![]);
+    let first = Transaction::sign_with_session_falcon512(
+        s9,
+        grant9.clone(),
+        [7u8; 32],
+        1,
+        1_000,
+        0,
+        1,
+        1,
+        vec![],
+    );
     let (a, f, _, _, _) = rt.state.apply_block_parallel_fees(&[first], TS).await;
     assert_eq!((a, f), (1, 0), "setup session tx must register the grant");
-    let revoke = Transaction::sign_with_payload(
+    let revoke = pq_payload_tx(
         m9,
         [7u8; 32],
         1,
         100_000,
-        1,
-        1,
         1,
         vec![OpCode::SysCallRevokeSession {
             session_pubkey: id_of(s9),
@@ -274,7 +372,7 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
             let g = grant(m, s, u64::MAX, 1_000_000);
             let base = if mi == REVOKED { 2 } else { 0 };
             for j in 0..SESSION_TXS {
-                let tx = Transaction::sign_with_session(
+                let tx = Transaction::sign_with_session_falcon512(
                     s,
                     g.clone(),
                     [7u8; 32],
@@ -340,7 +438,8 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     assert_eq!(failed, 0);
 
     // And the apply path refuses the revoked grant directly, like propose did.
-    let bad = Transaction::sign_with_session(s9, grant9, [7u8; 32], 1, 1_000, 2, 1, 1, vec![]);
+    let bad =
+        Transaction::sign_with_session_falcon512(s9, grant9, [7u8; 32], 1, 1_000, 2, 1, 1, vec![]);
     let (_, _, _, status, _) = rt.state.apply_block_parallel_fees(&[bad], TS).await;
     assert_eq!(status, vec![false], "revoked grant is refused at apply too");
 }
@@ -442,7 +541,7 @@ async fn scale_parallel_matches_sequential_distinct_accounts() {
 #[tokio::test]
 async fn scale_mev_parallel_gate_matches_sequential_filter() {
     const N: usize = 600; // over the 512-tx parallel-gate threshold
-    let keys: Vec<SigningKey> = (0..N as u64).map(|i| det_key(700_000 + i)).collect();
+    let keys: Vec<FalconKeypair> = (0..N as u64).map(|i| det_key(700_000 + i)).collect();
     let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
     let pool = Arc::new(tokio::sync::RwLock::new(Mempool::new(4_096, 4_096)));
     {

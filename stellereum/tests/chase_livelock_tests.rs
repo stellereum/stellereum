@@ -17,7 +17,8 @@
 
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use stellereum::consensus::ValidatorSet;
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -48,6 +49,15 @@ async fn two_node() -> (
     (rt, ks[0].clone(), ks[1].clone(), fks)
 }
 
+/// FULL-PQ companion for a signer: `falcon_set` derives each Falcon key from
+/// the Ed key's own first byte, and we re-register it (idempotent) so the
+/// Falcon-only block/vote verifiers see the key.
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(id(k), PqScheme::Falcon512, fk.public_key.clone());
+    fk
+}
+
 /// A block genuinely built by `proposer_key` on top of `rt`'s current state.
 /// Blocks carry no round, so this is valid for whatever round the proposer owns.
 async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Block {
@@ -69,7 +79,7 @@ async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Bloc
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(proposer_key);
+    b.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
     b
 }
 
@@ -814,7 +824,10 @@ async fn refused_proposal_still_records_peer_head() {
     // height) AND still learn finalized height-1 from its prev_hash.
     let mut high = genuine_block(&rt, &peer).await;
     high.height = rt.hc.height + 5;
-    high.sign_block(&peer);
+    // The re-signed body must not keep the stale Falcon signature: a matching
+    // slot with a bad signature refuses immediately (no fallback).
+    high.validator_signatures.clear();
+    high.sign_block_with_falcon(&peer, &fk_for(&peer));
     let r = rt.hc.round;
     let res = rt.on_proposal(id(&peer), high.clone(), r).await;
     assert!(res.is_err(), "must refuse the wrong height, got {res:?}");
@@ -826,7 +839,8 @@ async fn refused_proposal_still_records_peer_head() {
     // A LOWER (stale or maliciously rewound) claim never moves the hint back.
     let mut low = genuine_block(&rt, &peer).await;
     low.height = rt.hc.height; // timely height...
-    low.sign_block(&peer);
+    low.validator_signatures.clear();
+    low.sign_block_with_falcon(&peer, &fk_for(&peer));
     let _ = rt.on_proposal(id(&peer), low, r).await;
     assert!(rt.peer_hint.unwrap().0 >= high.height - 1);
 }

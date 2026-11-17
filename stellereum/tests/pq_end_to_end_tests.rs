@@ -526,7 +526,13 @@ fn pq_qc_sizes_vs_classical() {
             block_hash,
             signatures: csigs,
         };
-        assert!(cqc.verify_unified(&cvs), "classical QC @N={n} must verify");
+        // FULL-PQ: the classical Ed25519 threshold is deleted, so this QC
+        // carries NO power and MUST fail closed. Its bytes are still measured
+        // for the size report (wire comparison only, never a live quorum).
+        assert!(
+            !cqc.verify_unified(&cvs),
+            "classical QC @N={n} must be refused under FULL-PQ"
+        );
         let cqc_bin = bincode::serialize(&cqc).expect("QC must serialize").len();
 
         println!(

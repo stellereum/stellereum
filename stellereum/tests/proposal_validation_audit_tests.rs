@@ -28,8 +28,10 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
-use stellereum::post_quantum::FalconKeypair;
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorSet, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN};
 use stellereum::runtime::{
     count_block_actor_sends, fund_genesis, ValidatorRuntime, PROPOSAL_ALIGN_WINDOW_ROUNDS,
 };
@@ -48,6 +50,50 @@ fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
 
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+/// The Falcon companion `falcon_set` registered for this Ed identity.
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(k.to_bytes()[0])
+}
+
+/// FULL-PQ payload transaction for the block fixtures. `from` is the derived
+/// PQ address (the node refuses classical envelopes).
+fn pq_payload_tx(
+    k: &SigningKey,
+    to: [u8; 32],
+    gas_limit: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let kp = fk_for(k);
+    let pk = kp.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        0,
+        gas_limit,
+        0,
+        MASTERCHAIN_SHARD,
+        MASTERCHAIN_SHARD,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        0,
+        gas_limit,
+        0,
+        MASTERCHAIN_SHARD,
+        MASTERCHAIN_SHARD,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -94,7 +140,7 @@ async fn genuine(
     b.timestamp = ts;
     b.proposer = id(proposer);
     b.last_qc = last_qc;
-    b.sign_block(proposer);
+    b.sign_block_with_falcon(proposer, &fk_for(proposer));
     b
 }
 
@@ -108,18 +154,32 @@ fn qc_over(
     kind: VoteKind,
     bh: Option<[u8; 32]>,
 ) -> QuorumCertificate {
-    QuorumCertificate {
-        height: h,
-        round: r,
-        kind,
-        block_hash: bh,
-        signatures: idx
-            .iter()
-            .map(|&i| {
-                let v = falcon_votes::fvote(&ks[i], &fks[i], h, r, kind, bh);
-                (v.voter, v.signature)
-            })
-            .collect(),
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for &i in idx {
+        let v = falcon_votes::fvote(&ks[i], &fks[i], h, r, kind, bh);
+        set.add(v, &vs, h, r, kind)
+            .expect("fixture votes must be valid");
+    }
+    // The production committee path compiles the Falcon µQC envelope; the
+    // bare Ed list carries no power under FULL-PQ. A deliberately
+    // SUB-quorum fixture cannot compile an envelope, so it keeps the bare
+    // (inert) list - which is exactly the weak certificate the test feeds in.
+    match set.certificate_with_parent(bh, &vs, Some(&[0u8; 32])) {
+        Some(qc) => qc,
+        None => QuorumCertificate {
+            height: h,
+            round: r,
+            kind,
+            block_hash: bh,
+            signatures: idx
+                .iter()
+                .map(|&i| {
+                    let v = falcon_votes::fvote(&ks[i], &fks[i], h, r, kind, bh);
+                    (v.voter, v.signature)
+                })
+                .collect(),
+        },
     }
 }
 
@@ -135,16 +195,7 @@ fn actor_send() -> OpCode {
 
 fn actor_tx(from: &SigningKey, n_top: usize) -> Transaction {
     let payload: Vec<OpCode> = (0..n_top).map(|_| actor_send()).collect();
-    Transaction::sign_with_payload(
-        from,
-        [9u8; 32],
-        0,
-        1_000_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        payload,
-    )
+    pq_payload_tx(from, [9u8; 32], 1_000_000, payload)
 }
 
 async fn actor_block(rt: &ValidatorRuntime, proposer: &SigningKey, txs: Vec<Transaction>) -> Block {
@@ -157,7 +208,7 @@ async fn actor_block(rt: &ValidatorRuntime, proposer: &SigningKey, txs: Vec<Tran
     );
     b.timestamp = 1_000;
     b.proposer = id(proposer);
-    b.sign_block(proposer);
+    b.sign_block_with_falcon(proposer, &fk_for(proposer));
     b
 }
 
@@ -342,6 +393,14 @@ async fn non_member_proposal_refused_as_wrong_proposer() {
     let mut rt = runtime_for(&ks, 0).await;
     let outsider = SigningKey::generate(&mut OsRng);
     let oid = id(&outsider);
+    // Register the outsider's Falcon key so the block signature itself
+    // VERIFIES; the refusal must come from the proposer-slot check (it owns
+    // no slot), not from a missing PQ registration.
+    register_validator_pq_key(
+        oid,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        fk_for(&outsider).public_key.clone(),
+    );
     assert_eq!(rt.validators.power_of(&oid), 0);
 
     // Self-signed, so the signature check passes; membership fails later at
@@ -409,7 +468,7 @@ async fn evidence_none_refused_when_node_knows_parent() {
     child.timestamp = 1_001;
     child.proposer = cid;
     child.last_qc = None;
-    child.sign_block(&c_sched);
+    child.sign_block_with_falcon(&c_sched, &fk_for(&c_sched));
     let err = rt
         .on_proposal(cid, child, rt.hc.round)
         .await
@@ -639,16 +698,7 @@ async fn actor_send_count_is_transitive_over_nested_bodies() {
         bounce: false,
         gas_budget: 0,
     };
-    let tx = Transaction::sign_with_payload(
-        &from,
-        [9u8; 32],
-        0,
-        1_000_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        vec![outer],
-    );
+    let tx = pq_payload_tx(&from, [9u8; 32], 1_000_000, vec![outer]);
     let b = Block::new_for_test(MASTERCHAIN_SHARD, 1, [0u8; 32], [0u8; 32], vec![tx]);
     assert_eq!(count_block_actor_sends(&b), 3);
 }

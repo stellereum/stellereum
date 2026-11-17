@@ -5,9 +5,10 @@
 //! These assertions are deliberately loose so they pass in debug too; their job
 //! is to catch catastrophic regressions, not to be precise micro-benchmarks.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::time::Instant;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
@@ -23,16 +24,46 @@ fn tps(iters: u64, secs: f64) -> f64 {
 #[tokio::test]
 async fn perf_native_transfer_tps() {
     let engine = InMemoryStateEngine::new();
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    // FULL-PQ: native transfers are signed Falcon-512 PQ1 envelopes.
+    let sk = FalconKeypair::generate_from_seed(0x11);
+    let from = derive_pq_address(PqScheme::Falcon512, &sk.public_key, &DEFAULT_SALT);
     let to = [2u8; 32];
     engine
         .update_account(AccountState::new(from, u64::MAX / 2))
         .await;
 
     let n = 500u64;
+    let pk = sk.public_key.clone();
     let txs: Vec<Transaction> = (0..n)
-        .map(|i| Transaction::sign(&sk, to, 1, 0, i, 1, 1))
+        .map(|i| {
+            let probe = Transaction::new_pq_explicit(
+                PqScheme::Falcon512,
+                pk.clone(),
+                vec![0u8; FALCON512_SIG_LEN],
+                to,
+                1,
+                0,
+                i,
+                1,
+                1,
+                Vec::new(),
+                &DEFAULT_SALT,
+            );
+            let sig = sk.sign(&probe.signing_message());
+            Transaction::new_pq_explicit(
+                PqScheme::Falcon512,
+                pk.clone(),
+                sig,
+                to,
+                1,
+                0,
+                i,
+                1,
+                1,
+                Vec::new(),
+                &DEFAULT_SALT,
+            )
+        })
         .collect();
 
     let t = Instant::now();
@@ -42,7 +73,7 @@ async fn perf_native_transfer_tps() {
     let secs = t.elapsed().as_secs_f64();
     let rate = tps(n, secs);
     println!("[perf] native transfer TPS = {:.0} tx/s", rate);
-    // Loose bound: passes in debug (where Ed25519 verify is ~10x slower than release).
+    // Loose bound: passes in debug (where Falcon verify is slower than release).
     assert!(rate > 10.0, "native TPS collapsed: {rate}");
 }
 

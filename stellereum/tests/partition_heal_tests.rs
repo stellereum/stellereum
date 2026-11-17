@@ -9,11 +9,12 @@
 //! partitioned network heals, all in-process (no real network, no sleeps).
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellereum::consensus::{HeightConsensus, ValidatorSet, VoteKind};
-use stellereum::post_quantum::FalconKeypair;
+use stellereum::consensus::{HeightConsensus, ValidatorSet, VoteKind, VoteSet};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
@@ -27,6 +28,60 @@ mod falcon_votes;
 
 fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
     falcon_votes::falcon_set(n)
+}
+
+/// A DISJOINT validator key set (for foreign-quorum tests): same shape as
+/// `falcon_set`, different seeds, registered under its own Ed ids.
+fn keys_from(base: u8, n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    let ks: Vec<SigningKey> = (0..n)
+        .map(|i| SigningKey::from_bytes(&[base.wrapping_add(i as u8); 32]))
+        .collect();
+    let fks: Vec<FalconKeypair> = ks
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(base.wrapping_add(i as u8));
+            stellereum::consensus::register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect();
+    (ks, fks)
+}
+
+/// FULL-PQ (Falcon-512 only node): deterministic implicit Falcon-512 sender,
+/// registered globally so admission/apply accept the envelope.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in these fixtures.
+fn pq_transfer(kp: &FalconKeypair, to: [u8; 32], amount: u64, nonce: u64) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: 0,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn id(k: &SigningKey) -> [u8; 32] {
@@ -51,6 +106,7 @@ fn mkblock(
     prev: [u8; 32],
     pre_root: [u8; 32],
     proposer: &SigningKey,
+    proposer_pq: &FalconKeypair,
     txs: Vec<Transaction>,
     timestamp: u64,
 ) -> Block {
@@ -73,32 +129,40 @@ fn mkblock(
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(proposer);
+    // FULL-PQ: Ed-only bodies are refused by `verify_proposer_signature`.
+    b.sign_block_with_falcon(proposer, proposer_pq);
     b
 }
 
 /// Attach a genuine precommit QC so the block carries a quorum that
 /// `validate_sync_chain` can verify (membership + power).
 ///
-/// The quorum lives in the QC, not in extra block-hash signatures: validators agree
-/// via votes (over vote_sign_bytes), and only the QC proves they did.
-fn quorum_sign(b: &mut Block, ks: &[SigningKey], fks: &[FalconKeypair], round: u32) {
+/// FULL-PQ: a raw Ed25519 signature list carries no power. The quorum is
+/// compiled through the production committee path (`VoteSet::certificate`),
+/// which attaches the Falcon µQC envelope the verifier reads.
+fn quorum_sign(
+    b: &mut Block,
+    signers: &[SigningKey],
+    signer_fks: &[FalconKeypair],
+    all: &ValidatorSet,
+    round: u32,
+) {
     let bh = b.compute_hash();
-    let sigs = ks
-        .iter()
-        .zip(fks.iter())
-        .map(|(k, fk)| {
-            let v = falcon_votes::fvote(k, fk, b.height, round, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(stellereum::consensus::QuorumCertificate {
-        height: b.height,
-        round,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    });
+    let mut set = VoteSet::new();
+    for (k, fk) in signers.iter().zip(signer_fks.iter()) {
+        set.add(
+            falcon_votes::fvote(k, fk, b.height, round, VoteKind::Precommit, Some(bh)),
+            all,
+            b.height,
+            round,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    b.precommit_qc = Some(
+        set.certificate(Some(bh), all, &b.prev_hash)
+            .expect("signers reach quorum"),
+    );
 }
 
 fn store(blocks: &[Block]) -> HashMap<[u8; 32], Block> {
@@ -206,8 +270,7 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     assert_eq!(vs.quorum_power(), 3, "4 validators need 3 for quorum");
 
     // One funded payer; both sides start from byte-identical state.
-    let payer_key = SigningKey::generate(&mut OsRng);
-    let payer = id(&payer_key);
+    let (payer_key, payer) = pq_key(0x11);
     let recipient = [0x99u8; 32];
     let eng_a = funded(payer, 1_000_000_000).await;
     let eng_b = funded(payer, 1_000_000_000).await;
@@ -220,11 +283,19 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     let proposer_idx = proposer_idx.expect("non-empty set has a proposer");
     let pre_root = eng_a.get_state_root().await;
     assert_eq!(pre_root, eng_b.get_state_root().await);
-    let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, 0, 1, 1);
-    let mut block = mkblock(1, [0u8; 32], pre_root, &ks[proposer_idx], vec![tx], 1_000);
+    let tx = pq_transfer(&payer_key, recipient, 1_000, 0);
+    let mut block = mkblock(
+        1,
+        [0u8; 32],
+        pre_root,
+        &ks[proposer_idx],
+        &fks[proposer_idx],
+        vec![tx],
+        1_000,
+    );
     // Only the two sides' own keys ever sign: each partition holds 2 of 3 needed.
     // On heal both sides' votes combine into one QC over all four keys.
-    quorum_sign(&mut block, &ks, &fks, 0);
+    quorum_sign(&mut block, &ks, &fks, &vs, 0);
     let bh = block.compute_hash();
     {
         let qc = block
@@ -360,7 +431,7 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     // Both sides apply the reunited block after the F3.2 root check.
     // The block already carries the reunited 4-of-4 QC attached above; re-assert
     // it here so the applied block keeps a genuine quorum (not a sub-quorum).
-    quorum_sign(&mut block, &ks, &fks, 0);
+    quorum_sign(&mut block, &ks, &fks, &vs, 0);
     for (eng, name) in [(&eng_a, "A"), (&eng_b, "B")] {
         assert_eq!(
             eng.get_state_root().await,
@@ -391,8 +462,7 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
     let majority_fks: Vec<FalconKeypair> = fks[..3].to_vec();
     let lone = &ks[3];
 
-    let payer_key = SigningKey::generate(&mut OsRng);
-    let payer = id(&payer_key);
+    let (payer_key, payer) = pq_key(0x12);
     let recipient = [0x77u8; 32];
     // Majority nodes each hold their OWN engine; the isolated node holds its own.
     let mut maj_engines = vec![];
@@ -420,7 +490,8 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
             round += 1;
         }
         let prop = vs.proposer_for(h, round).unwrap();
-        let proposer = majority.iter().find(|k| id(k) == prop).unwrap().clone();
+        let pidx = majority.iter().position(|k| id(k) == prop).unwrap();
+        let proposer = majority[pidx].clone();
 
         // REAL block: links to the majority head, commits to the pre-apply root.
         let pre_root = maj_engines[0].get_state_root().await;
@@ -431,9 +502,17 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
                 "majority stays in lockstep"
             );
         }
-        let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
-        let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 1_000 + h);
-        quorum_sign(&mut b, &majority, &majority_fks, round);
+        let tx = pq_transfer(&payer_key, recipient, 1_000, h - 1);
+        let mut b = mkblock(
+            h,
+            prev,
+            pre_root,
+            &proposer,
+            &majority_fks[pidx],
+            vec![tx],
+            1_000 + h,
+        );
+        quorum_sign(&mut b, &majority, &majority_fks, &vs, round);
         let bh = b.compute_hash();
         assert!(b.verify_proposer_signature());
         // The quorum lives in the attached precommit QC, not in extra block-hash
@@ -513,8 +592,7 @@ async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
     let (ks, fks) = keys(4);
     let vs = vset(&ks);
 
-    let payer_key = SigningKey::generate(&mut OsRng);
-    let payer = id(&payer_key);
+    let (payer_key, payer) = pq_key(0x13);
     let recipient = [0x55u8; 32];
     let builder = funded(payer, 1_000_000_000_000).await;
 
@@ -523,11 +601,20 @@ async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
     let mut prev = [0u8; 32];
     for h in 1..=N {
         let prop = vs.proposer_for(h, 0).unwrap();
-        let proposer = ks.iter().find(|k| id(k) == prop).unwrap().clone();
+        let pidx = ks.iter().position(|k| id(k) == prop).unwrap();
+        let proposer = ks[pidx].clone();
         let pre_root = builder.get_state_root().await;
-        let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
-        let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 2_000 + h);
-        quorum_sign(&mut b, &ks, &fks, 0);
+        let tx = pq_transfer(&payer_key, recipient, 1_000, h - 1);
+        let mut b = mkblock(
+            h,
+            prev,
+            pre_root,
+            &proposer,
+            &fks[pidx],
+            vec![tx],
+            2_000 + h,
+        );
+        quorum_sign(&mut b, &ks, &fks, &vs, 0);
         let (applied, failed, _, _, _) = builder
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -587,14 +674,13 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
     let (ks, fks) = keys(4);
     let vs = vset(&ks);
     // A DIFFERENT validator set: same size, disjoint keys, its own quorum.
-    let (foreign_keys, foreign_fks) = keys(4);
+    let (foreign_keys, foreign_fks) = keys_from(0x40, 4);
     for k in &foreign_keys {
         assert_eq!(vs.power_of(&id(k)), 0, "foreign keys hold no power here");
     }
     let foreign_vs = vset(&foreign_keys);
 
-    let payer_key = SigningKey::generate(&mut OsRng);
-    let payer = id(&payer_key);
+    let (payer_key, payer) = pq_key(0x14);
     let ours = funded(payer, 1_000_000_000).await;
 
     // OUR chain through height 6 (recipient A).
@@ -602,11 +688,20 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
     let mut own: Vec<Block> = Vec::new();
     for h in 1..=6u64 {
         let prop = vs.proposer_for(h, 0).unwrap();
-        let proposer = ks.iter().find(|k| id(k) == prop).unwrap().clone();
+        let pidx = ks.iter().position(|k| id(k) == prop).unwrap();
+        let proposer = ks[pidx].clone();
         let pre_root = ours.get_state_root().await;
-        let tx = Transaction::sign(&payer_key, [0xAAu8; 32], 1_000, 0, h - 1, 1, 1);
-        let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 3_000 + h);
-        quorum_sign(&mut b, &ks, &fks, 0);
+        let tx = pq_transfer(&payer_key, [0xAAu8; 32], 1_000, h - 1);
+        let mut b = mkblock(
+            h,
+            prev,
+            pre_root,
+            &proposer,
+            &fks[pidx],
+            vec![tx],
+            3_000 + h,
+        );
+        quorum_sign(&mut b, &ks, &fks, &vs, 0);
         let (applied, failed, _, _, _) = ours
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -633,11 +728,20 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
     let mut fprev = own_last_3;
     for h in 4..=6u64 {
         let prop = foreign_vs.proposer_for(h, 0).unwrap();
-        let proposer = foreign_keys.iter().find(|k| id(k) == prop).unwrap().clone();
+        let pidx = foreign_keys.iter().position(|k| id(k) == prop).unwrap();
+        let proposer = foreign_keys[pidx].clone();
         let pre_root = fork_state.get_state_root().await;
-        let tx = Transaction::sign(&payer_key, [0xBBu8; 32], 9_999, 0, h - 1, 1, 1);
-        let mut b = mkblock(h, fprev, pre_root, &proposer, vec![tx], 9_000 + h);
-        quorum_sign(&mut b, &foreign_keys, &foreign_fks, 0);
+        let tx = pq_transfer(&payer_key, [0xBBu8; 32], 9_999, h - 1);
+        let mut b = mkblock(
+            h,
+            fprev,
+            pre_root,
+            &proposer,
+            &foreign_fks[pidx],
+            vec![tx],
+            9_000 + h,
+        );
+        quorum_sign(&mut b, &foreign_keys, &foreign_fks, &foreign_vs, 0);
         let (applied, failed, _, _, _) = fork_state
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -691,8 +795,7 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     let (ks, fks) = keys(4);
     let vs = vset(&ks);
 
-    let payer_key = SigningKey::generate(&mut OsRng);
-    let payer = id(&payer_key);
+    let (payer_key, payer) = pq_key(0x15);
     let recipient = [0x33u8; 32];
     let net_state = funded(payer, 1_000_000_000).await;
     let ret_state = funded(payer, 1_000_000_000).await;
@@ -706,17 +809,19 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
         round1 += 1;
     }
     let prop1 = vs.proposer_for(1, round1).unwrap();
-    let proposer1 = ks.iter().find(|k| id(k) == prop1).unwrap().clone();
+    let proposer1_idx = ks.iter().position(|k| id(k) == prop1).unwrap();
+    let proposer1 = ks[proposer1_idx].clone();
     let pre1 = net_state.get_state_root().await;
     let mut b1 = mkblock(
         1,
         [0u8; 32],
         pre1,
         &proposer1,
-        vec![Transaction::sign(&payer_key, recipient, 1_000, 0, 0, 1, 1)],
+        &fks[proposer1_idx],
+        vec![pq_transfer(&payer_key, recipient, 1_000, 0)],
         4_001,
     );
-    quorum_sign(&mut b1, &ks[..3], &fks[..3], round1);
+    quorum_sign(&mut b1, &ks[..3], &fks[..3], &vs, round1);
     let bh1 = b1.compute_hash();
     hc_net.receive_proposal(prop1, bh1).unwrap();
     assert_eq!(
@@ -789,7 +894,8 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     let mut hc_net2 = HeightConsensus::new(2, vs.clone());
     let mut hc_ret2 = HeightConsensus::new(2, vs.clone());
     let prop2 = vs.proposer_for(2, 0).unwrap();
-    let proposer2 = ks.iter().find(|k| id(k) == prop2).unwrap().clone();
+    let proposer2_idx = ks.iter().position(|k| id(k) == prop2).unwrap();
+    let proposer2 = ks[proposer2_idx].clone();
     let pre2 = net_state.get_state_root().await;
     assert_eq!(ret_state.get_state_root().await, pre2);
     let mut b2 = mkblock(
@@ -797,10 +903,11 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
         bh1,
         pre2,
         &proposer2,
-        vec![Transaction::sign(&payer_key, recipient, 2_000, 0, 1, 1, 1)],
+        &fks[proposer2_idx],
+        vec![pq_transfer(&payer_key, recipient, 2_000, 1)],
         4_002,
     );
-    quorum_sign(&mut b2, &ks, &fks, 0);
+    quorum_sign(&mut b2, &ks, &fks, &vs, 0);
     let bh2 = b2.compute_hash();
     // The returnee accepts the network's proposal for the current height/round.
     hc_net2.receive_proposal(prop2, bh2).unwrap();

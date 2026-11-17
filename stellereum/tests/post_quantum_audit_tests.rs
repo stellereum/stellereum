@@ -28,7 +28,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use stellereum::commitment::COMMITMENT_VERSION;
 use stellereum::mempool::{
     Mempool, MempoolError, PendingActivationBuffer, PQ_ACTIVATION_SURCHARGE_GAS,
@@ -620,6 +620,19 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
     let cross_msg = CrossShardMessage::new(1, 2, tx, source_state_root, block_hash, Some(proof))
         .with_source_balance(initial_balance);
 
+    // HARDENED SINCE THIS FIXTURE: the credit path now requires the message to
+    // anchor to a LOCALLY FINALIZED source header (`verify_cross_shard_anchored`),
+    // not just a self-consistent Merkle proof. Production installs the
+    // process-shared header registry; the fixture must do the same, recording
+    // shard 1's finalized block at the root the proof was made against.
+    let headers = Arc::new(RwLock::new(
+        stellereum::sharding::FinalizedHeaderRegistry::default(),
+    ));
+    headers
+        .write()
+        .unwrap()
+        .note_finalized(1, block_hash, source_state_root);
+
     // Verify inclusion for pinned 49-byte account
     assert!(
         cross_msg.verify_inclusion(),
@@ -632,6 +645,7 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
 
     // Apply on target shard engine (shard 2)
     let target_engine = InMemoryStateEngine::new();
+    target_engine.with_finalized_headers(headers);
     target_engine.enable_cross_shard();
 
     let balance_before = target_engine

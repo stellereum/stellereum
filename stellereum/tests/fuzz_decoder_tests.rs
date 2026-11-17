@@ -633,19 +633,19 @@ fn report_all_zero_payloads_decode_as_valid_messages() {
     // SPLIT HARDENING (PENTEST F1 `reject_trailing_bytes`): a 1024-zero blob
     // no longer decodes as a height-0 Proposal — the zero prefix is a valid
     // Vote-shaped prefix but the surplus zeros are trailing bytes, so the
-    // wire `ConsensusMsg::decode` fails closed (None). The plain-tx path
-    // still uses lenient `bincode::deserialize`, so a 256-zero blob still
-    // decodes as a zero tx (rejected downstream by signature verification).
+    // wire `ConsensusMsg::decode` fails closed (None). The transaction wire
+    // path now shares the same exact-fit rule (`decode_wire_limited`), so a
+    // 256-zero blob is refused there too instead of decoding to a zero tx.
+    // Both are pinned as fail-closed: the lenient-decode era is over.
     let raw = serde_json::json!({ "data": "00".repeat(1024) }).to_string();
     assert!(
         parse_incoming(&raw).is_none(),
         "zero blob must now fail closed on the wire path (trailing-bytes hardening)"
     );
     let raw = serde_json::json!({ "data": "00".repeat(256) }).to_string();
-    let tx = parse_tx_incoming(&raw).expect("zero tx currently decodes");
     assert!(
-        !tx.verify_signature(),
-        "zero tx must fail signature verification"
+        parse_tx_incoming(&raw).is_none(),
+        "zero tx blob must now fail closed on the exact-fit wire path (trailing-bytes hardening)"
     );
 }
 

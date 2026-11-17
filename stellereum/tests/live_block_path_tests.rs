@@ -21,7 +21,10 @@
 //! `UNBONDING_PERIOD_SECS` instead of `block.timestamp + UNBONDING_PERIOD_SECS`
 //! and contracts were created at time 0.
 
-use ed25519_dalek::SigningKey;
+use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
@@ -39,8 +42,57 @@ fn floor() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ fixture key. The node refuses bare Ed25519 transaction envelopes,
+/// so every sender is a Falcon keypair signing a PQ envelope.
+fn key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
+/// The PQ mirror of `Transaction::sign_with_payload`.
+#[allow(clippy::too_many_arguments)]
+// GATE: mirrors the production constructor's full tx context.
+fn pq_tx(
+    kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = kp.public_key().to_vec();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -61,7 +113,7 @@ async fn pool(e: &InMemoryStateEngine) -> u64 {
 async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x11);
-    let sender = sk.verifying_key().to_bytes();
+    let sender = addr(&sk);
     let plain_to = [0xAAu8; 32];
     let payload_to = [0xBBu8; 32];
     let start = 1_000_000u64;
@@ -71,7 +123,7 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
 
     // gas_limit == the opcode's own cost, so the assertion below is about the
     // value movement and not about which fee rule a path charges.
-    let tx = Transaction::sign_with_payload(
+    let tx = pq_tx(
         &sk,
         plain_to,
         1_000,
@@ -91,7 +143,11 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
 
     assert_eq!((applied, failed), (1, 0), "the payload transaction applies");
     assert_eq!(status, vec![true]);
-    assert_eq!(fees, GAS_BASIC_TRANSFER, "the declared gas is collected");
+    assert_eq!(
+        fees,
+        GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS,
+        "the declared gas plus the PQ activation surcharge is collected"
+    );
 
     // THE regression: before the fix the payload's transfers were discarded, so
     // `payload_to` stayed at 0 while the transaction reported success.
@@ -107,7 +163,7 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
     );
     assert_eq!(
         balance(&engine, &sender).await,
-        start - 1_000 - GAS_BASIC_TRANSFER - 5_000,
+        start - 1_000 - fees - 5_000,
         "the sender pays the amount, the fee AND what the payload moved"
     );
     assert_eq!(engine.get_account(&sender).await.unwrap().nonce, 1);
@@ -121,14 +177,14 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
 async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x22);
-    let validator = sk.verifying_key().to_bytes();
-    let start = floor() + GAS_STAKE_BOND + 4_242;
+    let validator = addr(&sk);
+    let start = floor() + GAS_STAKE_BOND + PQ_ACTIVATION_SURCHARGE_GAS + 4_242;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
     assert_eq!(pool(&engine).await, 0, "the pool starts empty");
 
-    let tx = Transaction::sign_with_payload(
+    let tx = pq_tx(
         &sk,
         validator,
         0,
@@ -142,7 +198,7 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
         }],
     );
 
-    let (applied, failed, _fees, status, _) = engine
+    let (applied, failed, fees, status, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS)
         .await;
     assert_eq!((applied, failed), (1, 0), "the bond transaction applies");
@@ -157,8 +213,8 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
     );
     assert_eq!(
         balance(&engine, &validator).await,
-        start - floor() - GAS_STAKE_BOND,
-        "the bond and the gas leave the sender"
+        start - floor() - fees,
+        "the bond and the fee leave the sender"
     );
     let vs = engine.staking_read().await.to_validator_set();
     assert_eq!(
@@ -177,14 +233,14 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
 async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x33);
-    let validator = sk.verifying_key().to_bytes();
-    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_CLAIM;
+    let validator = addr(&sk);
+    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_CLAIM + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
 
     // Block 1: bond through the live path, so the pool really holds the coins.
-    let bond_tx = Transaction::sign_with_payload(
+    let bond_tx = pq_tx(
         &sk,
         validator,
         0,
@@ -223,7 +279,7 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     );
 
     // Block 2: claim through the live path.
-    let claim_tx = Transaction::sign_with_payload(
+    let claim_tx = pq_tx(
         &sk,
         [0u8; 32],
         0,
@@ -233,7 +289,7 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
         1,
         vec![OpCode::SysCallClaimRewards { validator }],
     );
-    let (applied, failed, _fees, status, _) = engine
+    let (applied, failed, claim_fees, status, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&claim_tx), BLOCK_TS)
         .await;
     assert_eq!((applied, failed), (1, 0), "the claim applies");
@@ -259,7 +315,7 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     );
     assert_eq!(
         balance(&engine, &validator).await,
-        after_bond + reward - GAS_STAKE_CLAIM,
+        after_bond + reward - claim_fees,
         "the payout reaches the claimant"
     );
 }
@@ -277,14 +333,14 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
 async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x44);
-    let validator = sk.verifying_key().to_bytes();
-    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_UNBOND;
+    let validator = addr(&sk);
+    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_UNBOND + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
 
     // Block 1: bond so there is something to unbond.
-    let bond_tx = Transaction::sign_with_payload(
+    let bond_tx = pq_tx(
         &sk,
         validator,
         0,
@@ -303,7 +359,7 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     assert_eq!((applied, failed), (1, 0));
 
     // Block 2: full exit, applied at BLOCK_TS.
-    let unbond_tx = Transaction::sign_with_payload(
+    let unbond_tx = pq_tx(
         &sk,
         [0u8; 32],
         0,
@@ -367,13 +423,13 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
 async fn block_timestamp_reaches_the_vm_contract_creation_time() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x55);
-    let creator = sk.verifying_key().to_bytes();
+    let creator = addr(&sk);
     engine
         .update_account(AccountState::new(creator, 10_000_000))
         .await;
 
     let code = wat::parse_str("(module)").expect("wat compiles");
-    let tx = Transaction::sign_with_payload(
+    let tx = pq_tx(
         &sk,
         [0u8; 32],
         0,
@@ -437,11 +493,11 @@ async fn run_on_both_paths(
 #[tokio::test]
 async fn live_block_path_and_single_tx_path_agree_on_a_payload_transfer() {
     let sk = key(0x66);
-    let sender = sk.verifying_key().to_bytes();
+    let sender = addr(&sk);
     let plain_to = [0xCCu8; 32];
     let payload_to = [0xDDu8; 32];
 
-    let tx = Transaction::sign_with_payload(
+    let tx = pq_tx(
         &sk,
         plain_to,
         2_000,
@@ -467,7 +523,7 @@ async fn live_block_path_and_single_tx_path_agree_on_a_payload_transfer() {
         assert_eq!(balance(e, &plain_to).await, 2_000, "plain amount credited");
         assert_eq!(
             balance(e, &sender).await,
-            1_000_000 - 2_000 - GAS_BASIC_TRANSFER - 7_000
+            1_000_000 - 2_000 - (GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS) - 7_000
         );
         assert_eq!(e.get_account(&sender).await.unwrap().nonce, 1);
     }
@@ -485,15 +541,16 @@ async fn live_block_path_and_single_tx_path_agree_on_a_payload_transfer() {
 #[tokio::test]
 async fn unaffordable_payload_transfer_fails_identically_on_both_paths() {
     let sk = key(0x77);
-    let sender = sk.verifying_key().to_bytes();
+    let sender = addr(&sk);
     let plain_to = [0xEEu8; 32];
     let payload_to = [0xEFu8; 32];
 
     // Exactly enough for `amount + gas_limit` (so admission accepts it), and
     // the payload then tries to move all of it on top - the combined debit is
     // unaffordable.
-    let funding = 1_000 + GAS_BASIC_TRANSFER;
-    let tx = Transaction::sign_with_payload(
+    let fee = GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS;
+    let funding = 1_000 + fee;
+    let tx = pq_tx(
         &sk,
         plain_to,
         1_000,
@@ -503,7 +560,7 @@ async fn unaffordable_payload_transfer_fails_identically_on_both_paths() {
         1,
         vec![OpCode::Transfer {
             recipient: payload_to,
-            amount: 1_000 + GAS_BASIC_TRANSFER,
+            amount: 1_000 + fee,
         }],
     );
 
@@ -520,7 +577,7 @@ async fn unaffordable_payload_transfer_fails_identically_on_both_paths() {
         // the SAME on both paths.
         assert_eq!(
             balance(e, &sender).await,
-            funding - GAS_BASIC_TRANSFER,
+            funding - fee,
             "a refused transfer moves no value; only the failure fee is charged"
         );
         assert_eq!(

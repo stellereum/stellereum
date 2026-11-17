@@ -46,9 +46,15 @@ const FAUCET_CANARY: &str = "audit-explorer-faucet-canary-1a2b3c4d";
 const FAUCET_SEED: [u8; 32] = [0x5Au8; 32];
 
 fn faucet_addr() -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(&FAUCET_SEED)
-        .verifying_key()
-        .to_bytes()
+    // FULL-PQ: the faucet signs with the Falcon-512 keypair derived from
+    // `FAUCET_SEED` (the classical Ed25519 faucet key is deleted), so its
+    // genesis-funded account is the derived PQ address, not the Ed key bytes.
+    let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&FAUCET_SEED);
+    stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &kp.public_key,
+        &stellereum::post_quantum::DEFAULT_SALT,
+    )
 }
 
 // ---------------------------------------------------------------------------

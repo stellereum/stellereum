@@ -379,7 +379,13 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(&imposter);
+    // FULL-PQ: proposal signatures are verified Falcon-only; `imposter` owns
+    // a near-future slot, so the block must carry its registered Falcon half.
+    let imposter_idx = ks
+        .iter()
+        .position(|k| id(k) == id(&imposter))
+        .expect("imposter is a member");
+    b.sign_block_with_falcon(&imposter, &fks[imposter_idx]);
     let bhash = b.compute_hash();
     assert_ne!(id(&imposter), real_proposer);
 

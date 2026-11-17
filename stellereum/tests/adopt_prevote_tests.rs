@@ -12,6 +12,7 @@
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
@@ -33,10 +34,10 @@ async fn runtime(ks: &[SigningKey], idx: usize) -> ValidatorRuntime {
 }
 
 /// Block authored by the scheduled proposer for (1, 0) committing to our root.
-async fn good_block(rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block {
+async fn good_block(rt: &ValidatorRuntime, ks: &[SigningKey], fks: &[FalconKeypair]) -> Block {
     let vs = rt.validators.clone();
     let proposer = vs.proposer_for(1, 0).unwrap();
-    let pk = ks.iter().find(|k| id(k) == proposer).unwrap();
+    let idx = ks.iter().position(|k| id(k) == proposer).unwrap();
     let mut b = Block {
         shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
         height: 1,
@@ -55,7 +56,7 @@ async fn good_block(rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pk);
+    b.sign_block_with_falcon(&ks[idx], &fks[idx]);
     b
 }
 
@@ -89,7 +90,7 @@ fn precommit_cert(
 async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
-    let blk = good_block(&rt, &ks).await;
+    let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let cert = precommit_cert(&ks, &fks, bh);
     assert!(cert.verify(&rt.validators));
@@ -107,7 +108,7 @@ async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
 async fn matching_prevote_and_precommit_is_accepted() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
-    let blk = good_block(&rt, &ks).await;
+    let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
         rt.on_prevote(falcon_votes::fvote(
@@ -130,7 +131,7 @@ async fn matching_prevote_and_precommit_is_accepted() {
 async fn conflicting_local_prevote_quorum_refuses_adoption() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
-    let blk = good_block(&rt, &ks).await;
+    let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let other = [0xEEu8; 32];
     assert_ne!(other, bh);
@@ -164,7 +165,7 @@ async fn conflicting_local_prevote_quorum_refuses_adoption() {
 async fn anti_lock_adoption_is_refused() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
-    let blk = good_block(&rt, &ks).await;
+    let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some(([0xAAu8; 32], 0));
     let cert = precommit_cert(&ks, &fks, bh);
@@ -179,7 +180,7 @@ async fn anti_lock_adoption_is_refused() {
 async fn adopting_the_locked_block_succeeds() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
-    let blk = good_block(&rt, &ks).await;
+    let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some((bh, 0));
     let cert = precommit_cert(&ks, &fks, bh);

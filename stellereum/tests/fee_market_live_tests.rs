@@ -17,20 +17,49 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ sender identity for a seed: implicit Falcon-512, registered
+/// globally so admission verifies it with no activation surcharge.
+fn pq_id(seed: u8) -> [u8; 32] {
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
 }
 
 fn transfer(seed: u8, nonce: u64, gas: u64, amount: u64) -> Transaction {
-    let k = key(seed);
-    Transaction::sign(&k, [0xEE; 32], amount, gas, nonce, 0, 0)
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to: [0xEE; 32],
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn funded(seed: u8) -> [u8; 32] {
-    key(seed).verifying_key().to_bytes()
+    pq_id(seed)
+}
+
+/// Ed25519 validator identity (the runtime's voter id / proposer id).
+fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
 }
 
 #[test]
@@ -63,11 +92,11 @@ fn the_gas_budget_skips_an_oversized_transaction_rather_than_truncating() {
     let picked = mp.select_bounded(10, 1_500);
     let senders: Vec<[u8; 32]> = picked.iter().map(|t| t.from).collect();
     assert!(
-        !senders.contains(&key(3).verifying_key().to_bytes()),
+        !senders.contains(&funded(3)),
         "the oversized tx must be skipped"
     );
     assert!(
-        senders.contains(&key(4).verifying_key().to_bytes()),
+        senders.contains(&funded(4)),
         "a cheaper tx behind it must still fit"
     );
     assert_eq!(picked.len(), 3, "500 + 400 + 300 = 1200 fits a 1500 budget");
@@ -178,15 +207,14 @@ fn a_base_fee_above_zero_blocks_free_spam() {
     );
 
     let mut guarded = Mempool::default().with_base_fee(560);
-    let k = key(3);
-    let spam = Transaction::sign(&k, [0xEE; 32], 1, 0, 0, 0, 0);
+    let spam = transfer(3, 0, 0, 1);
     let err = guarded
         .add_checked(spam, 1_000_000)
         .expect_err("free tx must be rejected");
     assert_eq!(err, stellereum::mempool::MempoolError::FeeTooLow);
 
     // And a real transfer, priced at the cheapest real operation, gets through.
-    let real = Transaction::sign(&k, [0xEE; 32], 1, 560, 0, 0, 0);
+    let real = transfer(3, 0, 560, 1);
     assert!(guarded.add_checked(real, 1_000_000).is_ok());
 }
 
@@ -204,7 +232,7 @@ fn selection_prefers_executable_work_under_pressure() {
         mp.add(transfer(9, n, 50_000, 1)).expect("admit");
     }
 
-    let picked = mp.select_for_block(5, u64::MAX, |t| t.from == key(1).verifying_key().to_bytes());
+    let picked = mp.select_for_block(5, u64::MAX, |t| t.from == funded(1));
     assert_eq!(picked.len(), 5);
     let fees: Vec<u64> = picked.iter().map(|t| t.gas_limit).collect();
     assert_eq!(
@@ -227,24 +255,33 @@ async fn proposer_filter_skips_below_floor_without_rejecting() {
 
     let master = key(11);
     let master_pub = master.verifying_key().to_bytes();
-    let poor = key(12);
-    let poor_pub = poor.verifying_key().to_bytes();
+    let ok_sender = funded(11);
+    let low_sender = funded(12);
     let engine = Arc::new(InMemoryStateEngine::new());
     engine
         .update_account(AccountState::new(master_pub, 10_000_000))
         .await;
     engine
-        .update_account(AccountState::new(poor_pub, 10_000_000))
+        .update_account(AccountState::new(ok_sender, 10_000_000))
+        .await;
+    engine
+        .update_account(AccountState::new(low_sender, 10_000_000))
         .await;
     let vset = ValidatorSet::from_list(vec![(master_pub, 1)]);
-    let mut rt = ValidatorRuntime::new(master, vset, engine, 1);
+    let master_fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(11);
+    stellereum::consensus::register_validator_pq_key(
+        master_pub,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        master_fk.public_key.clone(),
+    );
+    let mut rt = ValidatorRuntime::new(master, vset, engine, 1).with_falcon_key(master_fk);
 
     // Unchecked admission (no BALANCE check), then the floor rises past one
     // tx. The runtime's default pool already carries the operator's floor
     // (`STELL_MIN_GAS_LIMIT`), so both transactions declare at least that
     // much gas; the floor is then raised past the cheaper one.
-    let ok_tx = Transaction::sign(&key(11), [0xEE; 32], 1, 560_000, 0, 0, 0);
-    let low_tx = Transaction::sign(&poor, [0xEE; 32], 1, 280_000, 0, 0, 0);
+    let ok_tx = transfer(11, 0, 560_000, 1);
+    let low_tx = transfer(12, 0, 280_000, 1);
     {
         let mut mp = rt.mempool.write().await;
         mp.add(ok_tx.clone()).expect("unchecked admit");
@@ -284,7 +321,7 @@ fn a_cheap_flood_cannot_displace_expensive_transactions() {
         mp.add(transfer(2, n, 90_000, 1)).expect("admit expensive");
     }
     let picked = mp.select_bounded(5, u64::MAX);
-    let expensive = key(2).verifying_key().to_bytes();
+    let expensive = funded(2);
     assert_eq!(
         picked.iter().filter(|t| t.from == expensive).count(),
         3,

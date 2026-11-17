@@ -52,6 +52,19 @@ fn grind_delegated_to_zero(l: &mut StakingLedger, v: [u8; 32], max_height: u64) 
     burned_total
 }
 
+/// Restore the bond floor and clear the downtime jail installed by the grind,
+/// so the reward-split assertions run on a validator that may be paid.
+fn unjail_after_downtime(l: &mut StakingLedger, v: [u8; 32]) {
+    let target = stellereum::staking::required_bond_floor_nano();
+    let current = l.validators[&v].self_bond;
+    if current < target {
+        l.add_bond(v, target - current)
+            .expect("top up the bond to the floor");
+    }
+    l.unjail(v, u64::MAX)
+        .expect("cooldown elapsed; bond at floor");
+}
+
 fn sum_delegations(l: &StakingLedger, v: [u8; 32]) -> u64 {
     l.delegations
         .iter()
@@ -161,6 +174,11 @@ fn desync_inflates_delegator_rewards() {
     l.delegate(d, v, delegated).unwrap();
 
     let burned = grind_delegated_to_zero(&mut l, v, 200_000_000);
+    // The downtime slashes also jail the validator. Rewards are refused for a
+    // jailed validator (a separate, correct gate), so re-admit it here to keep
+    // this test on its own property: the pro-rata split after the delegation
+    // aggregate has been ground down.
+    unjail_after_downtime(&mut l, v);
     let agg = l.validators[&v].delegated;
     let per = sum_delegations(&l, v);
     println!("ground state: burned={burned} delegated_agg={agg} delegations_map={per}");
@@ -201,13 +219,19 @@ async fn inflated_rewards_become_spendable_native_stell() {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use stellereum::consensus::ValidatorSet;
+    use stellereum::post_quantum::{
+        derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+    };
     use stellereum::runtime::ValidatorRuntime;
     use stellereum::sharding::Transaction;
 
     let engine = std::sync::Arc::new(InMemoryStateEngine::new());
     let v = [0x04; 32];
-    let delegator = SigningKey::generate(&mut OsRng);
-    let delegator_addr = delegator.verifying_key().to_bytes();
+    // FULL-PQ: the spender is a Falcon-512 key; its account is the derived
+    // PQ address the reward is delegated under.
+    let delegator = FalconKeypair::generate_from_seed(0xD4);
+    let delegator_addr =
+        derive_pq_address(PqScheme::Falcon512, &delegator.public_key, &DEFAULT_SALT);
 
     // Fund the staking pool so the setup is realistic.
     engine
@@ -222,6 +246,7 @@ async fn inflated_rewards_become_spendable_native_stell() {
         let delegated = 100 * NANO;
         l.delegate(delegator_addr, v, delegated).unwrap();
         let burned = grind_delegated_to_zero(&mut l, v, 200_000_000);
+        unjail_after_downtime(&mut l, v);
         println!("downtime burned from the pool = {burned}");
         println!(
             "delegated_agg = {}, delegations_map = {}",
@@ -230,9 +255,13 @@ async fn inflated_rewards_become_spendable_native_stell() {
         );
     }
 
+    // One block's reward. Large enough that the (post-fix) pro-rata share of
+    // the remaining 999-nano delegation is still a non-zero payout, so the
+    // spendable-native leg is actually exercised.
+    let reward = 1_000_000_000_000_000u64;
     let key = SigningKey::generate(&mut OsRng);
     let mut rt = ValidatorRuntime::new(key, ValidatorSet::new(), engine.clone(), 1);
-    rt = rt.with_block_reward(1_000_000_000);
+    rt = rt.with_block_reward(reward);
 
     // The delegator starts with NOTHING.
     let start_bal = engine
@@ -245,10 +274,10 @@ async fn inflated_rewards_become_spendable_native_stell() {
     // A block is finalised and the proposer (validator `v`) earns a reward.
     rt.staking_write()
         .await
-        .distribute_reward(v, 1_000_000_000)
+        .distribute_reward(v, reward)
         .unwrap();
     engine
-        .credit_native(&stellereum::staking::REWARDS_POOL, 1_000_000_000)
+        .credit_native(&stellereum::staking::REWARDS_POOL, reward)
         .await
         .expect("back the accrual");
 
@@ -261,7 +290,7 @@ async fn inflated_rewards_become_spendable_native_stell() {
         .map(|a| a.balance)
         .unwrap_or(0);
 
-    println!("block reward      = 1000000000");
+    println!("block reward      = {reward}");
     println!("claimed           = {claimed}");
     println!("delegator balance = {start_bal} -> {end_bal}");
 
@@ -271,16 +300,44 @@ async fn inflated_rewards_become_spendable_native_stell() {
     // only the aggregate. With both moved together the split is exactly
     // pro-rata and cannot exceed the emission.
     assert!(
-        claimed <= 1_000_000_000,
+        claimed <= reward,
         "a delegator must not claim more than the whole reward: {claimed}"
     );
     assert!(end_bal > start_bal, "the delegator ends up with real STELL");
-    // And the STELL is spendable: it can be moved by an ordinary transaction.
+    // And the STELL is spendable: it can be moved by an ordinary Falcon-512
+    // PQ transaction (the claimed balance must also cover the consensus fee
+    // floor, so move half of it).
+    let spend = end_bal / 2;
+    let pk = delegator.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xAB; 32],
+        spend,
+        100_000,
+        0,
+        0,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
+    let sig = delegator.sign(&probe.signing_message());
+    let spend_tx = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        [0xAB; 32],
+        spend,
+        100_000,
+        0,
+        0,
+        1,
+        Vec::new(),
+        &DEFAULT_SALT,
+    );
     engine
-        .apply_transaction(
-            &Transaction::sign(&delegator, [0xAB; 32], end_bal, 0, 0, 0, 1),
-            0,
-        )
+        .apply_transaction(&spend_tx, 0)
         .await
         .expect("the inflated balance must be spendable");
     println!("ATTACKER GOAL MET: {end_bal} nano-STELL of unbacked value is spendable");

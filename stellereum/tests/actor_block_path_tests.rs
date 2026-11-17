@@ -27,7 +27,9 @@
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use stellereum::consensus::{register_validator_pq_key, ValidatorSet, VoteKind};
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::{fund_genesis, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, ActorSendBody, InMemoryStateEngine};
@@ -42,8 +44,60 @@ const CHAIN_ID: u64 = 5757;
 /// A non-master shard id, for the cross-shard refusal test.
 const OTHER_SHARD: u32 = 1;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ sender fixture: the node refuses bare Ed25519 transaction
+/// envelopes, so every account in these tests is a Falcon keypair and its
+/// address is the registered PQ address (`derive_pq_address`).
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+/// Build a signed Falcon-512 transaction carrying `payload` (the PQ mirror of
+/// `Transaction::sign_with_payload`). The probe fixes the signing bytes; the
+/// second constructor attaches the real signature over those same bytes.
+#[allow(clippy::too_many_arguments)]
+// GATE: mirrors the production constructor's full tx context.
+fn pq_tx(
+    kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = kp.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 #[path = "support/falcon_votes.rs"]
@@ -132,8 +186,8 @@ fn mk_block(height: u64, ts: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> 
 #[tokio::test]
 async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_delivers() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x31);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x31);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x77u8; 32];
     engine
         .update_account(AccountState::new(sender, 10_000_000))
@@ -141,8 +195,8 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
     engine.update_account(AccountState::new(recipient, 0)).await;
 
     let gas = gas_for(1, 500);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         recipient,
         500, // plain amount, to the same recipient
         gas,
@@ -153,7 +207,7 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
     );
 
     // --- step 1: the transactions step only -------------------------------
-    let (applied, failed, _fees, status, _) = engine
+    let (applied, failed, fees, status, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&tx), TS)
         .await;
     assert_eq!((applied, failed), (1, 0), "the send transaction applies");
@@ -183,8 +237,8 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
     // Settlement already debited the value (delivery credits later) ...
     assert_eq!(
         balance(&engine, &sender).await,
-        10_000_000 - 500 - gas - 4_242,
-        "sender paid amount + fee + message value at settlement"
+        10_000_000 - 500 - fees - 4_242,
+        "sender paid amount + the fee actually charged + message value at settlement"
     );
     assert_eq!(
         balance(&engine, &recipient).await,
@@ -224,8 +278,8 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
 #[tokio::test]
 async fn delivery_credits_the_recipient_and_conserves_value() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x32);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x32);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x78u8; 32];
     let proposer = [0x99u8; 32];
     let start = 10_000_000u64;
@@ -236,8 +290,8 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
     engine.update_account(AccountState::new(proposer, 0)).await;
 
     let gas = gas_for(1, 500);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         recipient, // tx.to == recipient: the plain amount lands there too
         777,
         gas,
@@ -251,6 +305,7 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
         .apply_block_transition(&mk_block(1, TS, vec![tx], proposer), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    let fee = out.tx_fees[0];
 
     assert_eq!(
         balance(&engine, &recipient).await,
@@ -259,13 +314,13 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
     );
     assert_eq!(
         balance(&engine, &sender).await,
-        start - 777 - gas - 4_242,
-        "sender paid amount + declared fee + message value"
+        start - 777 - fee - 4_242,
+        "sender paid amount + the fee the engine charged + message value"
     );
     assert_eq!(
         balance(&engine, &proposer).await,
-        gas,
-        "the declared gas is the proposer's fee"
+        fee,
+        "the fee charged is the proposer's entire credit"
     );
     // Conservation: nothing minted, nothing destroyed.
     assert_eq!(
@@ -291,8 +346,8 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
 #[tokio::test]
 async fn bounce_returns_the_value_exactly_once() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x33);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x33);
+    let sender = pq_addr(&sender_kp);
     let mut missing = [0u8; 32];
     missing[0] = 0xDE;
     missing[1] = 0xAD;
@@ -304,8 +359,8 @@ async fn bounce_returns_the_value_exactly_once() {
     engine.update_account(AccountState::new(proposer, 0)).await;
 
     let gas = gas_for(1, 0);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         sender, // plain amount back to self: only the fee and the value move
         0,
         gas,
@@ -319,14 +374,15 @@ async fn bounce_returns_the_value_exactly_once() {
         .apply_block_transition(&mk_block(1, TS, vec![tx], proposer), 0)
         .await;
     assert_eq!(out.status, vec![true], "the send itself applies");
+    let fee = out.tx_fees[0];
 
     assert_eq!(
         balance(&engine, &sender).await,
-        start - gas,
+        start - fee,
         "value came back exactly once: sender is down ONLY the fee - not down \
          9_999 (lost) and not up 9_999 (credited twice)"
     );
-    assert_eq!(balance(&engine, &proposer).await, gas);
+    assert_eq!(balance(&engine, &proposer).await, fee);
     assert!(
         engine.get_account(&missing).await.is_none(),
         "a bounce must not create the dead recipient's account"
@@ -348,8 +404,8 @@ async fn bounce_returns_the_value_exactly_once() {
 #[tokio::test]
 async fn failed_body_has_no_partial_effect() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x34);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x34);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x79u8; 32];
     let bystander = [0xC0u8; 32];
     let start = 1_000_000u64;
@@ -366,8 +422,8 @@ async fn failed_body_has_no_partial_effect() {
         amount: 1_000,
     }];
     let gas = gas_for(1, 5_000);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         sender,
         0,
         gas,
@@ -428,8 +484,8 @@ async fn failed_body_has_no_partial_effect() {
 /// pass that iterated the HashMap directly would agree only by luck.
 #[tokio::test]
 async fn delivery_order_is_deterministic_independent_of_insertion_order() {
-    let sender_sk = key(0x35);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x35);
+    let sender = pq_addr(&sender_kp);
     let a = [0xA1u8; 32];
     let b = [0xB1u8; 32];
     // Funds the sender's declared gas (two sends prepaid inside one tx).
@@ -474,8 +530,8 @@ async fn delivery_order_is_deterministic_independent_of_insertion_order() {
     ];
     let gas = gas_for(2, 500_000);
     // Built ONCE and cloned: both engines apply the byte-identical block.
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         sender,
         0,
         gas,
@@ -524,8 +580,8 @@ async fn delivery_order_is_deterministic_independent_of_insertion_order() {
 #[tokio::test]
 async fn rejected_transaction_enqueues_nothing_and_moves_nothing() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x36);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x36);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x7Au8; 32];
     let start = 1_000_000u64;
     engine
@@ -536,8 +592,8 @@ async fn rejected_transaction_enqueues_nothing_and_moves_nothing() {
 
     // Valid signature, WRONG nonce: admitted nowhere, payload never runs.
     let gas = gas_for(1, 500);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         recipient,
         500,
         gas,
@@ -573,10 +629,11 @@ async fn rejected_transaction_enqueues_nothing_and_moves_nothing() {
 // 7. Session-key scope + the recorded sender is the MASTER
 // ===========================================================================
 
-fn grant(master: &SigningKey, session: &SigningKey, scope: u64) -> SessionKeyAuthorization {
-    SessionKeyAuthorization::sign_delegation(
+fn grant(master: &FalconKeypair, session: &FalconKeypair, scope: u64) -> SessionKeyAuthorization {
+    SessionKeyAuthorization::sign_delegation_falcon512(
         master,
-        session.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        session.public_key(),
         2_000_000_000, // valid_until (well past TS)
         1_000_000,     // max_gas_spend
         scope,
@@ -594,14 +651,14 @@ fn grant(master: &SigningKey, session: &SigningKey, scope: u64) -> SessionKeyAut
 /// the account the master authorized.
 #[tokio::test]
 async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
-    let master = key(0x37);
-    let session = key(0x38);
-    let master_pub = master.verifying_key().to_bytes();
+    let master = pq_key(0x37);
+    let session = pq_key(0x38);
+    let master_pub = pq_addr(&master);
     let recipient = [0x7Bu8; 32];
     let gas = gas_for(1, 500);
 
     let session_tx = |scope: u64| {
-        Transaction::sign_with_session(
+        Transaction::sign_with_session_falcon512(
             &session,
             grant(&master, &session, scope),
             recipient,
@@ -666,7 +723,7 @@ async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
     );
     assert_ne!(
         msg.sender,
-        session.verifying_key().to_bytes(),
+        pq_addr(&session),
         "the session key must never appear as the message sender"
     );
     assert_eq!(msg.value, 4_242);
@@ -679,8 +736,8 @@ async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
 #[tokio::test]
 async fn cross_shard_actor_send_is_refused() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x39);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x39);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x7Cu8; 32];
     let start = 1_000_000u64;
     engine
@@ -689,8 +746,8 @@ async fn cross_shard_actor_send_is_refused() {
     let before = engine.get_state_root().await;
 
     let gas = gas_for(1, 500);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         recipient,
         0,
         gas,
@@ -799,8 +856,8 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
             .collect(),
     );
 
-    let sender_sk = key(0x3A);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x3A);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x7Du8; 32];
 
     let mut engines = Vec::new();
@@ -824,8 +881,8 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
     let mut reorg = ChainState::new(engine_reorg.clone()).with_block_reward(REWARD);
 
     let gas = gas_for(1, 500);
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         sender,
         0,
         gas,
@@ -857,6 +914,9 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
+    // FULL-PQ: the live adoption path verifies the proposer's Falcon
+    // signature (Ed25519-only blocks are refused).
+    blk.sign_block_with_falcon(&ks[0], &fks[0]);
     let bh = certify(&mut live, &ks, &fks, &mut blk).await;
 
     // ---- LIVE ----
@@ -899,8 +959,8 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
 #[tokio::test]
 async fn actor_send_coexists_with_a_plain_payload_transfer() {
     let engine = InMemoryStateEngine::new();
-    let sender_sk = key(0x3B);
-    let sender = sender_sk.verifying_key().to_bytes();
+    let sender_kp = pq_key(0x3B);
+    let sender = pq_addr(&sender_kp);
     let recipient = [0x7Eu8; 32];
     let transfer_to = [0xC1u8; 32];
     let start = 1_000_000u64;
@@ -910,8 +970,8 @@ async fn actor_send_coexists_with_a_plain_payload_transfer() {
     engine.update_account(AccountState::new(recipient, 0)).await;
 
     let gas = gas_for(1, 500) + GAS_BASIC_TRANSFER;
-    let tx = Transaction::sign_with_payload(
-        &sender_sk,
+    let tx = pq_tx(
+        &sender_kp,
         sender,
         0,
         gas,

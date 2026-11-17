@@ -11,9 +11,9 @@
 //! Attacker goal: sender balance strictly greater than before, paid for with a
 //! few hundred nano-STELL of gas.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -30,18 +30,53 @@ fn floor() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
 
-fn tx_of(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> stellereum::sharding::Transaction {
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
+fn tx_of(
+    key: &FalconKeypair,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> stellereum::sharding::Transaction {
     tx_of_gas(key, nonce, 10_000, payload)
 }
 
 fn tx_of_gas(
-    key: &SigningKey,
+    key: &FalconKeypair,
     nonce: u64,
     gas: u64,
     payload: Vec<OpCode>,
 ) -> stellereum::sharding::Transaction {
-    let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(key, from, 0, gas, nonce, 1, 1, payload)
+    let from = pq_addr(key);
+    let pk = key.public_key().to_vec();
+    let probe = stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        from,
+        0,
+        gas,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        from,
+        0,
+        gas,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
@@ -55,14 +90,14 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
 async fn stranger_cannot_steal_validator_rewards_from_pool() {
     let engine = InMemoryStateEngine::new();
 
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let victim = FalconKeypair::generate();
+    let victim_addr = pq_addr(&victim);
+    let attacker = FalconKeypair::generate();
+    let attacker_addr = pq_addr(&attacker);
 
     // Victim bonds 10,000 STELL -> the coins land in the shared STAKING_POOL.
     engine
-        .update_account(AccountState::new(victim_addr, stell(10_000) + 10_000))
+        .update_account(AccountState::new(victim_addr, stell(10_000) + 100_000))
         .await;
     let bond = tx_of(
         &victim,
@@ -97,10 +132,10 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
     // The attacker holds NOTHING but gas, and is not the validator, not a
     // delegator, has no bond, no signature over the victim's key. One syscall.
     engine
-        .update_account(AccountState::new(attacker_addr, 10_000))
+        .update_account(AccountState::new(attacker_addr, 100_000))
         .await;
     let before = bal(&engine, &attacker_addr).await;
-    assert_eq!(before, 10_000);
+    assert_eq!(before, 100_000);
 
     let steal = tx_of(
         &attacker,
@@ -182,8 +217,8 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
 #[tokio::test]
 async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
     let engine = InMemoryStateEngine::new();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let attacker = FalconKeypair::generate();
+    let attacker_addr = pq_addr(&attacker);
     engine
         .update_account(AccountState::new(attacker_addr, 10_000_000))
         .await;
@@ -191,10 +226,10 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
     // 20 honest validators, each bonding the MIN+buffer floor.
     let mut validators = Vec::new();
     for _i in 0..20u8 {
-        let k = SigningKey::generate(&mut OsRng);
-        let a = k.verifying_key().to_bytes();
+        let k = FalconKeypair::generate();
+        let a = pq_addr(&k);
         engine
-            .update_account(AccountState::new(a, floor() + 10_000))
+            .update_account(AccountState::new(a, floor() + 100_000))
             .await;
         let t = tx_of(
             &k,
@@ -216,6 +251,7 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
     let attacker_before = bal(&engine, &attacker_addr).await;
 
     // 20 transactions, one per validator -- every single one must bounce.
+    let mut total_fee = 0u64;
     for (i, v) in validators.iter().enumerate() {
         let t = tx_of(
             &attacker,
@@ -226,6 +262,7 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
         // attacker its declared limit, and burns its nonce - so the loop
         // cannot be free, and cannot be replayed with the same nonce.
         let fee = failure_fee(&engine, &t).await;
+        total_fee = total_fee.saturating_add(fee);
         let before_attempt = bal(&engine, &attacker_addr).await;
         engine
             .apply_transaction(&t, 0)
@@ -247,13 +284,13 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
         pool_after, pool_before,
         "20 rejected claims move not a single coin out of the pool"
     );
-    // F-01: the loop is NOT free - 20 refusals x the declared limit. This is
+    // F-01: the loop is NOT free - 20 refusals x the failure fee each. This is
     // the anti-DoS half of the contract: the theft fails AND it costs the
     // attacker. (The value half: the pool never moved - asserted above.)
     assert_eq!(
         attacker_after,
-        attacker_before - 20 * 10_000,
-        "all 20 claims rolled back atomically: only the failure fee was charged"
+        attacker_before - total_fee,
+        "all 20 claims rolled back atomically: only the failure fees were charged"
     );
     assert_eq!(
         engine.get_account(&attacker_addr).await.unwrap().nonce,
@@ -283,13 +320,13 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
 #[tokio::test]
 async fn failed_claim_does_not_burn_validator_rewards() {
     let engine = InMemoryStateEngine::new();
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let victim = FalconKeypair::generate();
+    let victim_addr = pq_addr(&victim);
+    let attacker = FalconKeypair::generate();
+    let attacker_addr = pq_addr(&attacker);
 
     engine
-        .update_account(AccountState::new(victim_addr, floor() + 10_000))
+        .update_account(AccountState::new(victim_addr, floor() + 100_000))
         .await;
     let bond = tx_of(
         &victim,
@@ -306,7 +343,7 @@ async fn failed_claim_does_not_burn_validator_rewards() {
         l.distribute_reward(victim_addr, stell(5_000)).unwrap();
     }
     engine
-        .update_account(AccountState::new(attacker_addr, 10_000))
+        .update_account(AccountState::new(attacker_addr, 100_000))
         .await;
 
     let t = tx_of(

@@ -225,8 +225,9 @@ async fn poc_negative_controls_still_fail_closed() {
     let code = resp.error.as_ref().map(|e| e.code);
     assert_eq!(code, Some(-32602));
 
-    // unshield > 64 inputs refused (native dispatch, no engine state needed
-    // for the length gate).
+    // unshield was removed with the shielded protocol (Ristretto deletion
+    // wave): even a 65-input payload must fail closed as an unknown method,
+    // so nothing reaches decrypt/verify work on an unauthenticated call.
     let inputs: Vec<Value> = (0..65)
         .map(|_| json!({"commitment": "00".repeat(32), "amount": "1", "blinding": "00".repeat(32)}))
         .collect();
@@ -236,6 +237,10 @@ async fn poc_negative_controls_still_fail_closed() {
         &json!({"to": "00".repeat(32), "amount": 1, "inputs": inputs}),
     )
     .await
-    .expect_err("65 unshield inputs must be refused");
-    assert_eq!(err.code(), -32602);
+    .expect_err("removed unshield method must be refused");
+    assert_eq!(
+        err.code(),
+        -32601,
+        "the removed unshield method must fail closed as unknown (no payload work)"
+    );
 }

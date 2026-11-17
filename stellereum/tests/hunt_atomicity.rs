@@ -23,9 +23,11 @@
 //! transaction now leaves literally nothing behind. Tests 1-2 below pin the
 //! FIXED behavior (they asserted the exploit before the fix).
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
+// FULL-PQ: fixture transactions are Falcon-512 PQ1 envelopes; the node
+// refuses classical Ed25519 envelopes at apply admission.
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -35,16 +37,56 @@ fn stell(n: u64) -> u64 {
     n * 1_000_000_000
 }
 
+/// The bond floor every stake must clear (bare MIN is refused).
+fn floor() -> u64 {
+    MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
+}
+
+mod support;
+use support::failure_fee;
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
 fn tx_of(
-    key: &SigningKey,
+    key: &FalconKeypair,
     to: [u8; 32],
     amount: u64,
     gas_limit: u64,
     payload: Vec<OpCode>,
 ) -> stellereum::sharding::Transaction {
-    let _from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, to, amount, gas_limit, 0, 1, 1, payload,
+    let pk = key.public_key.clone();
+    let probe = stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        0,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    stellereum::sharding::Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        0,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -54,13 +96,14 @@ fn tx_of(
 #[tokio::test]
 async fn free_validator_bond_from_a_rejected_transaction() {
     let engine = InMemoryStateEngine::new();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let attacker = pq_key(0xA1);
+    let attacker_addr = pq_addr(&attacker);
     let validator = [0x42u8; 32];
 
-    // Enough to pass the *first* check (`amount + gas_limit`), and exactly
-    // enough to bond the 1,000 STELL minimum inside the VM.
-    let balance = MIN_VALIDATOR_BOND + 2_000;
+    // Enough to pass admission and the bond floor inside the VM, but not
+    // enough to ALSO pay the carried amount plus the failure fee: the VM
+    // spends the bond first, then the real debit is discovered short.
+    let balance = floor() + 2_000;
     engine
         .update_account(AccountState::new(attacker_addr, balance))
         .await;
@@ -75,9 +118,10 @@ async fn free_validator_bond_from_a_rejected_transaction() {
         2_000,
         vec![OpCode::SysCallStake {
             validator,
-            amount: MIN_VALIDATOR_BOND,
+            amount: floor(),
         }],
     );
+    let fee = failure_fee(&engine, &t).await;
     let res = engine.apply_transaction(&t, 0).await;
     println!("apply_transaction -> {res:?}");
 
@@ -124,7 +168,7 @@ async fn free_validator_bond_from_a_rejected_transaction() {
     // recipient's money.
     assert_eq!(
         attacker_bal,
-        balance - 2_000,
+        balance - fee,
         "it cost the attacker the failure fee - and nothing else"
     );
     assert_eq!(pool, 0, "not one coin of the bond is in the staking pool");
@@ -137,10 +181,10 @@ async fn free_validator_bond_from_a_rejected_transaction() {
 #[tokio::test]
 async fn rejected_transaction_still_commits_a_token_mint() {
     let engine = InMemoryStateEngine::new();
-    let minter = SigningKey::generate(&mut OsRng);
-    let minter_addr = minter.verifying_key().to_bytes();
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
+    let minter = pq_key(0xB1);
+    let minter_addr = pq_addr(&minter);
+    let victim = pq_key(0xB2);
+    let victim_addr = pq_addr(&victim);
 
     let meta = TokenMetadata {
         name: "Test".into(),
@@ -155,11 +199,13 @@ async fn rejected_transaction_still_commits_a_token_mint() {
     let token = engine.create_token(minter_addr, meta, 0).await.unwrap();
     let supply0 = engine.token_total_supply(&token).await;
 
-    // The minter holds 20,000 STELL. The mint costs it nothing; the trailing
-    // `Transfer` of the whole balance is what makes the real debit exceed what
-    // the account has once `tx.amount` is added - AFTER the mint was committed.
+    // The mint costs nothing; the trailing `Transfer` of the whole balance is
+    // what makes the real debit exceed what the account has once `tx.amount`
+    // is added - AFTER the mint was committed. The starting balance clears
+    // admission (amount + gas_limit + the consensus floor).
+    let start = 360_000u64;
     engine
-        .update_account(AccountState::new(minter_addr, 309_500))
+        .update_account(AccountState::new(minter_addr, start))
         .await;
     let t = tx_of(
         &minter,
@@ -174,10 +220,11 @@ async fn rejected_transaction_still_commits_a_token_mint() {
             },
             OpCode::Transfer {
                 recipient: [0x55u8; 32],
-                amount: 20_000,
+                amount: start,
             },
         ],
     );
+    let fee = failure_fee(&engine, &t).await;
     let res = engine.apply_transaction(&t, 0).await;
     println!("apply_transaction -> {res:?}");
     let supply1 = engine.token_total_supply(&token).await;
@@ -193,9 +240,12 @@ async fn rejected_transaction_still_commits_a_token_mint() {
         "FIXED: no tokens minted by a rejected transaction"
     );
     assert_eq!(supply1, supply0, "supply unchanged");
-    // The failure fee is charged (the declared gas limit, 300k): the MINT
-    // itself moved nothing.
-    assert_eq!(minter_bal, 9_500, "the minter paid the failure fee");
+    // The failure fee is charged: the MINT itself moved nothing.
+    assert_eq!(
+        minter_bal,
+        start - fee,
+        "the minter paid the failure fee - and nothing else"
+    );
 }
 
 /// A payout failure (state_engine.rs:528) is raised AFTER the sender has been
@@ -204,17 +254,14 @@ async fn rejected_transaction_still_commits_a_token_mint() {
 #[tokio::test]
 async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
     let engine = InMemoryStateEngine::new();
-    let validator = SigningKey::generate(&mut OsRng);
-    let validator_addr = validator.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let validator = pq_key(0xC1);
+    let validator_addr = pq_addr(&validator);
+    let attacker = pq_key(0xC2);
+    let attacker_addr = pq_addr(&attacker);
 
     // A validator bond small enough that the pool cannot cover the reward.
     engine
-        .update_account(AccountState::new(
-            validator_addr,
-            MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 20_000,
-        ))
+        .update_account(AccountState::new(validator_addr, floor() + 100_000))
         .await;
     let b = tx_of(
         &validator,
@@ -223,7 +270,7 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
         20_000,
         vec![OpCode::SysCallStake {
             validator: validator_addr,
-            amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
+            amount: floor(),
         }],
     );
     engine.apply_transaction(&b, 0).await.unwrap();
@@ -249,6 +296,7 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
             validator: attacker_addr,
         }],
     );
+    let fee = failure_fee(&engine, &t).await;
     let res = engine.apply_transaction(&t, 0).await;
     let acc = engine.get_account(&attacker_addr).await.unwrap();
     println!("apply_transaction -> {res:?}");
@@ -274,8 +322,8 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
     assert_eq!(acc.nonce, 1, "a failed attempt consumes the nonce");
     assert_eq!(
         acc.balance,
-        start - 20_000,
-        "a failed attempt pays the fee it declared - and moves no other value"
+        start - fee,
+        "a failed attempt pays the failure fee - and moves no other value"
     );
     // The victim's accrued rewards are untouched: a failed claim must not zero
     // the counter. (Before the ownership fix this transaction reached the payout

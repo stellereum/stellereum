@@ -43,7 +43,13 @@ async fn cluster(ks: &[SigningKey]) -> Vec<ValidatorRuntime> {
     out
 }
 
-fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
+fn mkblock(
+    pkey: &SigningKey,
+    fkey: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    prev: [u8; 32],
+    root: [u8; 32],
+) -> Block {
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: h,
@@ -62,8 +68,21 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pkey);
+    // FULL-PQ: an Ed-only block is refused by `verify_proposer_signature`
+    // (Falcon-only, height-indexed). `falcon_set` has registered the
+    // proposer's Falcon key under its Ed id.
+    b.sign_block_with_falcon(pkey, fkey);
     b
+}
+
+/// The Falcon keypair belonging to the Ed validator `target` (both key sets
+/// are index-aligned in `falcon_set`).
+fn fkey_of<'a>(
+    ks: &[SigningKey],
+    fks: &'a [stellereum::post_quantum::FalconKeypair],
+    target: [u8; 32],
+) -> &'a stellereum::post_quantum::FalconKeypair {
+    &fks[idx_of(ks, target)]
 }
 
 fn idx_of(ks: &[SigningKey], target: [u8; 32]) -> usize {
@@ -92,6 +111,7 @@ async fn drive_round(
         .proposer_for(h, 0)
         .expect("a proposer");
     let pkey = ks[idx_of(ks, proposer_id)].clone();
+    let pfk = fkey_of(ks, fks, proposer_id);
 
     // All recipients must agree on the parent state, else the proposal is
     // invalid for someone (validate_proposal checks the header root).
@@ -109,7 +129,7 @@ async fn drive_round(
         .map(|(_, h)| *h)
         .unwrap_or([0u8; 32]);
 
-    let mut block = mkblock(&pkey, h, prev, root);
+    let mut block = mkblock(&pkey, pfk, h, prev, root);
     // Canonical downtime evidence (W10.5): production `propose()` embeds the
     // QC that decided the parent (`decided_parent_qc`), and receivers that
     // know the parent decision REFUSE a block that omits it
@@ -136,7 +156,7 @@ async fn drive_round(
         // The block hash commits to the evidence: re-sign after embedding
         // (`sign_block` appends, so clear the pre-evidence signature first).
         block.validator_signatures.clear();
-        block.sign_block(&pkey);
+        block.sign_block_with_falcon(&pkey, pfk);
     }
     let bh = block.compute_hash();
 
@@ -344,8 +364,9 @@ async fn bft_equivocator_does_not_halt_or_multi_slash() {
     let h = nodes[0].height();
     let proposer_id = nodes[0].validators.proposer_for(h, 0).unwrap();
     let pkey = ks[idx_of(&ks, proposer_id)].clone();
+    let pfk = fkey_of(&ks, &fks, proposer_id);
     let root = nodes[honest[0]].state.get_state_root().await;
-    let block = mkblock(&pkey, h, [0u8; 32], root);
+    let block = mkblock(&pkey, pfk, h, [0u8; 32], root);
     let bh = block.compute_hash();
     let fake = [0xEEu8; 32];
     assert_ne!(bh, fake);

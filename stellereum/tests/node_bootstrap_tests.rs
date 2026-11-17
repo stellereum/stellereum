@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellereum::bootstrap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::consensus::{ValidatorSet, VoteKind, VoteSet};
 use stellereum::post_quantum::FalconKeypair;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -65,24 +65,22 @@ fn attach_quorum(
     b: &mut Block,
     ks: &[SigningKey],
     fks: &[FalconKeypair],
+    vs: &ValidatorSet,
     height: u64,
     bh: [u8; 32],
 ) {
-    let sigs = ks
-        .iter()
-        .zip(fks.iter())
-        .map(|(k, fk)| {
-            let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    });
+    // FULL-PQ: a raw signature list carries no power — the QC must be the
+    // committee envelope production builds, so compile it through VoteSet.
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(bh));
+        set.add(v, vs, height, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    b.precommit_qc = Some(
+        set.certificate_with_parent(Some(bh), vs, Some(&b.prev_hash))
+            .expect("full set reaches quorum"),
+    );
 }
 
 struct LiveChain {
@@ -112,11 +110,11 @@ async fn build_live_chain(
     for h in 1..=tip {
         let root_before = engine.get_state_root().await;
         let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let proposer = ks
+        let proposer_idx = ks
             .iter()
-            .find(|k| k.verifying_key().to_bytes() == proposer_id)
-            .expect("proposer is a member")
-            .clone();
+            .position(|k| k.verifying_key().to_bytes() == proposer_id)
+            .expect("proposer is a member");
+        let proposer = ks[proposer_idx].clone();
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -135,9 +133,9 @@ async fn build_live_chain(
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&proposer);
+        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, fks, h, bh);
+        attach_quorum(&mut b, ks, fks, &vs, h, bh);
         prev = bh;
         blocks.push(b);
         engine

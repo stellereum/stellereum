@@ -18,14 +18,62 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::mempool::Mempool;
 use stellereum::mev::{MevPreemptionEngine, OrderVerdict, SealVerdict};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::Cluster;
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 fn engine_with() -> Arc<InMemoryStateEngine> {
     Arc::new(InMemoryStateEngine::new())
+}
+
+/// FULL-PQ fixture identity: a Falcon-512 keypair and its derived address.
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+fn pq_transfer(kp: &FalconKeypair, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    // Implicit PQ1 envelope: the sender key is registered in the process
+    // registry (no per-tx explicit activation surcharge), so the fixture's
+    // small declared gas limits stay admissible.
+    let from = pq_addr(kp);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("implicit registration");
+    let probe = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        to,
+        amount,
+        gas,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    )
 }
 
 async fn seed(st: &InMemoryStateEngine, from: [u8; 32]) {
@@ -124,8 +172,8 @@ async fn run_height_tampered(cluster: &mut Cluster, timestamp: u64, tamper: Tamp
 
 #[tokio::test]
 async fn sealed_admission_unseals_to_the_same_transaction() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let tx = Transaction::sign(&sk, [9u8; 32], 100, 10, 0, 1, 1);
+    let sk = pq_key(0x11);
+    let tx = pq_transfer(&sk, [9u8; 32], 100, 10, 0);
 
     // Admission through the real pool seals the transaction...
     let mut mp = Mempool::new(16, 16);
@@ -166,10 +214,10 @@ async fn sealed_admission_unseals_to_the_same_transaction() {
 
 #[tokio::test]
 async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let sk = pq_key(0x12);
+    let from = pq_addr(&sk);
     let to = [9u8; 32];
-    let direct = Transaction::sign(&sk, to, 1_000, 0, 0, 1, 1);
+    let direct = pq_transfer(&sk, to, 1_000, 0, 0);
 
     // Seal/unseal the SAME logical transaction through the mempool path.
     let mut mp = Mempool::new(16, 16);
@@ -201,7 +249,17 @@ async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&SigningKey::from_bytes(&[7u8; 32]));
+        // FULL-PQ: the proposer slot must carry a Falcon signature; the key
+        // is registered so consensus verification resolves it.
+        let block_key = SigningKey::from_bytes(&[7u8; 32]);
+        let block_fk = FalconKeypair::generate_from_seed(7);
+        register_validator_pq_key(
+            block_key.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            block_fk.public_key.clone(),
+        );
+        b.proposer = block_key.verifying_key().to_bytes();
+        b.sign_block_with_falcon(&block_key, &block_fk);
         b
     };
 
@@ -234,8 +292,8 @@ async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
 
 #[tokio::test]
 async fn mutated_pool_copy_and_tampered_ciphertext_fail_the_unseal_gate() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let tx = Transaction::sign(&sk, [9u8; 32], 100, 10, 0, 1, 1);
+    let sk = pq_key(0x11);
+    let tx = pq_transfer(&sk, [9u8; 32], 100, 10, 0);
 
     // Case 1: the ciphertext in the engine is tampered with.
     let mut mp = Mempool::new(16, 16);
@@ -250,21 +308,23 @@ async fn mutated_pool_copy_and_tampered_ciphertext_fail_the_unseal_gate() {
         "a tampered envelope must not open"
     );
 
-    // Case 2: the POOL copy is mutated after admission. The mutation is in the
-    // signature field, which `compute_tx_hash` does NOT cover, so the lookup
-    // still hits the envelope — and the byte comparison catches it.
+    // Case 2: the POOL copy is mutated after admission. FULL-PQ: the PQ
+    // envelope (including the Falcon signature) is COMMITTED into
+    // `compute_tx_hash`, so a signature mutation is a different transaction
+    // and cannot alias the admitted envelope's lookup key by construction.
+    // Either way the mutated copy must never be accepted as the sealed one.
     let mut mp2 = Mempool::new(16, 16);
     let h2 = mp2.add(tx.clone()).unwrap();
     let mut mutated = tx.clone();
     mutated.signature[0] ^= 0xFF;
-    assert_eq!(
+    assert_ne!(
         mutated.compute_tx_hash(),
         h2,
-        "a signature-only mutation must not change the lookup key"
+        "FULL-PQ: the PQ envelope is part of the tx identity, so mutating it moves the hash"
     );
-    assert_eq!(
+    assert_ne!(
         mp2.mev.verify_pool_tx(&mutated),
-        SealVerdict::Mismatch,
+        SealVerdict::Match,
         "a pooled copy mutated after admission must be refused"
     );
     // The pristine copy still matches: only the mutated one is refused.
@@ -275,9 +335,9 @@ async fn mutated_pool_copy_and_tampered_ciphertext_fail_the_unseal_gate() {
 async fn build_order_commitment_matches_and_tampering_fails() {
     let mut engine = MevPreemptionEngine::new();
     let key = SigningKey::generate(&mut OsRng);
-    let sk = SigningKey::generate(&mut OsRng);
-    let tx1 = Transaction::sign(&sk, [1u8; 32], 100, 0, 0, 1, 1);
-    let tx2 = Transaction::sign(&sk, [2u8; 32], 100, 0, 1, 1, 1);
+    let sk = pq_key(0x14);
+    let tx1 = pq_transfer(&sk, [1u8; 32], 100, 0, 0);
+    let tx2 = pq_transfer(&sk, [2u8; 32], 100, 0, 1);
     let bh = [0xD0u8; 32];
 
     // No commitment yet: nothing to enforce (a node that did not build this
@@ -373,11 +433,11 @@ async fn finalize_warns_but_converges_on_tampered_build_commitment() {
     // but no longer refuses finalization — execution is deterministic from the
     // voted body, so every node reaches the same root either way, while the
     // old refusal stalled ONLY the builder at H as everyone else moved on.
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let user = pq_key(0x15);
+    let from = pq_addr(&user);
     let mut cluster = cluster_of_two(from).await;
     cluster
-        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 500, 0, 0, 1, 1))
+        .broadcast_tx(pq_transfer(&user, [9u8; 32], 500, 0, 0))
         .await;
 
     let proposer_idx = cluster
@@ -417,14 +477,14 @@ async fn finalize_refuses_a_reordered_block_body() {
     // longer hashes to the decided hash — executing it would finalize a
     // different state than the quorum (a split), unlike a mere commitment
     // mismatch where the body is byte-identical everywhere. Refuse.
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let user = pq_key(0x16);
+    let from = pq_addr(&user);
     let mut cluster = cluster_of_two(from).await;
     cluster
-        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 100, 0, 0, 1, 1))
+        .broadcast_tx(pq_transfer(&user, [9u8; 32], 100, 0, 0))
         .await;
     cluster
-        .broadcast_tx(Transaction::sign(&user, [8u8; 32], 100, 0, 1, 1, 1))
+        .broadcast_tx(pq_transfer(&user, [8u8; 32], 100, 0, 1))
         .await;
 
     let proposer_idx = cluster
@@ -450,9 +510,9 @@ async fn finalize_refuses_a_reordered_block_body() {
 
 #[tokio::test]
 async fn persisted_pool_roundtrip_reseals_on_restore() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
-    let tx = Transaction::sign(&sk, [9u8; 32], 100, 10, 0, 1, 1);
+    let sk = pq_key(0x17);
+    let from = pq_addr(&sk);
+    let tx = pq_transfer(&sk, [9u8; 32], 100, 10, 0);
 
     let mut mp = Mempool::new(16, 16);
     mp.add(tx.clone()).unwrap();
@@ -492,8 +552,8 @@ async fn persisted_pool_roundtrip_reseals_on_restore() {
 #[tokio::test]
 async fn cluster_finalizes_normally_with_sealing_and_commitments_active() {
     // The gates above must never fire on the honest path: this is the control.
-    let user = SigningKey::generate(&mut OsRng);
-    let from = user.verifying_key().to_bytes();
+    let user = pq_key(0x18);
+    let from = pq_addr(&user);
     let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
     let nodes: Vec<_> = keys.iter().map(|k| (k.clone(), engine_with())).collect();
     let mut cluster = Cluster::new(nodes);
@@ -502,7 +562,7 @@ async fn cluster_finalizes_normally_with_sealing_and_commitments_active() {
     }
     for h in 0..3u64 {
         cluster
-            .broadcast_tx(Transaction::sign(&user, [9u8; 32], 1_000, 0, h, 1, 1))
+            .broadcast_tx(pq_transfer(&user, [9u8; 32], 1_000, 0, h))
             .await;
         cluster.run_height(1_000 + h).await;
         for n in &cluster.nodes {

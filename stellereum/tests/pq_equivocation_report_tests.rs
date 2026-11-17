@@ -23,8 +23,10 @@
 //!     key), even when the evidence is re-submitted in a later transaction;
 //!  4. the state root moves (a slash is consensus state).
 
-use ed25519_dalek::{Signer, SigningKey};
 use stellereum::consensus::VoteKind;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::staking::{CompactPqEquivocationEvidence, EQUIVOCATION_SLASH_BPS, STAKING_POOL};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -51,9 +53,14 @@ fn expected_burn() -> u64 {
     (BOND as u128 * EQUIVOCATION_SLASH_BPS as u128 / 10_000u128) as u64
 }
 
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
 /// A genuine PQ double-sign: two conflicting votes at the same
-/// (height, round, kind), both signed by the accused validator.
-fn double_sign(offender: &SigningKey) -> CompactPqEquivocationEvidence {
+/// (height, round, kind), both signed by the accused validator with its
+/// registered Falcon key (classical evidence carries no power under FULL-PQ).
+fn double_sign(offender: &FalconKeypair) -> CompactPqEquivocationEvidence {
     let height = 1u64;
     let round = 0u32;
     let kind = VoteKind::Prevote;
@@ -62,39 +69,63 @@ fn double_sign(offender: &SigningKey) -> CompactPqEquivocationEvidence {
     let msg_a = stellereum::consensus::vote_sign_bytes(height, round, kind, &target_a);
     let msg_b = stellereum::consensus::vote_sign_bytes(height, round, kind, &target_b);
     CompactPqEquivocationEvidence {
-        voter: offender.verifying_key().to_bytes(),
+        voter: pq_addr(offender),
         height,
         round,
         kind,
         block_hash_a: target_a,
-        signature_a: offender.sign(&msg_a).to_bytes().to_vec(),
+        signature_a: offender.sign(&msg_a),
         block_hash_b: target_b,
-        signature_b: offender.sign(&msg_b).to_bytes().to_vec(),
+        signature_b: offender.sign(&msg_b),
     }
 }
 
 fn report_tx(
-    reporter: &SigningKey,
+    reporter: &FalconKeypair,
     nonce: u64,
     evidence: CompactPqEquivocationEvidence,
 ) -> Transaction {
-    Transaction::sign_with_payload(
-        reporter,
+    let pk = reporter.public_key().to_vec();
+    let payload = vec![OpCode::SysCallReportPqEquivocation {
+        evidence: Box::new(evidence),
+    }];
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
         [0u8; 32],
         0,
         REPORT_GAS,
         nonce,
         1,
         1,
-        vec![OpCode::SysCallReportPqEquivocation {
-            evidence: Box::new(evidence),
-        }],
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = reporter.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        [0u8; 32],
+        0,
+        REPORT_GAS,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
 /// An engine with one bonded validator, a funded reporter and a funded
-/// staking pool (the pool holds the bonded principal).
-async fn engine_with(victim: [u8; 32], reporter: [u8; 32]) -> InMemoryStateEngine {
+/// staking pool (the pool holds the bonded principal). The victim's Falcon
+/// key is registered in the ledger so PQ evidence can verify.
+async fn engine_with(
+    victim: [u8; 32],
+    victim_fk: &FalconKeypair,
+    reporter: [u8; 32],
+) -> InMemoryStateEngine {
     let e = InMemoryStateEngine::new();
     e.credit_native(&reporter, BAL)
         .await
@@ -102,7 +133,12 @@ async fn engine_with(victim: [u8; 32], reporter: [u8; 32]) -> InMemoryStateEngin
     e.credit_native(&STAKING_POOL, 10 * BOND)
         .await
         .expect("pool funded");
-    e.staking_write().await.bond(victim, BOND, 0).unwrap();
+    {
+        let mut l = e.staking_write().await;
+        l.bond(victim, BOND, 0).unwrap();
+        l.register_pq_key(victim, PqScheme::Falcon512, victim_fk.public_key().to_vec())
+            .expect("victim PQ key must register");
+    }
     e
 }
 
@@ -119,12 +155,12 @@ async fn pool_of(e: &InMemoryStateEngine) -> u64 {
 
 #[tokio::test]
 async fn valid_pq_evidence_slashes_the_validator_and_burns_the_staking_pool() {
-    let offender = SigningKey::from_bytes(&[1u8; 32]);
-    let reporter = SigningKey::from_bytes(&[2u8; 32]);
-    let victim = offender.verifying_key().to_bytes();
-    let reporter_pk = reporter.verifying_key().to_bytes();
+    let offender = FalconKeypair::generate_from_seed(1);
+    let reporter = FalconKeypair::generate_from_seed(2);
+    let victim = pq_addr(&offender);
+    let reporter_pk = pq_addr(&reporter);
 
-    let e = engine_with(victim, reporter_pk).await;
+    let e = engine_with(victim, &offender, reporter_pk).await;
     let pool_before = pool_of(&e).await;
     let root_before = e.get_state_root().await;
 
@@ -165,11 +201,11 @@ async fn valid_pq_evidence_slashes_the_validator_and_burns_the_staking_pool() {
 
 #[tokio::test]
 async fn invalid_pq_evidence_is_refused_fail_closed() {
-    let offender = SigningKey::from_bytes(&[3u8; 32]);
-    let stranger = SigningKey::from_bytes(&[4u8; 32]);
-    let reporter = SigningKey::from_bytes(&[5u8; 32]);
-    let victim = offender.verifying_key().to_bytes();
-    let reporter_pk = reporter.verifying_key().to_bytes();
+    let offender = FalconKeypair::generate_from_seed(3);
+    let stranger = FalconKeypair::generate_from_seed(4);
+    let reporter = FalconKeypair::generate_from_seed(5);
+    let victim = pq_addr(&offender);
+    let reporter_pk = pq_addr(&reporter);
 
     let good = double_sign(&offender);
 
@@ -177,25 +213,25 @@ async fn invalid_pq_evidence_is_refused_fail_closed() {
     let mut forged = good.clone();
     let msg_b =
         stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &Some([0x22u8; 32]));
-    forged.signature_b = stranger.sign(&msg_b).to_bytes().to_vec();
+    forged.signature_b = stranger.sign(&msg_b);
 
     // (b) The SAME target twice (not an equivocation at all).
     let mut same_target = good.clone();
     same_target.block_hash_b = same_target.block_hash_a;
     let msg_same =
         stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &Some([0x11u8; 32]));
-    same_target.signature_b = offender.sign(&msg_same).to_bytes().to_vec();
+    same_target.signature_b = offender.sign(&msg_same);
 
     // (c) An unknown voter (never bonded).
     let mut unknown = good.clone();
-    unknown.voter = stranger.verifying_key().to_bytes();
+    unknown.voter = pq_addr(&stranger);
 
     for (label, ev) in [
         ("forged signature", forged),
         ("same target", same_target),
         ("unknown voter", unknown),
     ] {
-        let e = engine_with(victim, reporter_pk).await;
+        let e = engine_with(victim, &offender, reporter_pk).await;
         let pool_before = pool_of(&e).await;
         let root_before = e.get_state_root().await;
 
@@ -246,12 +282,12 @@ async fn invalid_pq_evidence_is_refused_fail_closed() {
 
 #[tokio::test]
 async fn the_same_offense_burns_exactly_once() {
-    let offender = SigningKey::from_bytes(&[6u8; 32]);
-    let reporter = SigningKey::from_bytes(&[7u8; 32]);
-    let victim = offender.verifying_key().to_bytes();
-    let reporter_pk = reporter.verifying_key().to_bytes();
+    let offender = FalconKeypair::generate_from_seed(6);
+    let reporter = FalconKeypair::generate_from_seed(7);
+    let victim = pq_addr(&offender);
+    let reporter_pk = pq_addr(&reporter);
 
-    let e = engine_with(victim, reporter_pk).await;
+    let e = engine_with(victim, &offender, reporter_pk).await;
     let pool_before = pool_of(&e).await;
     let burn = expected_burn();
 
@@ -287,12 +323,12 @@ async fn the_same_offense_burns_exactly_once() {
 
 #[tokio::test]
 async fn the_block_path_burns_the_staking_pool_too() {
-    let offender = SigningKey::from_bytes(&[8u8; 32]);
-    let reporter = SigningKey::from_bytes(&[9u8; 32]);
-    let victim = offender.verifying_key().to_bytes();
-    let reporter_pk = reporter.verifying_key().to_bytes();
+    let offender = FalconKeypair::generate_from_seed(8);
+    let reporter = FalconKeypair::generate_from_seed(9);
+    let victim = pq_addr(&offender);
+    let reporter_pk = pq_addr(&reporter);
 
-    let e = engine_with(victim, reporter_pk).await;
+    let e = engine_with(victim, &offender, reporter_pk).await;
     let pool_before = pool_of(&e).await;
     let burn = expected_burn();
 

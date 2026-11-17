@@ -18,8 +18,10 @@
 //!    - RE-EXECUTION, not a SNARK (see the opcode docs) - and reverts the
 //!      whole transaction on failure, like every other refusal opcode.
 
-use ed25519_dalek::SigningKey;
 use stellereum::commitment::{commitment_digest, commitment_digest_with_zkml, COMMITMENT_VERSION};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{
@@ -31,8 +33,42 @@ use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 const BLOCK_TS: u64 = 1_760_000_000;
 const GAS: u64 = 500_000;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ account fixture: an implicit Falcon-512 identity registered
+/// globally, so admission charges no activation surcharge.
+fn pq_key(seed: u8) -> ([u8; 32], FalconKeypair) {
+    let fk = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (addr, fk)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures.
+fn pq_tx(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, fk.sign(&msg)).encode();
+    tx
 }
 
 fn tiny_model() -> QuantizedLinearModel {
@@ -57,31 +93,29 @@ fn other_model() -> QuantizedLinearModel {
 const MODEL_A: [u8; 32] = [0x51; 32];
 const MODEL_B: [u8; 32] = [0x52; 32];
 
-async fn funded(nonce_start: u64) -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+async fn funded(nonce_start: u64) -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
     let _ = nonce_start;
     let e = InMemoryStateEngine::new();
-    let sk = key(0x71);
-    let addr = sk.verifying_key().to_bytes();
+    let (addr, fk) = pq_key(0x71);
     e.update_account(AccountState::new(addr, 1_000_000_000_000))
         .await;
-    (e, sk, addr)
+    (e, fk, addr)
 }
 
 fn register_tx(
-    sk: &SigningKey,
-    to: [u8; 32],
+    fk: &FalconKeypair,
+    from: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     m: &QuantizedLinearModel,
 ) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        to,
+    pq_tx(
+        fk,
+        from,
+        from,
         0,
         GAS,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallRegisterZkMlModel {
             model_id: id,
             model: Box::new(m.clone()),
@@ -90,20 +124,19 @@ fn register_tx(
 }
 
 fn verify_tx(
-    sk: &SigningKey,
-    to: [u8; 32],
+    fk: &FalconKeypair,
+    from: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     p: &ZkMlProof,
 ) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        to,
+    pq_tx(
+        fk,
+        from,
+        from,
         0,
         GAS,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallVerifyZkMlReexec {
             model_id: id,
             proof: Box::new(p.clone()),
@@ -117,18 +150,18 @@ fn verify_tx(
 
 #[tokio::test]
 async fn valid_proof_is_accepted_on_the_live_block_path() {
-    let (e, sk, addr) = funded(0).await;
+    let (e, fk, addr) = funded(0).await;
     let m = tiny_model();
     let (_out, proof) = ZkMlProof::prove_reexec(&m, &[3, 4]);
 
-    let rtx = register_tx(&sk, addr, 0, MODEL_A, &m);
+    let rtx = register_tx(&fk, addr, 0, MODEL_A, &m);
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
         .await;
     assert_eq!((a, f), (1, 0), "registration must apply");
     assert_eq!(s, vec![true]);
 
-    let vtx = verify_tx(&sk, addr, 1, MODEL_A, &proof);
+    let vtx = verify_tx(&fk, addr, 1, MODEL_A, &proof);
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
         .await;
@@ -158,14 +191,14 @@ async fn forged_proof_is_rejected_on_the_live_block_path() {
     // And the live opcode - which calls the sound check - rejects it too.
     // This closes the gap: the old path called the structural check (and was
     // unreachable anyway).
-    let (e, sk, addr) = funded(0).await;
-    let rtx = register_tx(&sk, addr, 0, MODEL_A, &m);
+    let (e, fk, addr) = funded(0).await;
+    let rtx = register_tx(&fk, addr, 0, MODEL_A, &m);
     let (a, f, _, _, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
         .await;
     assert_eq!((a, f), (1, 0));
 
-    let vtx = verify_tx(&sk, addr, 1, MODEL_A, &forged);
+    let vtx = verify_tx(&fk, addr, 1, MODEL_A, &forged);
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
         .await;
@@ -185,11 +218,11 @@ async fn forged_proof_is_rejected_on_the_live_block_path() {
 
 #[tokio::test]
 async fn unregistered_model_is_rejected() {
-    let (e, sk, addr) = funded(0).await;
+    let (e, fk, addr) = funded(0).await;
     let m = tiny_model();
     let (_, proof) = ZkMlProof::prove_reexec(&m, &[3, 4]);
     // Never registered: the handler has nothing to check against.
-    let vtx = verify_tx(&sk, addr, 0, MODEL_A, &proof);
+    let vtx = verify_tx(&fk, addr, 0, MODEL_A, &proof);
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
         .await;
@@ -199,12 +232,12 @@ async fn unregistered_model_is_rejected() {
 
 #[tokio::test]
 async fn proof_for_another_model_is_rejected_under_a_registered_id() {
-    let (e, sk, addr) = funded(0).await;
+    let (e, fk, addr) = funded(0).await;
     let m = tiny_model();
     let other = other_model();
     let (_, other_proof) = ZkMlProof::prove_reexec(&other, &[3, 4]);
 
-    let rtx = register_tx(&sk, addr, 0, MODEL_A, &m);
+    let rtx = register_tx(&fk, addr, 0, MODEL_A, &m);
     assert_eq!(
         e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
             .await
@@ -214,7 +247,7 @@ async fn proof_for_another_model_is_rejected_under_a_registered_id() {
 
     // The proof's `model_hash` names `other`, the registry binds MODEL_A to
     // `m`: hash-match fails before re-execution even runs.
-    let vtx = verify_tx(&sk, addr, 1, MODEL_A, &other_proof);
+    let vtx = verify_tx(&fk, addr, 1, MODEL_A, &other_proof);
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
         .await;
@@ -228,18 +261,18 @@ async fn proof_for_another_model_is_rejected_under_a_registered_id() {
 
 #[tokio::test]
 async fn registry_is_append_only_validated_and_clone_committed() {
-    let (e, sk, addr) = funded(0).await;
+    let (e, fk, addr) = funded(0).await;
     let m = tiny_model();
 
     // First writer wins.
-    let r1 = register_tx(&sk, addr, 0, MODEL_A, &m);
+    let r1 = register_tx(&fk, addr, 0, MODEL_A, &m);
     assert_eq!(
         e.apply_block_parallel_fees(std::slice::from_ref(&r1), BLOCK_TS)
             .await
             .0,
         1
     );
-    let r2 = register_tx(&sk, addr, 1, MODEL_A, &other_model());
+    let r2 = register_tx(&fk, addr, 1, MODEL_A, &other_model());
     let (a, f, _, s, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&r2), BLOCK_TS)
         .await;
@@ -260,7 +293,7 @@ async fn registry_is_append_only_validated_and_clone_committed() {
         biases: vec![0],
     });
     assert!(!bad.validate());
-    let rb = register_tx(&sk, addr, 2, MODEL_B, &bad);
+    let rb = register_tx(&fk, addr, 2, MODEL_B, &bad);
     let (a, f, _, _, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&rb), BLOCK_TS)
         .await;
@@ -269,14 +302,13 @@ async fn registry_is_append_only_validated_and_clone_committed() {
     // Clone-commit: a registration in a transaction that later reverts leaves
     // nothing behind. Payload = [register MODEL_B, verify FORGED under MODEL_B].
     let forged = ZkMlProof::forge_structural_proof(&m, &[3, 4], &[999, 999]);
-    let both = Transaction::sign_with_payload(
-        &sk,
+    let both = pq_tx(
+        &fk,
+        addr,
         addr,
         0,
         GAS,
         3,
-        1,
-        1,
         vec![
             OpCode::SysCallRegisterZkMlModel {
                 model_id: MODEL_B,
@@ -308,15 +340,13 @@ async fn register_verify_roundtrip_and_two_nodes_agree() {
     let m = tiny_model();
     let (_, proof) = ZkMlProof::prove_reexec(&m, &[3, 4]);
 
-    async fn build() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+    async fn build() -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
         funded(0).await
     }
-    let (a, ska, addra) = build().await;
-    let (b, _, _) = build().await;
-    // Same funding key/addr on both (deterministic engines): mirror b's
-    // account to a's addr so both apply identical txs.
-    let skb = SigningKey::from_bytes(&[0x71; 32]);
-    let addrb = skb.verifying_key().to_bytes();
+    let (a, fka, addra) = build().await;
+    let (b, _, addrb) = build().await;
+    // Same deterministic funding key/addr on both engines, so both apply
+    // byte-identical transactions.
     assert_eq!(addra, addrb);
 
     let root_empty_a = a.get_state_root().await;
@@ -324,7 +354,7 @@ async fn register_verify_roundtrip_and_two_nodes_agree() {
     assert_eq!(root_empty_a, root_empty_b, "empty registries agree");
 
     for engine in [&a, &b] {
-        let rtx = register_tx(&ska, addra, 0, MODEL_A, &m);
+        let rtx = register_tx(&fka, addra, 0, MODEL_A, &m);
         assert_eq!(
             engine
                 .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
@@ -349,7 +379,7 @@ async fn register_verify_roundtrip_and_two_nodes_agree() {
     // Verify is read-only on the registry: the digest is unchanged by it.
     let before_a = stellereum::commitment::zkml_models_digest(&a.zkml_models_read().await.clone());
     for (engine, nonce) in [(&a, 1u64), (&b, 1u64)] {
-        let vtx = verify_tx(&ska, addra, nonce, MODEL_A, &proof);
+        let vtx = verify_tx(&fka, addra, nonce, MODEL_A, &proof);
         assert_eq!(
             engine
                 .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
@@ -443,9 +473,8 @@ async fn direct_vm_without_registry_fails_closed_and_legacy_is_refused() {
 
     // The legacy structural-only opcode is hard-refused even on the block
     // path (it can no longer be resurrected by wiring `zkml_proof`).
-    let (e, sk, addr) = funded(0).await;
-    let legacy =
-        Transaction::sign_with_payload(&sk, addr, 0, GAS, 0, 1, 1, vec![OpCode::SysCallVerifyZkMl]);
+    let (e, fk, addr) = funded(0).await;
+    let legacy = pq_tx(&fk, addr, addr, 0, GAS, 0, vec![OpCode::SysCallVerifyZkMl]);
     let (a, f, _, _, _) = e
         .apply_block_parallel_fees(std::slice::from_ref(&legacy), BLOCK_TS)
         .await;
@@ -518,9 +547,12 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
     use stellereum::oracle::PriceFeedUpdate;
     use stellereum::zkml::SessionKeyAuthorization;
     use stellereum::zkml_attestation::AttestationProof;
-    let grant = SessionKeyAuthorization::sign_delegation(
-        &SigningKey::from_bytes(&[7u8; 32]),
-        [9u8; 32],
+    // FULL-PQ: grants are Falcon-mastered (Ed master grants are refused).
+    let grant_master = FalconKeypair::generate_from_seed(7);
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
+        &grant_master,
+        PqScheme::Falcon512,
+        &FalconKeypair::generate_from_seed(9).public_key,
         1_500_000_000,
         1_000_000,
         u64::MAX,
@@ -765,26 +797,46 @@ fn appended_discriminants_preserve_every_existing_encoding() {
 
 #[test]
 fn zkml_tx_hash_commits_the_proof_and_pre_node_fails_closed() {
-    let sk = SigningKey::from_bytes(&[3u8; 32]);
+    let (sender, fk) = pq_key(0x03);
     let recipient = [0xABu8; 32];
     let m = tiny_model();
     let (_, proof) = ZkMlProof::prove_reexec(&m, &[3, 4]);
     let forged = ZkMlProof::forge_structural_proof(&m, &[3, 4], &[999, 999]);
 
+    // FULL-PQ: a PQ envelope's signature bytes ARE committed to the tx hash
+    // (`Transaction::hash_into` folds `PQ_ENV || signature`), and Falcon
+    // signing is randomized by design. To keep the "same logical content ->
+    // same hash" assertion meaningful, cache the signature per signing message
+    // (same rationale as `support/falcon_votes.rs::fvote_deterministic`); a
+    // different proof has a different message and therefore a different
+    // signature and hash.
+    let sig_cache: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
     let mk = |p: &ZkMlProof| {
-        Transaction::sign_with_payload(
-            &sk,
-            recipient,
-            0,
-            50_000,
-            0,
-            1,
-            1,
-            vec![OpCode::SysCallVerifyZkMlReexec {
+        let mut tx = Transaction {
+            from: sender,
+            to: recipient,
+            amount: 0,
+            gas_limit: 50_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: vec![OpCode::SysCallVerifyZkMlReexec {
                 model_id: MODEL_A,
                 proof: Box::new(p.clone()),
             }],
-        )
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = sig_cache
+            .lock()
+            .unwrap()
+            .entry(msg.clone())
+            .or_insert_with(|| fk.sign(&msg))
+            .clone();
+        tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+        tx
     };
     let a = mk(&proof);
     let b = mk(&forged);
@@ -899,9 +951,9 @@ async fn zkml_registry_is_folded_into_the_commitment_conditionally() {
     );
 
     // And through the engine: registration moves the live root.
-    let (e, sk, addr) = funded(0).await;
+    let (e, fk, addr) = funded(0).await;
     let before = e.get_state_root().await;
-    let rtx = register_tx(&sk, addr, 0, MODEL_A, &tiny_model());
+    let rtx = register_tx(&fk, addr, 0, MODEL_A, &tiny_model());
     assert_eq!(
         e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
             .await

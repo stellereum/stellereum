@@ -27,9 +27,12 @@
 //! `anyone_can_cancel_a_foreign_order_and_orphan_its_escrow` already asserted
 //! the fixed behaviour of hypothesis 2 and is unchanged.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+// FULL-PQ: fixture transactions are Falcon-512 PQ1 envelopes; the node
+// refuses classical Ed25519 envelopes at apply admission.
 use stellereum::orderbook::{OrderSide, OrderType};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_ORDER_PLACE};
@@ -38,8 +41,43 @@ use stellereum::token::TokenMetadata;
 const NANO: u64 = 1_000_000_000;
 const GAS: u64 = 1_000_000;
 
-fn tx(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> Transaction {
-    Transaction::sign_with_payload(key, [0xEE; 32], 0, GAS, nonce, 0, 1, payload)
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+fn tx(key: &FalconKeypair, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+    let pk = key.public_key.clone();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xEE; 32],
+        0,
+        GAS,
+        nonce,
+        0,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        [0xEE; 32],
+        0,
+        GAS,
+        nonce,
+        0,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
 }
 
 async fn bal(e: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
@@ -83,8 +121,8 @@ async fn clob_engine() -> (InMemoryStateEngine, [u8; 32]) {
 #[tokio::test]
 async fn svm_place_order_escrows_the_order_cost() {
     let e = InMemoryStateEngine::new();
-    let alice = SigningKey::generate(&mut OsRng);
-    let alice_addr = alice.verifying_key().to_bytes();
+    let alice = pq_key(0x11);
+    let alice_addr = pq_addr(&alice);
     let start = 1_000 * NANO;
     e.update_account(AccountState::new(alice_addr, start)).await;
 
@@ -95,40 +133,40 @@ async fn svm_place_order_escrows_the_order_cost() {
     let amount = 1_000 * NANO;
     let cost = price_micro.saturating_mul(amount) / 1_000_000; // same as svm.rs
 
-    e.apply_transaction(
-        &tx(
-            &alice,
-            0,
-            vec![OpCode::SysCallPlaceOrder {
-                pair_id: 1,
-                is_buy: true,
-                price: price_micro,
-                amount,
-            }],
-        ),
+    let order_tx = tx(
+        &alice,
         0,
-    )
-    .await
-    .expect("order must be accepted");
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price: price_micro,
+            amount,
+        }],
+    );
+    // The engine's own fee rule: `max(gas used, consensus floor) + surcharge`.
+    let (floor_base, surcharge) = e.consensus_floor_parts(&order_tx).await;
+    let fee = GAS_ORDER_PLACE.max(floor_base).saturating_add(surcharge);
+    e.apply_transaction(&order_tx, 0)
+        .await
+        .expect("order must be accepted");
 
     let after = bal(&e, &alice_addr).await;
-    let gas = GAS_ORDER_PLACE as i128;
     println!("start        = {start}");
     println!("order_cost   = {cost} (escrowed)");
     println!("after        = {after}");
     println!("actual debit = {}", start - after);
-    println!("gas          = {gas}");
+    println!("fee          = {fee}");
 
     assert_eq!(
         after,
-        start - cost - GAS_ORDER_PLACE,
-        "the {} nano order cost is really debited, plus gas",
+        start - cost - fee,
+        "the {} nano order cost is really debited, plus the fee",
         cost
     );
     assert_eq!(
-        (start - after) as i128,
-        cost as i128 + gas,
-        "cost + gas, nothing else"
+        start - after,
+        cost + fee,
+        "cost + the engine fee, nothing else"
     );
 
     // The position IS secured: one escrow record for exactly that cost.
@@ -161,7 +199,7 @@ async fn svm_place_order_escrows_the_order_cost() {
         .await
         .expect("cancel")
         .expect("order exists");
-    assert_eq!(bal(&e, &alice_addr).await, start - GAS_ORDER_PLACE);
+    assert_eq!(bal(&e, &alice_addr).await, start - fee);
     assert!(e.order_escrow_read().await.is_empty(), "escrow released");
 }
 
@@ -171,10 +209,10 @@ async fn svm_place_order_escrows_the_order_cost() {
 #[tokio::test]
 async fn anyone_can_cancel_a_foreign_order_and_orphan_its_escrow() {
     let (e, usdt) = clob_engine().await;
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let victim = pq_key(0x21);
+    let victim_addr = pq_addr(&victim);
+    let attacker = pq_key(0x22);
+    let attacker_addr = pq_addr(&attacker);
     let pair = 1u32;
     let price = 250_000u64;
 

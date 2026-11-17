@@ -444,21 +444,32 @@ fn hunt_neg_p9_u64_overflow_in_total_power_is_a_release_only_latent_hazard() {
     // (src/runtime.rs:181-209). Reaching 2^63 nano-STELL (9.2e9 STELL) needs
     // that much real, already-minted supply. Reported as hardening, not as a
     // live exploit.
+    // HARDENED SINCE THIS FINDING: `ValidatorSet::total_power` now folds with
+    // `saturating_add` (src/consensus/types.rs), so the old "debug panics,
+    // release wraps" premise no longer exists. The fail-closed property is
+    // SATURATION: the total pins at u64::MAX, quorum stays unreachable for a
+    // single 2^63 holder, and nothing wraps to a tiny total.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let r = std::panic::catch_unwind(|| {
         let mut vs = ValidatorSet::new();
         vs.validators.insert([1u8; 32], two63);
         vs.validators.insert([2u8; 32], two63);
-        vs.total_power()
+        (vs.total_power(), vs.quorum_power())
     });
     std::panic::set_hook(prev_hook);
-    println!(
-        "[NEG P9] two 2^63 entries: debug build panics = {}",
-        r.is_err()
+    let (total, quorum) = r.expect("saturating total_power must not panic");
+    println!("[NEG P9] two 2^63 entries: total = {total}, quorum = {quorum}");
+    assert_eq!(
+        total,
+        u64::MAX,
+        "total_power must saturate, never wrap to a tiny total"
     );
-    assert!(r.is_err(), "overflow-checks are on in the test build");
-    println!("[NEG P9] => a release build would silently wrap. Suggest checked_add / u128.");
+    assert!(
+        quorum > two63,
+        "one 2^63 validator must never reach the saturated quorum alone"
+    );
+    println!("[NEG P9] => saturation keeps the overflow fail-closed (no wrap, no single-validator quorum).");
 }
 
 // ===========================================================================
@@ -554,12 +565,40 @@ fn hunt_neg_p10_proposer_is_deterministic_but_the_slot_is_grindable() {
 
 #[test]
 fn hunt_neg_p11_block_hash_binds_the_svm_payload() {
-    let from = SigningKey::generate(&mut OsRng);
+    use stellereum::post_quantum::{
+        derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+    };
+    // FULL-PQ: the signer is an implicit Falcon-512 key (Ed-only envelopes are
+    // refused by `verify_signature`).
+    let from_fk = FalconKeypair::generate_from_seed(0x71);
+    let from = derive_pq_address(PqScheme::Falcon512, &from_fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(
+            from,
+            PqScheme::Falcon512,
+            &from_fk.public_key,
+            &DEFAULT_SALT,
+        )
+        .expect("PQ test key must register");
     let payload = vec![
         stellereum::svm::OpCode::Push(1),
         stellereum::svm::OpCode::Add,
     ];
-    let tx = Transaction::sign_with_payload(&from, [1u8; 32], 10, 0, 0, 1, 1, payload.clone());
+    let mut tx = Transaction {
+        from,
+        to: [1u8; 32],
+        amount: 10,
+        gas_limit: 0,
+        nonce: 0,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: payload.clone(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature =
+        PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, from_fk.sign(&msg)).encode();
     assert!(tx.verify_signature());
     let h1 = tx.compute_tx_hash();
 
@@ -582,6 +621,12 @@ fn hunt_neg_p11_block_hash_binds_the_svm_payload() {
 
     // And therefore changes the block hash, invalidating the proposer signature.
     let pk = SigningKey::generate(&mut OsRng);
+    let block_fk = FalconKeypair::generate_from_seed(0x72);
+    stellereum::consensus::register_validator_pq_key(
+        pk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        block_fk.public_key.clone(),
+    );
     let mk = |txs: Vec<Transaction>| {
         let order_merkle_root = stellereum::mev::compute_order_merkle_root(&txs);
         let mut b = Block {
@@ -602,7 +647,7 @@ fn hunt_neg_p11_block_hash_binds_the_svm_payload() {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&pk);
+        b.sign_block_with_falcon(&pk, &block_fk);
         b
     };
     let honest = mk(vec![tx.clone()]);

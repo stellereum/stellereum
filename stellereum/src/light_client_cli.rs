@@ -134,6 +134,30 @@ pub fn validator_set_from_value(v: &Value, ctx: &str) -> anyhow::Result<Validato
                     .or_else(|| e.get("stake"))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("validator entry {i} has no power"))?;
+                // FULL-PQ: a quorum certificate is a Falcon µQC, so an
+                // out-of-process verifier (this CLI) needs each validator's
+                // Falcon-512 public key. It was previously resolved from the
+                // process-global registry, which is empty in a fresh process —
+                // every honest certificate was refused. The pinned file may
+                // carry `pq_pubkey` (hex); register it before any verification.
+                if let Some(pq_hex) = e.get("pq_pubkey").and_then(|x| x.as_str()) {
+                    let pk = hex::decode(
+                        pq_hex
+                            .strip_prefix("0x")
+                            .or_else(|| pq_hex.strip_prefix("0X"))
+                            .unwrap_or(pq_hex),
+                    )
+                    .map_err(|err| {
+                        anyhow::anyhow!("validator entry {i}: bad pq_pubkey hex: {err}")
+                    })?;
+                    let id_bytes = parse_hex32(id)
+                        .map_err(|err| anyhow::anyhow!("validator entry {i}: {err}"))?;
+                    crate::consensus::register_validator_pq_key(
+                        id_bytes,
+                        crate::post_quantum::PqScheme::Falcon512,
+                        pk,
+                    );
+                }
                 (id.to_string(), p)
             }
             _ => return Err(anyhow::anyhow!("validator entry {i} is malformed")),
@@ -169,7 +193,8 @@ pub fn validator_set_from_value(v: &Value, ctx: &str) -> anyhow::Result<Validato
 /// Accepted shapes (all hex pubkeys, power as a number or a decimal string):
 ///
 /// ```json
-/// {"validators": [{"validator": "<64 hex>", "power": "1000"}, ...]}
+/// {"validators": [{"validator": "<64 hex>", "power": "1000",
+///                    "pq_pubkey": "<Falcon-512 pubkey hex>"}, ...]}
 /// [["<64 hex>", 1000], ...]
 /// [{"validator": "<64 hex>", "power": 1000}, ...]
 /// ```

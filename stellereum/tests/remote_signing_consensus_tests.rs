@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::remote_signer::{
     LocalSigner, RemoteSigner, Signer, SignerError, SignerTransport, TransportErrorKind,
     SIGNATURE_LEN,
@@ -68,7 +69,38 @@ fn remote_setup(
 
     let vs = ValidatorSet::from_list(vec![(key.verifying_key().to_bytes(), 1)]);
     let state = Arc::new(InMemoryStateEngine::new());
+    // FULL-PQ: votes verify Falcon-only. The runtime attaches the Falcon half
+    // locally from its persisted keypair; the REMOTE signer still produces the
+    // Ed half (that is what this suite proves is in process).
     let rt = ValidatorRuntime::new(key, vs, state, 1)
+        .with_falcon_key(FalconKeypair::generate_from_seed(0xF1))
+        .with_remote_signer(Arc::new(remote))
+        .expect("remote key matches the validator identity");
+    (rt, fail, calls)
+}
+
+/// Same as [`remote_setup`] but with a caller-chosen Falcon seed, so two
+/// runtimes can share byte-identical Falcon vote halves.
+fn remote_setup_with_falcon(
+    key: SigningKey,
+    falcon_seed: u8,
+) -> (
+    ValidatorRuntime,
+    Arc<AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let fail = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = FakeTransport {
+        key: key.clone(),
+        fail: Arc::clone(&fail),
+        sign_calls: Arc::clone(&calls),
+    };
+    let remote = RemoteSigner::new(Arc::new(transport)).expect("remote signer pins the key");
+    let vs = ValidatorSet::from_list(vec![(key.verifying_key().to_bytes(), 1)]);
+    let state = Arc::new(InMemoryStateEngine::new());
+    let rt = ValidatorRuntime::new(key, vs, state, 1)
+        .with_falcon_key(FalconKeypair::generate_from_seed(falcon_seed))
         .with_remote_signer(Arc::new(remote))
         .expect("remote key matches the validator identity");
     (rt, fail, calls)
@@ -158,7 +190,8 @@ async fn the_local_path_is_unchanged_when_no_remote_signer_is_configured() {
     state
         .update_account(AccountState::new(key.verifying_key().to_bytes(), 1_000_000))
         .await;
-    let mut rt = ValidatorRuntime::new(key.clone(), vs, state, 1);
+    let mut rt = ValidatorRuntime::new(key.clone(), vs, state, 1)
+        .with_falcon_key(FalconKeypair::generate_from_seed(0xF2));
 
     rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0x11; 32]));
     rt.hc.step = stellereum::consensus::Step::Prevote;
@@ -182,9 +215,15 @@ fn remote_signed_vote_is_indistinguishable_from_a_local_one() {
     let key = SigningKey::generate(&mut OsRng);
     let vs = ValidatorSet::from_list(vec![(key.verifying_key().to_bytes(), 1)]);
 
-    let mut local_rt = ValidatorRuntime::new(key.clone(), vs.clone(), local_state(), 1);
-    let (remote_rt, _f, _c) = remote_setup(key.clone());
-    let mut remote_rt = remote_rt;
+    // FULL-PQ: the Falcon half must be identical on both paths too, so both
+    // runtimes carry the SAME seeded keypair and the deterministic vote signer
+    // (Falcon signing is randomized by design). The Ed half is the key under
+    // test; `remote_setup` wires the remote transport for it.
+    let mut local_rt = ValidatorRuntime::new(key.clone(), vs.clone(), local_state(), 1)
+        .with_falcon_key(FalconKeypair::generate_from_seed(0xF3))
+        .with_deterministic_sim_signing();
+    let (remote_rt, _f, _c) = remote_setup_with_falcon(key.clone(), 0xF3);
+    let mut remote_rt = remote_rt.with_deterministic_sim_signing();
 
     for rt in [&mut local_rt, &mut remote_rt] {
         rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0x42; 32]));

@@ -15,6 +15,9 @@ use rand::rngs::OsRng;
 use std::sync::Arc;
 
 use stellereum::consensus::ValidatorSet;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::staking::{
     StakingLedger, MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
@@ -25,6 +28,45 @@ use stellereum::token::{TokenError, TokenMetadata};
 
 fn stell(n: u64) -> u64 {
     n * 1_000_000_000
+}
+
+/// FULL-PQ (Falcon-512 only node): deterministic implicit Falcon-512 identity,
+/// registered globally so admission/apply accept the envelope.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    stellereum::sharding::Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload`: same gas, nonce,
+/// shards and payload, signed with Falcon-512.
+fn pq_tx(
+    kp: &FalconKeypair,
+    nonce: u64,
+    gas: u64,
+    payload: Vec<OpCode>,
+) -> stellereum::sharding::Transaction {
+    use stellereum::sharding::Transaction;
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 #[test]
@@ -230,10 +272,8 @@ async fn staking_withdrawal_moves_coins_from_the_pool() {
 #[tokio::test]
 async fn third_party_can_buy_any_validators_voting_power() {
     let engine = InMemoryStateEngine::new();
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let funder = SigningKey::generate(&mut OsRng);
-    let funder_addr = funder.verifying_key().to_bytes();
+    let (victim, victim_addr) = pq_key(0x81);
+    let (funder, funder_addr) = pq_key(0x82);
 
     engine
         .update_account(AccountState::new(
@@ -241,14 +281,10 @@ async fn third_party_can_buy_any_validators_voting_power() {
             MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 20_000,
         ))
         .await;
-    let b = stellereum::sharding::Transaction::sign_with_payload(
+    let b = pq_tx(
         &victim,
-        victim_addr,
         0,
         20_000,
-        0,
-        1,
-        1,
         vec![OpCode::SysCallStake {
             validator: victim_addr,
             amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
@@ -266,14 +302,10 @@ async fn third_party_can_buy_any_validators_voting_power() {
     engine
         .update_account(AccountState::new(funder_addr, stell(1_000_000) + 100_000))
         .await;
-    let t = stellereum::sharding::Transaction::sign_with_payload(
+    let t = pq_tx(
         &funder,
-        funder_addr,
         0,
         100_000,
-        0,
-        1,
-        1,
         vec![OpCode::SysCallStake {
             validator: victim_addr,
             amount: stell(1_000_000),

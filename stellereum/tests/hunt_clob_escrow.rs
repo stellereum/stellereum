@@ -32,6 +32,9 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use stellereum::orderbook::{OrderSide, OrderType};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 use stellereum::token::{TokenMetadata, TokenOp};
@@ -40,11 +43,39 @@ fn stell(n: u64) -> u64 {
     n * 1_000_000_000
 }
 
-fn tx_of(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> stellereum::sharding::Transaction {
-    let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, from, 0, 100_000, nonce, 1, 1, payload,
-    )
+/// FULL-PQ trader fixture: an implicit Falcon-512 key registered globally
+/// (so the tx is not an activation and pays no 45k surcharge).
+fn pq_trader(seed: u8) -> ([u8; 32], FalconKeypair) {
+    let fk = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    stellereum::sharding::Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (addr, fk)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures.
+fn tx_of(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> stellereum::sharding::Transaction {
+    let mut tx = stellereum::sharding::Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: 100_000,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, fk.sign(&msg)).encode();
+    tx
 }
 
 /// The exact `order_cost` the VM computes for a buy (`src/svm.rs`), so a test
@@ -91,8 +122,7 @@ async fn svm_crossing_settles_a_makers_escrow() {
     let (engine, _usdt) = setup().await;
     let victim = SigningKey::generate(&mut OsRng);
     let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let (attacker_addr, attacker_fk) = pq_trader(0x51);
 
     let price = 250_000u64; // $0.25
     let amount = stell(1_000);
@@ -136,7 +166,8 @@ async fn svm_crossing_settles_a_makers_escrow() {
         .await;
     let attacker_before = engine.get_account(&attacker_addr).await.unwrap().balance;
     let t = tx_of(
-        &attacker,
+        &attacker_fk,
+        attacker_addr,
         0,
         vec![OpCode::SysCallPlaceOrder {
             pair_id: 1,
@@ -242,8 +273,7 @@ async fn one_tx_settles_many_maker_escrows() {
     assert_eq!(escrowed_before, n * per_order);
 
     // One transaction, N crossings: N * (GAS_ORDER_PLACE + one match level).
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let (attacker_addr, attacker_fk) = pq_trader(0x51);
     engine
         .update_account(AccountState::new(attacker_addr, n * per_cost + 100_000))
         .await;
@@ -256,7 +286,7 @@ async fn one_tx_settles_many_maker_escrows() {
             amount: per_order,
         })
         .collect();
-    let t = tx_of(&attacker, 0, payload);
+    let t = tx_of(&attacker_fk, attacker_addr, 0, payload);
     engine.apply_transaction(&t, 0).await.unwrap();
     let after = engine.get_account(&attacker_addr).await.unwrap().balance;
     let gas = n * (stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL);
@@ -306,8 +336,7 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
     let amount = stell(1_000_000); // 1,000,000 STELL notional
     let cost = order_cost(price, amount);
 
-    let trader = SigningKey::generate(&mut OsRng);
-    let trader_addr = trader.verifying_key().to_bytes();
+    let (trader_addr, trader_fk) = pq_trader(0x53);
     engine
         .update_account(AccountState::new(trader_addr, cost + 1_000_000))
         .await;
@@ -315,7 +344,8 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
     println!("trader real balance {before}, order cost {cost}");
 
     let t = tx_of(
-        &trader,
+        &trader_fk,
+        trader_addr,
         0,
         vec![OpCode::SysCallPlaceOrder {
             pair_id: 1,

@@ -472,11 +472,15 @@ async fn oversized_reflections_are_bounded() {
         "getter-arg reflection must be bounded: {}",
         body.len()
     );
-    // Address parsing truncates the echo as well.
-    let r = st
+    // Address parsing truncates the echo as well. The contract PREVIEW arm
+    // requires the RPC token on every bind (fail-closed auth), so use an
+    // authed state and present it; the address-parsing reflection rule is the
+    // thing under test.
+    let authed = base_state(Some(AUTH_TOKEN), None).await;
+    let r = authed
         .call(
             "stell_callContract",
-            json!({"contract": huge, "method": "m"}),
+            json!({"contract": huge, "method": "m", "token": AUTH_TOKEN}),
         )
         .await;
     let e = err_of(&r).unwrap_or_default();

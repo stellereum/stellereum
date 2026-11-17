@@ -10,6 +10,7 @@
 //! every restart hands a rotating drain a fresh hourly budget.
 
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN};
 use stellereum::rpc::Faucet;
 use stellereum::sharding::Transaction;
 
@@ -26,9 +27,54 @@ fn snark_op() -> stellereum::svm::OpCode {
     }
 }
 
+/// FULL-PQ fixture: admission refuses bare Ed25519 envelopes, so sign with a
+/// Falcon key and use its derived PQ address as the sender.
+fn pq_key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_tx(
+    kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<stellereum::svm::OpCode>,
+) -> Transaction {
+    let pk = kp.public_key().to_vec();
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
+}
+
 fn payload_tx(ops: Vec<stellereum::svm::OpCode>, nonce: u64) -> Transaction {
-    let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
-    Transaction::sign_with_payload(&key, [0x99u8; 32], 10, 1_000, nonce, 1, 1, ops)
+    // FULL-PQ: admission prices the consensus floor plus the 45k PQ activation
+    // surcharge, so a 1,000-gas envelope would be refused for underpayment.
+    pq_tx(&pq_key(0x77), [0x99u8; 32], 10, 500_000, nonce, ops)
 }
 
 // D1: a single tx carrying more proof work than any block may verify (33 x 64
@@ -76,8 +122,7 @@ fn d1_boundary_and_honest_tx_still_admit() {
         mp.add_checked(at_cap, u64::MAX).is_ok(),
         "tx exactly at cap must admit"
     );
-    let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
-    let honest = Transaction::sign(&key, [0x99u8; 32], 10, 1_000, 1, 1, 1);
+    let honest = pq_tx(&pq_key(0x77), [0x99u8; 32], 10, 500_000, 1, Vec::new());
     assert!(
         mp.add_checked(honest, u64::MAX).is_ok(),
         "honest tx must admit"

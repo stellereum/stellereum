@@ -72,11 +72,11 @@ async fn build_chain(
         // F8: the proposer must be the one the deterministic schedule names for
         // (height, round); validate_sync_chain now enforces it.
         let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let proposer = ks
+        let proposer_idx = ks
             .iter()
-            .find(|k| k.verifying_key().to_bytes() == proposer_id)
-            .expect("proposer is a member")
-            .clone();
+            .position(|k| k.verifying_key().to_bytes() == proposer_id)
+            .expect("proposer is a member");
+        let proposer = ks[proposer_idx].clone();
         let mut b = Block {
             shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
             height: h,
@@ -95,7 +95,10 @@ async fn build_chain(
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&proposer);
+        // FULL-PQ: the proposal signature is verified Falcon-only by
+        // `consensus::verify_proposer_signature`, so the block carries both
+        // halves (Ed id + registered Falcon half).
+        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         // Real quorum, carried as the block's precommit QC: validate_sync_chain must
         // be able to tell a genuine history from a single-peer forgery, and it checks
         // the attached QC -- not extra block-hash signatures, which prove nothing
@@ -284,7 +287,7 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(&proposer);
+    b.sign_block_with_falcon(&proposer, &fks[0]);
     let bh = b.compute_hash();
     attach_quorum(&mut b, &ks, &fks, &vs, 6, bh, [0xAB; 32]);
     forked.push(b);

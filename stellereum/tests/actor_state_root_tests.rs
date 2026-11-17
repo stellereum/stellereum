@@ -10,7 +10,7 @@
 //! commit, no new account encoding, and the genesis KAT's root cannot drift
 //! on a chain that never carried an actor send.
 
-use ed25519_dalek::SigningKey;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -18,26 +18,54 @@ use stellereum::svm::OpCode;
 /// Realistic block timestamp - never 0.
 const TS: u64 = 1_760_000_000;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ (Falcon-512 only node): an implicit Falcon-512 identity. The
+/// address is the derived PQ address and the key is registered globally so
+/// admission/apply verify the envelope with no activation surcharge.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, from)
 }
 
-fn actor_tx(sk: &SigningKey, recipient: [u8; 32], value: u64) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
+/// FULL-PQ replacement for `Transaction::sign_with_payload`: same payload,
+/// gas, shards and nonce, signed with Falcon-512.
+fn actor_tx(kp: &FalconKeypair, recipient: [u8; 32], value: u64) -> Transaction {
+    let payload = vec![OpCode::SysCallActorSend {
+        recipient,
+        value,
+        body: vec![],
+        bounce: true,
+        gas_budget: 500,
+    }];
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
         recipient,
         0,
         30_000, // declared gas: covers the send's gas + delivery prepay
         0,
         MASTERCHAIN_SHARD,
         MASTERCHAIN_SHARD,
-        vec![OpCode::SysCallActorSend {
-            recipient,
-            value,
-            body: vec![],
-            bounce: true,
-            gas_budget: 500,
-        }],
+        payload,
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        sig,
+        recipient,
+        0,
+        30_000,
+        0,
+        MASTERCHAIN_SHARD,
+        MASTERCHAIN_SHARD,
+        probe.payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -63,12 +91,11 @@ fn mk_block(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
     }
 }
 
-async fn funded(seed: u8) -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
-    let sk = key(seed);
-    let addr = sk.verifying_key().to_bytes();
+async fn funded(seed: u8) -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
+    let (kp, addr) = pq_key(seed);
     let e = InMemoryStateEngine::new();
     e.update_account(AccountState::new(addr, 10_000_000)).await;
-    (e, sk, addr)
+    (e, kp, addr)
 }
 
 // ===========================================================================
@@ -80,12 +107,12 @@ async fn funded(seed: u8) -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
 /// block does.
 #[tokio::test]
 async fn holding_a_signed_tx_moves_nothing() {
-    let (e, sk, sender) = funded(0x41).await;
+    let (e, kp, sender) = funded(0x41).await;
     let recipient = [0x88u8; 32];
     let root0 = e.get_state_root().await;
 
     // Build the transaction (this is what a node in the mempool would hold).
-    let tx = actor_tx(&sk, recipient, 4_242);
+    let tx = actor_tx(&kp, recipient, 4_242);
     assert!(tx.verify_signature(), "sanity: it is a valid transaction");
     assert!(
         tx.check_session_policy(TS).is_ok(),
@@ -114,13 +141,13 @@ async fn holding_a_signed_tx_moves_nothing() {
 
 #[tokio::test]
 async fn root_moves_only_when_the_block_applies() {
-    let (e, sk, _sender) = funded(0x42).await;
+    let (e, kp, _sender) = funded(0x42).await;
     let recipient = [0x89u8; 32];
     e.update_account(AccountState::new(recipient, 0)).await;
     let root0 = e.get_state_root().await;
 
     // Build (but do not apply) the transaction: no movement.
-    let tx = actor_tx(&sk, recipient, 4_242);
+    let tx = actor_tx(&kp, recipient, 4_242);
     let held = e.get_state_root().await;
     assert_eq!(root0, held, "building the tx moved nothing");
 
@@ -158,8 +185,7 @@ async fn root_moves_only_when_the_block_applies() {
 /// determines the state.
 #[tokio::test]
 async fn same_block_produces_the_same_root_on_two_engines() {
-    let sk = key(0x43);
-    let sender = sk.verifying_key().to_bytes();
+    let (kp, sender) = pq_key(0x43);
     let recipient = [0x8Au8; 32];
 
     let e1 = InMemoryStateEngine::new();
@@ -179,7 +205,7 @@ async fn same_block_produces_the_same_root_on_two_engines() {
         "precondition: identical state => identical pre-root"
     );
 
-    let tx = actor_tx(&sk, recipient, 4_242);
+    let tx = actor_tx(&kp, recipient, 4_242);
     let blk = mk_block(1, vec![tx], sender);
 
     let out1 = e1.apply_block_transition(&blk, 0).await;

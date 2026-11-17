@@ -34,9 +34,15 @@ async fn missed_map(st: &Arc<InMemoryStateEngine>) -> BTreeMap<[u8; 32], (u32, u
         .collect()
 }
 
-fn block_at(vset: &ValidatorSet, ks: &[SigningKey], height: u64, root: [u8; 32]) -> Block {
+fn block_at(
+    vset: &ValidatorSet,
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    height: u64,
+    root: [u8; 32],
+) -> Block {
     let proposer = vset.proposer_for(height, 0).unwrap();
-    let pk = ks.iter().find(|k| id(k) == proposer).unwrap();
+    let idx = ks.iter().position(|k| id(k) == proposer).unwrap();
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height,
@@ -55,7 +61,8 @@ fn block_at(vset: &ValidatorSet, ks: &[SigningKey], height: u64, root: [u8; 32])
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pk);
+    // FULL-PQ: Ed-only proposals are refused by `verify_proposer_signature`.
+    b.sign_block_with_falcon(&ks[idx], &fks[idx]);
     b
 }
 
@@ -108,14 +115,14 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
     };
     let (st_a, ksa, vs_a) = mk();
     fund_genesis(&st_a, &vs_a, 1_000_000_000_000_000).await;
-    let blk = block_at(&vs_a, &ksa, 1, st_a.get_state_root().await);
+    let blk = block_at(&vs_a, &ksa, &fks, 1, st_a.get_state_root().await);
     let block_hash = blk.compute_hash();
 
     let (st_b, ksb, vs_b) = mk();
     fund_genesis(&st_b, &vs_b, 1_000_000_000_000_000).await;
     assert_eq!(
         blk.compute_hash(),
-        block_at(&vs_b, &ksb, 1, st_b.get_state_root().await).compute_hash()
+        block_at(&vs_b, &ksb, &fks, 1, st_b.get_state_root().await).compute_hash()
     );
 
     let before_a = missed_map(&st_a).await;
@@ -216,7 +223,7 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
     let victim = ks[3].clone();
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
-    let blk = block_at(&vset, &ks, 1, st.get_state_root().await);
+    let blk = block_at(&vset, &ks, &fks, 1, st.get_state_root().await);
     let block_hash = blk.compute_hash();
 
     let pool_before = st

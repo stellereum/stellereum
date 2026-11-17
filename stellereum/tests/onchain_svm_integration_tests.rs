@@ -1,9 +1,10 @@
 //! End-to-end tests proving the SVM / token / orderbook are actually executed
 //! as part of block application (on-chain), not just as a standalone library.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::orderbook::PAIR_STELL_USDT;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -14,10 +15,47 @@ async fn funded_engine(owner: [u8; 32], balance: u64) -> InMemoryStateEngine {
     e
 }
 
+/// FULL-PQ sender fixture: an implicit Falcon-512 identity, registered
+/// globally so the tx pays no activation surcharge.
+fn pq_owner(seed: u8) -> ([u8; 32], FalconKeypair) {
+    let fk = FalconKeypair::generate_from_seed(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (from, fk)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures.
+fn pq_tx(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, fk.sign(&msg)).encode();
+    tx
+}
+
 #[tokio::test]
 async fn token_syscall_in_payload_is_applied_on_chain() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let (from, fk) = pq_owner(0x61);
     let engine = funded_engine(from, 1_000_000).await;
 
     let meta = stellereum::token::TokenMetadata {
@@ -40,7 +78,7 @@ async fn token_syscall_in_payload_is_applied_on_chain() {
     }];
     // The token table is priced at the native floor, so the declared gas must
     // cover it.
-    let tx = Transaction::sign_with_payload(&sk, [0u8; 32], 0, 300_000, 0, 1, 1, payload);
+    let tx = pq_tx(&fk, from, [0u8; 32], 0, 300_000, 0, payload);
 
     engine
         .apply_transaction(&tx, 0)
@@ -53,8 +91,7 @@ async fn token_syscall_in_payload_is_applied_on_chain() {
 
 #[tokio::test]
 async fn reverting_payload_does_not_move_native_balance() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let (from, fk) = pq_owner(0x62);
     let engine = funded_engine(from, 1_000_000).await;
 
     let missing = [0xAB; 32];
@@ -63,7 +100,7 @@ async fn reverting_payload_does_not_move_native_balance() {
         to: [7u8; 32],
         amount: 1,
     }];
-    let tx = Transaction::sign_with_payload(&sk, [9u8; 32], 5_000, 100_000, 0, 1, 1, payload);
+    let tx = pq_tx(&fk, from, [9u8; 32], 5_000, 100_000, 0, payload);
 
     let res = engine.apply_transaction(&tx, 0).await;
     assert!(res.is_err(), "reverting payload must fail the tx");
@@ -86,8 +123,7 @@ async fn reverting_payload_does_not_move_native_balance() {
 
 #[tokio::test]
 async fn orderbook_order_in_payload_is_recorded_in_consensus_state() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let (from, fk) = pq_owner(0x63);
     let engine = funded_engine(from, 10_000_000_000).await;
 
     let payload = vec![OpCode::SysCallPlaceOrder {
@@ -96,7 +132,7 @@ async fn orderbook_order_in_payload_is_recorded_in_consensus_state() {
         price: 250_000,
         amount: 1_000,
     }];
-    let tx = Transaction::sign_with_payload(&sk, [0u8; 32], 0, 10_000_000, 0, 1, 1, payload);
+    let tx = pq_tx(&fk, from, [0u8; 32], 0, 10_000_000, 0, payload);
     engine
         .apply_transaction(&tx, 0)
         .await
@@ -110,15 +146,14 @@ async fn orderbook_order_in_payload_is_recorded_in_consensus_state() {
 
 #[test]
 fn payload_is_bound_into_the_signature() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let mut tx = Transaction::sign_with_payload(
-        &sk,
+    let (from, fk) = pq_owner(0x64);
+    let mut tx = pq_tx(
+        &fk,
+        from,
         [1u8; 32],
         0,
         100_000,
         0,
-        1,
-        1,
         vec![OpCode::Push(1), OpCode::Halt],
     );
     assert!(tx.verify_signature());
@@ -131,13 +166,12 @@ fn payload_is_bound_into_the_signature() {
 
 #[tokio::test]
 async fn block_execution_runs_payloads_and_conserves_native_value() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
+    let (from, fk) = pq_owner(0x65);
     let to = [5u8; 32];
     let engine = funded_engine(from, 1_000_000).await;
 
     let payload = vec![OpCode::Push(42), OpCode::Halt];
-    let tx = Transaction::sign_with_payload(&sk, to, 1_000, 560, 0, 1, 1, payload);
+    let tx = pq_tx(&fk, from, to, 1_000, 560, 0, payload);
     let (applied, failed) = engine.apply_block_parallel(&[tx], 0).await;
     assert_eq!((applied, failed), (1, 0));
 

@@ -82,7 +82,14 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
         GOLDEN_SIGNING_MSG,
         "legacy signing message must be byte-identical"
     );
-    assert!(tx.verify_signature(), "legacy signature must still verify");
+    // FULL-PQ: the pinned legacy bytes still decode and re-encode exactly,
+    // but a bare Ed25519 envelope is REFUSED at signature verification (the
+    // classical branch is deleted). Pin the fail-closed verdict so a
+    // regression that re-admits it cannot hide behind the byte equality.
+    assert!(
+        !tx.verify_signature(),
+        "FULL-PQ: a legacy Ed25519 envelope must be refused (fail-closed)"
+    );
     assert_eq!(
         hex::encode(tx.compute_tx_hash()),
         GOLDEN_TX_HASH,
@@ -128,8 +135,8 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     );
     assert_eq!(
         re.len(),
-        raw_block.len() + 8 + 32 + 32 + 1 + 32,
-        "only the empty shard-head set, the zero order root, the zero epoch-key commitment, the None last_qc byte and the zero epoch-MMR root are appended (W10.5 canonical downtime evidence; V5 Tier-2 MMR)"
+        raw_block.len() + 8 + 32 + 32 + 1 + 32 + 1,
+        "only the empty shard-head set, the zero order root, the zero epoch-key commitment, the None last_qc byte, the zero epoch-MMR root and the None CN-VRF v3 payload byte are appended (W10.5 canonical downtime evidence; V5 Tier-2 MMR; CN-VRF v3)"
     );
     assert_eq!(
         block.order_merkle_root, [0u8; 32],

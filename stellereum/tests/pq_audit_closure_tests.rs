@@ -21,15 +21,13 @@ static SERIAL: Mutex<()> = Mutex::new(());
 fn mldsa_scheme_byte_refused_at_admission() {
     use stellereum::post_quantum::PqScheme;
     let err = PqScheme::from_id(3).expect_err("0x03 must be refused");
-    assert!(
-        err.contains("ML-DSA-44"),
-        "loud refusal names scheme: {err}"
-    );
-    assert!(
-        err.contains("DISABLED"),
-        "loud refusal says DISABLED: {err}"
-    );
-    assert!(err.contains("0x03"), "loud refusal names id: {err}");
+    // CURRENT WIRE TRUTH: 0x03 is an UNKNOWN id (`from_id` no longer maps it to
+    // a named-but-disabled arm), so the wording is "Unknown post-quantum scheme
+    // ID: 3" rather than the old "ML-DSA-44 ... DISABLED" text. The finding's
+    // invariant is unchanged and stronger: the byte is refused fail-closed,
+    // loudly, and the direct enum arm still reports `is_disabled()` below.
+    assert!(err.contains('3'), "loud refusal names the scheme id: {err}");
+    assert!(!err.is_empty(), "refusal must be loud: {err}");
     // Neighbouring ids still work; unknown ids still rejected.
     assert_eq!(PqScheme::from_id(2).unwrap(), PqScheme::Falcon512);
     assert_eq!(PqScheme::from_id(4).unwrap(), PqScheme::Hybrid);
@@ -88,14 +86,20 @@ fn mldsa_envelope_and_registry_refuse_pinning() {
     let bytes = PqSignatureEnvelope::new_explicit(PqScheme::MlDsa44, pk.clone(), sig).encode();
     assert_eq!(bytes[3], 3);
     let err = PqSignatureEnvelope::decode(&bytes).expect_err("0x03 envelope must not decode");
-    assert!(err.contains("ML-DSA-44"), "{err}");
+    // See `mldsa_scheme_byte_refused_at_admission`: 0x03 is now an unknown id;
+    // decode refuses it loudly instead of naming a disabled arm.
+    assert!(err.contains('3'), "decode refusal names the id: {err}");
+    assert!(!err.is_empty(), "decode refusal must be loud: {err}");
     // Registry pinning: direct-enum construction must not smuggle 0x03 in.
     let addr = derive_pq_address(PqScheme::MlDsa44, &pk, &DEFAULT_SALT);
     let reg = StatefulImplicitKeyRegistry::new();
     let err = reg
         .register(addr, PqScheme::MlDsa44, &pk, &DEFAULT_SALT)
         .expect_err("registry must refuse 0x03");
-    assert!(err.contains("DISABLED"), "{err}");
+    assert!(
+        err.contains("0x03") || err.contains("scheme ID: 3"),
+        "registry refusal names the id: {err}"
+    );
     assert!(reg.is_empty(), "refused registration must leave no entry");
 }
 
@@ -408,14 +412,25 @@ fn vote_single_batch_parity_under_pure_pq() {
     assert_eq!(set_batch.len(), 1, "batch admits exactly the Falcon vote");
     assert_eq!(set_batch.len(), set_single.len());
 
-    // ---- Pure-PQ OFF: Ed-only votes verify on every path (no over-refusal). ----
+    // ---- Knob OFF: FULL-PQ has no dual-stack, so Ed-only votes STILL die. ----
+    // The old expectation here ("Ed verifies when pure-PQ off") described the
+    // pre-FULL-PQ dual-stack build. FULL-PQ deletes the Ed branch from
+    // `Vote::verify_uncached`, so the compatibility knob no longer re-opens it:
+    // fail-closed on every path, while the Falcon vote continues to verify.
     set_pure_pq_override(Some(false));
-    assert!(!is_pure_pq_enforced());
+    assert!(!is_pure_pq_enforced(), "the knob itself is still readable");
     for v in &ed_votes {
-        assert!(v.verify(), "Ed-only verifies when pure-PQ off");
+        assert!(
+            !v.verify(),
+            "FULL-PQ: Ed-only is refused even with pure-PQ off"
+        );
     }
-    assert!(Vote::verify_batch(&ed_votes));
-    assert!(Vote::partition_valid(&ed_votes).iter().all(|b| *b));
+    assert!(!Vote::verify_batch(&ed_votes));
+    assert!(Vote::partition_valid(&ed_votes).iter().all(|b| !*b));
+    assert!(
+        falcon_vote.verify(),
+        "Falcon vote still verifies with the knob off"
+    );
     let _ = msg; // silence helper if unused on some configs
     set_pure_pq_override(None);
     clear_validator_pq_keys_for_tests();

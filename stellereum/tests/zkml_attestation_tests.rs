@@ -25,11 +25,13 @@
 //! (machine-dependent; `benches/zkml_snark.rs` REPORTS them, and the
 //! measurement test below prints them with `--nocapture`).
 
-use ed25519_dalek::SigningKey;
 use stellereum::commitment::{
     commitment_digest, commitment_digest_with_zkml, zkml_vks_digest, COMMITMENT_VERSION,
 };
 use stellereum::mempool::Mempool;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{
@@ -49,8 +51,56 @@ const ATTEST_TEST_SEED: u64 = 0x534E41524B;
 const MODEL_A: [u8; 32] = [0x51; 32];
 const MODEL_B: [u8; 32] = [0x52; 32];
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+fn key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed(seed)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
+/// FULL-PQ signer. The IMPLICIT envelope is deliberate: these tests pin the
+/// declared-gas fee exactly, and the explicit envelope's 45k activation
+/// surcharge would be an unrelated extra debit. The key is registered in the
+/// global implicit registry (the wire omits it); the signature is a real
+/// Falcon-512 over the same transaction message.
+fn pq_tx(
+    sk: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let from = pq_addr(sk);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, sk.public_key(), &DEFAULT_SALT)
+        .expect("implicit PQ key must register");
+    let probe = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+    );
+    let sig = sk.sign(&probe.signing_message());
+    Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+    )
 }
 
 /// Same fixture as the re-execution tests: [3,4] -> [11,7]. Weights fit i8,
@@ -85,30 +135,28 @@ fn legacy_big_model() -> QuantizedLinearModel {
     )])
 }
 
-async fn funded() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+async fn funded() -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
     let e = InMemoryStateEngine::new();
     let sk = key(0x71);
-    let addr = sk.verifying_key().to_bytes();
+    let addr = pq_addr(&sk);
     e.update_account(AccountState::new(addr, 1_000_000_000_000))
         .await;
     (e, sk, addr)
 }
 
 fn register_model_tx(
-    sk: &SigningKey,
+    sk: &FalconKeypair,
     to: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     m: &QuantizedLinearModel,
 ) -> Transaction {
-    Transaction::sign_with_payload(
+    pq_tx(
         sk,
         to,
         0,
         GAS,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallRegisterZkMlModel {
             model_id: id,
             model: Box::new(m.clone()),
@@ -117,20 +165,18 @@ fn register_model_tx(
 }
 
 fn register_vk_tx(
-    sk: &SigningKey,
+    sk: &FalconKeypair,
     to: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     vk: &ModelSpec,
 ) -> Transaction {
-    Transaction::sign_with_payload(
+    pq_tx(
         sk,
         to,
         0,
         GAS,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallRegisterZkMlSpec {
             model_id: id,
             spec: Box::new(vk.clone()),
@@ -139,20 +185,18 @@ fn register_vk_tx(
 }
 
 fn verify_snark_tx(
-    sk: &SigningKey,
+    sk: &FalconKeypair,
     to: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     p: &AttestationProof,
 ) -> Transaction {
-    Transaction::sign_with_payload(
+    pq_tx(
         sk,
         to,
         0,
         GAS,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallVerifyZkMlAttestation {
             model_id: id,
             proof: Box::new(p.clone()),
@@ -172,7 +216,7 @@ fn test_setup(m: &QuantizedLinearModel, seed: u64) -> (Vec<u8>, ModelSpec) {
 /// Register model + VK on the engine; returns proving key bytes + VK.
 async fn register_model_and_vk(
     e: &InMemoryStateEngine,
-    sk: &SigningKey,
+    sk: &FalconKeypair,
     addr: [u8; 32],
     id: [u8; 32],
     m: &QuantizedLinearModel,
@@ -878,14 +922,12 @@ async fn snark_vk_registry_is_append_only_and_clone_committed() {
     };
     let mut bad_proof = proof_for_b.clone();
     bad_proof.public_outputs[1] = 123456; // void it
-    let both = Transaction::sign_with_payload(
+    let both = pq_tx(
         &sk,
         addr,
         0,
         GAS,
         5,
-        1,
-        1,
         vec![
             OpCode::SysCallRegisterZkMlSpec {
                 model_id: MODEL_B,
@@ -983,14 +1025,12 @@ async fn snark_gas_exhaustion_reverts() {
     // PINNED POLICY (SEC-07): the starvation is an ATTRIBUTABLE failure, so
     // it pays the failure fee and CONSUMES ITS NONCE (the nonce is 3
     // afterwards) - a free failure would be a free DoS.
-    let starved = Transaction::sign_with_payload(
+    let starved = pq_tx(
         &sk,
         addr,
         0,
         cost - 1,
         2,
-        1,
-        1,
         vec![OpCode::SysCallVerifyZkMlAttestation {
             model_id: MODEL_A,
             proof: Box::new(proof.clone()),
@@ -1010,14 +1050,12 @@ async fn snark_gas_exhaustion_reverts() {
     // Exact price applies (proves the shortfall above is really the gas:
     // the block path charges exactly the table for this payload). It is
     // signed with the NEXT nonce (3), because the refusal above burned 2.
-    let exact = Transaction::sign_with_payload(
+    let exact = pq_tx(
         &sk,
         addr,
         0,
         cost,
         3,
-        1,
-        1,
         vec![OpCode::SysCallVerifyZkMlAttestation {
             model_id: MODEL_A,
             proof: Box::new(proof),
@@ -1040,7 +1078,7 @@ async fn snark_two_nodes_agree_and_verify_is_read_only() {
     let (a, ska, addra) = funded().await;
     let (b, _, _) = funded().await;
     let skb = key(0x71);
-    assert_eq!(addra, skb.verifying_key().to_bytes());
+    assert_eq!(addra, pq_addr(&skb));
 
     // Identical setup artifacts on both (same seed = same VK/PK bytes).
     let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
@@ -1219,13 +1257,11 @@ async fn snark_legacy_big_model_keeps_reexec_but_refuses_vk() {
     );
     let (_, legacy_proof) = ZkMlProof::prove_reexec(&big, &[3, 4]);
     assert!(legacy_proof.verify_inference_against(&big));
-    let vtx = Transaction::sign_with_payload(
+    let vtx = pq_tx(
         &sk,
         addr,
         0,
         GAS,
-        1,
-        1,
         1,
         vec![OpCode::SysCallVerifyZkMlReexec {
             model_id: MODEL_A,
@@ -1325,7 +1361,7 @@ fn snark_pre_node_fails_closed_on_new_discriminant() {
 
 #[test]
 fn snark_tx_hash_commits_the_proof() {
-    let sk = SigningKey::from_bytes(&[3u8; 32]);
+    let sk = key(3);
     let recipient = [0xABu8; 32];
     let m = tiny_model();
     let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
@@ -1334,14 +1370,12 @@ fn snark_tx_hash_commits_the_proof() {
     other_proof.public_outputs[0] += 1;
 
     let mk = |p: &AttestationProof| {
-        Transaction::sign_with_payload(
+        pq_tx(
             &sk,
             recipient,
             0,
             50_000,
             0,
-            1,
-            1,
             vec![OpCode::SysCallVerifyZkMlAttestation {
                 model_id: MODEL_A,
                 proof: Box::new(p.clone()),

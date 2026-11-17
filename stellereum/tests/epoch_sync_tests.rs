@@ -276,11 +276,11 @@ async fn build_chain(
         let root = base.get_state_root().await;
         // F8: proposer must match the deterministic schedule.
         let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let proposer = ks
+        let proposer_idx = ks
             .iter()
-            .find(|k| k.verifying_key().to_bytes() == proposer_id)
-            .expect("proposer is a member")
-            .clone();
+            .position(|k| k.verifying_key().to_bytes() == proposer_id)
+            .expect("proposer is a member");
+        let proposer = ks[proposer_idx].clone();
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -299,7 +299,7 @@ async fn build_chain(
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        b.sign_block(&proposer);
+        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);
         prev = b.compute_hash();

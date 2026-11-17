@@ -47,11 +47,11 @@ fn finalized_block(
     let proposer_id = validators
         .proposer_for(height, 0)
         .expect("non-empty set has a proposer");
-    let proposer = keys
+    let (proposer_idx, proposer) = keys
         .iter()
-        .find(|k| k.verifying_key().to_bytes() == proposer_id)
-        .expect("proposer is a member")
-        .clone();
+        .enumerate()
+        .find(|(_, k)| k.verifying_key().to_bytes() == proposer_id)
+        .expect("proposer is a member");
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height,
@@ -70,7 +70,7 @@ fn finalized_block(
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
     };
-    b.sign_block(&proposer);
+    b.sign_block_with_falcon(proposer, &fks[proposer_idx]);
     let hash = b.compute_hash();
     let mut set = VoteSet::new();
     for (k, fk) in keys.iter().zip(fks.iter()) {

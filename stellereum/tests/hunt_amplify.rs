@@ -171,6 +171,16 @@ fn downtime_slash_cannot_inflate_reward_distribution() {
 
     // Take the self-bond out of the picture, then diverge 2x.
     let (outages, heights, _) = diverge_to(&mut l, val, 2.0);
+    // Downtime slashing also JAILS the offender (validator-UX). A jailed
+    // validator is excluded from the set and earns no rewards, so the reward
+    // split below could not run at all — restore the bond floor and unjail at
+    // the recorded release height before exercising `distribute_reward`. This
+    // only re-admits the same validator; every assertion below is unchanged.
+    if l.is_jailed(&val) {
+        l.add_bond(val, floor()).expect("restore self-bond floor");
+        let release = l.jail_record(&val).expect("jail record").release_height;
+        l.unjail(val, release).expect("unjail after release height");
+    }
     let agg = l.validators[&val].delegated;
     let map = sum_delegations(&l, val);
     println!(

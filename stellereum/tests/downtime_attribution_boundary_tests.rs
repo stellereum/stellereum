@@ -43,8 +43,10 @@
 //!   accordingly.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -58,6 +60,43 @@ const TS: u64 = 1_760_000_000;
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+/// FULL-PQ sender for the adversarial fixtures: implicit Falcon-512, key
+/// registered globally (no activation surcharge). Returns the derived address.
+fn pq_identity(seed: u8) -> ([u8; 32], FalconKeypair) {
+    let fk = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (addr, fk)
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures.
+fn pq_stake_tx(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    validator: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to: validator,
+        amount: 0,
+        gas_limit,
+        nonce: 0,
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload: vec![OpCode::SysCallStake { validator, amount }],
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = fk.sign(&msg);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    tx
 }
 
 /// Four bonded validators with funded accounts, plus a funded staking pool
@@ -174,25 +213,12 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
     // A newcomer E bonds INSIDE block H=2. After the transition the set has
     // 5 members and the same 3 signatures are a sub-quorum — but the
     // evidence is for H-1, when the set still had 4.
-    let newcomer = SigningKey::generate(&mut OsRng);
-    let newcomer_id = id_of(&newcomer);
+    let (newcomer_id, newcomer_fk) = pq_identity(0xE1);
     engine
         .credit_native(&newcomer_id, BOND * 4)
         .await
         .expect("fund newcomer");
-    let bond_tx = Transaction::sign_with_payload(
-        &newcomer,
-        newcomer_id,
-        0,
-        500_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        vec![OpCode::SysCallStake {
-            validator: newcomer_id,
-            amount: BOND,
-        }],
-    );
+    let bond_tx = pq_stake_tx(&newcomer_fk, newcomer_id, newcomer_id, BOND, 500_000);
 
     let block = block_h2_with_bond(a, bond_tx, qc);
     engine.apply_block_transition(&block, 0).await;
@@ -272,8 +298,7 @@ async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
     // Half 2: after a fifth member bonds, the LIVE oracle skips the very
     // same evidence (3 of 5 is a sub-quorum) — the old transition behavior.
     let engine2 = four_member_engine(&keys).await;
-    let newcomer = SigningKey::generate(&mut OsRng);
-    let newcomer_id = id_of(&newcomer);
+    let (newcomer_id, _newcomer_fk) = pq_identity(0xE2);
     engine2
         .credit_native(&newcomer_id, BOND * 4)
         .await

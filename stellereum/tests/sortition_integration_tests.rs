@@ -45,7 +45,7 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use stellereum::consensus::{
     derive_sortition_committee, register_validator_pq_key, sortition_seed, HeightConsensus,
-    QuorumCertificate, ValidatorSet, VoteKind,
+    QuorumCertificate, ValidatorSet, VoteKind, VoteSet,
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -94,31 +94,38 @@ fn fk_for(k: &SigningKey) -> FalconKeypair {
 
 fn precommit_qc(
     signers: &[&SigningKey],
+    vs: &ValidatorSet,
     height: u64,
     round: u32,
     block_hash: [u8; 32],
 ) -> QuorumCertificate {
-    let sigs = signers
-        .iter()
-        .map(|k| {
-            let v = falcon_votes::fvote(
+    // FULL-PQ: a QC must carry a Falcon µQC envelope compiled by the committee
+    // path. A raw Ed signature list carries no power (`QC::verify` is
+    // Falcon-only), so build the certificate through `VoteSet` exactly like a
+    // node does. The parent hash is the fixed fixture parent used to elect the
+    // sortition committee; finality verification does not check it against a
+    // chain here.
+    const FIXTURE_PARENT: [u8; 32] = [0x11; 32];
+    let mut set = VoteSet::new();
+    for k in signers {
+        set.add(
+            falcon_votes::fvote(
                 k,
                 &fk_for(k),
                 height,
                 round,
                 VoteKind::Precommit,
                 Some(block_hash),
-            );
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round,
-        kind: VoteKind::Precommit,
-        block_hash: Some(block_hash),
-        signatures: sigs,
+            ),
+            vs,
+            height,
+            round,
+            VoteKind::Precommit,
+        )
+        .expect("genuine Falcon vote admits");
     }
+    set.certificate_with_parent(Some(block_hash), vs, Some(&FIXTURE_PARENT))
+        .expect("fixture signers reach quorum")
 }
 
 // --- 1. determinism -----------------------------------------------------------
@@ -407,7 +414,7 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     // with the header naming the deterministic new-set proposer.
     let block_hash = [0xABu8; 32];
     let proposer = in_force.proposer_for(BOUNDARY_H + 1, 0).expect("elects");
-    let qc = precommit_qc(&[&ka, &kc], BOUNDARY_H + 1, 0, block_hash);
+    let qc = precommit_qc(&[&ka, &kc], &in_force, BOUNDARY_H + 1, 0, block_hash);
     assert!(
         qc.verify(&in_force),
         "fixture QC must verify under the H+1 set"

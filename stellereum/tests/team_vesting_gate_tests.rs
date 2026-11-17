@@ -13,7 +13,9 @@
 //! Fail-closed, ships coordinated: a refusal moves nothing (B1 rollback) and
 //! touches no committed shape when the registry is empty.
 
-use ed25519_dalek::SigningKey;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::sharding::Transaction;
 use stellereum::staking::StakingLedger;
 use stellereum::state_engine::InMemoryStateEngine;
@@ -22,14 +24,18 @@ use stellereum::tokenomics::TeamVestingSchedule;
 const STELL: u64 = 1_000_000_000;
 const T0: u64 = 1_700_000_000;
 
-fn team_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x71; 32])
+fn team_key() -> FalconKeypair {
+    FalconKeypair::generate_from_seed(0x71)
 }
 fn team_addr() -> [u8; 32] {
-    team_key().verifying_key().to_bytes()
+    pq_addr(&team_key())
 }
-fn other_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x72; 32])
+fn other_key() -> FalconKeypair {
+    FalconKeypair::generate_from_seed(0x72)
+}
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
 }
 
 /// Small deterministic schedule: 1000s cliff, 2000s linear, total 2000 nano.
@@ -43,8 +49,40 @@ fn sched(total: u64) -> TeamVestingSchedule {
     }
 }
 
-fn plain(key: &SigningKey, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
-    Transaction::sign(key, to, amount, gas, nonce, 1, 1)
+/// FULL-PQ spend. Uses the IMPLICIT envelope: these fixtures are nano-sized
+/// allocations, and the 45k activation surcharge an explicit envelope pays
+/// would dwarf them. The key is registered globally (the implicit wire form
+/// omits it); verification is still a real Falcon-512 signature.
+fn plain(key: &FalconKeypair, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    let from = pq_addr(key);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, key.public_key(), &DEFAULT_SALT)
+        .expect("implicit PQ key must register");
+    let probe = Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        vec![0u8; FALCON512_SIG_LEN],
+        to,
+        amount,
+        gas,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    );
+    let sig = key.sign(&probe.signing_message());
+    Transaction::new_pq_implicit(
+        from,
+        PqScheme::Falcon512,
+        sig,
+        to,
+        amount,
+        gas,
+        nonce,
+        1,
+        1,
+        Vec::new(),
+    )
 }
 
 // ===========================================================================
@@ -178,7 +216,7 @@ async fn funded_tracked_engine(total: u64) -> InMemoryStateEngine {
     e.credit_native(&team_addr(), total)
         .await
         .expect("fund team");
-    e.credit_native(&other_key().verifying_key().to_bytes(), 10 * STELL)
+    e.credit_native(&pq_addr(&other_key()), 10 * STELL)
         .await
         .expect("fund other");
     e.staking_write()
@@ -252,7 +290,7 @@ async fn fees_count_toward_the_locked_floor() {
 #[tokio::test]
 async fn untracked_accounts_are_unaffected() {
     let e = funded_tracked_engine(2_000).await;
-    let other = other_key().verifying_key().to_bytes();
+    let other = pq_addr(&other_key());
     e.apply_transaction(&plain(&other_key(), [0xCDu8; 32], 1_000, 0, 0), T0)
         .await
         .expect("untracked spend always passes");
@@ -278,9 +316,9 @@ async fn parallel_plain_fast_path_refuses_locked_spend() {
     // waves; with parallel execution on, each plain wave commits through the
     // fast path that bypasses `commit_native` — the gate must hold there too.
     let e = InMemoryStateEngine::new().with_parallel_exec(true);
-    let a_key = SigningKey::from_bytes(&[0xA0; 32]);
+    let a_key = FalconKeypair::generate_from_seed(0xA0);
     let b_key = team_key(); // B is the vesting-tracked account.
-    let (a, b) = (a_key.verifying_key().to_bytes(), team_addr());
+    let (a, b) = (pq_addr(&a_key), team_addr());
     e.credit_native(&a, 50 * STELL).await.expect("fund A");
     e.credit_native(&b, 2_000).await.expect("fund B");
     e.staking_write()
@@ -288,8 +326,8 @@ async fn parallel_plain_fast_path_refuses_locked_spend() {
         .register_team_vesting(b, sched(2_000))
         .expect("track B");
     let c = [0xCCu8; 32];
-    let tx0 = Transaction::sign(&a_key, b, 500, 0, 0, 1, 1); // inbound to B: allowed
-    let tx1 = Transaction::sign(&b_key, c, 1_500, 0, 0, 1, 1); // B spends locked funds: refused
+    let tx0 = plain(&a_key, b, 500, 0, 0); // inbound to B: allowed
+    let tx1 = plain(&b_key, c, 1_500, 0, 0); // B spends locked funds: refused
     let (applied, failed, _fees, status, _) = e.apply_block_parallel_fees(&[tx0, tx1], T0).await;
     assert_eq!(
         status,

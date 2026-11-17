@@ -21,8 +21,10 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use std::time::Instant;
 use stellereum::consensus::register_validator_pq_key;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::consensus::{ValidatorSet, VoteKind, VoteSet};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::runtime::{count_block_actor_sends, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{
@@ -66,24 +68,81 @@ fn send_op(recipient: [u8; 32], value: u64) -> OpCode {
     }
 }
 
-/// A single-validator runtime at height 1, validator + user funded.
-async fn single_runtime() -> (ValidatorRuntime, SigningKey, SigningKey) {
+/// FULL-PQ user identity: implicit Falcon-512, registered globally.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+fn addr_of(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+/// A single-validator runtime at height 1, validator + PQ user funded.
+async fn single_runtime() -> (ValidatorRuntime, SigningKey, FalconKeypair) {
     let val_sk = key(0x11);
     let val = id_of(&val_sk);
-    let _ = val_fk(&val_sk);
-    let user_sk = key(0x22);
-    let user = id_of(&user_sk);
+    let vfk = val_fk(&val_sk);
+    let (user_kp, user) = pq_key(0x22);
     let engine = Arc::new(InMemoryStateEngine::new());
     engine.update_account(AccountState::new(val, BAL)).await;
     engine.update_account(AccountState::new(user, BAL)).await;
     let vs = ValidatorSet::from_list(vec![(val, 1)]);
-    let rt = ValidatorRuntime::new(val_sk.clone(), vs, engine, 1);
-    (rt, val_sk, user_sk)
+    let rt = ValidatorRuntime::new(val_sk.clone(), vs, engine, 1).with_falcon_key(vfk);
+    (rt, val_sk, user_kp)
 }
 
-/// Plain transfer user -> `to`, nonce `nonce`.
-fn transfer_tx(user_sk: &SigningKey, to: [u8; 32], nonce: u64) -> Transaction {
-    Transaction::sign(user_sk, to, 1_000, 1_000, nonce, 1, 1)
+/// FULL-PQ replacement for `Transaction::sign`.
+fn transfer_tx(user_kp: &FalconKeypair, to: [u8; 32], nonce: u64) -> Transaction {
+    let from = addr_of(user_kp);
+    let mut t = Transaction {
+        from,
+        to,
+        amount: 1_000,
+        gas_limit: 1_000,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = user_kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload`.
+fn payload_tx(
+    user_kp: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let from = addr_of(user_kp);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = user_kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 /// Drive the current height to a decided-but-unexecuted block: propose, feed
@@ -118,10 +177,10 @@ async fn decide_submit(rt: &mut ValidatorRuntime) -> [u8; 32] {
 
 #[tokio::test]
 async fn propose_returns_none_while_apply_pending() {
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
-    rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 0)).await;
 
     let root_pre = rt.state_root().await;
     let _bh = decide_submit(&mut rt).await;
@@ -164,10 +223,10 @@ async fn propose_returns_none_while_apply_pending() {
 
 #[tokio::test]
 async fn on_proposal_deferred_while_apply_pending() {
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
-    rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 0)).await;
     let _bh = decide_submit(&mut rt).await;
 
     // Even an UNSIGNED would-be H+1 body gets the gate error first: no state
@@ -226,20 +285,18 @@ async fn on_proposal_deferred_while_apply_pending() {
 #[tokio::test]
 async fn worker_applied_root_equals_inline_and_reorg_roots() {
     // --- sequenced route: propose, decide, submit, collect -----------------
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let actor_to = [0x77u8; 32];
     rt.state
         .update_account(AccountState::new(actor_to, 0))
         .await;
-    let user = id_of(&user_sk);
-    let send_tx = Transaction::sign_with_payload(
-        &user_sk,
+    let user = addr_of(&user_kp);
+    let send_tx = payload_tx(
+        &user_kp,
         actor_to,
         500,
         100_000,
         0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
         vec![send_op(actor_to, 4_242)],
     );
     rt.add_tx(send_tx.clone()).await;
@@ -310,13 +367,13 @@ async fn worker_applied_root_equals_inline_and_reorg_roots() {
 /// twin's root after that height.
 #[tokio::test]
 async fn h_and_hplus1_execute_strictly_in_order() {
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
-    let user = id_of(&user_sk);
+    let user = addr_of(&user_kp);
 
     // --- H ------------------------------------------------------------------
-    rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 0)).await;
     let root_pre = rt.state_root().await;
     let bh_h = decide_submit(&mut rt).await;
     // A second decision while H executes is refused, never queued in parallel.
@@ -333,7 +390,7 @@ async fn h_and_hplus1_execute_strictly_in_order() {
     assert_eq!(rt.height(), 2);
 
     // --- H+1 ------------------------------------------------------------------
-    rt.add_tx(transfer_tx(&user_sk, to, 1)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 1)).await;
     let bh_h1 = decide_submit(&mut rt).await;
     let done_h1 = rt.await_apply_completion().await.expect("H+1 installs");
     assert_eq!((done_h1.height, done_h1.hash), (2, bh_h1));
@@ -369,10 +426,10 @@ async fn h_and_hplus1_execute_strictly_in_order() {
 
 #[tokio::test]
 async fn no_observable_effects_before_poll() {
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
-    rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 0)).await;
     let bh = decide_submit(&mut rt).await;
 
     // Decision known, execution pending: poll is non-blocking and reports
@@ -404,10 +461,10 @@ async fn no_observable_effects_before_poll() {
 
 #[tokio::test]
 async fn loop_drains_votes_while_apply_pending() {
-    let (mut rt, val_sk, user_sk) = single_runtime().await;
+    let (mut rt, val_sk, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
-    rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
+    rt.add_tx(transfer_tx(&user_kp, to, 0)).await;
     let _bh = decide_submit(&mut rt).await;
 
     // Votes never read post-H state, so they keep ingesting while the worker
@@ -433,7 +490,7 @@ async fn loop_drains_votes_while_apply_pending() {
 
 #[tokio::test]
 async fn sequenced_submit_does_not_wait_for_execution() {
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let to = [0x77u8; 32];
     rt.state.update_account(AccountState::new(to, 0)).await;
     // A loaded block so execution is resolvably slower than queueing (batch
@@ -441,7 +498,7 @@ async fn sequenced_submit_does_not_wait_for_execution() {
     // block by the mempool's pass limit, so 400 queued selects a ~30-tx
     // prefix — still a real batch for the comparison below.
     for n in 0..400u64 {
-        rt.add_tx(transfer_tx(&user_sk, to, n)).await;
+        rt.add_tx(transfer_tx(&user_kp, to, n)).await;
     }
     let block = rt.propose(TS).await.expect("proposer must propose");
     assert!(!block.transactions.is_empty());
@@ -481,26 +538,17 @@ async fn sequenced_submit_does_not_wait_for_execution() {
 #[tokio::test]
 async fn overcap_actor_block_rejected_at_propose() {
     // --- over cap: 4096 + 4 sends in one transaction -------------------------
-    let (mut rt, _val, user_sk) = single_runtime().await;
+    let (mut rt, _val, user_kp) = single_runtime().await;
     let actor_to = [0x77u8; 32];
     rt.state
         .update_account(AccountState::new(actor_to, 0))
         .await;
-    let user = id_of(&user_sk);
+    let user = addr_of(&user_kp);
     let mut ops = Vec::new();
     for _ in 0..(MAX_ACTOR_MSGS_PER_BLOCK as u64 + 4) {
         ops.push(send_op(actor_to, 1));
     }
-    let over_tx = Transaction::sign_with_payload(
-        &user_sk,
-        actor_to,
-        0,
-        20_000_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    );
+    let over_tx = payload_tx(&user_kp, actor_to, 0, 20_000_000, 0, ops);
     let __order_txs = vec![over_tx.clone()];
     let order_merkle_root = stellereum::mev::compute_order_merkle_root(&__order_txs);
     let __overcap_block = Block {
@@ -529,7 +577,7 @@ async fn overcap_actor_block_rejected_at_propose() {
     );
 
     // --- exactly at cap: proposes ------------------------------------------------
-    let (mut rt2, _v2, user_sk2) = single_runtime().await;
+    let (mut rt2, _v2, user_kp2) = single_runtime().await;
     rt2.state
         .update_account(AccountState::new(actor_to, 0))
         .await;
@@ -537,16 +585,7 @@ async fn overcap_actor_block_rejected_at_propose() {
     for _ in 0..MAX_ACTOR_MSGS_PER_BLOCK {
         ops2.push(send_op(actor_to, 1));
     }
-    let at_cap_tx = Transaction::sign_with_payload(
-        &user_sk2,
-        actor_to,
-        0,
-        20_000_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops2,
-    );
+    let at_cap_tx = payload_tx(&user_kp2, actor_to, 0, 20_000_000, 0, ops2);
     rt2.add_tx(at_cap_tx).await;
     let built = rt2
         .propose(TS)
@@ -564,7 +603,7 @@ async fn overcap_actor_block_rejected_at_propose() {
 /// applied) and by the synchronous `validate_proposal` static check.
 #[tokio::test]
 async fn overcap_actor_block_rejected_at_adopt() {
-    let (mut rt, val_sk, user_sk) = single_runtime().await;
+    let (mut rt, val_sk, user_kp) = single_runtime().await;
     let actor_to = [0x77u8; 32];
     rt.state
         .update_account(AccountState::new(actor_to, 0))
@@ -573,16 +612,7 @@ async fn overcap_actor_block_rejected_at_adopt() {
     for _ in 0..(MAX_ACTOR_MSGS_PER_BLOCK + 1) {
         ops.push(send_op(actor_to, 1));
     }
-    let over_tx = Transaction::sign_with_payload(
-        &user_sk,
-        actor_to,
-        0,
-        20_000_000,
-        0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    );
+    let over_tx = payload_tx(&user_kp, actor_to, 0, 20_000_000, 0, ops);
     let root = rt.state_root().await;
     let __order_txs = vec![over_tx];
     let order_merkle_root = stellereum::mev::compute_order_merkle_root(&__order_txs);
@@ -604,7 +634,9 @@ async fn overcap_actor_block_rejected_at_adopt() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    block.sign_block(&val_sk);
+    let vfk = val_fk(&val_sk);
+    block.validator_signatures.clear();
+    block.sign_block_with_falcon(&val_sk, &vfk);
     let bh = block.compute_hash();
 
     // Static half first: rejected without touching the engine.
@@ -614,21 +646,19 @@ async fn overcap_actor_block_rejected_at_adopt() {
     assert!(err.contains("actor"), "got: {err}");
 
     // Adopt side: a genuine QC for the same body, still refused pre-execution.
-    let v = falcon_votes::fvote(
-        &val_sk,
-        &val_fk(&val_sk),
+    let vs = ValidatorSet::from_list(vec![(id_of(&val_sk), 1)]);
+    let mut set = VoteSet::new();
+    set.add(
+        falcon_votes::fvote(&val_sk, &vfk, 1, 0, VoteKind::Precommit, Some(bh)),
+        &vs,
         1,
         0,
         VoteKind::Precommit,
-        Some(bh),
-    );
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![(v.voter, v.signature)],
-    };
+    )
+    .expect("genuine vote admits");
+    let cert = set
+        .certificate(Some(bh), &vs, &block.prev_hash)
+        .expect("single validator reaches quorum");
     let root_before = rt.state_root().await;
     let err = rt
         .adopt_committed(1, block, cert)
@@ -655,12 +685,12 @@ async fn overcap_actor_block_rejected_at_adopt() {
 /// cap) still passes both.
 #[tokio::test]
 async fn actor_cap_counts_backlog_plus_block() {
-    let (rt, _val, user_sk) = single_runtime().await;
+    let (rt, _val, user_kp) = single_runtime().await;
     let actor_to = [0x77u8; 32];
     rt.state
         .update_account(AccountState::new(actor_to, 0))
         .await;
-    let user = id_of(&user_sk);
+    let user = addr_of(&user_kp);
     // Queue 100 messages out of band (direct API debits value + nonce).
     for _ in 0..100 {
         rt.state
@@ -673,14 +703,12 @@ async fn actor_cap_counts_backlog_plus_block() {
     let mk = |n: usize| {
         let txs: Vec<Transaction> = (0..n)
             .map(|_| {
-                Transaction::sign_with_payload(
-                    &user_sk,
+                payload_tx(
+                    &user_kp,
                     actor_to,
                     0,
                     20_000_000,
                     0,
-                    MASTERCHAIN_SHARD,
-                    MASTERCHAIN_SHARD,
                     vec![send_op(actor_to, 1)],
                 )
             })
@@ -736,14 +764,12 @@ async fn actor_cap_counts_backlog_plus_block() {
 
     // Nested bodies count transitively: one top-level send whose body carries
     // two more counts three.
-    let __order_txs = vec![Transaction::sign_with_payload(
-        &user_sk,
+    let __order_txs = vec![payload_tx(
+        &user_kp,
         actor_to,
         0,
         20_000_000,
         0,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
         vec![OpCode::SysCallActorSend {
             recipient: actor_to,
             value: 1,

@@ -28,14 +28,14 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::consensus::register_validator_pq_key;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::consensus::{
+    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size, vote_sign_bytes,
+    PqMicroCertificate, QuorumCertificate, ValidatorSet, VoteKind, PQ_UQC_MARKER_ID,
+};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
-
-#[path = "support/falcon_votes.rs"]
-mod falcon_votes;
 
 const H: u64 = 100;
 // Bond floor: MIN_VALIDATOR_BOND (1000 STELL) + buffer (100 STELL). Powers
@@ -88,32 +88,47 @@ fn fk_for(k: &SigningKey) -> FalconKeypair {
     fk
 }
 
+/// Build a Falcon µQC envelope over `block_hash` from `signers` (a subset of
+/// `all`). FULL-PQ: a raw per-voter signature list carries no power, so the
+/// certificate is assembled in the exact shape the production committee path
+/// emits (`PqMicroCertificate` + marker entry). This also builds a
+/// deliberately SUB-quorum certificate (the unilateral case under test):
+/// attribution counts the signers, while `qc_meets_quorum` still refuses it.
 fn precommit_qc(
+    all: &ValidatorSet,
     signers: &[&SigningKey],
     height: u64,
     round: u32,
     block_hash: [u8; 32],
+    parent: &[u8; 32],
 ) -> QuorumCertificate {
-    let sigs = signers
-        .iter()
-        .map(|k| {
-            let v = falcon_votes::fvote(
-                k,
-                &fk_for(k),
-                height,
-                round,
-                VoteKind::Precommit,
-                Some(block_hash),
-            );
-            (v.voter, v.signature)
-        })
-        .collect();
+    let k = micro_committee_size(all.len());
+    let committee = derive_sortition_committee(all, height, round, k, parent);
+    let msg = vote_sign_bytes(height, round, VoteKind::Precommit, &Some(block_hash));
+    let mut bitmask = vec![0u8; (k as usize).div_ceil(8)];
+    let mut signatures = Vec::new();
+    for (i, id) in committee.iter().enumerate() {
+        let Some(k) = signers.iter().find(|k| k.verifying_key().to_bytes() == *id) else {
+            continue;
+        };
+        bitmask[i / 8] |= 1 << (i % 8);
+        signatures.push(fk_for(k).sign(&msg));
+    }
+    let uqc = PqMicroCertificate::new(
+        PqScheme::Falcon512,
+        height,
+        round,
+        k,
+        bitmask,
+        signatures,
+        *parent,
+    );
     QuorumCertificate {
         height,
         round,
         kind: VoteKind::Precommit,
         block_hash: Some(block_hash),
-        signatures: sigs,
+        signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
     }
 }
 
@@ -226,7 +241,7 @@ async fn unilateral_finalization_with_only_the_joiner_power_is_refused() {
 
     // The unilateral QC: only A's precommit for a candidate block at H+1.
     let bh = [0x42u8; 32];
-    let weak = precommit_qc(&[&ka], H + 1, 0, bh);
+    let weak = precommit_qc(&in_force, &[&ka], H + 1, 0, bh, &[0u8; 32]);
     let signed = in_force.qc_signed_power(&weak);
     assert_eq!(signed, 2 * floor(), "only the joiner's power is behind it");
     assert!(
@@ -253,16 +268,16 @@ async fn unilateral_finalization_with_only_the_joiner_power_is_refused() {
     let root = e.get_state_root().await;
     let parent = empty_block(H, [0u8; 32], root, proposer, None);
     let parent_hash = parent.compute_hash();
-    let parent_qc = precommit_qc(&[&kb, &kc], H, 0, parent_hash);
+    let parent_qc = precommit_qc(&old, &[&kb, &kc], H, 0, parent_hash, &[0u8; 32]);
     r.blocks.insert(parent_hash, parent.clone());
     r.finalized.push((H, parent_hash));
     r.last_decision = Some((H, parent.clone(), parent_qc.clone()));
     // A real proposer embeds the parent QC as canonical downtime evidence.
     let mut blk = empty_block(H + 1, parent_hash, root, proposer, Some(parent_qc.clone()));
     blk.timestamp = parent.timestamp + 1;
-    blk.sign_block(proposer_key);
+    blk.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
     let bh = blk.compute_hash();
-    let weak = precommit_qc(&[&ka], H + 1, 0, bh);
+    let weak = precommit_qc(&in_force, &[&ka], H + 1, 0, bh, &parent_hash);
     let err = r
         .adopt_committed(H + 1, blk, weak)
         .await
@@ -280,9 +295,9 @@ async fn unilateral_finalization_with_only_the_joiner_power_is_refused() {
     // The quorate QC (A+C = 3F >= floor(8F/3)+1) IS accepted on the same path.
     let mut blk = empty_block(H + 1, parent_hash, root, proposer, Some(parent_qc));
     blk.timestamp = parent.timestamp + 1;
-    blk.sign_block(proposer_key);
+    blk.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
     let bh = blk.compute_hash();
-    let strong = precommit_qc(&[&ka, &kc], H + 1, 0, bh);
+    let strong = precommit_qc(&in_force, &[&ka, &kc], H + 1, 0, bh, &parent_hash);
     assert!(in_force.qc_meets_quorum(&strong));
     let decided = r.adopt_committed(H + 1, blk, strong).await;
     assert!(decided.is_ok(), "a quorate QC must adopt: {decided:?}");
@@ -321,14 +336,22 @@ async fn same_block_with_different_qc_subsets_converges() {
     assert_eq!(r1, e2.get_state_root().await, "genesis children must agree");
 
     // The canonical evidence for height 1: the subset QC {A,C} the proposer saw.
-    let evidence = precommit_qc(&[&ka, &kc], 1, 0, bh1);
+    let joined = e1.staking_read().await.to_validator_set();
+    let evidence = precommit_qc(&joined, &[&ka, &kc], 1, 0, bh1, &[0u8; 32]);
     // Node X attaches {A,C}; node Y attaches the fuller {A,B,C}. Same block
     // hash either way (the finality QC is excluded from the hash; the
     // canonical evidence is included and identical).
     let mut bx = empty_block(2, bh1, r1, proposer, Some(evidence.clone()));
     bx.precommit_qc = Some(evidence.clone());
     let mut by = empty_block(2, bh1, r1, proposer, Some(evidence.clone()));
-    by.precommit_qc = Some(precommit_qc(&[&ka, &kb, &kc], 1, 0, bh1));
+    by.precommit_qc = Some(precommit_qc(
+        &joined,
+        &[&ka, &kb, &kc],
+        1,
+        0,
+        bh1,
+        &[0u8; 32],
+    ));
     assert_eq!(
         bx.compute_hash(),
         by.compute_hash(),

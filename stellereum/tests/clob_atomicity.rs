@@ -23,10 +23,11 @@
 //! transaction is refused by `commit_native` (recipient overflow). Nothing
 //! survives: no mint, no moved coins, no escrow/book change.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-
 use stellereum::orderbook::{OrderSide, OrderType};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
+use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 use stellereum::token::TokenMetadata;
@@ -62,15 +63,19 @@ async fn setup() -> (InMemoryStateEngine, [u8; 32]) {
     (engine, usdt)
 }
 
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, kp.public_key(), &DEFAULT_SALT)
+}
+
 /// Maker rests a BUY escrowed in wUSDT; returns (maker key, order id,
 /// locked quote, maker native before, maker wusdt before).
 async fn rest_maker_buy(
     engine: &InMemoryStateEngine,
     usdt: &[u8; 32],
     amount: u64,
-) -> (SigningKey, u64) {
-    let maker = SigningKey::generate(&mut OsRng);
-    let maker_addr = maker.verifying_key().to_bytes();
+) -> (FalconKeypair, u64) {
+    let maker = FalconKeypair::generate();
+    let maker_addr = pq_addr(&maker);
     let q = quote_wusdt(PRICE, amount);
     engine
         .update_account(AccountState::new(maker_addr, 5 * STELL))
@@ -114,24 +119,43 @@ async fn rest_maker_buy(
 /// A taker SELL that fills the maker's buy, wrapped so `commit_native`
 /// overflows crediting `overflow_to` and refuses the whole transaction.
 fn doomed_taker_sell(
-    taker: &SigningKey,
+    taker: &FalconKeypair,
     overflow_to: [u8; 32],
     amount: u64,
 ) -> stellereum::sharding::Transaction {
-    stellereum::sharding::Transaction::sign_with_payload(
-        taker,
+    let pk = taker.public_key().to_vec();
+    let payload = vec![OpCode::SysCallPlaceOrder {
+        pair_id: PAIR,
+        is_buy: false,
+        price: PRICE,
+        amount,
+    }];
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
         overflow_to,
         1_000, // tiny transfer that overflows the recipient
         100_000,
         0,
         1,
         1,
-        vec![OpCode::SysCallPlaceOrder {
-            pair_id: PAIR,
-            is_buy: false,
-            price: PRICE,
-            amount,
-        }],
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = taker.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        overflow_to,
+        1_000,
+        100_000,
+        0,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
     )
 }
 
@@ -141,10 +165,10 @@ async fn clob_fill_rolls_back_when_the_native_commit_fails() {
     let amount = 2 * STELL;
     let q = quote_wusdt(PRICE, amount);
     let (maker, order_id) = rest_maker_buy(&engine, &usdt, amount).await;
-    let maker_addr = maker.verifying_key().to_bytes();
+    let maker_addr = pq_addr(&maker);
 
-    let taker = SigningKey::generate(&mut OsRng);
-    let taker_addr = taker.verifying_key().to_bytes();
+    let taker = FalconKeypair::generate();
+    let taker_addr = pq_addr(&taker);
     engine
         .update_account(AccountState::new(taker_addr, 10 * STELL))
         .await;
@@ -260,10 +284,10 @@ async fn clob_fill_rolls_back_on_the_block_path_when_the_native_commit_fails() {
     let (engine, usdt) = setup().await;
     let amount = 2 * STELL;
     let (maker, _) = rest_maker_buy(&engine, &usdt, amount).await;
-    let maker_addr = maker.verifying_key().to_bytes();
+    let maker_addr = pq_addr(&maker);
 
-    let taker = SigningKey::generate(&mut OsRng);
-    let taker_addr = taker.verifying_key().to_bytes();
+    let taker = FalconKeypair::generate();
+    let taker_addr = pq_addr(&taker);
     engine
         .update_account(AccountState::new(taker_addr, 10 * STELL))
         .await;

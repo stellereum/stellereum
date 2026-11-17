@@ -10,6 +10,9 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use std::time::Instant;
 use stellereum::network::CrossShardTransport;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::runtime::ShardedCluster;
 use stellereum::sharding::{
     ShardRegistry, Transaction, BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD,
@@ -26,6 +29,51 @@ fn test_signer(seed: u64) -> SigningKey {
     SigningKey::from_bytes(&bytes)
 }
 
+/// FULL-PQ sender: deterministic implicit Falcon-512 identity, registered
+/// globally so the tx is not an activation (no 45k surcharge).
+fn pq_signer(seed: u64) -> ([u8; 32], FalconKeypair) {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&seed.to_be_bytes());
+    bytes[8..16].copy_from_slice(&(!seed).to_be_bytes());
+    let fk = FalconKeypair::generate_from_seed_bytes(&bytes);
+    let addr = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (addr, fk)
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures.
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy constructor arity (sender, dest, amount,
+// gas, nonce, shards); splitting would obscure each call site.
+fn pq_tx(
+    fk: &FalconKeypair,
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, fk.sign(&msg)).encode();
+    tx
+}
+
 #[tokio::test]
 async fn test_two_shard_parallel_stress_and_tps_benchmark() {
     let validator = test_signer(999);
@@ -39,19 +87,17 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
     let mut senders_s1 = Vec::new();
 
     for i in 0..num_senders {
-        let sk0 = test_signer(1000 + i as u64);
-        let addr0 = sk0.verifying_key().to_bytes();
+        let (addr0, fk0) = pq_signer(1000 + i as u64);
         s0_engine
             .update_account(AccountState::new(addr0, initial_bal))
             .await;
-        senders_s0.push(sk0);
+        senders_s0.push((addr0, fk0));
 
-        let sk1 = test_signer(2000 + i as u64);
-        let addr1 = sk1.verifying_key().to_bytes();
+        let (addr1, fk1) = pq_signer(2000 + i as u64);
         s1_engine
             .update_account(AccountState::new(addr1, initial_bal))
             .await;
-        senders_s1.push(sk1);
+        senders_s1.push((addr1, fk1));
     }
 
     let mut cluster = ShardedCluster::new(
@@ -68,11 +114,12 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
 
     // Prepare 200 intra-shard transactions for Shard 0
     let mut txs_s0 = Vec::new();
-    for (i, sender) in senders_s0.iter().enumerate() {
-        let recipient = senders_s0[(i + 1) % num_senders].verifying_key().to_bytes();
+    for (i, (sender, fk)) in senders_s0.iter().enumerate() {
+        let recipient = senders_s0[(i + 1) % num_senders].0;
         for nonce in 0..4 {
-            let tx = Transaction::sign(
-                sender,
+            let tx = pq_tx(
+                fk,
+                *sender,
                 recipient,
                 transfer_amount,
                 fee,
@@ -86,11 +133,12 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
 
     // Prepare 200 intra-shard transactions for Shard 1
     let mut txs_s1 = Vec::new();
-    for (i, sender) in senders_s1.iter().enumerate() {
-        let recipient = senders_s1[(i + 1) % num_senders].verifying_key().to_bytes();
+    for (i, (sender, fk)) in senders_s1.iter().enumerate() {
+        let recipient = senders_s1[(i + 1) % num_senders].0;
         for nonce in 0..4 {
-            let tx = Transaction::sign(
-                sender,
+            let tx = pq_tx(
+                fk,
+                *sender,
                 recipient,
                 transfer_amount,
                 fee,
@@ -106,14 +154,14 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
     let mut x_senders_s0 = Vec::new();
     let mut x_txs_0_to_1 = Vec::new();
     for (i, sender) in senders_s1.iter().enumerate().take(num_senders) {
-        let x_sk = test_signer(3000 + i as u64);
-        let x_addr = x_sk.verifying_key().to_bytes();
+        let (x_addr, x_fk) = pq_signer(3000 + i as u64);
         s0_engine
             .update_account(AccountState::new(x_addr, initial_bal))
             .await;
-        let recipient = sender.verifying_key().to_bytes();
-        let tx = Transaction::sign(
-            &x_sk,
+        let recipient = sender.0;
+        let tx = pq_tx(
+            &x_fk,
+            x_addr,
             recipient,
             transfer_amount * 2,
             fee,
@@ -122,21 +170,21 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
             SHARD1,
         );
         x_txs_0_to_1.push(tx);
-        x_senders_s0.push(x_sk);
+        x_senders_s0.push((x_addr, x_fk));
     }
 
     // Prepare 50 cross-shard transactions Shard 1 -> Shard 0 from dedicated senders
     let mut x_senders_s1 = Vec::new();
     let mut x_txs_1_to_0 = Vec::new();
     for (i, sender) in senders_s0.iter().enumerate().take(num_senders) {
-        let x_sk = test_signer(4000 + i as u64);
-        let x_addr = x_sk.verifying_key().to_bytes();
+        let (x_addr, x_fk) = pq_signer(4000 + i as u64);
         s1_engine
             .update_account(AccountState::new(x_addr, initial_bal))
             .await;
-        let recipient = sender.verifying_key().to_bytes();
-        let tx = Transaction::sign(
-            &x_sk,
+        let recipient = sender.0;
+        let tx = pq_tx(
+            &x_fk,
+            x_addr,
             recipient,
             transfer_amount * 2,
             fee,
@@ -145,7 +193,7 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
             SHARD0,
         );
         x_txs_1_to_0.push(tx);
-        x_senders_s1.push(x_sk);
+        x_senders_s1.push((x_addr, x_fk));
     }
 
     let total_txs = txs_s0.len() + txs_s1.len() + x_txs_0_to_1.len() + x_txs_1_to_0.len();

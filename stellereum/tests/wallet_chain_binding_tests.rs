@@ -23,7 +23,9 @@ use stellereum::chain_binding::{ChainBindingActivation, UNBOUND_REFUSED_ERR_PREF
 use stellereum::consensus::{
     set_consensus_chain_id_for_tests, verify_transaction_envelope_at_height_with_activation,
 };
-use stellereum::wallet::WalletAccount;
+use stellereum::sharding::Transaction;
+use stellereum::svm::GAS_BASIC_TRANSFER;
+use stellereum::wallet::{WalletAccount, WalletKeyMaterial};
 
 const TEST_CHAIN_ID: u64 = 5757;
 const OTHER_CHAIN_ID: u64 = 9999;
@@ -44,8 +46,19 @@ impl Drop for ChainGuard {
     }
 }
 
-fn wallet() -> WalletAccount {
-    WalletAccount::from_seed(&[0xA1u8; 32])
+/// FULL-PQ wallet key: the wallet constructors are PQ-first, and a classical
+/// Ed25519 envelope is refused by consensus under the pure-PQ rule. The
+/// binding predicate under test is scheme-independent; only the signer is PQ.
+fn wallet() -> WalletKeyMaterial {
+    WalletKeyMaterial::from_seed(&[0xA1u8; 32])
+}
+
+fn bound_tx(w: &WalletKeyMaterial, to: [u8; 32], chain_id: u64) -> Transaction {
+    w.sign_bound_transfer(to, 1_000, GAS_BASIC_TRANSFER, 5, 0, 0, chain_id)
+}
+
+fn unbound_tx(w: &WalletKeyMaterial, to: [u8; 32]) -> Transaction {
+    w.sign_transfer(to, 1_000, GAS_BASIC_TRANSFER, 5, 0, 0)
 }
 
 #[test]
@@ -53,7 +66,7 @@ fn bound_envelope_verifies_before_and_after_activation() {
     let _guard = pin_test_chain();
     let activation = ChainBindingActivation::at_height(ACTIVATION_HEIGHT);
     let w = wallet();
-    let tx = w.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, TEST_CHAIN_ID);
+    let tx = bound_tx(&w, [0x99u8; 32], TEST_CHAIN_ID);
     assert!(tx.chain_id().is_some(), "bound fixture must carry chain id");
     assert!(
         verify_transaction_envelope_at_height_with_activation(
@@ -103,7 +116,7 @@ fn unbound_pre_activation_verifies_compat() {
     let _guard = pin_test_chain();
     let activation = ChainBindingActivation::at_height(ACTIVATION_HEIGHT);
     let w = wallet();
-    let tx = w.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
+    let tx = unbound_tx(&w, [0x99u8; 32]);
     assert_eq!(tx.chain_id(), None, "legacy fixture must stay unbound");
     assert!(
         verify_transaction_envelope_at_height_with_activation(
@@ -131,7 +144,7 @@ fn unbound_post_activation_refuses_with_pinned_prefix() {
     let _guard = pin_test_chain();
     let activation = ChainBindingActivation::at_height(ACTIVATION_HEIGHT);
     let w = wallet();
-    let tx = w.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
+    let tx = unbound_tx(&w, [0x99u8; 32]);
     for height in [ACTIVATION_HEIGHT, ACTIVATION_HEIGHT + 1] {
         let err = verify_transaction_envelope_at_height_with_activation(&tx, height, &activation)
             .expect_err("unbound envelope must be refused at/after activation");
@@ -167,7 +180,7 @@ fn cross_chain_replay_refuses_at_every_height() {
     let activation = ChainBindingActivation::at_height(ACTIVATION_HEIGHT);
     let w = wallet();
     // Signed bound to ANOTHER chain, verified on this one: the replay.
-    let tx = w.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, OTHER_CHAIN_ID);
+    let tx = bound_tx(&w, [0x99u8; 32], OTHER_CHAIN_ID);
     assert_eq!(tx.chain_id(), Some(OTHER_CHAIN_ID));
     for height in [
         0,
@@ -188,7 +201,7 @@ fn default_off_never_activates_unilaterally() {
     let _guard = pin_test_chain();
     let never = ChainBindingActivation::never();
     let w = wallet();
-    let unbound = w.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
+    let unbound = unbound_tx(&w, [0x99u8; 32]);
     // Even at the top of the height range, the default admits unbound:
     // enforcement requires an explicitly configured height.
     assert!(

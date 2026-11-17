@@ -12,8 +12,10 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
-use stellereum::post_quantum::FalconKeypair;
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
@@ -55,6 +57,19 @@ async fn cluster(ks: &[SigningKey]) -> Vec<ValidatorRuntime> {
     out
 }
 
+/// FULL-PQ companion for a signer: `falcon_set` derives each Falcon key from
+/// the Ed key's own first byte; re-register it so Falcon-only block/vote
+/// verification sees the key (idempotent).
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
+
 fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
@@ -74,7 +89,7 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(pkey);
+    b.sign_block_with_falcon(pkey, &fk_for(pkey));
     b
 }
 
@@ -197,21 +212,20 @@ async fn test1_downtime_parity_local_vs_adopt() {
     let mut block2 = mkblock(&pkey2, 2, bh1, root_after_1_a);
     block2.last_qc = Some(cert1.clone());
     block2.validator_signatures.clear();
-    block2.sign_block(&pkey2);
+    block2.sign_block_with_falcon(&pkey2, &fk_for(&pkey2));
     let bh2 = block2.compute_hash();
-    let cert2 = QuorumCertificate {
-        height: 2,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh2),
-        signatures: signers
-            .iter()
-            .map(|&i| {
-                let v = falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    // FULL-PQ: compile the QC through VoteSet so it carries the committee
+    // envelope (a raw signature list has no power at all).
+    let mut cert2_set = VoteSet::new();
+    for &i in &signers {
+        let v = falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2));
+        cert2_set
+            .add(v, &vs, 2, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    let cert2 = cert2_set
+        .certificate_with_parent(Some(bh2), &vs, Some(&bh1))
+        .expect("3-of-4 precommits reach quorum");
 
     // ---- Local path: run the height-2 round, then try_finalize. ----
     let burn_before_l = c1[0].state.staking_read().await.total_burned;
@@ -789,7 +803,7 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let mut blk2 = mkblock(&pkey2, 2, bh, root2);
     blk2.last_qc = Some(cert1);
     blk2.validator_signatures.clear();
-    blk2.sign_block(&pkey2);
+    blk2.sign_block_with_falcon(&pkey2, &fk_for(&pkey2));
     let bh2 = blk2.compute_hash();
     for &i in &[0usize, 1, 2] {
         nodes[0]
@@ -843,25 +857,23 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     // NEXT height and verify it against the post-rotation set.
     let h2 = nodes[0].height();
     let bh2 = [0x77u8; 32];
-    let sigs: Vec<(ValidatorId, Vec<u8>)> = [0usize, 1, 2]
-        .iter()
-        .map(|&i| {
-            let v = falcon_votes::fvote(&ks[i], &fks[i], h2, 0, VoteKind::Precommit, Some(bh2));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let qc = QuorumCertificate {
-        height: h2,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh2),
-        signatures: sigs,
-    };
+    let post_vs = nodes[0].validators.clone();
+    // FULL-PQ: the survivor certificate must be the committee envelope, not a
+    // raw signature list (which carries zero power).
+    let mut set = VoteSet::new();
+    for &i in &[0usize, 1, 2] {
+        let v = falcon_votes::fvote(&ks[i], &fks[i], h2, 0, VoteKind::Precommit, Some(bh2));
+        set.add(v, &post_vs, h2, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    let qc = set
+        .certificate(Some(bh2), &post_vs, &[0u8; 32])
+        .expect("survivors reach quorum");
     // NOTE: post-rotation powers are stake-weighted (MIN each), while the votes
     // above were checked against power; QC::verify weights by the CURRENT set,
     // so it must verify with the survivors alone.
     assert!(
-        qc.verify(&nodes[0].validators),
+        qc.verify(&post_vs),
         "survivor-only QC must verify against the rotated set"
     );
 }

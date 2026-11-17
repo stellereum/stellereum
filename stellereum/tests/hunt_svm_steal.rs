@@ -11,8 +11,9 @@
 //! payout path acts on a caller-supplied `validator` without consulting the
 //! ledger's owner field.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::Transaction;
 use stellereum::staking::{self, StakingLedger};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -22,11 +23,35 @@ const NANO: u64 = 1_000_000_000;
 /// A generous gas limit; only the *consumed* gas is charged.
 const GAS: u64 = 100_000;
 
-fn tx(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> Transaction {
-    Transaction::sign_with_payload(
-        key, [0xEE; 32], // `to` is irrelevant for a payload-only tx
-        0, GAS, nonce, 0, 1, payload,
-    )
+/// FULL-PQ (Falcon-512 only node): deterministic implicit Falcon-512 identity,
+/// registered globally so admission/apply accept the envelope.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let addr = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(addr, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, addr)
+}
+
+fn tx(kp: &FalconKeypair, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
+        from,
+        to: [0xEE; 32], // `to` is irrelevant for a payload-only tx
+        amount: 0,
+        gas_limit: GAS,
+        nonce,
+        source_shard: 0,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 /// The total native STELL in existence, as tracked by the account map.
@@ -47,10 +72,8 @@ async fn bal(e: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
 async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     let e = InMemoryStateEngine::new();
 
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let (victim, victim_addr) = pq_key(0x71);
+    let (attacker, attacker_addr) = pq_key(0x72);
 
     let validator = [0x77; 32];
     let start = 100_000 * NANO;
@@ -164,8 +187,7 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
 #[tokio::test]
 async fn reward_theft_is_not_loopable() {
     let e = InMemoryStateEngine::new();
-    let attacker = SigningKey::generate(&mut OsRng);
-    let attacker_addr = attacker.verifying_key().to_bytes();
+    let (attacker, attacker_addr) = pq_key(0x74);
     let validator = [0x11; 32];
 
     // Fund the pool directly so the thief does not even have to bond first.
@@ -234,14 +256,13 @@ async fn reward_theft_is_not_loopable() {
 #[tokio::test]
 async fn a_stranger_cannot_force_unbond_a_validator_and_eject_it_from_the_set() {
     let e = InMemoryStateEngine::new();
-    let victim = SigningKey::generate(&mut OsRng);
-    let victim_addr = victim.verifying_key().to_bytes();
-    let attacker = SigningKey::generate(&mut OsRng);
+    let (victim, victim_addr) = pq_key(0x75);
+    let (attacker, attacker_addr) = pq_key(0x76);
 
     let validator = [0x55; 32];
     e.update_account(AccountState::new(victim_addr, 100_000 * NANO))
         .await;
-    e.update_account(AccountState::new(attacker.verifying_key().to_bytes(), NANO))
+    e.update_account(AccountState::new(attacker_addr, NANO))
         .await;
 
     let bond = 50_000 * NANO;

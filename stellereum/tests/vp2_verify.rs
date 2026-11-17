@@ -4,24 +4,138 @@
 //! Each module pins one claimed fix. Verdicts are recorded in the test names
 //! and in the summary at the bottom of this file. Code only — no live cluster.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
 use stellereum::mev::SealVerdict;
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::sharding::{Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
-fn sk() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
+/// FULL-PQ sender: implicit Falcon-512 key, registered globally so admission
+/// charges no activation surcharge.
+fn sk() -> FalconKeypair {
+    let fk = FalconKeypair::generate();
+    let a = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(a, PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    fk
 }
 
-fn addr(k: &SigningKey) -> [u8; 32] {
-    k.verifying_key().to_bytes()
+fn addr(k: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &k.public_key, &DEFAULT_SALT)
+}
+
+/// FULL-PQ transaction builder (implicit envelope, optional bid).
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy constructor arity plus the bid.
+fn pq_build(
+    k: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    src: u32,
+    tgt: u32,
+    payload: Vec<stellereum::svm::OpCode>,
+    bid: u64,
+) -> Transaction {
+    let mut t = Transaction {
+        from: addr(k),
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: src,
+        target_shard: tgt,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: bid,
+    };
+    let msg = t.signing_message();
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, k.sign(&msg)).encode();
+    t
+}
+
+/// FULL-PQ chain-bound envelope: explicit Falcon key + `chain_id` in the
+/// signed message and the envelope.
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy chain-bound constructor arity.
+fn tx_chain(
+    k: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    src: u32,
+    tgt: u32,
+    chain_id: u64,
+) -> Transaction {
+    let pk = k.public_key.clone();
+    let probe = Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        pk.clone(),
+        Vec::new(),
+        to,
+        amount,
+        gas,
+        nonce,
+        src,
+        tgt,
+        Vec::new(),
+        &DEFAULT_SALT,
+        chain_id,
+    );
+    let sig = k.sign(&probe.signing_message_for_chain(chain_id));
+    Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        pk,
+        sig,
+        to,
+        amount,
+        gas,
+        nonce,
+        src,
+        tgt,
+        Vec::new(),
+        &DEFAULT_SALT,
+        chain_id,
+    )
 }
 
 /// Plain funded transfer: cost = amount + gas_limit.
-fn tx(k: &SigningKey, to: [u8; 32], amount: u64, gas: u64, nonce: u64, src: u32) -> Transaction {
-    Transaction::sign(k, to, amount, gas, nonce, src, src)
+fn tx(k: &FalconKeypair, to: [u8; 32], amount: u64, gas: u64, nonce: u64, src: u32) -> Transaction {
+    pq_build(k, to, amount, gas, nonce, src, src, Vec::new(), 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy priority constructor arity.
+fn tx_priority(
+    k: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    src: u32,
+    bid: u64,
+) -> Transaction {
+    pq_build(k, to, amount, gas, nonce, src, src, Vec::new(), bid)
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture mirrors the legacy payload constructor arity.
+fn tx_payload(
+    k: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    src: u32,
+    tgt: u32,
+    payload: Vec<stellereum::svm::OpCode>,
+) -> Transaction {
+    pq_build(k, to, amount, gas, nonce, src, tgt, payload, 0)
 }
 
 // ===========================================================================
@@ -111,7 +225,7 @@ fn shard_gate_2pc_transfer_admission_follows_source_shard_pin() {
     let k = sk();
     let bal = 10_000_000u64;
     // outbound cross-shard transfer sourced on shard 1
-    let x = Transaction::sign(&k, [9u8; 32], 10, 1_000, 0, 1, 0);
+    let x = pq_build(&k, [9u8; 32], 10, 1_000, 0, 1, 0, Vec::new(), 0);
     let mut pool0 = Mempool::new(100, 100).pin_admission_shard(Some(0));
     assert!(matches!(
         pool0.add_checked(x.clone(), bal),
@@ -173,7 +287,7 @@ async fn shard_gate_restore_drops_foreign() {
 fn priority_bid_max_does_not_overflow_and_requires_full_funding() {
     let k = sk();
     let mp = Mempool::new(10, 10);
-    let t = Transaction::sign_with_priority(&k, [1u8; 32], 0, u64::MAX, 0, 1, 1, u64::MAX);
+    let t = tx_priority(&k, [1u8; 32], 0, u64::MAX, 0, 1, u64::MAX);
     // floor 0 + bid MAX saturates to MAX
     assert_eq!(mp.required_fee_for_tx(&t), u64::MAX);
     // gas_limit MAX covers it exactly
@@ -185,7 +299,7 @@ fn priority_bid_max_does_not_overflow_and_requires_full_funding() {
         mp3.add_checked(t.clone(), u64::MAX - 1),
         Err(MempoolError::InsufficientBalance)
     ));
-    let short = Transaction::sign_with_priority(&k, [1u8; 32], 0, u64::MAX - 1, 0, 1, 1, u64::MAX);
+    let short = tx_priority(&k, [1u8; 32], 0, u64::MAX - 1, 0, 1, u64::MAX);
     let mut mp4 = Mempool::new(10, 10);
     assert!(matches!(
         mp4.add_checked(short, u64::MAX),
@@ -199,11 +313,11 @@ fn priority_bid_zero_floor_bid_only_admission() {
     let k = sk();
     let mut mp = Mempool::new(10, 10); // base_fee 0
     assert_eq!(mp.base_fee, 0);
-    let t = Transaction::sign_with_priority(&k, [1u8; 32], 0, 500, 0, 1, 1, 500);
+    let t = tx_priority(&k, [1u8; 32], 0, 500, 0, 1, 500);
     assert_eq!(mp.required_fee_for_tx(&t), 500);
     assert!(mp.add_checked(t, 500).is_ok());
     // bid NOT covered by gas_limit: refused even though floor is 0
-    let free = Transaction::sign_with_priority(&k, [1u8; 32], 0, 100, 1, 1, 1, 500);
+    let free = tx_priority(&k, [1u8; 32], 0, 100, 1, 1, 500);
     let mut mp2 = Mempool::new(10, 10);
     assert!(matches!(
         mp2.add_checked(free, 10_000),
@@ -217,7 +331,7 @@ fn priority_bid_zero_floor_bid_only_admission() {
 fn priority_bid_mutation_after_admission_changes_nothing() {
     let k = sk();
     let mut mp = Mempool::new(10, 10);
-    let low = Transaction::sign_with_priority(&k, [1u8; 32], 0, 1_000, 0, 1, 1, 10);
+    let low = tx_priority(&k, [1u8; 32], 0, 1_000, 0, 1, 10);
     let h = mp.add_checked(low.clone(), 1_000_000).unwrap();
     assert!(matches!(mp.mev.verify_pool_tx(&low), SealVerdict::Match));
 
@@ -243,7 +357,7 @@ fn priority_bid_mutation_after_admission_changes_nothing() {
     ));
     // order still ranks by the ADMITTED bid
     let k2 = sk();
-    let mid = Transaction::sign_with_priority(&k2, [1u8; 32], 0, 1_000, 0, 1, 1, 50);
+    let mid = tx_priority(&k2, [1u8; 32], 0, 1_000, 0, 1, 50);
     mp.add_checked(mid, 1_000_000).unwrap();
     let first = mp.select(1);
     assert_eq!(first.len(), 1);
@@ -371,8 +485,11 @@ fn nonce_duplicate_no_replacement_coexists_with_full_reservation() {
     assert_eq!(mp.len(), 2);
     // ...but BOTH reservations are held: slot-stuffing costs real money
     assert_eq!(mp.reserved_for(&addr(&k)), 2_050);
-    // exact replay by hash is still refused
-    let replay = tx(&k, [1u8; 32], 0, 1_000, 0, 1);
+    // exact replay by hash is still refused. FULL-PQ: Falcon signatures are
+    // randomized, so REBUILDING the same logical tx yields different bytes and
+    // is a legitimate same-nonce sibling (allowed above); a byte-for-byte
+    // replay is the pooled copy itself.
+    let replay = mp.get(&h1).expect("pooled").clone();
     assert_eq!(mp.add_checked(replay, bal), Err(MempoolError::Duplicate));
     // a third duplicate the sender cannot FULLY fund is refused: the
     // reservation ledger (not a replacement rule) is the economic bound
@@ -507,7 +624,7 @@ fn token_meta(minter: [u8; 32]) -> stellereum::token::TokenMetadata {
     }
 }
 
-async fn funded_engine(balance: u64, k: &SigningKey) -> (InMemoryStateEngine, [u8; 32]) {
+async fn funded_engine(balance: u64, k: &FalconKeypair) -> (InMemoryStateEngine, [u8; 32]) {
     let e = InMemoryStateEngine::new();
     let me = addr(k);
     e.update_account(AccountState::new(me, balance)).await;
@@ -532,7 +649,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
     {
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
-        let t = Transaction::sign_with_payload(
+        let t = tx_payload(
             &k,
             [0x44; 32],
             0,
@@ -565,7 +682,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let (e, me) = funded_engine(2_000_000, &k).await;
         let tok = e.create_token(me, token_meta(me), 1_000).await.unwrap();
         assert_eq!(e.token_balance(&tok, &me).await, 1_000);
-        let t = Transaction::sign_with_payload(
+        let t = tx_payload(
             &k,
             me,
             0,
@@ -603,7 +720,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
     {
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
-        let t = Transaction::sign_with_payload(
+        let t = tx_payload(
             &k,
             me,
             0,
@@ -639,7 +756,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         e.enable_cross_shard();
         let me = addr(&k);
         e.update_account(AccountState::new(me, 1_000_000)).await;
-        let t = Transaction::sign_with_payload(
+        let t = tx_payload(
             &k,
             [0x66; 32],
             50_000,
@@ -675,7 +792,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         stellereum::staking::REWARDS_POOL,
     ] {
         let k = sk(); // signature is FOR k, sender field claims the pool
-        let mut t = Transaction::sign(&k, [1u8; 32], 10, 1_000, 0, 1, 1);
+        let mut t = tx(&k, [1u8; 32], 10, 1_000, 0, 1);
         t.from = pool;
         for engine in [InMemoryStateEngine::new(), InMemoryStateEngine::new()] {
             engine
@@ -759,7 +876,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
             None,
             vec![],
         );
-        let t = Transaction::sign_with_payload(
+        let t = tx_payload(
             &k,
             me,
             0,
@@ -796,7 +913,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
             None,
             vec![],
         );
-        let t2 = Transaction::sign_with_payload(
+        let t2 = tx_payload(
             &k,
             me,
             0,
@@ -826,7 +943,7 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         e.update_account(AccountState::new(m1, 1_000_000)).await;
         e.update_account(AccountState::new(m2, 1_000_000)).await;
         let ok = tx(&k1, m2, 100_000, 50_000, 0, 1); // succeeds
-        let bad = Transaction::sign_with_payload(
+        let bad = tx_payload(
             &k2,
             m1,
             0,
@@ -880,9 +997,19 @@ fn legacy_unbound_replay_succeeds_on_both_chains() {
             None,
             "wallet default carries no chain binding"
         );
-        assert!(wt.verify_signature());
+        // FULL-PQ INVERTED ASSERTION: `WalletAccount` still builds a classical
+        // Ed25519 envelope, which this node now refuses on every path. The
+        // audit finding (an unbound, replayable wallet tx) no longer exists in
+        // the classical form: it fails closed at signature verification.
+        assert!(
+            !wt.verify_signature(),
+            "FULL-PQ: the classical wallet envelope must be refused"
+        );
 
-        let t = Transaction::sign(&k, [0x22; 32], 100, 50_000, 0, 1, 1);
+        // The replay property can still be probed with a PQ envelope (there is
+        // no chain-id binding in this shape either), which is what the loop
+        // below does; the classical path above is the fail-closed arm.
+        let t = tx(&k, [0x22; 32], 100, 50_000, 0, 1);
         assert_eq!(t.chain_id(), None);
         let h = t.compute_tx_hash();
         for chain in [5757u64, 777u64] {
@@ -907,7 +1034,7 @@ fn bound_envelope_wrong_chain_fails() {
     rt.block_on(async {
         let k = sk();
         let me = addr(&k);
-        let t = Transaction::sign_with_chain_id(&k, [0x22; 32], 100, 50_000, 0, 1, 1, 5757);
+        let t = tx_chain(&k, [0x22; 32], 100, 50_000, 0, 1, 1, 5757);
         assert_eq!(t.chain_id(), Some(5757));
         assert!(t.verify_signature());
         assert!(t.verify_signature_for_chain(5757, true));
@@ -923,8 +1050,9 @@ fn bound_envelope_wrong_chain_fails() {
         assert!(err.contains("chain_id mismatch"), "{err}");
         // tampered chain id in the envelope breaks the signature itself
         let mut tampered = t.clone();
-        let off = 64 + stellereum::sharding::CHAIN_SIG_TAG.len();
-        tampered.signature[off..off + 8].copy_from_slice(&777u64.to_be_bytes());
+        let mut env = tampered.pq_envelope().expect("PQ envelope");
+        env.chain_id = Some(777);
+        tampered.signature = env.encode();
         assert!(!tampered.verify_signature());
     });
 }

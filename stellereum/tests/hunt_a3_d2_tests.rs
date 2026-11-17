@@ -17,30 +17,81 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use ed25519_dalek::Signer;
-use stellereum::consensus::{vote_sign_bytes, QuorumCertificate, ValidatorSet, VoteKind};
+use ed25519_dalek::SigningKey;
+use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
 use stellereum::mempool::{Mempool, MempoolError, FAILED_SENDER_PENALTY};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+};
 use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
-fn key(seed: u8) -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
 }
 
-async fn solo_rt() -> (ValidatorRuntime, ed25519_dalek::SigningKey) {
+/// FULL-PQ transaction sender: implicit Falcon-512, registered globally.
+/// Returns the keypair and its derived address.
+fn pq_key(seed: u8) -> (FalconKeypair, [u8; 32]) {
+    let kp = FalconKeypair::generate_from_seed(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (kp, from)
+}
+
+/// FULL-PQ replacement for `Transaction::sign`: same amount/gas/nonce/shards,
+/// implicit Falcon-512 envelope.
+fn pq_tx(kp: &FalconKeypair, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
+/// The runtime's Falcon key: registered under the Ed validator id so
+/// `verify_proposer_signature` resolves it at every height.
+fn validator_falcon(seed: u8) -> FalconKeypair {
+    let k = key(seed);
+    let fk = FalconKeypair::generate_from_seed(seed);
+    stellereum::consensus::register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
+
+async fn solo_rt() -> (ValidatorRuntime, SigningKey, FalconKeypair) {
     let k = key(0xA1);
     let me = k.verifying_key().to_bytes();
     let vs = ValidatorSet::from_list(vec![(me, 1)]);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000).await;
-    let rt = ValidatorRuntime::new(k.clone(), vs, st, 1);
-    (rt, k)
+    let fk = validator_falcon(0xA1);
+    let rt = ValidatorRuntime::new(k.clone(), vs, st, 1).with_falcon_key(fk.clone());
+    (rt, k, fk)
 }
 
 fn signed_block(
-    k: &ed25519_dalek::SigningKey,
+    k: &SigningKey,
+    fk: &FalconKeypair,
     height: u64,
     prev: [u8; 32],
     root: [u8; 32],
@@ -64,7 +115,8 @@ fn signed_block(
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
-    b.sign_block(k);
+    // FULL-PQ: Ed-only blocks are refused by `verify_proposer_signature`.
+    b.sign_block_with_falcon(k, fk);
     b
 }
 
@@ -72,17 +124,17 @@ fn signed_block(
 // `last_decision` is None (fresh/adopted node). Today it is accepted.
 #[tokio::test]
 async fn a3_backward_timestamp_refused_without_last_decision() {
-    let (mut rt, k) = solo_rt().await;
+    let (mut rt, k, fk) = solo_rt().await;
     assert!(rt.last_decision.is_none(), "precondition: no last decision");
     let root = rt.state.get_state_root().await;
 
-    let parent = signed_block(&k, 1, [0u8; 32], root, 1_000);
+    let parent = signed_block(&k, &fk, 1, [0u8; 32], root, 1_000);
     let ph = parent.compute_hash();
     rt.blocks.insert(ph, parent);
     rt.finalized.push((1, ph));
     rt.hc.height = 2;
 
-    let child = signed_block(&k, 2, ph, root, 500);
+    let child = signed_block(&k, &fk, 2, ph, root, 500);
     let r = rt.validate_proposal(&child, root);
     assert!(
         r.is_err(),
@@ -98,13 +150,13 @@ async fn a3_backward_timestamp_refused_without_last_decision() {
 // "skip the check and accept".
 #[tokio::test]
 async fn a3_unknown_parent_timestamp_refused() {
-    let (mut rt, k) = solo_rt().await;
+    let (mut rt, k, fk) = solo_rt().await;
     let root = rt.state.get_state_root().await;
     let ghost = [0xEEu8; 32];
     rt.finalized.push((1, ghost)); // prev-hash gate passes...
     rt.hc.height = 2;
     // ...but no body for `ghost` exists anywhere (no blocks entry, no decision).
-    let child = signed_block(&k, 2, ghost, root, 2_000);
+    let child = signed_block(&k, &fk, 2, ghost, root, 2_000);
     let r = rt.validate_proposal(&child, root);
     assert!(
         r.is_err(),
@@ -116,20 +168,20 @@ async fn a3_unknown_parent_timestamp_refused() {
 // parent), not vs the wall clock. Parent+3600 is the bound; parent+3601 fails.
 #[tokio::test]
 async fn a3_future_jump_refused_vs_parent() {
-    let (mut rt, k) = solo_rt().await;
+    let (mut rt, k, fk) = solo_rt().await;
     let root = rt.state.get_state_root().await;
-    let parent = signed_block(&k, 1, [0u8; 32], root, 1_000);
+    let parent = signed_block(&k, &fk, 1, [0u8; 32], root, 1_000);
     let ph = parent.compute_hash();
     rt.blocks.insert(ph, parent);
     rt.finalized.push((1, ph));
     rt.hc.height = 2;
 
-    let edge = signed_block(&k, 2, ph, root, 1_000 + 3_600);
+    let edge = signed_block(&k, &fk, 2, ph, root, 1_000 + 3_600);
     assert!(
         rt.validate_proposal(&edge, root).is_ok(),
         "parent+3600 (the bound) must still admit"
     );
-    let far = signed_block(&k, 2, ph, root, 1_000 + 3_601);
+    let far = signed_block(&k, &fk, 2, ph, root, 1_000 + 3_601);
     let r = rt.validate_proposal(&far, root);
     assert!(
         r.is_err(),
@@ -141,9 +193,9 @@ async fn a3_future_jump_refused_vs_parent() {
 // refused (the VM reads it as "now": unbonding/contract time at epoch 0).
 #[tokio::test]
 async fn a3_zero_timestamp_refused() {
-    let (rt, k) = solo_rt().await;
+    let (rt, k, fk) = solo_rt().await;
     let root = rt.state.get_state_root().await;
-    let b = signed_block(&k, 1, [0u8; 32], root, 0);
+    let b = signed_block(&k, &fk, 1, [0u8; 32], root, 0);
     let r = rt.validate_proposal(&b, root);
     assert!(
         r.is_err(),
@@ -156,16 +208,16 @@ async fn a3_zero_timestamp_refused() {
 // it is perfectly monotone and must be accepted.
 #[tokio::test]
 async fn a3_no_wall_clock_in_timestamp_verdict() {
-    let (mut rt, k) = solo_rt().await;
+    let (mut rt, k, fk) = solo_rt().await;
     let root = rt.state.get_state_root().await;
     let parent_ts: u64 = 9_000_000_000; // far ahead of any wall clock
-    let parent = signed_block(&k, 1, [0u8; 32], root, parent_ts);
+    let parent = signed_block(&k, &fk, 1, [0u8; 32], root, parent_ts);
     let ph = parent.compute_hash();
     rt.blocks.insert(ph, parent);
     rt.finalized.push((1, ph));
     rt.hc.height = 2;
 
-    let child = signed_block(&k, 2, ph, root, parent_ts + 10);
+    let child = signed_block(&k, &fk, 2, ph, root, parent_ts + 10);
     let r = rt.validate_proposal(&child, root);
     assert!(
         r.is_ok(),
@@ -178,14 +230,14 @@ async fn a3_no_wall_clock_in_timestamp_verdict() {
 #[test]
 fn d2_unchecked_below_floor_admits_free() {
     let mut mp = Mempool::new(100, 100).with_base_fee(100);
-    let sk = key(0xB2);
-    let cheap = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
+    let (kp, _) = pq_key(0xB2);
+    let cheap = pq_tx(&kp, [1u8; 32], 10, 5, 0);
     assert_eq!(
         mp.add(cheap),
         Err(MempoolError::FeeTooLow),
         "BUG (D2): unchecked path admits below-floor spam for free"
     );
-    let ok_tx = Transaction::sign(&sk, [1u8; 32], 10, 100, 1, 1, 1);
+    let ok_tx = pq_tx(&kp, [1u8; 32], 10, 100, 1);
     assert!(mp.add(ok_tx).is_ok(), "at-floor tx must still admit");
 }
 
@@ -197,12 +249,11 @@ fn d2_failed_sender_posts_penalty_bond() {
     use stellereum::mempool::{FAILED_SENDER_PENALTY, MAX_FAILED_SENDER_PENALTY};
 
     let mut mp = Mempool::new(100, 100);
-    let bad_sk = key(0xD4);
-    let bad_sender = bad_sk.verifying_key().to_bytes();
-    let good_sk = key(0xD5);
+    let (bad_kp, bad_sender) = pq_key(0xD4);
+    let (good_kp, _) = pq_key(0xD5);
 
     // No penalty yet: the floor admits.
-    let t0 = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let t0 = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 0);
     assert!(
         mp.add_checked(t0, u64::MAX).is_ok(),
         "precondition: admits clean"
@@ -213,21 +264,13 @@ fn d2_failed_sender_posts_penalty_bond() {
     assert_eq!(mp.effective_floor(&bad_sender), FAILED_SENDER_PENALTY);
 
     // Retry at the old fee is now refused; over-posting the bond re-admits.
-    let retry_cheap = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 1, 1, 1);
+    let retry_cheap = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 1);
     assert_eq!(
         mp.add_checked(retry_cheap, u64::MAX),
         Err(MempoolError::FeeTooLow),
         "a failing sender must bond to retry"
     );
-    let retry_bonded = Transaction::sign(
-        &bad_sk,
-        [1u8; 32],
-        10,
-        1_000 + FAILED_SENDER_PENALTY,
-        2,
-        1,
-        1,
-    );
+    let retry_bonded = pq_tx(&bad_kp, [1u8; 32], 10, 1_000 + FAILED_SENDER_PENALTY, 2);
     assert!(
         mp.add_checked(retry_bonded, u64::MAX).is_ok(),
         "bonded retry admits"
@@ -240,7 +283,7 @@ fn d2_failed_sender_posts_penalty_bond() {
     assert_eq!(mp.effective_floor(&bad_sender), MAX_FAILED_SENDER_PENALTY);
 
     // An unrelated sender is untouched throughout.
-    let other = Transaction::sign(&good_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let other = pq_tx(&good_kp, [1u8; 32], 10, 1_000, 0);
     assert!(
         mp.add_checked(other, u64::MAX).is_ok(),
         "good senders unaffected"
@@ -249,7 +292,7 @@ fn d2_failed_sender_posts_penalty_bond() {
     // One success clears the failing sender entirely.
     mp.note_apply_feedback(&[], &[bad_sender]);
     assert_eq!(mp.effective_floor(&bad_sender), 0);
-    let fresh = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 3, 1, 1);
+    let fresh = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 3);
     assert!(
         mp.add_checked(fresh, u64::MAX).is_ok(),
         "cleared sender re-admits at floor"
@@ -258,11 +301,10 @@ fn d2_failed_sender_posts_penalty_bond() {
 #[tokio::test]
 async fn d2_failed_block_tx_pays_nothing() {
     let e = InMemoryStateEngine::new();
-    let sk = key(0xC3);
-    let sender = sk.verifying_key().to_bytes();
+    let (kp, sender) = pq_key(0xC3);
     e.update_account(AccountState::new(sender, 1_000_000)).await;
     // Wrong nonce: a Byzantine proposer can include it anyway; apply fails it.
-    let bad = Transaction::sign(&sk, [9u8; 32], 10, 1_000, 5, 1, 1);
+    let bad = pq_tx(&kp, [9u8; 32], 10, 1_000, 5);
     let (applied, failed, fees_collected, status, fees) = e
         .apply_block_parallel_fees(std::slice::from_ref(&bad), 1_760_000_000)
         .await;
@@ -281,35 +323,39 @@ async fn d2_failed_block_tx_pays_nothing() {
 // backwards relative to the parent must be refused.
 #[tokio::test]
 async fn a3_adopt_committed_refuses_backward_timestamp() {
-    let (mut rt, k) = solo_rt().await;
+    let (mut rt, k, fk) = solo_rt().await;
     let root = rt.state.get_state_root().await;
 
-    let parent = signed_block(&k, 1, [0u8; 32], root, 1_000);
+    let parent = signed_block(&k, &fk, 1, [0u8; 32], root, 1_000);
     let ph = parent.compute_hash();
     rt.blocks.insert(ph, parent);
     rt.finalized.push((1, ph));
     rt.hc.height = 2;
 
-    let child = signed_block(&k, 2, ph, root, 500); // backward: 500 < 1000
+    let child = signed_block(&k, &fk, 2, ph, root, 500); // backward: 500 < 1000
     let ch = child.compute_hash();
-    let msg = vote_sign_bytes(2, 0, VoteKind::Precommit, &Some(ch));
-    let sig = k.sign(&msg).to_vec();
-    let cert = QuorumCertificate {
-        height: 2,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(ch),
-        signatures: vec![(k.verifying_key().to_bytes(), sig)],
-    };
+    // FULL-PQ: a raw Ed25519 signature list carries no power. Build the QC
+    // through the production committee path from a genuine Falcon precommit
+    // envelope (the µQC/CEC envelope is assembled by `VoteSet::certificate`).
+    let vs = ValidatorSet::from_list(vec![(k.verifying_key().to_bytes(), 1)]);
+    let mut set = VoteSet::new();
+    set.add(
+        Vote::sign_with_falcon(&k, &fk, 2, 0, VoteKind::Precommit, Some(ch)),
+        &vs,
+        2,
+        0,
+        VoteKind::Precommit,
+    )
+    .expect("genuine vote admits");
+    let cert = set
+        .certificate(Some(ch), &vs, &ph)
+        .expect("single-validator set reaches quorum");
 
     let r = rt.adopt_committed(2, child, cert).await;
+    let err = r.expect_err("BUG (A3): backward timestamp accepted on adopt path");
     assert!(
-        r.is_err(),
-        "BUG (A3): backward timestamp accepted on adopt path: {r:?}"
-    );
-    assert!(
-        r.unwrap_err().contains("backwards"),
-        "adopt_committed refusal must name the timestamp rule"
+        err.contains("backwards"),
+        "adopt_committed refusal must name the timestamp rule: {err:?}"
     );
 }
 
@@ -318,19 +364,19 @@ async fn a3_adopt_committed_refuses_backward_timestamp() {
 // pooled retries that do not pay the bond.
 #[tokio::test]
 async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
-    let (mut rt, k) = solo_rt().await;
-    let bad_sk = key(0xE1);
-    let bad_sender = bad_sk.verifying_key().to_bytes();
+    let (mut rt, k, fk) = solo_rt().await;
+    let (bad_kp, bad_sender) = pq_key(0xE1);
     rt.state
         .update_account(AccountState::new(bad_sender, 10_000_000))
         .await;
 
     // Bad tx: wrong nonce (5 != 0).
-    let bad_tx = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 5, 1, 1);
+    let bad_tx = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 5);
     let root_before = rt.state.get_state_root().await;
-    let mut block = signed_block(&k, 1, [0u8; 32], root_before, 1_000);
+    let mut block = signed_block(&k, &fk, 1, [0u8; 32], root_before, 1_000);
     block.transactions = vec![bad_tx];
-    block.sign_block(&k);
+    block.validator_signatures.clear();
+    block.sign_block_with_falcon(&k, &fk);
     let bh = block.compute_hash();
 
     assert_eq!(rt.mempool.read().await.effective_floor(&bad_sender), 0);
@@ -346,7 +392,7 @@ async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
     );
 
     // Cheap retry (under penalty floor) is rejected by mempool
-    let retry_cheap = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let retry_cheap = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 0);
     assert_eq!(
         rt.mempool
             .write()
@@ -356,15 +402,7 @@ async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
     );
 
     // Bonded retry is admitted
-    let bonded_tx = Transaction::sign(
-        &bad_sk,
-        [1u8; 32],
-        10,
-        1_000 + FAILED_SENDER_PENALTY,
-        0,
-        1,
-        1,
-    );
+    let bonded_tx = pq_tx(&bad_kp, [1u8; 32], 10, 1_000 + FAILED_SENDER_PENALTY, 0);
     assert!(rt
         .mempool
         .write()
@@ -402,8 +440,7 @@ async fn d2_rpc_rejects_unbonded_retry_from_penalized_sender() {
         shard_registry: stellereum::sharding::ShardRegistry::single(),
     });
 
-    let bad_sk = key(0xF1);
-    let bad_sender = bad_sk.verifying_key().to_bytes();
+    let (bad_kp, bad_sender) = pq_key(0xF1);
     engine
         .update_account(AccountState::new(bad_sender, 10_000_000))
         .await;
@@ -415,7 +452,7 @@ async fn d2_rpc_rejects_unbonded_retry_from_penalized_sender() {
         .note_apply_feedback(&[bad_sender], &[]);
 
     // RPC stell_sendRawTransaction with unbonded fee
-    let cheap_tx = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
+    let cheap_tx = pq_tx(&bad_kp, [1u8; 32], 10, 1_000, 0);
     let params_cheap = serde_json::json!({
         "tx": hex::encode(bincode::serialize(&cheap_tx).unwrap())
     });
@@ -433,15 +470,7 @@ async fn d2_rpc_rejects_unbonded_retry_from_penalized_sender() {
     );
 
     // RPC stell_sendRawTransaction with bonded fee
-    let bonded_tx = Transaction::sign(
-        &bad_sk,
-        [1u8; 32],
-        10,
-        1_000 + FAILED_SENDER_PENALTY,
-        0,
-        1,
-        1,
-    );
+    let bonded_tx = pq_tx(&bad_kp, [1u8; 32], 10, 1_000 + FAILED_SENDER_PENALTY, 0);
     let params_bonded = serde_json::json!({
         "tx": hex::encode(bincode::serialize(&bonded_tx).unwrap())
     });

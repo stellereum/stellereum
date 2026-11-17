@@ -187,6 +187,20 @@ pub(crate) async fn run_consensus_node(
         // follows every masterchain rotation instead of freezing on the
         // config-defined set.
         .with_master_staking(master_staking.clone());
+    // CN-VRF v3 secret custody: only when the gate is actually live at this
+    // node's height. Write-ahead `enc2:` persistence lives beside the node
+    // keys; the boot self-check refuses to reveal/propose if the on-disk
+    // secret no longer matches the on-chain commitment (`sync_cnvrf_v3_on_boot`).
+    if rt.cnvrf_v3_is_active_at(rt.height()) {
+        // Ops-controlled location (the gate is off in production, so this is
+        // only exercised by an activating rollout and by tests):
+        // `STELL_CNVRF_V3_DIR`, else `data/cnvrf_v3` beside the node data.
+        let custody_dir = std::env::var("STELL_CNVRF_V3_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("data/cnvrf_v3"));
+        rt.configure_cnvrf_v3_custody(custody_dir, stellereum::zkml::DEFAULT_CHAIN_ID);
+        rt.sync_cnvrf_v3_on_boot().await;
+    }
     // P2 shard gate (pool level, defense in depth): the runtime and the RPC
     // layer share ONE pool (`with_mempool(rpc.mempool.clone())`), so pinning
     // it here covers EVERY admission path at the choke point — RPC, faucet,
@@ -1772,6 +1786,9 @@ pub(crate) async fn run_consensus_node(
             // (the DKG starts when the chain crosses an epoch boundary).
             // Cheap: the manager only does work when the epoch changed.
             rt.sync_mev_epoch().await;
+            // Off-tick CN-VRF v3 VDF completion (cheap `try_recv`; the lane
+            // itself runs on a blocking worker, never on this tick).
+            rt.poll_vdf_lane();
             if let Some(block) = rt.propose(now_secs()).await {
                 let bh = block.compute_hash();
                 let ntx = block.transactions.len();
@@ -3041,6 +3058,7 @@ pub(crate) async fn run_consensus_node(
                             session_keys,
                             bridge,
                             zkml_models,
+                            cnvrf_v3,
                         } = bundle;
                         // Serialize on the blocking pool. Bytes are identical to
                         // the old inline `create_snapshot`/`bincode::serialize`
@@ -3071,6 +3089,7 @@ pub(crate) async fn run_consensus_node(
                         if let Some(domain_bytes) =
                             stellereum::storage::serialize_off_tick(domains).await
                         {
+                            ap2.enqueue_cnvrf_v3(height, cnvrf_v3.clone());
                             ap2.enqueue_domains(
                                 height,
                                 domain_bytes.clone(),
@@ -3104,6 +3123,7 @@ pub(crate) async fn run_consensus_node(
                                 ("bridge", bridge.clone()),
                                 ("zkml", zkml_models.clone()),
                                 ("cross_shard", cross_shard.clone()),
+                                ("cnvrf_v3", cnvrf_v3.clone()),
                             ];
                             debug_assert!(
                                 {
@@ -3265,6 +3285,7 @@ pub(crate) async fn run_consensus_node(
                 && last_block_at.elapsed() >= min_block_time
                 && rt.has_prebuild_for(rt.hc.height)
             {
+                rt.poll_vdf_lane();
                 if let Some(block) = rt.propose(now_secs()).await {
                     let height = rt.hc.height;
                     let round = rt.hc.round;

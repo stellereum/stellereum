@@ -237,6 +237,7 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     block.sign_block(&proposer);
 
@@ -330,6 +331,7 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     block2.sign_block(&proposer);
 
@@ -427,6 +429,7 @@ async fn test_block_execution_collects_contract_events() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     block.sign_block(&proposer);
 

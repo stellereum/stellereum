@@ -1045,6 +1045,7 @@ mod tests {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(&sk);
         b
@@ -1466,6 +1467,7 @@ mod tests {
             order_merkle_root: crate::mev::compute_order_merkle_root(&[]),
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
         };
         let hash = b.compute_hash();
         b.validator_signatures

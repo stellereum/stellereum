@@ -2606,15 +2606,256 @@ impl InMemoryStateEngine {
         //     block — the reporter already paid gas in step 1.
         let _gov_ops = self.apply_gov_ops(block, &status).await;
 
+        // 5d. CN-VRF v3 state transition (commit admission, proposer slot reveal,
+        //     leaky-bucket abort slash, epoch MinRoot VDF beacon, key-rotation
+        //     migration, and epoch expiry). Strictly gated by
+        //     `cnvrf_v3_is_active_at(block.height)` so pre-activation blocks
+        //     remain 100% untouched.
+        let cnvrf_slashed = if self.cnvrf_v3_is_active_at(block.height) {
+            self.apply_cnvrf_v3(block, &status).await
+        } else {
+            0
+        };
+
         BlockTransitionOutcome {
             applied,
             failed,
             fees_collected: fees,
             status,
             tx_fees,
-            slashed: slashed.saturating_add(eq_slashed),
+            slashed: slashed
+                .saturating_add(eq_slashed)
+                .saturating_add(cnvrf_slashed),
             events,
         }
+    }
+
+    /// Deterministic CN-VRF v3 block transition (active only when
+    /// `cnvrf_v3_is_active_at(block.height)` is true).
+    async fn apply_cnvrf_v3(&self, block: &crate::sharding::Block, status: &[bool]) -> u64 {
+        use crate::cn_vrf::{
+            epoch_of_height, epoch_raw_seed, CommitCarrierV3, SlotRevealOutcome, CNVRF_PK_LEN,
+            EPOCH_LEN, V3_COMMIT_LOOKAHEAD_BLOCKS,
+        };
+
+        let current_epoch = epoch_of_height(block.height);
+        let mut pending_staking_burn = 0u64;
+        let mut pending_rewards_burn = 0u64;
+
+        let mut v3_state = self.cnvrf_v3.write().await;
+        let mut abort_state = self.cnvrf_abort.write().await;
+        let mut epoch_beacons = self.epoch_vdf_beacons.write().await;
+        let mut freeze_inputs = self.cnvrf_freeze_inputs.write().await;
+
+        let v3_before = v3_state.clone();
+        let abort_before = abort_state.clone();
+        let beacons_before = epoch_beacons.clone();
+
+        // 1. Migrate CN-VRF v3 commitments and abort-slash debt for any applied
+        //    `SysCallRotateValidatorKey` transactions in this block.
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            if !status.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            for op in &tx.payload {
+                if let crate::svm::OpCode::SysCallRotateValidatorKey {
+                    old_validator,
+                    new_validator,
+                } = op
+                {
+                    v3_state.migrate_validator(old_validator, new_validator, current_epoch);
+                    abort_state.migrate_validator(old_validator, new_validator);
+                }
+            }
+        }
+
+        // 2. Admit CommitCarrierV3 entries in canonical sorted order `(validator_id, epoch_n)`.
+        if let Some(payload) = &block.cnvrf_v3 {
+            if !payload.commits.is_empty() {
+                let mut commits: Vec<&CommitCarrierV3> = payload.commits.iter().collect();
+                commits.sort_by(|a, b| {
+                    a.validator_id
+                        .cmp(&b.validator_id)
+                        .then_with(|| a.epoch_n.cmp(&b.epoch_n))
+                });
+                let ledger = self.staking.read().await;
+                for c in commits {
+                    if !ledger.validators.contains_key(&c.validator_id) {
+                        tracing::warn!(
+                            validator = %hex::encode(c.validator_id),
+                            epoch = c.epoch_n,
+                            "cnvrf_v3 commit ignored: unknown validator"
+                        );
+                        continue;
+                    }
+                    let key_opt = ledger
+                        .validator_pq_keys
+                        .get(&c.validator_id)
+                        .cloned()
+                        .or_else(|| {
+                            crate::consensus::pq_key_at_height(&c.validator_id, block.height)
+                        })
+                        .or_else(|| self.get_pinned_pubkey(&c.validator_id));
+                    let Some((scheme, pk)) = key_opt else {
+                        tracing::warn!(
+                            validator = %hex::encode(c.validator_id),
+                            epoch = c.epoch_n,
+                            "cnvrf_v3 commit ignored: no active PQ key"
+                        );
+                        continue;
+                    };
+                    if scheme.is_disabled() || pk.len() != CNVRF_PK_LEN {
+                        tracing::warn!(
+                            validator = %hex::encode(c.validator_id),
+                            epoch = c.epoch_n,
+                            "cnvrf_v3 commit ignored: invalid PQ key scheme or length"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = v3_state.admit_commit(c, block.height, self.chain_id, &pk) {
+                        tracing::warn!(
+                            validator = %hex::encode(c.validator_id),
+                            epoch = c.epoch_n,
+                            "cnvrf_v3 commit rejected: {e:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Apply proposer slot reveal and update leaky-bucket abort state.
+        let reveal_ref = block.cnvrf_v3.as_ref().and_then(|p| p.reveal.as_ref());
+        match v3_state.apply_slot_reveal(self.chain_id, &block.proposer, block.height, reveal_ref) {
+            SlotRevealOutcome::Revealed { .. } => {
+                let ledger = self.staking.read().await;
+                ledger.record_cnvrf_reveal_present(&mut abort_state, &block.proposer);
+            }
+            SlotRevealOutcome::CommittedMissingReveal => {
+                if block.shard_id == crate::sharding::MASTERCHAIN_SHARD {
+                    let mut ledger = self.staking_write().await;
+                    let rewards_before = ledger.rewards_pool;
+                    match ledger.record_cnvrf_reveal_abort(
+                        &mut abort_state,
+                        &block.proposer,
+                        block.height,
+                    ) {
+                        Ok(burned) if burned > 0 => {
+                            let rewards_burn = rewards_before.saturating_sub(ledger.rewards_pool);
+                            let staking_burn = burned.saturating_sub(rewards_burn);
+                            pending_rewards_burn =
+                                pending_rewards_burn.saturating_add(rewards_burn);
+                            pending_staking_burn =
+                                pending_staking_burn.saturating_add(staking_burn);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                proposer = %hex::encode(block.proposer),
+                                height = block.height,
+                                "cnvrf_v3 reveal abort slash skipped: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            SlotRevealOutcome::AbsentNoCommit => {}
+            SlotRevealOutcome::InvalidReveal => {
+                tracing::warn!(
+                    proposer = %hex::encode(block.proposer),
+                    height = block.height,
+                    "cnvrf_v3 invalid proposer reveal ignored"
+                );
+            }
+            SlotRevealOutcome::UnexpectedReveal => {
+                tracing::warn!(
+                    proposer = %hex::encode(block.proposer),
+                    height = block.height,
+                    "cnvrf_v3 unexpected proposer reveal ignored"
+                );
+            }
+        }
+
+        // 4. Snapshot freeze-boundary `(freeze_block_hash, rolling_mix)` at `H_freeze`
+        //    so the upcoming epoch's `EpochVdfBeacon::raw_seed` is verified against it.
+        if block.height >= V3_COMMIT_LOOKAHEAD_BLOCKS {
+            if let Some(boundary) = block.height.checked_add(V3_COMMIT_LOOKAHEAD_BLOCKS) {
+                if boundary.is_multiple_of(EPOCH_LEN) {
+                    let target_epoch = boundary / EPOCH_LEN;
+                    let prev_epoch = target_epoch.saturating_sub(1);
+                    let freeze_mix = v3_state.rolling_mix_for_epoch(prev_epoch);
+                    freeze_inputs.insert(target_epoch, (block.compute_hash(), freeze_mix));
+                }
+            }
+        }
+
+        // 5. Verify and record finalized epoch VDF beacon, if carried.
+        if let Some(vdf_beacon) = block.cnvrf_v3.as_ref().and_then(|p| p.epoch_vdf.as_ref()) {
+            let e = vdf_beacon.epoch;
+            if !epoch_beacons.contains_key(&e) && e <= current_epoch.saturating_add(1) {
+                let seed_matches = if let Some((freeze_hash, freeze_mix)) = freeze_inputs.get(&e) {
+                    let prev_beacon = if e == 0 {
+                        [0u8; 48]
+                    } else {
+                        epoch_beacons.get(&(e - 1)).copied().unwrap_or([0u8; 48])
+                    };
+                    let expected =
+                        epoch_raw_seed(self.chain_id, e, &prev_beacon, freeze_hash, freeze_mix);
+                    vdf_beacon.raw_seed == expected
+                } else {
+                    true
+                };
+                if seed_matches {
+                    if let Some(out) = crate::minroot_vdf::verify(
+                        &vdf_beacon.raw_seed,
+                        vdf_beacon.proof.steps,
+                        &vdf_beacon.proof,
+                    ) {
+                        epoch_beacons.insert(e, out);
+                    } else {
+                        tracing::warn!(
+                            epoch = e,
+                            height = block.height,
+                            "cnvrf_v3 epoch_vdf proof verification failed"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        epoch = e,
+                        height = block.height,
+                        "cnvrf_v3 epoch_vdf raw_seed mismatch against freeze boundary"
+                    );
+                }
+            }
+        }
+
+        // 6. Expire old epoch commits (keep current, previous, and current-2).
+        v3_state.expire_before(current_epoch.saturating_sub(2));
+
+        let cnvrf_changed = *v3_state != v3_before
+            || *abort_state != abort_before
+            || *epoch_beacons != beacons_before;
+
+        drop(freeze_inputs);
+        drop(epoch_beacons);
+        drop(abort_state);
+        drop(v3_state);
+
+        if cnvrf_changed {
+            self.bump_domain_generation(crate::commitment::Domain::CnVrf);
+        }
+
+        if pending_staking_burn > 0 {
+            let _ = self
+                .debit_native(&crate::staking::STAKING_POOL, pending_staking_burn)
+                .await;
+        }
+        if pending_rewards_burn > 0 {
+            let _ = self
+                .debit_native(&crate::staking::REWARDS_POOL, pending_rewards_burn)
+                .await;
+        }
+
+        pending_staking_burn.saturating_add(pending_rewards_burn)
     }
 
     // -----------------------------------------------------------------------

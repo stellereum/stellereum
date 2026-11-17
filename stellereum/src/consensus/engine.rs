@@ -1235,10 +1235,29 @@ impl HeightConsensus {
         proposer: ValidatorId,
         block_hash: BlockHash,
     ) -> Result<(), String> {
+        let expected = self.proposer();
+        self.receive_proposal_for(proposer, block_hash, expected)
+    }
+
+    /// [`Self::receive_proposal`] with an EXPLICIT expected proposer.
+    ///
+    /// The parent-hash schedule is not the only legal one: from
+    /// `CNVRF_V3_ACTIVATION_HEIGHT` on, the epoch-beacon schedule names the
+    /// proposer (`ValidatorSet::proposer_for_with_beacon`), and this struct's
+    /// own `proposer()` (parent-hash draw) would then disagree with the
+    /// network and refuse the caller's OWN honest proposals. The caller passes
+    /// the schedule it actually validates against; every other rule (propose
+    /// step, one value per round) is unchanged.
+    pub fn receive_proposal_for(
+        &mut self,
+        proposer: ValidatorId,
+        block_hash: BlockHash,
+        expected: Option<ValidatorId>,
+    ) -> Result<(), String> {
         if self.step != Step::Propose {
             return Err("not in propose step".to_string());
         }
-        if Some(proposer) != self.proposer() {
+        if Some(proposer) != expected {
             return Err("wrong proposer".to_string());
         }
         // Audit F1: one value per round. A second DISTINCT proposal in the

@@ -150,6 +150,7 @@ fn mk_block(txs: Vec<Transaction>, proposer: &SigningKey) -> Block {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     blk.sign_block(proposer);
     blk

@@ -73,9 +73,10 @@ from memory):
 
 | Tag | Value | Used in |
 |---|---|---|
-| `CNVRF_COMMIT_DST` | `b"STELL_CNVRF_COMMIT_V1"` | commitment preimage |
-| `CNVRF_OPEN_DST` | `b"STELL_CNVRF_OPEN_V1"` | Falcon-signed open message |
-| `CNVRF_BETA_DST` | `b"STELL_CNVRF_BETA_V1"` | beta derivation |
+| `CNVRF_COMMIT_DST` | `b"STELL_CNVRF_COMMIT_V1"` | commitment preimage (21 B) |
+| `CNVRF_COMMIT_SIG_DST` | `b"STELL_CNVRF_COMMIT_SIG_V1"` | `CommitCarrier` Falcon signature (25 B) |
+| `CNVRF_OPEN_DST` | `b"STELL_CNVRF_OPEN_V1"` | Falcon-signed open message (19 B) |
+| `CNVRF_BETA_DST` | `b"STELL_CNVRF_BETA_V1"` | beta derivation (19 B) |
 
 Rationale: three different cryptographic roles (hiding commitment, signed
 statement, pseudorandom output) must never collide even if field layouts
@@ -90,14 +91,28 @@ different preimage, never a re-interpretation).
 
 ```text
 commit_preimage =
-    CNVRF_COMMIT_DST            (20 B)
+    CNVRF_COMMIT_DST            (21 B)
  || chain_id                    (8 B, u64le)
  || validator_id                (32 B)
  || epoch_N                     (8 B, u64le)
  || nonce                       (32 B)
-                                total: 100 B
+                                total: 101 B
 c = SHAKE256(commit_preimage, 32)   (32 B)
+
+commit_sig_message =
+    CNVRF_COMMIT_SIG_DST        (25 B, "STELL_CNVRF_COMMIT_SIG_V1")
+ || chain_id                    (8 B, u64le)
+ || validator_id                (32 B)
+ || epoch_N                     (8 B, u64le)
+ || c                           (32 B)
+                                total: 105 B
 ```
+
+> **Spec bugfix (v1):** Earlier revisions wrote that `CommitCarrier.sig` signs
+> `commit_preimage`. Signing `commit_preimage` would leak the secret `nonce` to
+> epoch N−1 verifiers. Normatively (`cn_vrf.rs:234-252`, `362-418`), `sig`
+> signs the **public** 105-byte `commit_sig_message` containing `c`, never
+> `commit_preimage` or `nonce`.
 
 Commit carrier published in epoch N−1 (see §4 for commit/open vehicle):
 
@@ -106,7 +121,7 @@ CommitCarrier {
     validator_id : [u8; 32],
     epoch_N      : u64,          // the FUTURE epoch this commits to
     c            : [u8; 32],     // the commitment above
-    sig          : [u8; 666],   // Falcon-512 sig over commit_preimage
+    sig          : [u8; 666],   // Falcon-512 sig over commit_sig_message
                                 //   by the validator's REGISTERED PQ key
                                 //   (pq_active_key at commit height)
 }
@@ -122,17 +137,17 @@ scheme || pubkey || effective_height, `pq_registry.rs:578-591`).
 
 ```text
 open_message(alpha) =
-    CNVRF_OPEN_DST              (18 B)
+    CNVRF_OPEN_DST              (19 B)
  || chain_id                    (8 B, u64le)
  || validator_id                (32 B)
  || epoch_N                     (8 B, u64le)
  || nonce                       (32 B)
  || alpha                       (32 B)
-                                total: 130 B
+                                total: 131 B
 pi = Falcon_Sign(sk, open_message(alpha))   (666 B, randomized — EVERY call
                                 yields fresh bytes; post_quantum.rs:2135-2144)
 beta = SHAKE256(CNVRF_BETA_DST || nonce || alpha || validator_id || epoch_N, 32)
-                                preimage total: 18+32+32+32+8 = 122 B
+                                preimage total: 19+32+32+32+8 = 123 B
 ```
 
 Reveal carrier published in epoch N per draw:
@@ -697,5 +712,201 @@ asserts byte-exact equality or byte-exact refusal (`None` / `Err`, never
 
 ---
 
-*End of spec. Total open questions: 10. No implementation code. No
-existing file modified. Audit before wiring.*
+## 7. CN-VRF v3 — Reverse Hash-Chain + Checkpointed MinRoot PQ-VDF
+
+CN-VRF v3 upgrades the v1 per-draw Falcon reveal into a lightweight, bounded-work
+proposer-only epoch randomness pipeline combined with a time-asymmetric
+post-quantum VDF (`stellereum/src/cn_vrf.rs`, `stellereum/src/minroot_vdf.rs`,
+`stellereum/src/consensus/sortition.rs`, `stellereum/src/staking.rs`).
+Activation is gated behind `CNVRF_V3_ACTIVATION_HEIGHT` (`consensus/sortition.rs:507`,
+default `u64::MAX` GatedOff until audit & coordinated rollout).
+
+### 7.1 Parameters and Domain Separators
+
+| Constant | Value | Meaning | Source |
+|---|---|---|---|
+| `EPOCH_LEN` / `CNVRF_V3_EPOCH_LEN` | `7_200` | Heights per epoch | `cn_vrf.rs:62`, `consensus/sortition.rs:511` |
+| `V3_LINK_LEN` | `48` bytes | 384-bit link (128-bit quantum BHT collision security) | `cn_vrf.rs:1013` |
+| `V3_SEGMENTS` | `16` | Segment anchors per epoch chain | `cn_vrf.rs:1015` |
+| `V3_SEGMENT_LEN` | `450` | Slots per segment (`16 × 450 = 7_200`) | `cn_vrf.rs:1017` |
+| `V3_COMMIT_LOOKAHEAD_BLOCKS` | `360` | Freeze cutoff before epoch `N+1` starts | `cn_vrf.rs:1019` |
+| `COMMIT_CARRIER_V3_LEN` | `1_474` bytes | `32 + 8 + 16×48 + 666` | `cn_vrf.rs:1025` |
+| `DST_CHAIN_V3` | `"STELL_CNVRF_CHAIN_V3"` | Reverse hash-chain step (`BLAKE3-XOF-48`) | `cn_vrf.rs:1029` |
+| `DST_COMMIT_SIG_V3` | `"STELL_CNVRF_COMMIT_SIG_V3"` | Falcon-512 commit auth over 16 anchors | `cn_vrf.rs:1031` |
+| `DST_BETA_V3` | `"STELL_CNVRF_BETA_V3"` | Rolling mix update per proposer reveal | `cn_vrf.rs:1033` |
+| `DST_EPOCH_RAW_SEED_V3` | `"STELL_CNVRF_EPOCH_RAW_SEED_V3"` | Epoch raw seed (pre-VDF) | `cn_vrf.rs:1035` |
+| `DST_V3_SEED_DERIVE` | `"STELL_CNVRF_SEED_DERIVE_V3"` | Deterministic secret seed derivation | `cn_vrf.rs:1037` |
+| `CNVRF_V3_DRAW_DOMAIN` | `"STELL_SORTITION_CNVRF_V3"` | Committee sortition draw seed | `consensus/sortition.rs:516` |
+| `CNVRF_V3_PROPOSER_DOMAIN` | `"STELL_PROPOSER_CNVRF_V3"` | Proposer selection draw seed | `consensus/sortition.rs:519` |
+
+### 7.2 16-Segment `BLAKE3` 48-Byte XOF Reverse Hash-Chain
+
+Each committed validator `i` samples or derives a 48-byte secret tip `s_{i,N} = x_{7200}`
+for epoch `N` (`derive_v3_epoch_secret` or OS CSPRNG) and builds a 7,201-link reverse
+hash-chain `x_{7200} → x_{7199} → … → x_0` using `blake3::Hasher::new_derive_key`:
+
+```text
+x_t = BLAKE3_XOF_48(
+    DST_CHAIN_V3,
+    chain_id(u64le) || validator_id([u8; 32]) || epoch_n(u64le) || t(u64le) || x_{t+1}
+)   for t in (0..7200).rev()
+```
+
+- **Segment anchors:** `anchors[seg] = x_{seg * 450}` for `seg ∈ 0..16`
+  (`compute_v3_anchors` computes all 16 anchors in O(1) memory; `CnVrfV3Chain`
+  caches all 7,201 links and is `ZeroizeOnDrop`).
+- **Bounded verification:** At slot `slot_t = height % EPOCH_LEN`, segment index is
+  `seg = slot_t / 450` with `seg_start = seg * 450`. A verifier starts from
+  `state.head` at `state.last_step` if `state.last_step > seg_start && state.last_step <= slot_t`,
+  or directly from `state.anchors[seg]` at `seg_start` otherwise, and hashes backward
+  at most `V3_SEGMENT_LEN = 450` steps (`cnvrf_v3_verify_reveal`). Even after
+  an arbitrary run of missed proposals, per-block reveal verification never exceeds
+  450 BLAKE3 calls.
+
+### 7.3 `CommitCarrierV3`, Lookahead Cutoff, and `rotate_key` Anchor Migration
+
+```text
+CommitCarrierV3 {
+    validator_id : [u8; 32],
+    epoch_n      : u64,                   // strictly current_epoch + 1
+    anchors      : [[u8; 48]; 16],        // [x_0, x_450, ..., x_6750]
+    sig          : [u8; 666],             // Falcon-512 sig over commit_v3_sig_message_bytes
+}                                         // fixed 1,474 B on wire
+```
+
+- `commit_v3_sig_message_bytes = DST_COMMIT_SIG_V3 || chain_id(le) || validator_id || epoch_n(le) || anchors[0..16]`.
+- **Lookahead cutoff (`V3_COMMIT_LOOKAHEAD_BLOCKS = 360`):**
+  For target epoch `N+1`, commitments MUST be admitted at
+  `current_height < H_freeze`, where
+  `H_freeze = (N + 1) * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`
+  (`cn_vrf.rs:1578-1584`). Any commit at `current_height >= H_freeze` is refused
+  fail-closed with `CommitError::PastCommitCutoff`. First-committed-wins applies
+  (`CommitOutcome::IgnoredDuplicate`).
+- **`rotate_key` anchor migration (`CnVrfV3State::migrate_validator`):**
+  Each `CnVrfV3Record` stores `anchor_validator_id` (the `validator_id` originally
+  bound in the `DST_CHAIN_V3` preimage at commit time). When a validator rotates
+  its consensus key `old_id → new_id`, `migrate_validator(old_id, new_id, from_epoch)`
+  re-keys records for `epoch >= from_epoch` under `new_id` while preserving
+  `anchor_validator_id`, so pre-committed epoch chains remain valid and verifiable
+  after rotation without re-committing.
+
+### 7.4 Proposer-Only `Block` `RevealV3` (48 B) and Rolling Mix
+
+Only the block proposer for height `h` attaches a reveal (`RevealV3`: 48 bytes
+`x_{slot_t + 1}`, indexed strictly by `slot_t = height % EPOCH_LEN`). Non-proposer
+validators do not gossip reveals per block.
+
+`CnVrfV3State::apply_slot_reveal` enforces fail-closed semantics (`SlotRevealOutcome`):
+- **Committed proposer + valid reveal (`slot_t >= last_step`, hash chain matches):**
+  advances `rec.head = reveal`, `rec.last_step = slot_t + 1`, and updates the
+  epoch rolling mix:
+  ```text
+  rolling_mix = BLAKE3_XOF_48(
+      DST_BETA_V3,
+      rolling_mix || reveal(48 B) || proposer(32 B) || height(u64le)
+  )
+  ```
+- **Committed proposer + invalid/stale/replayed reveal:** `InvalidReveal` → caller rejects block.
+- **Uncommitted proposer + injected reveal:** `UnexpectedReveal` → caller rejects block.
+- **Committed proposer + missing reveal:** `CommittedMissingReveal` → block admitted
+  if valid otherwise, and proposer accrues a CN-VRF v3 reveal abort (§7.8).
+- **Uncommitted proposer + no reveal (e.g., mid-epoch newcomer):** `AbsentNoCommit` → admissible,
+  no abort slash.
+
+### 7.5 Checkpointed `MinRoot` PQ-VDF (`minroot_vdf.rs`) & Off-Tick `VdfLane`
+
+To remove last-revealer / proposer-censor bias over `rolling_mix`, the epoch raw seed
+passes through a time-asymmetric sequential post-quantum VDF (`stellereum/src/minroot_vdf.rs`):
+
+- **Prime field:** 256-bit safe prime `p = 2^256 - 36113` (`P_LIMBS`), where
+  `p ≡ 2 (mod 3)` and `(p - 1) / 2` is prime. Every `z ∈ F_p` has a unique cube root
+  `z^((2p - 1) / 3) mod p` (`CUBE_ROOT_EXP`).
+- **Initialization:** `init_state_from_seed(seed)` maps the 48-byte `epoch_raw_seed`
+  via `BLAKE3_XOF("STELL_MINROOT_VDF_V1_INIT", seed, 64)` to non-zero `(x_0, y_0) ∈ F_p × F_p`.
+- **Forward step (`eval`, strictly sequential):**
+  `x_{i+1} = (x_i + y_i + c_i)^((2p - 1) / 3) mod p`, `y_{i+1} = x_i`, using a fixed
+  294-op addition chain (255 squarings + 39 multiplications) and domain-separated round
+  constants `c_i = [step + 1, "STELL_MR", "VDF_V1_C", "MINRV101"] < p`.
+  Calibrated default: `DEFAULT_VDF_STEPS_PER_EPOCH = 3_000_000` (~21.8 s on 1 vCPU at
+  ~137.6k steps/s), fitting comfortably inside the 360-block (`~18 min`) window.
+- **Checkpointed backward verification (`verify`, parallelizable):**
+  `MinRootProof` carries `steps`, canonical `< p` `final_xy`, and up to
+  `MAX_VDF_CHECKPOINTS = 4096` strictly increasing intermediate states `(idx, x_idx, y_idx)`.
+  Each backward step computes `x_i = y_{i+1}`, `y_i = (x_{i+1}^3 - y_{i+1} - c_i) mod p` —
+  only **2 modular multiplications per step** (~156 ms on 1 core, `rayon`-parallelized
+  across checkpoint segments). Any non-canonical element `>= p` or out-of-order
+  checkpoint is rejected fail-closed (`None`).
+- **Beacon output:**
+  `BLAKE3_XOF_48("STELL_MINROOT_VDF_V1_OUT", seed || steps(u64le) || final_x || final_y)`.
+- **Off-tick `VdfLane`:** VDF evaluation runs off the consensus hot-tick thread in a
+  dedicated background `VdfLane` worker so 1-vCPU validators never miss proposal/vote
+  ticks while computing the epoch beacon proof.
+
+### 7.6 Deterministic Fallback Without Reverting to Raw `parent_hash`
+
+At the freeze boundary `H_freeze` of epoch `N`, the raw input for epoch `N+1`'s beacon is:
+
+```text
+epoch_raw_seed(chain_id, epoch_n, prev_beacon, freeze_block_hash, rolling_mix)
+  = BLAKE3_XOF_48(
+      DST_EPOCH_RAW_SEED_V3,
+      chain_id(u64le) || epoch_n(u64le) || prev_beacon(48 B)
+        || freeze_block_hash(32 B) || rolling_mix(48 B)
+    )
+```
+
+Even if **zero** validators revealed during epoch `N` (`rolling_mix == [0u8; 48]`),
+`epoch_raw_seed` remains well-defined and deterministic across all honest nodes and
+still enters the `MinRoot` PQ-VDF to produce the epoch `N+1` `EpochBeacon`. Post
+`CNVRF_V3_ACTIVATION_HEIGHT`, sortition and proposer selection (`cnvrf_v3_beacon_seed` /
+`cnvrf_v3_proposer_seed` in `consensus/sortition.rs:540-590`) **never** fall back to
+raw, un-delayed `parent_hash` sortition.
+
+### 7.7 `enc2:` Encrypted Write-Ahead Custody + Startup Commitment Self-Check
+
+- Before broadcasting `CommitCarrierV3`, a validator persists its 48-byte epoch secret
+  `s_{i,N}` via `save_cnvrf_v3_secret` (`cn_vrf.rs:1730-1763`), which delegates to
+  `node_keys` `enc2:` encryption (Argon2id + XChaCha20-Poly1305) with atomic `0600`
+  write and symlink refusal (plaintext permitted only under explicit `STELL_KEY_PLAINTEXT=1`).
+- On restart, `load_cnvrf_v3_secret` (`cn_vrf.rs:1770-1808`) verifies `0600` permissions
+  and decrypts `enc2:`, and `verify_v3_secret_matches_commit` (`cn_vrf.rs:1812-1821`)
+  recomputes `compute_v3_anchors` to confirm the loaded secret matches the 16 anchors
+  committed on-chain for `(chain_id, validator_id, epoch_n)` before proposing.
+
+### 7.8 Unresettable Leaky-Bucket Abort Slashing (`staking.rs`)
+
+CN-VRF v3 reveal aborts (`CommittedMissingReveal`) are accounted separately from
+`last_qc` vote downtime (`ValidatorStake::missed` / `DOWNTIME_MISS_THRESHOLD` remain
+frozen and untouched):
+
+| Constant | Value | Meaning | Source |
+|---|---|---|---|
+| `CNVRF_ABORT_SLASH_BPS` | `100` (1%) | Burn fraction per threshold trigger | `staking.rs` |
+| `CNVRF_ABORT_THRESHOLD` | `3` | Aborts triggering slash + jail | `staking.rs` |
+| `CNVRF_ABORT_RECOVERY_STREAK` | `20` | Consecutive valid reveals for `-1` miss credit | `staking.rs` |
+
+- **Non-vote-resettable leaky bucket (`CnVrfAbortCounter { misses, recovery_streak }`):**
+  - `record_cnvrf_reveal_present`: increments `recovery_streak`; ONLY decrements `misses`
+    by 1 (and resets `recovery_streak = 0`) once `recovery_streak >= 20`. Signing
+    `last_qc` votes or producing a single valid reveal NEVER resets `misses` to 0
+    (closing the "9 misses + 1 sign" loophole).
+  - `record_cnvrf_reveal_abort`: increments `misses` and resets `recovery_streak = 0`.
+- **Audit F5-closed multi-bucket slash + jail (`slash_cnvrf_abort`):**
+  When `misses >= CNVRF_ABORT_THRESHOLD` (3), the counter clears and the ledger burns
+  `CNVRF_ABORT_SLASH_BPS` (1%) pro-rata across **`self_bond`, `pending_rewards`
+  (decrementing `rewards_pool` 1:1), ALL active `unbonding` entries (both self-bond and
+  delegator unbondings — defeating same-block `unbond()` evasion), and `delegated`
+  stake**, increments `total_slashed` + `total_burned`, and jails the validator until
+  `height + JAIL_RELEASE_DELAY_HEIGHTS`.
+- **Key-rotation debt preservation (`CnVrfAbortState::migrate_validator` /
+  `StakingLedger::rotate_key_with_cnvrf_abort`):** rotating consensus keys migrates
+  accumulated `(misses, recovery_streak)` from `old` to `new` so an offender cannot
+  launder abort debt via `rotate_key`.
+- **Persistence posture:** `CnVrfAbortState` uses deterministic `BTreeMap` side-state
+  matching the `PqRegistry` pattern (`pq_registry.rs:62-72`) until the coordinated
+  `StakingLedgerV5` / `DomainSnapshotV8` + conditional `commitment.rs` domain upgrade
+  embeds it directly inside `StakingLedger`.
+
+---
+
+*End of spec (v1 sandbox + v3 design). Audit before consensus activation (`CNVRF_V3_ACTIVATION_HEIGHT`).*

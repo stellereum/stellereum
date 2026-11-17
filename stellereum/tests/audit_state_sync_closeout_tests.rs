@@ -96,6 +96,7 @@ fn test_block(height: u64, prev: [u8; 32], proposer: [u8; 32], state_root: [u8; 
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     }
@@ -253,6 +254,7 @@ fn f2_push_policy_classes() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -647,6 +649,7 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             precommit_qc: None,
             last_qc: Some(qc),
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };

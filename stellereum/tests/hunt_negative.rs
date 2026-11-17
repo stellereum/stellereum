@@ -598,6 +598,7 @@ fn hunt_neg_p11_block_hash_binds_the_svm_payload() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
         };
@@ -628,6 +629,7 @@ fn hunt_neg_p12_proposer_signature_must_match_the_declared_proposer() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -663,6 +665,7 @@ fn hunt_neg_p13_sync_walk_rejects_cycles_gaps_and_overlong_chains() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };

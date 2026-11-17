@@ -141,6 +141,17 @@ pub const VOTE_MSG_BYTES: usize = 158;
 pub const QC_FIXED_BYTES: usize = 57;
 pub const QC_ED_SIG_ENTRY_BYTES: usize = 104; // 32 id + 8 len + 64 sig
 
+/// Bincode-1.3 overhead of `Block::cnvrf_v3 == None` (1-byte `Option::None` tag).
+pub const CNVRF_V3_ABSENT_OVERHEAD_BYTES: usize = 1;
+
+/// Bincode-1.3 overhead of an active CN-VRF v3 proposer reveal (`Option<[u8; 48]>::Some`:
+/// 1-byte `Option::Some` tag + 48-byte BLAKE3-XOF reverse hash-chain link).
+pub const CNVRF_V3_REVEAL_OVERHEAD_BYTES: usize = 1 + 48;
+
+/// Bincode-1.3 size of a reveal-only `Some(CnVrfV3BlockPayload)` trailing field
+/// (`1` outer `Option::Some` + `49` `reveal` + `8` empty `commits` len + `1` `epoch_vdf: None`).
+pub const CNVRF_V3_REVEAL_PAYLOAD_BYTES: usize = 1 + CNVRF_V3_REVEAL_OVERHEAD_BYTES + 8 + 1;
+
 /// Derive a 6-byte short-id: domain-separated BLAKE3 over
 /// `b"STELL_COMPACT_SHORT_ID_V1" || salt || txid`, truncated to
 /// `SHORT_ID_LEN` bytes.
@@ -201,8 +212,41 @@ pub fn baseline_proposal_bytes(n_txs: usize) -> usize {
 }
 
 /// Compact proposal bytes: header + 6 B/short-id + full bytes for misses.
+///
+/// Note: pre-CN-VRF-v3 baseline header (`PROPOSAL_FIXED_BYTES = 366` /
+/// `BLOCK_FIXED_BYTES = 350`) excludes the trailing `Block::cnvrf_v3` field; use
+/// [`compact_proposal_bytes_with_cnvrf_v3`] and [`cnvrf_v3_header_overhead_bytes`]
+/// to account for the `1 B` absent tag or `49 B` reveal (`59 B` reveal-only payload).
 pub fn compact_proposal_bytes(n_txs: usize, n_missing: usize) -> usize {
     PROPOSAL_FIXED_BYTES + n_txs * SHORT_ID_LEN + n_missing * TX_PLAIN_BYTES
+}
+
+/// Trailing CN-VRF v3 header overhead in bincode-1.3 bytes (excluding commits and epoch VDF):
+/// - `has_payload == false` (`cnvrf_v3: None`): `1 B` (`CNVRF_V3_ABSENT_OVERHEAD_BYTES`)
+/// - `has_payload == true, has_reveal == true`: `59 B` (`CNVRF_V3_REVEAL_PAYLOAD_BYTES`,
+///   where `49 B` = `CNVRF_V3_REVEAL_OVERHEAD_BYTES` is `Option<[u8; 48]>`)
+/// - `has_payload == true, has_reveal == false`: `11 B` (`1 + 1 + 8 + 1`)
+pub const fn cnvrf_v3_header_overhead_bytes(has_payload: bool, has_reveal: bool) -> usize {
+    if !has_payload {
+        CNVRF_V3_ABSENT_OVERHEAD_BYTES
+    } else if has_reveal {
+        CNVRF_V3_REVEAL_PAYLOAD_BYTES
+    } else {
+        1 + 1 + 8 + 1
+    }
+}
+
+/// Compact proposal bytes including the trailing CN-VRF v3 payload framing/reveal overhead
+/// (assuming 0 commits and no epoch VDF beacon).
+pub const fn compact_proposal_bytes_with_cnvrf_v3(
+    n_txs: usize,
+    n_missing: usize,
+    has_reveal: bool,
+) -> usize {
+    PROPOSAL_FIXED_BYTES
+        + n_txs * SHORT_ID_LEN
+        + n_missing * TX_PLAIN_BYTES
+        + cnvrf_v3_header_overhead_bytes(has_reveal, has_reveal)
 }
 
 /// Classical-baseline QC bytes for `n_sigs` Ed25519 signatures (refused under
@@ -581,6 +625,24 @@ mod tests {
         assert_eq!(compact_proposal_bytes(1000, 50), 15166);
         // Savings are real and large: compact(1000,0) < 4% of baseline.
         assert!(compact_proposal_bytes(1000, 0) * 100 < baseline_proposal_bytes(1000) * 4);
+    }
+
+    #[test]
+    fn cnvrf_v3_header_overhead_accounting() {
+        assert_eq!(CNVRF_V3_ABSENT_OVERHEAD_BYTES, 1);
+        assert_eq!(CNVRF_V3_REVEAL_OVERHEAD_BYTES, 49);
+        assert_eq!(CNVRF_V3_REVEAL_PAYLOAD_BYTES, 59);
+        assert_eq!(cnvrf_v3_header_overhead_bytes(false, false), 1);
+        assert_eq!(cnvrf_v3_header_overhead_bytes(true, false), 11);
+        assert_eq!(cnvrf_v3_header_overhead_bytes(true, true), 59);
+        assert_eq!(
+            compact_proposal_bytes_with_cnvrf_v3(100, 0, false),
+            compact_proposal_bytes(100, 0) + 1
+        );
+        assert_eq!(
+            compact_proposal_bytes_with_cnvrf_v3(100, 0, true),
+            compact_proposal_bytes(100, 0) + 59
+        );
     }
 
     /// Deterministic 64-seat compact-QC fixture (structural only — signature

@@ -1889,3 +1889,353 @@ fn qc_verify_batch_parity_falcon_uqc_k4716_and_forged() {
         );
     }
 }
+
+/// CN-VRF v3 (7,200-block epoch, gated OFF): epoch boundaries, determinism,
+/// stake weighting, and wrong-epoch fail-closed refusal.
+#[test]
+fn test_cnvrf_v3_beacon_draw_committee_7200_epoch_and_gated_off() {
+    assert_eq!(CNVRF_V3_ACTIVATION_HEIGHT, u64::MAX);
+    assert!(!cnvrf_v3_active_at(0));
+    assert!(!cnvrf_v3_active_at(7199));
+    assert!(!cnvrf_v3_active_at(7200));
+    assert!(!cnvrf_v3_active_at(u64::MAX - 1));
+    assert!(cnvrf_v3_active_at(u64::MAX));
+
+    assert_eq!(CNVRF_V3_EPOCH_LEN, 7_200);
+    assert_eq!(CNVRF_V3_EPOCH_LEN, crate::cn_vrf::EPOCH_LEN);
+    assert_eq!(cnvrf_v3_epoch_of_height(0), 0);
+    assert_eq!(cnvrf_v3_epoch_of_height(7199), 0);
+    assert_eq!(cnvrf_v3_epoch_of_height(7200), 1);
+    assert_eq!(cnvrf_v3_epoch_of_height(14399), 1);
+    assert_eq!(cnvrf_v3_epoch_of_height(14400), 2);
+
+    let mut vs = ValidatorSet::new();
+    for i in 0..16u8 {
+        let mut id = [0xD1; 32];
+        id[0] = i + 1;
+        vs.add(id, 10);
+    }
+    let beacon = [0x5Au8; 48];
+
+    // 7,200-block epoch boundary: 7199 -> epoch 0, 7200 -> epoch 1.
+    let c_7199 = cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 0);
+    assert_eq!(c_7199.len(), 8);
+    assert_eq!(
+        c_7199,
+        cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 0)
+    );
+    assert!(
+        cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 1).is_empty(),
+        "height 7199 (epoch 0) must refuse epoch-1 beacon"
+    );
+
+    let c_7200 = cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 8, &beacon, 1);
+    assert_eq!(c_7200.len(), 8);
+    assert!(
+        cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 8, &beacon, 0).is_empty(),
+        "height 7200 (epoch 1) must refuse epoch-0 beacon"
+    );
+
+    // Changing beacon output or epoch changes seed & committee.
+    assert_ne!(
+        cnvrf_v3_beacon_seed(&beacon, 0, 7199, 0),
+        cnvrf_v3_beacon_seed(&beacon, 1, 7199, 0)
+    );
+    let beacon_other = [0xA5u8; 48];
+    let mut differs = false;
+    for round in 0..32u32 {
+        let a = cnvrf_v3_beacon_draw_committee(&vs, 7200, round, 8, &beacon, 1);
+        let b = cnvrf_v3_beacon_draw_committee(&vs, 7200, round, 8, &beacon_other, 1);
+        if a != b {
+            differs = true;
+            break;
+        }
+    }
+    assert!(differs, "different beacon outputs must alter committee");
+
+    // Stake-weighting: 90% whale wins >= 80% of single-seat draws.
+    let mut weighted_vs = ValidatorSet::new();
+    let whale = [0x01; 32];
+    weighted_vs.add(whale, 900);
+    weighted_vs.add([0x02; 32], 33);
+    weighted_vs.add([0x03; 32], 33);
+    weighted_vs.add([0x04; 32], 34);
+
+    let mut whale_wins = 0usize;
+    for h in 1..=100u64 {
+        let comm = cnvrf_v3_beacon_draw_committee(&weighted_vs, h, 0, 1, &beacon, 0);
+        assert_eq!(comm.len(), 1);
+        if comm[0] == whale {
+            whale_wins += 1;
+        }
+    }
+    assert!(
+        whale_wins >= 80,
+        "90% stake validator should win >= 80/100 draws, got {whale_wins}"
+    );
+
+    // Edge cases: empty set, zero committee_size, oversize committee_size.
+    let empty_vs = ValidatorSet::new();
+    assert!(cnvrf_v3_beacon_draw_committee(&empty_vs, 7200, 0, 8, &beacon, 1).is_empty());
+    assert!(cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 0, &beacon, 1).is_empty());
+    assert_eq!(
+        cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 100, &beacon, 1).len(),
+        16
+    );
+}
+
+/// CN-VRF v3 proposer selection: pre-activation delegates byte-identically to
+/// `proposer_for`; active mode fails closed on missing/wrong-epoch beacon and
+/// uses GCD-normalized stake-weighted `cnvrf_v3_proposer_seed`.
+#[test]
+fn test_proposer_for_with_beacon_pre_and_post_activation() {
+    let mut vs = ValidatorSet::new();
+    let id_a = [0xD2; 32];
+    let mut id_b = [0xD2; 32];
+    id_b[0] = 0x02;
+    let mut id_c = [0xD2; 32];
+    id_c[0] = 0x03;
+    // Large GCD-scalable powers (10^12, 2*10^12, 10^12).
+    vs.add(id_a, 1_000_000_000_000);
+    vs.add(id_b, 2_000_000_000_000);
+    vs.add(id_c, 1_000_000_000_000);
+
+    let beacon_e0 = EpochBeacon {
+        epoch: 0,
+        output: [0x3Cu8; 48],
+    };
+    let beacon_e1 = EpochBeacon {
+        epoch: 1,
+        output: [0xC3u8; 48],
+    };
+
+    // Pre-activation: delegates byte-identically to `proposer_for`.
+    for h in [0u64, 7199, 7200] {
+        for r in 0..5u32 {
+            let legacy = vs.proposer_for(h, r);
+            assert_eq!(vs.proposer_for_with_beacon(h, r, None), legacy);
+            assert_eq!(vs.proposer_for_with_beacon(h, r, Some(&beacon_e0)), legacy);
+            assert_eq!(vs.proposer_for_with_beacon(h, r, Some(&beacon_e1)), legacy);
+        }
+    }
+
+    // Domain separation between committee draw seed and proposer seed.
+    assert_ne!(
+        cnvrf_v3_beacon_seed(&beacon_e1.output, 1, 7200, 0),
+        cnvrf_v3_proposer_seed(&beacon_e1.output, 1, 7200, 0)
+    );
+
+    // Active at sentinel height `u64::MAX` directly via `proposer_for_with_beacon`.
+    let max_epoch = cnvrf_v3_epoch_of_height(u64::MAX);
+    let beacon_max = EpochBeacon {
+        epoch: max_epoch,
+        output: [0x7Eu8; 48],
+    };
+    assert_eq!(vs.proposer_for_with_beacon(u64::MAX, 0, None), None);
+    assert_eq!(
+        vs.proposer_for_with_beacon(u64::MAX, 0, Some(&beacon_e0)),
+        None
+    );
+    assert!(vs
+        .proposer_for_with_beacon(u64::MAX, 0, Some(&beacon_max))
+        .is_some());
+
+    // Simulated active at reachable epoch-boundary heights 7199 (epoch 0) and 7200 (epoch 1).
+    assert_eq!(
+        vs.proposer_for_with_beacon_active(7199, 0, None, true),
+        None
+    );
+    assert_eq!(
+        vs.proposer_for_with_beacon_active(7199, 0, Some(&beacon_e1), true),
+        None
+    );
+    assert_eq!(
+        vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e0), true),
+        None
+    );
+
+    let p1 = vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true);
+    let p2 = vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true);
+    assert!(p1.is_some());
+    assert_eq!(p1, p2, "proposer_for_with_beacon must be deterministic");
+
+    // Different beacon output alters proposer schedule across rounds.
+    let beacon_e1_alt = EpochBeacon {
+        epoch: 1,
+        output: [0x99u8; 48],
+    };
+    let mut differs = false;
+    for r in 0..32u32 {
+        if vs.proposer_for_with_beacon_active(7200, r, Some(&beacon_e1), true)
+            != vs.proposer_for_with_beacon_active(7200, r, Some(&beacon_e1_alt), true)
+        {
+            differs = true;
+            break;
+        }
+    }
+    assert!(differs, "different epoch beacons must alter proposers");
+
+    // Stake-weighting & GCD normalization when active: 90% whale wins >= 80% of 100 trials.
+    let mut whale_vs = ValidatorSet::new();
+    let whale = [0xD3; 32];
+    let mut minor_a = [0xD3; 32];
+    minor_a[0] = 1;
+    let mut minor_b = [0xD3; 32];
+    minor_b[0] = 2;
+    whale_vs.add(whale, 900_000_000_000);
+    whale_vs.add(minor_a, 50_000_000_000);
+    whale_vs.add(minor_b, 50_000_000_000);
+
+    let mut wins = 0usize;
+    for h in 0..100u64 {
+        if whale_vs.proposer_for_with_beacon_active(h, 0, Some(&beacon_e0), true) == Some(whale) {
+            wins += 1;
+        }
+    }
+    assert!(
+        wins >= 80,
+        "90% stake validator should be elected proposer >= 80/100 times, got {wins}"
+    );
+
+    // Empty validator set fails closed.
+    let empty_vs = ValidatorSet::new();
+    assert_eq!(
+        empty_vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true),
+        None
+    );
+}
+
+/// CN-VRF v3 `QuorumCertificate::verify_with_beacon`, `qc_signed_power_with_beacon`,
+/// and `qc_meets_quorum_with_beacon` across pre-activation and simulated active modes.
+#[test]
+fn test_qc_verify_with_beacon_pre_and_post_activation() {
+    const N: usize = 150;
+    const POWER: u64 = 10;
+    let mut vs = ValidatorSet::new();
+    let mut fks = Vec::with_capacity(N);
+
+    // Fresh 0xD5 ID domain so global PQ-key registry stays isolated from parallel tests.
+    for i in 0..N {
+        let mut id = [0xD5; 32];
+        id[0] = (i & 0xFF) as u8;
+        id[1] = ((i >> 8) & 0xFF) as u8;
+        let fk = make_sample_falcon512(0x20u8.wrapping_add((i % 200) as u8));
+        register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key().to_vec(),
+        );
+        vs.add(id, POWER);
+        fks.push((id, fk));
+    }
+
+    let height: Height = 7200; // Epoch 1 under 7,200-block CN-VRF v3 epochs
+    let round: Round = 0;
+    let kind = VoteKind::Precommit;
+    let block_hash = Some([0x6Du8; 32]);
+    let parent = [0x9Au8; 32];
+    let committee_size = micro_committee_size(vs.len());
+    assert_eq!(committee_size, MICRO_COMMITTEE_MAX_SIZE);
+
+    let beacon_e1 = EpochBeacon {
+        epoch: 1,
+        output: [0xE4u8; 48],
+    };
+    let beacon_e0 = EpochBeacon {
+        epoch: 0,
+        output: [0xE4u8; 48],
+    };
+    let beacon_e1_other = EpochBeacon {
+        epoch: 1,
+        output: [0x4Eu8; 48],
+    };
+
+    let parent_committee = derive_sortition_committee(&vs, height, round, committee_size, &parent);
+    let beacon_committee = cnvrf_v3_beacon_draw_committee(
+        &vs,
+        height,
+        round,
+        committee_size,
+        &beacon_e1.output,
+        beacon_e1.epoch,
+    );
+    assert_eq!(parent_committee.len(), committee_size as usize);
+    assert_eq!(beacon_committee.len(), committee_size as usize);
+    assert_ne!(
+        parent_committee, beacon_committee,
+        "128-of-150 committees from parent vs CN-VRF v3 beacon must differ"
+    );
+
+    let msg = vote_sign_bytes(height, round, kind, &block_hash);
+    let build_qc = |committee: &[ValidatorId]| -> QuorumCertificate {
+        let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+        let mut sigs = Vec::with_capacity(committee.len());
+        for (i, val_id) in committee.iter().enumerate() {
+            let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+            sigs.push(fk.sign(&msg));
+            bitmask[i / 8] |= 1 << (i % 8);
+        }
+        let uqc = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            height,
+            round,
+            committee_size,
+            bitmask,
+            sigs,
+            parent,
+        );
+        QuorumCertificate {
+            height,
+            round,
+            kind,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+        }
+    };
+
+    let parent_qc = build_qc(&parent_committee);
+    let beacon_qc = build_qc(&beacon_committee);
+
+    // 1. Pre-activation (`CNVRF_V3_ACTIVATION_HEIGHT == u64::MAX`):
+    //    `verify_with_beacon` behaves byte-identically to `verify`.
+    assert!(parent_qc.verify(&vs));
+    assert!(parent_qc.verify_with_beacon(&vs, None));
+    assert!(parent_qc.verify_with_beacon(&vs, Some(&beacon_e1)));
+    assert_eq!(
+        vs.qc_signed_power_with_beacon(&parent_qc, None),
+        vs.qc_signed_power(&parent_qc)
+    );
+    assert!(vs.qc_meets_quorum_with_beacon(&parent_qc, None));
+    assert!(!beacon_qc.verify_with_beacon(&vs, Some(&beacon_e1)));
+
+    // 2. Active CN-VRF v3 mode (simulated at height 7200):
+    //    `beacon_qc` verifies ONLY with the matching epoch-1 beacon, still binds to parent.
+    assert!(beacon_qc.binds_to_parent(&parent));
+    assert!(!beacon_qc.binds_to_parent(&[0x11; 32]));
+    assert!(beacon_qc.verify_with_beacon_active(&vs, Some(&beacon_e1), true));
+    assert_eq!(
+        vs.qc_signed_power_with_beacon_active(&beacon_qc, Some(&beacon_e1), true),
+        128 * POWER
+    );
+    assert!(vs.qc_meets_quorum_with_beacon_active(&beacon_qc, Some(&beacon_e1), true));
+
+    // Fail-closed on missing beacon, wrong epoch, or mismatched beacon output.
+    assert!(!beacon_qc.verify_with_beacon_active(&vs, None, true));
+    assert_eq!(
+        vs.qc_signed_power_with_beacon_active(&beacon_qc, None, true),
+        0
+    );
+    assert!(!vs.qc_meets_quorum_with_beacon_active(&beacon_qc, None, true));
+
+    assert!(!beacon_qc.verify_with_beacon_active(&vs, Some(&beacon_e0), true));
+    assert_eq!(
+        vs.qc_signed_power_with_beacon_active(&beacon_qc, Some(&beacon_e0), true),
+        0
+    );
+    assert!(!vs.qc_meets_quorum_with_beacon_active(&beacon_qc, Some(&beacon_e0), true));
+
+    assert!(!beacon_qc.verify_with_beacon_active(&vs, Some(&beacon_e1_other), true));
+
+    // Parent-hash-drawn QC cannot verify under active CN-VRF v3 beacon sortition.
+    assert!(!parent_qc.verify_with_beacon_active(&vs, Some(&beacon_e1), true));
+}

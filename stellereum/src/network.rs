@@ -453,8 +453,14 @@ pub fn peer_head_is_ahead(our_height: u64, peer_height: u64) -> bool {
 /// publisher yet because raw PQ pins are auxiliary to the state root (the
 /// accounts snapshot already commits to every pin's hash). Pinned by
 /// `tests/observer_and_recovery_tests.rs`.
-pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] =
-    &["domains", "session", "bridge", "zkml", "cross_shard"];
+pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
+    "domains",
+    "session",
+    "bridge",
+    "zkml",
+    "cross_shard",
+    "cnvrf_v3",
+];
 
 /// Process-wide bound on concurrent DHT fetches (storm guard 2026-10-13).
 ///
@@ -3997,6 +4003,7 @@ mod retention_tests {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         let writes = plan_block_body_publish(&epoch, &block).expect("plan");
         assert_eq!(writes.len(), 1);

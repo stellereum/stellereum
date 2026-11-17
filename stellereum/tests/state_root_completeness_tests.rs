@@ -826,3 +826,184 @@ async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbag
         "refused restore must not move the root"
     );
 }
+
+#[tokio::test]
+async fn cnvrf_v3_state_moves_the_root_and_empty_preserves_genesis() {
+    use stellereum::cn_vrf::{CnVrfV3Chain, EPOCH_LEN};
+    use stellereum::sharding::{Block, CnVrfV3BlockPayload, EpochVdfBeacon, MASTERCHAIN_SHARD};
+    use stellereum::staking::{CnVrfAbortCounter, CNVRF_ABORT_THRESHOLD};
+    use stellereum::state_engine::CnVrfV3EngineSnapshot;
+
+    let e1 = InMemoryStateEngine::new();
+    let e2 = InMemoryStateEngine::new();
+    let genesis_root = e1.get_state_root().await;
+    assert_eq!(
+        e2.get_state_root().await,
+        genesis_root,
+        "empty CN-VRF v3 state must leave genesis root unchanged"
+    );
+
+    // Restoring an empty CnVrfV3EngineSnapshot leaves the genesis root untouched.
+    e2.restore_cnvrf_v3_snapshot(&CnVrfV3EngineSnapshot::default())
+        .await;
+    assert_eq!(e2.get_state_root().await, genesis_root);
+
+    // 1. Mutating cnvrf_v3 moves the root.
+    let val_kp = FalconKeypair::generate_from_seed(91);
+    let val_id = funded_key(91).verifying_key().to_bytes();
+    let chain = CnVrfV3Chain::generate(e1.chain_id, &val_id, 1, &[0x7Au8; 48]);
+    let carrier = chain.commit_carrier(&val_kp);
+    {
+        let mut st = e1.cnvrf_v3_write().await;
+        st.admit_commit(&carrier, 0, e1.chain_id, val_kp.public_key())
+            .expect("valid commit");
+    }
+    let after_commit = e1.get_state_root().await;
+    assert_ne!(
+        after_commit, genesis_root,
+        "admitting a CN-VRF v3 commit must move the state root"
+    );
+
+    // Reveal mutates head, last_step, rolling_mix, and epoch_rolling_mixes -> moves the root.
+    {
+        let rev = chain.reveal_for_slot(0).expect("slot 0 reveal");
+        let mut st = e1.cnvrf_v3_write().await;
+        st.apply_slot_reveal(e1.chain_id, &val_id, EPOCH_LEN, Some(&rev));
+    }
+    let after_reveal = e1.get_state_root().await;
+    assert_ne!(
+        after_reveal, after_commit,
+        "applying a CN-VRF v3 reveal must move the state root"
+    );
+
+    // 2. Mutating cnvrf_abort moves the root.
+    {
+        let mut abort = e1.cnvrf_abort_write().await;
+        abort.counters.insert(
+            val_id,
+            CnVrfAbortCounter {
+                misses: 1,
+                recovery_streak: 3,
+            },
+        );
+    }
+    let after_abort = e1.get_state_root().await;
+    assert_ne!(
+        after_abort, after_reveal,
+        "mutating CN-VRF v3 abort counters must move the state root"
+    );
+
+    // 3. Mutating epoch_vdf_beacons moves the root.
+    {
+        let mut beacons = e1.epoch_vdf_beacons_write().await;
+        beacons.insert(1, [0x42u8; 48]);
+    }
+    let after_beacon = e1.get_state_root().await;
+    assert_ne!(
+        after_beacon, after_abort,
+        "recording a finalized epoch VDF beacon must move the state root"
+    );
+
+    // Restoring empty snapshot brings the root back to exact genesis root.
+    e1.restore_cnvrf_v3_snapshot(&CnVrfV3EngineSnapshot::default())
+        .await;
+    assert_eq!(
+        e1.get_state_root().await,
+        genesis_root,
+        "emptying CN-VRF v3 state must restore the exact genesis root"
+    );
+
+    // 4. End-to-end apply_block_transition wiring (with per-engine test activation override).
+    let a = InMemoryStateEngine::new();
+    let b = InMemoryStateEngine::new();
+    a.set_cnvrf_v3_activation_height_for_tests(0);
+    b.set_cnvrf_v3_activation_height_for_tests(0);
+
+    for eng in [&a, &b] {
+        eng.credit_native(&val_id, 5_000_000_000_000)
+            .await
+            .expect("credit");
+        let mut ledger = eng.staking_write().await;
+        ledger.bond(val_id, 2_000_000_000_000, 0).unwrap();
+        ledger
+            .register_pq_key(val_id, PqScheme::Falcon512, val_kp.public_key.clone())
+            .unwrap();
+    }
+
+    // Block at height 0 (epoch 0): admit commit for epoch 1 + verify EpochVdfBeacon.
+    let raw_seed = [0x19u8; 48];
+    let proof =
+        stellereum::minroot_vdf::eval(&raw_seed, stellereum::minroot_vdf::TEST_VDF_STEPS, 4);
+    let expected_beacon =
+        stellereum::minroot_vdf::verify(&raw_seed, stellereum::minroot_vdf::TEST_VDF_STEPS, &proof)
+            .expect("valid vdf proof");
+
+    let blk0 = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 0,
+        proposer: val_id,
+        cnvrf_v3: Some(CnVrfV3BlockPayload {
+            reveal: None,
+            commits: vec![carrier.clone()],
+            epoch_vdf: Some(EpochVdfBeacon {
+                epoch: 1,
+                raw_seed,
+                proof,
+            }),
+        }),
+        ..Default::default()
+    };
+    a.apply_block_transition(&blk0, 0).await;
+    b.apply_block_transition(&blk0, 0).await;
+
+    assert_eq!(
+        a.epoch_vdf_beacons_read().await.get(&1).copied(),
+        Some(expected_beacon)
+    );
+    assert!(a.cnvrf_v3_read().await.get_record(&val_id, 1).is_some());
+    assert_eq!(a.get_state_root().await, b.get_state_root().await);
+
+    // Epoch 1 slot 0: proposer reveals -> rolling mix updated.
+    let rev0 = chain.reveal_for_slot(0).expect("slot 0");
+    let blk_reveal = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: EPOCH_LEN,
+        proposer: val_id,
+        cnvrf_v3: Some(CnVrfV3BlockPayload {
+            reveal: Some(rev0),
+            commits: vec![],
+            epoch_vdf: None,
+        }),
+        ..Default::default()
+    };
+    a.apply_block_transition(&blk_reveal, 0).await;
+    b.apply_block_transition(&blk_reveal, 0).await;
+    assert_ne!(a.cnvrf_v3_read().await.rolling_mix_for_epoch(1), [0u8; 48]);
+    assert_eq!(a.get_state_root().await, b.get_state_root().await);
+
+    // Epoch 1 slots 1..=CNVRF_ABORT_THRESHOLD: missing reveals trigger abort slash + jail.
+    for s in 1..=CNVRF_ABORT_THRESHOLD {
+        let blk_miss = Block {
+            shard_id: MASTERCHAIN_SHARD,
+            height: EPOCH_LEN + s as u64,
+            proposer: val_id,
+            cnvrf_v3: None,
+            ..Default::default()
+        };
+        let out_a = a.apply_block_transition(&blk_miss, 0).await;
+        let out_b = b.apply_block_transition(&blk_miss, 0).await;
+        assert_eq!(out_a.slashed, out_b.slashed);
+        if s == CNVRF_ABORT_THRESHOLD {
+            assert!(
+                out_a.slashed > 0,
+                "reaching abort threshold must slash validator"
+            );
+        }
+    }
+    assert!(
+        a.staking_read().await.jail.contains_key(&val_id),
+        "validator must be jailed after CN-VRF v3 abort threshold"
+    );
+    assert_eq!(a.get_state_root().await, b.get_state_root().await);
+    assert_eq!(a.cnvrf_v3_snapshot().await, b.cnvrf_v3_snapshot().await);
+}

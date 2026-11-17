@@ -134,10 +134,12 @@ pub enum Domain {
     CrossShard,
     Xpc,
     Zkml,
+    CnVrf,
 }
 
 impl Domain {
-    /// Every domain, in digest order.
+    /// Every core domain, in digest order (the 13-element array used by
+    /// `assemble_cached_digest` / `assemble_from_cache`).
     pub const ALL: [Domain; 13] = [
         Domain::Tokens,
         Domain::Staking,
@@ -157,6 +159,25 @@ impl Domain {
     #[inline(always)]
     pub fn index(self) -> usize {
         self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Domain::Tokens => "tokens",
+            Domain::Staking => "staking",
+            Domain::Pmm => "pmm",
+            Domain::Contracts => "contracts",
+            Domain::Escrow => "escrow",
+            Domain::Governance => "governance",
+            Domain::Oracle => "oracle",
+            Domain::SessionKeys => "session_keys",
+            Domain::Books => "books",
+            Domain::Bridge => "bridge",
+            Domain::CrossShard => "cross_shard",
+            Domain::Xpc => "xpc",
+            Domain::Zkml => "zkml",
+            Domain::CnVrf => "cnvrf",
+        }
     }
 }
 
@@ -186,6 +207,7 @@ pub struct DomainGenerations {
     pub cross_shard: std::sync::atomic::AtomicU64,
     pub xpc: std::sync::atomic::AtomicU64,
     pub zkml: std::sync::atomic::AtomicU64,
+    pub cnvrf: std::sync::atomic::AtomicU64,
 }
 
 impl DomainGenerations {
@@ -213,6 +235,9 @@ impl DomainGenerations {
             dst.counter(d)
                 .store(v, std::sync::atomic::Ordering::Release);
         }
+        let v = self.load(Domain::CnVrf);
+        dst.counter(Domain::CnVrf)
+            .store(v, std::sync::atomic::Ordering::Release);
     }
 
     fn counter(&self, domain: Domain) -> &std::sync::atomic::AtomicU64 {
@@ -230,6 +255,7 @@ impl DomainGenerations {
             Domain::CrossShard => &self.cross_shard,
             Domain::Xpc => &self.xpc,
             Domain::Zkml => &self.zkml,
+            Domain::CnVrf => &self.cnvrf,
         }
     }
 
@@ -246,6 +272,7 @@ impl DomainGenerations {
         for d in Domain::ALL {
             self.bump(d);
         }
+        self.bump(Domain::CnVrf);
     }
 }
 
@@ -362,6 +389,7 @@ struct DomainSlot {
 #[derive(Debug, Default)]
 pub struct DomainCache {
     slots: [Option<DomainSlot>; 13],
+    cnvrf_slot: Option<DomainSlot>,
     /// Per-contract ABI JSON cache (feeds the contracts domain).
     pub abi: AbiJsonCache,
     /// Domain-level hits (reused preimage) since creation / last reset.
@@ -371,23 +399,54 @@ pub struct DomainCache {
 }
 
 impl DomainCache {
+    #[inline]
+    fn slot_ref(&self, domain: Domain) -> Option<&DomainSlot> {
+        match domain {
+            Domain::CnVrf => self.cnvrf_slot.as_ref(),
+            other => self.slots[other.index()].as_ref(),
+        }
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, domain: Domain) -> &mut Option<DomainSlot> {
+        match domain {
+            Domain::CnVrf => &mut self.cnvrf_slot,
+            other => &mut self.slots[other.index()],
+        }
+    }
+
     /// Fetch a cached preimage when its generation still matches.
     pub fn get(&mut self, domain: Domain, generation: u64) -> Option<Vec<u8>> {
-        match &self.slots[domain.index()] {
-            Some(slot) if slot.generation == generation => {
-                self.hits += 1;
-                Some(slot.bytes.clone())
-            }
-            _ => {
-                self.misses += 1;
-                None
-            }
+        let hit = match self.slot_ref(domain) {
+            Some(slot) if slot.generation == generation => Some(slot.bytes.clone()),
+            _ => None,
+        };
+        if hit.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
         }
+        hit
     }
 
     /// Store a freshly built preimage under its generation.
     pub fn put(&mut self, domain: Domain, generation: u64, bytes: Vec<u8>) {
-        self.slots[domain.index()] = Some(DomainSlot { generation, bytes });
+        *self.slot_mut(domain) = Some(DomainSlot { generation, bytes });
+    }
+
+    /// Fetch the cached CN-VRF v3 preimage without altering the 13-domain
+    /// benchmark/regression hit/miss counters.
+    pub(crate) fn get_cnvrf_silent(&self, generation: u64) -> Option<Vec<u8>> {
+        match &self.cnvrf_slot {
+            Some(slot) if slot.generation == generation => Some(slot.bytes.clone()),
+            _ => None,
+        }
+    }
+
+    /// Store the CN-VRF v3 preimage under its generation without altering the
+    /// 13-domain hit/miss counters.
+    pub(crate) fn put_cnvrf_silent(&mut self, generation: u64, bytes: Vec<u8>) {
+        self.cnvrf_slot = Some(DomainSlot { generation, bytes });
     }
 
     /// Borrow a cached preimage when its generation still matches.
@@ -399,16 +458,14 @@ impl DomainCache {
     /// total at the tempo-probe fixture). Miss semantics match `get` exactly.
     pub fn get_ref(&mut self, domain: Domain, generation: u64) -> Option<&[u8]> {
         let hit = matches!(
-            &self.slots[domain.index()],
+            self.slot_ref(domain),
             Some(slot) if slot.generation == generation
         );
         if hit {
             self.hits += 1;
             // Re-borrow after the counter bump: the slot is still present
             // (only `&mut self` aliasing was in play, no mutation happened).
-            self.slots[domain.index()]
-                .as_ref()
-                .map(|s| s.bytes.as_slice())
+            self.slot_ref(domain).map(|s| s.bytes.as_slice())
         } else {
             self.misses += 1;
             None
@@ -418,7 +475,7 @@ impl DomainCache {
     /// Invalidate one domain (tests; the live path invalidates implicitly
     /// because the generation counters move on mutation).
     pub fn invalidate(&mut self, domain: Domain) {
-        self.slots[domain.index()] = None;
+        *self.slot_mut(domain) = None;
     }
 
     /// Hit rate over domain slots, `None` when nothing was looked up yet.
@@ -434,7 +491,7 @@ impl DomainCache {
     /// Number of domains with a stored preimage (diagnostics / fork-isolation
     /// tests: a deep copy must start at zero).
     pub fn slots_filled(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
+        self.slots.iter().filter(|s| s.is_some()).count() + usize::from(self.cnvrf_slot.is_some())
     }
 
     /// Reset counters (tests / diagnostics; entries are kept).
@@ -1827,6 +1884,109 @@ pub fn zkml_preimage(reg: &crate::zkml::ZkMlModelRegistry) -> Vec<u8> {
     })
 }
 
+/// CN-VRF v3 domain commitment writer.
+///
+/// CONDITIONAL DOMAIN: if `v3_state` has no commits and no rolling mixes (and
+/// zeroed `rolling_mix`/`rolling_mix_epoch`), `abort_state.counters` is empty,
+/// and `epoch_beacons` is empty, this emits ZERO bytes so pre-activation genesis
+/// roots and `COMMITMENT_VERSION` remain 100% unchanged.
+pub fn write_cnvrf_v3_domain<S: PreimageSink>(
+    h: &mut S,
+    v3_state: &crate::cn_vrf::CnVrfV3State,
+    abort_state: &crate::staking::CnVrfAbortState,
+    epoch_beacons: &std::collections::BTreeMap<u64, [u8; 48]>,
+) {
+    if v3_state.records.is_empty()
+        && v3_state.epoch_rolling_mixes.is_empty()
+        && v3_state.rolling_mix == [0u8; crate::cn_vrf::V3_LINK_LEN]
+        && v3_state.rolling_mix_epoch == 0
+        && abort_state.counters.is_empty()
+        && epoch_beacons.is_empty()
+    {
+        return;
+    }
+
+    put_bytes(h, b"cnvrf_v3_domain", b"CNVRF_V3_STATE_V1");
+
+    // Active rolling mix + epoch.
+    put_u64(h, b"cnvrf_rolling_mix_epoch", v3_state.rolling_mix_epoch);
+    put_bytes(h, b"cnvrf_rolling_mix", &v3_state.rolling_mix);
+
+    // Sorted commits `(epoch_n, validator_id) -> CnVrfV3Record` (all fields).
+    let mut records: Vec<(u64, &[u8; 32], &crate::cn_vrf::CnVrfV3Record)> = v3_state
+        .records
+        .iter()
+        .map(|((vid, epoch_n), rec)| (*epoch_n, vid, rec))
+        .collect();
+    records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    put_u64(h, b"cnvrf_records_len", records.len() as u64);
+    for (epoch_n, vid, rec) in records {
+        put_u64(h, b"cnvrf_rec_epoch", epoch_n);
+        put_addr(h, b"cnvrf_rec_validator", vid);
+        put_addr(h, b"cnvrf_rec_anchor_validator", &rec.anchor_validator_id);
+        put_u64(h, b"cnvrf_rec_anchors_len", rec.anchors.len() as u64);
+        for anchor in &rec.anchors {
+            put_bytes(h, b"cnvrf_rec_anchor", anchor);
+        }
+        put_bytes(h, b"cnvrf_rec_head", &rec.head);
+        put_u64(h, b"cnvrf_rec_last_step", rec.last_step);
+        put_u64(h, b"cnvrf_rec_commit_height", rec.commit_height);
+    }
+
+    // Sorted rolling mixes `BTreeMap<u64, Vec<u8>>`.
+    put_u64(
+        h,
+        b"cnvrf_rolling_mixes_len",
+        v3_state.epoch_rolling_mixes.len() as u64,
+    );
+    for (epoch_n, mix) in &v3_state.epoch_rolling_mixes {
+        put_u64(h, b"cnvrf_mix_epoch", *epoch_n);
+        put_bytes(h, b"cnvrf_mix_bytes", mix);
+    }
+
+    // Sorted abort counters `(validator_id -> (misses, recovery_streak))`.
+    put_u64(
+        h,
+        b"cnvrf_abort_counters_len",
+        abort_state.counters.len() as u64,
+    );
+    for (vid, ctr) in &abort_state.counters {
+        put_addr(h, b"cnvrf_abort_validator", vid);
+        put_u64(h, b"cnvrf_abort_misses", ctr.misses as u64);
+        put_u64(
+            h,
+            b"cnvrf_abort_recovery_streak",
+            ctr.recovery_streak as u64,
+        );
+    }
+
+    // Sorted finalized epoch beacons `(epoch_n -> [u8; 48])`.
+    put_u64(h, b"cnvrf_beacons_len", epoch_beacons.len() as u64);
+    for (epoch_n, beacon) in epoch_beacons {
+        put_u64(h, b"cnvrf_beacon_epoch", *epoch_n);
+        put_bytes(h, b"cnvrf_beacon_bytes", beacon);
+    }
+}
+
+/// CN-VRF v3 domain preimage (zero bytes while empty).
+pub fn cnvrf_v3_preimage(snap: &crate::state_engine::CnVrfV3EngineSnapshot) -> Vec<u8> {
+    capture(|h| {
+        write_cnvrf_v3_domain(h, &snap.v3_state, &snap.abort_state, &snap.epoch_beacons);
+    })
+}
+
+/// Standalone digest of the CN-VRF v3 domain.
+pub fn cnvrf_v3_digest(snap: &crate::state_engine::CnVrfV3EngineSnapshot) -> [u8; 32] {
+    let mut h = Sha256::new();
+    write_cnvrf_v3_domain(
+        &mut h,
+        &snap.v3_state,
+        &snap.abort_state,
+        &snap.epoch_beacons,
+    );
+    h.finalize().into()
+}
+
 /// Assemble the full §2-aware commitment digest from per-domain preimage
 /// bytes (digest order = [`Domain::ALL`]).
 ///
@@ -1840,6 +2000,19 @@ pub fn assemble_cached_digest(domains: [&[u8]; 13]) -> [u8; 32] {
     for bytes in domains {
         h.update(bytes);
     }
+    h.finalize().into()
+}
+
+/// Cached commitment assembly including the conditional CN-VRF v3 domain bytes.
+///
+/// Byte-identical to [`assemble_cached_digest`] when `cnvrf` is empty.
+pub fn assemble_cached_digest_with_cnvrf(domains: [&[u8]; 13], cnvrf: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
+    for bytes in domains {
+        h.update(bytes);
+    }
+    h.update(cnvrf);
     h.finalize().into()
 }
 
@@ -1893,6 +2066,27 @@ pub fn commitment_digest_with_zkml(
     commitment_digest_into(&mut h, s);
     zkml_models_digest_inner(&mut h, zkml_models);
     write_zkml_vks_domain(&mut h, zkml_models);
+    h.finalize().into()
+}
+
+/// Full live-path commitment digest: snapshot + zkML + conditional CN-VRF v3 domain.
+///
+/// Byte-identical to [`commitment_digest_with_zkml`] when CN-VRF v3 state is empty.
+pub fn commitment_digest_with_zkml_and_cnvrf(
+    s: &CommitmentSnapshot,
+    zkml_models: &crate::zkml::ZkMlModelRegistry,
+    cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    commitment_digest_into(&mut h, s);
+    zkml_models_digest_inner(&mut h, zkml_models);
+    write_zkml_vks_domain(&mut h, zkml_models);
+    write_cnvrf_v3_domain(
+        &mut h,
+        &cnvrf.v3_state,
+        &cnvrf.abort_state,
+        &cnvrf.epoch_beacons,
+    );
     h.finalize().into()
 }
 
@@ -3036,5 +3230,168 @@ mod tests {
             "every unchanged manifest must be an ABI hit"
         );
         assert_eq!(cache.abi.misses, 0);
+    }
+
+    #[test]
+    fn empty_cnvrf_v3_domain_contributes_zero_bytes_and_preserves_genesis() {
+        let s = empty_snapshot();
+        let zkml = crate::zkml::ZkMlModelRegistry::default();
+        let cnvrf = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        assert!(cnvrf_v3_preimage(&cnvrf).is_empty());
+        assert_eq!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &cnvrf),
+            EMPTY_SNAPSHOT_DIGEST,
+            "empty CN-VRF v3 domain must contribute zero bytes to the digest"
+        );
+        assert_eq!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &cnvrf),
+            commitment_digest_with_zkml(&s, &zkml)
+        );
+    }
+
+    #[test]
+    fn cnvrf_v3_domain_commits_all_fields_and_is_order_independent() {
+        let s = empty_snapshot();
+        let zkml = crate::zkml::ZkMlModelRegistry::default();
+        let base_cnvrf = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        let base_digest = commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &base_cnvrf);
+
+        // 1. Commit record moves digest.
+        let mut with_rec = base_cnvrf.clone();
+        with_rec.v3_state.records.insert(
+            ([0x11u8; 32], 2),
+            crate::cn_vrf::CnVrfV3Record {
+                anchors: [[0xAAu8; 48]; 16],
+                head: [0xBBu8; 48],
+                last_step: 5,
+                commit_height: 100,
+                anchor_validator_id: [0x22u8; 32],
+            },
+        );
+        let d_rec = commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &with_rec);
+        assert_ne!(d_rec, base_digest);
+
+        // Mutating each record field moves the digest.
+        let mut rec_anchor = with_rec.clone();
+        rec_anchor
+            .v3_state
+            .records
+            .get_mut(&([0x11u8; 32], 2))
+            .unwrap()
+            .anchor_validator_id[0] ^= 1;
+        assert_ne!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &rec_anchor),
+            d_rec
+        );
+
+        let mut rec_head = with_rec.clone();
+        rec_head
+            .v3_state
+            .records
+            .get_mut(&([0x11u8; 32], 2))
+            .unwrap()
+            .head[0] ^= 1;
+        assert_ne!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &rec_head),
+            d_rec
+        );
+
+        let mut rec_step = with_rec.clone();
+        rec_step
+            .v3_state
+            .records
+            .get_mut(&([0x11u8; 32], 2))
+            .unwrap()
+            .last_step += 1;
+        assert_ne!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &rec_step),
+            d_rec
+        );
+
+        // 2. Rolling mix archive moves digest.
+        let mut with_mix = with_rec.clone();
+        with_mix
+            .v3_state
+            .epoch_rolling_mixes
+            .insert(2, vec![0x33u8; 48]);
+        let d_mix = commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &with_mix);
+        assert_ne!(d_mix, d_rec);
+
+        // 3. Abort counter moves digest.
+        let mut with_abort = with_mix.clone();
+        with_abort.abort_state.counters.insert(
+            [0x44u8; 32],
+            crate::staking::CnVrfAbortCounter {
+                misses: 2,
+                recovery_streak: 7,
+            },
+        );
+        let d_abort = commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &with_abort);
+        assert_ne!(d_abort, d_mix);
+
+        // 4. Epoch beacon moves digest.
+        let mut with_beacon = with_abort.clone();
+        with_beacon.epoch_beacons.insert(2, [0x55u8; 48]);
+        let d_beacon = commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &with_beacon);
+        assert_ne!(d_beacon, d_abort);
+
+        // 5. Insertion order independence.
+        let mut a = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        let mut b = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        for i in 0..4u8 {
+            let vid = [i + 1; 32];
+            a.v3_state.records.insert(
+                (vid, i as u64),
+                crate::cn_vrf::CnVrfV3Record {
+                    anchors: [[i; 48]; 16],
+                    head: [i; 48],
+                    last_step: i as u64,
+                    commit_height: i as u64 * 10,
+                    anchor_validator_id: vid,
+                },
+            );
+            a.v3_state.epoch_rolling_mixes.insert(i as u64, vec![i; 48]);
+            a.abort_state.counters.insert(
+                vid,
+                crate::staking::CnVrfAbortCounter {
+                    misses: i as u32 + 1,
+                    recovery_streak: i as u32,
+                },
+            );
+            a.epoch_beacons.insert(i as u64, [i; 48]);
+        }
+        for i in (0..4u8).rev() {
+            let vid = [i + 1; 32];
+            b.v3_state.records.insert(
+                (vid, i as u64),
+                crate::cn_vrf::CnVrfV3Record {
+                    anchors: [[i; 48]; 16],
+                    head: [i; 48],
+                    last_step: i as u64,
+                    commit_height: i as u64 * 10,
+                    anchor_validator_id: vid,
+                },
+            );
+            b.v3_state.epoch_rolling_mixes.insert(i as u64, vec![i; 48]);
+            b.abort_state.counters.insert(
+                vid,
+                crate::staking::CnVrfAbortCounter {
+                    misses: i as u32 + 1,
+                    recovery_streak: i as u32,
+                },
+            );
+            b.epoch_beacons.insert(i as u64, [i; 48]);
+        }
+        assert_eq!(cnvrf_v3_digest(&a), cnvrf_v3_digest(&b));
+
+        // 6. Emptying returns to zero bytes.
+        let mut emptied = with_beacon;
+        emptied.v3_state = crate::cn_vrf::CnVrfV3State::default();
+        emptied.abort_state = crate::staking::CnVrfAbortState::default();
+        emptied.epoch_beacons.clear();
+        assert_eq!(
+            commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &emptied),
+            base_digest
+        );
     }
 }

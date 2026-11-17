@@ -1857,6 +1857,7 @@ async fn faucet_masterchain_drip_finalizes_on_shard_0() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 0");
@@ -1911,6 +1912,7 @@ async fn faucet_workchain_drip_finalizes_on_its_shard() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 1");
@@ -3822,6 +3824,7 @@ async fn archive_fixture() -> (Arc<RpcState>, ArchiveFixture) {
             order_merkle_root: order_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(&signer);
         b
@@ -4163,6 +4166,7 @@ async fn rpc_hydrates_from_the_durable_receipt_store() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     b.sign_block(&sk);
     let bh = b.compute_hash();
@@ -4220,6 +4224,7 @@ async fn rpc_accepts_stl57_address_and_archive_store_fallback() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     b.sign_block(&sk);
     let bh = b.compute_hash();
@@ -6968,6 +6973,7 @@ async fn a_runtime_invalidation_reaches_the_rpc_feed() {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(&key);
         b
@@ -7993,6 +7999,7 @@ fn gov_block(
         order_merkle_root: crate::mev::compute_order_merkle_root(&txs),
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     }
 }
 

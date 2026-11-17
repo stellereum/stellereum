@@ -369,6 +369,7 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -454,6 +455,7 @@ async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -516,6 +518,7 @@ async fn proof_carrying_ack_or_bounce_is_refused() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

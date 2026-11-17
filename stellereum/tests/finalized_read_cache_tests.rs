@@ -151,6 +151,7 @@ async fn publish_height(
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -250,6 +251,7 @@ async fn fixed_workload() -> Arc<RpcState> {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -360,6 +362,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -697,6 +700,7 @@ async fn finalized_read_cache_bounded_growth() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -785,6 +789,7 @@ async fn finalized_read_cache_before_after() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };

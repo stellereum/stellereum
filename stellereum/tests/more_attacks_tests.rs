@@ -41,6 +41,7 @@ fn consensus_duplicate_signatures_do_not_fake_quorum() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -80,6 +81,7 @@ fn consensus_block_signature_not_replayable_across_height() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

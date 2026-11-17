@@ -6,15 +6,20 @@
 use std::collections::BTreeMap;
 
 use stellereum::cn_vrf::{
-    cnvrf_beta, cnvrf_commit, cnvrf_commit_state, cnvrf_commit_verified_state, cnvrf_draw_absence,
-    cnvrf_expire_before, cnvrf_mark_revealed, cnvrf_open, cnvrf_verify, cnvrf_verify_carrier,
+    blake3_xof_48, cnvrf_beta, cnvrf_commit, cnvrf_commit_state, cnvrf_commit_verified_state,
+    cnvrf_draw_absence, cnvrf_expire_before, cnvrf_mark_revealed, cnvrf_open, cnvrf_v3_commit,
+    cnvrf_v3_verify_commit, cnvrf_v3_verify_reveal, cnvrf_verify, cnvrf_verify_carrier,
     cnvrf_verify_commit, cnvrf_verify_with_resolver, commit_hash, commit_preimage_bytes,
-    commit_sig_message_bytes, epoch_of_height, epoch_start_height, first_usable_epoch,
-    load_cnvrf_nonce_from_file, open_message_bytes, parse_cnvrf_nonce_hex,
-    save_cnvrf_nonce_to_file, shake256_32, shake256_xof, CnVrfError, CommitError, CommitOutcome,
-    BETA_PREIMAGE_LEN, CNVRF_BETA_DST, CNVRF_COMMIT_DST, CNVRF_COMMIT_SIG_DST, CNVRF_OPEN_DST,
-    CNVRF_PI_LEN, COMMIT_CARRIER_LEN, COMMIT_PREIMAGE_LEN, COMMIT_SIG_MESSAGE_LEN, EPOCH_LEN,
-    OPEN_MESSAGE_LEN, REVEAL_CARRIER_LEN,
+    commit_sig_message_bytes, compute_v3_anchors, derive_v3_epoch_secret, epoch_of_height,
+    epoch_raw_seed, epoch_start_height, first_usable_epoch, load_cnvrf_nonce_from_file,
+    load_cnvrf_v3_secret, open_message_bytes, parse_cnvrf_nonce_hex, save_cnvrf_nonce_to_file,
+    save_cnvrf_v3_secret, shake256_32, shake256_xof, verify_v3_secret_matches_commit, CnVrfError,
+    CnVrfV3Chain, CnVrfV3Record, CnVrfV3State, CommitCarrierV3, CommitError, CommitOutcome,
+    SlotRevealOutcome, BETA_PREIMAGE_LEN, CNVRF_BETA_DST, CNVRF_COMMIT_DST, CNVRF_COMMIT_SIG_DST,
+    CNVRF_OPEN_DST, CNVRF_PI_LEN, COMMIT_CARRIER_LEN, COMMIT_CARRIER_V3_LEN, COMMIT_PREIMAGE_LEN,
+    COMMIT_SIG_MESSAGE_LEN, DST_BETA_V3, DST_CHAIN_V3, DST_COMMIT_SIG_V3, DST_EPOCH_RAW_SEED_V3,
+    DST_V3_SEED_DERIVE, EPOCH_LEN, OPEN_MESSAGE_LEN, REVEAL_CARRIER_LEN,
+    V3_COMMIT_LOOKAHEAD_BLOCKS, V3_LINK_LEN, V3_SEGMENTS, V3_SEGMENT_LEN,
 };
 use stellereum::post_quantum::{FalconKeypair, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN};
 use stellereum::staking::{StakingLedger, DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS};
@@ -1300,6 +1305,534 @@ fn cnvrf_nonce_file_rejects_symlinks_and_loose_perms() {
             );
         }
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ===========================================================================
+// CN-VRF v3 tests — 16-segment BLAKE3-XOF-48 reverse hash-chain, state
+// machine, cutoff, key rotation migration, fallback seed, and enc2: custody
+// ===========================================================================
+
+const V3_SECRET: [u8; V3_LINK_LEN] = [0x5Au8; V3_LINK_LEN];
+
+#[test]
+fn cnvrf_v3_constants_dsts_and_blake3_xof_48() {
+    assert_eq!(V3_LINK_LEN, 48);
+    assert_eq!(V3_SEGMENTS, 16);
+    assert_eq!(V3_SEGMENT_LEN, 450);
+    assert_eq!(V3_SEGMENTS as u64 * V3_SEGMENT_LEN, EPOCH_LEN);
+    assert_eq!(V3_COMMIT_LOOKAHEAD_BLOCKS, 360);
+    assert_eq!(COMMIT_CARRIER_V3_LEN, 1474);
+
+    let dsts = [
+        DST_CHAIN_V3,
+        DST_COMMIT_SIG_V3,
+        DST_BETA_V3,
+        DST_EPOCH_RAW_SEED_V3,
+        DST_V3_SEED_DERIVE,
+    ];
+    for (i, d) in dsts.iter().enumerate() {
+        assert!(d.is_ascii(), "DST must be ASCII: {d}");
+        assert!(d.ends_with("_V3"), "DST must end with _V3: {d}");
+        for (j, other) in dsts.iter().enumerate() {
+            if i != j {
+                assert_ne!(d, other, "DSTs must be pairwise distinct");
+            }
+        }
+    }
+
+    // Zero-allocation blake3_xof_48 determinism + domain separation.
+    let h1 = blake3_xof_48(DST_CHAIN_V3, &[b"hello", b"world"]);
+    let h2 = blake3_xof_48(DST_CHAIN_V3, &[b"hello", b"world"]);
+    let h3 = blake3_xof_48(DST_BETA_V3, &[b"hello", b"world"]);
+    assert_eq!(h1, h2);
+    assert_ne!(h1, h3);
+
+    // Master secret derivation is domain-separated and binds chain/validator/epoch.
+    let s_a = derive_v3_epoch_secret(b"master-key", CHAIN_MAIN, &VID, EPOCH);
+    let s_b = derive_v3_epoch_secret(b"master-key", CHAIN_ALT, &VID, EPOCH);
+    let s_c = derive_v3_epoch_secret(b"master-key", CHAIN_MAIN, &VID, EPOCH + 1);
+    assert_ne!(&*s_a, &*s_b);
+    assert_ne!(&*s_a, &*s_c);
+}
+
+#[test]
+fn cnvrf_v3_chain_anchors_commit_verify_and_serde() {
+    let sk = key(0xD1);
+    let other_sk = key(0xD2);
+    let chain = CnVrfV3Chain::generate(CHAIN_MAIN, &VID, EPOCH, &V3_SECRET);
+
+    // O(1)-memory compute_v3_anchors matches full CnVrfV3Chain anchors.
+    let anchors_o1 = compute_v3_anchors(CHAIN_MAIN, &VID, EPOCH, &V3_SECRET);
+    assert_eq!(chain.anchors(), &anchors_o1);
+    assert_eq!(chain.root_anchor(), anchors_o1[0]);
+
+    // Slot 7199 reveals x_{7200} = s_{i,N}; slot 7200 is out of bounds.
+    assert_eq!(chain.reveal_for_slot(EPOCH_LEN - 1), Some(V3_SECRET));
+    assert_eq!(chain.reveal_for_slot(EPOCH_LEN), None);
+    assert_eq!(
+        chain.reveal_for_height(EPOCH * EPOCH_LEN + 42),
+        chain.reveal_for_slot(42)
+    );
+    assert_eq!(chain.reveal_for_height((EPOCH + 1) * EPOCH_LEN), None);
+
+    // CommitCarrierV3 via both cnvrf_v3_commit and CnVrfV3Chain::commit_carrier.
+    let carrier = cnvrf_v3_commit(&sk, CHAIN_MAIN, &VID, EPOCH, &V3_SECRET);
+    assert_eq!(carrier.anchors, anchors_o1);
+    assert_eq!(carrier.encoded_len(), COMMIT_CARRIER_V3_LEN);
+    assert_eq!(
+        cnvrf_v3_verify_commit(&carrier, CHAIN_MAIN, sk.pubkey()),
+        Ok(())
+    );
+
+    let carrier2 = chain.commit_carrier(&sk);
+    assert_eq!(carrier2.anchors, carrier.anchors);
+    assert_eq!(
+        cnvrf_v3_verify_commit(&carrier2, CHAIN_MAIN, sk.pubkey()),
+        Ok(())
+    );
+
+    // Serde round-trip (bincode + JSON) for CommitCarrierV3.
+    let bin = bincode::serialize(&carrier).expect("bincode serialize CommitCarrierV3");
+    let decoded_bin: CommitCarrierV3 =
+        bincode::deserialize(&bin).expect("bincode deserialize CommitCarrierV3");
+    assert_eq!(decoded_bin, carrier);
+
+    let json = serde_json::to_string(&carrier).expect("json serialize CommitCarrierV3");
+    let decoded_json: CommitCarrierV3 =
+        serde_json::from_str(&json).expect("json deserialize CommitCarrierV3");
+    assert_eq!(decoded_json, carrier);
+
+    // Fail-closed checks on cnvrf_v3_verify_commit.
+    assert_eq!(
+        cnvrf_v3_verify_commit(&carrier, CHAIN_ALT, sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature)
+    );
+    assert_eq!(
+        cnvrf_v3_verify_commit(&carrier, CHAIN_MAIN, other_sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature)
+    );
+    assert_eq!(
+        cnvrf_v3_verify_commit(
+            &carrier,
+            CHAIN_MAIN,
+            &sk.pubkey()[..FALCON512_PUBKEY_LEN - 1]
+        ),
+        Err(CnVrfError::InvalidPublicKeyLength)
+    );
+    let mut zero_sig = carrier.clone();
+    zero_sig.sig = [0u8; FALCON512_SIG_LEN];
+    assert_eq!(
+        cnvrf_v3_verify_commit(&zero_sig, CHAIN_MAIN, sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature)
+    );
+    let mut tampered_anchor = carrier.clone();
+    tampered_anchor.anchors[15][0] ^= 0x01;
+    assert_eq!(
+        cnvrf_v3_verify_commit(&tampered_anchor, CHAIN_MAIN, sk.pubkey()),
+        Err(CnVrfError::InvalidCommitSignature)
+    );
+}
+
+#[test]
+fn cnvrf_v3_slot_by_slot_skip_ahead_and_replay_rejection() {
+    let chain = CnVrfV3Chain::generate(CHAIN_MAIN, &VID, EPOCH, &V3_SECRET);
+    let mut rec = CnVrfV3Record {
+        anchors: *chain.anchors(),
+        head: chain.anchors()[0],
+        last_step: 0,
+        commit_height: 100,
+        anchor_validator_id: VID,
+    };
+
+    // Slot 0: 1 step against anchors[0].
+    let rev0 = chain.reveal_for_slot(0).unwrap();
+    assert_eq!(
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 0, &rev0),
+        Ok(1)
+    );
+    rec.head = rev0;
+    rec.last_step = 1;
+
+    // Replay of slot 0 fails.
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 0, &rev0).is_err());
+
+    // Skip ahead within segment 0 to slot 449: verifies against head (x_1) in 449 steps!
+    let rev449 = chain.reveal_for_slot(449).unwrap();
+    assert_eq!(
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 449, &rev449),
+        Ok(449)
+    );
+    rec.head = rev449;
+    rec.last_step = 450;
+
+    // Replay of any earlier slot (< 450) fails.
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 449, &rev449).is_err());
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 100, &rev449).is_err());
+
+    // Cross-segment skip: jump straight to slot 899 (last slot of segment 1):
+    // verifies against anchors[1] (x_450) in exactly 450 steps.
+    let rev899 = chain.reveal_for_slot(899).unwrap();
+    assert_eq!(
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 899, &rev899),
+        Ok(450)
+    );
+    rec.head = rev899;
+    rec.last_step = 900;
+
+    // Multi-segment jump straight to the very last slot 7199 (segment 15):
+    // verifies against anchors[15] (x_6750) in <= 450 steps (exact 450).
+    let rev7199 = chain.reveal_for_slot(7199).unwrap();
+    assert_eq!(
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 7199, &rev7199),
+        Ok(450)
+    );
+    rec.head = rev7199;
+    rec.last_step = 7200;
+
+    // Out-of-bounds slot 7200 rejected; wrong reveal rejected.
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 7200, &rev7199).is_err());
+    let mut bad_rev = chain.reveal_for_slot(1000).unwrap();
+    bad_rev[0] ^= 0xFF;
+    let fresh_rec = CnVrfV3Record {
+        anchors: *chain.anchors(),
+        head: chain.anchors()[0],
+        last_step: 0,
+        commit_height: 100,
+        anchor_validator_id: VID,
+    };
+    assert!(cnvrf_v3_verify_reveal(&fresh_rec, CHAIN_MAIN, &VID, EPOCH, 1000, &bad_rev).is_err());
+}
+
+#[test]
+fn cnvrf_v3_commit_cutoff_lookahead_and_state_machine() {
+    let sk = key(0xD3);
+    let mut state = CnVrfV3State::new();
+    let target_epoch = EPOCH; // epoch 5 starts at height 36_000
+    let h_freeze = target_epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS; // 35_640
+    let carrier = cnvrf_v3_commit(&sk, CHAIN_MAIN, &VID, target_epoch, &V3_SECRET);
+
+    // Wrong epoch (stale / current / too far ahead) refused.
+    assert_eq!(
+        state.admit_commit(&carrier, target_epoch * EPOCH_LEN, CHAIN_MAIN, sk.pubkey()),
+        Err(CnVrfError::CommitState(CommitError::StaleOrCurrent))
+    );
+    assert_eq!(
+        state.admit_commit(
+            &carrier,
+            (target_epoch - 2) * EPOCH_LEN,
+            CHAIN_MAIN,
+            sk.pubkey()
+        ),
+        Err(CnVrfError::CommitState(CommitError::TooFarAhead))
+    );
+
+    // At exactly H_freeze and inside the final 360 blocks: refused!
+    assert_eq!(
+        state.admit_commit(&carrier, h_freeze, CHAIN_MAIN, sk.pubkey()),
+        Err(CnVrfError::CommitState(CommitError::PastCommitCutoff))
+    );
+    assert_eq!(
+        state.admit_commit(
+            &carrier,
+            target_epoch * EPOCH_LEN - 1,
+            CHAIN_MAIN,
+            sk.pubkey()
+        ),
+        Err(CnVrfError::CommitState(CommitError::PastCommitCutoff))
+    );
+
+    // At H_freeze - 1: accepted!
+    assert_eq!(
+        state.admit_commit(&carrier, h_freeze - 1, CHAIN_MAIN, sk.pubkey()),
+        Ok(CommitOutcome::Accepted)
+    );
+    // First-committed-wins duplicate returns IgnoredDuplicate without overwriting commit_height.
+    let carrier_dup = cnvrf_v3_commit(&sk, CHAIN_MAIN, &VID, target_epoch, &[0x99u8; 48]);
+    assert_eq!(
+        state.admit_commit(&carrier_dup, h_freeze - 2, CHAIN_MAIN, sk.pubkey()),
+        Ok(CommitOutcome::IgnoredDuplicate)
+    );
+    assert_eq!(
+        state.get_record(&VID, target_epoch).unwrap().commit_height,
+        h_freeze - 1
+    );
+    assert_eq!(
+        state.get_record(&VID, target_epoch).unwrap().anchors,
+        carrier.anchors
+    );
+}
+
+#[test]
+fn cnvrf_v3_key_rotation_migration_preserves_anchor_validator_id() {
+    let sk_old = key(0xD4);
+    let old_id = [0x41u8; 32];
+    let new_id = [0x42u8; 32];
+    let third_id = [0x43u8; 32];
+
+    let chain = CnVrfV3Chain::generate(CHAIN_MAIN, &old_id, EPOCH, &V3_SECRET);
+    let carrier = chain.commit_carrier(&sk_old);
+
+    let mut state = CnVrfV3State::new();
+    let commit_height = (EPOCH - 1) * EPOCH_LEN + 100;
+    assert_eq!(
+        state.admit_commit(&carrier, commit_height, CHAIN_MAIN, sk_old.pubkey()),
+        Ok(CommitOutcome::Accepted)
+    );
+
+    // Migrate old_id -> new_id for EPOCH onward (simulating StakingLedger::rotate_key).
+    state.migrate_validator(&old_id, &new_id, EPOCH);
+    assert!(state.get_record(&old_id, EPOCH).is_none());
+    let migrated_rec = state.get_record(&new_id, EPOCH).expect("migrated record");
+    assert_eq!(migrated_rec.anchor_validator_id, old_id);
+
+    // New validator_id proposes at slot 10 of EPOCH using the pre-committed chain.
+    let rev10 = chain.reveal_for_slot(10).unwrap();
+    let h10 = EPOCH * EPOCH_LEN + 10;
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &new_id, h10, Some(&rev10)),
+        SlotRevealOutcome::Revealed { steps: 11 }
+    );
+
+    // Double rotation new_id -> third_id still preserves anchor_validator_id == old_id!
+    state.migrate_validator(&new_id, &third_id, EPOCH);
+    let rev500 = chain.reveal_for_slot(500).unwrap();
+    let h500 = EPOCH * EPOCH_LEN + 500;
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &third_id, h500, Some(&rev500)),
+        SlotRevealOutcome::Revealed { steps: 51 }
+    );
+    assert_eq!(
+        state
+            .get_record(&third_id, EPOCH)
+            .unwrap()
+            .anchor_validator_id,
+        old_id
+    );
+}
+
+#[test]
+fn cnvrf_v3_reveal_outcomes_rolling_mix_and_fallback_seed() {
+    let sk_a = key(0xE1);
+    let sk_b = key(0xE2);
+    let id_a = [0xA1u8; 32];
+    let id_b = [0xB2u8; 32];
+    let id_newcomer = [0xC3u8; 32];
+
+    let secret_a = [0x11u8; V3_LINK_LEN];
+    let secret_b = [0x22u8; V3_LINK_LEN];
+    let chain_a = CnVrfV3Chain::generate(CHAIN_MAIN, &id_a, EPOCH, &secret_a);
+    let chain_b = CnVrfV3Chain::generate(CHAIN_MAIN, &id_b, EPOCH, &secret_b);
+
+    let mut state = CnVrfV3State::new();
+    let h_commit = (EPOCH - 1) * EPOCH_LEN + 10;
+    assert_eq!(
+        state.admit_commit(
+            &chain_a.commit_carrier(&sk_a),
+            h_commit,
+            CHAIN_MAIN,
+            sk_a.pubkey()
+        ),
+        Ok(CommitOutcome::Accepted)
+    );
+    assert_eq!(
+        state.admit_commit(
+            &chain_b.commit_carrier(&sk_b),
+            h_commit + 1,
+            CHAIN_MAIN,
+            sk_b.pubkey()
+        ),
+        Ok(CommitOutcome::Accepted)
+    );
+
+    let prev_beacon = [0x77u8; V3_LINK_LEN];
+    let freeze_hash = [0x88u8; 32];
+
+    // Zero reveals -> deterministic fallback seed with rolling_mix == [0; 48].
+    assert_eq!(state.rolling_mix_for_epoch(EPOCH), [0u8; V3_LINK_LEN]);
+    let fallback_seed_1 = epoch_raw_seed(CHAIN_MAIN, EPOCH, &prev_beacon, &freeze_hash, &[0u8; 48]);
+    let fallback_seed_2 = epoch_raw_seed(CHAIN_MAIN, EPOCH, &prev_beacon, &freeze_hash, &[0u8; 48]);
+    assert_eq!(fallback_seed_1, fallback_seed_2);
+    assert_ne!(fallback_seed_1, [0u8; V3_LINK_LEN]);
+
+    // Uncommitted newcomer without reveal -> AbsentNoCommit (admissible).
+    let h0 = EPOCH * EPOCH_LEN;
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_newcomer, h0, None),
+        SlotRevealOutcome::AbsentNoCommit
+    );
+    // Uncommitted newcomer WITH reveal -> UnexpectedReveal (reject block).
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_newcomer, h0, Some(&[0x01; 48])),
+        SlotRevealOutcome::UnexpectedReveal
+    );
+
+    // Committed validator omitting reveal -> CommittedMissingReveal.
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_a, h0, None),
+        SlotRevealOutcome::CommittedMissingReveal
+    );
+
+    // Committed validator with bogus reveal -> InvalidReveal (and state untouched).
+    let bad = [0xFEu8; V3_LINK_LEN];
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_a, h0, Some(&bad)),
+        SlotRevealOutcome::InvalidReveal
+    );
+    assert_eq!(state.rolling_mix_for_epoch(EPOCH), [0u8; V3_LINK_LEN]);
+
+    // 1 validator reveals -> rolling_mix updated deterministically.
+    let rev_a0 = chain_a.reveal_for_slot(0).unwrap();
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_a, h0, Some(&rev_a0)),
+        SlotRevealOutcome::Revealed { steps: 1 }
+    );
+    let mix_after_1 = state.rolling_mix_for_epoch(EPOCH);
+    assert_eq!(state.rolling_mix, mix_after_1);
+    assert_ne!(mix_after_1, [0u8; V3_LINK_LEN]);
+
+    let seed_1_val = epoch_raw_seed(CHAIN_MAIN, EPOCH, &prev_beacon, &freeze_hash, &mix_after_1);
+    assert_ne!(seed_1_val, fallback_seed_1);
+
+    // 2nd validator reveals -> rolling_mix chains again; identical across two independent nodes.
+    let h1 = EPOCH * EPOCH_LEN + 1;
+    let rev_b1 = chain_b.reveal_for_slot(1).unwrap();
+    assert_eq!(
+        state.apply_slot_reveal(CHAIN_MAIN, &id_b, h1, Some(&rev_b1)),
+        SlotRevealOutcome::Revealed { steps: 2 }
+    );
+    let mix_after_2 = state.rolling_mix_for_epoch(EPOCH);
+    assert_ne!(mix_after_2, mix_after_1);
+    let seed_2_val = epoch_raw_seed(CHAIN_MAIN, EPOCH, &prev_beacon, &freeze_hash, &mix_after_2);
+    assert_ne!(seed_2_val, seed_1_val);
+
+    // Expiry drops old epochs cleanly.
+    assert_eq!(state.expire_before(EPOCH), 0);
+    assert_eq!(state.expire_before(EPOCH + 1), 2);
+    assert!(state.get_record(&id_a, EPOCH).is_none());
+}
+
+#[test]
+fn cnvrf_v3_enc2_secret_custody_and_startup_verify() {
+    use std::sync::{Mutex, OnceLock};
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    const ENV_VARS: &[&str] = &[
+        "STELL_NODE_PASSPHRASE",
+        "STELL_KEY_PASSPHRASE",
+        "INFNODE_KEY_PASSPHRASE",
+        "STELL_KEY_PLAINTEXT",
+        "STELL_KEY_PROMPT",
+    ];
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+    let _restore = EnvRestore(
+        ENV_VARS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect(),
+    );
+    for k in ENV_VARS {
+        std::env::remove_var(k);
+    }
+
+    let dir = std::env::temp_dir().join(format!("cnvrf_v3_custody_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let secret_path = dir.join("epoch5_v3.secret");
+
+    // Without passphrase and without STELL_KEY_PLAINTEXT=1 -> fail-closed!
+    assert!(
+        save_cnvrf_v3_secret(&secret_path, &V3_SECRET).is_err(),
+        "must refuse to write unencrypted v3 secret without passphrase"
+    );
+    assert!(!secret_path.exists());
+
+    // With STELL_KEY_PASSPHRASE -> encrypted enc2: with 0600 permissions.
+    std::env::set_var("STELL_KEY_PASSPHRASE", "v3-test-passphrase-correct");
+    save_cnvrf_v3_secret(&secret_path, &V3_SECRET).expect("save encrypted v3 secret");
+
+    let on_disk = std::fs::read_to_string(&secret_path).expect("read raw file");
+    assert!(on_disk.starts_with("enc2:"), "must use enc2: format");
+    assert!(
+        !on_disk.contains(&hex::encode(V3_SECRET)),
+        "secret must not leak in ciphertext"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&secret_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be 0600");
+    }
+
+    // Round-trip load + startup verification against committed anchors.
+    let loaded = load_cnvrf_v3_secret(&secret_path).expect("load encrypted v3 secret");
+    assert_eq!(*loaded, V3_SECRET);
+
+    let anchors = compute_v3_anchors(CHAIN_MAIN, &VID, EPOCH, &loaded);
+    assert!(verify_v3_secret_matches_commit(
+        &loaded, CHAIN_MAIN, &VID, EPOCH, &anchors
+    ));
+    assert!(!verify_v3_secret_matches_commit(
+        &loaded, CHAIN_ALT, &VID, EPOCH, &anchors
+    ));
+    assert!(!verify_v3_secret_matches_commit(
+        &[0x00; V3_LINK_LEN],
+        CHAIN_MAIN,
+        &VID,
+        EPOCH,
+        &anchors
+    ));
+
+    // Wrong passphrase -> fail-closed.
+    std::env::set_var("STELL_KEY_PASSPHRASE", "wrong-passphrase");
+    assert!(load_cnvrf_v3_secret(&secret_path).is_err());
+
+    // Missing passphrase -> fail-closed.
+    std::env::remove_var("STELL_KEY_PASSPHRASE");
+    assert!(load_cnvrf_v3_secret(&secret_path).is_err());
+
+    // Loose permissions (0644) -> fail-closed even with right passphrase.
+    std::env::set_var("STELL_KEY_PASSPHRASE", "v3-test-passphrase-correct");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_cnvrf_v3_secret(&secret_path).is_err());
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Symlink refused on load and save.
+        let link_path = dir.join("link_v3.secret");
+        std::os::unix::fs::symlink(&secret_path, &link_path).unwrap();
+        assert!(load_cnvrf_v3_secret(&link_path).is_err());
+        assert!(save_cnvrf_v3_secret(&link_path, &V3_SECRET).is_err());
+    }
+
+    // Explicit STELL_KEY_PLAINTEXT=1 opt-out path works and still enforces 0600.
+    std::env::remove_var("STELL_KEY_PASSPHRASE");
+    std::env::set_var("STELL_KEY_PLAINTEXT", "1");
+    let plain_path = dir.join("epoch5_v3_plain.secret");
+    save_cnvrf_v3_secret(&plain_path, &V3_SECRET).expect("save plaintext opt-out");
+    let loaded_plain = load_cnvrf_v3_secret(&plain_path).expect("load plaintext opt-out");
+    assert_eq!(*loaded_plain, V3_SECRET);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

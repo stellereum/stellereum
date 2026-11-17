@@ -51,6 +51,7 @@ fn block_at(vset: &ValidatorSet, ks: &[SigningKey], height: u64, root: [u8; 32])
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -323,6 +324,7 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -391,6 +393,7 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };

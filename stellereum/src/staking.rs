@@ -345,6 +345,23 @@ pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 7_200;
 /// Change requires spec update + audit note (AGENTS.md §7).
 pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 7_200;
 
+/// CN-VRF v3 reveal-abort slash fraction in basis points (1% = 100 bps).
+///
+/// Triggered when a committed proposer's leaky-bucket abort counter reaches
+/// [`CNVRF_ABORT_THRESHOLD`]. Dedicated offense distinct from `last_qc` vote
+/// downtime ([`DOWNTIME_SLASH_BPS`] stays frozen).
+pub const CNVRF_ABORT_SLASH_BPS: u64 = 100;
+
+/// CN-VRF v3 leaky-bucket abort threshold: aborting 3 reveals without earning
+/// recovery credits triggers an abort slash + jail.
+pub const CNVRF_ABORT_THRESHOLD: u32 = 3;
+
+/// Consecutive valid CN-VRF v3 reveals required to earn 1 recovery credit
+/// (decrement `misses` by 1). Vote signing (`last_qc`) or a single valid
+/// reveal NEVER resets `misses` to 0 — closing the "9 misses + 1 sign"
+/// reset loophole.
+pub const CNVRF_ABORT_RECOVERY_STREAK: u32 = 20;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StakingError {
     BondBelowMinimum,
@@ -669,6 +686,105 @@ pub struct JailRecord {
     pub jailed_at_height: u64,
     /// First height at which [`StakingLedger::unjail`] may succeed.
     pub release_height: u64,
+}
+
+/// Per-validator CN-VRF v3 reveal-abort leaky-bucket counter.
+///
+/// Deliberately separated from [`ValidatorStake::missed`] (which tracks
+/// `last_qc` vote participation and resets to 0 on a single vote):
+/// - An aborted reveal increments `misses` and resets `recovery_streak = 0`.
+/// - A valid reveal increments `recovery_streak`, and ONLY decrements
+///   `misses` by 1 once `recovery_streak >= `[`CNVRF_ABORT_RECOVERY_STREAK`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CnVrfAbortCounter {
+    /// Accumulated unrecovered reveal aborts (`0..CNVRF_ABORT_THRESHOLD`).
+    pub misses: u32,
+    /// Consecutive valid reveals toward the next `-1` recovery credit.
+    pub recovery_streak: u32,
+}
+
+/// Deterministic side-state for CN-VRF v3 abort-slash accounting.
+///
+/// Uses a `BTreeMap` (never `HashMap`) so iteration is identical across nodes.
+/// Held alongside [`StakingLedger`] (matching the
+/// [`crate::pq_registry::PqRegistry`] posture: `storage.rs` constructs
+/// `StakingLedger` with an exhaustive struct literal in `StakingLedgerV4::upgrade`
+/// and uses non-self-describing bincode for `DomainSnapshot`, so embedding this
+/// directly on `StakingLedger` is deferred to the coordinated `DomainSnapshotV8`
+/// + conditional `commitment.rs` migration).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CnVrfAbortState {
+    pub counters: BTreeMap<ValidatorId, CnVrfAbortCounter>,
+}
+
+impl CnVrfAbortState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the current counter for `validator` (zeros when absent).
+    pub fn counter_of(&self, validator: &ValidatorId) -> CnVrfAbortCounter {
+        self.counters.get(validator).copied().unwrap_or_default()
+    }
+
+    /// Record one valid CN-VRF v3 reveal for `validator`.
+    ///
+    /// Never resets `misses` to 0 on a single reveal: only after
+    /// [`CNVRF_ABORT_RECOVERY_STREAK`] consecutive valid reveals does `misses`
+    /// decrement by 1. When `misses == 0`, no recovery credit is pre-banked.
+    pub fn record_present(&mut self, validator: &ValidatorId) {
+        let Some(ctr) = self.counters.get_mut(validator) else {
+            return;
+        };
+        if ctr.misses == 0 {
+            self.counters.remove(validator);
+            return;
+        }
+        ctr.recovery_streak = ctr.recovery_streak.saturating_add(1);
+        if ctr.recovery_streak >= CNVRF_ABORT_RECOVERY_STREAK {
+            ctr.misses = ctr.misses.saturating_sub(1);
+            ctr.recovery_streak = 0;
+            if ctr.misses == 0 {
+                self.counters.remove(validator);
+            }
+        }
+    }
+
+    /// Record one aborted CN-VRF v3 reveal for `validator`.
+    ///
+    /// Increments `misses` and resets `recovery_streak = 0`. Returns `true`
+    /// (and clears the counter) when `misses >= `[`CNVRF_ABORT_THRESHOLD`].
+    pub fn record_abort(&mut self, validator: &ValidatorId) -> bool {
+        let ctr = self.counters.entry(*validator).or_default();
+        ctr.misses = ctr.misses.saturating_add(1);
+        ctr.recovery_streak = 0;
+        if ctr.misses >= CNVRF_ABORT_THRESHOLD {
+            self.counters.remove(validator);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Migrate abort-slash debt from `old` to `new` on key rotation so an
+    /// offender cannot launder CN-VRF abort misses by rotating keys.
+    pub fn migrate_validator(&mut self, old: &ValidatorId, new: &ValidatorId) {
+        if old == new {
+            return;
+        }
+        if let Some(old_ctr) = self.counters.remove(old) {
+            let entry = self.counters.entry(*new).or_default();
+            entry.misses = entry.misses.saturating_add(old_ctr.misses);
+            if old_ctr.misses > 0 {
+                entry.recovery_streak = 0;
+            } else {
+                entry.recovery_streak = entry.recovery_streak.max(old_ctr.recovery_streak);
+            }
+            if entry.misses == 0 {
+                self.counters.remove(new);
+            }
+        }
+    }
 }
 
 /// An announced-but-not-yet-effective commission change: the delegator-exit
@@ -1531,6 +1647,12 @@ impl StakingLedger {
     /// never launder a downtime record (otherwise a failing validator escapes
     /// its slash by rekeying). The new key inherits the exact standing — good
     /// or bad — of the old one.
+    ///
+    /// CALL-SITE NOTE (CN-VRF v3 & PQ registry): like `PqRegistry::migrate_validator`
+    /// (line ~2850), this 2-argument signature is frozen; callers holding
+    /// [`CnVrfAbortState`] should use [`Self::rotate_key_with_cnvrf_abort`]
+    /// (or invoke [`CnVrfAbortState::migrate_validator`] alongside it) so
+    /// CN-VRF abort debt is preserved across rotation.
     ///
     /// Fails when `old` is not a validator (nothing to rotate) or `new`
     /// already is one (rotation must never merge two records: amounts would
@@ -3243,6 +3365,174 @@ impl StakingLedger {
             }
         }
         slashed
+    }
+
+    /// Record a valid CN-VRF v3 proposer reveal for `validator`.
+    ///
+    /// Increments `recovery_streak` in `abort_state` and ONLY decrements
+    /// `misses` by 1 when `recovery_streak >= `[`CNVRF_ABORT_RECOVERY_STREAK`]
+    /// (20 consecutive valid reveals). Never resets `misses` to 0 on a single
+    /// reveal or on `last_qc` vote signing.
+    pub fn record_cnvrf_reveal_present(
+        &self,
+        abort_state: &mut CnVrfAbortState,
+        validator: &ValidatorId,
+    ) {
+        if !self.validators.contains_key(validator) {
+            return;
+        }
+        abort_state.record_present(validator);
+    }
+
+    /// Record an aborted (missing) CN-VRF v3 reveal by a committed proposer.
+    ///
+    /// Increments `misses` and resets `recovery_streak = 0`. Once
+    /// `misses >= `[`CNVRF_ABORT_THRESHOLD`] (3), resets `misses = 0`, slashes
+    /// [`CNVRF_ABORT_SLASH_BPS`] (1%) across `self_bond`, `pending_rewards`,
+    /// active `unbonding` entries, and `delegated` stake via
+    /// [`Self::slash_cnvrf_abort`], and jails the validator until
+    /// `height + `[`JAIL_RELEASE_DELAY_HEIGHTS`].
+    pub fn record_cnvrf_reveal_abort(
+        &mut self,
+        abort_state: &mut CnVrfAbortState,
+        validator: &ValidatorId,
+        height: u64,
+    ) -> Result<u64, StakingError> {
+        if !self.validators.contains_key(validator) {
+            return Err(StakingError::NotValidator);
+        }
+        if !abort_state.record_abort(validator) {
+            return Ok(0);
+        }
+        self.slash_cnvrf_abort(*validator, height)
+    }
+
+    /// Execute the CN-VRF v3 abort slash (`CNVRF_ABORT_SLASH_BPS`) across
+    /// `self_bond`, `pending_rewards`, active `unbonding` entries (both
+    /// self-bond and delegator unbondings — closing audit F5 so same-block
+    /// `unbond()` cannot evade the penalty), and `delegated` stake, then jail
+    /// `validator` until `height + `[`JAIL_RELEASE_DELAY_HEIGHTS`].
+    ///
+    /// Note for callers settling pools: `pending_rewards` reductions decrement
+    /// `rewards_pool` (backed by `REWARDS_POOL`), while `self_bond`,
+    /// `unbonding`, and `delegated` reductions correspond to `STAKING_POOL`.
+    pub fn slash_cnvrf_abort(
+        &mut self,
+        validator: ValidatorId,
+        height: u64,
+    ) -> Result<u64, StakingError> {
+        let (self_bond, delegated_now, pending_rewards) = {
+            let v = self
+                .validators
+                .get(&validator)
+                .ok_or(StakingError::NotValidator)?;
+            (v.self_bond, v.delegated, v.pending_rewards)
+        };
+        let slash_bps = CNVRF_ABORT_SLASH_BPS;
+
+        let cut_self = ((self_bond as u128 * slash_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+        let cut_self = cut_self.min(self_bond);
+
+        let cut_pending =
+            ((pending_rewards as u128 * slash_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+        let cut_pending = cut_pending.min(pending_rewards);
+
+        let mut cut_unbonding = 0u64;
+        for entry in self.unbonding.iter_mut() {
+            if entry.validator == validator {
+                let cut =
+                    ((entry.amount as u128 * slash_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(entry.amount);
+                entry.amount -= cut;
+                cut_unbonding = cut_unbonding.saturating_add(cut);
+            }
+        }
+        self.unbonding.retain(|e| e.amount > 0);
+
+        let mut cut_delegated = 0u64;
+        if delegated_now > 0 {
+            let keys: Vec<(ValidatorId, [u8; 32])> = self
+                .delegations
+                .keys()
+                .filter(|(vid, _)| *vid == validator)
+                .copied()
+                .collect();
+            for key in keys {
+                let amount = self.delegations.get(&key).copied().unwrap_or(0);
+                let cut = ((amount as u128 * slash_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(amount);
+                if cut > 0 {
+                    self.settle_delegator_rewards(key.1, key.0);
+                    if amount - cut == 0 {
+                        self.delegations.remove(&key);
+                    } else {
+                        self.delegations.insert(key, amount - cut);
+                    }
+                    cut_delegated = cut_delegated.saturating_add(cut);
+                }
+            }
+        }
+
+        let actually_burned = cut_self
+            .saturating_add(cut_pending)
+            .saturating_add(cut_unbonding)
+            .saturating_add(cut_delegated);
+
+        if let Some(v) = self.validators.get_mut(&validator) {
+            v.self_bond = v.self_bond.saturating_sub(cut_self);
+            v.pending_rewards = v.pending_rewards.saturating_sub(cut_pending);
+            v.delegated = v.delegated.saturating_sub(cut_delegated);
+            v.total_slashed = v.total_slashed.saturating_add(actually_burned);
+        }
+        self.rewards_pool = self.rewards_pool.saturating_sub(cut_pending);
+        self.total_burned = self.total_burned.saturating_add(actually_burned);
+
+        let release = height.saturating_add(JAIL_RELEASE_DELAY_HEIGHTS);
+        self.jail
+            .entry(validator)
+            .and_modify(|r| {
+                r.jailed_at_height = height;
+                r.release_height = r.release_height.max(release);
+            })
+            .or_insert(JailRecord {
+                jailed_at_height: height,
+                release_height: release,
+            });
+
+        let self_bond_after = self
+            .validators
+            .get(&validator)
+            .map(|v| v.self_bond)
+            .unwrap_or(0);
+        if let Some(msg) = eject_message_for(&validator, self_bond_after, actually_burned) {
+            tracing::warn!("{msg}");
+        } else if let Some(msg) = eject_warn_message_for(
+            &validator,
+            self_bond_after,
+            actually_burned,
+            slash_eject_warn_gap_nano(),
+        ) {
+            tracing::warn!("{msg}");
+        }
+        tracing::warn!(
+            "CNVRF-ABORT-JAILED validator {} jailed at height {height} after CN-VRF v3 reveal aborts (burned {actually_burned}: self={cut_self}, pending_rewards={cut_pending}, unbonding={cut_unbonding}, delegated={cut_delegated}): excluded until height {release}",
+            hex::encode(validator),
+        );
+
+        Ok(actually_burned)
+    }
+
+    /// Rotate a validator consensus key while preserving its CN-VRF v3 abort-slash
+    /// debt inside `abort_state`.
+    pub fn rotate_key_with_cnvrf_abort(
+        &mut self,
+        old: ValidatorId,
+        new: ValidatorId,
+        abort_state: &mut CnVrfAbortState,
+    ) -> Result<(), StakingError> {
+        self.rotate_key(old, new)?;
+        abort_state.migrate_validator(&old, &new);
+        Ok(())
     }
 
     /// Distribute `reward` (minted nano-STELL) to `validator`. Split:
@@ -6439,5 +6729,184 @@ mod tests {
         assert!(!vs_gov.validators.contains_key(&vid(1)));
         assert!(vs_gov.validators.contains_key(&vid(2)));
         assert_eq!(l.elected_count(), 1);
+    }
+
+    #[test]
+    fn cnvrf_abort_2_misses_plus_1_reveal_does_not_reset_misses() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let v = vid(71);
+        l.bond(v, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+
+        // 2 aborts: below threshold (3), zero slash, misses == 2.
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &v, 100)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &v, 101)
+                .unwrap(),
+            0
+        );
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 0);
+
+        // Signing last_qc votes (downtime counter reset) must NOT reset CN-VRF abort misses.
+        l.note_missed_heights(102, &|id| *id == v, &[v]);
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+
+        // 1 valid reveal increments recovery_streak to 1, does NOT reset misses to 0.
+        l.record_cnvrf_reveal_present(&mut abort_state, &v);
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 1);
+        assert!(!l.is_jailed(&v));
+        assert_eq!(l.total_burned, 0);
+    }
+
+    #[test]
+    fn cnvrf_abort_20_consecutive_reveals_decrement_misses_by_1() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let v = vid(72);
+        l.bond(v, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+
+        // Record 2 aborts -> misses = 2.
+        l.record_cnvrf_reveal_abort(&mut abort_state, &v, 10)
+            .unwrap();
+        l.record_cnvrf_reveal_abort(&mut abort_state, &v, 11)
+            .unwrap();
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+
+        // 19 consecutive valid reveals: still 2 misses, streak = 19.
+        for _ in 0..19 {
+            l.record_cnvrf_reveal_present(&mut abort_state, &v);
+        }
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 19);
+
+        // 20th consecutive valid reveal earns 1 recovery credit: misses = 1, streak = 0.
+        l.record_cnvrf_reveal_present(&mut abort_state, &v);
+        assert_eq!(abort_state.counter_of(&v).misses, 1);
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 0);
+
+        // 19 more reveals then an abort resets recovery_streak = 0 and reaches misses = 2 (no slash).
+        for _ in 0..19 {
+            l.record_cnvrf_reveal_present(&mut abort_state, &v);
+        }
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 19);
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &v, 50)
+                .unwrap(),
+            0
+        );
+        assert_eq!(abort_state.counter_of(&v).misses, 2);
+        assert_eq!(abort_state.counter_of(&v).recovery_streak, 0);
+
+        // 40 consecutive reveals clear both remaining misses cleanly.
+        for _ in 0..(2 * CNVRF_ABORT_RECOVERY_STREAK) {
+            l.record_cnvrf_reveal_present(&mut abort_state, &v);
+        }
+        assert_eq!(abort_state.counter_of(&v), CnVrfAbortCounter::default());
+        assert!(abort_state.counters.is_empty());
+    }
+
+    #[test]
+    fn cnvrf_abort_threshold_slashes_self_bond_pending_rewards_and_unbonding_and_jails() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let v = vid(73);
+        l.bond(v, stell(3000), DEFAULT_COMMISSION_BPS).unwrap();
+        // Mint 500 STELL pending rewards into REWARDS_POOL + validator pending_rewards.
+        l.distribute_reward(v, stell(500)).unwrap();
+        // Same-block unbond() of 1000 STELL (audit F5 evasion vector).
+        l.unbond(v, stell(1000), 1_000).unwrap();
+
+        assert_eq!(l.validators[&v].self_bond, stell(2000));
+        assert_eq!(l.validators[&v].pending_rewards, stell(500));
+        assert_eq!(l.unbonding[0].amount, stell(1000));
+        assert_eq!(l.rewards_pool, stell(500));
+
+        // 1st and 2nd aborts do not slash yet.
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &v, 200)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &v, 201)
+                .unwrap(),
+            0
+        );
+        assert!(!l.is_jailed(&v));
+
+        // 3rd abort hits CNVRF_ABORT_THRESHOLD: 1% (100 bps) across all three buckets + jail.
+        let slash_height = 202u64;
+        let burned = l
+            .record_cnvrf_reveal_abort(&mut abort_state, &v, slash_height)
+            .unwrap();
+        // 1% of (2000 + 500 + 1000) = 20 + 5 + 10 = 35 STELL
+        assert_eq!(burned, stell(35));
+        assert_eq!(l.validators[&v].self_bond, stell(1980));
+        assert_eq!(l.validators[&v].pending_rewards, stell(495));
+        assert_eq!(l.unbonding[0].amount, stell(990));
+        assert_eq!(l.rewards_pool, stell(495));
+        assert_eq!(l.validators[&v].total_slashed, stell(35));
+        assert_eq!(l.total_burned, stell(35));
+
+        // Counter reset after slash; validator is jailed until height + JAIL_RELEASE_DELAY_HEIGHTS.
+        assert_eq!(abort_state.counter_of(&v), CnVrfAbortCounter::default());
+        assert!(l.is_jailed(&v));
+        let jr = l.jail_record(&v).expect("jail record installed");
+        assert_eq!(jr.jailed_at_height, slash_height);
+        assert_eq!(jr.release_height, slash_height + JAIL_RELEASE_DELAY_HEIGHTS);
+        assert!(!l.to_validator_set().contains(&v));
+    }
+
+    #[test]
+    fn cnvrf_abort_rotate_key_preserves_abort_debt() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let old_v = vid(74);
+        let new_v = vid(75);
+        l.bond(old_v, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+
+        // Accumulate 2 aborts on old_v.
+        l.record_cnvrf_reveal_abort(&mut abort_state, &old_v, 300)
+            .unwrap();
+        l.record_cnvrf_reveal_abort(&mut abort_state, &old_v, 301)
+            .unwrap();
+        assert_eq!(abort_state.counter_of(&old_v).misses, 2);
+
+        // Rotate key: debt MUST move from old_v to new_v.
+        l.rotate_key_with_cnvrf_abort(old_v, new_v, &mut abort_state)
+            .unwrap();
+        assert_eq!(abort_state.counter_of(&old_v), CnVrfAbortCounter::default());
+        assert_eq!(abort_state.counter_of(&new_v).misses, 2);
+
+        // 1 more abort on new_v triggers the threshold slash + jail immediately!
+        let burned = l
+            .record_cnvrf_reveal_abort(&mut abort_state, &new_v, 302)
+            .unwrap();
+        assert_eq!(burned, stell(20)); // 1% of 2000 STELL
+        assert_eq!(l.validators[&new_v].self_bond, stell(1980));
+        assert!(l.is_jailed(&new_v));
+    }
+
+    #[test]
+    fn cnvrf_abort_unknown_validator_refused_fail_closed() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let unknown = vid(99);
+
+        assert_eq!(
+            l.record_cnvrf_reveal_abort(&mut abort_state, &unknown, 10),
+            Err(StakingError::NotValidator)
+        );
+        assert!(abort_state.counters.is_empty());
+        assert_eq!(
+            l.slash_cnvrf_abort(unknown, 10),
+            Err(StakingError::NotValidator)
+        );
     }
 }

@@ -46,6 +46,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
 use crate::post_quantum::{
     verify_pq_signature, FalconKeypair, PqScheme, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
 };
@@ -347,6 +350,12 @@ impl core::fmt::Display for CnVrfError {
             Self::CommitState(CommitError::TooFarAhead) => {
                 write!(f, "commit epoch is too far ahead (must be current + 1)")
             }
+            Self::CommitState(CommitError::PastCommitCutoff) => {
+                write!(
+                    f,
+                    "commit arrived at or after lookahead freeze cutoff H_freeze"
+                )
+            }
         }
     }
 }
@@ -635,6 +644,8 @@ pub enum CommitError {
     StaleOrCurrent,
     /// Commit for epoch > current + 1 (at most one epoch lookahead, O10).
     TooFarAhead,
+    /// Commit arrived inside the lookahead freeze window (`height >= H_freeze`).
+    PastCommitCutoff,
 }
 
 /// Pure commit transition (O7/O10, spec §3.1 lifecycle):
@@ -992,4 +1003,826 @@ pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
         ));
     }
     parse_cnvrf_nonce_hex(line).map_err(|e| format!("{e} (in {})", path.display()))
+}
+
+// ===========================================================================
+// CN-VRF v3 — 16-segment BLAKE3 48-byte XOF reverse hash-chain
+// ===========================================================================
+
+/// Hash-chain link length in bytes (384-bit / 128-bit quantum BHT collision security).
+pub const V3_LINK_LEN: usize = 48;
+/// Number of segments partitioning an epoch's reverse hash-chain.
+pub const V3_SEGMENTS: usize = 16;
+/// Number of slots per segment (`16 * 450 == 7200 == EPOCH_LEN`).
+pub const V3_SEGMENT_LEN: u64 = 450;
+/// Lookahead cutoff before epoch `N+1` starts (`H_freeze = (N+1)*EPOCH_LEN - 360`).
+pub const V3_COMMIT_LOOKAHEAD_BLOCKS: u64 = 360;
+
+const _: () = assert!(V3_SEGMENTS as u64 * V3_SEGMENT_LEN == EPOCH_LEN);
+
+/// On-wire encoded byte length of [`CommitCarrierV3`]:
+/// `32 (validator_id) + 8 (epoch_n) + 16*48 (anchors) + 666 (Falcon-512 sig) = 1474`.
+pub const COMMIT_CARRIER_V3_LEN: usize = 32 + 8 + V3_SEGMENTS * V3_LINK_LEN + FALCON512_SIG_LEN;
+
+/// Domain separation tag: reverse hash-chain step (`BLAKE3-XOF-48`).
+pub const DST_CHAIN_V3: &str = "STELL_CNVRF_CHAIN_V3";
+/// Domain separation tag: Falcon-512 commit authentication over 16 anchors.
+pub const DST_COMMIT_SIG_V3: &str = "STELL_CNVRF_COMMIT_SIG_V3";
+/// Domain separation tag: rolling beacon mix (`rolling_mix`) update per reveal.
+pub const DST_BETA_V3: &str = "STELL_CNVRF_BETA_V3";
+/// Domain separation tag: deterministic epoch raw seed derivation (with or without reveals).
+pub const DST_EPOCH_RAW_SEED_V3: &str = "STELL_CNVRF_EPOCH_RAW_SEED_V3";
+/// Domain separation tag: deterministic per-epoch v3 secret seed derivation.
+pub const DST_V3_SEED_DERIVE: &str = "STELL_CNVRF_SEED_DERIVE_V3";
+
+/// Zero-allocation 48-byte BLAKE3-XOF keyed derivation over `parts` under `domain`.
+pub fn blake3_xof_48(domain: &str, parts: &[&[u8]]) -> [u8; V3_LINK_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key(domain);
+    for part in parts {
+        hasher.update(part);
+    }
+    let mut out = [0u8; V3_LINK_LEN];
+    hasher.finalize_xof().fill(&mut out);
+    out
+}
+
+/// Derive a deterministic 48-byte epoch secret `s_{i,N}` from a node master secret.
+pub fn derive_v3_epoch_secret(
+    master_seed: &[u8],
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+) -> Zeroizing<[u8; V3_LINK_LEN]> {
+    Zeroizing::new(blake3_xof_48(
+        DST_V3_SEED_DERIVE,
+        &[
+            master_seed,
+            &chain_id.to_le_bytes(),
+            validator_id,
+            &epoch_n.to_le_bytes(),
+        ],
+    ))
+}
+
+mod serde_bytes_48 {
+    use super::V3_LINK_LEN;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &[u8; V3_LINK_LEN], s: S) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(V3_LINK_LEN)?;
+        for byte in val {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; V3_LINK_LEN], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [u8; V3_LINK_LEN];
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "a {V3_LINK_LEN}-byte array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; V3_LINK_LEN];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(V3_LINK_LEN, V)
+    }
+}
+
+mod serde_anchors_16_48 {
+    use super::{serde_bytes_48, V3_LINK_LEN, V3_SEGMENTS};
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    struct Link48([u8; V3_LINK_LEN]);
+    impl Serialize for Link48 {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            serde_bytes_48::serialize(&self.0, s)
+        }
+    }
+    impl<'de> Deserialize<'de> for Link48 {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            serde_bytes_48::deserialize(d).map(Link48)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        val: &[[u8; V3_LINK_LEN]; V3_SEGMENTS],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(V3_SEGMENTS)?;
+        for anchor in val {
+            tup.serialize_element(&Link48(*anchor))?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[[u8; V3_LINK_LEN]; V3_SEGMENTS], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [[u8; V3_LINK_LEN]; V3_SEGMENTS];
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "an array of {V3_SEGMENTS} 48-byte anchors")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [[0u8; V3_LINK_LEN]; V3_SEGMENTS];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let link: Link48 = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                    *slot = link.0;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(V3_SEGMENTS, V)
+    }
+}
+
+mod serde_falcon_sig {
+    use super::FALCON512_SIG_LEN;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        val: &[u8; FALCON512_SIG_LEN],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(FALCON512_SIG_LEN)?;
+        for byte in val {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[u8; FALCON512_SIG_LEN], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [u8; FALCON512_SIG_LEN];
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "a {FALCON512_SIG_LEN}-byte Falcon-512 signature")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; FALCON512_SIG_LEN];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(FALCON512_SIG_LEN, V)
+    }
+}
+
+/// Compute one reverse hash-chain step: `x_t = H(DST_CHAIN_V3, chain_id || validator_id || epoch_n || t || x_{t+1})`.
+#[inline]
+fn v3_chain_step(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    step_t: u64,
+    next_link: &[u8; V3_LINK_LEN],
+) -> [u8; V3_LINK_LEN] {
+    blake3_xof_48(
+        DST_CHAIN_V3,
+        &[
+            &chain_id.to_le_bytes(),
+            validator_id,
+            &epoch_n.to_le_bytes(),
+            &step_t.to_le_bytes(),
+            next_link,
+        ],
+    )
+}
+
+/// Compute the 16 segment anchors `anchors[seg] = x_{seg * 450}` in O(1) memory.
+pub fn compute_v3_anchors(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    s_secret: &[u8; V3_LINK_LEN],
+) -> [[u8; V3_LINK_LEN]; V3_SEGMENTS] {
+    let mut anchors = [[0u8; V3_LINK_LEN]; V3_SEGMENTS];
+    let mut cur = *s_secret;
+    for t in (0..EPOCH_LEN).rev() {
+        cur = v3_chain_step(chain_id, validator_id, epoch_n, t, &cur);
+        if t % V3_SEGMENT_LEN == 0 {
+            let seg = (t / V3_SEGMENT_LEN) as usize;
+            anchors[seg] = cur;
+        }
+    }
+    cur.zeroize();
+    anchors
+}
+
+/// Validator-side precomputed 16-segment reverse hash-chain for a single `(chain_id, validator_id, epoch_n)`.
+///
+/// Links `x_0 ..= x_{7200}` are zeroized on drop. Slot `t` (`0..7200`) reveals `x_{t+1}`.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct CnVrfV3Chain {
+    chain_id: u64,
+    validator_id: [u8; 32],
+    epoch_n: u64,
+    links: Vec<[u8; V3_LINK_LEN]>,
+    anchors: [[u8; V3_LINK_LEN]; V3_SEGMENTS],
+}
+
+impl core::fmt::Debug for CnVrfV3Chain {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CnVrfV3Chain")
+            .field("chain_id", &self.chain_id)
+            .field("validator_id", &hex::encode(self.validator_id))
+            .field("epoch_n", &self.epoch_n)
+            .field("anchor_0", &hex::encode(self.anchors[0]))
+            .finish_non_exhaustive()
+    }
+}
+
+impl CnVrfV3Chain {
+    /// Generate the complete 7,201-link reverse hash-chain from `s_secret = x_{7200}`.
+    pub fn generate(
+        chain_id: u64,
+        validator_id: &[u8; 32],
+        epoch_n: u64,
+        s_secret: &[u8; V3_LINK_LEN],
+    ) -> Self {
+        let len = EPOCH_LEN as usize + 1;
+        let mut links = vec![[0u8; V3_LINK_LEN]; len];
+        links[EPOCH_LEN as usize] = *s_secret;
+        let mut anchors = [[0u8; V3_LINK_LEN]; V3_SEGMENTS];
+        for t in (0..EPOCH_LEN).rev() {
+            let next = links[t as usize + 1];
+            let x_t = v3_chain_step(chain_id, validator_id, epoch_n, t, &next);
+            links[t as usize] = x_t;
+            if t % V3_SEGMENT_LEN == 0 {
+                anchors[(t / V3_SEGMENT_LEN) as usize] = x_t;
+            }
+        }
+        Self {
+            chain_id,
+            validator_id: *validator_id,
+            epoch_n,
+            links,
+            anchors,
+        }
+    }
+
+    /// Return the 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    pub const fn anchors(&self) -> &[[u8; V3_LINK_LEN]; V3_SEGMENTS] {
+        &self.anchors
+    }
+
+    /// Return the root anchor `x_0`.
+    pub const fn root_anchor(&self) -> [u8; V3_LINK_LEN] {
+        self.anchors[0]
+    }
+
+    /// Return the chain ID this chain was generated for.
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Return the validator ID this chain was generated for.
+    pub const fn validator_id(&self) -> &[u8; 32] {
+        &self.validator_id
+    }
+
+    /// Return the epoch this chain was generated for.
+    pub const fn epoch_n(&self) -> u64 {
+        self.epoch_n
+    }
+
+    /// Reveal `x_{slot_t + 1}` for slot `t` in `0..EPOCH_LEN`.
+    pub fn reveal_for_slot(&self, slot_t: u64) -> Option<[u8; V3_LINK_LEN]> {
+        if slot_t >= EPOCH_LEN {
+            return None;
+        }
+        self.links.get(slot_t as usize + 1).copied()
+    }
+
+    /// Reveal the link for block `height`, verifying `epoch_of_height(height) == self.epoch_n`.
+    pub fn reveal_for_height(&self, height: u64) -> Option<[u8; V3_LINK_LEN]> {
+        if epoch_of_height(height) != self.epoch_n {
+            return None;
+        }
+        self.reveal_for_slot(height % EPOCH_LEN)
+    }
+
+    /// Build and sign a [`CommitCarrierV3`] from the precomputed anchors.
+    pub fn commit_carrier(&self, sk: &FalconKeypair) -> CommitCarrierV3 {
+        let msg = commit_v3_sig_message_bytes(
+            self.chain_id,
+            &self.validator_id,
+            self.epoch_n,
+            &self.anchors,
+        );
+        let sig = sk.sign(&msg);
+        let mut sig_arr = [0u8; FALCON512_SIG_LEN];
+        if sig.len() == FALCON512_SIG_LEN {
+            sig_arr.copy_from_slice(&sig);
+        }
+        CommitCarrierV3 {
+            validator_id: self.validator_id,
+            epoch_n: self.epoch_n,
+            anchors: self.anchors,
+            sig: sig_arr,
+        }
+    }
+}
+
+/// Exact Falcon-512 commit signature message for CN-VRF v3:
+/// `DST_COMMIT_SIG_V3 || chain_id(le) || validator_id || epoch_n(le) || anchors[0..16]`.
+pub fn commit_v3_sig_message_bytes(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    anchors: &[[u8; V3_LINK_LEN]; V3_SEGMENTS],
+) -> Vec<u8> {
+    let cap = DST_COMMIT_SIG_V3.len() + 8 + 32 + 8 + V3_SEGMENTS * V3_LINK_LEN;
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(DST_COMMIT_SIG_V3.as_bytes());
+    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.extend_from_slice(validator_id);
+    out.extend_from_slice(&epoch_n.to_le_bytes());
+    for anchor in anchors {
+        out.extend_from_slice(anchor);
+    }
+    debug_assert_eq!(out.len(), cap);
+    out
+}
+
+/// CN-VRF v3 commitment carrier published before `H_freeze` of epoch `N-1`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommitCarrierV3 {
+    /// Validator identity committing to `epoch_n`.
+    pub validator_id: [u8; 32],
+    /// Future epoch `N` being committed to.
+    pub epoch_n: u64,
+    /// 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    #[serde(with = "serde_anchors_16_48")]
+    pub anchors: [[u8; V3_LINK_LEN]; V3_SEGMENTS],
+    /// Falcon-512 signature over [`commit_v3_sig_message_bytes`].
+    #[serde(with = "serde_falcon_sig")]
+    pub sig: [u8; FALCON512_SIG_LEN],
+}
+
+impl CommitCarrierV3 {
+    /// Fixed on-wire encoded byte length (`1474` bytes).
+    pub const fn encoded_len(&self) -> usize {
+        COMMIT_CARRIER_V3_LEN
+    }
+}
+
+/// Compute the 16 segment anchors from `s_secret` and sign a [`CommitCarrierV3`].
+///
+/// Fails closed if `sk` cannot sign (leaves zeroed `sig` which [`cnvrf_v3_verify_commit`] rejects).
+pub fn cnvrf_v3_commit(
+    sk: &FalconKeypair,
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    s_secret: &[u8; V3_LINK_LEN],
+) -> CommitCarrierV3 {
+    let anchors = compute_v3_anchors(chain_id, validator_id, epoch_n, s_secret);
+    let msg = commit_v3_sig_message_bytes(chain_id, validator_id, epoch_n, &anchors);
+    let sig = sk.sign(&msg);
+    let mut sig_arr = [0u8; FALCON512_SIG_LEN];
+    if sig.len() == FALCON512_SIG_LEN {
+        sig_arr.copy_from_slice(&sig);
+    }
+    CommitCarrierV3 {
+        validator_id: *validator_id,
+        epoch_n,
+        anchors,
+        sig: sig_arr,
+    }
+}
+
+/// Verify a [`CommitCarrierV3`] against `chain_id` and active Falcon-512 public key `pk`.
+///
+/// Fails closed on `pk.len() != CNVRF_PK_LEN`, all-zero signature, or invalid Falcon signature.
+pub fn cnvrf_v3_verify_commit(
+    carrier: &CommitCarrierV3,
+    chain_id: u64,
+    pk: &[u8],
+) -> Result<(), CnVrfError> {
+    if pk.len() != CNVRF_PK_LEN {
+        return Err(CnVrfError::InvalidPublicKeyLength);
+    }
+    if carrier.sig.iter().all(|&b| b == 0) {
+        return Err(CnVrfError::InvalidCommitSignature);
+    }
+    let msg = commit_v3_sig_message_bytes(
+        chain_id,
+        &carrier.validator_id,
+        carrier.epoch_n,
+        &carrier.anchors,
+    );
+    if !verify_pq_signature(PqScheme::Falcon512, pk, &msg, &carrier.sig) {
+        return Err(CnVrfError::InvalidCommitSignature);
+    }
+    Ok(())
+}
+
+/// On-chain commitment record for a validator in an epoch (CN-VRF v3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CnVrfV3Record {
+    /// 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    #[serde(with = "serde_anchors_16_48")]
+    pub anchors: [[u8; V3_LINK_LEN]; V3_SEGMENTS],
+    /// Most recently revealed link `x_{last_step}` (initialized to `anchors[0] = x_0`).
+    #[serde(with = "serde_bytes_48")]
+    pub head: [u8; V3_LINK_LEN],
+    /// Next expected chain step (`0` initially; `slot_t + 1` after revealing at `slot_t`).
+    pub last_step: u64,
+    /// Block height at which the commitment was admitted.
+    pub commit_height: u64,
+    /// Original `validator_id` bound in the hash-chain preimage at commit time
+    /// (preserved across [`CnVrfV3State::migrate_validator`] key rotations).
+    pub anchor_validator_id: [u8; 32],
+}
+
+/// Verify a reveal `x_{slot_t + 1}` against `state` in at most `V3_SEGMENT_LEN` (`450`) BLAKE3 steps.
+///
+/// Returns the number of hash steps checked (`1..=450`), or a static error reason on failure.
+pub fn cnvrf_v3_verify_reveal(
+    state: &CnVrfV3Record,
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    slot_t: u64,
+    reveal: &[u8; V3_LINK_LEN],
+) -> Result<u64, &'static str> {
+    if slot_t >= EPOCH_LEN {
+        return Err("slot_t out of epoch bounds");
+    }
+    if slot_t < state.last_step {
+        return Err("stale or replayed slot reveal");
+    }
+    let seg = (slot_t / V3_SEGMENT_LEN) as usize;
+    let seg_start = (seg as u64) * V3_SEGMENT_LEN;
+
+    let (target_step, target_hash) = if state.last_step > seg_start && state.last_step <= slot_t {
+        (state.last_step, &state.head)
+    } else {
+        (seg_start, &state.anchors[seg])
+    };
+
+    let mut cur = *reveal;
+    for step in (target_step..=slot_t).rev() {
+        cur = v3_chain_step(chain_id, validator_id, epoch_n, step, &cur);
+    }
+    if cur != *target_hash {
+        return Err("hash-chain reveal mismatch");
+    }
+    Ok(slot_t - target_step + 1)
+}
+
+/// Outcome of [`CnVrfV3State::apply_slot_reveal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRevealOutcome {
+    /// Committed proposer supplied a valid reveal; verified in `steps <= 450` BLAKE3 calls.
+    Revealed {
+        /// Number of reverse hash-chain steps verified.
+        steps: u64,
+    },
+    /// Committed proposer supplied an invalid or stale/replayed reveal (caller rejects block).
+    InvalidReveal,
+    /// Committed proposer omitted the reveal (caller enforces abort/miss policy).
+    CommittedMissingReveal,
+    /// Uncommitted proposer omitted the reveal (e.g. mid-epoch newcomer, admissible).
+    AbsentNoCommit,
+    /// Uncommitted proposer injected a reveal (caller rejects block).
+    UnexpectedReveal,
+}
+
+/// Deterministic on-chain state machine for CN-VRF v3 commitments and slot reveals.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CnVrfV3State {
+    /// Active per-`(validator_id, epoch_n)` commitment records (`BTreeMap` for determinism).
+    pub records: BTreeMap<(ValidatorId, u64), CnVrfV3Record>,
+    /// Current rolling mix (`[0u8; 48]` before any reveal in the active epoch).
+    #[serde(with = "serde_bytes_48")]
+    pub rolling_mix: [u8; V3_LINK_LEN],
+    /// Epoch corresponding to `rolling_mix`.
+    pub rolling_mix_epoch: u64,
+    /// Per-epoch rolling mix archive (allows clean epoch boundary transitions).
+    #[serde(default)]
+    pub epoch_rolling_mixes: BTreeMap<u64, Vec<u8>>,
+}
+
+impl Default for CnVrfV3State {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            rolling_mix: [0u8; V3_LINK_LEN],
+            rolling_mix_epoch: 0,
+            epoch_rolling_mixes: BTreeMap::new(),
+        }
+    }
+}
+
+impl CnVrfV3State {
+    /// Create a fresh empty CN-VRF v3 state machine.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a validator's commitment record for `epoch_n`.
+    pub fn get_record(&self, validator_id: &[u8; 32], epoch_n: u64) -> Option<&CnVrfV3Record> {
+        self.records.get(&(*validator_id, epoch_n))
+    }
+
+    /// Return the rolling mix recorded for `epoch_n` (all-zero if no reveals occurred).
+    pub fn rolling_mix_for_epoch(&self, epoch_n: u64) -> [u8; V3_LINK_LEN] {
+        if let Some(bytes) = self.epoch_rolling_mixes.get(&epoch_n) {
+            if bytes.len() == V3_LINK_LEN {
+                let mut out = [0u8; V3_LINK_LEN];
+                out.copy_from_slice(bytes);
+                return out;
+            }
+        }
+        if epoch_n == self.rolling_mix_epoch {
+            return self.rolling_mix;
+        }
+        [0u8; V3_LINK_LEN]
+    }
+
+    /// Admit a [`CommitCarrierV3`] at `current_height`:
+    /// - Enforces `carrier.epoch_n == current_epoch + 1`
+    /// - Enforces `current_height < (carrier.epoch_n * EPOCH_LEN) - V3_COMMIT_LOOKAHEAD_BLOCKS` (`H_freeze`)
+    /// - Verifies Falcon-512 signature once against `pk`
+    /// - Preserves first-committed-wins (`IgnoredDuplicate`)
+    pub fn admit_commit(
+        &mut self,
+        carrier: &CommitCarrierV3,
+        current_height: u64,
+        chain_id: u64,
+        pk: &[u8],
+    ) -> Result<CommitOutcome, CnVrfError> {
+        let current_epoch = epoch_of_height(current_height);
+        if carrier.epoch_n <= current_epoch {
+            return Err(CnVrfError::CommitState(CommitError::StaleOrCurrent));
+        }
+        if carrier.epoch_n > current_epoch.saturating_add(1) {
+            return Err(CnVrfError::CommitState(CommitError::TooFarAhead));
+        }
+        let h_freeze = carrier
+            .epoch_n
+            .saturating_mul(EPOCH_LEN)
+            .saturating_sub(V3_COMMIT_LOOKAHEAD_BLOCKS);
+        if current_height >= h_freeze {
+            return Err(CnVrfError::CommitState(CommitError::PastCommitCutoff));
+        }
+
+        cnvrf_v3_verify_commit(carrier, chain_id, pk)?;
+
+        use std::collections::btree_map::Entry;
+        match self.records.entry((carrier.validator_id, carrier.epoch_n)) {
+            Entry::Occupied(_) => Ok(CommitOutcome::IgnoredDuplicate),
+            Entry::Vacant(slot) => {
+                slot.insert(CnVrfV3Record {
+                    anchors: carrier.anchors,
+                    head: carrier.anchors[0],
+                    last_step: 0,
+                    commit_height: current_height,
+                    anchor_validator_id: carrier.validator_id,
+                });
+                Ok(CommitOutcome::Accepted)
+            }
+        }
+    }
+
+    /// Apply an optional block-proposer reveal at `height`.
+    pub fn apply_slot_reveal(
+        &mut self,
+        chain_id: u64,
+        proposer: &[u8; 32],
+        height: u64,
+        reveal: Option<&[u8; V3_LINK_LEN]>,
+    ) -> SlotRevealOutcome {
+        let epoch = epoch_of_height(height);
+        let slot_t = height % EPOCH_LEN;
+        let Some(rec) = self.records.get_mut(&(*proposer, epoch)) else {
+            return match reveal {
+                None => SlotRevealOutcome::AbsentNoCommit,
+                Some(_) => SlotRevealOutcome::UnexpectedReveal,
+            };
+        };
+        let Some(rev) = reveal else {
+            return SlotRevealOutcome::CommittedMissingReveal;
+        };
+        let anchor_vid = rec.anchor_validator_id;
+        match cnvrf_v3_verify_reveal(rec, chain_id, &anchor_vid, epoch, slot_t, rev) {
+            Ok(steps) => {
+                rec.head = *rev;
+                rec.last_step = slot_t + 1;
+                if self.rolling_mix_epoch != epoch {
+                    self.rolling_mix = self
+                        .epoch_rolling_mixes
+                        .get(&epoch)
+                        .and_then(|b| b.as_slice().try_into().ok())
+                        .unwrap_or([0u8; V3_LINK_LEN]);
+                    self.rolling_mix_epoch = epoch;
+                }
+                self.rolling_mix = blake3_xof_48(
+                    DST_BETA_V3,
+                    &[&self.rolling_mix, rev, proposer, &height.to_le_bytes()],
+                );
+                self.epoch_rolling_mixes
+                    .insert(epoch, self.rolling_mix.to_vec());
+                SlotRevealOutcome::Revealed { steps }
+            }
+            Err(_) => SlotRevealOutcome::InvalidReveal,
+        }
+    }
+
+    /// Migrate committed records for `old_id` to `new_id` starting at `from_epoch`
+    /// (preserving `anchor_validator_id` so the hash-chain preimage remains valid).
+    pub fn migrate_validator(&mut self, old_id: &[u8; 32], new_id: &[u8; 32], from_epoch: u64) {
+        if old_id == new_id {
+            return;
+        }
+        let keys_to_move: Vec<(ValidatorId, u64)> = self
+            .records
+            .keys()
+            .filter(|(vid, epoch)| vid == old_id && *epoch >= from_epoch)
+            .copied()
+            .collect();
+        for key in keys_to_move {
+            if let Some(rec) = self.records.remove(&key) {
+                self.records.entry((*new_id, key.1)).or_insert(rec);
+            }
+        }
+    }
+
+    /// Expire commitment records strictly older than `current_epoch`, returning count removed.
+    pub fn expire_before(&mut self, current_epoch: u64) -> usize {
+        let stale: Vec<(ValidatorId, u64)> = self
+            .records
+            .keys()
+            .filter(|(_, epoch_n)| *epoch_n < current_epoch)
+            .copied()
+            .collect();
+        let count = stale.len();
+        for k in stale {
+            self.records.remove(&k);
+        }
+        let stale_mix_epoch = current_epoch.saturating_sub(1);
+        let stale_mixes: Vec<u64> = self
+            .epoch_rolling_mixes
+            .keys()
+            .copied()
+            .filter(|&e| e < stale_mix_epoch)
+            .collect();
+        for e in stale_mixes {
+            self.epoch_rolling_mixes.remove(&e);
+        }
+        count
+    }
+}
+
+/// Deterministic epoch raw seed combining `(chain_id, epoch_n, prev_beacon, freeze_block_hash, rolling_mix)`.
+///
+/// Produces a deterministic fallback seed even when zero validators revealed (`rolling_mix == [0u8; 48]`),
+/// and stays identical across all honest nodes regardless of whether `1` or `N` validators revealed.
+pub fn epoch_raw_seed(
+    chain_id: u64,
+    epoch_n: u64,
+    prev_beacon: &[u8; V3_LINK_LEN],
+    freeze_block_hash: &[u8; 32],
+    rolling_mix: &[u8; V3_LINK_LEN],
+) -> [u8; V3_LINK_LEN] {
+    blake3_xof_48(
+        DST_EPOCH_RAW_SEED_V3,
+        &[
+            &chain_id.to_le_bytes(),
+            &epoch_n.to_le_bytes(),
+            prev_beacon,
+            freeze_block_hash,
+            rolling_mix,
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CN-VRF v3 encrypted secret custody (enc2: via node_keys)
+// ---------------------------------------------------------------------------
+
+/// Save a 48-byte CN-VRF v3 epoch secret `s_{i,N}` to `path` with `enc2:`
+/// encryption (Argon2id + XChaCha20-Poly1305) and atomic `0600` file write.
+///
+/// Refuses symlinks and fails closed when no passphrase is available unless
+/// `STELL_KEY_PLAINTEXT=1` is explicitly set.
+pub fn save_cnvrf_v3_secret(path: &Path, secret: &[u8; V3_LINK_LEN]) -> anyhow::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to write CN-VRF v3 secret to symlink {}",
+                path.display()
+            );
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "refusing to use symlinked parent directory {}",
+                        parent.display()
+                    );
+                }
+            }
+            crate::node_keys::ensure_secure_dir(parent)?;
+        }
+    }
+    let secret_hex = Zeroizing::new(hex::encode(secret));
+    let content: Zeroizing<Vec<u8>> = if crate::node_keys::plaintext_keys_allowed() {
+        tracing::warn!(
+            "{} set: saving CN-VRF v3 secret in PLAINTEXT",
+            crate::node_keys::ENV_PLAINTEXT,
+        );
+        Zeroizing::new(format!("{}\n", secret_hex.as_str()).into_bytes())
+    } else {
+        let pass = crate::node_keys::passphrase_for_write("cnvrf_v3.secret")?;
+        Zeroizing::new(
+            crate::node_keys::encrypt_bytes(secret_hex.as_bytes(), pass.as_str())?.into_bytes(),
+        )
+    };
+    crate::node_keys::atomic_write_private(path, &content)
+}
+
+/// Load a 48-byte CN-VRF v3 epoch secret `s_{i,N}` from `path`, verifying `0600`
+/// file permissions and decrypting `enc2:` (Argon2id + XChaCha20-Poly1305).
+///
+/// Fails closed on symlinks, loose permissions, missing/wrong passphrase for
+/// encrypted secrets, or invalid length/hex.
+pub fn load_cnvrf_v3_secret(path: &Path) -> anyhow::Result<Zeroizing<[u8; V3_LINK_LEN]>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "refusing CN-VRF v3 secret under symlinked directory {}",
+                        parent.display()
+                    );
+                }
+            }
+        }
+    }
+    crate::node_keys::verify_file_perms(path)?;
+    let raw = Zeroizing::new(
+        std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("read CN-VRF v3 secret {}: {e}", path.display()))?,
+    );
+    let pass = Zeroizing::new(crate::node_keys::get_passphrase());
+    let plain = Zeroizing::new(crate::node_keys::decrypt_bytes(&raw, pass.as_deref())?);
+    let text = std::str::from_utf8(&plain)
+        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in CN-VRF v3 secret: {e}"))?
+        .trim();
+    let hex_part = text.strip_prefix("0x").unwrap_or(text).trim();
+    let decoded = Zeroizing::new(
+        hex::decode(hex_part).map_err(|e| anyhow::anyhow!("invalid CN-VRF v3 secret hex: {e}"))?,
+    );
+    if decoded.len() != V3_LINK_LEN {
+        anyhow::bail!(
+            "invalid CN-VRF v3 secret length: expected {} bytes, got {}",
+            V3_LINK_LEN,
+            decoded.len()
+        );
+    }
+    let mut out = Zeroizing::new([0u8; V3_LINK_LEN]);
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
+
+/// Startup check verifying that a loaded 48-byte secret `s_{i,N}` derives
+/// the exact 16 segment anchors committed on-chain for `(chain_id, validator_id, epoch_n)`.
+pub fn verify_v3_secret_matches_commit(
+    secret: &[u8; V3_LINK_LEN],
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    epoch_n: u64,
+    commit_anchors: &[[u8; V3_LINK_LEN]; V3_SEGMENTS],
+) -> bool {
+    let computed = compute_v3_anchors(chain_id, validator_id, epoch_n, secret);
+    computed == *commit_anchors
 }

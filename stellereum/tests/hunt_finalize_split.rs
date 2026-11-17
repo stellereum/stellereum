@@ -139,6 +139,7 @@ fn mkblock(
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };

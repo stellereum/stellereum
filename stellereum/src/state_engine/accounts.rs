@@ -65,6 +65,12 @@ impl InMemoryStateEngine {
             ))),
             hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(HASH_POOL_ENABLED)),
             gov_ops_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cnvrf_v3: Arc::new(RwLock::new(crate::cn_vrf::CnVrfV3State::default())),
+            cnvrf_abort: Arc::new(RwLock::new(crate::staking::CnVrfAbortState::default())),
+            epoch_vdf_beacons: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            cnvrf_freeze_inputs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            #[cfg(any(test, debug_assertions))]
+            cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -91,6 +97,10 @@ impl InMemoryStateEngine {
         let bridge = self.bridge.read().await.clone();
         let consensus_penalty = self.consensus_penalty.read().await.clone();
         let hashpool = self.hashpool.read().await.clone();
+        let cnvrf_v3 = self.cnvrf_v3.read().await.clone();
+        let cnvrf_abort = self.cnvrf_abort.read().await.clone();
+        let epoch_vdf_beacons = self.epoch_vdf_beacons.read().await.clone();
+        let cnvrf_freeze_inputs = self.cnvrf_freeze_inputs.read().await.clone();
 
         let pq_tree = self
             .pq_tree
@@ -174,6 +184,15 @@ impl InMemoryStateEngine {
             )),
             gov_ops_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
                 self.gov_ops_tests_on
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            cnvrf_v3: Arc::new(RwLock::new(cnvrf_v3)),
+            cnvrf_abort: Arc::new(RwLock::new(cnvrf_abort)),
+            epoch_vdf_beacons: Arc::new(RwLock::new(epoch_vdf_beacons)),
+            cnvrf_freeze_inputs: Arc::new(RwLock::new(cnvrf_freeze_inputs)),
+            #[cfg(any(test, debug_assertions))]
+            cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.cnvrf_v3_activation_override
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
         }
@@ -827,21 +846,46 @@ impl InMemoryStateEngine {
             }
         };
 
-        crate::commitment::assemble_cached_digest([
-            &tokens,
-            &staking,
-            &pmm,
-            &contracts,
-            &escrow,
-            &governance,
-            &oracle,
-            &session_keys,
-            &books,
-            &bridge,
-            &cross_shard,
-            &xpc,
-            &zkml,
-        ])
+        // CN-VRF v3 (commits, rolling mixes, abort counters, finalized epoch beacons).
+        let gen = self.domain_gens.load(Domain::CnVrf);
+        let cnvrf_hit = self
+            .domain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_cnvrf_silent(gen);
+        let cnvrf = match cnvrf_hit {
+            Some(b) => b,
+            None => {
+                let snap = self.cnvrf_v3_snapshot().await;
+                let b = crate::commitment::cnvrf_v3_preimage(&snap);
+                if self.domain_gens.load(Domain::CnVrf) == gen {
+                    self.domain_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put_cnvrf_silent(gen, b.clone());
+                }
+                b
+            }
+        };
+
+        crate::commitment::assemble_cached_digest_with_cnvrf(
+            [
+                &tokens,
+                &staking,
+                &pmm,
+                &contracts,
+                &escrow,
+                &governance,
+                &oracle,
+                &session_keys,
+                &books,
+                &bridge,
+                &cross_shard,
+                &xpc,
+                &zkml,
+            ],
+            &cnvrf,
+        )
     }
 
     /// Take a writer lock on a committed subsystem and mark the commitment dirty.
@@ -1130,6 +1174,102 @@ impl InMemoryStateEngine {
             .await
     }
 
+    /// Read the committed CN-VRF v3 hash-chain state.
+    pub async fn cnvrf_v3_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, crate::cn_vrf::CnVrfV3State> {
+        self.cnvrf_v3.read().await
+    }
+
+    /// Write access to the committed CN-VRF v3 hash-chain state (bumps
+    /// `Domain::CnVrf` and `commitment_generation`).
+    pub async fn cnvrf_v3_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, crate::cn_vrf::CnVrfV3State> {
+        self.dom_guard(crate::commitment::Domain::CnVrf, &self.cnvrf_v3)
+            .await
+    }
+
+    /// Read the committed CN-VRF v3 reveal-abort leaky-bucket counters.
+    pub async fn cnvrf_abort_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, crate::staking::CnVrfAbortState> {
+        self.cnvrf_abort.read().await
+    }
+
+    /// Write access to the committed CN-VRF v3 reveal-abort counters (bumps
+    /// `Domain::CnVrf` and `commitment_generation`).
+    pub async fn cnvrf_abort_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, crate::staking::CnVrfAbortState> {
+        self.dom_guard(crate::commitment::Domain::CnVrf, &self.cnvrf_abort)
+            .await
+    }
+
+    /// Read the finalized CN-VRF v3 epoch VDF beacons (`epoch -> [u8; 48]`).
+    pub async fn epoch_vdf_beacons_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, std::collections::BTreeMap<u64, [u8; 48]>> {
+        self.epoch_vdf_beacons.read().await
+    }
+
+    /// Write access to the finalized CN-VRF v3 epoch VDF beacons (bumps
+    /// `Domain::CnVrf` and `commitment_generation`).
+    pub async fn epoch_vdf_beacons_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<u64, [u8; 48]>> {
+        self.dom_guard(crate::commitment::Domain::CnVrf, &self.epoch_vdf_beacons)
+            .await
+    }
+
+    /// Capture a consistent snapshot of the CN-VRF v3 state, abort counters,
+    /// and finalized epoch beacons.
+    pub async fn cnvrf_v3_snapshot(&self) -> super::CnVrfV3EngineSnapshot {
+        let v3_state = self.cnvrf_v3.read().await.clone();
+        let abort_state = self.cnvrf_abort.read().await.clone();
+        let epoch_beacons = self.epoch_vdf_beacons.read().await.clone();
+        super::CnVrfV3EngineSnapshot {
+            v3_state,
+            abort_state,
+            epoch_beacons,
+        }
+    }
+
+    /// Restore a [`CnVrfV3EngineSnapshot`] and bump `Domain::CnVrf` +
+    /// `commitment_generation`.
+    pub async fn restore_cnvrf_v3_snapshot(&self, snap: &super::CnVrfV3EngineSnapshot) {
+        *self.cnvrf_v3.write().await = snap.v3_state.clone();
+        *self.cnvrf_abort.write().await = snap.abort_state.clone();
+        *self.epoch_vdf_beacons.write().await = snap.epoch_beacons.clone();
+        self.bump_domain_generation(crate::commitment::Domain::CnVrf);
+    }
+
+    /// Set the test/debug per-engine CN-VRF v3 activation height override.
+    ///
+    /// Keeps frozen `CNVRF_V3_ACTIVATION_HEIGHT` (`u64::MAX`) untouched.
+    #[cfg(any(test, debug_assertions))]
+    pub fn set_cnvrf_v3_activation_height_for_tests(&self, height: u64) {
+        self.cnvrf_v3_activation_override
+            .store(height, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns `true` when CN-VRF v3 state transitions are active at `height`.
+    pub fn cnvrf_v3_is_active_at(&self, height: u64) -> bool {
+        if crate::consensus::cnvrf_v3_active_at(height) {
+            return true;
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            let ov = self
+                .cnvrf_v3_activation_override
+                .load(std::sync::atomic::Ordering::Acquire);
+            if height >= ov {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Shared handle to the registry lock, for the one synchronous reader that
     /// cannot await: mempool admission. Like `staking_handle`, READS through
     /// the handle are safe; it exists so admission can consult revocation
@@ -1415,7 +1555,12 @@ impl InMemoryStateEngine {
         // transient read guards, so both entry points commit byte-identical
         // digests for the same state.
         let zkml_models = self.zkml_models.read().await.clone();
-        let digest = crate::commitment::commitment_digest_with_zkml(&snapshot, &zkml_models);
+        let cnvrf_snap = self.cnvrf_v3_snapshot().await;
+        let digest = crate::commitment::commitment_digest_with_zkml_and_cnvrf(
+            &snapshot,
+            &zkml_models,
+            &cnvrf_snap,
+        );
         self.state_trie
             .write()
             .await

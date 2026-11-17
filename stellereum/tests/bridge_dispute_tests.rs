@@ -179,6 +179,7 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     }
 }
 

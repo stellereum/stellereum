@@ -106,6 +106,7 @@ pub fn shard_genesis_block(
         // Genesis is never an epoch-committing boundary (see
         // `crate::mmr::commits_epoch_root`): it commits to no epoch root.
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     }
 }
 
@@ -248,6 +249,7 @@ pub struct SnapBundle {
     pub session_keys: Vec<u8>,
     pub bridge: Vec<u8>,
     pub zkml_models: Vec<u8>,
+    pub cnvrf_v3: Vec<u8>,
 }
 
 /// Snapshot request/response on the sequenced lane (see `SnapBundle`).
@@ -354,6 +356,8 @@ impl ApplyLane {
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
                         let zkml_models = state.zkml_models_snapshot().await;
+                        let cnvrf_v3 = bincode::serialize(&state.cnvrf_v3_snapshot().await)
+                            .unwrap_or_default();
                         let _ = job.done.send(Some(SnapBundle {
                             height: job.height,
                             accounts,
@@ -361,6 +365,7 @@ impl ApplyLane {
                             session_keys,
                             bridge,
                             zkml_models,
+                            cnvrf_v3,
                         }));
                     }
                 }
@@ -497,5 +502,269 @@ impl PackFilterCtx {
             rej_basefee: std::cell::Cell::new(0),
             rej_sponsor: std::cell::Cell::new(0),
         }
+    }
+}
+
+// ============================================================================
+// CN-VRF v3 off-tick MinRoot VDF lane (local only, never on the wire)
+// ============================================================================
+
+/// Completed MinRoot VDF evaluation returned by [`VdfLane`].
+#[allow(dead_code)]
+// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VdfJobOutput {
+    /// Epoch this VDF proof was evaluated for.
+    pub epoch: u64,
+    /// 48-byte raw seed passed into `minroot_vdf::eval`.
+    pub raw_seed: [u8; 48],
+    /// Checkpointed MinRoot VDF proof.
+    pub proof: crate::minroot_vdf::MinRootProof,
+    /// Canonical 48-byte VDF beacon output derived from `(raw_seed, proof)`.
+    pub output: [u8; 48],
+}
+
+/// One queued MinRoot VDF evaluation request for [`VdfLane`].
+#[allow(dead_code)]
+// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
+pub struct VdfJob {
+    /// Epoch associated with this VDF evaluation.
+    pub epoch: u64,
+    /// 48-byte raw seed for `minroot_vdf::eval`.
+    pub raw_seed: [u8; 48],
+    /// Number of sequential MinRoot forward steps (`> 0`).
+    pub steps: u64,
+    /// Number of intermediate checkpoints to record in the proof.
+    pub checkpoints: usize,
+    /// One-shot completion channel (`None` if superseded or on panic).
+    pub done: tokio::sync::oneshot::Sender<Option<VdfJobOutput>>,
+}
+
+/// Dedicated off-tick sequential worker for `MinRoot` PQ-VDF evaluation.
+///
+/// Cloning the lane clones the sender and epoch-cancellation handle only —
+/// every clone feeds the SAME FIFO worker task. Each job executes inside
+/// `tokio::task::spawn_blocking` wrapped in `AssertUnwindSafe` + `catch_unwind`
+/// so CPU-bound VDF evaluation never stalls async consensus ticks and a panic
+/// returns `None` without crashing the consensus process.
+#[allow(dead_code)]
+// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
+#[derive(Clone)]
+pub struct VdfLane {
+    tx: tokio::sync::mpsc::UnboundedSender<VdfJob>,
+    latest_epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[allow(dead_code)]
+// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
+impl VdfLane {
+    /// Spawn the single sequential off-tick VDF worker task.
+    pub fn spawn() -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VdfJob>();
+        let latest_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_latest_epoch = Arc::clone(&latest_epoch);
+
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                if job.epoch < worker_latest_epoch.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::debug!(
+                        epoch = job.epoch,
+                        "vdf job skipped: superseded by newer epoch"
+                    );
+                    let _ = job.done.send(None);
+                    continue;
+                }
+
+                let epoch = job.epoch;
+                let raw_seed = job.raw_seed;
+                let steps = job.steps;
+                let checkpoints = job.checkpoints;
+                let blocking_latest_epoch = Arc::clone(&worker_latest_epoch);
+
+                let join_res = tokio::task::spawn_blocking(move || {
+                    std::thread::yield_now();
+                    if epoch < blocking_latest_epoch.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let eval_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let proof = crate::minroot_vdf::eval(&raw_seed, steps, checkpoints);
+                        std::thread::yield_now();
+                        let output = crate::minroot_vdf::derive_vdf_output(&raw_seed, &proof);
+                        VdfJobOutput {
+                            epoch,
+                            raw_seed,
+                            proof,
+                            output,
+                        }
+                    }));
+                    match eval_res {
+                        Ok(out) => {
+                            if epoch
+                                < blocking_latest_epoch.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                Ok(None)
+                            } else {
+                                Ok(Some(out))
+                            }
+                        }
+                        Err(_) => Err(()),
+                    }
+                })
+                .await;
+
+                match join_res {
+                    Ok(Ok(maybe_out)) => {
+                        let _ = job.done.send(maybe_out);
+                    }
+                    Ok(Err(())) => {
+                        tracing::error!(
+                            epoch,
+                            steps,
+                            "vdf worker PANICKED during MinRoot evaluation — returning None"
+                        );
+                        let _ = job.done.send(None);
+                    }
+                    Err(join_err) => {
+                        tracing::error!(
+                            epoch,
+                            steps,
+                            error = %join_err,
+                            "vdf blocking task aborted — returning None"
+                        );
+                        let _ = job.done.send(None);
+                    }
+                }
+            }
+        });
+
+        Self { tx, latest_epoch }
+    }
+
+    /// Enqueue a `MinRoot` VDF evaluation job and return a one-shot receiver
+    /// for its result (`None` if superseded by a newer epoch or on panic).
+    pub fn submit(
+        &self,
+        epoch: u64,
+        raw_seed: [u8; 48],
+        steps: u64,
+        checkpoints: usize,
+    ) -> tokio::sync::oneshot::Receiver<Option<VdfJobOutput>> {
+        self.latest_epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let job = VdfJob {
+            epoch,
+            raw_seed,
+            steps,
+            checkpoints,
+            done: done_tx,
+        };
+        if let Err(err) = self.tx.send(job) {
+            let _ = err.0.done.send(None);
+        }
+        done_rx
+    }
+
+    /// Mark any queued or in-flight VDF jobs for epochs strictly below `epoch`
+    /// as stale so they are skipped or dropped cleanly.
+    pub fn cancel_below(&self, epoch: u64) {
+        self.latest_epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Return the highest epoch seen by this lane so far.
+    pub fn latest_epoch(&self) -> u64 {
+        self.latest_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod vdf_lane_tests {
+    use super::*;
+    use crate::minroot_vdf::{verify, TEST_VDF_STEPS};
+
+    #[tokio::test]
+    async fn vdf_lane_computes_and_verifies_minroot_proof() {
+        let lane = VdfLane::spawn();
+        let seed = [0x42u8; 48];
+        let out = lane
+            .submit(1, seed, TEST_VDF_STEPS, 4)
+            .await
+            .expect("vdf worker channel open")
+            .expect("vdf job should produce proof");
+
+        assert_eq!(out.epoch, 1);
+        assert_eq!(out.raw_seed, seed);
+        assert_eq!(out.proof.steps, TEST_VDF_STEPS);
+        assert_eq!(out.proof.checkpoints.len(), 4);
+
+        let verified_output = verify(&seed, TEST_VDF_STEPS, &out.proof)
+            .expect("minroot_vdf::verify must accept VdfLane proof");
+        assert_eq!(verified_output, out.output);
+    }
+
+    #[tokio::test]
+    async fn vdf_lane_sequential_multiple_epochs_and_panic_recovery() {
+        let lane = VdfLane::spawn();
+
+        // Multiple sequential epochs complete cleanly in order.
+        for epoch in 0..=3u64 {
+            let mut seed = [0u8; 48];
+            seed[0] = epoch as u8;
+            seed[47] = 0xA5;
+            let out = lane
+                .submit(epoch, seed, TEST_VDF_STEPS, 4)
+                .await
+                .expect("vdf worker channel open")
+                .expect("vdf job should succeed");
+            assert_eq!(out.epoch, epoch);
+            let verified = verify(&seed, TEST_VDF_STEPS, &out.proof)
+                .expect("sequential epoch proof must verify");
+            assert_eq!(verified, out.output);
+        }
+
+        // Submitting an invalid 0-step job triggers minroot_vdf::eval's assert! panic,
+        // which must be caught by AssertUnwindSafe + catch_unwind and return None
+        // without crashing the worker or subsequent jobs.
+        let panic_res = lane
+            .submit(4, [0x11u8; 48], 0, 4)
+            .await
+            .expect("vdf worker channel open after panic");
+        assert!(panic_res.is_none(), "panicking VDF job must return None");
+
+        // Worker remains alive for epoch 5.
+        let post_panic = lane
+            .submit(5, [0x22u8; 48], TEST_VDF_STEPS, 4)
+            .await
+            .expect("vdf worker channel open")
+            .expect("subsequent VDF job must still succeed");
+        assert_eq!(post_panic.epoch, 5);
+        assert_eq!(
+            verify(&[0x22u8; 48], TEST_VDF_STEPS, &post_panic.proof),
+            Some(post_panic.output)
+        );
+    }
+
+    #[tokio::test]
+    async fn vdf_lane_supersedes_stale_epoch_jobs() {
+        let lane = VdfLane::spawn();
+        let rx_stale = lane.submit(10, [0x01u8; 48], TEST_VDF_STEPS, 4);
+        let rx_newer = lane.submit(11, [0x02u8; 48], TEST_VDF_STEPS, 4);
+
+        let stale_out = rx_stale.await.expect("stale receiver open");
+        assert!(
+            stale_out.is_none(),
+            "superseded epoch 10 job must be skipped/dropped"
+        );
+
+        let newer_out = rx_newer
+            .await
+            .expect("newer receiver open")
+            .expect("latest epoch 11 job must complete");
+        assert_eq!(newer_out.epoch, 11);
+        assert_eq!(
+            verify(&[0x02u8; 48], TEST_VDF_STEPS, &newer_out.proof),
+            Some(newer_out.output)
+        );
     }
 }

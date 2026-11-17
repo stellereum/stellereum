@@ -186,6 +186,7 @@ async fn on_proposal_deferred_while_apply_pending() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -516,6 +517,7 @@ async fn overcap_actor_block_rejected_at_propose() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
@@ -598,6 +600,7 @@ async fn overcap_actor_block_rejected_at_adopt() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
@@ -697,6 +700,7 @@ async fn actor_cap_counts_backlog_plus_block() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: root,
             epoch_key_commitment: [0u8; 32],
         }
@@ -763,6 +767,7 @@ async fn actor_cap_counts_backlog_plus_block() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };

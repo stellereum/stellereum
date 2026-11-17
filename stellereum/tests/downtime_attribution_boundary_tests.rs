@@ -142,6 +142,7 @@ fn block_h2_with_bond(
         precommit_qc: None,
         last_qc: Some(last_qc),
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: stellereum::mev::compute_order_merkle_root(&txs),
         epoch_key_commitment: [0u8; 32],
     }

@@ -1,4 +1,6 @@
-use super::ValidatorRuntime;
+use super::{
+    ValidatorRuntime, VdfLane, MAX_CNVRF_V3_COMMITS_PER_BLOCK, MAX_PENDING_CNVRF_V3_COMMITS,
+};
 use crate::consensus::{FalconKeypair, Height, HeightConsensus, ValidatorId, ValidatorSet};
 use crate::mempool::Mempool;
 use crate::sharding::{
@@ -6,8 +8,9 @@ use crate::sharding::{
     MASTERCHAIN_SHARD,
 };
 use crate::state_engine::InMemoryStateEngine;
+use crate::storage::BlockHash;
 use ed25519_dalek::{Signer as _, SigningKey};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 impl ValidatorRuntime {
@@ -91,6 +94,20 @@ impl ValidatorRuntime {
             proposer_sig_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             qc_power_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             prebuilt_selection: std::sync::Mutex::new(None),
+            vdf_lane: None,
+            pending_vdf_rx: None,
+            ready_vdf_beacons: BTreeMap::new(),
+            finalized_epoch_beacons: BTreeMap::new(),
+            cnvrf_v3_mirror: crate::cn_vrf::CnVrfV3State::default(),
+            cnvrf_freeze_inputs: BTreeMap::new(),
+            cnvrf_v3_chains: BTreeMap::new(),
+            cnvrf_v3_disabled_epochs: HashSet::new(),
+            pending_cnvrf_v3_commits: Vec::new(),
+            cnvrf_v3_dir: None,
+            cnvrf_v3_chain_id: state.chain_id,
+            cnvrf_v3_vdf_steps: crate::minroot_vdf::DEFAULT_VDF_STEPS_PER_EPOCH,
+            #[cfg(any(test, debug_assertions))]
+            cnvrf_v3_activation_override: None,
             last_progress_at: std::time::Instant::now(),
             last_breaker_at: None,
             // The fork-choice tree starts EMPTY: the node learns its
@@ -105,6 +122,843 @@ impl ValidatorRuntime {
             // chain this node has finalized.
             light: None,
         }
+    }
+
+    // =========================================================================
+    // CN-VRF v3 (7,200-block reverse hash-chain + MinRoot PQ-VDF epoch beacon)
+    // =========================================================================
+
+    /// Configure test/debug CN-VRF v3 activation height on both this runtime and
+    /// its backing state engine, leaving the frozen `CNVRF_V3_ACTIVATION_HEIGHT`
+    /// constant untouched.
+    #[cfg(any(test, debug_assertions))]
+    pub fn set_cnvrf_v3_activation_height_for_tests(&mut self, activation: u64) {
+        self.cnvrf_v3_activation_override = Some(activation);
+        self.state
+            .set_cnvrf_v3_activation_height_for_tests(activation);
+    }
+
+    /// Builder: override MinRoot VDF steps per epoch (e.g. `64` in tests).
+    pub fn with_cnvrf_v3_vdf_steps(mut self, steps: u64) -> Self {
+        self.cnvrf_v3_vdf_steps = steps.max(1);
+        self
+    }
+
+    /// Set MinRoot VDF steps per epoch at runtime.
+    pub fn set_cnvrf_v3_vdf_steps(&mut self, steps: u64) {
+        self.cnvrf_v3_vdf_steps = steps.max(1);
+    }
+
+    /// Configure encrypted (`enc2:`) disk custody directory and chain ID for
+    /// CN-VRF v3 per-epoch secrets.
+    pub fn configure_cnvrf_v3_custody(&mut self, dir: std::path::PathBuf, chain_id: u64) {
+        self.cnvrf_v3_dir = Some(dir);
+        self.cnvrf_v3_chain_id = chain_id;
+    }
+
+    /// Returns `true` when CN-VRF v3 is active at `height`.
+    pub fn cnvrf_v3_is_active_at(&self, height: Height) -> bool {
+        if crate::consensus::cnvrf_v3_active_at(height) {
+            return true;
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(activation) = self.cnvrf_v3_activation_override {
+                if height >= activation {
+                    return true;
+                }
+            }
+            if self.state.cnvrf_v3_is_active_at(height) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Synchronous lookup of the active CN-VRF v3 [`crate::consensus::EpochBeacon`]
+    /// for `height`, reading from finalized state mirrors and locally completed
+    /// `MinRoot` VDF proofs.
+    ///
+    /// For epoch 0 (or an activation epoch whose `H_freeze` occurred prior to
+    /// CN-VRF v3 activation), returns a deterministic genesis/activation bootstrap
+    /// beacon derived from `(chain_id, epoch)` so `proposer_for_with_beacon` and
+    /// `QuorumCertificate::verify_with_beacon` remain deterministic across all nodes.
+    /// For any subsequent epoch whose `H_freeze` ran under active CN-VRF v3,
+    /// fails closed (`None`) until the verified VDF beacon is ready or finalized.
+    pub fn active_epoch_beacon(&self, height: Height) -> Option<crate::consensus::EpochBeacon> {
+        if !self.cnvrf_v3_is_active_at(height) {
+            return None;
+        }
+        let epoch = crate::cn_vrf::epoch_of_height(height);
+        if let Some(&output) = self.finalized_epoch_beacons.get(&epoch) {
+            return Some(crate::consensus::EpochBeacon { epoch, output });
+        }
+        if let Some(vdf) = self.ready_vdf_beacons.get(&epoch) {
+            let output = crate::minroot_vdf::derive_vdf_output(&vdf.raw_seed, &vdf.proof);
+            return Some(crate::consensus::EpochBeacon { epoch, output });
+        }
+        let h_freeze = epoch
+            .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+            .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+        if epoch == 0 || !self.cnvrf_v3_is_active_at(h_freeze) {
+            let output = crate::cn_vrf::epoch_raw_seed(
+                self.cnvrf_v3_chain_id,
+                epoch,
+                &[0u8; crate::cn_vrf::V3_LINK_LEN],
+                &[0u8; 32],
+                &[0u8; crate::cn_vrf::V3_LINK_LEN],
+            );
+            return Some(crate::consensus::EpochBeacon { epoch, output });
+        }
+        None
+    }
+
+    /// Lazily spawn the off-tick sequential MinRoot VDF worker on first active use.
+    pub(super) fn ensure_vdf_lane(&mut self) -> VdfLane {
+        if self.vdf_lane.is_none() {
+            self.vdf_lane = Some(VdfLane::spawn());
+        }
+        self.vdf_lane.clone().expect("vdf lane just spawned")
+    }
+
+    /// Non-blocking poll of the pending VDF job; moves a completed
+    /// `VdfJobOutput` into `ready_vdf_beacons`.
+    pub fn poll_vdf_lane(&mut self) {
+        let Some((expected_epoch, mut rx)) = self.pending_vdf_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(out)) => {
+                if out.epoch == expected_epoch {
+                    self.ready_vdf_beacons.insert(
+                        out.epoch,
+                        crate::sharding::EpochVdfBeacon {
+                            epoch: out.epoch,
+                            raw_seed: out.raw_seed,
+                            proof: out.proof,
+                        },
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    epoch = expected_epoch,
+                    "CN-VRF v3 VDF lane returned None (superseded or panicked)"
+                );
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.pending_vdf_rx = Some((expected_epoch, rx));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                tracing::error!(
+                    epoch = expected_epoch,
+                    "CN-VRF v3 VDF lane channel closed before delivering beacon"
+                );
+            }
+        }
+    }
+
+    /// True if a verified or locally computed `EpochVdfBeacon` for `epoch` is
+    /// already ready (either in `ready_vdf_beacons` or `finalized_epoch_beacons`).
+    pub fn has_ready_vdf_beacon(&self, epoch: u64) -> bool {
+        self.ready_vdf_beacons.contains_key(&epoch)
+            || self.finalized_epoch_beacons.contains_key(&epoch)
+    }
+
+    /// Number of queued outbound CN-VRF v3 commitments waiting to be packed.
+    pub fn pending_cnvrf_v3_commits_len(&self) -> usize {
+        self.pending_cnvrf_v3_commits.len()
+    }
+
+    /// True if local reveal/propose is disabled for `epoch` due to custody mismatch.
+    pub fn cnvrf_v3_is_epoch_disabled(&self, epoch: u64) -> bool {
+        self.cnvrf_v3_disabled_epochs.contains(&epoch)
+    }
+
+    pub(super) fn cnvrf_v3_secret_path(&self, epoch_n: u64) -> Option<std::path::PathBuf> {
+        self.cnvrf_v3_dir.as_ref().map(|dir| {
+            dir.join(format!(
+                "cnvrf_v3_epoch_{epoch_n}_{}.secret",
+                hex::encode(&self.id[..8])
+            ))
+        })
+    }
+
+    /// Resolve a validator's active PQ key synchronously (matching `apply_cnvrf_v3`).
+    pub(super) fn resolve_validator_pq_key_sync(
+        &self,
+        validator_id: &ValidatorId,
+        height: Height,
+    ) -> Result<(crate::post_quantum::PqScheme, Vec<u8>), String> {
+        let ledger = self.staking.try_read().map_err(|_| {
+            "proposal: staking ledger unavailable for CN-VRF commit check".to_string()
+        })?;
+        if !ledger.validators.contains_key(validator_id) {
+            return Err("proposal: CN-VRF v3 commit from unknown/unbonded validator".to_string());
+        }
+        let key_opt = ledger
+            .validator_pq_keys
+            .get(validator_id)
+            .cloned()
+            .or_else(|| crate::consensus::pq_key_at_height(validator_id, height))
+            .or_else(|| self.state.get_pinned_pubkey(validator_id));
+        let Some((scheme, pk)) = key_opt else {
+            return Err("proposal: CN-VRF v3 commit validator has no active PQ key".to_string());
+        };
+        if scheme.is_disabled() || pk.len() != crate::cn_vrf::CNVRF_PK_LEN {
+            return Err(
+                "proposal: CN-VRF v3 commit validator has invalid PQ key scheme or length"
+                    .to_string(),
+            );
+        }
+        Ok((scheme, pk))
+    }
+
+    /// Enqueue a gossiped peer [`crate::cn_vrf::CommitCarrierV3`] to be included
+    /// in our next block proposal before `H_freeze`. Deduplicated and bounded.
+    pub fn enqueue_peer_cnvrf_v3_commit(&mut self, carrier: crate::cn_vrf::CommitCarrierV3) {
+        if !self.cnvrf_v3_is_active_at(self.hc.height) {
+            return;
+        }
+        let current_epoch = crate::cn_vrf::epoch_of_height(self.hc.height);
+        if carrier.epoch_n != current_epoch.saturating_add(1) {
+            return;
+        }
+        let h_freeze = carrier
+            .epoch_n
+            .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+            .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+        if self.hc.height >= h_freeze {
+            return;
+        }
+        if self
+            .cnvrf_v3_mirror
+            .get_record(&carrier.validator_id, carrier.epoch_n)
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .pending_cnvrf_v3_commits
+            .iter()
+            .any(|c| c.validator_id == carrier.validator_id && c.epoch_n == carrier.epoch_n)
+        {
+            return;
+        }
+        if self.pending_cnvrf_v3_commits.len() >= MAX_PENDING_CNVRF_V3_COMMITS {
+            return;
+        }
+        let Ok((_, pk)) = self.resolve_validator_pq_key_sync(&carrier.validator_id, self.hc.height)
+        else {
+            return;
+        };
+        if crate::cn_vrf::cnvrf_v3_verify_commit(&carrier, self.cnvrf_v3_chain_id, &pk).is_err() {
+            return;
+        }
+        self.pending_cnvrf_v3_commits.push(carrier);
+    }
+
+    /// Restore CN-VRF v3 state mirrors on boot and verify local `enc2:` secret
+    /// custody against any existing on-chain commitments for `self.id`.
+    pub async fn sync_cnvrf_v3_on_boot(&mut self) {
+        self.finalized_epoch_beacons = self.state.epoch_vdf_beacons_read().await.clone();
+        let v3_state = self.state.cnvrf_v3_read().await.clone();
+        self.cnvrf_v3_mirror = v3_state.clone();
+
+        if !self.cnvrf_v3_is_active_at(self.hc.height) {
+            return;
+        }
+
+        let current_epoch = crate::cn_vrf::epoch_of_height(self.hc.height);
+        for epoch in [current_epoch, current_epoch.saturating_add(1)] {
+            let Some(rec) = v3_state.get_record(&self.id, epoch) else {
+                continue;
+            };
+            if let Some(existing) = self.cnvrf_v3_chains.get(&epoch) {
+                if existing.anchors() == &rec.anchors
+                    && existing.validator_id() == &rec.anchor_validator_id
+                {
+                    self.cnvrf_v3_disabled_epochs.remove(&epoch);
+                    continue;
+                }
+            }
+            if let Some(path) = self.cnvrf_v3_secret_path(epoch) {
+                if !path.exists() {
+                    tracing::error!(
+                        validator = %hex::encode(self.id),
+                        epoch,
+                        path = %path.display(),
+                        "CN-VRF v3 secret file missing for on-chain commitment; disabling local reveal/propose for this epoch"
+                    );
+                    self.cnvrf_v3_disabled_epochs.insert(epoch);
+                    continue;
+                }
+                match crate::cn_vrf::load_cnvrf_v3_secret(&path) {
+                    Ok(secret) => {
+                        if crate::cn_vrf::verify_v3_secret_matches_commit(
+                            &secret,
+                            self.cnvrf_v3_chain_id,
+                            &rec.anchor_validator_id,
+                            epoch,
+                            &rec.anchors,
+                        ) {
+                            let chain = crate::cn_vrf::CnVrfV3Chain::generate(
+                                self.cnvrf_v3_chain_id,
+                                &rec.anchor_validator_id,
+                                epoch,
+                                &secret,
+                            );
+                            self.cnvrf_v3_chains.insert(epoch, chain);
+                            self.cnvrf_v3_disabled_epochs.remove(&epoch);
+                        } else {
+                            tracing::error!(
+                                validator = %hex::encode(self.id),
+                                epoch,
+                                path = %path.display(),
+                                "CN-VRF v3 secret on disk does NOT match on-chain commitment anchors; disabling local reveal/propose for this epoch"
+                            );
+                            self.cnvrf_v3_disabled_epochs.insert(epoch);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            validator = %hex::encode(self.id),
+                            epoch,
+                            path = %path.display(),
+                            error = %e,
+                            "CN-VRF v3 failed to load encrypted secret for committed epoch; disabling local reveal/propose for this epoch"
+                        );
+                        self.cnvrf_v3_disabled_epochs.insert(epoch);
+                    }
+                }
+            } else {
+                tracing::error!(
+                    validator = %hex::encode(self.id),
+                    epoch,
+                    "CN-VRF v3 on-chain commitment exists with no custody directory or matching in-memory chain; disabling local reveal/propose for this epoch"
+                );
+                self.cnvrf_v3_disabled_epochs.insert(epoch);
+            }
+        }
+
+        // Also prepare next epoch's commitment if we are before H_freeze.
+        if self.validators.validators.contains_key(&self.id) {
+            let next_epoch = current_epoch.saturating_add(1);
+            let h_freeze = next_epoch
+                .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+                .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+            if self.hc.height < h_freeze {
+                self.ensure_cnvrf_v3_chain_and_commit(next_epoch);
+            }
+        }
+    }
+
+    /// Ensure local `CnVrfV3Chain` + `CommitCarrierV3` exists for `epoch` (with
+    /// write-ahead `enc2:` persistence BEFORE signing/queuing when `cnvrf_v3_dir`
+    /// is configured).
+    pub(super) fn ensure_cnvrf_v3_chain_and_commit(&mut self, epoch: u64) {
+        if self.cnvrf_v3_disabled_epochs.contains(&epoch) {
+            return;
+        }
+        if self.cnvrf_v3_mirror.get_record(&self.id, epoch).is_some() {
+            return;
+        }
+        if let Some(chain) = self.cnvrf_v3_chains.get(&epoch) {
+            if !self
+                .pending_cnvrf_v3_commits
+                .iter()
+                .any(|c| c.validator_id == self.id && c.epoch_n == epoch)
+            {
+                if let Some(fk) = self.falcon_signing_key() {
+                    let carrier = chain.commit_carrier(fk);
+                    if self.pending_cnvrf_v3_commits.len() < MAX_PENDING_CNVRF_V3_COMMITS {
+                        self.pending_cnvrf_v3_commits.push(carrier);
+                    }
+                }
+            }
+            return;
+        }
+
+        let secret: zeroize::Zeroizing<[u8; crate::cn_vrf::V3_LINK_LEN]> = if let Some(path) =
+            self.cnvrf_v3_secret_path(epoch)
+        {
+            if path.exists() {
+                match crate::cn_vrf::load_cnvrf_v3_secret(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            validator = %hex::encode(self.id),
+                            epoch,
+                            path = %path.display(),
+                            error = %e,
+                            "CN-VRF v3 failed to load existing epoch secret; refusing to commit"
+                        );
+                        self.cnvrf_v3_disabled_epochs.insert(epoch);
+                        return;
+                    }
+                }
+            } else {
+                let mut raw = zeroize::Zeroizing::new([0u8; crate::cn_vrf::V3_LINK_LEN]);
+                if self.deterministic_sim_signing {
+                    let derived = crate::cn_vrf::derive_v3_epoch_secret(
+                        &self.key.to_bytes(),
+                        self.cnvrf_v3_chain_id,
+                        &self.id,
+                        epoch,
+                    );
+                    raw.copy_from_slice(&*derived);
+                } else {
+                    use rand::RngCore as _;
+                    rand::rngs::OsRng.fill_bytes(&mut *raw);
+                }
+                // Write-ahead persist enc2: secret BEFORE signing/queuing CommitCarrierV3.
+                if let Err(e) = crate::cn_vrf::save_cnvrf_v3_secret(&path, &raw) {
+                    tracing::error!(
+                        validator = %hex::encode(self.id),
+                        epoch,
+                        path = %path.display(),
+                        error = %e,
+                        "CN-VRF v3 write-ahead secret persistence failed; refusing to sign/queue CommitCarrierV3"
+                    );
+                    return;
+                }
+                raw
+            }
+        } else if self.deterministic_sim_signing {
+            crate::cn_vrf::derive_v3_epoch_secret(
+                &self.key.to_bytes(),
+                self.cnvrf_v3_chain_id,
+                &self.id,
+                epoch,
+            )
+        } else {
+            use rand::RngCore as _;
+            let mut raw = zeroize::Zeroizing::new([0u8; crate::cn_vrf::V3_LINK_LEN]);
+            rand::rngs::OsRng.fill_bytes(&mut *raw);
+            raw
+        };
+
+        let Some(fk) = self.falcon_signing_key() else {
+            return;
+        };
+        let chain =
+            crate::cn_vrf::CnVrfV3Chain::generate(self.cnvrf_v3_chain_id, &self.id, epoch, &secret);
+        let carrier = chain.commit_carrier(fk);
+        self.cnvrf_v3_chains.insert(epoch, chain);
+        if self.pending_cnvrf_v3_commits.len() < MAX_PENDING_CNVRF_V3_COMMITS
+            && !self
+                .pending_cnvrf_v3_commits
+                .iter()
+                .any(|c| c.validator_id == self.id && c.epoch_n == epoch)
+        {
+            self.pending_cnvrf_v3_commits.push(carrier);
+        }
+    }
+
+    /// Build the CN-VRF v3 payload a proposal at `height` must carry.
+    ///
+    /// Only the proposer's own chain step, our queued peer commit carriers,
+    /// and (on an epoch boundary) the ready `MinRoot` beacon travel with the
+    /// block — never another validator's reveal, and never a value we cannot
+    /// prove. `None` below the gate and when there is nothing to publish, so
+    /// pre-activation blocks keep their legacy wire shape and hash.
+    pub(super) fn build_cnvrf_v3_payload(
+        &mut self,
+        height: Height,
+    ) -> Option<crate::sharding::CnVrfV3BlockPayload> {
+        if !self.cnvrf_v3_is_active_at(height) {
+            return None;
+        }
+        let epoch = crate::cn_vrf::epoch_of_height(height);
+
+        // A reveal may be emitted ONLY for an epoch whose commitment is already
+        // ON-CHAIN (`epoch == current + 1` at commit time, so the record for
+        // the current epoch can only come from the previous epoch's proposal).
+        // Emitting one without a record would be refused by every peer as
+        // `UnexpectedReveal` — and rightly so: the chain would be unverifiable.
+        let reveal = if self.cnvrf_v3_mirror.get_record(&self.id, epoch).is_some() {
+            self.cnvrf_v3_chains
+                .get(&epoch)
+                .and_then(|chain| chain.reveal_for_slot(height % crate::cn_vrf::EPOCH_LEN))
+        } else {
+            None
+        };
+        let commits = self.collect_pending_cnvrf_v3_commits(height);
+        let epoch_vdf = if height.is_multiple_of(crate::cn_vrf::EPOCH_LEN)
+            && height >= crate::cn_vrf::EPOCH_LEN
+        {
+            self.ready_vdf_beacons
+                .get(&(height / crate::cn_vrf::EPOCH_LEN))
+                .cloned()
+        } else {
+            None
+        };
+
+        let payload = crate::sharding::CnVrfV3BlockPayload {
+            reveal,
+            commits,
+            epoch_vdf,
+        };
+        if payload.is_empty() {
+            None
+        } else {
+            Some(payload)
+        }
+    }
+
+    /// Collect canonical, verified, non-expired, deduplicated pending
+    /// `CommitCarrierV3` entries admissible at `height`.
+    pub(super) fn collect_pending_cnvrf_v3_commits(
+        &self,
+        height: Height,
+    ) -> Vec<crate::cn_vrf::CommitCarrierV3> {
+        let current_epoch = crate::cn_vrf::epoch_of_height(height);
+        let target_epoch = current_epoch.saturating_add(1);
+        let h_freeze = target_epoch
+            .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+            .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+        if height >= h_freeze {
+            return Vec::new();
+        }
+        let mut out: Vec<crate::cn_vrf::CommitCarrierV3> = self
+            .pending_cnvrf_v3_commits
+            .iter()
+            .filter(|c| {
+                if c.epoch_n != target_epoch {
+                    return false;
+                }
+                if self
+                    .cnvrf_v3_mirror
+                    .get_record(&c.validator_id, c.epoch_n)
+                    .is_some()
+                {
+                    return false;
+                }
+                let Ok((_, pk)) = self.resolve_validator_pq_key_sync(&c.validator_id, height)
+                else {
+                    return false;
+                };
+                crate::cn_vrf::cnvrf_v3_verify_commit(c, self.cnvrf_v3_chain_id, &pk).is_ok()
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.validator_id
+                .cmp(&b.validator_id)
+                .then_with(|| a.epoch_n.cmp(&b.epoch_n))
+        });
+        out.dedup_by(|a, b| a.validator_id == b.validator_id && a.epoch_n == b.epoch_n);
+        out.truncate(MAX_CNVRF_V3_COMMITS_PER_BLOCK);
+        out
+    }
+
+    /// Epoch hooks run on every finalized-block advance (`install_apply_outcome`,
+    /// `try_finalize`, and `apply_and_advance`): refreshes synchronous CN-VRF v3
+    /// mirrors, prepares `next_epoch` commitment before `H_freeze`, and dispatches
+    /// `VdfLane::submit` at `H_freeze`.
+    pub async fn prepare_cnvrf_v3_epoch_hooks(
+        &mut self,
+        finalized_height: Height,
+        finalized_hash: BlockHash,
+    ) {
+        self.poll_vdf_lane();
+
+        let next_height = finalized_height.saturating_add(1);
+        if !self.cnvrf_v3_is_active_at(next_height) && !self.cnvrf_v3_is_active_at(finalized_height)
+        {
+            return;
+        }
+
+        // Refresh synchronous mirrors from the authoritative state engine.
+        self.finalized_epoch_beacons = self.state.epoch_vdf_beacons_read().await.clone();
+        self.cnvrf_v3_mirror = self.state.cnvrf_v3_read().await.clone();
+
+        let current_epoch = crate::cn_vrf::epoch_of_height(next_height);
+        let min_keep_epoch = current_epoch.saturating_sub(1);
+        self.cnvrf_v3_chains.retain(|&e, _| e >= min_keep_epoch);
+        self.cnvrf_v3_disabled_epochs
+            .retain(|&e| e >= min_keep_epoch);
+        self.ready_vdf_beacons
+            .retain(|&e, _| e >= min_keep_epoch && !self.finalized_epoch_beacons.contains_key(&e));
+        self.pending_cnvrf_v3_commits.retain(|c| {
+            let h_freeze = c
+                .epoch_n
+                .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+                .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+            c.epoch_n == current_epoch.saturating_add(1)
+                && next_height < h_freeze
+                && self
+                    .cnvrf_v3_mirror
+                    .get_record(&c.validator_id, c.epoch_n)
+                    .is_none()
+        });
+
+        // At exact H_freeze: snapshot freeze inputs and dispatch VdfLane.
+        if self.cnvrf_v3_is_active_at(finalized_height)
+            && finalized_height >= crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS
+        {
+            if let Some(boundary) =
+                finalized_height.checked_add(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS)
+            {
+                if boundary.is_multiple_of(crate::cn_vrf::EPOCH_LEN) {
+                    let target_epoch = boundary / crate::cn_vrf::EPOCH_LEN;
+                    let prev_epoch = target_epoch.saturating_sub(1);
+                    let freeze_mix = self.cnvrf_v3_mirror.rolling_mix_for_epoch(prev_epoch);
+                    self.cnvrf_freeze_inputs
+                        .insert(target_epoch, (finalized_hash, freeze_mix));
+
+                    let already_done = self.finalized_epoch_beacons.contains_key(&target_epoch)
+                        || self.ready_vdf_beacons.contains_key(&target_epoch)
+                        || self
+                            .pending_vdf_rx
+                            .as_ref()
+                            .is_some_and(|(e, _)| *e == target_epoch);
+                    if !already_done {
+                        let prev_beacon = if target_epoch == 0 {
+                            [0u8; crate::cn_vrf::V3_LINK_LEN]
+                        } else {
+                            self.finalized_epoch_beacons
+                                .get(&(target_epoch - 1))
+                                .copied()
+                                .unwrap_or([0u8; crate::cn_vrf::V3_LINK_LEN])
+                        };
+                        let raw_seed = crate::cn_vrf::epoch_raw_seed(
+                            self.cnvrf_v3_chain_id,
+                            target_epoch,
+                            &prev_beacon,
+                            &finalized_hash,
+                            &freeze_mix,
+                        );
+                        let lane = self.ensure_vdf_lane();
+                        let rx = lane.submit(target_epoch, raw_seed, self.cnvrf_v3_vdf_steps, 16);
+                        self.pending_vdf_rx = Some((target_epoch, rx));
+                    }
+                }
+            }
+        }
+
+        // Before H_freeze of next_epoch, ensure local chain + commit exist.
+        if self.cnvrf_v3_is_active_at(next_height)
+            && self.validators.validators.contains_key(&self.id)
+        {
+            let next_epoch = current_epoch.saturating_add(1);
+            let h_freeze = next_epoch
+                .saturating_mul(crate::cn_vrf::EPOCH_LEN)
+                .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
+            if next_height < h_freeze {
+                self.ensure_cnvrf_v3_chain_and_commit(next_epoch);
+            }
+        }
+    }
+
+    pub(super) fn expected_proposer_at(
+        &self,
+        validators: &ValidatorSet,
+        height: Height,
+        round: crate::consensus::Round,
+    ) -> Option<ValidatorId> {
+        if !self.cnvrf_v3_is_active_at(height) {
+            return validators.proposer_for(height, round);
+        }
+        let beacon = self.active_epoch_beacon(height);
+        #[cfg(test)]
+        {
+            validators.proposer_for_with_beacon_active(height, round, beacon.as_ref(), true)
+        }
+        #[cfg(not(test))]
+        {
+            validators.proposer_for_with_beacon(height, round, beacon.as_ref())
+        }
+    }
+
+    pub(super) fn verify_qc_for_height(
+        &self,
+        qc: &crate::consensus::QuorumCertificate,
+        validators: &ValidatorSet,
+    ) -> bool {
+        if !self.cnvrf_v3_is_active_at(qc.height) {
+            return qc.verify(validators);
+        }
+        let beacon = self.active_epoch_beacon(qc.height);
+        #[cfg(test)]
+        {
+            qc.verify_with_beacon_active(validators, beacon.as_ref(), true)
+        }
+        #[cfg(not(test))]
+        {
+            qc.verify_with_beacon(validators, beacon.as_ref())
+        }
+    }
+
+    pub(super) fn qc_signed_power_for_height(
+        &self,
+        validators: &ValidatorSet,
+        qc: &crate::consensus::QuorumCertificate,
+    ) -> u64 {
+        if !self.cnvrf_v3_is_active_at(qc.height) {
+            return validators.qc_signed_power(qc);
+        }
+        let beacon = self.active_epoch_beacon(qc.height);
+        #[cfg(test)]
+        {
+            validators.qc_signed_power_with_beacon_active(qc, beacon.as_ref(), true)
+        }
+        #[cfg(not(test))]
+        {
+            validators.qc_signed_power_with_beacon(qc, beacon.as_ref())
+        }
+    }
+
+    /// Who the schedule names for OUR current (height, round).
+    ///
+    /// Parent-hash schedule below `CNVRF_V3_ACTIVATION_HEIGHT`; epoch-beacon
+    /// schedule at/above it (fail-closed `None` when the epoch beacon is not
+    /// known yet, exactly like `ValidatorSet::proposer_for_with_beacon`).
+    pub fn expected_proposer_now(&self) -> Option<ValidatorId> {
+        self.expected_proposer_at(&self.hc.validators, self.hc.height, self.hc.round)
+    }
+
+    /// Validate the CN-VRF v3 payload of `block` when the gate is active.
+    ///
+    /// Pure mirror of what `state_engine::apply_cnvrf_v3` will do: every commit
+    /// must be admissible (epoch `current + 1`, before `H_freeze`, Falcon
+    /// signature valid under the validator's active PQ key, no conflicting
+    /// re-commit) and the proposer reveal must be either a valid chain step, a
+    /// deliberate omission by a COMMITTED proposer (the transition slashes
+    /// that height), or no reveal at all by an uncommitted newcomer.
+    ///
+    /// Rejected verdicts (fail closed, so a proposer cannot stuff garbage the
+    /// transition would silently ignore):
+    /// * `InvalidReveal` — a commit exists but the bytes do not walk the chain;
+    /// * `UnexpectedReveal` — no commit, yet the proposer injected a reveal;
+    /// * unforgeable commit entry (bad signature / wrong epoch / past cutoff);
+    /// * a boundary block that omits or mis-verifies its `MinRoot` epoch beacon.
+    pub(super) fn validate_cnvrf_v3_payload(&self, block: &Block) -> Result<(), String> {
+        use crate::cn_vrf::{
+            epoch_of_height, epoch_raw_seed, SlotRevealOutcome, EPOCH_LEN,
+            V3_COMMIT_LOOKAHEAD_BLOCKS,
+        };
+
+        let payload = block.cnvrf_v3.as_ref();
+        if let Some(p) = payload {
+            if p.commits.len() > MAX_CNVRF_V3_COMMITS_PER_BLOCK {
+                return Err("proposal: CN-VRF v3 carries too many commit carriers".to_string());
+            }
+            // Commits are validated in canonical order against a CLONE of the
+            // mirror: validation must never mutate consensus state.
+            let mut scratch = self.cnvrf_v3_mirror.clone();
+            let current_epoch = epoch_of_height(block.height);
+            for carrier in &p.commits {
+                if carrier.epoch_n <= current_epoch {
+                    return Err("proposal: CN-VRF v3 commit for a stale/current epoch".to_string());
+                }
+                let h_freeze = carrier
+                    .epoch_n
+                    .saturating_mul(EPOCH_LEN)
+                    .saturating_sub(V3_COMMIT_LOOKAHEAD_BLOCKS);
+                if block.height >= h_freeze {
+                    return Err("proposal: CN-VRF v3 commit past the freeze cutoff".to_string());
+                }
+                let (_, pk) =
+                    self.resolve_validator_pq_key_sync(&carrier.validator_id, block.height)?;
+                match scratch.admit_commit(carrier, block.height, self.cnvrf_v3_chain_id, &pk) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "proposal: CN-VRF v3 commit for {} rejected: {e}",
+                            hex::encode(&carrier.validator_id[..8])
+                        ))
+                    }
+                }
+            }
+
+            let reveal = p.reveal.as_ref();
+            match scratch.apply_slot_reveal(
+                self.cnvrf_v3_chain_id,
+                &block.proposer,
+                block.height,
+                reveal,
+            ) {
+                // A committed proposer that omits its step is ACCEPTED here on
+                // purpose: the apply transition charges it through the
+                // leaky-bucket abort counter (that is the only way an abort
+                // can ever be slashed on-chain — rejecting the block would let
+                // an offender escape by simply never proposing again).
+                SlotRevealOutcome::Revealed { .. }
+                | SlotRevealOutcome::CommittedMissingReveal
+                | SlotRevealOutcome::AbsentNoCommit => {}
+                SlotRevealOutcome::InvalidReveal => {
+                    return Err(
+                        "proposal: CN-VRF v3 proposer reveal does not walk its committed chain"
+                            .to_string(),
+                    )
+                }
+                SlotRevealOutcome::UnexpectedReveal => {
+                    return Err(
+                        "proposal: CN-VRF v3 reveal from a proposer with no commitment".to_string(),
+                    )
+                }
+            }
+        }
+
+        // Epoch-boundary beacon: REQUIRED once a previous epoch's VDF could
+        // exist (epoch >= 1), verified against the freeze input this node
+        // recorded at `H_freeze`.
+        if block.height.is_multiple_of(EPOCH_LEN) && block.height >= EPOCH_LEN {
+            let epoch = block.height / EPOCH_LEN;
+            let Some(vdf) = payload.and_then(|p| p.epoch_vdf.as_ref()) else {
+                return Err(format!(
+                    "proposal: boundary block {} omits the epoch {epoch} MinRoot VDF beacon",
+                    block.height
+                ));
+            };
+            if vdf.epoch != epoch {
+                return Err(format!(
+                    "proposal: epoch VDF beacon names epoch {} but the block is {}",
+                    vdf.epoch, epoch
+                ));
+            }
+            if vdf.proof.steps != self.cnvrf_v3_vdf_steps {
+                return Err(format!(
+                    "proposal: epoch VDF beacon uses {} steps, the network agrees on {}",
+                    vdf.proof.steps, self.cnvrf_v3_vdf_steps
+                ));
+            }
+            // The seed is checked ONLY when this node recorded the freeze
+            // input itself: a node that joined after `H_freeze` has nothing to
+            // contradict, and manufacturing a claim from zeros would reject a
+            // beacon the quorum already verified (the same principle as
+            // `check_epoch_mmr_commitment`). The MinRoot proof below is
+            // self-contained and always enforced.
+            if let Some((freeze_hash, freeze_mix)) = self.cnvrf_freeze_inputs.get(&epoch).copied() {
+                let expected_seed = epoch_raw_seed(
+                    self.cnvrf_v3_chain_id,
+                    epoch,
+                    &self
+                        .active_epoch_beacon(block.height.saturating_sub(1))
+                        .map(|b| b.output)
+                        .unwrap_or([0u8; crate::cn_vrf::V3_LINK_LEN]),
+                    &freeze_hash,
+                    &freeze_mix,
+                );
+                if vdf.raw_seed != expected_seed {
+                    return Err(format!(
+                        "proposal: epoch VDF beacon {epoch} does not match the freeze input"
+                    ));
+                }
+            }
+            if crate::minroot_vdf::verify(&vdf.raw_seed, vdf.proof.steps, &vdf.proof).is_none() {
+                return Err(format!(
+                    "proposal: epoch VDF beacon {epoch} fails MinRoot verification"
+                ));
+            }
+        } else if let Some(p) = payload {
+            if p.epoch_vdf.is_some() {
+                return Err("proposal: epoch VDF beacon on a non-boundary height".to_string());
+            }
+        }
+
+        Ok(())
     }
 
     /// Attach the node's LIGHT CLIENT, anchored at the chain's GENESIS.
@@ -1688,7 +2542,8 @@ impl ValidatorRuntime {
     }
 
     pub fn is_proposer(&self) -> bool {
-        self.hc.proposer() == Some(self.id)
+        self.expected_proposer_at(&self.hc.validators, self.hc.height, self.hc.round)
+            == Some(self.id)
     }
 
     pub async fn add_tx(&mut self, tx: Transaction) {

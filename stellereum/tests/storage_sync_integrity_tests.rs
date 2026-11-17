@@ -57,6 +57,7 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32]) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     b.sign_block(&sk);
     b
@@ -123,11 +124,10 @@ fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
     let mut prev = [0u8; 32];
     for h in 1..=n {
         let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let proposer = keys
+        let proposer_idx = keys
             .iter()
-            .find(|k| k.verifying_key().to_bytes() == proposer_id)
-            .expect("proposer is a member")
-            .clone();
+            .position(|k| k.verifying_key().to_bytes() == proposer_id)
+            .expect("proposer is a member");
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -144,8 +144,11 @@ fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
         };
-        b.sign_block(&proposer);
+        // FULL-PQ: the proposer half must be a Falcon-512 signature
+        // (`verify_proposer_signature` refuses the Ed-only shape).
+        b.sign_block_with_falcon(&keys[proposer_idx], &fks[proposer_idx]);
         let hash = b.compute_hash();
         b.precommit_qc = Some(qc_from(&keys, &fks, &vs, h, hash, prev));
         prev = hash;

@@ -12,7 +12,7 @@ use crate::sharding::{
 };
 use crate::state_engine::InMemoryStateEngine;
 use ed25519_dalek::SigningKey;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 mod anchors;
@@ -26,7 +26,7 @@ pub use cluster::{ChainState, Cluster, ShardedCluster};
 pub use lanes::{
     block_reward_for, count_block_actor_sends, fund_genesis, fund_shard_genesis,
     missing_sender_accounts, shard_genesis_block, ApplyCompleted, PackFilterCtx, PrebuiltSelection,
-    SnapBundle,
+    SnapBundle, VdfJobOutput, VdfLane,
 };
 use lanes::{ApplyInflight, ApplyLane};
 
@@ -432,8 +432,42 @@ pub struct ValidatorRuntime {
     /// [`Self::prebuild_next_proposal`]). Single slot (overwritten, never
     /// grown), txs bounded by `MAX_BLOCK_TXS`. `None` or a height mismatch
     /// means "build fresh" — the propose path is unchanged in that case.
+    /// Bounded queue cap for pending outbound CN-VRF v3 commitments.
     prebuilt_selection: std::sync::Mutex<Option<PrebuiltSelection>>,
+    // --- CN-VRF v3 runtime state (local custody + VDF lane + synchronous mirrors) ---
+    /// Lazily-spawned off-tick sequential MinRoot VDF worker.
+    vdf_lane: Option<VdfLane>,
+    /// In-flight VDF job `(target_epoch, oneshot_rx)` submitted at `H_freeze`.
+    pending_vdf_rx: Option<(u64, tokio::sync::oneshot::Receiver<Option<VdfJobOutput>>)>,
+    /// Completed `EpochVdfBeacon`s ready to embed at epoch boundary `epoch * EPOCH_LEN`.
+    ready_vdf_beacons: BTreeMap<u64, crate::sharding::EpochVdfBeacon>,
+    /// Synchronous mirror of `state.epoch_vdf_beacons_read()` for sync validation paths.
+    finalized_epoch_beacons: BTreeMap<u64, [u8; 48]>,
+    /// Synchronous mirror of `state.cnvrf_v3_read()` for sync validation paths.
+    cnvrf_v3_mirror: crate::cn_vrf::CnVrfV3State,
+    /// Freeze-boundary `(freeze_block_hash, rolling_mix)` inputs recorded at `H_freeze`.
+    cnvrf_freeze_inputs: BTreeMap<u64, ([u8; 32], [u8; 48])>,
+    /// Local precomputed per-epoch CN-VRF v3 hash chains keyed by `epoch_n`.
+    cnvrf_v3_chains: BTreeMap<u64, crate::cn_vrf::CnVrfV3Chain>,
+    /// Epochs whose local secret custody failed verification against on-chain commitments.
+    cnvrf_v3_disabled_epochs: HashSet<u64>,
+    /// Outbound CN-VRF v3 commitments queued to ride proposals before `H_freeze`.
+    pending_cnvrf_v3_commits: Vec<crate::cn_vrf::CommitCarrierV3>,
+    /// Optional disk directory for `enc2:` encrypted per-epoch secret custody.
+    cnvrf_v3_dir: Option<std::path::PathBuf>,
+    /// Chain ID bound into CN-VRF v3 commitments, reveals, and epoch seeds.
+    cnvrf_v3_chain_id: u64,
+    /// Configured MinRoot VDF steps per epoch (defaults to `DEFAULT_VDF_STEPS_PER_EPOCH`).
+    cnvrf_v3_vdf_steps: u64,
+    /// Test/debug activation height override (keeps frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
+    #[cfg(any(test, debug_assertions))]
+    cnvrf_v3_activation_override: Option<u64>,
 }
+
+/// Hard cap on queued outbound CN-VRF v3 commitments held in memory.
+pub const MAX_PENDING_CNVRF_V3_COMMITS: usize = 1024;
+/// Hard cap on CN-VRF v3 commitments packed into a single proposed block.
+pub const MAX_CNVRF_V3_COMMITS_PER_BLOCK: usize = 256;
 
 /// Validation is "slow" (backpressure) when the whole check exceeds this.
 ///

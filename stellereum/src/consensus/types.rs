@@ -5,14 +5,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::rotation::pq_key_at_height;
 use super::sortition::{
-    consensus_quorum_min, derive_sortition_committee, micro_committee_size, mixed_quorum_pair_safe,
-    pq_micro_quorum_threshold, pq_micro_required_power, qc_split_active_at,
+    cnvrf_v3_active_at, cnvrf_v3_beacon_draw_committee, cnvrf_v3_epoch_of_height,
+    cnvrf_v3_proposer_seed, consensus_quorum_min, derive_sortition_committee, micro_committee_size,
+    mixed_quorum_pair_safe, pq_micro_quorum_threshold, pq_micro_required_power, qc_split_active_at,
 };
 
 pub type Height = u64;
 pub type Round = u32;
 pub type BlockHash = [u8; 32];
 pub type ValidatorId = [u8; 32];
+
+/// Epoch-bound 48-byte CN-VRF v3 randomness beacon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochBeacon {
+    pub epoch: u64,
+    pub output: [u8; 48],
+}
 
 // ============================================================================
 // Chain-id binding (cross-chain replay protection)
@@ -755,12 +763,108 @@ impl ValidatorSet {
         self.qc_signed_power(qc) >= self.quorum_power()
     }
 
+    /// Cumulative voting power a quorum certificate carries under this set,
+    /// using the CN-VRF v3 epoch beacon draw at/after `CNVRF_V3_ACTIVATION_HEIGHT`.
+    pub fn qc_signed_power_with_beacon(
+        &self,
+        qc: &QuorumCertificate,
+        beacon: Option<&EpochBeacon>,
+    ) -> u64 {
+        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active_at(qc.height))
+    }
+
+    /// True when `qc` carries quorum power under this set using [`Self::qc_signed_power_with_beacon`].
+    pub fn qc_meets_quorum_with_beacon(
+        &self,
+        qc: &QuorumCertificate,
+        beacon: Option<&EpochBeacon>,
+    ) -> bool {
+        self.qc_signed_power_with_beacon(qc, beacon) >= self.quorum_power()
+    }
+
+    fn qc_signed_power_with_beacon_inner(
+        &self,
+        qc: &QuorumCertificate,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> u64 {
+        qc.signers_set_with_beacon_inner(self, beacon, cnvrf_v3_active)
+            .iter()
+            .map(|v| self.power_of(v))
+            .fold(0u64, |a, p| a.saturating_add(p))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qc_signed_power_with_beacon_active(
+        &self,
+        qc: &QuorumCertificate,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> u64 {
+        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qc_meets_quorum_with_beacon_active(
+        &self,
+        qc: &QuorumCertificate,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> bool {
+        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active) >= self.quorum_power()
+    }
+
     pub fn len(&self) -> usize {
         self.validators.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
+    }
+
+    /// Map a 32-byte digest into the normalized `total / gcd` cumulative power
+    /// slot over explicitly sorted validator IDs.
+    fn proposer_from_digest(&self, digest: &[u8; 32]) -> Option<ValidatorId> {
+        let total = self.total_power();
+        if total == 0 {
+            return None;
+        }
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                let t = b;
+                b = a % b;
+                a = t;
+            }
+            a
+        }
+        let g = self.validators.values().fold(0u64, |acc, &p| gcd(acc, p));
+        let g = if g == 0 { 1 } else { g };
+        let range = total / g;
+        let slot =
+            u64::from_le_bytes(digest[..8].try_into().expect("blake3 digest is 32 bytes")) % range;
+        // Deterministic order (audit-consensus F8): the set is a `BTreeMap`
+        // (sorted iteration today), but the schedule must not depend on any
+        // container's implicit order — sort EXPLICITLY so every node walks
+        // the same cumulative table even if the map type ever changes.
+        // (An older comment here said "HashMap"; the container is and was a
+        // `BTreeMap` — the explicit sort is what makes the claim load-bearing
+        // rather than incidental.) Walking the map raw would elect a
+        // DIFFERENT proposer on each node for the same (height, round):
+        // with two equal-power validators the nodes disagreed half
+        // the rounds (masked by fast retries), with three the agreement odds
+        // per round fell to ~1/9 and the chain halted (observed live: three
+        // nodes, zero coinciding proposers for hours). Sorted ids make the
+        // schedule identical everywhere.
+        let mut ids: Vec<(&ValidatorId, &u64)> = self.validators.iter().collect();
+        ids.sort_unstable();
+        let mut acc = 0u64;
+        for (id, power) in ids {
+            acc = acc.saturating_add(*power / g);
+            if slot < acc {
+                return Some(*id);
+            }
+        }
+        self.validators.keys().next().copied()
     }
 
     /// Deterministic proposer selection: weighted round-robin over sorted validators.
@@ -786,53 +890,58 @@ impl ValidatorSet {
     /// accepted for testnet. CONSENSUS CHANGE: old nodes compute a different
     /// schedule — deploy only as a coordinated all-validators upgrade.
     pub fn proposer_for(&self, height: Height, round: Round) -> Option<ValidatorId> {
-        let total = self.total_power();
-        if total == 0 {
+        if self.total_power() == 0 {
             return None;
         }
-        fn gcd(mut a: u64, mut b: u64) -> u64 {
-            while b != 0 {
-                let t = b;
-                b = a % b;
-                a = t;
-            }
-            a
-        }
-        let g = self.validators.values().fold(0u64, |acc, &p| gcd(acc, p));
-        let g = if g == 0 { 1 } else { g };
-        let range = total / g;
         let mut hasher = blake3::Hasher::new_derive_key("STELL_PROPOSER_V1");
         hasher.update(&height.to_le_bytes());
         hasher.update(&round.to_le_bytes());
         let digest = hasher.finalize();
-        let slot = u64::from_le_bytes(
-            digest.as_bytes()[..8]
-                .try_into()
-                .expect("blake3 digest is 32 bytes"),
-        ) % range;
-        // Deterministic order (audit-consensus F8): the set is a `BTreeMap`
-        // (sorted iteration today), but the schedule must not depend on any
-        // container's implicit order — sort EXPLICITLY so every node walks
-        // the same cumulative table even if the map type ever changes.
-        // (An older comment here said "HashMap"; the container is and was a
-        // `BTreeMap` — the explicit sort is what makes the claim load-bearing
-        // rather than incidental.) Walking the map raw would elect a
-        // DIFFERENT proposer on each node for the same (height, round):
-        // with two equal-power validators the nodes disagreed half
-        // the rounds (masked by fast retries), with three the agreement odds
-        // per round fell to ~1/9 and the chain halted (observed live: three
-        // nodes, zero coinciding proposers for hours). Sorted ids make the
-        // schedule identical everywhere.
-        let mut ids: Vec<(&ValidatorId, &u64)> = self.validators.iter().collect();
-        ids.sort_unstable();
-        let mut acc = 0u64;
-        for (id, power) in ids {
-            acc = acc.saturating_add(*power / g);
-            if slot < acc {
-                return Some(*id);
-            }
+        self.proposer_from_digest(digest.as_bytes())
+    }
+
+    /// Beacon-seeded proposer selection (CN-VRF v3):
+    /// - Below `CNVRF_V3_ACTIVATION_HEIGHT`: delegates directly to [`Self::proposer_for`].
+    /// - At/after `CNVRF_V3_ACTIVATION_HEIGHT`: requires `Some(b)` with
+    ///   `b.epoch == cnvrf_v3_epoch_of_height(height)` (returns `None` fail-closed if
+    ///   missing or wrong epoch), and maps `cnvrf_v3_proposer_seed` into the
+    ///   normalized `total / gcd` cumulative power slot.
+    pub fn proposer_for_with_beacon(
+        &self,
+        height: Height,
+        round: Round,
+        beacon: Option<&EpochBeacon>,
+    ) -> Option<ValidatorId> {
+        self.proposer_for_with_beacon_inner(height, round, beacon, cnvrf_v3_active_at(height))
+    }
+
+    fn proposer_for_with_beacon_inner(
+        &self,
+        height: Height,
+        round: Round,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> Option<ValidatorId> {
+        if !cnvrf_v3_active {
+            return self.proposer_for(height, round);
         }
-        self.validators.keys().next().copied()
+        let b = beacon?;
+        if b.epoch != cnvrf_v3_epoch_of_height(height) {
+            return None;
+        }
+        let seed = cnvrf_v3_proposer_seed(&b.output, b.epoch, height, round);
+        self.proposer_from_digest(&seed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proposer_for_with_beacon_active(
+        &self,
+        height: Height,
+        round: Round,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> Option<ValidatorId> {
+        self.proposer_for_with_beacon_inner(height, round, beacon, cnvrf_v3_active)
     }
 }
 
@@ -1333,6 +1442,35 @@ impl QuorumCertificate {
         self.verify_unified(validators)
     }
 
+    /// Verify the QC using the CN-VRF v3 epoch beacon draw when
+    /// `cnvrf_v3_active_at(self.height)` is true; below `CNVRF_V3_ACTIVATION_HEIGHT`
+    /// behaves byte-identically to [`Self::verify`].
+    ///
+    /// Fail-closed (`false`) if CN-VRF v3 is active and `beacon` is `None` or
+    /// carries the wrong epoch for `self.height`.
+    pub fn verify_with_beacon(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+    ) -> bool {
+        self.verify_unified_with_pq_keys_and_beacon_inner(
+            validators,
+            None,
+            beacon,
+            cnvrf_v3_active_at(self.height),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_with_beacon_active(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> bool {
+        self.verify_unified_with_pq_keys_and_beacon_inner(validators, None, beacon, cnvrf_v3_active)
+    }
+
     /// Unified certificate verification supporting:
     /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and CEC Epoch (`PQ_QC_MARKER_ID`) envelopes.
     ///
@@ -1357,6 +1495,16 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
     ) -> bool {
+        self.verify_unified_with_pq_keys_and_beacon_inner(validators, pq_keys, None, false)
+    }
+
+    fn verify_unified_with_pq_keys_and_beacon_inner(
+        &self,
+        validators: &ValidatorSet,
+        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> bool {
         // Anti-DoS (audit F7): reject an implausibly long signer list BEFORE
         // touching any signature. The list is attacker-supplied and uncapped on
         // the wire, so one message could otherwise pin a verifier in a
@@ -1369,7 +1517,7 @@ impl QuorumCertificate {
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
 
         // 1. Post-Quantum path: µQC (PQ_UQC_MARKER_ID) or CEC Epoch (PQ_QC_MARKER_ID)
-        if self.pq_path_verify(validators, &msg, pq_keys) {
+        if self.pq_path_verify_with_beacon(validators, &msg, pq_keys, beacon, cnvrf_v3_active) {
             return true;
         }
 
@@ -1382,11 +1530,13 @@ impl QuorumCertificate {
     ///
     /// FULL-PQ (nodes wiped): non-post-quantum schemes are refused
     /// unconditionally (old pure-PQ gate, now the only path).
-    fn pq_path_verify(
+    fn pq_path_verify_with_beacon(
         &self,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
     ) -> bool {
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
@@ -1394,10 +1544,16 @@ impl QuorumCertificate {
                     if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    // Canonical parent-hash draw.
-                    // Borrow-compat: `verify_micro_cert` takes an owned snapshot;
+                    // Borrow-compat: `verify_micro_cert_with_beacon` takes an owned snapshot;
                     // clone the (small, test/override-only) map. Same data.
-                    if self.verify_micro_cert(&cert, validators, msg, pq_keys.cloned()) {
+                    if self.verify_micro_cert_with_beacon(
+                        &cert,
+                        validators,
+                        msg,
+                        pq_keys.cloned(),
+                        beacon,
+                        cnvrf_v3_active,
+                    ) {
                         return true;
                     }
                 }
@@ -1488,23 +1644,34 @@ impl QuorumCertificate {
         })
     }
 
-    fn micro_cert_valid_signers(
+    fn micro_cert_valid_signers_with_beacon(
         &self,
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
     ) -> Option<Vec<ValidatorId>> {
-        self.micro_cert_valid_signers_and_committee(cert, validators, msg, pq_keys)
-            .map(|(signers, _)| signers)
+        self.micro_cert_valid_signers_and_committee_with_beacon(
+            cert,
+            validators,
+            msg,
+            pq_keys,
+            beacon,
+            cnvrf_v3_active,
+        )
+        .map(|(signers, _)| signers)
     }
 
-    fn micro_cert_valid_signers_and_committee(
+    fn micro_cert_valid_signers_and_committee_with_beacon(
         &self,
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
     ) -> Option<(Vec<ValidatorId>, Vec<ValidatorId>)> {
         if cert.height != self.height || cert.round != self.round {
             return None;
@@ -1527,20 +1694,37 @@ impl QuorumCertificate {
             }
         }
 
-        // The committee is re-derived from the certificate's OWN sortition
-        // parent (the parent block hash the signers elected with), so the
-        // verifier lands on exactly the committee the signers did. The
-        // block-apply path additionally pins that parent to the hash committed
-        // in the block header (`QuorumCertificate::binds_to_parent`), so a
-        // certificate cannot pick a favourable committee of its own.
-        // Election: always the canonical parent-hash draw.
-        let committee = derive_sortition_committee(
-            validators,
-            cert.height,
-            cert.round,
-            cert.committee_size,
-            &cert.sortition_parent,
-        );
+        // Pre-activation: the committee is re-derived from the certificate's OWN
+        // sortition parent (`derive_sortition_committee`), while `binds_to_parent`
+        // pins that parent to `block.prev_hash`.
+        // Post-activation (CN-VRF v3): the committee is drawn from the
+        // 7,200-block epoch beacon (`cnvrf_v3_beacon_draw_committee`) without
+        // mixing `sortition_parent` (eliminating parent-hash grinding), while
+        // `binds_to_parent` STILL pins `cert.sortition_parent == block.prev_hash`
+        // so certificates remain chain-bound. Fails closed if beacon is missing
+        // or carries the wrong epoch.
+        let committee = if cnvrf_v3_active {
+            let b = beacon?;
+            if b.epoch != cnvrf_v3_epoch_of_height(cert.height) {
+                return None;
+            }
+            cnvrf_v3_beacon_draw_committee(
+                validators,
+                cert.height,
+                cert.round,
+                cert.committee_size,
+                &b.output,
+                b.epoch,
+            )
+        } else {
+            derive_sortition_committee(
+                validators,
+                cert.height,
+                cert.round,
+                cert.committee_size,
+                &cert.sortition_parent,
+            )
+        };
         let expected_len = (cert.committee_size as usize).min(validators.len());
         if committee.len() != expected_len || committee.is_empty() {
             return None;
@@ -1614,13 +1798,16 @@ impl QuorumCertificate {
     /// 11/16, …) certificates verify unchanged — they carry the full
     /// committee power.
     ///
-    /// Election: always the canonical parent-hash draw.
-    fn verify_micro_cert(
+    /// Election: parent-hash draw before `CNVRF_V3_ACTIVATION_HEIGHT`, or
+    /// CN-VRF v3 epoch-beacon draw when `cnvrf_v3_active` is true.
+    fn verify_micro_cert_with_beacon(
         &self,
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
     ) -> bool {
         // C1 split (FIXES §1.7): at/after `QC_SPLIT_ACTIVATION_HEIGHT` the
         // µQC is ADVISORY-ONLY and never finalizes — refuse outright, even
@@ -1631,9 +1818,14 @@ impl QuorumCertificate {
         if qc_split_active_at(self.height) {
             return false;
         }
-        let Some((valid, committee)) =
-            self.micro_cert_valid_signers_and_committee(cert, validators, msg, pq_keys.as_ref())
-        else {
+        let Some((valid, committee)) = self.micro_cert_valid_signers_and_committee_with_beacon(
+            cert,
+            validators,
+            msg,
+            pq_keys.as_ref(),
+            beacon,
+            cnvrf_v3_active,
+        ) else {
             return false;
         };
         // Power-weighted quorum over the ACTUAL committee. Fail-closed on
@@ -1860,12 +2052,32 @@ impl QuorumCertificate {
     /// silently forgiving downtime slash for validators that actually
     /// missed). Anything unverifiable contributes nothing.
     pub fn signers_set(&self, validators: &ValidatorSet) -> HashSet<ValidatorId> {
+        self.signers_set_with_beacon_inner(validators, None, false)
+    }
+
+    /// Extracts verified signer IDs using the CN-VRF v3 epoch beacon draw when
+    /// `cnvrf_v3_active_at(self.height)` is true; below `CNVRF_V3_ACTIVATION_HEIGHT`
+    /// behaves byte-identically to [`Self::signers_set`].
+    pub fn signers_set_with_beacon(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+    ) -> HashSet<ValidatorId> {
+        self.signers_set_with_beacon_inner(validators, beacon, cnvrf_v3_active_at(self.height))
+    }
+
+    fn signers_set_with_beacon_inner(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> HashSet<ValidatorId> {
         let mut signers = HashSet::new();
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
-                // Verify-grade: exactly what `verify_micro_cert` accepts (sans
-                // the quorum-power gate — a genuinely-signed member is named
+                // Verify-grade: exactly what `verify_micro_cert_with_beacon` accepts
+                // (sans the quorum-power gate — a genuinely-signed member is named
                 // even in a sub-quorum certificate, so nobody is slashed for
                 // signing). A schemaless bincode parse of a non-envelope
                 // payload used to land on garbage bitmask bytes and attribute
@@ -1874,9 +2086,14 @@ impl QuorumCertificate {
                     if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    // Canonical parent-hash draw (same as `pq_path_verify`).
-                    if let Some(ids) = self.micro_cert_valid_signers(&cert, validators, &msg, None)
-                    {
+                    if let Some(ids) = self.micro_cert_valid_signers_with_beacon(
+                        &cert,
+                        validators,
+                        &msg,
+                        None,
+                        beacon,
+                        cnvrf_v3_active,
+                    ) {
                         signers.extend(ids);
                     }
                 }

@@ -69,6 +69,7 @@ fn exec_chain(store: &Storage, n: u64) -> (Vec<BlockHash>, Vec<Block>) {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             cross_shard_out: vec![],
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],

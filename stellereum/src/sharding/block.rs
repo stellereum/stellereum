@@ -110,6 +110,150 @@ pub const MMR_EPOCH_COMMITMENT_TAG: &[u8; 8] = b"MMRROOT1";
 /// to before this commitment existed.
 pub const XSHARD_FULL_COMMITMENT_TAG: &[u8; 8] = b"XSHARD01";
 
+/// Domain separator for the CN-VRF v3 trailing block payload inside a block hash.
+///
+/// Mixed into [`Block::compute_hash`] ONLY when `cnvrf_v3` is `Some(...)`, so
+/// every block with `cnvrf_v3: None` (including all legacy blocks) keeps its
+/// pre-existing block hash byte-for-byte.
+pub const CNVRF_V3_COMMITMENT_TAG: &[u8; 8] = b"CNVRFV31";
+
+mod bytes48_serde {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(val: &[u8; 48], s: S) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(48)?;
+        for byte in val {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [u8; 48];
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "a 48-byte array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = [0u8; 48];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(48, V)
+    }
+}
+
+mod opt_bytes48_serde {
+    use super::bytes48_serde;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    struct Bytes48Ref<'a>(&'a [u8; 48]);
+    impl Serialize for Bytes48Ref<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            bytes48_serde::serialize(self.0, s)
+        }
+    }
+
+    struct Bytes48Owned([u8; 48]);
+    impl<'de> Deserialize<'de> for Bytes48Owned {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            bytes48_serde::deserialize(d).map(Bytes48Owned)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(val: &Option<[u8; 48]>, s: S) -> Result<S::Ok, S::Error> {
+        match val {
+            Some(arr) => s.serialize_some(&Bytes48Ref(arr)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 48]>, D::Error> {
+        Option::<Bytes48Owned>::deserialize(d).map(|opt| opt.map(|w| w.0))
+    }
+}
+
+/// Epoch-boundary MinRoot VDF beacon carried inside a CN-VRF v3 block payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochVdfBeacon {
+    pub epoch: u64,
+    #[serde(with = "bytes48_serde")]
+    pub raw_seed: [u8; 48],
+    pub proof: crate::minroot_vdf::MinRootProof,
+}
+
+/// Trailing CN-VRF v3 consensus payload carried by a [`Block`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CnVrfV3BlockPayload {
+    #[serde(with = "opt_bytes48_serde")]
+    pub reveal: Option<[u8; 48]>,
+    pub commits: Vec<crate::cn_vrf::CommitCarrierV3>,
+    pub epoch_vdf: Option<EpochVdfBeacon>,
+}
+
+impl CnVrfV3BlockPayload {
+    /// Returns `true` when no reveal, commits, or epoch VDF beacon are present.
+    pub fn is_empty(&self) -> bool {
+        self.reveal.is_none() && self.commits.is_empty() && self.epoch_vdf.is_none()
+    }
+
+    /// Canonical commitment bytes over all fields of this payload.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.reveal {
+            None => out.push(0u8),
+            Some(rev) => {
+                out.push(1u8);
+                out.extend_from_slice(rev);
+            }
+        }
+        let mut commits: Vec<&crate::cn_vrf::CommitCarrierV3> = self.commits.iter().collect();
+        commits.sort_by(|a, b| {
+            a.validator_id
+                .cmp(&b.validator_id)
+                .then_with(|| a.epoch_n.cmp(&b.epoch_n))
+                .then_with(|| a.anchors.cmp(&b.anchors))
+                .then_with(|| a.sig.cmp(&b.sig))
+        });
+        out.extend_from_slice(&(commits.len() as u32).to_be_bytes());
+        for c in commits {
+            out.extend_from_slice(&c.validator_id);
+            out.extend_from_slice(&c.epoch_n.to_be_bytes());
+            for anchor in &c.anchors {
+                out.extend_from_slice(anchor);
+            }
+            out.extend_from_slice(&(c.sig.len() as u32).to_be_bytes());
+            out.extend_from_slice(&c.sig);
+        }
+        match &self.epoch_vdf {
+            None => out.push(0u8),
+            Some(vdf) => {
+                out.push(1u8);
+                out.extend_from_slice(&vdf.epoch.to_be_bytes());
+                out.extend_from_slice(&vdf.raw_seed);
+                out.extend_from_slice(&vdf.proof.steps.to_be_bytes());
+                out.extend_from_slice(&vdf.proof.final_xy.0);
+                out.extend_from_slice(&vdf.proof.final_xy.1);
+                out.extend_from_slice(&(vdf.proof.checkpoints.len() as u32).to_be_bytes());
+                for &(step_idx, ref x_bytes, ref y_bytes) in &vdf.proof.checkpoints {
+                    out.extend_from_slice(&step_idx.to_be_bytes());
+                    out.extend_from_slice(x_bytes);
+                    out.extend_from_slice(y_bytes);
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub shard_id: ShardId,
@@ -291,6 +435,16 @@ pub struct Block {
     ///   as such.
     #[serde(default, deserialize_with = "de_mmr_epoch_root")]
     pub mmr_epoch_root: [u8; 32],
+    /// Trailing CN-VRF v3 consensus payload (proposer hash-chain reveal,
+    /// epoch-ahead validator commits, and optional epoch-boundary MinRoot VDF
+    /// beacon).
+    ///
+    /// BACKWARD COMPATIBILITY: trailing field with `serde(default)` +
+    /// [`de_cnvrf_v3`]. Legacy blocks decoded under `with_legacy_block_tolerance`
+    /// decode missing trailing bytes as `None`, while strict wire decoding fails
+    /// closed. Mixed into [`Block::compute_hash`] ONLY when `Some(...)`.
+    #[serde(default, deserialize_with = "de_cnvrf_v3")]
+    pub cnvrf_v3: Option<CnVrfV3BlockPayload>,
 }
 
 impl Default for Block {
@@ -324,6 +478,7 @@ impl Default for Block {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
         }
     }
 }
@@ -486,6 +641,33 @@ where
                     || msg.contains("UnexpectedEof"))
             {
                 Ok([0u8; 32])
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Bincode-tolerant reader for the trailing `cnvrf_v3` field of a block.
+///
+/// A block persisted BEFORE CN-VRF v3 existed ends its byte stream right
+/// after `mmr_epoch_root`. Under `legacy_block_tolerance()`, a missing trailing
+/// field decodes as `None`. Strict wire decoding propagates every error
+/// unchanged (fail closed).
+fn de_cnvrf_v3<'de, D>(d: D) -> Result<Option<CnVrfV3BlockPayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<CnVrfV3BlockPayload>::deserialize(d) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if legacy_block_tolerance()
+                && (msg.contains("end of file")
+                    || msg.contains("failed to fill whole buffer")
+                    || msg.contains("UnexpectedEof"))
+            {
+                Ok(None)
             } else {
                 Err(e)
             }
@@ -759,6 +941,13 @@ impl Block {
         if self.mmr_epoch_root != [0u8; 32] {
             hasher.update(MMR_EPOCH_COMMITMENT_TAG);
             hasher.update(self.mmr_epoch_root);
+        }
+        // CN-VRF v3 COMMITMENT: proposer reveal, epoch-ahead commits, and
+        // optional epoch-boundary VDF beacon. Mixed in ONLY when `Some(...)`,
+        // keeping every block with `cnvrf_v3: None` byte-identical to before.
+        if let Some(payload) = &self.cnvrf_v3 {
+            hasher.update(CNVRF_V3_COMMITMENT_TAG);
+            hasher.update(payload.canonical_bytes());
         }
         hasher.update(self.timestamp.to_be_bytes());
         hasher.update(self.proposer);

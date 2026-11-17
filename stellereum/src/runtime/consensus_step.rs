@@ -688,7 +688,7 @@ impl ValidatorRuntime {
         expected_state_root: [u8; 32],
     ) -> Result<(), String> {
         self.validate_proposal_unaligned(block, expected_state_root)?;
-        if Some(block.proposer) != self.hc.proposer() {
+        if Some(block.proposer) != self.expected_proposer_now() {
             return Err("proposal: wrong proposer".to_string());
         }
         Ok(())
@@ -1115,7 +1115,7 @@ impl ValidatorRuntime {
         // vote that would have synced us arrives after the proposal it should
         // have preceded). Bounded to near rounds: a far claim is answered by
         // the vote path, not by an unsigned envelope.
-        if Some(block.proposer) != self.hc.proposer() {
+        if Some(block.proposer) != self.expected_proposer_now() {
             // Near-future phase alignment (widened +4 -> +8, see
             // `PROPOSAL_ALIGN_WINDOW_ROUNDS`): early delivery of a
             // GENUINE future proposal must align, not reject — the scan is
@@ -1130,7 +1130,9 @@ impl ValidatorRuntime {
             for r in (self.hc.round.saturating_add(1))
                 ..=(self.hc.round.saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS))
             {
-                if self.validators.proposer_for(self.hc.height, r) == Some(block.proposer) {
+                if self.expected_proposer_at(&self.validators, self.hc.height, r)
+                    == Some(block.proposer)
+                {
                     target = Some(r);
                     break;
                 }
@@ -1153,8 +1155,13 @@ impl ValidatorRuntime {
         // `validate_proposal` not covered by the timed run is the
         // proposer-slot check against the ALIGNED round, kept here verbatim
         // so the accept/refuse verdict is byte-identical to before.
-        if Some(block.proposer) != self.hc.proposer() {
+        if Some(block.proposer) != self.expected_proposer_now() {
             return Err("proposal: wrong proposer".to_string());
+        }
+        // CN-VRF v3 payload (commit carriers + proposer reveal + epoch-boundary
+        // MinRoot beacon). No-op below the activation gate.
+        if self.cnvrf_v3_is_active_at(block.height) {
+            self.validate_cnvrf_v3_payload(&block)?;
         }
         // EPOCH-KEY COMMITMENT: the block pins the MEV epoch key the network
         // uses for this epoch (see `crate::mev_epoch`). Record it: a node
@@ -1172,7 +1179,8 @@ impl ValidatorRuntime {
             return Err("proposal: proposer field mismatch".to_string());
         }
         let bh = block.compute_hash();
-        self.hc.receive_proposal(proposer, bh)?;
+        let expected = self.expected_proposer_now();
+        self.hc.receive_proposal_for(proposer, bh, expected)?;
         // Fork-choice: the proposal is recorded as a CANDIDATE before it is
         // finalized, so a competing branch is KNOWN. When it loses (another
         // block is finalized at this height) the blocks that lost can be
@@ -2059,7 +2067,8 @@ impl ValidatorRuntime {
         // height/round, not merely a key that signed. Otherwise a peer names an
         // address it controls, and `apply_block_fees_rewards` credits the fees to
         // it with no membership test.
-        if Some(block.proposer) != validators.proposer_for(height, certificate.round) {
+        if Some(block.proposer) != self.expected_proposer_at(&validators, height, certificate.round)
+        {
             return Err("committed block's proposer is not the expected proposer".to_string());
         }
         // The block must still be a valid extension of what we finalized.
@@ -2087,7 +2096,7 @@ impl ValidatorRuntime {
         if !certificate.binds_to_parent(&block.prev_hash) {
             return Err("commit certificate was elected with a different parent block".to_string());
         }
-        if !certificate.verify(&validators) {
+        if !self.verify_qc_for_height(&certificate, &validators) {
             return Err("commit certificate does not carry a validator quorum".to_string());
         }
         // W10.5 HARDENING (fail LOUD): the power behind the certificate must

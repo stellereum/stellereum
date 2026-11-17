@@ -1,7 +1,7 @@
 # 02 — Crypto & Post-Quantum (HDAE Phase-2, code truth)
 
 Source files: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `bls.rs`,
-`vrf.rs`, `cn_vrf.rs`, `wallet_signing.rs`, `stellereum/Cargo.toml`.
+`vrf.rs`, `cn_vrf.rs`, `minroot_vdf.rs`, `staking.rs`, `wallet_signing.rs`, `stellereum/Cargo.toml`.
 Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
 
 ## 1. Falcon-512 (FIPS 206)
@@ -67,17 +67,34 @@ Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
   `VRF_BINDING_DST` (`:104`), `VRF_PROOF_DOMAIN` (`:111`),
   `VRF_OUTPUT_DOMAIN` (`:118`), `VRF_ELECTION_DOMAIN` (`:124`).
 
-## 5. CN-VRF pointer
+## 5. CN-VRF pointer (v1 + v3 + MinRoot PQ-VDF)
 
-- Spec: `docs/PQ_CN_VRF_SPEC.md:1` (status SPEC ONLY at time of writing;
-  since then sandbox code landed — see next).
-- Sandbox: `cn_vrf.rs:1-4` (pure module, KATs, NO consensus wiring);
-  `EPOCH_LEN 7200` (`:58`); DSTs `STELL_CNVRF_COMMIT_V1` / `OPEN_V1` / `BETA_V1`
-  (`:61-65`); nonce custody 0600 (`:633-646`, load `:681-726`).
-- Live-protocol wiring status: code truth is `cn_vrf.rs` sandbox + spec pointer;
-  no activation-height const exists in `cn_vrf.rs` (only `EPOCH_LEN 7200` at
-  `:58`); the sortition gate only knows `vrf::VrfActivation`
-  (`consensus.rs:1080-1086`); zero `cn_vrf::` callers outside `cn_vrf.rs`.
+- Spec: `docs/PQ_CN_VRF_SPEC.md:1` (v1 spec + §7 CN-VRF v3 specification; v1
+  `CommitCarrier` signs public `CNVRF_COMMIT_SIG_DST`, never secret
+  `commit_preimage`).
+- Sandbox v1: `cn_vrf.rs:1-4`, `EPOCH_LEN 7200` (`:62`); DSTs
+  `STELL_CNVRF_COMMIT_V1` / `COMMIT_SIG_V1` / `OPEN_V1` / `BETA_V1` (`:65-71`);
+  nonce custody 0600 (`:761-1006`).
+- CN-VRF v3 (`cn_vrf.rs:1009-1821`): 16-segment 48-byte `BLAKE3-XOF-48` reverse
+  hash-chain (`V3_LINK_LEN 48` `:1013`, `V3_SEGMENTS 16` `:1015`,
+  `V3_SEGMENT_LEN 450` `:1017`, `16 × 450 = EPOCH_LEN`); `V3_COMMIT_LOOKAHEAD_BLOCKS 360`
+  (`:1019`); `CommitCarrierV3` (`COMMIT_CARRIER_V3_LEN 1474` `:1025`, Falcon-512
+  sig over `DST_COMMIT_SIG_V3`); bounded reveal verify (`cnvrf_v3_verify_reveal`
+  `<= 450` BLAKE3 steps `:1467`); `CnVrfV3State` (`:1520`) with `migrate_validator`
+  preserving `anchor_validator_id` (`:1650`); `epoch_raw_seed` deterministic
+  fallback (`:1702`); `enc2:` write-ahead custody `save_cnvrf_v3_secret` /
+  `load_cnvrf_v3_secret` + `verify_v3_secret_matches_commit` (`:1730-1821`).
+- MinRoot PQ-VDF (`minroot_vdf.rs`): 256-bit safe prime `p = 2^256 - 36113`
+  (`p ≡ 2 (mod 3)`, `P_LIMBS` `:42`); sequential cube-root `eval`
+  (`CUBE_ROOT_EXP` `:60`, `DEFAULT_VDF_STEPS_PER_EPOCH 3_000_000` `:38`) vs
+  `rayon`-parallel 2-mul backward `verify` (`MAX_VDF_CHECKPOINTS 4096` `:32`);
+  DSTs `STELL_MINROOT_VDF_V1_INIT` / `OUT` (`:26,:29`).
+- Activation & abort accounting: `CNVRF_V3_ACTIVATION_HEIGHT`
+  (`consensus/sortition.rs:507`, default `u64::MAX` GatedOff; `CNVRF_V3_EPOCH_LEN 7200`
+  `:511`); dedicated non-vote-resettable abort slashing in `staking.rs`
+  (`CNVRF_ABORT_SLASH_BPS 100`, `CNVRF_ABORT_THRESHOLD 3`,
+  `CNVRF_ABORT_RECOVERY_STREAK 20`, `CnVrfAbortState` + `slash_cnvrf_abort`
+  across `self_bond + pending_rewards + unbonding + delegated` + jail).
 
 ## 6. PQ registry + rotation
 

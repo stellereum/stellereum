@@ -6,7 +6,9 @@
 //! diagnostics, and tests have a single source of truth with zero duplicated
 //! literals.
 
-use crate::consensus::{BEACON_DRAW_ACTIVATION_HEIGHT, QC_SPLIT_ACTIVATION_HEIGHT};
+use crate::consensus::{
+    BEACON_DRAW_ACTIVATION_HEIGHT, CNVRF_V3_ACTIVATION_HEIGHT, QC_SPLIT_ACTIVATION_HEIGHT,
+};
 use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
@@ -130,6 +132,12 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "Epoch-bound XMSS-VRF beacon committee draw",
             ),
             ActivationGate::new(
+                "CNVRF_V3_ACTIVATION_HEIGHT",
+                "stellereum::consensus::sortition",
+                CNVRF_V3_ACTIVATION_HEIGHT,
+                "7,200-block epoch CN-VRF v3 sortition and proposer beacon draw",
+            ),
+            ActivationGate::new(
                 "COMPACT_GOSSIP_ACTIVATION_HEIGHT",
                 "stellereum::consensus_net",
                 COMPACT_GOSSIP_ACTIVATION_HEIGHT,
@@ -232,6 +240,7 @@ mod tests {
                 "BEACON_DRAW_ACTIVATION_HEIGHT",
                 BEACON_DRAW_ACTIVATION_HEIGHT,
             ),
+            ("CNVRF_V3_ACTIVATION_HEIGHT", CNVRF_V3_ACTIVATION_HEIGHT),
             (
                 "PQ_TRANSPORT_H_ACTIVATION_HEIGHT",
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,

@@ -232,7 +232,18 @@ impl ValidatorRuntime {
         // have not proposed, else round 0 of the next height if scheduled.
         let target = if self.is_proposer() && !self.hc.has_live_proposal() {
             self.hc.height
-        } else if self.validators.proposer_for(self.hc.height + 1, 0) == Some(self.id) {
+        } else if self.expected_proposer_at(&self.validators, self.hc.height + 1, 0)
+            == Some(self.id)
+        {
+            // CN-VRF v3: never prebuild ACROSS an epoch boundary. The block at
+            // `height + 1 == N * EPOCH_LEN` must carry that epoch's `MinRoot`
+            // beacon and the beacon-driven schedule, neither of which is known
+            // while the last block of the previous epoch is unfinalized.
+            if self.cnvrf_v3_is_active_at(self.hc.height + 1)
+                && (self.hc.height + 1).is_multiple_of(crate::cn_vrf::EPOCH_LEN)
+            {
+                return;
+            }
             self.hc.height + 1
         } else {
             return;
@@ -914,7 +925,10 @@ impl ValidatorRuntime {
                 // Self-record like the fresh path: without this the section-1
                 // gate (`!has_live_proposal`) refires every tick and
                 // rebroadcasts the identical hash all round (refire spam).
-                self.hc.receive_proposal(self.id, locked_hash).ok()?;
+                let expected = self.expected_proposer_now();
+                self.hc
+                    .receive_proposal_for(self.id, locked_hash, expected)
+                    .ok()?;
                 return Some(body);
             }
         }
@@ -966,7 +980,8 @@ impl ValidatorRuntime {
                         // Self-record like the fresh path (see the locked path).
                         let bh = body.compute_hash();
                         self.blocks.insert(bh, body.clone());
-                        self.hc.receive_proposal(self.id, bh).ok()?;
+                        let expected = self.expected_proposer_now();
+                        self.hc.receive_proposal_for(self.id, bh, expected).ok()?;
                         // Served: consume one-shot (a still-stuck peer re-hints).
                         self.demanded.remove(&h);
                         return Some(body);
@@ -1789,6 +1804,10 @@ impl ValidatorRuntime {
                 [0u8; 32]
             }
         };
+        // CN-VRF v3 payload: our own chain step, queued peer commit
+        // carriers, and the epoch-boundary MinRoot beacon. `None` below the
+        // gate, so pre-activation blocks keep their legacy shaped hash.
+        let cnvrf_v3 = self.build_cnvrf_v3_payload(self.hc.height);
         let mut block = Block {
             shard_id: self.shard_id,
             height: self.hc.height,
@@ -1823,6 +1842,7 @@ impl ValidatorRuntime {
             // byte-for-byte; non-zero is covered by the block hash the
             // quorum signs.
             mmr_epoch_root: self.epoch_mmr_commitment(),
+            cnvrf_v3,
         };
         // Sign the proposer slot with whichever signer is configured. `sign_block`
         // signs with an in-process key, so when a remote signer is present the
@@ -1996,7 +2016,8 @@ impl ValidatorRuntime {
             );
         }
         self.blocks.insert(bh, block.clone());
-        self.hc.receive_proposal(self.id, bh).ok()?;
+        let expected = self.expected_proposer_now();
+        self.hc.receive_proposal_for(self.id, bh, expected).ok()?;
         Some(block)
     }
 }

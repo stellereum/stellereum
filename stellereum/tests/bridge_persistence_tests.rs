@@ -155,6 +155,7 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     }
@@ -309,6 +310,7 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

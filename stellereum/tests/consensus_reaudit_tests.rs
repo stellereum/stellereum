@@ -326,6 +326,7 @@ fn root_block() -> Block {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         shard_headers: vec![],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
@@ -432,6 +433,7 @@ async fn block_at(
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

@@ -679,7 +679,7 @@ impl ValidatorRuntime {
                 crate::metrics::global().inc_weak_qc_refused();
                 return None;
             };
-            let signed = in_force.qc_signed_power(qc);
+            let signed = self.qc_signed_power_for_height(&in_force, qc);
             let required = in_force.quorum_power();
             if signed < required {
                 tracing::error!(
@@ -750,6 +750,7 @@ impl ValidatorRuntime {
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
         self.hc.set_parent_hash(bh);
+        self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
         Some(bh)
     }
 
@@ -923,7 +924,7 @@ impl ValidatorRuntime {
         // the node is catching up on. The order root is enforced where it
         // matters: on the LIVE paths (proposal, finalize, adopt).
         let bh = block.compute_hash();
-        let Some(qc) = &block.precommit_qc else {
+        let Some(qc) = block.precommit_qc.clone() else {
             return Err(format!(
                 "block {} carries no decision proof (predates verifiable history)",
                 block.height
@@ -987,7 +988,19 @@ impl ValidatorRuntime {
                 block.height
             ));
         }
-        if !qc.verify(&verify_set) {
+        if self.cnvrf_v3_is_active_at(block.height) {
+            self.validate_cnvrf_v3_payload(block)?;
+            if block.height.is_multiple_of(crate::cn_vrf::EPOCH_LEN)
+                && block.height >= crate::cn_vrf::EPOCH_LEN
+            {
+                if let Some(vdf) = block.cnvrf_v3.as_ref().and_then(|p| p.epoch_vdf.as_ref()) {
+                    self.ready_vdf_beacons
+                        .entry(vdf.epoch)
+                        .or_insert_with(|| vdf.clone());
+                }
+            }
+        }
+        if !self.verify_qc_for_height(&qc, &verify_set) {
             return Err(format!(
                 "block {} decision proof lacks a validator quorum at its height",
                 block.height
@@ -1045,6 +1058,24 @@ impl ValidatorRuntime {
         // height AFTER the head while the network already voted it.
         self.refresh_validator_set_from_staking_checked(block.height, block.height)
             .await;
+        if self.cnvrf_v3_is_active_at(block.height) {
+            self.finalized_epoch_beacons = self.state.epoch_vdf_beacons_read().await.clone();
+            self.cnvrf_v3_mirror = self.state.cnvrf_v3_read().await.clone();
+            if block.height >= crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS {
+                if let Some(boundary) = block
+                    .height
+                    .checked_add(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS)
+                {
+                    if boundary.is_multiple_of(crate::cn_vrf::EPOCH_LEN) {
+                        let target_epoch = boundary / crate::cn_vrf::EPOCH_LEN;
+                        let prev_epoch = target_epoch.saturating_sub(1);
+                        let freeze_mix = self.cnvrf_v3_mirror.rolling_mix_for_epoch(prev_epoch);
+                        self.cnvrf_freeze_inputs
+                            .insert(target_epoch, (bh, freeze_mix));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1110,6 +1141,7 @@ impl ValidatorRuntime {
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
         self.hc.set_parent_hash(bh);
+        self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
     }
 }
 
@@ -1231,6 +1263,7 @@ mod tests {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };

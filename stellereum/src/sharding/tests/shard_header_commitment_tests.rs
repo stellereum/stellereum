@@ -34,6 +34,7 @@ fn block_with(headers: Vec<ShardHeaderCommitment>) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     }
 }
 
@@ -151,6 +152,7 @@ fn epoch_mmr_root_keeps_legacy_hashes_and_moves_hash_when_set() {
         order_merkle_root: legacy.order_merkle_root,
         epoch_key_commitment: legacy.epoch_key_commitment,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     assert_eq!(legacy_shaped.compute_hash(), legacy_hash);
 }
@@ -351,6 +353,10 @@ fn legacy_block_bytes_still_decode() {
         decoded.mmr_epoch_root, [0u8; 32],
         "a legacy block commits to no epoch MMR root"
     );
+    assert!(
+        decoded.cnvrf_v3.is_none(),
+        "a legacy block carries no CN-VRF v3 payload"
+    );
     // The block HASH is untouched by the extension: a legacy block still
     // rehashes to the hash it had before the field existed (this is what
     // keeps an existing chain valid).
@@ -370,6 +376,7 @@ fn legacy_block_bytes_still_decode() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     assert_eq!(decoded.compute_hash(), rebuilt.compute_hash());
 
@@ -384,16 +391,17 @@ fn legacy_block_bytes_still_decode() {
     // difference is the trailing shard-head set (empty => 8 bytes), the
     // trailing order commitment (32 bytes), the trailing epoch-key
     // commitment (32 bytes), the trailing canonical-evidence QC
-    // (`None` => 1-byte option tag) and the trailing epoch-MMR root
-    // (32 bytes).
+    // (`None` => 1-byte option tag), the trailing epoch-MMR root
+    // (32 bytes), and the trailing CN-VRF v3 payload (`None` => 1-byte
+    // option tag).
     let empty = block_with(vec![]);
     let empty_bytes = bincode::serialize(&empty).expect("empty encodes");
     assert_eq!(
         empty_bytes.len(),
-        bytes_len_legacy + 8 + 32 + 32 + 1 + 32,
+        bytes_len_legacy + 8 + 32 + 32 + 1 + 32 + 1,
         "the shard-head set adds its (empty) length prefix, the order root adds 32 bytes, \
-         the epoch-key commitment adds 32 bytes, the absent evidence QC adds its 1-byte tag \
-         and the zero epoch-MMR root adds 32 bytes"
+         the epoch-key commitment adds 32 bytes, the absent evidence QC adds its 1-byte tag, \
+         the zero epoch-MMR root adds 32 bytes, and the absent cnvrf_v3 adds its 1-byte tag"
     );
 }
 
@@ -673,6 +681,7 @@ fn xshard_empty_block_hash_is_byte_identical_to_the_legacy_preimage() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     let mut legacy = Sha256::new();
     legacy.update(b"STELLEREUM_BLOCK_V3");
@@ -713,6 +722,7 @@ fn xshard_full_message_commitment_binds_the_body_beyond_msg_id() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     let honest_hash = block.compute_hash();
 
@@ -826,4 +836,192 @@ fn block_compute_hash_matches_single_tx_hash_reference() {
             "Block::compute_hash must stay byte-identical for {count} txs"
         );
     }
+}
+
+#[test]
+fn cnvrf_v3_payload_preserves_legacy_hash_commits_every_field_and_fails_closed_on_eof() {
+    use crate::cn_vrf::{cnvrf_v3_commit, CommitCarrierV3};
+    use crate::minroot_vdf::{eval, TEST_VDF_STEPS};
+
+    let base = block_with(vec![]);
+    assert!(base.cnvrf_v3.is_none());
+
+    // 1. Exact byte-identity when `cnvrf_v3` is `None` (matches pre-CN-VRF-v3 preimage).
+    let mut legacy_hasher = Sha256::new();
+    legacy_hasher.update(b"STELLEREUM_BLOCK_V3");
+    legacy_hasher.update(crate::consensus::consensus_chain_id().to_be_bytes());
+    legacy_hasher.update(base.shard_id.to_be_bytes());
+    legacy_hasher.update(base.height.to_be_bytes());
+    legacy_hasher.update(base.prev_hash);
+    legacy_hasher.update(base.state_root);
+    legacy_hasher.update(0u32.to_be_bytes());
+    legacy_hasher.update(0u32.to_be_bytes());
+    legacy_hasher.update(base.timestamp.to_be_bytes());
+    legacy_hasher.update(base.proposer);
+    let legacy_hash: [u8; 32] = legacy_hasher.finalize().into();
+    assert_eq!(
+        base.compute_hash(),
+        legacy_hash,
+        "Block with cnvrf_v3: None must remain 100% byte-identical"
+    );
+
+    // 2. Empty `Some(payload)` vs `None` and `is_empty()`.
+    let empty_payload = CnVrfV3BlockPayload {
+        reveal: None,
+        commits: vec![],
+        epoch_vdf: None,
+    };
+    assert!(empty_payload.is_empty());
+    let mut with_empty = base.clone();
+    with_empty.cnvrf_v3 = Some(empty_payload.clone());
+    assert_ne!(
+        with_empty.compute_hash(),
+        legacy_hash,
+        "Some(payload) mixes CNVRF_V3_COMMITMENT_TAG"
+    );
+
+    // 3. Full payload construction & every-field sensitivity.
+    let fk1 = FalconKeypair::generate_from_seed(0xC1);
+    let fk2 = FalconKeypair::generate_from_seed(0xC2);
+    let c1: CommitCarrierV3 = cnvrf_v3_commit(&fk1, 0, &[0x11u8; 32], 5, &[0xA1u8; 48]);
+    let c2: CommitCarrierV3 = cnvrf_v3_commit(&fk2, 0, &[0x22u8; 32], 5, &[0xB2u8; 48]);
+    let raw_seed = [0x55u8; 48];
+    let proof = eval(&raw_seed, TEST_VDF_STEPS, 4);
+    let full_payload = CnVrfV3BlockPayload {
+        reveal: Some([0x77u8; 48]),
+        commits: vec![c2.clone(), c1.clone()], // intentionally unsorted
+        epoch_vdf: Some(EpochVdfBeacon {
+            epoch: 5,
+            raw_seed,
+            proof,
+        }),
+    };
+    assert!(!full_payload.is_empty());
+
+    let mut full_block = base.clone();
+    full_block.cnvrf_v3 = Some(full_payload.clone());
+    let full_hash = full_block.compute_hash();
+    assert_ne!(full_hash, legacy_hash);
+
+    // Commits are sorted canonically by validator_id: reversing input order keeps hash identical.
+    let mut reordered_block = full_block.clone();
+    reordered_block.cnvrf_v3.as_mut().unwrap().commits = vec![c1, c2];
+    assert_eq!(reordered_block.compute_hash(), full_hash);
+
+    // Mutating reveal (byte flip and None vs Some) moves compute_hash.
+    let mut mut_rev = full_block.clone();
+    mut_rev.cnvrf_v3.as_mut().unwrap().reveal.as_mut().unwrap()[0] ^= 1;
+    assert_ne!(mut_rev.compute_hash(), full_hash);
+    let mut no_rev = full_block.clone();
+    no_rev.cnvrf_v3.as_mut().unwrap().reveal = None;
+    assert_ne!(no_rev.compute_hash(), full_hash);
+
+    // Mutating commit fields moves compute_hash.
+    let mut mut_c_vid = full_block.clone();
+    mut_c_vid.cnvrf_v3.as_mut().unwrap().commits[0].validator_id[0] ^= 1;
+    assert_ne!(mut_c_vid.compute_hash(), full_hash);
+
+    let mut mut_c_epoch = full_block.clone();
+    mut_c_epoch.cnvrf_v3.as_mut().unwrap().commits[0].epoch_n += 1;
+    assert_ne!(mut_c_epoch.compute_hash(), full_hash);
+
+    let mut mut_c_anchor = full_block.clone();
+    mut_c_anchor.cnvrf_v3.as_mut().unwrap().commits[0].anchors[0][0] ^= 1;
+    assert_ne!(mut_c_anchor.compute_hash(), full_hash);
+
+    let mut mut_c_sig = full_block.clone();
+    mut_c_sig.cnvrf_v3.as_mut().unwrap().commits[0].sig[0] ^= 1;
+    assert_ne!(mut_c_sig.compute_hash(), full_hash);
+
+    // Mutating epoch_vdf fields (epoch, raw_seed, steps, final_xy, checkpoints) moves compute_hash.
+    let mut mut_vdf_epoch = full_block.clone();
+    mut_vdf_epoch
+        .cnvrf_v3
+        .as_mut()
+        .unwrap()
+        .epoch_vdf
+        .as_mut()
+        .unwrap()
+        .epoch += 1;
+    assert_ne!(mut_vdf_epoch.compute_hash(), full_hash);
+
+    let mut mut_vdf_seed = full_block.clone();
+    mut_vdf_seed
+        .cnvrf_v3
+        .as_mut()
+        .unwrap()
+        .epoch_vdf
+        .as_mut()
+        .unwrap()
+        .raw_seed[0] ^= 1;
+    assert_ne!(mut_vdf_seed.compute_hash(), full_hash);
+
+    let mut mut_vdf_steps = full_block.clone();
+    mut_vdf_steps
+        .cnvrf_v3
+        .as_mut()
+        .unwrap()
+        .epoch_vdf
+        .as_mut()
+        .unwrap()
+        .proof
+        .steps += 1;
+    assert_ne!(mut_vdf_steps.compute_hash(), full_hash);
+
+    let mut mut_vdf_xy = full_block.clone();
+    mut_vdf_xy
+        .cnvrf_v3
+        .as_mut()
+        .unwrap()
+        .epoch_vdf
+        .as_mut()
+        .unwrap()
+        .proof
+        .final_xy
+        .0[0] ^= 1;
+    assert_ne!(mut_vdf_xy.compute_hash(), full_hash);
+
+    let mut mut_vdf_cp = full_block.clone();
+    mut_vdf_cp
+        .cnvrf_v3
+        .as_mut()
+        .unwrap()
+        .epoch_vdf
+        .as_mut()
+        .unwrap()
+        .proof
+        .checkpoints[0]
+        .1[0] ^= 1;
+    assert_ne!(mut_vdf_cp.compute_hash(), full_hash);
+
+    let mut no_vdf = full_block.clone();
+    no_vdf.cnvrf_v3.as_mut().unwrap().epoch_vdf = None;
+    assert_ne!(no_vdf.compute_hash(), full_hash);
+
+    // 4. Bincode round-trip preserves full payload and hash.
+    let encoded_full = bincode::serialize(&full_block).expect("full CN-VRF v3 block encodes");
+    let decoded_full: Block =
+        bincode::deserialize(&encoded_full).expect("full CN-VRF v3 block decodes");
+    assert_eq!(decoded_full.cnvrf_v3, full_block.cnvrf_v3);
+    assert_eq!(decoded_full.compute_hash(), full_hash);
+
+    // 5. Legacy pre-v3 bytes (ending right after `mmr_epoch_root`, missing trailing `cnvrf_v3`)
+    //    decode as `cnvrf_v3: None` under `with_legacy_block_tolerance`, while strict wire mode
+    //    fails closed on EOF.
+    let encoded_none = bincode::serialize(&base).expect("none block encodes");
+    let pre_v3_bytes = &encoded_none[..encoded_none.len() - 1];
+    assert!(
+        bincode::deserialize::<Block>(pre_v3_bytes).is_err(),
+        "strict wire mode must fail closed on missing trailing cnvrf_v3"
+    );
+    let legacy_decoded: Block = with_legacy_block_tolerance(|| bincode::deserialize(pre_v3_bytes))
+        .expect("legacy store path must tolerate missing trailing cnvrf_v3");
+    assert!(legacy_decoded.cnvrf_v3.is_none());
+    assert_eq!(legacy_decoded.compute_hash(), legacy_hash);
+
+    // Strict wire mode also fails closed on truncated Some(payload).
+    assert!(
+        bincode::deserialize::<Block>(&encoded_full[..encoded_full.len() - 1]).is_err(),
+        "strict wire mode must fail closed on truncated CN-VRF v3 payload"
+    );
 }

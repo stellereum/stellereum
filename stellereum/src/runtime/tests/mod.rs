@@ -241,6 +241,7 @@ fn gate_block(height: u64, prev: [u8; 32], ts: u64, proposer: [u8; 32]) -> Block
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     }
 }
 
@@ -1322,6 +1323,7 @@ async fn reorg_restores_state_and_applies_new_chain() {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         blk.sign_block(sk);
         blk
@@ -1407,6 +1409,7 @@ async fn the_state_reorg_reports_the_rolled_back_blocks() {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         blk.sign_block(&user);
         blk
@@ -1471,6 +1474,7 @@ fn fork_block(height: u64, prev: [u8; 32], tag: u8, sk: &SigningKey) -> Block {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     b.sign_block(sk);
     b
@@ -1737,6 +1741,7 @@ async fn replay_verifies_qc_against_the_height_set_not_the_current_set() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     block.sign_block(&historical[0]);
     let bh = block.compute_hash();
@@ -1886,6 +1891,7 @@ async fn parallel_exec_configuration_and_preservation() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     rt.apply_and_advance(blk.compute_hash(), &blk).await;
     assert!(
@@ -2136,6 +2142,7 @@ async fn test_sec01_adopt_lock_superseded_by_equal_or_higher_round_qc() {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(pk);
         // Falconize: the proposer half under the derived Falcon address
@@ -2573,4 +2580,118 @@ async fn consensus_copy_resyncs_to_runtime_without_height_advance() {
             "round {round} must schedule identically"
         );
     }
+}
+
+/// CN-VRF v3 ACTIVE end-to-end: the epoch-beacon schedule replaces the
+/// parent-hash schedule, blocks carry commit carriers for the next epoch,
+/// and every node still converges on one state root.
+///
+/// Below the gate (`CNVRF_V3_ACTIVATION_HEIGHT = u64::MAX`) this suite exercises
+/// the same code through `set_cnvrf_v3_activation_height_for_tests(0)`, which
+/// flips BOTH the runtime override and the engine override — the production
+/// gate constant stays frozen.
+#[tokio::test]
+async fn cnvrf_v3_active_schedule_converges_and_carries_commits() {
+    let keys = signer_keys(3);
+    let validators = ValidatorSet::from_list(
+        keys.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
+    let states: Vec<Arc<InMemoryStateEngine>> = (0..keys.len())
+        .map(|_| Arc::new(InMemoryStateEngine::new()))
+        .collect();
+    for st in &states {
+        crate::runtime::fund_genesis(st, &validators, 1_000_000).await;
+    }
+    let mut cluster = falcon_cluster(&keys, states, 0xD0);
+    for n in cluster.nodes.iter_mut() {
+        n.set_cnvrf_v3_activation_height_for_tests(0);
+        n.set_cnvrf_v3_vdf_steps(64);
+        n.hc.set_parent_hash([0u8; 32]);
+        assert!(
+            n.cnvrf_v3_is_active_at(1),
+            "gate must be active for the test"
+        );
+    }
+
+    let mut ts = 1_700_000_000u64;
+    let mut committed_seen = 0usize;
+    for _ in 1u64..=6 {
+        ts += 1;
+        let bh = cluster.run_height(ts).await;
+        for n in cluster.nodes.iter() {
+            assert!(
+                n.finalized.last().is_some_and(|(_, h)| *h == bh),
+                "every node must finalize the same hash"
+            );
+        }
+        if let Some((_, block, _)) = cluster.nodes[0].last_decision.clone() {
+            if let Some(payload) = block.cnvrf_v3.as_ref() {
+                committed_seen += payload.commits.len();
+            }
+        }
+    }
+    assert!(
+        committed_seen > 0,
+        "active CN-VRF v3 proposals must carry epoch N+1 commit carriers"
+    );
+
+    let roots: Vec<_> = {
+        let mut v = Vec::new();
+        for n in cluster.nodes.iter() {
+            v.push(n.state.get_state_root().await);
+        }
+        v
+    };
+    assert!(
+        roots.windows(2).all(|w| w[0] == w[1]),
+        "all nodes must converge on one state root, got {roots:?}"
+    );
+    // The commits actually landed in the engine's on-chain state.
+    let mirror = cluster.nodes[0].state.cnvrf_v3_read().await.clone();
+    for n in cluster.nodes.iter() {
+        assert!(
+            mirror.get_record(&n.id, 1).is_some(),
+            "every validator's epoch-1 commitment must be recorded on-chain"
+        );
+    }
+}
+
+/// An active CN-VRF v3 proposal whose commit carrier is not admissible
+/// (wrong epoch / forged signature) must be REFUSED by validation instead of
+/// being silently ignored by the transition.
+#[tokio::test]
+async fn cnvrf_v3_active_rejects_inadmissible_commit_payload() {
+    let key = SigningKey::generate(&mut OsRng);
+    let me = key.verifying_key().to_bytes();
+    let validators = ValidatorSet::from_list(vec![(me, 1)]);
+    let mut rt = ValidatorRuntime::new(key, validators, funded_state(me).await, 1)
+        .with_falcon_key(FalconKeypair::generate_from_seed(0xE7));
+    rt.set_cnvrf_v3_activation_height_for_tests(0);
+    rt.set_cnvrf_v3_vdf_steps(64);
+
+    let root = rt.state.get_state_root().await;
+    let mut block = rt.propose(1_700_000_500).await.expect("propose");
+    block.state_root = root;
+
+    // A commit for the CURRENT epoch is stale by construction.
+    let fk = FalconKeypair::generate_from_seed(0xE8);
+    let secret = [7u8; crate::cn_vrf::V3_LINK_LEN];
+    let chain = crate::cn_vrf::CnVrfV3Chain::generate(rt.cnvrf_v3_chain_id, &me, 0, &secret);
+    let stale = chain.commit_carrier(&fk);
+    let mut payload = block
+        .cnvrf_v3
+        .clone()
+        .unwrap_or(crate::sharding::CnVrfV3BlockPayload {
+            reveal: None,
+            commits: Vec::new(),
+            epoch_vdf: None,
+        });
+    payload.commits.push(stale);
+    block.cnvrf_v3 = Some(payload);
+    assert!(
+        rt.validate_proposal_unaligned(&block, root).is_err(),
+        "a stale-epoch commit carrier must be refused"
+    );
 }

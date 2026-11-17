@@ -26,6 +26,7 @@ fn tx_and_block_max_prefixes_never_panic() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
     };
     block.sign_block(&sk);
     let benc = bincode::serialize(&block).unwrap();

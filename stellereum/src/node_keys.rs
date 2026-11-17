@@ -368,7 +368,7 @@ pub fn prompt_passphrase(prompt: &str) -> Option<String> {
 ///
 /// Fails closed when no passphrase is available: writing a plaintext private
 /// key by accident is exactly what the encrypted-at-rest default prevents.
-fn passphrase_for_write(what: &str) -> Result<Zeroizing<String>> {
+pub(crate) fn passphrase_for_write(what: &str) -> Result<Zeroizing<String>> {
     if let Some(p) = get_passphrase() {
         return Ok(Zeroizing::new(p));
     }
@@ -392,7 +392,7 @@ fn passphrase_for_write(what: &str) -> Result<Zeroizing<String>> {
 /// never flushed) or leave the rename itself unpersisted — the node can come
 /// back with a truncated or missing private key. The rename is already atomic
 /// for a PROCESS crash; the syncs extend that guarantee to a MACHINE crash.
-fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

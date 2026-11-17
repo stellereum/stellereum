@@ -88,6 +88,8 @@ pub fn silent_stealth_display(
 ) -> String {
     address::encode_stl57_address(&silent_stealth_address(chain_id, chain, ss, index))
 }
+/// Pure-Rust 256-bit prime-field MinRoot post-quantum VDF for CN-VRF v3.
+pub mod minroot_vdf;
 pub mod mmr;
 pub mod native_api;
 pub mod network;

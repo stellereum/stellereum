@@ -117,6 +117,7 @@ fn hunt1_sync_accepts_chain_signed_only_by_non_validators() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -215,6 +216,7 @@ async fn hunt1b_forged_chain_passes_the_state_root_replay_too() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -306,6 +308,7 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -395,6 +398,7 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -477,6 +481,7 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
             precommit_qc: None,
             last_qc: None,
             mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
@@ -693,6 +698,7 @@ fn hunt7b_proposal_round_field_is_unauthenticated_metadata() {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

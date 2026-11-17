@@ -68,6 +68,7 @@ fn finalized_block(
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
     };
     b.sign_block(&proposer);
     let hash = b.compute_hash();

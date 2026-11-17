@@ -449,6 +449,123 @@ pub struct InMemoryStateEngine {
     /// called on the live path (grep-proof: only `tests/` call it). Live
     /// activation flips the const, never this flag.
     gov_ops_tests_on: Arc<std::sync::atomic::AtomicBool>,
+    /// CN-VRF v3 reverse hash-chain commitments and rolling mix state.
+    ///
+    /// PRIVATE on purpose: reads go through `cnvrf_v3_read`, mutations through
+    /// `cnvrf_v3_write` (which bumps `Domain::CnVrf` and `commitment_generation`).
+    cnvrf_v3: Arc<RwLock<crate::cn_vrf::CnVrfV3State>>,
+    /// CN-VRF v3 non-vote-resettable reveal-abort leaky-bucket counters.
+    ///
+    /// PRIVATE on purpose: reads go through `cnvrf_abort_read`, mutations through
+    /// `cnvrf_abort_write` (which bumps `Domain::CnVrf` and `commitment_generation`).
+    cnvrf_abort: Arc<RwLock<crate::staking::CnVrfAbortState>>,
+    /// Finalized epoch-boundary MinRoot VDF beacon outputs (`epoch -> [u8; 48]`).
+    ///
+    /// PRIVATE on purpose: reads go through `epoch_vdf_beacons_read`, mutations
+    /// through `epoch_vdf_beacons_write` (which bumps `Domain::CnVrf` and
+    /// `commitment_generation`).
+    epoch_vdf_beacons: Arc<RwLock<std::collections::BTreeMap<u64, [u8; 48]>>>,
+    /// Per-epoch `(freeze_block_hash, rolling_mix_at_freeze)` captured at
+    /// `H_freeze = epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`.
+    cnvrf_freeze_inputs: Arc<RwLock<std::collections::BTreeMap<u64, ([u8; 32], [u8; 48])>>>,
+    /// Test/debug per-engine activation height override for CN-VRF v3
+    /// (initialized to `u64::MAX`, keeping frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
+    #[cfg(any(test, debug_assertions))]
+    cnvrf_v3_activation_override: Arc<std::sync::atomic::AtomicU64>,
+}
+
+mod serde_epoch_beacons {
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+    use serde::ser::{SerializeMap, SerializeTuple};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    struct Beacon48([u8; 48]);
+
+    impl Serialize for Beacon48 {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut tup = s.serialize_tuple(48)?;
+            for b in &self.0 {
+                tup.serialize_element(b)?;
+            }
+            tup.end()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Beacon48 {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Beacon48;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a 48-byte beacon array")
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                    let mut out = [0u8; 48];
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                    }
+                    Ok(Beacon48(out))
+                }
+            }
+            d.deserialize_tuple(48, V)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        val: &BTreeMap<u64, [u8; 48]>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(val.len()))?;
+        for (k, v) in val {
+            map.serialize_entry(k, &Beacon48(*v))?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<u64, [u8; 48]>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = BTreeMap<u64, [u8; 48]>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of epoch -> 48-byte beacon")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((k, v)) = map.next_entry::<u64, Beacon48>()? {
+                    out.insert(k, v.0);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+/// Snapshot of the engine's CN-VRF v3 subsystem (`v3_state`, `abort_state`, and
+/// finalized `epoch_beacons`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CnVrfV3EngineSnapshot {
+    pub v3_state: crate::cn_vrf::CnVrfV3State,
+    pub abort_state: crate::staking::CnVrfAbortState,
+    #[serde(with = "serde_epoch_beacons")]
+    pub epoch_beacons: std::collections::BTreeMap<u64, [u8; 48]>,
+}
+
+impl CnVrfV3EngineSnapshot {
+    /// Returns `true` when all three CN-VRF v3 sub-states are completely empty/default.
+    pub fn is_empty(&self) -> bool {
+        self.v3_state.records.is_empty()
+            && self.v3_state.epoch_rolling_mixes.is_empty()
+            && self.v3_state.rolling_mix == [0u8; crate::cn_vrf::V3_LINK_LEN]
+            && self.v3_state.rolling_mix_epoch == 0
+            && self.abort_state.counters.is_empty()
+            && self.epoch_beacons.is_empty()
+    }
 }
 
 impl std::fmt::Debug for InMemoryStateEngine {

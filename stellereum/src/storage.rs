@@ -18,6 +18,7 @@
 //!   "bridge"      : height(8B BE) -> bincode(BridgeState)
 //!   "zkml_models" : height(8B BE) -> bincode(ZkMlModelRegistry)  [audit F-B]
 //!   "cross_shard" : height(8B BE) -> bincode(CrossShardReplaySnapshot) [audit F-I]
+//!   "cnvrf_v3"    : height(8B BE) -> bincode(CnVrfV3EngineSnapshot)
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
 //!   "pq_keys"     : b"a:"+address (32B) -> bincode(scheme, pubkey, salt) / b"h:"+pk_hash (32B) -> pubkey
 //!
@@ -85,6 +86,11 @@ pub struct Storage {
     /// moves the root and is refused, so replay safety comes from the sets
     /// being BOTH consulted AND hashed.
     cross_shard: sled::Tree,
+    /// CN-VRF v3 subsystem state (`v3_state`, `abort_state`, `epoch_beacons`),
+    /// keyed by height and written alongside the domain snapshot. Own tree for
+    /// the same reason as `session_keys`/`bridge`/`zkml_models`: `DomainSnapshot`
+    /// is frozen, and an absent/empty entry means `CnVrfV3EngineSnapshot::default()`.
+    cnvrf_v3: sled::Tree,
     /// Execution receipts, keyed by tx hash. NEW tree (additive only): existing
     /// trees are untouched, so pre-existing data directories open unchanged and
     /// simply report no receipts until heights are adopted/replicated.
@@ -416,6 +422,7 @@ impl Storage {
         let bridge = db.open_tree("bridge")?;
         let zkml_models = db.open_tree("zkml_models")?;
         let cross_shard = db.open_tree("cross_shard")?;
+        let cnvrf_v3 = db.open_tree("cnvrf_v3")?;
         let receipts = db.open_tree("receipts_v1")?;
         let pq_keys = db.open_tree("pq_keys")?;
         let this = Self {
@@ -430,6 +437,7 @@ impl Storage {
             bridge,
             zkml_models,
             cross_shard,
+            cnvrf_v3,
             receipts,
             pq_keys,
         };
@@ -1081,6 +1089,7 @@ impl Storage {
         self.prune_bridge_below(keep_from)?;
         self.prune_zkml_models_below(keep_from)?;
         self.prune_cross_shard_below(keep_from)?;
+        self.prune_cnvrf_v3_below(keep_from)?;
         Ok(removed)
     }
 
@@ -1314,6 +1323,47 @@ impl Storage {
         Ok(removed)
     }
 
+    // ---------- CN-VRF v3 domain snapshots ----------
+
+    pub fn put_cnvrf_v3(&self, height: u64, bytes: &[u8]) -> Result<()> {
+        self.cnvrf_v3.insert(height.to_be_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// The committed CN-VRF v3 subsystem state exactly as it stood after
+    /// `height`, when one was stored. `None` (or empty bytes) for older
+    /// directories means `CnVrfV3EngineSnapshot::default()` (empty), which
+    /// contributes zero bytes to the commitment digest.
+    pub fn cnvrf_v3_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self.cnvrf_v3.get(height.to_be_bytes())?.map(|v| v.to_vec()))
+    }
+
+    /// Drop CN-VRF v3 snapshots older than `keep_from`. Called from
+    /// `prune_domains_below` so this tree follows the same window. Never drops
+    /// a row at a snapshotted height: see [`Self::aux_retained_heights`].
+    pub fn prune_cnvrf_v3_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
+        let mut removed = 0;
+        let keys: Vec<sled::IVec> = self
+            .cnvrf_v3
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
+            })
+            .collect();
+        for k in keys {
+            self.cnvrf_v3.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// The trusted state root a snapshot at `snapshot_height` must hash to.
     ///
     /// A block header commits to the state BEFORE the block applies it (the
@@ -1374,6 +1424,13 @@ impl Storage {
             }
             return Ok(());
         };
+        if let Some(bytes) = self.cnvrf_v3_at(snapshot_height)? {
+            if !bytes.is_empty() {
+                let snap: crate::state_engine::CnVrfV3EngineSnapshot = bincode::deserialize(&bytes)
+                    .map_err(|e| anyhow!("restore cnvrf_v3 at height {snapshot_height}: {e}"))?;
+                engine.restore_cnvrf_v3_snapshot(&snap).await;
+            }
+        }
         let computed = engine.get_state_root().await;
         if computed != expected {
             // No height-0 exception: a genesis snapshot whose bytes hash
@@ -1611,6 +1668,13 @@ impl Storage {
                 crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&bytes))
                     .map_err(|e| anyhow!("restore cross-shard replay at height {height}: {e:?}"))?;
             tmp.restore_cross_shard_replay(&replay).await;
+        }
+        if let Some(bytes) = self.cnvrf_v3_at(height)? {
+            if !bytes.is_empty() {
+                let snap: crate::state_engine::CnVrfV3EngineSnapshot = bincode::deserialize(&bytes)
+                    .map_err(|e| anyhow!("restore cnvrf_v3 at height {height}: {e}"))?;
+                tmp.restore_cnvrf_v3_snapshot(&snap).await;
+            }
         }
 
         // Anchor the recomputed root: the header at height+1 commits to the
@@ -2784,6 +2848,13 @@ pub async fn load_full_state_into(
             // or, at the tip with no anchor, silently re-opened lifecycles.
             tmp.restore_cross_shard_replay(&snap).await;
         }
+        if let Some(bytes) = storage.cnvrf_v3_at(height)? {
+            if !bytes.is_empty() {
+                let snap: crate::state_engine::CnVrfV3EngineSnapshot =
+                    bincode::deserialize(&bytes).map_err(|e| anyhow!("restore cnvrf_v3: {e}"))?;
+                tmp.restore_cnvrf_v3_snapshot(&snap).await;
+            }
+        }
         storage.verify_restored_root(&tmp, height).await?;
     }
 
@@ -2821,6 +2892,13 @@ pub async fn load_full_state_into(
         // install byte-identical replay state, or the verified root would not
         // describe the live engine.
         engine.restore_cross_shard_replay(&snap).await;
+    }
+    if let Some(bytes) = storage.cnvrf_v3_at(height)? {
+        if !bytes.is_empty() {
+            let snap: crate::state_engine::CnVrfV3EngineSnapshot =
+                bincode::deserialize(&bytes).map_err(|e| anyhow!("restore cnvrf_v3: {e}"))?;
+            engine.restore_cnvrf_v3_snapshot(&snap).await;
+        }
     }
     match domains_opt {
         Some(bytes) => {
@@ -2877,6 +2955,10 @@ pub enum PersistJob {
         bridge: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
+    },
+    CnVrfV3 {
+        height: u64,
+        bytes: Vec<u8>,
     },
     Consensus(Box<ConsensusCheckpoint>),
     Finalized {
@@ -2995,6 +3077,7 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_session_keys(height, &session_keys))
                         .and_then(|()| st.put_bridge(height, &bridge))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
+                    PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
                     PersistJob::Receipts {
@@ -3203,6 +3286,12 @@ impl AsyncPersistence {
         });
     }
 
+    /// Non-blocking: enqueue a CN-VRF v3 subsystem snapshot for `height`
+    /// (`BoundedWait` policy, matching `Domains`/`Bridge`).
+    pub fn enqueue_cnvrf_v3(&self, height: u64, bytes: Vec<u8>) {
+        self.push(PersistJob::CnVrfV3 { height, bytes });
+    }
+
     /// Capture + enqueue the full domain snapshot (A9), plus the session-key
     /// registry AND the committed bridge domain captured from the SAME engine
     /// in the SAME job.
@@ -3230,6 +3319,7 @@ impl AsyncPersistence {
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
+        let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
         // tests) - and that is CORRECT here, because there is nothing live to
@@ -3264,6 +3354,7 @@ impl AsyncPersistence {
         // Serialize OFF the executor (bincode of every domain is real CPU work);
         // skip on error exactly like the old inline `if let Ok(bytes)` did.
         if let Some(bytes) = serialize_off_tick(snap).await {
+            self.enqueue_cnvrf_v3(height, cnvrf_v3);
             self.enqueue_domains(
                 height,
                 bytes,
@@ -3607,6 +3698,7 @@ mod tests {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(signer);
         b
@@ -4627,6 +4719,143 @@ mod tests {
         std::fs::remove_dir_all(&dir1).ok();
         std::fs::remove_dir_all(&dir2).ok();
     }
+
+    #[tokio::test]
+    async fn cnvrf_v3_snapshot_roundtrip_verify_and_prune() {
+        use crate::cn_vrf::{CnVrfV3Chain, EPOCH_LEN};
+        use crate::consensus::FalconKeypair;
+        use crate::staking::CnVrfAbortCounter;
+        use crate::state_engine::CnVrfV3EngineSnapshot;
+
+        let dir = tmp();
+        let st = Arc::new(Storage::open(&dir).unwrap());
+        let sk = SigningKey::generate(&mut OsRng);
+
+        // Build an engine with non-empty account + non-empty CN-VRF v3 state
+        // across all three sub-fields (v3_state, abort_state, epoch_beacons).
+        let engine = InMemoryStateEngine::new();
+        let who = [0x33u8; 32];
+        engine.update_account(AccountState::new(who, 7_500)).await;
+
+        let val_kp = FalconKeypair::generate_from_seed(77);
+        let val_id = sk.verifying_key().to_bytes();
+        let chain = CnVrfV3Chain::generate(engine.chain_id, &val_id, 1, &[0x5Bu8; 48]);
+        let carrier = chain.commit_carrier(&val_kp);
+        {
+            let mut v3 = engine.cnvrf_v3_write().await;
+            v3.admit_commit(&carrier, 0, engine.chain_id, val_kp.public_key())
+                .expect("valid commit");
+            let rev = chain.reveal_for_slot(0).expect("slot 0 reveal");
+            v3.apply_slot_reveal(engine.chain_id, &val_id, EPOCH_LEN, Some(&rev));
+        }
+        {
+            let mut abort = engine.cnvrf_abort_write().await;
+            abort.counters.insert(
+                val_id,
+                CnVrfAbortCounter {
+                    misses: 2,
+                    recovery_streak: 1,
+                },
+            );
+        }
+        {
+            let mut beacons = engine.epoch_vdf_beacons_write().await;
+            beacons.insert(1, [0x42u8; 48]);
+        }
+
+        let expected_snap = engine.cnvrf_v3_snapshot().await;
+        assert!(!expected_snap.is_empty());
+        let root_10 = engine.get_state_root().await;
+
+        // Persist via AsyncPersistence::snapshot_domains + enqueue_state at H=10,
+        // and anchor H=11 with root_10.
+        const H: u64 = 10;
+        let ap = AsyncPersistence::start(st.clone());
+        ap.enqueue_state(H, engine.create_snapshot().await);
+        ap.snapshot_domains(
+            &engine,
+            &crate::staking::StakingLedger::new(),
+            &crate::governance::Governance::new(),
+            H,
+        )
+        .await;
+        ap.request_flush();
+        for _ in 0..200 {
+            if st.cnvrf_v3_at(H).unwrap().is_some() && st.domain_at(H).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(st.cnvrf_v3_at(H).unwrap().is_some(), "cnvrf_v3 persisted");
+
+        let mut anchor = block(H + 1, [0x99u8; 32], &sk, None);
+        anchor.state_root = root_10;
+        let anchor_hash = anchor.compute_hash();
+        st.put_header(&BlockHeaderRecord::of(&anchor)).unwrap();
+        st.set_finalized(H + 1, &anchor_hash).unwrap();
+
+        // Full restore into a fresh engine must match root and CnVrfV3EngineSnapshot.
+        let fresh = InMemoryStateEngine::new();
+        let (loaded_h, _, _) = load_full_state_into(&st, &fresh)
+            .await
+            .expect("load_full_state_into must verify")
+            .expect("snapshot must exist");
+        assert_eq!(loaded_h, H);
+        assert_eq!(fresh.get_state_root().await, root_10);
+        assert_eq!(fresh.cnvrf_v3_snapshot().await, expected_snap);
+
+        // Direct verify_restored_root on an engine with accounts+domains restored
+        // (even without manually calling restore_cnvrf_v3_snapshot) restores & passes.
+        let direct = InMemoryStateEngine::new();
+        direct
+            .restore_snapshot_preserve_replay_sets(&st.get_state(H).unwrap().unwrap())
+            .await
+            .unwrap();
+        let dom = decode_domain_snapshot(&st.domain_at(H).unwrap().unwrap()).unwrap();
+        dom.apply(&direct).await;
+        st.verify_restored_root(&direct, H)
+            .await
+            .expect("verify_restored_root must restore cnvrf_v3 and pass");
+        assert_eq!(direct.cnvrf_v3_snapshot().await, expected_snap);
+
+        // Enqueue path + prune behavior:
+        // Add a stale unreferenced cnvrf_v3 row at height 5 and a newer snapshot at height 20.
+        let stale_bytes = bincode::serialize(&CnVrfV3EngineSnapshot::default()).unwrap();
+        ap.enqueue_cnvrf_v3(5, stale_bytes.clone());
+        ap.request_flush();
+        for _ in 0..200 {
+            if st.cnvrf_v3_at(5).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(st.cnvrf_v3_at(5).unwrap().is_some());
+
+        st.put_state(20, &engine.create_snapshot().await).unwrap();
+        st.put_domains(20, &st.domain_at(H).unwrap().unwrap())
+            .unwrap();
+        st.put_cnvrf_v3(20, &st.cnvrf_v3_at(H).unwrap().unwrap())
+            .unwrap();
+
+        // Prune below 15: height 5 (unretained) is dropped; height 10 (still in
+        // state/domains) is retained; height 20 is retained.
+        let pruned_cnvrf = st.prune_cnvrf_v3_below(15).unwrap();
+        assert_eq!(pruned_cnvrf, 1);
+        assert!(st.cnvrf_v3_at(5).unwrap().is_none());
+        assert!(st.cnvrf_v3_at(H).unwrap().is_some());
+        assert!(st.cnvrf_v3_at(20).unwrap().is_some());
+
+        // After state/domains at H=10 are pruned via prune_state_below + prune_domains_below,
+        // cnvrf_v3 at H=10 is also pruned cleanly while H=20 survives.
+        assert_eq!(st.prune_state_below(15).unwrap(), 1);
+        assert_eq!(st.prune_domains_below(15).unwrap(), 1);
+        assert!(st.cnvrf_v3_at(H).unwrap().is_none());
+        assert!(st.cnvrf_v3_at(20).unwrap().is_some());
+
+        drop(ap);
+        drop(st);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
@@ -4693,6 +4922,7 @@ mod archive_proof_tests {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(signer);
         b

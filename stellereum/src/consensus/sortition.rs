@@ -286,13 +286,17 @@ pub fn mixed_quorum_pair_safe(t_micro: u64, t_full: u64, total_power: u64) -> bo
 /// (ungrindable) selection would remove the grinding surface entirely; that
 /// is the structural fix and is out of scope here.
 ///
-/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
-pub fn derive_sortition_committee(
+/// Canonical stake-weighted without-replacement committee draw from a
+/// pre-derived 32-byte seed and domain separator.
+///
+/// Shared by [`derive_sortition_committee`], [`beacon_draw_committee`], and
+/// [`cnvrf_v3_beacon_draw_committee`] so all three use identical weighted
+/// without-replacement ticket math without duplication.
+fn select_committee_from_seed(
     validators: &ValidatorSet,
-    height: Height,
-    round: Round,
     committee_size: u32,
-    prev_block_hash: &[u8; 32],
+    domain: &str,
+    seed: &[u8; 32],
 ) -> Vec<ValidatorId> {
     if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
         return Vec::new();
@@ -319,17 +323,13 @@ pub fn derive_sortition_committee(
     let mut selected = Vec::with_capacity(target_k);
     let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
 
-    // Per-(height, round) seed: the parent block hash is the only entropy
-    // that is not known before the chain reaches this height.
-    let seed = sortition_seed(prev_block_hash, height, round);
-
     for step in 0..target_k {
         if total_power == 0 || pool.is_empty() {
             break;
         }
 
-        let mut hasher = blake3::Hasher::new_derive_key(SORTITION_DRAW_DOMAIN);
-        hasher.update(&seed);
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(seed);
         hasher.update(&(step as u32).to_le_bytes());
         let hash = hasher.finalize();
 
@@ -353,6 +353,24 @@ pub fn derive_sortition_committee(
 
     selected.sort_unstable();
     selected
+}
+
+/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
+pub fn derive_sortition_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    prev_block_hash: &[u8; 32],
+) -> Vec<ValidatorId> {
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    // Per-(height, round) seed: the parent block hash is the only entropy
+    // that is not known before the chain reaches this height.
+    let seed = sortition_seed(prev_block_hash, height, round);
+    select_committee_from_seed(validators, committee_size, SORTITION_DRAW_DOMAIN, &seed)
 }
 
 /// Domain separator of the sortition draw (v5 = parent-block entropy).
@@ -474,61 +492,101 @@ pub fn beacon_draw_committee(
         return Vec::new();
     }
 
-    // Filter positive-power validators in canonical sorted order (BTreeMap order)
-    let mut pool: Vec<(ValidatorId, u64)> = validators
-        .validators
-        .iter()
-        .filter(|(_, &p)| p > 0)
-        .map(|(&id, &p)| (id, p))
-        .collect();
-
-    let target_k = (committee_size as usize).min(pool.len());
-    if target_k == 0 {
-        return Vec::new();
-    }
-    if target_k == pool.len() {
-        let mut ids: Vec<ValidatorId> = pool.into_iter().map(|(id, _)| id).collect();
-        ids.sort_unstable();
-        return ids;
-    }
-
-    let mut selected = Vec::with_capacity(target_k);
-    let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
-
     // Same weighted without-replacement ticket loop as the parent-hash draw,
     // but seeded by the epoch-bound beacon instead of the parent hash.
     let seed = beacon_seed(beacon_output, beacon_epoch, height, round);
+    select_committee_from_seed(validators, committee_size, BEACON_DRAW_DOMAIN, &seed)
+}
 
-    for step in 0..target_k {
-        if total_power == 0 || pool.is_empty() {
-            break;
-        }
+// ============================================================================
+// CN-VRF v3 BEACON DRAW & PROPOSER SORTITION (7,200-block epoch; gated-OFF)
+// ============================================================================
 
-        let mut hasher = blake3::Hasher::new_derive_key(BEACON_DRAW_DOMAIN);
-        hasher.update(&seed);
-        hasher.update(&(step as u32).to_le_bytes());
-        let hash = hasher.finalize();
+/// Activation height of CN-VRF v3 sortition and proposer beacon selection:
+/// `u64::MAX` = never (GatedOff sentinel until Sub-wave B + audit/rollout).
+pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
-        let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
-        let ticket = rand_val % total_power;
+/// Canonical CN-VRF v3 epoch length in heights (7,200 blocks), pinned at
+/// compile time to [`crate::cn_vrf::EPOCH_LEN`].
+pub const CNVRF_V3_EPOCH_LEN: u64 = 7_200;
 
-        let mut acc = 0u64;
-        let mut chosen_idx = 0;
-        for (idx, (_id, power)) in pool.iter().enumerate() {
-            acc += *power;
-            if ticket < acc {
-                chosen_idx = idx;
-                break;
-            }
-        }
+const _: () = assert!(CNVRF_V3_EPOCH_LEN == crate::cn_vrf::EPOCH_LEN);
 
-        let (winner_id, winner_power) = pool.remove(chosen_idx);
-        total_power = total_power.saturating_sub(winner_power);
-        selected.push(winner_id);
+/// Domain separator for CN-VRF v3 committee sortition draws.
+pub const CNVRF_V3_DRAW_DOMAIN: &str = "STELL_SORTITION_CNVRF_V3";
+
+/// Domain separator for CN-VRF v3 proposer selection draws.
+pub const CNVRF_V3_PROPOSER_DOMAIN: &str = "STELL_PROPOSER_CNVRF_V3";
+
+/// True once CN-VRF v3 sortition is active at `height` (false at every
+/// reachable height while [`CNVRF_V3_ACTIVATION_HEIGHT`] is `u64::MAX`).
+pub fn cnvrf_v3_active_at(height: Height) -> bool {
+    #[allow(clippy::absurd_extreme_comparisons)]
+    // GATE: `>=` is the rollout semantic (live at/after the flipped height);
+    // the lint fires only because the constant is currently the never-value
+    // `u64::MAX`, and goes quiet on its own when the lead flips it.
+    {
+        height >= CNVRF_V3_ACTIVATION_HEIGHT
     }
+}
 
-    selected.sort_unstable();
-    selected
+/// CN-VRF v3 epoch index for `height` (`height / 7_200`).
+pub fn cnvrf_v3_epoch_of_height(height: Height) -> u64 {
+    height / CNVRF_V3_EPOCH_LEN
+}
+
+/// The per-`(epoch, height, round)` CN-VRF v3 committee seed:
+/// `BLAKE3_derive_key("STELL_SORTITION_CNVRF_V3", beacon_output (48B) || beacon_epoch || height || round)`.
+pub fn cnvrf_v3_beacon_seed(
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CNVRF_V3_DRAW_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// The per-`(epoch, height, round)` CN-VRF v3 proposer seed:
+/// `BLAKE3_derive_key("STELL_PROPOSER_CNVRF_V3", beacon_output (48B) || beacon_epoch || height || round)`.
+pub fn cnvrf_v3_proposer_seed(
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CNVRF_V3_PROPOSER_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// CN-VRF v3 beacon-draw committee selector using 7,200-block epochs.
+///
+/// Fail closed (`Vec::new()`) if `beacon_epoch != cnvrf_v3_epoch_of_height(height)`,
+/// `committee_size == 0`, `validators` is empty, or total voting power is zero.
+pub fn cnvrf_v3_beacon_draw_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+) -> Vec<ValidatorId> {
+    if beacon_epoch != cnvrf_v3_epoch_of_height(height) {
+        return Vec::new();
+    }
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+    let seed = cnvrf_v3_beacon_seed(beacon_output, beacon_epoch, height, round);
+    select_committee_from_seed(validators, committee_size, CNVRF_V3_DRAW_DOMAIN, &seed)
 }
 
 /// Multiplicative per-round backoff factor of the DETERMINISTIC round timeout.

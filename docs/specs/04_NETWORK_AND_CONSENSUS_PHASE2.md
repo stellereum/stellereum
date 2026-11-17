@@ -1,7 +1,8 @@
 # 04 — Network & Consensus (HDAE Phase-2, code truth)
 
-Sources: `stellereum/src/consensus.rs`, `consensus_net.rs`, `network.rs`,
-`sync.rs`, `mempool.rs`, `staking.rs`, `main.rs`, `zkml.rs`.
+Sources: `stellereum/src/consensus.rs`, `consensus/sortition.rs`, `consensus_net.rs`,
+`network.rs`, `sync.rs`, `mempool.rs`, `staking.rs`, `cn_vrf.rs`, `minroot_vdf.rs`,
+`main.rs`, `zkml.rs`.
 
 ## 1. BFT round structure
 
@@ -14,8 +15,20 @@ Sources: `stellereum/src/consensus.rs`, `consensus_net.rs`, `network.rs`,
 - µQC: committee cap 64 (`:817`), power rule max(2/3 committee, 1/2 network+1)
   (`:873-882`); markers `PQ_UQC 0xFD` (`:476`), `PQ_QC 0xFE` (`:470`),
   `BLS_QC 0xFF` (`:221`); signer cap 4096 (`:191`).
-- Sortition: seed `BLAKE3(STELL_SORTITION_V5 || parent || h || r)` (`:1052-1064`);
+- Sortition: legacy seed `BLAKE3(STELL_SORTITION_V5 || parent || h || r)` (`:1052-1064`);
   VRF-gated variant (`:1080-1086`) consuming registry-verified output only.
+  CN-VRF v3 gated beacon sortition (`consensus/sortition.rs:505-590`, gated by
+  `CNVRF_V3_ACTIVATION_HEIGHT`, default `u64::MAX` GatedOff): `CNVRF_V3_EPOCH_LEN 7_200`
+  (`:511`), `CNVRF_V3_DRAW_DOMAIN` (`"STELL_SORTITION_CNVRF_V3"` `:516`),
+  `CNVRF_V3_PROPOSER_DOMAIN` (`"STELL_PROPOSER_CNVRF_V3"` `:519`),
+  `cnvrf_v3_beacon_draw_committee` (`:574`), `cnvrf_v3_proposer_seed` (`:556`),
+  fed by `CommitCarrierV3` (`V3_COMMIT_LOOKAHEAD_BLOCKS 360`, `cn_vrf.rs:1019`),
+  proposer-only `Block` `RevealV3` (`48 B`, `height % 7200`), off-tick `VdfLane`
+  evaluating checkpointed `MinRoot` PQ-VDF (`minroot_vdf.rs`), deterministic
+  `epoch_raw_seed` fallback (never raw `parent_hash`), and non-vote-resettable
+  leaky-bucket abort slashing in `staking.rs` (`CNVRF_ABORT_SLASH_BPS 100`,
+  `CNVRF_ABORT_THRESHOLD 3`, `CNVRF_ABORT_RECOVERY_STREAK 20`; see
+  `docs/PQ_CN_VRF_SPEC.md` §7).
 
 ## 2. Timeout ladder
 

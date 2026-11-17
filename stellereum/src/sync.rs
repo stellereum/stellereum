@@ -980,6 +980,7 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
     "bridge",
     "zkml",
     "cross_shard",
+    "cnvrf_v3",
     "pq_keys",
 ];
 
@@ -1324,6 +1325,20 @@ async fn install_bundle(
                     )
                     .map_err(|e| format!("fast sync: restore cross-shard error: {e}"))?;
                 engine.restore_cross_shard_replay(&snap).await;
+            }
+            "cnvrf_v3" => {
+                // Absent or empty bytes mean `CnVrfV3EngineSnapshot::default()`
+                // (pre-v3 snapshots / legacy test fixtures); non-empty bytes
+                // decode strictly and restore the CN-VRF v3 subsystem.
+                if !dbytes.is_empty() {
+                    let snap: crate::state_engine::CnVrfV3EngineSnapshot =
+                        crate::network::decode_wire_limited(
+                            dbytes,
+                            (dbytes.len() as u64).min(crate::network::MAX_WIRE_BLOCK_BYTES),
+                        )
+                        .map_err(|e| format!("fast sync: restore cnvrf_v3 error: {e}"))?;
+                    engine.restore_cnvrf_v3_snapshot(&snap).await;
+                }
             }
             "pq_keys" => {
                 // Audit F7: the fetched `pq_keys` blob is INSTALLED, not
@@ -1985,6 +2000,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+                cnvrf_v3: None,
             };
             b.sign_block(&sk);
             // Falconize: Ed-only refuses `verify_proposer_signature` (no
@@ -2083,6 +2099,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+                cnvrf_v3: None,
             };
             b.sign_block(&proposer);
             // Falconize (same envelope as `chain` above): the proposer half
@@ -2286,6 +2303,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+                cnvrf_v3: None,
             };
             b.sign_block(&keys[proposer_idx]);
             // Falconize: the derived-address half registered for this Ed id
@@ -2521,6 +2539,102 @@ mod tests {
             reqs.contains(&"pq_keys"),
             "fast_sync_state must fetch pq_keys domain"
         );
+        assert!(
+            reqs.contains(&"cnvrf_v3"),
+            "fast_sync_state must fetch cnvrf_v3 domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_sync_state_carries_cnvrf_v3_and_handles_empty_fallback() {
+        use crate::cn_vrf::CnVrfV3Chain;
+        use crate::consensus::FalconKeypair;
+        use crate::state_engine::InMemoryStateEngine;
+        use crate::storage::DomainSnapshot;
+        use std::collections::HashMap;
+
+        let source = InMemoryStateEngine::new();
+        let val_kp = FalconKeypair::generate_from_seed(55);
+        let val_id = [0x55u8; 32];
+        let chain = CnVrfV3Chain::generate(source.chain_id, &val_id, 1, &[0x99u8; 48]);
+        let carrier = chain.commit_carrier(&val_kp);
+        {
+            let mut st = source.cnvrf_v3_write().await;
+            st.admit_commit(&carrier, 0, source.chain_id, val_kp.public_key())
+                .expect("valid commit");
+        }
+        {
+            let mut beacons = source.epoch_vdf_beacons_write().await;
+            beacons.insert(2, [0xABu8; 48]);
+        }
+
+        let root = source.get_state_root().await;
+        let snap = source.create_snapshot().await;
+        let dom = DomainSnapshot::capture(
+            &source,
+            &crate::staking::StakingLedger::new(),
+            &crate::governance::Governance::new(),
+        )
+        .await;
+        let cnvrf_bytes = bincode::serialize(&source.cnvrf_v3_snapshot().await).unwrap();
+
+        let mut domains: HashMap<&'static str, Vec<u8>> = HashMap::new();
+        domains.insert("domains", bincode::serialize(&dom).unwrap());
+        domains.insert("cnvrf_v3", cnvrf_bytes);
+
+        let target = InMemoryStateEngine::new();
+        fast_sync_state(
+            &target,
+            root,
+            || async { Some(snap.clone()) },
+            |kind: &'static str| {
+                let domains = domains.clone();
+                async move { domains.get(kind).cloned() }
+            },
+        )
+        .await
+        .expect("fast_sync_state with cnvrf_v3 must verify");
+        assert_eq!(target.get_state_root().await, root);
+        assert_eq!(
+            target.cnvrf_v3_snapshot().await,
+            source.cnvrf_v3_snapshot().await
+        );
+
+        // Without cnvrf_v3, root check fails because source has non-empty cnvrf_v3.
+        let bare = InMemoryStateEngine::new();
+        let mut without_cnvrf = domains.clone();
+        without_cnvrf.remove("cnvrf_v3");
+        let err = fast_sync_state(
+            &bare,
+            root,
+            || async { Some(snap.clone()) },
+            |kind: &'static str| {
+                let d = without_cnvrf.clone();
+                async move { d.get(kind).cloned() }
+            },
+        )
+        .await;
+        assert!(err.is_err(), "missing non-empty cnvrf_v3 must fail root");
+
+        // Backward compatibility: empty cnvrf_v3 source verifies when blob is Some(vec![]).
+        let empty_source = InMemoryStateEngine::new();
+        let empty_root = empty_source.get_state_root().await;
+        let empty_snap = empty_source.create_snapshot().await;
+        let target_empty = InMemoryStateEngine::new();
+        fast_sync_state(
+            &target_empty,
+            empty_root,
+            || async { Some(empty_snap.clone()) },
+            |kind: &'static str| async move {
+                if kind == "cnvrf_v3" {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            },
+        )
+        .await
+        .expect("empty cnvrf_v3 bytes must gracefully mean default/empty");
     }
 
     // ==================== F3(a): mismatched body rejected ====================
@@ -2749,6 +2863,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+                cnvrf_v3: None,
             };
             eb.sign_block(&proposer);
             let hash = eb.compute_hash();
@@ -2950,6 +3065,7 @@ mod repl_tests {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+            cnvrf_v3: None,
         };
         b.sign_block(&sk);
         b

@@ -102,9 +102,7 @@ impl ChainActivationSchedule {
         lines.push(format!(
             "chain_spec: default_chain_id={}, pq_rotation_delay_heights={}, \
              qc_split_by_size_threshold={}",
-            self.default_chain_id,
-            self.pq_rotation_delay_heights,
-            self.qc_split_by_size_threshold
+            self.default_chain_id, self.pq_rotation_delay_heights, self.qc_split_by_size_threshold
         ));
         lines.push(format!(
             "QC_SPLIT_BY_SIZE_THRESHOLD [stellereum::consensus::sortition]: \

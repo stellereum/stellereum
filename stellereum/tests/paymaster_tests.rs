@@ -42,12 +42,11 @@ const GAS_LIMIT: u64 = 300_000;
 /// is `max(min(gas_limit, gas_used + intrinsic), floor) + surcharge`, so a
 /// plain transfer declaring 300 000 is billed the 280 000 intrinsic envelope
 /// cost (capped at the declaration) — not the declaration itself.
-const EXPECTED_SPONSORED_FEE: u64 =
-    if GAS_LIMIT < stellereum::svm::GAS_BASIC_TRANSFER {
-        GAS_LIMIT
-    } else {
-        stellereum::svm::GAS_BASIC_TRANSFER
-    } + PQ_ACTIVATION_SURCHARGE_GAS;
+const EXPECTED_SPONSORED_FEE: u64 = if GAS_LIMIT < stellereum::svm::GAS_BASIC_TRANSFER {
+    GAS_LIMIT
+} else {
+    stellereum::svm::GAS_BASIC_TRANSFER
+} + PQ_ACTIVATION_SURCHARGE_GAS;
 /// The MEMPOOL reservation stays the DECLARED limit + surcharge: admission must
 /// cover the worst case before execution runs, and the reservation is released
 /// after apply. Not a charged fee.

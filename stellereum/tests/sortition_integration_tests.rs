@@ -288,15 +288,8 @@ fn proposer_edge_cases_empty_and_singleton_sets() {
         signatures: vec![],
     };
     assert!(
-        verify_finality_for_header(
-            &empty,
-            1,
-            &[0xABu8; 32],
-            &[0u8; 32],
-            &[0x11u8; 32],
-            &qc
-        )
-        .is_err()
+        verify_finality_for_header(&empty, 1, &[0xABu8; 32], &[0u8; 32], &[0x11u8; 32], &qc)
+            .is_err()
     );
 
     // All-zero powers behave like empty (add() drops zero-power members).
@@ -474,17 +467,15 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
         &wrong_kind
     )
     .is_err());
-    assert!(
-        verify_finality_for_header(
-            &in_force,
-            BOUNDARY_H + 1,
-            &[0x00u8; 32],
-            &[0u8; 32],
-            &proposer,
-            &qc
-        )
-        .is_err()
-    );
+    assert!(verify_finality_for_header(
+        &in_force,
+        BOUNDARY_H + 1,
+        &[0x00u8; 32],
+        &[0u8; 32],
+        &proposer,
+        &qc
+    )
+    .is_err());
     let _ = (a, kb);
 }
 

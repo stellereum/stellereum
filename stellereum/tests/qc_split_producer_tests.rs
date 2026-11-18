@@ -26,8 +26,8 @@ use stellereum::consensus::{
     produce_full_network_certificate_from_signers, qc_split_active_at, qc_split_required,
     set_qc_split_activation_override, vote_sign_bytes, BlockHash, CommitteeSchedule, Height,
     QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
-    MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID, QC_SPLIT_BY_SIZE_THRESHOLD,
-    QC_SPLIT_ACTIVATION_HEIGHT,
+    MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID, QC_SPLIT_ACTIVATION_HEIGHT,
+    QC_SPLIT_BY_SIZE_THRESHOLD,
 };
 use stellereum::consensus::{micro_committee_size, pq_micro_required_power};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
@@ -537,7 +537,9 @@ fn four_validators_keep_a_byte_identical_micro_qc() {
         "exactly one µQC marker"
     );
     assert!(
-        qc.signatures.iter().all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
+        qc.signatures
+            .iter()
+            .all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
         "no CEC marker below the threshold"
     );
     assert!(qc.verify(&vs), "the µQC must verify");
@@ -608,7 +610,10 @@ fn producer_and_verifier_agree_at_the_exact_threshold_boundary() {
         "191: the verifier must accept the µQC the producer emitted"
     );
     assert!(
-        qc_below.signatures.iter().all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
+        qc_below
+            .signatures
+            .iter()
+            .all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
         "191: no CEC while below the threshold"
     );
 

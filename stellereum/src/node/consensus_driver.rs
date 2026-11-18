@@ -1552,7 +1552,8 @@ pub(crate) async fn run_consensus_node(
         // unbound arrivals while armed, so re-draining would only rescan.
         // Default-off: `refusal_active` is always false, so this whole block
         // is a no-op and every context below behaves byte-identically.
-        let binding_activation = stellereum::chain_binding::ChainBindingActivation::from_chain_spec();
+        let binding_activation =
+            stellereum::chain_binding::ChainBindingActivation::from_chain_spec();
         let ingress_height = rt
             .finalized
             .last()

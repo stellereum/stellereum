@@ -863,8 +863,7 @@ async fn fork288000_explicit_pq_self_transfer_parity() {
     // fee (billed gas + PQ surcharge) leaves the account.
     assert_eq!(
         *balance,
-        fund - crate::svm::GAS_BASIC_TRANSFER
-            - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+        fund - crate::svm::GAS_BASIC_TRANSFER - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
     );
     assert_eq!(
         results[0], results[1],
@@ -958,8 +957,7 @@ async fn fork288000_conflicting_pin_fails_closed_with_fee() {
     assert_eq!(after.nonce, 1);
     assert_eq!(
         after.balance,
-        fund - crate::svm::GAS_BASIC_TRANSFER
-            - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+        fund - crate::svm::GAS_BASIC_TRANSFER - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
     );
 }
 

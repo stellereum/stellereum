@@ -2575,7 +2575,11 @@ impl StakingLedger {
             (
                 v.self_bond,
                 v.delegated,
-                if include_rewards { v.pending_rewards } else { 0 },
+                if include_rewards {
+                    v.pending_rewards
+                } else {
+                    0
+                },
             )
         };
         // Saturating sums (econ audit 2026-11-01): `Iterator::sum` panics on
@@ -2669,11 +2673,8 @@ impl StakingLedger {
             keys.sort_unstable();
             for key in keys {
                 let amount = self.withdrawable.get(&key).copied().unwrap_or(0);
-                let cut =
-                    (amount as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
-                let cut = cut
-                    .min(amount)
-                    .min(burn.saturating_sub(unbond_cut_total));
+                let cut = (amount as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(amount).min(burn.saturating_sub(unbond_cut_total));
                 if cut > 0 {
                     let left = amount - cut;
                     if left == 0 {
@@ -6801,8 +6802,7 @@ mod tests {
         let supply_before = l.ledger_stake_supply();
         let burned = l.slash(v, 10_000).unwrap(); // 100% of the base
         assert_eq!(
-            burned,
-            supply_before,
+            burned, supply_before,
             "100% of self_bond + matured withdrawable must burn"
         );
         assert_eq!(l.validators[&v].self_bond, 0);

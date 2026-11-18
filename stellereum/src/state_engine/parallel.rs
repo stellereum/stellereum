@@ -540,10 +540,8 @@ impl InMemoryStateEngine {
                             // `billed_gas(tx, gas_used)` and the two paths
                             // must agree on the committed registry spend for
                             // the same block.
-                            session_notes.push((
-                                &txs[*i],
-                                InMemoryStateEngine::billed_gas(&txs[*i], 0),
-                            ));
+                            session_notes
+                                .push((&txs[*i], InMemoryStateEngine::billed_gas(&txs[*i], 0)));
                         }
                     }
                 }

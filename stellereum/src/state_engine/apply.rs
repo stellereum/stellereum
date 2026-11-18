@@ -1471,7 +1471,8 @@ impl InMemoryStateEngine {
         // empty-payload transfer, both capped at the declared limit). The
         // block path files the same number, so the registry does not care
         // which path applied the transaction.
-        self.session_note_applied(tx, Self::billed_gas(tx, gas_charged)).await;
+        self.session_note_applied(tx, Self::billed_gas(tx, gas_charged))
+            .await;
         // Contract deploys commit code hashes here — AFTER the native commit,
         // never speculatively inside execution (B1: the trie has no undo).
         // Read (never write-locked together with the trie below): lock order
@@ -2888,8 +2889,8 @@ impl InMemoryStateEngine {
     /// `cnvrf_v3_is_active_at(block.height)` is true).
     async fn apply_cnvrf_v3(&self, block: &crate::sharding::Block, status: &[bool]) -> u64 {
         use crate::cn_vrf::{
-            epoch_of_height, epoch_raw_seed, CommitCarrierV3, SlotRevealOutcome, CNVRF_PK_LEN,
-            EPOCH_LEN, V3_COMMIT_LOOKAHEAD_BLOCKS,
+            epoch_of_height, CommitCarrierV3, SlotRevealOutcome, CNVRF_PK_LEN, EPOCH_LEN,
+            V3_COMMIT_LOOKAHEAD_BLOCKS,
         };
 
         let current_epoch = epoch_of_height(block.height);
@@ -3047,13 +3048,25 @@ impl InMemoryStateEngine {
             let e = vdf_beacon.epoch;
             if !epoch_beacons.contains_key(&e) && e <= current_epoch.saturating_add(1) {
                 let seed_matches = if let Some((freeze_hash, freeze_mix)) = freeze_inputs.get(&e) {
-                    let prev_beacon = if e == 0 {
-                        [0u8; 48]
-                    } else {
-                        epoch_beacons.get(&(e - 1)).copied().unwrap_or([0u8; 48])
-                    };
-                    let expected =
-                        epoch_raw_seed(self.chain_id, e, &prev_beacon, freeze_hash, freeze_mix);
+                    // ONE derivation, shared with the producer (H_freeze
+                    // dispatch in `runtime/anchors.rs`) and the proposal
+                    // validator (`validate_cnvrf_v3_payload`): the bootstrap
+                    // beacon chains the first post-activation epoch, a
+                    // committed on-chain beacon chains every later one, and a
+                    // missing VDF-era beacon fails closed on zeros. The local
+                    // copy chained zeros for the FIRST boundary, which the
+                    // producer never derived — the beacon chain could never
+                    // start (review R1, finding F3).
+                    let expected = crate::cn_vrf::epoch_seed(
+                        self.chain_id,
+                        e,
+                        epoch_beacons.get(&e.saturating_sub(1)),
+                        self.cnvrf_v3_is_active_at(crate::cn_vrf::freeze_height_of_epoch(
+                            e.saturating_sub(1),
+                        )),
+                        freeze_hash,
+                        freeze_mix,
+                    );
                     vdf_beacon.raw_seed == expected
                 } else {
                     true
@@ -3907,10 +3920,39 @@ impl InMemoryStateEngine {
         // the honest path and a firewall on every other path — replay,
         // reorg re-application under a rotated set, hand-built callers. No
         // certificate and a rejected certificate are treated alike.
-        if !cert.verify(val_set) {
+        // COMMITTEE SCHEDULE (review R1, finding F2): at/after the CN-VRF v3
+        // activation the evidence committee is drawn from the EPOCH BEACON,
+        // not the parent hash — the same schedule the producer used. Below the
+        // gate this is byte-identical to the plain verify/signers path.
+        let cert_epoch = crate::cn_vrf::epoch_of_height(cert.height);
+        let schedule = if self.cnvrf_v3_is_active_at(cert.height) {
+            let committed = self
+                .epoch_vdf_beacons_read()
+                .await
+                .get(&cert_epoch)
+                .copied();
+            let beacon = crate::cn_vrf::epoch_beacon_for_active(
+                self.chain_id,
+                cert_epoch,
+                committed.as_ref(),
+                self.cnvrf_v3_is_active_at(crate::cn_vrf::freeze_height_of_epoch(cert_epoch)),
+            );
+            crate::consensus::CommitteeSchedule::Beacon(beacon.map(|output| {
+                crate::consensus::EpochBeacon {
+                    epoch: cert_epoch,
+                    output,
+                }
+            }))
+        } else {
+            crate::consensus::CommitteeSchedule::ParentHash
+        };
+        // `Beacon(None)` (a VDF-era beacon we have not committed) elects
+        // nobody and verifies nothing — fail closed, exactly like every other
+        // beacon consumer.
+        if !cert.verify_with_schedule(val_set, schedule) {
             return 0;
         }
-        let signers = cert.signers_set(val_set);
+        let signers = cert.signers_set_with_schedule(val_set, schedule);
         let eligible: Vec<[u8; 32]> = val_set.validators.keys().copied().collect();
         // SLASH-02: settle BOTH backing pools from the ledger's own split.
         // `note_missed_heights` burns on the evidence scope (SLASH-01), so
@@ -3921,11 +3963,8 @@ impl InMemoryStateEngine {
         let (burned, rewards_cut) = {
             let mut ledger = self.staking_write().await;
             let rewards_before = ledger.rewards_pool;
-            let burned = ledger.note_missed_heights(
-                height,
-                &|v: &[u8; 32]| signers.contains(v),
-                &eligible,
-            );
+            let burned =
+                ledger.note_missed_heights(height, &|v: &[u8; 32]| signers.contains(v), &eligible);
             (burned, rewards_before.saturating_sub(ledger.rewards_pool))
         };
         if burned > 0 {
@@ -3934,7 +3973,11 @@ impl InMemoryStateEngine {
                 .settle_slash_burn(crate::staking::STAKING_POOL, staking_cut, "downtime")
                 .await;
             let settled_rewards = self
-                .settle_slash_burn(crate::staking::REWARDS_POOL, rewards_cut, "downtime-rewards")
+                .settle_slash_burn(
+                    crate::staking::REWARDS_POOL,
+                    rewards_cut,
+                    "downtime-rewards",
+                )
                 .await;
             // Report what ACTUALLY left the pools (equal to `burned` unless the
             // state was already drifted); `outcome.slashed` claims destruction,

@@ -42,10 +42,9 @@ use stellereum::svm::{
 };
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 use stellereum::zkml_attestation::{
-    model_spec_test_only, model_spec_with_attestation, prove_attestation,
-    prove_attestation_bound, verify_attestation, verify_attestation_at,
-    verify_attestation_bound, AttestationProof, ModelSpec, ZkmlContextBinding,
-    ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
+    model_spec_test_only, model_spec_with_attestation, prove_attestation, prove_attestation_bound,
+    verify_attestation, verify_attestation_at, verify_attestation_bound, AttestationProof,
+    ModelSpec, ZkmlContextBinding, ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
     ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT,
 };
 
@@ -1677,7 +1676,9 @@ fn snark_proof_leaves_inputs_and_outputs_public_no_hiding() {
 fn context_binding_is_opt_in_and_inert_by_default() {
     // The gate constant is the "never" sentinel; nothing can open it here.
     assert_eq!(ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT, u64::MAX);
-    assert!(!stellereum::zkml_attestation::zkml_context_binding_active(0));
+    assert!(!stellereum::zkml_attestation::zkml_context_binding_active(
+        0
+    ));
     assert!(!stellereum::zkml_attestation::zkml_context_binding_active(
         u64::MAX - 1
     ));

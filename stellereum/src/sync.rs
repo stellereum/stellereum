@@ -65,6 +65,13 @@ pub fn verify_synced_blocks_against_anchor(
 /// resolver cannot name falls back to the pinned set (the pre-change set the
 /// anchor was built on, which is the conservative direction for recent
 /// windows; ancient windows are snapshot-gated, not walked here).
+///
+/// The probe is a CLONE of the caller's client, so it inherits that client's
+/// CN-VRF v3 configuration (activation height + recorded epoch beacons) and
+/// therefore verifies each header under the same committee schedule the
+/// producer drew with (review F2). No separate schedule resolver is needed
+/// here: a client that is not beacon-configured keeps the parent-hash schedule
+/// and fails closed on beacon-era certificates.
 pub fn verify_synced_blocks_against_anchor_with_sets(
     light: &crate::light_client::LightClient,
     blocks: &[Block],
@@ -360,8 +367,9 @@ pub fn verify_finality_for_header(
 /// attribution all come from the SAME schedule, so a beacon-era header is
 /// judged by the draw the producer signed under instead of the parent-hash
 /// draw. Below activation the schedule is
-/// [`crate::consensus::CommitteeSchedule::ParentHash`] and the verdict and
-/// refusal strings are identical to [`verify_finality_for_header`].
+/// [`crate::consensus::CommitteeSchedule::ParentHash`] and the verdict is
+/// identical to [`verify_finality_for_header`] (whose quorum refusal now names
+/// the signed power that same schedule attributes).
 pub fn verify_finality_for_header_with_schedule(
     validators: &crate::consensus::ValidatorSet,
     height: u64,
@@ -1220,11 +1228,7 @@ pub fn validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
         // parent hash this block commits to, so a peer cannot pick the
         // committee it controls. SAME shared predicate the header-anchor path
         // uses (`verify_qc_parent_binding`), so the two can never drift.
-        verify_qc_parent_binding(
-            qc,
-            &b.prev_hash,
-            &format!("block sync: block {}", b.height),
-        )?;
+        verify_qc_parent_binding(qc, &b.prev_hash, &format!("block sync: block {}", b.height))?;
         if !qc.verify_with_schedule(&validators, schedule) {
             return Err(format!(
                 "block sync: block {} decision proof lacks a validator quorum (carries {} of {} required power, total {})",

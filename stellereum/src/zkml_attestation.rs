@@ -479,14 +479,7 @@ pub fn prove_attestation_bound(
     spec_hash: [u8; 32],
     binding: &ZkmlContextBinding,
 ) -> Result<(Vec<i64>, AttestationProof), String> {
-    prove_attestation_inner(
-        view,
-        model_hash,
-        inputs,
-        pk_bytes,
-        spec_hash,
-        Some(binding),
-    )
+    prove_attestation_inner(view, model_hash, inputs, pk_bytes, spec_hash, Some(binding))
 }
 
 fn prove_attestation_inner(
@@ -852,11 +845,7 @@ mod context_binding_tests {
         assert!(!verify_attestation(&spec.spec_bytes, &bound));
         // ... and the converse.
         assert!(verify_attestation_bound(&spec.spec_bytes, &bound, &ctx));
-        assert!(!verify_attestation_bound(
-            &spec.spec_bytes,
-            &legacy,
-            &ctx
-        ));
+        assert!(!verify_attestation_bound(&spec.spec_bytes, &legacy, &ctx));
     }
 
     #[test]

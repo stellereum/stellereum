@@ -30,8 +30,8 @@ use stellereum::storage::{DomainSnapshot, DomainSnapshotV1};
 use stellereum::sync::{
     check_snapshot_set_binding, collect_missing_blocks, fast_sync_state_with_set_binding,
     genesis_light_anchor, validate_sync_chain_for_shard_with_sets,
-    validate_sync_chain_for_shard_with_sets_hashed_with_schedule,
-    verify_snapshot_anchor_with_sets, walked_head_anchor, HeaderLink,
+    validate_sync_chain_for_shard_with_sets_hashed_with_schedule, verify_snapshot_anchor_with_sets,
+    walked_head_anchor, HeaderLink,
 };
 
 // ==================== deterministic fixtures ====================
@@ -809,9 +809,7 @@ fn schedule_set() -> &'static (Vec<SigningKey>, Vec<FalconKeypair>, ValidatorSet
         // Distinct Ed seeds (0x80..=0xFF then 0x00..=0x02); `fk_for` derives the
         // Falcon companion deterministically from the Ed id, so every test in
         // this binary registers the same keypair for the same voter.
-        let ks: Vec<SigningKey> = (0..n)
-            .map(|i| key(0x80u8.wrapping_add(i as u8)))
-            .collect();
+        let ks: Vec<SigningKey> = (0..n).map(|i| key(0x80u8.wrapping_add(i as u8))).collect();
         reg_all(&ks);
         let fks = fks_for(&ks);
         let vs = vset(&ks);
@@ -932,7 +930,8 @@ fn e1_sync_verifies_qc_under_the_activation_schedule() {
         "fixture must exceed the committee cap ({committee_size} vs {})",
         vs.len()
     );
-    let beacon_committee = committee_for_height(vs, height, 0, committee_size, Some(&parent), beacon);
+    let beacon_committee =
+        committee_for_height(vs, height, 0, committee_size, Some(&parent), beacon);
     let legacy_committee = committee_for_height(
         vs,
         height,

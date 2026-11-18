@@ -42,8 +42,7 @@ use stellereum::state_engine::InMemoryStateEngine;
 /// Failed faucet-state durability writes (audit 2.3). Counted so a repeating
 /// failure is visible even if the log is rotated; the consequence (lifetime
 /// caps can reset on restart) is named at the failure site.
-static FAUCET_PERSIST_FAILURES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static FAUCET_PERSIST_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Read the persisted genesis fingerprint, refusing on an I/O error.
 ///
@@ -1307,8 +1306,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                             // drip from this sync hook without changing the RPC
                             // API, so this is an explicit LOUD best-effort:
                             // counted and logged with the consequence named.
-                            if let Err(e) = store
-                                .set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes)
+                            if let Err(e) =
+                                store.set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes)
                             {
                                 let n = FAUCET_PERSIST_FAILURES
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1532,8 +1531,14 @@ mod genesis_fingerprint_gate_tests {
         let err = read_genesis_fingerprint(Err("sled: corrupted page".into()), "shard 0")
             .expect_err("a READ error must refuse startup");
         let text = format!("{err}");
-        assert!(text.contains("cannot READ"), "names the failed read: {text}");
-        assert!(text.contains("Refusing to start"), "names the refusal: {text}");
+        assert!(
+            text.contains("cannot READ"),
+            "names the failed read: {text}"
+        );
+        assert!(
+            text.contains("Refusing to start"),
+            "names the refusal: {text}"
+        );
         assert!(
             text.contains("corrupted page"),
             "keeps the underlying I/O reason: {text}"

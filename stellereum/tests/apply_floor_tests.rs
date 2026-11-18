@@ -529,8 +529,7 @@ async fn block_charges_the_measured_gas_of_a_payload() {
             amount: 3_000,
         }],
     );
-    let (applied, failed, _, status, fees) =
-        engine.apply_block_parallel_fees(&[tx], TS).await;
+    let (applied, failed, _, status, fees) = engine.apply_block_parallel_fees(&[tx], TS).await;
 
     assert_eq!((applied, failed), (1, 0));
     assert_eq!(status, vec![true]);

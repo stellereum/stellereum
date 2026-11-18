@@ -1983,7 +1983,11 @@ mod tests {
             err.contains("registry full"),
             "refusal must say the registry is full: {err}"
         );
-        assert_eq!(reg.len(), MAX_ZKML_REGISTRY_MODELS, "refusal changes nothing");
+        assert_eq!(
+            reg.len(),
+            MAX_ZKML_REGISTRY_MODELS,
+            "refusal changes nothing"
+        );
     }
 
     #[test]

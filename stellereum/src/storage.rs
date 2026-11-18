@@ -3225,9 +3225,7 @@ pub enum PersistPushPolicy {
 pub fn persist_push_policy(job: &PersistJob) -> PersistPushPolicy {
     match job {
         PersistJob::Prune { .. } => PersistPushPolicy::DropFirst,
-        PersistJob::Consensus(_) | PersistJob::Finalized { .. } => {
-            PersistPushPolicy::CriticalWait
-        }
+        PersistJob::Consensus(_) | PersistJob::Finalized { .. } => PersistPushPolicy::CriticalWait,
         _ => PersistPushPolicy::BoundedWait,
     }
 }
@@ -3294,11 +3292,7 @@ pub const PERSIST_RETRY_PACE_MS: u64 = 5;
 /// consensus-critical class — names the exact recovery consequence. Kept in
 /// one place so the synchronous and deferred (current-thread) drop paths can
 /// never diverge in either metric or message.
-fn record_persist_drop(
-    policy: PersistPushPolicy,
-    label: &'static str,
-    consequence: &'static str,
-) {
+fn record_persist_drop(policy: PersistPushPolicy, label: &'static str, consequence: &'static str) {
     match policy {
         PersistPushPolicy::CriticalWait => {
             tracing::error!(
@@ -3540,9 +3534,7 @@ impl AsyncPersistence {
                             self.bump_queue_depth();
                             tokio::spawn(async move {
                                 match tokio::time::timeout(
-                                    std::time::Duration::from_millis(
-                                        PERSIST_BLOCKING_WAIT_MS,
-                                    ),
+                                    std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS),
                                     tx.send(job),
                                 )
                                 .await
@@ -3597,8 +3589,8 @@ impl AsyncPersistence {
     /// the job was accepted (or the writer is gone, so there is nothing left
     /// to persist), `false` when the budget expired with the queue still full.
     fn bounded_wait_send(&self, mut job: PersistJob) -> bool {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(PERSIST_RETRY_PACE_MS));
             match self.tx.try_send(job) {
@@ -5721,15 +5713,11 @@ mod persist_policy_tests {
         // One job fills the single slot; the writer is not running (we hold
         // the only receiver), so the next push hits `Full`.
         ap.enqueue_finalized(1, [1u8; 32]);
-        let before = crate::metrics::global()
-            .snapshot()
-            .persist_queue_dropped;
+        let before = crate::metrics::global().snapshot().persist_queue_dropped;
         ap.enqueue_finalized(2, [2u8; 32]);
         // The old current-thread path dropped this synchronously.
         assert_eq!(
-            crate::metrics::global()
-                .snapshot()
-                .persist_queue_dropped,
+            crate::metrics::global().snapshot().persist_queue_dropped,
             before,
             "a critical job must never be dropped before its bounded drain"
         );
@@ -5742,9 +5730,7 @@ mod persist_policy_tests {
             .expect("deferred critical job delivered");
         assert!(matches!(second, PersistJob::Finalized { height: 2, .. }));
         assert_eq!(
-            crate::metrics::global()
-                .snapshot()
-                .persist_queue_dropped,
+            crate::metrics::global().snapshot().persist_queue_dropped,
             before,
             "delivered critical job is not a drop"
         );
@@ -5758,18 +5744,14 @@ mod persist_policy_tests {
         let dir = tmpdir("counted");
         let (ap, _rx) = handle_with_capacity(&dir, 1);
         ap.enqueue_finalized(1, [1u8; 32]);
-        let before = crate::metrics::global()
-            .snapshot()
-            .persist_queue_dropped;
+        let before = crate::metrics::global().snapshot().persist_queue_dropped;
         ap.enqueue_finalized(2, [2u8; 32]);
         // Never drain: the deferred send must expire and COUNT the loss.
         tokio::time::sleep(std::time::Duration::from_millis(
             PERSIST_BLOCKING_WAIT_MS.saturating_mul(3),
         ))
         .await;
-        let after = crate::metrics::global()
-            .snapshot()
-            .persist_queue_dropped;
+        let after = crate::metrics::global().snapshot().persist_queue_dropped;
         assert_eq!(
             after - before,
             1.0,

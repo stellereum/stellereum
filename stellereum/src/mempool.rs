@@ -2877,11 +2877,8 @@ impl Mempool {
             .map(|op| match op {
                 OpCode::SysCallVerifyZkMlAttestation { .. } => 64, // ~one 64-bit proof of work
                 OpCode::SysCallVerifyZkMlReexec { .. } => 16,      // re-execution, model-bounded
-                OpCode::SysCallRegisterZkMlModel { model, .. } => {
-                    Self::PROOF_UNITS_REGISTER_MODEL.saturating_add(
-                        model.param_count() / Self::REGISTER_PARAMS_PER_PROOF_UNIT,
-                    )
-                }
+                OpCode::SysCallRegisterZkMlModel { model, .. } => Self::PROOF_UNITS_REGISTER_MODEL
+                    .saturating_add(model.param_count() / Self::REGISTER_PARAMS_PER_PROOF_UNIT),
                 OpCode::SysCallRegisterZkMlSpec { .. } => Self::PROOF_UNITS_REGISTER_SPEC,
                 _ => 0,
             })

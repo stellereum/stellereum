@@ -527,30 +527,73 @@ fn finality_gate_rejects_every_qc_mismatch() {
     let b = &blocks[1];
     let hash = b.compute_hash();
     let qc = b.precommit_qc.clone().unwrap();
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &qc).is_ok());
+    assert!(
+        sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &qc)
+            .is_ok()
+    );
 
     // Wrong kind.
     let mut wrong = qc.clone();
     wrong.kind = VoteKind::Prevote;
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &wrong).is_err());
+    assert!(sync::verify_finality_for_header(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &b.proposer,
+        &wrong
+    )
+    .is_err());
 
     // QC for another height.
     let mut wrong = qc.clone();
     wrong.height += 1;
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &wrong).is_err());
+    assert!(sync::verify_finality_for_header(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &b.proposer,
+        &wrong
+    )
+    .is_err());
 
     // QC binding another block.
     let mut wrong = qc.clone();
     wrong.block_hash = Some([0x5Eu8; 32]);
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &wrong).is_err());
+    assert!(sync::verify_finality_for_header(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &b.proposer,
+        &wrong
+    )
+    .is_err());
 
     // Non-member proposer holds no schedule slot.
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &[0x5Eu8; 32], &qc).is_err());
+    assert!(sync::verify_finality_for_header(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &[0x5Eu8; 32],
+        &qc
+    )
+    .is_err());
 
     // Sub-quorum signatures: one of four votes cannot decide.
     let mut thin = qc.clone();
     thin.signatures.truncate(1);
-    assert!(sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &thin).is_err());
+    assert!(sync::verify_finality_for_header(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &b.proposer,
+        &thin
+    )
+    .is_err());
 }
 
 /// Audit 7.3: the header-anchor finality gate must enforce the SAME
@@ -576,15 +619,9 @@ fn header_finality_refuses_a_foreign_sortition_parent() {
     inner.sortition_parent = [0xEEu8; 32];
     let mut foreign = qc.clone();
     foreign.attach_pq_micro_certificate(&inner);
-    let err = sync::verify_finality_for_header(
-        &vs,
-        b.height,
-        &hash,
-        &parent,
-        &b.proposer,
-        &foreign,
-    )
-    .expect_err("a header anchor must refuse a certificate elected with a foreign parent");
+    let err =
+        sync::verify_finality_for_header(&vs, b.height, &hash, &parent, &b.proposer, &foreign)
+            .expect_err("a header anchor must refuse a certificate elected with a foreign parent");
     assert!(
         err.contains("different parent block"),
         "refusal must name the parent binding, got: {err}"

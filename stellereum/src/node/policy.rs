@@ -355,7 +355,16 @@ pub(crate) fn store_path_for_shard(shard: u32, sharded: bool) -> std::path::Path
 /// Fixed genesis balance credited to every validator account. Because it is the
 /// SAME for every node and applied to the SAME validator set, all nodes derive an
 /// identical genesis state root (deterministic genesis).
-pub(crate) const GENESIS_VALIDATOR_BALANCE: u64 = 100_000_000_000_000_000;
+///
+/// SUPPLY INVARIANT: the pre-mined genesis allocation is folded into the
+/// engine's minted-supply counter on the first post-genesis mint, so
+/// `validators * this + faucet <= TOTAL_SUPPLY_CAP` must hold for EVERY
+/// supported set size. At the old 100M STELL a 250-validator network allocated
+/// 25B against a 1B cap, which (correctly) refused all future emission and made
+/// the node refuse to boot. 1M STELL per validator keeps the largest supported
+/// set (250) at 250M + 1M faucet, i.e. a quarter of the cap, and is still
+/// 1000x the minimum bond — ample for fees and transfers.
+pub(crate) const GENESIS_VALIDATOR_BALANCE: u64 = 1_000_000_000_000_000;
 
 /// Floor on the interval between blocks, in milliseconds. Without it a small
 /// validator set finalizes as fast as the CPU allows (~5000 blocks/s on a single

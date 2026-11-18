@@ -202,8 +202,26 @@ fn model_registry_is_first_wins_validated_and_bounded() {
         .register([0x01u8; 32], tiny_model())
         .expect("first writer wins");
     assert_eq!(reg.get(&[0x01u8; 32]).unwrap().model_hash, h);
-    // Second writer for the same id is refused — weights cannot be swapped.
-    assert!(reg.register([0x01u8; 32], tiny_model()).is_err());
+    // Re-registering the BYTE-IDENTICAL model is an idempotent no-op (it
+    // returns the same hash and leaves the record alone), so a retried
+    // admission cannot bump a generation or rebuild the committed preimage.
+    assert_eq!(
+        reg.register([0x01u8; 32], tiny_model())
+            .expect("byte-identical re-registration is idempotent"),
+        h
+    );
+    // A DIFFERENT model under a taken id is still refused — weights cannot be
+    // swapped under an existing id.
+    let swapped = QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![1, 0, -1, 2],
+        vec![0, -1],
+    )]);
+    assert!(
+        reg.register([0x01u8; 32], swapped).is_err(),
+        "different weights under a taken id must be refused"
+    );
     // Malformed models never join: re-execution only ever sees valid shapes.
     assert!(reg
         .register([0x02u8; 32], QuantizedLinearModel::new(vec![]))

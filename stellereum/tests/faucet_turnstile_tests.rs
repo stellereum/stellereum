@@ -570,9 +570,11 @@ async fn unconfigured_non_loopback_is_503_without_dispense() {
     }
 }
 
-// 12. Unconfigured captcha + loopback claim → legacy local/dev path still
-//     works (this is the allowed path the pre-existing test 1 exercises;
-//     pinned here explicitly with an XFF loopback client too).
+// 12. Unconfigured captcha + a DIRECT loopback peer → the legacy local/dev
+//     path still works. A FORWARDED loopback claim is NOT equivalent: a
+//     `X-Forwarded-For: 127.0.0.1` from the trusted proxy is refused unless
+//     the operator explicitly opts in (Z2: the header used to let anybody
+//     bypass the captcha by claiming loopback), and nothing is minted.
 #[tokio::test]
 async fn unconfigured_loopback_still_dispenses() {
     let mock = MockVerifier::new(CaptchaVerdict::Success);
@@ -586,7 +588,9 @@ async fn unconfigured_loopback_still_dispenses() {
         "loopback claim without captcha must still work: {status} {body}"
     );
     assert!(body.contains("pending"), "must mint on loopback: {body}");
-    // Explicit loopback via X-Forwarded-For from the trusted test peer.
+    // A FORWARDED loopback claim is refused (503) and mints nothing: the
+    // direct peer is the trusted proxy, but a loopback forwarded address is
+    // accepted only under an explicit operator opt-in.
     let who2 = hex::encode([24u8; 32]);
     let (status, body) = http_post_with(
         addr,
@@ -596,10 +600,13 @@ async fn unconfigured_loopback_still_dispenses() {
     )
     .await;
     assert!(
-        status.contains("200"),
-        "XFF-loopback claim without captcha must still work: {status} {body}"
+        status.contains("503"),
+        "a forwarded loopback claim must be refused without the opt-in: {status} {body}"
     );
-    assert!(body.contains("pending"), "must mint on loopback: {body}");
+    assert!(
+        !body.contains("pending"),
+        "a refused forwarded claim must not mint: {body}"
+    );
     assert_eq!(
         mock.calls.load(Ordering::SeqCst),
         0,

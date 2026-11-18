@@ -1483,6 +1483,13 @@ pub(crate) async fn run_consensus_node(
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(2), n_probe.probe_peers()).await;
             });
+            // F8: `net_peerCount` follows the live peer table. One read per
+            // probe window, off the tick — the RPC then serves the observed
+            // count (honest `0x0` when nothing was seen), never a constant.
+            let a_peers = adapter.clone();
+            tokio::spawn(async move {
+                let _ = a_peers.publish_live_peer_count().await;
+            });
             if let Some((fh, fhash)) = rt.finalized.last().copied() {
                 let a = adapter.clone();
                 let shard_id = block_shard;

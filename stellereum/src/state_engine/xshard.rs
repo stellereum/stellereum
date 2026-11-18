@@ -551,8 +551,29 @@ impl InMemoryStateEngine {
                 // §9 2PC: the intermediate states. Every transition is a pure
                 // function of the committed record, so a replay is a no-op and
                 // a crash mid-2PC resumes to the SAME decision.
-                if self.apply_xpc_record(msg, block.height).await {
+                let applied = self.apply_xpc_record(msg, block.height).await;
+                if applied {
                     mutated = true;
+                    // A TARGET-side COMMIT is the §9 credit: the source
+                    // proved that it escrowed the value and decided to commit,
+                    // and `apply_xpc_record` moved the value to the recipient
+                    // on the Prepared -> Committed transition. Count it
+                    // exactly like a legacy inbound credit so the apply log
+                    // ("cross-shard inbound credited N ...") is emitted for the
+                    // 2PC path too. Without this the target credited SILENTLY:
+                    // a soak/operator watching that line saw a completed
+                    // transfer as a missing credit, and no counter anywhere
+                    // reflected the value movement.
+                    //
+                    // `applied` is true only when the transition advanced AND
+                    // the credit succeeded (a duplicate COMMIT is a Noop, and
+                    // a failed credit rolls its completion claim back), so a
+                    // replay can never inflate the count.
+                    if msg.kind() == crate::sharding::CrossShardKind::Commit
+                        && msg.is_inbound_for(block.shard_id)
+                    {
+                        credited += 1;
+                    }
                 }
                 // The replay key is recorded for every 2PC record that reached
                 // a terminal phase, so the audit trail (and the digest) show
@@ -1168,7 +1189,7 @@ mod tests {
         derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
     };
     use crate::sharding::{Block, CrossShardMessage, FinalizedHeaderRegistry, Transaction};
-    use crate::xshard2pc::{XpcPhase, XPC_PREPARE};
+    use crate::xshard2pc::{XpcPhase, XPC_COMMIT, XPC_PREPARE};
 
     #[tokio::test]
     async fn unsigned_xpc_prepare_is_rejected() {
@@ -1535,5 +1556,135 @@ mod tests {
         );
         assert_eq!(armed.cross_shard_consumed_len().await, 0);
         assert!(armed.xpc_record(&tx_hash).await.is_some());
+    }
+
+    /// REGRESSION (live two-shard soak, phase 2): a TARGET-side §9 COMMIT is
+    /// a value credit and MUST be counted exactly like a legacy inbound
+    /// credit. The count is what drives the committed
+    /// `cross-shard inbound credited N message(s) on shard N` log line, and
+    /// the just-completed transfer was invisible there: the target credited
+    /// the recipient but every consumer watching the log saw a missing
+    /// credit forever (the soak's exactly-once assertion).
+    ///
+    /// The count must also be replay-safe: a duplicate COMMIT advances no
+    /// transition, so it contributes zero.
+    #[tokio::test]
+    async fn xpc_commit_credit_is_counted_once_and_replay_does_not_count() {
+        let kp = FalconKeypair::generate_from_seed(44);
+        let recipient = [0x5Au8; 32];
+        let amount = 1_000_000u64;
+
+        let probe = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            vec![0u8; FALCON512_SIG_LEN],
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let sig = kp.sign(&probe.signing_message());
+        let tx = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig,
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let tx_hash = tx.compute_tx_hash();
+        let anchor_block = [0xD1u8; 32];
+
+        // Source: the committed PREPARED leaf the COMMIT proves.
+        let source = InMemoryStateEngine::new();
+        source.enable_cross_shard();
+        assert!(
+            source
+                .write_xpc_record(&crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 1))
+                .await
+        );
+        let source_root = source.get_state_root().await;
+        let proof = source
+            .get_xpc_proof(&tx_hash)
+            .await
+            .expect("PREPARED leaf proof");
+
+        let reg = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+        reg.write()
+            .unwrap()
+            .note_finalized(0, anchor_block, source_root);
+
+        // Target: it voted PREPARE and now receives the source's decision.
+        let target = InMemoryStateEngine::new();
+        target.enable_cross_shard();
+        target.with_finalized_headers(reg);
+        assert!(
+            target
+                .write_xpc_record(&crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 1))
+                .await
+        );
+
+        let commit = CrossShardMessage::new_xpc(
+            XPC_COMMIT,
+            0,
+            1,
+            tx.clone(),
+            source_root,
+            anchor_block,
+            Some(proof),
+        );
+        let block = Block {
+            shard_id: 1,
+            height: 2,
+            prev_hash: [0u8; 32],
+            state_root: source_root,
+            transactions: vec![],
+            cross_shard_out: vec![commit],
+            timestamp: 1_770_000_002,
+            proposer: [0x11; 32],
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+        };
+
+        let credited = target.apply_cross_shard_consumptions(&block).await;
+        assert_eq!(
+            credited, 1,
+            "the target's 2PC COMMIT must count as one inbound credit (the log/counter is the \
+             observable a live soak and an operator rely on)"
+        );
+        assert_eq!(
+            target.get_account(&recipient).await.map(|a| a.balance),
+            Some(amount),
+            "the recipient is credited exactly once"
+        );
+        assert_eq!(
+            target.xpc_record(&tx_hash).await.map(|r| r.phase),
+            Some(XpcPhase::Committed)
+        );
+
+        // Replay of the SAME decision: no second transition, no second credit,
+        // and therefore no second count (the log must never report a double).
+        let replayed = target.apply_cross_shard_consumptions(&block).await;
+        assert_eq!(replayed, 0, "a duplicate COMMIT must not be counted");
+        assert_eq!(
+            target.get_account(&recipient).await.map(|a| a.balance),
+            Some(amount),
+            "a duplicate COMMIT must not credit twice"
+        );
     }
 }

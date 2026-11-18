@@ -1572,7 +1572,7 @@ impl ValidatorRuntime {
                 let mut inbound = transport.fetch_cross_shard_inbound(my_shard).await;
                 // Deterministic order, independent of KV enumeration order.
                 inbound.sort_by_key(CrossShardKey::of);
-                let mut engine_hit_ids: Vec<[u8; 32]> = Vec::new();
+                let mut prune_ids: Vec<[u8; 32]> = Vec::new();
                 for msg in inbound {
                     if !msg.is_inbound_for(my_shard) {
                         continue;
@@ -1589,7 +1589,7 @@ impl ValidatorRuntime {
                     // a restarted proposer would re-propose it forever (its
                     // mirrors are empty) while every apply refuses it.
                     if self.state.is_cross_shard_consumed(&key).await {
-                        engine_hit_ids.push(msg.msg_id);
+                        prune_ids.push(msg.msg_id);
                         continue;
                     }
                     // §5 M3 kind-dispatched admission: transfers prove
@@ -1601,6 +1601,30 @@ impl ValidatorRuntime {
                             continue;
                         }
                     } else if msg.is_xpc() {
+                        if !xpc_on {
+                            continue;
+                        }
+                        // STALE AFTER COMPLETION: a terminal 2PC transfer can
+                        // never need another control record, and the SOURCE
+                        // re-publishes its COMMIT every block until the
+                        // target's mailbox is drained. Check completion
+                        // BEFORE the anchor gate and PRUNE such a record:
+                        // once the target has credited (or refunded), later
+                        // copies are worthless, and an old copy whose parent
+                        // block has already aged out of the finalized-header
+                        // window fails `xpc_admissible` FOREVER. Leaving it
+                        // in the node-local mailbox made every propose rescan
+                        // an ever-growing set of dead records (they are never
+                        // included, so apply never prunes them); under a high
+                        // solo block rate the set grew by one COMMIT per
+                        // height for the life of the process.
+                        if self
+                            .completed_cross_shard
+                            .contains(&msg.tx.compute_tx_hash())
+                        {
+                            prune_ids.push(msg.msg_id);
+                            continue;
+                        }
                         // §9 2PC admission. Every 2PC record carries a proof of
                         // the PEER's committed 2PC state (the peer is the
                         // message's `source_shard`), anchored to a locally
@@ -1608,9 +1632,6 @@ impl ValidatorRuntime {
                         // anchor the legacy flow uses, applied to the 2PC
                         // state instead of the account leaf. A record whose
                         // proof or anchor does not check out is refused.
-                        if !xpc_on {
-                            continue;
-                        }
                         if !self.xpc_admissible(&msg) {
                             continue;
                         }
@@ -1637,8 +1658,8 @@ impl ValidatorRuntime {
                     }
                     cross_shard_out.push(msg);
                 }
-                if !engine_hit_ids.is_empty() {
-                    transport.prune_consumed(my_shard, &engine_hit_ids).await;
+                if !prune_ids.is_empty() {
+                    transport.prune_consumed(my_shard, &prune_ids).await;
                 }
                 // §9 2PC: the OUTBOUND records of the transfers this shard
                 // owns are a pure function of its committed 2PC state:

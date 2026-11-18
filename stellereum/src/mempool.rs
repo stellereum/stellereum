@@ -781,7 +781,30 @@ impl Mempool {
     /// verifies and zkML re-executions serialize on the single apply worker
     /// while `apply_in_flight` blocks the next propose. Bounds worst-case lane
     /// stall per height; gas alone does not (cheap gas, costly verify).
+    ///
+    /// Registration counts too ([`Self::count_tx_proof_units`]): a registration
+    /// is permanent state whose commit re-hashes the WHOLE registry preimage,
+    /// so it is the most expensive zkML operation per unit of gas.
     pub const MAX_BLOCK_PROOF_UNITS: usize = 2048;
+    /// Proof units charged for one `SysCallRegisterZkMlModel`.
+    ///
+    /// Same order as a re-execution verify: the registration itself hashes the
+    /// model, and committing it makes the next state-root read rebuild the
+    /// preimage of every registered weight. Previously this counted ZERO, so
+    /// registrations were bounded only by block gas/wire - the cheapest way to
+    /// make the chain do unbounded hashing.
+    pub const PROOF_UNITS_REGISTER_MODEL: usize = 16;
+    /// Parameters per extra proof unit on a model registration (rounded down).
+    ///
+    /// A maximum-size model ([`crate::zkml::MAX_ZKML_MODEL_PARAMS`] = 16_384)
+    /// costs `16 + 16 = 32` units, i.e. at most 64 max-size registrations per
+    /// block ([`Self::MAX_BLOCK_PROOF_UNITS`] / 32).
+    pub const REGISTER_PARAMS_PER_PROOF_UNIT: usize = 1024;
+    /// Proof units charged for one `SysCallRegisterZkMlSpec`.
+    ///
+    /// Spec registration grows the committed VK domain, whose preimage is
+    /// rebuilt whenever any spec changes; 16 units bounds it to 128 per block.
+    pub const PROOF_UNITS_REGISTER_SPEC: usize = 16;
     /// Denominator of the sealed-transaction share of the pool (audit:
     /// mempool economics — free sealed fill): sealed envelopes may occupy at
     /// most `max_size / MAX_SEALED_SHARE_DENOM` slots (see
@@ -2837,8 +2860,16 @@ impl Mempool {
     }
 
     /// Verified-proof units in a transaction for packing (audit: blocks
-    /// troubles): counts attestation verifies + zkML re-executions, the work
-    /// that serializes on the single apply worker.
+    /// troubles): counts attestation verifies + zkML re-executions, plus the
+    /// zkML registrations that force a registry/VK preimage rebuild, i.e. the
+    /// work that serializes on the single apply worker.
+    ///
+    /// Registration used to count ZERO even though it is permanent state whose
+    /// commit is `O(total registered params)` of hashing. It now costs
+    /// [`Self::PROOF_UNITS_REGISTER_MODEL`] + one unit per
+    /// [`Self::REGISTER_PARAMS_PER_PROOF_UNIT`] parameters (and
+    /// [`Self::PROOF_UNITS_REGISTER_SPEC`] for a spec), so a block's worth of
+    /// registrations is bounded by the same 2_048-unit budget as verifies.
     pub fn count_tx_proof_units(tx: &Transaction) -> usize {
         use crate::svm::OpCode;
         tx.payload
@@ -2846,6 +2877,12 @@ impl Mempool {
             .map(|op| match op {
                 OpCode::SysCallVerifyZkMlAttestation { .. } => 64, // ~one 64-bit proof of work
                 OpCode::SysCallVerifyZkMlReexec { .. } => 16,      // re-execution, model-bounded
+                OpCode::SysCallRegisterZkMlModel { model, .. } => {
+                    Self::PROOF_UNITS_REGISTER_MODEL.saturating_add(
+                        model.param_count() / Self::REGISTER_PARAMS_PER_PROOF_UNIT,
+                    )
+                }
+                OpCode::SysCallRegisterZkMlSpec { .. } => Self::PROOF_UNITS_REGISTER_SPEC,
                 _ => 0,
             })
             .sum()

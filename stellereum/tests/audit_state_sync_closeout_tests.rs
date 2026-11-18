@@ -291,7 +291,7 @@ fn f2_push_policy_classes() {
             height: 1,
             hash: [0u8; 32]
         }),
-        PersistPushPolicy::BoundedWait
+        PersistPushPolicy::CriticalWait
     );
     assert_eq!(
         persist_push_policy(&PersistJob::Receipts {
@@ -306,7 +306,7 @@ fn f2_push_policy_classes() {
     );
     assert_eq!(
         persist_push_policy(&PersistJob::Consensus(Box::default())),
-        PersistPushPolicy::BoundedWait
+        PersistPushPolicy::CriticalWait
     );
     assert_eq!(
         persist_push_policy(&PersistJob::Flush),
@@ -604,8 +604,15 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
 
     const TS: u64 = 1_760_000_000;
     const REWARD: u64 = 1_000_000_000;
-    let slashable = 2 * MIN_VALIDATOR_BOND - MIN_VALIDATOR_BOND / 2;
-    let expected_slash = slashable / 1000; // DOWNTIME_SLASH_BPS = 10 → /1000
+    // SLASH-01: the base is the validator's WHOLE remaining stake at slash
+    // time — the bonded self-bond, the MATURED-but-unwithdrawn unbond
+    // (`process_unbonding` runs in step 4, BEFORE the step-5 slash) and the
+    // step-3 reward that is still unclaimed. The old expectation used the
+    // bonded stake alone, which was exactly the "matured stake escapes a late
+    // slash" gap this fix closes.
+    let bonded = 2 * MIN_VALIDATOR_BOND - MIN_VALIDATOR_BOND / 2;
+    let matured = MIN_VALIDATOR_BOND / 2;
+    let expected_slash = (bonded + matured + REWARD) / 1000; // DOWNTIME_SLASH_BPS = 10 → /1000
     assert_eq!(DOWNTIME_SLASH_BPS, 10);
 
     async fn apply_once(
@@ -679,8 +686,8 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
     );
     assert_eq!(
         rec.self_bond,
-        slashable - expected_slash,
-        "slash took bonded stake only"
+        bonded - expected_slash,
+        "the burn is consumed self-bond first (matured and rewards stay whole)"
     );
     assert_eq!(rec.total_slashed, expected_slash);
     assert_eq!(

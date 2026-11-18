@@ -177,6 +177,13 @@ async fn block_execution_runs_payloads_and_conserves_native_value() {
 
     let sender = engine.get_account(&from).await.unwrap();
     let recipient = engine.get_account(&to).await.unwrap();
-    assert_eq!(sender.balance, 1_000_000 - 1_000 - 560);
+    // FEE-01: the bill is `min(declared, consumed + intrinsic)` — floored at
+    // consensus (0 here). The payload consumed one `Push` (`Halt` is free), so
+    // the fee is that measurement, capped at the declared 560. (Before FEE-01
+    // the block path charged the whole 560 declaration.)
+    assert_eq!(
+        sender.balance,
+        1_000_000 - 1_000 - stellereum::svm::GAS_PUSH
+    );
     assert_eq!(recipient.balance, 1_000);
 }

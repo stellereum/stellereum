@@ -251,16 +251,22 @@ impl ValidatorRuntime {
         }
         let set = self.validator_set_for_height(parent_h);
         // SAME VERDICT AS APPLY (PENTEST F-2): `apply_downtime_slash_with_set`
-        // accepts evidence only after `cert.verify(val_set)`. The gate used to
+        // accepts evidence only after a verify-grade check. The gate used to
         // use attribution (`qc_signed_power`, no verify) instead, so an
         // over-cap `last_qc` carrying a genuine quorum passed the gate and was
         // then silently skipped by apply: any proposer could suppress the
         // downtime attribution for a height. Attribution is now capped (F-1),
         // but the two paths must not merely agree on this input class — they
-        // must share ONE verdict. `qc.verify` is that verdict; attribution is
-        // consulted only to name the shortfall in the refusal message.
-        if !qc.verify(&set) {
-            let signed = set.qc_signed_power(qc);
+        // must share ONE verdict.
+        //
+        // CN-VRF v3 (review F2): the verdict is the HEIGHT-AWARE one. At/after
+        // activation an honest `last_qc` is a µQC drawn from the epoch beacon,
+        // so verifying it through the parent-hash draw found no committee
+        // match and refused every honest proposal that carried the required
+        // downtime evidence. `verify_qc_for_height` / `qc_signed_power_for_height`
+        // use the same schedule the producer used.
+        if !self.verify_qc_for_height(qc, &set) {
+            let signed = self.qc_signed_power_for_height(&set, qc);
             let required = set.quorum_power();
             crate::metrics::global().inc_weak_qc_refused();
             return Err(format!(
@@ -1323,6 +1329,9 @@ impl ValidatorRuntime {
         //
         // The scan also runs the polka-UNLOCK rule (a polka for another block
         // at a higher round releases our lock), so it must run first.
+        // CN-VRF v3: the prevote QC this builds must come from the same
+        // schedule the network used at this height (review F2).
+        self.install_committee_schedule();
         self.hc.try_prevote_quorum_at();
         // The precommit follows the newest POLKA -- a quorum of prevotes FOR A
         // BLOCK. It must NOT follow the newest quorum of any kind: a NIL

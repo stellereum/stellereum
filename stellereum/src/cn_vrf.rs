@@ -1724,6 +1724,160 @@ pub fn epoch_raw_seed(
 }
 
 // ---------------------------------------------------------------------------
+// THE ONE EPOCH-SEED RULE (review F3)
+// ---------------------------------------------------------------------------
+//
+// Three code paths derive the `raw_seed` of an epoch:
+//
+//  1. the PRODUCER's `H_freeze` dispatch (`runtime::prepare_cnvrf_v3_epoch_hooks`),
+//  2. the VALIDATOR's boundary-payload check
+//     (`runtime::validate_cnvrf_v3_payload`), and
+//  3. the STATE ENGINE's beacon admission (`state_engine::apply_cnvrf_v3`).
+//
+// If any two disagree, the first boundary block under the activation gate can
+// never verify and the beacon chain never starts (exactly review finding F3).
+// They therefore all call [`epoch_seed`] — there is no second derivation.
+//
+// THE BOOTSTRAP / FIRST-EPOCH RULE, stated once:
+//
+//  * Epoch 0 has no predecessor, so its seed never chains a beacon (the
+//    all-zero link, exactly the pre-fix behavior; block 0 is not a boundary).
+//  * An epoch whose `H_freeze` (= `epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD`)
+//    ran BEFORE the activation height never dispatched a VDF, so it has no
+//    committed beacon. Its CANONICAL beacon is the deterministic bootstrap
+//    output [`epoch_bootstrap_beacon`] — NOT the all-zero link. The next
+//    epoch's seed chains THAT value.
+//  * Every later epoch chains the committed (on-chain) beacon of its
+//    predecessor.
+//
+// The pre-fix code chained zeros in the producer and the bootstrap value in
+// the validator, so the first post-activation boundary could never verify.
+
+/// `H_freeze` of `epoch`: the height whose applied block snapshots the VDF
+/// inputs and dispatches the MinRoot worker for that epoch.
+///
+/// `epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`, saturating at 0 (epoch 0
+/// has no freeze height).
+pub const fn freeze_height_of_epoch(epoch: u64) -> u64 {
+    epoch_start_height(epoch).saturating_sub(V3_COMMIT_LOOKAHEAD_BLOCKS)
+}
+
+/// True when `epoch` is a VDF-bearing epoch under `activation_height`: its
+/// `H_freeze` ran at/after activation, so a MinRoot beacon was dispatched for
+/// it and MUST appear on chain.
+///
+/// Epoch 0 is never VDF-bearing: it is the chain's first epoch and has no
+/// predecessor to chain.
+pub const fn epoch_had_vdf(epoch: u64, activation_height: u64) -> bool {
+    if epoch == 0 {
+        return false;
+    }
+    freeze_height_of_epoch(epoch) >= activation_height
+}
+
+/// The deterministic BOOTSTRAP beacon of `epoch` — what an epoch whose
+/// `H_freeze` preceded activation uses as its (never-VDF'd) beacon.
+///
+/// This is [`epoch_raw_seed`] over the all-zero predecessor link, zero freeze
+/// hash and zero rolling mix: a pure function of `(chain_id, epoch)`, so every
+/// node derives the same value without any on-chain data. It is the value the
+/// first post-activation epoch chains, and it is what
+/// [`crate::runtime::ValidatorRuntime::active_epoch_beacon`] returns for a
+/// pre-activation epoch.
+pub fn epoch_bootstrap_beacon(chain_id: u64, epoch: u64) -> [u8; V3_LINK_LEN] {
+    epoch_raw_seed(
+        chain_id,
+        epoch,
+        &[0u8; V3_LINK_LEN],
+        &[0u8; 32],
+        &[0u8; V3_LINK_LEN],
+    )
+}
+
+/// THE epoch-seed rule (see the block comment above): the single derivation
+/// shared by the producer, the validator and the state engine.
+///
+/// * `committed_prev_beacon` — the on-chain beacon of `epoch - 1`, if this node
+///   holds it.
+/// * `prev_epoch_freeze_active` — whether `H_freeze(epoch - 1)` ran at/after
+///   the activation height ([`epoch_had_vdf`] with the caller's activation).
+///
+/// Deterministic for every `(chain_id, epoch, committed_prev_beacon,
+/// prev_epoch_freeze_active, freeze_block_hash, rolling_mix)` tuple: no clock,
+/// no env, no map iteration.
+pub fn epoch_seed(
+    chain_id: u64,
+    epoch: u64,
+    committed_prev_beacon: Option<&[u8; V3_LINK_LEN]>,
+    prev_epoch_freeze_active: bool,
+    freeze_block_hash: &[u8; 32],
+    rolling_mix: &[u8; V3_LINK_LEN],
+) -> [u8; V3_LINK_LEN] {
+    let prev_beacon = match (epoch, committed_prev_beacon) {
+        // No predecessor epoch: the historical all-zero link.
+        (0, _) => [0u8; V3_LINK_LEN],
+        (_, Some(beacon)) => *beacon,
+        // The predecessor's H_freeze preceded activation (or it was epoch 0):
+        // no VDF ran, so chain its deterministic bootstrap beacon.
+        (_, None) if epoch == 1 || !prev_epoch_freeze_active => {
+            epoch_bootstrap_beacon(chain_id, epoch - 1)
+        }
+        // A VDF-bearing predecessor with no committed beacon here: the beacon
+        // is missing, not bootstrapped. Chaining zeros is deterministic and
+        // fail-closed — no honest node records a beacon for this seed, so the
+        // chain stalls loudly instead of accepting a beacon nobody derived.
+        (_, None) => [0u8; V3_LINK_LEN],
+    };
+    epoch_raw_seed(
+        chain_id,
+        epoch,
+        &prev_beacon,
+        freeze_block_hash,
+        rolling_mix,
+    )
+}
+
+/// The beacon of `epoch` as every consumer (proposer schedule, committee draw,
+/// light client) must see it: the committed on-chain beacon when available,
+/// else the deterministic bootstrap output for an epoch that never ran a VDF,
+/// else `None` (fail closed: a VDF-bearing epoch whose beacon is not known
+/// here cannot be guessed).
+pub fn epoch_beacon_for(
+    chain_id: u64,
+    epoch: u64,
+    committed_beacon: Option<&[u8; V3_LINK_LEN]>,
+    activation_height: u64,
+) -> Option<[u8; V3_LINK_LEN]> {
+    epoch_beacon_for_active(
+        chain_id,
+        epoch,
+        committed_beacon,
+        epoch_had_vdf(epoch, activation_height),
+    )
+}
+
+/// [`epoch_beacon_for`] for callers that know only their own
+/// `is_active_at(height)` predicate (the state engine, the sync walk): pass
+/// `epoch_freeze_active = is_active_at(freeze_height_of_epoch(epoch))`.
+///
+/// Same rule, one implementation: committed beacon, else the bootstrap beacon
+/// for an epoch that never ran a VDF, else `None` (fail closed).
+pub fn epoch_beacon_for_active(
+    chain_id: u64,
+    epoch: u64,
+    committed_beacon: Option<&[u8; V3_LINK_LEN]>,
+    epoch_freeze_active: bool,
+) -> Option<[u8; V3_LINK_LEN]> {
+    if let Some(beacon) = committed_beacon {
+        return Some(*beacon);
+    }
+    if epoch == 0 || !epoch_freeze_active {
+        return Some(epoch_bootstrap_beacon(chain_id, epoch));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // CN-VRF v3 encrypted secret custody (enc2: via node_keys)
 // ---------------------------------------------------------------------------
 

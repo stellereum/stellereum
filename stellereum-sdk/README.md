@@ -1,48 +1,102 @@
-# stellereum-sdk
+# stellereum-sdk (Rust client)
 
-> Testnet software — no real funds, no mainnet yet, no external audit yet.
+Thin, client-only SDK for the live Stellereum chain. It builds and signs real
+Falcon-512 `PQ1` transactions, mints `SF1` session grants, and talks to the
+node's `stell_*` JSON-RPC surface.
 
-Minimal canonical transaction-builder SDK for Stellereum: transfers, tokens,
-staking, contract deploy and calls. Every byte comes from the node's own
-constructors, so SDK output matches consensus encoding by construction.
-Full reference: [`SDK-README.md`](SDK-README.md).
+Full reference (fees, lifecycle, errors, honest non-support table, node
+line references): [`../docs/SDK.md`](../docs/SDK.md).
 
-<p align="center">
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
-</p>
+> Testnet software. No external audit. The key file is plaintext JSON at mode
+> 0600 — protect it or wrap it in the OS keystore.
 
-## Builders
+## Why this crate does not depend on the node
 
-- `TxBuilder::transfer` — native STELL transfers
-- `TxBuilder::token_transfer` / `token_approve` / `token_transfer_from` — STS-20 flows
-- `TxBuilder::stake_bond` / `delegate` / `begin_undelegate` / `undelegate_withdraw` — staking lifecycle
-- `TxBuilder::contract_deploy` — deploys with node-derived addresses (`predict_contract_address`)
-- `TxBuilder::contract_call` — calls with node-encoded calldata (`ContractAbi::encode_args`)
-
-Every builder: `.nonce(n)` · `.gas_limit(n)` · `.shards(s, t)` · `.chain_id(id)` ·
-`.sign(&key)` (Ed25519, Falcon-512 or Hybrid) · `.to_bytes()` (exact wire bytes) ·
-`.tx_hash_hex()` · `.verify()` · `.fee_estimate(rpc_url)` · `.submit(rpc_url)`.
-
-## Install
-
-```toml
-[dependencies]
-stellereum-sdk = { git = "https://github.com/stellereum/stellereum-sdk" }
-```
+A wallet must not link tokio/axum/sled/wasmi and the whole RPC state. This
+crate reimplements only the wire pieces it mints (PQ1 envelope, four opcodes,
+signing preimages) and pins every byte against the node in the optional
+`node-parity` test suite. The node is an **optional** dependency:
 
 ```bash
-cargo build
+cargo test                     # thin client tests (no node crate)
+cargo test --features node-parity   # + byte-for-byte parity with the node
+```
+
+## Quickstart
+
+```rust
+use stellereum_sdk::prelude::*;
+
+fn main() -> Result<(), stellereum_sdk::SdkError> {
+    let key = FalconKeypair::generate()?;
+    key.save_key_file(std::path::Path::new("wallet.json"))?;
+
+    let mut wallet = Wallet::connect(
+        FalconKeypair::load_key_file(std::path::Path::new("wallet.json"))?,
+        "http://127.0.0.1:8545",
+    );
+
+    let signed = wallet.transfer([0x22; 32], 1_000_000)?; // fills nonce + chain id + fee
+    let outcome = wallet.submit(&signed, &RetryPolicy::default())?;
+    let receipt = wallet.rpc().wait_for_receipt(
+        &outcome.tx_hash,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(1),
+    )?;
+    println!("{} {:?}", outcome.tx_hash, receipt.status);
+    Ok(())
+}
+```
+
+## Shapes
+
+| Builder | Payload |
+| --- | --- |
+| `TxBuilder::transfer(to, amount)` | empty (native value transfer) |
+| `TxBuilder::contract_call(contract, method, args, value)` | `SysCallCallContractArgs` |
+| `TxBuilder::stake(validator, amount)` | `SysCallStake` |
+| `TxBuilder::unjail(validator, top_up)` | optional `SysCallStake` + `SysCallUnjail` |
+
+> The SDK key file is PQClean Falcon-512 material. The node operator's
+> `FalconKeypair::to_bytes` container is a different (expanded polynomial)
+> private-key layout and is not importable; public keys and signatures are
+> interoperable.
+
+Chainable: `.nonce(n)`, `.chain_id(id)`, `.base_fee(n)`, `.gas_limit(n)`,
+`.priority_fee_per_gas(n)`, `.shards(s, t)`, `.implicit()`, `.unbound()`
+(testing only), `.to(addr)`. Then `.sign(&key)` or
+`.sign_with_session(&session_key, &grant)`.
+
+`SignedTx`: `.to_hex()`, `.tx_hash_hex()`, `.verify()`, `.from()`, `.nonce()`,
+`.gas_limit()`, `.chain_id()`, `.payload_bytes()`.
+
+`RpcClient`: `.account`, `.nonce`, `.base_fee`, `.validators`, `.block`,
+`.receipt`, `.estimate_fee`, `.send_with_retry`, `.wait_for_receipt`,
+`.send_and_wait`.
+
+`Wallet`: `.transfer`, `.contract_call`, `.stake`, `.unjail`, `.submit`,
+`.submit_and_wait`, `.next_nonce`, `.reset_nonce`.
+
+## Signing helper CLI
+
+```bash
+cargo run --bin stellereum-sdk-cli -- keygen --out wallet.json
+cargo run --bin stellereum-sdk-cli -- address --key wallet.json
+cargo run --bin stellereum-sdk-cli -- sign --key wallet.json < request.json
+cargo run --bin stellereum-sdk-cli -- serve --key wallet.json --listen 127.0.0.1:8787
+```
+
+`serve` is the localhost helper used by the TypeScript package. It is plain
+HTTP on loopback; set `STELL_SDK_SIGNER_TOKEN` to require a bearer token.
+
+## Gate
+
+```bash
 cargo test
+cargo test --features node-parity
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Security
+## License
 
-No external audit yet. Testnet only. Signed payloads never leave your machine
-except through `.submit()` to an RPC you choose. **Never open a public issue
-for a suspected vulnerability** — report via [`SECURITY.md`](SECURITY.md).
-
-## Contributing · License
-
-Keep tests green. MIT **or** Apache-2.0
-([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)).
+MIT OR Apache-2.0.

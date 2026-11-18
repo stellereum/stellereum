@@ -6,7 +6,16 @@
 //! This test replays the EXACT wire bytes of that transaction
 //! (tx `6b096d17...`, dust self-transfer, explicit Falcon-512 envelope,
 //! legacy no-salt framing) against a fresh engine in the live
-//! pre-state shape and pins the canonical verdict: success, fee 395000.
+//! pre-state shape and pins the canonical verdict: success.
+//!
+//! FEE NOTE (FEE-01): the live fork block was charged its DECLARED 350_000 gas
+//! plus the 45_000 PQ surcharge (395_000), because the block path of that era
+//! passed the declaration as the gas charged. FEE-01 bills the intrinsic
+//! envelope (280_000) instead, so the canonical fee for these bytes is now
+//! `GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS` = 325_000. The pre-state
+//! below is DERIVED from the post balance, so this replay stays exact for the
+//! rule the engine implements today; replaying the same bytes against a
+//! pre-upgrade binary is the only way to reproduce the historical 395 000.
 //!
 //! It also pins the consensus-safety property the fork violated:
 //! two engines starting from identical pre-state that apply the same
@@ -60,8 +69,9 @@ const BLOCK_TIMESTAMP: u64 = 1792705388;
 /// Live post-state both nodes agree on for the faucet account.
 const POST_BALANCE: u64 = 995_999_998_125_000;
 const POST_NONCE: u64 = 5;
-/// Success fee the canonical execution charges: declared 350_000 + PQ surcharge.
-const CANONICAL_FEE: u64 = 350_000 + 45_000;
+/// Success fee the canonical execution charges: the 280_000 intrinsic envelope
+/// (capped at the 350_000 declaration) + the additive PQ surcharge (FEE-01).
+const CANONICAL_FEE: u64 = stellereum::svm::GAS_BASIC_TRANSFER + 45_000;
 
 fn faucet() -> [u8; 32] {
     let v = hex::decode(FAUCET_HEX).unwrap();
@@ -151,9 +161,10 @@ async fn install_live_prestate(engine: &InMemoryStateEngine, tx: &Transaction) {
 }
 
 /// The canonical replay: the exact #288000 bytes apply cleanly as a success
-/// charging gas_limit + PQ surcharge, leaving the exact live post-state leaf.
+/// charging the consumed gas + PQ surcharge (FEE-01), leaving the exact
+/// post-state leaf this test derives its pre-state from.
 #[tokio::test]
-async fn fork288000_replay_of_exact_bytes_is_a_success_charging_395000() {
+async fn fork288000_replay_of_exact_bytes_is_a_success_charging_canonical_fee() {
     let tx = decode_live_tx();
     let engine = InMemoryStateEngine::new().with_parallel_exec(true);
     install_live_prestate(&engine, &tx).await;

@@ -2391,6 +2391,26 @@ impl StakingLedger {
         ValidatorSet::from_list(ranked)
     }
 
+    /// SLASH-02 failure repair: retire `shortfall` from [`Self::total_burned`]
+    /// when the native pool could NOT fund that part of a burn.
+    ///
+    /// `total_burned` is the committed counter of coins actually DESTROYED
+    /// (it is folded into the staking commitment digest), so it must never
+    /// claim a burn that left the pool untouched — that is the ledger/pool
+    /// drift the slash docs forbid, made worse by a supply counter that lies
+    /// about it. The engine calls this ONLY after a pool debit failed and it
+    /// capped the debit at the pool's remaining balance
+    /// (`InMemoryStateEngine::settle_slash_burn`), i.e. only in a state that
+    /// was ALREADY drifted (a consistent ledger preserves
+    /// `STAKING_POOL == ledger_stake_supply()` and `REWARDS_POOL ==
+    /// rewards_pool`, so the debit cannot fail). The per-validator
+    /// `total_slashed` is an informational counter and cannot be repaired
+    /// here (the aggregate call may span several offenders); the shortfall is
+    /// logged at ERROR by the caller.
+    pub fn record_unbacked_burn(&mut self, shortfall: u64) {
+        self.total_burned = self.total_burned.saturating_sub(shortfall);
+    }
+
     /// Number of validators that would be elected (post-cap, post-jail), for RPC/metrics.
     pub fn elected_count(&self) -> usize {
         let min_bond = self.min_validator_bond.unwrap_or(MIN_VALIDATOR_BOND);
@@ -2444,9 +2464,37 @@ impl StakingLedger {
         }
     }
 
-    /// Slash a fraction (basis points) of a validator's TOTAL stake (self +
-    /// delegated), burning it. Self-bond is consumed first, then delegated.
+    /// Slash a fraction (basis points) of a validator's TOTAL slashable
+    /// stake, burning it. Self-bond is consumed first, then delegated.
     /// Returns the amount burned.
+    ///
+    /// THE SLASHABLE BASE (SLASH-01) and the consumption order:
+    ///
+    /// ```text
+    /// base = self_bond + delegated
+    ///          + in-flight unbonding (self and delegator)   [audit P1]
+    ///          + MATURED withdrawable (self and delegator)  [SLASH-01]
+    ///
+    /// order = delegator in-flight haircut -> delegator matured haircut
+    ///          -> self_bond -> self unbonding -> self matured
+    ///          -> pending_rewards (evidence scope) -> active delegations
+    /// ```
+    ///
+    /// Exiting stake (in flight OR matured) takes its haircut before any of
+    /// the validator's own money, and the validator's own stake is consumed
+    /// before the active delegations (the audited self-first shield).
+    ///
+    /// The `withdrawable` leg is what closes the "wait out the unbonding
+    /// period, then get slashed" escape: evidence (downtime, equivocation)
+    /// has no age bound, so stake that cleared `process_unbonding` must not
+    /// leave the base until it actually leaves the ledger
+    /// (`withdraw`/`withdraw_delegator`). Every nano of this base is backed
+    /// by [`STAKING_POOL`], so the burn settles as ONE `STAKING_POOL` debit.
+    ///
+    /// Unclaimed `pending_rewards` are in the base only on the
+    /// [`Self::slash_including_rewards`] scope (they are backed by
+    /// [`REWARDS_POOL`] and need a second debit); it is the scope every
+    /// engine-side evidence scan uses.
     ///
     /// FAIL-CLOSED BPS GATE (staking-economics audit 2026-11-01, low (b)):
     /// `slash_bps > BPS_DENOMINATOR` is refused with
@@ -2463,17 +2511,72 @@ impl StakingLedger {
     /// the unfloorable nanos simply REMAIN STAKED — the dust favors the
     /// slashed party, never the protocol. Pinned by closure-suite test.
     pub fn slash(&mut self, validator: ValidatorId, slash_bps: u64) -> Result<u64, StakingError> {
+        self.slash_scoped(validator, slash_bps, false)
+    }
+
+    /// [`Self::slash`] that ALSO burns the validator's unclaimed
+    /// `pending_rewards`.
+    ///
+    /// SLASH-01 (evidence-driven slashes): `pending_rewards` are minted,
+    /// pool-backed coins owed to the offender, not a claim on someone else's
+    /// value. Leaving them out of the base let an offender keep a slice of
+    /// the penalty by converting stake into pending rewards before the
+    /// evidence landed. Every engine-side evidence scan (downtime
+    /// attribution, block-carried vote/proposal/XMSS equivocation) uses this
+    /// scope.
+    ///
+    /// POOL CONTRACT (differs from [`Self::slash`]): the burned amount is
+    /// backed by TWO native pools. `pending_rewards` is backed by
+    /// [`REWARDS_POOL`] and every nano of it is mirrored in
+    /// [`StakingLedger::rewards_pool`], which this function decrements by
+    /// exactly the pending cut. The caller MUST therefore settle the burn as
+    /// two debits:
+    ///
+    /// ```text
+    /// rewards_cut = rewards_pool_before - ledger.rewards_pool  (after the call)
+    /// debit REWARDS_POOL by rewards_cut
+    /// debit STAKING_POOL by burned - rewards_cut
+    /// ```
+    ///
+    /// [`Self::note_missed_heights`] and the `slash_*_verified` primitives
+    /// do exactly that split at their engine call sites. The VM's
+    /// `SysCallReportPqEquivocation` carrier can only name ONE pool
+    /// (`burns: Vec<([u8; 32], u64)>`), so [`Self::slash_pq_equivocation`]
+    /// deliberately stays on the staking-only scope: its burn is fully
+    /// backed by [`STAKING_POOL`] and settles as one debit with no drift.
+    pub fn slash_including_rewards(
+        &mut self,
+        validator: ValidatorId,
+        slash_bps: u64,
+    ) -> Result<u64, StakingError> {
+        self.slash_scoped(validator, slash_bps, true)
+    }
+
+    /// The one slash implementation. `include_rewards` extends the slashable
+    /// base by the validator's unclaimed `pending_rewards` (and mirrors the
+    /// cut in [`StakingLedger::rewards_pool`]); see
+    /// [`Self::slash_including_rewards`] for the pool-settlement contract.
+    fn slash_scoped(
+        &mut self,
+        validator: ValidatorId,
+        slash_bps: u64,
+        include_rewards: bool,
+    ) -> Result<u64, StakingError> {
         // Fail-closed bps gate BEFORE any state lookup: burning more than
         // 100% is never meaningful, so refuse it regardless of membership.
         if slash_bps > BPS_DENOMINATOR {
             return Err(StakingError::BadSlashBps);
         }
-        let (self_bond, delegated_now) = {
+        let (self_bond, delegated_now, pending_rewards) = {
             let v = self
                 .validators
                 .get(&validator)
                 .ok_or(StakingError::NotValidator)?;
-            (v.self_bond, v.delegated)
+            (
+                v.self_bond,
+                v.delegated,
+                if include_rewards { v.pending_rewards } else { 0 },
+            )
         };
         // Saturating sums (econ audit 2026-11-01): `Iterator::sum` panics on
         // overflow in debug and wraps in release. Per-validator pending
@@ -2495,17 +2598,39 @@ impl StakingLedger {
             .iter()
             .filter(|e| e.validator == validator && e.owner.is_some())
             .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+        // SLASH-01: MATURED-but-unclaimed stake is part of the same base.
+        // `process_unbonding` drains a mature entry out of `unbonding` into
+        // `withdrawable`, so omitting this map let an offender equivocate,
+        // unbond, wait out `UNBONDING_PERIOD_SECS` and keep the matured
+        // amount: the evidence has no age bound, so the escape was simply
+        // "wait one cooldown". The zero-owner key is the validator's own
+        // matured self-bond; every other owner is a delegator.
+        let withdrawable_self = self
+            .withdrawable
+            .get(&(validator, [0u8; 32]))
+            .copied()
+            .unwrap_or(0);
+        let withdrawable_deleg: u64 = self
+            .withdrawable
+            .iter()
+            .filter(|((v, owner), _)| *v == validator && *owner != [0u8; 32])
+            .fold(0u64, |acc, (_, amount)| acc.saturating_add(*amount));
         let total = self_bond
             .saturating_add(delegated_now)
             .saturating_add(unbonding_self)
-            .saturating_add(unbonding_deleg);
+            .saturating_add(unbonding_deleg)
+            .saturating_add(withdrawable_self)
+            .saturating_add(withdrawable_deleg)
+            .saturating_add(pending_rewards);
         let burn = (total as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
         if burn == 0 {
             return Ok(0);
         }
         // In-flight delegator stake takes its haircut FIRST (pro-rata, floored
         // like the active pool below): exiting stake cannot shelter behind the
-        // validator's bond. Active delegations keep the self-first shield.
+        // validator's bond. Matured delegator `withdrawable` is the same
+        // category — an exit that already cleared cooldown — so it is cut in
+        // the same pass, before any of the validator's own stake.
         let mut unbond_cut_total = 0u64;
         for entry in self.unbonding.iter_mut() {
             if entry.validator == validator && entry.owner.is_some() {
@@ -2527,6 +2652,42 @@ impl StakingLedger {
             }
         }
         self.unbonding.retain(|e| e.amount > 0);
+        // SLASH-01: same haircut for matured delegator withdrawals.
+        //
+        // DETERMINISM: `withdrawable` is a HashMap, so the keys are SORTED
+        // before the cap (`burn - cut so far`) is applied. An unsorted walk
+        // would let the cap decide WHICH entries survive depending on the
+        // hash layout — a committed-state divergence between nodes. Sorted,
+        // every node applies the same haircut in the same order.
+        if unbond_cut_total < burn {
+            let mut keys: Vec<(ValidatorId, [u8; 32])> = self
+                .withdrawable
+                .keys()
+                .filter(|(v, owner)| *v == validator && *owner != [0u8; 32])
+                .copied()
+                .collect();
+            keys.sort_unstable();
+            for key in keys {
+                let amount = self.withdrawable.get(&key).copied().unwrap_or(0);
+                let cut =
+                    (amount as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut
+                    .min(amount)
+                    .min(burn.saturating_sub(unbond_cut_total));
+                if cut > 0 {
+                    let left = amount - cut;
+                    if left == 0 {
+                        self.withdrawable.remove(&key);
+                    } else {
+                        self.withdrawable.insert(key, left);
+                    }
+                    unbond_cut_total = unbond_cut_total.saturating_add(cut);
+                }
+                if unbond_cut_total >= burn {
+                    break;
+                }
+            }
+        }
         let mut remaining = burn.saturating_sub(unbond_cut_total);
         // Consume self-bond first.
         let from_self = remaining.min(self_bond);
@@ -2548,6 +2709,34 @@ impl StakingLedger {
                 }
             }
             self.unbonding.retain(|e| e.amount > 0);
+        }
+
+        // SLASH-01: then the validator's own MATURED self-bond.
+        if remaining > 0 {
+            let key = (validator, [0u8; 32]);
+            let matured = self.withdrawable.get(&key).copied().unwrap_or(0);
+            let take = remaining.min(matured);
+            if take > 0 {
+                if matured == take {
+                    self.withdrawable.remove(&key);
+                } else {
+                    self.withdrawable.insert(key, matured - take);
+                }
+                remaining -= take;
+            }
+        }
+
+        // SLASH-01 (rewards scope): the validator's unclaimed rewards are
+        // pool-backed coins, so burning them must also retire the ledger's
+        // mirror of that backing (`rewards_pool`) — otherwise a later claim
+        // would be capped by a pool that no longer owes it.
+        if remaining > 0 && pending_rewards > 0 {
+            let take = remaining.min(pending_rewards);
+            if let Some(v) = self.validators.get_mut(&validator) {
+                v.pending_rewards = v.pending_rewards.saturating_sub(take);
+            }
+            self.rewards_pool = self.rewards_pool.saturating_sub(take);
+            remaining -= take;
         }
 
         if remaining > 0 {
@@ -2757,8 +2946,10 @@ impl StakingLedger {
             return Ok(0);
         }
         self.equivocation_dedup.insert(key);
-        // 5. Burn 5% (self-bond first, audited spillover).
-        let burned = self.slash(voter, EQUIVOCATION_SLASH_BPS)?;
+        // 5. Burn 5% (self-bond first, audited spillover) on the full
+        //    evidence scope (SLASH-01: matured `withdrawable` + unclaimed
+        //    rewards are in the base).
+        let burned = self.slash_including_rewards(voter, EQUIVOCATION_SLASH_BPS)?;
         if burned > 0 {
             tracing::warn!(
                 "equivocation SLASHED {} (5%): offender {} at height {} round {:?}, burned {}",
@@ -2859,8 +3050,9 @@ impl StakingLedger {
             return Ok(0);
         }
         self.equivocation_dedup.insert(key);
-        // 5. Burn 5% (self-bond first, audited spillover).
-        let burned = self.slash(proposer, EQUIVOCATION_SLASH_BPS)?;
+        // 5. Burn 5% (self-bond first, audited spillover) on the full
+        //    evidence scope (SLASH-01).
+        let burned = self.slash_including_rewards(proposer, EQUIVOCATION_SLASH_BPS)?;
         if burned > 0 {
             tracing::warn!(
                 "proposal equivocation SLASHED {} (5%): offender {} at height {}, burned {}",
@@ -3020,8 +3212,9 @@ impl StakingLedger {
             return Ok(0);
         }
         self.equivocation_dedup.insert(key);
-        // 5. Burn 5% (self-bond first, audited spillover).
-        let burned = self.slash(validator, EQUIVOCATION_SLASH_BPS)?;
+        // 5. Burn 5% (self-bond first, audited spillover) on the full
+        //    evidence scope (SLASH-01).
+        let burned = self.slash_including_rewards(validator, EQUIVOCATION_SLASH_BPS)?;
         if burned > 0 {
             tracing::warn!(
                 "xmss equivocation SLASHED {} (5%): offender {} at epoch {}, burned {}",
@@ -3356,6 +3549,13 @@ impl StakingLedger {
             EQUIVOCATION_SLASH_BPS
         };
 
+        // SLASH-01 SCOPE: staking-only. The VM carrier that reports this
+        // burn (`burns: Vec<([u8; 32], u64)>`) can name exactly ONE pool, so
+        // the burn must be fully backed by `STAKING_POOL` — matured
+        // `withdrawable` is (it is in the base), unclaimed `pending_rewards`
+        // is not (REWARDS_POOL), so it stays out here. The engine-side
+        // evidence scans settle the reward leg separately and use
+        // `slash_including_rewards`.
         let burned = self.slash(evidence.voter, slash_bps)?;
         if is_micro_committee {
             self.validators.remove(&evidence.voter);
@@ -3365,8 +3565,12 @@ impl StakingLedger {
     }
 
     /// Slash for downtime.
+    ///
+    /// SLASH-01: the full evidence scope (matured `withdrawable` +
+    /// unclaimed `pending_rewards`), like the wired
+    /// [`Self::note_missed_heights`] path.
     pub fn slash_downtime(&mut self, validator: ValidatorId) -> Result<u64, StakingError> {
-        self.slash(validator, DOWNTIME_SLASH_BPS)
+        self.slash_including_rewards(validator, DOWNTIME_SLASH_BPS)
     }
 
     /// Note that `validator` did not contribute to the quorum certificate of
@@ -3450,7 +3654,10 @@ impl StakingLedger {
 
         let mut slashed = 0u64;
         for v in penalise {
-            if let Ok(burned) = self.slash(v, DOWNTIME_SLASH_BPS) {
+            // SLASH-01: downtime is evidence-driven and unbounded in age, so
+            // it burns on the full evidence scope (matured `withdrawable`
+            // plus unclaimed `pending_rewards`), never just the live bond.
+            if let Ok(burned) = self.slash_including_rewards(v, DOWNTIME_SLASH_BPS) {
                 slashed = slashed.saturating_add(burned);
                 // JAIL ON DOWNTIME SLASH (validator-UX gap): the offender is
                 // excluded from the set until `unjail` re-admits it. The
@@ -6569,6 +6776,109 @@ mod tests {
         assert_eq!(burned, stell(250));
         assert_eq!(l.total_stake(&vid), stell(4750));
         assert_eq!(l.total_burned, stell(250));
+    }
+
+    // --- SLASH-01: the full slashable base ---
+
+    /// SLASH-01: MATURED-but-unwithdrawn stake is slashable.
+    ///
+    /// The escape this closes: equivocate, `unbond`, wait
+    /// `UNBONDING_PERIOD_SECS` so `process_unbonding` moves the entry into
+    /// `withdrawable`, then let the (age-unbounded) evidence land — under the
+    /// old base the matured amount was outside the sum and survived 100%.
+    #[test]
+    fn matured_withdrawable_is_in_the_slashable_base() {
+        let mut l = StakingLedger::new();
+        let v = vid(41);
+        l.bond(v, stell(5000), DEFAULT_COMMISSION_BPS).unwrap();
+        // Leave only the MIN+buffer bonded and mature the rest.
+        l.unbond(v, stell(3900), 0).unwrap();
+        l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
+        let matured = l.withdrawable_of(&v);
+        assert_eq!(matured, stell(3900), "the unbonded amount matured");
+        assert_eq!(l.validators[&v].self_bond, stell(1100));
+
+        let supply_before = l.ledger_stake_supply();
+        let burned = l.slash(v, 10_000).unwrap(); // 100% of the base
+        assert_eq!(
+            burned,
+            supply_before,
+            "100% of self_bond + matured withdrawable must burn"
+        );
+        assert_eq!(l.validators[&v].self_bond, 0);
+        assert_eq!(l.withdrawable_of(&v), 0, "the matured escape is closed");
+        assert_eq!(l.total_burned, burned);
+        assert_eq!(l.ledger_stake_supply(), 0, "supply fell by the burn");
+    }
+
+    /// SLASH-01: delegated MATURED withdrawals are slashable too (the
+    /// delegator's exit cannot shelter behind the validator's bond), and a
+    /// partial bps leaves the rest intact.
+    #[test]
+    fn matured_delegator_withdrawable_is_in_the_slashable_base() {
+        let mut l = StakingLedger::new();
+        let v = vid(42);
+        let d = del(42);
+        l.bond(v, stell(5000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.delegate(d, v, stell(1000)).unwrap();
+        l.undelegate(d, v, stell(1000), 0).unwrap();
+        l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
+        assert_eq!(l.withdrawable_delegator(&v, &d), stell(1000));
+
+        // 5% of (5000 self + 1000 matured delegation) = 300: the exiting
+        // delegator takes its own 5% (50) first, the validator's bond covers
+        // the remaining 250 — i.e. the matured delegation is IN the base, no
+        // longer outside it.
+        let burned = l.slash(v, 500).unwrap();
+        assert_eq!(burned, stell(300));
+        assert_eq!(
+            l.withdrawable_delegator(&v, &d),
+            stell(950),
+            "the delegator's matured exit took its 5% haircut"
+        );
+        assert_eq!(
+            l.validators[&v].self_bond,
+            stell(4750),
+            "the rest of the burn comes out of the validator's bond"
+        );
+    }
+
+    /// SLASH-01: unclaimed `pending_rewards` are in the base only on the
+    /// evidence scope, and that scope retires the ledger's `rewards_pool`
+    /// mirror by exactly the pending cut (the two-pool settlement contract).
+    #[test]
+    fn pending_rewards_join_the_evidence_scope_only() {
+        // Base: 1100 self-bond + 3900 MATURED self-bond (withdrawable) +
+        // 400 unclaimed pool-backed rewards.
+        let mut base = StakingLedger::new();
+        let v = vid(43);
+        base.bond(v, stell(5000), DEFAULT_COMMISSION_BPS).unwrap();
+        base.unbond(v, stell(3900), 0).unwrap();
+        base.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
+        base.distribute_reward(v, stell(400)).unwrap();
+        assert_eq!(base.validators[&v].pending_rewards, stell(400));
+        assert_eq!(base.rewards_pool, stell(400));
+        assert_eq!(base.ledger_stake_supply(), stell(5000));
+
+        // Staking-only scope (the VM's single-pool PQ carrier): 100% of the
+        // STAKING_POOL-backed base burns; the pool-backed rewards survive.
+        let mut plain = base.clone();
+        let burned_plain = plain.slash(v, 10_000).unwrap();
+        assert_eq!(burned_plain, stell(5000));
+        assert_eq!(plain.validators[&v].pending_rewards, stell(400));
+        assert_eq!(plain.rewards_pool, stell(400));
+        assert_eq!(plain.rewards_minted, stell(400));
+
+        // Evidence scope: the rewards join the base, and the mirror falls by
+        // exactly the pending cut so a later claim stays pool-backed 1:1.
+        let burned = base.slash_including_rewards(v, 10_000).unwrap();
+        assert_eq!(burned, stell(5400));
+        assert_eq!(base.validators[&v].pending_rewards, 0);
+        assert_eq!(
+            base.rewards_pool, 0,
+            "the ledger mirror of REWARDS_POOL fell by the burned rewards"
+        );
+        assert_eq!(base.ledger_stake_supply(), 0);
     }
 
     // --- MIN+buffer / eject-WARN policy (урок валидатора C) ---

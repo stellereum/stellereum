@@ -37,6 +37,9 @@ const SHARD0: u32 = MASTERCHAIN_SHARD;
 const SHARD1: u32 = BASE_WORKCHAIN_SHARD_INITIAL;
 const TS: u64 = 1_760_000_000;
 
+#[path = "support/xshard_escrow.rs"]
+mod xshard_escrow;
+
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
@@ -145,6 +148,12 @@ async fn balance(cluster: &Cluster, shard: u32, addr: &[u8; 32]) -> u64 {
 
 /// Drive a single transfer SHARD0 -> SHARD1 to full consumption. Returns the
 /// consumed message (as committed in the target block) for later replay.
+/// Drive a single transfer SHARD0 -> SHARD1 to full consumption. Returns the
+/// consumed record (the one a replay would re-present) for later replay.
+///
+/// XSHARD-01: escrow-backed (the source debited the sender in an applied escrow
+/// block and the message proves that escrow against an anchored source header).
+/// An affordability-only record is refused by the gate.
 async fn consume_one(
     sc: &mut ShardedCluster,
     sender_seed: u8,
@@ -152,19 +161,28 @@ async fn consume_one(
     amount: u64,
 ) -> stellereum::sharding::CrossShardMessage {
     let tx = pq_xshard_tx(sender_seed, recipient_addr, amount, 10, 0);
-    sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
-    sc.shard_mut(SHARD1).broadcast_tx(tx.clone()).await;
-    let _ = sc.run_height(SHARD0, TS).await;
-    let tbh = sc.run_height(SHARD1, TS + 1).await;
-    sc.shard(SHARD1).nodes[0]
-        .blocks
-        .get(&tbh)
-        .cloned()
-        .expect("target block retained")
-        .cross_shard_out
-        .into_iter()
-        .find(|m| m.is_inbound_for(SHARD1))
-        .expect("target block carries the consumption record")
+    let registry = sc.shard(SHARD1).nodes[0]
+        .finalized_headers
+        .clone()
+        .expect("the fixture wires the finalized-header registry");
+    let msg = xshard_escrow::escrow_backed_message(&tx, &registry).await;
+
+    let target = sc.shard(SHARD1).nodes[0].state.clone();
+    let record = xshard_escrow::carrier(SHARD1, 1, vec![msg.clone()]);
+    assert_eq!(
+        target.apply_cross_shard_consumptions(&record).await,
+        1,
+        "the escrow-backed record must credit once"
+    );
+
+    // Mirror the RUNTIME half of the replay state, exactly as the live apply
+    // path does (the two halves are snapshotted together).
+    let mirrored = stellereum::sharding::CrossShardReplaySnapshot {
+        runtime_consumed: vec![CrossShardKey::of(&msg)],
+        ..Default::default()
+    };
+    sc.shard_mut(SHARD1).nodes[0].restore_cross_shard_sets(&mirrored);
+    msg
 }
 
 /// Snapshot the shard-1 replay state, persist it height-keyed, reopen the
@@ -248,13 +266,34 @@ async fn restart_replay_refused_at_propose_validate_and_apply() {
         .broadcast_cross_shard(&consumed_msg)
         .await
         .expect("re-feed");
-    // Control: an identical fresh cluster WITHOUT the restore.
-    let mut control = sharded_pair(&validator, &[(sender_addr, 1_000_000)], &[]).await;
-    control
-        .transport
-        .broadcast_cross_shard(&consumed_msg)
-        .await
-        .expect("re-feed");
+    // Control: an identical fresh cluster WITHOUT the restore. The record
+    // itself is valid (escrow-backed), so applying it CREDITS again — that is
+    // the hole the restored replay set closes.
+    let control = sharded_pair(&validator, &[(sender_addr, 1_000_000)], &[]).await;
+    {
+        let src_reg = sc.shard(SHARD1).nodes[0]
+            .finalized_headers
+            .clone()
+            .expect("registry");
+        let dst_reg = control.shard(SHARD1).nodes[0]
+            .finalized_headers
+            .clone()
+            .expect("registry");
+        dst_reg
+            .write()
+            .expect("registry lock")
+            .merge(&src_reg.read().expect("registry lock"))
+            .expect("identical anchor merge");
+    }
+    let control_target = control.shard(SHARD1).nodes[0].state.clone();
+    let control_record = xshard_escrow::carrier(SHARD1, 1, vec![consumed_msg.clone()]);
+    assert_eq!(
+        control_target
+            .apply_cross_shard_consumptions(&control_record)
+            .await,
+        1,
+        "control: without restore the replay credits again (the hole, now closed)"
+    );
 
     // Propose: both restored nodes skip the replayed message; the engine-only
     // node additionally prunes it from its mailbox (its runtime mirrors are
@@ -294,20 +333,6 @@ async fn restart_replay_refused_at_propose_validate_and_apply() {
             .all(|m| CrossShardKey::of(m) != consumed_key),
         "the replay must be pruned from the mailbox (no forever re-propose)"
     );
-    let control_bh = control.run_height(SHARD1, TS + 100).await;
-    let control_block = control.shard(SHARD1).nodes[0]
-        .blocks
-        .get(&control_bh)
-        .cloned()
-        .expect("control block retained");
-    assert!(
-        control_block
-            .cross_shard_out
-            .iter()
-            .any(|m| CrossShardKey::of(m) == consumed_key),
-        "control: without restore the replay IS proposed (the hole, now closed)"
-    );
-
     // Validate: a carrier block forged for THIS node (right height, prev,
     // root, proposer) but re-including the consumed record is refused for the
     // replay - not for any header mismatch.

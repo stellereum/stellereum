@@ -254,26 +254,122 @@ pub fn proposer_matches_schedule(
     proposer: &[u8; 32],
     qc_round: u32,
 ) -> bool {
+    // Pre-activation default: the canonical parent-hash-era rule, byte-identical
+    // to the pre-schedule code. Beacon-era callers use the `_with` variant.
+    proposer_matches_schedule_with(
+        validators,
+        height,
+        proposer,
+        qc_round,
+        crate::consensus::CommitteeSchedule::ParentHash,
+    )
+}
+
+/// [`proposer_matches_schedule`] under an explicit
+/// [`crate::consensus::CommitteeSchedule`] (review F2).
+///
+/// The proposer slot is drawn by
+/// [`crate::consensus::ValidatorSet::proposer_for_with_schedule`] — the same
+/// rule the runtime producer (`expected_proposer_at`) and `adopt_committed`
+/// use — while the certificate's SIGNER committee is the separate
+/// `sortition::committee_for_height` draw the QC verifier re-derives from the
+/// same schedule. Both draws are driven by the ONE schedule passed here, so a
+/// sync verifier can never check the proposer (or attribute the QC) under a
+/// different schedule than the one the producer signed under.
+///
+/// Below activation the schedule is [`crate::consensus::CommitteeSchedule::ParentHash`]
+/// and the verdict is identical to [`proposer_matches_schedule`].
+pub fn proposer_matches_schedule_with(
+    validators: &crate::consensus::ValidatorSet,
+    height: u64,
+    proposer: &[u8; 32],
+    qc_round: u32,
+    schedule: crate::consensus::CommitteeSchedule,
+) -> bool {
     // Non-validators have 0 power and never match any round.
     if validators.power_of(proposer) == 0 {
         return false;
     }
     let bound = qc_round.min(MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS);
-    (0..=bound).any(|r| validators.proposer_for(height, r).as_ref() == Some(proposer))
+    (0..=bound).any(|r| {
+        validators
+            .proposer_for_with_schedule(height, r, schedule)
+            .as_ref()
+            == Some(proposer)
+    })
+}
+
+/// CHAIN BINDING of the sortition parent, shared by the header-anchor path
+/// and the body path (audit 7.3/A1). A certificate carrying a µQC must have
+/// been elected with exactly the parent hash the block commits to; without
+/// this pin a peer could elect a committee it controls. Certificates without
+/// a µQC have no committee and pass (they must clear the full-set quorum).
+///
+/// `subject` is the caller's refusal prefix (`"block sync: block N"` or
+/// `"finality: height N"`) so both paths keep their operator-facing names
+/// while enforcing one predicate. Pure.
+pub fn verify_qc_parent_binding(
+    qc: &crate::consensus::QuorumCertificate,
+    parent_hash: &[u8; 32],
+    subject: &str,
+) -> Result<(), String> {
+    if qc.binds_to_parent(parent_hash) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{subject}: decision proof was elected with a different parent block"
+        ))
+    }
 }
 
 /// One height's finality gate, shared by the header-anchor path and the body
 /// path so the two can never drift (A1). Fails closed with a height-named
-/// reason on: wrong QC kind, height/hash mismatch, bad proposer schedule,
-/// or failed quorum verification under the GIVEN set (which must always be
-/// the node's own pre-snapshot committed set — verifying against a set read
-/// from the untrusted snapshot would be circular).
+/// reason on: wrong QC kind, height/hash mismatch, a certificate elected with
+/// a foreign sortition parent, bad proposer schedule, or failed quorum
+/// verification under the GIVEN set (which must always be the node's own
+/// pre-snapshot committed set — verifying against a set read from the
+/// untrusted snapshot would be circular).
+///
+/// `parent_hash` is the block's `prev_hash` as committed by the header this
+/// certificate finalizes. The body paths enforce the same binding (via
+/// [`verify_qc_parent_binding`]); omitting it here let a header anchor accept
+/// a certificate the body path refuses (audit 7.3).
 pub fn verify_finality_for_header(
     validators: &crate::consensus::ValidatorSet,
     height: u64,
     block_hash: &[u8; 32],
+    parent_hash: &[u8; 32],
     proposer: &[u8; 32],
     qc: &crate::consensus::QuorumCertificate,
+) -> Result<(), String> {
+    verify_finality_for_header_with_schedule(
+        validators,
+        height,
+        block_hash,
+        parent_hash,
+        proposer,
+        qc,
+        crate::consensus::CommitteeSchedule::ParentHash,
+    )
+}
+
+/// [`verify_finality_for_header`] under an explicit
+/// [`crate::consensus::CommitteeSchedule`] (review F2).
+///
+/// The proposer slot, the certificate's signer committee and the signed-power
+/// attribution all come from the SAME schedule, so a beacon-era header is
+/// judged by the draw the producer signed under instead of the parent-hash
+/// draw. Below activation the schedule is
+/// [`crate::consensus::CommitteeSchedule::ParentHash`] and the verdict and
+/// refusal strings are identical to [`verify_finality_for_header`].
+pub fn verify_finality_for_header_with_schedule(
+    validators: &crate::consensus::ValidatorSet,
+    height: u64,
+    block_hash: &[u8; 32],
+    parent_hash: &[u8; 32],
+    proposer: &[u8; 32],
+    qc: &crate::consensus::QuorumCertificate,
+    schedule: crate::consensus::CommitteeSchedule,
 ) -> Result<(), String> {
     use crate::consensus::VoteKind;
     if qc.kind != VoteKind::Precommit {
@@ -292,15 +388,19 @@ pub fn verify_finality_for_header(
             "finality: QC does not bind header hash at height {height}"
         ));
     }
-    if !proposer_matches_schedule(validators, height, proposer, qc.round) {
+    verify_qc_parent_binding(qc, parent_hash, &format!("finality: height {height}"))?;
+    if !proposer_matches_schedule_with(validators, height, proposer, qc.round, schedule) {
         return Err(format!(
             "finality: header proposer at height {height} held no schedule slot in rounds 0..={} ",
             qc.round
         ));
     }
-    if !qc.verify(validators) {
+    if !qc.verify_with_schedule(validators, schedule) {
         return Err(format!(
-            "finality: QC fails quorum verification at height {height}"
+            "finality: QC fails quorum verification at height {height} (carries {} of {} required power, total {})",
+            validators.qc_signed_power_with_schedule(qc, schedule),
+            validators.quorum_power(),
+            validators.total_power()
         ));
     }
     Ok(())
@@ -370,6 +470,44 @@ pub async fn verify_snapshot_anchor_with_sets<F, Fut, R>(
     next_height: u64,
     resolve_set: R,
     max_span: u64,
+    fetch_header: F,
+) -> Result<SnapshotAnchor, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<HeaderLink>>,
+    R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+{
+    // Pre-activation default: the canonical parent-hash schedule at every
+    // height, byte-identical to the pre-schedule code. Live callers pass the
+    // runtime's `committee_schedule_at` so a beacon-era header walk verifies
+    // under the draw its producer signed with (review F2).
+    verify_snapshot_anchor_with_sets_and_schedule(
+        our_finalized,
+        genesis_root,
+        next_height,
+        resolve_set,
+        |_| crate::consensus::CommitteeSchedule::ParentHash,
+        max_span,
+        fetch_header,
+    )
+    .await
+}
+
+/// [`verify_snapshot_anchor_with_sets`] with the committee schedule resolved
+/// PER HEIGHT as well.
+///
+/// `resolve_schedule(height)` is the runtime's `committee_schedule_at`: the
+/// epoch beacon at/after `CNVRF_V3_ACTIVATION_HEIGHT`, the parent-hash draw
+/// below it. Each walked header's proposer slot and QC are checked under that
+/// height's schedule, so a beacon-era snapshot anchor is verifiable (and a
+/// certificate drawn under the other schedule is still refused).
+pub async fn verify_snapshot_anchor_with_sets_and_schedule<F, Fut, R, S>(
+    our_finalized: Option<(u64, [u8; 32])>,
+    genesis_root: [u8; 32],
+    next_height: u64,
+    resolve_set: R,
+    resolve_schedule: S,
+    max_span: u64,
     mut fetch_header: F,
 ) -> Result<SnapshotAnchor, String>
 where
@@ -379,6 +517,7 @@ where
     // `tokio::spawn`ed sync tasks, so the future must stay `Send` — a bare
     // `&dyn Fn` is not `Sync` and would poison every spawner.
     R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+    S: Fn(u64) -> crate::consensus::CommitteeSchedule,
 {
     let (anchor_height, mut parent_hash) = match our_finalized {
         Some((h, hash)) => (h, hash),
@@ -434,8 +573,16 @@ where
                  refusing without a set-at-height (F5 fail-closed)"
             )
         })?;
-        verify_finality_for_header(&vs, height, &link.block_hash, &link.proposer, &link.qc)
-            .map_err(|e| format!("snapshot anchor: {e}"))?;
+        verify_finality_for_header_with_schedule(
+            &vs,
+            height,
+            &link.block_hash,
+            &link.prev_hash,
+            &link.proposer,
+            &link.qc,
+            resolve_schedule(height),
+        )
+        .map_err(|e| format!("snapshot anchor: {e}"))?;
         // The block at `next_height - 1` is the boundary: it is the height
         // the snapshot restores to, and its hash is the finalized head the
         // node resumes from.
@@ -487,6 +634,42 @@ where
         genesis_root,
         next_height,
         move |_| Some(single.clone()),
+        max_span,
+        fetch_header,
+    )
+    .await
+}
+
+/// Single-set entry for [`verify_snapshot_anchor_with_sets_and_schedule`]:
+/// every height resolves to the SAME committed set (the pre-existing
+/// behaviour of [`verify_snapshot_anchor`]), while the committee schedule can
+/// still follow the chain (review F2).
+///
+/// Live callers pass the runtime's `committee_schedule_at` for
+/// `resolve_schedule`; below activation it answers
+/// [`crate::consensus::CommitteeSchedule::ParentHash`] at every height, making
+/// this byte-identical to [`verify_snapshot_anchor`].
+pub async fn verify_snapshot_anchor_with_schedule<F, Fut, S>(
+    our_finalized: Option<(u64, [u8; 32])>,
+    genesis_root: [u8; 32],
+    next_height: u64,
+    validators: &crate::consensus::ValidatorSet,
+    resolve_schedule: S,
+    max_span: u64,
+    fetch_header: F,
+) -> Result<SnapshotAnchor, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<HeaderLink>>,
+    S: Fn(u64) -> crate::consensus::CommitteeSchedule,
+{
+    let single = validators.clone();
+    verify_snapshot_anchor_with_sets_and_schedule(
+        our_finalized,
+        genesis_root,
+        next_height,
+        move |_| Some(single.clone()),
+        resolve_schedule,
         max_span,
         fetch_header,
     )
@@ -577,6 +760,35 @@ pub const SNAPSHOT_ANCHOR_TAIL_WINDOW: u64 = 3;
 pub async fn verify_snapshot_anchor_tail_with_sets<F, Fut, R>(
     next_height: u64,
     resolve_set: R,
+    fetch_header: F,
+) -> Result<SnapshotAnchor, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<HeaderLink>>,
+    R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+{
+    // Pre-activation default: the canonical parent-hash schedule at every
+    // window height, byte-identical to the pre-schedule code.
+    verify_snapshot_anchor_tail_with_sets_and_schedule(
+        next_height,
+        resolve_set,
+        |_| crate::consensus::CommitteeSchedule::ParentHash,
+        fetch_header,
+    )
+    .await
+}
+
+/// [`verify_snapshot_anchor_tail_with_sets`] with the committee schedule
+/// resolved PER HEIGHT (review F2).
+///
+/// Each window height's proposer slot and QC are verified under
+/// `resolve_schedule(height)` — the runtime's `committee_schedule_at` — so a
+/// beacon-era tail anchor is provable while a certificate drawn under the
+/// other schedule is still refused.
+pub async fn verify_snapshot_anchor_tail_with_sets_and_schedule<F, Fut, R, S>(
+    next_height: u64,
+    resolve_set: R,
+    resolve_schedule: S,
     mut fetch_header: F,
 ) -> Result<SnapshotAnchor, String>
 where
@@ -585,6 +797,7 @@ where
     // Owned (not `&dyn Fn`): same `Send`-future reason as
     // [`verify_snapshot_anchor_with_sets`].
     R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+    S: Fn(u64) -> crate::consensus::CommitteeSchedule,
 {
     if next_height == 0 {
         return Err("snapshot anchor (tail): no header at height 0 to anchor on".to_string());
@@ -633,8 +846,16 @@ where
                  refusing without a set-at-height (F5 fail-closed)"
             )
         })?;
-        verify_finality_for_header(&vs, height, &link.block_hash, &link.proposer, &link.qc)
-            .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
+        verify_finality_for_header_with_schedule(
+            &vs,
+            height,
+            &link.block_hash,
+            &link.prev_hash,
+            &link.proposer,
+            &link.qc,
+            resolve_schedule(height),
+        )
+        .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
         // The boundary block (the height the snapshot restores to): its hash
         // is QC-verified above, so it is a value the quorum vouched for.
         if height + 1 == next_height {
@@ -723,17 +944,16 @@ pub fn walked_head_anchor(
 /// `required_quorum` is the node's own 2/3 quorum size; a zero quorum is refused
 /// outright rather than degenerating into "accept anything".
 ///
-/// F5 SET-AT-HEIGHT (validator-set rotation), CLOSED by threading:
+/// F5 SET-AT-HEIGHT (validator-set rotation) is CLOSED on the live paths:
 /// `StakingLedger::to_validator_set` still only ever reflects current bonded
 /// stake (`src/staking.rs`), so a historical block's precommit QC verified
 /// against the node's CURRENT set is the conservative direction (signers who
 /// have rotated out carry no power; a peer cannot manufacture a quorum from
-/// stale keys). The threading that closes the residual — a quorum of current
-/// validators pointlessly vouching for old heights — is:
+/// stale keys). The residual — a quorum of CURRENT validators pointlessly
+/// vouching for old heights — is threaded out by:
 /// * body walks: [`validate_sync_chain_with_sets`], which resolves the set in
 ///   force at EACH height (`ValidatorRuntime::validator_set_for_height`) and
-///   fail-closes on an unresolvable height (the single-set
-///   [`validate_sync_chain`] below is the backward-compatible entry);
+///   fail-closes on an unresolvable height;
 /// * snapshot anchors: [`verify_snapshot_anchor_with_sets`] and
 ///   [`verify_snapshot_anchor_tail_with_sets`], same per-height rule;
 /// * snapshot trust: [`check_snapshot_set_binding`], which requires the
@@ -743,15 +963,23 @@ pub fn walked_head_anchor(
 ///
 /// The replay path in `runtime::replay_historical_block` derives the
 /// set-at-height from the engine at the block's pre-state.
+///
+/// THIS ENTRY IS TEST-ONLY, NOT A LIVE PATH: it resolves EVERY height to the
+/// single `validators` set, so a caller that uses it re-opens the F5 residual
+/// (a current-set quorum can vouch for an old height). It has ZERO production
+/// callers — live catch-up calls
+/// [`validate_sync_chain_for_shard_with_sets_hashed`] via `node/sync.rs` — and
+/// exists only because the sync test suites and PoC harnesses call it
+/// directly. Do not wire it into a node path.
 pub fn validate_sync_chain(
     blocks: &[Block],
     expected_first_height: u64,
     expected_first_hash: [u8; 32],
     validators: &crate::consensus::ValidatorSet,
 ) -> Result<(), String> {
-    // Backward-compatible single-set entry: every height resolves to the same
-    // set. Live callers MUST use `validate_sync_chain_with_sets` so each
-    // certificate is checked against the set in force at ITS height.
+    // TEST-ONLY single-set entry: every height resolves to the same set, which
+    // re-opens F5. Live callers use `validate_sync_chain_for_shard_with_sets`
+    // so each certificate is checked against the set in force at ITS height.
     let single = validators.clone();
     validate_sync_chain_with_sets(
         blocks,
@@ -793,11 +1021,13 @@ pub fn validate_sync_chain_with_sets(
 }
 
 /// Shard-aware variant of [`validate_sync_chain`]: additionally requires every
-/// block to be on `expected_shard` (the node's own chain). See the F5 note on
-/// `validate_sync_chain` for the validator-rotation limitation.
+/// block to be on `expected_shard` (the node's own chain).
 ///
-/// Backward-compatible single-set entry (see `validate_sync_chain`): live
-/// callers MUST use [`validate_sync_chain_for_shard_with_sets`].
+/// TEST-ONLY single-set entry: it carries the SAME F5 limitation as
+/// [`validate_sync_chain`] (one set for every height) and has zero production
+/// callers. Live callers use
+/// [`validate_sync_chain_for_shard_with_sets`], which resolves the set in
+/// force at each height.
 pub fn validate_sync_chain_for_shard(
     blocks: &[Block],
     expected_first_height: u64,
@@ -854,6 +1084,38 @@ pub fn validate_sync_chain_for_shard_with_sets_hashed(
     resolve_set: &dyn Fn(u64) -> Option<crate::consensus::ValidatorSet>,
     expected_shard: u32,
 ) -> Result<Vec<[u8; 32]>, String> {
+    // Pre-activation default: every height verifies under the canonical
+    // parent-hash schedule, byte-identical to the pre-schedule code. Live
+    // callers use the `_with_schedule` variant so a beacon-era chain verifies
+    // under the draw its producers signed with (review F2).
+    validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+        blocks,
+        expected_first_height,
+        expected_first_hash,
+        resolve_set,
+        expected_shard,
+        &|_| crate::consensus::CommitteeSchedule::ParentHash,
+    )
+}
+
+/// [`validate_sync_chain_for_shard_with_sets_hashed`] with the committee
+/// schedule resolved PER HEIGHT (review F2).
+///
+/// `resolve_schedule(height)` answers "which draw was in force at this height":
+/// the runtime passes its `committee_schedule_at` (epoch beacon at/after
+/// `CNVRF_V3_ACTIVATION_HEIGHT`, [`crate::consensus::CommitteeSchedule::ParentHash`]
+/// below it). Every schedule-dependent check inside the walk — the proposer
+/// slot, the decision certificate's quorum, and the signed-power figure in the
+/// refusal — uses that ONE value, so the committee a certificate is attributed
+/// with is always the one its producer drew.
+pub fn validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+    blocks: &[Block],
+    expected_first_height: u64,
+    expected_first_hash: [u8; 32],
+    resolve_set: &dyn Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+    expected_shard: u32,
+    resolve_schedule: &dyn Fn(u64) -> crate::consensus::CommitteeSchedule,
+) -> Result<Vec<[u8; 32]>, String> {
     // An empty walk proves nothing: accepting it would let a caller treat "no
     // blocks" as "a valid chain", re-anchoring consensus on heights no block
     // exists for. Every legitimate caller holds at least one block here.
@@ -897,6 +1159,12 @@ pub fn validate_sync_chain_for_shard_with_sets_hashed(
                 b.height
             )
         })?;
+        // The schedule IN FORCE AT THIS BLOCK'S HEIGHT, from the same resolver
+        // contract as the set: the schedule a producer drew under is the one
+        // this walk verifies and attributes under (review F2). Derived ONCE so
+        // the proposer check, the quorum check and the signed-power figure in
+        // the refusal cannot disagree.
+        let schedule = resolve_schedule(b.height);
         // F8: a synced block must belong to the chain we are syncing. A chain
         // that extends our finalized hash but claims another shard (or mixes
         // shards) must be refused before its QCs are given any weight.
@@ -950,18 +1218,18 @@ pub fn validate_sync_chain_for_shard_with_sets_hashed(
         }
         // CHAIN BINDING of the committee: a µQC must have been elected with the
         // parent hash this block commits to, so a peer cannot pick the
-        // committee it controls.
-        if !qc.binds_to_parent(&b.prev_hash) {
-            return Err(format!(
-                "block sync: block {} decision proof was elected with a different parent block",
-                b.height
-            ));
-        }
-        if !qc.verify(&validators) {
+        // committee it controls. SAME shared predicate the header-anchor path
+        // uses (`verify_qc_parent_binding`), so the two can never drift.
+        verify_qc_parent_binding(
+            qc,
+            &b.prev_hash,
+            &format!("block sync: block {}", b.height),
+        )?;
+        if !qc.verify_with_schedule(&validators, schedule) {
             return Err(format!(
                 "block sync: block {} decision proof lacks a validator quorum (carries {} of {} required power, total {})",
                 b.height,
-                validators.qc_signed_power(qc),
+                validators.qc_signed_power_with_schedule(qc, schedule),
                 validators.quorum_power(),
                 validators.total_power()
             ));
@@ -975,7 +1243,7 @@ pub fn validate_sync_chain_for_shard_with_sets_hashed(
         // signature above only proves the named key signed; it says nothing
         // about whether that key was allowed to propose this slot.
         let round = qc.round;
-        if !proposer_matches_schedule(&validators, b.height, &b.proposer, round) {
+        if !proposer_matches_schedule_with(&validators, b.height, &b.proposer, round, schedule) {
             return Err(format!(
                 "block sync: block {} proposer {} holds no schedule slot in rounds 0..={round}",
                 b.height,
@@ -1819,6 +2087,35 @@ pub fn snapshot_probe_pace_ms(consecutive_misses: u32) -> u64 {
     (consecutive_misses as u64)
         .saturating_mul(SNAPSHOT_PROBE_PACE_MS_PER_MISS)
         .min(SNAPSHOT_PROBE_PACE_MAX_MS)
+}
+
+/// Step between snapshot-probe boundaries for a given snapshot interval.
+///
+/// Snapshots are submitted at exact multiples of `snapshot_interval()` (plus
+/// the `CATCHUP_GRID` catch-up multiples when a capture was missed), so a
+/// fixed 100-height walk is only correct when the interval itself is a
+/// multiple of 100. Probing by the configured interval keeps every normal
+/// snapshot boundary on the walk for ANY interval (audit F4).
+pub fn snapshot_probe_step(snapshot_interval: u64) -> u64 {
+    snapshot_interval.max(1)
+}
+
+/// How many interval-spaced boundaries the probe must visit to cover the
+/// worst-case published-snapshot gap.
+///
+/// The old window was a hard-coded 8 x 100 = 800 heights. With the default
+/// interval (1000) and a node that restored between snapshots, every probe
+/// could land between two published snapshots and the node never found the
+/// next one. The window now tracks the cadence
+/// ([`crate::snapshot_cadence::worst_case_gap`] = interval + 100): enough
+/// interval-spaced boundaries to span that gap, plus the starting boundary.
+/// Pure so it is test-pinned without a network.
+pub fn snapshot_probe_steps(snapshot_interval: u64) -> u64 {
+    let interval = snapshot_probe_step(snapshot_interval);
+    crate::snapshot_cadence::worst_case_gap(interval)
+        .div_ceil(interval)
+        .saturating_add(1)
+        .max(2)
 }
 
 /// Retry backoff WITH jitter: exponential base plus a uniform draw.
@@ -3468,5 +3765,52 @@ mod fanout_tests {
             retro_publish_pace_with_jitter_ms(u64::MAX),
             crate::network::RETRO_PUBLISH_PACE_MS + RETRO_PUSH_JITTER_MAX_MS
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_probe_window_tests {
+    //! Audit F4: the snapshot probe window must track the configured cadence,
+    //! not a fixed 8 x 100 heights that misses a 1000-height snapshot
+    //! interval.
+    use super::*;
+
+    #[test]
+    fn probe_window_tracks_the_snapshot_interval() {
+        for interval in [50u64, 100, 350, 1000, 4096] {
+            let step = snapshot_probe_step(interval);
+            assert_eq!(step, interval, "the walk steps by the configured interval");
+            let steps = snapshot_probe_steps(interval);
+            // N boundaries span (N - 1) steps.
+            let covered = steps.saturating_sub(1).saturating_mul(step);
+            let required = crate::snapshot_cadence::worst_case_gap(interval);
+            assert!(
+                covered >= required,
+                "window {covered} must cover the worst-case gap {required} at interval {interval}"
+            );
+            assert!(steps >= 2, "at least the newest boundary and one below");
+        }
+    }
+
+    #[test]
+    fn default_interval_reaches_the_snapshot_at_4000_from_peer_4999() {
+        // The review's concrete miss: peer 4999, node restored mid-interval,
+        // newest published snapshot at 4000. The old 8 x 100 walk stopped at
+        // 4200; the derived window must reach 4000.
+        let step = snapshot_probe_step(1000);
+        let steps = snapshot_probe_steps(1000);
+        let newest = (4999 / step) * step;
+        let oldest = newest.saturating_sub((steps - 1).saturating_mul(step));
+        assert_eq!(newest, 4000);
+        assert!(
+            oldest <= 4000,
+            "oldest probed boundary {oldest} must reach the snapshot at 4000"
+        );
+    }
+
+    #[test]
+    fn zero_interval_is_clamped_never_panics() {
+        assert_eq!(snapshot_probe_step(0), 1);
+        assert!(snapshot_probe_steps(0) >= 2);
     }
 }

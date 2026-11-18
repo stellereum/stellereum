@@ -55,6 +55,11 @@ pub struct ZkMlOpcodeCapability {
     /// The verifier's work is linear in the model's parameter count.
     pub verifier_work: String,
     /// What the verifier must already hold for the check to mean anything.
+    ///
+    /// LEGACY FIELD NAME (kept for JSON/RPC compatibility): it describes a
+    /// PREMISE, not a setup. `zkml_capabilities().trusted_setup == false`
+    /// states the truth: there is no ceremony, no proving key and no toxic
+    /// waste anywhere in this subsystem.
     pub trusted_setup: String,
 }
 
@@ -107,10 +112,13 @@ pub fn zkml_capabilities() -> ZkMlCapabilities {
         hiding: false,
         sound: true,
         trusted_setup: false,
-        setup_note: "There is no ceremony, no toxic waste and no Powers-of-Tau: the \
-                     registered 'setup attestation' is a free-form operator LABEL \
-                     carried in committed state. The chain only refuses the \
-                     documented test-only prefix 'TEST-ONLY-DETERMINISTIC-SETUP'."
+        setup_note: "There is NO setup: no ceremony, no proving key, no toxic waste and no \
+                     Powers-of-Tau - there is nothing to set up. The registered 'setup \
+                     attestation' is a free-form operator LABEL carried in committed \
+                     state, it is UNAUTHENTICATED and FIRST-WRITER-WINS (anyone can attach \
+                     a label to any model via SysCallRegisterZkMlSpec), and it is not part \
+                     of any cryptographic argument. The chain only refuses the documented \
+                     test-only prefix 'TEST-ONLY-DETERMINISTIC-SETUP'."
             .to_string(),
         opcodes: vec![
             ZkMlOpcodeCapability {
@@ -121,7 +129,9 @@ pub fn zkml_capabilities() -> ZkMlCapabilities {
                 succinct: false,
                 hiding: false,
                 verifier_work: "linear in the registered model's parameter count".to_string(),
-                trusted_setup: "the committed model registry (append-only, hash-matched)"
+                trusted_setup: "PREMISE (no setup exists): you must pin the model_id you \
+                                trust - anyone can register any model - and hold the exact \
+                                weights the registry carries"
                     .to_string(),
             },
             ZkMlOpcodeCapability {
@@ -132,8 +142,10 @@ pub fn zkml_capabilities() -> ZkMlCapabilities {
                 succinct: false,
                 hiding: false,
                 verifier_work: "linear in the registered model's parameter count".to_string(),
-                trusted_setup: "the committed model registry plus the committed model SPEC \
-                                (constrained format + I/O shape + a setup LABEL)"
+                trusted_setup: "PREMISE (no setup exists): the committed model registry plus \
+                                the committed model SPEC (constrained format + I/O shape + a \
+                                free-form, unauthenticated setup LABEL). The label is not a \
+                                setup commitment and can be written by anyone"
                     .to_string(),
             },
         ],
@@ -1055,6 +1067,32 @@ impl SessionKeyRegistry {
 /// this - see the opcode's gas arm and its in-handler re-execution charge).
 pub const MAX_ZKML_MODEL_PARAMS: usize = 16_384;
 
+/// Hard cap on the number of models the committed registry will hold.
+///
+/// `register` is permissionless, permanent (there is no deregistration and no
+/// rent) and every registration rebuilds the commitment preimage of the WHOLE
+/// registry (`commitment::write_zkml_models_domain`). Without a total cap a
+/// chain accumulates registrations forever and the per-registration hashing
+/// cost grows without bound. 4_096 ids is far above any plausible honest use
+/// and still bounds the map, the specs (one per model) and the walk.
+///
+/// Refusal message: `"registry full: ..."` - the opcode turns any `register`
+/// error into a transaction revert, so the refusal is deterministic and free
+/// of state change.
+pub const MAX_ZKML_REGISTRY_MODELS: usize = 4_096;
+
+/// Hard cap on the TOTAL parameters across every model in the registry.
+///
+/// The parameter count is what the commitment actually hashes, so this - not
+/// the model count - is the real bound on per-registration cost: an empty
+/// registry writes zero bytes, and after a `register` the preimage covers
+/// `O(total params)` `i64`s. 1_048_576 parameters = 8 MiB of weights = 64
+/// maximum-size ([`MAX_ZKML_MODEL_PARAMS`]) models. It is computed by summing
+/// the live records instead of being stored, so no field is added to the
+/// persisted `ZkMlModelRegistry` (a trailing field would be a silent
+/// cross-version fork; see the `ZkMlModelRecord` docs).
+pub const MAX_ZKML_REGISTRY_PARAMS: usize = 1_048_576;
+
 /// Quantized Neural Network layer with weights, biases and ReLU activation
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QuantizedLayer {
@@ -1418,8 +1456,11 @@ impl ZkMlProof {
     /// trusted setup and no succinctness: the verifier runs the whole forward
     /// pass (cost linear in the model's parameters) and compares. The claim
     /// this supports is exactly "these outputs come from THIS model on THESE
-    /// inputs", which is what makes it sound for a value-bearing decision -
-    /// and no more than that.
+    /// inputs", which is a SOUND statement — but it is NOT a usable on-chain
+    /// gate: the VM has no branch on it, `apply.rs` drops the `return_value`,
+    /// and no event or state records it. Treat the verdict as an EVENT, not a
+    /// branch condition; any value-bearing decision must be made off chain
+    /// from the (public) block payload.
     ///
     /// A4: `verify_inference` alone is only a structural consistency check — it
     /// never verifies the matrix multiplication, so a prover can fabricate
@@ -1478,7 +1519,7 @@ impl ZkMlProof {
         true
     }
 
-    /// Verify inference computational correctness at consensus level without heavy TEE/SGX.
+    /// Structural consistency check for an inference proof (NOT sound alone).
     ///
     /// WARNING: this is a STRUCTURAL check only (Fiat-Shamir binding + ReLU
     /// constraints + output shape). It does NOT verify the linear layers, so it is
@@ -1486,12 +1527,17 @@ impl ZkMlProof {
     /// activations passes it (regression
     /// `forged_proof_passes_structural_but_fails_sound_check`, and the live-path
     /// twin `forged_proof_is_rejected_on_the_live_block_path`). Use
-    /// [`ZkMlProof::verify_inference_against`] with a known model for
-    /// value-bearing decisions: that is what the block path's
+    /// [`ZkMlProof::verify_inference_against`] with a known model for the sound
+    /// re-execution check: that is what the block path's
     /// `OpCode::SysCallVerifyZkMlReexec` calls. The legacy
     /// `OpCode::SysCallVerifyZkMl` calls THIS method and therefore carries no
     /// soundness at all - it is unreachable on the block path (`VmContext.zkml_proof`
     /// is never supplied) and stays fail-closed.
+    ///
+    /// Even the sound check is an EVENT, not a branch condition: the verify
+    /// opcodes only push to the VM stack, and `apply.rs` discards the
+    /// execution result's `return_value`, so no on-chain program can consume
+    /// the verdict.
     pub fn verify_inference(&self) -> bool {
         if self.proof_bytes.is_empty() {
             return false;
@@ -1580,9 +1626,19 @@ pub struct ZkMlModelRecord {
     /// `None` is the common case (re-execution-only models, and every model
     /// registered before the spec wave): the commitment spec domain writes
     /// zero bytes while NO record carries a spec, so the genesis root and
-    /// `COMMITMENT_VERSION` are untouched. In-memory only like the rest of
-    /// the registry (no persistence tree this wave), so extending the record
-    /// changes no persisted encoding.
+    /// `COMMITMENT_VERSION` are untouched.
+    ///
+    /// ⚠️ PERSISTED (do not trust an older "in-memory only" note): the WHOLE
+    /// [`ZkMlModelRegistry`] - this record included - is `bincode`-serialised
+    /// into the `"zkml_models"` sled tree (`storage.rs::put_zkml_models`, per
+    /// height) and restored through `bincode_deserialize_limited`, which
+    /// permits TRAILING BYTES. Consequence: adding a field to this struct (or
+    /// to [`crate::zkml_attestation::ModelSpec`]) is a SILENT cross-version
+    /// fork - old binaries decode the new bytes, ignore the tail and keep the
+    /// old digest; new binaries cannot restore old snapshots (bincode 1.3 is
+    /// positional and cannot default a missing field). Extend the state only
+    /// through a NEW versioned domain/registry wrapper, never by appending a
+    /// field here.
     pub spec: Option<crate::zkml_attestation::ModelSpec>,
 }
 
@@ -1597,14 +1653,19 @@ pub struct ZkMlModelRecord {
 /// Rules (enforced by [`ZkMlModelRegistry::register`], which is what
 /// `OpCode::SysCallRegisterZkMlModel` calls):
 ///  * APPEND-ONLY, first writer wins: an id that is already registered cannot
-///    be re-registered or overwritten, so nobody can swap the weights a proof
-///    is checked against after the fact. (The flip side - someone squatting an
-///    id first with their own model - is a naming/griefing question for
-///    governance, not a soundness hole: a proof for the squatter's model still
-///    only ever proves the squatter's model.)
+///    be re-bound to DIFFERENT weights, so nobody can swap the weights a proof
+///    is checked against after the fact. Re-registering the BYTE-IDENTICAL
+///    model under the same id is an idempotent no-op (it returns the existing
+///    hash and touches nothing, so the commitment preimage is not rebuilt).
+///    (The flip side - someone squatting an id first with their own model - is
+///    a naming/griefing question for governance, not a soundness hole: a proof
+///    for the squatter's model still only ever proves the squatter's model.)
 ///  * MALFORMED models are rejected before they can be re-executed
-///    (`QuantizedLinearModel::validate`), and
-///  * a registration is bounded by [`MAX_ZKML_MODEL_PARAMS`].
+///    (`QuantizedLinearModel::validate`),
+///  * a registration is bounded by [`MAX_ZKML_MODEL_PARAMS`], and
+///  * the registry is bounded in total by [`MAX_ZKML_REGISTRY_MODELS`] and
+///    [`MAX_ZKML_REGISTRY_PARAMS`] - after which `register` refuses with
+///    `"registry full: ..."` (a revert, no state change).
 ///
 /// `BTreeMap` because the commitment digest iterates it and PROTOCOL.md I2
 /// requires identical bytes for identical state on every node.
@@ -1630,16 +1691,26 @@ impl ZkMlModelRegistry {
     /// proof must carry), or an error describing why the registration is
     /// refused - the opcode turns any error into a transaction revert.
     ///
+    /// IDEMPOTENT FAST PATH: re-registering the byte-identical model under an
+    /// id that already holds it returns `Ok(existing_model_hash)` WITHOUT
+    /// touching the map. The apply path writes the registry back only when the
+    /// working copy differs (`apply.rs`, `if *before != work`), so a duplicate
+    /// registration neither bumps `commitment_generation` nor re-serialises /
+    /// re-hashes the whole registry preimage. Different weights under a taken
+    /// id still revert (first writer wins).
+    ///
     /// WHO CAN REGISTER (audit Z1 model-registry access): anyone. The live
     /// caller (`OpCode::SysCallRegisterZkMlModel`) imposes no allowlist — any
     /// transaction payer who pays the gas registers. This is safe, not an
     /// oversight, because the registry is APPEND-ONLY first-wins (an id that
-    /// is already registered cannot be re-registered or overwritten, so
+    /// is already registered cannot be re-bound to different weights, so
     /// nobody can swap the weights a proof is checked against after the
     /// fact), every model is validated (`validate`) and bounded
-    /// ([`MAX_ZKML_MODEL_PARAMS`]), and proofs match by MODEL HASH
-    /// (`verify_inference_against` re-derives the hash from the registered
-    /// weights) — trusting an id only ever proves that id's model.
+    /// ([`MAX_ZKML_MODEL_PARAMS`]), the registry as a whole is bounded
+    /// ([`MAX_ZKML_REGISTRY_MODELS`], [`MAX_ZKML_REGISTRY_PARAMS`]), and proofs
+    /// match by MODEL HASH (`verify_inference_against` re-derives the hash
+    /// from the registered weights) — trusting an id only ever proves that
+    /// id's model.
     /// Residual: id-squatting is naming grief only (a squatter's model still
     /// proves just the squatter's model). GATING PRECONDITION (deferred): a
     /// governed id namespace (e.g. a `GovAction` reserving model-id prefixes)
@@ -1650,7 +1721,10 @@ impl ZkMlModelRegistry {
         model_id: [u8; 32],
         model: QuantizedLinearModel,
     ) -> Result<[u8; 32], String> {
-        if self.models.contains_key(&model_id) {
+        if let Some(existing) = self.models.get(&model_id) {
+            if existing.model == model {
+                return Ok(existing.model_hash);
+            }
             return Err("model id already registered (registry is append-only)".to_string());
         }
         if !model.validate() {
@@ -1664,6 +1738,21 @@ impl ZkMlModelRegistry {
         if params > MAX_ZKML_MODEL_PARAMS {
             return Err(format!(
                 "model too large: {params} parameters > {MAX_ZKML_MODEL_PARAMS} cap"
+            ));
+        }
+        if self.models.len() >= MAX_ZKML_REGISTRY_MODELS {
+            return Err(format!(
+                "registry full: {} models >= {MAX_ZKML_REGISTRY_MODELS} cap",
+                self.models.len()
+            ));
+        }
+        let total: usize = self
+            .models
+            .values()
+            .fold(0usize, |acc, r| acc.saturating_add(r.model.param_count()));
+        if total.saturating_add(params) > MAX_ZKML_REGISTRY_PARAMS {
+            return Err(format!(
+                "registry full: {total} + {params} parameters > {MAX_ZKML_REGISTRY_PARAMS} cap"
             ));
         }
         let model_hash = model.compute_model_hash();
@@ -1798,6 +1887,26 @@ mod tests {
         let json = serde_json::to_string(&caps).expect("capabilities serialize");
         assert!(json.contains("\"zero_knowledge\":false"));
         assert!(json.contains("SysCallVerifyZkMlAttestation"));
+        // The "setup" wording must not read as a vetted setup: there is none,
+        // and the label is unauthenticated / first-writer-wins.
+        assert!(
+            caps.setup_note.to_lowercase().contains("no setup"),
+            "setup_note must say there is no setup: {}",
+            caps.setup_note
+        );
+        assert!(
+            caps.setup_note.to_lowercase().contains("first-writer-wins"),
+            "setup_note must say the label is unauthenticated: {}",
+            caps.setup_note
+        );
+        for o in &caps.opcodes {
+            assert!(
+                o.trusted_setup.starts_with("PREMISE"),
+                "{}: setup wording must state a premise, not a setup: {}",
+                o.opcode,
+                o.trusted_setup
+            );
+        }
     }
 
     fn model() -> QuantizedLinearModel {
@@ -1807,6 +1916,97 @@ mod tests {
             vec![2, -1, 1, 3],
             vec![1, -2],
         )])
+    }
+
+    /// One layer with EXACTLY `params` parameters (`(params - 1) x 1` weights
+    /// plus one bias), so the cap arithmetic is explicit.
+    fn param_model(params: usize) -> QuantizedLinearModel {
+        let in_dim = params - 1;
+        QuantizedLinearModel::new(vec![QuantizedLayer::new(
+            in_dim,
+            1,
+            vec![0; in_dim],
+            vec![0],
+        )])
+    }
+
+    fn id_at(i: u64) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&i.to_be_bytes());
+        id
+    }
+
+    #[test]
+    fn duplicate_registration_is_an_idempotent_no_op() {
+        let mut reg = ZkMlModelRegistry::default();
+        let m = model();
+        let id = [0x51; 32];
+
+        let first = reg.register(id, m.clone()).expect("first registration");
+        let snapshot = reg.clone();
+        let second = reg
+            .register(id, m.clone())
+            .expect("identical re-registration must be idempotent (Ok, no state change)");
+        assert_eq!(first, second, "the returned model hash must not change");
+        assert_eq!(
+            reg, snapshot,
+            "an identical duplicate must not touch the registry (so the preimage is not rebuilt)"
+        );
+
+        // Different weights under a taken id still revert: first writer wins.
+        let other = QuantizedLinearModel::new(vec![QuantizedLayer::new(
+            2,
+            2,
+            vec![1, 1, 1, 1],
+            vec![0, 0],
+        )]);
+        let err = reg
+            .register(id, other)
+            .expect_err("different weights under a taken id must stay refused");
+        assert!(err.contains("already registered"), "{err}");
+        assert_eq!(reg, snapshot);
+    }
+
+    #[test]
+    fn registry_refuses_beyond_its_total_model_cap() {
+        let mut reg = ZkMlModelRegistry::default();
+        let m = param_model(4);
+        for i in 0..MAX_ZKML_REGISTRY_MODELS as u64 {
+            reg.register(id_at(i), m.clone())
+                .expect("registration under the total model cap must succeed");
+        }
+        assert_eq!(reg.len(), MAX_ZKML_REGISTRY_MODELS);
+        let err = reg
+            .register(id_at(MAX_ZKML_REGISTRY_MODELS as u64), m)
+            .expect_err("one model over the cap must be refused");
+        assert!(
+            err.contains("registry full"),
+            "refusal must say the registry is full: {err}"
+        );
+        assert_eq!(reg.len(), MAX_ZKML_REGISTRY_MODELS, "refusal changes nothing");
+    }
+
+    #[test]
+    fn registry_refuses_beyond_its_total_parameter_cap() {
+        // 4_096 params each; the total cap is 1_048_576 => exactly 256 fit.
+        let m = param_model(4_096);
+        let per = m.param_count();
+        let max_models = MAX_ZKML_REGISTRY_PARAMS / per;
+        assert!(max_models < MAX_ZKML_REGISTRY_MODELS);
+        let mut reg = ZkMlModelRegistry::default();
+        for i in 0..max_models as u64 {
+            reg.register(id_at(i), m.clone())
+                .expect("registration under the total parameter cap must succeed");
+        }
+        assert_eq!(reg.len(), max_models);
+        let err = reg
+            .register(id_at(max_models as u64), m)
+            .expect_err("one model over the parameter cap must be refused");
+        assert!(
+            err.contains("registry full") && err.contains("parameters"),
+            "refusal must name the parameter cap: {err}"
+        );
+        assert_eq!(reg.len(), max_models, "refusal changes nothing");
     }
 
     #[test]

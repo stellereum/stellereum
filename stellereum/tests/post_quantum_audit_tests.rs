@@ -686,9 +686,14 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
     };
 
     let credited = target_engine.apply_cross_shard_consumptions(&block).await;
+    // XSHARD-01: the pinned-account proof above is an AFFORDABILITY proof
+    // (the sender could pay), not proof that shard 1 DEBITED the sender. The
+    // inbound legacy credit is paid only against the source's committed
+    // ESCROW/DEBIT leaf, so this message is REFUSED: the recipient is not
+    // credited and the replay key is not claimed.
     assert_eq!(
-        credited, 1,
-        "Exactly 1 cross-shard inbound message must be credited"
+        credited, 0,
+        "an affordability-only inbound message must NOT be credited"
     );
     let balance_after = target_engine
         .get_account(&recipient)
@@ -696,8 +701,13 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
         .map(|a| a.balance)
         .unwrap_or(0);
     assert_eq!(
-        balance_after, transfer_amount,
-        "Recipient must be credited exact transfer amount"
+        balance_after, 0,
+        "an affordability-only inbound message must not move value"
+    );
+    assert_eq!(
+        target_engine.cross_shard_consumed_len().await,
+        0,
+        "a refused message must not touch the replay set"
     );
 }
 

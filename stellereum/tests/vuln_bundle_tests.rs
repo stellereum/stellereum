@@ -305,9 +305,9 @@ fn persist_queue_setters_reflect_in_snapshot() {
 
 /// Overflowing the bounded queue counts drops on the process-global registry
 /// (the F2 wiring: `AsyncPersistence::push` -> `inc_persist_queue_dropped`).
-/// Deterministic: on a current_thread runtime the worker cannot drain while
-/// this loop holds the thread without awaiting, so CAP+5 sync enqueues drop
-/// exactly 5.
+/// Uses the `DropFirst` prune class: consensus-critical `Finalized`/
+/// `Consensus` jobs are now `CriticalWait` and are DEFERRED (never dropped
+/// synchronously), so they are not a deterministic drop fixture.
 #[tokio::test]
 async fn persist_queue_full_counts_drops() {
     use stellereum::storage::{AsyncPersistence, Storage, PERSIST_QUEUE_CAP};
@@ -323,14 +323,14 @@ async fn persist_queue_full_counts_drops() {
         .persist_queue_dropped;
     let ap = AsyncPersistence::start(storage);
     for _ in 0..PERSIST_QUEUE_CAP + 5 {
-        ap.enqueue_finalized(1, [0u8; 32]);
+        ap.enqueue_prune(1);
     }
     let after = stellereum::metrics::global()
         .snapshot()
         .persist_queue_dropped;
     assert!(
         after - before >= 5.0,
-        "5 over-cap pushes must count 5 drops (delta={})",
+        "5 over-cap prune pushes must count 5 drops (delta={})",
         after - before
     );
     let _ = std::fs::remove_dir_all(&dir);

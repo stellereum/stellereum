@@ -9,7 +9,7 @@
 //! | --- | --- | --- |
 //! | refused at ADMISSION (bad signature, wrong nonce, cannot cover `amount + fee`) | nothing - it never ran | unchanged |
 //! | replay / nonce gap (not attributable) | nothing | unchanged |
-//! | attributable failure the sender CAN cover | `max(gas_limit, consensus floor) + surcharge` | **advanced by one** |
+//! | attributable failure the sender CAN cover | `max(min(gas_limit, intrinsic envelope), consensus floor) + surcharge` (FEE-01: the declaration is a budget, never the price) | **advanced by one** |
 //! | attributable failure the sender CANNOT cover | **nothing moves at all** (I15, the grief rule) | unchanged |
 //!
 //! WHY THE FEE EXISTS (anti-DoS): a free failure is a free DoS - a spammer
@@ -216,20 +216,20 @@ async fn a_replay_or_a_nonce_gap_moves_nothing() {
 ///
 /// THE SETUP: one block, two transactions from the same sender.
 ///
-/// * tx1 MOVES value out through a payload transfer. Admission reserves only
-///   `amount + fee`, so the block path charges the DECLARED limit
-///   (`GAS_TRANSFER_LIMIT`) and the sender is left with
-///   `10_000_000 - 9_000_000 - 300_000 = 700_000`.
-/// * tx2 DECLARES a limit (1_000_000) the sender can no longer cover. It was
-///   admitted (the admission reserve still saw the pre-drain balance), so
-///   its refusal is ATTRIBUTABLE - the block path treats it as a failure that
-///   owes the floor - but the floor is UNCOVERABLE.
+/// * tx1 MOVES value out through a payload transfer. Admission reserved
+///   `amount + declared gas_limit`; FEE-01 charges the gas actually consumed
+///   (`GAS_BASIC_TRANSFER` for the one `Transfer` opcode) plus the PQ
+///   surcharge, so the sender is left with
+///   `9_500_000 - 9_000_000 - (280_000 + 45_000) = 175_000`.
+/// * tx2's failure fee is `min(declared, GAS_BASIC_TRANSFER) + surcharge`
+///   = 325_000, which the sender can no longer cover. Its refusal is
+///   therefore the UNCOVERABLE case (the grief rule).
 ///
 /// The rule is atomic: nothing is charged (not even the dust), and the nonce
 /// is NOT burned, so the sender's NEXT transaction is still possible.
 #[tokio::test]
 async fn a_failure_the_sender_cannot_cover_moves_nothing() {
-    let (engine, addr) = engine_with(10_000_000, 0xA3).await;
+    let (engine, addr) = engine_with(9_500_000, 0xA3).await;
     let k = key(0xA3);
     let sink = [0xB2; 32];
 
@@ -243,8 +243,8 @@ async fn a_failure_the_sender_cannot_cover_moves_nothing() {
             amount: 9_000_000,
         }],
     );
-    // The declared limit is what the block path charges on a SUCCESS, so the
-    // sender is left with exactly 700_000 - less than tx2's 1_000_000 limit.
+    // FEE-01: the drain pays its CONSUMED gas (280 000 + surcharge), so the
+    // sender is left with 175 000 - less than tx2's 325 000 failure fee.
     let doomed = tx_of(
         &k,
         1,
@@ -265,7 +265,7 @@ async fn a_failure_the_sender_cannot_cover_moves_nothing() {
         "the drain applies, the doomed one fails"
     );
     assert_eq!(status, vec![true, false]);
-    let drain_fee = GAS_TRANSFER_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS;
+    let drain_fee = stellereum::svm::GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS;
     assert_eq!(fees, drain_fee, "only the drain paid a fee");
     assert_eq!(
         tx_fees,
@@ -275,7 +275,7 @@ async fn a_failure_the_sender_cannot_cover_moves_nothing() {
 
     // The sender keeps every coin it had after the drain, and its nonce was
     // not burned: the failure moves NOTHING.
-    let balance_after_drain = 10_000_000 - 9_000_000 - drain_fee;
+    let balance_after_drain = 9_500_000 - 9_000_000 - drain_fee;
     assert_eq!(
         balance_of(&engine, &addr).await,
         balance_after_drain,
@@ -332,10 +332,14 @@ async fn an_attributable_failure_pays_exactly_the_failure_fee() {
     );
 
     let fee = failure_fee(&engine, &t).await;
+    // FEE-01: the failure fee is the intrinsic envelope cost (`GAS_BASIC_TRANSFER`,
+    // capped at the 300 000 declaration) plus the additive PQ surcharge — NOT
+    // the declared limit. The old expectation, `GAS_TRANSFER_LIMIT +
+    // PQ_ACTIVATION_SURCHARGE_GAS`, encoded the declared-limit over-charge.
     assert_eq!(
         fee,
-        GAS_TRANSFER_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS,
-        "the declared limit plus PQ activation surcharge is the failure fee here"
+        stellereum::svm::GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS,
+        "the intrinsic envelope cost plus PQ activation surcharge is the failure fee here"
     );
     let before = balance_of(&engine, &addr).await;
     assert!(

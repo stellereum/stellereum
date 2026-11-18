@@ -1,201 +1,126 @@
 # 02 — Crypto & Post-Quantum (HDAE Phase-2, code truth)
 
-Source files: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `bls.rs`,
-`vrf.rs`, `cn_vrf.rs`, `minroot_vdf.rs`, `staking.rs`, `wallet_signing.rs`, `stellereum/Cargo.toml`.
-Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
+Verified on the 2026-11-18 tree (base HEAD `0fdf1eefc` plus the day's in-flight
+edits; line numbers match that tree), after the FULL-PQ wipe and the module
+split. Classical signature paths are deleted: there is no `bls.rs`, no
+ECVRF activation, and no `STELL_PURE_PQ` switch on the node. Every `file:line`
+below was re-grepped on this tree; anything that is no longer resolvable is
+marked `STALE — see <path>`.
+
+Sources: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `vrf.rs`,
+`cn_vrf.rs`, `minroot_vdf.rs`, `staking.rs`, `wallet_signing.rs`,
+`stellereum/Cargo.toml`.
 
 ## 1. Falcon-512 (FIPS 206)
 
-- Sizes pinned: pubkey 897 B (`post_quantum.rs:103`), sig 666 B (`:109`);
-  hybrid 929 B (`:105`) / 730 B (`:111`); Ed25519 32 B (`:102`) / 64 B (`:108`).
-- Lattice params: `FALCON_MODULUS_Q 12289` (`:114`), `FALCON_N 512` (`:115`),
-  `FALCON_NORM_BOUND_SQ 34034726` (`:116`).
-- Verifier: `verify_pq_signature` (`:520`), Falcon path `verify_falcon512` (`:2319`);
-  FIPS-206-compliant keygen+signer block (`:1190`); linked C archive via
-  `use pqcrypto_falcon as _` (`:23`), dep `pqcrypto-falcon 0.4.1`
-  (`stellereum/Cargo.toml:55`).
-- Verify-only posture: node links the Falcon C archive for verify; keygen/signer
-  code present in-module (`:1190-1222` header — FIPS-206 `ffSampling` signer,
-  C entry points for caller-seeded randomness; operator key tooling = this
-  in-module signer, linked archive via `use pqcrypto_falcon as _` `:23`).
-- CN-VRF re-pins the same sizes: `pk == 897`, `pi == 666` (`cn_vrf.rs:67-69`).
+- Sizes pinned: pubkey 897 B (`post_quantum.rs:127`), sig 666 B (`:136`);
+  ML-DSA-44 sizes 1312 B / 2420 B are listed but unusable (`:128,:137`).
+- Lattice params: `FALCON_MODULUS_Q 12289` (`:140`), `FALCON_N 512` (`:141`),
+  `FALCON_NORM_BOUND_SQ 34034726` (`:142`).
+- Verifier: `verify_pq_signature` (`:534`), Falcon path `verify_falcon512`
+  (`:2213`); linked C archive via `pqcrypto-falcon 0.4.1`
+  (`stellereum/Cargo.toml:46`, link note `:43-45`).
+- Verify-only posture: node links the Falcon C archive for verify; the
+  in-module FIPS-206 signer exists for operator tooling. There is no classical
+  fallback anywhere.
+- CN-VRF re-pins the same sizes: `CNVRF_PK_LEN` / `CNVRF_PI_LEN`
+  (`cn_vrf.rs:77-79`).
 
 ## 2. Pure-PQ enforcement points
 
-- Switch: `is_pure_pq_enforced()` (`post_quantum.rs:71-90`); env `STELL_PURE_PQ`
-  (`:80-84`, values `1`/`true`/`always`); programmatic override
-  `set_pure_pq_override` (`:48-56`, atomic `:25`, test thread-local `:39-41`).
-- Mempool: non-PQ `pq_envelope` refused (`mempool.rs:1844-1859`,
-  message `Pure PQ mode: classical non-PQ transactions rejected` `:1850`).
-- QC verify: classical BLS/Ed25519 paths refused under pure-PQ
-  (`consensus.rs:2851-2854`).
-- Batch-mirror contract: every batched screen MUST branch on the flag and fall
-  back to scalar verify (`post_quantum.rs:65-70`).
-- ML-DSA-44 fail-closed: `from_id(3)` refuses loud (`post_quantum.rs:159-171`),
-  `is_disabled` gate (`:173-179`), sizes 1312/2420 listed but unusable
-  (`:104,:110`).
+- `is_pure_pq_enforced()` (`post_quantum.rs:89`): on the node the override is
+  installed as `Some(true)` (`node/consensus_driver.rs:94`), so the
+  `STELL_PURE_PQ` env is parsed-and-ignored with a WARN (`:78`). It is a
+  library/sim switch only — **do not document it as a node switch**.
+- Programmatic override `set_pure_pq_override` (`post_quantum.rs:56`).
+- Mempool: non-PQ envelopes are refused (`mempool.rs`; FULL-PQ admission).
+- QC verify: non-post-quantum entries are rejected with no fallback
+  (`consensus/types.rs:1859-1861`).
+- ML-DSA-44 fail-closed: `from_id(3)` is unknown/refused (`post_quantum.rs:184-197`),
+  `is_disabled()` returns true for it (`:206-208`).
 
 ## 3. Classical inventory pointer
 
-- `docs/CLASSICAL_INVENTORY.md:1` is the classical-use registry (ed25519,
-  secp256k1, X25519, P-256, BLS12-381, RSA/DSA/DH). Tree deps confirm classical
-  crates: `ed25519-dalek` + `x25519-dalek` (`stellereum/Cargo.toml:13-14`),
-  `bls12_381 0.9` (`:41`), `argon2 0.5` (`:46`); infnode workspace also carries
-  ed25519/x25519 (confirmed `infnode/Cargo.toml:17,40`,
-  `infnode/crates/infnode/Cargo.toml:14,32`; inventory `:17-19`).
-- No PQ KEM op in tree: `Cargo.lock` carries no `ml-kem`/`mlkem`/`kyber` package
-  (verdict `pq_transport.rs:60-70`); only ML-KEM-768 framing consts in parked
-  `mev_v4.rs:84-112` (dead engine, `STELL_MEV_V4` default-off) + an
-  explicitly-unavailable rank-1 KEM entry (`pq_transport.rs:391-396`, test-pinned
-  `:639-641`); PQ sigs present. Inventory `:21` corroborates.
+- `docs/CLASSICAL_INVENTORY.md:1` is the classical-use registry. The tree
+  still carries transport/ECC dependencies that are NOT consensus signature
+  schemes: `ed25519-dalek` (`stellereum/Cargo.toml:13`) and `argon2` (`:37`).
+  `bls12_381` is **gone**; `x25519-dalek` is gone from the core crate.
+- infnode's PQ transport is the live PQ path (Falcon frame auth + ML-KEM-768
+  KEX); stale KEX-verdict prose was corrected in `pq_transport.rs:8`.
+- `ml-kem 0.3` is a direct `infnode` dependency
+  (`infnode/crates/infnode/Cargo.toml:34`) with Wycheproof KATs
+  (`infnode/crates/infnode/tests/kem_kat_tests.rs`). The module is still NOT
+  declared in `infnode/src/lib.rs` (mod list `:4-17`), so `pq_transport` is
+  UNWIRED: the crate and KATs exist, no node path calls them.
 
 ## 4. Classical markers (do not present as PQ)
 
-- BLS: `PUBLIC_KEY_LEN 48` (`bls.rs:72`), `SIGNATURE_LEN 96` (`:74`),
-  `BLS_IS_POST_QUANTUM = false` (`:80`), activation-gated
-  `DEFAULT_BLS_ACTIVATION_HEIGHT 10000` / `is_bls_active` (`:83-86`).
-  No-PoP structural status: `parse_registry_entries` accepts any non-identity
-  G1 with NO proof-of-possession — rogue-key rationale at `bls.rs:527-531`;
-  strict-PoP parse opt-in via `STELL_BLS_POP_REQUIRED` (`:508-518`).
-- ECVRF: Edwards25519 ECVRF per RFC 9381 (`vrf.rs:21-23`); explicitly
-  CLASSICAL/legacy/off-only (`:56-73`); activation env
-  `STELL_VRF_ACTIVATION_HEIGHT` (`:128`); default Disabled (runtime gate
-  `runtime.rs:1677` comment). Deterministic-Schnorr construction: "legacy
-  Schnorr proof hashes" domain `vrf.rs:106`, output-hash domain `:113`,
-  phase-1 envelope note (`R || z`, 80 B) `:145`.
-- Domains: `VRF_BEACON_DOMAIN` (`vrf.rs:94`), `VRF_SCALAR_DOMAIN` (`:101`),
-  `VRF_BINDING_DST` (`:104`), `VRF_PROOF_DOMAIN` (`:111`),
-  `VRF_OUTPUT_DOMAIN` (`:118`), `VRF_ELECTION_DOMAIN` (`:124`).
+- **BLS: DELETED.** There is no `bls.rs`, no `DEFAULT_BLS_ACTIVATION_HEIGHT`,
+  and no BLS QC marker. Any pointer to `bls.rs` is STALE — see
+  `stellereum/src/consensus/` for the PQ-only QC path.
+- **ECVRF: DELETED.** `vrf.rs` is 133 lines of pure sortition MATH only
+  (`vrf.rs:1-22` header): no key material, no registry, no environment reads,
+  no `VrfActivation`, no `STELL_VRF_ACTIVATION_HEIGHT`. The live committee
+  election is the canonical parent-hash draw (`consensus/sortition.rs:404,425`).
+  Any pointer to `vrf.rs:128` / `STELL_VRF_ACTIVATION_HEIGHT` is STALE.
+- Domains that remain are CN-VRF's, not ECVRF's: see §5.
 
-## 5. CN-VRF pointer (v1 + v3 + MinRoot PQ-VDF)
+## 5. CN-VRF (v1 + v3 + MinRoot PQ-VDF) — WIRED
 
-- Spec: `docs/PQ_CN_VRF_SPEC.md:1` (v1 spec + §7 CN-VRF v3 specification; v1
-  `CommitCarrier` signs public `CNVRF_COMMIT_SIG_DST`, never secret
-  `commit_preimage`).
-- Sandbox v1: `cn_vrf.rs:1-4`, `EPOCH_LEN 7200` (`:62`); DSTs
-  `STELL_CNVRF_COMMIT_V1` / `COMMIT_SIG_V1` / `OPEN_V1` / `BETA_V1` (`:65-71`);
-  nonce custody 0600 (`:761-1006`).
-- CN-VRF v3 (`cn_vrf.rs:1009-1821`): 16-segment 48-byte `BLAKE3-XOF-48` reverse
+- Spec: `docs/PQ_CN_VRF_SPEC.md:1`.
+- v1 sandbox primitives: `EPOCH_LEN 7200` (`cn_vrf.rs:65`); DSTs
+  `STELL_CNVRF_COMMIT_V1` / `COMMIT_SIG_V1` / `OPEN_V1` / `BETA_V1`;
+  `cnvrf_commit` (`:381`), `cnvrf_verify` (`:491`), commit state
+  (`:655,:687`); nonce custody 0600.
+- CN-VRF v3 (`cn_vrf.rs:1009+`): 16-segment 48-byte `BLAKE3-XOF-48` reverse
   hash-chain (`V3_LINK_LEN 48` `:1013`, `V3_SEGMENTS 16` `:1015`,
-  `V3_SEGMENT_LEN 450` `:1017`, `16 × 450 = EPOCH_LEN`); `V3_COMMIT_LOOKAHEAD_BLOCKS 360`
-  (`:1019`); `CommitCarrierV3` (`COMMIT_CARRIER_V3_LEN 1474` `:1025`, Falcon-512
-  sig over `DST_COMMIT_SIG_V3`); bounded reveal verify (`cnvrf_v3_verify_reveal`
-  `<= 450` BLAKE3 steps `:1467`); `CnVrfV3State` (`:1520`) with `migrate_validator`
-  preserving `anchor_validator_id` (`:1650`); `epoch_raw_seed` deterministic
-  fallback (`:1702`); `enc2:` write-ahead custody `save_cnvrf_v3_secret` /
-  `load_cnvrf_v3_secret` + `verify_v3_secret_matches_commit` (`:1730-1821`).
-- MinRoot PQ-VDF (`minroot_vdf.rs`): 256-bit safe prime `p = 2^256 - 36113`
-  (`p ≡ 2 (mod 3)`, `P_LIMBS` `:42`); sequential cube-root `eval`
-  (`CUBE_ROOT_EXP` `:60`, `DEFAULT_VDF_STEPS_PER_EPOCH 3_000_000` `:38`) vs
-  `rayon`-parallel 2-mul backward `verify` (`MAX_VDF_CHECKPOINTS 4096` `:32`);
-  DSTs `STELL_MINROOT_VDF_V1_INIT` / `OUT` (`:26,:29`).
+  `V3_SEGMENT_LEN 450` `:1017`; `16 × 450 = EPOCH_LEN`);
+  `V3_COMMIT_LOOKAHEAD_BLOCKS 360` (`:1019`); `CommitCarrierV3`
+  (`COMMIT_CARRIER_V3_LEN` `:1025`); bounded reveal verify
+  `cnvrf_v3_verify_reveal` (`:1466`); `CnVrfV3State` (`:1519`);
+  deterministic `epoch_raw_seed` fallback (`:1707`).
 - Activation & abort accounting: `CNVRF_V3_ACTIVATION_HEIGHT`
-  (`consensus/sortition.rs:507`, default `u64::MAX` GatedOff; `CNVRF_V3_EPOCH_LEN 7200`
-  `:511`); dedicated non-vote-resettable abort slashing in `staking.rs`
-  (`CNVRF_ABORT_SLASH_BPS 100`, `CNVRF_ABORT_THRESHOLD 3`,
-  `CNVRF_ABORT_RECOVERY_STREAK 20`, `CnVrfAbortState` + `slash_cnvrf_abort`
-  across `self_bond + pending_rewards + unbonding + delegated` + jail).
+  (`consensus/sortition.rs:552`, default `u64::MAX` = dormant),
+  `CNVRF_V3_EPOCH_LEN 7200` (`:556`), sortition entry points
+  (`:601,:619`); dedicated non-vote-resettable abort slashing in `staking.rs`
+  (`CNVRF_ABORT_SLASH_BPS`, `CNVRF_ABORT_THRESHOLD`,
+  `CNVRF_ABORT_RECOVERY_STREAK`, `CnVrfAbortState` + `slash_cnvrf_abort`).
+- **The old "sandbox, zero callers, unwired" claim is FALSE now.** `cn_vrf`
+  is imported by `runtime/mod.rs:621-629`, `runtime/anchors.rs:101-209`,
+  `runtime/apply.rs:1001-1078`, `commitment.rs:1919+`, `storage.rs:5106`,
+  `sync.rs:2864`. The v3 sortition gate is production code, currently OFF.
+- Off-tick `VdfLane` (`runtime/anchors.rs:265,274,744`;
+  `runtime/lanes.rs` VdfLane) evaluates the checkpointed MinRoot PQ-VDF
+  (`minroot_vdf.rs`).
 
 ## 6. PQ registry + rotation
 
-- `PQ_ROTATION_DELAY_HEIGHTS 7200` (`pq_registry.rs:97`, ≈6h at 3s blocks `:86`);
-  rationale + test pin vs `COMMISSION_EFFECT_DELAY_HEIGHTS` (`:88-96`).
-- `PQ_KEY_HISTORY_LIMIT 2` (`:106`); `PQ_MAX_KEY_BYTES = HYBRID_PUBKEY_LEN 929`
-  (`:115`); announce DST `STELL_PQ_ROTATE_V1` (`:119`); error enum fail-closed
-  (`:127-144`).
+- `PQ_ROTATION_DELAY_HEIGHTS 7200` (`pq_registry.rs:101`);
+  `PQ_KEY_HISTORY_LIMIT 2` (`:110`); `PQ_MAX_KEY_BYTES = MLDSA44_PUBKEY_LEN`
+  (`:122`); announce DST `STELL_PQ_ROTATE_V1` (`:126`).
+- The old "`PQ_MAX_KEY_BYTES = HYBRID_PUBKEY_LEN 929`" claim is STALE: the
+  hybrid scheme is removed.
 
-## 7. CN-VRF API surface (sandbox, code truth 2026-11-02)
+## 7. `mev_pq_plan.rs` — test-only posture
 
-- Sandbox header + purity contract (`cn_vrf.rs:1-16`): pure fns + KATs only,
-  NO consensus/staking imports, no activation-height const; spec pointer
-  `docs/PQ_CN_VRF_SPEC.md:1`.
-- `EPOCH_LEN 7200` (`cn_vrf.rs:58`, O1 == `PQ_ROTATION_DELAY_HEIGHTS`);
-  DSTs `CNVRF_COMMIT_DST`/`OPEN_DST`/`BETA_DST` (`:61-65`); lens
-  `CNVRF_PI_LEN 666` / `CNVRF_PK_LEN 897` (`:67-70`, re-pin Falcon-512 sizes).
-- API: `shake256_32` (`:114`), `shake256_xof` (`:122`),
-  `commit_preimage_bytes` (`:174`), `open_message_bytes` (`:192`),
-  `beta_preimage_bytes` (`:212`), `commit_hash` (`:229`),
-  `CommitCarrier`/`RevealCarrier` (`:249,:269`, carriers `:90,:92`),
-  `cnvrf_commit` (`:300`), `cnvrf_open` (`:325`), `cnvrf_beta` (`:350`),
-  `cnvrf_verify` (`:383`), `cnvrf_verify_carrier` (`:425`),
-  `cnvrf_verify_with_resolver` (`:461`).
-- Epoch/state helpers: `epoch_of_height` (`:490`), `epoch_start_height`
-  (`:495`), `first_usable_epoch` (`:502`, O9 waits one full epoch),
-  `CommitmentRecord` (`:512`), `cnvrf_commit_state` (`:545`, O10 max-one-pending,
-  only `current_epoch+1`), `cnvrf_mark_revealed` (`:579`),
-  `cnvrf_expire_before` (`:600`), `cnvrf_draw_absence` (`:618`, O5 maps absence
-  to existing downtime path); nonce custody 0600 `save/load/parse`
-  (`:638,:662,:681`, O6 mirrors `vrf.rs:360-421`).
-- Sandbox status VERIFIED: zero `cn_vrf::` callers in `stellereum/src/` by grep
-  (only definitions in `cn_vrf.rs` + `stellereum/tests/cn_vrf_tests.rs:8,293`);
-  live sortition gate knows only `vrf::VrfActivation`
-  (`consensus.rs:1080-1086`); `cn_vrf` IS declared `pub mod` (`lib.rs:9`) but
-  unwired (no production call site).
+- `#[cfg(test)] mod mev_pq_plan` (`lib.rs:35-37` with GATE comment); 335
+  lines; header self-describes UNWIRED, `std`-only mechanics model; zero
+  production callers. Its domains/API (`pq_plan_digest`, `pq_plan_commit`,
+  `pq_plan_open_verify`, `pq_plan_beta`, `pq_plan_transcript`) remain
+  test-only; line numbers from the pre-split pass are STALE — read
+  `stellereum/src/mev_pq_plan.rs` directly.
+- Ranked replacement discussion is a design note only; the live MEV transport
+  is PQ already (classical packages refused at every height,
+  `mev_epoch.rs:990-1006`).
 
-## 8. `mev_pq_plan.rs` — test-only posture + ranked replacement
+## 8. KEM harness / benches (no invented numbers)
 
-- Posture: `#[cfg(test)] mod mev_pq_plan` (`lib.rs:31` with GATE comment
-  `test builds only, never production surface`); header self-describes UNWIRED,
-  `std`-only mechanics model, KATs via `rustc --test` (`mev_pq_plan.rs:1-7`);
-  zero `mev_pq_plan::` callers in tree by grep (only `lib.rs:31` decl).
-- Domains: `PQ_PLAN_COMMIT_DOMAIN` (`:82`), `PQ_PLAN_BETA_DOMAIN` (`:84`),
-  `PQ_PLAN_TRANSCRIPT_DOMAIN` (`:86`); model digest `pq_plan_digest` (`:109`),
-  `pq_plan_commit` (`:133`), `pq_plan_open_verify` (`:141`),
-  `pq_plan_beta` (`:154`), `pq_plan_transcript` (`:169`) +
-  `pq_plan_transcript_verify` (`:178`); KATs `#[cfg(test)]` (`:190-315`).
-- Ranked replacement (honest fit, `:45-68`): RANK-1 Falcon-authenticated PQ-KEM
-  transport swap (keep Feldman VSS + Ristretto threshold, replace only X25519
-  package encryption `mev_epoch.rs:1094-1136` + Falcon-sign contributions);
-  RANK-2 Falcon-signed commit-reveal per CN-VRF pattern for epoch seed only
-  (this file prototypes RANK-2 shape — KAT-testable in `std` today);
-  RANK-3/REJECTED pure hash-DRB (no threshold-decryption property).
-  Design doc mirror: `docs/MEV_PQ_PLAN.md`.
-
-## 9. ML-KEM crate + KEM tests + UNWIRED verdict
-
-- Crate: `ml-kem = "0.3"` direct dep of `infnode`
-  (`infnode/crates/infnode/Cargo.toml:36`); locked `ml-kem 0.3.4`
-  (`stellereum/Cargo.lock:1580-1582`, deps `hybrid-array/kem/module-lattice`
-  `:1584-1589`); pulled into `stellereum/Cargo.lock` via `infnode 0.1.0`
-  (`:1327-1350` lists `"ml-kem"` under `infnode` deps).
-- Note on stale verdict text: `pq_transport.rs:60-70` KEX VERDICT (dated
-  2026-11-02) states `Cargo.lock` holds NO `ml-kem` package — that sentence is
-  STALE as of the `infnode` direct dep above; the UNWIRED conclusion still
-  holds (next bullet). Do not cite `:60-70` package-absence line as current.
-- KEM tests (Wycheproof-pinned, `std`-runnable): published vector
-  `mlkem_768_test.json` group 1 tcId 2
-  (`infnode/crates/infnode/tests/kem_kat_tests.rs:20-24,40-70`);
-  KATs `mlkem768_wycheproof_kat_keygen_ek` (`:144`, ek 1184 B `:148`),
-  `mlkem768_wycheproof_kat_decap` (`:153`, ct 1088 B `:156`),
-  `mlkem768_roundtrip_fixed_seed_deterministic_encap` (`:171-187`),
-  `mlkem768_tampered_ciphertext_implicit_rejection` (`:194`),
-  `mlkem512_roundtrip_fixed_seed` (`:218`, ct 768 B `:223`),
-  `mlkem1024_roundtrip_fixed_seed` (`:233`, ct 1568 B `:238`).
-- UNWIRED: `pq_transport` is NOT declared in
-  `infnode/crates/infnode/src/lib.rs` (mod list `config/dht/federation/keyring/
-  log/mailbox/metrics/migration/node/proto/reputation/rewards/services/totp` —
-  no `pq_transport`); machine-checked by `pqplan_unwired_proof`
-  (`pq_transport.rs:734-770`, asserts `lib.rs` + `node.rs` reference neither
-  `pq_transport` nor `PqPlan`). `stellereum` PQ-KEM framing consts remain parked
-  in dead engine `mev_v4.rs:84-115` (`MLKEM768_PUBLIC_KEY_SIZE 1184`,
-  `CIPHERTEXT_SIZE 1088`, magics `MLKEM768_PK_MAGIC/CTXT_MAGIC/SHR_MAGIC`).
-
-## 10. KEM-KAT / privacy_pq / pq-gates harness (no invented numbers)
-
-- No static before/after ns/tx values exist in tree (grep over
-  `stellereum/benches/*` + `stellereum/tests/*` finds only harness print
-  formats, e.g. `[bench][...] ... ns/op` at `benches/privacy_batch.rs:49-56`,
-  `benches/packing.rs:53-66`, `benches/fee_path.rs:168`; measured numbers are
-  runtime-only). All throughput claims below are therefore HARNESS-EXISTENCE
-  claims, not measurements — UNVERIFIED static count added: 0.
-- `privacy_batch` bench (`benches/privacy_batch.rs:1-16`): scalar-vs-batched
-  `openings`/`conservation`/`range` + `bitproof_reference_vs_msm` (`:94-155`);
-  prints `[bench][privacy_batch][<item>] n=<size> scalar=<ns> batch=<ns>
-  speedup=<x>` (`:49-56`) via `time_ns_per_op` (`:35-41`).
-- `privacy_pq_tests.rs` (`stellereum/tests/privacy_pq_tests.rs:1-4`): default
-  mode honest flow unchanged (`:95-112`), enforced mode refuses all
-  Ristretto ops (`:141-222`, `privacy_pq_refused` mirror `:36-55`).
-- `pq_gates_staking_light_tests.rs` (`:1-4` mirrors gate rows P2-10/P2-11/P2-16):
-  ED-fallback present w/o enforcement (`:130`), refused under pure-PQ (`:145`),
-  slash ED-refused/Falcon-slashed matrix (`:180-312`, `BURN_5PC 250*STELL`),
-  light-quorum ED-counts/Falcon-counts/empty matrix (`:321-383`).
+- `STALE — see stellereum/benches/ and stellereum/tests/`. The old text cited
+  `benches/privacy_batch.rs` and `tests/privacy_pq_tests.rs`, which no longer
+  exist. No static before/after ns/tx values are pinned anywhere; throughput
+  is runtime-only.
+- `tests/pq_gates_staking_light_tests.rs` and
+  `tests/privacy_pq_tests.rs` — the latter is gone; the gate matrix that
+  remains lives in `stellereum/tests/` (grep for `pq_gates`).
+- `ml-kem` KATs: §3 above (1184/1088/768/1568 B vectors in
+  `kem_kat_tests.rs`); measured numbers are not claimed here.

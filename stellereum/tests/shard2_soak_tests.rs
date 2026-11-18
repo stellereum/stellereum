@@ -108,14 +108,18 @@ async fn sharded_pair(
                 .expect("PQ sender must pin");
         }
     }
-    ShardedCluster::new(
+    let mut sc = ShardedCluster::new(
         sharded(),
         vec![
             (SHARD0, vec![(validator.clone(), s0)]),
             (SHARD1, vec![(validator.clone(), s1)]),
         ],
         CrossShardTransport::local(),
-    )
+    );
+    // XSHARD-01: cross-shard VALUE runs through the §9 2PC (the legacy
+    // one-step credit is refused; it cannot prove the source-side debit).
+    sc.with_xpc_activation(stellereum::xshard2pc::XpcActivation::FromHeight(0));
+    sc
 }
 
 async fn balance(sc: &ShardedCluster, shard: u32, addr: &[u8; 32]) -> u64 {
@@ -362,12 +366,15 @@ async fn shard2_soak_freeze_and_heal() {
     let f1_healed = finalized_len(sc.shard(SHARD1));
     eprintln!("SOAK heal: finals1 {f1_frozen}->{f1_healed}");
     assert_eq!(f1_healed, f1_pre + 4, "healed shard catches up");
-    // Interop still works after the heal.
+    // Interop still works after the heal (the 2PC handshake needs a few
+    // heights: prepare, vote, commit).
     let tx = pq_tx(32, recipient_addr, 5_000, 25, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
     sc.shard_mut(SHARD1).broadcast_tx(tx).await;
-    sc.run_height(SHARD0, 8).await;
-    sc.run_height(SHARD1, 8).await;
+    for h in 8..=11 {
+        sc.run_height(SHARD0, h).await;
+        sc.run_height(SHARD1, h).await;
+    }
     assert_eq!(
         balance(&sc, SHARD1, &recipient_addr).await,
         5_000,

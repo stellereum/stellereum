@@ -1,3 +1,27 @@
+//! Node bootstrap: masterchain genesis + workchain shard startup.
+//!
+//! # KNOWN LIMITATION — the supply cap is PER ENGINE, not chain-wide (SUPPLY-01)
+//!
+//! [`stellereum::tokenomics::TOTAL_SUPPLY_CAP`] is enforced by a counter that
+//! lives in ONE [`InMemoryStateEngine`] (`reserve_mint_nano`, folded into that
+//! engine's committed root and snapshot). Every shard runs its OWN engine, so
+//! with N shards the enforced ceiling is N x the cap plus N genesis
+//! allocations: nothing aggregates the counters, and an inbound cross-shard
+//! credit arrives as a plain balance that the target shard's lazy baseline
+//! then treats as pre-mined genesis, permanently reducing that shard's
+//! headroom.
+//!
+//! This is NOT a bug in the single-shard deployment that ships today (one
+//! engine, one counter, invariant holds), but it means the "1 B STELL hard
+//! cap" headline is single-shard-only. Making it real needs a CHAIN-WIDE
+//! supply registry that shard mints reserve against — the same shape as the
+//! masterchain-only bridge — or an explicit spec decision that the cap is
+//! per-shard. Both are design changes (a new cross-shard committed value, an
+//! activation height, and a coordinated rollout), so they are deliberately
+//! NOT attempted here; the code below only adds the same boot-time
+//! genesis-allocation refusal the masterchain already has, which is the part
+//! that can be made true today.
+
 use ed25519_dalek::SigningKey;
 use infnode::config as node_config;
 use infnode::node::Node;
@@ -14,6 +38,30 @@ use stellereum::network::P2pNetworkAdapter;
 use stellereum::orderbook::OrderbookManager;
 use stellereum::sharding::{Block, ShardRegistry};
 use stellereum::state_engine::InMemoryStateEngine;
+
+/// Failed faucet-state durability writes (audit 2.3). Counted so a repeating
+/// failure is visible even if the log is rotated; the consequence (lifetime
+/// caps can reset on restart) is named at the failure site.
+static FAUCET_PERSIST_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the persisted genesis fingerprint, refusing on an I/O error.
+///
+/// An unreadable store is NOT "no fingerprint": treating the two the same
+/// would make the caller overwrite an existing record and accept a different
+/// genesis (audit 2.1). Pure over the `Result` so the read-gate is testable
+/// without a corrupt sled installation.
+fn read_genesis_fingerprint(
+    recorded: Result<Option<Vec<u8>>, String>,
+    context: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    recorded.map_err(|e| {
+        anyhow::anyhow!(
+            "{context}: cannot READ the persisted genesis fingerprint: {e}. Refusing to start: \
+             the store is unreadable and the genesis cannot be verified."
+        )
+    })
+}
 
 // Upgrade-halt durability + startup guard (`docs/UPGRADE_AND_RECOVERY.md`
 // §1.2.3/§1.2.4). Declared here rather than in `node/mod.rs` so the module
@@ -109,6 +157,29 @@ pub(crate) async fn start_workchain_shard(
             anyhow::anyhow!("[shard {shard}] workchain faucet genesis key error: {e}")
         })?;
     if let Some(seed) = workchain_seed {
+        // SUPPLY INVARIANT AT BOOT (SUPPLY-01 part B, fail closed): the
+        // workchain genesis credits ONE deterministic faucet account with
+        // `GENESIS_FAUCET_BALANCE` outside the minted-supply counter, so that
+        // shard's first mint folds it in as a pre-mined baseline. A genesis
+        // above `TOTAL_SUPPLY_CAP` would therefore refuse EVERY later reward
+        // and inbound mint on this shard. Refuse to boot instead of starting a
+        // shard that can never emit again — the same check the masterchain
+        // performs over `validators x GENESIS_VALIDATOR_BALANCE + faucet`.
+        //
+        // SCOPE: this is a per-shard assertion (each engine checks its OWN
+        // genesis); it does NOT make the cap chain-wide — see the module
+        // header's KNOWN LIMITATION note.
+        {
+            let genesis_nano = GENESIS_FAUCET_BALANCE as u128;
+            let cap = stellereum::tokenomics::TOTAL_SUPPLY_CAP as u128;
+            if genesis_nano > cap {
+                anyhow::bail!(
+                    "[shard {shard}] REFUSING genesis: the workchain pre-mined allocation (faucet = {} nano-STELL) exceeds TOTAL_SUPPLY_CAP ({}). Lower GENESIS_FAUCET_BALANCE; every post-genesis mint on this shard would otherwise fail closed.",
+                    GENESIS_FAUCET_BALANCE,
+                    cap
+                );
+            }
+        }
         // Own the seed in a wiping wrapper: the copy handed to Faucet::new is
         // wiped with its frame there; this binding is wiped on scope exit.
         let seed = zeroize::Zeroizing::new(seed);
@@ -173,15 +244,30 @@ pub(crate) async fn start_workchain_shard(
         stellereum::storage::Storage::open(&store_dir)
             .map_err(|e| anyhow::anyhow!("storage open shard {shard}: {e}"))?,
     );
-    match storage.get_meta("genesis_state_root") {
-        Ok(Some(prev)) if prev != genesis_root => {
+    let recorded_genesis = read_genesis_fingerprint(
+        storage
+            .get_meta("genesis_state_root")
+            .map_err(|e| e.to_string()),
+        &format!("shard {shard}"),
+    )?;
+    match recorded_genesis {
+        Some(prev) if prev != genesis_root => {
             anyhow::bail!(
                 "{}",
                 stellereum::bootstrap::genesis_mismatch_msg(Some(shard), &genesis_root, &prev)
             );
         }
-        _ => {
-            let _ = storage.set_meta("genesis_state_root", &genesis_root);
+        Some(_) => {}
+        None => {
+            storage
+                .set_meta("genesis_state_root", &genesis_root)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "shard {shard}: cannot WRITE the genesis fingerprint: {e}. Refusing to \
+                         run a chain whose genesis is not durably recorded (a later restart \
+                         could treat a different genesis as unrecorded)."
+                    )
+                })?;
         }
     }
     let persistence = Arc::new(stellereum::storage::AsyncPersistence::start(storage));
@@ -804,14 +890,25 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             faucet.account()
         });
         if let Some(faucet_addr) = faucet_key {
-            let _ = state_engine
+            state_engine
                 // GENESIS ALLOCATION (pre-mined): the faucet balance is part of
                 // the fixed 1B allocation, so it is credited with the UNCAPPED
                 // transfer primitive and does NOT advance the post-genesis
                 // emission counter. `TOTAL_SUPPLY_CAP` bounds everything minted
                 // AFTER genesis (rewards, bridge, faucet drips).
                 .credit_native_transfer(&faucet_addr, GENESIS_FAUCET_BALANCE)
-                .await;
+                .await
+                .map_err(|e| {
+                    // Genesis construction has NO best-effort steps: swallowing
+                    // this produced a funded-vs-unfunded faucet difference in
+                    // the genesis state root on one node only.
+                    anyhow::anyhow!(
+                        "genesis: failed to fund faucet account {} with {} nano: {e}. Refusing \
+                         to build a genesis whose allocation is not exact.",
+                        hex::encode(&faucet_addr[..6]),
+                        GENESIS_FAUCET_BALANCE
+                    )
+                })?;
             info!(
                 "Genesis: funded faucet account {} with {} STELL",
                 hex::encode(&faucet_addr[..6]),
@@ -909,11 +1006,17 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             "c840d1dc2e6c70eb7c639a193715c0a57375fc78ae1f9749dc3cc73cb4c8ee77";
         let legacy_v1_root = hex::decode(LEGACY_V1_GENESIS_ROOT_HEX).unwrap_or_default();
 
-        match storage.get_meta("genesis_state_root") {
-            Ok(Some(prev)) if prev == genesis_root => {
+        let recorded_genesis = read_genesis_fingerprint(
+            storage
+                .get_meta("genesis_state_root")
+                .map_err(|e| e.to_string()),
+            "masterchain",
+        )?;
+        match recorded_genesis {
+            Some(prev) if prev == genesis_root => {
                 info!("Genesis fingerprint matches the persisted chain");
             }
-            Ok(Some(prev)) if prev.as_slice() == legacy_v1_root.as_slice() => {
+            Some(prev) if prev.as_slice() == legacy_v1_root.as_slice() => {
                 info!(
                     "Genesis fingerprint matches legacy v1 testnet chain: {}",
                     hex::encode(&prev)
@@ -922,14 +1025,22 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     adapter.set_epoch(stellereum::network::EpochTag::from_genesis(&arr));
                 }
             }
-            Ok(Some(prev)) => {
+            Some(prev) => {
                 anyhow::bail!(
                     "{}",
                     stellereum::bootstrap::genesis_mismatch_msg(None, &genesis_root, &prev)
                 );
             }
-            _ => {
-                let _ = storage.set_meta("genesis_state_root", &genesis_root);
+            None => {
+                storage
+                    .set_meta("genesis_state_root", &genesis_root)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "cannot WRITE the genesis fingerprint: {e}. Refusing to run a \
+                             chain whose genesis is not durably recorded (a later restart \
+                             could treat a different genesis as unrecorded)."
+                        )
+                    })?;
                 info!(
                     "Recorded genesis state root {} for this chain",
                     hex::encode(genesis_root)
@@ -1188,7 +1299,33 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     // so no drip can slip through unpersisted.
                     let saver: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync> =
                         std::sync::Arc::new(move |bytes: &[u8]| {
-                            let _ = store.set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes);
+                            // Durability is a HARD requirement for the lifetime
+                            // caps/nonce: an in-memory advance whose durable
+                            // record did not land lets every capped address
+                            // redraw its full cap after a restart (rotating-IP
+                            // drain). We cannot fail the (already reserved)
+                            // drip from this sync hook without changing the RPC
+                            // API, so this is an explicit LOUD best-effort:
+                            // counted and logged with the consequence named.
+                            if let Err(e) = store
+                                .set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes)
+                            {
+                                let n = FAUCET_PERSIST_FAILURES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    .saturating_add(1);
+                                tracing::error!(
+                                    "[faucet] CRITICAL: failed to persist lifetime caps/nonce \
+                                     ({} failure(s)): {e}. Consequence: this drip's lifetime \
+                                     credit is in memory only; a restart can RESET per-address \
+                                     caps and reopen the faucet budget. Fix the store or stop \
+                                     the faucet.",
+                                    n
+                                );
+                                eprintln!(
+                                    "[faucet] CRITICAL: failed to persist faucet state \
+                                     ({n} failure(s)): {e}; lifetime caps can reset on restart"
+                                );
+                            }
                         });
                     Some(Arc::new(faucet.with_persist(saver)))
                 }),
@@ -1381,4 +1518,38 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     tokio::signal::ctrl_c().await?;
     info!("Stellereum Node shutting down cleanly.");
     Ok(())
+}
+
+#[cfg(test)]
+mod genesis_fingerprint_gate_tests {
+    //! Audit 2.1: a genesis-root READ failure must never be treated as
+    //! "no fingerprint" (which would overwrite the record and accept a
+    //! different genesis). Fails loudly instead.
+    use super::*;
+
+    #[test]
+    fn read_error_is_refused_never_treated_as_missing() {
+        let err = read_genesis_fingerprint(Err("sled: corrupted page".into()), "shard 0")
+            .expect_err("a READ error must refuse startup");
+        let text = format!("{err}");
+        assert!(text.contains("cannot READ"), "names the failed read: {text}");
+        assert!(text.contains("Refusing to start"), "names the refusal: {text}");
+        assert!(
+            text.contains("corrupted page"),
+            "keeps the underlying I/O reason: {text}"
+        );
+    }
+
+    #[test]
+    fn absent_and_present_records_pass_through_unchanged() {
+        assert_eq!(
+            read_genesis_fingerprint(Ok(None), "shard 0").expect("absent is not an error"),
+            None
+        );
+        let root = vec![0xABu8; 32];
+        assert_eq!(
+            read_genesis_fingerprint(Ok(Some(root.clone())), "shard 0").expect("record passes"),
+            Some(root)
+        );
+    }
 }

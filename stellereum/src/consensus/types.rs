@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::rotation::pq_key_at_height;
 use super::sortition::{
-    cnvrf_v3_active_at, cnvrf_v3_beacon_draw_committee, cnvrf_v3_epoch_of_height,
-    cnvrf_v3_proposer_seed, consensus_quorum_min, derive_sortition_committee, micro_committee_size,
-    mixed_quorum_pair_safe, pq_micro_quorum_threshold, pq_micro_required_power, qc_split_active_at,
+    cnvrf_v3_active_at, cnvrf_v3_epoch_of_height, cnvrf_v3_proposer_seed, consensus_quorum_min,
+    micro_committee_size, mixed_quorum_pair_safe, pq_micro_quorum_threshold,
+    pq_micro_required_power, qc_split_required,
 };
 
 pub type Height = u64;
@@ -20,6 +20,47 @@ pub type ValidatorId = [u8; 32];
 pub struct EpochBeacon {
     pub epoch: u64,
     pub output: [u8; 48],
+}
+
+/// The committee/proposer schedule in force at ONE height — the value every
+/// producer and verifier passes around instead of a bare activation boolean.
+///
+/// * [`CommitteeSchedule::ParentHash`] — below `CNVRF_V3_ACTIVATION_HEIGHT`.
+///   Every consumer takes the canonical v5 parent-hash path, byte-identical to
+///   the pre-activation code.
+/// * [`CommitteeSchedule::Beacon(Some(beacon))`] — at/after activation: the
+///   committee is drawn (`sortition::committee_for_height`) and the proposer
+///   chosen from the epoch beacon. The parent hash stays the chain-binding
+///   value (`binds_to_parent`) but lends no entropy.
+/// * [`CommitteeSchedule::Beacon(None)`] — activation is in force but this
+///   node does not know the epoch beacon yet. Every producer elects nobody and
+///   every verifier refuses (fail closed). It NEVER falls back to the
+///   parent-hash draw: a silent fallback is how two nodes would disagree about
+///   the committee at one height (review F2).
+///
+/// Owns its beacon ([`EpochBeacon`] is `Copy`) so a schedule can be built on
+/// the fly (runtime activation override, light-client epoch map) without
+/// borrowing anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitteeSchedule {
+    ParentHash,
+    Beacon(Option<EpochBeacon>),
+}
+
+impl CommitteeSchedule {
+    /// True when the beacon schedule is in force (the beacon may still be
+    /// unknown: producers/verifiers fail closed on `Beacon(None)`).
+    pub fn is_beacon(&self) -> bool {
+        matches!(self, Self::Beacon(_))
+    }
+
+    /// The epoch beacon carried by this schedule, if any.
+    pub fn beacon(&self) -> Option<&EpochBeacon> {
+        match self {
+            Self::Beacon(Some(b)) => Some(b),
+            Self::ParentHash | Self::Beacon(None) => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -107,7 +148,7 @@ pub fn verify_transaction_envelope_at_height(
     tx: &crate::sharding::Transaction,
     chain_height: u64,
 ) -> Result<(), String> {
-    let activation = crate::chain_binding::ChainBindingActivation::from_env();
+    let activation = crate::chain_binding::ChainBindingActivation::from_chain_spec();
     verify_transaction_envelope_at_height_with_activation(tx, chain_height, &activation)
 }
 
@@ -819,7 +860,25 @@ impl ValidatorSet {
         qc: &QuorumCertificate,
         beacon: Option<&EpochBeacon>,
     ) -> u64 {
-        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active_at(qc.height))
+        let schedule = if cnvrf_v3_active_at(qc.height) {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.qc_signed_power_with_schedule(qc, schedule)
+    }
+
+    /// [`Self::qc_signed_power_with_beacon`] under an explicit
+    /// [`CommitteeSchedule`] (the runtime/light-client entry point).
+    pub fn qc_signed_power_with_schedule(
+        &self,
+        qc: &QuorumCertificate,
+        schedule: CommitteeSchedule,
+    ) -> u64 {
+        qc.signers_set_with_schedule(self, schedule)
+            .iter()
+            .map(|v| self.power_of(v))
+            .fold(0u64, |a, p| a.saturating_add(p))
     }
 
     /// True when `qc` carries quorum power under this set using [`Self::qc_signed_power_with_beacon`].
@@ -835,18 +894,6 @@ impl ValidatorSet {
             && self.qc_signed_power_with_beacon(qc, beacon) >= self.quorum_power()
     }
 
-    fn qc_signed_power_with_beacon_inner(
-        &self,
-        qc: &QuorumCertificate,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
-    ) -> u64 {
-        qc.signers_set_with_beacon_inner(self, beacon, cnvrf_v3_active)
-            .iter()
-            .map(|v| self.power_of(v))
-            .fold(0u64, |a, p| a.saturating_add(p))
-    }
-
     #[cfg(test)]
     pub(crate) fn qc_signed_power_with_beacon_active(
         &self,
@@ -854,7 +901,12 @@ impl ValidatorSet {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> u64 {
-        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active)
+        let schedule = if cnvrf_v3_active {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.qc_signed_power_with_schedule(qc, schedule)
     }
 
     #[cfg(test)]
@@ -864,7 +916,7 @@ impl ValidatorSet {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> bool {
-        self.qc_signed_power_with_beacon_inner(qc, beacon, cnvrf_v3_active) >= self.quorum_power()
+        self.qc_signed_power_with_beacon_active(qc, beacon, cnvrf_v3_active) >= self.quorum_power()
     }
 
     pub fn len(&self) -> usize {
@@ -965,24 +1017,41 @@ impl ValidatorSet {
         round: Round,
         beacon: Option<&EpochBeacon>,
     ) -> Option<ValidatorId> {
-        self.proposer_for_with_beacon_inner(height, round, beacon, cnvrf_v3_active_at(height))
+        let schedule = if cnvrf_v3_active_at(height) {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.proposer_for_with_schedule(height, round, schedule)
+    }
+
+    /// [`Self::proposer_for_with_beacon`] under an explicit
+    /// [`CommitteeSchedule`]: the ONE proposer-schedule rule the runtime and
+    /// the light client use, so the proposer a node expects always comes from
+    /// the same schedule the producer signed under (review F2).
+    pub fn proposer_for_with_schedule(
+        &self,
+        height: Height,
+        round: Round,
+        schedule: CommitteeSchedule,
+    ) -> Option<ValidatorId> {
+        self.proposer_for_with_beacon_inner(height, round, schedule)
     }
 
     fn proposer_for_with_beacon_inner(
         &self,
         height: Height,
         round: Round,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> Option<ValidatorId> {
-        if !cnvrf_v3_active {
-            return self.proposer_for(height, round);
-        }
-        let b = beacon?;
-        if b.epoch != cnvrf_v3_epoch_of_height(height) {
+        let beacon = match schedule {
+            CommitteeSchedule::ParentHash => return self.proposer_for(height, round),
+            CommitteeSchedule::Beacon(beacon) => beacon?,
+        };
+        if beacon.epoch != cnvrf_v3_epoch_of_height(height) {
             return None;
         }
-        let seed = cnvrf_v3_proposer_seed(&b.output, b.epoch, height, round);
+        let seed = cnvrf_v3_proposer_seed(&beacon.output, beacon.epoch, height, round);
         self.proposer_from_digest(&seed)
     }
 
@@ -994,7 +1063,12 @@ impl ValidatorSet {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> Option<ValidatorId> {
-        self.proposer_for_with_beacon_inner(height, round, beacon, cnvrf_v3_active)
+        let schedule = if cnvrf_v3_active {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.proposer_for_with_schedule(height, round, schedule)
     }
 }
 
@@ -1555,12 +1629,29 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         beacon: Option<&EpochBeacon>,
     ) -> bool {
-        self.verify_unified_with_pq_keys_and_beacon_inner(
-            validators,
-            None,
-            beacon,
-            cnvrf_v3_active_at(self.height),
-        )
+        let schedule = if cnvrf_v3_active_at(self.height) {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.verify_with_schedule(validators, schedule)
+    }
+
+    /// THE verifier entry point: verify under an explicit [`CommitteeSchedule`].
+    ///
+    /// This is what every height-aware caller uses (the runtime derives the
+    /// schedule from its activation state and epoch beacon; the light client
+    /// from its configured activation height and recorded beacons), so the
+    /// committee the signers are attributed with is ALWAYS the one the producer
+    /// drew (review F2). Below activation the schedule is
+    /// [`CommitteeSchedule::ParentHash`] and the verdict is byte-identical to
+    /// [`Self::verify`].
+    pub fn verify_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> bool {
+        self.verify_unified_with_pq_keys_and_schedule_inner(validators, None, schedule)
     }
 
     #[cfg(test)]
@@ -1570,7 +1661,12 @@ impl QuorumCertificate {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> bool {
-        self.verify_unified_with_pq_keys_and_beacon_inner(validators, None, beacon, cnvrf_v3_active)
+        let schedule = if cnvrf_v3_active {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.verify_with_schedule(validators, schedule)
     }
 
     /// Verify the certificate AND return the power its verified signers carry
@@ -1595,7 +1691,7 @@ impl QuorumCertificate {
     /// * the returned power is summed over the UNION of verified signer ids
     ///   (exactly what `signers_set` + `qc_signed_power` compute).
     pub fn verify_and_signed_power(&self, validators: &ValidatorSet) -> (bool, u64) {
-        self.verify_and_signed_power_inner(validators, None, None, false)
+        self.verify_and_signed_power_inner(validators, None, CommitteeSchedule::ParentHash)
     }
 
     /// Beacon-aware variant of [`Self::verify_and_signed_power`]; below
@@ -1605,30 +1701,48 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         beacon: Option<&EpochBeacon>,
     ) -> (bool, u64) {
-        self.verify_and_signed_power_inner(
-            validators,
-            None,
-            beacon,
-            cnvrf_v3_active_at(self.height),
-        )
+        let schedule = if cnvrf_v3_active_at(self.height) {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.verify_and_signed_power_with_schedule(validators, schedule)
+    }
+
+    /// [`Self::verify_and_signed_power`] under an explicit
+    /// [`CommitteeSchedule`] — the fused verify+attribute entry point of the
+    /// adopt/replay paths.
+    pub fn verify_and_signed_power_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> (bool, u64) {
+        self.verify_and_signed_power_inner(validators, None, schedule)
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
+    // GATE: symmetry helper kept for test fixtures that assert the beacon-aware
+    // fused path matches `verify_with_beacon_active` + attribution.
     pub(crate) fn verify_and_signed_power_with_beacon_active(
         &self,
         validators: &ValidatorSet,
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> (bool, u64) {
-        self.verify_and_signed_power_inner(validators, None, beacon, cnvrf_v3_active)
+        let schedule = if cnvrf_v3_active {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.verify_and_signed_power_with_schedule(validators, schedule)
     }
 
     fn verify_and_signed_power_inner(
         &self,
         validators: &ValidatorSet,
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> (bool, u64) {
         // Same anti-DoS cap as `verify` (and `signers_set`): an over-cap
         // attacker-supplied list decides nothing and attributes nobody.
@@ -1651,12 +1765,7 @@ impl QuorumCertificate {
                     }
                     if let Some((valid, committee)) = self
                         .micro_cert_valid_signers_and_committee_with_beacon(
-                            &cert,
-                            validators,
-                            &msg,
-                            pq_keys,
-                            beacon,
-                            cnvrf_v3_active,
+                            &cert, validators, &msg, pq_keys, schedule,
                         )
                     {
                         if !verified
@@ -1697,10 +1806,12 @@ impl QuorumCertificate {
     /// Unified certificate verification supporting:
     /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and CEC Epoch (`PQ_QC_MARKER_ID`) envelopes.
     ///
-    /// C1 split (FIXES §1.7): at/after `QC_SPLIT_ACTIVATION_HEIGHT` the µQC
-    /// branch is advisory-only and refuses (`verify_micro_cert` fails closed
-    /// when the split is active), so only the full network QC (epoch/CEC,
-    /// ≥ `pq_full_required_power`) verifies. Pre-activation the legacy
+    /// C1 split (FIXES §1.7): whenever `qc_split_required(height, set size)`
+    /// holds — the governance gate at `QC_SPLIT_ACTIVATION_HEIGHT`, or a set
+    /// at/above `QC_SPLIT_BY_SIZE_THRESHOLD` — the µQC branch is
+    /// advisory-only and refuses (`verify_micro_cert` fails closed when the
+    /// split is required), so only the full network QC (epoch/CEC,
+    /// ≥ `pq_full_required_power`) verifies. Below BOTH legs the legacy
     /// network-anchored `max` rule applies unchanged.
     ///
     /// FULL-PQ: classical Ed25519 threshold deleted (no compat). A QC without
@@ -1718,15 +1829,18 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
     ) -> bool {
-        self.verify_unified_with_pq_keys_and_beacon_inner(validators, pq_keys, None, false)
+        self.verify_unified_with_pq_keys_and_schedule_inner(
+            validators,
+            pq_keys,
+            CommitteeSchedule::ParentHash,
+        )
     }
 
-    fn verify_unified_with_pq_keys_and_beacon_inner(
+    fn verify_unified_with_pq_keys_and_schedule_inner(
         &self,
         validators: &ValidatorSet,
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> bool {
         // Anti-DoS (audit F7): reject an implausibly long signer list BEFORE
         // touching any signature. The list is attacker-supplied and uncapped on
@@ -1740,7 +1854,7 @@ impl QuorumCertificate {
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
 
         // 1. Post-Quantum path: µQC (PQ_UQC_MARKER_ID) or CEC Epoch (PQ_QC_MARKER_ID)
-        if self.pq_path_verify_with_beacon(validators, &msg, pq_keys, beacon, cnvrf_v3_active) {
+        if self.pq_path_verify_with_schedule(validators, &msg, pq_keys, schedule) {
             return true;
         }
 
@@ -1753,13 +1867,12 @@ impl QuorumCertificate {
     ///
     /// FULL-PQ (nodes wiped): non-post-quantum schemes are refused
     /// unconditionally (old pure-PQ gate, now the only path).
-    fn pq_path_verify_with_beacon(
+    fn pq_path_verify_with_schedule(
         &self,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> bool {
         // AMBIGUITY FAILS CLOSED (PENTEST F-4): `binds_to_parent` pins the
         // µQC parent, while the loop below accepts ANY verifying envelope. If
@@ -1778,14 +1891,8 @@ impl QuorumCertificate {
                     }
                     // The helper borrows the optional override map; nothing is
                     // cloned on this path (`None` on the live verifier).
-                    if self.verify_micro_cert_with_beacon(
-                        &cert,
-                        validators,
-                        msg,
-                        pq_keys,
-                        beacon,
-                        cnvrf_v3_active,
-                    ) {
+                    if self.verify_micro_cert_with_beacon(&cert, validators, msg, pq_keys, schedule)
+                    {
                         return true;
                     }
                 }
@@ -1882,16 +1989,10 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> Option<Vec<ValidatorId>> {
         self.micro_cert_valid_signers_and_committee_with_beacon(
-            cert,
-            validators,
-            msg,
-            pq_keys,
-            beacon,
-            cnvrf_v3_active,
+            cert, validators, msg, pq_keys, schedule,
         )
         .map(|(signers, _)| signers)
     }
@@ -1902,18 +2003,19 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> Option<(Vec<ValidatorId>, Vec<ValidatorId>)> {
-        // C1 split (FIXES §1.7), fail-closed at the SHARED choke point: at/
-        // after `QC_SPLIT_ACTIVATION_HEIGHT` the µQC is advisory-only, so it
-        // names no signers and carries no power. `verify_micro_cert_with_beacon`
-        // already refuses it; gating here as well makes ATTRIBUTION
-        // (`signers_set` → `qc_signed_power` → `qc_meets_quorum`) refuse it
-        // too. Without this, a decision boundary that counts power through
-        // attribution (the recommended primitive) would accept the very
-        // certificate the verifier refuses — the split would be bypassed.
-        if qc_split_active_at(self.height) {
+        // C1 split (FIXES §1.7), fail-closed at the SHARED choke point: when
+        // the split is required at this height/set size (governance gate OR
+        // the set reached `QC_SPLIT_BY_SIZE_THRESHOLD`), the µQC is
+        // advisory-only, so it names no signers and carries no power.
+        // `verify_micro_cert_with_beacon` already refuses it; gating here as
+        // well makes ATTRIBUTION (`signers_set` → `qc_signed_power` →
+        // `qc_meets_quorum`) refuse it too. Without this, a decision boundary
+        // that counts power through attribution (the recommended primitive)
+        // would accept the very certificate the verifier refuses — the split
+        // would be bypassed.
+        if qc_split_required(self.height, validators.len()) {
             return None;
         }
         if cert.height != self.height || cert.round != self.round {
@@ -1946,28 +2048,19 @@ impl QuorumCertificate {
         // `binds_to_parent` STILL pins `cert.sortition_parent == block.prev_hash`
         // so certificates remain chain-bound. Fails closed if beacon is missing
         // or carries the wrong epoch.
-        let committee = if cnvrf_v3_active {
-            let b = beacon?;
-            if b.epoch != cnvrf_v3_epoch_of_height(cert.height) {
-                return None;
-            }
-            cnvrf_v3_beacon_draw_committee(
-                validators,
-                cert.height,
-                cert.round,
-                cert.committee_size,
-                &b.output,
-                b.epoch,
-            )
-        } else {
-            derive_sortition_committee(
-                validators,
-                cert.height,
-                cert.round,
-                cert.committee_size,
-                &cert.sortition_parent,
-            )
-        };
+        //
+        // BOTH branches go through `sortition::committee_for_height` — the ONE
+        // "who signs at height H" rule the producer also uses — so a node can
+        // never attribute a certificate through a different draw than the one
+        // it built it with (review F2).
+        let committee = crate::consensus::committee_for_height(
+            validators,
+            cert.height,
+            cert.round,
+            cert.committee_size,
+            Some(&cert.sortition_parent),
+            schedule,
+        );
         let expected_len = (cert.committee_size as usize).min(validators.len());
         if committee.len() != expected_len || committee.is_empty() {
             return None;
@@ -2049,25 +2142,21 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> bool {
-        // C1 split (FIXES §1.7): at/after `QC_SPLIT_ACTIVATION_HEIGHT` the
-        // µQC is ADVISORY-ONLY and never finalizes — refuse outright, even
-        // at full-network power. Finality requires the full network QC (the
-        // epoch/CEC path, `verify_epoch_cert` ≥ `pq_full_required_power`).
-        // Before activation this gate is inert (`u64::MAX` default) and the
-        // legacy network-anchored `max` rule below applies byte-identically.
-        if qc_split_active_at(self.height) {
+        // C1 split (FIXES §1.7): when the split is required at this
+        // height/set size (governance gate OR the set reached
+        // `QC_SPLIT_BY_SIZE_THRESHOLD`) the µQC is ADVISORY-ONLY and never
+        // finalizes — refuse outright, even at full-network power. Finality
+        // requires the full network QC (the epoch/CEC path,
+        // `verify_epoch_cert` ≥ `pq_full_required_power`). Below BOTH legs
+        // this gate is inert (`u64::MAX` default, small sets) and the legacy
+        // network-anchored `max` rule below applies byte-identically.
+        if qc_split_required(self.height, validators.len()) {
             return false;
         }
         let Some((valid, committee)) = self.micro_cert_valid_signers_and_committee_with_beacon(
-            cert,
-            validators,
-            msg,
-            pq_keys,
-            beacon,
-            cnvrf_v3_active,
+            cert, validators, msg, pq_keys, schedule,
         ) else {
             return false;
         };
@@ -2354,7 +2443,8 @@ impl QuorumCertificate {
     /// never attributed. Attribution mirrors verification: only signers
     /// `verify` accepts are named.
     ///
-    /// C1 split: at/after `QC_SPLIT_ACTIVATION_HEIGHT` a µQC is
+    /// C1 split: when `qc_split_required(height, set size)` holds (governance
+    /// gate OR a set at/above `QC_SPLIT_BY_SIZE_THRESHOLD`) a µQC is
     /// advisory-only, so it attributes NOBODY here (the gate lives in
     /// `micro_cert_valid_signers_and_committee_with_beacon`). That keeps
     /// `qc_signed_power` / `qc_meets_quorum` fail-closed for the same
@@ -2370,7 +2460,7 @@ impl QuorumCertificate {
     /// silently forgiving downtime slash for validators that actually
     /// missed). Anything unverifiable contributes nothing.
     pub fn signers_set(&self, validators: &ValidatorSet) -> HashSet<ValidatorId> {
-        self.signers_set_with_beacon_inner(validators, None, false)
+        self.signers_set_with_schedule(validators, CommitteeSchedule::ParentHash)
     }
 
     /// Extracts verified signer IDs using the CN-VRF v3 epoch beacon draw when
@@ -2381,14 +2471,29 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         beacon: Option<&EpochBeacon>,
     ) -> HashSet<ValidatorId> {
-        self.signers_set_with_beacon_inner(validators, beacon, cnvrf_v3_active_at(self.height))
+        let schedule = if cnvrf_v3_active_at(self.height) {
+            CommitteeSchedule::Beacon(beacon.copied())
+        } else {
+            CommitteeSchedule::ParentHash
+        };
+        self.signers_set_with_schedule(validators, schedule)
+    }
+
+    /// [`Self::signers_set_with_beacon`] under an explicit
+    /// [`CommitteeSchedule`] — the attribution entry point that must ALWAYS
+    /// mirror the schedule the verifier used (review F2).
+    pub fn signers_set_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> HashSet<ValidatorId> {
+        self.signers_set_with_beacon_inner(validators, schedule)
     }
 
     fn signers_set_with_beacon_inner(
         &self,
         validators: &ValidatorSet,
-        beacon: Option<&EpochBeacon>,
-        cnvrf_v3_active: bool,
+        schedule: CommitteeSchedule,
     ) -> HashSet<ValidatorId> {
         // ANTI-DoS (pentest P1): `verify` already rejects an implausibly long
         // signer list BEFORE touching crypto, but ATTRIBUTION (`signers_set` /
@@ -2424,12 +2529,7 @@ impl QuorumCertificate {
                         continue;
                     }
                     if let Some(ids) = self.micro_cert_valid_signers_with_beacon(
-                        &cert,
-                        validators,
-                        &msg,
-                        None,
-                        beacon,
-                        cnvrf_v3_active,
+                        &cert, validators, &msg, None, schedule,
                     ) {
                         signers.extend(ids);
                     }
@@ -2462,6 +2562,7 @@ impl QuorumCertificate {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+    use crate::consensus::derive_sortition_committee;
     use std::time::{Duration, Instant};
 
     fn make_validator_set(

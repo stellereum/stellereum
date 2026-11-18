@@ -1015,6 +1015,76 @@ fn qc_split_threshold_math_pins() {
     assert!(qc_split_active_at(QC_SPLIT_ACTIVATION_HEIGHT));
 }
 
+/// Review F1 — the SIZE leg of the split: the exact size at which a µQC stops
+/// being able to finalize, derived from the quorum curves (not guessed).
+///
+/// With a committee of `min(N, 128)` and the network-anchored `max` rule a
+/// µQC is reachable only while `floor(2N/3)+1 <= min(N,128)`:
+///
+/// * `N = 191` → 128 <= 128 (reachable, unanimity required);
+/// * `N = 192` → 129 > 128 (UNREACHABLE — the finality cliff).
+#[test]
+#[allow(clippy::assertions_on_constants)]
+// GATE: these ARE the pinned spec values; a runtime indirection would unpin
+// exactly what the test exists to pin.
+fn qc_split_size_threshold_is_the_quorum_crossing() {
+    assert_eq!(QC_SPLIT_BY_SIZE_THRESHOLD, 192);
+    assert_eq!(
+        QC_SPLIT_BY_SIZE_THRESHOLD,
+        (MICRO_COMMITTEE_MAX_SIZE as usize * 3) / 2,
+        "threshold must stay the 128-seat committee's 3/2 crossing"
+    );
+    // Below the threshold every uniform set size is still reachable by its
+    // own committee, so the µQC path stays legal (byte-identical legacy).
+    for n in 1..QC_SPLIT_BY_SIZE_THRESHOLD {
+        let network_two_thirds = consensus_quorum_min(n as u64);
+        let committee = micro_committee_size(n) as u64;
+        assert!(
+            network_two_thirds <= committee,
+            "N={n}: network 2/3 ({network_two_thirds}) must be reachable by a \
+             128-seat-max committee ({committee})"
+        );
+    }
+    // The cliff, exactly one validator apart.
+    assert_eq!(micro_committee_size(191), 128);
+    assert_eq!(micro_committee_size(192), 128);
+    assert_eq!(consensus_quorum_min(191), 128);
+    assert_eq!(consensus_quorum_min(192), 129);
+    assert!(consensus_quorum_min(192) > micro_committee_size(192) as u64);
+    // And it is inside the documented decentralization window.
+    assert!(QC_SPLIT_BY_SIZE_THRESHOLD < crate::staking::MAX_ACTIVE_VALIDATORS);
+}
+
+/// Review F1 — [`qc_split_required`] is the ONE predicate producer and
+/// verifiers share: gate-active OR count at/above the threshold.
+#[test]
+#[allow(clippy::assertions_on_constants)]
+// GATE: pins the gate-off default (the height constant is `u64::MAX`).
+fn qc_split_required_is_gate_or_size() {
+    // Gate off + small set: legacy µQC legal, including the live N = 4.
+    assert!(!qc_split_required(0, 4));
+    assert!(!qc_split_required(u64::MAX - 1, 4));
+    // Every size below the threshold stays on the legacy path…
+    for n in 0..QC_SPLIT_BY_SIZE_THRESHOLD {
+        assert!(
+            !qc_split_required(0, n),
+            "N={n} is below the size threshold and the gate is off"
+        );
+    }
+    // …and the threshold itself switches, with no rollout step.
+    assert!(qc_split_required(0, QC_SPLIT_BY_SIZE_THRESHOLD));
+    assert!(qc_split_required(0, QC_SPLIT_BY_SIZE_THRESHOLD + 1));
+    assert!(qc_split_required(0, 250));
+    // The height leg still forces the full-network QC for a small set.
+    assert!(qc_split_required(QC_SPLIT_ACTIVATION_HEIGHT, 4));
+    // Monotone in both arguments (no non-deterministic holes).
+    for n in 0..300 {
+        if qc_split_required(0, n) {
+            assert!(qc_split_required(0, n + 1));
+        }
+    }
+}
+
 /// C1 split — advisory ≠ finality, end to end with real Falcon signatures.
 ///
 /// N=4 whole-set committee. Post-activation height (the inactive-default

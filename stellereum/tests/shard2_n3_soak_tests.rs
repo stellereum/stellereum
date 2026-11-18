@@ -107,11 +107,15 @@ async fn sharded_n(
         }
         s1nodes.push((v.clone(), e));
     }
-    ShardedCluster::new(
+    let mut sc = ShardedCluster::new(
         sharded(),
         vec![(SHARD0, s0nodes), (SHARD1, s1nodes)],
         CrossShardTransport::local(),
-    )
+    );
+    // XSHARD-01: cross-shard VALUE runs through the §9 2PC (the legacy
+    // one-step credit is refused; it cannot prove the source-side debit).
+    sc.with_xpc_activation(stellereum::xshard2pc::XpcActivation::FromHeight(0));
+    sc
 }
 
 fn finalized_len(c: &Cluster) -> usize {
@@ -553,8 +557,8 @@ async fn shard2_n3_cross_shard_transfer_through_degraded_soak() {
             .any(|m| m.is_inbound_for(SHARD1)),
         "target must commit the consumption record after heal"
     );
-    // Post-transfer soak at full quorum.
-    for _ in 0..2 {
+    // Post-transfer soak at full quorum: drive the 2PC handshake to COMMIT.
+    for _ in 0..4 {
         ts += 1;
         sc.run_height(SHARD0, ts).await;
         ts += 1;
@@ -742,10 +746,12 @@ async fn shard2_n3_freeze_shard1_heal_catch_up() {
         SHARD1,
     );
     sc.broadcast_tx(tx).await;
-    ts += 1;
-    sc.run_height(SHARD0, ts).await;
-    ts += 1;
-    sc.run_height(SHARD1, ts).await;
+    for _ in 0..4 {
+        ts += 1;
+        sc.run_height(SHARD0, ts).await;
+        ts += 1;
+        sc.run_height(SHARD1, ts).await;
+    }
     assert_balances_agree(&sc, SHARD1, &recipient_addr).await;
     assert_eq!(balance_at(&sc, SHARD1, 0, &recipient_addr).await, 5_000);
     eprintln!(
@@ -771,20 +777,23 @@ async fn shard2_n3_double_spend_refused_everywhere() {
     let amount = 20_000u64;
     let gas = 50u64 + PQ_ACTIVATION_SURCHARGE_GAS;
     let tx = sign_pq_explicit_transfer(&sender, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
+    let tx_hash = tx.compute_tx_hash();
     sc.broadcast_tx(tx.clone()).await;
-    ts += 1;
-    sc.run_height(SHARD0, ts).await;
-    ts += 1;
-    let tgt_bh = sc.run_height(SHARD1, ts).await;
+    for _ in 0..4 {
+        ts += 1;
+        sc.run_height(SHARD0, ts).await;
+        ts += 1;
+        sc.run_height(SHARD1, ts).await;
+    }
+    // The value-moving record is the source's COMMIT (2PC), not a bare
+    // legacy transfer (whose credit is refused).
     let consumed_msg = sc.shard(SHARD1).nodes[0]
         .blocks
-        .get(&tgt_bh)
+        .values()
+        .flat_map(|b| b.cross_shard_out.iter())
+        .find(|m| m.is_inbound_for(SHARD1) && m.is_commit())
         .cloned()
-        .expect("target block retained")
-        .cross_shard_out
-        .into_iter()
-        .find(|m| m.is_inbound_for(SHARD1))
-        .expect("consumption record committed");
+        .expect("the target consumed the COMMIT");
     assert_eq!(balance_at(&sc, SHARD1, 0, &recipient_addr).await, amount);
 
     let mut s0_view = vaddrs.clone();
@@ -810,6 +819,13 @@ async fn shard2_n3_double_spend_refused_everywhere() {
         sc.run_height(SHARD1, ts).await;
     }
     // Exactly-once everywhere: no second credit, no second debit.
+    assert!(
+        sc.shard(SHARD1).nodes[0]
+            .state
+            .is_cross_shard_completed(&tx_hash)
+            .await,
+        "the lifecycle completed exactly once"
+    );
     assert_balances_agree(&sc, SHARD0, &sender_addr).await;
     assert_balances_agree(&sc, SHARD1, &recipient_addr).await;
     assert_eq!(
@@ -873,7 +889,10 @@ async fn shard2_n3_double_spend_refused_everywhere() {
         let err = node
             .validate_proposal(&forged, root)
             .expect_err("replayed consumption must be refused");
-        assert!(err.contains("replayed"), "target node{i}: {err}");
+        assert!(
+            err.contains("replayed") || err.contains("completed"),
+            "target node{i}: {err}"
+        );
     }
     eprintln!(
         "N3 double-spend refused: recipient={amount} supply={supply_before}->{supply_after} \

@@ -71,15 +71,15 @@ fn pq_gas() -> u64 {
     stellereum::svm::GAS_BASIC_TRANSFER + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS
 }
 
-/// Success-path debit for our activation tx:
-/// `amount + max(gas_limit, floor) + surcharge`
-/// (sequential apply: `state_engine.rs` total_cost =
-/// `amount + fee_reserved + surcharge`; `fee_to_charge` contract in
-/// `sharding.rs`: `max(gas_limit, floor) + surcharge`).
-/// Our declared gas (325k) clears the base floor, so the fee is gas + one
-/// surcharge.
+/// Success-path debit for our activation tx (FEE-01):
+/// `amount + max(min(gas_limit, consumed + intrinsic), floor) + surcharge`.
+///
+/// The transaction is an empty-payload transfer, so the gas it is BILLED for
+/// is the 280 000 intrinsic envelope (capped at the 325k declaration) — not
+/// the declaration (the old `pq_gas() + surcharge`, 370 000, encoded the
+/// over-charge FEE-01 removes) — plus ONE additive PQ surcharge.
 fn pq_fee() -> u64 {
-    pq_gas() + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+    stellereum::svm::GAS_BASIC_TRANSFER + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS
 }
 
 fn faucet_keypair() -> FalconKeypair {

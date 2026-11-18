@@ -226,13 +226,17 @@ async fn both_apply_paths_reach_the_identical_state_root() {
     }
 }
 
-/// The documented fee divergence (single-tx charges what was consumed, blocks
-/// charge the declared limit) must be the ONLY thing that differs. The
-/// settlement itself - book, escrow, tokens, the maker's balance, the whole
-/// commitment digest - is identical, and the taker differs by exactly the fee
-/// delta.
+/// FEE-01: the former fee divergence is GONE. The single-tx path and the block
+/// path both charge `min(gas_limit, gas_used + intrinsic)` — here the CLOB
+/// payload's own 1 240 — so a settlement declaring 50 000 gas costs the same
+/// on both, and every OTHER observable (book, escrow, the whole commitment
+/// digest, both balances) is identical too.
+///
+/// (Before FEE-01 the block path charged the 50 000 declaration while the
+/// single-tx path charged 1 240, and this test pinned that 48 760-nano delta
+/// as documented behaviour. That delta was the over-charge the fix removes.)
 #[tokio::test]
-async fn settlement_is_identical_even_when_the_fee_number_differs() {
+async fn settlement_is_identical_and_both_paths_charge_consumed_gas() {
     let (_, seller) = pq_key(0xB1);
     let (taker_kp, taker) = pq_key(0xB2);
     let a = build(seller, taker).await;
@@ -245,7 +249,14 @@ async fn settlement_is_identical_even_when_the_fee_number_differs() {
 
     a.apply_transaction(&tx, 7).await.expect("single-tx path");
     let (applied, failed, fees, _, _) = b.apply_block_parallel_fees(&[tx], 7).await;
-    assert_eq!((applied, failed, fees), (1, 0, declared));
+    // FEE-01: the fee is `min(declared, gas_used + intrinsic)` — a payload's
+    // own measured gas, never the declaration. A CLOB settlement declaring
+    // 50 000 costs its 1 240 on BOTH paths; the other 48 760 is refunded.
+    assert_eq!(
+        (applied, failed, fees),
+        (1, 0, gas_used),
+        "the block path charges the consumed gas, not the 50 000 declaration"
+    );
 
     // Everything except the fee is the same.
     assert_eq!(
@@ -269,9 +280,13 @@ async fn settlement_is_identical_even_when_the_fee_number_differs() {
     let taker_a = a.get_account(&taker).await.unwrap().balance;
     let taker_b = b.get_account(&taker).await.unwrap().balance;
     assert_eq!(
-        taker_a - taker_b,
+        taker_a, taker_b,
+        "FEE-01: identical settlement AND identical fee on both paths"
+    );
+    assert_eq!(
         declared - gas_used,
-        "the taker differs by EXACTLY the fee divergence, nothing else"
+        50_000 - gas_used,
+        "the old divergence was exactly the unused declared gas"
     );
 }
 

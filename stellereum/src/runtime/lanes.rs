@@ -512,8 +512,10 @@ impl PackFilterCtx {
 // ============================================================================
 
 /// Completed MinRoot VDF evaluation returned by [`VdfLane`].
-#[allow(dead_code)]
-// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
+///
+/// Wired: [`crate::runtime::ValidatorRuntime`] owns the lane
+/// (`runtime/mod.rs` `vdf_lane`) and drives it from
+/// `runtime::anchors::poll_vdf_lane` / `ensure_vdf_lane`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VdfJobOutput {
     /// Epoch this VDF proof was evaluated for.
@@ -527,8 +529,6 @@ pub struct VdfJobOutput {
 }
 
 /// One queued MinRoot VDF evaluation request for [`VdfLane`].
-#[allow(dead_code)]
-// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
 pub struct VdfJob {
     /// Epoch associated with this VDF evaluation.
     pub epoch: u64,
@@ -549,16 +549,12 @@ pub struct VdfJob {
 /// `tokio::task::spawn_blocking` wrapped in `AssertUnwindSafe` + `catch_unwind`
 /// so CPU-bound VDF evaluation never stalls async consensus ticks and a panic
 /// returns `None` without crashing the consensus process.
-#[allow(dead_code)]
-// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
 #[derive(Clone)]
 pub struct VdfLane {
     tx: tokio::sync::mpsc::UnboundedSender<VdfJob>,
     latest_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[allow(dead_code)]
-// GATE: VdfLane is scoped to lanes.rs here and wired into runtime/mod.rs in a follow-up integration step.
 impl VdfLane {
     /// Spawn the single sequential off-tick VDF worker task.
     pub fn spawn() -> Self {

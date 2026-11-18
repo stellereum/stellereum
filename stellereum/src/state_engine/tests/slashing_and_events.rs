@@ -283,8 +283,12 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     let alice_drain_seed = 0xA2u8;
     let (alice_drain_addr, _alice_drain_pk) = pq_pair(alice_drain_seed);
     let bob_addr = [0xB0; 32];
+    // FEE-01: Tx1 is charged the gas it CONSUMED (`GAS_BASIC_TRANSFER` for
+    // the `Transfer` opcode), not its declared 500 000, so the funding is
+    // sized to leave 120 000 after it — below Tx2's 200 000 failure fee, so
+    // the "uncoverable failure moves nothing" scenario still occurs.
     engine
-        .credit_native(&alice_drain_addr, 1_200_000)
+        .credit_native(&alice_drain_addr, 1_000_000)
         .await
         .unwrap();
 
@@ -299,8 +303,8 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
             amount: 600_000,
         }],
     );
-    // Tx2 is admitted against simulated remainder (1.2M - 500k = 700k >= 200k),
-    // but at execution time Tx1 left only 100k balance.
+    // Tx2 is admitted against simulated remainder (1M - 500k = 500k >= 200k),
+    // but at execution time Tx1 left only 120k balance.
     let (tx_broke, _, _) = pq_tx_payload(
         alice_drain_seed,
         recipient,
@@ -339,22 +343,25 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     assert_eq!(outcome2.applied, 1);
     assert_eq!(outcome2.failed, 1);
     assert_eq!(outcome2.status, vec![true, false]);
-    // Tx2 fails with only 100k left against its declared 200k fee: a
+    // Tx2 fails with only 120k left against its 200k failure fee: a
     // failure whose FEE the sender cannot cover moves NOTHING at all (no
     // dust burn, no nonce burn) - the grief rule. A failure the sender CAN
-    // pay for is charged its declared fee and consumes the nonce (see
+    // pay for is charged that fee and consumes the nonce (see
     // `broke_sender_failure_changes_nothing` and the block path).
+    //
+    // FEE-01: Tx1 pays the gas it CONSUMED (GAS_BASIC_TRANSFER for its
+    // `Transfer` opcode), not the 500 000 it declared.
     assert_eq!(
         outcome2.tx_fees,
-        vec![500_000, 0],
+        vec![crate::svm::GAS_BASIC_TRANSFER, 0],
         "an uncoverable failure fee moves nothing"
     );
-    assert_eq!(outcome2.fees_collected, 500_000);
+    assert_eq!(outcome2.fees_collected, crate::svm::GAS_BASIC_TRANSFER);
 
     let sender_drain = engine.get_account(&alice_drain_addr).await.unwrap();
     assert_eq!(
         sender_drain.balance,
-        1_200_000 - 600_000 - 500_000,
+        1_000_000 - 600_000 - crate::svm::GAS_BASIC_TRANSFER,
         "the dust is not drained by an uncoverable failure"
     );
     assert_eq!(sender_drain.nonce, 1, "no pay, no advance: nonce untouched");
@@ -363,16 +370,18 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     assert_eq!(bob.balance, 600_000);
 
     let proposer_acc2 = engine.get_account(&proposer_addr).await.unwrap();
-    assert_eq!(proposer_acc2.balance, gas_limit + 500_000);
-
-    // Value conservation: the drain sender's 1.2M is the sender's
-    // remainder + bob's 600k + the fee the proposer collected for THIS
-    // block. (The proposer's total also holds the first block's fee,
-    // which came out of a different sender - so it is not part of this
-    // balance.)
     assert_eq!(
-        sender_drain.balance + bob.balance + 500_000,
-        1_200_000,
+        proposer_acc2.balance,
+        gas_limit + crate::svm::GAS_BASIC_TRANSFER
+    );
+
+    // Value conservation: the drain sender's 1M is the sender's remainder +
+    // bob's 600k + the fee the proposer collected for THIS block. (The
+    // proposer's total also holds the first block's fee, which came out of
+    // a different sender - so it is not part of this balance.)
+    assert_eq!(
+        sender_drain.balance + bob.balance + crate::svm::GAS_BASIC_TRANSFER,
+        1_000_000,
         "funds conserved: every debit arrived somewhere"
     );
 }
@@ -441,4 +450,122 @@ async fn test_block_execution_collects_contract_events() {
     assert_eq!(outcome.events[0][0].contract, contract_addr);
     assert_eq!(outcome.events[0][0].topic, 999);
     assert_eq!(outcome.events[0][0].value, 12345);
+}
+
+/// SLASH-02: the engine-side slash debit is fail-CLOSED and LOUD, never a
+/// dropped `let _ =`.
+///
+/// The scenario is the one the finding describes: the ledger removes the
+/// stake (and counts it in `total_burned`), but the backing pool cannot fund
+/// the debit (here: it was already drained, i.e. the state was drifted before
+/// the slash). The contract under test:
+///
+///  * the caller is told what ACTUALLY left the pool, not what the ledger
+///    claimed;
+///  * the pool is never over-drawn (it ends at exactly 0);
+///  * `total_burned` is repaired down by the unbacked shortfall, so the
+///    committed supply counter never claims coins that did not move.
+#[tokio::test]
+async fn slash_pool_shortfall_is_capped_reported_and_never_silent() {
+    use crate::consensus::{QuorumCertificate, VoteKind};
+    use crate::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, STAKING_POOL};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let ids: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let offline_id = ids[1];
+    let bond_amount = MIN_VALIDATOR_BOND + crate::staking::STELL_MIN_BOND_BUFFER;
+
+    let engine = InMemoryStateEngine::new();
+    for id in &ids {
+        engine.credit_native(id, bond_amount * 2).await.unwrap();
+        engine
+            .staking_write()
+            .await
+            .bond(*id, bond_amount, 0)
+            .unwrap();
+    }
+    // Fund the pool with the real bonds (the ledger is ledger-only; these
+    // tests move the native side by hand).
+    engine
+        .credit_native(&STAKING_POOL, 4 * bond_amount)
+        .await
+        .unwrap();
+
+    let vs = engine.staking_read().await.to_validator_set();
+    let fks: Vec<crate::post_quantum::FalconKeypair> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x30 + i as u8);
+            crate::consensus::register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect();
+    let qc_without_offline = || -> QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for &i in &[0usize, 2, 3] {
+            let v = crate::consensus::Vote::sign_with_falcon(
+                &keys[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some([0xAA; 32]),
+            );
+            set.add(v, &vs, 1, 0, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some([0xAA; 32]), &vs, Some(&[0u8; 32]))
+            .expect("quorum must compile a Falcon µQC")
+    };
+
+    for h in 1..DOWNTIME_MISS_THRESHOLD as u64 {
+        assert_eq!(
+            engine
+                .apply_downtime_slash(h, Some(&qc_without_offline()))
+                .await,
+            0
+        );
+    }
+
+    // DRIFT: the pool is drained to 1 nano — far below the ~10^9-nano burn
+    // the ledger is about to claim.
+    let pool_balance = engine.get_account(&STAKING_POOL).await.unwrap().balance;
+    engine
+        .debit_native(&STAKING_POOL, pool_balance - 1)
+        .await
+        .expect("drain the pool to one nano");
+
+    let burned = engine
+        .apply_downtime_slash(DOWNTIME_MISS_THRESHOLD as u64, Some(&qc_without_offline()))
+        .await;
+
+    // What the ledger CLAIMED (its own counter) is far larger than what the
+    // pool could fund.
+    let ledger = engine.staking_read().await;
+    let claimed = ledger.validators[&offline_id].total_slashed;
+    assert!(
+        claimed > 1,
+        "precondition: the ledger claims a slash larger than the pool holds"
+    );
+    assert_eq!(
+        burned, 1,
+        "SLASH-02: the caller is told what actually left the pool"
+    );
+    assert_eq!(
+        ledger.total_burned, 1,
+        "SLASH-02: the committed burn counter is repaired by the unbacked shortfall"
+    );
+    drop(ledger);
+    assert_eq!(
+        engine.get_account(&STAKING_POOL).await.unwrap().balance,
+        0,
+        "the pool is taken to exactly zero, never over-drawn"
+    );
 }

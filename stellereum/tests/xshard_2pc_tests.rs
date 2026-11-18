@@ -1168,20 +1168,37 @@ async fn the_activation_boundary_switches_the_protocol() {
         xpc_record(&cluster, SHARD0, &legacy_hash).await.is_none(),
         "a legacy transfer holds no 2PC record"
     );
-    // The legacy flow still credits the target.
+    // XSHARD-01: a below-boundary (legacy) transfer is REFUSED at the target's
+    // credit gate — the one-step legacy message cannot prove the source-side
+    // debit — so it is neither credited nor completed. Value must move through
+    // the 2PC, including transfers whose producer predates the boundary.
     cluster.run_height(SHARD1, TS + 1).await;
     cluster.run_height(SHARD0, TS + 2).await;
     assert_eq!(
         balance(&cluster, SHARD1, &recipient_addr).await,
-        amount,
-        "the legacy flow must keep working after the switch is armed"
+        0,
+        "a legacy (below-boundary) transfer must NOT be credited"
+    );
+    let legacy_key = stellereum::sharding::CrossShardKey::of(
+        block1
+            .cross_shard_out
+            .iter()
+            .find(|m| m.is_transfer())
+            .expect("legacy transfer record"),
     );
     assert!(
-        cluster.shard(SHARD0).nodes[0]
+        !cluster.shard(SHARD1).nodes[0]
+            .state
+            .is_cross_shard_consumed(&legacy_key)
+            .await,
+        "a refused legacy credit must not consume the message"
+    );
+    assert!(
+        !cluster.shard(SHARD0).nodes[0]
             .state
             .is_cross_shard_completed(&legacy_hash)
             .await,
-        "a below-boundary transfer must FINISH on the legacy flow (ack committed)"
+        "a refused legacy credit never completes"
     );
     assert!(
         xpc_record(&cluster, SHARD1, &legacy_hash).await.is_none(),
@@ -1216,6 +1233,11 @@ async fn the_activation_boundary_switches_the_protocol() {
     // ---- The boundary is EXACT on every block of both shards: one transfer
     // never carries records of both flows (no half-legacy/half-2PC). ----
     run_2pc_to_completion(&mut cluster, 6).await;
+    assert_eq!(
+        balance(&cluster, SHARD1, &recipient_addr).await,
+        amount,
+        "only the 2PC transfer may credit (the legacy one is refused)"
+    );
     for shard in [SHARD0, SHARD1] {
         for block in cluster.shard(shard).nodes[0].blocks.values() {
             for msg in &block.cross_shard_out {

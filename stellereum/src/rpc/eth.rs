@@ -678,9 +678,9 @@ pub(super) async fn dispatch_eth(
         "web3_clientVersion" => ok(id, json!(crate::evm_adapter::web3_client_version())),
         "net_listening" => ok(id, json!(crate::evm_adapter::net_listening())),
         // REAL peer count (F8): the process-wide counter the network layer
-        // feeds via `rpc::note_peer_count`. `0x0` means "no peer observed by
-        // this process" — never an invented positive like the old constant
-        // `0x2`.
+        // feeds via `P2pNetworkAdapter::publish_live_peer_count` →
+        // `rpc::note_peer_count`. `0x0` means "no peer observed by this
+        // process" — never an invented positive like the old constant `0x2`.
         "net_peerCount" => ok(
             id,
             json!(crate::evm_adapter::format_peer_count_hex(

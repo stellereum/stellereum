@@ -738,15 +738,23 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         );
         let (failed, _, fees) = block_outcome(&e, &t).await;
         assert_eq!(failed, 1);
-        assert_eq!(fees, vec![300_000]);
+        // FEE-01: an attributable failure pays the 280_000 intrinsic envelope
+        // (capped at the 300 000 declaration), not the declaration itself.
+        assert_eq!(fees, vec![stellereum::svm::GAS_BASIC_TRANSFER]);
         // no message was queued anywhere
         let acc = e.get_account(&me).await.unwrap();
         assert!(acc.inbox.is_empty() && acc.outbox.is_empty());
-        assert_eq!((acc.balance, acc.nonce), (700_000, 1));
+        assert_eq!(
+            (acc.balance, acc.nonce),
+            (1_000_000 - stellereum::svm::GAS_BASIC_TRANSFER, 1)
+        );
         let (e2, _) = funded_engine(1_000_000, &k).await;
         assert!(e2.apply_transaction(&t, 1_700_000_000).await.is_err());
         let acc2 = e2.get_account(&me).await.unwrap();
-        assert_eq!((acc2.balance, acc2.nonce), (700_000, 1));
+        assert_eq!(
+            (acc2.balance, acc2.nonce),
+            (1_000_000 - stellereum::svm::GAS_BASIC_TRANSFER, 1)
+        );
         assert!(acc2.inbox.is_empty() && acc2.outbox.is_empty());
     }
     // Shape 4: fails on the cross-shard boundary (funded outbound, bad payload).

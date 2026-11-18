@@ -243,7 +243,10 @@ pub fn fresh_peer_height() -> Option<u64> {
 pub static LIVE_PEER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record the live connected-peer count (`net_peerCount` source of truth).
-/// Called by the network layer wherever the peer table changes.
+///
+/// Fed by [`crate::network::P2pNetworkAdapter::publish_live_peer_count`], the
+/// single hook that reads the node's live peer table (`Node::peers_ready`) and
+/// publishes it here. 0 means "no connected peer observed", never a guess.
 pub fn note_peer_count(n: u64) {
     LIVE_PEER_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
 }

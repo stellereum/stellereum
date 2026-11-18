@@ -142,10 +142,13 @@
 //! learns "not in the state committed at height H", not "never existed".
 
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
-use crate::consensus::{BlockHash, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
+use crate::consensus::{
+    BlockHash, CommitteeSchedule, EpochBeacon, QuorumCertificate, ValidatorId, ValidatorSet,
+    VoteKind,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 
 /// Default number of headers retained above the trusted checkpoint.
@@ -446,11 +449,50 @@ impl Checkpoint {
             .map_err(|e| format!("checkpoint at height {} rejected: {e}", self.height))
     }
 
+    /// [`Self::verify`] under an explicit [`CommitteeSchedule`] (CN-VRF v3
+    /// epoch beacon at/after activation).
+    pub fn verify_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> Result<(), String> {
+        verify_finality_with_schedule(
+            &self.cert,
+            self.height,
+            self.block_hash,
+            validators,
+            schedule,
+        )
+        .map_err(|e| format!("checkpoint at height {} rejected: {e}", self.height))
+    }
+
     /// A checkpoint self-referential on its own hash would mean a block hashes
     /// to its parent, which is not something the chain can produce.
     pub fn is_self_referential(&self) -> bool {
         self.block_hash == self.parent_hash
     }
+}
+
+/// THE schedule rule of the light client: parent-hash below the configured
+/// CN-VRF v3 activation height, epoch beacon at/after it (bootstrap beacon for
+/// an epoch whose `H_freeze` predates activation, fail-closed `None` for a
+/// VDF-bearing epoch whose beacon is not recorded).
+///
+/// Free function so a checkpoint can be verified under the schedule of its own
+/// height BEFORE the client exists.
+fn schedule_for(
+    chain_id: u64,
+    activation: u64,
+    beacons: &BTreeMap<u64, [u8; 48]>,
+    height: u64,
+) -> CommitteeSchedule {
+    if height < activation {
+        return CommitteeSchedule::ParentHash;
+    }
+    let epoch = crate::cn_vrf::epoch_of_height(height);
+    let beacon = crate::cn_vrf::epoch_beacon_for(chain_id, epoch, beacons.get(&epoch), activation)
+        .map(|output| EpochBeacon { epoch, output });
+    CommitteeSchedule::Beacon(beacon)
 }
 
 /// Shared finality gate: a precommit quorum for exactly this (height, hash).
@@ -459,6 +501,31 @@ fn verify_finality(
     height: u64,
     block_hash: BlockHash,
     validators: &ValidatorSet,
+) -> Result<(), String> {
+    verify_finality_with_schedule(
+        cert,
+        height,
+        block_hash,
+        validators,
+        CommitteeSchedule::ParentHash,
+    )
+}
+
+/// [`verify_finality`] under an explicit [`CommitteeSchedule`].
+///
+/// Below CN-VRF v3 activation the schedule is
+/// [`CommitteeSchedule::ParentHash`] and this is byte-identical to the legacy
+/// gate. At/after activation the certificate's signers are attributed through
+/// the epoch beacon (`QuorumCertificate::verify_with_schedule`), which is the
+/// draw the block was actually certified under — without it every
+/// post-activation header looks like a foreign-committee certificate and the
+/// light client can no longer follow the chain (review F2's light-client leg).
+fn verify_finality_with_schedule(
+    cert: &QuorumCertificate,
+    height: u64,
+    block_hash: BlockHash,
+    validators: &ValidatorSet,
+    schedule: CommitteeSchedule,
 ) -> Result<(), String> {
     // A prevote quorum is not finality. A supermajority can prevote a value
     // that a minority then locks against in a way that never gets decided, and
@@ -523,7 +590,7 @@ fn verify_finality(
     // definition of the bytes a validator signs. `vote_sign_bytes` is private
     // to `crate::consensus`; re-deriving it here would be a second definition
     // that could drift from the first.
-    if !cert.verify(validators) {
+    if !cert.verify_with_schedule(validators, schedule) {
         return Err("certificate signatures did not verify against the validator set".to_string());
     }
     Ok(())
@@ -567,8 +634,25 @@ pub struct LightHeader {
 impl LightHeader {
     /// Verify the header's finality evidence against a validator set.
     pub fn verify(&self, validators: &ValidatorSet) -> Result<(), String> {
-        verify_finality(&self.cert, self.height, self.block_hash, validators)
-            .map_err(|e| format!("header at height {} rejected: {e}", self.height))?;
+        self.verify_with_schedule(validators, CommitteeSchedule::ParentHash)
+    }
+
+    /// [`Self::verify`] under an explicit [`CommitteeSchedule`]: at/after
+    /// CN-VRF v3 activation the certificate's signers are attributed through
+    /// the epoch beacon, exactly as the producer drew them.
+    pub fn verify_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> Result<(), String> {
+        verify_finality_with_schedule(
+            &self.cert,
+            self.height,
+            self.block_hash,
+            validators,
+            schedule,
+        )
+        .map_err(|e| format!("header at height {} rejected: {e}", self.height))?;
         self.verify_validator_quorum(validators)
     }
 
@@ -1223,6 +1307,18 @@ pub struct LightClient {
     /// Headers accepted above the anchor, oldest first. Bounded.
     headers: VecDeque<LightHeader>,
     max_headers: usize,
+    /// CN-VRF v3 activation height this client verifies under. Defaults to the
+    /// frozen [`crate::consensus::CNVRF_V3_ACTIVATION_HEIGHT`] (`u64::MAX` =
+    /// inactive), so an unconfigured client keeps the byte-identical
+    /// parent-hash verification it always had.
+    cnvrf_v3_activation: u64,
+    /// Chain id the deterministic bootstrap beacon is derived from.
+    cnvrf_v3_chain_id: u64,
+    /// Epoch beacons this client has been given (finalized blocks it followed,
+    /// or an operator's out-of-band feed). Missing VDF-bearing epochs fail
+    /// closed; epochs whose `H_freeze` predates activation use the shared
+    /// bootstrap beacon instead.
+    epoch_beacons: BTreeMap<u64, [u8; 48]>,
 }
 
 impl LightClient {
@@ -1246,14 +1342,62 @@ impl LightClient {
             return Err("light client: header cap must be at least 1".to_string());
         }
         checkpoint.verify(&validators)?;
+        Ok(Self::from_checkpoint(
+            validators,
+            checkpoint,
+            max_headers,
+            crate::zkml::effective_chain_id(),
+            crate::consensus::CNVRF_V3_ACTIVATION_HEIGHT,
+        ))
+    }
+
+    /// Create a client trusting `checkpoint` under an EXPLICIT CN-VRF v3
+    /// activation height, verifying the checkpoint's certificate through the
+    /// schedule of its own height (epoch beacon at/after activation,
+    /// parent-hash below it).
+    ///
+    /// The runtime's "re-anchor from a finalized head" fallback needs this: at
+    /// activation the legacy `Checkpoint::verify` (parent-hash gate) would
+    /// refuse an honest checkpoint, so the rebuild has to configure the
+    /// activation BEFORE verifying (review F2).
+    pub fn with_checkpoint_under_cnvrf_v3(
+        validators: ValidatorSet,
+        checkpoint: Checkpoint,
+        chain_id: u64,
+        activation: u64,
+    ) -> Result<Self, String> {
+        let schedule = schedule_for(chain_id, activation, &BTreeMap::new(), checkpoint.height);
+        checkpoint
+            .verify_with_schedule(&validators, schedule)
+            .map_err(|e| format!("light client: checkpoint rejected: {e}"))?;
+        Ok(Self::from_checkpoint(
+            validators,
+            checkpoint,
+            DEFAULT_MAX_HEADERS,
+            chain_id,
+            activation,
+        ))
+    }
+
+    /// Build the client around an ALREADY VERIFIED checkpoint.
+    fn from_checkpoint(
+        validators: ValidatorSet,
+        checkpoint: Checkpoint,
+        max_headers: usize,
+        chain_id: u64,
+        activation: u64,
+    ) -> Self {
         let set_height = checkpoint.height;
-        Ok(Self {
+        Self {
             validators,
             set_height,
             anchor: LightAnchor::Checkpoint(checkpoint),
             headers: VecDeque::new(),
             max_headers,
-        })
+            cnvrf_v3_activation: activation,
+            cnvrf_v3_chain_id: chain_id,
+            epoch_beacons: BTreeMap::new(),
+        }
     }
 
     /// Create a client anchored at the chain's GENESIS.
@@ -1296,6 +1440,9 @@ impl LightClient {
             anchor: LightAnchor::Genesis(genesis),
             headers: VecDeque::new(),
             max_headers,
+            cnvrf_v3_activation: crate::consensus::CNVRF_V3_ACTIVATION_HEIGHT,
+            cnvrf_v3_chain_id: crate::zkml::effective_chain_id(),
+            epoch_beacons: BTreeMap::new(),
         })
     }
 
@@ -1416,6 +1563,61 @@ impl LightClient {
         self.max_headers
     }
 
+    // ---------- CN-VRF v3 (beacon-aware verification) ----------
+
+    /// Configure the CN-VRF v3 activation height and chain id this client
+    /// verifies under.
+    ///
+    /// `activation` is the height at/after which certificates are attributed
+    /// through the epoch beacon. Leaving it at the default
+    /// (`CNVRF_V3_ACTIVATION_HEIGHT`, `u64::MAX` in production) keeps the
+    /// legacy parent-hash verification byte-identical.
+    pub fn configure_cnvrf_v3(&mut self, chain_id: u64, activation: u64) {
+        self.cnvrf_v3_chain_id = chain_id;
+        self.cnvrf_v3_activation = activation;
+    }
+
+    /// The CN-VRF v3 activation height in force for this client.
+    pub fn cnvrf_v3_activation_height(&self) -> u64 {
+        self.cnvrf_v3_activation
+    }
+
+    /// Record a finalized epoch beacon this client may verify against.
+    pub fn record_epoch_beacon(&mut self, epoch: u64, output: [u8; 48]) {
+        self.epoch_beacons.insert(epoch, output);
+    }
+
+    /// The epoch beacon of `height` as this client knows it.
+    ///
+    /// `None` below activation (the beacon schedule is not in force) and for a
+    /// VDF-bearing epoch whose beacon has not been recorded (fail closed). The
+    /// bootstrap rule is the shared one
+    /// ([`crate::cn_vrf::epoch_beacon_for`]), never a local re-derivation.
+    pub fn epoch_beacon_at(&self, height: u64) -> Option<EpochBeacon> {
+        if height < self.cnvrf_v3_activation {
+            return None;
+        }
+        let epoch = crate::cn_vrf::epoch_of_height(height);
+        let output = crate::cn_vrf::epoch_beacon_for(
+            self.cnvrf_v3_chain_id,
+            epoch,
+            self.epoch_beacons.get(&epoch),
+            self.cnvrf_v3_activation,
+        )?;
+        Some(EpochBeacon { epoch, output })
+    }
+
+    /// THE schedule this client verifies `height` under: the epoch beacon
+    /// at/after activation, the canonical parent-hash draw below it.
+    pub fn committee_schedule_at(&self, height: u64) -> CommitteeSchedule {
+        schedule_for(
+            self.cnvrf_v3_chain_id,
+            self.cnvrf_v3_activation,
+            &self.epoch_beacons,
+            height,
+        )
+    }
+
     // ---------- accepting the chain ----------
 
     /// Accept one header on top of the current tip.
@@ -1430,7 +1632,8 @@ impl LightClient {
     pub fn apply_header(&mut self, header: LightHeader) -> Result<(), String> {
         self.check_header_shape(&header)?;
         // --- finality --------------------------------------------------------
-        header.verify(&self.validators)?;
+        let schedule = self.committee_schedule_at(header.height);
+        header.verify_with_schedule(&self.validators, schedule)?;
         self.check_no_rollback(&header)?;
         self.headers.push_back(header);
         Ok(())
@@ -1456,11 +1659,12 @@ impl LightClient {
     ) -> Result<(), String> {
         self.check_header_shape(&header)?;
         // --- finality (QC quorum) WITHOUT the block-signature quorum -------
-        verify_finality(
+        verify_finality_with_schedule(
             &header.cert,
             header.height,
             header.block_hash,
             &self.validators,
+            self.committee_schedule_at(header.height),
         )
         .map_err(|e| format!("header at height {} rejected: {e}", header.height))?;
         self.check_no_rollback(&header)?;
@@ -1553,7 +1757,12 @@ impl LightClient {
     ///  * contradict a header already in the window. A peer must not be able to
     ///    walk us back to a fork by handing us a "checkpoint".
     pub fn advance_to_checkpoint(&mut self, cp: Checkpoint) -> Result<(), String> {
-        cp.verify(&self.validators)
+        // CN-VRF v3: verify the checkpoint under the schedule of ITS height
+        // (epoch beacon at/after activation, parent-hash below it) — the same
+        // rule `apply_header` uses, so a snapshot re-anchor can never be
+        // stricter than the header path it replaces (review F2).
+        let schedule = self.committee_schedule_at(cp.height);
+        cp.verify_with_schedule(&self.validators, schedule)
             .map_err(|e| format!("light client: refusing to re-anchor: {e}"))?;
 
         let anchor_height = self.anchor_height();
@@ -1674,9 +1883,13 @@ impl LightClient {
         // Finality under the CURRENT (old) set. A rotation the old quorum did
         // not sign is not a rotation — including a header the NEW set signed
         // for itself, which verifies here only if the old set also backs it.
+        // CN-VRF v3: the rotation header's committee schedule is its own
+        // height's (epoch beacon at/after activation), exactly like
+        // `apply_header` (review F2).
+        let rotation_schedule = self.committee_schedule_at(proof.rotation.height);
         proof
             .rotation
-            .verify(&self.validators)
+            .verify_with_schedule(&self.validators, rotation_schedule)
             .map_err(|e| format!("light client: refusing rotation: {e}"))?;
         self.check_no_rollback(&proof.rotation)?;
         let effective = proof.rotation.height;

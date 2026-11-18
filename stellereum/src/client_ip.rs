@@ -49,6 +49,25 @@
 //!   values set by the proxy; they are honored only from a trusted peer, for
 //!   the same reason. Prefer `X-Forwarded-For`/`Forwarded` chains when the
 //!   proxy appends; single-IP headers only when the proxy overwrites them.
+//!
+//! ## Loopback claims are never trusted by default
+//!
+//! Being a trusted proxy is not enough to forward a **loopback** address: a
+//! same-host nginx forwards `CF-Connecting-IP: 127.0.0.1` verbatim when a
+//! client sends it, and the public faucet's captcha-disabled path treats
+//! loopback as local (no captcha). Such a claim must not open that branch.
+//!
+//! Enforced rule:
+//! * the TCP peer must be in `STELL_TRUSTED_PROXY_CIDRS` (as before), AND
+//! * a forwarded address that is loopback is accepted only when the
+//!   deployment opts in with `STELL_TRUST_LOOPBACK_FORWARDED=1` (default
+//!   **off**). Without the opt-in the header claim is discarded and the
+//!   resolution is marked [`ClientIpSource::ForwardedLoopbackRejected`].
+//!
+//! Provenance is part of the result: [`ClientIp::is_local_client`] is true
+//! only for a DIRECT loopback TCP peer, never for a header claim. The
+//! legitimate same-host topology keeps working because the forwarded address
+//! there is the real (public) client, not loopback.
 
 use axum::http::HeaderMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -57,6 +76,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const TRUSTED_PROXY_CIDRS_ENV: &str = "STELL_TRUSTED_PROXY_CIDRS";
 /// Env var selecting the `X-Forwarded-For` chain discipline.
 pub const XFF_MODE_ENV: &str = "STELL_XFF_MODE";
+/// Opt-in for accepting a forwarded LOOPBACK client address (default off).
+///
+/// Only meaningful together with a trusted (configured) proxy peer: a
+/// loopback claim from a non-proxy peer is ignored regardless. Turn this on
+/// only for a proxy that OVERWRITES the client-IP headers and fronts local
+/// callers whose loopback identity genuinely matters; with the default off,
+/// a loopback claim is never captcha-exempt.
+pub const TRUST_LOOPBACK_FORWARDED_ENV: &str = "STELL_TRUST_LOOPBACK_FORWARDED";
 
 /// How to pick the client out of an `X-Forwarded-For` / `Forwarded` chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,36 +387,144 @@ pub fn select_from_chain(
     }
 }
 
-/// Resolve with explicit config (deterministic; tests use this).
+/// Where the resolved client address came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIpSource {
+    /// The TCP peer itself; no forwarding header was accepted.
+    Peer,
+    /// A forwarding header, accepted because the peer is a configured proxy
+    /// (and, for a loopback address, the deployment opted in).
+    Forwarded,
+    /// A forwarding header claimed a loopback address from a configured proxy
+    /// but the deployment has NOT opted in. The address falls back to the TCP
+    /// peer, and the claim must never be treated as a local client (see
+    /// [`ClientIp::is_local_client`]).
+    ForwardedLoopbackRejected,
+}
+
+/// A resolved client address plus where it came from.
+///
+/// Rate limits and faucet budgets key on [`ClientIp::addr`]; security
+/// decisions that depend on locality must use [`ClientIp::is_local_client`],
+/// which is false for every header-derived address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientIp {
+    /// The resolved client address (never header-derived loopback unless the
+    /// deployment opted in).
+    pub addr: IpAddr,
+    /// Provenance of [`ClientIp::addr`].
+    pub source: ClientIpSource,
+}
+
+impl ClientIp {
+    /// The address came from the TCP connection itself.
+    pub fn from_peer(addr: IpAddr) -> Self {
+        Self {
+            addr,
+            source: ClientIpSource::Peer,
+        }
+    }
+
+    /// True when a forwarding header supplied the address.
+    pub fn is_forwarded(&self) -> bool {
+        matches!(self.source, ClientIpSource::Forwarded)
+    }
+
+    /// True only for a DIRECT loopback TCP peer: a header-derived loopback
+    /// claim is never local (fail-closed for the captcha-exempt faucet path).
+    pub fn is_local_client(&self) -> bool {
+        self.source == ClientIpSource::Peer && self.addr.is_loopback()
+    }
+}
+
+impl PartialEq<IpAddr> for ClientIp {
+    fn eq(&self, other: &IpAddr) -> bool {
+        self.addr == *other
+    }
+}
+
+/// Parse an explicit boolean env flag (`1/true/yes/on`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Whether the deployment opted in to forwarding a LOOPBACK client address
+/// (`STELL_TRUST_LOOPBACK_FORWARDED`, default off).
+pub fn trust_loopback_forwarded_from_env() -> bool {
+    env_flag(TRUST_LOOPBACK_FORWARDED_ENV)
+}
+
+/// Resolve with explicit config and an explicit loopback-forwarding policy
+/// (deterministic; tests use this).
+///
+/// A forwarded address is returned only when `peer` is trusted. A forwarded
+/// address that is loopback is accepted only with `trust_loopback_forwarded`
+/// AND a trusted peer; otherwise the claim is recorded as
+/// [`ClientIpSource::ForwardedLoopbackRejected`] and `addr` falls back to the
+/// peer.
+pub fn resolve_detailed(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted: &[TrustedNet],
+    mode: XffMode,
+    trust_loopback_forwarded: bool,
+) -> ClientIp {
+    if !is_trusted_in(&peer, trusted) {
+        return ClientIp::from_peer(peer);
+    }
+    let claimed = select_from_chain(&xff_chain_from_headers(headers), mode, trusted)
+        .or_else(|| select_from_chain(&forwarded_chain_from_headers(headers), mode, trusted))
+        .or_else(|| {
+            ["cf-connecting-ip", "true-client-ip", "x-real-ip"]
+                .iter()
+                .find_map(|name| single_ip_header(headers, name))
+        });
+    match claimed {
+        None => ClientIp::from_peer(peer),
+        Some(ip)
+            if ip.is_loopback() && !(trust_loopback_forwarded && is_trusted_in(&peer, trusted)) =>
+        {
+            ClientIp {
+                addr: peer,
+                source: ClientIpSource::ForwardedLoopbackRejected,
+            }
+        }
+        Some(ip) => ClientIp {
+            addr: ip,
+            source: ClientIpSource::Forwarded,
+        },
+    }
+}
+
+/// Resolve with explicit config using the SECURE default policy: a forwarded
+/// loopback address is rejected unless `STELL_TRUST_LOOPBACK_FORWARDED` is set.
 pub fn resolve_with(
     headers: &HeaderMap,
     peer: IpAddr,
     trusted: &[TrustedNet],
     mode: XffMode,
-) -> IpAddr {
-    if !is_trusted_in(&peer, trusted) {
-        return peer;
-    }
-    let xff = xff_chain_from_headers(headers);
-    if let Some(ip) = select_from_chain(&xff, mode, trusted) {
-        return ip;
-    }
-    let fwd = forwarded_chain_from_headers(headers);
-    if let Some(ip) = select_from_chain(&fwd, mode, trusted) {
-        return ip;
-    }
-    for name in ["cf-connecting-ip", "true-client-ip", "x-real-ip"] {
-        if let Some(ip) = single_ip_header(headers, name) {
-            return ip;
-        }
-    }
-    peer
+) -> ClientIp {
+    resolve_detailed(
+        headers,
+        peer,
+        trusted,
+        mode,
+        trust_loopback_forwarded_from_env(),
+    )
 }
 
 /// Resolve the real client IP: proxy headers only when the TCP `peer` is a
 /// trusted proxy per `STELL_TRUSTED_PROXY_CIDRS`; otherwise the peer itself.
-/// `X-Forwarded-For` chain discipline comes from `STELL_XFF_MODE`.
-pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+/// `X-Forwarded-For` chain discipline comes from `STELL_XFF_MODE`; loopback
+/// forwarded addresses also require `STELL_TRUST_LOOPBACK_FORWARDED`.
+pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr) -> ClientIp {
     let trusted = trusted_nets_from_env();
     let mode = XffMode::from_env();
     resolve_with(headers, peer, &trusted, mode)
@@ -401,7 +536,7 @@ pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
 /// trusted without a peer, so this returns `None` unless headers yield an IP
 /// under an explicitly trusted view. Prefer [`resolve_client_ip`] when the
 /// peer is known.
-pub fn resolve_client_ip_opt(headers: &HeaderMap, peer: Option<IpAddr>) -> Option<IpAddr> {
+pub fn resolve_client_ip_opt(headers: &HeaderMap, peer: Option<IpAddr>) -> Option<ClientIp> {
     peer.map(|p| resolve_client_ip(headers, p))
 }
 
@@ -599,5 +734,89 @@ mod tests {
         assert_eq!(XffMode::parse("rightmost"), XffMode::Rightmost);
         assert_eq!(XffMode::parse(""), XffMode::Rightmost);
         assert_eq!(XffMode::parse("garbage"), XffMode::Rightmost);
+    }
+
+    /// F11: a loopback claim forwarded by a same-host (loopback) proxy is
+    /// NOT accepted without the explicit opt-in, and is never local.
+    #[test]
+    fn loopback_forwarded_claim_rejected_without_opt_in() {
+        let trusted = nets("127.0.0.0/8, ::1/128, 10.0.0.0/8");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        for name in ["cf-connecting-ip", "x-real-ip", "true-client-ip"] {
+            let headers = h(&[(name, "127.0.0.1")]);
+            let r = resolve_detailed(&headers, peer, &trusted, XffMode::Rightmost, false);
+            assert_eq!(r.addr, peer, "{name}: falls back to the TCP peer");
+            assert_eq!(
+                r.source,
+                ClientIpSource::ForwardedLoopbackRejected,
+                "{name}: claim must be recorded as rejected"
+            );
+            assert!(
+                !r.is_local_client(),
+                "{name}: a header claim must never be a local client"
+            );
+        }
+        // The same rule on the chain headers.
+        for (name, value) in [
+            ("x-forwarded-for", "127.0.0.1"),
+            ("forwarded", "for=127.0.0.1"),
+        ] {
+            let headers = h(&[(name, value)]);
+            let r = resolve_detailed(&headers, peer, &trusted, XffMode::Rightmost, false);
+            assert_eq!(r.source, ClientIpSource::ForwardedLoopbackRejected);
+            assert!(!r.is_local_client(), "{name}: chain claim is not local");
+        }
+
+        // A trusted NON-loopback proxy claiming loopback gets the same refusal.
+        let lan_proxy: IpAddr = "10.0.0.7".parse().unwrap();
+        let headers = h(&[("cf-connecting-ip", "127.0.0.1")]);
+        let r = resolve_detailed(&headers, lan_proxy, &trusted, XffMode::Rightmost, false);
+        assert_eq!(r.addr, lan_proxy);
+        assert_eq!(r.source, ClientIpSource::ForwardedLoopbackRejected);
+        assert!(!r.is_local_client());
+
+        // Opt-in: accepted from a configured proxy...
+        let r = resolve_detailed(&headers, lan_proxy, &trusted, XffMode::Rightmost, true);
+        assert_eq!(r.addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(r.source, ClientIpSource::Forwarded);
+        // ...but never from an unconfigured peer, opt-in or not.
+        let untrusted: IpAddr = "8.8.8.8".parse().unwrap();
+        let r = resolve_detailed(&headers, untrusted, &trusted, XffMode::Rightmost, true);
+        assert_eq!(r.addr, untrusted);
+        assert_eq!(r.source, ClientIpSource::Peer);
+    }
+
+    /// The legitimate same-host deployment (loopback proxy, real public
+    /// client) keeps working: the forwarded address is the client.
+    #[test]
+    fn legit_same_host_proxy_forwards_public_client() {
+        let trusted = nets("127.0.0.0/8, ::1/128");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let headers = h(&[("x-real-ip", "203.0.113.9")]);
+        let r = resolve_detailed(&headers, peer, &trusted, XffMode::Rightmost, false);
+        assert_eq!(r.addr, "203.0.113.9".parse::<IpAddr>().unwrap());
+        assert_eq!(r.source, ClientIpSource::Forwarded);
+        assert!(r.is_forwarded());
+        assert!(!r.is_local_client());
+    }
+
+    /// Only a DIRECT loopback peer is a local client (captcha-exempt path).
+    #[test]
+    fn direct_loopback_peer_is_local_client() {
+        let trusted = nets("127.0.0.0/8");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let r = resolve_detailed(&HeaderMap::new(), peer, &trusted, XffMode::Rightmost, false);
+        assert_eq!(r.source, ClientIpSource::Peer);
+        assert!(r.is_local_client());
+
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        let r = resolve_detailed(
+            &HeaderMap::new(),
+            public,
+            &trusted,
+            XffMode::Rightmost,
+            false,
+        );
+        assert!(!r.is_local_client());
     }
 }

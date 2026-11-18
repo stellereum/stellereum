@@ -311,10 +311,12 @@ async fn test_distinct_tokens_share_a_wave_and_match_sequential() {
 // W6.6: the F-01 failure fee contract
 // ==================================================================
 
-/// THE failure-fee contract, pinned (audit W6.6, item 1):
-/// * an ATTRIBUTABLE failure the sender can pay for: the fee they
-///   declared is charged and their nonce is consumed - the attempt is not
-///   free (the "free failure" DoS);
+/// THE failure-fee contract, pinned (audit W6.6, item 1; FEE-01):
+/// * an ATTRIBUTABLE failure the sender can pay for: the failure fee is
+///   charged and their nonce is consumed - the attempt is not free (the
+///   "free failure" DoS). The fee is `max(min(declared limit, intrinsic
+///   envelope), consensus floor) + surcharge` (FEE-01: the declared limit is
+///   a budget, not a price);
 /// * an attributable failure the sender CANNOT pay for: NOTHING moves -
 ///   no fee, no nonce, no dust burn. A transaction whose fee they cannot
 ///   cover was never going to run, and charging their remaining balance
@@ -351,7 +353,10 @@ async fn failure_fee_contract_is_identical_on_both_paths() {
         let (_, failed, _, status, fees) =
             engine.apply_block_parallel_fees(&[tx], 1_700_000_000).await;
         assert_eq!((failed, status), (1, vec![false]));
-        assert_eq!(fees, vec![200_000], "the declared fee is charged");
+        // FEE-01: the failure fee is the intrinsic envelope (capped at the
+        // 200 000 declaration) — the same 200 000 here, because the
+        // declaration is BELOW the intrinsic.
+        assert_eq!(fees, vec![200_000], "the intrinsic failure fee is charged");
         let acc = engine.get_account(&from).await.unwrap();
         assert_eq!(acc.balance, 1_000_000 - 200_000);
         assert_eq!(acc.nonce, 1, "the failure consumes the nonce");
@@ -845,17 +850,21 @@ async fn fork288000_explicit_pq_self_transfer_parity() {
     let (applied, failed, status, fees, balance, nonce, _pre, root) = &results[0];
     assert_eq!((*applied, *failed), (1, 0));
     assert_eq!(status.as_slice(), &[true]);
-    // Fee shape of the live C-side receipt: gas_limit + PQ surcharge.
+    // Fee shape of the live C-side receipt, FEE-01: the BILLED gas —
+    // `min(gas_limit, measured + intrinsic)` = the 280 000 intrinsic
+    // envelope for an empty-payload transfer, not the declared 350 000 —
+    // plus the additive PQ surcharge.
     assert_eq!(
         fees.as_slice(),
-        &[350_000 + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS]
+        &[crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS]
     );
     assert_eq!(*nonce, 1);
     // Self-transfer: the dust amount returns to the sender, so only the
-    // fee (gas_limit + PQ surcharge) leaves the account.
+    // fee (billed gas + PQ surcharge) leaves the account.
     assert_eq!(
         *balance,
-        fund - 350_000 - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+        fund - crate::svm::GAS_BASIC_TRANSFER
+            - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
     );
     assert_eq!(
         results[0], results[1],
@@ -936,16 +945,21 @@ async fn fork288000_conflicting_pin_fails_closed_with_fee() {
         .await;
     assert_eq!((applied, failed), (0, 1));
     assert_eq!(status.as_slice(), &[false]);
+    // FEE-01: an attributable failure pays the intrinsic envelope (capped at
+    // the 350 000 declaration) plus the additive PQ surcharge — never the
+    // whole declared limit. It is still a POSITIVE fee, so the failure is
+    // not free (the property this test exists for).
     assert_eq!(
         fees.as_slice(),
-        &[350_000 + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS],
+        &[crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS],
         "an attributable post-admission failure still pays the floor"
     );
     let after = engine.get_account(&from).await.unwrap();
     assert_eq!(after.nonce, 1);
     assert_eq!(
         after.balance,
-        fund - 350_000 - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+        fund - crate::svm::GAS_BASIC_TRANSFER
+            - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
     );
 }
 

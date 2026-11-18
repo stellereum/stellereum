@@ -229,7 +229,11 @@ pub fn write_marker(path: &Path, marker: &UpgradeHaltMarker) -> std::io::Result<
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    sync_parent(path);
+    // The directory entry must be durable too: a marker whose file contents
+    // were fsynced but whose rename was not can VANISH on power loss, letting
+    // the node restart the OLD binary with no halt guard (audit 2.4). Report
+    // the failure to the caller instead of swallowing it.
+    sync_parent(path)?;
     Ok(())
 }
 
@@ -252,7 +256,7 @@ pub fn read_marker(path: &Path) -> std::io::Result<Option<UpgradeHaltMarker>> {
 pub fn clear_marker(path: &Path) -> std::io::Result<bool> {
     match std::fs::remove_file(path) {
         Ok(()) => {
-            sync_parent(path);
+            sync_parent(path)?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -260,14 +264,16 @@ pub fn clear_marker(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn sync_parent(path: &Path) {
+/// fsync the directory holding `path` so a create/rename/remove survives a
+/// power loss. `?` on both the open and the sync: a directory we cannot open
+/// (or fsync) means the marker's durability is unproven, which the caller
+/// must report rather than silently proceed.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// The version this binary reports. `STELL_UPGRADE_VERSION` (trimmed,

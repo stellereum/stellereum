@@ -287,7 +287,17 @@ fn proposer_edge_cases_empty_and_singleton_sets() {
         block_hash: Some([0xABu8; 32]),
         signatures: vec![],
     };
-    assert!(verify_finality_for_header(&empty, 1, &[0xABu8; 32], &[0x11u8; 32], &qc).is_err());
+    assert!(
+        verify_finality_for_header(
+            &empty,
+            1,
+            &[0xABu8; 32],
+            &[0u8; 32],
+            &[0x11u8; 32],
+            &qc
+        )
+        .is_err()
+    );
 
     // All-zero powers behave like empty (add() drops zero-power members).
     let zero = ValidatorSet::from_list(vec![([0x11u8; 32], 0), ([0x12u8; 32], 0)]);
@@ -420,7 +430,15 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
         "fixture QC must verify under the H+1 set"
     );
     assert!(
-        verify_finality_for_header(&in_force, BOUNDARY_H + 1, &block_hash, &proposer, &qc).is_ok(),
+        verify_finality_for_header(
+            &in_force,
+            BOUNDARY_H + 1,
+            &block_hash,
+            &[0x11u8; 32],
+            &proposer,
+            &qc
+        )
+        .is_ok(),
         "header+QC valid under the set in force at H+1"
     );
 
@@ -433,7 +451,15 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
         "fixture QC must NOT verify under the old set"
     );
     assert!(
-        verify_finality_for_header(&stale, BOUNDARY_H + 1, &block_hash, &proposer, &qc).is_err(),
+        verify_finality_for_header(
+            &stale,
+            BOUNDARY_H + 1,
+            &block_hash,
+            &[0x11u8; 32],
+            &proposer,
+            &qc
+        )
+        .is_err(),
         "stale-set verification must refuse a rotated-height header"
     );
     // Wrong-QC-kind / wrong-hash variants fail closed under the right set too.
@@ -443,13 +469,21 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
         &in_force,
         BOUNDARY_H + 1,
         &block_hash,
+        &[0x11u8; 32],
         &proposer,
         &wrong_kind
     )
     .is_err());
     assert!(
-        verify_finality_for_header(&in_force, BOUNDARY_H + 1, &[0x00u8; 32], &proposer, &qc)
-            .is_err()
+        verify_finality_for_header(
+            &in_force,
+            BOUNDARY_H + 1,
+            &[0x00u8; 32],
+            &[0u8; 32],
+            &proposer,
+            &qc
+        )
+        .is_err()
     );
     let _ = (a, kb);
 }

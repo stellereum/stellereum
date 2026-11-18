@@ -344,15 +344,20 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
 ///
 /// PINNED POLICY (the slash base): a downtime slash burns `bps` of the
 /// validator's WHOLE remaining stake - the bonded self-bond, the stake still
-/// LOCKED in the unbonding queue, and the delegations - and it consumes it in
-/// THAT ORDER: the validator's own money first (so a validator cannot unbond
-/// and then go offline to dodge the penalty), the delegators' money last.
-/// A MATURED unbond is withdrawable and no longer slashable.
+/// LOCKED in the unbonding queue, the MATURED-but-unwithdrawn amount, and the
+/// delegations - and it consumes it in THAT ORDER: the validator's own money
+/// first (so a validator cannot unbond and then go offline to dodge the
+/// penalty), the delegators' money last. SLASH-01 closed the last gap: a
+/// matured unbond stays in the base until it is actually WITHDRAWN (evidence
+/// has no age bound, so "wait one cooldown" must not be an escape).
 ///
 /// The target's self-bond is fully unbonded first (legal full exit). The
 /// unbonding entry is still LOCKED, so phase 1's burn comes out of it and the
-/// delegation map must NOT move. Phase 2 matures that entry and the NEXT
-/// downtime streak then lands on the delegators, where the map must move.
+/// delegation map must NOT move. Phase 2 matures that entry: the NEXT
+/// downtime streak then lands on the MATURED principal (still the validator's
+/// own money), not the delegators. Phase 3 withdraws it — value leaves the
+/// ledger — and only then does the streak land on the delegators, where the
+/// map must move.
 #[test]
 fn load_downtime_slash_debits_map_aggregate_and_pool() {
     let (mut l, mut pool) = build_loaded_ledger();
@@ -446,9 +451,11 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     );
     assert_map_aggregate_in_step(&l, &vs, "after phase 1");
 
-    // Phase 2: the unbonding MATURES. A matured unbond is withdrawable, not
-    // slashable, so the NEXT downtime streak lands on the delegators - and
-    // the map MUST move with it.
+    // Phase 2: the unbonding MATURES. SLASH-01: matured-but-unwithdrawn stake
+    // is STILL in the slashable base, so the NEXT downtime streak lands on the
+    // matured principal — NOT on the delegators. (The old expectation, "a
+    // matured unbond is not slashable", encoded the escape this fix closes:
+    // wait one cooldown and the penalty misses the stake.)
     l.process_unbonding(UNBONDING_PERIOD_SECS).unwrap();
     let matured: u64 = l.withdrawable.values().sum();
     assert_eq!(
@@ -474,19 +481,58 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     );
     pool -= burned_total2;
 
-    // Nominal 0.1% burn of the delegations, modulo per-delegator floor dust
-    // (< #delegators nanos).
-    let nominal2 = agg_before * DOWNTIME_SLASH_BPS / 10_000;
+    // Nominal 0.1% burn of (matured principal + delegations): the delegators
+    // are NOT touched — the validator's own matured money pays.
+    let nominal2 = (agg_before + matured) * DOWNTIME_SLASH_BPS / 10_000;
     assert!(
         burned_total2 <= nominal2 && nominal2 - burned_total2 < 17,
         "burned {burned_total2} must equal nominal {nominal2} modulo floor dust"
+    );
+    assert_eq!(
+        l.withdrawable_of(&target),
+        matured - burned_total2,
+        "the matured principal paid the burn (SLASH-01)"
+    );
+    assert_eq!(
+        l.validators[&target].delegated, agg_before,
+        "the delegators did not pay while matured stake remained"
+    );
+    assert_map_aggregate_in_step(&l, &vs, "after matured slash");
+
+    // Phase 3: WITHDRAW the matured funds — the value leaves the ledger, so
+    // it finally leaves the slashable base. The next streak then lands on the
+    // delegators, where the map MUST move and stay in step with the
+    // aggregate.
+    let withdrawn = l.withdraw(target).unwrap();
+    assert_eq!(withdrawn, matured - burned_total2);
+    pool -= withdrawn;
+    assert_eq!(l.withdrawable_of(&target), 0);
+
+    let mut burned_total3: u64 = 0;
+    for h in (11 + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN)
+        ..=(10 + 2 * stellereum::staking::DOWNTIME_PENALTY_COOLDOWN)
+    {
+        burned_total3 += l.note_missed_heights(h, &signer, &eligible);
+    }
+    assert!(
+        burned_total3 > 0,
+        "the third downtime streak must slash the delegations"
+    );
+    pool -= burned_total3;
+
+    // Nominal 0.1% burn of the delegations, modulo per-delegator floor dust
+    // (< #delegators nanos).
+    let nominal3 = agg_before * DOWNTIME_SLASH_BPS / 10_000;
+    assert!(
+        burned_total3 <= nominal3 && nominal3 - burned_total3 < 17,
+        "burned {burned_total3} must equal nominal {nominal3} modulo floor dust"
     );
 
     // Aggregate, map, burn ledger, and pool all agree on the same figure.
     let agg_after = l.validators[&target].delegated;
     assert_eq!(
         agg_before - agg_after,
-        burned_total2,
+        burned_total3,
         "aggregate debit must equal the burn"
     );
     let map_after = map_sum(&l, &target);
@@ -499,18 +545,18 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
         .map(|(d, b)| b - l.delegations.get(&(target, *d)).copied().unwrap_or(0))
         .sum();
     assert_eq!(
-        cut_sum, burned_total2,
-        "sum of per-delegator map cuts {cut_sum} must equal the burn {burned_total2}"
+        cut_sum, burned_total3,
+        "sum of per-delegator map cuts {cut_sum} must equal the burn {burned_total3}"
     );
     assert_eq!(
         l.total_burned,
-        burned_before + burned_total + burned_total2,
-        "total_burned must track both burns"
+        burned_before + burned_total + burned_total2 + burned_total3,
+        "total_burned must track all three burns"
     );
     assert_eq!(
         l.total_stake(&target),
         agg_after,
-        "total stake drops by exactly the burn (self was 0)"
+        "total stake drops by exactly the burn (self and matured are gone)"
     );
     let bonded: u64 = vs.iter().map(|v| l.total_stake(v)).sum();
     let in_flight: u64 = l.unbonding.iter().map(|e| e.amount).sum();

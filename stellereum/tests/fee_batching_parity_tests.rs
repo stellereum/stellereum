@@ -181,7 +181,10 @@ fn plain_block_matches_sequential_singles() {
 
 /// The fixed mixed fixture: (status, fee) intent per row.
 /// 0: plain success, declared gas below the floor -> fee = FLOOR.
-/// 1: plain success, declared gas above the floor -> fee = declared.
+/// 1: plain success, declared gas above the floor -> fee = FLOOR. FEE-01: a
+///    plain (empty-payload) transaction is billed the intrinsic envelope cost
+///    (`GAS_BASIC_TRANSFER`), capped at its 600 000 declaration, so what binds
+///    is the floor - not the declaration (that was the over-charge).
 /// 2: plain, covers amount+declared but NOT amount+floor -> admission
 ///    refusal: failed, fee 0, no state change.
 /// 3: OOM payload, funded -> attributable failure: fee = FLOOR (the floor
@@ -244,11 +247,11 @@ fn mixed_fee_vectors_are_pinned() {
         // row 4 is explicit PQ1+SP1 so charges FLOOR + PQ_ACTIVATION_SURCHARGE_GAS = 545_000).
         assert_eq!((applied, failed), (3, 3));
         assert_eq!(status, vec![true, true, false, false, true, false]);
-        assert_eq!(fees, vec![500_000, 600_000, 0, 500_000, 545_000, 0]);
-        assert_eq!(fees_collected, 2_145_000);
+        assert_eq!(fees, vec![500_000, 500_000, 0, 500_000, 545_000, 0]);
+        assert_eq!(fees_collected, 2_045_000);
         let pinned: [([u8; 32], u64, u64); 8] = [
             (addr_of(11), 9_499_999, 1),
-            (addr_of(12), 9_399_998, 1),
+            (addr_of(12), 9_499_998, 1),
             (addr_of(13), BAL, 0),
             (addr_of(14), 9_500_000, 1),
             (addr_of(15), 9_999_993, 1),

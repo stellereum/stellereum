@@ -6203,6 +6203,16 @@ impl Node {
 
     /// Обобщённое хранилище блобов (для файлов file.storage): локально сразу + фоновая
     /// репликация, как store_mail, но с произвольным бакетом и манифестом "{bucket}:{name}".
+    ///
+    /// ⚠ БЕЗ `owner_pub` ЭТО НЕ КОНФИДЕНЦИАЛЬНО. Вызывается
+    /// `store_blob_boxed_with_ttl(.., None, ..)`: данные шифруются
+    /// детерминированным ключом из публичных (bucket, name, H(plaintext))
+    /// (`blob_key_nonce`), а сам ключ кладётся в манифест полем `"key"`.
+    /// Любой держатель манифеста и чанков расшифровывает блоб. Это at-rest
+    /// обфускация (защита от случайного чтения диска), НЕ E2E-шифрование.
+    /// Если нужна конфиденциальность от нод/DHT — передайте ML-KEM-768 ek
+    /// владельца в `store_blob_boxed`, тогда plaintext-key в манифест не
+    /// попадает, а payload запечатан на владельца (`BLOB_SEAL_V1`).
     pub async fn store_blob(self: &Arc<Self>, bucket: &str, name: &str, blob: &[u8]) -> usize {
         self.store_blob_with_ttl(bucket, name, blob, 30 * 24 * 3600 * 1000)
             .await
@@ -6225,15 +6235,22 @@ impl Node {
             .await
     }
 
-    /// store_blob с Proton-моделью: если owner_pub задан (ML-KEM-768 ek hex
-    /// владельца), ключ блоба шифруется box на публичный ключ (key_box в
-    /// манифесте) — прочитать может только владелец.
+    /// store_blob с владельческим запечатыванием: если owner_pub задан
+    /// (ML-KEM-768 ek hex владельца), данные шифруются СЛУЧАЙНЫМ data key,
+    /// который заворачивается box'ом на публичный ключ владельца (`key_box` в
+    /// манифесте). Открытого `"key"` в манифесте нет; прочитать блоб может
+    /// только владелец ML-KEM-сида (через `fetch_blob_owner`). Payload
+    /// AEAD-привязан к (bucket, name, H(plaintext)) — см. `blob_seal_aad`.
     ///
-    /// ИДЕМПОТЕНТНОСТЬ: key/nonce и chunk_id выводятся из содержимого (см.
-    /// blob_key_nonce / chunk_id_for), поэтому повторный publish того же имени с тем же
-    /// контентом пишет в ТЕ ЖЕ файлы чанков (поверх, write_chunk_atomic) и кладёт тот же
-    /// манифест — размер каталога не растёт. Другое содержимое => новые id; старые файлы
-    /// остаются сиротами до prune-chunk-orphans.
+    /// Fail-closed: если owner_pub задан, но не является валидным ML-KEM-768
+    /// ek, запись ОТКАЗЫВАЕТСЯ (0), а не деградирует до plaintext-key.
+    ///
+    /// ИДЕМПОТЕНТНОСТЬ: chunk_id по-прежнему считается от H(plaintext)
+    /// (`chunk_id_for`), поэтому повторный publish того же имени пишет в ТЕ ЖЕ
+    /// файлы чанков (перезапись, не рост). Key/nonce теперь случайны, так что
+    /// байты ct и хэши чанков в манифесте между репаблишами различаются — это
+    /// ожидаемо; читатель, взявший старый манифест, получит hash-mismatch и
+    /// перечитает манифест (fail-closed, не отдаст чужие байты).
     pub async fn store_blob_boxed(
         self: &Arc<Self>,
         bucket: &str,
@@ -6255,10 +6272,36 @@ impl Node {
         ttl_ms: i64,
     ) -> usize {
         const CHUNK: usize = 1024 * 1024;
-        // содержимо-адресность: (key, nonce) и id чанков выводятся из H(plaintext)
         let content_hash = blob_content_hash(blob);
-        let (data_key, nonce) = blob_key_nonce(bucket, name, &content_hash);
-        let ct = e2e_encrypt_det(&data_key, &nonce, blob);
+        // Два режима:
+        //  - owner_pub: настоящая конфиденциальность (случайный DEK + ML-KEM box, AAD);
+        //  - None: legacy at-rest обфускация (публично выводимый ключ + "key" в манифесте).
+        let (data_key, nonce, key_box, sealed) = match owner_pub {
+            Some(pub_hex) => {
+                let (k, n) = random_blob_key_nonce();
+                match box_wrap_key(pub_hex, &k) {
+                    Some(kb) => (k, n, Some(kb), true),
+                    None => {
+                        eprintln!(
+                            "[node] store_blob {bucket}/{name}: owner_pub is not a valid ML-KEM-768 ek \
+                             ({} hex chars expected); refusing to write a plaintext data key",
+                            crate::mailbox::KEM_EK_LEN * 2
+                        );
+                        return 0;
+                    }
+                }
+            }
+            None => {
+                let (k, n) = blob_key_nonce(bucket, name, &content_hash);
+                (k, n, None, false)
+            }
+        };
+        let aad = if sealed {
+            blob_seal_aad(bucket, name, &content_hash)
+        } else {
+            Vec::new()
+        };
+        let ct = e2e_encrypt_det_aad(&data_key, &nonce, &aad, blob);
         let mut chunks: Vec<serde_json::Value> = Vec::new();
         let mut offset = 0usize;
         let mut local_chunks = 0usize;
@@ -6298,13 +6341,13 @@ impl Node {
             "nonce": hex::encode(nonce),
             "chunks": chunks,
         });
-        if let Some(pub_hex) = owner_pub {
-            if let Some(kb) = box_wrap_key(pub_hex, &data_key) {
-                manifest["key_box"] = kb;
-            } else {
-                manifest["key"] = json!(hex::encode(data_key));
-            }
+        if let Some(kb) = key_box {
+            // Owner-sealed: key_box + AAD + content hash; НИКОГДА не "key".
+            manifest["seal"] = json!(BLOB_SEAL_V1);
+            manifest["content_hash"] = json!(hex::encode(content_hash));
+            manifest["key_box"] = kb;
         } else {
+            // Legacy at-rest обфускация (owner_pub == None). Не E2E.
             manifest["key"] = json!(hex::encode(data_key));
         }
         let mkey = Self::blob_manifest_key(bucket, name);
@@ -6383,7 +6426,35 @@ impl Node {
     }
 
     /// Скачать блоб из произвольного бакета (манифест + чанки + расшифровка).
+    ///
+    /// Понимает оба формата:
+    ///  - `seal = BLOB_SEAL_V1` (+ `key_box`): owner-sealed, нужен
+    ///    `fetch_blob_owner` с ML-KEM-сидом владельца; здесь вернёт None
+    ///    (fail-closed — без ключа владельца блоб не отдаётся);
+    ///  - `key` в манифесте: legacy at-rest обфускация, читается без секретов.
     pub async fn fetch_blob(self: &Arc<Self>, bucket: &str, name: &str) -> Option<Vec<u8>> {
+        self.fetch_blob_inner(bucket, name, None).await
+    }
+
+    /// Скачать owner-sealed блоб, распаковав `key_box` ML-KEM-768 сидом
+    /// владельца (64 байта hex). Только владелец (или получивший его сид)
+    /// может прочитать данные.
+    pub async fn fetch_blob_owner(
+        self: &Arc<Self>,
+        bucket: &str,
+        name: &str,
+        owner_priv_hex: &str,
+    ) -> Option<Vec<u8>> {
+        self.fetch_blob_inner(bucket, name, Some(owner_priv_hex))
+            .await
+    }
+
+    async fn fetch_blob_inner(
+        self: &Arc<Self>,
+        bucket: &str,
+        name: &str,
+        owner_priv: Option<&str>,
+    ) -> Option<Vec<u8>> {
         let mkey = Self::blob_manifest_key(bucket, name);
         let manifest_str = self.get_local_kv(&mkey).await;
         let manifest_str = if let Some(m) = manifest_str {
@@ -6413,12 +6484,34 @@ impl Node {
         };
         let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
         let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).ok()?;
-        let key = hex::decode(manifest["key"].as_str().unwrap_or("")).ok()?;
-        if key.len() != 32 {
-            return None;
-        }
-        let mut dk = [0u8; 32];
-        dk.copy_from_slice(&key);
+        let sealed = manifest.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1);
+        // (data_key, aad, claimed content hash after decrypt)
+        let (dk, aad, want_hash): ([u8; 32], Vec<u8>, Option<[u8; 32]>) = if sealed {
+            // Owner-sealed: ключ только в key_box (ML-KEM-768 на владельца).
+            let priv_hex = owner_priv?;
+            let kb = manifest.get("key_box")?;
+            let dk = box_unwrap_key(kb, priv_hex).ok()?;
+            let ch = hex::decode(manifest["content_hash"].as_str()?).ok()?;
+            if ch.len() != 32 {
+                return None;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&ch);
+            let aad = blob_seal_aad(bucket, name, &h);
+            (dk, aad, Some(h))
+        } else if let Some(kb) = manifest.get("key_box") {
+            // Legacy boxed-манифест (до BLOB_SEAL_V1): key_box есть, AAD нет.
+            let priv_hex = owner_priv?;
+            (box_unwrap_key(kb, priv_hex).ok()?, Vec::new(), None)
+        } else {
+            let key = hex::decode(manifest["key"].as_str().unwrap_or("")).ok()?;
+            if key.len() != 32 {
+                return None;
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&key);
+            (k, Vec::new(), None)
+        };
         let mut buf: Vec<u8> = Vec::new();
         if let Some(chunks) = manifest["chunks"].as_array() {
             for c in chunks {
@@ -6485,7 +6578,16 @@ impl Node {
                 buf.extend_from_slice(&got?);
             }
         }
-        e2e_decrypt(&dk, &nonce, &buf).ok()
+        let plain = e2e_decrypt_aad(&dk, &nonce, &aad, &buf).ok()?;
+        if let Some(want) = want_hash {
+            // AEAD уже аутентифицировал AAD; сверка H(plaintext) ловит подмену
+            // манифеста (другой content_hash/bucket/name при валидном box).
+            if blob_content_hash(&plain) != want {
+                eprintln!("[node] fetch_blob {name}: decrypted content hash mismatch, refusing");
+                return None;
+            }
+        }
+        Some(plain)
     }
 
     // ============ конец Хранилища ============
@@ -7856,24 +7958,69 @@ pub fn e2e_encrypt(key: &[u8; 32], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (ct, nonce.to_vec())
 }
 
+/// Manifest marker for an owner-sealed bucket blob (see `store_blob_boxed`).
+/// v1 = fresh random data key per publish, key wrapped to the owner's
+/// ML-KEM-768 encapsulation key, payload AEAD-bound to the canonical AAD
+/// from [`blob_seal_aad`].
+pub const BLOB_SEAL_V1: &str = "infnode-blob-seal-v1";
+
+/// Canonical AAD for an owner-sealed blob. Binds the ciphertext to
+/// (format, bucket, name, H(plaintext)) so a chunk (or a whole blob) moved to
+/// another bucket/name/content fails authentication instead of decrypting.
+pub fn blob_seal_aad(bucket: &str, name: &str, content_hash: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "{BLOB_SEAL_V1}:{bucket}:{name}:{}",
+        hex::encode(content_hash)
+    )
+    .into_bytes()
+}
+
 /// XChaCha20-Poly1305 с ЗАДАННЫМИ key/nonce — детерминированная версия e2e_encrypt.
-/// Блоб-хранилище шифрует так, чтобы повторный publish того же содержимого дал
-/// байт-в-байт тот же ct (см. blob_key_nonce).
+/// НЕ даёт конфиденциальности сама по себе: безопасность зависит от того, кто
+/// знает `key`. Для блобов, где key выводится из публичных данных, это
+/// обфускация (см. `blob_key_nonce`); владельческое хранилище использует
+/// случайный key, завёрнутый в ML-KEM (`store_blob_boxed`).
 pub fn e2e_encrypt_det(key: &[u8; 32], nonce: &[u8; 24], plain: &[u8]) -> Vec<u8> {
+    e2e_encrypt_det_aad(key, nonce, &[], plain)
+}
+
+/// `e2e_encrypt_det` с дополнительным AAD (привязка ciphertext к контексту).
+pub fn e2e_encrypt_det_aad(key: &[u8; 32], nonce: &[u8; 24], aad: &[u8], plain: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .encrypt(XNonce::from_slice(nonce), plain)
+        .encrypt(
+            XNonce::from_slice(nonce),
+            chacha20poly1305::aead::Payload { msg: plain, aad },
+        )
         .expect("e2e encrypt")
 }
 
 pub fn e2e_decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
+    e2e_decrypt_aad(key, nonce, &[], ct)
+}
+
+/// `e2e_decrypt` с AAD. Пустой AAD совместим с прежним форматом байт-в-байт.
+pub fn e2e_decrypt_aad(key: &[u8; 32], nonce: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
     if nonce.len() != 24 {
         bail!("invalid nonce length");
     }
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .decrypt(XNonce::from_slice(nonce), ct)
+        .decrypt(
+            XNonce::from_slice(nonce),
+            chacha20poly1305::aead::Payload { msg: ct, aad },
+        )
         .map_err(|_| anyhow!("e2e decrypt failed (tamper?)"))
+}
+
+/// Fresh data key + nonce for one owner-sealed blob. Random on purpose: a key
+/// derived from public data (bucket/name/content) is decryptable by anyone.
+fn random_blob_key_nonce() -> ([u8; 32], [u8; 24]) {
+    let mut key = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    (key, nonce)
 }
 
 /// KEX frame seal site (ONE swap): every session is PQ, so bodies are sealed
@@ -7902,30 +8049,37 @@ fn frame_open_body(key: &[u8; 32], pq_digest: &[u8; 32], f: &Frame) -> Result<Ve
     proto::kex_frame_open(key, &f.nonce, &aad, &f.payload)
 }
 
-/// Content id блоба: blake3(плейнтекст целиком). Из него выводятся и chunk_id
-/// (chunk_id_for), и крипто-материалы (blob_key_nonce) — единый источник
-/// «содержимого» для идентификации и шифрования.
+/// Content id блоба: blake3(плейнтекст целиком). Из него выводится chunk_id
+/// (chunk_id_for); owner-sealed путь кладёт его в AAD и в манифест для
+/// верификации после расшифровки. Для legacy-пути из него же выводится
+/// обфускационный ключ (blob_key_nonce — НЕ конфиденциальность).
 pub fn blob_content_hash(blob: &[u8]) -> [u8; 32] {
     *blake3::hash(blob).as_bytes()
 }
 
-/// Детерминированные крипто-материалы блоба: (key, nonce) = f(bucket, name, H(plaintext)).
+/// Детерминированные (key, nonce) = f(bucket, name, H(plaintext)).
 ///
-/// КОРНЕВАЯ ПРИЧИНА РОСТА ДИСКА: раньше key был rand::random() на КАЖДЫЙ publish,
-/// поэтому ct — а вместе с ним chunk_id, считавшийся от ct-байтов — менялся каждый
-/// раз, и репаблиш того же имени добавлял новый набор файлов вместо перезаписи
-/// старых (752 МБ / 187k файлов, 76% — вытесненные дубликаты).
+/// ⚠ ЭТО НЕ ШИФРОВАНИЕ, А AT-REST ОБФУСКАЦИЯ. Все входы публичны: bucket и
+/// name лежат в манифесте, а H(plaintext) выводится из id чанков
+/// (`chunk_id_for`). Любой, кто знает (bucket, name) и угадывает содержимое,
+/// пересчитывает ключ и расшифровывает блоб. Поэтому путь, использующий эту
+/// функцию, НЕЛЬЗЯ называть E2E/encryption и нельзя рекламировать как
+/// конфиденциальный. Для настоящей конфиденциальности — `store_blob_boxed`
+/// (случайный data key, key_box на ML-KEM-768 ключ владельца) +
+/// `fetch_blob_owner`.
 ///
-/// Теперь одинаковые (bucket, name, содержимое) дают одинаковый key/nonce/ct на
-/// любой ноде: повторный publish пишет в ТЕ ЖЕ пути (write_chunk_atomic поверх),
-/// а смена содержимого даёт новые key/ct/ids — старые файлы остаются сиротами,
-/// их подметает prune-chunk-orphans по текущим манифестам.
+/// Зачем она осталась: старые манифесты (`"key"` в открытом виде) и почтовый
+/// путь с key_box должны читаться, а детерминированный ct нужен, чтобы повторный
+/// publish того же содержимого писал в ТЕ ЖЕ пути чанков.
 ///
-/// Замечание по модели угроз: ключ воспроизводим из имени+контента, т.е. у
-/// держателя data_dir появляется offline-проверка догадки о содержимом. Слой
-/// key_box (owner_pub) рассчитан на то, что контент и так зашифрован на уровне
-/// приложения (storage_seal/proton_box — так делает web-слой); случайный ключ
-/// в манифесте (модель без key_box) и так открыт, здесь ничего не меняется.
+/// КОРНЕВАЯ ПРИЧИНА РОСТА ДИСКА (исторически): раньше key был rand::random() на
+/// КАЖДЫЙ publish, поэтому ct — а вместе с ним chunk_id, считавшийся от ct-байтов
+/// — менялся каждый раз, и репаблиш того же имени добавлял новый набор файлов
+/// вместо перезаписи старых (752 МБ / 187k файлов, 76% — вытесненные дубликаты).
+/// Теперь одинаковые (bucket, name, содержимое) дают одинаковый key/nonce/ct.
+/// Современный owner-sealed путь сохраняет идемпотентность иначе: chunk_id
+/// считается от H(plaintext), поэтому случайный key не меняет пути (файлы
+/// перезаписываются), меняются только байты ct и хэши чанков в манифесте.
 pub fn blob_key_nonce(bucket: &str, name: &str, blob_hash: &[u8; 32]) -> ([u8; 32], [u8; 24]) {
     let h = hex::encode(blob_hash);
     let key_h = blake3::hash(format!("infnode:blob-key:v1:{bucket}:{name}:{h}").as_bytes());
@@ -7955,6 +8109,13 @@ pub fn blob_key_nonce(bucket: &str, name: &str, blob_hash: &[u8; 32]) -> ([u8; 3
 /// Единая точка: ВСЕ продьюсеры (store_mail, store_mail_ec, store_blob, их
 /// replicate_*, CLI storage-put) обязаны вызывать именно её (для EC-шардов —
 /// ec_chunk_id_for), передавая content id того же блоба.
+///
+/// МЕТАДАННЫЕ (не конфиденциальность): id выводится из H(plaintext), поэтому
+/// держатель id может offline проверить догадку о содержимом и сопоставить
+/// одинаковые блобы (bucket+name+offset). Owner-sealed шифрование скрывает
+/// сами байты, но НЕ скрывает этот факт; для снятия нужен id-salt из секрета
+/// владельца, которого на storage-нодах нет (это осознанный компромисс с
+/// content-addressed репликацией).
 pub fn chunk_id_for(bucket: &str, name: &str, offset: usize, content_hash: &[u8; 32]) -> String {
     hex::encode(
         blake3::hash(format!("{bucket}:{name}:{offset}:{}", hex::encode(content_hash)).as_bytes())

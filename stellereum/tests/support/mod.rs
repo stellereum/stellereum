@@ -76,10 +76,12 @@ use stellereum::state_engine::InMemoryStateEngine;
 
 /// The fee the engine charges for a refused `tx`.
 ///
-/// The number is the ENGINE's own rule - `max(declared gas_limit, consensus
-/// floor) + surcharge` (see `state_engine::consensus_floor_parts`, which is
-/// the same helper admission uses) - so the expectation cannot drift from the
-/// implementation.
+/// The number is the ENGINE's own rule, obtained from the engine's own helper
+/// ([`InMemoryStateEngine::failure_fee_for`]: the intrinsic envelope cost,
+/// capped at the declaration, floored by consensus, surcharge additive — FEE-01),
+/// so the expectation cannot drift from the implementation. Before FEE-01 this
+/// helper duplicated the then-current `max(gas_limit, floor) + surcharge`
+/// rule; the declared limit is no longer a price, so the copy had to go.
 ///
 /// CALL IT BEFORE the transaction is applied. The consensus floor carries the
 /// D2 failure penalty, and the block path records that penalty at the END of
@@ -87,7 +89,7 @@ use stellereum::state_engine::InMemoryStateEngine;
 /// penalty the refusal itself caused, and would over-state what was charged.
 pub async fn failure_fee(engine: &InMemoryStateEngine, tx: &Transaction) -> u64 {
     let (floor_base, surcharge) = engine.consensus_floor_parts(tx).await;
-    tx.gas_limit.max(floor_base).saturating_add(surcharge)
+    InMemoryStateEngine::failure_fee_for(tx, floor_base, surcharge)
 }
 
 /// THE F-01 CONTRACT: after an attributable refusal the sender paid exactly

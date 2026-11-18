@@ -1,6 +1,7 @@
-//! §2 zkML, ATTESTATION half: PQ-STARK-BLAKE3 (`STELLEREUM_PQ_STARK_BLAKE3_V1`)
-//! trace attestations on the live block path (Groth16/arkworks were replaced;
-//! there is no succinct ZK here — see `zkml_capabilities()`).
+//! §2 zkML, ATTESTATION half: re-execution over a constrained model with a
+//! BLAKE3 Merkle trace root (the FS domain tag is the legacy
+//! `STELLEREUM_PQ_STARK_BLAKE3_V1`; despite its name there is no STARK and no
+//! succinct ZK here — see `zkml_capabilities()`).
 //!
 //! Companion to `tests/zkml_live_tests.rs` (the re-execution half). What this
 //! file pins end to end:
@@ -41,8 +42,11 @@ use stellereum::svm::{
 };
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 use stellereum::zkml_attestation::{
-    model_spec_test_only, model_spec_with_attestation, prove_attestation, verify_attestation,
-    AttestationProof, ModelSpec, ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
+    model_spec_test_only, model_spec_with_attestation, prove_attestation,
+    prove_attestation_bound, verify_attestation, verify_attestation_at,
+    verify_attestation_bound, AttestationProof, ModelSpec, ZkmlContextBinding,
+    ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
+    ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT,
 };
 
 const BLOCK_TS: u64 = 1_760_000_000;
@@ -444,10 +448,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     assert!(verify_attestation(&vk_b.spec_bytes, &proof_b));
     let vtx = verify_snark_tx(&sk, addr, nonce, MODEL_A, &proof_b);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -489,10 +497,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     proof_a.spec_hash = vk_b.spec_hash;
     let vtx = verify_snark_tx(&sk, addr, nonce, MODEL_A, &proof_a);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -530,10 +542,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     proof_a2.model_hash = other.compute_model_hash();
     let vtx = verify_snark_tx(&sk, addr, nonce, MODEL_A, &proof_a2);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -571,10 +587,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     proof_a3.public_outputs.pop();
     let vtx = verify_snark_tx(&sk, addr, nonce, MODEL_A, &proof_a3);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -612,10 +632,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     proof_a4.public_inputs[0] = ATTEST_MAX_INPUT + 1;
     let vtx = verify_snark_tx(&sk, addr, nonce, MODEL_A, &proof_a4);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -665,16 +689,23 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
         .await;
     assert_eq!((a, f), (1, 0), "model registration must apply");
     assert_eq!(s, vec![true]);
+    // FEE-01: a SUCCESS pays the gas the VM MEASURED (`sum(per-PQ-param
+    // price)` here — 1 400 000), capped at the 5 000 000 declaration, not the
+    // declaration itself. The old expectation, `GAS`, was the over-charge.
     assert_eq!(
         fees,
-        vec![GAS],
-        "success pays the declared gas (floor does not bind here)"
+        vec![1_400_000],
+        "success pays the consumed gas, capped at the declaration"
+    );
+    assert!(
+        fees[0] <= GAS,
+        "the declared limit is a cap: a success can never pay more"
     );
     let acct = e.get_account(&addr).await.unwrap();
     assert_eq!(
         acct.balance,
-        bal_before - GAS,
-        "success balance delta == declared gas"
+        bal_before - fees[0],
+        "success balance delta == the fee actually charged"
     );
     assert_eq!(acct.nonce, nonce + 1);
     assert_ne!(
@@ -687,10 +718,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let (_, proof_nvk) = prove_for(&m, &[3, 4], &pk_a, &vk_a);
     let vtx = verify_snark_tx(&sk, addr, nonce, no_vk_id, &proof_nvk);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -730,10 +765,14 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     // Unknown model id.
     let vtx = verify_snark_tx(&sk, addr, nonce, [0x99; 32], &proof_nvk);
     let expected_floor = floor_mirror.effective_floor_for_tx(&vtx);
-    // PINNED POLICY (SEC-07 / F-01): the failure fee is
-    // `max(declared gas limit, consensus floor)` - the DECLARED limit binds
-    // unless the D2 penalty floor is higher. A failure is NEVER free.
-    let expected_fee = GAS.max(expected_floor);
+    // PINNED POLICY (SEC-07 / F-01 / FEE-01): the failure fee is
+    // `max(min(declared gas limit, intrinsic envelope), consensus floor)`.
+    // The 5 000 000 declaration is a BUDGET; the executor is only guaranteed
+    // to have consumed the 280 000 intrinsic envelope, so that is what a
+    // failure pays (the floor can still raise it). A failure is NEVER free.
+    let expected_fee = stellereum::svm::GAS_BASIC_TRANSFER
+        .min(GAS)
+        .max(expected_floor);
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
@@ -807,7 +846,8 @@ async fn snark_tampered_vk_rejected() {
         assert!(reg.register_spec(MODEL_A, mismatched).is_err());
     }
 
-    // (c) Tampered PROOF byte with a valid hash binding: pairing fails.
+    // (c) Tampered PROOF byte with a valid hash binding: the re-execution /
+    // trace-root check fails (there is no pairing anywhere in this path).
     let (e, sk, addr) = funded().await;
     let (pk_bytes, vk) =
         register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
@@ -1627,4 +1667,75 @@ fn snark_proof_leaves_inputs_and_outputs_public_no_hiding() {
     assert!(caps.sound);
     assert!(!caps.zero_knowledge && !caps.succinct && !caps.hiding);
     assert!(caps.protocol.contains("re-execution"));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Context binding is OPT-IN and inert by default (separate FS domain).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn context_binding_is_opt_in_and_inert_by_default() {
+    // The gate constant is the "never" sentinel; nothing can open it here.
+    assert_eq!(ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT, u64::MAX);
+    assert!(!stellereum::zkml_attestation::zkml_context_binding_active(0));
+    assert!(!stellereum::zkml_attestation::zkml_context_binding_active(
+        u64::MAX - 1
+    ));
+
+    let m = tiny_model();
+    let (pk, vk) = test_setup(&m, ATTEST_TEST_SEED);
+    let ctx = ZkmlContextBinding {
+        chain_id: 5_757,
+        model_id: MODEL_A,
+        height: 77,
+        sender: [0x77; 32],
+    };
+    let (_, plain) = prove_attestation(
+        &m.attestation_view(),
+        m.compute_model_hash(),
+        &[3, 4],
+        &pk,
+        vk.spec_hash,
+    )
+    .expect("legacy prove must succeed");
+    let (_, bound) = prove_attestation_bound(
+        &m.attestation_view(),
+        m.compute_model_hash(),
+        &[3, 4],
+        &pk,
+        vk.spec_hash,
+        &ctx,
+    )
+    .expect("bound prove must succeed");
+
+    // Distinct domains: the two transcripts never cross-verify.
+    assert!(verify_attestation(&vk.spec_bytes, &plain));
+    assert!(!verify_attestation(&vk.spec_bytes, &bound));
+    assert!(verify_attestation_bound(&vk.spec_bytes, &bound, &ctx));
+    assert!(!verify_attestation_bound(&vk.spec_bytes, &plain, &ctx));
+
+    // TODAY'S behaviour is byte-identical: with the gate at u64::MAX the
+    // gate-aware entry point is the legacy verifier and IGNORES the context.
+    assert!(verify_attestation_at(&vk.spec_bytes, &plain, 0, None));
+    assert!(!verify_attestation_at(
+        &vk.spec_bytes,
+        &bound,
+        0,
+        Some(&ctx)
+    ));
+
+    // Replay resistance is the point: every bound field is part of the
+    // statement. Flipping any one of them invalidates the proof.
+    let mut wrong = ctx;
+    wrong.chain_id += 1;
+    assert!(!verify_attestation_bound(&vk.spec_bytes, &bound, &wrong));
+    let mut wrong = ctx;
+    wrong.model_id[0] ^= 1;
+    assert!(!verify_attestation_bound(&vk.spec_bytes, &bound, &wrong));
+    let mut wrong = ctx;
+    wrong.height += 1;
+    assert!(!verify_attestation_bound(&vk.spec_bytes, &bound, &wrong));
+    let mut wrong = ctx;
+    wrong.sender[0] ^= 1;
+    assert!(!verify_attestation_bound(&vk.spec_bytes, &bound, &wrong));
 }

@@ -142,11 +142,18 @@ fn plan_plain_tx(
         return plan;
     }
 
-    // F-01: never execute below the floor. The success fee is the declared
-    // limit raised to the floor; a failure pays the same floor (plus the
-    // PQ surcharge, which is 0 for a plain transaction).
-    let fee = tx.gas_limit.max(floor_base);
-    let fail_fee = fee.saturating_add(surcharge);
+    // FEE-01: a plain (empty-payload) transaction runs no VM, so execution
+    // measured 0 gas; `billed_gas(tx, 0)` adds the INTRINSIC envelope cost and
+    // caps it at the declaration — never the declaration itself (charging it
+    // in full was the over-charge FEE-01 closes). F-01: the consensus floor
+    // still raises the result. Both numbers come from the engine's helpers, so
+    // they cannot drift from `commit_native`'s.
+    let fee = InMemoryStateEngine::fee_for_gas(tx, 0, floor_base, 0);
+    // The failure price is `failure_fee_for` (the intrinsic envelope is
+    // guaranteed consumption whether or not a payload ran); for a plain
+    // transfer the two coincide, and the debug assertion pins that.
+    let fail_fee = InMemoryStateEngine::failure_fee_for(tx, floor_base, surcharge);
+    debug_assert_eq!(fail_fee, fee.saturating_add(surcharge));
 
     // A live session-gate refusal is attributable: the floor is charged and
     // the nonce is consumed (the sequential path's `fail_with_floor!`).
@@ -526,12 +533,17 @@ impl InMemoryStateEngine {
                             trie_dirty,
                         );
                         if plan.applied && txs[*i].delegation().is_some() {
-                            // Session budget follows the DECLARED gas, not the
-                            // floored money fee: the sequential path records
-                            // `gas_used` (= declared limit for an empty
-                            // payload), and the two paths must agree on the
-                            // committed registry spend for the same block.
-                            session_notes.push((&txs[*i], txs[*i].gas_limit));
+                            // Session budget follows the BILLED gas (FEE-01:
+                            // intrinsic envelope capped at the declaration),
+                            // not the floored money fee and not the declared
+                            // limit: the sequential path records
+                            // `billed_gas(tx, gas_used)` and the two paths
+                            // must agree on the committed registry spend for
+                            // the same block.
+                            session_notes.push((
+                                &txs[*i],
+                                InMemoryStateEngine::billed_gas(&txs[*i], 0),
+                            ));
                         }
                     }
                 }
@@ -582,7 +594,7 @@ impl InMemoryStateEngine {
                     trie_dirty,
                 );
                 if plan.applied && tx.delegation().is_some() {
-                    session_notes.push((tx, tx.gas_limit));
+                    session_notes.push((tx, InMemoryStateEngine::billed_gas(tx, 0)));
                 }
             }
         }
@@ -612,9 +624,9 @@ impl InMemoryStateEngine {
     /// reorg path (`ChainState::apply_block`). Its per-transaction semantics
     /// come from `commit_native` + `execute_payload`, the same code
     /// `apply_transaction` uses, so a block and the sequential path cannot
-    /// disagree about what a transaction moved (the one deliberate difference -
-    /// which gas number each charges as the fee - is documented on
-    /// `commit_native`).
+    /// disagree about what a transaction moved OR about what it cost (FEE-01:
+    /// both charge `min(gas_limit, gas_used + intrinsic)`, floored, plus the
+    /// additive surcharge — see `commit_native`).
     ///
     /// `timestamp` is `block.timestamp`, which the VM reads as "now" for
     /// unbonding maturity, contract creation, order stamps and session-key gas
@@ -801,7 +813,7 @@ impl InMemoryStateEngine {
         // GATE: judged at `chain_height`, the COMMITTED block height passed
         // down from [`Self::apply_block_transition`] (`block.height`) — never
         // a caller-supplied value. Default-off (env unset) passes everything.
-        let binding_activation = crate::chain_binding::ChainBindingActivation::from_env();
+        let binding_activation = crate::chain_binding::ChainBindingActivation::from_chain_spec();
         {
             let map = self.accounts.read().await;
             // Held for the whole pass (it is read-only) so the loop stays
@@ -994,7 +1006,11 @@ impl InMemoryStateEngine {
             ($tx:expr, $idx:expr) => {{
                 failed += 1;
                 let (floor_base, surcharge) = fee_floors[$idx];
-                let fee = $tx.gas_limit.max(floor_base).saturating_add(surcharge);
+                // FEE-01: a failure pays the intrinsic envelope cost, floored
+                // at the consensus floor, plus the additive surcharge — never
+                // the declared limit (the failure arm of the VM result carries
+                // no consumption measurement; see `failure_fee_for`).
+                let fee = Self::failure_fee_for($tx, floor_base, surcharge);
                 if let Some(auth) = $tx.sponsored_grant() {
                     let (debited, charged_state) = self
                         .charge_sponsored_failure_fee($tx, &auth.sponsor, fee)
@@ -1174,7 +1190,10 @@ impl InMemoryStateEngine {
                         let mut post_actions: Option<ExecPostActions> = None;
                         let (transfers, payouts, burns, gas_used, tx_events) =
                             if tx.payload.is_empty() {
-                                (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
+                                // FEE-01: no VM ran, so execution measured 0
+                                // gas; `billed_gas` adds the intrinsic
+                                // envelope cost at the commit.
+                                (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new())
                             } else {
                                 domain_snap =
                                     Some(self.snapshot_payload_domains(&tx.payload).await);
@@ -1222,10 +1241,14 @@ impl InMemoryStateEngine {
                                     }
                                 }
                             };
+                        // FEE-01: the fee is priced from what execution
+                        // MEASURED (`gas_used`), never from the declared
+                        // limit — `commit_native_with_floor` caps it at the
+                        // limit and refunds the rest.
                         match self
                             .commit_native_with_floor(
                                 tx,
-                                tx.gas_limit,
+                                gas_used,
                                 &transfers,
                                 &payouts,
                                 &burns,
@@ -1255,7 +1278,11 @@ impl InMemoryStateEngine {
                                 status[i] = true;
                                 fees[i] = fee;
                                 events[i] = tx_events;
-                                self.session_note_applied(tx, gas_used).await;
+                                self.session_note_applied(
+                                    tx,
+                                    InMemoryStateEngine::billed_gas(tx, gas_used),
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 if let (Some(snap), Some(actions)) = (domain_snap, post_actions) {
@@ -1370,12 +1397,14 @@ impl InMemoryStateEngine {
                 // here, so a Transfer, a SysCallStake bond or a reward claim moved
                 // no coins while still reporting success.
                 //
-                // `gas_used` is what the session budget will be charged if this
-                // transaction applies: the VM's consumption for a payload, the
-                // DECLARED `gas_limit` for an empty-payload transfer (no VM ran,
-                // so nothing else could measure it - and it must still consume
-                // budget, or a plain session transfer would bypass the cap that
-                // phase 1 closed for the policy checks).
+                // `gas_used` is what execution MEASURED: the VM's consumption
+                // for a payload, 0 for an empty-payload transfer (no VM ran).
+                // The session budget and the fee are charged the BILLED gas
+                // (`billed_gas(tx, gas_used)` = the measurement plus the
+                // intrinsic envelope cost, capped at the declaration), so a
+                // plain session transfer still consumes budget — without it, it
+                // would bypass the cap that phase 1 closed for the policy
+                // checks — and is never charged its declared limit.
                 //
                 // B1 atomicity (mirrors `apply_transaction`): per-tx domain
                 // snapshot + settlement undo records, restored if the commit
@@ -1383,7 +1412,9 @@ impl InMemoryStateEngine {
                 let mut domain_snap: Option<PayloadDomainSnapshot> = None;
                 let mut post_actions: Option<ExecPostActions> = None;
                 let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
-                    (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
+                    // FEE-01: no VM ran, so execution measured 0 gas;
+                    // `billed_gas` adds the intrinsic envelope cost.
+                    (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new())
                 } else {
                     // B1 atomicity: snapshot domains BEFORE the VM runs; any
                     // failure after (including the native commit below) restores
@@ -1442,20 +1473,20 @@ impl InMemoryStateEngine {
 
                 // Commit: amount + fee + payload transfers + payload payouts.
                 //
-                // FEE: the block path hands `commit_native` the DECLARED
-                // `tx.gas_limit` - that is what admission reserved and what
-                // `fees_collected` credits to the proposer, and it is the rule this
-                // path has always had. `apply_transaction` hands over the gas
-                // actually consumed instead. The arithmetic is shared; only the
-                // number the caller supplies differs. See `commit_native` for why
-                // this divergence is preserved rather than papered over.
-                // F-01: EITHER number is raised to at least the consensus floor
-                // inside `commit_native` — a below-floor declaration is charged
-                // the floor anyway, never executed below it.
+                // FEE-01: the block path hands `commit_native` the gas
+                // execution MEASURED (`gas_used`: the VM's own number for a
+                // payload, 0 when no VM ran) — never the DECLARED
+                // `tx.gas_limit`, which is only the budget/admission
+                // reservation. `commit_native` bills
+                // `min(gas_limit, gas_used + intrinsic)`, raises it to the
+                // consensus floor (F-01: a below-floor declaration is charged
+                // the floor anyway, never executed below it) and credits the
+                // sum of those fees to the proposer, so unused gas is
+                // refunded and `fee_charged` equals what left the sender.
                 match self
                     .commit_native_with_floor(
                         tx,
-                        tx.gas_limit,
+                        gas_used,
                         &transfers,
                         &payouts,
                         &burns,
@@ -1493,7 +1524,11 @@ impl InMemoryStateEngine {
                         // grant's budget untouched. This is the live path
                         // (`apply_block_transition` -> here), so the deduction is
                         // consensus state: it lands in the committed registry.
-                        self.session_note_applied(tx, gas_used).await;
+                        self.session_note_applied(
+                            tx,
+                            InMemoryStateEngine::billed_gas(tx, gas_used),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         // B1 atomicity (mirrors `apply_transaction`): the commit

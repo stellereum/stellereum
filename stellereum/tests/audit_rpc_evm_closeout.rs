@@ -450,7 +450,6 @@ async fn eth_call_sandbox_reads_only_and_never_panics() {
     // Truncated / missing / garbage calldata -> "0x", never a panic.
     for params in [
         json!([]),
-        json!([{ "to": "0x3535" }]),
         json!([{ "data": "0x1234" }]),
         json!([{ "data": "not-hex-at-all!!!" }]),
         json!("just-a-string"),
@@ -458,6 +457,15 @@ async fn eth_call_sandbox_reads_only_and_never_panics() {
         let v = evm::eth_call_with_engine(&engine, &params).await.unwrap();
         assert_eq!(v, json!("0x"), "params {params} must emulate to empty");
     }
+
+    // A malformed TARGET is refused exactly as `eth_getCode` refuses it
+    // (invalid params), not silently treated as a codeless address.
+    assert!(
+        evm::eth_call_with_engine(&engine, &json!([{ "to": "0x3535" }]))
+            .await
+            .is_err(),
+        "malformed `to` must be invalid params, same rule as eth_getCode"
+    );
 
     // 100 KiB of calldata: bounded work, prompt empty answer (input is under
     // the body cap; emulation does one selector match, no iteration over it).
@@ -650,7 +658,7 @@ fn f8_spoof_cannot_hop_rate_limit_buckets() {
     let spoof = real_headers(&[("x-forwarded-for", "1.2.3.4")]);
     let resolved = cip::resolve_with(&spoof, attacker_peer, &trusted, cip::XffMode::Rightmost);
     assert_eq!(resolved, attacker_peer);
-    assert!(limiter.check_at(resolved, now));
+    assert!(limiter.check_at(resolved.addr, now));
 
     // Even from a TRUSTED peer, rightmost-untrusted resolves to the proxy-
     // appended entry, never the attacker-prepended one: flooding as "9.9.9.9"
@@ -660,7 +668,7 @@ fn f8_spoof_cannot_hop_rate_limit_buckets() {
     let resolved2 = cip::resolve_with(&forged, proxy_peer, &trusted, cip::XffMode::Rightmost);
     assert_eq!(resolved2, victim);
     assert!(
-        !limiter.check_at(resolved2, now),
+        !limiter.check_at(resolved2.addr, now),
         "victim bucket already exhausted"
     );
 }

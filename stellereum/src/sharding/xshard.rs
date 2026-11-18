@@ -55,6 +55,53 @@ pub struct CrossShardMessage {
     pub xpc_phase: u8,
 }
 
+/// Domain tag of the SOURCE-side ESCROW/DEBIT record of a legacy cross-shard
+/// value transfer (XSHARD-01).
+///
+/// The record lives in the source shard's state trie, keyed by
+/// [`xshard_escrow_state_key`], with the value built by
+/// [`xshard_escrow_state_value`]. It is written by the source's block-apply
+/// path and ONLY for an outbound transfer whose escrow transaction applied, so
+/// its existence proves that the source DEBITED the sender for this transfer —
+/// which is exactly what the inbound credit needs, and what the sender's
+/// account leaf (an affordability statement about the PRE-transfer state) does
+/// not prove.
+pub const XSHARD_ESCROW_TAG: &[u8] = b"STELLEREUM_XSHARD_ESCROW_V1";
+
+/// Key-domain tag of the escrow record (kept distinct from the value tag so the
+/// key cannot be used as a value preimage or vice versa).
+const XSHARD_ESCROW_KEY_TAG: &[u8] = b"STELLEREUM_XSHARD_ESCROW_KEY_V1";
+
+/// State-trie key of the escrow/debit record of one cross-shard transfer.
+///
+/// Keyed by the transfer's transaction hash (which itself commits the shards,
+/// sender, recipient, amount, gas and nonce), so two transfers can never share
+/// an escrow record.
+pub fn xshard_escrow_state_key(tx_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(XSHARD_ESCROW_KEY_TAG);
+    hasher.update(tx_hash);
+    hasher.finalize().into()
+}
+
+/// State-trie value of the escrow/debit record of one cross-shard transfer.
+///
+/// Commits the WHOLE transfer (shard pair, sender, recipient, amount) so the
+/// record a target verifies is bound to exactly one transfer and cannot be
+/// re-used for a different recipient or amount. Deterministic: a pure function
+/// of the transaction, so every node that applied the same block writes the
+/// same leaf and derives the same state root.
+pub fn xshard_escrow_state_value(tx: &Transaction) -> Vec<u8> {
+    let mut value = Vec::with_capacity(XSHARD_ESCROW_TAG.len() + 4 + 4 + 32 + 32 + 32 + 8);
+    value.extend_from_slice(XSHARD_ESCROW_TAG);
+    value.extend_from_slice(&tx.source_shard.to_be_bytes());
+    value.extend_from_slice(&tx.target_shard.to_be_bytes());
+    value.extend_from_slice(&tx.from);
+    value.extend_from_slice(&tx.to);
+    value.extend_from_slice(&tx.amount.to_be_bytes());
+    value
+}
+
 impl CrossShardMessage {
     /// Construct a wire (untrusted) cross-shard message. Requires a Merkle proof
     /// for value-bearing transfers — a missing proof will be rejected.
@@ -173,6 +220,81 @@ impl CrossShardMessage {
         self.verify_inclusion_untrusted()
     }
 
+    /// Verify the SOURCE-SIDE ESCROW/DEBIT proof of a legacy value transfer
+    /// (XSHARD-01).
+    ///
+    /// WHAT THIS PROVES, AND WHY IT IS NOT THE SAME AS [`Self::verify_inclusion_strict`].
+    /// `verify_inclusion_strict` proves the SENDER'S ACCOUNT LEAF
+    /// (`balance || nonce`) at `source_state_root`. That is a statement about
+    /// the source's state BEFORE the transfer: "the sender could afford the
+    /// amount". It says nothing about the transfer being included in any
+    /// source block, and nothing about the amount having been removed from
+    /// the sender. A colluding target proposer can therefore pair a funded
+    /// sender account with a signed-but-never-applied transaction and a
+    /// perfectly valid affordability proof, and mint the amount on the
+    /// target: the sender's source balance is untouched, so the "same" coins
+    /// are credited twice (once as the unchanged source balance, once as the
+    /// target credit). This proof closes that hole.
+    ///
+    /// The leaf proven here is the SOURCE's escrow/debit record for the
+    /// transfer, written by the source shard's block-APPLY path
+    /// (`InMemoryStateEngine::record_legacy_escrow_receipts`) ONLY for an
+    /// outbound legacy transfer whose escrow transaction actually applied
+    /// (`status == true`). The record is keyed by the transfer's transaction
+    /// hash and commits the full transfer (source/target shard, sender,
+    /// recipient, amount), so it cannot be replayed for a different transfer.
+    /// A source that never debited the sender has no such leaf, and a
+    /// Byzantine target cannot fabricate one: the Merkle proof must verify
+    /// against a `source_state_root` that the target anchors to a locally
+    /// finalized source header ([`Self::verify_escrow_anchored`]).
+    ///
+    /// The local `trusted` shortcut is IGNORED for the same reason
+    /// [`Self::verify_inclusion_strict`] ignores it: `trusted` travels with
+    /// attacker-supplied block content.
+    pub fn verify_escrow_proof(&self) -> bool {
+        // Untrusted-boundary id recompute first (same rule as every other
+        // proof verifier here): a rebound message id is refused before any
+        // trie work.
+        if !self.verify_msg_id() {
+            return false;
+        }
+        // The escrow leaf commits the transfer's OWN shard pair, so the
+        // message must not claim a direction the leaf does not describe.
+        if self.source_shard != self.tx.source_shard || self.target_shard != self.tx.target_shard {
+            return false;
+        }
+        let Some(proof) = &self.merkle_inclusion_proof else {
+            return false;
+        };
+        let tx_hash = self.tx.compute_tx_hash();
+        let key = xshard_escrow_state_key(&tx_hash);
+        let value = xshard_escrow_state_value(&self.tx);
+        PatriciaTrie::verify_merkle_proof(&self.source_state_root, &key, &value, proof)
+    }
+
+    /// Anchored escrow proof: [`Self::verify_escrow_proof`] checked against a
+    /// state root that a LOCALLY FINALIZED source header committed to — the
+    /// C1 anchor rule of [`Self::verify_anchored`], applied to the escrow leaf
+    /// instead of the account leaf.
+    ///
+    /// `false` covers both "forged" and "not finalized here yet"; callers must
+    /// treat it as NOT-READY (never credit, never claim the replay key), so a
+    /// lagging node retries after catching up. A missing/poisoned registry
+    /// fails closed.
+    pub fn verify_escrow_anchored(&self, registry: Option<&FinalizedHeaderRegistry>) -> bool {
+        let Some(reg) = registry else {
+            return false;
+        };
+        if !reg.anchor_holds(
+            self.source_shard,
+            &self.finalized_in_block,
+            &self.source_state_root,
+        ) {
+            return false;
+        }
+        self.verify_escrow_proof()
+    }
+
     /// Anchored inclusion (C1 fix): the Merkle proof PLUS a check that
     /// `source_state_root` is the state root of a source block THIS process
     /// finalized (or adopted with a verified QC) — looked up by the
@@ -183,6 +305,12 @@ impl CrossShardMessage {
     /// (skip embedding / refuse the carrying block and retry after catching
     /// up), never as verified. `None` registry (single-shard contexts,
     /// unit tests) also fails closed.
+    ///
+    /// NOTE: this is the AFFORDABILITY check (sender account leaf). It is the
+    /// correct rule for the OPENING §9 PREPARE (which does not move value),
+    /// but it is NOT sufficient to pay an inbound legacy credit: see
+    /// [`Self::verify_escrow_proof`] / [`Self::verify_escrow_anchored`]
+    /// (XSHARD-01).
     pub fn verify_anchored(&self, registry: Option<&FinalizedHeaderRegistry>) -> bool {
         let Some(reg) = registry else {
             return false;

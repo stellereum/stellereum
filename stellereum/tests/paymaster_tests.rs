@@ -38,9 +38,20 @@ const CHAIN_ID: u64 = 5757;
 /// declared limit is what execution charges (governed floor is 0 on a fresh
 /// engine).
 const GAS_LIMIT: u64 = 300_000;
-/// Explicit PQ1 activation inner adds `PQ_ACTIVATION_SURCHARGE_GAS` (45_000)
-/// to the fee charged by mempool, proposer, and execution.
-const EXPECTED_SPONSORED_FEE: u64 = GAS_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS;
+/// The fee EXECUTION charges for a sponsored plain transfer. FEE-01: the fee
+/// is `max(min(gas_limit, gas_used + intrinsic), floor) + surcharge`, so a
+/// plain transfer declaring 300 000 is billed the 280 000 intrinsic envelope
+/// cost (capped at the declaration) — not the declaration itself.
+const EXPECTED_SPONSORED_FEE: u64 =
+    if GAS_LIMIT < stellereum::svm::GAS_BASIC_TRANSFER {
+        GAS_LIMIT
+    } else {
+        stellereum::svm::GAS_BASIC_TRANSFER
+    } + PQ_ACTIVATION_SURCHARGE_GAS;
+/// The MEMPOOL reservation stays the DECLARED limit + surcharge: admission must
+/// cover the worst case before execution runs, and the reservation is released
+/// after apply. Not a charged fee.
+const RESERVED_SPONSORED_FEE: u64 = GAS_LIMIT + PQ_ACTIVATION_SURCHARGE_GAS;
 /// Far-future grant expiry for tests that are not about expiry.
 const NO_EXPIRY: u64 = u64::MAX;
 
@@ -703,7 +714,9 @@ async fn mid_mempool_spend_down_is_re_refused() {
 /// the joint reservation: the first admits, the second is refused.
 #[tokio::test]
 async fn joint_reservation_stops_unforeseen_block_overspend() {
-    // Sponsor holds 500_000: one 345_000 fee fits, two (690_000) do not.
+    // Sponsor holds 500_000: one 345_000 RESERVATION fits, two (690_000) do
+    // not. (The charge is the lower FEE-01 amount; reservations are
+    // conservative and released after apply.)
     let tx0 = sponsored_tx(
         0xD4,
         0xE4,
@@ -737,7 +750,11 @@ async fn joint_reservation_stops_unforeseen_block_overspend() {
     );
     // The user leg is reserved separately: the user still only needs `amount`.
     assert_eq!(pool.reserved_for(&addr_of(0xD4)), 0);
-    assert_eq!(pool.reserved_for(&addr_of(0xE4)), EXPECTED_SPONSORED_FEE);
+    assert_eq!(
+        pool.reserved_for(&addr_of(0xE4)),
+        RESERVED_SPONSORED_FEE,
+        "the reservation prices the declaration, the charge prices consumption"
+    );
 }
 
 /// A failing transaction whose fee the sponsor CANNOT cover moves NOTHING

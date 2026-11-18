@@ -35,6 +35,9 @@ const SHARD0: u32 = MASTERCHAIN_SHARD;
 const SHARD1: u32 = BASE_WORKCHAIN_SHARD_INITIAL;
 const TS: u64 = 1_760_000_000;
 
+#[path = "support/xshard_escrow.rs"]
+mod xshard_escrow;
+
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
@@ -137,7 +140,12 @@ async fn sharded_pair(
 }
 
 /// Drive a single transfer SHARD0 -> SHARD1 to full consumption. Returns the
-/// consumed message (as committed in the target block) for later replay.
+/// consumed message (the record a replay would re-present) for later replay.
+///
+/// XSHARD-01: the record is ESCROW-BACKED (the source debited the sender in an
+/// applied escrow block, and the message proves that escrow against an
+/// anchored source header). An affordability-only record is refused by the
+/// gate, so it can no longer be used to seed replay tests.
 async fn consume_one(
     sc: &mut ShardedCluster,
     sender_seed: u8,
@@ -145,19 +153,31 @@ async fn consume_one(
     amount: u64,
 ) -> stellereum::sharding::CrossShardMessage {
     let tx = pq_xshard_tx(sender_seed, recipient_addr, amount, 10, 0);
-    sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
-    sc.shard_mut(SHARD1).broadcast_tx(tx.clone()).await;
-    let _ = sc.run_height(SHARD0, TS).await;
-    let tbh = sc.run_height(SHARD1, TS + 1).await;
-    sc.shard(SHARD1).nodes[0]
-        .blocks
-        .get(&tbh)
-        .cloned()
-        .expect("target block retained")
-        .cross_shard_out
-        .into_iter()
-        .find(|m| m.is_inbound_for(SHARD1))
-        .expect("target block carries the consumption record")
+    let registry = sc.shard(SHARD1).nodes[0]
+        .finalized_headers
+        .clone()
+        .expect("the fixture wires the finalized-header registry");
+    let msg = xshard_escrow::escrow_backed_message(&tx, &registry).await;
+
+    // Apply the committed record on the target engine (the credit + the
+    // atomic replay claim).
+    let target = sc.shard(SHARD1).nodes[0].state.clone();
+    let record = xshard_escrow::carrier(SHARD1, 1, vec![msg.clone()]);
+    assert_eq!(
+        target.apply_cross_shard_consumptions(&record).await,
+        1,
+        "the escrow-backed record must credit once"
+    );
+
+    // Mirror the RUNTIME half of the replay state exactly as the live apply
+    // path would: the same key lands in the runtime set alongside the engine's
+    // (the two halves are snapshotted together).
+    let mirrored = stellereum::sharding::CrossShardReplaySnapshot {
+        runtime_consumed: vec![CrossShardKey::of(&msg)],
+        ..Default::default()
+    };
+    sc.shard_mut(SHARD1).nodes[0].restore_cross_shard_sets(&mirrored);
+    msg
 }
 
 // ===========================================================================
@@ -494,6 +514,12 @@ async fn double_apply_refused_after_snapshot_install() {
     // Fresh node installs via snapshot-sync.
     let fresh = InMemoryStateEngine::new();
     fresh.enable_cross_shard();
+    fresh.with_finalized_headers(
+        sc.shard(SHARD1).nodes[0]
+            .finalized_headers
+            .clone()
+            .expect("the fixture wires the finalized-header registry"),
+    );
     fast_sync_state(
         &fresh,
         source_root,

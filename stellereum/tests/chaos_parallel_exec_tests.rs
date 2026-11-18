@@ -117,7 +117,13 @@ fn pq_payload(
 
 async fn expected_fee(engine: &InMemoryStateEngine, tx: &Transaction) -> u64 {
     let (floor_base, surcharge) = engine.consensus_floor_parts(tx).await;
-    tx.gas_limit.max(floor_base).saturating_add(surcharge)
+    // FEE-01: the fee is `max(min(gas_limit, consumed + intrinsic), floor) +
+    // surcharge`, never the declared limit. Both transactions in this file
+    // consume exactly the intrinsic envelope (one `Transfer` opcode / an
+    // empty payload), so the engine's failure-fee helper — which prices the
+    // guaranteed intrinsic consumption — is the same number for the success
+    // and the failure, and it is the ENGINE's own rule, not a copy.
+    InMemoryStateEngine::failure_fee_for(tx, floor_base, surcharge)
 }
 
 fn token_meta(name: &str, symbol: &str) -> TokenMetadata {

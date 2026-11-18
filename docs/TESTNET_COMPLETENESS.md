@@ -4,6 +4,10 @@ Sources: `FEATURES.md` (102 GREEN / 1 RED / 1 SKIP), `docs/PUBLIC_TESTNET_CODE_G
 (lead freeze, 2026-11-03), code+tests (every `file:line` below grep/execution-verified).
 Rule: no existing file modified; this is the single new doc.
 Runtime verification pass 2026-11-03 (HEAD `ea69c425f` working tree): UNVERIFIED count 0, see §5.
+**2026-11-18 correction:** the "H cutoffs" statements (§4, §5 row 4) described a deleted
+policy; they are rewritten to the current truth (classical refused at every height, PQ
+transport unconditional). Everything else is a 2026-11-03 snapshot and may cite paths that
+have since moved in the module split.
 
 ## 1. Journey table (17 steps: 17 PRESENT / 0 missing-code, 4 with caveats)
 
@@ -94,11 +98,17 @@ Runtime verification pass 2026-11-03 (HEAD `ea69c425f` working tree): UNVERIFIED
   `https://rpc.stellereum.org` (`stell-wallet/src/main.rs:45`, `client.rs:124`).
   `rpc.stellereum.org` / `seeds.stellereum.org` appear as example/default strings
   only — no live host exists to probe (no commit of live URLs, per task ban).
-- **H cutoffs: VALUES GREP-VERIFIED (§5.4).** `PQ_CLASSICAL_REFUSE_AFTER_HEIGHT = 300_000`
-  (`infnode/crates/infnode/src/proto.rs:395`); `PQ_TRANSPORT_H_ACTIVATION_HEIGHT = 10_000`
-  (`stellereum/src/mev_epoch.rs:1191`, gated by `PREFER_PQ_MEV_TRANSPORT=false` `:1175`);
-  rotation `PQ_ROTATION_DELAY_HEIGHTS = 7_200` (`pq_registry.rs:97`) == `EPOCH_LEN = 7200`
-  (`cn_vrf.rs:58`).
+- **H cutoffs: CORRECTED 2026-11-18 (§5.4).** There is **no H** any more.
+  `PQ_CLASSICAL_REFUSE_AFTER_HEIGHT` (and the mixed window + fallback counter) is
+  **deleted**: classical is refused at EVERY height
+  (`infnode/crates/infnode/src/proto.rs:371-378`), and `STELL_INF_PQ_HANDSHAKE` is
+  parsed-and-ignored (`:357-368`). `PQ_TRANSPORT_H_ACTIVATION_HEIGHT = 10_000`
+  (`stellereum/src/mev_epoch.rs:995`) is retained only for the frozen schedule
+  (`chain_spec.rs:153-155`); the PQ leg is unconditional
+  (`is_pq_transport_active` → `true`, `mev_epoch.rs:1003-1006`) and the
+  `PREFER_PQ_MEV_TRANSPORT` const no longer exists. Rotation remains
+  `PQ_ROTATION_DELAY_HEIGHTS = 7_200` (`pq_registry.rs:101`) == `EPOCH_LEN = 7200`
+  (`cn_vrf.rs:65`).
 - **Wallet-vs-endpoint: VERDICT — code supports public endpoint, no public endpoint exists to test against (§5.5).**
   Wallet resolves target `--rpc-url` → `STELL_RPC_URL` env → else `None` = local mode
   (`stell-wallet/src/main.rs:1135`; `client.rs:5-9,124`); local-only commands
@@ -113,7 +123,7 @@ Runtime verification pass 2026-11-03 (HEAD `ea69c425f` working tree): UNVERIFIED
 | 1 | Full `--help` text of every CLI (structure only, never executed) | **RESOLVED — executed.** Node `--help` + `run`/`node-bootstrap`/`light-client`/`keys` helps + full wallet `stell --help` (Appendix A). Clap derive `stell-wallet/src/main.rs:29`, node about `stellereum/src/main.rs:6629`. |
 | 2 | Explorer HTML rendering in a browser (routes + tests only) | **RESOLVED as runtime-check (no claim).** No stellereum node process running (`pgrep stellereum|infnode` = only build shells; `run/cluster/` dirs present but no PIDs; RPC base `127.0.0.1:18645` connection-refused per `scripts/local-cluster.sh:36`). Browser render NOT claimed. Exact runtime-check for the operator: `scripts/local-cluster.sh start --nodes 3` then `curl -s http://127.0.0.1:18647/api/block-detail/latest` + open `http://127.0.0.1:18647/` and compare against `explorer.rs:371-443` `render_index` (public form shows `5 STELL per address every 45 minutes`, `:390`). Routes + 15 `explorer-ux` tests + `indexer-api` GREEN remain the code proof. |
 | 3 | Real public DNS seeds / chain-id / faucet URL values (none published yet) | **RESOLVED — values grep-verified, publication is a lead action.** Chain-id default 5757 (`zkml.rs:220`, `evm_adapter.rs:51,81` `0x167d`, env `STELL_CHAIN_ID` `:226`); DNS seeds opt-in env `STELL_DNS_SEEDS` (`dns_seeds.rs:68,74`); wallet default `https://rpc.stellereum.org` (`stell-wallet/src/main.rs:45`); faucet is per-node local (`explorer.rs:736`, `main.rs:8092` disabled-by-default). Nothing published → nothing to curl (live-host ban respected). |
-| 4 | `H` cutoff constants' chosen values (lead picks pre-public; code has placeholders) | **RESOLVED — values grep-verified.** 300_000 (`proto.rs:395`, enforced `:400`, fail-closed `:701-749`, tests `pq_handshake_tests.rs:1027-1168`); 10_000 (`mev_epoch.rs:1191`, gate `:1198`, `PREFER_PQ_MEV_TRANSPORT=false` `:1175`, tests `:1090-1097`); 7200 (`pq_registry.rs:97`, `cn_vrf.rs:58` `EPOCH_LEN`, lead doc §5 fixes "7200 — параметр, не пробел"). Lead freeze doc pins them pre-public (`PUBLIC_TESTNET_CODE_GAPS.md:22-23`). |
+| 4 | `H` cutoff constants' chosen values | **SUPERSEDED 2026-11-18 — no H exists.** Classical PQ handshakes are refused at every height and the height constant/window/counter are deleted (`proto.rs:371-378`; `STELL_INF_PQ_HANDSHAKE` ignored `:357-368`). PQ MEV transport is active at every height (`mev_epoch.rs:1003-1006`); `PQ_TRANSPORT_H_ACTIVATION_HEIGHT = 10_000` survives only inside the frozen schedule (`chain_spec.rs:153-155`). Rotation `7200` unchanged (`pq_registry.rs:101`, `cn_vrf.rs:65`). The old cited tests (`pq_handshake_tests.rs:1027-1168`) no longer test a live policy. |
 | 5 | Wallet-against-public-endpoint run (only local `wallet-live-node` GREEN) | **RESOLVED — verdict with file:line.** Wallet RPC-target code `stell-wallet/src/main.rs:1135` + `client.rs:124` + fail-loud local guards (`main.rs:3483,3528`); public endpoint list = one default string (`main.rs:45`) with no live host behind it. No code gap; run is blocked on lead publishing §5.3 values. |
 
 ## 6. Faucet-captcha decision (lead-pending — NOT implemented, no code in this task)

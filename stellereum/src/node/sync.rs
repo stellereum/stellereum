@@ -75,16 +75,23 @@ pub(crate) async fn try_snapshot_sync(
         );
     }
 
-    // Probe the newest 100-height boundaries downward. Bounded: peers retain
-    // only ~300 heights of snapshots (see prune_state_below(height - 300)),
-    // so probing past 8 boundaries (800 heights) is guaranteed to miss and
-    // only wastes seconds on a weak link.
-    const PROBE_STEPS: u64 = 8;
-    let mut boundary = (peer_height / 100) * 100;
+    // Probe snapshot boundaries downward. The window is derived from
+    // `policy::snapshot_interval()` (audit F4), not a fixed 8 x 100 heights:
+    // snapshots are published every `snapshot_interval()` heights (default
+    // 1000) and pruning retains `3 * interval`, so a fixed 800-height walk
+    // could land between two snapshots and never find the next one. The
+    // window covers the proven worst-case publish gap (interval + catch-up
+    // grid) with one extra interval of slack; it stays bounded, so a weak
+    // link still spends only a few probes before giving up.
+    let snap_int = crate::node::policy::snapshot_interval();
+    let probe_step = stellereum::sync::snapshot_probe_step(snap_int);
+    let probe_steps = stellereum::sync::snapshot_probe_steps(snap_int);
+    let mut boundary = (peer_height / probe_step) * probe_step;
     // Latest-snapshot pointer first: snapshots complete on worker timing at
-    // arbitrary heights (78519, 78620, ...), so %100 probes miss them all.
-    // A sane pointer (ahead of us, at or under the peer tip) jumps straight
-    // to a usable boundary; otherwise the %100 walk below runs unchanged.
+    // arbitrary heights (78519, 78620, ...), so fixed-grid probes miss them
+    // all. A sane pointer (ahead of us, at or under the peer tip) jumps
+    // straight to a usable boundary; otherwise the interval-spaced walk below
+    // runs unchanged.
     if let Some(latest) = adapter.fetch_latest_snapshot(shard).await {
         if latest > our_height && latest <= peer_height {
             eprintln!(
@@ -104,7 +111,7 @@ pub(crate) async fn try_snapshot_sync(
     // starving consensus traffic behind the same 256 stream slots. Pacing
     // yields to the consensus sender; a hit resets the streak.
     let mut consecutive_misses: u32 = 0;
-    for _ in 0..PROBE_STEPS {
+    for _ in 0..probe_steps {
         if boundary <= our_height || boundary == 0 {
             break;
         }
@@ -115,7 +122,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         };
 
@@ -129,7 +136,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         };
         let Some(next_hdr) = adapter
@@ -142,7 +149,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         };
         if next_hdr.height != boundary + 1 || next_hdr.block_hash != next_hash {
@@ -152,7 +159,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         }
         consecutive_misses = 0;
@@ -201,9 +208,13 @@ pub(crate) async fn try_snapshot_sync(
             // the live set. On today's single-set chains the resolver answers
             // the same set at every height, so this is behavior-identical to
             // the single-set wrapper it replaces.
-            match stellereum::sync::verify_snapshot_anchor_tail_with_sets(
+            match stellereum::sync::verify_snapshot_anchor_tail_with_sets_and_schedule(
                 boundary + 1,
                 |h| Some(rt.validator_set_for_height(h)),
+                // Review F2: the same committee schedule the producer drew
+                // under (epoch beacon at/after CN-VRF v3 activation, the
+                // parent-hash draw below it).
+                |h| rt.committee_schedule_at(h),
                 anchor_fetch,
             )
             .await
@@ -218,16 +229,19 @@ pub(crate) async fn try_snapshot_sync(
                         stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
                     ))
                     .await;
-                    boundary = boundary.saturating_sub(100);
+                    boundary = boundary.saturating_sub(probe_step);
                     continue;
                 }
             }
         } else {
-            match stellereum::sync::verify_snapshot_anchor(
+            match stellereum::sync::verify_snapshot_anchor_with_schedule(
                 rt.finalized.last().copied(),
                 [0u8; 32],
                 boundary + 1,
                 &rt.validators,
+                // Review F2: header QCs are checked under the schedule in
+                // force at each height, never a forced parent-hash draw.
+                |h| rt.committee_schedule_at(h),
                 1_000_000,
                 anchor_fetch,
             )
@@ -244,7 +258,7 @@ pub(crate) async fn try_snapshot_sync(
                         stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
                     ))
                     .await;
-                    boundary = boundary.saturating_sub(100);
+                    boundary = boundary.saturating_sub(probe_step);
                     continue;
                 }
             }
@@ -286,7 +300,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         }
 
@@ -314,7 +328,7 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
             ))
             .await;
-            boundary = boundary.saturating_sub(100);
+            boundary = boundary.saturating_sub(probe_step);
             continue;
         }
         rt.finalized.push((boundary, boundary_hash));
@@ -400,7 +414,8 @@ pub(crate) async fn try_snapshot_sync(
 /// height is long pruned. But peers publish domain snapshots (which embed the
 /// staking ledger) every 100 heights with FOREVER retention, so the set is
 /// fetchable on its own. This probes the newest boundaries (latest-snapshot
-/// pointer first, then %100 downward, bounded) for a `domains` blob NEWER
+/// pointer first, then interval-spaced downward, bounded by the cadence (see
+/// [`stellereum::sync::snapshot_probe_steps`]) for a `domains` blob NEWER
 /// than the ledger the runtime currently trusts, decodes it, and installs it
 /// through the freshness-gated
 /// [`ValidatorRuntime::refresh_validator_set_from_domain_bytes`].
@@ -419,9 +434,13 @@ pub(crate) async fn refresh_validator_set_from_fresh_snapshot(
 ) -> bool {
     let current_ledger = rt.validator_set_ledger_height.unwrap_or(0);
     // Candidate boundaries: the exact newest pointer first (snapshots complete
-    // on worker timing at arbitrary heights, so %100 probes miss them), then
-    // %100 boundaries downward. Bounded: a peer with no domains must not make
-    // us probe forever.
+    // on worker timing at arbitrary heights, so fixed-grid probes miss them),
+    // then interval-spaced boundaries downward. Bounded: a peer with no
+    // domains must not make us probe forever, and the window tracks the
+    // configured cadence instead of a fixed 8 x 100 (audit F4).
+    let snap_int = crate::node::policy::snapshot_interval();
+    let probe_step = stellereum::sync::snapshot_probe_step(snap_int);
+    let probe_steps = stellereum::sync::snapshot_probe_steps(snap_int);
     let mut candidates: Vec<u64> = Vec::new();
     if let Some(latest) = adapter.fetch_latest_snapshot(shard).await {
         if latest > current_ledger {
@@ -429,15 +448,15 @@ pub(crate) async fn refresh_validator_set_from_fresh_snapshot(
         }
     }
     if let Some(head) = adapter.fetch_head(shard).await.map(|(h, _)| h) {
-        let mut b = (head / 100) * 100;
-        for _ in 0..8 {
+        let mut b = (head / probe_step) * probe_step;
+        for _ in 0..probe_steps {
             if b == 0 || b <= current_ledger {
                 break;
             }
             if !candidates.contains(&b) {
                 candidates.push(b);
             }
-            b = b.saturating_sub(100);
+            b = b.saturating_sub(probe_step);
         }
     }
     candidates.sort_unstable();
@@ -764,19 +783,26 @@ pub(crate) async fn walk_chain(
     // block it hashed, so the apply loop below reuses them instead of hashing
     // every (unchanged) body again for the retention key, the apply call, the
     // RPC record and the parent link.
-    let block_hashes = match stellereum::sync::validate_sync_chain_for_shard_with_sets_hashed(
-        &blocks,
-        expected_first_height,
-        our_last,
-        &|h| Some(rt.validator_set_for_height(h)),
-        rt.shard_id,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[sync] rejecting peer chain: {e}");
-            return None;
-        }
-    };
+    let block_hashes =
+        match stellereum::sync::validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+            &blocks,
+            expected_first_height,
+            our_last,
+            &|h| Some(rt.validator_set_for_height(h)),
+            rt.shard_id,
+            // Review F2: every block's decision proof is verified and
+            // attributed under the committee schedule IN FORCE AT ITS HEIGHT
+            // (epoch beacon at/after CN-VRF v3 activation, the parent-hash
+            // draw below it). Passing the runtime resolver keeps sync aligned
+            // with the producer and the finalize gate.
+            &|h| rt.committee_schedule_at(h),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[sync] rejecting peer chain: {e}");
+                return None;
+            }
+        };
 
     // LIGHT CLIENT ANCHOR (audit W8.3 / production blocker A10).
     //

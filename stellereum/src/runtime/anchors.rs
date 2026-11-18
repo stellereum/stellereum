@@ -38,7 +38,7 @@ impl ValidatorRuntime {
         let mempool = Arc::new(tokio::sync::RwLock::new(
             Mempool::default().with_session_registry(state.session_keys_handle()),
         ));
-        Self {
+        let mut rt = Self {
             key,
             remote_signer: None,
             id,
@@ -121,7 +121,9 @@ impl ValidatorRuntime {
             // `with_light_client`); from then on it is the quorum-certified
             // chain this node has finalized.
             light: None,
-        }
+        };
+        rt.install_committee_schedule();
+        rt
     }
 
     // =========================================================================
@@ -131,11 +133,32 @@ impl ValidatorRuntime {
     /// Configure test/debug CN-VRF v3 activation height on both this runtime and
     /// its backing state engine, leaving the frozen `CNVRF_V3_ACTIVATION_HEIGHT`
     /// constant untouched.
+    ///
+    /// The ACTIVATION-HEIGHT RULE (review F4) is enforced here: a height on an
+    /// epoch boundary (or inside the freeze lookahead before one) would make the
+    /// activation block an epoch boundary whose `epoch_vdf` was never dispatched
+    /// (`H_freeze < activation`), i.e. an unproposable block. See
+    /// [`crate::consensus::cnvrf_v3_activation_height_allowed`].
     #[cfg(any(test, debug_assertions))]
     pub fn set_cnvrf_v3_activation_height_for_tests(&mut self, activation: u64) {
+        crate::consensus::assert_cnvrf_v3_activation_height(activation);
         self.cnvrf_v3_activation_override = Some(activation);
         self.state
             .set_cnvrf_v3_activation_height_for_tests(activation);
+        self.install_committee_schedule();
+    }
+
+    /// The CN-VRF v3 activation height in force for this node: the test/debug
+    /// override when installed, else the frozen
+    /// [`crate::consensus::CNVRF_V3_ACTIVATION_HEIGHT`].
+    pub fn cnvrf_v3_activation_height(&self) -> Height {
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(activation) = self.cnvrf_v3_activation_override {
+                return activation;
+            }
+        }
+        crate::consensus::CNVRF_V3_ACTIVATION_HEIGHT
     }
 
     /// Builder: override MinRoot VDF steps per epoch (e.g. `64` in tests).
@@ -197,20 +220,45 @@ impl ValidatorRuntime {
             let output = crate::minroot_vdf::derive_vdf_output(&vdf.raw_seed, &vdf.proof);
             return Some(crate::consensus::EpochBeacon { epoch, output });
         }
-        let h_freeze = epoch
-            .saturating_mul(crate::cn_vrf::EPOCH_LEN)
-            .saturating_sub(crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS);
-        if epoch == 0 || !self.cnvrf_v3_is_active_at(h_freeze) {
-            let output = crate::cn_vrf::epoch_raw_seed(
-                self.cnvrf_v3_chain_id,
-                epoch,
-                &[0u8; crate::cn_vrf::V3_LINK_LEN],
-                &[0u8; 32],
-                &[0u8; crate::cn_vrf::V3_LINK_LEN],
-            );
-            return Some(crate::consensus::EpochBeacon { epoch, output });
+        // THE bootstrap rule (shared with the producer/validator/apply seed
+        // derivation, review F3): an epoch whose `H_freeze` predates activation
+        // never ran a VDF, so its canonical beacon is the deterministic
+        // `epoch_bootstrap_beacon` — the same value `epoch_seed` chains.
+        let output = crate::cn_vrf::epoch_beacon_for(
+            self.cnvrf_v3_chain_id,
+            epoch,
+            None,
+            self.cnvrf_v3_activation_height(),
+        )?;
+        Some(crate::consensus::EpochBeacon { epoch, output })
+    }
+
+    /// THE schedule of "who signs at height `height`" for this node: the epoch
+    /// beacon at/after the CN-VRF v3 activation height, the canonical
+    /// parent-hash draw below it.
+    ///
+    /// Every producer and verifier in the runtime goes through this (via
+    /// [`Self::install_committee_schedule`] and the `verify_qc_for_height`
+    /// family), so a certificate this node builds and the certificate it
+    /// attributes can never be drawn from different committees (review F2).
+    pub fn committee_schedule_at(&self, height: Height) -> crate::consensus::CommitteeSchedule {
+        if self.cnvrf_v3_is_active_at(height) {
+            crate::consensus::CommitteeSchedule::Beacon(self.active_epoch_beacon(height))
+        } else {
+            crate::consensus::CommitteeSchedule::ParentHash
         }
-        None
+    }
+
+    /// Push [`Self::committee_schedule_at`] into the height state machine
+    /// BEFORE it produces a decision certificate.
+    ///
+    /// Called at every height anchor this crate owns and, defensively, at the
+    /// top of the cert-producing entry points — the engine is also re-anchored
+    /// by the node's startup/sync code, and the schedule must never be left at
+    /// its parent-hash default once activation is in force.
+    pub fn install_committee_schedule(&mut self) {
+        let schedule = self.committee_schedule_at(self.hc.height);
+        self.hc.set_committee_schedule(schedule);
     }
 
     /// Lazily spawn the off-tick sequential MinRoot VDF worker on first active use.
@@ -714,18 +762,18 @@ impl ValidatorRuntime {
                             .as_ref()
                             .is_some_and(|(e, _)| *e == target_epoch);
                     if !already_done {
-                        let prev_beacon = if target_epoch == 0 {
-                            [0u8; crate::cn_vrf::V3_LINK_LEN]
-                        } else {
-                            self.finalized_epoch_beacons
-                                .get(&(target_epoch - 1))
-                                .copied()
-                                .unwrap_or([0u8; crate::cn_vrf::V3_LINK_LEN])
-                        };
-                        let raw_seed = crate::cn_vrf::epoch_raw_seed(
+                        // ONE seed rule (review F3): chain the predecessor's
+                        // committed beacon, or its deterministic bootstrap
+                        // beacon when that epoch never ran a VDF. The boundary
+                        // validator derives the SAME value.
+                        let raw_seed = crate::cn_vrf::epoch_seed(
                             self.cnvrf_v3_chain_id,
                             target_epoch,
-                            &prev_beacon,
+                            self.finalized_epoch_beacons.get(&prev_epoch),
+                            crate::cn_vrf::epoch_had_vdf(
+                                prev_epoch,
+                                self.cnvrf_v3_activation_height(),
+                            ),
                             &finalized_hash,
                             &freeze_mix,
                         );
@@ -757,18 +805,7 @@ impl ValidatorRuntime {
         height: Height,
         round: crate::consensus::Round,
     ) -> Option<ValidatorId> {
-        if !self.cnvrf_v3_is_active_at(height) {
-            return validators.proposer_for(height, round);
-        }
-        let beacon = self.active_epoch_beacon(height);
-        #[cfg(test)]
-        {
-            validators.proposer_for_with_beacon_active(height, round, beacon.as_ref(), true)
-        }
-        #[cfg(not(test))]
-        {
-            validators.proposer_for_with_beacon(height, round, beacon.as_ref())
-        }
+        validators.proposer_for_with_schedule(height, round, self.committee_schedule_at(height))
     }
 
     pub(super) fn verify_qc_for_height(
@@ -776,18 +813,7 @@ impl ValidatorRuntime {
         qc: &crate::consensus::QuorumCertificate,
         validators: &ValidatorSet,
     ) -> bool {
-        if !self.cnvrf_v3_is_active_at(qc.height) {
-            return qc.verify(validators);
-        }
-        let beacon = self.active_epoch_beacon(qc.height);
-        #[cfg(test)]
-        {
-            qc.verify_with_beacon_active(validators, beacon.as_ref(), true)
-        }
-        #[cfg(not(test))]
-        {
-            qc.verify_with_beacon(validators, beacon.as_ref())
-        }
+        qc.verify_with_schedule(validators, self.committee_schedule_at(qc.height))
     }
 
     /// Verify a QC AND return the power its verified signers carry under
@@ -801,18 +827,7 @@ impl ValidatorRuntime {
         qc: &crate::consensus::QuorumCertificate,
         validators: &ValidatorSet,
     ) -> (bool, u64) {
-        if !self.cnvrf_v3_is_active_at(qc.height) {
-            return qc.verify_and_signed_power(validators);
-        }
-        let beacon = self.active_epoch_beacon(qc.height);
-        #[cfg(test)]
-        {
-            qc.verify_and_signed_power_with_beacon_active(validators, beacon.as_ref(), true)
-        }
-        #[cfg(not(test))]
-        {
-            qc.verify_and_signed_power_with_beacon(validators, beacon.as_ref())
-        }
+        qc.verify_and_signed_power_with_schedule(validators, self.committee_schedule_at(qc.height))
     }
 
     pub(super) fn qc_signed_power_for_height(
@@ -820,18 +835,7 @@ impl ValidatorRuntime {
         validators: &ValidatorSet,
         qc: &crate::consensus::QuorumCertificate,
     ) -> u64 {
-        if !self.cnvrf_v3_is_active_at(qc.height) {
-            return validators.qc_signed_power(qc);
-        }
-        let beacon = self.active_epoch_beacon(qc.height);
-        #[cfg(test)]
-        {
-            validators.qc_signed_power_with_beacon_active(qc, beacon.as_ref(), true)
-        }
-        #[cfg(not(test))]
-        {
-            validators.qc_signed_power_with_beacon(qc, beacon.as_ref())
-        }
+        validators.qc_signed_power_with_schedule(qc, self.committee_schedule_at(qc.height))
     }
 
     /// Who the schedule names for OUR current (height, round).
@@ -860,8 +864,7 @@ impl ValidatorRuntime {
     /// * a boundary block that omits or mis-verifies its `MinRoot` epoch beacon.
     pub(super) fn validate_cnvrf_v3_payload(&self, block: &Block) -> Result<(), String> {
         use crate::cn_vrf::{
-            epoch_of_height, epoch_raw_seed, SlotRevealOutcome, EPOCH_LEN,
-            V3_COMMIT_LOOKAHEAD_BLOCKS,
+            epoch_of_height, SlotRevealOutcome, EPOCH_LEN, V3_COMMIT_LOOKAHEAD_BLOCKS,
         };
 
         let payload = block.cnvrf_v3.as_ref();
@@ -955,14 +958,20 @@ impl ValidatorRuntime {
             // beacon the quorum already verified (the same principle as
             // `check_epoch_mmr_commitment`). The MinRoot proof below is
             // self-contained and always enforced.
+            //
+            // ONE seed rule (review F3): the SAME `epoch_seed` the producer and
+            // `apply_cnvrf_v3` call. The predecessor's beacon is its committed
+            // on-chain beacon, or the deterministic bootstrap beacon when that
+            // epoch's `H_freeze` preceded activation — never a bare zero link
+            // (that mismatch made the first post-activation boundary
+            // unverifiable).
             if let Some((freeze_hash, freeze_mix)) = self.cnvrf_freeze_inputs.get(&epoch).copied() {
-                let expected_seed = epoch_raw_seed(
+                let prev_epoch = epoch.saturating_sub(1);
+                let expected_seed = crate::cn_vrf::epoch_seed(
                     self.cnvrf_v3_chain_id,
                     epoch,
-                    &self
-                        .active_epoch_beacon(block.height.saturating_sub(1))
-                        .map(|b| b.output)
-                        .unwrap_or([0u8; crate::cn_vrf::V3_LINK_LEN]),
+                    self.finalized_epoch_beacons.get(&prev_epoch),
+                    crate::cn_vrf::epoch_had_vdf(prev_epoch, self.cnvrf_v3_activation_height()),
                     &freeze_hash,
                     &freeze_mix,
                 );
@@ -998,11 +1007,33 @@ impl ValidatorRuntime {
         validators: ValidatorSet,
         genesis_root: [u8; 32],
     ) -> Result<(), String> {
-        self.light = Some(crate::light_client::LightClient::with_genesis_anchor(
+        let light = crate::light_client::LightClient::with_genesis_anchor(
             validators,
             crate::sync::genesis_light_anchor(genesis_root),
-        )?);
+        )?;
+        self.light = Some(light);
+        self.configure_light_client_cnvrf_v3();
         Ok(())
+    }
+
+    /// Teach the node's light client the CN-VRF v3 activation height, the chain
+    /// id (bootstrap-beacon derivation) and every epoch beacon this node has
+    /// finalized — otherwise its beacon-aware verification fails closed on the
+    /// first post-activation header (review F2's light-client leg).
+    pub(super) fn configure_light_client_cnvrf_v3(&mut self) {
+        let chain_id = self.cnvrf_v3_chain_id;
+        let activation = self.cnvrf_v3_activation_height();
+        let beacons: Vec<(u64, [u8; 48])> = self
+            .finalized_epoch_beacons
+            .iter()
+            .map(|(e, b)| (*e, *b))
+            .collect();
+        if let Some(light) = self.light.as_mut() {
+            light.configure_cnvrf_v3(chain_id, activation);
+            for (epoch, output) in beacons {
+                light.record_epoch_beacon(epoch, output);
+            }
+        }
     }
 
     /// The node's light client, if it has one.
@@ -1192,8 +1223,19 @@ impl ValidatorRuntime {
         // checked under the set that was in force at ITS height. The node's
         // current set is that set (the same simplification `validate_sync_chain`
         // makes — see its F5 note).
+        let cnvrf_chain_id = self.cnvrf_v3_chain_id;
+        let cnvrf_activation = self.cnvrf_v3_activation_height();
+        let cnvrf_beacons: Vec<(u64, [u8; 48])> = self
+            .finalized_epoch_beacons
+            .iter()
+            .map(|(e, b)| (*e, *b))
+            .collect();
         if let Some(light) = self.light.as_mut() {
             light.validators = self.validators.clone();
+            light.configure_cnvrf_v3(cnvrf_chain_id, cnvrf_activation);
+            for (epoch, output) in cnvrf_beacons.iter() {
+                light.record_epoch_beacon(*epoch, *output);
+            }
             if light.apply_header(header.clone()).is_ok() {
                 return;
             }
@@ -1210,8 +1252,16 @@ impl ValidatorRuntime {
         // The chain BELOW the anchor was verified when this node finalized it,
         // and the anchor itself is quorum-certified, so the light client is
         // sound from here on.
-        match crate::light_client::LightClient::new(self.validators.clone(), cp) {
-            Ok(fresh) => {
+        match crate::light_client::LightClient::with_checkpoint_under_cnvrf_v3(
+            self.validators.clone(),
+            cp,
+            cnvrf_chain_id,
+            cnvrf_activation,
+        ) {
+            Ok(mut fresh) => {
+                for (epoch, output) in cnvrf_beacons.iter() {
+                    fresh.record_epoch_beacon(*epoch, *output);
+                }
                 tracing::warn!(
                     "[light-client] rebuilt the anchor at height {} (the previous anchor was inconsistent)",
                     block.height
@@ -1278,8 +1328,19 @@ impl ValidatorRuntime {
             );
             return;
         }
+        let cnvrf_chain_id = self.cnvrf_v3_chain_id;
+        let cnvrf_activation = self.cnvrf_v3_activation_height();
+        let cnvrf_beacons: Vec<(u64, [u8; 48])> = self
+            .finalized_epoch_beacons
+            .iter()
+            .map(|(e, b)| (*e, *b))
+            .collect();
         if let Some(light) = self.light.as_mut() {
             light.validators = vs.clone();
+            light.configure_cnvrf_v3(cnvrf_chain_id, cnvrf_activation);
+            for (epoch, output) in cnvrf_beacons.iter() {
+                light.record_epoch_beacon(*epoch, *output);
+            }
             if light.apply_header(header.clone()).is_ok() {
                 return;
             }
@@ -1293,8 +1354,16 @@ impl ValidatorRuntime {
                 return;
             }
         }
-        match crate::light_client::LightClient::new(vs, cp) {
-            Ok(fresh) => {
+        match crate::light_client::LightClient::with_checkpoint_under_cnvrf_v3(
+            vs,
+            cp,
+            cnvrf_chain_id,
+            cnvrf_activation,
+        ) {
+            Ok(mut fresh) => {
+                for (epoch, output) in cnvrf_beacons.iter() {
+                    fresh.record_epoch_beacon(*epoch, *output);
+                }
                 tracing::warn!("[light-client] rebuilt the anchor at snapshot boundary {boundary}");
                 self.light = Some(fresh);
             }
@@ -2180,7 +2249,7 @@ impl ValidatorRuntime {
             .map_err(|_| StakingError::InsufficientBond)?;
         let _ = self
             .state
-            .credit_native(&crate::staking::STAKING_POOL, amount)
+            .credit_native_transfer(&crate::staking::STAKING_POOL, amount)
             .await;
         let res = self
             .state
@@ -2195,7 +2264,7 @@ impl ValidatorRuntime {
                 .state
                 .debit_native(&crate::staking::STAKING_POOL, amount)
                 .await;
-            let _ = self.state.credit_native(&validator, amount).await;
+            let _ = self.state.credit_native_transfer(&validator, amount).await;
             return Err(e);
         }
         Ok(())
@@ -2239,11 +2308,11 @@ impl ValidatorRuntime {
             .map_err(|_| StakingError::InsufficientDelegation)?;
         if self
             .state
-            .credit_native(&crate::staking::STAKING_POOL, amount)
+            .credit_native_transfer(&crate::staking::STAKING_POOL, amount)
             .await
             .is_err()
         {
-            let _ = self.state.credit_native(&delegator, amount).await;
+            let _ = self.state.credit_native_transfer(&delegator, amount).await;
             return Err(StakingError::InsufficientDelegation);
         }
         let res = self
@@ -2256,7 +2325,7 @@ impl ValidatorRuntime {
                 .state
                 .debit_native(&crate::staking::STAKING_POOL, amount)
                 .await;
-            let _ = self.state.credit_native(&delegator, amount).await;
+            let _ = self.state.credit_native_transfer(&delegator, amount).await;
             return Err(e);
         }
         Ok(())
@@ -2317,10 +2386,15 @@ impl ValidatorRuntime {
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
-        if self.state.credit_native(&validator, amount).await.is_err() {
+        if self
+            .state
+            .credit_native_transfer(&validator, amount)
+            .await
+            .is_err()
+        {
             let _ = self
                 .state
-                .credit_native(&crate::staking::STAKING_POOL, amount)
+                .credit_native_transfer(&crate::staking::STAKING_POOL, amount)
                 .await;
             let mut l = self.state.staking_write().await;
             let key = (validator, [0u8; 32]);
@@ -2369,10 +2443,15 @@ impl ValidatorRuntime {
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
-        if self.state.credit_native(&delegator, amount).await.is_err() {
+        if self
+            .state
+            .credit_native_transfer(&delegator, amount)
+            .await
+            .is_err()
+        {
             let _ = self
                 .state
-                .credit_native(&crate::staking::STAKING_POOL, amount)
+                .credit_native_transfer(&crate::staking::STAKING_POOL, amount)
                 .await;
             let mut l = self.state.staking_write().await;
             let key = (validator, delegator);
@@ -2419,11 +2498,11 @@ impl ValidatorRuntime {
                 }
                 return Err(crate::staking::StakingError::RewardCreditFailed);
             }
-            if let Err(_e) = self.state.credit_native(&validator, amount).await {
+            if let Err(_e) = self.state.credit_native_transfer(&validator, amount).await {
                 // Refund the pool debit and restore the ledger entry.
                 let _ = self
                     .state
-                    .credit_native(&crate::staking::REWARDS_POOL, amount)
+                    .credit_native_transfer(&crate::staking::REWARDS_POOL, amount)
                     .await;
                 let mut l = self.state.staking_write().await;
                 l.rewards_pool = l.rewards_pool.saturating_add(amount);
@@ -2470,11 +2549,16 @@ impl ValidatorRuntime {
                     .saturating_add(amount);
                 return 0;
             }
-            if self.state.credit_native(&delegator, amount).await.is_err() {
+            if self
+                .state
+                .credit_native_transfer(&delegator, amount)
+                .await
+                .is_err()
+            {
                 // Refund the pool debit and restore the ledger entry.
                 let _ = self
                     .state
-                    .credit_native(&crate::staking::REWARDS_POOL, amount)
+                    .credit_native_transfer(&crate::staking::REWARDS_POOL, amount)
                     .await;
                 {
                     let mut l = self.state.staking_write().await;
@@ -2723,5 +2807,269 @@ impl ValidatorRuntime {
 
     pub async fn state_root(&self) -> [u8; 32] {
         self.state.get_state_root().await
+    }
+}
+
+// ============================================================================
+// CN-VRF v3 activation wiring (review F2 + F3), unit-level
+// ============================================================================
+#[cfg(test)]
+mod cnvrf_v3_activation_unit_tests {
+    use super::*;
+    use crate::consensus::{
+        register_validator_pq_key, CommitteeSchedule, Vote, VoteKind, VoteSet,
+        MICRO_COMMITTEE_MAX_SIZE,
+    };
+    use crate::post_quantum::{FalconKeypair, PqScheme};
+    use crate::sharding::{Block, CnVrfV3BlockPayload, EpochVdfBeacon, MASTERCHAIN_SHARD};
+
+    fn vote_keys(n: usize) -> (ValidatorSet, Vec<SigningKey>, Vec<FalconKeypair>) {
+        let mut vs = ValidatorSet::new();
+        let mut keys = Vec::with_capacity(n);
+        let mut fks = Vec::with_capacity(n);
+        for i in 0..n {
+            // Distinct id pattern (first byte varies, 0x9D filler) so this
+            // fixture can never collide with another test's global PQ keys.
+            let mut id_bytes = [0x9Du8; 32];
+            id_bytes[0] = i as u8;
+            let sk = SigningKey::from_bytes(&id_bytes);
+            let fk = FalconKeypair::generate_from_seed(i as u8);
+            register_validator_pq_key(
+                sk.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            vs.add(sk.verifying_key().to_bytes(), 1);
+            keys.push(sk);
+            fks.push(fk);
+        }
+        (vs, keys, fks)
+    }
+
+    fn boundary_block(height: u64, prev_hash: [u8; 32], beacon: EpochVdfBeacon) -> Block {
+        Block {
+            shard_id: MASTERCHAIN_SHARD,
+            height,
+            prev_hash,
+            state_root: [0u8; 32],
+            transactions: Vec::new(),
+            cross_shard_out: Vec::new(),
+            timestamp: 1_760_000_000,
+            proposer: [0x11u8; 32],
+            validator_signatures: Vec::new(),
+            shard_headers: Vec::new(),
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: Some(CnVrfV3BlockPayload {
+                reveal: None,
+                commits: Vec::new(),
+                epoch_vdf: Some(beacon),
+            }),
+            order_merkle_root: crate::mev::compute_order_merkle_root(&[]),
+            epoch_key_commitment: [0u8; 32],
+        }
+    }
+
+    async fn poll_ready_beacon(rt: &mut ValidatorRuntime, epoch: u64) -> EpochVdfBeacon {
+        for _ in 0..400 {
+            rt.poll_vdf_lane();
+            if let Some(beacon) = rt.ready_vdf_beacons.get(&epoch).cloned() {
+                return beacon;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the VDF lane never delivered the epoch {epoch} beacon");
+    }
+
+    /// F3 END-TO-END: the REAL producer hook (`H_freeze` dispatch) and the REAL
+    /// boundary validator derive the SAME seed, so the beacon chain starts at
+    /// the first post-activation boundary and continues across the next one.
+    ///
+    /// Pre-fix this test fails: the producer chained a zero link while the
+    /// validator chained the bootstrap beacon, so `validate_cnvrf_v3_payload`
+    /// refused the very beacon the producer dispatched.
+    #[tokio::test]
+    async fn beacon_chain_starts_across_the_first_boundary() {
+        let key = SigningKey::from_bytes(&[0x31u8; 32]);
+        let me = key.verifying_key().to_bytes();
+        let validators = ValidatorSet::from_list(vec![(me, 1)]);
+        let mut rt =
+            ValidatorRuntime::new(key, validators, Arc::new(InMemoryStateEngine::new()), 1)
+                .with_falcon_key(FalconKeypair::generate_from_seed(0x77));
+        // Genesis warm start: the activation-height rule allows 0.
+        rt.set_cnvrf_v3_activation_height_for_tests(0);
+        rt.set_cnvrf_v3_vdf_steps(64);
+
+        // --- first boundary: epoch 1, `H_freeze` = 6840 -------------------
+        let freeze_hash = [0xA1u8; 32];
+        rt.prepare_cnvrf_v3_epoch_hooks(6840, freeze_hash).await;
+        assert!(
+            rt.cnvrf_freeze_inputs.contains_key(&1),
+            "the producer must snapshot epoch 1's freeze inputs at H_freeze"
+        );
+        let beacon1 = poll_ready_beacon(&mut rt, 1).await;
+        let block_7200 = boundary_block(7200, [0x71u8; 32], beacon1.clone());
+        rt.validate_cnvrf_v3_payload(&block_7200)
+            .expect("the FIRST post-activation boundary beacon must verify (F3)");
+
+        // The state engine records the beacon; the runtime mirror follows.
+        let out1 = crate::minroot_vdf::derive_vdf_output(&beacon1.raw_seed, &beacon1.proof);
+        rt.state.epoch_vdf_beacons_write().await.insert(1, out1);
+        rt.finalized_epoch_beacons.insert(1, out1);
+        rt.ready_vdf_beacons.remove(&1);
+
+        // --- second boundary: epoch 2, `H_freeze` = 14040 ------------------
+        let freeze2 = [0xB2u8; 32];
+        rt.prepare_cnvrf_v3_epoch_hooks(14040, freeze2).await;
+        let beacon2 = poll_ready_beacon(&mut rt, 2).await;
+        let block_14400 = boundary_block(14400, [0x72u8; 32], beacon2);
+        rt.validate_cnvrf_v3_payload(&block_14400)
+            .expect("the beacon chain must continue across the second boundary");
+
+        // The second seed really chained the first beacon (not zeros).
+        let expected = crate::cn_vrf::epoch_seed(
+            rt.cnvrf_v3_chain_id,
+            2,
+            Some(&out1),
+            crate::cn_vrf::epoch_had_vdf(1, 0),
+            &freeze2,
+            &rt.cnvrf_freeze_inputs
+                .get(&2)
+                .expect("freeze inputs for epoch 2")
+                .1,
+        );
+        assert_eq!(
+            rt.ready_vdf_beacons.get(&2).map(|b| b.raw_seed),
+            Some(expected),
+            "epoch 2's seed must chain epoch 1's committed beacon"
+        );
+    }
+
+    /// F2 AT THE NODE: the engine's own decision-certificate producer (as
+    /// driven by `try_precommit_quorum`) draws the beacon committee at
+    /// activation, and the SAME node's verifier accepts it — while the legacy
+    /// parent-hash verifier refuses it (the pre-fix halt). Uses more than
+    /// `MICRO_COMMITTEE_MAX_SIZE` validators so the two draws differ.
+    #[tokio::test]
+    async fn node_accepts_its_own_beacon_certificate_at_activation() {
+        let activation = crate::cn_vrf::EPOCH_LEN + 1;
+        let n = MICRO_COMMITTEE_MAX_SIZE as usize + 2;
+        let (vs, keys, fks) = vote_keys(n);
+        let key = keys[0].clone();
+        let mut rt = ValidatorRuntime::new(
+            key,
+            vs.clone(),
+            Arc::new(InMemoryStateEngine::new()),
+            activation,
+        );
+        rt.set_cnvrf_v3_activation_height_for_tests(activation);
+        rt.hc.set_parent_hash([0x21u8; 32]);
+
+        let block = [0x55u8; 32];
+        let parent = [0x21u8; 32];
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            rt.hc
+                .add_prevote(Vote::sign_with_falcon(
+                    sk,
+                    fk,
+                    activation,
+                    0,
+                    VoteKind::Prevote,
+                    Some(block),
+                ))
+                .expect("prevote admits");
+        }
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            rt.hc
+                .add_precommit(Vote::sign_with_falcon(
+                    sk,
+                    fk,
+                    activation,
+                    0,
+                    VoteKind::Precommit,
+                    Some(block),
+                ))
+                .expect("precommit admits");
+        }
+        let decided = rt
+            .hc
+            .try_precommit_quorum()
+            .expect("the whole set precommitted, so the height decides");
+        assert_eq!(decided, block);
+        let qc = rt.hc.precommit_qc.clone().expect("decision certificate");
+
+        // The schedule the node produced under is the beacon draw.
+        let schedule = rt.committee_schedule_at(activation);
+        assert!(matches!(schedule, CommitteeSchedule::Beacon(Some(_))));
+        assert!(
+            rt.verify_qc_for_height(&qc, &vs),
+            "the same node must verify its OWN decision certificate (F2)"
+        );
+        assert!(
+            vs.qc_signed_power_with_schedule(&qc, schedule) >= vs.quorum_power(),
+            "the beacon-attributed signers must carry quorum power"
+        );
+
+        // Negative control: the pre-fix parent-hash gate refuses it.
+        assert!(
+            !qc.verify(&vs),
+            "the legacy parent-hash verifier must refuse the beacon-drawn QC"
+        );
+
+        // --- `last_qc` downtime evidence is beacon-aware too ----------------
+        // Evidence for a height ABOVE activation: the parent QC is drawn from
+        // the epoch beacon, so the parent-hash gate would refuse it (the F2
+        // downtime-attribution halt).
+        let evidence_height = activation + 1;
+        let parent_len = parent_height(evidence_height);
+        let mut votes = VoteSet::new();
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            votes
+                .add(
+                    Vote::sign_with_falcon(
+                        sk,
+                        fk,
+                        parent_len,
+                        0,
+                        VoteKind::Precommit,
+                        Some(parent),
+                    ),
+                    &vs,
+                    parent_len,
+                    0,
+                    VoteKind::Precommit,
+                )
+                .expect("parent vote admits");
+        }
+        let parent_qc = crate::consensus::produce_decision_certificate_with_schedule(
+            &votes,
+            Some(parent),
+            &vs,
+            Some(&[0x20u8; 32]),
+            rt.committee_schedule_at(parent_len),
+        )
+        .expect("parent certificate compiles");
+        assert!(
+            !parent_qc.verify(&vs),
+            "the legacy parent-hash verifier must refuse the beacon-drawn last_qc"
+        );
+        let mut evidence_block = boundary_block(
+            evidence_height,
+            parent,
+            EpochVdfBeacon {
+                epoch: 0,
+                raw_seed: [0u8; 48],
+                proof: crate::minroot_vdf::eval(&[0u8; 48], 1, 1),
+            },
+        );
+        evidence_block.last_qc = Some(parent_qc);
+        // The check only cares about the parent height / hash / kind / quorum.
+        rt.check_last_qc_evidence(&evidence_block)
+            .expect("an honest beacon-drawn last_qc must be accepted (F2)");
+    }
+
+    fn parent_height(height: u64) -> u64 {
+        height - 1
     }
 }

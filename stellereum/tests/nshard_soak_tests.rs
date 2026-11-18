@@ -114,7 +114,11 @@ async fn sharded_n(
         }
         entries.push((*shard, vec![(validator.clone(), engine)]));
     }
-    ShardedCluster::new(registry, entries, CrossShardTransport::local())
+    let mut sc = ShardedCluster::new(registry, entries, CrossShardTransport::local());
+    // XSHARD-01: cross-shard VALUE runs through the §9 2PC (the legacy
+    // one-step credit is refused; it cannot prove the source-side debit).
+    sc.with_xpc_activation(stellereum::xshard2pc::XpcActivation::FromHeight(0));
+    sc
 }
 
 async fn balance_at(sc: &ShardedCluster, shard: u32, addr: &[u8; 32]) -> u64 {
@@ -264,8 +268,12 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
             .any(|m| m.target_shard == SHARD1),
         "source shard0 must emit the 0->1 outbound message"
     );
-    ts += 1;
-    sc.run_height(SHARD1, ts).await;
+    for _ in 0..4 {
+        for shard in [SHARD0, SHARD1, SHARD2] {
+            ts += 1;
+            sc.run_height(shard, ts).await;
+        }
+    }
     assert_eq!(balance_at(&sc, SHARD1, &r1).await, 10_000);
 
     // Pair 2: 1 -> 2.
@@ -281,8 +289,12 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
             .any(|m| m.target_shard == SHARD2),
         "source shard1 must emit the 1->2 outbound message"
     );
-    ts += 1;
-    sc.run_height(SHARD2, ts).await;
+    for _ in 0..4 {
+        for shard in [SHARD0, SHARD1, SHARD2] {
+            ts += 1;
+            sc.run_height(shard, ts).await;
+        }
+    }
     assert_eq!(balance_at(&sc, SHARD2, &r2).await, 4_000);
 
     // Pair 3: 0 -> 2 (second nonce on sender0).
@@ -298,8 +310,12 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
             .any(|m| m.target_shard == SHARD2),
         "source shard0 must emit the 0->2 outbound message"
     );
-    ts += 1;
-    sc.run_height(SHARD2, ts).await;
+    for _ in 0..4 {
+        for shard in [SHARD0, SHARD1, SHARD2] {
+            ts += 1;
+            sc.run_height(shard, ts).await;
+        }
+    }
     assert_eq!(balance_at(&sc, SHARD2, &r2).await, 9_000);
 
     // Post-transfer soak: all three shards keep finalizing.
@@ -310,6 +326,13 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
         }
     }
 
+    let h0 = sc.shard(SHARD0).height();
+    for shard in [SHARD1, SHARD2] {
+        while sc.shard(shard).height() < h0 {
+            ts += 1;
+            sc.run_height(shard, ts).await;
+        }
+    }
     let f0 = finalized_len(sc.shard(SHARD0));
     let f1 = finalized_len(sc.shard(SHARD1));
     let f2 = finalized_len(sc.shard(SHARD2));

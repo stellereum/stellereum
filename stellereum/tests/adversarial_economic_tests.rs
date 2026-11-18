@@ -390,11 +390,14 @@ async fn faucet_caps_hold_and_treasury_stays_exact() {
     }
     // Treasury accounting exact: each drip is a PQ-activation tx whose
     // declared gas_limit is GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS
-    // and whose execution adds PQ_ACTIVATION_SURCHARGE_GAS.
+    // and whose fee is FEE-01's `min(declared, consumed + intrinsic)` — the
+    // 280_000 intrinsic envelope — plus the additive
+    // PQ_ACTIVATION_SURCHARGE_GAS. (The old expectation charged the
+    // declaration and added the surcharge a second time.)
     let dispensed_sum: u64 = 50 * 25;
     let expect = treasury_start
         - dispensed_sum
-        - applied * (GAS_BASIC_TRANSFER + 2 * PQ_ACTIVATION_SURCHARGE_GAS);
+        - applied * (GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS);
     let got = engine
         .get_account(&faucet_addr)
         .await

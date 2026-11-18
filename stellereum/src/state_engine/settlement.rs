@@ -1389,7 +1389,14 @@ impl InMemoryStateEngine {
             }
         };
         if !paid {
-            let _ = self.credit_native(&seller, stell_nano).await;
+            // REFUND of the seller's already-debited STELL: a transfer, never a
+            // mint (the capped path would strand the money at the supply cap).
+            if let Err(e) = self.credit_native_transfer(&seller, stell_nano).await {
+                tracing::error!(
+                    "PMM sell: wUSDT payout failed AND the STELL refund failed for {}: {e}",
+                    hex::encode(&seller[..8])
+                );
+            }
             return Err("wUSDT payout failed (PMM treasury lacks minter authority)".to_string());
         }
 

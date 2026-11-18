@@ -276,10 +276,16 @@ async fn both_shards_finalize_and_masterchain_commits_their_heads() {
     );
 }
 
-/// (3) One native cross-shard transfer: exact debit, exactly-once credit, a
-/// replay that cannot credit twice, and a resolvable source anchor.
+/// (3) One native cross-shard transfer: exact escrow debit, exactly-once
+/// credit, a replay that cannot credit twice, and a resolvable source anchor.
+///
+/// XSHARD-01: the value path is the §9 2PC. The legacy one-way credit is
+/// refused (it cannot prove the source-side debit in one step), so the credit
+/// is paid on the COMMIT, backed by the source's committed escrow.
 #[tokio::test]
 async fn native_transfer_credits_once_and_source_anchor_verifies() {
+    use stellereum::xshard2pc::{XpcActivation, XpcPhase};
+
     let validators = validator_keys();
     let (sender, sender_addr) = pq_sender(0x51);
     let recipient_addr = id_of(&key(0x52));
@@ -287,6 +293,7 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
     let amount = 10_000u64;
 
     let mut sc = two_shard_cluster(&validators, &[(sender_addr, initial)], &[]).await;
+    sc.with_xpc_activation(XpcActivation::FromHeight(0));
     let mut ts = 8_000_000u64;
     for _ in 0..2 {
         ts += 1;
@@ -297,7 +304,8 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
     assert_eq!(balance_at(&sc, SHARD0, &sender_addr).await, initial);
     assert_eq!(balance_at(&sc, SHARD1, &recipient_addr).await, 0);
 
-    // Produce the transfer on the source shard.
+    // Produce (escrow) the transfer on the source shard: a PREPARE, not a bare
+    // transfer.
     let tx = sign_pq_explicit_transfer(
         &sender,
         recipient_addr,
@@ -316,62 +324,59 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
         .get(&source_hash)
         .expect("source block retained")
         .clone();
-    assert_eq!(
-        source_block
-            .cross_shard_out
-            .iter()
-            .filter(|m| m.is_outbound_for(SHARD0))
-            .count(),
-        1,
-        "the source must emit exactly one outbound message"
-    );
+    let prepare = source_block
+        .cross_shard_out
+        .iter()
+        .find(|m| m.is_outbound_for(SHARD0))
+        .expect("the source must emit an outbound record")
+        .clone();
+    assert!(prepare.is_prepare(), "the escrow is a 2PC PREPARE");
     assert_eq!(
         balance_at(&sc, SHARD0, &sender_addr).await,
         initial - amount - GAS_LIMIT - PQ_ACTIVATION_SURCHARGE_GAS,
         "the source must be debited exactly once"
     );
 
-    // Consume it on the target shard.
-    ts += 1;
-    let target_hash = sc.run_height(SHARD1, ts).await;
-    let target_block = sc.shard(SHARD1).nodes[0]
-        .blocks
-        .get(&target_hash)
-        .expect("target block retained")
-        .clone();
-    let inbound = target_block
-        .cross_shard_out
-        .iter()
-        .find(|m| m.is_inbound_for(SHARD1))
-        .expect("the target block must commit the consumption record")
-        .clone();
-    assert_eq!(inbound.tx.compute_tx_hash(), tx_hash);
+    // Drive the handshake to the COMMIT: the recipient is credited on the
+    // target, backed by the source's committed escrow.
+    for _ in 0..4 {
+        ts += 1;
+        sc.run_height(SHARD0, ts).await;
+        ts += 1;
+        sc.run_height(SHARD1, ts).await;
+    }
     assert_eq!(balance_at(&sc, SHARD1, &recipient_addr).await, amount);
 
-    // The registry anchor for the source block (the block the message names)
-    // must resolve to the very root the message carries, so an inbound message
-    // verifies strictly.
+    // The inbound record the target credited on: the source's COMMIT. Its proof
+    // is the source's committed escrow leaf, anchored to a locally finalized
+    // source header — the stronger proof XSHARD-01 requires.
+    let commit = finalized_blocks(sc.shard(SHARD1))
+        .iter()
+        .flat_map(|b| b.cross_shard_out.iter())
+        .find(|m| m.is_inbound_for(SHARD1) && m.is_commit())
+        .cloned()
+        .expect("the target consumed a COMMIT");
+    assert_eq!(commit.tx.compute_tx_hash(), tx_hash);
+    assert!(
+        commit.verify_xpc_proof(&[XpcPhase::Prepared, XpcPhase::Committed]),
+        "the COMMIT must prove the source's committed escrow"
+    );
     let registry_handle = sc.shard(SHARD1).nodes[0]
         .finalized_headers
         .as_ref()
         .expect("the fixture wires the finalized-header registry")
         .clone();
-    let anchor = {
+    let anchor_ok = {
         let reg = registry_handle.read().expect("registry lock");
-        reg.lookup(SHARD0, &inbound.finalized_in_block)
+        reg.anchor_holds(
+            commit.source_shard,
+            &commit.finalized_in_block,
+            &commit.source_state_root,
+        )
     };
-    assert_eq!(
-        anchor,
-        Some(inbound.source_state_root),
-        "the source block's registry anchor must resolve to the message root"
-    );
-    assert_eq!(
-        inbound.finalized_in_block, source_block.prev_hash,
-        "the message names its source block (the parent of the producing block)"
-    );
     assert!(
-        sc.shard(SHARD1).nodes[0].verify_cross_shard_anchored(&inbound),
-        "an anchored inbound message must verify against the finalized source header"
+        anchor_ok,
+        "the COMMIT's state root must be a locally finalized source header"
     );
 
     let watched0 = [sender_addr];
@@ -379,12 +384,12 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
     let supply_before = watched_supply(&sc, &watched0, &watched1).await;
 
     // Replay attack: re-seed the same transaction on the source and re-publish
-    // the consumed message on the target, twice each.
+    // the credited COMMIT on the target, twice each.
     sc.broadcast_tx(tx.clone()).await;
     sc.broadcast_tx(tx.clone()).await;
     for _ in 0..2 {
         sc.transport
-            .broadcast_cross_shard(&inbound)
+            .broadcast_cross_shard(&commit)
             .await
             .expect("node-local re-broadcast must succeed");
     }
@@ -399,27 +404,25 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
     assert_eq!(
         balance_at(&sc, SHARD0, &sender_addr).await,
         initial - amount - GAS_LIMIT - PQ_ACTIVATION_SURCHARGE_GAS,
-        "a replayed message must not debit the source twice"
+        "a replayed record must not debit the source twice"
     );
     assert_eq!(
         balance_at(&sc, SHARD1, &recipient_addr).await,
         amount,
-        "a replayed message must not credit the target twice"
+        "a replayed record must not credit the target twice"
     );
     assert_eq!(
         watched_supply(&sc, &watched0, &watched1).await,
         supply_before,
         "replay must not mint or burn value"
     );
-
-    // Exactly one committed consumption record for this transaction across the
-    // whole finalized target chain.
-    let committed = finalized_blocks(sc.shard(SHARD1))
-        .iter()
-        .flat_map(|b| b.cross_shard_out.iter())
-        .filter(|m| m.is_inbound_for(SHARD1) && m.tx.compute_tx_hash() == tx_hash)
-        .count();
-    assert_eq!(committed, 1, "exactly one consumption record must commit");
+    assert!(
+        sc.shard(SHARD1).nodes[0]
+            .state
+            .is_cross_shard_completed(&tx_hash)
+            .await,
+        "the lifecycle completed exactly once"
+    );
 
     for shard in [SHARD0, SHARD1] {
         assert_shard_roots_agree(&sc, shard).await;
@@ -431,6 +434,8 @@ async fn native_transfer_credits_once_and_source_anchor_verifies() {
 /// shards.
 #[tokio::test]
 async fn restart_replay_reproduces_identical_roots_on_both_shards() {
+    use stellereum::xshard2pc::XpcActivation;
+
     let validators = validator_keys();
     let (sender, sender_addr) = pq_sender(0x61);
     let recipient_addr = id_of(&key(0x62));
@@ -438,6 +443,7 @@ async fn restart_replay_reproduces_identical_roots_on_both_shards() {
     let amount = 12_345u64;
 
     let mut sc = two_shard_cluster(&validators, &[(sender_addr, initial)], &[]).await;
+    sc.with_xpc_activation(XpcActivation::FromHeight(0));
     let mut ts = 9_000_000u64;
     for _ in 0..2 {
         ts += 1;
@@ -461,13 +467,19 @@ async fn restart_replay_reproduces_identical_roots_on_both_shards() {
     ts += 1;
     sc.run_height(SHARD1, ts).await;
 
-    // Soak a few more heights so the replay covers state after the credit too.
-    for _ in 0..3 {
+    // Soak a few more heights so the 2PC handshake completes and the replay
+    // covers state after the credit too.
+    for _ in 0..4 {
         ts += 1;
         sc.run_height(SHARD0, ts).await;
         ts += 1;
         sc.run_height(SHARD1, ts).await;
     }
+    assert_eq!(
+        balance_at(&sc, SHARD1, &recipient_addr).await,
+        amount,
+        "precondition: the 2PC transfer credited the target"
+    );
 
     // Live roots to reproduce.
     let live0 = sc.shard(SHARD0).nodes[0].state_root().await;
@@ -487,6 +499,10 @@ async fn restart_replay_reproduces_identical_roots_on_both_shards() {
         .finalized_headers
         .clone()
         .expect("the fixture wires the finalized-header registry");
+    // The source also CONSUMES peer records (the PREPARE-ACK that commits the
+    // transfer), and those records are proven against the peer's committed
+    // state — so the replay needs the same anchor registry the live node had.
+    replay0.with_finalized_headers(anchors.clone());
     let mut chain0 = ChainState::new(replay0.clone());
     for block in finalized_blocks(sc.shard(SHARD0)) {
         chain0.apply_block(&block).await;

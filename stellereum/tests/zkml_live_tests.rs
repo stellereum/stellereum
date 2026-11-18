@@ -18,7 +18,10 @@
 //!    - RE-EXECUTION, not a SNARK (see the opcode docs) - and reverts the
 //!      whole transaction on failure, like every other refusal opcode.
 
-use stellereum::commitment::{commitment_digest, commitment_digest_with_zkml, COMMITMENT_VERSION};
+use stellereum::commitment::{
+    commitment_digest, commitment_digest_with_zkml, zkml_models_digest, COMMITMENT_VERSION,
+};
+use stellereum::mempool::Mempool;
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
 };
@@ -964,5 +967,125 @@ async fn zkml_registry_is_folded_into_the_commitment_conditionally() {
         e.get_state_root().await,
         before,
         "registry is consensus state"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Registration is a priced, capped, idempotent registry operation.
+// ---------------------------------------------------------------------------
+
+/// A model with exactly `params` parameters (`(params - 1) x 1` + one bias).
+fn param_model(params: usize) -> QuantizedLinearModel {
+    let in_dim = params - 1;
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        in_dim,
+        1,
+        vec![0; in_dim],
+        vec![0],
+    )])
+}
+
+#[test]
+fn registration_costs_nonzero_proof_units() {
+    let fk = FalconKeypair::generate_from_seed(0x31);
+    let from = derive_pq_address(PqScheme::Falcon512, &fk.public_key, &DEFAULT_SALT);
+
+    // A tiny registration is no longer free.
+    let tiny = register_tx(&fk, from, 0, MODEL_A, &tiny_model());
+    assert_eq!(
+        Mempool::count_tx_proof_units(&tiny),
+        Mempool::PROOF_UNITS_REGISTER_MODEL,
+        "a sub-1024-param registration costs the base units"
+    );
+
+    // Cost grows with the registered parameter count, inside the block budget.
+    let big_model = param_model(4 * Mempool::REGISTER_PARAMS_PER_PROOF_UNIT);
+    let big = register_tx(&fk, from, 0, MODEL_B, &big_model);
+    let units = Mempool::count_tx_proof_units(&big);
+    assert_eq!(
+        units,
+        Mempool::PROOF_UNITS_REGISTER_MODEL + 4,
+        "one proof unit per 1024 parameters on top of the base"
+    );
+    assert!(
+        units <= Mempool::MAX_BLOCK_PROOF_UNITS,
+        "one registration must always fit the per-block proof budget"
+    );
+
+    // Spec registration is priced too.
+    let (_, spec) = stellereum::zkml_attestation::model_spec_with_attestation(
+        &tiny_model().attestation_view(),
+        b"label".to_vec(),
+    )
+    .expect("spec builds");
+    let spec_tx = pq_tx(
+        &fk,
+        from,
+        from,
+        0,
+        GAS,
+        0,
+        vec![OpCode::SysCallRegisterZkMlSpec {
+            model_id: MODEL_A,
+            spec: Box::new(spec),
+        }],
+    );
+    assert_eq!(
+        Mempool::count_tx_proof_units(&spec_tx),
+        Mempool::PROOF_UNITS_REGISTER_SPEC
+    );
+
+    // Verify opcodes keep their historical unit costs.
+    let verify = pq_tx(
+        &fk,
+        from,
+        from,
+        0,
+        GAS,
+        0,
+        vec![OpCode::SysCallVerifyZkMlReexec {
+            model_id: MODEL_A,
+            proof: Box::new(ZkMlProof::prove_reexec(&tiny_model(), &[3, 4]).1),
+        }],
+    );
+    assert_eq!(Mempool::count_tx_proof_units(&verify), 16);
+}
+
+#[tokio::test]
+async fn duplicate_registration_is_idempotent_and_leaves_the_registry_alone() {
+    let (e, fk, addr) = funded(0).await;
+    let m = tiny_model();
+
+    let r1 = register_tx(&fk, addr, 0, MODEL_A, &m);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&r1), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
+    let snapshot = e.zkml_models_read().await.clone();
+    let digest_before = zkml_models_digest(&snapshot);
+
+    // Byte-identical re-registration: applies (no revert) but is a no-op, so
+    // the apply path never writes the registry back and the committed preimage
+    // is not rebuilt.
+    let r2 = register_tx(&fk, addr, 1, MODEL_A, &m);
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&r2), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (1, 0),
+        "an identical duplicate is an idempotent no-op, not a revert"
+    );
+    assert_eq!(s, vec![true]);
+    assert_eq!(
+        *e.zkml_models_read().await,
+        snapshot,
+        "the registry (and therefore the preimage) must be untouched"
+    );
+    assert_eq!(
+        zkml_models_digest(&*e.zkml_models_read().await),
+        digest_before
     );
 }

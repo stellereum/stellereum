@@ -368,6 +368,11 @@ impl Runner {
         self.ops += 1;
         match res {
             Ok(burned) => {
+                // `slash` is the STAKING_POOL scope: every nano of its base
+                // (self-bond, delegations, in-flight unbonding, matured
+                // withdrawable — SLASH-01) is in `ledger_stake_supply`, so the
+                // burn still maps 1:1 onto the supply and never touches the
+                // rewards mirror.
                 assert_eq!(a.1 - b.1, burned, "burned must be booked");
                 assert!(b.0 >= a.0, "slash never inflates supply");
                 assert_eq!(b.0 - a.0, burned, "supply falls by exactly burned");
@@ -417,10 +422,22 @@ impl Runner {
         let got = self.l.note_missed_heights(h, &sign, &eligible);
         let a = self.snap();
         self.ops += 1;
+        // SLASH-01: downtime burns on the EVIDENCE scope, so part of `got` may
+        // be unclaimed pool-backed rewards. Those are not part of
+        // `ledger_stake_supply` (they are new value, backed by `rewards_pool`
+        // instead), so the supply falls by `got - rewards_cut` while
+        // `total_burned` still rises by the whole `got` and the rewards mirror
+        // falls by exactly the cut.
+        let rewards_cut = b.2.saturating_sub(a.2);
+        assert!(rewards_cut <= got, "the rewards cut is part of the burn");
         assert!(b.0 >= a.0, "downtime never inflates supply");
-        assert_eq!(b.0 - a.0, got, "downtime supply falls by exactly burned");
+        assert_eq!(
+            b.0 - a.0,
+            got - rewards_cut,
+            "downtime supply falls by exactly the STAKING_POOL-backed part of burned"
+        );
         assert_eq!(a.1 - b.1, got, "downtime burned must be booked");
-        assert_eq!((a.2, a.3), (b.2, b.3), "downtime mints no rewards");
+        assert_eq!(a.3, b.3, "downtime mints no rewards");
         self.checks += 3;
         for (v, pre) in &pre_pen {
             let post = self

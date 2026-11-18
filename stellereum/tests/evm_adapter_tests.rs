@@ -1604,16 +1604,19 @@ fn test_erc20_name_call() {
     let res_bare = adapter.emulate_erc20_call(SELECTOR_NAME);
     assert_eq!(abi_decode_string(&res_bare).unwrap(), "Stellereum");
 
-    // 4. Through eth_call with standard call object [{ to: ..., data: "0x06fdde03" }, "latest"]
+    // 4. A TARGETED eth_call on the stateless adapter answers `0x`: with no
+    //    state engine, no target can be shown to hold code, which is exactly
+    //    this adapter's `eth_getCode` contract (`0x` for every address). It
+    //    must never invent token metadata for an arbitrary `to`.
     let call_obj = json!([{
         "to": "0x1111111111111111111111111111111111111111",
         "data": SELECTOR_NAME_HEX
     }, "latest"]);
     let eth_call_res = adapter.handle_eth_call(&call_obj).expect("eth_call name");
-    let val_str = eth_call_res.as_str().expect("must be string");
-    assert_eq!(abi_decode_string(val_str).unwrap(), "Stellereum");
+    assert_eq!(eth_call_res, json!("0x"), "codeless target must answer 0x");
 
-    // 5. Through eth_call with "input" alias
+    // 5. Same rule for the "input" alias, and a malformed target is still
+    //    refused exactly as `eth_getCode` refuses it.
     let call_input = json!([{
         "to": "0x1111111111111111111111111111111111111111",
         "input": SELECTOR_NAME_HEX
@@ -1621,12 +1624,13 @@ fn test_erc20_name_call() {
     let eth_call_input = adapter
         .handle_eth_call(&call_input)
         .expect("eth_call input name");
-    assert_eq!(
-        abi_decode_string(eth_call_input.as_str().unwrap()).unwrap(),
-        "Stellereum"
-    );
+    assert_eq!(eth_call_input, json!("0x"));
+    assert!(adapter
+        .handle_eth_call(&json!([{ "to": "0x1234", "data": SELECTOR_NAME_HEX }]))
+        .is_err());
 
-    // 6. Direct module-level function eth_call
+    // 6. Direct module-level function eth_call (no target) keeps the
+    //    legacy native-token view.
     let global_res = eth_call(&json!([{ "data": SELECTOR_NAME_HEX }])).expect("global eth_call");
     assert_eq!(
         abi_decode_string(global_res.as_str().unwrap()).unwrap(),
@@ -1756,7 +1760,9 @@ fn test_erc20_balance_of_call() {
     let bal_alice = abi_decode_u128(&res_alice).expect("balance alice");
     assert_eq!(bal_alice, balance_wei);
 
-    // 3. Call via eth_call object parameter
+    // 3. A TARGETED eth_call on the stateless adapter answers `0x` — no
+    //    engine exists here to prove the target holds code (same rule as
+    //    `eth_getCode`). `balanceOf` itself is asserted above.
     let call_obj = json!([{
         "to": "0x9999999999999999999999999999999999999999",
         "data": calldata_alice
@@ -1764,10 +1770,7 @@ fn test_erc20_balance_of_call() {
     let eth_call_res = adapter
         .handle_eth_call(&call_obj)
         .expect("eth_call balanceOf");
-    assert_eq!(
-        abi_decode_u128(eth_call_res.as_str().unwrap()).unwrap(),
-        balance_wei
-    );
+    assert_eq!(eth_call_res, json!("0x"));
 
     // 4. Bob with 32-byte Stellereum address format
     let bob_evm = "0x2222222222222222222222222222222222222222";
@@ -1848,6 +1851,69 @@ async fn test_erc20_balance_of_with_state_engine() {
     );
 }
 
+/// Audit 2026-11-18: `eth_call` must not answer token metadata for an address
+/// that the SAME node reports has no code. `eth_getCode` is the rule (codeless
+/// -> `0x`), so a codeless target answers `0x` while a target with committed
+/// code still serves the read-only views.
+#[tokio::test]
+async fn eth_call_refuses_a_codeless_target_and_answers_a_code_target() {
+    let engine = InMemoryStateEngine::new();
+    let codeless = "0x1111111111111111111111111111111111111111";
+    let deployed = "0x2222222222222222222222222222222222222222";
+
+    let mut contract_addr = [0u8; 32];
+    contract_addr[12..32].copy_from_slice(&[0x22u8; 20]);
+    let mut account = AccountState::new(contract_addr, 0);
+    account.code = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00];
+    engine.update_account(account).await;
+
+    // Precondition: `eth_getCode` distinguishes the two addresses.
+    let codeless_code =
+        stellereum::evm_adapter::eth_get_code_with_engine(&engine, &json!([codeless, "latest"]))
+            .await
+            .unwrap();
+    assert_eq!(codeless_code, "0x");
+    let deployed_code =
+        stellereum::evm_adapter::eth_get_code_with_engine(&engine, &json!([deployed, "latest"]))
+            .await
+            .unwrap();
+    assert_ne!(deployed_code, "0x");
+
+    // Known selector (`name()`) at the codeless address: honest empty.
+    let codeless_call = eth_call_with_engine(
+        &engine,
+        &json!([{ "to": codeless, "data": SELECTOR_NAME_HEX }, "latest"]),
+    )
+    .await
+    .expect("codeless eth_call");
+    assert_eq!(
+        codeless_call,
+        json!("0x"),
+        "a call at an address with no code must answer `0x`, never metadata"
+    );
+
+    // The same selector at an address that DOES hold committed code still
+    // answers (the adapter keeps its read-only native-token view).
+    let deployed_call = eth_call_with_engine(
+        &engine,
+        &json!([{ "to": deployed, "data": SELECTOR_NAME_HEX }, "latest"]),
+    )
+    .await
+    .expect("deployed eth_call");
+    assert_eq!(
+        abi_decode_string(deployed_call.as_str().unwrap()).unwrap(),
+        "Stellereum"
+    );
+
+    // Invalid target is refused exactly as `eth_getCode` refuses it.
+    assert!(eth_call_with_engine(
+        &engine,
+        &json!([{ "to": "0x1234", "data": SELECTOR_NAME_HEX }])
+    )
+    .await
+    .is_err());
+}
+
 #[test]
 fn test_erc20_unrecognized_selectors_and_edge_cases() {
     let adapter = EvmAdapter::new();
@@ -1902,8 +1968,9 @@ fn test_erc20_calls_through_jsonrpc_string_and_batch() {
     let raw_resp = adapter.handle_raw_json(raw_req);
     let resp: JsonRpcResponse<String> = serde_json::from_str(&raw_resp).unwrap();
     assert_eq!(resp.id, json!(100));
-    let name_str = resp.result.unwrap();
-    assert_eq!(abi_decode_string(&name_str).unwrap(), "Stellereum");
+    // Targeted call on the stateless adapter: codeless target -> `0x`
+    // (the same answer `eth_getCode` gives for that address).
+    assert_eq!(resp.result.unwrap(), "0x");
 
     // 2. Batch request containing all 5 ERC-20 methods and an unknown selector
     let batch_req = r#"[

@@ -2,12 +2,13 @@
 //!
 //! ## Why this module exists
 //!
-//! At/after [`qc_split_active_at`] the µQC is ADVISORY-ONLY: the verifier's
+//! At/after [`qc_split_required`] the µQC is ADVISORY-ONLY: the verifier's
 //! µQC branch fails closed, and finality requires a FULL-network QC — the
 //! epoch/CEC envelope under [`PQ_QC_MARKER_ID`], whose signer set is the
 //! WHOLE validator set (canonically ordered) and whose quorum is
 //! [`crate::consensus::pq_full_required_power`] over the NETWORK's total
-//! power.
+//! power. The predicate is true either at/after the governance height OR once
+//! the validator set reaches [`QC_SPLIT_BY_SIZE_THRESHOLD`].
 //!
 //! The verifier side already existed; without a PRODUCER, activating the gate
 //! made every locally decided block carry a certificate its own peers refuse,
@@ -51,16 +52,23 @@
 //! [`QC_SPLIT_ACTIVATION_HEIGHT`] remains `u64::MAX` (frozen off). The
 //! active branch is exercised through the thread-scoped test override
 //! [`set_qc_split_activation_override`], exactly like the other gates.
+//!
+//! The SAME branch also fires below that height once the validator set reaches
+//! [`QC_SPLIT_BY_SIZE_THRESHOLD`] (review F1: at that size a 128-seat µQC can
+//! no longer reach the network-anchored two-thirds, so it could never
+//! finalize). Producer and verifiers both read the one predicate
+//! [`qc_split_required`], so they cannot disagree about which certificate
+//! shape is legal at a given `(height, validator_count)`.
 
 use std::collections::HashMap;
 
 use super::engine::VoteSet;
 use super::rotation::pq_key_at_height;
-use super::sortition::qc_split_active_at;
+use super::sortition::qc_split_required;
 use super::types::{
-    encode_pq_epoch_envelope, verify_falcon_signature, vote_sign_bytes, BlockHash, Height,
-    PqMicroCertificate, QuorumCertificate, Round, ValidatorId, ValidatorSet, VoteKind,
-    MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID,
+    encode_pq_epoch_envelope, verify_falcon_signature, vote_sign_bytes, BlockHash,
+    CommitteeSchedule, Height, PqMicroCertificate, QuorumCertificate, Round, ValidatorId,
+    ValidatorSet, VoteKind, MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID,
 };
 use crate::post_quantum::PqScheme;
 
@@ -75,12 +83,14 @@ pub type PqKeyMap = HashMap<ValidatorId, (PqScheme, Vec<u8>)>;
 
 /// The decision certificate for a decided height/round/target.
 ///
-/// * Split INACTIVE at the votes' height: byte-identical legacy behavior —
-///   [`VoteSet::certificate_with_parent`] (µQC when the votes carry Falcon
-///   halves and the parent is known).
-/// * Split ACTIVE: the full-network epoch/CEC certificate produced by
-///   [`produce_full_network_certificate`]. A µQC is never emitted there
-///   (the verifier would refuse it anyway, fail-closed).
+/// * Split NOT required at `(height, validators.len())`: byte-identical legacy
+///   behavior — [`VoteSet::certificate_with_parent`] (µQC when the votes carry
+///   Falcon halves and the parent is known).
+/// * Split required (height gate OR the set reached
+///   [`crate::consensus::QC_SPLIT_BY_SIZE_THRESHOLD`]): the full-network
+///   epoch/CEC certificate produced by [`produce_full_network_certificate`]. A
+///   µQC is never emitted there (the verifier would refuse it anyway,
+///   fail-closed).
 ///
 /// `parent_hash` is only consulted on the legacy branch: the CEC path does
 /// not elect a sortition committee, so it needs no parent entropy.
@@ -106,11 +116,61 @@ pub fn produce_decision_certificate_with_pq_keys(
     parent_hash: Option<&[u8; 32]>,
     pq_keys: Option<&PqKeyMap>,
 ) -> Option<QuorumCertificate> {
+    produce_decision_certificate_with_schedule_and_pq_keys(
+        votes,
+        target,
+        validators,
+        parent_hash,
+        CommitteeSchedule::ParentHash,
+        pq_keys,
+    )
+}
+
+/// THE decision-certificate producer (review F2): aggregate a [`VoteSet`] into
+/// the certificate for a decided height under an explicit
+/// [`CommitteeSchedule`].
+///
+/// * [`CommitteeSchedule::ParentHash`] — the legacy µQC drawn from the parent
+///   hash, byte-identical to [`VoteSet::certificate_with_parent`].
+/// * [`CommitteeSchedule::Beacon`] — the µQC drawn from the CN-VRF v3 epoch
+///   beacon, the SAME draw `QuorumCertificate::verify_with_schedule` re-derives
+///   on the finalize gate. This is what makes activation possible: without it a
+///   node builds a parent-hash µQC that its own beacon-aware gate refuses.
+///
+/// The C1 full-network branch is schedule-independent (the CEC elects no
+/// committee), so the schedule only reaches the branch that actually draws one.
+pub fn produce_decision_certificate_with_schedule(
+    votes: &VoteSet,
+    target: Option<BlockHash>,
+    validators: &ValidatorSet,
+    parent_hash: Option<&[u8; 32]>,
+    schedule: CommitteeSchedule,
+) -> Option<QuorumCertificate> {
+    produce_decision_certificate_with_schedule_and_pq_keys(
+        votes,
+        target,
+        validators,
+        parent_hash,
+        schedule,
+        None,
+    )
+}
+
+/// [`produce_decision_certificate_with_schedule`] with explicit PQ key
+/// overrides.
+pub fn produce_decision_certificate_with_schedule_and_pq_keys(
+    votes: &VoteSet,
+    target: Option<BlockHash>,
+    validators: &ValidatorSet,
+    parent_hash: Option<&[u8; 32]>,
+    schedule: CommitteeSchedule,
+    pq_keys: Option<&PqKeyMap>,
+) -> Option<QuorumCertificate> {
     let (height, _, _) = votes.scope()?;
-    if qc_split_active_at(height) {
+    if qc_split_required(height, validators.len()) {
         produce_full_network_certificate_with_pq_keys(votes, target, validators, pq_keys)
     } else {
-        votes.certificate_with_parent(target, validators, parent_hash)
+        votes.certificate_with_schedule(target, validators, parent_hash, schedule)
     }
 }
 

@@ -315,7 +315,7 @@ pub(crate) async fn run_consensus_node(
     // take effect uniformly). Unset/unparsable/`0` keeps phase-1 behaviour
     // (admit + meter) on every path; a set height arms refusal at RPC,
     // mempool and apply (see docs/PLAN-BINDING.md).
-    match stellereum::chain_binding::ChainBindingActivation::from_env() {
+    match stellereum::chain_binding::ChainBindingActivation::from_chain_spec() {
         a if a.height == stellereum::chain_binding::CHAIN_BINDING_NEVER => info!(
             "[binding] chain-binding refusal inactive (STELL_CHAIN_BIND_ACTIVATION_HEIGHT unset): unbound transactions are admitted + metered"
         ),
@@ -1552,7 +1552,7 @@ pub(crate) async fn run_consensus_node(
         // unbound arrivals while armed, so re-draining would only rescan.
         // Default-off: `refusal_active` is always false, so this whole block
         // is a no-op and every context below behaves byte-identically.
-        let binding_activation = stellereum::chain_binding::ChainBindingActivation::from_env();
+        let binding_activation = stellereum::chain_binding::ChainBindingActivation::from_chain_spec();
         let ingress_height = rt
             .finalized
             .last()
@@ -3100,9 +3100,11 @@ pub(crate) async fn run_consensus_node(
                 // a skipped capture simply snapshots a later height (labels
                 // stay exact — `last_snapshot_height` advances only when a
                 // bundle ARRIVES, never on submit).
-                // Align snapshot boundaries to exact multiples of 100 so
-                // that `try_snapshot_sync`'s `(peer_height / 100) * 100` probes
-                // find them reliably on any peer without needing to guess offsets.
+                // Snapshots land on exact multiples of `snap_int` (plus the
+                // 100-grid catch-up multiples), and `try_snapshot_sync` now
+                // walks interval-spaced boundaries derived from the same
+                // cadence, so probes find them without guessing offsets
+                // (audit F4).
                 let snap_int = snapshot_interval();
                 // Adaptive cadence (`stellereum::snapshot_cadence`): the
                 // candidate rule below is byte-identical to the old trigger;
@@ -3139,24 +3141,49 @@ pub(crate) async fn run_consensus_node(
                     // died in `verify_restored_root` (restore root mismatch
                     // crash-loop). The bytes travel with the submit
                     // (single-flight) and are never re-read at poll.
-                    let xshard = bincode::serialize(&rt.cross_shard_replay_snapshot().await)
-                        .unwrap_or_default();
-                    if rt.submit_snapshot(height, root) {
-                        pending_snapshot_xshard = Some((height, xshard));
-                        info!(
-                            "[snapshot] submitted capture for height {height} \
-                             (last_snapshot_height={last_snapshot_height})"
-                        );
-                    } else {
-                        // By design at most one capture is in flight (a
-                        // refused submit snapshots a later height instead) —
-                        // but a refusal on EVERY height means the worker never
-                        // answers, so it stays LOUD, never silent.
-                        tracing::warn!(
-                            "[snapshot] submit REFUSED for height {height} \
-                             (a capture is still in flight; \
-                             last_snapshot_height={last_snapshot_height})"
-                        );
+                    // A failed OR EMPTY cross-shard replay encode must never
+                    // be published beside a snapshot (audit 2.6): the paired
+                    // restore would then reject the whole snapshot loudly, but
+                    // the height would burn and a good snapshot could be
+                    // pruned. Treat empty as failure and SKIP this capture;
+                    // the cadence retries at a later height.
+                    let xshard = match bincode::serialize(&rt.cross_shard_replay_snapshot().await) {
+                        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                        Ok(_) => {
+                            tracing::error!(
+                                "[snapshot] height {height}: cross-shard replay encode \
+                                 produced EMPTY bytes — SKIPPING this capture (an empty replay \
+                                 set must never be published; restore would fail closed)"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[snapshot] height {height}: cross-shard replay encode FAILED: \
+                                 {e} — SKIPPING this capture (publishing an empty replay set \
+                                 would fail every restore)"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(xshard) = xshard {
+                        if rt.submit_snapshot(height, root) {
+                            pending_snapshot_xshard = Some((height, xshard));
+                            info!(
+                                "[snapshot] submitted capture for height {height} \
+                                 (last_snapshot_height={last_snapshot_height})"
+                            );
+                        } else {
+                            // By design at most one capture is in flight (a
+                            // refused submit snapshots a later height instead)
+                            // — but a refusal on EVERY height means the worker
+                            // never answers, so it stays LOUD, never silent.
+                            tracing::warn!(
+                                "[snapshot] submit REFUSED for height {height} \
+                                 (a capture is still in flight; \
+                                 last_snapshot_height={last_snapshot_height})"
+                            );
+                        }
                     }
                 } else if candidate {
                     // Adaptive cadence skip: a candidate that provably brought

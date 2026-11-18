@@ -23,11 +23,13 @@ use falcon_votes::{falcon_set, fvote};
 use stellereum::consensus::{
     decode_pq_epoch_envelope, produce_decision_certificate,
     produce_decision_certificate_with_pq_keys, produce_full_network_certificate,
-    produce_full_network_certificate_from_signers, qc_split_active_at,
-    set_qc_split_activation_override, vote_sign_bytes, BlockHash, Height, QuorumCertificate, Round,
-    ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet, MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID,
-    PQ_UQC_MARKER_ID,
+    produce_full_network_certificate_from_signers, qc_split_active_at, qc_split_required,
+    set_qc_split_activation_override, vote_sign_bytes, BlockHash, CommitteeSchedule, Height,
+    QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
+    MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID, QC_SPLIT_BY_SIZE_THRESHOLD,
+    QC_SPLIT_ACTIVATION_HEIGHT,
 };
+use stellereum::consensus::{micro_committee_size, pq_micro_required_power};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
 /// Thread-scoped activation override guard: clears the override on drop so a
@@ -98,6 +100,59 @@ fn pq_key_map(
             )
         })
         .collect()
+}
+
+/// The MAXIMAL µQC the old path could ever assemble: every one of the
+/// `min(N, 128)` committee seats signs, so it carries the largest signer power
+/// a µQC can possibly have.
+///
+/// At/above `QC_SPLIT_BY_SIZE_THRESHOLD` even this certificate cannot reach
+/// the network-anchored two-thirds (review F1), which is why it is the
+/// strongest possible fixture for proving the verifier REFUSES a µQC there:
+/// the refusal cannot be dismissed as "just too few signers".
+fn maximal_micro_qc(
+    vs: &ValidatorSet,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    height: Height,
+    round: Round,
+    target: Option<BlockHash>,
+    parent: [u8; 32],
+) -> QuorumCertificate {
+    use stellereum::consensus::{
+        derive_sortition_committee, encode_pq_micro_envelope, PqMicroCertificate,
+    };
+
+    let committee_size = micro_committee_size(vs.len());
+    let committee = derive_sortition_committee(vs, height, round, committee_size, &parent);
+    assert_eq!(committee.len(), committee_size as usize);
+    let msg = vote_sign_bytes(height, round, VoteKind::Precommit, &target);
+    let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+    let mut signatures = Vec::with_capacity(committee.len());
+    for (i, id) in committee.iter().enumerate() {
+        let pos = ks
+            .iter()
+            .position(|k| validator_id(k) == *id)
+            .expect("every committee member must have a fixture key");
+        signatures.push(fks[pos].sign(&msg));
+        bitmask[i / 8] |= 1 << (i % 8);
+    }
+    let uqc = PqMicroCertificate::new(
+        PqScheme::Falcon512,
+        height,
+        round,
+        committee_size,
+        bitmask,
+        signatures,
+        parent,
+    );
+    QuorumCertificate {
+        height,
+        round,
+        kind: VoteKind::Precommit,
+        block_hash: target,
+        signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+    }
 }
 
 /// Producer → verifier round trip at the activation height.
@@ -421,4 +476,295 @@ fn producer_and_verifier_symmetry_with_explicit_pq_keys() {
             .expect("explicit-key producer must build the CEC");
     assert!(qc.verify_unified_with_pq_keys(&vs, Some(&pq_map)));
     assert!(vs.qc_meets_quorum(&qc));
+}
+
+// ===========================================================================
+// REVIEW F1 — the size leg: full-network QC by validator COUNT
+// ===========================================================================
+//
+// The three suites below close the "finality cliff": a set at/above
+// `QC_SPLIT_BY_SIZE_THRESHOLD` (192) must produce and verify the CEC with the
+// governance gate still frozen off, a set below it must keep the legacy µQC
+// byte-for-byte, and the exact boundary (191 vs 192) must be the same verdict
+// on the producer and on every verifier. No `ActivationOverride` is installed
+// in any of them: `qc_split_active_at(HEIGHT)` is asserted FALSE, so the size
+// leg is provably the only reason the CEC is selected.
+
+/// Below the threshold AND below the gate: the µQC must be BYTE-identical to
+/// the legacy assembler (`VoteSet::certificate_with_parent`), which is what
+/// the existing pre-activation pins already verify.
+#[test]
+fn four_validators_keep_a_byte_identical_micro_qc() {
+    const HEIGHT: Height = 3;
+    const ROUND: Round = 0;
+
+    // Gate off, count below threshold: the legacy branch is the rule.
+    assert!(!qc_split_active_at(HEIGHT));
+    assert!(!qc_split_required(HEIGHT, 4));
+
+    let (ks, fks) = falcon_set(4);
+    let vs = uniform_set(&ks);
+    let target = Some([0x31u8; 32]);
+    let parent = [0x30u8; 32];
+    let set = vote_set(
+        votes_for(&ks, &fks, HEIGHT, ROUND, VoteKind::Precommit, target),
+        &vs,
+        HEIGHT,
+        ROUND,
+        VoteKind::Precommit,
+    );
+
+    let qc = produce_decision_certificate(&set, target, &vs, Some(&parent))
+        .expect("4-of-4 below the threshold must produce a decision certificate");
+    let legacy = set
+        .certificate_with_parent(target, &vs, Some(&parent))
+        .expect("the legacy assembler must build the same certificate");
+
+    assert_eq!(
+        qc, legacy,
+        "below the threshold the producer must be the legacy µQC byte-for-byte"
+    );
+    assert!(
+        qc.pq_micro_certificate().is_some(),
+        "the small-set decision certificate must still be the µQC"
+    );
+    assert_eq!(
+        qc.signatures
+            .iter()
+            .filter(|(voter, _)| *voter == PQ_UQC_MARKER_ID)
+            .count(),
+        1,
+        "exactly one µQC marker"
+    );
+    assert!(
+        qc.signatures.iter().all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
+        "no CEC marker below the threshold"
+    );
+    assert!(qc.verify(&vs), "the µQC must verify");
+    assert!(vs.qc_meets_quorum(&qc), "the µQC must carry quorum power");
+    assert_eq!(qc.signers_set(&vs).len(), 4);
+}
+
+/// The EXACT boundary: 191 is the last size a 128-seat committee can carry
+/// (network 2/3 = 128 = the whole committee), 192 the first it cannot
+/// (network 2/3 = 129 > 128). Producer and verifiers must agree on both sides.
+#[test]
+fn producer_and_verifier_agree_at_the_exact_threshold_boundary() {
+    const HEIGHT: Height = 5;
+    const ROUND: Round = 0;
+    const BELOW: usize = QC_SPLIT_BY_SIZE_THRESHOLD - 1; // 191
+    const AT: usize = QC_SPLIT_BY_SIZE_THRESHOLD; // 192
+
+    // The cliff this test straddles, in the protocol's own numbers.
+    assert_eq!(BELOW, 191);
+    assert_eq!(AT, 192);
+    assert_eq!(micro_committee_size(BELOW), 128);
+    assert_eq!(micro_committee_size(AT), 128);
+    assert!(
+        pq_micro_required_power(128, BELOW as u64) <= 128,
+        "191: a unanimous 128-seat committee can still carry the network"
+    );
+    assert!(
+        pq_micro_required_power(128, AT as u64) > 128,
+        "192: the network anchor is out of the committee's reach"
+    );
+    assert!(!qc_split_active_at(HEIGHT), "governance gate stays off");
+    assert!(!qc_split_required(HEIGHT, BELOW));
+    assert!(qc_split_required(HEIGHT, AT));
+
+    // One key set: id i <-> seed i, so the 191 set is a subset of the 192 set
+    // (the global PQ registry is shared and idempotent for identical keys).
+    let (ks, fks) = falcon_set(AT);
+    let target = Some([0x41u8; 32]);
+    let parent = [0x40u8; 32];
+
+    // ---- 191: µQC produced and verified; a CEC is NOT required. ----
+    let vs_below =
+        ValidatorSet::from_list(ks[..BELOW].iter().map(|k| (validator_id(k), 1)).collect());
+    assert_eq!(vs_below.len(), BELOW);
+    let set_below = vote_set(
+        votes_for(
+            &ks[..BELOW],
+            &fks[..BELOW],
+            HEIGHT,
+            ROUND,
+            VoteKind::Precommit,
+            target,
+        ),
+        &vs_below,
+        HEIGHT,
+        ROUND,
+        VoteKind::Precommit,
+    );
+    assert!(set_below.quorum_reached(target, &vs_below));
+    let qc_below = produce_decision_certificate(&set_below, target, &vs_below, Some(&parent))
+        .expect("191 validators: the µQC producer must still build a certificate");
+    assert!(
+        qc_below.pq_micro_certificate().is_some(),
+        "191 (< threshold): the producer must emit the µQC"
+    );
+    assert!(
+        qc_below.verify(&vs_below),
+        "191: the verifier must accept the µQC the producer emitted"
+    );
+    assert!(
+        qc_below.signatures.iter().all(|(voter, _)| *voter != PQ_QC_MARKER_ID),
+        "191: no CEC while below the threshold"
+    );
+
+    // ---- 192: CEC produced and verified; the same-shape µQC REFUSED. ----
+    let vs_at = uniform_set(&ks);
+    assert_eq!(vs_at.len(), AT);
+    let set_at = vote_set(
+        votes_for(&ks, &fks, HEIGHT, ROUND, VoteKind::Precommit, target),
+        &vs_at,
+        HEIGHT,
+        ROUND,
+        VoteKind::Precommit,
+    );
+    assert!(set_at.quorum_reached(target, &vs_at));
+    let qc_at = produce_decision_certificate(&set_at, target, &vs_at, Some(&parent))
+        .expect("192 validators: the CEC producer must build a certificate");
+    assert_eq!(
+        qc_at.signatures[0].0, PQ_QC_MARKER_ID,
+        "192 (= threshold): the producer must emit the full-network CEC"
+    );
+    assert!(
+        qc_at.pq_micro_certificate().is_none(),
+        "192: the decision certificate is not a µQC"
+    );
+    assert!(
+        qc_at.verify(&vs_at),
+        "192: the verifier must accept the CEC the producer emitted"
+    );
+    assert!(
+        vs_at.qc_meets_quorum(&qc_at),
+        "192: the CEC must carry the network's 2/3"
+    );
+
+    // The LEGACY assembler itself refuses to compile a µQC here — even with
+    // every validator voting, a 128-seat committee cannot reach the network
+    // anchor, so the old producer emits no µQC marker at all. That IS the
+    // finality cliff F1 describes.
+    let legacy_at = set_at
+        .certificate_with_parent(target, &vs_at, Some(&parent))
+        .expect("the legacy assembler still builds certificate bytes");
+    assert!(
+        legacy_at.pq_micro_certificate().is_none(),
+        "192: the legacy assembler cannot compile a µQC that would carry quorum"
+    );
+
+    // The MAXIMAL µQC (every one of the 128 seats signs) is the strongest
+    // certificate the old path could ever produce. It is structurally valid
+    // and still REFUSED by every verifier entry point.
+    let maximal = maximal_micro_qc(&vs_at, &ks, &fks, HEIGHT, ROUND, target, parent);
+    assert!(
+        maximal.pq_micro_certificate().is_some(),
+        "fixture must really be a µQC"
+    );
+    assert!(
+        !maximal.verify(&vs_at),
+        "192: a µQC must be REFUSED at the threshold"
+    );
+    assert!(!maximal.verify_with_schedule(&vs_at, CommitteeSchedule::ParentHash));
+    assert!(!maximal.verify_unified(&vs_at));
+    assert!(
+        maximal.signers_set(&vs_at).is_empty(),
+        "192: a refused µQC attributes NOBODY (the gate, not just the quorum, \
+         refuses it — attribution would otherwise name all 128 signers)"
+    );
+    assert!(
+        !vs_at.qc_meets_quorum(&maximal),
+        "192: power accounting must refuse the µQC too"
+    );
+    let (verified, power) = maximal.verify_and_signed_power(&vs_at);
+    assert!(
+        !verified && power == 0,
+        "192: the fused verify+attribute path must agree (got {verified}, {power})"
+    );
+    assert_eq!(
+        vs_at.qc_signed_power(&maximal),
+        0,
+        "192: qc_signed_power must be zero for a refused µQC"
+    );
+}
+
+/// The documented decentralization target: 250 validators
+/// (`staking::MAX_ACTIVE_VALIDATORS`) must finalize out of the box — full-set
+/// CEC, no activation height, no µQC.
+#[test]
+fn two_hundred_fifty_validators_produce_and_verify_cec_automatically() {
+    const HEIGHT: Height = 11;
+    const ROUND: Round = 0;
+    const N: usize = 250;
+
+    assert_eq!(N, stellereum::staking::MAX_ACTIVE_VALIDATORS);
+    // NO activation override anywhere in this test: the gate is off, so the
+    // CEC can only be selected through the SIZE leg.
+    assert!(!qc_split_active_at(HEIGHT));
+    assert!(qc_split_required(HEIGHT, N));
+    assert_eq!(micro_committee_size(N), 128);
+    assert!(
+        pq_micro_required_power(128, N as u64) > 128,
+        "250: a µQC is arithmetically unable to reach the network anchor"
+    );
+
+    let (ks, fks) = falcon_set(N);
+    let vs = uniform_set(&ks);
+    let target = Some([0x51u8; 32]);
+    let parent = [0x50u8; 32];
+    let set = vote_set(
+        votes_for(&ks, &fks, HEIGHT, ROUND, VoteKind::Precommit, target),
+        &vs,
+        HEIGHT,
+        ROUND,
+        VoteKind::Precommit,
+    );
+
+    let qc = produce_decision_certificate(&set, target, &vs, Some(&parent))
+        .expect("250-of-250 must produce the full-network decision certificate");
+    assert_eq!(
+        qc.signatures.len(),
+        1,
+        "the decision QC carries exactly one marker entry"
+    );
+    assert_eq!(
+        qc.signatures[0].0, PQ_QC_MARKER_ID,
+        "250 validators: the producer must emit the CEC automatically"
+    );
+    let cert = decode_pq_epoch_envelope(&qc.signatures[0].1)
+        .expect("the marker payload must decode as an epoch envelope");
+    assert_eq!(cert.committee_size as usize, N, "CEC covers the FULL set");
+    assert_eq!(cert.signed_count(), N, "every validator signs the CEC");
+
+    assert!(qc.verify(&vs), "the 250-validator CEC must verify");
+    assert!(qc.verify_unified(&vs));
+    assert!(vs.qc_meets_quorum(&qc));
+    assert!(vs.qc_meets_quorum_with_beacon(&qc, None));
+    assert_eq!(
+        qc.signers_set(&vs).len(),
+        N,
+        "attribution must name the whole set"
+    );
+    assert!(qc.binds_to_parent(&parent), "chain binding still holds");
+
+    // The µQC path is dead at this size: a maximal 128-of-250 µQC is
+    // structurally valid yet refused, attributing nobody.
+    let legacy = set
+        .certificate_with_parent(target, &vs, Some(&parent))
+        .expect("the legacy assembler still builds certificate bytes");
+    assert!(
+        legacy.pq_micro_certificate().is_none(),
+        "250: the legacy assembler cannot compile a quorum-bearing µQC"
+    );
+    let maximal = maximal_micro_qc(&vs, &ks, &fks, HEIGHT, ROUND, target, parent);
+    assert!(maximal.pq_micro_certificate().is_some());
+    assert!(!maximal.verify(&vs), "a 250-set µQC must be REFUSED");
+    assert!(maximal.signers_set(&vs).is_empty());
+    assert!(!vs.qc_meets_quorum(&maximal));
+    assert_eq!(
+        QC_SPLIT_ACTIVATION_HEIGHT,
+        u64::MAX,
+        "gate remains frozen off"
+    );
 }

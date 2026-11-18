@@ -385,9 +385,11 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // the registry). Registration is priced per parameter written.
         OpCode::SysCallVerifyZkMlReexec { proof, .. } => zkml_verify_in_gas(proof.wire_len()),
         OpCode::SysCallRegisterZkMlModel { model, .. } => zkml_register_gas(model.param_count()),
-        // §2 succinct halves: fully priced here (everything is visible on
-        // the proof/key the opcode carries - no registry-sized remainder
-        // for the handler, unlike the re-execution verify).
+        // §2 attestation halves: the wire-visible part is priced here (base +
+        // public inputs + proof bytes). The MODEL-SIZED re-execution charge is
+        // NOT visible here - `opcode_gas` cannot see the registry - so the
+        // handler charges it on top, exactly like the re-execution verify
+        // (`GAS_ZKML_REEXEC_PER_PARAM`).
         OpCode::SysCallRegisterZkMlSpec { spec, .. } => spec_register_gas(spec),
         OpCode::SysCallVerifyZkMlAttestation { proof, .. } => attestation_verify_gas(
             proof
@@ -498,6 +500,10 @@ pub enum OpCode {
     // (11). The reachable, sound §2 opcode is `SysCallVerifyZkMlReexec` (below),
     // which carries the proof in the payload and re-executes the registered
     // model.
+    //
+    // Like every zkML verify opcode, it could not gate anything even if it were
+    // reachable: a verify is an EVENT, not a branch condition (no conditional
+    // opcode reads the stack value, and `apply.rs` drops `return_value`).
     SysCallVerifyZkMl,
     // Patricia Tree Traversal
     SysCallPatriciaLookup(CellHash),
@@ -703,6 +709,13 @@ pub enum OpCode {
     /// so verifiers could check a huge model without running it. Until then
     /// [`crate::zkml::MAX_ZKML_MODEL_PARAMS`] bounds what one registration can
     /// make every node re-execute.
+    ///
+    /// WHAT THE VERDICT IS: an EVENT, not a branch condition. On success the
+    /// handler pushes `1` onto the VM stack, but no opcode branches on it and
+    /// `apply.rs` discards `VmExecutionResult::Success.return_value`, so no
+    /// on-chain program can consume the verdict. "Verify succeeded" is only
+    /// observable as transaction success/failure; a value-bearing decision
+    /// must be taken off chain from the (public) payload.
     SysCallVerifyZkMlReexec {
         model_id: [u8; 32],
         proof: Box<crate::zkml::ZkMlProof>,
@@ -713,16 +726,22 @@ pub enum OpCode {
     /// registry, which is what makes a later `SysCallVerifyZkMlReexec` a
     /// CONSENSUS statement instead of a per-node opinion.
     ///
-    /// Permissionless and APPEND-ONLY (first writer wins): an already
-    /// registered id cannot be re-registered, so the weights a proof is
-    /// checked against can never be swapped after the fact. The model is
-    /// validated (`QuantizedLinearModel::validate`) and bounded
-    /// (`MAX_ZKML_MODEL_PARAMS`) BEFORE it joins the registry, so a malformed
-    /// or unbounded model can never reach the re-execution path. The registry
-    /// is clone-committed: a later revert, out-of-gas or failed settlement
-    /// discards the registration along with everything else the payload did,
-    /// and the registry is folded into the state root conditionally (empty
-    /// registry = zero digest bytes, `COMMITMENT_VERSION` untouched).
+    /// Permissionless and APPEND-ONLY (first writer wins): an id that is
+    /// already registered cannot be re-bound to DIFFERENT weights, so the
+    /// weights a proof is checked against can never be swapped after the fact.
+    /// Re-registering the byte-identical model is an idempotent no-op that
+    /// applies without touching the registry (so it does not rebuild the
+    /// commitment preimage). The model is validated
+    /// (`QuantizedLinearModel::validate`) and bounded
+    /// (`MAX_ZKML_MODEL_PARAMS`) BEFORE it joins the registry, and the registry
+    /// as a whole is bounded by `MAX_ZKML_REGISTRY_MODELS` /
+    /// `MAX_ZKML_REGISTRY_PARAMS` (over-cap => revert, no state change), so a
+    /// malformed or unbounded model can never reach the re-execution path. The
+    /// registry is clone-committed: a later revert, out-of-gas or failed
+    /// settlement discards the registration along with everything else the
+    /// payload did, and the registry is folded into the state root
+    /// conditionally (empty registry = zero digest bytes, `COMMITMENT_VERSION`
+    /// untouched).
     SysCallRegisterZkMlModel {
         model_id: [u8; 32],
         model: Box<crate::zkml::QuantizedLinearModel>,
@@ -802,6 +821,15 @@ pub enum OpCode {
     /// The machine-readable statement of what this opcode is and is not lives
     /// in [`crate::zkml::zkml_capabilities`] and is served over RPC as
     /// `stell_zkmlCapabilities`.
+    ///
+    /// WHAT THE VERDICT IS: an EVENT, not a branch condition. Success pushes
+    /// `1` on the VM stack, but no opcode branches on it and `apply.rs`
+    /// discards `VmExecutionResult::Success.return_value`, so nothing on chain
+    /// can consume the verdict. The attestation FS transcript is also UNBOUND
+    /// today (no chain id / model id / height / sender), so an accepted proof
+    /// is a permanent bearer token; the opt-in bound transcript exists behind
+    /// `crate::zkml_attestation::ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT`
+    /// (`u64::MAX` = inert) and does NOT change this opcode's semantics.
     SysCallVerifyZkMlAttestation {
         model_id: [u8; 32],
         proof: Box<crate::zkml_attestation::AttestationProof>,
@@ -2888,9 +2916,12 @@ impl Svm {
                                 .to_string(),
                         );
                     }
-                    // Cheap fail-fast with a clear error: the circuit's input
-                    // gadget only admits u16. (A larger value would fail the
-                    // pairing check anyway; this names the reason.)
+                    // Cheap fail-fast with a clear error: the constrained
+                    // format admits u16 inputs only (the re-execution casts
+                    // u64 -> i64). There is no pairing and no other
+                    // cryptographic check behind this bound - the sound check
+                    // is the re-execution below; this only names the reason
+                    // early.
                     if proof
                         .public_inputs
                         .iter()

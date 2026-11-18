@@ -4,6 +4,38 @@ Status document, not a plan. Every row was produced by reading the tree and by r
 commands reproduced in **Appendix A**. Numbers come from that output, not from memory.
 Anything I could not verify is marked **UNVERIFIED**.
 
+## 2026-11-18 correction (read before the tables)
+
+The tables below are a **17 Nov snapshot pinned to `HEAD 6e6384940`**. The
+current tree (`HEAD 0fdf1eefc`) has moved further; where a row is now false,
+the correction is here and inline in the row:
+
+- `PQ_CLASSICAL_REFUSE_AFTER_HEIGHT` **no longer exists**. Classical PQ
+  handshakes are refused at EVERY height, with no mixed window and no
+  fallback counter (`infnode/crates/infnode/src/proto.rs:371-378`);
+  `STELL_INF_PQ_HANDSHAKE` is parsed-and-ignored (`:352-368`). Treat the
+  §1.2 row as historical.
+- `PQ_TRANSPORT_H_ACTIVATION_HEIGHT` still exists but moved:
+  `stellereum/src/mev_epoch.rs:995` (not `:1187`), and it no longer gates
+  anything — `is_pq_transport_active` returns `true` at every height
+  (`:1003-1006`). The row's "no longer gates the ingest" conclusion holds;
+  only the line number moved.
+- `PqScheme::Ed25519` / `Hybrid` are removed at the current HEAD:
+  `from_id` refuses ids `1`/`4` (`stellereum/src/post_quantum.rs:184-197`),
+  not only in the old working tree.
+- The X25519 ephemeral transcript binding is gone from `proto.rs`: the
+  transcript now carries ML-KEM init/response hashes plus freshness nonces
+  (`proto.rs:394-416`). The §1.2 X25519 row is historical.
+- `infnode` bucket storage no longer conflates obfuscation with encryption:
+  `store_blob_boxed(.., Some(owner_ek))` now seals a per-publish random data
+  key to the owner's ML-KEM-768 key (`key_box`, `seal = infnode-blob-seal-v1`,
+  AAD = bucket/name/H(plaintext)) and `fetch_blob_owner` is the only reader; the
+  content-derived `blob_key_nonce` path is documented as **at-rest
+  obfuscation, not encryption** and is pinned by
+  `infnode/crates/infnode/tests/storage_seal_tests.rs` (a third party with the
+  full blob decrypts it). CLI/web callers that still pass no owner key must not
+  be described as E2E-confidential.
+
 ## Snapshot (read this first)
 
 | item | value |
@@ -142,7 +174,7 @@ there and must be replaced, not what currently compiles.
 | Ed25519 **TLS self-signed cert**, CN pin | `node.rs:8806-8815` (`rcgen::PKCS_ED25519`, CN `infnode-<ed_pub>`); verifier `node.rs:8846-8880` | **yes** — `build_tls` at `node.rs:670`, `:6665` | no | PQ TLS cert or raw-PubKey pin; both ends simultaneously | TLS identity + QUIC config |
 | ephemeral **X25519** transcript binding | `node.rs:22` (import), `:1545-1546`, `:7453-7454`; transcript fields `proto.rs:387-390` | **yes** — fields `eph`/`ch_eph` are exchanged on every handshake (`node.rs:1560`, `:1572`) | no — comments state there is **no ECDH**, only freshness (`node.rs:1542-1544`, `:7451-7452`) | drop `eph_*` from `PqTranscript` and bump `PQ_TRANSCRIPT_VERSION` (`proto.rs:365`) | transcript is a wire contract; the digest feeds `pq_session_key` |
 | static X25519 e2e key | `keyring.rs:161-163`, `:265-270`; `mailbox.rs:95-98` | **no** — 32-byte seeds are refused (`keyring.rs:266-270`) | refuse-always | delete the dead refusal arms (the `x25519-dalek` crate stays until the ephemeral-binding row is retired) | none (already inert) |
-| `PQ_CLASSICAL_REFUSE_AFTER_HEIGHT = 300_000` | `proto.rs:329`; predicate `:333-335`; enforced `:622-646`, `:653-682` | **yes** — handshake policy | height const, no env (`proto.rs:318-321`) | lower the const to the current height to retire classical handshakes | a classical-only peer stops connecting at/after H; needs all peers provisioned with `pq-identity.key` |
+| ~~`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT = 300_000`~~ | **DELETED at current HEAD** (`proto.rs:371-378`); this row is the `6e6384940` snapshot (`proto.rs:329`) | **no** — classical is refused at every height | n/a | none | none (retired by deletion) |
 | `NodeKeys::id()` = `blake3(ed_pub)[..20]` | `keyring.rs:184-199`, `:209` | **partly** — one live caller: `main.rs:1357` (`announce`) through `id_hex()`. It is **not** the canonical node id: `resolve_node_id` returns the PQ id (`keyring.rs:537-542`) and `Node::new` uses `ceremony_local_id` (`node.rs:646-650`) | none (documented "NON-CANONICAL helper", `keyring.rs:185-190`) | delete it once `announce` publishes a PQ id | config `validators:` ids are derived from `blake3(ed_pub)[..20]` (`node/bootstrap.rs:266-296`) |
 | `consensus.sign` Ed25519 sidecar | `node.rs:2855-2884` (sign at `:2874`) | **yes** — p2p service gated on `cfg.validators` (`node.rs:2857-2863`) | allow-list only | Falcon sign endpoint + client migration | sidecar protocol used by sub-validators |
 | mailbox owner/sender Ed25519 signature | `mailbox.rs:12`, `:23-29`, `:131-141`; verify at `node.rs:6574` | **yes** — `mail.list` ownership check; CLI at `main.rs:967` | no | PQ owner signature + new mailbox key file | on-disk mailbox format `kem:`/`ed:` (`mailbox.rs:50`, `:90-98`) |
@@ -165,7 +197,7 @@ classical/EC excision.
 | `encryption_secret_from_ed25519` | `mev_epoch.rs:1069` | **yes** — `mev_epoch.rs:2989` | no | derive from a PQ secret instead | committee is derived from validator ids (`mev_epoch.rs:2940-2950`) |
 | `encryption_public_key_from_ed25519` | `mev_epoch.rs:1087` | **yes** — `mev_epoch.rs:2948`, `:3415` | no | same | same |
 | X25519 share-package encryption | `mev_epoch.rs:81`, `:528-544`, `:1100-1145` | **partly** — the *ingest* of classical packages is refused at any height (`:1704-1717`), but the DKG still constructs/expects packages distinguished **by length** (`:1733-1743`) | ingest refuses; construction still classical | delete the 48-byte package type and the length discrimination | wire format has no scheme tag: legacy 48-byte vs 1136-byte packages are told apart by length only (`:1184-1186`) |
-| `PQ_TRANSPORT_H_ACTIVATION_HEIGHT = 10_000` | `mev_epoch.rs:1187` | **yes** — pinned in the activation schedule (`chain_spec.rs:153-155`) | height const | none (historical gate; PQ leg is unconditional) | none — but the const is now below any live height, so it no longer gates the ingest |
+| `PQ_TRANSPORT_H_ACTIVATION_HEIGHT = 10_000` | `mev_epoch.rs:995` (current HEAD; `:1187` was the `6e6384940` snapshot) | **no** — schedule metadata only; `is_pq_transport_active` is `true` at every height (`:1003-1006`) | height const | none (historical gate; PQ leg is unconditional) | none — the const is below any live height and no longer gates ingest |
 | `RistrettoPoint` in `mev_v4` | `mev_v4.rs:54` | **no** — zero callers outside the module (`rg -n "mev_v4" src/ --glob '!src/mev_v4.rs'` returns only `lib.rs:34`) | env `STELL_MEV_V4`, default OFF (`mev_v4.rs:71-81`) | delete the module | **owner directive forbids removal** (`mev_v4.rs:25-27`: "DEAD ENGINE — OFF BY DEFAULT, NOT WIRED, NOT REMOVED") |
 | Ed25519 order commitment (`commit_block_order`) | `mev.rs:50`, `:686-700`; verify `:596-604`, `:734-754` | **yes** — signed at proposal build `runtime/mev_sync.rs:2005-2010`; checked at finalize `runtime/apply.rs:621-634` | no | sign the commitment with Falcon and change `BlindRoundCommitment` | verdict is **advisory** (a mismatch only warns, `runtime/apply.rs:626-633`), so consensus does not depend on it — but the type is public and carries Ed signatures |
 

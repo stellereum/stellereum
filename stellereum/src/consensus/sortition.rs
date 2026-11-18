@@ -178,6 +178,57 @@ pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: 
 /// existing QC pins running green unmodified.
 pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
+/// Validator-set size at which the full-network QC (epoch/CEC) becomes
+/// MANDATORY — independent of [`QC_SPLIT_ACTIVATION_HEIGHT`] (review F1, the
+/// "finality cliff").
+///
+/// ## Derivation (from the quorum math above, uniform stake)
+///
+/// The µQC committee is `min(N, MICRO_COMMITTEE_MAX_SIZE)` seats, i.e. at most
+/// 128. Its acceptance rule is [`pq_micro_required_power`]:
+///
+/// ```text
+/// required = max(floor(2·W_committee/3)+1, floor(2·W_network/3)+1)
+/// ```
+///
+/// and the signed power can never exceed the committee's own total power, so
+/// a µQC is *reachable at all* only when
+///
+/// ```text
+/// W_committee >= floor(2·W_network/3)+1.
+/// ```
+///
+/// On a uniform set `W_committee/W_network = min(N,128)/N`, so the condition
+/// is `128 >= floor(2N/3)+1`, which holds exactly for `N <= 191`:
+///
+/// * `N = 191` → `floor(382/3)+1 = 127+1 = 128 <= 128` (reachable, but only
+///   with a UNANIMOUS committee);
+/// * `N = 192` → `floor(384/3)+1 = 129 > 128` (UNREACHABLE — even every
+///   committee member signing cannot meet the network's two-thirds, so no
+///   µQC ever finalizes).
+///
+/// `192` is therefore the SMALLEST set size at which the µQC path is provably
+/// dead: exactly `ceil(MICRO_COMMITTEE_MAX_SIZE · 3 / 2)`, the point where the
+/// 128-seat committee holds 2/3 of the network and the strict `2/3 + 1` floor
+/// needs one more seat than the cap allows. Above it a 128-seat committee is a
+/// strict subset that can only ever carry `2/3` by stake luck, and relying on
+/// that makes liveness stake-distribution dependent (a re-stake can strand
+/// finality again). At or above this count the deterministic, always-available
+/// certificate is the full-network CEC (it needs the same `2/3` of the set
+/// every BFT round already assumes), so switching costs bandwidth, never
+/// liveness.
+///
+/// The value is a *count*: it is compared against `validators.len()` in
+/// [`qc_split_required`], never against a height, and it is deliberately below
+/// `staking::MAX_ACTIVE_VALIDATORS` (250) so the documented decentralization
+/// window runs on the path that finalizes.
+///
+/// FREEZE-shaped pin: `qc_split_size_threshold_is_the_quorum_crossing` in the
+/// consensus unit tests asserts that `191` is still reachable and `192` is the
+/// first unreachable size for a 128-seat committee, so this literal can never
+/// drift away from the quorum curve it is derived from.
+pub const QC_SPLIT_BY_SIZE_THRESHOLD: usize = (MICRO_COMMITTEE_MAX_SIZE as usize * 3) / 2;
+
 // TEST-ONLY override of the C1 activation height, scoped to the calling
 // thread.
 //
@@ -230,6 +281,30 @@ pub fn qc_split_activation_height() -> Height {
 /// so the `>=` comparison is the only activation semantics there is.
 pub fn qc_split_active_at(height: Height) -> bool {
     height >= qc_split_activation_height()
+}
+
+/// THE gate every producer and verifier shares: true when the decision
+/// certificate for this `(height, validator_count)` MUST be the full-network
+/// epoch/CEC and a µQC is advisory-only (refused, attributes nobody).
+///
+/// `= qc_split_active_at(height) || validator_count >=
+/// QC_SPLIT_BY_SIZE_THRESHOLD`
+///
+/// * The height leg is the governance rollout gate (frozen `u64::MAX`; tests
+///   drive it through the thread-scoped override).
+/// * The size leg closes review F1: once the set reaches
+///   [`QC_SPLIT_BY_SIZE_THRESHOLD`] a 128-seat committee can no longer carry
+///   the network-anchored two-thirds, so the full-set certificate is the only
+///   one that can finalize. It is a pure function of the count, so it fires
+///   with no rollout step and cannot be half-armed.
+///
+/// Pure and total: no I/O, no global state beyond the height gate, so a
+/// producer that calls it and a verifier that calls it at the same
+/// `(height, validator_count)` cannot disagree about which certificate shape
+/// is legal. Below BOTH legs the verdicts are the legacy µQC ones
+/// byte-for-byte.
+pub fn qc_split_required(height: Height, validator_count: usize) -> bool {
+    qc_split_active_at(height) || validator_count >= QC_SPLIT_BY_SIZE_THRESHOLD
 }
 
 /// Advisory µQC threshold (sketch §4.1): `floor(2*W_committee/3) + 1`.
@@ -549,6 +624,29 @@ pub fn beacon_draw_committee(
 
 /// Activation height of CN-VRF v3 sortition and proposer beacon selection:
 /// `u64::MAX` = never (GatedOff sentinel until Sub-wave B + audit/rollout).
+///
+/// # Activation-height rule (review F4)
+///
+/// The lead may flip this to a real height, but NOT to one that lands on an
+/// epoch boundary or inside the freeze lookahead before one. The boundary block
+/// at `N * EPOCH_LEN` must carry epoch `N`'s `epoch_vdf`, which is only
+/// dispatched at `H_freeze(N) = N * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`
+/// (and the dispatcher is gated on activation). Activating AT `N * EPOCH_LEN`
+/// therefore leaves `H_freeze < H` inactive, no beacon exists, and the
+/// activation block is unproposable.
+///
+/// Legal heights: `H == 0` (genesis; block 0 is not a boundary) or
+///
+/// ```text
+/// 0 < H mod EPOCH_LEN <= EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS
+/// ```
+///
+/// [`cnvrf_v3_activation_height_allowed`] is that predicate,
+/// [`assert_cnvrf_v3_activation_height`] enforces it on the test-only setter,
+/// and a `const` assertion below fails the BUILD if this constant is edited to
+/// an unproducible height. The activation epoch itself is then bootstrapped
+/// deterministically (`crate::cn_vrf::epoch_beacon_for`), and every later epoch
+/// has a dispatched beacon — so a working activation height exists.
 pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 /// Canonical CN-VRF v3 epoch length in heights (7,200 blocks), pinned at
@@ -633,6 +731,118 @@ pub fn cnvrf_v3_beacon_draw_committee(
     let seed = cnvrf_v3_beacon_seed(beacon_output, beacon_epoch, height, round);
     select_committee_from_seed(validators, committee_size, CNVRF_V3_DRAW_DOMAIN, &seed)
 }
+
+/// THE committee of `height`/`round` — the ONE source of truth for "who
+/// signs at height H" (review F2).
+///
+/// * `CommitteeSchedule::ParentHash` (below activation): byte-identical
+///   canonical v5 parent-hash draw ([`derive_sortition_committee`]) from the
+///   parent hash the header committed. `parent_hash == None` elects nobody —
+///   the fail-closed rule the producer and verifier already shared.
+/// * `CommitteeSchedule::Beacon(Some(b))` (at/after activation): the CN-VRF v3
+///   epoch-beacon draw ([`cnvrf_v3_beacon_draw_committee`]) from the epoch
+///   beacon, IGNORING the parent hash for entropy (parent-hash grinding is
+///   removed). `CommitteeSchedule::Beacon(None)` — the beacon for this epoch
+///   is not known here — elects nobody (fail closed), never a parent-hash
+///   fallback: falling back would let two nodes disagree about the committee at
+///   one height, which is exactly the fork the beacon draw exists to prevent.
+///
+/// Used by BOTH the producer ([`VoteSet::certificate_with_schedule`]) and the
+/// verifier (`QuorumCertificate::verify_with_schedule` →
+/// `micro_cert_valid_signers_and_committee_with_beacon`), so a certificate a
+/// node builds can never name a committee its own verifier refuses.
+pub fn committee_for_height(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    parent_hash: Option<&[u8; 32]>,
+    schedule: crate::consensus::CommitteeSchedule,
+) -> Vec<ValidatorId> {
+    match schedule {
+        crate::consensus::CommitteeSchedule::ParentHash => match parent_hash {
+            Some(parent) => {
+                derive_sortition_committee(validators, height, round, committee_size, parent)
+            }
+            None => Vec::new(),
+        },
+        crate::consensus::CommitteeSchedule::Beacon(beacon) => match beacon {
+            Some(b) => cnvrf_v3_beacon_draw_committee(
+                validators,
+                height,
+                round,
+                committee_size,
+                &b.output,
+                b.epoch,
+            ),
+            None => Vec::new(),
+        },
+    }
+}
+
+// ============================================================================
+// ACTIVATION-HEIGHT RULE (review F4)
+// ============================================================================
+//
+// A height `H` where CN-VRF v3 is activated is only producible when the NEXT
+// epoch boundary can carry its `epoch_vdf`:
+//
+//  * The boundary block at `N * EPOCH_LEN` REQUIRES the beacon of epoch `N`
+//    (`runtime::validate_cnvrf_v3_payload`), and that beacon is only dispatched
+//    at `H_freeze(N) = N * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`.
+//  * The dispatcher is gated on activation (`cnvrf_v3_is_active_at(H_freeze)`),
+//    so activating AT `N * EPOCH_LEN` (the rollout checklist's "exact
+//    multiple" advice) leaves `H_freeze(N) < H` inactive: no beacon exists,
+//    the activation block is unproposable, and the chain cannot start.
+//  * The same hole opens for the last `V3_COMMIT_LOOKAHEAD_BLOCKS` heights of
+//    an epoch (`H_freeze(next) < H`).
+//
+// RULE (enforced by `cnvrf_v3_activation_height_allowed`, asserted by the
+// test-only activation setter and compile-checked for the frozen constant):
+//
+//   activation height `H` is allowed iff `H == 0` (genesis, no boundary) or
+//
+//       0 < H mod EPOCH_LEN <= EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS
+//
+//   i.e. never on an epoch boundary (for `N >= 1`) and never inside the
+//   freeze lookahead of the next one.
+//
+// The epoch of activation itself is then bootstrapped deterministically
+// (`crate::cn_vrf::epoch_beacon_for`), and EVERY later epoch has a dispatched
+// beacon — so there is an activation height that works (unlike the pre-fix
+// state, where neither an exact multiple nor a mid-epoch height could cross
+// the first boundary).
+
+/// True when `height` is a legal CN-VRF v3 activation height (see the rule
+/// above). `u64::MAX` (the frozen "never" sentinel) is legal.
+pub const fn cnvrf_v3_activation_height_allowed(height: Height) -> bool {
+    if height == 0 || height == u64::MAX {
+        return true;
+    }
+    let remainder = height % CNVRF_V3_EPOCH_LEN;
+    remainder != 0 && remainder <= CNVRF_V3_EPOCH_LEN - crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS
+}
+
+/// Panic with the documented reason when `height` would land on an
+/// unproducible epoch boundary. Called by the test-only activation setter.
+pub fn assert_cnvrf_v3_activation_height(height: Height) {
+    assert!(
+        cnvrf_v3_activation_height_allowed(height),
+        "CN-VRF v3 activation height {height} is unproducible: it is on an epoch \
+         boundary or inside the {}-block freeze lookahead before one, so the next \
+         boundary block would require an epoch_vdf whose H_freeze preceded activation \
+         (review F4). Choose `0 < H mod {EPOCH} <= {safe}`.",
+        crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS,
+        EPOCH = CNVRF_V3_EPOCH_LEN,
+        safe = CNVRF_V3_EPOCH_LEN - crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS,
+    );
+}
+
+/// Compile-time enforcement: a governance edit of the frozen constant that
+/// lands on an unproducible boundary fails the build.
+const _: () = assert!(cnvrf_v3_activation_height_allowed(
+    CNVRF_V3_ACTIVATION_HEIGHT
+));
 
 /// Multiplicative per-round backoff factor of the DETERMINISTIC round timeout.
 ///

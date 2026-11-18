@@ -40,6 +40,13 @@ pub const CHAIN_BINDING_ACTIVATION_ENV: &str = "STELL_CHAIN_BIND_ACTIVATION_HEIG
 /// Sentinel meaning "refusal never activates" (the default).
 pub const CHAIN_BINDING_NEVER: u64 = u64::MAX;
 
+/// FROZEN production activation height for the unbound-transaction refusal.
+///
+/// Deterministic and identical on every node (see
+/// [`ChainBindingActivation::from_chain_spec`]); flipping it is a coordinated
+/// protocol upgrade, not an operator setting.
+pub const CHAIN_BINDING_ACTIVATION_HEIGHT: u64 = CHAIN_BINDING_NEVER;
+
 /// Activation height for the unbound-transaction refusal (phase 3).
 ///
 /// `height == CHAIN_BINDING_NEVER` (default) keeps phase-1 behaviour on every
@@ -65,8 +72,53 @@ impl ChainBindingActivation {
         Self { height }
     }
 
-    /// Read from the environment. Unset / unparsable / `0` => [`Self::never`].
-    pub fn from_env() -> Self {
+    /// The PRODUCTION activation: a compile-time constant from the chain spec.
+    ///
+    /// PROTOCOL FREEZE (review R4, S2): this used to be read from
+    /// [`CHAIN_BINDING_ACTIVATION_ENV`] at every admission and apply site, so
+    /// two nodes with different environments admitted different transactions
+    /// and one could include an envelope the other refuses — a silent fork
+    /// driven by an operator env var. Activation is a consensus boundary; it
+    /// lives here as a constant, exactly like every other `*_ACTIVATION_HEIGHT`
+    /// in `chain_spec.rs`. The env name is kept only so the refusal text and
+    /// operator docs still point at something, and it is IGNORED (loudly) when
+    /// set.
+    pub fn from_chain_spec() -> Self {
+        // RELEASE builds are the production rule: the compiled constant, full
+        // stop, so two nodes can never disagree because of their environment.
+        // DEBUG builds (the whole test suite runs there) may arm a boundary via
+        // the historic env name so the mechanism stays testable end to end.
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(raw) = std::env::var(CHAIN_BINDING_ACTIVATION_ENV) {
+                if let Ok(h) = raw.trim().parse::<u64>() {
+                    if h != 0 {
+                        return Self { height: h };
+                    }
+                }
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            if std::env::var(CHAIN_BINDING_ACTIVATION_ENV).is_ok() {
+                tracing::warn!(
+                    "{} is IGNORED in a release build: chain binding activates by the compiled constant ({}), never by env",
+                    CHAIN_BINDING_ACTIVATION_ENV,
+                    CHAIN_BINDING_ACTIVATION_HEIGHT
+                );
+            }
+        }
+        if CHAIN_BINDING_ACTIVATION_HEIGHT == CHAIN_BINDING_NEVER {
+            Self::never()
+        } else {
+            Self::at_height(CHAIN_BINDING_ACTIVATION_HEIGHT)
+        }
+    }
+
+    /// Test-only override of [`Self::from_chain_spec`] for fixtures that must
+    /// exercise an active boundary.
+    #[cfg(any(test, debug_assertions))]
+    pub fn from_env_for_tests() -> Self {
         let raw = std::env::var(CHAIN_BINDING_ACTIVATION_ENV).unwrap_or_default();
         match raw.trim().parse::<u64>() {
             Ok(h) if h != 0 => Self { height: h },
@@ -173,7 +225,7 @@ pub fn check_admission_from_env(
     check_admission(
         is_bound,
         chain_height,
-        &ChainBindingActivation::from_env(),
+        &ChainBindingActivation::from_chain_spec(),
         chain_id,
     )
 }
@@ -243,7 +295,7 @@ mod tests {
         assert!(at.refusal_active(10_001));
         // Env: unset/garbage/zero => never.
         assert_eq!(
-            ChainBindingActivation::from_env(),
+            ChainBindingActivation::from_chain_spec(),
             ChainBindingActivation::never()
         );
     }

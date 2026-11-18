@@ -69,6 +69,43 @@ impl InMemoryStateEngine {
         msg.verify_anchored(Some(reg))
     }
 
+    /// Anchored ESCROW/DEBIT check for one inbound LEGACY value transfer
+    /// (XSHARD-01).
+    ///
+    /// This is the only proof an inbound legacy credit may be paid against:
+    /// a Merkle proof of the SOURCE's escrow record for the transfer
+    /// ([`crate::sharding::xshard_escrow_state_key`]) verified against a state
+    /// root that a locally finalized source header committed to. The record is
+    /// written by the source's apply path (`record_legacy_escrow_receipts`)
+    /// only when the escrow transaction actually applied, so it proves the
+    /// source DEBITED the sender. The old rule
+    /// ([`Self::verify_cross_shard_anchored`]) proves only that the sender
+    /// could AFFORD the amount before the transfer, which a colluding target
+    /// proposer can pair with a signed-but-never-applied transaction to mint.
+    ///
+    /// `false` covers "forged", "not escrowed at the named source block" and
+    /// "not finalized here yet" — every caller must treat it as NOT-READY and
+    /// never credit, never claim the replay key. A missing or poisoned
+    /// registry fails closed.
+    pub fn verify_cross_shard_escrow_anchored(
+        &self,
+        msg: &crate::sharding::CrossShardMessage,
+    ) -> bool {
+        let guard = self
+            .finalized_headers
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(reg_arc) = guard else {
+            return false;
+        };
+        let inner = reg_arc.read().ok();
+        let Some(reg) = inner.as_deref() else {
+            return false;
+        };
+        msg.verify_escrow_anchored(Some(reg))
+    }
+
     /// True once the given message has been credited on this shard.
     pub async fn is_cross_shard_consumed(&self, key: &crate::sharding::CrossShardKey) -> bool {
         self.cross_shard_consumed.read().await.contains(key)
@@ -154,6 +191,21 @@ impl InMemoryStateEngine {
     /// ABORT-ACK) or decision (COMMIT) cannot be forged.
     pub async fn get_xpc_proof(&self, tx_hash: &[u8; 32]) -> Option<crate::cell::MerkleProof> {
         let key = crate::xshard2pc::xpc_state_key(tx_hash);
+        self.state_trie.read().await.generate_merkle_proof(&key)
+    }
+
+    /// The Merkle inclusion proof of the SOURCE-side escrow/debit record of one
+    /// legacy cross-shard transfer (XSHARD-01).
+    ///
+    /// This is what a target verifies before paying an inbound legacy credit:
+    /// the leaf is written by [`Self::record_legacy_escrow_receipts`] only when
+    /// the escrow transaction applied, so the proof says "the source DEBITED
+    /// the sender for this transfer", not merely "the sender could afford it".
+    pub async fn get_legacy_escrow_proof(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> Option<crate::cell::MerkleProof> {
+        let key = crate::sharding::xshard_escrow_state_key(tx_hash);
         self.state_trie.read().await.generate_merkle_proof(&key)
     }
 
@@ -303,6 +355,32 @@ impl InMemoryStateEngine {
             let mut produced = self.cross_shard_produced.write().await;
             for (h, _tx, height) in &snap.produced {
                 produced.entry(*h).or_insert(*height);
+            }
+        }
+        // XSHARD-01: the PRODUCED outbounds carry their full transaction, so
+        // the source-side escrow/debit leaf of every one of them is re-derived
+        // here exactly as the block that produced it derived it. Without this
+        // a restart (the trie is rebuilt from the accounts alone) would lose
+        // the escrow leaves and the restored node's root would stop matching
+        // the chain that produced them.
+        {
+            let mut leaves: Vec<([u8; 32], Vec<u8>)> = snap
+                .produced
+                .iter()
+                .map(|(tx_hash, tx, _height)| {
+                    (
+                        crate::sharding::xshard_escrow_state_key(tx_hash),
+                        crate::sharding::xshard_escrow_state_value(tx),
+                    )
+                })
+                .collect();
+            leaves.sort();
+            leaves.dedup();
+            if !leaves.is_empty() {
+                let mut trie = self.state_trie.write().await;
+                for (key, value) in &leaves {
+                    trie.insert(key, value);
+                }
             }
         }
         self.cross_shard_completed
@@ -536,34 +614,49 @@ impl InMemoryStateEngine {
             {
                 continue;
             }
-            // ANCHORED + SIGNED credit (cross-shard integrity hardening): the
-            // legacy credit path anchors the message to a LOCALLY FINALIZED
-            // source header (via `verify_cross_shard_anchored`: proof AND a
-            // committed source root) instead of checking the proof alone. A
-            // self-attested root (attacker trie + valid-for-that-root proof)
-            // names no committed header and is refused here.
-            //
-            // Fail-closed NOT-READY: a missing registry (single-shard
-            // contexts, most unit tests) or an unfinalized source header
-            // SKIPS the credit (never credits, never marks consumed), exactly
-            // like a bad proof. The carrying block's QC is NOT the trust for
-            // the message body: the quorum signs the block hash, and the
-            // block hash binds the full message bytes, but only the source
-            // shard's finalized header proves the claimed state root existed.
-            //
             // PQ-only (live rule): the carried transaction must pass
             // `tx.verify_signature()` — a legacy Ed cross-shard message is
-            // refused here, never credited.
+            // refused here, never credited. The `msg_id` recompute is part of
+            // the escrow verifier too, but it is kept explicit at this
+            // boundary so a rebound id is refused before any registry work.
             if !msg.verify_msg_id() {
                 continue;
             }
             if !msg.tx.verify_signature() {
                 continue;
             }
-            if !self.verify_cross_shard_anchored(msg) {
-                continue;
-            }
-            if !msg.verify_inclusion_strict() {
+            // XSHARD-01 (P0, multi-shard): the legacy inbound credit is paid
+            // ONLY against proof of the SOURCE-SIDE ESCROW/DEBIT.
+            //
+            // The previous rule (`verify_cross_shard_anchored` +
+            // `verify_inclusion_strict`) proved the SENDER'S ACCOUNT LEAF at a
+            // finalized source root — a statement about the PRE-transfer state
+            // ("the sender could afford the amount"). It proved neither
+            // inclusion nor a debit. A colluding target proposer plus one
+            // funded source account could therefore include a
+            // signed-but-never-applied transaction with a valid affordability
+            // proof: the source balance stayed put, the target credited the
+            // amount, and the value was minted on the target. Repeatable, so it
+            // drains the target shard.
+            //
+            // The gate below requires the source's ESCROW record
+            // (`xshard_escrow_state_key(tx_hash)`), which the source writes
+            // only for an outbound transfer whose escrow transaction APPLIED,
+            // proven against a state root anchored to a locally finalized
+            // source header — the same shape as the 2PC COMMIT's proof of the
+            // source's PREPARED leaf.
+            //
+            // FAIL CLOSED (documented consequence): the one-step legacy
+            // producer publishes the transfer in the SAME block that escrows
+            // it, and a message can only anchor to its parent's committed root,
+            // which predates the escrow. An honest one-step legacy message
+            // therefore cannot carry this proof and is REFUSED here — legacy
+            // cross-shard VALUE is disabled at this gate; cross-shard value
+            // moves through the §9 2PC, whose COMMIT is paid against the
+            // source's committed escrow. The refusal happens BEFORE the replay
+            // claim, so the message is neither consumed nor paid and the source
+            // can still refund it on the timeout path.
+            if !self.verify_cross_shard_escrow_anchored(msg) {
                 continue;
             }
             // THE ATOMIC CLAIM (audit F3). `HashSet::insert` under the write
@@ -622,6 +715,84 @@ impl InMemoryStateEngine {
         credited
     }
 
+    /// XSHARD-01: record the SOURCE-side ESCROW/DEBIT of every outbound LEGACY
+    /// transfer this block committed.
+    ///
+    /// This is the record an inbound legacy credit must prove (see
+    /// [`Self::verify_cross_shard_escrow_anchored`]). It is written into the
+    /// committed state trie at [`crate::sharding::xshard_escrow_state_key`],
+    /// which means:
+    ///
+    ///  * the value really left the sender's balance on this shard — the leaf
+    ///    is written ONLY for a transfer whose transaction is IN this block AND
+    ///    `status[idx] == true` (a refused transaction debits nobody, and a leaf
+    ///    written for it would let the target credit value that was never
+    ///    escrowed: a mint);
+    ///  * the leaf is part of the committed state (and therefore of the next
+    ///    block's state root), so it can be PROVED with a Merkle proof against
+    ///    an anchored source header, exactly like the 2PC PREPARED leaf;
+    ///  * it is deterministic: a pure function of the block's own bytes plus
+    ///    the apply status, so every node applying the block derives the same
+    ///    leaf and the same root.
+    ///
+    /// Idempotent (the same key/value is rewritten on a re-apply), so a replay
+    /// or a reorg re-apply cannot double-record anything.
+    ///
+    /// NOTE ON THE ONE-STEP LEGACY PRODUCER. The legacy outbox publishes a
+    /// transfer in the SAME block that escrows it, and a cross-shard message can
+    /// only anchor to its PARENT's committed root. That root predates the
+    /// escrow, so an honest one-step legacy message cannot carry this proof and
+    /// the inbound credit refuses it (see `apply_cross_shard_consumptions`):
+    /// cross-shard value must move through the §9 2PC (PREPARE → PREPARE-ACK →
+    /// COMMIT), whose COMMIT is paid only against a proof of the source's
+    /// committed escrow. This writer exists so the source-side escrow is a real,
+    /// provable, committed record (and so a future two-step legacy producer can
+    /// be verified without touching this gate).
+    pub async fn record_legacy_escrow_receipts(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> usize {
+        if !self.cross_shard_enabled() {
+            return 0;
+        }
+        // Collect first (deterministic block order), then write under ONE trie
+        // lock: the trie is the shared committed structure, so a single
+        // critical section keeps the apply cheap and the order irrelevant
+        // (each leaf has its own key).
+        let mut leaves: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        for msg in &block.cross_shard_out {
+            if !msg.is_transfer() || !msg.is_outbound_for(block.shard_id) {
+                continue;
+            }
+            let tx = &msg.tx;
+            let tx_hash = tx.compute_tx_hash();
+            let Some(idx) = block
+                .transactions
+                .iter()
+                .position(|t| t.compute_tx_hash() == tx_hash)
+            else {
+                continue;
+            };
+            if !status.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            leaves.push((
+                crate::sharding::xshard_escrow_state_key(&tx_hash),
+                crate::sharding::xshard_escrow_state_value(tx),
+            ));
+        }
+        if leaves.is_empty() {
+            return 0;
+        }
+        let mut trie = self.state_trie.write().await;
+        for (key, value) in &leaves {
+            trie.insert(key, value);
+        }
+        drop(trie);
+        leaves.len()
+    }
+
     /// §9 2PC, SOURCE side: record the PREPARED state of every transfer this
     /// block ESCROWED.
     ///
@@ -656,6 +827,11 @@ impl InMemoryStateEngine {
         if !self.cross_shard_enabled() {
             return 0;
         }
+        // XSHARD-01: the SOURCE-side escrow/debit record of every outbound
+        // LEGACY transfer this block committed. It runs after the transactions
+        // (this hook is called post-apply) so it can consult `status`: only a
+        // transfer whose escrow transaction APPLIED is recorded.
+        let _escrows = self.record_legacy_escrow_receipts(block, status).await;
         let mut created = 0usize;
         for msg in &block.cross_shard_out {
             if !msg.is_prepare() || !msg.is_outbound_for(block.shard_id) {
@@ -1322,15 +1498,24 @@ mod tests {
             epoch_key_commitment: [0u8; 32],
         };
 
-        // Control: a target with no 2PC record credits the legacy transfer.
+        // Control: this message carries NO source-escrow proof, so the legacy
+        // credit is refused even with no 2PC record (pentest XSHARD-01: an
+        // affordability-only leaf proves nothing about a source debit). The
+        // positive escrow-backed path is covered end to end by
+        // `sharding_m2_tests::escrow_backed_legacy_credit_is_paid_exactly_once`.
         let clean = InMemoryStateEngine::new();
         clean.enable_cross_shard();
         clean.with_finalized_headers(reg.clone());
         clean.apply_cross_shard_consumptions(&block).await;
         assert_eq!(
             clean.get_account(&recipient).await.map(|a| a.balance),
-            Some(amount),
-            "precondition: the legacy message itself is valid"
+            None,
+            "an unproven legacy credit must never mint on the target"
+        );
+        assert_eq!(
+            clean.cross_shard_consumed_len().await,
+            0,
+            "a refused credit must not claim the replay key"
         );
 
         // Armed: the SAME message is refused because a 2PC record exists.

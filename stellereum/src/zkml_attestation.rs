@@ -37,10 +37,13 @@
 //!    re-execution produced.
 //!
 //! The claim this supports is precisely: **"these outputs are what THIS model
-//! produces on THESE inputs."** That is a real and useful statement — it is
-//! what makes a value-bearing decision sound — and it is what
-//! `OpCode::SysCallVerifyZkMlReexec` and
-//! `OpCode::SysCallVerifyZkMlAttestation` both check.
+//! produces on THESE inputs."** That is a real and useful statement, and it is
+//! what `OpCode::SysCallVerifyZkMlReexec` and
+//! `OpCode::SysCallVerifyZkMlAttestation` both check — but the chain CANNOT
+//! act on the verdict: there is no branch, no event, and `apply.rs` drops the
+//! execution result's `return_value`. A verify is an EVENT, not a branch
+//! condition; a value-bearing decision has to be made off chain from the
+//! (public) payload.
 //!
 //! # What is TRUSTED
 //!
@@ -107,7 +110,89 @@ pub const MAX_MODEL_SPEC_BYTES: usize = 65_536;
 pub const MAX_SETUP_ATTESTATION_BYTES: usize = 1024;
 
 pub const TEST_SETUP_ATTESTATION: &[u8] = b"TEST-ONLY-DETERMINISTIC-SETUP:v1:StdRng-seed-domain-ATTEST-TEST;WASTE-DERIVABLE-NOT-FOR-PRODUCTION";
+
+/// Fiat–Shamir domain tag for the UNBOUND attestation transcript.
+///
+/// ⚠️ LEGACY NAME — the bytes are committed and must not change: this tag is
+/// part of every existing `AttestationProof` preimage, so renaming it would
+/// move the transcript (and therefore acceptance) for every proof ever made.
+/// Despite `PQ_STARK_BLAKE3` in the name, the mechanism is **re-execution with
+/// a BLAKE3 Merkle trace root and a Fiat–Shamir hash** — there is no STARK,
+/// no FRI, no polynomial commitment and no post-quantum-specific step here
+/// (the hash is BLAKE3, whose collision resistance is a separate assumption).
+/// A correctly-named tag can only be introduced with a NEW FS domain behind a
+/// gate; see [`ZKML_ATTESTATION_CONTEXT_TAG`].
 pub const ZKML_ATTESTATION_PROTOCOL_TAG: &[u8] = b"STELLEREUM_PQ_STARK_BLAKE3_V1";
+
+/// Fiat–Shamir domain tag for the OPT-IN, context-bound transcript.
+///
+/// This tag is used ONLY by [`prove_attestation_bound`] /
+/// [`verify_attestation_bound`] / [`verify_attestation_at`] when
+/// [`zkml_context_binding_active`] is true. It is a NEW domain, so a bound
+/// proof and an unbound proof can never verify under each other's rules. The
+/// legacy [`ZKML_ATTESTATION_PROTOCOL_TAG`] remains byte-identical for the
+/// current consensus path.
+pub const ZKML_ATTESTATION_CONTEXT_TAG: &[u8] = b"STELLEREUM_INFERENCE_CTX_V1";
+
+/// Hard-fork height at which context-bound attestation transcripts become
+/// mandatory. `u64::MAX` means **never**: today's unbound transcript is the
+/// only one accepted, and every code path below is byte-identical to before.
+///
+/// Changing this value changes acceptance (old proofs stop verifying), so it
+/// may only move with a spec update and a coordinated hard fork. The bound
+/// API exists so the seam is testable now without touching consensus.
+pub const ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// What a context-bound proof is bound TO. Committing these into the FS
+/// transcript turns a proof from a permanent bearer token into one that is
+/// only valid for (chain, model id, height, sender).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZkmlContextBinding {
+    pub chain_id: u64,
+    pub model_id: [u8; 32],
+    pub height: u64,
+    pub sender: [u8; 32],
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT`].
+    /// Thread-local so parallel unit tests cannot perturb each other; absent
+    /// outside `cfg(test)` so a release node has no local gate knob at all
+    /// (a node-local gate that changes acceptance would be a chain split).
+    static CONTEXT_BINDING_HEIGHT_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The activation height in force for this build/thread.
+///
+/// In production this is always [`ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT`]
+/// (`u64::MAX`); only unit tests can lower it.
+pub fn zkml_context_binding_activation_height() -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(h) = CONTEXT_BINDING_HEIGHT_OVERRIDE.with(std::cell::Cell::get) {
+            return h;
+        }
+    }
+    ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT
+}
+
+/// TEST-ONLY: override (or clear, with `None`) the gate height for the
+/// CURRENT thread. Not compiled into a release lib, so it cannot be used to
+/// fork a live chain.
+#[cfg(test)]
+pub fn set_zkml_context_binding_activation_height_for_tests(height: Option<u64>) {
+    CONTEXT_BINDING_HEIGHT_OVERRIDE.with(|c| c.set(height));
+}
+
+/// Is the context-bound transcript mandatory at `height`?
+///
+/// False by default in every build (`u64::MAX`), which is what keeps today's
+/// wire format, verdicts and state root byte-identical.
+pub fn zkml_context_binding_active(height: u64) -> bool {
+    height >= zkml_context_binding_activation_height()
+}
 
 // ---------------------------------------------------------------------------
 // Wire Types
@@ -127,7 +212,9 @@ pub struct ModelSpec {
     pub out_dim: u64,
 }
 
-/// A Post-Quantum STARK proof of quantized inference.
+/// An inference attestation: a re-executed forward pass plus its BLAKE3 trace
+/// root. NOT a "Post-Quantum STARK" proof (the historic doc line said so; it
+/// was wrong). There is no STARK, no circuit and no zero-knowledge here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationProof {
     pub model_hash: [u8; 32],
@@ -264,7 +351,7 @@ impl InferenceCostModel {
 }
 
 // ---------------------------------------------------------------------------
-// Setup Functions (Transparent / Zero-Knowledge)
+// Model-spec construction (there is NO setup: these are format commitments)
 // ---------------------------------------------------------------------------
 
 /// Test-only deterministic setup (fixed attestation): integration tests use
@@ -314,7 +401,7 @@ fn build_model_spec(
 }
 
 // ---------------------------------------------------------------------------
-// Post-Quantum STARK Prover & Verifier
+// Attestation Prover & Verifier (re-execution, no STARK)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,12 +411,91 @@ struct AttestationPayload {
     pub query_samples: Vec<([u8; 32], Vec<i64>)>,
 }
 
+/// The one Fiat–Shamir transcript used by BOTH sides.
+///
+/// `None` = the legacy unbound domain ([`ZKML_ATTESTATION_PROTOCOL_TAG`]),
+/// byte-identical to every proof the chain has ever accepted. `Some` = the
+/// opt-in context-bound domain ([`ZKML_ATTESTATION_CONTEXT_TAG`]) which
+/// additionally commits `chain_id || model_id || height || sender`. Because
+/// prove and verify call the SAME function, the two can never drift.
+fn attestation_challenge(
+    binding: Option<&ZkmlContextBinding>,
+    model_hash: &[u8; 32],
+    spec_hash: &[u8; 32],
+    trace_root: &[u8; 32],
+    inputs: &[u64],
+    outputs: &[u64],
+) -> [u8; 32] {
+    let mut fs = blake3::Hasher::new();
+    match binding {
+        None => {
+            fs.update(ZKML_ATTESTATION_PROTOCOL_TAG);
+        }
+        Some(b) => {
+            fs.update(ZKML_ATTESTATION_CONTEXT_TAG);
+            fs.update(&b.chain_id.to_le_bytes());
+            fs.update(&b.model_id);
+            fs.update(&b.height.to_le_bytes());
+            fs.update(&b.sender);
+        }
+    }
+    fs.update(model_hash);
+    fs.update(spec_hash);
+    fs.update(trace_root);
+    fs.update(&(inputs.len() as u64).to_le_bytes());
+    for &x in inputs {
+        fs.update(&x.to_le_bytes());
+    }
+    fs.update(&(outputs.len() as u64).to_le_bytes());
+    for &y in outputs {
+        fs.update(&y.to_le_bytes());
+    }
+    *fs.finalize().as_bytes()
+}
+
+/// Produce a re-execution attestation for `inputs` under the UNBOUND transcript
+/// (today's consensus format, byte-identical).
 pub fn prove_attestation(
+    view: &ModelView,
+    model_hash: [u8; 32],
+    inputs: &[i64],
+    pk_bytes: &[u8],
+    spec_hash: [u8; 32],
+) -> Result<(Vec<i64>, AttestationProof), String> {
+    prove_attestation_inner(view, model_hash, inputs, pk_bytes, spec_hash, None)
+}
+
+/// Produce a CONTEXT-BOUND attestation (opt-in, separate FS domain).
+///
+/// The proof will only verify through [`verify_attestation_bound`] (or
+/// [`verify_attestation_at`] once the gate is open) with the SAME binding -
+/// it is not a bearer token. It does NOT verify through the legacy
+/// [`verify_attestation`], and a legacy proof does not verify here.
+pub fn prove_attestation_bound(
+    view: &ModelView,
+    model_hash: [u8; 32],
+    inputs: &[i64],
+    pk_bytes: &[u8],
+    spec_hash: [u8; 32],
+    binding: &ZkmlContextBinding,
+) -> Result<(Vec<i64>, AttestationProof), String> {
+    prove_attestation_inner(
+        view,
+        model_hash,
+        inputs,
+        pk_bytes,
+        spec_hash,
+        Some(binding),
+    )
+}
+
+fn prove_attestation_inner(
     view: &ModelView,
     model_hash: [u8; 32],
     inputs: &[i64],
     _pk_bytes: &[u8],
     spec_hash: [u8; 32],
+    binding: Option<&ZkmlContextBinding>,
 ) -> Result<(Vec<i64>, AttestationProof), String> {
     view.check_compatible()?;
     if inputs.len() != view.in_dim() {
@@ -406,21 +572,16 @@ pub fn prove_attestation(
     }
     let trace_root = level[0];
 
-    // Fiat-Shamir challenge with explicit length delimiters
-    let mut fs = blake3::Hasher::new();
-    fs.update(ZKML_ATTESTATION_PROTOCOL_TAG);
-    fs.update(&model_hash);
-    fs.update(&spec_hash);
-    fs.update(&trace_root);
-    fs.update(&(inputs.len() as u64).to_le_bytes());
-    for &x in inputs {
-        fs.update(&(x as u64).to_le_bytes());
-    }
-    fs.update(&(public_outputs.len() as u64).to_le_bytes());
-    for &y in &public_outputs {
-        fs.update(&y.to_le_bytes());
-    }
-    let challenge = *fs.finalize().as_bytes();
+    // Fiat-Shamir challenge with explicit length delimiters. `binding == None`
+    // is the legacy transcript, byte-for-byte what it always was.
+    let challenge = attestation_challenge(
+        binding,
+        &model_hash,
+        &spec_hash,
+        &trace_root,
+        &public_inputs,
+        &public_outputs,
+    );
 
     let payload = AttestationPayload {
         trace_root,
@@ -442,7 +603,49 @@ pub fn prove_attestation(
     Ok((current, proof))
 }
 
+/// Verify a re-execution attestation under the UNBOUND transcript (today's
+/// consensus format).
 pub fn verify_attestation(spec_bytes: &[u8], proof: &AttestationProof) -> bool {
+    verify_attestation_inner(spec_bytes, proof, None)
+}
+
+/// Verify a CONTEXT-BOUND attestation (opt-in, separate FS domain).
+///
+/// A legacy proof fails here and a bound proof fails
+/// [`verify_attestation`]: the two transcripts are distinct domains.
+pub fn verify_attestation_bound(
+    spec_bytes: &[u8],
+    proof: &AttestationProof,
+    binding: &ZkmlContextBinding,
+) -> bool {
+    verify_attestation_inner(spec_bytes, proof, Some(binding))
+}
+
+/// Gate-aware entry point: today it is a literal call to
+/// [`verify_attestation`] (the binding argument is IGNORED while the gate is
+/// closed, so a caller cannot opt into a fork by accident). At or after
+/// [`ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT`] a binding is REQUIRED and only
+/// the bound transcript verifies.
+pub fn verify_attestation_at(
+    spec_bytes: &[u8],
+    proof: &AttestationProof,
+    height: u64,
+    binding: Option<&ZkmlContextBinding>,
+) -> bool {
+    if !zkml_context_binding_active(height) {
+        return verify_attestation(spec_bytes, proof);
+    }
+    match binding {
+        Some(b) => verify_attestation_bound(spec_bytes, proof, b),
+        None => false,
+    }
+}
+
+fn verify_attestation_inner(
+    spec_bytes: &[u8],
+    proof: &AttestationProof,
+    binding: Option<&ZkmlContextBinding>,
+) -> bool {
     let Ok(view) = bincode::deserialize::<ModelView>(spec_bytes) else {
         return false;
     };
@@ -527,26 +730,24 @@ pub fn verify_attestation(spec_bytes: &[u8], proof: &AttestationProof) -> bool {
     }
     let expected_trace_root = level[0];
 
-    // Cryptographic Soundness: Assert that trace_root commits to the actual forward pass!
+    // The trace root must equal the one recomputed from the forward pass.
+    // There is NO "cryptographic soundness" from the commitment alone: the
+    // root commits to the PROVER's claimed activations too, so soundness here
+    // comes from the fact that the verifier recomputed every leaf AND checked
+    // `public_outputs` against the same forward pass above.
     if payload.trace_root != expected_trace_root {
         return false;
     }
 
-    // Verify Fiat-Shamir challenge commitment consistency with length delimiters
-    let mut fs = blake3::Hasher::new();
-    fs.update(ZKML_ATTESTATION_PROTOCOL_TAG);
-    fs.update(&proof.model_hash);
-    fs.update(&proof.spec_hash);
-    fs.update(&payload.trace_root);
-    fs.update(&(proof.public_inputs.len() as u64).to_le_bytes());
-    for &x in &proof.public_inputs {
-        fs.update(&x.to_le_bytes());
-    }
-    fs.update(&(proof.public_outputs.len() as u64).to_le_bytes());
-    for &y in &proof.public_outputs {
-        fs.update(&y.to_le_bytes());
-    }
-    let expected_challenge = *fs.finalize().as_bytes();
+    // Fiat-Shamir challenge commitment consistency with length delimiters.
+    let expected_challenge = attestation_challenge(
+        binding,
+        &proof.model_hash,
+        &proof.spec_hash,
+        &payload.trace_root,
+        &proof.public_inputs,
+        &proof.public_outputs,
+    );
 
     if payload.commitments.first() != Some(&expected_challenge) {
         return false;
@@ -583,4 +784,149 @@ pub fn check_model_spec(view: &ModelView, vk: &ModelSpec) -> Result<(), String> 
         return Err("stark: vk n_public_inputs inconsistent".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod context_binding_tests {
+    use super::*;
+    use crate::zkml::{QuantizedLayer, QuantizedLinearModel};
+
+    fn model() -> QuantizedLinearModel {
+        // Same fixture as the zkml unit tests: [3, 4] -> [11, 7].
+        QuantizedLinearModel::new(vec![QuantizedLayer::new(
+            2,
+            2,
+            vec![2, -1, 1, 3],
+            vec![1, -2],
+        )])
+    }
+
+    fn setup() -> (QuantizedLinearModel, ModelSpec, Vec<u8>) {
+        let m = model();
+        let (pk, spec) = model_spec_with_attestation(&m.attestation_view(), b"label".to_vec())
+            .expect("compatible model must produce a spec");
+        (m, spec, pk)
+    }
+
+    fn binding(model_id: [u8; 32]) -> ZkmlContextBinding {
+        ZkmlContextBinding {
+            chain_id: 5_757,
+            model_id,
+            height: 42,
+            sender: [0x77; 32],
+        }
+    }
+
+    #[test]
+    fn gate_is_closed_by_default() {
+        assert_eq!(ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT, u64::MAX);
+        assert!(!zkml_context_binding_active(0));
+        assert!(!zkml_context_binding_active(u64::MAX - 1));
+    }
+
+    #[test]
+    fn bound_and_legacy_transcripts_do_not_cross_verify() {
+        let (m, spec, pk) = setup();
+        let ctx = binding([0x51; 32]);
+        let (_, bound) = prove_attestation_bound(
+            &m.attestation_view(),
+            m.compute_model_hash(),
+            &[3, 4],
+            &pk,
+            spec.spec_hash,
+            &ctx,
+        )
+        .expect("bound prove must succeed");
+        let (_, legacy) = prove_attestation(
+            &m.attestation_view(),
+            m.compute_model_hash(),
+            &[3, 4],
+            &pk,
+            spec.spec_hash,
+        )
+        .expect("legacy prove must succeed");
+
+        // Legacy proof is still accepted by the legacy verifier (byte-identical
+        // format) and the bound proof is NOT.
+        assert!(verify_attestation(&spec.spec_bytes, &legacy));
+        assert!(!verify_attestation(&spec.spec_bytes, &bound));
+        // ... and the converse.
+        assert!(verify_attestation_bound(&spec.spec_bytes, &bound, &ctx));
+        assert!(!verify_attestation_bound(
+            &spec.spec_bytes,
+            &legacy,
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn every_bound_field_is_part_of_the_statement() {
+        let (m, spec, pk) = setup();
+        let ctx = binding([0x51; 32]);
+        let (_, bound) = prove_attestation_bound(
+            &m.attestation_view(),
+            m.compute_model_hash(),
+            &[3, 4],
+            &pk,
+            spec.spec_hash,
+            &ctx,
+        )
+        .expect("bound prove must succeed");
+
+        let mut wrong = ctx;
+        wrong.chain_id += 1;
+        assert!(!verify_attestation_bound(&spec.spec_bytes, &bound, &wrong));
+        let mut wrong = ctx;
+        wrong.model_id[0] ^= 1;
+        assert!(!verify_attestation_bound(&spec.spec_bytes, &bound, &wrong));
+        let mut wrong = ctx;
+        wrong.height += 1;
+        assert!(!verify_attestation_bound(&spec.spec_bytes, &bound, &wrong));
+        let mut wrong = ctx;
+        wrong.sender[0] ^= 1;
+        assert!(!verify_attestation_bound(&spec.spec_bytes, &bound, &wrong));
+    }
+
+    #[test]
+    fn gate_is_inert_until_the_test_override_opens_it() {
+        let (m, spec, pk) = setup();
+        let ctx = binding([0x51; 32]);
+        let (_, bound) = prove_attestation_bound(
+            &m.attestation_view(),
+            m.compute_model_hash(),
+            &[3, 4],
+            &pk,
+            spec.spec_hash,
+            &ctx,
+        )
+        .expect("bound prove must succeed");
+
+        // Gate closed at every real height: the context argument is IGNORED
+        // and only the legacy transcript is accepted.
+        assert!(!verify_attestation_at(
+            &spec.spec_bytes,
+            &bound,
+            0,
+            Some(&ctx)
+        ));
+        set_zkml_context_binding_activation_height_for_tests(Some(0));
+        // Open: the binding is required and must match exactly.
+        assert!(verify_attestation_at(
+            &spec.spec_bytes,
+            &bound,
+            0,
+            Some(&ctx)
+        ));
+        let mut wrong = ctx;
+        wrong.chain_id += 1;
+        assert!(!verify_attestation_at(
+            &spec.spec_bytes,
+            &bound,
+            0,
+            Some(&wrong)
+        ));
+        assert!(!verify_attestation_at(&spec.spec_bytes, &bound, 0, None));
+        set_zkml_context_binding_activation_height_for_tests(None);
+        assert!(!zkml_context_binding_active(0));
+    }
 }

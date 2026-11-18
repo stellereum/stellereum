@@ -14,9 +14,13 @@
 
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 use stellereum::consensus::{
-    register_validator_pq_key, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+    cnvrf_v3_epoch_of_height, committee_for_height, micro_committee_size,
+    produce_decision_certificate_with_schedule, register_validator_pq_key, CommitteeSchedule,
+    EpochBeacon, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+    MICRO_COMMITTEE_MAX_SIZE,
 };
 use stellereum::light_client::LightClient;
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
@@ -26,6 +30,7 @@ use stellereum::storage::{DomainSnapshot, DomainSnapshotV1};
 use stellereum::sync::{
     check_snapshot_set_binding, collect_missing_blocks, fast_sync_state_with_set_binding,
     genesis_light_anchor, validate_sync_chain_for_shard_with_sets,
+    validate_sync_chain_for_shard_with_sets_hashed_with_schedule,
     verify_snapshot_anchor_with_sets, walked_head_anchor, HeaderLink,
 };
 
@@ -784,5 +789,263 @@ async fn d1_gap_zero_synced_state_equals_canonical_replay() {
         fresh.get_state_root().await,
         before,
         "refused gap leaves state untouched"
+    );
+}
+
+// ============ (e) CN-VRF v3 committee schedule on the sync paths ============
+
+/// Height the beacon-schedule fixture treats as active: one block past epoch 1,
+/// i.e. the epoch whose `H_freeze` predates activation (the bootstrap epoch).
+const SCHEDULE_ACTIVE_HEIGHT: u64 = stellereum::cn_vrf::EPOCH_LEN + 1;
+
+/// Review F2 fixture: MORE validators than the µQC committee cap. With
+/// `<= MICRO_COMMITTEE_MAX_SIZE` validators the draw elects the whole set, so
+/// the beacon and parent-hash schedules are indistinguishable and a
+/// wrong-schedule refusal could not be observed.
+fn schedule_set() -> &'static (Vec<SigningKey>, Vec<FalconKeypair>, ValidatorSet) {
+    static SET: OnceLock<(Vec<SigningKey>, Vec<FalconKeypair>, ValidatorSet)> = OnceLock::new();
+    SET.get_or_init(|| {
+        let n = MICRO_COMMITTEE_MAX_SIZE as usize + 2;
+        // Distinct Ed seeds (0x80..=0xFF then 0x00..=0x02); `fk_for` derives the
+        // Falcon companion deterministically from the Ed id, so every test in
+        // this binary registers the same keypair for the same voter.
+        let ks: Vec<SigningKey> = (0..n)
+            .map(|i| key(0x80u8.wrapping_add(i as u8)))
+            .collect();
+        reg_all(&ks);
+        let fks = fks_for(&ks);
+        let vs = vset(&ks);
+        (ks, fks, vs)
+    })
+}
+
+/// One block to build plus the two draws it must use: the PROPOSER schedule and
+/// the QC schedule. Splitting them lets the test keep the proposer valid while
+/// the certificate is drawn from the wrong committee (the exact pre-fix sync
+/// failure, review F2).
+#[derive(Clone, Copy)]
+struct BlockSchedules {
+    proposer: CommitteeSchedule,
+    qc: CommitteeSchedule,
+}
+
+/// `(height, round, parent hash, state root)` of the block under test.
+#[derive(Clone, Copy)]
+struct BlockSpec {
+    height: u64,
+    round: u32,
+    parent: [u8; 32],
+    root: [u8; 32],
+}
+
+/// Build one block whose proposer is drawn under `schedules.proposer` and whose
+/// precommit QC is compiled under `schedules.qc`.
+fn block_with_schedules(
+    keys: &[SigningKey],
+    fks: &[FalconKeypair],
+    vs: &ValidatorSet,
+    spec: BlockSpec,
+    schedules: BlockSchedules,
+) -> Block {
+    let BlockSpec {
+        height,
+        round,
+        parent,
+        root,
+    } = spec;
+    let proposer_id = vs
+        .proposer_for_with_schedule(height, round, schedules.proposer)
+        .expect("fixture set names a proposer");
+    let (idx, sk) = keys
+        .iter()
+        .enumerate()
+        .find(|(_, k)| k.verifying_key().to_bytes() == proposer_id)
+        .expect("the proposer is a fixture member");
+    let mut b = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height,
+        prev_hash: parent,
+        state_root: root,
+        transactions: vec![],
+        cross_shard_out: vec![],
+        timestamp: 1_700_000_000 + height,
+        proposer: proposer_id,
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
+        order_merkle_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+    };
+    b.sign_block_with_falcon(sk, &fks[idx]);
+    let bh = b.compute_hash();
+    let mut votes = VoteSet::new();
+    for (k, fk) in keys.iter().zip(fks.iter()) {
+        votes
+            .add(
+                Vote::sign_with_falcon(k, fk, height, round, VoteKind::Precommit, Some(bh)),
+                vs,
+                height,
+                round,
+                VoteKind::Precommit,
+            )
+            .expect("genuine vote admits");
+    }
+    b.precommit_qc = Some(
+        produce_decision_certificate_with_schedule(
+            &votes,
+            Some(bh),
+            vs,
+            Some(&parent),
+            schedules.qc,
+        )
+        .expect("the whole set signs, so a certificate must compile"),
+    );
+    b
+}
+
+/// Review F2: the body walk must verify a certificate under the committee
+/// schedule in force at its height.
+///
+/// * At activation a BEACON-drawn QC is accepted by sync, and the SAME block
+///   carrying a parent-hash-drawn QC is refused (the pre-fix behaviour).
+/// * Below activation a parent-hash QC is still accepted, byte-identically to
+///   the pre-schedule path.
+#[test]
+fn e1_sync_verifies_qc_under_the_activation_schedule() {
+    let (keys, fks, vs) = schedule_set();
+    let parent = [0x31u8; 32];
+
+    // --- at activation: beacon draw ---------------------------------------
+    let height = SCHEDULE_ACTIVE_HEIGHT;
+    let epoch = cnvrf_v3_epoch_of_height(height);
+    let beacon = CommitteeSchedule::Beacon(Some(EpochBeacon {
+        epoch,
+        output: [0x5Au8; 48],
+    }));
+    // The fixture is only meaningful when the two draws really disagree.
+    let committee_size = micro_committee_size(vs.len());
+    assert!(
+        (committee_size as usize) < vs.len(),
+        "fixture must exceed the committee cap ({committee_size} vs {})",
+        vs.len()
+    );
+    let beacon_committee = committee_for_height(vs, height, 0, committee_size, Some(&parent), beacon);
+    let legacy_committee = committee_for_height(
+        vs,
+        height,
+        0,
+        committee_size,
+        Some(&parent),
+        CommitteeSchedule::ParentHash,
+    );
+    assert_ne!(
+        beacon_committee, legacy_committee,
+        "the beacon draw must select a different committee for this fixture"
+    );
+
+    // Proposer drawn under the BEACON schedule in both cases, so only the
+    // certificate's committee differs.
+    let beacon_qc_block = block_with_schedules(
+        keys,
+        fks,
+        vs,
+        BlockSpec {
+            height,
+            round: 0,
+            parent,
+            root: [0x21u8; 32],
+        },
+        BlockSchedules {
+            proposer: beacon,
+            qc: beacon,
+        },
+    );
+    let legacy_qc_block = block_with_schedules(
+        keys,
+        fks,
+        vs,
+        BlockSpec {
+            height,
+            round: 0,
+            parent,
+            root: [0x21u8; 32],
+        },
+        BlockSchedules {
+            proposer: beacon,
+            qc: CommitteeSchedule::ParentHash,
+        },
+    );
+
+    let resolve_set = |_h: u64| Some(vs.clone());
+    let resolve_beacon = |_h: u64| beacon;
+
+    // 1. A beacon-drawn QC IS accepted by the sync body walk at activation.
+    let walked = validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+        std::slice::from_ref(&beacon_qc_block),
+        height,
+        parent,
+        &resolve_set,
+        MASTERCHAIN_SHARD,
+        &resolve_beacon,
+    )
+    .expect("a beacon-drawn certificate must be syncable at activation (review F2)");
+    assert_eq!(walked, vec![beacon_qc_block.compute_hash()]);
+
+    // 2. The SAME block with a parent-hash-drawn QC is REFUSED: the sync
+    //    verifier attributes under the beacon schedule, so the pre-fix
+    //    certificate no longer carries quorum there.
+    let err = validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+        std::slice::from_ref(&legacy_qc_block),
+        height,
+        parent,
+        &resolve_set,
+        MASTERCHAIN_SHARD,
+        &resolve_beacon,
+    )
+    .expect_err("a parent-hash-drawn certificate must be refused at activation (review F2)");
+    assert!(
+        err.contains("lacks a validator quorum"),
+        "refusal must name the committee mismatch, got: {err}"
+    );
+    assert!(
+        legacy_qc_block
+            .precommit_qc
+            .as_ref()
+            .expect("fixture carries a QC")
+            .verify(vs),
+        "the legacy certificate is genuine under the parent-hash draw"
+    );
+
+    // 3. Below activation a parent-hash QC is still accepted, unchanged.
+    let pre_height = 5u64;
+    let pre_block = block_with_schedules(
+        keys,
+        fks,
+        vs,
+        BlockSpec {
+            height: pre_height,
+            round: 0,
+            parent,
+            root: [0x22u8; 32],
+        },
+        BlockSchedules {
+            proposer: CommitteeSchedule::ParentHash,
+            qc: CommitteeSchedule::ParentHash,
+        },
+    );
+    assert!(
+        validate_sync_chain_for_shard_with_sets_hashed_with_schedule(
+            std::slice::from_ref(&pre_block),
+            pre_height,
+            parent,
+            &resolve_set,
+            MASTERCHAIN_SHARD,
+            &|_| CommitteeSchedule::ParentHash,
+        )
+        .is_ok(),
+        "below activation the parent-hash draw stays the live rule"
     );
 }

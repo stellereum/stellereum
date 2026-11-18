@@ -8,6 +8,7 @@
 
 use crate::consensus::{
     BEACON_DRAW_ACTIVATION_HEIGHT, CNVRF_V3_ACTIVATION_HEIGHT, QC_SPLIT_ACTIVATION_HEIGHT,
+    QC_SPLIT_BY_SIZE_THRESHOLD,
 };
 use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
@@ -77,6 +78,11 @@ pub struct ChainActivationSchedule {
     pub default_chain_id: u64,
     pub pq_rotation_delay_heights: u64,
     pub gates: Vec<ActivationGate>,
+    /// Validator-set size at/above which the full-network QC (epoch/CEC) is
+    /// mandatory — the C1 split's SIZE leg
+    /// (`consensus::sortition::QC_SPLIT_BY_SIZE_THRESHOLD`, review F1). Not a
+    /// height gate, so it lives beside `gates` rather than inside one.
+    pub qc_split_by_size_threshold: usize,
 }
 
 impl ChainActivationSchedule {
@@ -94,8 +100,17 @@ impl ChainActivationSchedule {
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.gates.len() + 1);
         lines.push(format!(
-            "chain_spec: default_chain_id={}, pq_rotation_delay_heights={}",
-            self.default_chain_id, self.pq_rotation_delay_heights
+            "chain_spec: default_chain_id={}, pq_rotation_delay_heights={}, \
+             qc_split_by_size_threshold={}",
+            self.default_chain_id,
+            self.pq_rotation_delay_heights,
+            self.qc_split_by_size_threshold
+        ));
+        lines.push(format!(
+            "QC_SPLIT_BY_SIZE_THRESHOLD [stellereum::consensus::sortition]: \
+             mandatory_at_set_size({}) — full-network QC (CEC) required at/above \
+             this validator count (review F1)",
+            self.qc_split_by_size_threshold
         ));
         for gate in &self.gates {
             let status_desc = match gate.status {
@@ -118,6 +133,7 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
     ChainActivationSchedule {
         default_chain_id: DEFAULT_CHAIN_ID,
         pq_rotation_delay_heights: PQ_ROTATION_DELAY_HEIGHTS,
+        qc_split_by_size_threshold: QC_SPLIT_BY_SIZE_THRESHOLD,
         gates: vec![
             ActivationGate::new(
                 "QC_SPLIT_ACTIVATION_HEIGHT",
@@ -225,6 +241,13 @@ mod tests {
             schedule.pq_rotation_delay_heights,
             PQ_ROTATION_DELAY_HEIGHTS
         );
+        assert_eq!(
+            schedule.qc_split_by_size_threshold, QC_SPLIT_BY_SIZE_THRESHOLD,
+            "the C1 split's size leg must be registered from its owning constant"
+        );
+        // The registered value is the F1 crossing point: 191 is the last size
+        // a 128-seat committee can still carry, 192 the first it cannot.
+        assert_eq!(schedule.qc_split_by_size_threshold, 192);
 
         let expected = [
             ("QC_SPLIT_ACTIVATION_HEIGHT", QC_SPLIT_ACTIVATION_HEIGHT),
@@ -288,6 +311,7 @@ mod tests {
         let genesis_schedule = ChainActivationSchedule {
             default_chain_id: DEFAULT_CHAIN_ID,
             pq_rotation_delay_heights: PQ_ROTATION_DELAY_HEIGHTS,
+            qc_split_by_size_threshold: QC_SPLIT_BY_SIZE_THRESHOLD,
             gates: vec![ActivationGate::new(
                 "GENESIS_GATE",
                 "test",
@@ -332,11 +356,14 @@ mod tests {
     fn summary_lines_includes_header_and_all_gates() {
         let schedule = current_activation_schedule();
         let lines = schedule.summary_lines();
-        assert_eq!(lines.len(), schedule.gates.len() + 1);
+        // Header + the size-leg line + one line per height gate.
+        assert_eq!(lines.len(), schedule.gates.len() + 2);
         assert!(lines[0].contains(&schedule.default_chain_id.to_string()));
         assert!(lines[0].contains(&schedule.pq_rotation_delay_heights.to_string()));
+        assert!(lines[1].contains("QC_SPLIT_BY_SIZE_THRESHOLD"));
+        assert!(lines[1].contains(&schedule.qc_split_by_size_threshold.to_string()));
 
-        for (gate, line) in schedule.gates.iter().zip(lines.iter().skip(1)) {
+        for (gate, line) in schedule.gates.iter().zip(lines.iter().skip(2)) {
             assert!(line.contains(gate.name));
             assert!(line.contains(gate.module));
         }

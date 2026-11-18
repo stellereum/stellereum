@@ -562,47 +562,80 @@ async fn message_kinds_come_from_direction_and_flags_only() {
     assert!(!weird.is_transfer() && !weird.is_ack() && !weird.is_bounce());
 }
 
-/// Happy path: consume -> ack -> source commits the ack -> transfer completes
-/// -> no bounce is ever admitted afterwards (even past the timeout).
+/// Happy path: the §9 2PC PREPARE -> PREPARE-ACK -> COMMIT flow completes the
+/// transfer (one credit) -> no bounce is ever admitted afterwards (even past
+/// the timeout), and a replayed terminal record cannot credit twice.
+///
+/// XSHARD-01: this replaces the legacy consume->ack dance. The legacy inbound
+/// CREDIT is refused (it cannot prove the source-side debit in one step), so
+/// value moves through the 2PC only; the M3 property under test — a completed
+/// transfer never bounces and a replay never pays — is unchanged.
 #[tokio::test]
 async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
+    use stellereum::xshard2pc::XpcActivation;
+
     let validator = key(1);
     let sender_addr = pq_id(2);
     let recipient_addr = key(3).verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let txh = produce_transfer(&mut sc, 2, recipient_addr, 1).await;
+    sc.with_xpc_activation(XpcActivation::FromHeight(0));
+    let tx = pq_tx(2, recipient_addr, 100, 10, 0, SHARD0, SHARD1);
+    let txh = tx.compute_tx_hash();
+    sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
 
-    // Target consumes: recipient credited, ack published to the transport.
-    sc.run_height(SHARD1, 2).await;
-    assert_eq!(balance(&sc, SHARD1, &recipient_addr).await, 100);
-    let inbound0 = sc.transport.fetch_cross_shard_inbound(SHARD0).await;
-    assert_eq!(inbound0.len(), 1, "target must publish exactly one ack");
-    assert!(inbound0[0].is_ack());
-    assert_eq!(inbound0[0].tx.compute_tx_hash(), txh);
-    let ack_bytes = inbound0[0].clone();
-
-    // Source commits the ack record: no value moves, transfer completes.
-    let bh = sc.run_height(SHARD0, 3).await;
+    // Source height 1: PREPARE + escrow (the debit).
+    let bh = sc.run_height(SHARD0, 1).await;
     let blk = block_of(&sc, SHARD0, bh);
     assert!(
-        blk.cross_shard_out
-            .iter()
-            .any(|m| m.is_ack() && m.tx.compute_tx_hash() == txh),
-        "source must commit the ack record"
+        blk.cross_shard_out.iter().any(|m| m.is_prepare()),
+        "the source must publish a PREPARE, not a bare transfer"
     );
-    assert!(sc.shard(SHARD0).nodes[0].is_transfer_completed(&txh));
     assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 100 - 10);
+
+    // Target height 2: PREPARED (vote YES), no credit yet. Height 3 publishes
+    // the PREPARE-ACK ("ack" in the M3 sense: the target's vote).
+    sc.run_height(SHARD1, 2).await;
+    assert_eq!(balance(&sc, SHARD1, &recipient_addr).await, 0);
+    sc.run_height(SHARD1, 3).await;
+    let vote = sc
+        .transport
+        .fetch_cross_shard_inbound(SHARD0)
+        .await
+        .into_iter()
+        .find(|m| m.is_prepare_ack() && m.tx.compute_tx_hash() == txh)
+        .expect("target must publish a PREPARE-ACK");
+    assert!(vote.merkle_inclusion_proof.is_some());
+
+    // Source height 4: consumes the vote -> COMMITTED. Height 5 publishes the
+    // COMMIT.
+    sc.run_height(SHARD0, 4).await;
+    let bh = sc.run_height(SHARD0, 5).await;
+    let blk = block_of(&sc, SHARD0, bh);
+    let commit = blk
+        .cross_shard_out
+        .iter()
+        .find(|m| m.is_commit() && m.tx.compute_tx_hash() == txh)
+        .cloned()
+        .expect("source must publish the COMMIT");
+    assert!(sc.shard(SHARD0).nodes[0].is_transfer_completed(&txh));
+
+    // Target height 6: consumes the COMMIT, credits exactly once.
+    sc.run_height(SHARD1, 6).await;
+    assert_eq!(balance(&sc, SHARD1, &recipient_addr).await, 100);
+
     // Consumed KV entries are pruned: nothing lingers for the source shard.
     assert!(sc
         .transport
         .fetch_cross_shard_inbound(SHARD0)
         .await
-        .is_empty());
+        .iter()
+        .all(|m| m.tx.compute_tx_hash() != txh));
 
-    // Past the timeout, no bounce may be constructed for a completed transfer.
+    // Past the timeout, no bounce may be constructed for a completed 2PC
+    // transfer (its decision is two-sided; the unilateral bounce is gone).
     let mut saw_bounce = false;
-    for h in 3..=(3 + CROSS_SHARD_TIMEOUT_HEIGHTS + 2) {
+    for h in 6..=(6 + CROSS_SHARD_TIMEOUT_HEIGHTS + 2) {
         let bh = sc.run_height(SHARD0, 100 + h).await;
         let blk = block_of(&sc, SHARD0, bh);
         saw_bounce |= blk.cross_shard_out.iter().any(|m| m.is_bounce());
@@ -611,29 +644,27 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
     assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 100 - 10);
     assert_eq!(balance(&sc, SHARD1, &recipient_addr).await, 100);
 
-    // Replaying the consumed ack is refused at proposal (filtered) and at
-    // validation (forged block rejected).
-    sc.transport
-        .broadcast_cross_shard(&ack_bytes)
-        .await
-        .unwrap();
-    let bh = sc.run_height(SHARD0, 999).await;
-    let blk = block_of(&sc, SHARD0, bh);
+    // Replaying the terminal COMMIT is filtered at proposal (completion) and
+    // refused at validation; the credit stays exactly once.
+    sc.transport.broadcast_cross_shard(&commit).await.unwrap();
+    let bh = sc.run_height(SHARD1, 999).await;
+    let blk = block_of(&sc, SHARD1, bh);
     assert!(
         blk.cross_shard_out
             .iter()
-            .all(|m| m.msg_id != ack_bytes.msg_id),
-        "a consumed ack must not be re-included"
+            .all(|m| m.msg_id != commit.msg_id),
+        "a completed record must not be re-included"
     );
-    let node = &sc.shard(SHARD0).nodes[0];
+    assert_eq!(balance(&sc, SHARD1, &recipient_addr).await, 100);
+    let node = &sc.shard(SHARD1).nodes[0];
     let root = node.state_root().await;
     let mut forged = Block {
-        shard_id: SHARD0,
+        shard_id: SHARD1,
         height: node.height(),
         prev_hash: node.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]),
         state_root: root,
         transactions: vec![],
-        cross_shard_out: vec![ack_bytes.clone()],
+        cross_shard_out: vec![commit.clone()],
         timestamp: 1_000,
         proposer: validator.verifying_key().to_bytes(),
         validator_signatures: vec![],
@@ -648,12 +679,12 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
     forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
-        .expect_err("replayed ack must be refused");
+        .expect_err("replayed terminal record must be refused");
     assert!(
         err.contains("replayed") || err.contains("completed"),
         "{err}"
     );
-    let _ = CrossShardKey::of(&ack_bytes);
+    let _ = CrossShardKey::of(&commit);
 }
 
 /// Failure path: the target never consumes; at produce_height + TIMEOUT the

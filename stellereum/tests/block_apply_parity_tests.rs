@@ -13,8 +13,8 @@
 //! silently forks a reorg (same height, two states):
 //!
 //!   1. FEE RULE - `apply_transaction` charged the gas actually CONSUMED, the
-//!      block path charges the DECLARED `gas_limit` (which admission reserved
-//!      and which `fees_collected` credits to the proposer).
+//!      block path charged the DECLARED `gas_limit` (FEE-01; both paths now
+//!      charge the consumed gas, see test 2).
 //!   2. PROPOSER FEES - the block path credited `fees_collected` to the
 //!      proposer; the reorg path credited nobody, so the proposer's balance
 //!      (and every later fee arithmetic) differed.
@@ -39,7 +39,7 @@
 //!
 //! | Dimension | LIVE (`try_finalize` / adopt / walk / replay) | REORG (`ChainState::apply_block`) | Verdict |
 //! |---|---|---|---|
-//! | gas-fee rule | declared `tx.gas_limit` | declared `tx.gas_limit` | **UNIFIED** for both block paths. The single-tx API `apply_transaction` still charges gas *consumed* - **pinned** divergence, test 2 (unifying = charging users for gas they never burned). |
+//! | gas-fee rule | `min(gas_limit, gas_used + intrinsic)`, floored | same | **UNIFIED** for BOTH block paths AND the single-tx API (FEE-01): `gate_limit` is a cap, never the price, so unused gas is refunded. Test 2 pins that the old declared-limit rule is gone. |
 //! | payload-failure semantics | `execute_payload` clone-commit; `commit_native` atomic | same code | **UNIFIED** (pre-existing, `tests/hunt_atomicity.rs`). A rejected tx moves no coins; both report `status=false`. |
 //! | proposer fee credit | `fees_collected` -> `credit_native(proposer)` | same | **UNIFIED** (was: reorg credited nobody). |
 //! | block reward | `block_reward_for(gov, default)` -> `distribute_reward` | same helper, same call | **UNIFIED** (was: live only). |
@@ -416,6 +416,9 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // quorum below is unsatisfiable. Carrying it makes this test the
     // end-to-end live-vs-reorg parity proof under a rotation boundary.
     let mut parent_qc: Option<stellereum::consensus::QuorumCertificate> = None;
+    // FEE-01: fees are no longer the declared limits, so the proposer's
+    // credit is accumulated from the per-block receipts instead of a literal.
+    let mut total_fees: u64 = 0;
     for (i, txs) in blocks.into_iter().enumerate() {
         let height = (i + 1) as u64;
         let root = engine_live.get_state_root().await;
@@ -464,6 +467,7 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             live.applied_txs, reorg.applied_txs,
             "APPLIED TX COUNT DIVERGED at height {height}"
         );
+        total_fees = total_fees.saturating_add(live.applied_fees.iter().sum::<u64>());
         prev_hash = bh;
     }
 
@@ -472,13 +476,17 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     assert_eq!(live.applied_txs, 5);
     assert_eq!(reorg.applied_txs, 5);
 
-    // --- the fee rule: BOTH block paths charge the DECLARED limit ----------
-    // alice: 1_000+500_000 (plain) + 2_000+500_000 (payload, declared) + the
-    // payload's own Transfer of 7_000 to carol + 500+500_000. Charging the
-    // consumed 280_000 instead of the declared 500_000 for the payload
-    // transaction would leave her richer on exactly one of the two engines.
-    let expected_alice =
-        2_000_000 - (1_000 + 500_000) - (2_000 + 500_000) - 7_000 - (500 + 500_000);
+    // --- the fee rule: BOTH block paths charge CONSUMED gas (FEE-01) --------
+    // alice: 1_000+GAS_BASIC_TRANSFER (plain) + 2_000+GAS_BASIC_TRANSFER
+    // (payload, one `Transfer`) + the payload's own Transfer of 7_000 to
+    // carol + 500+GAS_BASIC_TRANSFER. The three transactions DECLARE 500 000
+    // gas each; FEE-01 bills only what they consumed, and the two block paths
+    // must agree on it or a reorg forks.
+    let expected_alice = 2_000_000
+        - (1_000 + GAS_BASIC_TRANSFER)
+        - (2_000 + GAS_BASIC_TRANSFER)
+        - 7_000
+        - (500 + GAS_BASIC_TRANSFER);
     assert_eq!(balance(&engine_live, &pq_id(&alice)).await, expected_alice);
     assert_eq!(
         balance(&engine_reorg, &pq_id(&alice)).await,
@@ -551,17 +559,18 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
         );
         assert_eq!(
             balance(e, &id_of(&ks[0])).await,
-            proposer_before + 3_000_000,
-            "only the three blocks' declared fees (1M each) may credit the \
-             proposer, never a claim payout"
+            proposer_before + total_fees,
+            "only the fees actually charged (FEE-01: consumed gas, not the \
+             declared limits) may credit the proposer, never a claim payout"
         );
         // The reverted claim still paid the floor and consumed its nonce
         // (attributable execution failure), on both paths identically.
         let claimer_acct = e.get_account(&pq_id(&claimer)).await.unwrap();
         assert_eq!(
             claimer_acct.balance,
-            2_000_000 - 500_000,
-            "a reverted claim pays the declared floor"
+            2_000_000 - GAS_BASIC_TRANSFER,
+            "FEE-01: a reverted claim pays the intrinsic envelope it consumed, \
+             not its 500 000 declaration"
         );
         assert_eq!(claimer_acct.nonce, 1, "a reverted claim consumes its nonce");
     }
@@ -618,30 +627,29 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
 }
 
 // ===========================================================================
-// 2. The divergence that MUST remain, pinned with its reason
+// 2. FEE-01: gas is priced by what execution CONSUMED, on every path
 // ===========================================================================
 
-/// The single-transaction API (`InMemoryStateEngine::apply_transaction`) charges
-/// the gas the payload actually CONSUMED; every BLOCK application charges the
-/// DECLARED `gas_limit`.
+/// FEE-01 (P0): the block path used to pass the DECLARED `gas_limit` as the
+/// gas it had charged, so `min(gas_charged, gas_limit)` was a no-op and every
+/// block-applied transaction paid its full declaration - no refund for unused
+/// gas, and a failure paid the whole limit too. The single-transaction API
+/// (`InMemoryStateEngine::apply_transaction`) always charged what the payload
+/// consumed, so the two paths disagreed about the same transaction.
 ///
-/// WHY IT REMAINS: admission on the block path reserves exactly
-/// `amount + gas_limit`, `fees_collected` (the sum of declared limits) is what
-/// the proposer is credited with inside the shared transition, and the block
-/// rule is what the chain has always charged. Flipping `apply_transaction` to
-/// the declared limit would be an ECONOMIC change (it would start charging
-/// unused gas), not a consistency fix - so it is pinned rather than unified:
+/// Both now pass the executor's measurement and `commit_native` applies one
+/// rule: `max(min(gas_limit, gas_used + intrinsic), floor_base) + surcharge`.
+/// This test pins the unification from both ends:
 ///
-///   * `bonding_moves_real_funds_and_grants_validator_power` pins the single-tx
-///     rule (charges `GAS_STAKE_BOND`, not the 500_000 declared);
-///   * `block_execution_runs_payloads_and_conserves_native_value` pins the
-///     block rule (charges the declared limit, 500_000 here).
-///
-/// What WAS a bug is now closed: the REORG path used to sit on the single-tx
-/// side of this line, so it charged a different fee for the same block than the
-/// node that produced it. Both block paths are asserted equal below.
+///   * the same transaction costs the SAME on the single-tx API and through
+///     the block core (the old pinned divergence, which encoded the wrong
+///     block fee, is asserted gone);
+///   * the fee is the payload's consumed gas (`GAS_BASIC_TRANSFER` for one
+///     `Transfer`), NOT the 500 000 declared;
+///   * `fees_collected` is the sum of fees actually charged (the proposer's
+///     credit), so value is conserved.
 #[tokio::test]
-async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declared() {
+async fn block_path_charges_consumed_gas_like_the_single_tx_api() {
     let ks = keys(1);
     let claimer = pq_user();
     let to = [0x51u8; 32];
@@ -676,8 +684,9 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
         "the single-tx API charges the consumed gas, not the declared limit"
     );
 
-    // (b) block application: charges the declared limit. Run it through the
-    //     shared core with a Block, i.e. the exact code both block paths call.
+    // (b) block application: charges what execution CONSUMED too (FEE-01).
+    //     Run it through the shared core with a Block, i.e. the exact code
+    //     both block paths call.
     let block_e = Arc::new(InMemoryStateEngine::new());
     block_e
         .update_account(AccountState::new(pq_id(&claimer), 1_000_000))
@@ -688,22 +697,19 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
     let block_sender = balance(&block_e, &pq_id(&claimer)).await;
     assert_eq!(
         block_sender,
-        1_000_000 - 1_000 - 3_000 - declared,
-        "every block application charges the DECLARED limit"
+        1_000_000 - 1_000 - 3_000 - GAS_BASIC_TRANSFER,
+        "a block application charges the consumed gas, not the 500 000 declared"
     );
     assert_eq!(
-        out.fees_collected, declared,
-        "fees_collected is the sum of declared limits - the proposer's credit"
+        out.fees_collected, GAS_BASIC_TRANSFER,
+        "fees_collected is the sum of fees actually charged - the proposer's credit"
     );
 
-    // The divergence is real and DELIBERATE: unifying it is an economic change,
-    // so the two rules are asserted to differ, on the record.
-    assert_ne!(
+    // FEE-01: the old pinned DIVERGENCE is gone. Same transaction, same cost.
+    assert_eq!(
         single_sender, block_sender,
-        "PINNED DIVERGENCE: single-tx API charges consumed gas, blocks charge \
-         the declared limit (admission reserved it and fees_collected is defined \
-         as the sum of declared limits). Unifying would charge users for gas \
-         they never burned."
+        "FEE-01: the single-tx API and the block core must charge the same fee \
+         for the same transaction (the declared limit was the over-charge)"
     );
 
     // And the two BLOCK paths still cannot differ from each other.

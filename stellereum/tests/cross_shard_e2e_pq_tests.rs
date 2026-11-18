@@ -115,8 +115,17 @@ async fn setup_two_shard_cluster(
     )
 }
 
+/// Full lifecycle of a cross-shard value transfer.
+///
+/// XSHARD-01: the value path is the §9 2PC (PREPARE → PREPARE-ACK → COMMIT).
+/// The legacy one-way credit is refused because a message published in the
+/// same block that escrows it cannot prove the source-side debit. The
+/// properties this test pins — exact source debit, exactly-once target credit,
+/// a two-sided completion, no lingering mailbox entry — are unchanged.
 #[tokio::test]
 async fn test_cross_shard_transfer_and_ack_lifecycle() {
+    use stellereum::xshard2pc::XpcActivation;
+
     let validator = test_key(10);
     let recipient = test_key(30);
 
@@ -131,6 +140,7 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
 
     let mut cluster =
         setup_two_shard_cluster(&validator, &[(sender_addr, initial_balance)], &[]).await;
+    cluster.with_xpc_activation(XpcActivation::FromHeight(0));
 
     // 1. Send cross-shard transfer from Shard 0 to Shard 1
     let tx = pq_tx(
@@ -147,7 +157,8 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
     // Broadcast tx to both shards' nodes
     cluster.broadcast_tx(tx.clone()).await;
 
-    // 2. Shard 0 executes height 1: packages tx and emits CrossShardMessage in cross_shard_out
+    // 2. Shard 0 executes height 1: packages tx, ESCROWS the value and emits
+    //    the PREPARE in cross_shard_out (never a bare transfer).
     let s0_h1_hash = cluster.run_height(SHARD0, 100).await;
     let s0_block1 = cluster.shard(SHARD0).nodes[0]
         .blocks
@@ -158,19 +169,23 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
     assert_eq!(
         s0_block1.cross_shard_out.len(),
         1,
-        "Shard 0 must produce 1 outbound cross-shard message"
+        "Shard 0 must produce 1 outbound cross-shard record"
     );
     let outbound_msg = &s0_block1.cross_shard_out[0];
-    assert!(outbound_msg.is_transfer());
+    assert!(outbound_msg.is_prepare());
+    assert!(
+        !outbound_msg.is_transfer(),
+        "a 2PC transfer is not a bare transfer"
+    );
     assert_eq!(outbound_msg.source_shard, SHARD0);
     assert_eq!(outbound_msg.target_shard, SHARD1);
     assert_eq!(outbound_msg.tx.compute_tx_hash(), tx_hash);
     assert!(
         outbound_msg.merkle_inclusion_proof.is_some(),
-        "Transfer must carry a Merkle inclusion proof"
+        "the PREPARE must carry a Merkle inclusion proof"
     );
 
-    // Check sender balance on Shard 0: debited by amount + fee
+    // Check sender balance on Shard 0: debited by amount + fee (the escrow).
     let s0_sender_bal = cluster.shard(SHARD0).nodes[0]
         .state
         .get_account(&sender_addr)
@@ -179,15 +194,50 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
         .balance;
     assert_eq!(s0_sender_bal, initial_balance - transfer_amount - fee);
 
-    // 3. Shard 1 executes height 1: fetches inbound messages, verifies Merkle proof against Shard 0's root, credits recipient
-    let s1_h1_hash = cluster.run_height(SHARD1, 101).await;
-    let _s1_block1 = cluster.shard(SHARD1).nodes[0]
+    // 3. Shard 1 height 1: consumes the PREPARE (records PREPARED, votes YES)
+    //    but does NOT credit yet.
+    cluster.run_height(SHARD1, 101).await;
+    let s1_recipient_bal = cluster.shard(SHARD1).nodes[0]
+        .state
+        .get_account(&recipient_addr)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
+    assert_eq!(s1_recipient_bal, 0, "no credit before the source commits");
+
+    // Shard 1 height 2: publishes the PREPARE-ACK (its quorum-signed vote).
+    cluster.run_height(SHARD1, 102).await;
+    let inbound_for_s0 = cluster.transport.fetch_cross_shard_inbound(SHARD0).await;
+    let vote = inbound_for_s0
+        .iter()
+        .find(|m| m.is_prepare_ack() && m.tx.compute_tx_hash() == tx_hash)
+        .expect("Shard 1 must publish a PREPARE-ACK for Shard 0");
+    assert!(
+        vote.merkle_inclusion_proof.is_some(),
+        "the vote proves the target's committed PREPARED state"
+    );
+
+    // 4. Shard 0 height 2: consumes the vote and COMMITS; height 3 publishes
+    //    the COMMIT and the transfer completes.
+    cluster.run_height(SHARD0, 103).await;
+    let s0_h3_hash = cluster.run_height(SHARD0, 104).await;
+    let s0_block3 = cluster.shard(SHARD0).nodes[0]
         .blocks
-        .get(&s1_h1_hash)
+        .get(&s0_h3_hash)
         .cloned()
         .unwrap();
+    assert!(
+        s0_block3
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_commit() && m.tx.compute_tx_hash() == tx_hash),
+        "Shard 0 must publish the COMMIT"
+    );
+    assert!(cluster.shard(SHARD0).nodes[0].is_transfer_completed(&tx_hash));
 
-    // Check recipient balance on Shard 1: credited with exactly transfer_amount
+    // 5. Shard 1 height 3: consumes the COMMIT and credits the recipient —
+    //    exactly once, with the escrow-backed amount.
+    cluster.run_height(SHARD1, 105).await;
     let s1_recipient_bal = cluster.shard(SHARD1).nodes[0]
         .state
         .get_account(&recipient_addr)
@@ -199,41 +249,25 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
         "Recipient on Shard 1 must be credited with the transfer amount"
     );
 
-    // Shard 1 transport mailbox should now contain the Ack record for Shard 0
-    let inbound_for_s0 = cluster.transport.fetch_cross_shard_inbound(SHARD0).await;
-    assert_eq!(
-        inbound_for_s0.len(),
-        1,
-        "Shard 1 must publish an Ack message for Shard 0"
-    );
-    let ack_msg = &inbound_for_s0[0];
-    assert!(ack_msg.is_ack(), "Message must be an Ack");
-    assert_eq!(ack_msg.tx.compute_tx_hash(), tx_hash);
-
-    // 4. Shard 0 executes height 2: commits the Ack record and marks the transaction completed
-    let s0_h2_hash = cluster.run_height(SHARD0, 102).await;
-    let s0_block2 = cluster.shard(SHARD0).nodes[0]
-        .blocks
-        .get(&s0_h2_hash)
-        .cloned()
-        .unwrap();
-    assert!(
-        s0_block2
-            .cross_shard_out
-            .iter()
-            .any(|m| m.is_ack() && m.tx.compute_tx_hash() == tx_hash),
-        "Shard 0 block 2 must commit the Ack"
-    );
-
-    // Transfer is marked completed on Shard 0
-    assert!(cluster.shard(SHARD0).nodes[0].is_transfer_completed(&tx_hash));
-
-    // Mailbox is now clean
+    // Mailbox is now clean for the source shard.
     assert!(cluster
         .transport
         .fetch_cross_shard_inbound(SHARD0)
         .await
-        .is_empty());
+        .iter()
+        .all(|m| m.tx.compute_tx_hash() != tx_hash));
+
+    // No later height credits a second time.
+    cluster.run_height(SHARD1, 106).await;
+    assert_eq!(
+        cluster.shard(SHARD1).nodes[0]
+            .state
+            .get_account(&recipient_addr)
+            .await
+            .unwrap()
+            .balance,
+        transfer_amount
+    );
 }
 
 #[tokio::test]

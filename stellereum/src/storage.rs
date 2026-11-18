@@ -3203,15 +3203,80 @@ pub enum PersistPushPolicy {
     /// Wait (bounded) for the writer to drain before dropping: every job
     /// class carrying consensus-relevant data (see `push`'s loss assessment).
     BoundedWait,
+    /// Consensus-critical class (`Consensus` safety checkpoint / `Finalized`
+    /// tip pointer): ALWAYS attempt the bounded drain, including on a
+    /// current-thread runtime where the synchronous producer cannot hand the
+    /// thread to the writer. The wait is deferred to a spawned task instead
+    /// of dropping immediately. A drop is still possible after the budget
+    /// expires (wedged disk) but is LOUD, counted, and names the recovery
+    /// consequence — never silent.
+    CriticalWait,
 }
 
 /// Pure classifier for the push drop-policy: which job classes may be
 /// dropped outright when the persist queue is full, and which must wait out
 /// a bounded drain first. Pure so the policy is test-pinned without timing.
+///
+/// Audit F2 (mainnet blocker): `Consensus` carries the per-height BFT safety
+/// checkpoint and `Finalized` the durable tip pointer. Neither may be
+/// dropped just because the producer happens to run on a current-thread
+/// runtime, so both are `CriticalWait` (deferred drain) rather than the
+/// generic `BoundedWait`.
 pub fn persist_push_policy(job: &PersistJob) -> PersistPushPolicy {
     match job {
         PersistJob::Prune { .. } => PersistPushPolicy::DropFirst,
+        PersistJob::Consensus(_) | PersistJob::Finalized { .. } => {
+            PersistPushPolicy::CriticalWait
+        }
         _ => PersistPushPolicy::BoundedWait,
+    }
+}
+
+/// Human label for a job class, used by the drop log so an operator can name
+/// exactly what was lost without decoding an enum.
+pub fn persist_job_label(job: &PersistJob) -> &'static str {
+    match job {
+        PersistJob::Block(_) => "Block (finalized body)",
+        PersistJob::State { .. } => "State snapshot",
+        PersistJob::Domains { .. } => "Domains snapshot",
+        PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
+        PersistJob::XshardHeaders { .. } => "cross-shard header registry",
+        PersistJob::Consensus(_) => "Consensus safety checkpoint",
+        PersistJob::Finalized { .. } => "Finalized tip pointer",
+        PersistJob::Prune { .. } => "Prune pass",
+        PersistJob::Receipts { .. } => "Receipts",
+        PersistJob::Flush => "Flush barrier",
+    }
+}
+
+/// Documented recovery consequence of losing one job of this class. Shown
+/// verbatim in the LOUD drop path: a critical drop must never be a bare
+/// counter bump that leaves the operator guessing whether finality is safe.
+pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
+    match job {
+        PersistJob::Prune { .. } => {
+            "nothing durable is lost; the next snapshot cadence re-schedules the prune"
+        }
+        PersistJob::State { .. } | PersistJob::Domains { .. } => {
+            "one periodic snapshot is lost; the next cadence captures a newer height, widening the crash-recovery gap by at most one interval (half-pairs are refused loudly on restore)"
+        }
+        PersistJob::Block(_) => {
+            "one finalized body is missing until adopter replication re-fetches it by hash"
+        }
+        PersistJob::Finalized { .. } => {
+            "the durable tip pointer lags; the next boot re-walks from the last persisted finalized height (safe, slower). Finality itself is unaffected"
+        }
+        PersistJob::Consensus(_) => {
+            "this height's BFT safety checkpoint is not durable; the node re-locks/re-derives it on restart and finality remains protected by the consensus certificate"
+        }
+        PersistJob::Receipts { .. } => {
+            "receipts for this height are re-derivable by re-application; RPC serves no receipt until then"
+        }
+        PersistJob::CnVrfV3 { .. }
+        | PersistJob::XshardHeaders { .. }
+        | PersistJob::Flush => {
+            "recoverable auxiliary state; the next cadence/finalize refreshes it"
+        }
     }
 }
 
@@ -3224,6 +3289,62 @@ pub const PERSIST_BLOCKING_WAIT_MS: u64 = 200;
 /// Pace between queue-space retries inside the bounded wait: 5ms (up to ~40
 /// retries per wait). Yields the thread instead of spinning.
 pub const PERSIST_RETRY_PACE_MS: u64 = 5;
+
+/// Record one persist-job drop: always counted, always LOUD, and — for a
+/// consensus-critical class — names the exact recovery consequence. Kept in
+/// one place so the synchronous and deferred (current-thread) drop paths can
+/// never diverge in either metric or message.
+fn record_persist_drop(
+    policy: PersistPushPolicy,
+    label: &'static str,
+    consequence: &'static str,
+) {
+    match policy {
+        PersistPushPolicy::CriticalWait => {
+            tracing::error!(
+                "[storage] CRITICAL persist job DROPPED after {PERSIST_BLOCKING_WAIT_MS}ms \
+                 of bounded drain: {label}. Consequence: {consequence}. Counted in \
+                 stell_persist_queue_dropped_total — a repeating drop means the disk is too \
+                 slow or wedged; recover by restoring from a verified snapshot and fixing I/O."
+            );
+            eprintln!(
+                "[storage] CRITICAL persist job DROPPED ({label}) after \
+                 {PERSIST_BLOCKING_WAIT_MS}ms; consequence: {consequence} \
+                 (counted: stell_persist_queue_dropped_total)"
+            );
+        }
+        _ => {
+            eprintln!(
+                "[storage] persist queue full; dropping {label} (disk too slow? — counted, \
+                 alert on stell_persist_queue_dropped_total; consequence: {consequence})"
+            );
+        }
+    }
+    crate::metrics::global().inc_persist_queue_dropped();
+}
+
+/// Decrement the live queue-depth gauge exactly once, saturating at zero.
+/// Used by the writer on dequeue and by the deferred current-thread send when
+/// a reservation is abandoned (drop or closed writer), so `pending()` never
+/// leaks a phantom job — or hides a real one.
+fn decrement_queue_depth(depth: &std::sync::atomic::AtomicU64) -> u64 {
+    let mut prev = depth.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = prev.saturating_sub(1);
+        match depth.compare_exchange_weak(
+            prev,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => prev = actual,
+        }
+    }
+    let now_depth = prev.saturating_sub(1);
+    crate::metrics::global().set_persist_queue_depth(now_depth);
+    now_depth
+}
 
 impl AsyncPersistence {
     /// Start the background writer. Returns a handle for enqueuing jobs and the
@@ -3239,25 +3360,11 @@ impl AsyncPersistence {
                 // lands. `saturating` — a missed count must never wrap the
                 // gauge to u64::MAX.
                 // L-04: `fetch_update` is deprecated on newer toolchains; the
-                // explicit CAS loop below is exactly its body for an
-                // always-Some closure (same race-safety: concurrent dequeues
-                // serialize on the compare-exchange, the counter saturates at
-                // 0 instead of wrapping).
-                let mut prev = depth_worker.load(std::sync::atomic::Ordering::Relaxed);
-                loop {
-                    let next = prev.saturating_sub(1);
-                    match depth_worker.compare_exchange_weak(
-                        prev,
-                        next,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(actual) => prev = actual,
-                    }
-                }
-                let now_depth = prev.saturating_sub(1);
-                crate::metrics::global().set_persist_queue_depth(now_depth);
+                // explicit CAS loop in `decrement_queue_depth` is exactly its
+                // body for an always-Some closure (same race-safety:
+                // concurrent dequeues serialize on the compare-exchange, the
+                // counter saturates at 0 instead of wrapping).
+                decrement_queue_depth(&depth_worker);
                 let res = match job {
                     PersistJob::Block(b) => st.put_block(&b).map(|_| ()),
                     PersistJob::State { height, snapshot } => st.put_state(height, &snapshot),
@@ -3346,26 +3453,26 @@ impl AsyncPersistence {
     ///   (`put_verified_block` re-fetches by hash), but a missing body is
     ///   serving-visible until healed — hence bounded-wait, not drop-first.
     /// * `Finalized`: the tip pointer. Loss forces a full re-walk at next
-    ///   boot (safe but slow) — hence bounded-wait, not drop-first.
-    /// * `Receipts` / `Consensus`: per-height durable indexes / safety
-    ///   checkpoint. Re-derivable (receipts by re-application, consensus by
-    ///   re-locking) but safety-relevant — hence bounded-wait.
+    ///   boot (safe but slow) — CRITICAL, so it is always granted a bounded
+    ///   drain (deferred on a current-thread runtime) before any drop.
+    /// * `Consensus`: the per-height BFT safety checkpoint. Re-derivable by
+    ///   re-locking, but consensus-critical — same deferred bounded drain as
+    ///   `Finalized`.
+    /// * `Receipts`: per-height durable indexes. Re-derivable by
+    ///   re-application — hence bounded-wait.
     /// * `Flush`: a durability barrier with no data — dropping it only
     ///   widens the fsync window; still bounded-waited (cheap) for uniformity.
     fn push(&self, job: PersistJob) {
-        let droppable = persist_push_policy(&job) == PersistPushPolicy::DropFirst;
+        let policy = persist_push_policy(&job);
+        let label = persist_job_label(&job);
+        let consequence = persist_drop_consequence(&job);
         match self.tx.try_send(job) {
             Ok(()) => {
-                let d = self
-                    .queue_depth
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(1);
-                crate::metrics::global().set_persist_queue_depth(d);
+                self.bump_queue_depth();
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
-                if droppable {
-                    eprintln!("[storage] persist queue full; dropping a prune job (re-scheduled next cadence)");
-                    crate::metrics::global().inc_persist_queue_dropped();
+                if policy == PersistPushPolicy::DropFirst {
+                    record_persist_drop(policy, label, consequence);
                     return;
                 }
                 // Bounded blocking for consensus-relevant jobs (audit F2):
@@ -3384,33 +3491,7 @@ impl AsyncPersistence {
                 // Worst case is a bounded tick delay followed by a counted
                 // drop (whose loss class is documented above), never a hang
                 // and never silent loss.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
-                let mut job = Some(job);
-                let mut retry_fn = || {
-                    while std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(PERSIST_RETRY_PACE_MS));
-                        match self
-                            .tx
-                            .try_send(job.take().expect("job held across retries"))
-                        {
-                            Ok(()) => {
-                                let d = self
-                                    .queue_depth
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    .saturating_add(1);
-                                crate::metrics::global().set_persist_queue_depth(d);
-                                return true;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(j)) => {
-                                job = Some(j);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return true,
-                        }
-                    }
-                    false
-                };
-
+                //
                 // `block_in_place` is what lets the WRITER task drain the
                 // queue while this thread waits - but it PANICS on a
                 // current-thread runtime ("can call blocking only when
@@ -3423,42 +3504,115 @@ impl AsyncPersistence {
                 //     bounded wait can actually succeed.
                 //   * CurrentThread: the writer runs ONLY when the producer
                 //     awaits, and this is a SYNCHRONOUS push - so the writer
-                //     cannot drain while we wait. The bounded wait could
-                //     never succeed: skip it and drop now (loudly, counted)
-                //     instead of burning the whole budget on a guaranteed
-                //     timeout.
+                //     cannot drain while we wait. For a CRITICAL job the wait
+                //     is DEFERRED to a spawned task (which the runtime polls
+                //     as soon as the producer yields) instead of dropping
+                //     immediately; a non-critical BoundedWait job keeps the
+                //     historical immediate counted drop.
                 //   * No runtime at all: nothing can drain either; keep the
                 //     historical bounded wait.
                 let flavor = tokio::runtime::Handle::try_current()
                     .ok()
                     .map(|h| h.runtime_flavor());
-                let ok = match flavor {
+                match flavor {
                     Some(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                        tokio::task::block_in_place(retry_fn)
+                        if !tokio::task::block_in_place(|| self.bounded_wait_send(job)) {
+                            record_persist_drop(policy, label, consequence);
+                        }
                     }
                     Some(tokio::runtime::RuntimeFlavor::CurrentThread) => {
-                        eprintln!(
-                            "[storage] persist queue full on a current-thread runtime: \
-                             the writer cannot drain while this thread holds it - \
-                             dropping the job now (counted)"
-                        );
-                        false
+                        if policy == PersistPushPolicy::CriticalWait {
+                            // Deferred bounded drain: the current-thread
+                            // writer cannot run while the producer blocks on
+                            // this synchronous call, but it WILL run at the
+                            // producer's next await. The spawned send waits
+                            // for capacity under the same bounded budget and
+                            // only then records a drop — never an immediate,
+                            // silent loss of the safety checkpoint/tip.
+                            let tx = self.tx.clone();
+                            let depth = self.queue_depth.clone();
+                            // Reserve the gauge slot NOW: `pending()` drives
+                            // graceful shutdown, and a deferred job that is
+                            // not yet in the channel must still keep the drain
+                            // waiting. The writer removes this reservation
+                            // when it dequeues; an abandoned send removes it
+                            // here.
+                            self.bump_queue_depth();
+                            tokio::spawn(async move {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(
+                                        PERSIST_BLOCKING_WAIT_MS,
+                                    ),
+                                    tx.send(job),
+                                )
+                                .await
+                                {
+                                    // Accepted: the writer owns the
+                                    // reservation and decrements on dequeue.
+                                    Ok(Ok(())) => {}
+                                    // Writer gone: shutdown, no persistence
+                                    // target left to lose.
+                                    Ok(Err(_)) => {
+                                        decrement_queue_depth(&depth);
+                                    }
+                                    Err(_) => {
+                                        decrement_queue_depth(&depth);
+                                        record_persist_drop(policy, label, consequence);
+                                    }
+                                }
+                            });
+                        } else {
+                            record_persist_drop(policy, label, consequence);
+                        }
                     }
                     // `RuntimeFlavor` is `#[non_exhaustive]`: a future tokio
                     // could add a flavour whose drain semantics we do not
                     // know. Fail SAFE (counted drop, never a silent loss) and
                     // never call `block_in_place` on it.
-                    Some(_) => false,
-                    None => retry_fn(),
-                };
-
-                if !ok {
-                    eprintln!("[storage] persist queue full for {PERSIST_BLOCKING_WAIT_MS}ms; dropping a consensus-relevant job (disk too slow? — counted, alert on stell_persist_queue_dropped_total)");
-                    crate::metrics::global().inc_persist_queue_dropped();
+                    Some(_) => {
+                        record_persist_drop(policy, label, consequence);
+                    }
+                    None => {
+                        if !self.bounded_wait_send(job) {
+                            record_persist_drop(policy, label, consequence);
+                        }
+                    }
                 }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
+    }
+
+    /// Bump the live queue-depth gauge after a successful push.
+    fn bump_queue_depth(&self) -> u64 {
+        let d = self
+            .queue_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        crate::metrics::global().set_persist_queue_depth(d);
+        d
+    }
+
+    /// Retry `try_send` until the bounded budget expires. Returns `true` when
+    /// the job was accepted (or the writer is gone, so there is nothing left
+    /// to persist), `false` when the budget expired with the queue still full.
+    fn bounded_wait_send(&self, mut job: PersistJob) -> bool {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(PERSIST_RETRY_PACE_MS));
+            match self.tx.try_send(job) {
+                Ok(()) => {
+                    self.bump_queue_depth();
+                    return true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(j)) => {
+                    job = j;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return true,
+            }
+        }
+        false
     }
 
     /// Non-blocking: enqueue a finalized block for writing.
@@ -5470,5 +5624,170 @@ mod archive_proof_tests {
             "refusal must name the missing QC, got: {err:?}"
         );
         std::fs::remove_dir_all(&f.dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod persist_policy_tests {
+    //! Audit F2 (mainnet blocker): a full persist queue must never silently
+    //! drop a consensus-critical job. These pin the classifier AND the
+    //! current-thread deferred-drain path (the one that used to drop
+    //! immediately).
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Async-aware twin of `SERIAL` for the two tests that must `await` while
+    /// holding the guard.
+    fn serial_async() -> &'static tokio::sync::Mutex<()> {
+        static SERIAL_ASYNC: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        SERIAL_ASYNC.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "stell_persist_policy_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn handle_with_capacity(
+        dir: &std::path::Path,
+        cap: usize,
+    ) -> (AsyncPersistence, tokio::sync::mpsc::Receiver<PersistJob>) {
+        let storage = Arc::new(Storage::open(dir).expect("temp storage opens"));
+        let (tx, rx) = tokio::sync::mpsc::channel::<PersistJob>(cap);
+        (
+            AsyncPersistence {
+                tx,
+                storage,
+                queue_depth: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn consensus_and_finalized_are_critical_wait_not_bounded_wait() {
+        assert_eq!(
+            persist_push_policy(&PersistJob::Consensus(Box::default())),
+            PersistPushPolicy::CriticalWait
+        );
+        assert_eq!(
+            persist_push_policy(&PersistJob::Finalized {
+                height: 7,
+                hash: [7u8; 32]
+            }),
+            PersistPushPolicy::CriticalWait
+        );
+        assert_eq!(
+            persist_push_policy(&PersistJob::Prune { keep_from: 3 }),
+            PersistPushPolicy::DropFirst
+        );
+        // Everything else stays bounded-wait (never drop-first).
+        assert_eq!(
+            persist_push_policy(&PersistJob::Flush),
+            PersistPushPolicy::BoundedWait
+        );
+        // Every critical class has a documented, non-empty consequence.
+        for job in [
+            PersistJob::Consensus(Box::default()),
+            PersistJob::Finalized {
+                height: 1,
+                hash: [1u8; 32],
+            },
+        ] {
+            assert!(!persist_drop_consequence(&job).is_empty());
+            assert!(!persist_job_label(&job).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_queue_defers_critical_job_then_delivers_it() {
+        // ASYNC-AWARE serialisation (a std guard across an await is both a
+        // clippy error and a real hazard: it may drop on another thread).
+        let _g = serial_async().lock().await;
+        let dir = tmpdir("defer");
+        let (ap, mut rx) = handle_with_capacity(&dir, 1);
+        // One job fills the single slot; the writer is not running (we hold
+        // the only receiver), so the next push hits `Full`.
+        ap.enqueue_finalized(1, [1u8; 32]);
+        let before = crate::metrics::global()
+            .snapshot()
+            .persist_queue_dropped;
+        ap.enqueue_finalized(2, [2u8; 32]);
+        // The old current-thread path dropped this synchronously.
+        assert_eq!(
+            crate::metrics::global()
+                .snapshot()
+                .persist_queue_dropped,
+            before,
+            "a critical job must never be dropped before its bounded drain"
+        );
+        // Free the slot: the deferred send must complete and deliver height 2.
+        let first = rx.recv().await.expect("first job");
+        assert!(matches!(first, PersistJob::Finalized { height: 1, .. }));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("deferred critical send must not hang")
+            .expect("deferred critical job delivered");
+        assert!(matches!(second, PersistJob::Finalized { height: 2, .. }));
+        assert_eq!(
+            crate::metrics::global()
+                .snapshot()
+                .persist_queue_dropped,
+            before,
+            "delivered critical job is not a drop"
+        );
+        drop(ap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn critical_drop_after_budget_is_counted_never_silent() {
+        let _g = serial_async().lock().await;
+        let dir = tmpdir("counted");
+        let (ap, _rx) = handle_with_capacity(&dir, 1);
+        ap.enqueue_finalized(1, [1u8; 32]);
+        let before = crate::metrics::global()
+            .snapshot()
+            .persist_queue_dropped;
+        ap.enqueue_finalized(2, [2u8; 32]);
+        // Never drain: the deferred send must expire and COUNT the loss.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PERSIST_BLOCKING_WAIT_MS.saturating_mul(3),
+        ))
+        .await;
+        let after = crate::metrics::global()
+            .snapshot()
+            .persist_queue_dropped;
+        assert_eq!(
+            after - before,
+            1.0,
+            "a critical job that expires its bounded drain must be counted once"
+        );
+        drop(ap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queue_depth_gauge_counts_successful_push_only() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("depth");
+        let (ap, _rx) = handle_with_capacity(&dir, 2);
+        assert_eq!(ap.pending(), 0);
+        ap.enqueue_finalized(1, [1u8; 32]);
+        assert_eq!(ap.pending(), 1, "accepted job increments the gauge");
+        drop(ap);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

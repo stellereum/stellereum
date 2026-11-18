@@ -183,6 +183,40 @@ pub async fn eth_call_with_engine(
         .await
 }
 
+/// Extract the `to` target of an `eth_call` parameter object, if one is named.
+///
+/// Accepts every shape `eth_call` accepts: `[{to, data}, tag]`, `{to, data}`.
+/// A bare calldata string names no target; a missing, null, or empty `to` is
+/// "no target" (contract-creation emulation), not an address.
+fn extract_call_target(params: &Value) -> Option<&str> {
+    let obj = match params {
+        Value::Array(arr) => arr.first()?.as_object()?,
+        Value::Object(map) => map,
+        _ => return None,
+    };
+    obj.get("to")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Code status of an `eth_call` target: `Some(true)` = committed code,
+/// `Some(false)` = address with no code, `None` = the request names no target.
+///
+/// Delegates to [`eth_get_code_with_engine`] so `eth_call` and `eth_getCode`
+/// use ONE rule for "does this address have code". An invalid `to` is refused
+/// with the same `invalid params` error `eth_getCode` produces.
+async fn eth_call_target_code_status(
+    engine: &InMemoryStateEngine,
+    params: &Value,
+) -> Result<Option<bool>, JsonRpcError> {
+    let Some(target) = extract_call_target(params) else {
+        return Ok(None);
+    };
+    let code = eth_get_code_with_engine(engine, &json!([target])).await?;
+    Ok(Some(code != "0x"))
+}
+
 pub fn eth_new_block_filter() -> String {
     GLOBAL_EVM_ADAPTER.filter_manager.new_block_filter()
 }
@@ -647,7 +681,30 @@ impl EvmAdapter {
     /// an infinite allowance is never invented. `0x` is exactly what a node
     /// returns for a call at an address with no code (`eth_getCode` is `0x`
     /// here by design).
+    ///
+    /// TARGET RULE (audit 2026-11-18): a call that NAMES a `to` target is
+    /// answered `0x` by this stateless entry point, because no engine exists
+    /// here to show that the target holds code — the exact `eth_getCode`
+    /// contract above. The stateful path
+    /// ([`Self::handle_eth_call_with_engine`]) omits the metadata answer only
+    /// when the committed lookup proves the target is codeless; a target-less
+    /// call keeps the native-token view.
     pub fn handle_eth_call(&self, params: &Value) -> Result<Value, JsonRpcError> {
+        // STATELESS: this adapter has no state engine, so no target can be
+        // shown to hold code. That is the same rule as `eth_getCode` here
+        // (`handle_eth_get_code` answers `0x` for every address): a call with
+        // a `to` target is answered `0x`, never with token metadata invented
+        // for an address that may not be a token at all. Only a target-less
+        // call keeps the legacy native-token view (see
+        // `eth_call_target_code_status` for the stateful rule).
+        if let Some(target) = extract_call_target(params) {
+            // Validate exactly as the stateless `eth_getCode` does, so a
+            // malformed target is `invalid params` in both methods.
+            parse_evm_or_stell_address(target).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid address '{target}': {e}"))
+            })?;
+            return Ok(json!("0x"));
+        }
         let calldata = extract_calldata(params);
         let result = match calldata {
             Some(data) => self.emulate_erc20_call(data),
@@ -697,6 +754,18 @@ impl EvmAdapter {
         engine: &InMemoryStateEngine,
         params: &Value,
     ) -> Result<Value, JsonRpcError> {
+        // A call at an address with NO committed code answers `0x`, exactly as
+        // `eth_getCode` answers for that address (same lookup, so the two can
+        // never disagree). This used to answer native-token metadata for ANY
+        // `to`, including addresses with no code at all (audit 2026-11-18).
+        // Target-less calls keep the legacy native-token view: `{data}` with
+        // no `to` names no address to check.
+        if matches!(
+            eth_call_target_code_status(engine, params).await?,
+            Some(false)
+        ) {
+            return Ok(json!("0x"));
+        }
         let calldata = extract_calldata(params);
         let result = match calldata {
             Some(data) => self.emulate_erc20_call_with_engine(engine, data).await,
@@ -1654,6 +1723,10 @@ impl EvmAdapter {
         params: &Value,
     ) -> Result<Value, JsonRpcError> {
         match method {
+            "eth_call" => match &self.engine {
+                Some(engine) => self.handle_eth_call_with_engine(engine, params).await,
+                None => self.handle_eth_call(params),
+            },
             "eth_getCode" => match &self.engine {
                 Some(engine) => Ok(json!(self::eth_get_code_with_engine(engine, params).await?)),
                 None => Ok(json!(self::handle_eth_get_code(params)?)),

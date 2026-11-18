@@ -767,6 +767,58 @@ pub(super) type SseStream = std::pin::Pin<
     >,
 >;
 
+/// Seconds of inactivity after which an SSE stream is reaped.
+///
+/// Mirrors [`WS_IDLE_TIMEOUT_SECS`]: a stream that forwards no event for this
+/// long is closed, its owned subscriptions are dropped (via the
+/// `SubscriptionGuard`) and the HTTP connection — hence the gateway
+/// concurrency permit — is released. Without this, 512 one-request SSE
+/// clients could hold every permit forever (audit F12). Keep-alive comment
+/// frames are transport-level and do NOT count as stream activity; only a
+/// forwarded notification resets the window.
+pub const SSE_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Env override for [`SSE_IDLE_TIMEOUT_SECS`] (seconds; 0/unparsable keeps
+/// the default) — the same shape as the WS reaper's window.
+pub const SSE_IDLE_TIMEOUT_ENV: &str = "STELL_SSE_IDLE_TIMEOUT_SECS";
+
+// Compile-time shape of the SSE bound (fail the build, not a test, if a
+// future edit inverts it).
+pub(super) const _: () = assert!(SSE_IDLE_TIMEOUT_SECS > 0);
+
+/// Test-only override of [`SSE_IDLE_TIMEOUT_SECS`] (0 = const/env default).
+pub(super) static SSE_IDLE_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set the SSE idle timeout for tests (0 restores the configured default).
+/// Absent from production builds (`any(test, debug_assertions)` only).
+#[cfg(any(test, debug_assertions))]
+pub fn set_sse_idle_timeout_for_tests(secs: u64) {
+    SSE_IDLE_TIMEOUT_OVERRIDE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Effective SSE idle timeout: test override, else `STELL_SSE_IDLE_TIMEOUT_SECS`,
+/// else the const default.
+pub(super) fn sse_idle_timeout() -> std::time::Duration {
+    let ov = SSE_IDLE_TIMEOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        return std::time::Duration::from_secs(ov);
+    }
+    idle_timeout_from_env(SSE_IDLE_TIMEOUT_ENV)
+        .unwrap_or_else(|| std::time::Duration::from_secs(SSE_IDLE_TIMEOUT_SECS))
+}
+
+/// Parse a positive seconds value from `name` (None when unset/garbage/zero).
+fn idle_timeout_from_env(name: &str) -> Option<std::time::Duration> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs)
+}
+
 /// SSE transport: the same notifications as the WebSocket, framed as
 /// `text/event-stream` (`data: {"subscription":...,"result":{...}}\n\n`).
 ///
@@ -774,6 +826,10 @@ pub(super) type SseStream = std::pin::Pin<
 /// subscription) or creates them from `?topics=newHeads,newTxs,invalidations,events`
 /// (+ `?contract=`, `?event_topics=`). The ids of the subscriptions it
 /// serves are returned in the `x-stell-subscription-id` header.
+///
+/// Idle clients are reaped: no forwarded event for [`SSE_IDLE_TIMEOUT_SECS`]
+/// (or `STELL_SSE_IDLE_TIMEOUT_SECS`) ends the stream and releases the
+/// connection/permit, matching the WS idle rule.
 ///
 /// Public: the gateway mounts the very same handler on `/events`.
 pub async fn sse_handler(
@@ -789,7 +845,7 @@ pub async fn sse_handler(
     let mut owned: Vec<String> = Vec::new();
     let mut attached: Vec<String> = Vec::new();
     let peer_ip = peer.map(|axum::extract::ConnectInfo(addr)| {
-        crate::client_ip::resolve_client_ip(&headers, addr.ip())
+        crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr
     });
     let client = peer_ip
         .map(|ip| ip.to_string())
@@ -832,25 +888,40 @@ pub async fn sse_handler(
 
     let id_set: HashSet<String> = ids.iter().cloned().collect();
     let guard = SubscriptionGuard { owned, attached };
-    let stream = futures::stream::unfold((rx, id_set, guard), |(mut rx, ids, guard)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(note) => {
-                    if ids.contains(&note.subscription) {
-                        let payload =
-                            serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
-                        let ev = axum::response::sse::Event::default().data(payload);
-                        return Some((Ok(ev), (rx, ids, guard)));
+    let idle = sse_idle_timeout();
+    let stream = futures::stream::unfold(
+        (rx, id_set, guard, tokio::time::Instant::now() + idle, idle),
+        |(mut rx, ids, guard, deadline, idle)| async move {
+            loop {
+                // Idle reap (audit F12): no forwarded event within the window
+                // ends the stream. Transport keep-alive frames are generated
+                // by the `Sse` wrapper and deliberately do not reset this.
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            idle_secs = idle.as_secs(),
+                            "SSE stream idle past the reap window; closing"
+                        );
+                        return None;
                     }
+                    Ok(Ok(note)) => {
+                        if ids.contains(&note.subscription) {
+                            let payload =
+                                serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
+                            let ev = axum::response::sse::Event::default().data(payload);
+                            let next_deadline = tokio::time::Instant::now() + idle;
+                            return Some((Ok(ev), (rx, ids, guard, next_deadline, idle)));
+                        }
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        tracing::warn!(skipped, "SSE subscriber lagged behind the stream fan-out");
+                        continue;
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "SSE subscriber lagged behind the stream fan-out");
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    });
+        },
+    );
     let sse = axum::response::sse::Sse::new(Box::pin(stream) as SseStream).keep_alive(
         axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
     );
@@ -942,7 +1013,9 @@ pub(super) fn is_ws_expensive_method(method: &str) -> bool {
 // WS HARDENING (audit residual, rpc 8.5->9.0): bounded subscriptions per
 // connection, size-capped messages, per-message general budget symmetric to
 // the HTTP transport limiters, and stale-connection reaping with a live
-// connection count. No new env knobs: every bound is a const below.
+// connection count. Message/subscription bounds are consts; only the two
+// IDLE WINDOWS (WS + SSE) are env-tunable (`STELL_WS_IDLE_TIMEOUT_SECS`,
+// `STELL_SSE_IDLE_TIMEOUT_SECS`, same shape/default).
 // ===========================================================================
 
 /// Maximum bytes of one WS message (text or binary, UTF-8 decoded length).
@@ -1019,6 +1092,11 @@ impl Drop for WsLiveGuard {
 /// registry entry or a counter slot.
 pub const WS_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Env override for [`WS_IDLE_TIMEOUT_SECS`] (seconds; 0/unparsable keeps the
+/// default). Same shape as [`SSE_IDLE_TIMEOUT_ENV`]: local policy, not
+/// consensus — nodes MAY differ.
+pub const WS_IDLE_TIMEOUT_ENV: &str = "STELL_WS_IDLE_TIMEOUT_SECS";
+
 // Compile-time shape of the WS hardening bounds (fail the build, not a
 // test, if a future edit inverts them).
 pub(super) const _: () = assert!(WS_MAX_SUBS_PER_CONNECTION > 0);
@@ -1027,11 +1105,12 @@ pub(super) const _: () = assert!(MAX_SUBSCRIPTIONS_PER_CLIENT < MAX_SUBSCRIPTION
 pub(super) const _: () = assert!(WS_GENERAL_RATE_LIMIT_DEFAULT > 0);
 pub(super) const _: () = assert!(WS_IDLE_TIMEOUT_SECS > 0);
 
-/// Test-only override of [`WS_IDLE_TIMEOUT_SECS`] (0 = use the const).
+/// Test-only override of [`WS_IDLE_TIMEOUT_SECS`] (0 = use the env/const
+/// default).
 ///
 /// Integration tests cannot wait 300 s, so they set a 1 s timeout, prove the
-/// reap, and restore 0. Production never touches this: no env knob, no
-/// config, no HTTP behavior change.
+/// reap, and restore 0. Production never touches this override; operators
+/// tune the window with `STELL_WS_IDLE_TIMEOUT_SECS`.
 pub(super) static WS_IDLE_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1042,10 +1121,15 @@ pub fn set_ws_idle_timeout_for_tests(secs: u64) {
     WS_IDLE_TIMEOUT_OVERRIDE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Effective WS idle timeout (the const, unless a test overrode it).
+/// Effective WS idle timeout: test override, else `STELL_WS_IDLE_TIMEOUT_SECS`,
+/// else the const default.
 pub(super) fn ws_idle_timeout() -> std::time::Duration {
     let ov = WS_IDLE_TIMEOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    std::time::Duration::from_secs(if ov == 0 { WS_IDLE_TIMEOUT_SECS } else { ov })
+    if ov != 0 {
+        return std::time::Duration::from_secs(ov);
+    }
+    idle_timeout_from_env(WS_IDLE_TIMEOUT_ENV)
+        .unwrap_or_else(|| std::time::Duration::from_secs(WS_IDLE_TIMEOUT_SECS))
 }
 
 // ===========================================================================
@@ -1276,7 +1360,7 @@ pub(super) async fn ws_handler(
 ) -> axum::response::Response {
     let header_token = extract_header_token(&headers).map(|s| s.to_string());
     let peer_ip = peer.map(|axum::extract::ConnectInfo(addr)| {
-        crate::client_ip::resolve_client_ip(&headers, addr.ip())
+        crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr
     });
     ws.on_upgrade(move |socket| handle_ws(socket, st, header_token, peer_ip))
 }
@@ -1589,7 +1673,7 @@ pub(super) async fn rpc_handler(
     // the TCP peer is a trusted proxy (STELL_TRUSTED_PROXY_CIDRS,
     // loopback-only by default — see crate::client_ip); otherwise the peer.
     // Without this every client behind nginx/Cloudflare shared one bucket.
-    let peer_ip = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()));
+    let peer_ip = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr);
     if let Some(arr) = first.as_array() {
         let raw_len = body.len();
         match handle_rpc_batch_call(&st, arr, raw_len, header_token, peer_ip).await {
@@ -1694,7 +1778,7 @@ pub(super) async fn standalone_rate_limit(
         .get_or_init(|| crate::explorer::RateLimiter::new(standalone_limit_per_sec()));
     // Real client IP behind a trusted proxy (see crate::client_ip); without
     // this every client behind nginx/Cloudflare shared the 300/s bucket.
-    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip()).addr;
     if limiter.check(client) {
         next.run(req).await
     } else {

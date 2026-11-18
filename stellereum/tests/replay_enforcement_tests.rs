@@ -530,8 +530,16 @@ async fn activation_drain_drops_only_unbound_and_only_when_active() {
 #[tokio::test]
 async fn default_off_full_path_accepts_with_env_unset() {
     let _env = ArmedEnv::off().await;
+    // PRODUCTION ACTIVATION IS A CONSTANT now (review R4 S2): the env var is
+    // ignored, so the default-off proof asserts the compiled value. The
+    // env-reading path survives only as the `cfg(test)` fixture helper the
+    // armed-boundary tests drive.
     assert_eq!(
-        ChainBindingActivation::from_env(),
+        ChainBindingActivation::from_chain_spec(),
+        ChainBindingActivation::never()
+    );
+    assert_eq!(
+        ChainBindingActivation::from_env_for_tests(),
         ChainBindingActivation::never()
     );
     assert_eq!(ChainBindingActivation::never().height, CHAIN_BINDING_NEVER);

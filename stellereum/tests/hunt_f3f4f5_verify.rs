@@ -15,8 +15,13 @@
 //!   path (`try_finalize` / `apply_and_advance` / `replay_historical_block` /
 //!   adopt / walk); determinism is preserved by not slashing until evidence
 //!   travels in-block (hardfork, src/runtime.rs:745-776 + §10.52 handoff note).
-//! * F5 height-pinned validator set — STILL OPEN (documented limitation +
-//!   `TODO(F5)` at src/sync.rs:270-281). The PoC below is `#[ignore]`d.
+//! * F5 height-pinned validator set — CLOSED on the live paths:
+//!   `validate_sync_chain_with_sets` (per-height `resolve_set`), the
+//!   `verify_snapshot_anchor*_with_sets` pair, and the replay path's
+//!   set-at-height. The residual survives ONLY in the TEST-ONLY single-set
+//!   compat entries `validate_sync_chain` / `validate_sync_chain_for_shard`
+//!   (documented on those functions; zero production callers). The PoC below
+//!   is `#[ignore]`d and demonstrates exactly that compat-entry limitation.
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -295,17 +300,24 @@ async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
 }
 
 // ---------------------------------------------------------------------------
-// F5 STILL OPEN: QC checked against the CALLER's (current) set, not set-at-height
+// F5 residual confined to the TEST-ONLY single-set compat entry
 // ---------------------------------------------------------------------------
 
-/// PoC of the documented residual (src/sync.rs `TODO(F5)`): a quorum of the
-/// CURRENT set can vouch for ANY old heights and `validate_sync_chain`
-/// accepts — history is malleable by whoever holds power NOW. Two competing
-/// chains for heights 8..=9, both fully signed by the current set, BOTH pass.
+/// PoC of the residual that survives in the TEST-ONLY single-set compat entry
+/// `validate_sync_chain` (see its doc comment): it resolves every height to
+/// the caller's CURRENT set, so a quorum of the current set can vouch for ANY
+/// old heights and that entry accepts — history is malleable by whoever holds
+/// power NOW. Two competing chains for heights 8..=9, both fully signed by the
+/// current set, BOTH pass.
+///
+/// LIVE catch-up never calls this entry: it calls
+/// `validate_sync_chain_for_shard_with_sets_hashed` (`node/sync.rs`), which
+/// resolves the set in force at each height and fail-closes on an
+/// unresolvable one.
 #[tokio::test]
-#[ignore = "F5 OPEN (TODO(F5) src/sync.rs:270-281): documents the residual — \
-current-set quorum vouches for old heights. Ignored so it cannot gate CI \
-until per-height set snapshots land."]
+#[ignore = "documents the TEST-ONLY single-set compat entry's F5 limitation \
+(`validate_sync_chain`: one set for every height, zero production callers). \
+Live paths resolve set-at-height. Ignored so it cannot gate CI."]
 async fn f5_open_current_quorum_rewrites_old_heights() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let current = vset(&ks);
@@ -323,16 +335,17 @@ async fn f5_open_current_quorum_rewrites_old_heights() {
         "precondition: competing histories"
     );
 
-    // THE HOLE: both validate under the current set — nothing pins QCs to
-    // the set that held power at heights 8..=9.
+    // THE COMPAT-ENTRY HOLE: both validate under the single current set —
+    // this entry pins no QCs to the set that held power at heights 8..=9.
     assert!(
         validate_sync_chain(&chain_a, 8, anchor, &current).is_ok(),
         "chain A (current set) validates"
     );
     assert!(
         validate_sync_chain(&chain_b, 8, anchor, &current).is_ok(),
-        "F5 HOLE: competing chain B (same current set, different bodies) \
-         ALSO validates — old heights are whatever the current quorum says"
+        "single-set compat entry: competing chain B (same current set, \
+         different bodies) ALSO validates — old heights are whatever the \
+         current quorum says. Live paths use the set-at-height entry"
     );
-    println!("[F5 OPEN] current quorum rewrites heights 8..=9 at will");
+    println!("[F5 residual: single-set compat entry] current quorum rewrites heights 8..=9");
 }

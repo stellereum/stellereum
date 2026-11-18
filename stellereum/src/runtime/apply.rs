@@ -545,6 +545,8 @@ impl ValidatorRuntime {
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
         self.hc.set_parent_hash(bh);
+        // CN-VRF v3: install the new height's committee schedule (review F2).
+        self.install_committee_schedule();
     }
 
     /// Shared DECISION half of finalization: quorum, presence, order and cap
@@ -560,6 +562,12 @@ impl ValidatorRuntime {
         if self.apply_in_flight.is_some() {
             return None;
         }
+        // The decision certificate this height produces must be drawn from the
+        // schedule its own finalize gate attributes it with. The engine is also
+        // re-anchored by startup/sync code outside this crate's runtime, so the
+        // schedule is (re)installed here, right before the producer runs
+        // (review F2).
+        self.install_committee_schedule();
         let bh = self.hc.try_precommit_quorum()?;
         let height = self.hc.height;
         // The block must actually be here.
@@ -758,6 +766,11 @@ impl ValidatorRuntime {
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
         self.hc.set_parent_hash(bh);
+        // CN-VRF v3: the new height produces/verifies under the epoch-beacon
+        // schedule at/after activation (parent-hash draw below it), so this
+        // height's own decision certificate is drawn from the same committee
+        // its verifier attributes it with (review F2).
+        self.install_committee_schedule();
         self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
         Some(bh)
     }
@@ -1149,6 +1162,11 @@ impl ValidatorRuntime {
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
         self.hc.set_parent_hash(bh);
+        // CN-VRF v3: the new height produces/verifies under the epoch-beacon
+        // schedule at/after activation (parent-hash draw below it), so this
+        // height's own decision certificate is drawn from the same committee
+        // its verifier attributes it with (review F2).
+        self.install_committee_schedule();
         self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
     }
 }

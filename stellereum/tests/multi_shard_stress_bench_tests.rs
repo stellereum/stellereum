@@ -2,9 +2,14 @@
 //!
 //! Measures:
 //! - High-volume transaction throughput across Shard 0 (Masterchain) and Shard 1 (Workchain).
-//! - Cross-shard value transfer in both directions (0 -> 1 and 1 -> 0).
+//! - Cross-shard escrow packaging in both directions (0 -> 1 and 1 -> 0).
 //! - Disjoint concurrent execution performance.
-//! - State root determinism and balance conservation.
+//! - State root determinism.
+//!
+//! NOTE (XSHARD-01): cross-shard VALUE moves only through the §9 2PC; the
+//! legacy one-step inbound credit is refused. This benchmark keeps the legacy
+//! outbox volume (and its per-block record counts) to measure throughput, so
+//! the inbound records here are committed but not credited.
 
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
@@ -249,7 +254,11 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
         "Shard 1 packages 50 outbound transfers + 50 inbound Acks for Shard 0"
     );
 
-    // Height 2: Both shards consume inbound cross-shard messages, credit accounts, and produce Ack records
+    // Height 2: Both shards consume inbound cross-shard records. Under
+    // XSHARD-01 the legacy inbound CREDIT is refused (a one-step legacy
+    // message cannot prove the source-side debit), so the record is committed
+    // to the block but no value is credited here; throughput is the property
+    // this benchmark measures.
     let h2_s0 = cluster.run_height(SHARD0, 1002).await;
     let h2_s1 = cluster.run_height(SHARD1, 1003).await;
 
@@ -276,8 +285,11 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
     );
 
     assert!(
-        blk2_s0.cross_shard_out.iter().any(|m| m.is_ack()),
-        "Shard 0 must commit Acks from Shard 1"
+        blk2_s0
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_inbound_for(SHARD0)),
+        "Shard 0 must consume inbound records from Shard 1"
     );
 
     let mining_elapsed = t_mining_start.elapsed();

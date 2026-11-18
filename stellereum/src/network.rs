@@ -3679,6 +3679,27 @@ impl P2pNetworkAdapter {
         endpoints.dedup();
         endpoints
     }
+
+    /// Live connected-peer count, read from the node's peer table, and
+    /// published to the RPC layer so `net_peerCount` reflects an OBSERVED
+    /// number instead of the process-wide counter's initial `0x0`.
+    ///
+    /// This is the single hook the task requires: callers with the adapter in
+    /// hand (the consensus driver's periodic probe / supervisor loop) call it
+    /// once per tick and pay one `RwLock` read plus an `AtomicU64` store.
+    /// `rpc::note_peer_count` is the source of truth for
+    /// `eth`/`net_peerCount`; nothing here invents peers — an empty table
+    /// publishes 0.
+    pub async fn publish_live_peer_count(&self) -> u64 {
+        let n = self.node.peers_ready().await as u64;
+        crate::rpc::note_peer_count(n);
+        n
+    }
+
+    /// The observed live peer count without publishing it (diagnostics).
+    pub async fn live_peer_count(&self) -> u64 {
+        self.node.peers_ready().await as u64
+    }
 }
 
 #[cfg(test)]
@@ -4080,6 +4101,31 @@ mod pointer_overwrite_tests {
         let adapter = P2pNetworkAdapter::new(node);
         adapter.set_epoch(EpochTag::from_genesis(&[0x77u8; 32]));
         (adapter, dir)
+    }
+
+    /// The peer-count hook reads the LIVE peer table (not a constant): a
+    /// fresh node with no connections reports 0. `net_peerCount` is fed by
+    /// `publish_live_peer_count` (see `rpc::note_peer_count`), so this pins
+    /// the read path that makes the RPC value observed data.
+    #[tokio::test]
+    async fn live_peer_count_reads_the_peer_table() {
+        let (adapter, dir) = test_adapter("peercount").await;
+        assert_eq!(
+            adapter.live_peer_count().await,
+            0,
+            "a node with no established peer connection observes 0 peers"
+        );
+        assert_eq!(
+            adapter.publish_live_peer_count().await,
+            0,
+            "the hook publishes the observed table size"
+        );
+        assert_eq!(
+            crate::rpc::observed_peer_count(),
+            0,
+            "the RPC counter follows the observed count (0, never fabricated)"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Live (non-hidden) chunk files under `<data_dir>/chunks`, all buckets.

@@ -1348,6 +1348,9 @@ impl InMemoryStateEngine {
         //    (the SVM itself uses clone-commit for tokens/orderbooks). Release the
         //    account lock while the VM runs to avoid holding it across await.
         drop(map);
+        // What the executor MEASURED (FEE-01): the VM's `gas_used` for a
+        // payload, 0 when no VM ran. The fee is derived from it in
+        // `commit_native`, never from the declared limit.
         let gas_charged;
         // Value movements the payload itself performed. These used to be thrown
         // away, so `OpCode::Transfer` (and the staking bond, which parks funds in
@@ -1431,7 +1434,10 @@ impl InMemoryStateEngine {
                 }
             }
         } else {
-            gas_charged = tx.gas_limit;
+            // FEE-01: no VM ran, so the executor measured 0 gas. The intrinsic
+            // envelope cost is added by `billed_gas` at the commit below; the
+            // declared limit is NOT the consumption.
+            gas_charged = 0;
         }
 
         // 6. Commit the native movement (amount + fee + payload value) through
@@ -1460,12 +1466,12 @@ impl InMemoryStateEngine {
             }
         };
         // Session budget: charged only now that the transaction has actually
-        // applied, and with the gas this path consumed - the VM's `gas_used`
-        // for a payload, the declared `gas_limit` for an empty-payload
-        // transfer (no VM ran, so the declared limit is what it consumed).
-        // Same numbers as the block path, so the registry does not care which
-        // path applied the transaction.
-        self.session_note_applied(tx, gas_charged).await;
+        // applied, and with the gas it is BILLED for (`billed_gas`: the VM's
+        // measurement for a payload, the intrinsic envelope cost for an
+        // empty-payload transfer, both capped at the declared limit). The
+        // block path files the same number, so the registry does not care
+        // which path applied the transaction.
+        self.session_note_applied(tx, Self::billed_gas(tx, gas_charged)).await;
         // Contract deploys commit code hashes here — AFTER the native commit,
         // never speculatively inside execution (B1: the trie has no undo).
         // Read (never write-locked together with the trie below): lock order
@@ -1611,6 +1617,109 @@ impl InMemoryStateEngine {
         (floor_base, surcharge)
     }
 
+    /// FEE-01: the INTRINSIC envelope gas every transaction consumes before a
+    /// single payload opcode runs — signature verification, nonce ordering,
+    /// fee/transfer bookkeeping.
+    ///
+    /// Priced at [`crate::svm::GAS_BASIC_TRANSFER`] because that is already
+    /// the frozen admission floor (`Mempool::FROZEN_MIN_GAS_FLOOR`) and the
+    /// price of the cheapest meaningful operation, and because the shipped
+    /// RPC estimator (`rpc::reads::simulate_and_estimate_fee`) prices the
+    /// same quantity for an empty-payload transaction. Keeping all three on
+    /// one constant is what makes "estimate == charge" true.
+    pub(crate) const TX_INTRINSIC_GAS: u64 = crate::svm::GAS_BASIC_TRANSFER;
+
+    /// FEE-01: the gas a transaction is BILLED for, from the gas its
+    /// execution actually consumed.
+    ///
+    /// ```text
+    /// billed = min(tx.gas_limit, gas_used + intrinsic(tx))
+    /// ```
+    ///
+    ///  * `gas_used` is the EXECUTOR's own measurement
+    ///    (`VmExecutionResult::Success { gas_used }`) — never the declared
+    ///    limit, which is a budget, not a consumption;
+    ///  * `intrinsic(tx)` is [`Self::TX_INTRINSIC_GAS`] for an EMPTY-payload
+    ///    transaction and 0 otherwise. No VM runs for an empty payload, so the
+    ///    envelope is its WHOLE cost and 0 would make a plain transfer free.
+    ///    A payload's opcode gas already prices the envelope and the execution
+    ///    it performs (the cheapest `Transfer` is priced AT the intrinsic), so
+    ///    adding it there would double-price every contract call, make every
+    ///    RPC estimate under-charge by it, and re-introduce the over-charge
+    ///    for the cheap staking ops (`SysCallStake` costs 2 000 gas, and the
+    ///    single-tx path correctly charged those 2 000, not the 10 000
+    ///    declared — see `bonding_moves_real_funds_and_grants_validator_power`);
+    ///  * `tx.gas_limit` is a CAP, never the price: everything above what the
+    ///    transaction used is refunded.
+    ///
+    /// The consensus floor still applies ON TOP ([`Self::fee_for_gas`]), so a
+    /// transaction that declares less than the floor is never executed below
+    /// it.
+    pub(super) fn billed_gas(tx: &crate::sharding::Transaction, gas_used: u64) -> u64 {
+        let intrinsic = if tx.payload.is_empty() {
+            Self::TX_INTRINSIC_GAS
+        } else {
+            0
+        };
+        gas_used.saturating_add(intrinsic).min(tx.gas_limit)
+    }
+
+    /// FEE-01: the fee for one transaction.
+    ///
+    /// `max(min(gas_limit, gas_used + intrinsic), floor_base) + surcharge`
+    /// — the exact rule both apply paths now share (the block path used to
+    /// pass the DECLARED `gas_limit` and therefore charge it in full; see
+    /// the `commit_native` docs). The floor is fail-closed: it can only
+    /// raise the fee, never lower it, and the PQ surcharge is additive, as
+    /// before.
+    pub(super) fn fee_for_gas(
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        floor_base: u64,
+        surcharge: u64,
+    ) -> u64 {
+        Self::billed_gas(tx, gas_used)
+            .max(floor_base)
+            .saturating_add(surcharge)
+    }
+
+    /// FEE-01: the fee an ATTRIBUTABLE FAILURE pays.
+    ///
+    /// The failure arm of [`crate::svm::VmExecutionResult`] (`OutOfGas`,
+    /// `Reverted`) carries no consumption measurement — the VM drops its
+    /// meter when it aborts — so the billed gas is [`Self::TX_INTRINSIC_GAS`]:
+    /// the one quantity the executor is GUARANTEED to have consumed. It is not
+    /// payload-conditional here (unlike [`Self::billed_gas`]): a FAILED
+    /// payload did run, and the envelope is the part whose consumption is
+    /// certain. The declared limit is deliberately NOT used as a stand-in —
+    /// it is a budget, and charging it was the over-charge FEE-01 closes (a
+    /// 10 000 000-gas declaration that reverted after 3 opcodes paid
+    /// 10 000 000). The bill is still capped by the declaration, floored by
+    /// consensus, surcharge additive.
+    ///
+    /// A failure is still strictly expensive: the fee is floored at the
+    /// consensus floor (governed base + D2 penalty) plus the PQ surcharge,
+    /// so the D2 free-failure loop stays closed — a failure costs at least a
+    /// basic transfer. The one thing it can no longer do is price block
+    /// space it did not use.
+    ///
+    /// PUBLIC so the wire-level contract tests (`tests/failure_fee_contract_tests.rs`
+    /// and `tests/support`) compute their expectation with the engine's own
+    /// rule instead of a copy that can drift from it.
+    pub fn failure_fee_for(
+        tx: &crate::sharding::Transaction,
+        floor_base: u64,
+        surcharge: u64,
+    ) -> u64 {
+        // The intrinsic envelope for EVERY transaction (payload or not) is the
+        // guaranteed consumption; cap at the declaration, floor by consensus,
+        // add the surcharge.
+        Self::TX_INTRINSIC_GAS
+            .min(tx.gas_limit)
+            .max(floor_base)
+            .saturating_add(surcharge)
+    }
+
     /// SEC-07 failure fee, sync core: debit `fee` (base fee + gas consumed up to the
     /// failure point, saturating) for an attributable execution failure and consume
     /// the transaction's nonce.
@@ -1743,7 +1852,10 @@ impl InMemoryStateEngine {
         floor_base: u64,
         surcharge: u64,
     ) {
-        let fee = tx.gas_limit.max(floor_base).saturating_add(surcharge);
+        // FEE-01: a failure is priced by `failure_fee_for` — the intrinsic
+        // envelope cost, floored at the consensus floor, plus the additive
+        // surcharge. Never the declared limit (see the fn's docs).
+        let fee = Self::failure_fee_for(tx, floor_base, surcharge);
         // PAYMASTER: the failure fee debits the sponsor and consumes the
         // USER's nonce (both leaves are written below). The self-sponsored
         // path (`sponsor == from`) is the plain path and uses the legacy
@@ -1821,31 +1933,35 @@ impl InMemoryStateEngine {
     /// recipient credit -> payload transfers -> payload payouts), the balance
     /// checks and the failure handling are all defined here, once.
     ///
-    /// `gas_charged` is what execution consumed; the fee actually taken is
-    /// `max(min(gas_charged, tx.gas_limit), floor_base) + surcharge` (F-01:
-    /// never below the consensus floor — see `consensus_floor_parts`). The
-    /// two kinds of caller deliberately pass different `gas_charged`, which
-    /// is a PRE-EXISTING, PRESERVED divergence - and it is now the ONLY one
-    /// between them:
+    /// `gas_used` is what execution consumed — the executor's own measurement
+    /// (`VmExecutionResult::Success { gas_used }`), or 0 when no VM ran (an
+    /// empty-payload transaction, whose cost is then the intrinsic envelope).
+    /// The fee actually taken is
+    /// `max(min(tx.gas_limit, gas_used + intrinsic), floor_base) + surcharge`
+    /// ([`Self::fee_for_gas`]; F-01: never below the consensus floor — see
+    /// `consensus_floor_parts`). `tx.gas_limit` is a CAP, not a price, so
+    /// unused gas is refunded.
     ///
-    ///  * `apply_transaction` (the single-transaction API: RPC-level applies,
-    ///    tests) passes the gas actually consumed (and the declared `gas_limit`
-    ///    when the payload is empty), i.e. it charges what was used;
-    ///  * EVERY block application passes the DECLARED `tx.gas_limit`, because
-    ///    admission reserved exactly `amount + gas_limit` and `fees_collected`
-    ///    (credited to the proposer inside `apply_block_transition`) is defined
-    ///    as the sum of declared limits. The reorg path used to sit on the
-    ///    `apply_transaction` side of this line and therefore silently charged
-    ///    a different fee for the same block; it now delegates to
-    ///    `apply_block_transition` and cannot.
+    /// FEE-01 (closed here): both callers used to pass DIFFERENT numbers —
+    /// `apply_transaction` the consumed gas, EVERY block application the
+    /// DECLARED `tx.gas_limit` ("admission reserved it, and `fees_collected`
+    /// is the sum of declared limits"). That made the consensus path charge
+    /// every transaction its full declaration with no refund, and made the
+    /// reorg path and the producing node disagree about the fee of the same
+    /// block before they were unified. Both paths now pass the measurement
+    /// and this function applies the one rule; `fees_collected` is the sum of
+    /// the fees actually charged (the proposer credit already uses the
+    /// returned `fee`), and `fee_charged` in receipts equals what left the
+    /// sender.
     ///
-    /// Both rules are pinned by green tests - `bonding_moves_real_funds_and_grants_validator_power`
-    /// (single-tx charges `GAS_STAKE_BOND`, not the 10_000 declared) vs
-    /// `block_execution_runs_payloads_and_conserves_native_value` (block charges
-    /// the declared 560) - so unifying them would be an economic change, not the
-    /// value-movement fix this function exists for. What MUST match, and does:
-    /// a payload can never spend the fee, and a transaction whose movements are
-    /// unaffordable is refused on both paths.
+    /// Pinned by `block_apply_parity_tests::block_path_charges_consumed_gas_like_the_single_tx_api`
+    /// (both paths charge the consumed gas, not the declaration) and by the
+    /// golden FEE-01 cases in `tests/apply_floor_tests.rs`: an empty-payload
+    /// transfer declaring 1 000 000 gas debits the 280 000 intrinsic envelope,
+    /// one declaring 10 000 is capped at its 10 000, and a payload pays the
+    /// VM's own `gas_used`.
+    /// What MUST match, and does: a payload can never spend the fee, and a
+    /// transaction whose movements are unaffordable is refused on both paths.
     ///
     /// Failure is atomic: if any leg cannot be funded the account map is
     /// restored before `Err` is returned, so a refused transaction moves no
@@ -1858,8 +1974,8 @@ impl InMemoryStateEngine {
     /// (balance, nonce), for the caller to write into the state trie, plus the
     /// fee actually debited (from the sender — or from the SPONSOR on a
     /// sponsored transaction, whose user pays VALUE only)
-    /// (`max(min(gas_charged, gas_limit), floor_base) + surcharge`, where
-    /// `(floor_base, surcharge)` is [`Self::consensus_floor_parts`]; 0 is
+    /// (`max(min(gas_limit, gas_used + intrinsic), floor_base) + surcharge`,
+    /// where `(floor_base, surcharge)` is [`Self::consensus_floor_parts`]; 0 is
     /// never returned here - failure is `Err`, and a refused transaction
     /// moved nothing, so its receipt files `fee_charged: 0`).
     #[allow(clippy::type_complexity)]
@@ -1889,7 +2005,7 @@ impl InMemoryStateEngine {
     pub(super) async fn commit_native_with_floor(
         &self,
         tx: &crate::sharding::Transaction,
-        gas_charged: u64,
+        gas_used: u64,
         transfers: &[([u8; 32], u64)],
         payouts: &[([u8; 32], [u8; 32], u64)],
         burns: &[([u8; 32], u64)],
@@ -1919,7 +2035,13 @@ impl InMemoryStateEngine {
         // BATCHED: `floor_base`/`surcharge` arrive precomputed from the
         // block's one-time snapshot (`fee_floors`); see the fn docs for why
         // they equal the live reads they replace.
-        let fee = gas_charged.min(tx.gas_limit).max(floor_base);
+        //
+        // FEE-01: the fee is the BILLED gas (`min(gas_limit, gas_used +
+        // intrinsic)`, see `billed_gas`), raised to the consensus floor and
+        // plus the additive PQ surcharge — NEVER the declared limit. Both
+        // apply paths pass the executor's measurement, so a transaction
+        // that declared more than it used is refunded the difference.
+        let fee = Self::billed_gas(tx, gas_used).max(floor_base);
         let fee_with_surcharge = fee.saturating_add(surcharge);
         let charge = tx
             .amount
@@ -2367,7 +2489,7 @@ impl InMemoryStateEngine {
     pub(super) async fn commit_native(
         &self,
         tx: &crate::sharding::Transaction,
-        gas_charged: u64,
+        gas_used: u64,
         transfers: &[([u8; 32], u64)],
         payouts: &[([u8; 32], [u8; 32], u64)],
         burns: &[([u8; 32], u64)],
@@ -2394,7 +2516,7 @@ impl InMemoryStateEngine {
         };
         self.commit_native_with_floor(
             tx,
-            gas_charged,
+            gas_used,
             transfers,
             payouts,
             burns,
@@ -2976,16 +3098,22 @@ impl InMemoryStateEngine {
             self.bump_domain_generation(crate::commitment::Domain::CnVrf);
         }
 
-        if pending_staking_burn > 0 {
-            let _ = self
-                .debit_native(&crate::staking::STAKING_POOL, pending_staking_burn)
-                .await;
-        }
-        if pending_rewards_burn > 0 {
-            let _ = self
-                .debit_native(&crate::staking::REWARDS_POOL, pending_rewards_burn)
-                .await;
-        }
+        // SLASH-02: fail-closed, loud pool settlement (never a silent
+        // `let _ =` on a value path); the split itself was derived from the
+        // ledger's `rewards_pool` mirror above, so the two pools stay 1:1
+        // with it.
+        self.settle_slash_burn(
+            crate::staking::STAKING_POOL,
+            pending_staking_burn,
+            "cnvrf-abort",
+        )
+        .await;
+        self.settle_slash_burn(
+            crate::staking::REWARDS_POOL,
+            pending_rewards_burn,
+            "cnvrf-abort-rewards",
+        )
+        .await;
 
         pending_staking_burn.saturating_add(pending_rewards_burn)
     }
@@ -3683,6 +3811,66 @@ impl InMemoryStateEngine {
         unjailed
     }
 
+    /// SLASH-02: settle an engine-side slash's burn against its backing pool
+    /// and return the amount that ACTUALLY left it.
+    ///
+    /// The ledger has already removed the stake and counted it in
+    /// `total_burned` by the time this runs (there is no undo for a slash), so
+    /// a dropped debit error — the old `let _ = self.debit_native(..)` — left
+    /// the ledger claiming a burn that never happened: pool/ledger drift by
+    /// exactly `claimed`, which the staking docs forbid and which makes later
+    /// `withdraw` fail against a short pool.
+    ///
+    /// The rule here is fail-closed and LOUD, with no silent `let _ =` on a
+    /// value path:
+    ///
+    ///  * debit the claimed amount; success returns it;
+    ///  * on failure, take whatever the pool actually holds (never more);
+    ///  * log the shortfall at ERROR with both numbers (a consistent ledger
+    ///    preserves `STAKING_POOL == ledger_stake_supply()` and
+    ///    `REWARDS_POOL == rewards_pool`, so the shortfall is unreachable
+    ///    unless the state was already drifted);
+    ///  * retire the unbacked part from `total_burned` so the committed
+    ///    supply counter stops claiming coins that did not move.
+    ///
+    /// Deterministic: every node applies the same blocks to the same
+    /// pre-state, so every node sees the same pool balance and takes the same
+    /// branch.
+    async fn settle_slash_burn(&self, pool: [u8; 32], claimed: u64, what: &str) -> u64 {
+        if claimed == 0 {
+            return 0;
+        }
+        match self.debit_native(&pool, claimed).await {
+            Ok(()) => claimed,
+            Err(e) => {
+                let available = self
+                    .get_account(&pool)
+                    .await
+                    .map(|a| a.balance)
+                    .unwrap_or(0);
+                let moved = available.min(claimed);
+                tracing::error!(
+                    "SLASH-POOL-DRIFT {what}: the ledger removed {claimed} nano but pool {} holds only {available} ({e}); capping the debit at {moved} and un-counting the unbacked shortfall",
+                    hex::encode(pool),
+                );
+                if moved > 0 {
+                    if let Err(e2) = self.debit_native(&pool, moved).await {
+                        tracing::error!(
+                            "SLASH-POOL-DRIFT {what}: the capped debit of {moved} nano from {} ALSO failed ({e2}); nothing left the pool",
+                            hex::encode(pool),
+                        );
+                        return 0;
+                    }
+                }
+                let shortfall = claimed.saturating_sub(moved);
+                if shortfall > 0 {
+                    self.staking_write().await.record_unbacked_burn(shortfall);
+                }
+                moved
+            }
+        }
+    }
+
     /// Downtime attribution against an EXPLICIT validator set.
     ///
     /// W10.5 activation boundary: the evidence QC (height H-1) must be
@@ -3724,16 +3912,34 @@ impl InMemoryStateEngine {
         }
         let signers = cert.signers_set(val_set);
         let eligible: Vec<[u8; 32]> = val_set.validators.keys().copied().collect();
-        let burned = self.staking_write().await.note_missed_heights(
-            height,
-            &|v: &[u8; 32]| signers.contains(v),
-            &eligible,
-        );
+        // SLASH-02: settle BOTH backing pools from the ledger's own split.
+        // `note_missed_heights` burns on the evidence scope (SLASH-01), so
+        // part of `burned` may be unclaimed `pending_rewards` — backed by
+        // `REWARDS_POOL` and mirrored in `ledger.rewards_pool`. The ledger
+        // decrements that mirror by exactly the pending cut, so the difference
+        // is the reward leg; the rest is staking principal.
+        let (burned, rewards_cut) = {
+            let mut ledger = self.staking_write().await;
+            let rewards_before = ledger.rewards_pool;
+            let burned = ledger.note_missed_heights(
+                height,
+                &|v: &[u8; 32]| signers.contains(v),
+                &eligible,
+            );
+            (burned, rewards_before.saturating_sub(ledger.rewards_pool))
+        };
         if burned > 0 {
-            // The coins are real: take them out of the staking pool.
-            let _ = self
-                .debit_native(&crate::staking::STAKING_POOL, burned)
+            let staking_cut = burned.saturating_sub(rewards_cut);
+            let settled_staking = self
+                .settle_slash_burn(crate::staking::STAKING_POOL, staking_cut, "downtime")
                 .await;
+            let settled_rewards = self
+                .settle_slash_burn(crate::staking::REWARDS_POOL, rewards_cut, "downtime-rewards")
+                .await;
+            // Report what ACTUALLY left the pools (equal to `burned` unless the
+            // state was already drifted); `outcome.slashed` claims destruction,
+            // so it must not include a shortfall the pools could not fund.
+            return settled_staking.saturating_add(settled_rewards);
         }
         burned
     }
@@ -3822,23 +4028,43 @@ impl InMemoryStateEngine {
                 // Fail-closed per evidence: an unknown voter (membership moved
                 // since shaping) burns 0 with a loud WARN instead of failing
                 // the block; a repeat offense burns 0 via the ledger dedup.
-                let burned = match self.staking_write().await.slash_equivocation_verified(&ev) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            "equivocation evidence for {} skipped ({e}): refusing to slash",
-                            hex::encode(ev.voter),
-                        );
-                        0
-                    }
+                // SLASH-02: the primitive burns on the evidence scope, so
+                // the caller settles BOTH pools (staking principal split from
+                // unclaimed rewards by the ledger's own mirror).
+                let (burned, rewards_cut) = {
+                    let mut ledger = self.staking_write().await;
+                    let rewards_before = ledger.rewards_pool;
+                    let burned = match ledger.slash_equivocation_verified(&ev) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                "equivocation evidence for {} skipped ({e}): refusing to slash",
+                                hex::encode(ev.voter),
+                            );
+                            0
+                        }
+                    };
+                    (burned, rewards_before.saturating_sub(ledger.rewards_pool))
                 };
                 if burned > 0 {
-                    // The coins are real: take them out of the staking pool,
-                    // exactly like the downtime path above.
-                    let _ = self
-                        .debit_native(&crate::staking::STAKING_POOL, burned)
+                    let staking_cut = burned.saturating_sub(rewards_cut);
+                    let settled_staking = self
+                        .settle_slash_burn(
+                            crate::staking::STAKING_POOL,
+                            staking_cut,
+                            "vote-equivocation",
+                        )
                         .await;
-                    total = total.saturating_add(burned);
+                    let settled_rewards = self
+                        .settle_slash_burn(
+                            crate::staking::REWARDS_POOL,
+                            rewards_cut,
+                            "vote-equivocation-rewards",
+                        )
+                        .await;
+                    total = total
+                        .saturating_add(settled_staking)
+                        .saturating_add(settled_rewards);
                 }
             }
         }
@@ -3868,27 +4094,41 @@ impl InMemoryStateEngine {
                 // moved since shaping) burns 0 with a loud WARN instead of
                 // failing the block; a repeat offense burns 0 via the ledger
                 // dedup.
-                let burned = match self
-                    .staking_write()
-                    .await
-                    .slash_proposal_equivocation_verified(&ev)
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            "proposal equivocation evidence for {} skipped ({e}): refusing to slash",
-                            hex::encode(ev.proposer),
-                        );
-                        0
-                    }
+                // SLASH-02: same two-pool settlement as the vote pass.
+                let (burned, rewards_cut) = {
+                    let mut ledger = self.staking_write().await;
+                    let rewards_before = ledger.rewards_pool;
+                    let burned = match ledger.slash_proposal_equivocation_verified(&ev) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                "proposal equivocation evidence for {} skipped ({e}): refusing to slash",
+                                hex::encode(ev.proposer),
+                            );
+                            0
+                        }
+                    };
+                    (burned, rewards_before.saturating_sub(ledger.rewards_pool))
                 };
                 if burned > 0 {
-                    // The coins are real: take them out of the staking pool,
-                    // exactly like the vote path above.
-                    let _ = self
-                        .debit_native(&crate::staking::STAKING_POOL, burned)
+                    let staking_cut = burned.saturating_sub(rewards_cut);
+                    let settled_staking = self
+                        .settle_slash_burn(
+                            crate::staking::STAKING_POOL,
+                            staking_cut,
+                            "proposal-equivocation",
+                        )
                         .await;
-                    total = total.saturating_add(burned);
+                    let settled_rewards = self
+                        .settle_slash_burn(
+                            crate::staking::REWARDS_POOL,
+                            rewards_cut,
+                            "proposal-equivocation-rewards",
+                        )
+                        .await;
+                    total = total
+                        .saturating_add(settled_staking)
+                        .saturating_add(settled_rewards);
                 }
             }
         }

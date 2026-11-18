@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::qc_split::produce_decision_certificate;
+use super::qc_split::produce_decision_certificate_with_schedule;
 use super::rotation::pq_key_at_height;
-use super::sortition::{derive_sortition_committee, micro_committee_size, pq_micro_required_power};
+use super::sortition::{committee_for_height, micro_committee_size, pq_micro_required_power};
 use super::types::{
-    note_validator_set_for_vote_cache, verify_proposer_signature, BlockHash, Height,
-    PqMicroCertificate, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote, VoteKind,
+    note_validator_set_for_vote_cache, verify_proposer_signature, BlockHash, CommitteeSchedule,
+    Height, PqMicroCertificate, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote,
+    VoteKind,
 };
 
 /// Anti-DoS bound: ignore votes for rounds more than this far ahead of ours.
@@ -807,13 +808,43 @@ impl VoteSet {
     /// elected (audit W6.4b).
     ///
     /// Canonical parent-hash draw byte-for-byte.
-    #[allow(clippy::unnecessary_unwrap)]
-    // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
     pub fn certificate_with_parent(
         &self,
         target: Option<BlockHash>,
         validators: &ValidatorSet,
         parent_hash: Option<&[u8; 32]>,
+    ) -> Option<QuorumCertificate> {
+        self.certificate_with_schedule(
+            target,
+            validators,
+            parent_hash,
+            CommitteeSchedule::ParentHash,
+        )
+    }
+
+    /// [`Self::certificate_with_parent`] under an explicit
+    /// [`CommitteeSchedule`] — the ONE producer side of "who signs at height H".
+    ///
+    /// * [`CommitteeSchedule::ParentHash`]: the canonical v5 parent-hash draw,
+    ///   byte-identical to [`Self::certificate`].
+    /// * [`CommitteeSchedule::Beacon`]: the CN-VRF v3 epoch-beacon draw
+    ///   (`sortition::committee_for_height`), the same draw
+    ///   `QuorumCertificate::verify_with_schedule` re-derives. Without this the
+    ///   finalize gate attributes the µQC through the beacon, finds no committee
+    ///   match and refuses the node's OWN decision certificate (review F2).
+    ///
+    /// `parent_hash` is still required (and still stored as
+    /// `sortition_parent`) on BOTH branches: it is the chain binding
+    /// `binds_to_parent` checks, and an unknown parent means no honest verifier
+    /// can bind this height, so no µQC is compiled (fail closed).
+    #[allow(clippy::unnecessary_unwrap)]
+    // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
+    pub fn certificate_with_schedule(
+        &self,
+        target: Option<BlockHash>,
+        validators: &ValidatorSet,
+        parent_hash: Option<&[u8; 32]>,
+        schedule: CommitteeSchedule,
     ) -> Option<QuorumCertificate> {
         if !self.quorum_reached(target, validators) {
             return None;
@@ -859,13 +890,16 @@ impl VoteSet {
             let parent_hash = parent_hash.expect("checked above");
             let committee_size = micro_committee_size(validators.len());
             if committee_size > 0 {
-                // Canonical draw applies byte-for-byte.
-                let committee = derive_sortition_committee(
+                // The ONE committee rule: parent-hash draw below activation,
+                // epoch-beacon draw at/after it. The verifier re-derives the
+                // SAME committee for this certificate.
+                let committee = committee_for_height(
                     validators,
                     qc.height,
                     qc.round,
                     committee_size,
-                    parent_hash,
+                    Some(parent_hash),
+                    schedule,
                 );
                 // No seal ever travels with the certificate: verifiers resolve
                 // the same legacy committee, so embedding anything would only
@@ -1021,6 +1055,17 @@ pub struct HeightConsensus {
     /// which is strictly better than finalizing on a committee nobody else
     /// elected.
     parent_hash_known: bool,
+    /// THE schedule this height produces and verifies under (review F2).
+    ///
+    /// Defaults to [`CommitteeSchedule::ParentHash`] — the canonical v5 draw,
+    /// byte-identical to the pre-activation code — so a `HeightConsensus`
+    /// built directly (every test, every pre-activation node) is unchanged.
+    /// The runtime installs [`CommitteeSchedule::Beacon`] for a height at or
+    /// above its CN-VRF v3 activation (see
+    /// `ValidatorRuntime::install_committee_schedule`), and the decision
+    /// certificates this height produces are then drawn from the SAME epoch
+    /// beacon its own verifier attributes them with.
+    pub committee_schedule: CommitteeSchedule,
     /// (proposer, block_hash) proposed this round
     pub proposal: Option<(ValidatorId, BlockHash)>,
     /// The round `proposal` was accepted in. A vote must name the CURRENT
@@ -1278,6 +1323,7 @@ impl HeightConsensus {
             validators,
             parent_hash: [0u8; 32],
             parent_hash_known: height <= 1,
+            committee_schedule: CommitteeSchedule::ParentHash,
             proposal: None,
             proposal_round: None,
             locked: None,
@@ -1319,6 +1365,17 @@ impl HeightConsensus {
         self.parent_hash_known
     }
 
+    /// Install the committee/proposer schedule of this height (review F2).
+    ///
+    /// The runtime calls this with [`CommitteeSchedule::Beacon`] at/after its
+    /// CN-VRF v3 activation height and with
+    /// [`CommitteeSchedule::ParentHash`] before it, so the certificates this
+    /// height PRODUCES are drawn from exactly the schedule its own verifier
+    /// (`QuorumCertificate::verify_with_schedule`) attributes them with.
+    pub fn set_committee_schedule(&mut self, schedule: CommitteeSchedule) {
+        self.committee_schedule = schedule;
+    }
+
     /// The sortition parent of this height, or `None` when it is UNKNOWN.
     ///
     /// `None` means "no honest committee can be derived" — the caller must
@@ -1332,7 +1389,12 @@ impl HeightConsensus {
     }
 
     pub fn proposer(&self) -> Option<ValidatorId> {
-        self.validators.proposer_for(self.height, self.round)
+        // THE schedule of this height (review F2): parent-hash draw below
+        // CN-VRF v3 activation, epoch beacon at/after it. The runtime installs
+        // it via `set_committee_schedule`; a bare `HeightConsensus` keeps the
+        // byte-identical parent-hash default.
+        self.validators
+            .proposer_for_with_schedule(self.height, self.round, self.committee_schedule)
     }
 
     /// Accept a proposal for the current round from the correct proposer.
@@ -1664,11 +1726,12 @@ impl HeightConsensus {
                 continue;
             };
             if found.is_none() {
-                if let Some(qc) = produce_decision_certificate(
+                if let Some(qc) = produce_decision_certificate_with_schedule(
                     set,
                     target,
                     &self.validators,
                     self.sortition_parent(),
+                    self.committee_schedule,
                 ) {
                     self.prevote_qc.insert(round, qc);
                 }
@@ -1750,11 +1813,12 @@ impl HeightConsensus {
             let Some(Some(target)) = set.quorum_target(&self.validators) else {
                 continue;
             };
-            if let Some(qc) = produce_decision_certificate(
+            if let Some(qc) = produce_decision_certificate_with_schedule(
                 set,
                 Some(target),
                 &self.validators,
                 self.sortition_parent(),
+                self.committee_schedule,
             ) {
                 self.prevote_qc.insert(round, qc);
             }
@@ -1790,11 +1854,12 @@ impl HeightConsensus {
         if self.observed_polka.map(|(r, _)| r > round).unwrap_or(false) {
             return; // an older polka never supersedes a newer one
         }
-        let qc = produce_decision_certificate(
+        let qc = produce_decision_certificate_with_schedule(
             set,
             Some(target),
             &self.validators,
             self.sortition_parent(),
+            self.committee_schedule,
         );
         if let Some(qc) = qc {
             self.prevote_qc.insert(round, qc);
@@ -1881,9 +1946,13 @@ impl HeightConsensus {
             }
         }
 
-        if let Some(qc) =
-            produce_decision_certificate(set, target, &self.validators, self.sortition_parent())
-        {
+        if let Some(qc) = produce_decision_certificate_with_schedule(
+            set,
+            target,
+            &self.validators,
+            self.sortition_parent(),
+            self.committee_schedule,
+        ) {
             self.precommit_qc = Some(qc);
         }
         // Lock monotonicity (safety): the lock round only moves forward. A

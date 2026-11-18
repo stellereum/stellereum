@@ -77,11 +77,15 @@ async fn two_shard_cluster(
     // is funded with; each node gets its OWN engine from that shard's genesis.
     let nodes0 = vec![(validator.clone(), funded_engine(shard0_funding).await)];
     let nodes1 = vec![(validator.clone(), funded_engine(shard1_funding).await)];
-    ShardedCluster::new(
+    let mut cluster = ShardedCluster::new(
         fixed_pair_registry(),
         vec![(SHARD0, nodes0), (SHARD1, nodes1)],
         CrossShardTransport::local(),
-    )
+    );
+    // XSHARD-01: all cross-shard VALUE runs through the §9 2PC (the legacy
+    // one-step credit is refused; it cannot prove the source-side debit).
+    cluster.with_xpc_activation(stellereum::xshard2pc::XpcActivation::FromHeight(0));
+    cluster
 }
 
 fn finalized_blocks(c: &Cluster) -> Vec<Block> {
@@ -156,19 +160,26 @@ async fn drive_soak(sc: &mut ShardedCluster, transfers: &[(u64, Transaction)]) -
     trace
 }
 
+/// Number of COMMIT (terminal decision) records the source published for
+/// `tx_hash`. The 2PC re-publishes a decision until the peer consumes it, so
+/// this is "at least once" — exactly-once is asserted on the VALUE (one source
+/// debit, one target credit), which is what matters.
 fn produced_outbound(c: &Cluster, tx_hash: &[u8; 32]) -> usize {
     finalized_blocks(c)
         .iter()
         .flat_map(|b| b.cross_shard_out.iter())
-        .filter(|m| m.is_outbound_for(SHARD0) && m.tx.compute_tx_hash() == *tx_hash)
+        .filter(|m| {
+            m.is_outbound_for(SHARD0) && m.is_commit() && m.tx.compute_tx_hash() == *tx_hash
+        })
         .count()
 }
 
+/// Number of COMMIT (value-moving) records the target consumed for `tx_hash`.
 fn consumed_inbound(c: &Cluster, tx_hash: &[u8; 32]) -> usize {
     finalized_blocks(c)
         .iter()
         .flat_map(|b| b.cross_shard_out.iter())
-        .filter(|m| m.is_inbound_for(SHARD1) && m.tx.compute_tx_hash() == *tx_hash)
+        .filter(|m| m.is_inbound_for(SHARD1) && m.is_commit() && m.tx.compute_tx_hash() == *tx_hash)
         .count()
 }
 
@@ -258,20 +269,25 @@ async fn fixed_pair_soak_is_deterministic_and_never_diverges() {
         }
     }
 
-    // Zero cross-shard divergence: each transfer produced once, consumed once,
-    // in BOTH clusters.
+    // Zero cross-shard divergence: each transfer is escrowed once, decided
+    // once, and completed once, in BOTH clusters.
     for tx in [&transfer_a, &transfer_b] {
         let tx_hash = tx.compute_tx_hash();
         for cluster in [&cluster_a, &cluster_b] {
-            assert_eq!(
-                produced_outbound(cluster.shard(SHARD0), &tx_hash),
-                1,
-                "the source must emit the transfer exactly once"
+            assert!(
+                produced_outbound(cluster.shard(SHARD0), &tx_hash) >= 1,
+                "the source must publish the COMMIT (at least once)"
             );
-            assert_eq!(
-                consumed_inbound(cluster.shard(SHARD1), &tx_hash),
-                1,
-                "the target must consume the transfer exactly once"
+            assert!(
+                consumed_inbound(cluster.shard(SHARD1), &tx_hash) >= 1,
+                "the target must consume the COMMIT (at least once)"
+            );
+            assert!(
+                cluster.shard(SHARD1).nodes[0]
+                    .state
+                    .is_cross_shard_completed(&tx_hash)
+                    .await,
+                "the transfer must complete exactly once on the target"
             );
         }
     }

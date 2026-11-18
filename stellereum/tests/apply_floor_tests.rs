@@ -326,10 +326,14 @@ async fn replay_and_gap_failures_pay_nothing() {
 
     let sender = engine.get_account(&from).await.unwrap();
     assert_eq!(sender.nonce, 1, "only the honest apply advanced the nonce");
+    // FEE-01: the honest apply is an empty-payload transfer declaring
+    // `FLOOR` = 500 000 gas on a floor-0 chain, so it pays the 280 000
+    // intrinsic envelope cost — not its declaration. (The old expectation,
+    // `BAL - FLOOR`, encoded the declared-limit rule this fix removes.)
     assert_eq!(
         sender.balance,
-        BAL - FLOOR,
-        "only the honest apply was charged"
+        BAL - GAS_BASIC_TRANSFER,
+        "only the honest apply was charged, and only for what it used"
     );
 }
 
@@ -354,13 +358,17 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
         .await;
 
     assert_eq!(out.status, vec![true, true, false]);
-    assert_eq!(out.tx_fees, vec![600_000, FLOOR, FLOOR]);
-    assert_eq!(out.fees_collected, 600_000 + FLOOR + FLOOR);
+    // FEE-01: `valid` declares 600 000 gas but is an empty-payload transfer,
+    // so it is billed `min(600 000, 280 000)` = the 280 000 intrinsic, which
+    // the 500 000 consensus floor raises to FLOOR. (The old expectation,
+    // 600 000, encoded the declared-limit over-charge this fix removes.)
+    assert_eq!(out.tx_fees, vec![FLOOR, FLOOR, FLOOR]);
+    assert_eq!(out.fees_collected, FLOOR + FLOOR + FLOOR);
 
     let sender = engine.get_account(&from).await.unwrap();
     assert_eq!(
         sender.balance,
-        BAL - (1_000 + 600_000) - (500 + FLOOR) - FLOOR
+        BAL - (1_000 + FLOOR) - (500 + FLOOR) - FLOOR
     );
     assert_eq!(
         sender.nonce, 3,
@@ -369,7 +377,7 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
     let bob = engine.get_account(&[0xB0; 32]).await.unwrap();
     assert_eq!(bob.balance, 1_000 + 500);
     let proposer_acct = engine.get_account(&proposer_id).await.unwrap();
-    assert_eq!(proposer_acct.balance, 600_000 + FLOOR + FLOOR);
+    assert_eq!(proposer_acct.balance, FLOOR + FLOOR + FLOOR);
     assert_eq!(
         sender.balance + bob.balance + proposer_acct.balance,
         total_before,
@@ -458,6 +466,128 @@ async fn pq_activation_floor_includes_surcharge_at_apply() {
     );
     let sender = engine.get_account(&from).await.unwrap();
     assert_eq!(sender.balance, BAL - FLOOR - PQ_SURCHARGE);
+}
+
+// ===========================================================================
+// FEE-01: the fee is the gas CONSUMED, never the declared limit
+// ===========================================================================
+
+/// GOLDEN FEE-01 CASE (empty payload): a transfer declaring 1 000 000 gas on
+/// a floor-0 chain is billed the intrinsic envelope cost and REFUNDED the
+/// rest.
+///
+/// Before the fix the block path passed `tx.gas_limit` as the gas it had
+/// charged, so `min(gas_charged, gas_limit)` was a no-op and this transaction
+/// paid 1 000 000 for consuming ~0.
+#[tokio::test]
+async fn block_refunds_unused_gas_on_a_plain_transfer() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    let declared = 1_000_000u64;
+    let tx = tx(&alice, [0xB0; 32], 1_000, declared, 0);
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "the fee is the intrinsic envelope cost, not the 1 000 000 declaration"
+    );
+    assert_eq!(
+        fees_collected, GAS_BASIC_TRANSFER,
+        "fees_collected is the sum of charged fees (the proposer credit)"
+    );
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - 1_000 - GAS_BASIC_TRANSFER);
+    assert_eq!(sender.nonce, 1);
+}
+
+/// GOLDEN FEE-01 CASE (payload): the VM's own `gas_used` prices the fee.
+///
+/// A `Transfer` opcode consumes `GAS_BASIC_TRANSFER`; declaring 1 000 000 and
+/// consuming 280 000 must debit 280 000, not the declaration.
+#[tokio::test]
+async fn block_charges_the_measured_gas_of_a_payload() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    let tx = txp(
+        &alice,
+        [0xB0; 32],
+        1_000,
+        1_000_000,
+        0,
+        vec![OpCode::Transfer {
+            recipient: [0xB1; 32],
+            amount: 3_000,
+        }],
+    );
+    let (applied, failed, _, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "one Transfer opcode consumes GAS_BASIC_TRANSFER; the rest is refunded"
+    );
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - 1_000 - 3_000 - GAS_BASIC_TRANSFER,
+        "only the consumed gas leaves the sender"
+    );
+}
+
+/// GOLDEN FEE-01 CASE (failure): an attributable failure is priced at the
+/// intrinsic envelope, floored by consensus — never at the declared limit.
+///
+/// The failure arm of the VM result carries no consumption measurement, so
+/// the declared limit must not be used as a stand-in price (that was the
+/// over-charge). The fee stays strictly positive, so the D2 free-failure loop
+/// is still closed.
+#[tokio::test]
+async fn failed_block_tx_pays_measured_gas_not_the_declaration() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // A token transfer against a non-existent token reverts.
+    let tx = txp(
+        &alice,
+        [0xB0; 32],
+        0,
+        1_000_000,
+        0,
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: [0xAB; 32],
+            to: [0x44; 32],
+            amount: 1,
+        }],
+    );
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (0, 1));
+    assert_eq!(status, vec![false]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "a failure pays the intrinsic envelope cost, not the 1 000 000 declaration"
+    );
+    assert_eq!(fees_collected, GAS_BASIC_TRANSFER);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - GAS_BASIC_TRANSFER);
+    assert_eq!(sender.nonce, 1, "a paid failure consumes its nonce");
 }
 
 // ===========================================================================

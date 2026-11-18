@@ -344,7 +344,7 @@ async fn rate_limit(
     // Forwarded only when the TCP peer is in STELL_TRUSTED_PROXY_CIDRS,
     // loopback-only by default); otherwise the TCP peer. Without this every
     // client behind nginx/Cloudflare shared one bucket.
-    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip()).addr;
     if !st.limiter.check(client) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
@@ -357,7 +357,7 @@ async fn nested_rpc_rate_limit(
     req: Request,
     next: Next,
 ) -> Response {
-    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip()).addr;
     if !st.rpc_limiter.check(client) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
@@ -565,7 +565,7 @@ async fn api_faucet(
     };
     // Real client IP: proxy headers only from a trusted peer (see
     // crate::client_ip); feeds the per-IP faucet budget and the logs below.
-    let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip());
+    let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr;
     // Fail-closed: the faucet mints money, so "no token configured" must never
     // degrade into "anyone who can reach this gateway may mint". This mirrors
     // the `stell_faucet` JSON-RPC gate exactly and accepts the token either as
@@ -774,7 +774,18 @@ async fn api_faucet_public(
         };
     // Real client IP behind a trusted proxy (see crate::client_ip): feeds the
     // per-IP faucet budget and Turnstile `remoteip` below.
-    let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip());
+    let resolved = crate::client_ip::resolve_client_ip(&headers, addr.ip());
+    let client_ip = resolved.addr;
+    if resolved.source == crate::client_ip::ClientIpSource::ForwardedLoopbackRejected {
+        // Provenance is security-relevant: a proxy forwarded a loopback claim
+        // but the deployment has not opted in, so the claim is discarded and
+        // the local (captcha-exempt) branch below stays CLOSED.
+        tracing::warn!(
+            "[faucet] discarded forwarded loopback IP claim from peer {} (set {}=1 only for a trusted overwriting proxy)",
+            addr.ip(),
+            crate::client_ip::TRUST_LOOPBACK_FORWARDED_ENV,
+        );
+    }
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -833,12 +844,15 @@ async fn api_faucet_public(
         }
         crate::turnstile::CaptchaConfig::Disabled => {
             // Fail-closed default: an unconfigured captcha must not dispense to
-            // the public internet. Loopback (local dev/tests) keeps the legacy
-            // IP-throttle-only path; everything else is 503 with no funds
-            // moved, no throttle consumed. NOTE: behind a reverse proxy the
-            // operator must forward the client IP (STELL_TRUSTED_PROXY_CIDRS /
-            // X-Forwarded-For) so public traffic is not misread as loopback.
-            if !client_ip.is_loopback() {
+            // the public internet. Only a DIRECT loopback TCP peer (local
+            // dev/tests) keeps the legacy IP-throttle-only path: a loopback
+            // address claimed in a forwarding header is not local, so a
+            // same-host proxy cannot be talked into opening this branch by a
+            // client-supplied `CF-Connecting-IP: 127.0.0.1` (F11). Behind a
+            // reverse proxy the operator must forward the real client IP
+            // (STELL_TRUSTED_PROXY_CIDRS / X-Forwarded-For) so public traffic
+            // is not misread as loopback.
+            if !resolved.is_local_client() {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "public faucet captcha is not configured on this node (set STELL_TURNSTILE_SITE_KEY and STELL_TURNSTILE_SECRET_KEY); refusing to dispense",
@@ -2237,7 +2251,10 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         // SSE transport of the streaming subscriptions (`text/event-stream`).
         // The same handler the RPC server exposes on `/events`; mounted here
         // so a browser can `EventSource("/events")` against the public
-        // gateway without going through the `/rpc` prefix.
+        // gateway without going through the `/rpc` prefix. Idle streams are
+        // reaped on the handler's configured window (SSE_IDLE_TIMEOUT_SECS /
+        // STELL_SSE_IDLE_TIMEOUT_SECS), so one request cannot hold a gateway
+        // concurrency permit forever.
         .route("/events", get(crate::rpc::sse_handler))
         .layer(middleware::from_fn(cors_middleware))
         .layer(middleware::from_fn_with_state(gateway.clone(), rate_limit))

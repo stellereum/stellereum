@@ -23,6 +23,21 @@ pub const MAX_ACTIVATION_BUFFER_NONCES_PER_ACCOUNT: usize = 4;
 /// raw post-quantum public keys (§2.2).
 pub const PQ_ACTIVATION_SURCHARGE_GAS: u64 = 45_000;
 
+/// Stable refusal for an `EV1` EVM settlement envelope at admission.
+///
+/// `EV1` carries canonical EIP-155/EIP-1559 bytes in `Transaction.signature`
+/// and authenticates them with a secp256k1 signature. FULL-PQ admission has
+/// no mode in which that is a consensus credential: `Transaction::
+/// verify_signature` refuses every `EV1` inner envelope, and the mempool's
+/// `PQ1`/`SF1` gate below would refuse it anyway. Naming the requirement here
+/// (instead of the generic "classical non-PQ" text) makes a P2P-received or
+/// directly-submitted `EV1` fail with an actionable reason.
+pub const EVM_ENVELOPE_REFUSAL: &str =
+    "EV1 EVM settlement envelopes are not admissible: FULL-PQ admission requires a PQ1 \
+     (Falcon-512) envelope or an SF1 Falcon session grant; a secp256k1 signature is not a \
+     consensus credential. Submit the same value transfer as a PQ transaction via \
+     stell_sendRawTransaction.";
+
 /// Buffers out-of-order nonces for unactivated accounts (up to 4 nonces per account
 /// (= NONCE_FUTURE_WINDOW) when Tx2 arrives before Tx1 — Stellereum PQ-BFT v5 spec §2.3).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1901,6 +1916,15 @@ impl Mempool {
         // envelopes) is deleted, not gated — there is no mode in which a
         // classical transaction is admissible.
         //
+        // EVM CARRIER (`EV1`): the RPC compatibility layer may hand us a
+        // Phase-2 EVM settlement envelope (raw EIP-155/EIP-1559 bytes plus a
+        // secp256k1 signature). It is refused HERE, before the generic
+        // non-PQ branch, with its own reason so a caller learns the exact
+        // requirement. This ADDS a refusal; it does not relax the PQ gate
+        // below (an EV1 envelope never reaches it).
+        if tx.is_evm() {
+            return Err(MempoolError::Malformed(EVM_ENVELOPE_REFUSAL.to_string()));
+        }
         // SESSION-AUTH CARVE-OUT: `SF1` session-key envelopes (`delegation().is_some()`)
         // do not carry a `PQ1` transport wrapper — they skip this transport gate
         // and fall through to `check_session_policy()` and `verify_signature()`,

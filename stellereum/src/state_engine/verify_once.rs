@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +19,12 @@ use std::sync::{Mutex, OnceLock};
 //   commit the signature, so the sig binding is load-bearing: any mutated
 //   byte (amount, nonce, sig, delegation, sponsor, chain envelope, ...)
 //   changes at least one of the three digests and forces full re-verify.
+//   PQ1/EVM envelopes are the exception that proves it: their tx hash
+//   already folds the FULL signature bytes into its preimage (tags
+//   `PQ_ENV` / `EVM_TX`), so the dedicated signature digest is provably
+//   redundant there and is replaced by a constant — every mutated byte
+//   still changes the tx hash, and therefore the cache key. See
+//   `signature_digest`.
 // * The record binds the chain domain BOTH ways: the transaction's own
 //   `chain_id()` (None for legacy unbound) AND the node's chain id the
 //   admission was verified for (`verified_for_chain`). A replay of the same
@@ -82,14 +89,54 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+thread_local! {
+    /// Per-thread transaction-hash state (one hasher + one payload scratch
+    /// buffer). `Transaction::compute_tx_hash` allocates a fresh `Vec` for the
+    /// bincode payload on EVERY call; the block path calls it once per
+    /// transaction, so this reuses the allocation. `TxHashBatch::hash_one`
+    /// feeds the IDENTICAL update sequence, so hashes are byte-identical.
+    static TX_HASHER: RefCell<Option<crate::sharding::TxHashBatch>> = const { RefCell::new(None) };
+}
+
+/// `Transaction::compute_tx_hash` without the per-call allocation.
+fn tx_hash(tx: &crate::sharding::Transaction) -> [u8; 32] {
+    TX_HASHER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let batch = slot.get_or_insert_with(crate::sharding::Transaction::batch_hasher);
+        batch.hash_one(tx)
+    })
+}
+
+/// sha256 of the transaction's FULL signature bytes.
+///
+/// Skipped (replaced by the all-zero digest) when the transaction hash
+/// ALREADY commits those exact bytes: `hash_into` folds `self.signature`
+/// verbatim into the preimage for PQ envelopes (`PQ_ENV` tag) and EVM
+/// envelopes (`EVM_TX` tag), so any mutation of any signature byte changes
+/// `tx_hash` and the cache key still misses. Legacy / sponsored-classical
+/// transactions do NOT commit their signature, which is exactly why the
+/// separate digest exists for them (and is load-bearing there).
+///
+/// The map key stays unique per (exact bytes, chain): the verdict for a
+/// given transaction is unchanged, only a provably redundant second sha256
+/// pass over the same bytes is removed.
+#[inline]
+fn signature_digest(tx: &crate::sharding::Transaction) -> [u8; 32] {
+    if tx.is_pq() || tx.is_evm() {
+        [0u8; 32]
+    } else {
+        sha256_bytes(&tx.signature)
+    }
+}
+
 /// Record a verified signature attestation. Call ONLY after the transaction's
 /// signature has been cryptographically verified (mempool admission or a
 /// full apply verification). Fail-closed: recording a bad verdict is the
 /// caller's bug, so the single mempool call site sits directly behind its
 /// `verify_signature_with_registry` check.
 pub fn record_verified_signature(tx: &crate::sharding::Transaction, verified_for_chain: u64) {
-    let tx_hash = tx.compute_tx_hash();
-    let sig_hash = sha256_bytes(&tx.signature);
+    let tx_hash = tx_hash(tx);
+    let sig_hash = signature_digest(tx);
     let msg_hash = sha256_bytes(&tx.signing_message());
     let rec = VerifiedSigRecord {
         from: tx.from,
@@ -127,8 +174,15 @@ pub fn verified_signature_covers(tx: &crate::sharding::Transaction, expected_cha
         VERIFY_ONCE_MISSES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    let tx_hash = tx.compute_tx_hash();
-    let sig_hash = sha256_bytes(&tx.signature);
+    // Every digest this attestation binds is computed ONCE, outside the
+    // cache lock: the lock used to be held across the signing-preimage
+    // sha256, which serialised all cover checks on one mutex. The compared
+    // values are unchanged.
+    let tx_hash = tx_hash(tx);
+    let sig_hash = signature_digest(tx);
+    let msg_hash = sha256_bytes(&tx.signing_message());
+    let bound_chain = tx.chain_id();
+    let pure_pq_enforced = crate::post_quantum::is_pure_pq_enforced();
     let guard = verify_once_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -139,10 +193,10 @@ pub fn verified_signature_covers(tx: &crate::sharding::Transaction, expected_cha
     let covered = rec.from == tx.from
         && rec.tx_hash == tx_hash
         && rec.sig_len == tx.signature.len()
-        && rec.msg_hash == sha256_bytes(&tx.signing_message())
-        && rec.bound_chain == tx.chain_id()
+        && rec.msg_hash == msg_hash
+        && rec.bound_chain == bound_chain
         && rec.verified_for_chain == expected_chain
-        && rec.pure_pq_enforced == crate::post_quantum::is_pure_pq_enforced();
+        && rec.pure_pq_enforced == pure_pq_enforced;
     if covered {
         VERIFY_ONCE_HITS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -256,4 +310,89 @@ pub fn verify_once_clear() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .map
         .clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sharding::Transaction;
+
+    /// The cache is process-global; serialise the cases inside this module.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn bare_tx(signature: Vec<u8>, amount: u64) -> Transaction {
+        Transaction {
+            from: [0x11u8; 32],
+            to: [0x22u8; 32],
+            amount,
+            gas_limit: 50_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature,
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        }
+    }
+
+    /// The attestation must bind the EXACT signature bytes on BOTH digest
+    /// paths: the classic one (separate sha256 of the signature) and the
+    /// optimised one (the signature is already committed by `tx_hash` for
+    /// PQ/EVM-framed transactions, so no second pass is made). A one-bit
+    /// signature mutation, an amount mutation and a different chain context
+    /// all have to miss — i.e. the shortcut removes a hash pass, never a
+    /// binding.
+    #[test]
+    fn attestation_binds_exact_bytes_on_both_digest_paths() {
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        verify_once_clear();
+        for framed_pq in [false, true] {
+            let signature = if framed_pq {
+                // PQ1 framing ⇒ `tx_hash` folds the whole signature into its
+                // preimage ⇒ `signature_digest` returns the zero digest.
+                let mut s = b"PQ1".to_vec();
+                s.extend_from_slice(&[0x42u8; 700]);
+                s
+            } else {
+                vec![0x42u8; 64]
+            };
+            assert_eq!(
+                signature_digest(&bare_tx(signature.clone(), 7)),
+                if framed_pq {
+                    [0u8; 32]
+                } else {
+                    sha256_bytes(&signature)
+                },
+                "digest path selection"
+            );
+
+            let tx = bare_tx(signature, 7);
+            record_verified_signature(&tx, 5);
+            assert!(
+                verified_signature_covers(&tx, 5),
+                "the exact attested bytes must cover"
+            );
+
+            let mut bad_sig = tx.clone();
+            let last = bad_sig.signature.len() - 1;
+            bad_sig.signature[last] ^= 0x01;
+            assert!(
+                !verified_signature_covers(&bad_sig, 5),
+                "one flipped signature bit must miss the attestation"
+            );
+
+            let mut bad_amount = tx.clone();
+            bad_amount.amount += 1;
+            assert!(
+                !verified_signature_covers(&bad_amount, 5),
+                "an amount mutation must miss the attestation"
+            );
+
+            assert!(
+                !verified_signature_covers(&tx, 6),
+                "the same bytes under another chain context must miss"
+            );
+        }
+        verify_once_clear();
+    }
 }

@@ -1,5 +1,64 @@
+//! Ethereum JSON-RPC surface: read views are REAL, the EVM write path is an
+//! honest FULL-PQ refusal.
+//!
+//! # Design: what this module does, and why the write path refuses
+//!
+//! Stellereum's consensus credential is a post-quantum signature. Every
+//! admission path funnels through `Mempool::insert` -> `add_checked_ctx` ->
+//! `Transaction::verify_signature`, which requires a `PQ1` (Falcon-512)
+//! envelope (or an `SF1` Falcon session grant) and requires
+//! `tx.from == derive_pq_address(scheme, pubkey, salt)`. A secp256k1 signature
+//! is **not** a consensus credential and there is no mode that makes it one.
+//!
+//! A `MetaMask` EIP-155 transaction is signed by a secp256k1 key and its
+//! sender is the EVM address derived from that key. Two facts make an honest
+//! one-step conversion impossible without a consensus change:
+//!
+//! 1. `EV1` (the old Phase-2 carrier) embeds the raw EVM bytes inside
+//!    `Transaction.signature`; `Transaction::verify_inner_with_registry`
+//!    explicitly returns `false` for `EV1` in FULL-PQ builds, so the mempool
+//!    must refuse it (see the dedicated `EV1` branch in `mempool::insert`).
+//! 2. A PQ envelope's `from` is a PQ-derived address, not the zero-padded
+//!    20-byte EVM address, and no on-chain PQ<->EVM address binding exists.
+//!    Letting the node sign with its own configured key would spend the
+//!    NODE's funds (a custodial relayer), not the user's, and would turn the
+//!    node key into an authority over user transfers — not acceptable. The
+//!    only node-side PQ key path wired to a transaction builder today is the
+//!    optional faucet key (`rpc::faucet::Faucet`,
+//!    `sign_pq_explicit_transfer`); it would debit the
+//!    faucet account (testnet-only) rather than the EVM sender, so it is not
+//!    a settlement path for `eth_sendRawTransaction`.
+//!
+//! Therefore `eth_sendRawTransaction`:
+//! * decodes and strictly verifies the EVM intent (chain id, low-s,
+//!   ecrecover) so malformed / malleable / foreign-chain / unprotected input
+//!   keeps a precise error;
+//! * then refuses a WELL-FORMED intent with `-32000`, naming the exact PQ
+//!   requirement and the replacement call, and **files no pending intent**
+//!   (the old path left an intent that could never settle);
+//! * returns `error.data = { reason: "full-pq-admission", requires, submitWith,
+//!   evmHash, readOnly }` so a wallet can act on it programmatically.
+//!
+//! The full EVM execution path needs a consensus-level change, not a
+//! client-compatibility shim: an EVM state trie + execution domain, and an
+//! on-chain, PQ-signed binding between a PQ account and an EVM address (or a
+//! `PQEVM` carrier whose PQ envelope signs `keccak(EVM intent)` and whose
+//! source account is the bound PQ account). Until such a binding is committed
+//! and verified by every node, the only truthful write answer is the refusal
+//! above plus the native PQ path `stell_sendRawTransaction`.
+//!
+//! Read-only methods stay fully served: `eth_call`, `eth_getProof` (real
+//! cpat2 inclusion/exclusion proof from the state trie), `eth_getCode` (real
+//! committed bytecode), `eth_getBalance`, `eth_getTransactionCount`,
+//! `eth_getLogs`, block/receipt lookups.
+//!
+//! `eth_subscribe` is refused honestly: the WebSocket transport
+//! (`rpc/streams.rs::ws_handle_text`) only tracks `stell_subscribe` and frames
+//! notifications as `{"subscription","result"}`; it has no EIP-1193
+//! `eth_subscription` envelope or EVM header/log materialiser. `stell_subscribe`
+//! (newHeads / events) and polling `eth_getLogs` are the supported paths.
+
 use super::*;
-use crate::mempool::AdmissionCtx;
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -705,7 +764,7 @@ pub(super) async fn dispatch_eth(
              (no per-block base fee / gas-used history). Price with eth_gasPrice \
              and eth_maxPriorityFeePerGas; the admission floor is stell_baseFee",
         ),
-        "eth_getCode" => match crate::evm_adapter::handle_eth_get_code(params) {
+        "eth_getCode" => match crate::evm_adapter::eth_get_code_rpc(st, params).await {
             Ok(code) => ok(id, json!(code)),
             Err(e) => err(id, e.code, e.message),
         },
@@ -837,74 +896,50 @@ pub(super) async fn dispatch_eth(
             Err(e) => err(id, e.code, e.message),
         },
         "eth_sendRawTransaction" => {
-            // Phase-2 settlement: the SAME bytes feed the intent pool AND the
-            // consensus mempool. Order matters: build the L1 leg and admit it
-            // via `add_checked_ctx` FIRST (pure + balance/nonce-gated, no side
-            // effects on failure), and only then file the EVM intent — so a
-            // mempool rejection never leaves a stale pending intent behind.
-            // Returns the EVM keccak hash, as MetaMask expects.
-            let raw = match crate::evm_adapter::extract_raw_evm_bytes(params) {
-                Ok(raw) => raw,
-                Err(e) => return Some(err(id, e.code, e.message)),
-            };
-            let stell_tx = match crate::evm_adapter::evm_raw_to_stell_transaction(&raw) {
-                Ok(tx) => tx,
-                Err(reason) => return Some(err(id, -32603, reason)),
-            };
-            // A14 phase 3: the mapped L1 leg passes the same admission gate
-            // as every other submit path, with the check's message verbatim.
-            // GATE: height is finalized-tip+1 from COMMITTED `st.height`,
-            // never caller params. Default-off always passes.
-            let next_height = st
-                .height
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(1);
-            if let Some(reason) = chain_binding_refusal(&stell_tx, next_height, st.chain_id) {
-                crate::metrics::global().inc_unbound_refused();
-                return Some(err(id, -32000, reason));
-            }
-            let acct = st.engine.get_account(&stell_tx.from).await;
-            let balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
-            let onchain_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
-            // The write guard must be released BEFORE `save_mempool_throttled`
-            // (same deadlock discipline as `stell_sendRawTransaction`).
-            let admitted = {
-                let mut pool = st.mempool.write().await;
-                // Nonce-gap fail-fast: a far-future EVM nonce would sit in the
-                // pool forever behind an unreachable head.
-                if let Some(gap) =
-                    pool.check_nonce_gap(&stell_tx.from, stell_tx.nonce, onchain_nonce)
-                {
-                    tracing::warn!(
-                        "[mempool] rejecting gapped EVM tx from {}: {gap}",
-                        hex::encode(&stell_tx.from[..6])
-                    );
-                    return Some(err(id, -32000, format!("rejected: {gap}")));
-                }
-                pool.add_checked_ctx(
-                    stell_tx.clone(),
-                    balance,
-                    AdmissionCtx::wall_now().with_chain_height(next_height),
-                )
-            };
-            let _stell_hash = match admitted {
+            // FULL-PQ HONESTY CONTRACT (see the module header):
+            //  1. Decode + strictly verify the EVM intent (Phase-1 gate:
+            //     chain id, low-s, ecrecover). Malformed / malleable /
+            //     foreign-chain / unprotected input keeps its precise error.
+            //  2. A well-formed intent is REFUSED with the PQ requirement and
+            //     the replacement call. No pending intent is filed (the old
+            //     path pooled an EV1 transaction the mempool must reject, and
+            //     an intent that could never settle).
+            // Read-only eth_call / eth_getProof / eth_getCode stay served.
+            let evm_hash = match crate::evm_adapter::extract_raw_evm_bytes(params)
+                .and_then(|raw| crate::evm_adapter::verify_raw_evm_intent(&raw))
+            {
                 Ok(h) => h,
-                Err(e) => return Some(err(id, -32000, format!("rejected: {e}"))),
+                Err(e) => return Some(rpc_error(id, e)),
             };
-            // L1 leg admitted: file the intent (re-verifies the same bytes,
-            // so this cannot fail after the conversion above passed).
-            let evm_hash = match crate::evm_adapter::eth_send_raw_transaction_bytes(&raw) {
-                Ok(h) => h,
-                Err(e) => return Some(err(id, e.code, e.message)),
-            };
-            // Propagate the settled transaction to P2P peers via gossip.
-            if let Some(bcast) = &st.tx_broadcast {
-                let _ = bcast.send(stell_tx);
-            }
-            st.save_mempool_throttled().await;
-            ok(id, json!(evm_hash))
+            rpc_error(id, crate::evm_adapter::evm_send_refusal(Some(&evm_hash)))
         }
+        "eth_getProof" => match crate::evm_adapter::eth_get_proof_rpc(st, params).await {
+            Ok(v) => ok(id, v),
+            Err(e) => rpc_error(id, e),
+        },
+        // REFUSED honestly: the WebSocket plumbing frames only
+        // `stell_subscribe` notifications and has no EIP-1193
+        // `eth_subscription` envelope / EVM header payload. Issuing an id
+        // would promise notifications this transport can never shape.
+        "eth_subscribe" => rpc_error(id, crate::evm_adapter::eth_subscribe_refusal(params)),
+        "eth_unsubscribe" => rpc_error(id, crate::evm_adapter::eth_unsubscribe_refusal()),
         _ => return None,
+    })
+}
+
+/// Render a [`crate::evm_adapter::JsonRpcError`] as a JSON-RPC response,
+/// preserving its `data` (the refusal contract carries machine-readable
+/// fields there; the plain `err()` helper drops them).
+fn rpc_error(id: Value, e: crate::evm_adapter::JsonRpcError) -> Json<RpcResponse> {
+    Json(RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(RpcError {
+            code: e.code,
+            message: e.message,
+            data: e.data,
+        }),
     })
 }
 

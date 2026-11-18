@@ -28,20 +28,46 @@
 //! MEASURED ATTRIBUTION (n = 1_000 mixed txs, release, median of 3-5, empty
 //! chain, attested signatures — the `packing::apply_mixed_1000` shape):
 //!
-//! | phase                                   | time    | share |
-//! |-----------------------------------------|---------|-------|
-//! | `apply_block_parallel_fees`, mixed       | 5.71 ms | 100%  |
-//! |  … of which account-leaf trie inserts    | 2.31 ms |  40%  |
-//! |  … of which verify-once cover checks     | 1.51 ms |  27%  |
-//! |  … of which `DisjointScheduler::schedule`| 0.18 ms |   3%  |
-//! |  … of which the per-tx engine loop       | 1.71 ms |  30%  |
+//! | phase                                   | before  | after   | delta |
+//! |-----------------------------------------|---------|---------|-------|
+//! | `apply_block_parallel_fees`, mixed       | 5.71 ms | 3.18 ms | −44%  |
+//! |  … of which account-leaf trie inserts    | 2.31 ms | 0.23 ms | −90%  |
+//! |  … of which verify-once cover checks     | 1.51 ms | 1.10 ms | −27%  |
+//! |  … of which `DisjointScheduler::schedule`| 0.18 ms |    —    | not re-measured |
+//! |  … of which the per-tx engine loop       | 1.71 ms |    —    | not re-measured |
 //!
-//! The two biggest numbers live OUTSIDE `state_engine/apply.rs`,
+//! "before" for the two changed rows was taken on THIS machine with this
+//! bench before the edits (`[hotpath][trie] changed_value` 2_372.7 ns and
+//! `[hotpath][verifyonce]` 1_509.8 ns); "after" is the same rows afterwards
+//! (233.8 ns and 1_097.0 ns). The `apply` row's "before" is the previously
+//! documented 5.71 ms (other wave, other load) and is indicative only — the
+//! load-proof comparison for it is the sum of the two rows above plus the
+//! in-process A/Bs below.
+//! The two biggest numbers lived OUTSIDE `state_engine/apply.rs`,
 //! `state_engine/accounts.rs`, `parallel_exec.rs` and `commitment.rs`
 //! (`cpat2.rs` trie path re-hashing and `verify_once.rs`'s two sha256 per
-//! transaction). `packing::apply_mixed_*` is the end-to-end row; the rows here
-//! exist so a change to the scheduler, a payload guard, the commitment fold or
-//! the trie can be attributed instead of guessed.
+//! transaction), and both were changed (2026-11-18):
+//!
+//! * `cpat2.rs`: inserts mark the branches on the key's path dirty and the
+//!   first root/proof read flushes them bottom-up, so a block of K inserts
+//!   hashes each touched branch ONCE instead of once per key on its path;
+//!   the descent mutates in place (no re-boxing per level) and each branch
+//!   caches its leftmost key so the skipped-prefix compare is a field read.
+//!   Row `hotpath_trie_1000` `changed_value`: 2_372.7 → 233.8 ns/insert; with
+//!   the block's root read included, 381.3 ns/insert.
+//! * `verify_once.rs`: the signature is no longer sha256'd twice (for PQ/EVM
+//!   transactions `tx_hash` already commits those exact bytes), the tx hash
+//!   reuses a per-thread hasher/scratch, and the signing-preimage hash runs
+//!   OUTSIDE the cache lock. Row `hotpath_verifyonce_1000`: 1_509.8 → 1_097.0
+//!   ns/tx.
+//!
+//! Both comparisons are re-derived in-process by `hotpath_trie_ab` /
+//! `hotpath_verifyonce_ab`, which keep the pre-change implementation as a
+//! reference, time the two alternately, and assert the observable is
+//! unchanged (identical trie root after every block; identical accept/refuse
+//! verdict per transaction). That is the only comparison this machine allows:
+//! it runs other builds, so absolute numbers from two different processes are
+//! not comparable (single-shot runs of the same binary vary by ~60%).
 //!
 //! Scheduler before/after lives in `hotpath_schedule_ab`: it keeps the
 //! pre-change per-transaction-allocation implementation as an in-process
@@ -402,9 +428,10 @@ fn hotpath_trie_1000() {
         }
         assert_eq!(t.len(), keys.len());
     });
-    // Changed value: what a block ACTUALLY does (every touched account's leaf
-    // bytes differ). Same shape as `warm`, but the insert cannot short-circuit
-    // on an unchanged value, so this is the honest per-block trie cost.
+    // Changed value: every touched account's leaf bytes differ, so the insert
+    // cannot short-circuit on an unchanged value. NOTE this row does NOT read
+    // the root, so with deferred branch hashing it prices only the inserts;
+    // the block cost is the `changed_value+root` row below.
     let mut changed = leaf.clone();
     changed[7] ^= 0x01;
     let ns_changed = median_ns(10, 2, || {
@@ -416,12 +443,27 @@ fn hotpath_trie_1000() {
         }
         assert_eq!(t.len(), keys.len());
     });
+    // The honest BLOCK shape: every touched leaf changes AND the block ends by
+    // reading the state root. A trie that defers ancestor hashing to the root
+    // read must be priced with that read included, not only for the inserts.
+    let ns_block = median_ns(10, 2, || {
+        for k in &keys {
+            t.insert(k, &changed);
+        }
+        std::hint::black_box(t.root_hash());
+        for k in &keys {
+            t.insert(k, &leaf);
+        }
+        std::hint::black_box(t.root_hash());
+        assert_eq!(t.len(), keys.len());
+    });
     println!(
-        "[hotpath][trie] inserts={} cold={} warm_reinsert={} changed_value={}",
+        "[hotpath][trie] inserts={} cold={} warm_reinsert={} changed_value={} changed_value+root={}",
         keys.len(),
         medal_us(ns_cold, keys.len()),
         medal_us(ns_warm, keys.len()),
-        medal_us(ns_changed / 2.0, keys.len())
+        medal_us(ns_changed / 2.0, keys.len()),
+        medal_us(ns_block / 2.0, keys.len())
     );
 }
 
@@ -720,4 +762,512 @@ fn hotpath_domain_fold_waste() {
         medal_us(fold_six - fold_one, 1)
     );
     assert!(fold_six > 0.0);
+}
+
+// ============================================================================
+// In-binary A/B references (load-proof old-vs-new, same process)
+// ============================================================================
+//
+// The machine this repo is benchmarked on runs other builds, so a single
+// "before" number taken from an older binary is not comparable to an "after"
+// number taken later. Following `hotpath_schedule_ab`, the pre-change
+// implementation is kept here as an in-process REFERENCE, the two are timed
+// alternately, and the reference is asserted to agree with the live code on
+// the observable that matters (trie root / verify-once verdict).
+
+/// The PRE-CHANGE `cpat2` insert path, verbatim: owned `Option<Node>`
+/// recursion that re-boxes every node on the key's path, and the deep
+/// leftmost-leaf descent to recover a branch's skipped prefix.
+mod legacy_trie {
+    use stellereum::cpat2::{branch_hash, leaf_hash, Key, H};
+
+    pub enum Node {
+        Leaf(Key, H),
+        Branch {
+            skip: u16,
+            bit: u8,
+            left: Box<Node>,
+            right: Box<Node>,
+            hash: H,
+        },
+    }
+
+    fn bit(k: &Key, d: usize) -> u8 {
+        if d >= 256 {
+            return 0;
+        }
+        (k[d / 8] >> (7 - (d % 8))) & 1
+    }
+
+    fn common(a: &Key, b: &Key, from: usize) -> usize {
+        let mut d = from;
+        while d < 256 && bit(a, d) == bit(b, d) {
+            d += 1;
+        }
+        d
+    }
+
+    fn node_hash(node: &Node) -> H {
+        match node {
+            Node::Leaf(_, h) | Node::Branch { hash: h, .. } => *h,
+        }
+    }
+
+    fn mk_branch(skip: u16, bit: u8, left: Node, right: Node) -> Node {
+        let l = node_hash(&left);
+        let r = node_hash(&right);
+        let h = branch_hash(skip, bit, &l, &r);
+        Node::Branch {
+            skip,
+            bit,
+            left: Box::new(left),
+            right: Box::new(right),
+            hash: h,
+        }
+    }
+
+    fn insert(node: Option<Node>, key: Key, lh: H, depth: usize) -> Node {
+        match node {
+            None => Node::Leaf(key, lh),
+            Some(Node::Leaf(ek, eh)) => {
+                if ek == key {
+                    return Node::Leaf(key, lh);
+                }
+                let cp = common(&ek, &key, depth);
+                let skip = (cp - depth) as u16;
+                let bit0 = bit(&ek, cp);
+                let (left, right) = if bit0 == 0 {
+                    (Node::Leaf(ek, eh), Node::Leaf(key, lh))
+                } else {
+                    (Node::Leaf(key, lh), Node::Leaf(ek, eh))
+                };
+                mk_branch(skip, 0, left, right)
+            }
+            Some(Node::Branch {
+                skip,
+                bit: bbit,
+                left,
+                right,
+                hash,
+            }) => {
+                let bp = depth + skip as usize;
+                if bp >= 256 {
+                    return Node::Branch {
+                        skip,
+                        bit: bbit,
+                        left,
+                        right,
+                        hash,
+                    };
+                }
+                let cp_skip =
+                    common_prefix_len(&key, left.as_ref(), right.as_ref(), depth, skip as usize);
+                if cp_skip < skip as usize {
+                    let new_skip = cp_skip as u16;
+                    let diverge_at = depth + cp_skip;
+                    let new_bit = bit(&key, diverge_at);
+                    let existing_skip = (skip as usize - cp_skip - 1) as u16;
+                    let existing = mk_branch(existing_skip, bbit, *left, *right);
+                    let incoming = Node::Leaf(key, lh);
+                    let (l, r) = if new_bit == 0 {
+                        (incoming, existing)
+                    } else {
+                        (existing, incoming)
+                    };
+                    return mk_branch(new_skip, 0, l, r);
+                }
+                if bit(&key, bp) == 0 {
+                    let nl = insert(Some(*left), key, lh, bp + 1);
+                    mk_branch(skip, bbit, nl, *right)
+                } else {
+                    let nr = insert(Some(*right), key, lh, bp + 1);
+                    mk_branch(skip, bbit, *left, nr)
+                }
+            }
+        }
+    }
+
+    fn common_prefix_len(key: &Key, left: &Node, right: &Node, depth: usize, skip: usize) -> usize {
+        let rep = representative_key(left).or_else(|| representative_key(right));
+        match rep {
+            Some(rk) => {
+                let mut d = 0;
+                while d < skip && bit(key, depth + d) == bit(rk, depth + d) {
+                    d += 1;
+                }
+                d
+            }
+            None => skip,
+        }
+    }
+
+    fn representative_key(n: &Node) -> Option<&Key> {
+        match n {
+            Node::Leaf(k, _) => Some(k),
+            Node::Branch { left, .. } => representative_key(left),
+        }
+    }
+
+    /// Mirrors the pre-change `CompressedTrie` field-for-field, INCLUDING the
+    /// `entries` map bookkeeping, so the A/B compares the whole insert path.
+    pub struct LegacyTrie {
+        root: Option<Node>,
+        pub entries: std::collections::HashMap<Key, Vec<u8>>,
+    }
+
+    impl LegacyTrie {
+        pub fn new() -> Self {
+            Self {
+                root: None,
+                entries: std::collections::HashMap::new(),
+            }
+        }
+        pub fn insert(&mut self, key: &Key, value: &[u8]) {
+            if let Some(existing) = self.entries.get_mut(key) {
+                if existing.as_slice() == value && self.root.is_some() {
+                    return;
+                }
+                existing.clear();
+                existing.extend_from_slice(value);
+            } else {
+                self.entries.insert(*key, value.to_vec());
+            }
+            let lh = leaf_hash(key, value);
+            let r = self.root.take();
+            self.root = Some(insert(r, *key, lh, 0));
+        }
+        pub fn root_hash(&self) -> H {
+            match &self.root {
+                None => [0u8; 32],
+                Some(n) => node_hash(n),
+            }
+        }
+    }
+}
+
+/// TRIE A/B: identical root, alternating timings.
+///
+/// Corpus = the apply shape: 1000 distinct keys, every leaf's value differs
+/// from the previous block's (so the insert cannot short-circuit), plus a
+/// fresh-build row. Roots are asserted equal after EVERY phase — the pinned
+/// consensus root in `src/cpat2.rs` pins it against the pre-change
+/// implementation independently.
+#[test]
+fn hotpath_trie_ab() {
+    let keys: Vec<[u8; 32]> = senders()[..1_000].iter().map(|s| s.from).collect();
+    let base = AccountState::new([0u8; 32], BAL).to_trie_bytes();
+    let changed = {
+        let mut c = base.clone();
+        c[7] ^= 0x01;
+        c
+    };
+
+    let new_cold = {
+        let mut t = stellereum::cpat2::CompressedTrie::new();
+        for k in &keys {
+            t.insert(k, &base);
+        }
+        t.root_hash()
+    };
+    let old_cold = {
+        let mut t = legacy_trie::LegacyTrie::new();
+        for k in &keys {
+            t.insert(k, &base);
+        }
+        t.root_hash()
+    };
+    assert_eq!(new_cold, old_cold, "cold-build root must be identical");
+
+    // Changed-value update on a populated trie: the honest per-block shape.
+    let mut fresh = stellereum::cpat2::CompressedTrie::new();
+    let mut legacy = legacy_trie::LegacyTrie::new();
+    for k in &keys {
+        fresh.insert(k, &base);
+        legacy.insert(k, &base);
+    }
+    for k in &keys {
+        fresh.insert(k, &changed);
+        legacy.insert(k, &changed);
+    }
+    assert_eq!(
+        fresh.root_hash(),
+        legacy.root_hash(),
+        "changed-value root must be identical"
+    );
+
+    // One measured unit = ONE block: all 1000 touched leaves change, then the
+    // block's state root is read. Values alternate so every insert really
+    // changes a leaf (the `warm_reinsert` no-op path is measured separately).
+    let mut new_ns = Vec::new();
+    let mut old_ns = Vec::new();
+    for i in 0..18 {
+        let value = if i % 2 == 0 { &changed } else { &base };
+        let t = Instant::now();
+        for k in &keys {
+            fresh.insert(k, value);
+        }
+        let fresh_root = fresh.root_hash();
+        new_ns.push(t.elapsed().as_nanos() as f64);
+        let t = Instant::now();
+        for k in &keys {
+            legacy.insert(k, value);
+        }
+        let legacy_root = legacy.root_hash();
+        old_ns.push(t.elapsed().as_nanos() as f64);
+        assert_eq!(fresh_root, legacy_root, "block root must be identical");
+    }
+    new_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    old_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let new = new_ns[new_ns.len() / 2];
+    let old = old_ns[old_ns.len() / 2];
+    println!(
+        "[hotpath][trie_ab] per_block=1000_inserts+root old={} new={} delta={:+.1}%",
+        medal_us(old, 1_000),
+        medal_us(new, 1_000),
+        (new - old) / old * 100.0
+    );
+}
+
+/// The PRE-CHANGE verify-once cover check, verbatim: `compute_tx_hash` (fresh
+/// payload scratch per call), a standalone sha256 over the FULL signature,
+/// the signing preimage hashed while holding the cache lock, and
+/// `chain_id()` evaluated inside the comparison.
+///
+/// Its own map is keyed exactly like the live one and fed from the same
+/// attestation records, so the A/B asserts the verdict for every transaction
+/// is unchanged, not just that it is faster.
+mod legacy_verify_once {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use stellereum::sharding::Transaction;
+
+    #[derive(Clone)]
+    pub struct Rec {
+        pub from: [u8; 32],
+        pub tx_hash: [u8; 32],
+        pub sig_len: usize,
+        pub msg_hash: [u8; 32],
+        pub bound_chain: Option<u64>,
+        pub verified_for_chain: u64,
+        pub pure_pq_enforced: bool,
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+        let mut h: Sha256 = Sha256::new();
+        h.update(bytes);
+        h.finalize().into()
+    }
+
+    /// (tx hash, signature sha256, attesting chain) -> attestation.
+    pub type Key = ([u8; 32], [u8; 32], u64);
+
+    pub struct Cache {
+        map: Mutex<HashMap<Key, Rec>>,
+    }
+
+    impl Cache {
+        pub fn new() -> Self {
+            Self {
+                map: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub fn record(&self, tx: &Transaction, verified_for_chain: u64) {
+            let rec = Rec {
+                from: tx.from,
+                tx_hash: tx.compute_tx_hash(),
+                sig_len: tx.signature.len(),
+                msg_hash: sha256_bytes(&tx.signing_message()),
+                bound_chain: tx.chain_id(),
+                verified_for_chain,
+                pure_pq_enforced: stellereum::post_quantum::is_pure_pq_enforced(),
+            };
+            self.map.lock().unwrap().insert(
+                (rec.tx_hash, sha256_bytes(&tx.signature), verified_for_chain),
+                rec,
+            );
+        }
+
+        pub fn covers(&self, tx: &Transaction, expected_chain: u64) -> bool {
+            // Same PQ-implicit registry guard the live path takes first.
+            if tx.is_pq_implicit()
+                && Transaction::global_implicit_registry()
+                    .lookup(&tx.from)
+                    .is_none()
+            {
+                return false;
+            }
+            let tx_hash = tx.compute_tx_hash();
+            let sig_hash = sha256_bytes(&tx.signature);
+            let guard = self.map.lock().unwrap();
+            let Some(rec) = guard.get(&(tx_hash, sig_hash, expected_chain)) else {
+                return false;
+            };
+            rec.from == tx.from
+                && rec.tx_hash == tx_hash
+                && rec.sig_len == tx.signature.len()
+                && rec.msg_hash == sha256_bytes(&tx.signing_message())
+                && rec.bound_chain == tx.chain_id()
+                && rec.verified_for_chain == expected_chain
+                && rec.pure_pq_enforced == stellereum::post_quantum::is_pure_pq_enforced()
+        }
+    }
+}
+
+/// VERIFY-ONCE A/B: same accept/refuse verdict per transaction, alternating
+/// timings. The reference cache is populated from the LIVE attestations
+/// (after one real apply), so both sides answer over the same records.
+#[test]
+fn hotpath_verifyonce_ab() {
+    let txs = mixed_block(1_000);
+    let e = fresh_engine(1_000);
+    let _ = rt_block_on(e.apply_block_parallel_fees(&txs, TS));
+    let chain = stellereum::zkml::effective_chain_id();
+
+    let reference = legacy_verify_once::Cache::new();
+    for tx in &txs {
+        reference.record(tx, chain);
+    }
+    // Verdict parity on this block...
+    for tx in &txs {
+        assert_eq!(
+            verified_signature_covers(tx, chain),
+            reference.covers(tx, chain),
+            "cover verdict must be unchanged"
+        );
+    }
+    // ...and on a chain the attestation does NOT cover (both must refuse).
+    let foreign = chain.wrapping_add(1);
+    for tx in txs.iter().take(64) {
+        assert!(!verified_signature_covers(tx, foreign));
+        assert!(!reference.covers(tx, foreign));
+    }
+
+    let mut new_ns = Vec::new();
+    let mut old_ns = Vec::new();
+    for _ in 0..9 {
+        let t = Instant::now();
+        let live = txs
+            .iter()
+            .filter(|tx| verified_signature_covers(tx, chain))
+            .count();
+        new_ns.push(t.elapsed().as_nanos() as f64);
+        let t = Instant::now();
+        let old = txs.iter().filter(|tx| reference.covers(tx, chain)).count();
+        old_ns.push(t.elapsed().as_nanos() as f64);
+        assert_eq!(live, old);
+    }
+    new_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    old_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let new = new_ns[new_ns.len() / 2];
+    let old = old_ns[old_ns.len() / 2];
+    println!(
+        "[hotpath][verifyonce_ab] n=1000 old={} new={} delta={:+.1}%",
+        medal_us(old, txs.len()),
+        medal_us(new, txs.len()),
+        (new - old) / old * 100.0
+    );
+}
+
+/// Where the verify-once cover check's time goes, so a change can be
+/// attributed: the transaction hash, the signature sha256, the signing
+/// preimage sha256, and the chain-domain resolution (`chain_id()` decodes the
+/// PQ envelope).
+#[test]
+fn hotpath_verifyonce_parts() {
+    let txs = mixed_block(1_000);
+    let hashes = median_ns(10, 2, || {
+        let mut n = 0usize;
+        for tx in &txs {
+            n += tx.compute_tx_hash()[0] as usize;
+        }
+        assert!(n > 0);
+    });
+    // Same hash, reusing one hasher + payload scratch instead of allocating a
+    // fresh payload `Vec` per transaction (what `verify_once` does now).
+    let mut batch = Transaction::batch_hasher();
+    let mut batched = Vec::new();
+    for _ in 0..12 {
+        let t = Instant::now();
+        let mut n = 0usize;
+        for tx in &txs {
+            n += batch.hash_one(tx)[0] as usize;
+        }
+        batched.push(t.elapsed().as_nanos() as f64);
+        assert!(n > 0);
+    }
+    batched.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let batched_ns = batched[batched.len() / 2];
+    let sigs = median_ns(10, 2, || {
+        use sha2::Digest;
+        let mut n = 0usize;
+        for tx in &txs {
+            let d = sha2::Sha256::digest(&tx.signature);
+            n += d[0] as usize;
+        }
+        assert!(n > 0);
+    });
+    let msgs = median_ns(10, 2, || {
+        use sha2::Digest;
+        let mut n = 0usize;
+        for tx in &txs {
+            let d = sha2::Sha256::digest(tx.signing_message());
+            n += d[0] as usize;
+        }
+        assert!(n > 0);
+    });
+    let chains = median_ns(10, 2, || {
+        let mut n = 0usize;
+        for tx in &txs {
+            n += tx.chain_id().is_some() as usize + tx.is_pq_implicit() as usize;
+        }
+        assert!(n > 0);
+    });
+    println!(
+        "[hotpath][verifyonce_parts] n=1000 tx_hash={} tx_hash_batched={} sig_sha256={} msg_sha256={} chain_id={}",
+        medal_us(hashes, txs.len()),
+        medal_us(batched_ns, txs.len()),
+        medal_us(sigs, txs.len()),
+        medal_us(msgs, txs.len()),
+        medal_us(chains, txs.len())
+    );
+}
+
+/// Hashing floor for one leaf insert: the leaf hash plus the ~10 branch
+/// hashes a 1000-leaf Patricia path needs (measured separately, so the
+/// attribution is a number rather than a guess).
+#[test]
+fn hotpath_trie_parts() {
+    let keys: Vec<[u8; 32]> = senders()[..1_000].iter().map(|s| s.from).collect();
+    let leaf = AccountState::new([0u8; 32], BAL).to_trie_bytes();
+    let mut t = stellereum::cpat2::CompressedTrie::new();
+    for k in &keys {
+        t.insert(k, &leaf);
+    }
+    let depth: usize = keys
+        .iter()
+        .map(|k| t.proof(k).map(|p| p.path.len()).unwrap_or(0))
+        .sum::<usize>()
+        / keys.len();
+    let leaf_ns = median_ns(10, 2, || {
+        let mut n = 0usize;
+        for k in &keys {
+            n += stellereum::cpat2::leaf_hash(k, &leaf)[0] as usize;
+        }
+        assert!(n > 0);
+    });
+    let mut h = [7u8; 32];
+    let branch_ns = median_ns(10, 2, || {
+        for i in 0..10_000usize {
+            h = stellereum::cpat2::branch_hash((i % 256) as u16, (i & 1) as u8, &h, &h);
+        }
+        assert_ne!(h, [0u8; 32]);
+    });
+    println!(
+        "[hotpath][trie_parts] depth={depth} leaf_hash_1000={} branch_hash_10000={} per_insert_hash_floor={:.0} ns",
+        medal_us(leaf_ns, keys.len()),
+        medal_us(branch_ns, 10_000),
+        (leaf_ns + branch_ns * depth as f64 / 10_000.0) / keys.len() as f64
+    );
 }

@@ -18,9 +18,17 @@
 //!   Leaf:   blake3("L" || key || len(value) || value)
 //!   Branch: blake3("B" || skip_be || branch_bit || left || right)
 //!   Empty:  blake3("CPAT2_EMPTY")
+//!
+//! WHEN hashes are computed: a leaf hash is computed on insert (and skipped
+//! entirely when the value bytes are unchanged); a modified branch is only
+//! MARKED dirty and the first reader that needs a hash (root hash, proof
+//! walk) flushes the dirty subtrees bottom-up. The hash VALUES — and hence
+//! every root — are the same either way; only the number of times a branch is
+//! hashed per block changes.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 pub type Key = [u8; 32];
 pub type H = [u8; 32];
@@ -31,9 +39,19 @@ enum Node {
     Branch {
         skip: u16,
         bit: u8,
+        // `rep` is the leftmost key under this branch — a DERIVED cache, not
+        // committed state: every key under a branch shares its skipped bits,
+        // so any one of them lets us recover the branch's implied prefix.
+        // Keeping it here turns `common_prefix_len` from a descent to
+        // leftmost leaf into an O(1) field read. It never enters the hash.
+        rep: Key,
         left: Box<Node>,
         right: Box<Node>,
+        // Cached branch hash. Valid iff `!dirty`; a `dirty` node is
+        // recomputed by [`flush`] before ANY reader (root hash, proof walk)
+        // looks at it.
         hash: H,
+        dirty: bool,
     },
 }
 
@@ -53,10 +71,16 @@ pub struct Proof {
 }
 
 pub fn leaf_hash(key: &Key, val: &[u8]) -> H {
+    // One header update + one value update: the header is a fixed 37-byte
+    // stack buffer, so the hasher sees `L || key || len` in a single pass
+    // instead of three separate `update` calls. The byte stream is
+    // IDENTICAL to the original three-update form.
+    let mut header = [0u8; 37];
+    header[0] = b'L';
+    header[1..33].copy_from_slice(key);
+    header[33..37].copy_from_slice(&(val.len() as u32).to_le_bytes());
     let mut h = blake3::Hasher::new();
-    h.update(b"L");
-    h.update(key);
-    h.update(&(val.len() as u32).to_le_bytes());
+    h.update(&header);
     h.update(val);
     let o = h.finalize();
     let mut k = [0u8; 32];
@@ -64,12 +88,17 @@ pub fn leaf_hash(key: &Key, val: &[u8]) -> H {
     k
 }
 pub fn branch_hash(skip: u16, bit: u8, l: &H, r: &H) -> H {
+    // `B || skip_be || bit || left || right` is a fixed 68-byte preimage;
+    // building it once on the stack costs one `update` instead of five.
+    // Same bytes, same root.
+    let mut buf = [0u8; 68];
+    buf[0] = b'B';
+    buf[1..3].copy_from_slice(&skip.to_be_bytes());
+    buf[3] = bit & 1;
+    buf[4..36].copy_from_slice(l);
+    buf[36..68].copy_from_slice(r);
     let mut h = blake3::Hasher::new();
-    h.update(b"B");
-    h.update(&skip.to_be_bytes());
-    h.update(&[bit & 1]);
-    h.update(l);
-    h.update(r);
+    h.update(&buf);
     let o = h.finalize();
     let mut k = [0u8; 32];
     k.copy_from_slice(o.as_bytes());
@@ -85,12 +114,29 @@ fn bit(k: &Key, d: usize) -> u8 {
 }
 
 /// Length of common prefix of two keys from absolute depth `from`.
+///
+/// Byte-wise: the old bit loop compared one bit at a time (up to 256 shifts);
+/// this compares a whole byte (masking the already-consumed leading bits) and
+/// locates the first differing bit with `leading_zeros`. Identical result.
 fn common(a: &Key, b: &Key, from: usize) -> usize {
-    let mut d = from;
-    while d < 256 && bit(a, d) == bit(b, d) {
-        d += 1;
+    if from >= 256 {
+        return 256;
     }
-    d
+    let off = from % 8;
+    let mut i = from / 8;
+    let x = (a[i] ^ b[i]) & (0xFFu8 >> off);
+    if x != 0 {
+        return i * 8 + x.leading_zeros() as usize;
+    }
+    i += 1;
+    while i < 32 {
+        let x = a[i] ^ b[i];
+        if x != 0 {
+            return i * 8 + x.leading_zeros() as usize;
+        }
+        i += 1;
+    }
+    256
 }
 
 fn node_hash(node: &Node) -> H {
@@ -99,32 +145,87 @@ fn node_hash(node: &Node) -> H {
     }
 }
 
-/// Build a branch node, computing and caching its hash from children.
-fn mk_branch(skip: u16, bit: u8, left: Node, right: Node) -> Node {
-    let l = node_hash(&left);
-    let r = node_hash(&right);
-    let h = branch_hash(skip, bit, &l, &r);
-    Node::Branch {
-        skip,
-        bit,
-        left: Box::new(left),
-        right: Box::new(right),
-        hash: h,
+/// The leftmost key under `node` — the representative key a branch caches.
+#[inline]
+fn rep_key(node: &Node) -> Key {
+    match node {
+        Node::Leaf(k, _) => *k,
+        Node::Branch { rep, .. } => *rep,
     }
 }
 
-/// Insert `key` (with precomputed `lh = leaf_hash(&key, val)`) into subtree
-/// rooted at `node`, consuming keys from absolute depth `depth` (depth is only
-/// used to compute skips, not stored).
-fn insert(node: Option<Node>, key: Key, lh: H, depth: usize) -> Node {
+/// Build a branch node from two children.
+///
+/// The hash is deliberately NOT computed here: every caller is on a mutation
+/// path that marks the node dirty, and [`flush`] computes it once from the
+/// children bottom-up. That is what removes the "hash it now, hash it again
+/// at the root read" duplicate that a freshly split branch used to pay.
+/// A dirty node's `hash` field is not read by anything (`node_hash` is only
+/// called after a flush), so it starts zeroed.
+fn mk_branch(skip: u16, bit: u8, left: Node, right: Node) -> Node {
+    let rep = rep_key(&left);
+    Node::Branch {
+        skip,
+        bit,
+        rep,
+        left: Box::new(left),
+        right: Box::new(right),
+        hash: [0u8; 32],
+        dirty: true,
+    }
+}
+
+/// Recompute the cached hash of every dirty node, children first.
+///
+/// A clean node needs nothing: `dirty(node) ⇒ all ancestors dirty` is the
+/// invariant every mutation maintains, so a clean subtree holds no dirty
+/// descendant. Repeated calls after an unchanged read are therefore O(1) for
+/// the root and O(changed nodes) after a batch of inserts — each changed
+/// branch is hashed exactly ONCE per root read instead of once per inserted
+/// leaf on its path. The computed values are byte-identical to eager
+/// hashing: same `branch_hash`, same children, same order.
+fn flush(node: &mut Node) {
+    if let Node::Branch {
+        skip,
+        bit,
+        left,
+        right,
+        hash,
+        dirty,
+        ..
+    } = node
+    {
+        if !*dirty {
+            return;
+        }
+        flush(left);
+        flush(right);
+        *hash = branch_hash(*skip, *bit, &node_hash(left), &node_hash(right));
+        *dirty = false;
+    }
+}
+
+/// In-place insert: descend the existing tree mutating only the nodes on the
+/// key's path, instead of rebuilding every node on it.
+///
+/// The pre-change implementation moved each child `Node` out of its `Box`
+/// and boxed it again (`mk_branch`) at EVERY level, so one leaf insert paid
+/// one deallocation + two allocations per branch on the path. Here the
+/// descent takes `&mut Node` and recurses into the child's box: allocations
+/// happen solely where the tree actually gains a node (a key split), and the
+/// ancestor hashes are left dirty for [`flush`]. Skips, child order and
+/// therefore every root byte are unchanged.
+fn insert_in_place(node: &mut Node, key: Key, lh: H, depth: usize) {
     match node {
-        None => Node::Leaf(key, lh),
-        Some(Node::Leaf(ek, eh)) => {
-            if ek == key {
-                return Node::Leaf(key, lh);
+        Node::Leaf(ek, eh) => {
+            if *ek == key {
+                *eh = lh;
+                return;
             }
+            let ek = *ek;
+            let eh = *eh;
             let cp = common(&ek, &key, depth);
-            // cp < 256. Divergence at cp.
+            // cp < 256: the keys differ at cp.
             let skip = (cp - depth) as u16;
             let bit0 = bit(&ek, cp); // existing key's bit at divergence
                                      // left = bit 0, right = bit 1
@@ -133,81 +234,90 @@ fn insert(node: Option<Node>, key: Key, lh: H, depth: usize) -> Node {
             } else {
                 (Node::Leaf(key, lh), Node::Leaf(ek, eh))
             };
-            let _ = bit0;
-            mk_branch(skip, 0, left, right)
+            *node = mk_branch(skip, 0, left, right);
         }
-        Some(Node::Branch {
+        Node::Branch {
             skip,
             bit: bbit,
+            rep,
             left,
             right,
-            hash,
-        }) => {
-            let bp = depth + skip as usize; // absolute divergence point of this branch
+            hash: _hash,
+            dirty,
+        } => {
+            let bp = depth + *skip as usize; // absolute divergence point
             if bp >= 256 {
-                return Node::Branch {
-                    skip,
-                    bit: bbit,
-                    left,
-                    right,
-                    hash,
-                };
+                return;
             }
             // Does the incoming key match all skipped bits [depth, bp)?
-            let cp_skip =
-                common_prefix_len(&key, left.as_ref(), right.as_ref(), depth, skip as usize);
-            if cp_skip < skip as usize {
-                // Incoming key diverges BEFORE this branch's divergence point.
-                // Split here: new branch at (depth + cp_skip).
-                // The existing branch moves one level deeper, so its relative skip
-                // shrinks by (cp_skip + 1) (the +1 is the new branch's own bit).
-                let new_skip = cp_skip as u16;
-                let diverge_at = depth + cp_skip;
-                let new_bit = bit(&key, diverge_at);
-                let existing_skip = (skip as usize - cp_skip - 1) as u16;
-                let existing = mk_branch(existing_skip, bbit, *left, *right);
-                let incoming = Node::Leaf(key, lh);
-                let (l, r) = if new_bit == 0 {
-                    (incoming, existing)
-                } else {
-                    (existing, incoming)
-                };
-                return mk_branch(new_skip, 0, l, r);
+            let cp_skip = prefix_match(&key, rep, depth, *skip as usize);
+            if cp_skip < *skip as usize {
+                // Incoming key diverges BEFORE this branch's divergence
+                // point: split here, moving the whole existing branch one
+                // level deeper with a shorter relative skip.
+                let old_skip = *skip;
+                let old_bit = *bbit;
+                split_branch(node, key, lh, depth, old_skip, old_bit, cp_skip);
+                return;
             }
             // Key follows the skipped bits; descend on its bit at bp.
             if bit(&key, bp) == 0 {
-                let nl = insert(Some(*left), key, lh, bp + 1);
-                mk_branch(skip, bbit, nl, *right)
+                insert_in_place(left, key, lh, bp + 1);
             } else {
-                let nr = insert(Some(*right), key, lh, bp + 1);
-                mk_branch(skip, bbit, *left, nr)
+                insert_in_place(right, key, lh, bp + 1);
             }
+            // Defer the hash: this branch changed, nothing more is needed
+            // until a reader asks for the root or a proof (one flush then
+            // hashes every touched branch exactly once, instead of once per
+            // inserted key on its path).
+            *dirty = true;
+            // The inserted key may now be the leftmost key of this subtree.
+            *rep = rep_key(left);
         }
     }
+}
+
+/// Replace `*node` (a branch whose skipped prefix the incoming key breaks at
+/// `cp_skip`) with the new parent branch. Split out so the caller's field
+/// borrows are dead before the whole node is moved.
+fn split_branch(
+    node: &mut Node,
+    key: Key,
+    lh: H,
+    depth: usize,
+    skip: u16,
+    bbit: u8,
+    cp_skip: usize,
+) {
+    let diverge_at = depth + cp_skip;
+    let new_bit = bit(&key, diverge_at);
+    let existing_skip = (skip as usize - cp_skip - 1) as u16;
+    // The existing branch keeps its two children; only its relative skip
+    // shrinks by (cp_skip + 1) — the +1 is the new branch's own bit.
+    let existing = std::mem::replace(node, Node::Leaf(key, lh));
+    let existing = match existing {
+        Node::Branch { left, right, .. } => mk_branch(existing_skip, bbit, *left, *right),
+        leaf => leaf,
+    };
+    let incoming = Node::Leaf(key, lh);
+    let (l, r) = if new_bit == 0 {
+        (incoming, existing)
+    } else {
+        (existing, incoming)
+    };
+    *node = mk_branch(cp_skip as u16, 0, l, r);
 }
 
 /// How many bits the incoming key shares with the branch's skipped prefix.
-/// We recover the skipped bits from a representative leaf under either child.
-fn common_prefix_len(key: &Key, left: &Node, right: &Node, depth: usize, skip: usize) -> usize {
-    // Representative sibling key from one side gives the branch's implied bits.
-    let rep = representative_key(left).or_else(|| representative_key(right));
-    match rep {
-        Some(rk) => {
-            let mut d = 0;
-            while d < skip && bit(key, depth + d) == bit(rk, depth + d) {
-                d += 1;
-            }
-            d
-        }
-        None => skip, // no keys -> trivially matches
-    }
+/// Every key under a branch shares those bits, so the branch's cached
+/// representative (`rep`) recovers them without a descent.
+fn prefix_match(key: &Key, rep: &Key, depth: usize, skip: usize) -> usize {
+    let c = common(key, rep, depth);
+    (c - depth).min(skip)
 }
 
-fn representative_key(n: &Node) -> Option<&Key> {
-    match n {
-        Node::Leaf(k, _) => Some(k),
-        Node::Branch { left, .. } => representative_key(left),
-    }
+fn common_prefix_len(key: &Key, left: &Node, _right: &Node, depth: usize, skip: usize) -> usize {
+    prefix_match(key, &rep_key(left), depth, skip)
 }
 
 /// Collapse a parent branch when one child has been deleted.
@@ -246,18 +356,22 @@ impl Node {
             Node::Branch {
                 skip,
                 bit: bbit,
+                rep,
                 left,
                 right,
                 hash,
+                dirty,
             } => {
                 let bp = depth + skip as usize;
                 if bp >= 256 {
                     return Some(Node::Branch {
                         skip,
                         bit: bbit,
+                        rep,
                         left,
                         right,
                         hash,
+                        dirty,
                     });
                 }
                 if common_prefix_len(key, left.as_ref(), right.as_ref(), depth, skip as usize)
@@ -266,12 +380,14 @@ impl Node {
                     return Some(Node::Branch {
                         skip,
                         bit: bbit,
+                        rep,
                         left,
                         right,
                         hash,
+                        dirty,
                     });
                 }
-                let _ = hash;
+                let _ = (hash, rep, dirty);
                 if bit(key, bp) == 0 {
                     let nl = left.remove_node(key, bp + 1);
                     match nl {
@@ -290,22 +406,70 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// The compressed Patricia-Merkle trie.
+///
+/// `root` is behind a `Mutex` because the cached branch hashes are brought up
+/// to date LAZILY: inserts only mark the branches on the key's path dirty, and
+/// the first reader (root hash / proof walk) flushes them bottom-up, hashing
+/// each touched branch exactly once. Without interior mutability that flush
+/// would need `&mut self` on paths (`root_hash`, `proof`, `generate_*_proof`)
+/// whose callers legitimately only hold `&self`. The engine already
+/// serialises the trie behind its own `RwLock`, so the mutex is uncontended
+/// in the block path and is held only for the duration of one call.
 pub struct CompressedTrie {
-    root: Option<Node>,
+    root: Mutex<Option<Node>>,
     pub entries: HashMap<Key, Vec<u8>>,
+}
+
+impl Clone for CompressedTrie {
+    fn clone(&self) -> Self {
+        Self {
+            root: Mutex::new(
+                self.root
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompressedTrie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self
+            .root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f.debug_struct("CompressedTrie")
+            .field("root", &*guard)
+            .field("entries", &self.entries.len())
+            .finish()
+    }
+}
+
+impl Default for CompressedTrie {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CompressedTrie {
     pub fn new() -> Self {
         Self {
-            root: None,
+            root: Mutex::new(None),
             entries: HashMap::new(),
         }
     }
     pub fn insert(&mut self, key: &Key, value: &[u8]) {
         if let Some(existing) = self.entries.get_mut(key) {
-            if existing.as_slice() == value && self.root.is_some() {
+            if existing.as_slice() == value
+                && self
+                    .root
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some()
+            {
                 return;
             }
             existing.clear();
@@ -314,16 +478,26 @@ impl CompressedTrie {
             self.entries.insert(*key, value.to_vec());
         }
         let lh = leaf_hash(key, value);
-        let r = self.root.take();
-        self.root = Some(insert(r, *key, lh, 0));
+        let root = self
+            .root
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match root {
+            None => *root = Some(Node::Leaf(*key, lh)),
+            Some(n) => insert_in_place(n, *key, lh, 0),
+        }
     }
     pub fn get(&self, key: &Key) -> Option<&[u8]> {
         self.entries.get(key).map(|v| v.as_slice())
     }
     pub fn remove(&mut self, key: &Key) -> Option<Vec<u8>> {
         let v = self.entries.remove(key)?;
-        if let Some(r) = self.root.take() {
-            self.root = r.remove_node(key, 0);
+        let root = self
+            .root
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(r) = root.take() {
+            *root = r.remove_node(key, 0);
         }
         Some(v)
     }
@@ -333,9 +507,29 @@ impl CompressedTrie {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    /// Root hash (computed on demand — O(n); call once per block, not per insert).
+    /// Lock the root and bring every dirty branch hash up to date.
+    ///
+    /// O(1) when nothing changed since the last read, O(changed branches)
+    /// after a batch of inserts — and each of those branches is hashed once,
+    /// which is what makes a block of K inserts cost at most
+    /// `min(K * depth, changed branches)` hashes instead of always
+    /// `K * depth`.
+    fn write_root(&self) -> std::sync::MutexGuard<'_, Option<Node>> {
+        let mut guard = self
+            .root
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(n) = guard.as_mut() {
+            flush(n);
+        }
+        guard
+    }
+
+    /// Root hash (flushes deferred branch hashes first — call once per block,
+    /// not per insert; a second read with no mutation is a cached read).
     pub fn root_hash(&self) -> H {
-        match &self.root {
+        let guard = self.write_root();
+        match &*guard {
             None => [0u8; 32],
             Some(n) => node_hash(n),
         }
@@ -343,7 +537,8 @@ impl CompressedTrie {
 
     fn walk(&self, key: &Key) -> Option<(Vec<Step>, H)> {
         let mut path = Vec::new();
-        let mut node = self.root.as_ref()?;
+        let guard = self.write_root();
+        let mut node = guard.as_ref()?;
         let mut depth = 0usize;
         loop {
             match node {
@@ -503,7 +698,8 @@ impl CompressedTrie {
     ///
     /// Returns the path in LEAF → ROOT order together with the witness.
     fn prove(&self, key: &Key) -> Option<(Vec<Step>, Witness)> {
-        let root = self.root.as_ref()?;
+        let guard = self.write_root();
+        let root = guard.as_ref()?;
         let mut steps: Vec<Step> = Vec::new(); // ROOT → LEAF order while walking
         let mut node = root;
         let mut depth = 0usize;
@@ -2111,5 +2307,188 @@ mod tests {
         }))
         .map(|p| p.verify())
         .unwrap_or(false));
+    }
+
+    // ------------------------------------------------------------------
+    // Consensus-root differential pin
+    // ------------------------------------------------------------------
+
+    /// The deterministic corpus the root pin below is built from: 1000
+    /// pseudo-random keys and values whose LENGTH varies (so the
+    /// `len(value)` prefix in the leaf preimage is exercised, including
+    /// 0-length and >255-byte values), followed by update / insert /
+    /// remove / re-insert phases.
+    ///
+    /// Returns `(key, value)` snapshots after each phase so the caller can
+    /// pin the root of every shape the trie must agree on.
+    fn differential_corpus_roots() -> [H; 4] {
+        let mut rng = Rng(0x5EED_0FC0_FFEE_1234);
+        let mut keys: Vec<Key> = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            keys.push(rng.key());
+        }
+        // Deterministic values, lengths 0..=300 (lengths cross the u32
+        // prefix boundary and the 256-bit key boundary alike).
+        let value_for = |i: usize, salt: u8| -> Vec<u8> {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 16,
+                3 => 49,
+                4 => 64,
+                5 => 255,
+                _ => 300,
+            };
+            (0..len)
+                .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8) ^ salt)
+                .collect()
+        };
+
+        let mut trie = CompressedTrie::new();
+        for (i, k) in keys.iter().enumerate() {
+            trie.insert(k, &value_for(i, 0x00));
+        }
+        let root_insert = trie.root_hash();
+
+        // Phase 2: update every 3rd key with DIFFERENT bytes (the apply shape).
+        for (i, k) in keys.iter().enumerate() {
+            if i % 3 == 0 {
+                trie.insert(k, &value_for(i, 0xA5));
+            }
+        }
+        let root_update = trie.root_hash();
+
+        // Phase 3: remove every 7th key that is still present.
+        let mut removed: Vec<Key> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            if i % 7 == 0 && trie.remove(k).is_some() {
+                removed.push(*k);
+            }
+        }
+        let root_remove = trie.root_hash();
+
+        // Phase 4: re-insert half of the removed keys (the collapse/rebuild
+        // shape: paths shorten and lengthen again).
+        for (j, k) in removed.iter().enumerate() {
+            if j % 2 == 0 {
+                trie.insert(k, &value_for(j, 0x3C));
+            }
+        }
+        let root_reinsert = trie.root_hash();
+
+        [root_insert, root_update, root_remove, root_reinsert]
+    }
+
+    /// CONSENSUS PIN: the Patricia root is consensus state, so any change to
+    /// this file must reproduce these exact roots for the deterministic
+    /// corpus above. The values were taken from the implementation BEFORE
+    /// the leaf-insertion / hashing optimisation and are the differential
+    /// reference it is proven against.
+    #[test]
+    fn pinned_state_root_for_deterministic_corpus() {
+        let roots = differential_corpus_roots();
+        for (label, r) in ["insert", "update", "remove", "reinsert"]
+            .iter()
+            .zip(roots.iter())
+        {
+            println!("[cpat2][pin][{label}] {}", hex::encode(r));
+        }
+        assert_eq!(
+            hex::encode(roots[0]),
+            "c250abf60a121dbffc0b284e6c468ebf671f236eabc1c912fa5fd00a92f3cc07",
+            "insert-phase root must be bit-identical to the pinned consensus root"
+        );
+        assert_eq!(
+            hex::encode(roots[1]),
+            "8481f50da1b2a7873a449c98572f93669f61191b2941c2e7be09c6fc190d7d53",
+            "update-phase root must be bit-identical to the pinned consensus root"
+        );
+        assert_eq!(
+            hex::encode(roots[2]),
+            "42a3c5142a57bbc2e5112d9626d9eaabb2df41e9ae92e11782132d8c5b439d15",
+            "remove-phase root must be bit-identical to the pinned consensus root"
+        );
+        assert_eq!(
+            hex::encode(roots[3]),
+            "44991defdbb203face1953fac6de8b669ec7f3a3defece7b0f4bf61897360cea",
+            "reinsert-phase root must be bit-identical to the pinned consensus root"
+        );
+    }
+
+    /// The pin above only covers the shapes it names. This asserts the
+    /// invariants an optimisation must not break: idempotent re-insert,
+    /// order independence of a fresh build, and proof round-trip at every
+    /// phase root.
+    #[test]
+    fn differential_corpus_invariants() {
+        let roots = differential_corpus_roots();
+
+        // Idempotence: re-inserting identical values moves nothing.
+        let mut rng = Rng(0x5EED_0FC0_FFEE_1234);
+        let keys: Vec<Key> = (0..1_000).map(|_| rng.key()).collect();
+        let mut trie = CompressedTrie::new();
+        for (i, k) in keys.iter().enumerate() {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 16,
+                3 => 49,
+                4 => 64,
+                5 => 255,
+                _ => 300,
+            };
+            let v: Vec<u8> = (0..len)
+                .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8))
+                .collect();
+            trie.insert(k, &v);
+        }
+        assert_eq!(trie.root_hash(), roots[0]);
+        for (i, k) in keys.iter().enumerate() {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 16,
+                3 => 49,
+                4 => 64,
+                5 => 255,
+                _ => 300,
+            };
+            let v: Vec<u8> = (0..len)
+                .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8))
+                .collect();
+            trie.insert(k, &v);
+        }
+        assert_eq!(
+            trie.root_hash(),
+            roots[0],
+            "re-inserting identical bytes must not move the root"
+        );
+
+        // Build order independence: same set, different insertion order.
+        let mut rev = CompressedTrie::new();
+        for (i, k) in keys.iter().enumerate().rev() {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 16,
+                3 => 49,
+                4 => 64,
+                5 => 255,
+                _ => 300,
+            };
+            let v: Vec<u8> = (0..len)
+                .map(|j| (i as u8).wrapping_mul(31).wrapping_add(j as u8))
+                .collect();
+            rev.insert(k, &v);
+        }
+        assert_eq!(rev.root_hash(), roots[0], "trie root is order independent");
+
+        // Every leaf proves against the pinned insert-phase root.
+        for k in keys.iter().take(50) {
+            if let Some(p) = trie.proof(k) {
+                let v = trie.get(k).expect("proved key is present").to_vec();
+                assert!(CompressedTrie::verify(&roots[0], k, &v, &p));
+            }
+        }
     }
 }

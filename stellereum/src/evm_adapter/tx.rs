@@ -6,16 +6,18 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
-/// Submit a signed EVM raw transaction (MetaMask `eth_sendRawTransaction`).
+/// Phase-1 EVM intent-pool helper (stateless library / embedded adapters).
 ///
-/// Phase 1 (EVM intent pool): decodes RLP (legacy EIP-155 or EIP-1559 type-2),
-/// strictly verifies `chain_id == effective_chain_id()` + low-s + ecrecover,
-/// stores the pending `EvmTransaction` so `eth_getTransactionByHash` /
-/// filters see it, notifies pending-tx filters, and returns the keccak hash.
-/// Phase 2 (L1 settlement): the stateful RPC bridge maps the SAME bytes onto
-/// a consensus `Transaction` (EV1 secp256k1 envelope) and admits it to the
-/// real mempool via `add_checked_ctx` — see `evm_raw_to_stell_transaction`.
-/// Until a tx is settled, it is honestly reported as pending (receipt = null).
+/// Decodes RLP (legacy EIP-155 or EIP-1559 type-2), strictly verifies
+/// `chain_id == effective_chain_id()` + low-s + ecrecover, stores the pending
+/// `EvmTransaction` so `eth_getTransactionByHash` / filters see it, notifies
+/// pending-tx filters, and returns the keccak hash.
+///
+/// NOT an admission path: FULL-PQ consensus has no settlement for a secp256k1
+/// signature, so the node's `eth_sendRawTransaction` RPC never calls this and
+/// refuses well-formed intents via [`evm_send_refusal`] instead of leaving a
+/// pending intent that can never settle. The stateless `EvmAdapter` dispatch
+/// uses the same refusal.
 pub fn eth_send_raw_transaction(params: &Value) -> Result<String, JsonRpcError> {
     let raw = extract_raw_evm_bytes(params)?;
     eth_send_raw_transaction_bytes(&raw)
@@ -23,8 +25,8 @@ pub fn eth_send_raw_transaction(params: &Value) -> Result<String, JsonRpcError> 
 
 /// Extract canonical raw EVM bytes from `eth_sendRawTransaction` params
 /// (array / bare hex string / object with `rawTransaction` aliases).
-/// Shared by the stateless intent path and the stateful RPC settlement
-/// bridge so both decode exactly the same bytes.
+/// Shared by the stateless intent path and the RPC refusal path so both decode
+/// exactly the same bytes.
 pub fn extract_raw_evm_bytes(params: &Value) -> Result<Vec<u8>, JsonRpcError> {
     let raw_hex = match params {
         Value::Array(arr) => arr
@@ -55,14 +57,15 @@ pub fn extract_raw_evm_bytes(params: &Value) -> Result<Vec<u8>, JsonRpcError> {
 }
 
 /// Decode + strictly verify already-extracted raw EVM bytes (chain_id,
-/// low-s, ecrecover), store the pending intent and return the keccak hash.
-/// Pure function of the bytes: the RPC settlement bridge calls this only
-/// AFTER the L1 leg is admitted, so a mempool rejection never leaves a
-/// stale intent behind.
+/// low-s, ecrecover) and return the Phase-1 `EvmTransaction` view.
+///
+/// PURE: no pending-intent write, no filter notification, no mempool touch.
+/// [`eth_send_raw_transaction_bytes`] adds the stateless intent-pool write;
+/// the RPC refusal path calls [`verify_raw_evm_intent`] for the hash only.
 ///
 /// Verification compares against [`effective_chain_id`] (single source,
 /// M-02): served identity and admission agree on every deployment.
-pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError> {
+pub fn decode_verify_raw_evm(raw: &[u8]) -> Result<EvmTransaction, JsonRpcError> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
         return Err(JsonRpcError::invalid_params(
             "empty or oversized raw transaction",
@@ -71,7 +74,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
     let tx_hash = format!("0x{}", hex::encode(keccak256(raw)));
 
     // Decode + strictly verify (chain_id, low-s, ecrecover).
-    let evm_tx: EvmTransaction = if !raw.is_empty() && raw[0] == 0x02 {
+    Ok(if !raw.is_empty() && raw[0] == 0x02 {
         let decoded =
             parse_eip1559_envelope(raw).map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
         let from = decoded
@@ -155,8 +158,29 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
         }
-    };
+    })
+}
 
+/// Phase-1 admission gate, PURE: decode + strictly verify the EVM intent and
+/// return its keccak hash without writing the pending-intent pool.
+///
+/// `eth_sendRawTransaction` uses this to give precise errors for malformed /
+/// high-s / wrong-chain / unprotected envelopes while keeping the FULL-PQ
+/// refusal side-effect free: no intent is filed for a transaction that
+/// consensus admission can never settle.
+pub fn verify_raw_evm_intent(raw: &[u8]) -> Result<String, JsonRpcError> {
+    decode_verify_raw_evm(raw).map(|tx| tx.hash)
+}
+
+/// Store a verified EVM intent in the Phase-1 pool and notify filters.
+///
+/// NOTE: this is the STATELESS library path (tests, embedded adapters). The
+/// node's `eth_sendRawTransaction` RPC does **not** call it: FULL-PQ admission
+/// can never settle an EVM intent, so the RPC must never leave one pending
+/// forever (see [`evm_send_refusal`]).
+pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError> {
+    let evm_tx = decode_verify_raw_evm(raw)?;
+    let tx_hash = evm_tx.hash.clone();
     if let Ok(mut pending) = EVM_PENDING_TXS.lock() {
         // Bound pending pool (DoS guard): evict oldest arbitrary entry past 10k.
         if pending.len() >= 10_000 {
@@ -170,7 +194,83 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
     Ok(tx_hash)
 }
 
-/// Map verified raw EVM bytes onto a Phase-2 L1 settlement transaction.
+/// The stable reason tag returned in `error.data.reason` for a refused EVM
+/// write. Clients match this instead of a prose message.
+pub const EVM_WRITE_REFUSAL_REASON: &str = "full-pq-admission";
+
+/// Exact requirement an EVM write must meet before it can be admitted.
+pub const EVM_WRITE_PQ_REQUIREMENT: &str =
+    "PQ1 envelope (Falcon-512) or an SF1 Falcon session grant";
+
+/// The honest `eth_sendRawTransaction` refusal for a FULL-PQ chain.
+///
+/// The EVM intent is decoded and its secp256k1 signature is verified (Phase 1
+/// compatibility layer), but a classical signature is **not** a consensus
+/// credential: `Mempool::add_checked_ctx` admits only envelopes whose
+/// `Transaction::verify_signature` passes, and that requires a post-quantum
+/// scheme whose `from` is `derive_pq_address(scheme, pubkey, salt)`. No
+/// conversion can turn a secp256k1 key into that address, so the write is
+/// refused with the exact replacement path instead of being pooled forever.
+///
+/// `evm_hash` is the keccak hash of the verified intent when the bytes were
+/// well-formed (`None` only for error paths that already failed decoding).
+pub fn evm_send_refusal(evm_hash: Option<&str>) -> JsonRpcError {
+    let intent = match evm_hash {
+        Some(h) => {
+            format!(" The intent is well-formed (keccak {h}) but no PQ authorisation covers it.")
+        }
+        None => String::new(),
+    };
+    JsonRpcError::with_data(
+        -32000,
+        format!(
+            "eth_sendRawTransaction is not admitted: this is a FULL-PQ chain and a \
+             secp256k1/EIP-155 signature is not a consensus credential.{intent} \
+             Submit the transfer as a Falcon-512 {requirement} with \
+             stell_sendRawTransaction (params {{\"tx\":\"0x<bincode(Transaction)>\"}}); \
+             fund the PQ account derive_pq_address(Falcon512, pubkey, DEFAULT_SALT), not \
+             the EVM-derived address. Read-only eth_call / eth_getProof / eth_getCode / \
+             eth_getBalance remain available. See the design header of src/rpc/eth.rs.",
+            requirement = EVM_WRITE_PQ_REQUIREMENT
+        ),
+        serde_json::json!({
+            "reason": EVM_WRITE_REFUSAL_REASON,
+            "requires": EVM_WRITE_PQ_REQUIREMENT,
+            "submitWith": "stell_sendRawTransaction",
+            "evmHash": evm_hash,
+            "readOnly": [
+                "eth_call",
+                "eth_getProof",
+                "eth_getCode",
+                "eth_getBalance",
+                "eth_getTransactionCount",
+                "eth_getLogs"
+            ],
+        }),
+    )
+}
+
+/// Decode/verify `params` and return the honest FULL-PQ refusal.
+///
+/// Malformed / malleable / wrong-chain / unprotected envelopes keep their
+/// precise Phase-1 error; a well-formed intent gets the PQ requirement. No
+/// pending intent is created on either path.
+pub fn evm_send_refusal_from_params(params: &Value) -> JsonRpcError {
+    match extract_raw_evm_bytes(params).and_then(|raw| verify_raw_evm_intent(&raw)) {
+        Ok(hash) => evm_send_refusal(Some(&hash)),
+        Err(e) => e,
+    }
+}
+
+/// Map verified raw EVM bytes onto the legacy Phase-2 `EV1` carrier.
+///
+/// DECODE/SIMULATION ONLY — this is NOT an admission path in FULL-PQ builds.
+/// `Transaction::verify_signature` refuses every `EV1` inner envelope and
+/// `mempool::insert` refuses it explicitly with
+/// [`crate::mempool::EVM_ENVELOPE_REFUSAL`], so a
+/// transaction built here can never enter the consensus mempool or a block.
+/// It remains useful for read-only simulation (`stell_estimateFee` decodes raw
+/// EVM input) and for tests that pin the historical mapping.
 ///
 /// Decodes RLP (legacy EIP-155 or EIP-1559 type-2), strictly verifies
 /// `chain_id == effective_chain_id()` (single source, M-02) + low-s +
@@ -180,14 +280,11 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
 /// canonical raw inside the `EV1` envelope of
 /// [`crate::sharding::Transaction::new_evm`].
 ///
-/// Consensus re-verifies every binding from the envelope bytes alone
-/// (`Transaction::verify_evm_signature`), so this mapping needs no trust:
-///
-/// * contract creation (`to == None`) is rejected — Phase-2 settles value
-///   transfers and there is no Stell recipient to invent for a deployment;
-/// * calldata (if any) is NOT executed — the L1 leg is a plain transfer of
-///   the mapped value; EVM execution lands after settlement;
-/// * shards are masterchain (single-shard settlement lane).
+/// * contract creation (`to == None`) is rejected — there is no Stell
+///   recipient to invent for a deployment;
+/// * calldata (if any) is NOT executed — the carrier is a plain transfer of
+///   the mapped value;
+/// * shards are masterchain (single-shard carrier lane).
 pub fn evm_raw_to_stell_transaction(raw: &[u8]) -> Result<crate::sharding::Transaction, String> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
         return Err("empty or oversized raw transaction".to_string());

@@ -5491,3 +5491,110 @@ fn bvm_poc_wei_truncation_and_verbatim_gas_below_floor() {
         "pure figure stays unfloored underneath"
     );
 }
+
+// ============================================================================
+// FULL-PQ EVM write contract + state-backed read views
+// ============================================================================
+
+#[test]
+fn test_adapter_eth_send_raw_transaction_refuses_with_pq_requirement() {
+    // A well-formed EIP-1559 intent: decode + Phase-1 verification succeeds,
+    // and the adapter must NOT report it as accepted (there is no FULL-PQ
+    // admission path for a secp256k1 signature).
+    let (raw_hex, evm_hash) = build_signed_eip1559_raw(9101, [0x5Eu8; 20]);
+    let adapter = EvmAdapter::new();
+    let err = adapter
+        .dispatch("eth_sendRawTransaction", &json!([raw_hex]))
+        .expect_err("FIXED: EVM write must be an honest PQ refusal");
+    assert_eq!(err.code, -32000);
+    assert!(
+        err.message.contains("FULL-PQ")
+            && err.message.contains("PQ1")
+            && err.message.contains("stell_sendRawTransaction"),
+        "refusal names the requirement and the replacement: {}",
+        err.message
+    );
+    let data = err.data.expect("machine-readable refusal data");
+    assert_eq!(data["reason"], json!("full-pq-admission"));
+    assert_eq!(data["submitWith"], json!("stell_sendRawTransaction"));
+    assert_eq!(data["evmHash"], json!(evm_hash));
+    assert!(
+        stellereum::evm_adapter::eth_pending_tx(&evm_hash).is_none(),
+        "FIXED: a refused intent is not filed into the pending pool"
+    );
+}
+
+#[tokio::test]
+async fn test_state_backed_get_code_and_get_proof() {
+    use stellereum::evm_adapter as evm;
+
+    let engine = Arc::new(InMemoryStateEngine::new());
+    let evm20 = [0x5Au8; 20];
+    let evm_hex = format!("0x{}", hex::encode(evm20));
+    let stell_addr = evm_to_stell_address(&evm20);
+    let code = vec![0x60u8, 0x01, 0x60, 0x02, 0x55];
+    let mut acc = AccountState::new(stell_addr, 2_000_000_000);
+    acc.nonce = 4;
+    acc.code = code.clone();
+    engine.update_account(acc).await;
+
+    // Engine-backed adapter: real code.
+    let adapter = EvmAdapter::new().with_engine(engine.clone());
+    let got = adapter
+        .dispatch_async("eth_getCode", &json!([evm_hex.clone(), "latest"]))
+        .await
+        .expect("getCode");
+    assert_eq!(got, json!(format!("0x{}", hex::encode(&code))));
+    let got2 = adapter
+        .dispatch_with_engine(&engine, "eth_getCode", &json!([evm_hex.clone(), "latest"]))
+        .await
+        .expect("getCode with engine");
+    assert_eq!(got2, json!(format!("0x{}", hex::encode(&code))));
+
+    // Codeless address stays `0x`.
+    let none = adapter
+        .dispatch_async(
+            "eth_getCode",
+            &json!([format!("0x{}", "77".repeat(20)), "latest"]),
+        )
+        .await
+        .expect("getCode");
+    assert_eq!(none, json!("0x"));
+
+    // RPC view: a real EIP-1186 account proof + exact metadata.
+    let st = Arc::new(RpcState {
+        engine,
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
+        height: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        node_id: "evm-adapter-tests".to_string(),
+        chain_id: CHAIN_ID,
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
+        recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
+        receipts: Arc::new(tokio::sync::RwLock::new(ReceiptIndex::default())),
+        auth_token: None,
+        tx_broadcast: None,
+        faucet: None,
+        faucet_token: None,
+        msg_signing_seed: None,
+        archive_store: None,
+        shard_registry: stellereum::sharding::ShardRegistry::single(),
+    });
+    let p = st
+        .call("eth_getProof", json!([evm_hex, [], "latest"]))
+        .await;
+    assert!(p.get("error").is_none(), "eth_getProof must serve: {p}");
+    assert_eq!(p["nonce"], json!("0x4"));
+    assert_eq!(
+        p["codeHash"],
+        json!(format!("0x{}", hex::encode(evm::keccak256(&code))))
+    );
+    assert!(p["accountProof"].as_array().is_some());
+    assert!(p["storageHash"].is_null());
+}

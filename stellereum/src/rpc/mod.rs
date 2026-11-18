@@ -105,6 +105,9 @@ pub use reads::*;
 pub use state::*;
 pub(crate) use streams::extract_header_token;
 pub use streams::*;
+// The in-crate test module reaches helper functions defined in `writes`
+// through `use super::*`; production code calls them module-qualified.
+#[cfg(test)]
 use writes::*;
 
 /// Dispatch a single RPC call to its handler.

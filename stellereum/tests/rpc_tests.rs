@@ -441,3 +441,38 @@ async fn test_rpc_cors_headers_on_gateway() {
         .to_lowercase()
         .contains("access-control-allow-headers: content-type"));
 }
+
+/// FULL-PQ EVM surface: `eth_getCode` reads committed bytecode, `eth_getProof`
+/// serves the state trie, and `eth_subscribe` refuses with the missing
+/// transport named (never a dead subscription id).
+#[tokio::test]
+async fn test_evm_read_views_are_state_backed_and_subscribe_refuses() {
+    let st = test_rpc_state(None).await;
+    let evm20 = [0x4Du8; 20];
+    let evm_hex = format!("0x{}", hex::encode(evm20));
+    let stell = evm::parse_evm_or_stell_address(&evm_hex).expect("address");
+
+    let mut acc = AccountState::new(stell, 1_000_000_000);
+    acc.code = vec![0x60u8, 0x2a, 0x60, 0x00, 0x52];
+    st.engine.update_account(acc).await;
+
+    let code = st.call("eth_getCode", json!([evm_hex, "latest"])).await;
+    assert_eq!(code, json!("0x602a600052"));
+
+    let proof = st
+        .call(
+            "eth_getProof",
+            json!([format!("0x{}", hex::encode(evm20)), [], "latest"]),
+        )
+        .await;
+    assert!(proof.get("error").is_none(), "proof must serve: {proof}");
+    assert!(proof["accountProof"].as_array().is_some());
+    assert_eq!(proof["exists"], json!(true));
+
+    let sub = st.call("eth_subscribe", json!(["newHeads"])).await;
+    let msg = sub["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("eth_subscription") && msg.contains("stell_subscribe"),
+        "subscribe refusal names the gap, got {sub}"
+    );
+}

@@ -1638,8 +1638,10 @@ impl EvmAdapter {
             "eth_getLogs" => self.eth_get_logs(params),
             "eth_getStorageAt" => self.eth_get_storage_at(params).map(|v| json!(v)),
             "eth_sendRawTransaction" => {
-                let hash = eth_send_raw_transaction(params)?;
-                Ok(json!(hash))
+                // FULL-PQ: the stateless adapter cannot admit anything into a
+                // consensus mempool, and a secp256k1 signature is never an
+                // admission credential. Same honest refusal as the node RPC.
+                Err(evm_send_refusal_from_params(params))
             }
             _ => Err(JsonRpcError::method_not_found(method)),
         }
@@ -1652,7 +1654,10 @@ impl EvmAdapter {
         params: &Value,
     ) -> Result<Value, JsonRpcError> {
         match method {
-            "eth_getCode" => Ok(json!(self::handle_eth_get_code(params)?)),
+            "eth_getCode" => match &self.engine {
+                Some(engine) => Ok(json!(self::eth_get_code_with_engine(engine, params).await?)),
+                None => Ok(json!(self::handle_eth_get_code(params)?)),
+            },
             "eth_getBalance" => Ok(json!(self.eth_get_balance(params).await?)),
             "eth_getTransactionCount" => Ok(json!(self.eth_get_transaction_count(params).await?)),
             _ => self.dispatch(method, params),
@@ -1668,6 +1673,7 @@ impl EvmAdapter {
     ) -> Result<Value, JsonRpcError> {
         match method {
             "eth_call" => self.handle_eth_call_with_engine(engine, params).await,
+            "eth_getCode" => Ok(json!(self::eth_get_code_with_engine(engine, params).await?)),
             "eth_getBalance" => {
                 let res = self::eth_get_balance(engine, params).await?;
                 Ok(json!(res))
@@ -1819,6 +1825,10 @@ impl EvmAdapter {
             }
             "eth_getLogs" => st.eth_get_logs(params).await,
             "eth_getStorageAt" => st.eth_get_storage_at(params).await.map(|v| json!(v)),
+            "eth_getCode" => Ok(json!(self::eth_get_code_rpc(st, params).await?)),
+            "eth_getProof" => self::eth_get_proof_rpc(st, params).await,
+            "eth_subscribe" => Err(eth_subscribe_refusal(params)),
+            "eth_unsubscribe" => Err(eth_unsubscribe_refusal()),
             _ => self.dispatch_with_engine(&st.engine, method, params).await,
         }
     }
@@ -2248,6 +2258,11 @@ pub fn eth_get_transaction_count_at(
 
 /// Handles `eth_getCode` call, returning "0x".
 /// Validates address format if an address is provided in params.
+///
+/// STATELESS: this helper has no state engine, so it cannot know whether a
+/// deployed contract exists. It is kept for the embedded/stateless adapter and
+/// its long-standing "no code visible" contract. The JSON-RPC server uses
+/// [`eth_get_code_with_engine`], which returns the REAL committed code.
 pub fn handle_eth_get_code(params: &Value) -> Result<&'static str, JsonRpcError> {
     if !params.is_null() {
         let has_params = match params {
@@ -2264,6 +2279,348 @@ pub fn handle_eth_get_code(params: &Value) -> Result<&'static str, JsonRpcError>
         }
     }
     Ok(eth_get_code())
+}
+
+/// `eth_getCode` against a live engine: the REAL committed bytecode, or `0x`.
+///
+/// Lookup order (each read-only, no fabricated bytes):
+/// 1. the account's own `code` field;
+/// 2. the contract registry entry (code + ABI manifest deployments);
+/// 3. the state trie's raw-address entry when it is NOT the account leaf for
+///    that address (a plain account stores balance/nonce there, which must
+///    never be reported as bytecode).
+///
+/// `0x` is served only when all three sources hold no code for the address.
+pub async fn eth_get_code_with_engine(
+    engine: &InMemoryStateEngine,
+    params: &Value,
+) -> Result<String, JsonRpcError> {
+    let (addr_str, _tag) = parse_address_and_tag_params(params)?;
+    let address = parse_evm_or_stell_address(&addr_str)
+        .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+
+    let account = engine.get_account(&address).await;
+    if let Some(acc) = &account {
+        if !acc.code.is_empty() {
+            return Ok(format!("0x{}", hex::encode(&acc.code)));
+        }
+    }
+    let contract_code = engine
+        .get_contract(&address)
+        .await
+        .map(|c| c.code)
+        .unwrap_or_default();
+    if !contract_code.is_empty() {
+        return Ok(format!("0x{}", hex::encode(&contract_code)));
+    }
+    // Trie fallback: the raw value at an address is contract code only when
+    // it is NOT that address's account leaf (a plain account stores
+    // balance/nonce there, which must never be reported as bytecode).
+    if let Some(value) = engine.get_contract_code_from_trie(&address).await {
+        let is_account_leaf = account
+            .as_ref()
+            .map(|acc| acc.to_trie_bytes() == value)
+            .unwrap_or(false);
+        if !is_account_leaf && !value.is_empty() {
+            return Ok(format!("0x{}", hex::encode(&value)));
+        }
+    }
+    Ok("0x".to_string())
+}
+
+/// `eth_getCode` against an `RpcState` (stateful JSON-RPC path).
+pub async fn eth_get_code_rpc(st: &RpcState, params: &Value) -> Result<String, JsonRpcError> {
+    eth_get_code_with_engine(&st.engine, params).await
+}
+
+/// Maximum storage keys accepted by the `eth_getProof` parameter parser.
+/// Non-empty lists are refused anyway (no EVM storage trie), so this only
+/// bounds parse work.
+const MAX_ETH_GET_PROOF_STORAGE_KEYS: usize = 64;
+
+/// Parse `eth_getProof(address, storageKeys, blockTag)` in both array and
+/// object shapes. Storage keys are validated as 32-byte hex even though a
+/// non-empty list is refused below.
+fn parse_eth_get_proof_params(
+    params: &Value,
+) -> Result<(String, Vec<[u8; 32]>, BlockTag), JsonRpcError> {
+    fn keys_from(val: Option<&Value>) -> Result<Vec<[u8; 32]>, JsonRpcError> {
+        let Some(val) = val else {
+            return Ok(Vec::new());
+        };
+        if val.is_null() {
+            return Ok(Vec::new());
+        }
+        let items = val.as_array().ok_or_else(|| {
+            JsonRpcError::invalid_params("storageKeys must be an array of 32-byte hex strings")
+        })?;
+        if items.len() > MAX_ETH_GET_PROOF_STORAGE_KEYS {
+            return Err(JsonRpcError::invalid_params(format!(
+                "too many storage keys: at most {MAX_ETH_GET_PROOF_STORAGE_KEYS} per request"
+            )));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            let s = it
+                .as_str()
+                .ok_or_else(|| JsonRpcError::invalid_params("storage key must be a hex string"))?;
+            let clean = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
+            let bytes = hex::decode(clean).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid storage key '{s}': {e}"))
+            })?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                JsonRpcError::invalid_params(format!("storage key '{s}' must be exactly 32 bytes"))
+            })?;
+            out.push(key);
+        }
+        Ok(out)
+    }
+
+    match params {
+        Value::Array(arr) => {
+            let addr = arr
+                .first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| JsonRpcError::invalid_params("missing address parameter"))?
+                .to_string();
+            let keys = keys_from(arr.get(1))?;
+            let tag = match arr.get(2) {
+                Some(v) => BlockTag::parse(v)?,
+                None => BlockTag::Latest,
+            };
+            Ok((addr, keys, tag))
+        }
+        Value::Object(obj) => {
+            let addr = obj
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| JsonRpcError::invalid_params("missing 'address' in params object"))?
+                .to_string();
+            let keys = keys_from(
+                obj.get("storageKeys")
+                    .or_else(|| obj.get("storage_keys"))
+                    .or_else(|| obj.get("storageProof")),
+            )?;
+            let tag = match obj
+                .get("blockTag")
+                .or_else(|| obj.get("block_tag"))
+                .or_else(|| obj.get("block"))
+            {
+                Some(v) => BlockTag::parse(v)?,
+                None => BlockTag::Latest,
+            };
+            Ok((addr, keys, tag))
+        }
+        Value::String(s) => Ok((s.clone(), Vec::new(), BlockTag::Latest)),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array, object, or address string",
+        )),
+    }
+}
+
+/// `eth_getProof` (EIP-1186 account half) anchored at the committed state trie.
+///
+/// WHAT IS SERVED (real, verifiable):
+/// * `accountProof` — a cpat2 inclusion proof (or an exclusion proof when the
+///   address has no state entry) over the address's leaf in
+///   `engine.state_trie`, with `stateRoot` the root the proof folds to.
+///   Before returning, the node
+///   re-verifies the proof itself; a proof it cannot verify is an internal
+///   error, never a served answer.
+/// * `balance` (wei), `nonce`, and `codeHash = keccak256(eth_getCode(addr))`.
+///
+/// WHAT IS NOT SERVED: `storageProof` / `storageHash`. This chain has ONE
+/// account/contract Patricia trie, not a per-account EVM storage trie, so no
+/// EVM slot proof exists. A non-empty `storageKeys` request is refused with
+/// `-32000` naming that missing capability; `storageHash` is `null` and
+/// `storageProof` is `[]` for that same reason (never a fabricated Ethereum
+/// empty-trie root).
+///
+/// HISTORICAL STATE: the node keeps only the live trie, so a block tag that
+/// resolves to a height other than the current head is refused. `latest`
+/// (and the current height) is served.
+pub async fn eth_get_proof_with_engine(
+    engine: &InMemoryStateEngine,
+    head: u64,
+    params: &Value,
+) -> Result<Value, JsonRpcError> {
+    let (addr_str, storage_keys, tag) = parse_eth_get_proof_params(params)?;
+    let address = parse_evm_or_stell_address(&addr_str)
+        .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+    let want = tag.resolve(head);
+    if want != head {
+        return Err(JsonRpcError::new(
+            -32000,
+            format!(
+                "eth_getProof serves only the current state: this node is at height {head}, \
+                 not {want} (historical state is not retained; use stell_getArchiveProof with \
+                 an attached archive store)"
+            ),
+        ));
+    }
+    if !storage_keys.is_empty() {
+        return Err(JsonRpcError::with_data(
+            -32000,
+            "eth_getProof storageProof is not served: this chain has one account/contract \
+             Patricia trie, not a per-account EVM storage trie, so no EVM storage-slot proof \
+             exists. Request storageKeys: [] for the account proof; raw state-trie keys are \
+             available through stell_getProof."
+                .to_string(),
+            serde_json::json!({
+                "reason": "no-evm-storage-trie",
+                "missing": "per-account EVM storage trie (Verkle/MPT slot proofs)",
+                "accountProofAvailable": true,
+            }),
+        ));
+    }
+
+    let account = engine.get_account(&address).await;
+    let contract = engine.get_contract(&address).await;
+    let mut code = account.as_ref().map(|a| a.code.clone()).unwrap_or_default();
+    if code.is_empty() {
+        if let Some(c) = &contract {
+            code = c.code.clone();
+        }
+    }
+    if code.is_empty() {
+        if let Some(value) = engine.get_contract_code_from_trie(&address).await {
+            let is_account_leaf = account
+                .as_ref()
+                .map(|acc| acc.to_trie_bytes() == value)
+                .unwrap_or(false);
+            if !is_account_leaf {
+                code = value;
+            }
+        }
+    }
+
+    // Fold the consensus-domain digest first so the root served is the
+    // canonical committed root (same discipline as `stell_getProof`).
+    let _ = engine.get_state_root().await;
+    let (nodes, trie_has_entry, root) = {
+        let trie = engine.state_trie.read().await;
+        let root = trie.root_hash();
+        match trie.compressed().generate_proof(&address) {
+            Some(p) => {
+                if !crate::cpat2::verify_proof(&root, &address, &p.value, &p) {
+                    return Err(JsonRpcError::new(
+                        -32000,
+                        "internal error: generated account proof does not verify",
+                    ));
+                }
+                (p.to_nodes(), true, root)
+            }
+            None => match trie.compressed().generate_exclusion_proof(&address) {
+                Some(p) => {
+                    if !crate::cpat2::verify_exclusion_proof(&root, &address, &p) {
+                        return Err(JsonRpcError::new(
+                            -32000,
+                            "internal error: generated account exclusion proof does not verify",
+                        ));
+                    }
+                    (p.to_nodes(), false, root)
+                }
+                // Empty trie: nothing to prove against. The answer is an
+                // honest empty proof, never a manufactured leaf.
+                None => (Vec::new(), false, root),
+            },
+        }
+    };
+    if account.is_some() && !trie_has_entry {
+        return Err(JsonRpcError::new(
+            -32000,
+            "internal error: account exists in the engine but has no state-trie leaf",
+        ));
+    }
+
+    let proof_nodes: Vec<String> = nodes.iter().map(|n| format!("0x{n}")).collect();
+    let address_json = if address[..12] == [0u8; 12] {
+        format!("0x{}", hex::encode(&address[12..]))
+    } else {
+        format!("0x{}", hex::encode(address))
+    };
+    Ok(serde_json::json!({
+        "address": address_json,
+        "stellAddress": format!("0x{}", hex::encode(address)),
+        "accountProof": proof_nodes,
+        "balance": account
+            .as_ref()
+            .map(|a| nano_to_wei_hex(a.balance))
+            .unwrap_or_else(|| "0x0".to_string()),
+        "nonce": account
+            .as_ref()
+            .map(|a| format_u64_hex(a.nonce))
+            .unwrap_or_else(|| "0x0".to_string()),
+        "codeHash": format!("0x{}", hex::encode(keccak256(&code))),
+        // No per-account EVM storage trie exists; `null` is the honest answer
+        // (an Ethereum empty-trie root would describe a trie this chain lacks).
+        "storageHash": Value::Null,
+        "storageProof": Vec::<Value>::new(),
+        "stateRoot": format!("0x{}", hex::encode(root)),
+        "height": head,
+        "exists": account.is_some() || contract.is_some() || trie_has_entry,
+        "proofModel": "stell-cpat2-state-trie-v1",
+    }))
+}
+
+/// `eth_getProof` against an `RpcState` (stateful JSON-RPC path).
+pub async fn eth_get_proof_rpc(st: &RpcState, params: &Value) -> Result<Value, JsonRpcError> {
+    let head = st.height.load(std::sync::atomic::Ordering::Relaxed);
+    eth_get_proof_with_engine(&st.engine, head, params).await
+}
+
+/// Honest `eth_subscribe` refusal.
+///
+/// The node HAS a subscription registry and a WebSocket fan-out
+/// (`crate::rpc::streams`), but that transport only understands
+/// `stell_subscribe` topics and frames every notification as
+/// `{"subscription": <id>, "result": <stell payload>}`. It has no EIP-1193
+/// `eth_subscription` envelope and no EVM header/log materialiser, so an
+/// `eth_subscribe` id would never receive a correctly shaped notification.
+/// Refusing names the exact gap instead of issuing a dead id.
+pub fn eth_subscribe_refusal(params: &Value) -> JsonRpcError {
+    let kind = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("type").and_then(|v| v.as_str()))
+        .or_else(|| params.get("subscription").and_then(|v| v.as_str()))
+        .unwrap_or("subscription");
+    JsonRpcError::with_data(
+        -32000,
+        format!(
+            "eth_subscribe(\"{kind}\") is not served: this node's WebSocket transport \
+             (src/rpc/streams.rs::ws_handle_text) tracks only stell_subscribe and frames \
+             notifications as {{\"subscription\",\"result\"}}; it emits no EIP-1193 \
+             `eth_subscription` envelope and has no EVM newHeads/log payload materialiser. \
+             Use stell_subscribe [\"newHeads\"] / [\"events\", {{...}}] on /ws (or /events \
+             SSE), or poll eth_getBlockByNumber(\"latest\") / eth_getLogs. No subscription \
+             id was issued and no notification will be pushed for this call."
+        ),
+        serde_json::json!({
+            "reason": "no-evm-subscription-transport",
+            "missing": "EIP-1193 eth_subscription framing + EVM newHeads/log payloads in rpc/streams.rs",
+            "use": ["stell_subscribe", "eth_getLogs", "eth_getBlockByNumber"],
+            "kind": kind,
+        }),
+    )
+}
+
+/// Honest `eth_unsubscribe` refusal: no `eth_subscribe` id is ever issued, so
+/// there is nothing to remove. `stell_unsubscribe` removes stell ids.
+pub fn eth_unsubscribe_refusal() -> JsonRpcError {
+    JsonRpcError::with_data(
+        -32000,
+        "eth_unsubscribe is not served: this node issues no eth_subscribe ids (see \
+         eth_subscribe). Stell subscription ids are removed with stell_unsubscribe."
+            .to_string(),
+        serde_json::json!({
+            "reason": "no-evm-subscription-transport",
+            "use": ["stell_unsubscribe"],
+        }),
+    )
 }
 
 /// Handles `eth_getBalance` against an `InMemoryStateEngine`.

@@ -1209,6 +1209,32 @@ impl Vote {
         }
     }
 
+    /// Per-vote validity for the votes held in `slots` at `indices`, in the
+    /// SAME order as `indices`, with the SAME predicate and the SAME
+    /// serial/parallel threshold as [`Self::partition_valid`].
+    ///
+    /// Batch ingest keeps its votes in movable slots (so an admitted vote can
+    /// be moved into the set instead of cloned) while the signature screen
+    /// still has to run over a borrowed view; this is that view. Element `j`
+    /// is exactly `slots[indices[j]].verify()`.
+    pub(crate) fn partition_valid_slots(slots: &[Option<Vote>], indices: &[usize]) -> Vec<bool> {
+        use rayon::prelude::*;
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let one = |&i: &usize| {
+            slots[i]
+                .as_ref()
+                .expect("slot present during the signature screen")
+                .verify()
+        };
+        if indices.len() < 4 {
+            indices.iter().map(one).collect()
+        } else {
+            indices.par_iter().map(one).collect()
+        }
+    }
+
     /// The Falcon-512 half of this vote's signature, when it carries one.
     pub fn falcon_signature(&self) -> Option<&[u8]> {
         if self.signature.len() == VOTE_FALCON_PART_LEN
@@ -1271,9 +1297,9 @@ impl Vote {
 // EXACT INVALIDATION — every trigger enumerated (found by grep over the
 // tree; see call sites):
 //  1. VALIDATOR-SET CHANGE. `VoteSet::add` / `add_batch` receive the set in
-//     force and call `note_validator_set_for_vote_cache` first: a digest of
-//     the sorted `(voter, power)` table is compared against the last-seen
-//     digest, and ANY change clears the cache (miss = full verify). Set
+//     force and call `note_validator_set_for_vote_cache` first: an exact
+//     sorted `(voter, power)` snapshot is compared against the last-seen
+//     snapshot, and ANY change clears the cache (miss = full verify). Set
 //     producers (all outside this file, read-only from here):
 //     `runtime.rs` `refresh_validator_set_from_ledger`,
 //     `refresh_validator_set_from_master_ledger`,
@@ -1352,41 +1378,64 @@ static VERIFIED_VOTE_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 static VERIFIED_VOTE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static VERIFIED_VOTE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-/// Digest of the validator set the cache was last validated against
-/// (trigger 1). `None` forces a re-record on the next ingest.
-static VERIFIED_VOTE_CACHE_SET_DIGEST: std::sync::LazyLock<std::sync::RwLock<Option<[u8; 32]>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+/// Canonical `(validator, power)` view of the in-force set.
+type ValidatorSetSnapshot = Vec<(ValidatorId, u64)>;
 
-/// Deterministic digest of the in-force validator set (sorted iteration —
-/// `ValidatorSet.validators` is a `BTreeMap`, so equal sets digest equal on
-/// every node and every call).
-fn validator_set_digest(validators: &ValidatorSet) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_derive_key("STELL_VERIFIED_VOTE_SET_V1");
-    h.update(&(validators.validators.len() as u64).to_le_bytes());
-    for (id, power) in validators.validators.iter() {
-        h.update(id);
-        h.update(&power.to_le_bytes());
+/// Exact snapshot `(validator, power)` of the set the cache was last
+/// validated against (trigger 1). `None` forces a re-record on the next
+/// ingest.
+///
+/// A snapshot comparison is used instead of a per-call BLAKE3 digest: the
+/// digest was recomputed over the WHOLE set on every vote, so at `n = 2000`
+/// every `VoteSet::add` hashed ~80 KB before it could even consult the
+/// verdict cache. Comparing the stored pairs detects exactly the same
+/// changes (any added/removed validator or power edit makes the pair lists
+/// differ) without hashing or allocating on the no-change path.
+static VERIFIED_VOTE_CACHE_SET_SNAPSHOT: std::sync::LazyLock<
+    std::sync::RwLock<Option<ValidatorSetSnapshot>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Exact equality between the stored snapshot and `validators`.
+///
+/// `ValidatorSet.validators` is a `BTreeMap`, so both pair lists are in the
+/// same canonical (sorted) order. Equal lists ⇔ equal sets.
+fn validator_set_matches_snapshot(
+    snapshot: &[(ValidatorId, u64)],
+    validators: &ValidatorSet,
+) -> bool {
+    if snapshot.len() != validators.validators.len() {
+        return false;
     }
-    *h.finalize().as_bytes()
+    snapshot
+        .iter()
+        .zip(validators.validators.iter())
+        .all(|((sid, spower), (vid, vpower))| sid == vid && spower == vpower)
 }
 
 /// Trigger-1 enforcement: call at the top of every vote-ingest entry point
 /// that observes the in-force set. A changed set clears the cache before any
 /// verdict is consulted (miss = full verify).
 pub(super) fn note_validator_set_for_vote_cache(validators: &ValidatorSet) {
-    let digest = validator_set_digest(validators);
     let changed = {
-        let lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+        let lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        *lock != Some(digest)
+        match lock.as_deref() {
+            None => true,
+            Some(snapshot) => !validator_set_matches_snapshot(snapshot, validators),
+        }
     };
     if changed {
         clear_verified_vote_cache();
-        let mut lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+        let snapshot: ValidatorSetSnapshot = validators
+            .validators
+            .iter()
+            .map(|(id, power)| (*id, *power))
+            .collect();
+        let mut lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        *lock = Some(digest);
+        *lock = Some(snapshot);
     }
 }
 
@@ -1445,7 +1494,7 @@ pub fn clear_verified_vote_cache() {
 /// it. Safe to call redundantly: clearing only costs CPU.
 pub fn invalidate_verified_vote_cache() {
     clear_verified_vote_cache();
-    let mut lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+    let mut lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
         .write()
         .unwrap_or_else(|e| e.into_inner());
     *lock = None;
@@ -1522,6 +1571,127 @@ impl QuorumCertificate {
         cnvrf_v3_active: bool,
     ) -> bool {
         self.verify_unified_with_pq_keys_and_beacon_inner(validators, None, beacon, cnvrf_v3_active)
+    }
+
+    /// Verify the certificate AND return the power its verified signers carry
+    /// under `validators`, in ONE crypto pass.
+    ///
+    /// The adopted-block path used to call [`Self::verify`] and then
+    /// [`ValidatorSet::qc_signed_power`] (→ [`Self::signers_set`]) on the SAME
+    /// certificate: the first pass verified every signature to decide the
+    /// verdict, and the second pass verified all of them again only to sum
+    /// their power. Both passes walk the same markers and reach the same
+    /// verify-grade signer set, so here they are fused: every marker is
+    /// decoded/attributed once, the union of verified signers is accumulated,
+    /// and the quorum verdict is the OR of the same per-marker quorum checks
+    /// `verify` applies.
+    ///
+    /// Verdicts are IDENTICAL to `(self.verify(v), validators.qc_signed_power(&self))`:
+    /// * the anti-DoS cap and the µQC ambiguity refusal run first (same
+    ///   fail-closed `(false, 0)` as `verify` + empty attribution);
+    /// * a marker that cannot be decoded / has no PQ key / fails a signature
+    ///   or structural check contributes neither verdict nor signers;
+    /// * `true` iff at least one marker clears its quorum rule;
+    /// * the returned power is summed over the UNION of verified signer ids
+    ///   (exactly what `signers_set` + `qc_signed_power` compute).
+    pub fn verify_and_signed_power(&self, validators: &ValidatorSet) -> (bool, u64) {
+        self.verify_and_signed_power_inner(validators, None, None, false)
+    }
+
+    /// Beacon-aware variant of [`Self::verify_and_signed_power`]; below
+    /// `CNVRF_V3_ACTIVATION_HEIGHT` it is byte-identical to the plain form.
+    pub fn verify_and_signed_power_with_beacon(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+    ) -> (bool, u64) {
+        self.verify_and_signed_power_inner(
+            validators,
+            None,
+            beacon,
+            cnvrf_v3_active_at(self.height),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_and_signed_power_with_beacon_active(
+        &self,
+        validators: &ValidatorSet,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> (bool, u64) {
+        self.verify_and_signed_power_inner(validators, None, beacon, cnvrf_v3_active)
+    }
+
+    fn verify_and_signed_power_inner(
+        &self,
+        validators: &ValidatorSet,
+        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        beacon: Option<&EpochBeacon>,
+        cnvrf_v3_active: bool,
+    ) -> (bool, u64) {
+        // Same anti-DoS cap as `verify` (and `signers_set`): an over-cap
+        // attacker-supplied list decides nothing and attributes nobody.
+        if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
+            return (false, 0);
+        }
+        let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        // Same ambiguity refusal as `verify` (PENTEST F-4). `signers_set`
+        // returns an empty set for the same input, so power is 0.
+        if self.resolve_micro_certificate().is_err() {
+            return (false, 0);
+        }
+        let mut verified = false;
+        let mut signers: HashSet<ValidatorId> = HashSet::new();
+        for (voter, payload) in &self.signatures {
+            if *voter == PQ_UQC_MARKER_ID {
+                if let Some(cert) = decode_pq_micro_envelope(payload) {
+                    if !cert.scheme.is_post_quantum() {
+                        continue;
+                    }
+                    if let Some((valid, committee)) = self
+                        .micro_cert_valid_signers_and_committee_with_beacon(
+                            &cert,
+                            validators,
+                            &msg,
+                            pq_keys,
+                            beacon,
+                            cnvrf_v3_active,
+                        )
+                    {
+                        if !verified
+                            && Self::micro_cert_meets_quorum(&valid, &committee, validators)
+                        {
+                            verified = true;
+                        }
+                        signers.extend(valid);
+                    }
+                }
+            } else if *voter == PQ_QC_MARKER_ID {
+                if let Some(cert) =
+                    decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
+                {
+                    if !cert.scheme.is_post_quantum() {
+                        continue;
+                    }
+                    if let Some(valid) =
+                        self.epoch_cert_valid_signers(&cert, validators, &msg, pq_keys)
+                    {
+                        if !verified && Self::epoch_cert_meets_quorum(&valid, validators) {
+                            verified = true;
+                        }
+                        signers.extend(valid);
+                    }
+                }
+            }
+            // NON-QC entries (classical Ed25519 / unknown markers): `verify`
+            // never accepts them and `signers_set` never attributes them.
+        }
+        let power = signers
+            .iter()
+            .map(|v| validators.power_of(v))
+            .fold(0u64, |a, p| a.saturating_add(p));
+        (verified, power)
     }
 
     /// Unified certificate verification supporting:
@@ -1606,13 +1776,13 @@ impl QuorumCertificate {
                     if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    // Borrow-compat: `verify_micro_cert_with_beacon` takes an owned snapshot;
-                    // clone the (small, test/override-only) map. Same data.
+                    // The helper borrows the optional override map; nothing is
+                    // cloned on this path (`None` on the live verifier).
                     if self.verify_micro_cert_with_beacon(
                         &cert,
                         validators,
                         msg,
-                        pq_keys.cloned(),
+                        pq_keys,
                         beacon,
                         cnvrf_v3_active,
                     ) {
@@ -1878,7 +2048,7 @@ impl QuorumCertificate {
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
-        pq_keys: Option<HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> bool {
@@ -1895,20 +2065,33 @@ impl QuorumCertificate {
             cert,
             validators,
             msg,
-            pq_keys.as_ref(),
+            pq_keys,
             beacon,
             cnvrf_v3_active,
         ) else {
             return false;
         };
-        // Power-weighted quorum over the ACTUAL committee. Fail-closed on
-        // zero weight (empty set / all-zero powers can never reach quorum).
-        // NOTE: there is deliberately NO head-count early reject here — a
-        // 2-of-3 bitmask that the old `floor(2*3/3)+1 = 3` rule threw out may
-        // still carry quorum POWER, which is exactly the fragile-unanimous
-        // case this fixes.
-        // Election: the quorum is summed over the SAME
-        // canonical committee the attribution above resolved.
+        Self::micro_cert_meets_quorum(&valid, &committee, validators)
+    }
+
+    /// Power-weighted µQC quorum over the committee the attribution resolved.
+    ///
+    /// Shared by verification and the single-pass verify+attribution path so
+    /// both reach the SAME verdict from the SAME committee.
+    ///
+    /// Fail-closed on zero committee weight (empty set / all-zero powers can
+    /// never reach quorum). NOTE: there is deliberately NO head-count early
+    /// reject here — a 2-of-3 bitmask that the old `floor(2*3/3)+1 = 3` rule
+    /// threw out may still carry quorum POWER, which is exactly the
+    /// fragile-unanimous case the power rule fixes.
+    fn micro_cert_meets_quorum(
+        valid: &[ValidatorId],
+        committee: &[ValidatorId],
+        validators: &ValidatorSet,
+    ) -> bool {
+        // Power-weighted quorum over the ACTUAL committee. Election: the
+        // quorum is summed over the SAME canonical committee the attribution
+        // above resolved.
         let committee_total_u128: u128 = committee
             .iter()
             .map(|id| validators.power_of(id) as u128)
@@ -2038,6 +2221,12 @@ impl QuorumCertificate {
         let Some(valid) = self.epoch_cert_valid_signers(cert, validators, msg, pq_keys) else {
             return false;
         };
+        Self::epoch_cert_meets_quorum(&valid, validators)
+    }
+
+    /// Network-anchored quorum for the full-set epoch certificate. Shared by
+    /// verification and the single-pass verify+attribution path.
+    fn epoch_cert_meets_quorum(valid: &[ValidatorId], validators: &ValidatorSet) -> bool {
         let power: u128 = valid.iter().map(|id| validators.power_of(id) as u128).sum();
         let total: u128 = validators.validators.values().map(|&p| p as u128).sum();
         if total == 0 {
@@ -2488,5 +2677,135 @@ mod audit_tests {
             signatures: vec![(PQ_QC_MARKER_ID, encode_pq_epoch_envelope(&full_cert))],
         };
         assert!(full_qc.verify_unified_with_pq_keys(&vs, Some(&pq_map)));
+    }
+
+    /// The single-pass adoption API must return EXACTLY the pair
+    /// `(qc.verify(set), set.qc_signed_power(&qc))` for genuine, sub-quorum,
+    /// corrupt, over-cap and ambiguous certificates.
+    #[test]
+    fn verify_and_signed_power_matches_separate_calls() {
+        use crate::consensus::register_validator_pq_key;
+
+        const H: Height = 77;
+        const R: Round = 2;
+        let block_hash = Some([0x3Cu8; 32]);
+        let parent = [0x4Du8; 32];
+        let mut vs = ValidatorSet::new();
+        let mut keys: Vec<(ValidatorId, FalconKeypair)> = Vec::new();
+        for i in 0..4u8 {
+            let fk = FalconKeypair::generate_from_seed(0xF0 + i);
+            let mut id = [0u8; 32];
+            id[0] = 0xE0 + i;
+            id[1] = 0x5C;
+            vs.add(id, 10 + i as u64);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            keys.push((id, fk));
+        }
+        let msg = vote_sign_bytes(H, R, VoteKind::Precommit, &block_hash);
+        let csize = micro_committee_size(vs.len());
+        let committee = derive_sortition_committee(&vs, H, R, csize, &parent);
+        assert_eq!(committee.len(), csize as usize);
+        let key_of = |id: &ValidatorId| -> &FalconKeypair {
+            &keys
+                .iter()
+                .find(|(k, _)| k == id)
+                .expect("committee member has a key")
+                .1
+        };
+        let full_bitmask = {
+            let mut b = vec![0u8; (csize as usize).div_ceil(8)];
+            for i in 0..committee.len() {
+                b[i / 8] |= 1 << (i % 8);
+            }
+            b
+        };
+        let full_sigs: Vec<Vec<u8>> = committee.iter().map(|id| key_of(id).sign(&msg)).collect();
+        let cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            H,
+            R,
+            csize,
+            full_bitmask.clone(),
+            full_sigs.clone(),
+            parent,
+        );
+        let qc = QuorumCertificate {
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&cert))],
+        };
+        let check = |qc: &QuorumCertificate, label: &str| {
+            let separate = (qc.verify(&vs), vs.qc_signed_power(qc));
+            let fused = qc.verify_and_signed_power(&vs);
+            assert_eq!(fused, separate, "{label}: fused must equal verify+power");
+            separate
+        };
+        // Genuine full committee verifies and attributes every member's power.
+        let (ok, power) = check(&qc, "genuine");
+        assert!(ok);
+        assert_eq!(power, vs.total_power());
+
+        // Sub-quorum: one genuine signer still attributes that signer's power
+        // while the verdict stays false (nobody is slashed for signing).
+        let one_bitmask = vec![0x01u8];
+        let one_cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            H,
+            R,
+            csize,
+            one_bitmask,
+            vec![full_sigs[0].clone()],
+            parent,
+        );
+        let one_qc = QuorumCertificate {
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&one_cert))],
+        };
+        let (ok, power) = check(&one_qc, "sub-quorum");
+        assert!(!ok);
+        assert_eq!(power, vs.power_of(&committee[0]));
+
+        // One corrupt signature: fail-closed verdict AND no attribution.
+        let mut bad_cert = cert.clone();
+        bad_cert.signatures[0][0] ^= 0xFF;
+        let bad_qc = QuorumCertificate {
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&bad_cert))],
+        };
+        let (ok, power) = check(&bad_qc, "corrupt");
+        assert!(!ok);
+        assert_eq!(power, 0);
+
+        // Over-cap signer list: refused before any crypto, nobody attributed.
+        let mut over = qc.clone();
+        while over.signatures.len() <= MAX_COMMIT_CERT_SIGNERS {
+            over.signatures.push(over.signatures[0].clone());
+        }
+        let (ok, power) = check(&over, "over-cap");
+        assert!(!ok);
+        assert_eq!(power, 0);
+
+        // Ambiguous µQC parents: verify refuses and attribution names nobody.
+        let mut other_parent = cert.clone();
+        other_parent.sortition_parent[0] ^= 0x01;
+        let mut ambiguous = qc.clone();
+        ambiguous
+            .signatures
+            .push((PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&other_parent)));
+        let (ok, power) = check(&ambiguous, "ambiguous");
+        assert!(!ok);
+        assert_eq!(power, 0);
     }
 }

@@ -627,39 +627,51 @@ impl VoteSet {
     ) -> Vec<Result<(), String>> {
         // Trigger-1 invalidation once per batch (same guarantee as `add`).
         note_validator_set_for_vote_cache(validators);
+        // Votes live in movable slots: the signature screen borrows them, and
+        // admission MOVES the admitted vote into the set. Previously the
+        // screen cloned every in-scope vote into a scratch `Vec<Vote>` and
+        // admission cloned each accepted vote again, so one batch paid two
+        // full signature-vector allocations per vote for no new information.
+        let mut slots: Vec<Option<Vote>> = votes.into_iter().map(Some).collect();
+        let len = slots.len();
         // Canonical admission order: sorted by (voter, block_hash). `sort_by`
         // is stable and the keys are fully ordered, so every permutation of
         // the same input admits in the same order.
-        let mut order: Vec<usize> = (0..votes.len()).collect();
+        let mut order: Vec<usize> = (0..len).collect();
         order.sort_by(|&a, &b| {
-            votes[a]
-                .voter
-                .cmp(&votes[b].voter)
-                .then_with(|| votes[a].block_hash.cmp(&votes[b].block_hash))
+            let va = slots[a]
+                .as_ref()
+                .expect("slot present while ordering the batch");
+            let vb = slots[b]
+                .as_ref()
+                .expect("slot present while ordering the batch");
+            va.voter
+                .cmp(&vb.voter)
+                .then_with(|| va.block_hash.cmp(&vb.block_hash))
         });
         // One signature screen over the in-scope votes in admission order.
         // Out-of-scope votes skip the screen; the scope check in the admit
         // loop below reports their error exactly as `add` would.
-        let mut screen_input: Vec<Vote> = Vec::new();
-        let mut screen_pos: Vec<Option<usize>> = vec![None; votes.len()];
+        let mut screen_indices: Vec<usize> = Vec::new();
         for &i in &order {
-            let v = &votes[i];
+            let v = slots[i]
+                .as_ref()
+                .expect("slot present while screening the batch");
             if v.height == height && v.round == round && v.kind == kind {
-                screen_pos[i] = Some(screen_input.len());
-                screen_input.push(v.clone());
+                screen_indices.push(i);
             }
         }
-        let screen_flags = Vote::partition_valid(&screen_input);
-        let mut sig_ok = vec![true; votes.len()];
-        for (i, pos) in screen_pos.iter().enumerate() {
-            if let Some(p) = pos {
-                sig_ok[i] = screen_flags[*p];
-            }
+        let screen_flags = Vote::partition_valid_slots(&slots, &screen_indices);
+        let mut sig_ok = vec![true; len];
+        for (pos, &i) in screen_indices.iter().enumerate() {
+            sig_ok[i] = screen_flags[pos];
         }
         // Admit in canonical order; results stored per INPUT index.
-        let mut out: Vec<Option<Result<(), String>>> = (0..votes.len()).map(|_| None).collect();
+        let mut out: Vec<Option<Result<(), String>>> = (0..len).map(|_| None).collect();
         for &i in &order {
-            let v = &votes[i];
+            let v = slots[i]
+                .take()
+                .expect("every slot is admitted exactly once");
             if v.height != height || v.round != round || v.kind != kind {
                 out[i] = Some(Err("vote out of scope".to_string()));
                 continue;
@@ -668,7 +680,7 @@ impl VoteSet {
                 out[i] = Some(Err("bad vote signature".to_string()));
                 continue;
             }
-            out[i] = Some(self.add_verified(v.clone(), validators));
+            out[i] = Some(self.add_verified(v, validators));
         }
         out.into_iter()
             .map(|r| r.expect("every input index is admitted exactly once"))

@@ -2256,7 +2256,13 @@ impl ValidatorRuntime {
         if !certificate.binds_to_parent(&block.prev_hash) {
             return Err("commit certificate was elected with a different parent block".to_string());
         }
-        if !self.verify_qc_for_height(&certificate, &validators) {
+        // ONE attribution pass: `verify_qc_for_height` followed by
+        // `validators.qc_signed_power(&certificate)` used to verify every
+        // Falcon signature twice (once for the verdict, once for the power).
+        // The fused call reaches the SAME verdict and the SAME union-of-
+        // verified-signers power in a single pass.
+        let (quorum_ok, signed) = self.verify_qc_for_height_with_power(&certificate, &validators);
+        if !quorum_ok {
             return Err("commit certificate does not carry a validator quorum".to_string());
         }
         // W10.5 HARDENING (fail LOUD): the power behind the certificate must
@@ -2268,7 +2274,6 @@ impl ValidatorRuntime {
         // joiner's power after the set already moved on). Either way it is
         // unmissable: error log + metric + refusal.
         {
-            let signed = validators.qc_signed_power(&certificate);
             let required = validators.quorum_power();
             if signed < required {
                 tracing::error!(

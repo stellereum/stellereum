@@ -76,6 +76,18 @@ pub enum ResourceKey {
 /// what lets them share a wave.
 pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
     let mut keys = Vec::with_capacity(4);
+    fill_access_keys(tx, &mut keys);
+    keys
+}
+
+/// [`extract_access_keys`] writing into a REUSED buffer.
+///
+/// The block scheduler calls this once per transaction; taking the `Vec` from
+/// the caller removes one heap allocation per transaction from the block path
+/// without changing the produced key list (the buffer is cleared, then filled
+/// in the exact same push order, then deduped by the same routine).
+fn fill_access_keys(tx: &Transaction, keys: &mut Vec<ResourceKey>) {
+    keys.clear();
     keys.push(ResourceKey::Account(tx.from));
     keys.push(ResourceKey::Account(tx.to));
     // PAYMASTER v1: a sponsored transaction also mutates the sponsor account
@@ -89,8 +101,8 @@ pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
     }
 
     if tx.payload.is_empty() {
-        dedup_keys(&mut keys);
-        return keys;
+        dedup_keys(keys);
+        return;
     }
 
     if tx.required_scope() & crate::zkml::SCOPE_ACTOR_SEND != 0 {
@@ -218,8 +230,7 @@ pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
         }
     }
 
-    dedup_keys(&mut keys);
-    keys
+    dedup_keys(keys);
 }
 
 fn dedup_keys(keys: &mut Vec<ResourceKey>) {
@@ -260,12 +271,17 @@ impl DisjointScheduler {
         }
 
         let mut waves: Vec<Vec<usize>> = Vec::new();
-        let mut last_wave_for_key: HashMap<ResourceKey, usize> = HashMap::new();
+        let mut last_wave_for_key: HashMap<ResourceKey, usize> = HashMap::with_capacity(txs.len());
         let mut last_global_wave: Option<usize> = None;
         let mut current_max_wave: usize = 0;
+        // ONE key buffer for the whole block: `fill_access_keys` clears and
+        // refills it per transaction, so the scheduler no longer allocates a
+        // `Vec` per transaction in. The key list produced for each
+        // transaction is identical to `extract_access_keys`.
+        let mut keys: Vec<ResourceKey> = Vec::with_capacity(4);
 
         for (i, tx) in txs.iter().enumerate() {
-            let keys = extract_access_keys(tx);
+            fill_access_keys(tx, &mut keys);
             let has_global = keys.contains(&ResourceKey::Global);
 
             let target_wave = if has_global {
@@ -791,5 +807,72 @@ mod tests {
         );
         assert_eq!(waves[0], vec![0, 1, 2]);
         assert_eq!(wave_of(&waves, 0), Some(0));
+    }
+
+    /// The scheduler reuses ONE key buffer per block (`fill_access_keys`)
+    /// instead of allocating a `Vec` per transaction. This pins that the
+    /// reused buffer produces the EXACT list `extract_access_keys` returns —
+    /// same entries, same order — for every shape, including a buffer that
+    /// still holds a previous transaction's keys.
+    #[test]
+    fn test_reused_key_buffer_matches_extract_access_keys() {
+        let k1 = SigningKey::generate(&mut OsRng);
+        let k2 = SigningKey::generate(&mut OsRng);
+        let tx_plain = make_transfer(&k1, [7u8; 32], 0);
+        let tx_self = make_transfer(&k2, k2.verifying_key().to_bytes(), 0);
+        let tx_global = make_payload_tx(
+            &k1,
+            [0u8; 32],
+            0,
+            vec![OpCode::SysCallDeployContract {
+                code: vec![0x00, 0x61, 0x73, 0x6D],
+            }],
+        );
+        let tx_token = make_payload_tx(
+            &k2,
+            [1u8; 32],
+            0,
+            vec![OpCode::SysCallTokenTransfer {
+                token_id: [9u8; 32],
+                to: [2u8; 32],
+                amount: 1,
+            }],
+        );
+        let tx_mixed_payload = make_payload_tx(
+            &k1,
+            [3u8; 32],
+            0,
+            vec![
+                OpCode::Transfer {
+                    recipient: [4u8; 32],
+                    amount: 1,
+                },
+                OpCode::SysCallPlaceOrder {
+                    pair_id: 3,
+                    is_buy: true,
+                    price: 10,
+                    amount: 1,
+                },
+                OpCode::Halt,
+            ],
+        );
+
+        let mut buf: Vec<ResourceKey> = Vec::new();
+        for tx in [
+            &tx_plain,
+            &tx_self,
+            &tx_global,
+            &tx_token,
+            &tx_mixed_payload,
+        ] {
+            let direct = extract_access_keys(tx);
+            fill_access_keys(tx, &mut buf);
+            assert_eq!(direct, buf, "reused buffer must match the allocating path");
+        }
+        // Two different transactions in a row: the buffer is cleared, so the
+        // first one's keys cannot leak into the second one's list.
+        fill_access_keys(&tx_token, &mut buf);
+        fill_access_keys(&tx_plain, &mut buf);
+        assert_eq!(extract_access_keys(&tx_plain), buf);
     }
 }

@@ -250,17 +250,12 @@ pub(crate) async fn try_snapshot_sync(
             }
         };
         let trusted_root = anchor.state_root;
-        // Re-fetch inside the closures so `fast_sync_state`'s fetches are
-        // used, keeping a single code path for the verification. State +
-        // every committed domain (F-J): accounts-only restores fail the root
-        // check on any live chain.
-        let fetch = {
-            let a = adapter.clone();
-            move || {
-                let a = a.clone();
-                async move { a.fetch_state_snapshot(shard, boundary).await }
-            }
-        };
+        // The snapshot bytes fetched by the presence probe above ARE the
+        // restore input: re-fetching the same blob here (manifest + every
+        // chunk, tens of MB) doubled the wire cost of every snapshot-sync
+        // attempt for bytes already in hand. Verification is unchanged — the
+        // restore still has to reproduce `trusted_root` and match the anchor
+        // set before live state is touched.
         let fetch_domain = {
             let a = adapter.clone();
             move |kind: &'static str| {
@@ -274,10 +269,10 @@ pub(crate) async fn try_snapshot_sync(
         // single-set chains the snapshot commits to the one set in force, so
         // this is behavior-identical to the non-binding path it replaces.
         let anchor_set = rt.validator_set_for_height(boundary);
-        if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding(
+        if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding_prefetched(
             &rt.state,
             trusted_root,
-            fetch,
+            snapshot,
             fetch_domain,
             boundary,
             &anchor_set,
@@ -294,7 +289,6 @@ pub(crate) async fn try_snapshot_sync(
             boundary = boundary.saturating_sub(100);
             continue;
         }
-        drop(snapshot);
 
         // The snapshot's root is verified. Record the boundary so the normal
         // machinery continues from here.
@@ -766,17 +760,23 @@ pub(crate) async fn walk_chain(
     // W10.5: every block's decision proof is verified against the validator
     // set IN FORCE AT THAT BLOCK'S HEIGHT (never the live set), so a sync
     // window spanning a set change accepts exactly the quorums each height
-    // genuinely reached.
-    if let Err(e) = stellereum::sync::validate_sync_chain_for_shard_with_sets(
+    // genuinely reached. The validator also returns the canonical hash of each
+    // block it hashed, so the apply loop below reuses them instead of hashing
+    // every (unchanged) body again for the retention key, the apply call, the
+    // RPC record and the parent link.
+    let block_hashes = match stellereum::sync::validate_sync_chain_for_shard_with_sets_hashed(
         &blocks,
         expected_first_height,
         our_last,
         &|h| Some(rt.validator_set_for_height(h)),
         rt.shard_id,
     ) {
-        eprintln!("[sync] rejecting peer chain: {e}");
-        return None;
-    }
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[sync] rejecting peer chain: {e}");
+            return None;
+        }
+    };
 
     // LIGHT CLIENT ANCHOR (audit W8.3 / production blocker A10).
     //
@@ -847,7 +847,20 @@ pub(crate) async fn walk_chain(
         }
     };
 
-    for b in &blocks {
+    // Hoisted out of the loop: the chain is contiguous and already validated,
+    // so the tail height/hash and each block's successor are known up front.
+    // The previous loop re-derived the tail height on every iteration and did
+    // an O(n) scan for the successor (O(n^2) over a full walk), and re-hashed
+    // every body for each use.
+    let tail_height = blocks.last().map(|x| x.height).unwrap_or(0);
+    let tail_hash = block_hashes.last().copied().unwrap_or([0u8; 32]);
+
+    for (i, bh) in block_hashes.iter().copied().enumerate() {
+        // The walk CONSUMES each body: its only use after this iteration is the
+        // persistence job, which takes ownership of the verified bytes instead
+        // of paying a third full copy per block. Slot `i` is never read again
+        // (the successor and the pre-extracted tail are).
+        let b = std::mem::take(&mut blocks[i]);
         // A block header commits to the state it BUILDS ON, so this is checked
         // against the root before applying, not after.
         let root_before = rt.state.get_state_root().await;
@@ -866,7 +879,7 @@ pub(crate) async fn walk_chain(
         // (A disagreement means the two views of the chain diverged — exactly
         // the class of bug this wiring exists to catch.)
         if let Some(anchored) = anchored_root {
-            if b.height == blocks.last().map(|x| x.height).unwrap_or(0) && anchored != root_before {
+            if b.height == tail_height && anchored != root_before {
                 eprintln!(
                     "[sync] rejecting peer chain: the light-client anchor commits to root {} but our state is {}",
                     hex::encode(anchored),
@@ -895,7 +908,7 @@ pub(crate) async fn walk_chain(
         // §7 Phase 2 actor-mailbox cap (walk side): a walked block that is
         // over-cap is refused like an adopted one, so a peer cannot smuggle a
         // root-invisible leftover past the decision boundary via the walk.
-        if let Err(e) = rt.check_actor_cap(b).await {
+        if let Err(e) = rt.check_actor_cap(&b).await {
             eprintln!("[sync] rejecting peer chain: block {} {e}", b.height);
             return None;
         }
@@ -909,30 +922,26 @@ pub(crate) async fn walk_chain(
         rt.hc.precommit_qc = Some(qc);
         // Retain the body: later heights may need it (lock re-proposals,
         // catch-up broadcasts, RPC), and nothing else stores walked blocks.
-        rt.blocks.insert(b.compute_hash(), b.clone());
-        if let Some(ap) = persist {
-            ap.enqueue_block(b.clone());
-        }
+        rt.blocks.insert(bh, b.clone());
         if let Some(ref qc) = b.precommit_qc {
             rt.last_decision = Some((b.height, b.clone(), qc.clone()));
         }
-        rt.apply_and_advance(b.compute_hash(), b).await;
+        rt.apply_and_advance(bh, &b).await;
         // Replication for walked heights (same as the adopt path): file this
         // application's outcome so the serve path covers walked heights
         // too. Verified data only: every block here passed validate_sync_chain
         // (QC per height) plus the parent-root/divergence checks in this loop.
         // Records stay inline (the walk already runs off the per-tick drain,
         // time-boxed by the catch-up budget), but the body is NOT sled-put
-        // synchronously here: `enqueue_block` above persists the same verified
-        // bytes asynchronously (finalize-path parity), and the sync
+        // synchronously here: the `enqueue_block` call below persists the same
+        // verified bytes asynchronously (finalize-path parity), and the sync
         // `committed_body` + `put_verified_block` round trip only held the
         // walk's budget on disk I/O.
         {
-            let bh = b.compute_hash();
             // LIGHT CLIENT (audit W8.3): publish the finalized header with its
             // quorum certificate, so an external verifier can check a served
             // proof against a root a QUORUM committed to.
-            rpc.record_finalized_header(b).await;
+            rpc.record_finalized_header(&b).await;
             if rt.applied_statuses.len() == b.transactions.len() {
                 rpc.record_adopted_block_with_events(
                     b.height,
@@ -953,18 +962,24 @@ pub(crate) async fn walk_chain(
                 );
             }
         }
+        // Persist the verified body (finalize-path parity): the job takes the
+        // body by MOVE — same bytes, same job, no extra full copy.
+        let applied_height = b.height;
+        if let Some(ap) = persist {
+            ap.enqueue_block(b);
+        }
         // Fail fast on divergence: the NEXT block in this same validated chain
         // commits to the state our apply must have produced. Without this, a
         // wrong apply (nondeterminism, heterogeneous history, missed effects)
         // is silent and surfaces hundreds of heights later as an unexplainable
         // parent-root mismatch -- observed live as a failure at #643 after 642
         // matching heights. Pinpoint beats mystery.
-        if let Some(next) = blocks.iter().find(|x| x.height == b.height + 1) {
+        if let Some(next) = blocks.get(i + 1) {
             let ours = rt.state.get_state_root().await;
             if ours != next.state_root {
                 eprintln!(
                     "[sync] refusing peer chain: applying block {} moved our root to {} but block {} commits to {}",
-                    b.height,
+                    applied_height,
                     hex::encode(ours),
                     next.height,
                     hex::encode(next.state_root),
@@ -995,25 +1010,26 @@ pub(crate) async fn walk_chain(
     // that catches up silently strands whoever waits for its old-height votes
     // (they moved on and will never vote the old height again). Same broadcast
     // the finalize path sends, built from the last walked block's proof.
-    if let Some(last) = blocks.last() {
-        if let (Some(qc), Some(body)) = (
-            last.precommit_qc.clone(),
-            rt.blocks.get(&last.compute_hash()).cloned(),
-        ) {
+    //
+    // The body comes from the retention map the loop above filled (the walk
+    // consumes its own vector, so `blocks.last()` is no longer the tail); the
+    // hash and height were pinned before the loop from the validated tail.
+    if let Some(last) = rt.blocks.get(&tail_hash).cloned() {
+        if let Some(qc) = last.precommit_qc.clone() {
             let net = ConsensusNetwork::new(adapter.clone());
             let _ = net
                 .broadcast(&ConsensusMsg::Committed {
-                    height: last.height,
-                    block: body.clone(),
+                    height: tail_height,
+                    block: last.clone(),
                     certificate: qc,
                 })
                 .await;
             // Publish the tip body immediately (same reason as the finalize
             // path above): without this, a peer one block behind waits the
             // whole retro window for it.
-            let _ = adapter.retro_publish_blocks([&body], 1).await;
+            let _ = adapter.retro_publish_blocks([&last], 1).await;
             // And its header, so a cold node can anchor a snapshot walk on it.
-            adapter.persist_block_header(shard, last).await;
+            adapter.persist_block_header(shard, &last).await;
         }
     }
     Some(next_height.saturating_sub(1))

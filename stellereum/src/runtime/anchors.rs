@@ -790,6 +790,31 @@ impl ValidatorRuntime {
         }
     }
 
+    /// Verify a QC AND return the power its verified signers carry under
+    /// `validators`, in one attribution pass (live adoption path).
+    ///
+    /// Identical verdict/power to `verify_qc_for_height` followed by
+    /// [`Self::qc_signed_power_for_height`], without verifying every
+    /// signature twice.
+    pub(super) fn verify_qc_for_height_with_power(
+        &self,
+        qc: &crate::consensus::QuorumCertificate,
+        validators: &ValidatorSet,
+    ) -> (bool, u64) {
+        if !self.cnvrf_v3_is_active_at(qc.height) {
+            return qc.verify_and_signed_power(validators);
+        }
+        let beacon = self.active_epoch_beacon(qc.height);
+        #[cfg(test)]
+        {
+            qc.verify_and_signed_power_with_beacon_active(validators, beacon.as_ref(), true)
+        }
+        #[cfg(not(test))]
+        {
+            qc.verify_and_signed_power_with_beacon(validators, beacon.as_ref())
+        }
+    }
+
     pub(super) fn qc_signed_power_for_height(
         &self,
         validators: &ValidatorSet,

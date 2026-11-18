@@ -2672,9 +2672,11 @@ impl Mempool {
             return selected.into_iter().cloned().collect();
         }
 
-        // Multi-pass: snapshot descending fee-order references + cached packing
-        // costs into one contiguous array (computing wire/proofs lazily on
-        // first acceptance so rejected txs never pay for payload walks).
+        // Multi-pass: ONE descending fee-order walk materializes the candidate
+        // array AND runs the first pass (the array is only needed again when a
+        // later pass could add something, which requires a rejection by
+        // `accept` — see below). Packing costs are computed lazily on first
+        // acceptance so never-selected txs pay no payload walk.
         const UNCOMPUTED: usize = usize::MAX;
         struct Candidate<'a> {
             tx: &'a Transaction,
@@ -2684,16 +2686,51 @@ impl Mempool {
         }
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(order.len());
         for h in order.values().rev() {
-            if let Some(tx) = txs.get(h) {
-                candidates.push(Candidate {
-                    tx,
-                    wire: UNCOMPUTED,
-                    proofs: UNCOMPUTED,
-                    taken: false,
-                });
+            if selected.len() >= max_txs {
+                break;
             }
+            let Some(tx) = txs.get(h) else {
+                continue;
+            };
+            let idx = candidates.len();
+            candidates.push(Candidate {
+                tx,
+                wire: UNCOMPUTED,
+                proofs: UNCOMPUTED,
+                taken: false,
+            });
+            let c = &mut candidates[idx];
+            if !accept(c.tx) {
+                continue;
+            }
+            let g = c.tx.gas_limit;
+            if gas.saturating_add(g) > max_gas {
+                // This one does not fit. A cheaper one behind it might, so keep
+                // walking rather than truncating the block here.
+                continue;
+            }
+            if c.wire == UNCOMPUTED {
+                c.wire = Self::estimate_tx_wire_bytes(c.tx);
+                c.proofs = Self::count_tx_proof_units(c.tx);
+            }
+            // Wire + proof-unit caps (audit: blocks troubles): gas-valid
+            // does not mean gossipable or verifiable-in-time. Skip (do
+            // not truncate: a smaller tx behind may still fit).
+            if wire.saturating_add(c.wire) > Self::MAX_BLOCK_WIRE_BYTES {
+                continue;
+            }
+            if proofs.saturating_add(c.proofs) > Self::MAX_BLOCK_PROOF_UNITS {
+                continue;
+            }
+            gas = gas.saturating_add(g);
+            wire = wire.saturating_add(c.wire);
+            proofs = proofs.saturating_add(c.proofs);
+            c.taken = true;
+            selected.push(c.tx);
         }
-        for _ in 0..passes {
+        // Later passes revisit the txs a previous pass rejected (their nonce
+        // may have become expected); a pass that adds nothing ends the loop.
+        for _ in 1..passes {
             let before = selected.len();
             for c in &mut candidates {
                 if selected.len() >= max_txs {

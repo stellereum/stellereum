@@ -352,8 +352,13 @@ pub fn committed_bypasses_skip(msg: &ConsensusMsg) -> bool {
 }
 
 /// True when a batch carries the live catch-up path (any member bypasses).
+#[cfg(test)]
 fn batch_bypasses_skip(msgs: &[ConsensusMsg]) -> bool {
-    msgs.iter().any(committed_bypasses_skip)
+    batch_bypasses_skip_refs(msgs.iter())
+}
+
+fn batch_bypasses_skip_refs<'a>(msgs: impl Iterator<Item = &'a ConsensusMsg>) -> bool {
+    msgs.into_iter().any(committed_bypasses_skip)
 }
 
 /// True when a send outcome may be recorded in the peer-health ledger.
@@ -405,13 +410,103 @@ pub fn message_is_fire_and_forget(msg: &ConsensusMsg) -> bool {
 /// A chunk that carries a [`ConsensusMsg::Committed`] keeps the acknowledged
 /// path for the WHOLE chunk: the catch-up proof must not be traded away for
 /// latency. An empty chunk is never fire-and-forget (nothing to send).
+#[allow(dead_code)] // GATE: public slice-API wrapper; gossip paths use the refs form
 pub fn batch_is_fire_and_forget(msgs: &[ConsensusMsg]) -> bool {
-    !msgs.is_empty() && msgs.iter().all(message_is_fire_and_forget)
+    batch_is_fire_and_forget_refs(msgs.iter())
+}
+
+fn batch_is_fire_and_forget_refs<'a>(msgs: impl Iterator<Item = &'a ConsensusMsg>) -> bool {
+    let mut any = false;
+    for m in msgs {
+        any = true;
+        if !message_is_fire_and_forget(m) {
+            return false;
+        }
+    }
+    any
 }
 
 /// Encode `items` as one [`ConsensusMsg::Batch`] (P3-H4).
 pub fn batch_encode(items: &[ConsensusMsg]) -> Result<Vec<u8>, String> {
     ConsensusMsg::batch_encode(items)
+}
+
+/// The live subset of a gossip chunk after the send-time vote dedup, in order.
+///
+/// Borrows the chunk instead of cloning it: `broadcast_batch` only needs to
+/// READ these messages (encode / capability checks), so materializing an owned
+/// copy of a 24 MB proposal bought nothing. A `Cow` keeps the fallback path
+/// able to hand owned messages where the caller owns them.
+pub fn coalesce_live_for_send<'a>(
+    msgs: &'a [ConsensusMsg],
+    sent_votes: &mut VoteSendFilter,
+    now: Instant,
+) -> Vec<std::borrow::Cow<'a, ConsensusMsg>> {
+    use std::borrow::Cow;
+    msgs.iter()
+        .filter(|m| sent_votes.should_send(m, now))
+        .map(Cow::Borrowed)
+        .collect()
+}
+
+/// One encoded pubsub frame plus what the stage log reports about it.
+#[derive(Debug)]
+pub struct BroadcastFrame {
+    /// The exact bytes handed to the transport (JSON `{topic,data}` frame).
+    pub payload: Vec<u8>,
+    /// Length of the inner (bincode) encoding before hex/JSON framing.
+    pub encoded_len: usize,
+    /// True when the frame carries a `Batch` of several messages.
+    pub is_batch: bool,
+}
+
+/// Why a chunk could not be framed. The two classes are handled differently
+/// by the caller: a failed SINGLE is dropped, a failed BATCH falls back to
+/// one frame per message (so one oversize member cannot sink its batch-mates).
+#[derive(Debug)]
+pub enum BroadcastEncodeError {
+    Single(String),
+    Batch(String),
+}
+
+impl BroadcastEncodeError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Single(e) | Self::Batch(e) => e,
+        }
+    }
+
+    /// True when the caller may fall back to one frame per message.
+    pub fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch(_))
+    }
+}
+
+/// Build the pubsub frame for a live chunk: bincode encode (single message or
+/// one `Batch`), hex, JSON `{"topic", "data"}` — byte-for-byte the framing
+/// [`ConsensusNetwork::broadcast_batch`] has always put on the wire.
+pub fn encode_broadcast_payload(
+    topic: &str,
+    msgs: &[std::borrow::Cow<'_, ConsensusMsg>],
+) -> Result<BroadcastFrame, BroadcastEncodeError> {
+    let (bytes, is_batch) = if msgs.len() == 1 {
+        let bytes = msgs[0].encode().map_err(BroadcastEncodeError::Single)?;
+        (bytes, false)
+    } else {
+        let owned: Vec<ConsensusMsg> = msgs.iter().map(|m| m.clone().into_owned()).collect();
+        let bytes = ConsensusMsg::batch_encode_owned(owned).map_err(BroadcastEncodeError::Batch)?;
+        (bytes, true)
+    };
+    let encoded_len = bytes.len();
+    let data = hex::encode(bytes);
+    let payload = serde_json::json!({ "topic": topic, "data": data })
+        .to_string()
+        .into_bytes();
+    Ok(BroadcastFrame {
+        payload,
+        encoded_len,
+        is_batch,
+    })
 }
 
 impl ConsensusMsg {
@@ -515,16 +610,23 @@ impl ConsensusMsg {
 
     /// Encode `items` as one [`ConsensusMsg::Batch`].
     pub fn batch_encode(items: &[ConsensusMsg]) -> Result<Vec<u8>, String> {
+        Self::batch_encode_owned(items.to_vec())
+    }
+
+    /// [`ConsensusMsg::batch_encode`] that takes ownership of the members
+    /// instead of cloning them again into the `Batch` (gossip callers already
+    /// hold one materialized copy). Same checks, same byte string.
+    pub fn batch_encode_owned(items: Vec<ConsensusMsg>) -> Result<Vec<u8>, String> {
         if items.is_empty() {
             return Err("empty consensus batch".to_string());
         }
         if items.len() > MAX_BATCH_ITEMS {
             return Err(format!("consensus batch too many items: {}", items.len()));
         }
-        if items.iter().any(|m| matches!(m, ConsensusMsg::Batch(_))) {
+        if items.iter().any(|m| matches!(m, Self::Batch(_))) {
             return Err("nested consensus batch".to_string());
         }
-        let batch = ConsensusMsg::Batch(items.to_vec());
+        let batch = Self::Batch(items);
         let bytes =
             bincode::serialize(&batch).map_err(|e| format!("consensus batch encode: {e}"))?;
         if bytes.len() > MAX_BATCH_BYTES {
@@ -1455,15 +1557,15 @@ impl ConsensusNetwork {
         // votes always passes; only same-tick duplicates collapse, so loss
         // recovery on the retransmit cadence is unaffected. Proposals and
         // commits always pass.
-        let live: Vec<ConsensusMsg> = {
+        //
+        // The live subset BORROWS the chunk (see `coalesce_live_for_send`):
+        // the old code deep-cloned every message here, including a full block
+        // body on every proposal broadcast, only to read it during encoding.
+        let live = {
             let now = Instant::now();
             match self.sent_votes.lock() {
-                Ok(mut filter) => msgs
-                    .iter()
-                    .filter(|m| filter.should_send(m, now))
-                    .cloned()
-                    .collect(),
-                Err(_) => msgs.to_vec(),
+                Ok(mut filter) => coalesce_live_for_send(msgs, &mut filter, now),
+                Err(_) => msgs.iter().map(std::borrow::Cow::Borrowed).collect(),
             }
         };
         if live.is_empty() {
@@ -1473,49 +1575,41 @@ impl ConsensusNetwork {
         // Stage (a): bincode encode + hex + JSON framing. Timed separately so a
         // live measurement can tell a CPU-bound encode from a slow transport.
         let t_encode = std::time::Instant::now();
-        let bytes = if msgs.len() == 1 {
-            match msgs[0].encode() {
-                Ok(b) => b,
-                Err(_) => {
+        let frame = match encode_broadcast_payload(&self.topic, msgs) {
+            Ok(f) => f,
+            Err(e) => {
+                if !e.is_batch() {
                     tracing::warn!("[consensus] broadcast: encode failed, sending nothing");
                     return;
                 }
-            }
-        } else {
-            match ConsensusMsg::batch_encode(msgs) {
-                Ok(b) => b,
-                Err(e) => {
-                    // Size-aware fallback (audit: blocks troubles): a fat
-                    // proposal batched with votes failed the 512KB batch cap
-                    // and the WHOLE chunk — proposal included — was silently
-                    // dropped. Fall back to single-encode per message (each
-                    // still capped at MAX_CONSENSUS_MSG): votes may still drop
-                    // oversize, but a proposal always goes out alone.
-                    tracing::warn!(
-                        "[consensus] broadcast_batch: {e}, falling back to single sends"
-                    );
-                    return self.broadcast_singles(msgs).await;
-                }
+                // Size-aware fallback (audit: blocks troubles): a fat
+                // proposal batched with votes failed the 512KB batch cap
+                // and the WHOLE chunk — proposal included — was silently
+                // dropped. Fall back to single-encode per message (each
+                // still capped at MAX_CONSENSUS_MSG): votes may still drop
+                // oversize, but a proposal always goes out alone.
+                tracing::warn!(
+                    "[consensus] broadcast_batch: {}, falling back to single sends",
+                    e.message()
+                );
+                return self.broadcast_singles(msgs).await;
             }
         };
-        let nbytes = bytes.len();
-        let data = hex::encode(bytes);
-        let payload = serde_json::json!({ "topic": self.topic, "data": data })
-            .to_string()
-            .into_bytes();
+        let nbytes = frame.encoded_len;
+        let payload = frame.payload;
         log_stage(
             &ENCODE_STAGE_GATE,
             "encode",
             &format!("items={} bytes={nbytes}", msgs.len()),
             t_encode.elapsed(),
         );
-        let exempt = batch_bypasses_skip(msgs);
+        let exempt = batch_bypasses_skip_refs(msgs.iter().map(|m| &**m));
         // Fire-and-forget for votes/proposals: the peer's ACK carries no
         // information the sender needs, but it costs a full round trip
         // (300-1200 ms on WAN) and the ordered sender is FIFO, so an awaited
         // ACK also delays the NEXT chunk. A chunk carrying a `Committed`
         // keeps the acknowledged form (the catch-up proof).
-        let fof = batch_is_fire_and_forget(msgs);
+        let fof = batch_is_fire_and_forget_refs(msgs.iter().map(|m| &**m));
         self.send_payload_with_skip(payload, exempt, fof).await;
     }
 
@@ -1524,7 +1618,7 @@ impl ConsensusNetwork {
     /// member cannot sink its batch-mates. Proposals (which forced the
     /// fallback by their size) travel singleton; small votes regroup in later
     /// flushes. Each singleton is still capped at MAX_CONSENSUS_MSG.
-    async fn broadcast_singles(&self, msgs: &[ConsensusMsg]) {
+    async fn broadcast_singles(&self, msgs: &[std::borrow::Cow<'_, ConsensusMsg>]) {
         for m in msgs {
             let exempt = committed_bypasses_skip(m);
             let fof = message_is_fire_and_forget(m);
@@ -3607,6 +3701,93 @@ mod tests {
         assert!(!batch_is_fire_and_forget(&[vote, commit]));
         // An empty chunk is never fire-and-forget (nothing to send).
         assert!(!batch_is_fire_and_forget(&[]));
+    }
+
+    /// The gossip frame builder must emit EXACTLY the bytes the pre-refactor
+    /// composition did (bincode encode → hex → JSON `{topic,data}`); the wire
+    /// format is frozen. Also pins the owned batch encoder to the borrowed one.
+    #[test]
+    fn broadcast_framing_is_byte_identical_to_the_legacy_composition() {
+        use std::borrow::Cow;
+        let topic = "stellereum/consensus/v1/epoch-test";
+
+        // Single message: the payload is `msgs[0].encode()` framed as JSON.
+        let vote = tagged_vote(7);
+        let live = vec![Cow::Borrowed(&vote)];
+        let frame = encode_broadcast_payload(topic, &live).expect("single frame encodes");
+        let inner = vote.encode().expect("single encodes");
+        let expected = serde_json::json!({ "topic": topic, "data": hex::encode(&inner) })
+            .to_string()
+            .into_bytes();
+        assert_eq!(
+            frame.payload, expected,
+            "single-frame bytes must be unchanged"
+        );
+        assert_eq!(frame.encoded_len, inner.len());
+        assert!(!frame.is_batch);
+
+        // Several messages: one `Batch` frame of the SAME encoded batch.
+        let msgs = vec![tagged_vote(1), tagged_vote(2)];
+        let live: Vec<Cow<'_, ConsensusMsg>> = msgs.iter().map(Cow::Borrowed).collect();
+        let frame = encode_broadcast_payload(topic, &live).expect("batch frame encodes");
+        let legacy = ConsensusMsg::batch_encode(&msgs).expect("legacy batch encodes");
+        let expected = serde_json::json!({ "topic": topic, "data": hex::encode(&legacy) })
+            .to_string()
+            .into_bytes();
+        assert_eq!(
+            frame.payload, expected,
+            "batch-frame bytes must be unchanged"
+        );
+        assert!(frame.is_batch);
+        // Taking ownership must not change the bincode string either.
+        assert_eq!(
+            ConsensusMsg::batch_encode_owned(msgs).expect("owned batch encodes"),
+            legacy
+        );
+    }
+
+    /// The borrowing dedup filter must select exactly what the cloning filter
+    /// selected, and the resulting frame must be identical.
+    #[test]
+    fn coalesce_live_for_send_matches_the_cloned_filter() {
+        use std::borrow::Cow;
+        let chunk = vec![
+            tagged_vote(1),
+            tagged_vote(1), // same wire key: suppressed by the TTL filter
+            tagged_vote(2),
+            ConsensusMsg::Proposal {
+                height: 9,
+                round: 0,
+                block: sample_block(),
+            },
+        ];
+        let now = Instant::now();
+        let ttl = Duration::from_millis(200);
+        let mut borrow_filter = VoteSendFilter::new(ttl);
+        let live = coalesce_live_for_send(&chunk, &mut borrow_filter, now);
+        let mut clone_filter = VoteSendFilter::new(ttl);
+        let legacy: Vec<ConsensusMsg> = chunk
+            .iter()
+            .filter(|m| clone_filter.should_send(m, now))
+            .cloned()
+            .collect();
+        assert_eq!(live.len(), legacy.len(), "same live subset");
+        for (a, b) in live.iter().zip(legacy.iter()) {
+            assert_eq!(
+                a.encode().expect("encode live"),
+                b.encode().expect("encode legacy"),
+                "same message, same order"
+            );
+        }
+        let topic = "stellereum/consensus/v1/epoch-test";
+        let borrowed_frame = encode_broadcast_payload(topic, &live).expect("borrowed frames");
+        let legacy_live: Vec<Cow<'_, ConsensusMsg>> = legacy.iter().map(Cow::Borrowed).collect();
+        let cloned_frame = encode_broadcast_payload(topic, &legacy_live).expect("legacy frames");
+        assert_eq!(borrowed_frame.payload, cloned_frame.payload);
+        // A second pass over the same filter suppresses the repeated vote but
+        // keeps the proposal (identical in both forms).
+        let again = coalesce_live_for_send(&chunk, &mut borrow_filter, now);
+        assert_eq!(again.len(), 1, "only the proposal survives re-dedup");
     }
 
     fn sample_block() -> Block {

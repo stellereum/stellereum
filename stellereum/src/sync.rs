@@ -825,6 +825,35 @@ pub fn validate_sync_chain_for_shard_with_sets(
     resolve_set: &dyn Fn(u64) -> Option<crate::consensus::ValidatorSet>,
     expected_shard: u32,
 ) -> Result<(), String> {
+    validate_sync_chain_for_shard_with_sets_hashed(
+        blocks,
+        expected_first_height,
+        expected_first_hash,
+        resolve_set,
+        expected_shard,
+    )
+    .map(|_| ())
+}
+
+/// The same validation as [`validate_sync_chain_for_shard_with_sets`], but
+/// returning the canonical block hash of every block — computed ONCE per block
+/// and aligned with `blocks`.
+///
+/// WHY: `Block::compute_hash` hashes the whole body (every transaction's
+/// payload included), and the catch-up walk used to compute the same hash again
+/// for its retention key, its apply call and its RPC record — and once more as
+/// the NEXT block's parent link. Re-hashing an unchanged body is pure CPU: the
+/// validator is the only place that needs to hash it, so it hands the hashes
+/// back to the caller. Checks, refusal order and refusal strings are identical
+/// to [`validate_sync_chain_for_shard_with_sets`]; only the number of hashes
+/// changes.
+pub fn validate_sync_chain_for_shard_with_sets_hashed(
+    blocks: &[Block],
+    expected_first_height: u64,
+    expected_first_hash: [u8; 32],
+    resolve_set: &dyn Fn(u64) -> Option<crate::consensus::ValidatorSet>,
+    expected_shard: u32,
+) -> Result<Vec<[u8; 32]>, String> {
     // An empty walk proves nothing: accepting it would let a caller treat "no
     // blocks" as "a valid chain", re-anchoring consensus on heights no block
     // exists for. Every legitimate caller holds at least one block here.
@@ -844,7 +873,10 @@ pub fn validate_sync_chain_for_shard_with_sets(
     if first_set.quorum_power() == u64::MAX {
         return Err("block sync: validator set has no power; refusing to validate".to_string());
     }
-    let mut prev: Option<&Block> = None;
+    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(blocks.len());
+    // The parent link is the PREVIOUS block's hash, which this loop already
+    // computed (or `expected_first_hash` for the first block): no re-hash.
+    let mut prev_hash: Option<[u8; 32]> = None;
     let mut expected = expected_first_height;
     for b in blocks {
         if b.height != expected {
@@ -853,6 +885,9 @@ pub fn validate_sync_chain_for_shard_with_sets(
                 b.height
             ));
         }
+        // ONE hash per block: the QC binding, the parent link of the NEXT block
+        // and the caller's retention/apply keys all use this value.
+        let bh = b.compute_hash();
         // W10.5: the set IN FORCE AT THIS BLOCK'S HEIGHT — never the live
         // set. A rotation mid-window must not re-verify old certificates
         // against the new quorum (or new certificates against the old one).
@@ -862,12 +897,6 @@ pub fn validate_sync_chain_for_shard_with_sets(
                 b.height
             )
         })?;
-        if b.height != expected {
-            return Err(format!(
-                "block sync: height gap (expected {expected}, got {})",
-                b.height
-            ));
-        }
         // F8: a synced block must belong to the chain we are syncing. A chain
         // that extends our finalized hash but claims another shard (or mixes
         // shards) must be refused before its QCs are given any weight.
@@ -878,9 +907,7 @@ pub fn validate_sync_chain_for_shard_with_sets(
             ));
         }
         // The first block must continue OUR chain, not a peer's alternative.
-        let parent = prev
-            .map(|p| p.compute_hash())
-            .unwrap_or(expected_first_hash);
+        let parent = prev_hash.unwrap_or(expected_first_hash);
         if b.prev_hash != parent {
             return Err("block sync: broken parent link".to_string());
         }
@@ -915,7 +942,7 @@ pub fn validate_sync_chain_for_shard_with_sets(
                 b.height, qc.height
             ));
         }
-        if qc.block_hash != Some(b.compute_hash()) {
+        if qc.block_hash != Some(bh) {
             return Err(format!(
                 "block sync: block {} decision proof commits to a different block",
                 b.height
@@ -955,10 +982,11 @@ pub fn validate_sync_chain_for_shard_with_sets(
                 hex::encode(&b.proposer[..8]),
             ));
         }
-        prev = Some(b);
+        prev_hash = Some(bh);
+        hashes.push(bh);
         expected += 1;
     }
-    Ok(())
+    Ok(hashes)
 }
 
 /// State-Sync (Fast-Sync) for brand-new nodes or nodes lagging far behind.
@@ -1052,6 +1080,48 @@ where
     })
 }
 
+/// [`fast_sync_state_with_set_binding`] for a snapshot the caller ALREADY
+/// holds.
+///
+/// WHY: the snapshot-sync path probes a boundary by fetching the published
+/// state snapshot (`fetch_state_snapshot` = manifest + every chunk, tens of MB
+/// on a live chain) and then called the non-prefetched entry, which fetched
+/// the SAME blob a SECOND time. On a weak link that is the single most
+/// expensive step of every snapshot-sync attempt, for bytes the caller already
+/// has in hand. This entry takes those bytes, so the blob crosses the wire
+/// once. Verification is unchanged and still fail-closed: the bytes are
+/// restored into the throwaway engine, the root must equal `expected_root`,
+/// and the set binding must hold before the live engine is touched — a
+/// poisoned snapshot is refused exactly as before (the trust is the verified
+/// root, not which fetch produced the bytes).
+pub async fn fast_sync_state_with_set_binding_prefetched<G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
+    snapshot_bytes: Vec<u8>,
+    fetch_domain: G,
+    snapshot_height: u64,
+    anchor_set: &crate::consensus::ValidatorSet,
+) -> Result<crate::consensus::ValidatorSet, String>
+where
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    // Same yield as the fetching entry: the restore is heavy and must not hold
+    // a loaded 1-vCPU executor across it.
+    tokio::task::yield_now().await;
+    let bound = fast_sync_verify_commit(
+        target_engine,
+        expected_root,
+        snapshot_bytes,
+        fetch_domain,
+        Some((snapshot_height, anchor_set)),
+    )
+    .await?;
+    bound.ok_or_else(|| {
+        "fast sync: set binding requested but no bound set returned (internal error)".to_string()
+    })
+}
+
 /// F5 set-at-height binding check over an already-fetched domain bundle.
 ///
 /// The snapshot at `snapshot_height` MUST commit to the validator set in force
@@ -1119,7 +1189,7 @@ async fn fast_sync_fetch_verify_commit<F, Fut, G, GFut>(
     target_engine: &crate::state_engine::InMemoryStateEngine,
     expected_root: crate::cell::CellHash,
     mut fetch_snapshot: F,
-    mut fetch_domain: G,
+    fetch_domain: G,
     set_binding: Option<(u64, &crate::consensus::ValidatorSet)>,
 ) -> Result<Option<crate::consensus::ValidatorSet>, String>
 where
@@ -1134,7 +1204,32 @@ where
     // The snapshot is tens of MB: yield before the heavy restore so queued
     // consensus traffic runs first on a loaded 1-vCPU executor.
     tokio::task::yield_now().await;
+    fast_sync_verify_commit(
+        target_engine,
+        expected_root,
+        bytes,
+        fetch_domain,
+        set_binding,
+    )
+    .await
+}
 
+/// Verify-and-commit half of fast sync, over snapshot bytes the caller already
+/// holds (fetched here or handed in by
+/// [`fast_sync_state_with_set_binding_prefetched`]). Every gate — root,
+/// set binding, cross-shard replay coverage — runs BEFORE the target engine is
+/// touched.
+async fn fast_sync_verify_commit<G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
+    bytes: Vec<u8>,
+    mut fetch_domain: G,
+    set_binding: Option<(u64, &crate::consensus::ValidatorSet)>,
+) -> Result<Option<crate::consensus::ValidatorSet>, String>
+where
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
     // Fetch every domain blob ONCE (audit follow-up F-J): accounts-only
     // restores fail the root check on any live chain, so a far-behind node
     // could never fast-sync. Absent blobs (pre-domain directory, or a domain
@@ -2540,6 +2635,144 @@ mod tests {
         assert!(
             reqs.contains(&"cnvrf_v3"),
             "fast_sync_state must fetch cnvrf_v3 domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_sync_prefetched_verifies_the_bytes_it_was_handed() {
+        // The snapshot-sync path hands the restore the bytes it already probed
+        // (`fast_sync_state_with_set_binding_prefetched`) instead of downloading
+        // the same blob twice. Every gate must behave exactly as on the
+        // fetching entry: the root is verified, the set binding is enforced, and
+        // a poisoned blob is refused BEFORE the target engine is touched.
+        use crate::state_engine::{AccountState, InMemoryStateEngine};
+        use crate::storage::DomainSnapshot;
+
+        let keys: Vec<ed25519_dalek::SigningKey> = (0..3)
+            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0xB0 + i; 32]))
+            .collect();
+        let source = InMemoryStateEngine::new();
+        source
+            .update_account(AccountState::new([0x55u8; 32], 1_000_000))
+            .await;
+        {
+            let mut staking = source.staking_write().await;
+            for k in &keys {
+                staking
+                    .bond(
+                        k.verifying_key().to_bytes(),
+                        crate::staking::MIN_VALIDATOR_BOND + crate::staking::STELL_MIN_BOND_BUFFER,
+                        0,
+                    )
+                    .expect("bond admits");
+            }
+        }
+        let gov = source.governance_read().await.clone();
+        let staking = source.staking_read().await.clone();
+        let anchor_set = staking.to_validator_set();
+        assert!(
+            !anchor_set.validators.is_empty(),
+            "fixture must bond a real set"
+        );
+        let root = source.get_state_root().await;
+        let snap = source.create_snapshot().await;
+        let dom = DomainSnapshot::capture(&source, &staking, &gov).await;
+        let domains = bincode::serialize(&dom).expect("domains encode");
+
+        let target = InMemoryStateEngine::new();
+        let bound = fast_sync_state_with_set_binding_prefetched(
+            &target,
+            root,
+            snap.clone(),
+            |kind: &'static str| {
+                let d = domains.clone();
+                async move {
+                    if kind == "domains" {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                }
+            },
+            100,
+            &anchor_set,
+        )
+        .await
+        .expect("a genuine prefetched snapshot must verify and commit");
+        assert_eq!(bound.validators, anchor_set.validators);
+        assert_eq!(target.get_state_root().await, root);
+
+        // Poisoned bytes under the SAME trusted root: the prefetched blob is
+        // untrusted input exactly like a fetch, so it is refused and the target
+        // stays untouched.
+        let attacker = InMemoryStateEngine::new();
+        attacker
+            .update_account(AccountState::new([0x55u8; 32], 999_999_999))
+            .await;
+        let poisoned = attacker.create_snapshot().await;
+        let victim = InMemoryStateEngine::new();
+        let err = fast_sync_state_with_set_binding_prefetched(
+            &victim,
+            root,
+            poisoned,
+            |kind: &'static str| {
+                let d = domains.clone();
+                async move {
+                    if kind == "domains" {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                }
+            },
+            100,
+            &anchor_set,
+        )
+        .await
+        .expect_err("a poisoned prefetched snapshot must be refused");
+        assert!(err.contains("mismatch"), "error names the root gate: {err}");
+        assert!(
+            victim.get_account(&[0x55u8; 32]).await.is_none(),
+            "a refused prefetched snapshot must leave live state untouched"
+        );
+    }
+
+    /// The hashed validator must return exactly the canonical hash of each block
+    /// it accepted (the walk keys its retention map / apply calls off them), and
+    /// must keep refusing the same chains for the same reasons as the
+    /// `Result<()>` entry point.
+    #[test]
+    fn hashed_validation_returns_the_canonical_hashes() {
+        let blocks = quorum_chain(3, 2);
+        let genesis = blocks[0].compute_hash();
+        let vs = set_from(&blocks[1]);
+        let hashes = validate_sync_chain_for_shard_with_sets_hashed(
+            &blocks[1..],
+            1,
+            genesis,
+            &|_| Some(vs.clone()),
+            MASTERCHAIN_SHARD,
+        )
+        .expect("genuine chain validates");
+        let expected: Vec<[u8; 32]> = blocks[1..].iter().map(|b| b.compute_hash()).collect();
+        assert_eq!(hashes, expected, "hashes must be aligned with the blocks");
+
+        // Same refusals, same reasons as the unhashed entry point.
+        let err_hashed = validate_sync_chain_for_shard_with_sets_hashed(
+            &blocks[1..],
+            1,
+            [0xAAu8; 32],
+            &|_| Some(vs.clone()),
+            MASTERCHAIN_SHARD,
+        )
+        .expect_err("a fork at the join point is refused");
+        let err_plain =
+            validate_sync_chain_for_shard(&blocks[1..], 1, [0xAAu8; 32], &vs, MASTERCHAIN_SHARD)
+                .expect_err("the unhashed entry refuses the same chain");
+        assert_eq!(err_hashed, err_plain);
+        assert_eq!(
+            err_hashed, "block sync: broken parent link",
+            "refusal reason is unchanged"
         );
     }
 

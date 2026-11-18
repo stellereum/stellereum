@@ -2968,6 +2968,27 @@ pub async fn load_full_state_into(
     };
     let domains_opt: Option<Vec<u8>> = storage.domain_at(height)?;
 
+    // Aux-domain blobs are read ONCE and shared by the verify (throwaway) and
+    // commit (live) phases below. Both phases install byte-identical state, so
+    // the second sled read was pure duplication: each read is a tree lookup
+    // plus decompression plus a full copy, and on an active chain the
+    // cross-shard replay set, the zkML model registry and the CN-VRF v3 chain
+    // are megabytes. Read order is unchanged (same keys, same sequence).
+    //
+    // Residency: these are the AUX domains only (a small fraction of the state
+    // snapshot that is held by `state_bytes` across both phases regardless), so
+    // keeping them for the commit phase costs a few MB at most and removes the
+    // duplicate I/O.
+    let session_keys_opt: Option<Vec<u8>>;
+    let bridge_opt: Option<Vec<u8>>;
+    let zkml_opt: Option<Vec<u8>>;
+    // Decoded ONCE as well: `restore_cross_shard_replay` /
+    // `restore_cnvrf_v3_snapshot` take `&snap`, so the commit phase reuses the
+    // verify phase's decoded value instead of paying a second bincode pass
+    // over the same multi-MB bytes.
+    let cross_shard_snap: Option<crate::sharding::CrossShardReplaySnapshot>;
+    let cnvrf_snap: Option<crate::state_engine::CnVrfV3EngineSnapshot>;
+
     // Phase 1 (throwaway): restore + verify without touching live state. The
     // verification is MANDATORY whenever an anchor exists: a snapshot labeled H whose
     // bytes decode to other state is exactly how a node starts on a fork while
@@ -2988,8 +3009,9 @@ pub async fn load_full_state_into(
         // that has ever registered a session key. Absent (pre-phase-2
         // directory) simply means "empty", which hashes to the same digest an
         // old node computed.
-        if let Some(bytes) = storage.session_keys_at(height)? {
-            tmp.restore_session_keys(&bytes)
+        session_keys_opt = storage.session_keys_at(height)?;
+        if let Some(bytes) = &session_keys_opt {
+            tmp.restore_session_keys(bytes)
                 .await
                 .map_err(|e| anyhow!("restore session keys: {e}"))?;
         }
@@ -3000,23 +3022,30 @@ pub async fn load_full_state_into(
         // restore that quietly DROPPED it would re-root the chain while still
         // re-opening the source-tx replay. Absent (pre-bridge directory) simply
         // means "empty", which hashes to the digest an old node computed.
-        if let Some(bytes) = storage.bridge_at(height)? {
-            tmp.restore_bridge(&bytes)
+        bridge_opt = storage.bridge_at(height)?;
+        if let Some(bytes) = &bridge_opt {
+            tmp.restore_bridge(bytes)
                 .await
                 .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
         }
         // Ristretto deletion wave: confidential ledger removed; no restore.
-        if let Some(bytes) = storage.zkml_models_at(height)? {
-            tmp.restore_zkml_models(&bytes)
+        zkml_opt = storage.zkml_models_at(height)?;
+        if let Some(bytes) = &zkml_opt {
+            tmp.restore_zkml_models(bytes)
                 .await
                 .map_err(|e| anyhow!("restore zkML models: {e}"))?;
         }
-        if let Some(bytes) = storage.cross_shard_at(height)? {
+        let cross_shard_bytes = storage.cross_shard_at(height)?;
+        cross_shard_snap = match &cross_shard_bytes {
             // The STORE tolerates the legacy shape (a snapshot persisted
             // before the 2PC records existed).
-            let snap: crate::sharding::CrossShardReplaySnapshot =
-                crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&bytes))
-                    .map_err(|e| anyhow!("restore cross-shard replay: {e:?}"))?;
+            Some(bytes) => Some(
+                crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(bytes))
+                    .map_err(|e| anyhow!("restore cross-shard replay: {e:?}"))?,
+            ),
+            None => None,
+        };
+        if let Some(snap) = &cross_shard_snap {
             // FULL replay install (audit F1): consumed halves + produced +
             // completed, extend-only. Restoring only `engine_consumed` here
             // used to drop the produced/completed halves on every restart:
@@ -3024,59 +3053,54 @@ pub async fn load_full_state_into(
             // set gates ack/bounce completion, so a restarted node derived a
             // different root than its anchor (refused when an anchor exists)
             // or, at the tip with no anchor, silently re-opened lifecycles.
-            tmp.restore_cross_shard_replay(&snap).await;
+            tmp.restore_cross_shard_replay(snap).await;
         }
-        if let Some(bytes) = storage.cnvrf_v3_at(height)? {
-            if !bytes.is_empty() {
-                let snap: crate::state_engine::CnVrfV3EngineSnapshot =
-                    bincode::deserialize(&bytes).map_err(|e| anyhow!("restore cnvrf_v3: {e}"))?;
-                tmp.restore_cnvrf_v3_snapshot(&snap).await;
+        let cnvrf_bytes = storage.cnvrf_v3_at(height)?;
+        cnvrf_snap = match &cnvrf_bytes {
+            Some(bytes) if !bytes.is_empty() => {
+                Some(bincode::deserialize(bytes).map_err(|e| anyhow!("restore cnvrf_v3: {e}"))?)
             }
+            _ => None,
+        };
+        if let Some(snap) = &cnvrf_snap {
+            tmp.restore_cnvrf_v3_snapshot(snap).await;
         }
         storage.verify_restored_root(&tmp, height).await?;
     }
 
     // Phase 2 (commit): the snapshot is genuine; install it into the live engine.
+    // Same blobs as phase 1, from the copies read there — no second sled read.
     engine
         .restore_snapshot_preserve_replay_sets(&state_bytes)
         .await
         .map_err(|e| anyhow!("restore state: {e}"))?;
-    if let Some(bytes) = storage.session_keys_at(height)? {
+    if let Some(bytes) = &session_keys_opt {
         engine
-            .restore_session_keys(&bytes)
+            .restore_session_keys(bytes)
             .await
             .map_err(|e| anyhow!("restore session keys: {e}"))?;
     }
-    if let Some(bytes) = storage.bridge_at(height)? {
+    if let Some(bytes) = &bridge_opt {
         engine
-            .restore_bridge(&bytes)
+            .restore_bridge(bytes)
             .await
             .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
     }
     // Ristretto deletion wave: confidential ledger removed; no restore.
-    if let Some(bytes) = storage.zkml_models_at(height)? {
+    if let Some(bytes) = &zkml_opt {
         engine
-            .restore_zkml_models(&bytes)
+            .restore_zkml_models(bytes)
             .await
             .map_err(|e| anyhow!("restore zkML models: {e}"))?;
     }
-    if let Some(bytes) = storage.cross_shard_at(height)? {
-        // The STORE tolerates the legacy shape (a snapshot persisted before
-        // the 2PC records existed).
-        let snap: crate::sharding::CrossShardReplaySnapshot =
-            crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&bytes))
-                .map_err(|e| anyhow!("restore cross-shard replay: {e:?}"))?;
+    if let Some(snap) = &cross_shard_snap {
         // Same FULL install as the throwaway phase above: the two phases must
         // install byte-identical replay state, or the verified root would not
         // describe the live engine.
-        engine.restore_cross_shard_replay(&snap).await;
+        engine.restore_cross_shard_replay(snap).await;
     }
-    if let Some(bytes) = storage.cnvrf_v3_at(height)? {
-        if !bytes.is_empty() {
-            let snap: crate::state_engine::CnVrfV3EngineSnapshot =
-                bincode::deserialize(&bytes).map_err(|e| anyhow!("restore cnvrf_v3: {e}"))?;
-            engine.restore_cnvrf_v3_snapshot(&snap).await;
-        }
+    if let Some(snap) = &cnvrf_snap {
+        engine.restore_cnvrf_v3_snapshot(snap).await;
     }
     match domains_opt {
         Some(bytes) => {

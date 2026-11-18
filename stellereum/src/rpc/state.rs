@@ -845,7 +845,12 @@ pub async fn handle_rpc_batch_call(
     }
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let req: RpcRequest = match serde_json::from_value(item.clone()) {
+        // Borrow the item instead of cloning the whole JSON value: `&Value`
+        // is itself a serde deserializer, so the request's own fields (method,
+        // id) are read in place and only `params` is materialized inside the
+        // request. The old `item.clone()` copied the ENTIRE item first — for a
+        // batch of submission calls that duplicated every raw payload.
+        let req: RpcRequest = match RpcRequest::deserialize(item) {
             Ok(r) => r,
             Err(e) => {
                 out.push(batch_refused(format!("invalid request: {e}")));

@@ -18,9 +18,143 @@ pub(crate) const RETRO_PUBLISH_MAX_PER_PASS: usize = 128;
 pub(crate) const RETRO_PUBLISH_DEPTH: u64 = 4_096;
 
 /// How often the consensus loop asks the network whether it has fallen behind.
-/// Default 2000 ms; override with `STELL_CATCHUP_INTERVAL_MS`. Node-local
-/// liveness probe cadence, not consensus — nodes MAY differ.
-pub(crate) const CATCHUP_INTERVAL_DEFAULT_MS: u64 = 2_000;
+///
+/// CHANGED 2026-11-18 (event-driven catch-up): the PRIMARY catch-up path is
+/// now REACTIVE. A verified `Committed` / `Proposal` / `Vote` that names a
+/// height above ours — or a peer head pointer above ours — schedules the
+/// attempt on the next tick ([`catchup_action`]). This timer is only a
+/// BACKSTOP for a node that is already known to be behind; a node AT the tip
+/// (no peer known to be ahead) never probes the DHT on it.
+///
+/// Default 30_000 ms (was 2_000 ms). The old 2-3 s cadence made every idle
+/// node poll the DHT many times a minute, and with a dead peer in the table
+/// each poll cost the whole `STELL_CATCHUP_BUDGET_MS` (measured live: 15 000 ms
+/// burned on every tick, the stall the budget knob papered over). Reactive
+/// triggers remove the need to poll at all; 30 s is a last-resort recheck.
+///
+/// Override with `STELL_CATCHUP_INTERVAL_MS`. Node-local liveness probe
+/// cadence, not consensus — nodes MAY differ.
+pub(crate) const CATCHUP_INTERVAL_DEFAULT_MS: u64 = 30_000;
+
+/// Window in which a successful live adopt keeps the periodic catch-up machine
+/// deferred (the "live flow is delivering" proof).
+///
+/// Deliberately NOT `CATCHUP_INTERVAL_DEFAULT_MS`: the backstop moved to 30 s
+/// (event-driven catch-up), but this window must still track the LIVE message
+/// tempo. At 1 block/s a 30 s window would suppress the DHT walk for half a
+/// minute after the last adopt even when a hole in the pushed sequence needs
+/// it; 2 s (the old interval value) preserved the proven defer behavior.
+pub(crate) const LIVE_ADOPT_FRESH_MS: u64 = 2_000;
+
+/// Default wall-time budget for one catch-up pass (`STELL_CATCHUP_BUDGET_MS`).
+///
+/// Deliberately small: this loop IS the consensus clock, so a DHT/body walk
+/// that overruns it must be abandoned, not waited out. The live stall had this
+/// raised to 15 000 ms against a dead peer and every tick paid it in full;
+/// with event-driven catch-up the attempt is rare, but it must still never
+/// hold a tick hostage.
+pub(crate) const CATCHUP_BUDGET_DEFAULT_MS: u64 = 250;
+
+/// Minimum spacing between two REACTIVE catch-up attempts.
+///
+/// Behind evidence repeats every tick while it stays true (a stale peer hint,
+/// a peer rebroadcasting its commit), so without a floor the loop would start
+/// a DHT walk every tick (~50 ms). Half a second still reacts to a NEW event
+/// far inside the 30 s backstop. Local pacing only — never consensus.
+pub(crate) const REACTIVE_CATCHUP_MIN_GAP_MS: u64 = 500;
+
+/// What this tick should do about catch-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupAction {
+    /// Run the catch-up pass now (reactive evidence, or the backstop timer
+    /// fired on a node that is NOT at the tip).
+    Run,
+    /// The backstop timer fired, but no peer is known to be ahead: skip the
+    /// DHT probe entirely. This is the event-driven default on an idle,
+    /// in-sync node.
+    SkipAtTip,
+    /// Nothing to do this tick (reactive event too recent, timer not due, or
+    /// no reactive evidence yet).
+    Wait,
+}
+
+/// Event-driven catch-up decision (pure; pins the new scheduling policy).
+///
+/// Inputs:
+/// * `reactive_due` — a verified peer message named a height above ours, or a
+///   peer head pointer above ours, since the last decision;
+/// * `since_last_ms` — wall time since the last catch-up attempt (any kind);
+/// * `interval_ms` — the backstop interval (`catchup_interval()`);
+/// * `at_tip` — no peer is known to be ahead (see [`node_is_at_tip`]).
+///
+/// Rules:
+/// 1. REACTIVE evidence wins and runs as soon as the short reactive floor
+///    allows — never waiting for `interval_ms`;
+/// 2. otherwise the backstop interval runs ONLY when we are not at the tip
+///    (a node at the tip has nothing to fetch and must not poll the DHT);
+/// 3. otherwise wait.
+pub fn catchup_action(
+    reactive_due: bool,
+    since_last_ms: u64,
+    interval_ms: u64,
+    at_tip: bool,
+) -> CatchupAction {
+    if reactive_due && since_last_ms >= REACTIVE_CATCHUP_MIN_GAP_MS {
+        return CatchupAction::Run;
+    }
+    if since_last_ms < interval_ms {
+        return CatchupAction::Wait;
+    }
+    if at_tip {
+        CatchupAction::SkipAtTip
+    } else {
+        CatchupAction::Run
+    }
+}
+
+/// True when NO peer is known to be ahead of `our_tip`.
+///
+/// `peer_named_height` is the tallest height that VERIFIED peer traffic proves
+/// FINALIZED: a commit's height, or a proposal/vote height minus one (a peer
+/// building/voting at H has decided H-1). `peer_hint_height` is the head
+/// pointer a peer published/committed. Either being above our tip means a peer
+/// knows more than we do, so the node is NOT at the tip and the periodic
+/// backstop may probe. Pure.
+pub fn node_is_at_tip(our_tip: u64, peer_named_height: u64, peer_hint_height: Option<u64>) -> bool {
+    peer_named_height <= our_tip && peer_hint_height.unwrap_or(0) <= our_tip
+}
+
+/// Height a message NAMES that is above `our_height`, if any.
+///
+/// One choke point for "a peer told us it is ahead", used by the drain for
+/// `Proposal` and `Vote`. `Committed` is compared against our FINALIZED TIP by
+/// the drain itself (a commit for the height we are voting on is already one
+/// block ahead of what we decided), so it is also accepted here for callers
+/// that measure against a consensus height. Returns `None` for messages that
+/// carry no height (batches are flattened first) or that do not name a future
+/// height. NOTE: callers must only act on the result AFTER the message passed
+/// its own verification (QC / proposer signature / vote signature) — this
+/// helper is arithmetic, not authentication. Pure.
+pub fn inbound_names_ahead(our_height: u64, msg: &ConsensusMsg) -> Option<u64> {
+    let named = match msg {
+        ConsensusMsg::Committed { height, .. } => *height,
+        ConsensusMsg::Proposal { height, .. } => *height,
+        ConsensusMsg::Vote { vote, .. } => vote.height,
+        _ => return None,
+    };
+    (named > our_height).then_some(named)
+}
+
+/// Whether a DHT head read is still needed: only when no peer has already told
+/// us, in a verified message, that it is ahead.
+///
+/// This is the receive-side half of push-based propagation: the live stall was
+/// a catch-up pass spending its whole budget on a DHT query to a dead peer
+/// while the answer (a peer's head) was already in hand from the push channel.
+/// Pure.
+pub fn should_probe_dht_head(our_height: u64, peer_hint: Option<(u64, [u8; 32])>) -> bool {
+    !peer_hint.is_some_and(|(h, _)| stellereum::network::peer_head_is_ahead(our_height, h))
+}
 
 /// Effective retro-publish interval (`STELL_RETRO_PUBLISH_INTERVAL_MS`, default 30000).
 pub(crate) fn retro_publish_interval() -> std::time::Duration {
@@ -290,7 +424,8 @@ pub(crate) fn should_use_down_proposer_timeout(
     missed_streak >= stellereum::staking::DOWNTIME_MISS_THRESHOLD && !vote_seen_from_proposer
 }
 
-/// Effective catch-up probe interval (`STELL_CATCHUP_INTERVAL_MS`, default 2000).
+/// Effective catch-up probe interval (`STELL_CATCHUP_INTERVAL_MS`, default
+/// 30000 — the BACKSTOP cadence; reactive peer evidence runs far sooner).
 pub(crate) fn catchup_interval() -> std::time::Duration {
     std::time::Duration::from_millis(
         std::env::var("STELL_CATCHUP_INTERVAL_MS")
@@ -298,6 +433,19 @@ pub(crate) fn catchup_interval() -> std::time::Duration {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(CATCHUP_INTERVAL_DEFAULT_MS),
+    )
+}
+
+/// Effective wall-time budget for one catch-up pass (`STELL_CATCHUP_BUDGET_MS`,
+/// default 250). A pass that exceeds it is abandoned and retried later; the
+/// tick is the consensus clock and must not wait on a dead DHT.
+pub(crate) fn catchup_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("STELL_CATCHUP_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(CATCHUP_BUDGET_DEFAULT_MS),
     )
 }
 

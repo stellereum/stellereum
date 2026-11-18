@@ -1615,24 +1615,37 @@ async fn bridge_intents_from_a_workchain_are_refused() {
 }
 
 // ===========================================================================
-// 2PC activation-buffer pin (spec 03: "2PC-gated flows stay out until
-// `STELL_XPC_ACTIVATION_HEIGHT` (currently OFF everywhere)").
-// The switch itself lives in `xshard2pc::XpcActivation` (default `Disabled`)
-// with the env wiring in `main.rs`; this pins the OFF-by-default premise the
-// whole gated-surface table rests on, plus the boundary semantics an eventual
-// activation height will obey.
+// 2PC activation pin (spec 03; updated for the XPC_ACTIVATION_HEIGHT = 0
+// activation release). The switch lives in `xshard2pc::XpcActivation` and its
+// production value is the compiled chain-spec constant; this pins that the
+// default follows the chain spec (active from genesis) while the explicit
+// `Disabled` mode stays off at every height and the height boundary itself is
+// still strict (no silent early-on).
 // ===========================================================================
 
 #[tokio::test]
-async fn xpc_two_phase_commit_stays_off_until_an_activation_height() {
-    // Default is off, and off means off at EVERY height, past included.
-    assert_eq!(XpcActivation::default(), XpcActivation::Disabled);
+async fn xpc_two_phase_commit_default_follows_the_chain_spec_boundary() {
+    // The compiled chain spec arms the 2PC from genesis, and the default is
+    // the chain-spec value (never a hard-coded off).
+    assert_eq!(
+        XpcActivation::default(),
+        stellereum::xshard2pc::XpcActivation::from_chain_spec()
+    );
+    assert_eq!(
+        stellereum::xshard2pc::XPC_ACTIVATION_HEIGHT,
+        0,
+        "the activation release pins the 2PC on from genesis"
+    );
+    assert!(XpcActivation::default().is_active_at(0));
+    assert_eq!(XpcActivation::default().boundary(), Some(0));
+
+    // The explicit off mode is still off at EVERY height, past included.
     assert!(!XpcActivation::Disabled.is_active_at(0));
     assert!(!XpcActivation::Disabled.is_active_at(u64::MAX));
     assert_eq!(XpcActivation::Disabled.boundary(), None);
 
-    // Boundary semantics for the day an activation height is configured:
-    // strictly below is legacy, at-and-above is 2PC. No silent early-on.
+    // Boundary semantics for a later chain-spec height: strictly below is
+    // legacy, at-and-above is 2PC. No silent early-on.
     let at_100 = XpcActivation::FromHeight(100);
     assert!(!at_100.is_active_at(99));
     assert!(at_100.is_active_at(100));
@@ -1643,7 +1656,7 @@ async fn xpc_two_phase_commit_stays_off_until_an_activation_height() {
     let fresh = InMemoryStateEngine::new();
     assert!(
         !fresh.cross_shard_enabled(),
-        "2PC-gated flows stay out on a fresh engine"
+        "cross-shard transport stays opt-in on a fresh engine"
     );
 }
 

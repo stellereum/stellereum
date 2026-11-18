@@ -238,6 +238,15 @@ pub fn evm_send_refusal(evm_hash: Option<&str>) -> JsonRpcError {
             "requires": EVM_WRITE_PQ_REQUIREMENT,
             "submitWith": "stell_sendRawTransaction",
             "evmHash": evm_hash,
+            // The EVM WRITE path exists, but only for an address with an
+            // on-chain PQ binding: a bare secp256k1 account has no PQ account
+            // to debit. Naming the registration call keeps the refusal
+            // actionable without changing its historical reason tag.
+            "registerBinding": {
+                "method": "stell_evmBindingSubmit",
+                "requires": "Falcon-512 signature over keccak256(STELL_EVM_BIND_V1 || chain_id || evm_address || pq_address) plus the binding transaction envelope signature",
+                "readWith": "stell_getEvmBinding"
+            },
             "readOnly": [
                 "eth_call",
                 "eth_getProof",
@@ -522,6 +531,24 @@ pub fn build_secp_settlement_tx(
 /// Returns `(evm_hash, stell_hash)` when `tx` carries a valid envelope,
 /// after registering. Invalid envelopes return `None` (fail-closed, no link).
 pub fn link_secp_settlement(tx: &crate::sharding::Transaction) -> Option<(String, [u8; 32])> {
+    // PQ EVM CARRIER (FULL-PQ write path). This function is the RPC's ONLY
+    // per-committed-transaction hook (`record_receipts_with_events` calls it for
+    // every transaction of a finalized block), so BOTH settlement shapes are
+    // linked here — otherwise an EVM receipt would only be resolvable on the
+    // node that submitted the carrier:
+    //
+    //  * the carrier's `keccak256(EVM tx)` (exactly what the wallet tracks) is
+    //    registered against the L1 transaction hash, so
+    //    `eth_getTransactionReceipt(evmHash)` resolves after inclusion;
+    //  * a binding statement (claim or carrier) is replayed into the
+    //    deterministic binding index in block order, which is what makes the
+    //    index chain-derived on every node instead of admission-derived.
+    //
+    // Both legs re-verify their own signatures from block bytes (they never
+    // trust the caller), and neither writes consensus state.
+    if let Some(linked) = link_evm_carrier_settlement(tx) {
+        return Some(linked);
+    }
     let evm_hash = secp_envelope_evm_hash(tx)?;
     if verify_secp_settlement(tx).is_err() {
         return None;
@@ -529,6 +556,35 @@ pub fn link_secp_settlement(tx: &crate::sharding::Transaction) -> Option<(String
     let stell_hash = tx.compute_tx_hash();
     register_evm_settlement(&evm_hash, &stell_hash);
     Some((evm_hash, stell_hash))
+}
+
+/// Link one PQ EVM carrier / binding transaction into the EVM hash map and the
+/// binding index (`None` for every non-EVM transaction).
+fn link_evm_carrier_settlement(
+    tx: &crate::sharding::Transaction,
+) -> Option<(String, [u8; 32])> {
+    use crate::evm_adapter::{EvmPayload, classify_evm_payload};
+    let payload = classify_evm_payload(tx)?;
+    // Replay the statement into the (node-local, non-consensus) index. A claim
+    // that does not verify, or a conflicting first claim, is dropped: the index
+    // is first-writer-wins, and the committed transaction stays authoritative
+    // either way.
+    if let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() {
+        idx.observe_transaction(tx);
+    }
+    let stell_hash = tx.compute_tx_hash();
+    match payload {
+        EvmPayload::Carrier(carrier) => {
+            let evm_hash = format!(
+                "0x{}",
+                hex::encode(crate::evm_adapter::evm_intent_digest(&carrier.evm_tx))
+            );
+            register_evm_settlement(&evm_hash, &stell_hash);
+            Some((evm_hash, stell_hash))
+        }
+        // A claim settles no EVM intent: there is no EVM hash to link.
+        EvmPayload::Binding(_) | EvmPayload::Mixed => None,
+    }
 }
 
 /// Build the EVM receipt view for an EVM hash settled by `stell_receipt`.
@@ -578,6 +634,57 @@ pub fn stell_tx_to_evm_with_chain(
     chain_id: u64,
 ) -> EvmTransaction {
     let tx_hash = tx.compute_tx_hash();
+    // A PQ EVM CARRIER is served as the EVM transaction the wallet knows: its
+    // `from` is the bound EVM address, its `to`/`value` come from the canonical
+    // EIP-155 intent (not from the Stell accounting legs, whose addresses are
+    // 32-byte PQ accounts). That is what makes
+    // `eth_getTransactionByHash(evmHash)` and block transaction lists readable
+    // by MetaMask instead of showing a PQ address it has never seen.
+    let carrier_facts = match crate::evm_adapter::classify_evm_payload(tx) {
+        Some(crate::evm_adapter::EvmPayload::Carrier(c)) => Some((c, evm_transfer_facts(&c.evm_tx).ok())),
+        _ => None,
+    };
+    if let Some((carrier, facts)) = carrier_facts {
+        let (from_hex, to_hex, value_hex, input) = match facts {
+            Some(f) => (
+                evm_address_to_hex(&carrier.evm_address),
+                Some(evm_address_to_hex(&f.to)),
+                format_u128_hex(f.value_wei),
+                "0x".to_string(),
+            ),
+            // Undecodable intent (never admitted, but a corrupted view must stay
+            // honest): show the carried EVM sender and no invented recipient.
+            None => (
+                evm_address_to_hex(&carrier.evm_address),
+                None,
+                nano_to_wei_hex(tx.amount),
+                "0x".to_string(),
+            ),
+        };
+        return EvmTransaction {
+            hash: stell_hash_to_evm(&tx_hash),
+            nonce: format_u64_hex(tx.nonce),
+            block_hash: block_hash.map(|h| stell_hash_to_evm(&h)),
+            block_number: block_number.map(format_u64_hex),
+            transaction_index: tx_index.map(|i| format_u64_hex(i as u64)),
+            from: from_hex,
+            to: to_hex,
+            value: value_hex,
+            gas_price: Some("0x1".to_string()),
+            gas: format_u64_hex(tx.gas_limit),
+            input,
+            v: format!("0x{:x}", chain_id * 2 + 35),
+            r: "0x0".to_string(),
+            s: "0x0".to_string(),
+            tx_type: Some("0x0".to_string()),
+            chain_id: Some(format!("0x{:x}", chain_id)),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            access_list: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+    }
     let r = if tx.signature.len() >= 32 {
         format!("0x{}", hex::encode(&tx.signature[0..32]))
     } else {

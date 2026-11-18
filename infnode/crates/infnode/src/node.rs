@@ -288,6 +288,71 @@ pub fn circuit_probe_endpoint(endpoints: &[String]) -> Option<String> {
     endpoints.first().cloned()
 }
 
+/// Routing-table peer eviction (task 2 of the direct-mesh wave).
+///
+/// This is deliberately SEPARATE from the per-circuit park/extend breaker
+/// above: the breaker bounds redial cost for ONE circuit, while this table
+/// decides whether a peer may still be handed out as a DHT target. A peer
+/// that fails [`PEER_EVICT_FAIL_THRESHOLD`] consecutive transport attempts
+/// (dial/handshake failure, request timeout, send error) is marked
+/// "suspected dead": lookups stop returning it as a hop or target, but an
+/// explicit dial (`request_to(pid, ..)`, NAT punch, a validator mesh link)
+/// still reaches it, because identity/addressing is untouched.
+///
+/// After [`PEER_EVICT_COOLDOWN_MS`] one reconnect attempt is allowed again
+/// (the mesh heartbeat, the reconnect loop, or any explicit caller); a
+/// success clears the counter and the suspicion flag, a failure re-arms the
+/// cooldown. No exponential growth here: suspicion is a routing fact, not a
+/// penalty schedule.
+pub const PEER_EVICT_FAIL_THRESHOLD: u32 = 3;
+/// How long a suspected peer stays out of DHT targets before a reconnect is
+/// allowed. Configurable per node (`INFNODE_PEER_EVICT_COOLDOWN_MS` / the
+/// runtime setter); this is the 60 s default.
+pub const PEER_EVICT_COOLDOWN_MS: u64 = 60_000;
+/// Bound on scored peers (fail-closed: never evict a SUSPECTED entry, choose
+/// the healthiest non-suspect victim instead; if all are suspected, stop
+/// tracking new ones).
+pub const MAX_SCORED_PEERS: usize = 4096;
+
+/// Per-peer routing score: consecutive transport failures and the suspicion
+/// window derived from them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerScore {
+    /// Consecutive failures since the last success (saturating).
+    pub consecutive_failures: u32,
+    /// Peer is currently withheld from DHT lookups.
+    pub suspected: bool,
+    /// Unix-ms when a reconnect attempt becomes allowed (`0` = no window).
+    pub suspect_until_ms: i64,
+    /// Times this peer transitioned into "suspected dead".
+    pub evictions: u32,
+    /// Unix-ms of the last success (`0` = never observed live).
+    pub last_ok_ms: i64,
+}
+
+impl PeerScore {
+    fn fresh() -> Self {
+        Self {
+            consecutive_failures: 0,
+            suspected: false,
+            suspect_until_ms: 0,
+            evictions: 0,
+            last_ok_ms: 0,
+        }
+    }
+
+    /// Whether DHT lookups may still return this peer. Explicit dials are
+    /// never gated by this.
+    pub fn routing_allowed(&self) -> bool {
+        !self.suspected
+    }
+
+    /// Whether the cooldown has elapsed and one reconnect attempt is allowed.
+    pub fn reconnect_due(&self, now_ms: i64) -> bool {
+        self.suspected && now_ms >= self.suspect_until_ms
+    }
+}
+
 /// Granularity of the simultaneous-open wait (the wait is a whole number of
 /// these steps, so the peer is polled for an inbound connection every 50ms).
 const SIMOPEN_WAIT_STEP_MS: u64 = 50;
@@ -467,6 +532,14 @@ pub struct Node {
     /// Breaker transitions (parks/unparks), in-zone counters (not metrics.rs).
     circuit_parks: AtomicU64,
     circuit_unparks: AtomicU64,
+    /// Routing-level peer scores (task 2): consecutive transport failures,
+    /// suspected-dead flag and the reconnect cooldown. Distinct from
+    /// `circuit` (per-circuit redial backoff): this gates DHT targets.
+    peer_scores: std::sync::Mutex<HashMap<[u8; NODEID_LEN], PeerScore>>,
+    /// Cooldown before a suspected peer may be attempted again (ms).
+    peer_evict_cooldown_ms: AtomicU64,
+    /// Total suspected-dead transitions (operator-visible counter).
+    peer_evictions: AtomicU64,
     /// маршруты для discovery (node_id -> Route)
     routes: RwLock<HashMap<[u8; NODEID_LEN], Route>>,
     /// каталог для персистентности (routes.json и пр.)
@@ -778,6 +851,15 @@ impl Node {
             circuit: std::sync::Mutex::new(HashMap::new()),
             circuit_parks: AtomicU64::new(0),
             circuit_unparks: AtomicU64::new(0),
+            peer_scores: std::sync::Mutex::new(HashMap::new()),
+            peer_evict_cooldown_ms: AtomicU64::new(
+                std::env::var("INFNODE_PEER_EVICT_COOLDOWN_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(PEER_EVICT_COOLDOWN_MS),
+            ),
+            peer_evictions: AtomicU64::new(0),
             routes: RwLock::new(routes),
             data_dir: data_dir.clone(),
             started_at: Instant::now(),
@@ -1360,6 +1442,9 @@ impl Node {
         // Silent for healthy peers (no entry: no log, no counter). Auth,
         // reputation, and session logic below are untouched.
         self.circuit_record_success(pid);
+        // Routing score: a registered connection also proves the peer is a
+        // live DHT target again (clears a suspicion streak / cooldown).
+        self.peer_record_success(pid);
         let sid = conn.stable_id();
         // Backpressure admission (fail-closed): dedup first, then caps. The
         // checks run under a read guard; the insert re-checks under the
@@ -1979,6 +2064,167 @@ impl Node {
     pub fn circuit_len(&self) -> usize {
         self.circuit.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    // ------------------------------------------------------------------
+    // Routing-level peer scoring / fast eviction (task 2).
+    //
+    // NOT the circuit breaker above: `circuit` decides whether one peer is
+    // worth redialling; `peer_scores` decides whether DHT LOOKUPS still hand
+    // that peer out as a hop/target. A suspected peer remains explicitly
+    // dialable (mesh heartbeat, `request_to(pid, ..)`, NAT punch).
+    // ------------------------------------------------------------------
+
+    /// Cooldown before a suspected peer may be attempted again.
+    pub fn peer_evict_cooldown_ms(&self) -> u64 {
+        self.peer_evict_cooldown_ms.load(Ordering::Relaxed)
+    }
+
+    /// Override the suspicion cooldown (tests / operator tuning).
+    pub fn set_peer_evict_cooldown_ms(&self, ms: u64) {
+        self.peer_evict_cooldown_ms
+            .store(ms.max(1), Ordering::Relaxed);
+    }
+
+    /// Total suspected-dead transitions.
+    pub fn peer_evictions_total(&self) -> u64 {
+        self.peer_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Current score for a peer, if tracked.
+    pub fn peer_score(&self, pid: &[u8; NODEID_LEN]) -> Option<PeerScore> {
+        self.peer_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pid)
+            .copied()
+    }
+
+    /// Whether DHT lookups must withhold this peer (suspected dead).
+    ///
+    /// The flag persists through the cooldown: a due reconnect is attempted
+    /// explicitly (mesh heartbeat/reconnect loop), not by re-advertising the
+    /// peer to lookups. Only a success clears it.
+    pub fn peer_suspected(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        self.peer_score(pid).is_some_and(|s| s.suspected)
+    }
+
+    /// Whether the cooldown elapsed and one explicit reconnect is allowed.
+    pub fn peer_reconnect_due(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        self.peer_score(pid)
+            .is_some_and(|s| s.reconnect_due(now_ms()))
+    }
+
+    /// All currently suspected peers (diagnostics / mesh reconciliation).
+    pub fn suspected_peers(&self) -> Vec<([u8; NODEID_LEN], PeerScore)> {
+        self.peer_scores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, s)| s.suspected)
+            .map(|(k, s)| (*k, *s))
+            .collect()
+    }
+
+    /// Record one consecutive transport failure for `pid`.
+    ///
+    /// Transport errors, timeouts and handshake failures all land here. At
+    /// [`PEER_EVICT_FAIL_THRESHOLD`] the peer is marked suspected dead and
+    /// withheld from DHT lookups for [`Self::peer_evict_cooldown_ms`]. The
+    /// loud line fires on the healthy→suspected transition only; further
+    /// failures stay quiet until a success (one info line).
+    pub fn peer_record_failure(&self, pid: [u8; NODEID_LEN]) -> PeerScore {
+        self.peer_record_failure_at(pid, now_ms())
+    }
+
+    /// [`Self::peer_record_failure`] with an explicit clock (test hook).
+    pub fn peer_record_failure_at(&self, pid: [u8; NODEID_LEN], now: i64) -> PeerScore {
+        let cooldown_ms = self.peer_evict_cooldown_ms() as i64;
+        let (score, transitioned) = {
+            let mut map = self.peer_scores.lock().unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(&pid) && map.len() >= MAX_SCORED_PEERS {
+                // Fail-closed bound: never evict a suspected entry (that would
+                // silently re-advertise a dead peer). Drop the healthiest
+                // non-suspect record instead; if every entry is suspected,
+                // skip tracking this new peer.
+                let victim = map
+                    .iter()
+                    .filter(|(_, s)| !s.suspected)
+                    .min_by_key(|(_, s)| (s.consecutive_failures, s.last_ok_ms))
+                    .map(|(k, _)| *k);
+                match victim {
+                    Some(k) => {
+                        map.remove(&k);
+                    }
+                    None => return PeerScore::fresh(),
+                }
+            }
+            let entry = map.entry(pid).or_insert_with(PeerScore::fresh);
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            let mut transitioned = false;
+            if !entry.suspected && entry.consecutive_failures >= PEER_EVICT_FAIL_THRESHOLD {
+                entry.suspected = true;
+                entry.suspect_until_ms = now.saturating_add(cooldown_ms);
+                entry.evictions = entry.evictions.saturating_add(1);
+                transitioned = true;
+            }
+            (*entry, transitioned)
+        };
+        if transitioned {
+            let total = self.peer_evictions.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[{}] PEER EVICT peer={} fails={} cooldown_ms={} total_evictions={}",
+                self.cfg.name,
+                hex::encode(pid),
+                score.consecutive_failures,
+                cooldown_ms,
+                total
+            );
+        }
+        score
+    }
+
+    /// Record a successful transport interaction: clears the failure streak,
+    /// the suspicion flag and the cooldown. One loud line on recovery.
+    pub fn peer_record_success(&self, pid: [u8; NODEID_LEN]) {
+        self.peer_record_success_at(pid, now_ms())
+    }
+
+    /// [`Self::peer_record_success`] with an explicit clock (test hook).
+    pub fn peer_record_success_at(&self, pid: [u8; NODEID_LEN], now: i64) {
+        let mut map = self.peer_scores.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(&pid) {
+            Some(entry) => {
+                let was_suspected = entry.suspected;
+                entry.consecutive_failures = 0;
+                entry.suspected = false;
+                entry.suspect_until_ms = 0;
+                entry.last_ok_ms = now;
+                if was_suspected {
+                    eprintln!(
+                        "[{}] PEER RESTORED peer={} (reconnect succeeded after eviction)",
+                        self.cfg.name,
+                        hex::encode(pid)
+                    );
+                }
+            }
+            None => {
+                // Healthy peer: keep a cheap freshness record so a later
+                // failure streak starts from an observed-live baseline.
+                if map.len() < MAX_SCORED_PEERS {
+                    let mut s = PeerScore::fresh();
+                    s.last_ok_ms = now;
+                    map.insert(pid, s);
+                }
+            }
+        }
+    }
+
+    /// Whether DHT lookups may return this peer (i.e. it is not suspected).
+    fn routing_target_allowed(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        self.peer_score(pid)
+            .map(|s| s.routing_allowed())
+            .unwrap_or(true)
+    }
 }
 
 impl Node {
@@ -2062,6 +2308,9 @@ impl Node {
         // (per-attempt, not per-endpoint — `build_dial_plan` above already
         // bounds the width). Success resets via `add_conn`.
         self.circuit_record_failure(pid);
+        // Routing score: a failed dial/handshake sweep is one transport
+        // failure; three in a row withhold the peer from DHT targets.
+        self.peer_record_failure(pid);
         Err(last_err)
     }
 
@@ -2104,6 +2353,7 @@ impl Node {
                     self.cfg.name, peer.cfg.name
                 );
                 self.circuit_record_failure(pid);
+                self.peer_record_failure(pid);
                 Err(anyhow!("{} @ {ep} (parked probe): {e}", peer.cfg.name))
             }
         }
@@ -2235,7 +2485,12 @@ impl Node {
             );
         }
         match first {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                // A full request/response round trip proves the peer is alive:
+                // clear any failure streak / suspicion immediately.
+                self.peer_record_success(pid);
+                Ok(r)
+            }
             Err(e) => {
                 // повторяем ТОЛЬКО при сетевой ошибке (соединение умерло до ответа).
                 // Если сервис уже выполнился (publish/mail), повторный retry задублирует side-эффект.
@@ -2260,9 +2515,25 @@ impl Node {
                 let jitter_ms = 50u64 + rand::random::<u64>() % 101;
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                 self.drop_conn(pid, Some(conn.stable_id())).await;
-                let (conn, key) = self.conn_with_session(&peer, pid).await?;
-                self.request_on(&conn, &pid, &key, &peer, svc, &payload, req_timeout_secs)
-                    .await
+                let retried = async {
+                    let (conn, key) = self.conn_with_session(&peer, pid).await?;
+                    self.request_on(&conn, &pid, &key, &peer, svc, &payload, req_timeout_secs)
+                        .await
+                }
+                .await;
+                match retried {
+                    Ok(r) => {
+                        self.peer_record_success(pid);
+                        Ok(r)
+                    }
+                    Err(e2) => {
+                        // Network error survived the fresh-connection retry:
+                        // one consecutive transport failure for the routing
+                        // score (3 in a row => evicted from DHT targets).
+                        self.peer_record_failure(pid);
+                        Err(e2)
+                    }
+                }
             }
         }
     }
@@ -2313,8 +2584,49 @@ impl Node {
                 let jitter_ms = 50u64 + rand::random::<u64>() % 101;
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                 self.drop_conn(pid, Some(conn.stable_id())).await;
-                let (conn, key) = self.conn_with_session(&peer, pid).await?;
-                self.send_frame_on(&conn, &pid, &key, svc, &payload).await
+                let retried = async {
+                    let (conn, key) = self.conn_with_session(&peer, pid).await?;
+                    self.send_frame_on(&conn, &pid, &key, svc, &payload).await
+                }
+                .await;
+                // Fire-and-forget success only proves the LOCAL write, so it
+                // must not clear a failure streak (same rule as the consensus
+                // health ledger); a failed retry is a real transport failure.
+                if retried.is_err() {
+                    self.peer_record_failure(pid);
+                }
+                match retried {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Mesh-down fallback for consensus-delivery frames:
+                        // the direct link failed twice, but a pubsub.msg is a
+                        // terminal delivery whose payload is self-contained.
+                        // Re-publish it through the overlay so a vote,
+                        // proposal or commit is not lost while the direct
+                        // mesh is degraded. (Only pubsub.msg: other services
+                        // expect a peer response and must keep failing.)
+                        if svc == "pubsub.msg" {
+                            if let Ok(v) =
+                                serde_json::from_slice::<serde_json::Value>(&payload)
+                            {
+                                if let (Some(topic), Some(data)) =
+                                    (v["topic"].as_str(), v["data"].as_str())
+                                {
+                                    let n = self.publish_overlay(topic, data).await;
+                                    if n > 0 {
+                                        eprintln!(
+                                            "[{}] overlay fallback delivered pubsub.msg for {} (direct link failed: {e})",
+                                            self.cfg.name,
+                                            hex::encode(&pid[..4])
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -3561,6 +3873,12 @@ impl Node {
             if Some(pid) == exclude {
                 continue;
             }
+            // A suspected-dead peer must not receive overlay fan-out: the
+            // broadcast would pay its handshake timeout on every publish.
+            // It stays explicitly dialable (mesh heartbeat / direct calls).
+            if !self.routing_target_allowed(&pid) {
+                continue;
+            }
             let node = self.clone();
             let payload = payload.clone();
             tokio::spawn(async move {
@@ -4235,12 +4553,21 @@ impl Node {
         self: &Arc<Self>,
         target: &[u8; NODEID_LEN],
     ) -> Vec<crate::dht::NodeInfo> {
-        // начальные кандидаты: routing table + конфигурированные пиры (bootstrap)
-        let mut candidates = self.routing.read().await.closest(target, crate::dht::K);
+        // начальные кандидаты: routing table + конфигурированные пиры (bootstrap).
+        // Suspected-dead peers are withheld: they are still dialable as an
+        // explicit destination, but never handed out as a DHT hop/target.
+        let mut candidates: Vec<crate::dht::NodeInfo> = self
+            .routing
+            .read()
+            .await
+            .closest(target, crate::dht::K)
+            .into_iter()
+            .filter(|n| self.routing_target_allowed(&n.id))
+            .collect();
         {
             let peers = self.peers.read().await;
             for (pid, p) in peers.iter() {
-                if *pid == self.id {
+                if *pid == self.id || !self.routing_target_allowed(pid) {
                     continue;
                 }
                 let info = crate::dht::NodeInfo {
@@ -4270,7 +4597,11 @@ impl Node {
         loop {
             let to_query: Vec<crate::dht::NodeInfo> = candidates
                 .iter()
-                .filter(|n| !queried.contains(&n.id) && n.id != self.id)
+                .filter(|n| {
+                    !queried.contains(&n.id)
+                        && n.id != self.id
+                        && self.routing_target_allowed(&n.id)
+                })
                 .take(crate::dht::ALPHA)
                 .cloned()
                 .collect();
@@ -4342,17 +4673,30 @@ impl Node {
                 break;
             }
         }
-        candidates.into_iter().filter(|n| n.id != self.id).collect()
+        candidates
+            .into_iter()
+            .filter(|n| n.id != self.id && self.routing_target_allowed(&n.id))
+            .collect()
     }
 
     /// Локальный взгляд на ближайшие к target ноды (без сетевых запросов).
     /// Используется для отчёта о распределении данных по нодам.
+    ///
+    /// Suspected-dead peers are excluded exactly like in `dht_find_node`:
+    /// this is the routing target set, not the dialable peer set.
     pub async fn dht_closest_local(&self, target: &[u8; NODEID_LEN]) -> Vec<crate::dht::NodeInfo> {
-        let mut candidates = self.routing.read().await.closest(target, crate::dht::K);
+        let mut candidates: Vec<crate::dht::NodeInfo> = self
+            .routing
+            .read()
+            .await
+            .closest(target, crate::dht::K)
+            .into_iter()
+            .filter(|n| self.routing_target_allowed(&n.id))
+            .collect();
         {
             let peers = self.peers.read().await;
             for (pid, p) in peers.iter() {
-                if *pid == self.id {
+                if *pid == self.id || !self.routing_target_allowed(pid) {
                     continue;
                 }
                 let info = crate::dht::NodeInfo {
@@ -4369,7 +4713,10 @@ impl Node {
         candidates.sort_by(|a, b| {
             crate::dht::xor_distance(&a.id, target).cmp(&crate::dht::xor_distance(&b.id, target))
         });
-        candidates.into_iter().filter(|n| n.id != self.id).collect()
+        candidates
+            .into_iter()
+            .filter(|n| n.id != self.id && self.routing_target_allowed(&n.id))
+            .collect()
     }
 
     async fn handle_dht_find_node(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
@@ -4387,7 +4734,16 @@ impl Node {
         };
         let mut target = [0u8; NODEID_LEN];
         target.copy_from_slice(&b);
-        let nodes = self.routing.read().await.closest(&target, crate::dht::K);
+        // Never advertise a suspected-dead peer: the requester would route
+        // through a hop we already know is not answering.
+        let nodes: Vec<crate::dht::NodeInfo> = self
+            .routing
+            .read()
+            .await
+            .closest(&target, crate::dht::K)
+            .into_iter()
+            .filter(|n| self.routing_target_allowed(&n.id))
+            .collect();
         let list: Vec<serde_json::Value> = nodes
             .iter()
             .map(|n| {
@@ -5452,6 +5808,59 @@ impl Node {
     pub async fn kv_remove_local(&self, key: &str) {
         self.kv.write().await.remove(key);
         self.mark_kv_dirty();
+    }
+
+    /// Force the in-memory KV to disk now.
+    ///
+    /// Long-running nodes flush on the 1 s dirty cycle; one-shot CLI commands
+    /// (storage-put/get) exit immediately, so they must flush explicitly or
+    /// the manifest they just wrote never reaches `kv.json`.
+    pub async fn flush_kv(&self) {
+        self.persist_kv().await;
+    }
+
+    /// Publish to a pubsub topic through the OVERLAY (DHT/gossip) path.
+    ///
+    /// This is the fallback when a direct validator-mesh link is down: the
+    /// message is delivered to local subscribers, then flooded to known peers
+    /// with a short TTL exactly like an inbound `pubsub.publish` would be.
+    /// It does not address a specific peer, so it keeps working while the
+    /// mesh is degraded (as long as some overlay hop is reachable).
+    ///
+    /// Returns the number of local subscribers the message was delivered to.
+    pub async fn publish_overlay(self: &Arc<Self>, topic: &str, data: &str) -> usize {
+        if !crate::proto::topic_ok(topic) || !crate::proto::pubsub_data_ok(data) {
+            return 0;
+        }
+        let msg_id = rand_u64();
+        let seq = self.next_topic_seq(topic).await;
+        let origin = self.id_hex.clone();
+        if self.mark_seen(msg_id).await {
+            return 0;
+        }
+        let n = self
+            .deliver_local(topic, data, msg_id, seq, &origin, None)
+            .await;
+        self.metrics
+            .msgs_delivered
+            .fetch_add(n as u64, Ordering::Relaxed);
+        // Short TTL: the overlay fallback only needs to reach the validators
+        // subscribed to this topic (one hop); retransmission is the consensus
+        // layer's job, not an unbounded flood.
+        self.forward(topic, data, msg_id, seq, &origin, 2, None)
+            .await;
+        n
+    }
+
+    /// Ensure a warm, session-backed connection to `pid` (mesh heartbeat).
+    ///
+    /// Uses the ordinary direct dial path (`request_to`), so identity
+    /// pinning, PQ handshake and circuit/score bookkeeping all apply. A
+    /// `core.ping` carries no side effects.
+    pub async fn warm_peer(self: &Arc<Self>, pid: [u8; NODEID_LEN]) -> Result<()> {
+        self.request_to(pid, "core.ping", b"{}".to_vec())
+            .await
+            .map(|_| ())
     }
 
     /// Удалить блоб из хранилища: манифест локально + удаление чанков на этой ноде

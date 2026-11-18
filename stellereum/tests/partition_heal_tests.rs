@@ -933,3 +933,112 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
         "the healed network converges on one state root"
     );
 }
+
+// ============================================================================
+// Partition heal is EVENT-DRIVEN (2026-11-18)
+// ============================================================================
+//
+// Healing used to depend on the periodic catch-up timer noticing that a peer
+// was ahead. After a partition the healed side pushes its next `Committed`
+// straight to every connected peer; the lagging side must react to THAT, not
+// to a timer tick. The real `node/policy.rs` is included by path.
+#[path = "../src/node/policy.rs"]
+#[allow(dead_code)]
+mod catchup_policy;
+
+mod heal_is_reactive {
+    use super::catchup_policy::{
+        catchup_action, inbound_names_ahead, node_is_at_tip, should_probe_dht_head, CatchupAction,
+        CATCHUP_INTERVAL_DEFAULT_MS, REACTIVE_CATCHUP_MIN_GAP_MS,
+    };
+    use stellereum::consensus::{QuorumCertificate, VoteKind};
+    use stellereum::consensus_net::ConsensusMsg;
+    use stellereum::sharding::Block;
+
+    /// The commit the healed side pushes: a block above the lagging side's tip.
+    fn healed_commit(our_tip: u64) -> ConsensusMsg {
+        let height = our_tip + 1;
+        let block = Block {
+            height,
+            prev_hash: [9u8; 32],
+            ..Default::default()
+        };
+        let hash = block.compute_hash();
+        ConsensusMsg::Committed {
+            height,
+            block,
+            certificate: QuorumCertificate {
+                height,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some(hash),
+                signatures: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_first_commit_after_a_partition_starts_catchup_without_the_timer() {
+        let our_tip = 500;
+        // Before the heal: partitioned and alone, no evidence, at our tip.
+        assert!(node_is_at_tip(our_tip, our_tip, Some(our_tip)));
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                true
+            ),
+            CatchupAction::SkipAtTip,
+            "an isolated node does not poll a DHT that cannot answer"
+        );
+
+        // The partition heals and the peer's first pushed commit arrives.
+        let msg = healed_commit(our_tip);
+        assert_eq!(inbound_names_ahead(our_tip, &msg), Some(our_tip + 1));
+        // Not at the tip any more, and the attempt needs no timer wait: one
+        // reactive floor after the last attempt is enough.
+        assert!(!node_is_at_tip(our_tip, our_tip + 1, Some(our_tip + 1)));
+        assert_eq!(
+            catchup_action(
+                true,
+                REACTIVE_CATCHUP_MIN_GAP_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run
+        );
+        // The pushed block names the head, so the walk starts from it instead
+        // of spending a DHT head query.
+        assert!(!should_probe_dht_head(
+            our_tip,
+            Some((our_tip + 1, [9u8; 32]))
+        ));
+    }
+
+    #[test]
+    fn a_stale_peer_hint_does_not_keep_the_node_off_catchup() {
+        // A hint at/below our tip is NOT evidence of being behind; the next
+        // backstop tick is skipped rather than polling for a phantom gap.
+        assert!(node_is_at_tip(500, 500, Some(499)));
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                true
+            ),
+            CatchupAction::SkipAtTip
+        );
+        // A REAL gap keeps the backstop alive as a safety net.
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run
+        );
+    }
+}

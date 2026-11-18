@@ -127,14 +127,23 @@ pub const XPC_PREPARE_TIMEOUT_HEIGHTS: u64 = 64;
 
 /// The chain-spec activation height of the cross-shard 2PC.
 ///
-/// FROZEN SENTINEL: `u64::MAX` (reported as `GatedOff` by
-/// [`crate::chain_spec`]) keeps the public protocol on the legacy one-way
-/// flow. This constant — and only this constant — is the production source of
+/// ACTIVE FROM GENESIS (`0`): every cross-shard transfer produced at height
+/// `0` or later uses prepare/vote/commit, so a fresh chain never publishes a
+/// value transfer through the legacy one-way flow. That flow is still
+/// REFUSED at the target's credit gate (XSHARD-01: a one-step message cannot
+/// prove the source-side escrow), which is why the atomic path must be the
+/// only path new value can take. Transfers produced BEFORE the activation
+/// height (relevant when this binary upgrades an existing chain) keep running
+/// the legacy outbox/inbox/ack/bounce flow to completion; the two flows never
+/// interleave on one transfer.
+///
+/// This constant — and only this constant — is the production source of
 /// [`XpcActivation`] (see [`XpcActivation::from_chain_spec`]): the protocol
 /// freeze forbids env-driven protocol switches, so an operator variable can
-/// never arm the 2PC on a running chain. Flipping it is a protocol change and
+/// never arm the 2PC on a running chain, and every node derives the same
+/// boundary from the same compiled value. Flipping it is a protocol change and
 /// ships together with this gate in a release.
-pub const XPC_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const XPC_ACTIVATION_HEIGHT: u64 = 0;
 
 /// The phase of one 2PC transfer, as recorded by the shard that owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -315,13 +324,15 @@ impl Default for XpcActivation {
 
 impl XpcActivation {
     /// The PRODUCTION switch: derived from the compile-time chain spec gate
-    /// [`XPC_ACTIVATION_HEIGHT`].
+    /// [`XPC_ACTIVATION_HEIGHT`]. The shipped value is `0` (active from
+    /// genesis), so a fresh chain arms the 2PC from its first block.
     ///
-    /// `u64::MAX` is the frozen "off" sentinel and maps to [`Self::Disabled`]
-    /// — never to `FromHeight(u64::MAX)`, which would report a boundary at the
-    /// last representable height and let a node treat the gate as "armed".
-    /// This constructor is the ONLY production source of the switch; test
-    /// code may build [`Self::FromHeight`] directly to exercise the boundary.
+    /// `u64::MAX` remains the explicit "off" sentinel and maps to
+    /// [`Self::Disabled`] — never to `FromHeight(u64::MAX)`, which would
+    /// report a boundary at the last representable height and let a node treat
+    /// the gate as "armed". This constructor is the ONLY production source of
+    /// the switch; test code may build [`Self::FromHeight`] directly to
+    /// exercise the boundary.
     pub const fn from_chain_spec() -> Self {
         if XPC_ACTIVATION_HEIGHT == u64::MAX {
             XpcActivation::Disabled
@@ -893,13 +904,22 @@ mod tests {
 
     #[test]
     fn the_activation_gate_comes_from_the_chain_spec() {
-        // The frozen sentinel is the ONLY production source of the switch.
-        assert_eq!(XPC_ACTIVATION_HEIGHT, u64::MAX);
-        assert_eq!(XpcActivation::from_chain_spec(), XpcActivation::Disabled);
+        // The compiled chain-spec constant is the ONLY production source of
+        // the switch. It arms the 2PC from genesis, so no value transfer on a
+        // fresh chain can take the legacy one-way flow.
+        assert_eq!(XPC_ACTIVATION_HEIGHT, 0);
+        assert_eq!(
+            XpcActivation::from_chain_spec(),
+            XpcActivation::FromHeight(0)
+        );
         assert_eq!(XpcActivation::default(), XpcActivation::from_chain_spec());
-        assert_eq!(XpcActivation::from_chain_spec().boundary(), None);
-        assert!(!XpcActivation::from_chain_spec().is_active_at(0));
-        assert!(!XpcActivation::from_chain_spec().is_active_at(u64::MAX));
+        assert_eq!(XpcActivation::from_chain_spec().boundary(), Some(0));
+        assert!(XpcActivation::from_chain_spec().is_active_at(0));
+        assert!(XpcActivation::from_chain_spec().is_active_at(u64::MAX));
+        // The explicit off switch still means off at every height; only the
+        // chain spec (0 above) arms the protocol.
+        assert!(!XpcActivation::Disabled.is_active_at(0));
+        assert!(!XpcActivation::Disabled.is_active_at(u64::MAX));
     }
 
     #[test]

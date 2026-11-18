@@ -3085,7 +3085,11 @@ async fn mail_attachment_save(
         }
     }
     let blob_name = file_blob_key(&email, &final_name);
-    st.node.store_blob("files", &blob_name, &data).await;
+    // Owner-sealed: files are sealed to the account's derived owner key, so
+    // storage/replica nodes cannot read the plaintext.
+    st.node
+        .store_blob_boxed("files", &blob_name, &data, Some(&file_owner_ek(&st.node, &email)))
+        .await;
     list.push(json!({ "name": final_name, "size": data.len(), "at": proto::now_ms() }));
     kv_set(
         &st.node,
@@ -5105,6 +5109,58 @@ fn file_blob_key(email: &str, name: &str) -> String {
     format!("file:{email}:{}", hex::encode(h.as_bytes()))
 }
 
+/// Per-account owner ML-KEM seed for Files blobs.
+///
+/// The web backend never holds the account's transport/KEM secret, so Files
+/// are sealed to an owner key DERIVED here: `blake3_xof(node KEM seed ||
+/// account email)` domain-separated by `infmail-files-owner-v1`. Properties:
+/// * deterministic across restarts and index rebuilds on the same node;
+/// * different accounts get different keys (one account's blob cannot be
+///   opened by another account's web session);
+/// * storage/replica nodes only ever see the sealed manifest (no plaintext
+///   data key), exactly like the owner-sealed mail envelope path.
+fn file_owner_seed(node: &Node, email: &str) -> [u8; infnode::mailbox::KEM_SEED_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"infmail-files-owner-v1");
+    hasher.update(&node.keys.kem_seed);
+    hasher.update(email.as_bytes());
+    let mut seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
+    hasher.finalize_xof().fill(&mut seed);
+    seed
+}
+
+/// Owner encapsulation key (hex) for Files blobs of `email`.
+fn file_owner_ek(node: &Node, email: &str) -> String {
+    hex::encode(infnode::mailbox::kem_ek_from_seed(&file_owner_seed(
+        node, email,
+    )))
+}
+
+/// Owner seed (hex, secret) used to open Files blobs of `email`.
+fn file_owner_key(node: &Node, email: &str) -> String {
+    hex::encode(file_owner_seed(node, email))
+}
+
+/// Fetch a Files blob with the owner key, falling back to the legacy
+/// unsealed manifest for files stored before this wiring.
+async fn fetch_file_blob(node: &Arc<Node>, email: &str, name: &str) -> Option<Vec<u8>> {
+    let blob_name = file_blob_key(email, name);
+    match node
+        .fetch_blob_owner("files", &blob_name, &file_owner_key(node, email))
+        .await
+    {
+        Some(v) => Some(v),
+        None => match node.fetch_blob("files", &blob_name).await {
+            Some(v) => Some(v),
+            None => {
+                // raw-name layout (files before folders existed)
+                node.fetch_blob("files", &format!("file:{email}:{name}"))
+                    .await
+            }
+        },
+    }
+}
+
 fn file_index_key(email: &str) -> String {
     format!("files:{email}")
 }
@@ -5199,7 +5255,30 @@ async fn files_upload(
         save_db(&st.db_path, &db).await;
     }
     let blob_name = file_blob_key(&email, &req.name);
-    st.node.store_blob("files", &blob_name, &data).await;
+    // Owner-sealed upload (account-derived owner key; see file_owner_seed).
+    let stored = st
+        .node
+        .store_blob_boxed(
+            "files",
+            &blob_name,
+            &data,
+            Some(&file_owner_ek(&st.node, &email)),
+        )
+        .await;
+    // An empty blob (folder `.keep`) legitimately has zero chunks; only a
+    // missing manifest means the owner-key seal was refused.
+    if stored == 0
+        && st
+            .node
+            .get_local_kv(&Node::blob_manifest_key("files", &blob_name))
+            .await
+            .is_none()
+    {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file seal failed (owner key refused by storage)",
+        );
+    }
     // индекс файлов владельца
     let ikey = file_index_key(&email);
     let mut list = files_index(&st.node, &email).await;
@@ -5229,19 +5308,20 @@ async fn files_download(
     let blob_name = file_blob_key(&email, &name);
     // web-путь: файл юзера живёт на нодах (репликация f:*) — fetch_blob сам сделает
     // DHT-fallback манифеста и чанков, если локально нет (не только локальный манифест).
-    match st.node.fetch_blob("files", &blob_name).await {
+    // Owner-key fetch: the manifest is sealed to the account's derived key.
+    match st
+        .node
+        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &email))
+        .await
+    {
         Some(data) => ok_json(json!({
             "name": name,
             "size": data.len(),
             "data": base64::engine::general_purpose::STANDARD.encode(&data),
         })),
         None => {
-            // обратная совместимость: старые файлы до папок хранились с raw-именем
-            if let Some(data) = st
-                .node
-                .fetch_blob("files", &format!("file:{email}:{name}"))
-                .await
-            {
+            // backward compatibility: legacy unsealed / raw-name files
+            if let Some(data) = fetch_file_blob(&st.node, &email, &name).await {
                 ok_json(json!({
                     "name": name,
                     "size": data.len(),
@@ -5269,7 +5349,12 @@ async fn files_share_create(
     }
     // проверяем, что файл реально существует (владелец)
     let blob_name = file_blob_key(&email, &name);
-    let has = st.node.fetch_blob("files", &blob_name).await.is_some()
+    let has = st
+        .node
+        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &email))
+        .await
+        .is_some()
+        || st.node.fetch_blob("files", &blob_name).await.is_some()
         || st
             .node
             .fetch_blob("files", &format!("file:{email}:{name}"))
@@ -5373,13 +5458,13 @@ async fn files_share_download(State(st): State<WebState>, Path(token): Path<Stri
         return err_json(StatusCode::NOT_FOUND, "invalid link");
     }
     let blob_name = file_blob_key(&owner, &name);
-    let data = match st.node.fetch_blob("files", &blob_name).await {
+    let data = match st
+        .node
+        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &owner))
+        .await
+    {
         Some(d) => Some(d),
-        None => {
-            st.node
-                .fetch_blob("files", &format!("file:{owner}:{name}"))
-                .await
-        }
+        None => fetch_file_blob(&st.node, &owner, &name).await,
     };
     match data {
         Some(data) => ok_json(json!({

@@ -928,18 +928,37 @@ pub(crate) async fn run_consensus_node(
     // requirement: publishing is idempotent and content-addressed.
     let mut retro_published_upto: u64 = 0;
     let mut last_retro_publish: std::time::Instant = std::time::Instant::now();
-    // How often to ask the network whether we are behind. Cheap but not free,
-    // so it is throttled rather than run every tick. Env is read once here,
-    // like `round_timeout`/`min_block_time` above.
+    // How often to ask the network whether we are behind. This is now the
+    // BACKSTOP only (default 30 s, was 2 s): the primary path is REACTIVE —
+    // a verified peer message / head pointer naming a height above ours
+    // schedules the attempt on the next tick. See `catchup_action` in policy.
     let catchup_interval = catchup_interval();
     let retro_publish_interval = retro_publish_interval();
     let mut last_catchup: std::time::Instant = std::time::Instant::now() - catchup_interval;
+    // Reactive catch-up latch: set by the drain when a VERIFIED peer message
+    // (Committed / Proposal / Vote) names a height above ours. Consumed at the
+    // next tick top, so a lagging peer reacts to the push instead of waiting
+    // out `catchup_interval`. Survives ticks where the attempt could not run
+    // (apply in flight, live-adopt deferral) by being re-armed below.
+    let mut catchup_pending = false;
+    // Tallest height that VERIFIED peer traffic proves FINALIZED (a commit's
+    // height, or a proposal/vote height minus one — a peer building/voting at
+    // H has decided H-1). Together with `rt.peer_hint` it answers "is any peer
+    // known to be ahead?" — the at-tip test that keeps an in-sync node from
+    // polling the DHT on the backstop timer. Compared against our tip, so it
+    // self-heals as we advance; never reset by hand.
+    let mut peer_named_height: u64 = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    // Backstop ticks skipped because we were at the tip (visibility only).
+    let mut catchup_at_tip_skips: u64 = 0;
     // Freshness of the LIVE adopt flow: stamped on every successful parent-match
     // `adopt_committed` in the drain below. Starts stale so the first intervals
     // behave exactly as before until live flow proves itself. Compared against
-    // `catchup_interval`: at chain tempo the next Committed lands well within
-    // one interval, so a fresh stamp means "the DHT machine has nothing to add".
-    let mut last_live_adopt: std::time::Instant = std::time::Instant::now() - catchup_interval;
+    // `LIVE_ADOPT_FRESH_MS` (2 s — deliberately NOT the 30 s backstop interval):
+    // at chain tempo the next Committed lands well within it, so a fresh stamp
+    // means "the DHT machine has nothing to add".
+    let live_adopt_fresh_window = std::time::Duration::from_millis(LIVE_ADOPT_FRESH_MS);
+    let mut last_live_adopt: std::time::Instant =
+        std::time::Instant::now() - live_adopt_fresh_window;
     // Dead-peer retro-spin gate (local, zero new APIs): the last wall-clock
     // instant ANY parseable consensus message (vote/proposal/commit/batch)
     // arrived, plus the finalized tip as of the last retro pass. While the tip
@@ -1124,11 +1143,11 @@ pub(crate) async fn run_consensus_node(
             votes_seen_height = rt.hc.height;
             votes_seen_voters.clear();
         }
-        // Set when this tick observes VERIFIED evidence of a peer ahead of us
-        // (a signature+member-checked vote, or a signature-checked proposal,
-        // for a future height). Consumed after the drain to run catch-up on
-        // the next tick instead of waiting out the catch-up interval.
-        let mut catchup_due = false;
+        // Reactive evidence latched by the previous tick's drain: a VERIFIED
+        // Committed/Proposal/Vote named a height above ours, or a peer head
+        // pointer did. Consumed here so the attempt runs on THIS tick — never
+        // waiting out the backstop interval.
+        let reactive_catchup_due = std::mem::take(&mut catchup_pending);
         let height = rt.hc.height;
         let round = rt.hc.round;
 
@@ -1202,7 +1221,7 @@ pub(crate) async fn run_consensus_node(
                 .peer_hint
                 .map(|(ph, _)| ph.saturating_sub(our_tip))
                 .unwrap_or(0);
-            let live_adopt_fresh = last_live_adopt.elapsed() < catchup_interval;
+            let live_adopt_fresh = last_live_adopt.elapsed() < live_adopt_fresh_window;
             // Never defer catchup if we have stalled into round > 0 or haven't adopted
             // recently. Deferring during a round stall causes a permanent deadlock where
             // peers wait for our vote at H+1 while we defer catchup of H because of peer traffic.
@@ -1216,17 +1235,36 @@ pub(crate) async fn run_consensus_node(
                 )
             }
         };
-        if last_catchup.elapsed() >= catchup_interval && !rt.has_pending_apply() && !defer_for_live
-        {
+        // Event-driven decision (`policy::catchup_action`): reactive evidence
+        // runs NOW; the periodic timer is only a backstop and is SKIPPED
+        // entirely when no peer is known to be ahead (at-tip), so an in-sync
+        // node does not poll the DHT at all.
+        let our_tip_now = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        let at_tip = node_is_at_tip(our_tip_now, peer_named_height, rt.peer_hint.map(|(h, _)| h));
+        let catchup_decision = catchup_action(
+            reactive_catchup_due,
+            last_catchup.elapsed().as_millis() as u64,
+            catchup_interval.as_millis() as u64,
+            at_tip,
+        );
+        if catchup_decision == CatchupAction::SkipAtTip {
+            // At the tip: nothing to fetch. Do NOT spend a DHT round trip
+            // (the blind query is the part that burns the tick on a dead
+            // peer); the next reactive message re-arms catch-up.
+            last_catchup = std::time::Instant::now();
+            catchup_at_tip_skips += 1;
+            if catchup_at_tip_skips.is_multiple_of(20) {
+                tracing::debug!(
+                    "[sync] backstop catch-up skipped at the tip #{our_tip_now} \
+                     ({catchup_at_tip_skips} skips): no peer known to be ahead, no DHT probe"
+                );
+            }
+        }
+        if catchup_decision == CatchupAction::Run && !rt.has_pending_apply() && !defer_for_live {
             catchup_ran = true;
             last_catchup = std::time::Instant::now();
             let split_catchup_t0 = std::time::Instant::now();
-            let catchup_budget = std::time::Duration::from_millis(
-                std::env::var("STELL_CATCHUP_BUDGET_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(250),
-            );
+            let catchup_budget = catchup_budget();
             let caught = tokio::time::timeout(
                 catchup_budget,
                 try_catch_up(&adapter, &mut rt, block_shard, persistence.as_ref(), &rpc),
@@ -1308,6 +1346,12 @@ pub(crate) async fn run_consensus_node(
             catchup_ms = split_catchup_t0.elapsed().as_millis() as u64;
             split_catchup_ms += catchup_ms;
             split_catchup_n += 1;
+        } else if reactive_catchup_due {
+            // A verified peer told us it is ahead, but the attempt could not
+            // run this tick (apply in flight / live adopt deferral). KEEP the
+            // event latched so the next tick retries — dropping it would put
+            // the node back on the 30 s backstop.
+            catchup_pending = true;
         }
 
         // Periodically push our own history so a peer behind us has something to
@@ -2087,6 +2131,11 @@ pub(crate) async fn run_consensus_node(
                     ) {
                         last_consensus_rx_ms = liveness_alarm::now_ms();
                     }
+                    // Event-driven catch-up: a message that NAMES a height above
+                    // ours is potential "peer is ahead" evidence. It is acted on
+                    // only AFTER the arm's own verification (QC / proposer
+                    // signature / vote signature) — never on the raw claim.
+                    let named_ahead = inbound_names_ahead(rt.hc.height, &msg);
                     let is_catchup = matches!(msg, ConsensusMsg::Committed { .. });
                     if is_catchup {
                         // VERIFICATION F2-hardening: Committed bypasses the
@@ -2208,6 +2257,19 @@ pub(crate) async fn run_consensus_node(
                             let proposer = block.proposer;
                             let height = block.height;
                             let round_of_block = r;
+                            // Signature + membership check, computed ONLY when a
+                            // consumer below needs it (a future proposal, the
+                            // H+1 parent hint, or a behind peer). A proposal at
+                            // OUR height is verified inside `on_proposal`, so
+                            // the normal path pays no extra Falcon verification.
+                            let needs_attribution = named_ahead.is_some()
+                                || height < rt.hc.height
+                                || (height == rt.hc.height + 1 && !rt.has_pending_apply());
+                            let proposal_admissible = !needs_attribution
+                                || stellereum::consensus_net::proposal_hint_admissible(
+                                    &block,
+                                    &rt.validators,
+                                );
                             // Height-ahead deferral: peer finalized and proposed for H+1 while
                             // we are still applying H (or in tick transition). Defer instead of
                             // dropping, so H+1 proposals execute immediately on the next tick!
@@ -2227,16 +2289,13 @@ pub(crate) async fn run_consensus_node(
                                     // so try_catch_up can pull block H without waiting.
                                     //
                                     // VERIFICATION G1: the hint forces the
-                                    // catch-up timer every tick, so it must be
+                                    // catch-up machine to run, so it must be
                                     // attributable — only a proposal with a valid
                                     // proposer signature from a staked member
                                     // plants it. A forged H+1 proposal previously
                                     // set this before any verification, keeping
                                     // the node on loudly-failing DHT walks.
-                                    if stellereum::consensus_net::proposal_hint_admissible(
-                                        &block,
-                                        &rt.validators,
-                                    ) {
+                                    if proposal_admissible {
                                         let h = (block.height - 1, block.prev_hash);
                                         if rt.peer_hint.map(|(ph, _)| ph < h.0).unwrap_or(true) {
                                             rt.peer_hint = Some(h);
@@ -2244,16 +2303,26 @@ pub(crate) async fn run_consensus_node(
                                     }
                                 }
                             }
-                            // Behind-peer retro gate: a VERIFIED proposal (signature
-                            // + membership) from below our height proves a lagging
-                            // peer is talking — the only consumer a retro push can
-                            // serve. Stamped BEFORE any refusal below (wrong
-                            // proposer/round still proves liveness); forgeries never
-                            // land here (unverified).
-                            if height < rt.hc.height
-                                && stellereum::consensus::verify_proposer_signature(&block)
-                                && rt.validators.power_of(&proposer) != 0
-                            {
+                            // REACTIVE CATCH-UP TRIGGER (proposal): a VERIFIED
+                            // proposal for a height above ours proves its author
+                            // advanced ahead of us (it is building where we have
+                            // not arrived). Same admissibility verdict as the
+                            // parent hint above, so a forged far-ahead proposal
+                            // can never drive DHT work. The latch is consumed at
+                            // the NEXT tick top, not on the backstop timer.
+                            if named_ahead.is_some() && proposal_admissible {
+                                // A proposal AT height H says the author's
+                                // FINALIZED tip is at least H-1 (the parent it
+                                // builds on) — that is the at-tip evidence.
+                                peer_named_height = peer_named_height.max(height.saturating_sub(1));
+                                catchup_pending = true;
+                                stellereum::rpc::note_peer_height(height);
+                            }
+                            // Behind-peer retro gate: a VERIFIED proposal
+                            // (signature + membership) from below our height
+                            // proves a lagging peer is talking — the only
+                            // consumer a retro push can serve.
+                            if height < rt.hc.height && proposal_admissible {
                                 last_behind_peer_seen = Some(std::time::Instant::now());
                             }
                             match rt.on_proposal(proposer, block, round_of_block).await {
@@ -2353,7 +2422,15 @@ pub(crate) async fn run_consensus_node(
                                 VoteKind::Prevote => rt.on_prevote(v).is_ok(),
                                 VoteKind::Precommit => rt.on_precommit(v).is_ok(),
                             };
+                            // Falcon verification is the expensive part and the
+                            // refusal branches below only need the VERDICT:
+                            // signature plus staked membership. ACCEPTED votes
+                            // were already verified inside
+                            // `on_prevote`/`on_precommit`, so this runs on the
+                            // refusal path only (unchanged cost profile).
                             if !accepted {
+                                let vote_verified =
+                                    vcopy.verify() && rt.validators.power_of(&vcopy.voter) != 0;
                                 // Scope/signature failure: the vote does NOT count
                                 // toward any quorum. BUT a verified same-height
                                 // vote still feeds the peer-round counter
@@ -2364,10 +2441,7 @@ pub(crate) async fn run_consensus_node(
                                 // is, and dropping it is what wedged A r1550 vs
                                 // B r318 forever (live 2026-10-14). Only verified
                                 // votes update liveness/timer state here.
-                                if vh == rt.hc.height
-                                    && vcopy.verify()
-                                    && rt.validators.power_of(&vcopy.voter) != 0
-                                {
+                                if vh == rt.hc.height && vote_verified {
                                     // Verified same-height vote (down-proposer
                                     // fast timeout): the voter is provably alive
                                     // right now, even though this vote itself is
@@ -2378,16 +2452,25 @@ pub(crate) async fn run_consensus_node(
                                         round_started = std::time::Instant::now();
                                     }
                                 }
+                                // REACTIVE CATCH-UP TRIGGER (vote): a verified
+                                // vote at a height above ours proves the voter's
+                                // chain is ahead — it is voting where we have not
+                                // arrived. Signature + membership checked, so an
+                                // unverified claim never drives DHT work.
+                                if named_ahead.is_some() && vote_verified {
+                                    // A vote AT height H says the voter has
+                                    // decided H-1 at least — at-tip evidence.
+                                    peer_named_height = peer_named_height.max(vh.saturating_sub(1));
+                                    catchup_pending = true;
+                                    stellereum::rpc::note_peer_height(vh);
+                                }
                                 // Behind-peer retro gate: a VERIFIED vote from
                                 // below our height proves a lagging peer is
                                 // talking — the only consumer a retro push can
                                 // serve. Forged votes never land here (unverified),
                                 // so an attacker cannot wake retro — worst case a
                                 // real behind peer keeps it awake.
-                                if vh < rt.hc.height
-                                    && vcopy.verify()
-                                    && rt.validators.power_of(&vcopy.voter) != 0
-                                {
+                                if vh < rt.hc.height && vote_verified {
                                     last_behind_peer_seen = Some(std::time::Instant::now());
                                 }
                                 continue;
@@ -2407,11 +2490,15 @@ pub(crate) async fn run_consensus_node(
                             if vh < rt.hc.height {
                                 last_behind_peer_seen = Some(std::time::Instant::now());
                             }
-                            // Flag it; the post-drain block forces the catch-up
-                            // timer instead of waiting out the catch-up interval while
-                            // we burn view changes collecting "wrong height".
-                            if vh > rt.hc.height {
-                                catchup_due = true;
+                            // REACTIVE CATCH-UP TRIGGER (vote): an ACCEPTED vote
+                            // for a height above ours is attributable evidence
+                            // that the network moved on. Latch it; the next tick
+                            // top runs the catch-up instead of waiting out the
+                            // backstop interval while we burn view changes
+                            // collecting "wrong height".
+                            if named_ahead.is_some() {
+                                peer_named_height = peer_named_height.max(vh.saturating_sub(1));
+                                catchup_pending = true;
                                 stellereum::rpc::note_peer_height(vh);
                             }
                             // A nil prevote carrying the sender's locked hash is a
@@ -2459,6 +2546,52 @@ pub(crate) async fn run_consensus_node(
                             block,
                             certificate,
                         } => {
+                            // PUSH-BASED PROPAGATION, receive side: a commit for
+                            // a height ABOVE ours is peer evidence that the
+                            // network finalized ahead of us. It cannot be adopted
+                            // in place (`adopt_committed` requires OUR exact next
+                            // height), so schedule catch-up NOW — reacting to the
+                            // push is the whole point; waiting for the backstop
+                            // timer is what stranded lagging nodes.
+                            //
+                            // ATTRIBUTION: only a commit whose certificate is a
+                            // precommit quorum for THIS height and block, under
+                            // the validator set in force at that height, may
+                            // drive DHT work (and plant the head hint). A forged
+                            // far-ahead commit is ignored here.
+                            //
+                            // "Above ours" is measured against our FINALIZED TIP,
+                            // not `hc.height`: a commit for the height we are
+                            // currently voting on is still one block ahead of what
+                            // we have decided (and adopt refuses it when it does
+                            // not extend our tip — the refusal must not strand
+                            // us on the backstop timer).
+                            let our_tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                            if height > our_tip {
+                                let block_hash = block.compute_hash();
+                                let proven = certificate.kind == VoteKind::Precommit
+                                    && certificate.height == height
+                                    && certificate.block_hash == Some(block_hash)
+                                    && certificate.verify_with_schedule(
+                                        &rt.validator_set_for_height(height),
+                                        rt.committee_schedule_at(height),
+                                    );
+                                if proven {
+                                    peer_named_height = peer_named_height.max(height);
+                                    if rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true) {
+                                        rt.peer_hint = Some((height, block_hash));
+                                    }
+                                    catchup_pending = true;
+                                    stellereum::rpc::note_peer_height(height);
+                                    info!(
+                                        "[sync][push] peer committed #{height} ahead of our tip #{our_tip}: catch-up scheduled for the next tick"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "[sync][push] ignoring commit at #{height} above our tip #{our_tip}: certificate does not prove it"
+                                    );
+                                }
+                            }
                             // §7 Phase 2: adopting means executing, and the worker
                             // is still applying the decided height. The message is
                             // dropped, not queued: the peer rebroadcasts the commit
@@ -2616,26 +2749,27 @@ pub(crate) async fn run_consensus_node(
             }
         }
 
-        // Verified-only catch-up fast path (round efficiency, no safety
-        // change): `catchup_due` is set only by votes that passed signature +
-        // membership + scope checks, and `peer_hint` is written only after
-        // `verify_proposer_signature` — so a future height here is
-        // attributable evidence that a peer finalized ahead of us, never an
-        // unverified claim. Without this the loop waits up to
-        // catch-up interval (2s default) while burning view changes at a stale height
-        // and collecting "wrong height" rejects (154 view changes/10min
-        // live). Forcing the timer runs the check on the next tick; the walk
-        // itself still verifies the full chain (QC per height, anchored on
-        // our finalized head), so a false hint costs at most one
-        // loudly-failing walk.
-        if catchup_due
-            || rt
-                .peer_hint
-                .is_some_and(|(ph, _)| ph > rt.finalized.last().map(|(h, _)| *h).unwrap_or(0))
+        // EVENT-DRIVEN CATCH-UP latch (round efficiency, no safety change):
+        // the drain sets `catchup_pending` only on VERIFIED evidence that a
+        // peer is ahead — a commit whose precommit quorum proves it, a
+        // proposal that passed the proposer signature + membership check, a
+        // vote that passed signature + membership (with or without joining a
+        // quorum), or a peer head hint above our tip. The next tick top
+        // consumes it (see `catchup_action`) and runs the attempt immediately,
+        // instead of waiting out the backstop interval while burning view
+        // changes at a stale height collecting "wrong height" rejects (154
+        // view changes/10min live). The walk itself still verifies the full
+        // chain (QC per height, anchored on our finalized head), so a false
+        // hint costs at most one loudly-failing walk.
+        //
+        // A peer_hint above our tip is PERSISTENT evidence: keep the latch
+        // armed so a node that stays behind retries (paced by
+        // `REACTIVE_CATCHUP_MIN_GAP_MS`), never the timer.
+        if rt
+            .peer_hint
+            .is_some_and(|(ph, _)| ph > rt.finalized.last().map(|(h, _)| *h).unwrap_or(0))
         {
-            last_catchup = std::time::Instant::now()
-                .checked_sub(catchup_interval)
-                .unwrap_or(std::time::Instant::now());
+            catchup_pending = true;
         }
 
         // 4. precommit once a prevote quorum exists
@@ -2803,19 +2937,16 @@ pub(crate) async fn run_consensus_node(
             // `omits the downtime evidence` view-change stalls.
             if let Some((dh, block, certificate)) = rt.last_decision.clone() {
                 if dh == height {
-                    // P3-H4: commits enqueue then force-flush so lagging peers
-                    // learn the outcome on this tick, not the next window.
-                    enqueue_outbox(
-                        &mut outbox,
-                        ConsensusMsg::Committed {
-                            height,
-                            block,
-                            certificate,
-                        },
-                    );
-                    flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-                    outbox_flushes += 1;
-                    last_flush = std::time::Instant::now();
+                    // PUSH-BASED PROPAGATION (Task 1): the commit goes to
+                    // EVERY directly connected validator peer NOW, on its own
+                    // detached task — not through the batched outbox FIFO,
+                    // where it could queue behind votes/proposals behind a
+                    // slow peer, and not via the DHT, where a lagging peer
+                    // would only see it on its next poll. `ConsensusNetwork`
+                    // delivers `pubsub.msg` per peer concurrently and logs
+                    // every outcome; the DHT publication below (head pointer,
+                    // body, header) is unchanged and remains the slow path.
+                    spawn_committed_push(&net, height, block, certificate);
                 }
             }
             // Publish the finalized block to the RPC/explorer height + feed, and

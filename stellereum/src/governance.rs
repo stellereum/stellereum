@@ -122,6 +122,70 @@ pub fn upgrade_exec_active_at(height: u64) -> bool {
     height >= upgrade_exec_activation_height()
 }
 
+/// Activation height for BLOCK-CARRIED governance: the propose/vote opcode
+/// scan (`InMemoryStateEngine::apply_gov_ops`) and the deterministic
+/// finalize+execute sweep (`InMemoryStateEngine::apply_governance_transition`).
+///
+/// CHOICE: `0` — active from genesis. Rationale:
+///  * this repository has no deployed mainnet to migrate (the chain is new:
+///    the governance executor and the block carrier are both being switched
+///    on before launch), so there is no historical block whose verdict would
+///    change retroactively;
+///  * block-carried governance is the ONLY way a multi-validator network can
+///    change a parameter: the direct RPC form is refused on N>1 by design
+///    (it would fork), so leaving this inert would leave every real network
+///    with static parameters forever;
+///  * `0` is a plain compile-time constant, identical on every node, so every
+///    node applying the same block reaches the same verdict. It is NEVER an
+///    env knob (an env knob is a per-node fork window).
+///
+/// The gate covers proposals, votes, deterministic finalization and the
+/// execution of every `GovAction`. `SoftwareUpgrade`/`CancelUpgrade` execute
+/// only when their own coordinated [`UPGRADE_EXEC_ACTIVATION_HEIGHT`] gate is
+/// also open: a binary rollout is a heavier, separately ratified decision and
+/// must never ride in on a parameter-change activation.
+///
+/// Tests can force a closed gate per thread through
+/// [`set_gov_ops_activation_override`] (debug builds only, the
+/// `QC_SPLIT_ACTIVATION_HEIGHT` pattern). Release builds have no override.
+pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = 0;
+
+// TEST-ONLY override of the block-carried governance activation height,
+// scoped to the CALLING THREAD (same pattern as
+// `UPGRADE_EXEC_ACTIVATION_OVERRIDE` above). The frozen constant stays `0`;
+// an override exists so tests can still pin the pre-activation no-op without
+// changing process-wide state while other tests run in parallel.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static GOV_OPS_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY block-carried governance
+/// activation height for the CALLING THREAD. Available in test/debug builds
+/// only; release builds always use [`GOV_OPS_ACTIVATION_HEIGHT`].
+#[cfg(any(test, debug_assertions))]
+pub fn set_gov_ops_activation_override(activation: Option<u64>) {
+    GOV_OPS_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// The block-carried governance activation height in force for the calling
+/// thread: the frozen [`GOV_OPS_ACTIVATION_HEIGHT`] unless a test/debug
+/// caller installed [`set_gov_ops_activation_override`].
+pub fn gov_ops_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(activation) = GOV_OPS_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return activation;
+    }
+    GOV_OPS_ACTIVATION_HEIGHT
+}
+
+/// True once block-carried governance is active at `height` (`>=` semantic:
+/// the first block at the ratified height applies).
+pub fn gov_ops_active_at(height: u64) -> bool {
+    height >= gov_ops_activation_height()
+}
+
 /// The executor identity the deterministic sweep passes to
 /// [`Governance::execute_at_height`].
 ///
@@ -987,9 +1051,13 @@ pub struct AppliedParams {
 ///
 /// Arm it ONLY when you accept that a local-only governance mutation is NOT
 /// replicated: every peer that never saw the write derives a different state
-/// root, i.e. the chain forks. Full block-carried governance (proposals as
-/// transactions, voted in blocks) is a separate project; until it lands,
-/// multi-node writes stay refused by default.
+/// root, i.e. the chain forks. The supported way to govern a multi-validator
+/// network is the BLOCK-CARRIED path: build a transaction carrying
+/// `SysCallGovPropose` / `SysCallGovVote`
+/// ([`Governance::gov_propose_tx`] / [`Governance::gov_vote_tx`]), submit it
+/// through normal admission, and let every node apply the same block. This
+/// escape hatch applies ONLY to the legacy direct-ledger-write RPC/runtime
+/// forms.
 pub const GOV_MULTINODE_WRITES_ENV: &str = "STELL_GOV_ALLOW_MULTINODE_WRITES";
 
 /// Parse the escape-hatch flag: `1` or case-insensitive `true` (surrounding
@@ -1842,7 +1910,7 @@ impl Governance {
         }
         for id in due {
             out.checked += 1;
-            match self.execute_one_due_upgrade(id, cur_height) {
+            match self.execute_one_due_action(id, cur_height, None) {
                 Ok(()) => out.executed.push(id),
                 Err(reason) => {
                     tracing::error!(
@@ -1876,11 +1944,22 @@ impl Governance {
         ids
     }
 
-    /// Validate and execute ONE due upgrade action. `Err` is the loud reason;
-    /// on `Err` no state has moved (every check precedes
-    /// [`Governance::execute_at_height`], which is itself clone-free but only
-    /// writes after its own gates pass).
-    fn execute_one_due_upgrade(&mut self, proposal_id: u64, cur_height: u64) -> Result<(), String> {
+    /// Validate and execute ONE due governance action. `Err` is the loud
+    /// reason; on `Err` no state has moved (every check precedes the
+    /// domain write, and [`Governance::execute_at_height`] /
+    /// [`Governance::execute_with_oracle_at_height`] only write after their
+    /// own gates pass).
+    ///
+    /// `oracle` must be supplied for oracle actions (`register`/`unregister`
+    /// publisher, breaker reset); non-oracle actions ignore it. The upgrade
+    /// arms keep the plan-specific fail-closed checks (safe version label,
+    /// non-zero/future halt height, committed-plan conflict).
+    fn execute_one_due_action(
+        &mut self,
+        proposal_id: u64,
+        cur_height: u64,
+        oracle: Option<&mut crate::oracle::OracleState>,
+    ) -> Result<(), String> {
         // Snapshot everything the checks need so the `Proposal` borrow ends
         // before the mutable execution call.
         let (status, electorate, turnout, yes, no, action) = {
@@ -1961,14 +2040,194 @@ impl Governance {
                 }
             }
             GovAction::CancelUpgrade => {}
-            other => return Err(format!("not an upgrade action ({})", other.action_type())),
+            // Every other action (parameter change, signal, oracle action,
+            // min-gas floor) is validated by the execute-time backstops in
+            // `execute_inner`/`execute_with_oracle_at_height` (bounds, title
+            // cap, publisher key, quorum floor), identical on every node.
+            _ => {}
         }
         // Single-shot `Passed -> Executed` transition, timelock re-checked
-        // against `cur_height`; a plan is installed only when every check
-        // above passed.
-        self.execute_at_height(UPGRADE_EXECUTOR, proposal_id, cur_height)
-            .map(|_| ())
-            .map_err(|e| format!("execute refused: {e}"))
+        // against `cur_height`; the action is applied only when every check
+        // above passed. Oracle actions need the committed oracle domain so
+        // the governance half and the oracle half are all-or-nothing.
+        if action.is_oracle_action() {
+            let oracle = oracle.ok_or_else(|| {
+                format!(
+                    "oracle action ({}) requires the committed oracle domain, which was not supplied",
+                    action.action_type()
+                )
+            })?;
+            self.execute_with_oracle_at_height(UPGRADE_EXECUTOR, proposal_id, oracle, cur_height)
+                .map(|_| ())
+                .map_err(|e| format!("execute refused: {e}"))
+        } else {
+            self.execute_at_height(UPGRADE_EXECUTOR, proposal_id, cur_height)
+                .map(|_| ())
+                .map_err(|e| format!("execute refused: {e}"))
+        }
+    }
+
+    /// Whether any governance action needs the committed oracle domain at
+    /// `cur_height` (used by the apply path to take the oracle write lock only
+    /// when an oracle action is actually due).
+    pub fn has_due_oracle_action(&self, cur_height: u64) -> bool {
+        self.proposals.values().any(|p| {
+            p.status == ProposalStatus::Passed
+                && p.action.is_oracle_action()
+                && self.is_mature(p.id, cur_height)
+        })
+    }
+
+    /// Ascending ids of every `Passed`, mature governance action that the
+    /// deterministic block-path executor may run at `cur_height`.
+    ///
+    /// `SoftwareUpgrade`/`CancelUpgrade` are included only while the separate
+    /// [`upgrade_exec_active_at`] gate is open; every other action is governed
+    /// solely by [`GOV_OPS_ACTIVATION_HEIGHT`]. Ordering is ascending id, so
+    /// two nodes applying the same block execute the same actions in the same
+    /// order (last-write-wins parameter actions therefore converge).
+    fn due_governance_ids(&self, cur_height: u64) -> Vec<u64> {
+        let upgrades = upgrade_exec_active_at(cur_height);
+        let mut ids: Vec<u64> = self
+            .proposals
+            .values()
+            .filter(|p| {
+                p.status == ProposalStatus::Passed
+                    && self.is_mature(p.id, cur_height)
+                    && (upgrades
+                        || !matches!(
+                            p.action,
+                            GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
+                        ))
+            })
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Read-only fast path for the apply step: true when this block can move
+    /// governance state (an Open proposal whose voting window has closed, or a
+    /// Passed action that is mature and runnable).
+    ///
+    /// When false, [`crate::state_engine::InMemoryStateEngine::apply_governance_transition`]
+    /// takes no lock and bumps no commitment generation, so an ordinary block
+    /// leaves the state root byte-identical.
+    pub fn has_due_governance(&self, now: u64, cur_height: u64) -> bool {
+        let upgrades = upgrade_exec_active_at(cur_height);
+        self.proposals.values().any(|p| {
+            (p.status == ProposalStatus::Open && now >= p.voting_end)
+                || (p.status == ProposalStatus::Passed
+                    && self.is_mature(p.id, cur_height)
+                    && (upgrades
+                        || !matches!(
+                            p.action,
+                            GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
+                        )))
+        })
+    }
+
+    /// Deterministically finalize every `Open` proposal whose voting window
+    /// closed at or before `now` (the block timestamp), in ascending id
+    /// order. Returns the finalized ids.
+    ///
+    /// Uses [`Governance::finalize_at_height`] so a pass records
+    /// `cur_height + GOV_TIMELOCK_HEIGHTS`. Idempotent: a replay (or a second
+    /// block at the same timestamp) finds the terminal status and finalizes
+    /// nothing, so it moves no state.
+    pub fn finalize_due_at_height(
+        &mut self,
+        ledger: &mut StakingLedger,
+        now: u64,
+        cur_height: u64,
+    ) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .proposals
+            .values()
+            .filter(|p| p.status == ProposalStatus::Open && now >= p.voting_end)
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        let mut finalized = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.finalize_at_height(ledger, id, now, cur_height) {
+                Ok(status) => {
+                    tracing::info!(
+                        "gov proposal {id} finalized at height {cur_height}: {status:?}"
+                    );
+                    finalized.push(id);
+                }
+                Err(e) => tracing::error!(
+                    "gov finalize REFUSED at height {cur_height}: proposal {id}: {e} \
+                     (proposal stays Open; retried on the next block)"
+                ),
+            }
+        }
+        finalized
+    }
+
+    /// Deterministic block-path executor for EVERY governance action type:
+    /// finalization has already happened in
+    /// [`Governance::finalize_due_at_height`], and this sweep runs every
+    /// `Passed` action that is mature at `cur_height`, in ascending id order.
+    ///
+    /// Authority is re-derived from the committed tally (the same formula
+    /// `finalize` used) so a smuggled status cannot execute. Execution is
+    /// single-shot (`Passed -> Executed`); a replayed block finds no due
+    /// action and changes nothing.
+    ///
+    /// Oracle actions (`register`/`unregister` publisher, breaker reset) go
+    /// through [`Governance::execute_with_oracle_at_height`] so the governance
+    /// and oracle domains are written all-or-nothing.
+    pub fn execute_due_governance_at_height(
+        &mut self,
+        cur_height: u64,
+        chain_id: u64,
+        oracle: Option<&mut crate::oracle::OracleState>,
+    ) -> UpgradeExecOutcome {
+        let mut out = UpgradeExecOutcome::default();
+        let due = self.due_governance_ids(cur_height);
+        if due.is_empty() {
+            return out;
+        }
+        let this_chain = crate::consensus::consensus_chain_id();
+        let mut oracle = oracle;
+        for id in due {
+            out.checked += 1;
+            let action = match self.proposals.get(&id) {
+                Some(p) => p.action.clone(),
+                None => continue,
+            };
+            // Upgrade plans are chain-bound (a plan is executable only on the
+            // chain whose vote tallied it); parameter actions are not.
+            if matches!(
+                action,
+                GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
+            ) && chain_id != this_chain
+            {
+                let reason = format!(
+                    "plan is not executable on this chain: supplied chain id {chain_id} != \
+                     this consensus chain id {this_chain} (a plan is bound to the chain whose \
+                     vote tallied it)"
+                );
+                tracing::error!(
+                    "gov execution REFUSED at height {cur_height}: proposal {id}: {reason}"
+                );
+                out.refused.push((id, reason));
+                continue;
+            }
+            match self.execute_one_due_action(id, cur_height, oracle.as_deref_mut()) {
+                Ok(()) => out.executed.push(id),
+                Err(reason) => {
+                    tracing::error!(
+                        "gov execution REFUSED at height {cur_height}: proposal {id}: {reason} \
+                         (proposal stays Passed; action not applied)"
+                    );
+                    out.refused.push((id, reason));
+                }
+            }
+        }
+        out
     }
 
     fn execute_inner(
@@ -2239,6 +2498,10 @@ pub struct UpgradeExecOutcome {
     pub checked: usize,
     pub executed: Vec<u64>,
     pub refused: Vec<(u64, String)>,
+    /// Proposals finalized by the same block-path sweep (empty for the
+    /// upgrade-only entry point, which does not finalize). Not committed:
+    /// the proposal status change it reports IS committed.
+    pub finalized: Vec<u64>,
 }
 
 /// Outcome of one [`Governance::migrate_gov_proposals_to_genesis`] run: pure

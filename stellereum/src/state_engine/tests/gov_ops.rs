@@ -402,20 +402,36 @@ async fn gov_ops_closed_window_vote_refuses() {
     assert!(p.voters.is_empty(), "late vote recorded no voter");
 }
 
-/// Pre-activation refusal: with the gate closed (default: no test
-/// override, const `u64::MAX`), a block-carried propose moves NOTHING —
-/// the standard apply path is byte-identical — while the carrier itself
-/// still succeeds (gas paid, no block failure).
+/// Pre-activation refusal: with the gate forced closed (per-thread override;
+/// the shipped `GOV_OPS_ACTIVATION_HEIGHT` is `0`, active from genesis), a
+/// block-carried propose moves NOTHING — the standard apply path is
+/// byte-identical — while the carrier itself still succeeds (gas paid, no
+/// block failure).
+struct ClosedGovGate;
+
+impl ClosedGovGate {
+    fn install() -> Self {
+        crate::governance::set_gov_ops_activation_override(Some(u64::MAX));
+        Self
+    }
+}
+
+impl Drop for ClosedGovGate {
+    fn drop(&mut self) {
+        crate::governance::set_gov_ops_activation_override(None);
+    }
+}
+
 #[tokio::test]
 async fn gov_ops_pre_activation_refuses_and_moves_nothing() {
     use crate::svm::OpCode;
     assert_eq!(
-        GOV_OPS_ACTIVATION_HEIGHT,
-        u64::MAX,
-        "gate must ship INACTIVE (lead flips with spec + audit)"
+        GOV_OPS_ACTIVATION_HEIGHT, 0,
+        "gate must ship ACTIVE from genesis (block-carried governance is the only N>1 write path)"
     );
+    let _closed = ClosedGovGate::install();
     let engine = InMemoryStateEngine::new();
-    // Gate closed on a fresh instance by default.
+    // Gate closed by the per-thread override.
     assert!(!engine.gov_ops_active_at(1));
     assert!(!engine.gov_ops_active_at(u64::MAX - 1));
     let (addr, _pk) = pq_pair(0xC6);

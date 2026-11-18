@@ -6,6 +6,54 @@ use stellereum::consensus_net::{ConsensusMsg, ConsensusNetwork};
 use stellereum::network::P2pNetworkAdapter;
 use stellereum::runtime::ValidatorRuntime;
 
+/// PUSH-BASED BLOCK PROPAGATION (fast path): hand a finalized block's commit
+/// to every directly connected validator peer IMMEDIATELY.
+///
+/// The DHT publication (head pointer, body, header) is untouched and stays the
+/// slow/recovery path — this only adds the direct one. `ConsensusNetwork`
+/// delivers `pubsub.msg` straight to each configured peer's app subscription
+/// (per-peer, concurrent, bounded by the broadcast join budget), which is the
+/// channel the consensus drain already consumes, so a lagging peer sees the
+/// `Committed` on its next tick instead of waiting for its next DHT poll.
+///
+/// Runs DETACHED on purpose: the consensus tick calls this at finalize and
+/// must not wait for any peer's ACK (a slow peer once stretched every height
+/// by the per-peer round trip). Sends are idempotent, and `ConsensusNetwork`'s
+/// health ledger/backoff is unchanged.
+pub(crate) fn spawn_committed_push(
+    net: &Arc<ConsensusNetwork>,
+    height: u64,
+    block: stellereum::sharding::Block,
+    certificate: stellereum::consensus::QuorumCertificate,
+) {
+    let net = Arc::clone(net);
+    tokio::spawn(async move {
+        net.broadcast(&ConsensusMsg::Committed {
+            height,
+            block,
+            certificate,
+        })
+        .await;
+        tracing::debug!("[sync][push] committed #{height} pushed to every directly connected peer");
+    });
+}
+
+/// Awaitable form of [`spawn_committed_push`] for callers that already run off
+/// the tick (the body walk after a successful catch-up).
+pub(crate) async fn push_committed(
+    net: &ConsensusNetwork,
+    height: u64,
+    block: stellereum::sharding::Block,
+    certificate: stellereum::consensus::QuorumCertificate,
+) {
+    net.broadcast(&ConsensusMsg::Committed {
+        height,
+        block,
+        certificate,
+    })
+    .await;
+}
+
 /// Try to catch up from a state SNAPSHOT plus the headers above it.
 ///
 /// Returns `Some(height)` when a snapshot was found, verified and applied.
@@ -526,8 +574,24 @@ pub(crate) async fn try_catch_up(
     // observed DIRECTLY in a validated proposal (height-1 + prev_hash): the DHT
     // read is best-effort and goes blind for minutes at a time, while proposals
     // arrive every round on the reliable direct path.
-    let dht = adapter.fetch_head(shard).await;
-    if dht.is_none() {
+    let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    // EVENT-DRIVEN PREFERENCE (push-based propagation): when a verified peer
+    // message already named a head above ours, use it and SKIP the DHT head
+    // query. The query is the blind, expensive half — one round trip that can
+    // consume the whole catch-up budget on a dead peer (the live stall), while
+    // the push channel just handed us the same answer. Only a node with no
+    // ahead evidence still polls the DHT.
+    let probed_dht = should_probe_dht_head(our_height, rt.peer_hint);
+    let dht = if probed_dht {
+        adapter.fetch_head(shard).await
+    } else {
+        tracing::debug!(
+            "[sync] peer hint is already ahead (ours={our_height}, hint={:?}): skipping the DHT head read",
+            rt.peer_hint.map(|(h, _)| h)
+        );
+        None
+    };
+    if probed_dht && dht.is_none() {
         // Throttled visibility: a blind fetch_head (DHT miss, unpublished peer,
         // wrong shard/epoch, or the fetch timing out on a dead transport) is
         // otherwise indistinguishable from "in sync".
@@ -540,7 +604,6 @@ pub(crate) async fn try_catch_up(
             );
         }
     }
-    let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
     let dht_hint_head = [dht, rt.peer_hint]
         .into_iter()
         .flatten()
@@ -1043,13 +1106,11 @@ pub(crate) async fn walk_chain(
     if let Some(last) = rt.blocks.get(&tail_hash).cloned() {
         if let Some(qc) = last.precommit_qc.clone() {
             let net = ConsensusNetwork::new(adapter.clone());
-            let _ = net
-                .broadcast(&ConsensusMsg::Committed {
-                    height: tail_height,
-                    block: last.clone(),
-                    certificate: qc,
-                })
-                .await;
+            // PUSH (fast path): the caught-up tip goes straight to every
+            // directly connected peer, so a peer that is behind US learns the
+            // outcome now instead of on its next DHT poll. The DHT publishes
+            // below are unchanged.
+            push_committed(&net, tail_height, last.clone(), qc).await;
             // Publish the tip body immediately (same reason as the finalize
             // path above): without this, a peer one block behind waits the
             // whole retro window for it.

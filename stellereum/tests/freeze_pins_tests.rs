@@ -49,7 +49,7 @@
 //! | `STELL_ROUND_ZERO_TIMEOUT_MS` | 650 | Local propose-wait cap; heterogeneous caps are normal async drift — cannot fork. |
 //! | `STELL_STRAGGLER_{GRACE,CAP,FRESHNESS}_MS` | 0/30000/5x-base | Experimental local holds outside the deterministic core; default-off = frozen behavior. |
 //! | `STELL_DEADLOCK_TIMEOUT_SECS` | 300 | Local deadlock-breaker; override covered by `deadlock_breaker_tests` (removal = red suite). |
-//! | `STELL_CATCHUP_BUDGET_MS` / `STELL_CATCHUP_INTERVAL_MS` | 250/2000 | Node-local catch-up policy; nodes MAY differ. |
+//! | `STELL_CATCHUP_BUDGET_MS` / `STELL_CATCHUP_INTERVAL_MS` | 250/30000 | Node-local catch-up policy; nodes MAY differ (interval is now a backstop; catch-up is event-driven). |
 //! | `STELL_RETRO_PUBLISH_INTERVAL_MS` / `STELL_RETRO_BEHIND_WINDOW_SECS` | 30000/120 | Node-local DHT republication; nodes MAY differ (override unit tests exist). |
 //! | `STELL_SNAPSHOT_INTERVAL` | 1000 (min 50) | Local snapshot cadence/availability, not consensus validity. |
 //! | `STELL_SEND_TIMEOUT_MS` / `STELL_BROADCAST_JOIN_MS` / `STELL_CONS_BCAST_*` / `STELL_CONS_PROBE_*` / `STELL_INBOUND_*` / `STELL_REPL_*` / `STELL_PROBE_EVICT_AFTER` / `STELL_DIAL_*` / `STELL_LIVENESS_ALARM_MS` / `STELL_CATCHUP_BUDGET_MS` | various | Transport-local policy; nodes MAY differ; none feed the deterministic timeout ladder. |

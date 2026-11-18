@@ -2696,6 +2696,37 @@ pub fn eth_unsubscribe_refusal() -> JsonRpcError {
     )
 }
 
+/// Resolve an address parameter to the account whose balance / nonce it means.
+///
+/// A 32-byte (or hex-64) address is taken literally. A 20-byte EVM address is
+/// resolved through the on-chain PQ binding when this node knows one, because
+/// that is the account which can actually spend the funds: the bare 20-byte
+/// projection (`evm_to_stell_address`) is where ETH-shaped clients would look,
+/// but no Falcon-512 key derives it, so reporting that account would show a
+/// wallet `0` while its money sits in the bound PQ account.
+///
+/// No binding => the historical projection (unchanged behaviour, and the
+/// honest answer: nothing is bound, so nothing else can be claimed).
+pub async fn resolve_evm_account(
+    engine: &InMemoryStateEngine,
+    addr: &str,
+) -> Result<[u8; 32], JsonRpcError> {
+    let trimmed = addr.trim();
+    let bare = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if bare.len() == 40 {
+        let evm = evm_address_from_hex(bare)
+            .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr}': {e}")))?;
+        if let Some(pq) = engine.evm_binding_pq(&evm).await {
+            return Ok(pq);
+        }
+    }
+    parse_evm_or_stell_address(addr)
+        .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr}': {e}")))
+}
+
 /// Handles `eth_getBalance` against an `InMemoryStateEngine`.
 /// Returns balance in Wei formatted as hex quantity ("0x...").
 pub async fn eth_get_balance(
@@ -2703,8 +2734,7 @@ pub async fn eth_get_balance(
     params: &Value,
 ) -> Result<String, JsonRpcError> {
     let (addr_str, _tag) = parse_address_and_tag_params(params)?;
-    let stell_addr = parse_evm_or_stell_address(&addr_str)
-        .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+    let stell_addr = resolve_evm_account(engine, &addr_str).await?;
     let acc = engine.get_account(&stell_addr).await;
     let balance_nano = acc.map(|a| a.balance).unwrap_or(0);
     Ok(nano_to_wei_hex(balance_nano))
@@ -2722,8 +2752,7 @@ pub async fn eth_get_transaction_count(
     params: &Value,
 ) -> Result<String, JsonRpcError> {
     let (addr_str, _tag) = parse_address_and_tag_params(params)?;
-    let stell_addr = parse_evm_or_stell_address(&addr_str)
-        .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+    let stell_addr = resolve_evm_account(engine, &addr_str).await?;
     let acc = engine.get_account(&stell_addr).await;
     let nonce = acc.map(|a| a.nonce).unwrap_or(0);
     Ok(format_u64_hex(nonce))

@@ -216,3 +216,84 @@ async fn bounded_backfill_on_weak_link_converges_without_storm() {
         "test must actually exercise parallelism (max={max})"
     );
 }
+
+// ============================================================================
+// Event-driven catch-up: no polling at the tip (2026-11-18)
+// ============================================================================
+//
+// A second storm shape, distinct from the fetch fan-out above: the PERIODIC
+// probe. Every `STELL_CATCHUP_INTERVAL_MS` the node asked the DHT "is anyone
+// ahead?", and with a dead peer in the table the blind query could consume the
+// whole catch-up budget. The policy is now event-driven: a node at the tip
+// issues ZERO backstop probes, and one pushed `Committed` is what starts an
+// attempt. The real `node/policy.rs` is included by path so this pins the
+// shipped predicate.
+#[path = "../src/node/policy.rs"]
+#[allow(dead_code)]
+mod catchup_policy;
+
+mod tip_probe_budget {
+    use super::catchup_policy::{catchup_action, CatchupAction, CATCHUP_INTERVAL_DEFAULT_MS};
+
+    /// Simulate 10 minutes of 50 ms ticks exactly the way the driver consumes
+    /// `catchup_action`: run -> probe + reset, skip-at-tip -> reset (no probe),
+    /// wait -> keep counting.
+    fn probes_over_ten_minutes(at_tip: bool, commit_at_tick: Option<usize>) -> (u64, usize) {
+        const TICK_MS: u64 = 50;
+        const TICKS: usize = 12_000; // 10 minutes
+        let mut since = 0u64;
+        let mut probes = 0u64;
+        let mut first_probe_tick = None;
+        for tick in 0..TICKS {
+            let reactive = commit_at_tick == Some(tick);
+            match catchup_action(reactive, since, CATCHUP_INTERVAL_DEFAULT_MS, at_tip) {
+                CatchupAction::Run => {
+                    probes += 1;
+                    since = 0;
+                    if first_probe_tick.is_none() {
+                        first_probe_tick = Some(tick);
+                    }
+                }
+                CatchupAction::SkipAtTip => since = 0,
+                CatchupAction::Wait => since += TICK_MS,
+            }
+        }
+        (probes, first_probe_tick.unwrap_or(usize::MAX))
+    }
+
+    #[test]
+    fn a_node_at_the_tip_never_probes_the_dht_over_ten_minutes() {
+        let (probes, _) = probes_over_ten_minutes(true, None);
+        assert_eq!(
+            probes, 0,
+            "an in-sync node must not poll the DHT on the backstop timer at all"
+        );
+    }
+
+    #[test]
+    fn a_single_pushed_commit_probes_once_and_far_before_the_backstop() {
+        // At the tip, nothing polls; the pushed commit at tick 7_000 (350 s)
+        // is the FIRST and ONLY trigger, and it fires on that tick.
+        let (probes, first_tick) = probes_over_ten_minutes(true, Some(7_000));
+        assert_eq!(probes, 1, "exactly one reactive probe for one commit");
+        assert_eq!(
+            first_tick, 7_000,
+            "the attempt starts on the committing tick, never on the timer"
+        );
+
+        // Contrast: a node already known to be behind DOES use the 30 s
+        // backstop (that is what a backstop is for) — but it never polls every
+        // tick, which is what the old 2 s cadence plus a dead peer degenerated
+        // into.
+        let (probes, first_tick) = probes_over_ten_minutes(false, None);
+        assert!(probes > 0, "a known-behind node keeps the backstop");
+        assert_eq!(
+            first_tick, 600,
+            "the first backstop probe is one 30 s interval after the loop starts"
+        );
+        assert!(
+            probes <= 20,
+            "ten minutes hold at most ~20 backstop probes, not one per tick: {probes}"
+        );
+    }
+}

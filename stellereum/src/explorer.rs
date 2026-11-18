@@ -1607,6 +1607,20 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
         Op::SysCallUnjail { validator } => {
             format!("unjail validator={}", hex::encode(validator))
         }
+        // EVM write path (appended at the enum end): the carrier's EVM intent is
+        // summarised by its sender + digest (never the raw bytes), and the
+        // binding claim by the EVM address it binds — both bounded, indexed data.
+        Op::SysCallEvmCarrier(carrier) => format!(
+            "evm-carrier from=0x{} evm={} bytes digest=0x{}",
+            hex::encode(carrier.evm_address),
+            carrier.evm_tx.len(),
+            hex::encode(crate::evm_adapter::evm_intent_digest(&carrier.evm_tx)),
+        ),
+        Op::SysCallBindEvmAddress(claim) => format!(
+            "evm-bind evm=0x{} pq-key={} bytes",
+            hex::encode(claim.evm_address),
+            claim.pq_pubkey.len(),
+        ),
         Op::Reserved33ConfidentialTransfer(_)
         | Op::Reserved40ConfidentialTransfer2(_)
         | Op::Reserved41ConfidentialShield(_)

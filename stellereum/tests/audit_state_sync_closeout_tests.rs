@@ -1080,3 +1080,36 @@ async fn tail_anchor_refuses_gaps_and_empty() {
         .unwrap_err();
     assert!(err.contains("no header"), "gap refused fail-closed: {err}");
 }
+
+// ============================================================================
+// Push-based catch-up: a verified head replaces the blind DHT read (2026-11-18)
+// ============================================================================
+//
+// `node::sync::try_catch_up` used to open with an unconditional DHT head query.
+// With a dead peer in the table that blind read could consume the whole
+// catch-up budget (the live stall: 15 s on every tick), while the SAME fact —
+// a peer's head — had just arrived on the push channel. The real
+// `node/policy.rs` predicate is included by path.
+#[path = "../src/node/policy.rs"]
+#[allow(dead_code)]
+mod catchup_policy;
+
+mod push_head_preference {
+    use super::catchup_policy::should_probe_dht_head;
+
+    #[test]
+    fn a_verified_peer_hint_ahead_of_us_replaces_the_dht_head_read() {
+        let head = [0x42u8; 32];
+        // Nothing known: the DHT is the only source, so it must be read.
+        assert!(should_probe_dht_head(100, None));
+        // A hint AT our tip adds nothing; a running catch-up still reads the
+        // DHT (it may be chasing a different peer).
+        assert!(should_probe_dht_head(100, Some((100, head))));
+        // A hint BELOW our tip is stale, never a reason to skip the read.
+        assert!(should_probe_dht_head(100, Some((99, head))));
+        // A hint ABOVE our tip is exactly the answer the read would have
+        // returned: skip the blind query and walk from the pushed head.
+        assert!(!should_probe_dht_head(100, Some((101, head))));
+        assert!(!should_probe_dht_head(100, Some((10_000, head))));
+    }
+}

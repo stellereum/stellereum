@@ -8,8 +8,7 @@ use super::verify_once::require_pq_tx_envelope;
 use super::{
     AccountState, ActorMessage, BlockTransitionOutcome, ExecPostActions, GovOpsOutcome,
     HashPoolApplyOutcome, HashPoolBlockOps, HashPoolOpError, InMemoryStateEngine,
-    GOV_OPS_ACTIVATION_HEIGHT, HASH_POOL_ENABLED, MAX_ACTOR_MSGS_PER_BLOCK, MAX_ACTOR_ROUNDS,
-    PQ_ACTIVATION_SURCHARGE_GAS,
+    HASH_POOL_ENABLED, MAX_ACTOR_MSGS_PER_BLOCK, MAX_ACTOR_ROUNDS, PQ_ACTIVATION_SURCHARGE_GAS,
 };
 use crate::token::TokenRegistry;
 use std::collections::{HashMap, HashSet};
@@ -2861,16 +2860,17 @@ impl InMemoryStateEngine {
             0
         };
 
-        // 5e. DETERMINISTIC UPGRADE EXECUTION: install the plan of every
-        //     passed, matured `SoftwareUpgrade` at this exact height. This is
-        //     the piece that used to be missing (the plan was only ever
-        //     executed by a node-local RPC call), so a matured proposal now
-        //     executes on EVERY node applying the same blocks — same height,
-        //     same plan, same committed state root. Gated by
-        //     `UPGRADE_EXEC_ACTIVATION_HEIGHT` (inert `u64::MAX` default) and
-        //     a proven no-op while inactive: it returns before any lock is
-        //     taken, so the pre-activation root is byte-identical.
-        let _upgrade_exec = self.apply_upgrade_execution(block).await;
+        // 5e. DETERMINISTIC GOVERNANCE EXECUTION: finalize every proposal
+        //     whose voting window closed and execute every passed, matured
+        //     `GovAction` at this exact height. This is the piece that used to
+        //     be missing (actions were only ever executed by a node-local RPC
+        //     call), so a passed parameter change now executes on EVERY node
+        //     applying the same blocks — same height, same value, same
+        //     committed state root. Gated by
+        //     `GOV_OPS_ACTIVATION_HEIGHT` (0, active from genesis); a block
+        //     with nothing due takes no write lock and leaves the root
+        //     byte-identical.
+        let _gov_exec = self.apply_governance_transition(block).await;
 
         BlockTransitionOutcome {
             applied,
@@ -3145,18 +3145,14 @@ impl InMemoryStateEngine {
     }
 
     /// Whether block-carried gov ops apply at `height` on this instance: the
-    /// test-only override OR the ratified activation height. Default
-    /// (override off, const `u64::MAX`) is INACTIVE at every reachable
-    /// height, on every node identically. Pure function of instance state +
-    /// the block height: no env reads, no wall clock.
+    /// test-only override OR the ratified activation height.
+    /// [`crate::governance::GOV_OPS_ACTIVATION_HEIGHT`] is `0` (active from
+    /// genesis), so every reachable height activates on every node
+    /// identically. Pure function of instance state + the block height: no
+    /// env reads, no wall clock.
     pub fn gov_ops_active_at(&self, height: u64) -> bool {
-        // GATE: `>=` is the ratified-height semantic (every height at/after
-        // activation applies); the lint fires only because the const ships at
-        // `u64::MAX` (INACTIVE default the lead flips with spec + audit).
-        // `==` would silently break post-activation heights on the flip day.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        let ratified = height >= GOV_OPS_ACTIVATION_HEIGHT;
-        self.gov_ops_tests_on.load(Ordering::Relaxed) || ratified
+        self.gov_ops_tests_on.load(Ordering::Relaxed)
+            || crate::governance::gov_ops_active_at(height)
     }
 
     /// Test-only switch: open the block-carried gov gate on this instance.
@@ -4184,7 +4180,8 @@ impl InMemoryStateEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Block-carried governance ops (default-OFF; see GOV_OPS_ACTIVATION_HEIGHT).
+    // Block-carried governance ops (active from genesis; see
+    // `GOV_OPS_ACTIVATION_HEIGHT`).
     //
     // The SVM dispatch arms for `SysCallGovPropose` / `SysCallGovVote` are
     // PURE CARRIERS (charge + push, no state); THIS scan is the authoritative
@@ -4302,7 +4299,7 @@ impl InMemoryStateEngine {
                 "gov ops refused: block-carried governance is inactive at height {} ({} op(s) skipped, activation = {})",
                 block.height,
                 ops.len(),
-                GOV_OPS_ACTIVATION_HEIGHT,
+                crate::governance::gov_ops_activation_height(),
             );
             return out;
         }
@@ -4387,60 +4384,97 @@ impl InMemoryStateEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Deterministic upgrade execution (default-OFF; see
-    // `UPGRADE_EXEC_ACTIVATION_HEIGHT`).
+    // Deterministic governance execution (block-carried path).
     //
     // The counterpart of the block-carried gov scan above, on the OUTPUT side:
-    // a passed, timelock-matured `SoftwareUpgrade` must be executed by every
-    // node applying the same block, at the same height, with no RPC and no
-    // wall-clock trigger. The plan it installs is committed in the state root
-    // (`commitment::governance_digest`), so a node that skips (or duplicates)
-    // the execution can no longer hide behind an identical root.
+    // a proposal whose voting window closed is finalized at a block, and a
+    // passed, timelock-matured action of ANY type is executed by every node
+    // applying the same block, at the same height, with no RPC and no
+    // wall-clock trigger. Every applied parameter is committed in the state
+    // root (`commitment::governance_digest`), so a node that skips (or
+    // duplicates) the execution can no longer hide behind an identical root.
     // -----------------------------------------------------------------------
 
-    /// Execute every due upgrade action at this block's height.
+    /// Deterministically finalize due proposals and execute every due
+    /// governance action at this block.
     ///
-    /// Pure function of committed governance state + `block.height` (the
-    /// governance verdict is re-derived inside
-    /// [`crate::governance::Governance::execute_due_upgrades_at_height`]); no
-    /// env reads, no wall clock, no node-local input. Gated by
-    /// `crate::governance::upgrade_exec_active_at(block.height)`:
-    /// pre-activation (the `u64::MAX` default) this returns BEFORE taking any
-    /// lock or reading any state, so the block leaves the commitment
-    /// generation — and therefore the state root — byte-identical.
+    /// Pure function of committed governance state + `block.height` +
+    /// `block.timestamp` (the block timestamp is the same clock the
+    /// block-carried propose/vote arms use — never wall time). Gated by
+    /// [`crate::governance::gov_ops_active_at`] (`GOV_OPS_ACTIVATION_HEIGHT`
+    /// is `0`, active from genesis, identical on every node).
+    ///
+    /// `SoftwareUpgrade`/`CancelUpgrade` additionally require the separate
+    /// `upgrade_exec_active_at` gate, so a binary rollout never rides in on a
+    /// parameter-change activation.
     ///
     /// The read-only fast path skips the write lock when nothing is due, which
     /// is what an ordinary block (and every replay of an already-executed
-    /// upgrade) hits: no generation bump, identical root.
-    pub async fn apply_upgrade_execution(
+    /// proposal) hits: no generation bump, identical root.
+    pub async fn apply_governance_transition(
         &self,
         block: &crate::sharding::Block,
     ) -> crate::governance::UpgradeExecOutcome {
-        use crate::governance::{upgrade_exec_active_at, UpgradeExecOutcome};
-        if !upgrade_exec_active_at(block.height) {
+        use crate::governance::UpgradeExecOutcome;
+        if !self.gov_ops_active_at(block.height) {
             return UpgradeExecOutcome::default();
         }
         // Read-only pre-check with the guard scoped to its own statement: no
-        // due action means no write lock and no generation bump.
-        let due = self.governance_read().await.has_due_upgrade(block.height);
+        // due finalization/action means no write lock and no generation bump.
+        let due = self
+            .governance_read()
+            .await
+            .has_due_governance(block.timestamp, block.height);
         if !due {
             return UpgradeExecOutcome::default();
         }
+        // Same lock order as the direct governance path: governance, then
+        // staking (finalize releases voter/proposer locks). The oracle write
+        // lock is taken only when an oracle action is actually due.
         let mut gov = self.governance_write().await;
-        let out = gov
-            .execute_due_upgrades_at_height(block.height, crate::consensus::consensus_chain_id());
+        let mut ledger = self.staking_write().await;
+        let finalized = gov.finalize_due_at_height(&mut ledger, block.timestamp, block.height);
+        drop(ledger);
+        let mut out = if gov.has_due_oracle_action(block.height) {
+            let mut oracle = self.oracle_write().await;
+            gov.execute_due_governance_at_height(
+                block.height,
+                crate::consensus::consensus_chain_id(),
+                Some(&mut oracle),
+            )
+        } else {
+            gov.execute_due_governance_at_height(
+                block.height,
+                crate::consensus::consensus_chain_id(),
+                None,
+            )
+        };
+        out.finalized = finalized;
         if !out.refused.is_empty() {
             // The individual reasons are already logged loudly by the sweep;
             // this line names the height once so an operator can grep the block
             // and see that the state root did NOT move for these proposals.
             tracing::error!(
-                "upgrade execution at height {}: {} of {} matured upgrade action(s) REFUSED, no plan installed (proposals stay Passed)",
+                "gov execution at height {}: {} of {} matured action(s) REFUSED, nothing applied (proposals stay Passed)",
                 block.height,
                 out.refused.len(),
                 out.checked,
             );
         }
         out
+    }
+
+    /// Backwards-compatible alias for [`InMemoryStateEngine::apply_governance_transition`].
+    ///
+    /// The sweep used to execute upgrade actions only; it now covers every
+    /// `GovAction`. Existing callers (and the upgrade-plan regression suite)
+    /// keep the old entry point, whose upgrade arm is still gated by
+    /// `upgrade_exec_active_at` inside the sweep.
+    pub async fn apply_upgrade_execution(
+        &self,
+        block: &crate::sharding::Block,
+    ) -> crate::governance::UpgradeExecOutcome {
+        self.apply_governance_transition(block).await
     }
 
     /// The full session gate: the stateless GRANT policy

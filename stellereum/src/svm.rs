@@ -304,6 +304,29 @@ pub fn pq_verify_gas(pubkey_len: usize, message_len: usize, signature_len: usize
     GAS_PQ_VERIFY_BASE.saturating_add(wire_bytes.saturating_mul(GAS_PQ_VERIFY_PER_BYTE))
 }
 
+/// Base gas for the EVM carrier / binding opcodes: RLP decode, strict
+/// secp256k1 recovery (chain id + low-s), the Falcon-512 derivation and the
+/// signature check, on top of the wire bytes the arm below prices per byte.
+pub const GAS_EVM_CARRIER_BASE: u64 = 2_000;
+
+/// Gas for `SysCallEvmCarrier`: the EVM decode/recovery base plus every byte
+/// carried (the EVM transaction, the 897-byte key and the 666-byte signature
+/// are all re-verified by every node), priced from the PQ-verify table so the
+/// Falcon half cannot be made cheaper than the plain verify opcode.
+#[inline(always)]
+pub fn evm_carrier_gas(evm_tx_len: usize, pubkey_len: usize, signature_len: usize) -> u64 {
+    GAS_EVM_CARRIER_BASE
+        .saturating_add(pq_verify_gas(pubkey_len, 32, signature_len))
+        .saturating_add((evm_tx_len as u64).saturating_mul(GAS_PQ_VERIFY_PER_BYTE))
+}
+
+/// Gas for `SysCallBindEvmAddress`: one derivation + one Falcon-512 verify
+/// over a 32-byte digest, plus the carried key and signature bytes.
+#[inline(always)]
+pub fn evm_binding_gas(pubkey_len: usize, signature_len: usize) -> u64 {
+    GAS_EVM_CARRIER_BASE.saturating_add(pq_verify_gas(pubkey_len, 32, signature_len))
+}
+
 /// Base gas for an equivocation report (`OpCode::SysCallReportEquivocation`):
 /// two signature verifications plus ledger-membership and dedup-key work.
 pub const GAS_EQUIVOCATION_REPORT_BASE: u64 = 2_500;
@@ -440,6 +463,16 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // is rare; price it with the unbond table. The block-carried apply
         // (not this dispatch) is authoritative, exactly like the gov ops.
         OpCode::SysCallUnjail { .. } => GAS_STAKE_UNBOND,
+        // EVM carrier / binding: priced from the PQ-verify table plus the
+        // bytes each one makes every node re-check (see the helpers).
+        OpCode::SysCallEvmCarrier(carrier) => evm_carrier_gas(
+            carrier.evm_tx.len(),
+            carrier.pq_pubkey.len(),
+            carrier.evm_signature.len(),
+        ),
+        OpCode::SysCallBindEvmAddress(claim) => {
+            evm_binding_gas(claim.pq_pubkey.len(), claim.binding_signature.len())
+        }
         OpCode::Halt => GAS_HALT,
     }
 }
@@ -1152,6 +1185,81 @@ pub enum OpCode {
     SysCallUnjail {
         validator: [u8; 32],
     },
+    // APPEND, never insert above: same bincode-discriminant rule as every
+    // variant above (see the comment on `SysCallSubmitPriceFeed`).
+    //
+    // THE EVM WRITE PATH (FULL-PQ). MetaMask's EVM intents are settled by a
+    // normal PQ1 carrier transaction; these two opcodes are the payload that
+    // makes the intent part of the signed, committed transaction instead of a
+    // node-local side effect. Both are verified by PURE functions
+    // (`crate::evm_adapter::verify_carrier_intent` /
+    // `verify_binding_claim`): the VM reads no registry and no clock, so every
+    // node reaches the same verdict from block bytes alone and a stale
+    // node-local binding index can influence ADMISSION POLICY at most, never
+    // execution.
+    /// Settle one EVM value transfer under a Falcon-512 authorisation.
+    ///
+    /// The handler verifies, in order: the carried Falcon-512 key derives
+    /// `ctx.sender`; the carried `evm_signature` is that key's signature over
+    /// `keccak256(evm_tx)`; the EVM intent decodes with this chain's chain id,
+    /// a low-s secp256k1 signature that recovers `evm_address`, a present
+    /// recipient and NO calldata (contract creation / calls are refused by
+    /// [`crate::evm_adapter::EVM_CONTRACT_EXECUTION_REFUSAL`]). The recipient's
+    /// ROUTING (its bound PQ account) is the transaction's `to`, authorised by
+    /// the envelope signature, so the VM does not need an address book.
+    ///
+    /// The VALUE LEG is the transaction itself (`tx.from` → `tx.to`,
+    /// `tx.amount` nano-STELL), settled by the engine's normal native commit —
+    /// the VM has no account map. Admission additionally requires
+    /// `evm.nonce == tx.nonce` and `wei_to_nano(evm.value) == tx.amount`, so
+    /// the intent and the leg cannot describe different payments.
+    SysCallEvmCarrier(Box<EvmCarrierIntent>),
+    // APPEND, never insert above: same bincode-discriminant rule.
+    /// Register an on-chain EVM address ↔ PQ account binding.
+    ///
+    /// The claim is signed by the PQ key that owns `ctx.sender`, over
+    /// `keccak256("STELL_EVM_BIND_V1" || chain_id || evm_address || pq_address)`,
+    /// so nobody can bind an EVM address to an account they do not control.
+    /// Moves no value: the record IS this committed transaction, which the
+    /// deterministic binding index replays in block order (first claim wins);
+    /// a conflicting claim is refused at admission.
+    SysCallBindEvmAddress(Box<EvmAddressClaim>),
+}
+
+/// Payload of [`OpCode::SysCallEvmCarrier`]: the EVM intent plus the PQ
+/// authorisation that makes it settleable.
+///
+/// Defined next to the opcode (like every other opcode payload in this crate)
+/// so `OpCode` serializes exactly as its discriminant + these fields; the
+/// bytes are therefore covered by the transaction hash and by the PQ1
+/// envelope's signature over the Stell signing message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvmCarrierIntent {
+    /// Chain id the authorisation is bound to (`effective_chain_id`).
+    pub chain_id: u64,
+    /// Canonical EIP-155 / EIP-1559 bytes exactly as the wallet produced them.
+    pub evm_tx: Vec<u8>,
+    /// EVM sender (`keccak256(secp_pubkey)[12..]`) the intent must recover.
+    pub evm_address: [u8; 20],
+    /// Falcon-512 public key of the debited PQ account.
+    pub pq_pubkey: Vec<u8>,
+    /// Falcon-512 signature by that key over `keccak256(evm_tx)`.
+    pub evm_signature: Vec<u8>,
+}
+
+/// Payload of [`OpCode::SysCallBindEvmAddress`]: a PQ-signed EVM address claim.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvmAddressClaim {
+    /// Chain id the claim is bound to.
+    pub chain_id: u64,
+    /// The EVM (20-byte) address being bound.
+    pub evm_address: [u8; 20],
+    /// Falcon-512 public key of the claiming PQ account (must derive the
+    /// sender).
+    pub pq_pubkey: Vec<u8>,
+    /// Falcon-512 signature over
+    /// `keccak256("STELL_EVM_BIND_V1" || chain_id || evm_address || pq_address)`.
+    pub binding_signature: Vec<u8>,
 }
 
 /// One actor send the VM accepted, handed to the ENGINE through
@@ -2428,6 +2536,57 @@ impl Svm {
                     charge!(GAS_HALT);
                     state.halted = true;
                     break;
+                }
+                OpCode::SysCallEvmCarrier(carrier) => {
+                    charge!(evm_carrier_gas(
+                        carrier.evm_tx.len(),
+                        carrier.pq_pubkey.len(),
+                        carrier.evm_signature.len(),
+                    ));
+                    // PURE verification (see `crate::evm_adapter::binding`):
+                    // no registry, no clock, no node-local state — every node
+                    // re-checks the EVM intent and the Falcon-512
+                    // authorisation from block bytes alone, so execution can
+                    // never disagree between nodes.
+                    //
+                    // The VALUE leg is the transaction itself (`tx.from` →
+                    // `tx.to`), settled by the engine's native commit after
+                    // this payload succeeds; the VM only proves the intent.
+                    // A refusal reverts the whole transaction (fail-closed),
+                    // exactly like every other refusal syscall.
+                    match crate::evm_adapter::verify_carrier_intent(carrier, &ctx.sender) {
+                        Ok(_facts) => state.stack.push(1),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "EVM carrier rejected: {e}"
+                            ))
+                        }
+                    }
+                }
+                OpCode::SysCallBindEvmAddress(claim) => {
+                    charge!(evm_binding_gas(
+                        claim.pq_pubkey.len(),
+                        claim.binding_signature.len(),
+                    ));
+                    // PURE: the claim must be signed by the key that owns
+                    // `ctx.sender`, over this chain + this EVM address + this
+                    // PQ address. The committed transaction IS the record;
+                    // the deterministic index replays it in block order
+                    // (first claim wins), and a conflicting claim is refused
+                    // at admission. Nothing is written here, so execution
+                    // stays a pure function of the block.
+                    match crate::evm_adapter::verify_binding_claim(
+                        claim,
+                        &ctx.sender,
+                        claim.chain_id,
+                    ) {
+                        Ok(()) => state.stack.push(1),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "EVM binding rejected: {e}"
+                            ))
+                        }
+                    }
                 }
                 OpCode::SysCallSubmitPriceFeed(feed) => {
                     charge!(GAS_SUBMIT_PRICE_FEED);

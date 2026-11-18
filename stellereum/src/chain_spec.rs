@@ -173,7 +173,7 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "XPC_ACTIVATION_HEIGHT",
                 "stellereum::xshard2pc",
                 XPC_ACTIVATION_HEIGHT,
-                "Cross-shard two-phase commit (frozen off: legacy one-way flow)",
+                "Cross-shard two-phase commit (active from genesis: new transfers use prepare/vote/commit)",
             ),
         ],
     }
@@ -334,20 +334,21 @@ mod tests {
             .expect("the 2PC gate must be registered in the chain spec");
         assert_eq!(gate.activation_height, XPC_ACTIVATION_HEIGHT);
         assert_eq!(gate.module, "stellereum::xshard2pc");
-        // Frozen sentinel: GatedOff at every reachable height.
-        assert_eq!(gate.status, ActivationStatus::GatedOff);
+        // Active from genesis: the compiled gate arms the 2PC at height 0.
+        assert_eq!(gate.status, ActivationStatus::ActiveFromGenesis);
         for height in [0, 1, u64::MAX - 1, u64::MAX] {
             assert_eq!(
                 schedule.is_active("XPC_ACTIVATION_HEIGHT", height),
-                Some(false)
+                Some(true)
             );
         }
-        // The production switch derived from the SAME constant is Disabled,
-        // so the gate can never be half-armed.
+        // The production switch derived from the SAME constant can never be
+        // half-armed: it is `FromHeight(0)`, not `Disabled`.
         let activation = crate::xshard2pc::XpcActivation::from_chain_spec();
-        assert_eq!(activation, crate::xshard2pc::XpcActivation::Disabled);
-        assert_eq!(activation.boundary(), None);
+        assert_eq!(activation, crate::xshard2pc::XpcActivation::FromHeight(0));
+        assert_eq!(activation.boundary(), Some(0));
         assert_eq!(gate.is_active_at(0), activation.is_active_at(0));
+        assert!(activation.is_active_at(0));
     }
 
     #[test]

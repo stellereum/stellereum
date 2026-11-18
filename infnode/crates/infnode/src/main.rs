@@ -1,5 +1,4 @@
 use anyhow::Result;
-use base64::Engine;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -206,6 +205,10 @@ enum Cmd {
         file: PathBuf,
         #[arg(long, default_value = "files")]
         bucket: String,
+        /// ML-KEM-768 owner encapsulation key (hex) used to seal the blob.
+        /// Omit to seal to this node's own KEM key (owner = operator).
+        #[arg(long)]
+        owner_ek: Option<String>,
     },
     /// Storage: получить файл/данные по имени
     StorageGet {
@@ -219,6 +222,10 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value = "files")]
         bucket: String,
+        /// Owner ML-KEM-768 seed (hex, secret) used to open an owner-sealed
+        /// blob. Omit to use this node's own KEM seed (owner = operator).
+        #[arg(long)]
+        owner_key: Option<String>,
     },
     /// DHT: найти k ближайших нод к target
     DhtFind {
@@ -987,121 +994,65 @@ async fn main() -> Result<()> {
             name,
             file,
             bucket,
+            owner_ek,
         } => {
-            use serde_json::json;
             let data = std::fs::read(&file)?;
             let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let owner_ek = owner_ek.unwrap_or_else(|| keys.kem_ek_hex());
             let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
-            // чанкинг по 1MB
-            const CHUNK: usize = 1024 * 1024;
-            let mut chunks: Vec<serde_json::Value> = Vec::new();
-            // детерминированное шифрование + content-адресные id (см. blob_key_nonce /
-            // chunk_id_for): повторный put того же имени с тем же контентом
-            // перезаписывает те же чанки, а не добавляет новые.
-            let content_hash = infnode::node::blob_content_hash(&data);
-            let (data_key, nonce) = infnode::node::blob_key_nonce(&bucket, &name, &content_hash);
-            // данные шифруем (XChaCha20) — E2E-слой; ключ в манифест (v1, TODO: шифровать ключом владельца)
-            let chunks_blob = infnode::node::e2e_encrypt_det(&data_key, &nonce, &data);
-            let mut offset = 0usize;
-            while offset < chunks_blob.len() {
-                let end = (offset + CHUNK).min(chunks_blob.len());
-                let chunk = &chunks_blob[offset..end];
-                let chunk_id = infnode::node::chunk_id_for(&bucket, &name, offset, &content_hash);
-                let stored = node.store_chunk_replicated(&bucket, &chunk_id, chunk).await;
-                chunks.push(json!({ "id": chunk_id, "n": stored, "off": offset, "len": chunk.len(), "hash": hex::encode(blake3::hash(chunk).as_bytes()) }));
-                offset = end;
+            // Owner-sealed path: random data key wrapped to the owner's
+            // ML-KEM-768 ek, payload AEAD-bound to (bucket, name, H(plain)).
+            // Invalid ek fails closed (store returns 0, no manifest written).
+            let stored = node
+                .store_blob_boxed(&bucket, &name, &data, Some(&owner_ek))
+                .await;
+            // `store_blob_boxed` returns 0 both for a refused owner key and
+            // for an empty blob (no chunks); only the manifest tells them
+            // apart. A refused key writes no manifest (fail-closed).
+            if stored == 0
+                && node
+                    .get_local_kv(&Node::blob_manifest_key(&bucket, &name))
+                    .await
+                    .is_none()
+            {
+                anyhow::bail!("put refused: owner ek is not a valid ML-KEM-768 key");
             }
-            // манифест в DHT KV
-            let manifest = json!({
-                "bucket": bucket,
-                "name": name,
-                "size": data.len(),
-                "nonce": hex::encode(nonce),
-                "key": hex::encode(data_key),
-                "chunks": chunks,
-            });
-            let mkey = format!("{bucket}:{name}");
-            // сохранить манифест через dht-store на k-ближайших
-            let h = blake3::hash(mkey.as_bytes());
-            let mut target = [0u8; 20];
-            target.copy_from_slice(&h.as_bytes()[..20]);
-            let closest = node.dht_find_node(&target).await;
-            let mpayload = json!({ "key": mkey, "value": manifest.to_string() }).to_string().into_bytes();
-            let mut saved = 0usize;
-            for n in closest {
-                if node.ensure_dht_peer(&n).await.is_ok()
-                    && node.request_to(n.id, "dht.store", mpayload.clone()).await.is_ok()
-                {
-                    saved += 1;
-                }
-            }
-            println!("put ok: name={name} bytes={} chunks={} manifest saved on {saved} nodes", data.len(), chunks.len());
+            // One-shot CLI process: flush the manifest to kv.json before exit.
+            node.flush_kv().await;
+            println!(
+                "put ok: name={name} bytes={} chunks={} sealed=owner (owner ek {}…)",
+                data.len(),
+                stored,
+                &owner_ek[..owner_ek.len().min(16)],
+            );
         }
-        Cmd::StorageGet { config, to: _, name, out, bucket } => {
-            use serde_json::json;
+        Cmd::StorageGet {
+            config,
+            to: _,
+            name,
+            out,
+            bucket,
+            owner_key,
+        } => {
             let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
+            let owner_key = owner_key.unwrap_or_else(|| hex::encode(keys.kem_seed));
             let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
-            // читаем манифест из DHT
-            let mkey = format!("{bucket}:{name}");
-            let h = blake3::hash(mkey.as_bytes());
-            let mut target = [0u8; 20];
-            target.copy_from_slice(&h.as_bytes()[..20]);
-            let closest = node.dht_find_node(&target).await;
-            let q = json!({ "key": mkey }).to_string().into_bytes();
-            // сначала локальный KV (манифест мог быть сохранён на этой ноде)
-            let mut manifest_str = node.get_local_kv(&mkey).await;
-            for n in closest.iter() {
-                if manifest_str.is_some() { break; }
-                if node.ensure_dht_peer(n).await.is_ok() {
-                    if let Ok(resp) = node.request_to(n.id, "dht.find_value", q.clone()).await {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                            if v["found"].as_bool().unwrap_or(false) {
-                                manifest_str = v["value"].as_str().map(String::from);
-                                break;
-                            }
-                        }
+            // Owner-aware fetch: opens an owner-sealed manifest, falls back to
+            // the legacy at-rest-obfuscation format when the blob predates
+            // sealing. Plain `fetch_blob` remains the compatibility path.
+            let plain = match node
+                .fetch_blob_owner(&bucket, &name, &owner_key)
+                .await
+            {
+                Some(p) => p,
+                None => match node.fetch_blob(&bucket, &name).await {
+                    Some(p) => p,
+                    None => {
+                        println!("blob not found or owner key refused");
+                        return Ok(());
                     }
-                }
-            }
-            let manifest: serde_json::Value = match manifest_str {
-                Some(m) => serde_json::from_str(&m)?,
-                None => { println!("manifest not found"); return Ok(()); }
+                },
             };
-            let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).unwrap_or_default();
-            let key = hex::decode(manifest["key"].as_str().unwrap_or("")).unwrap_or_default();
-            let mut data_key = [0u8; 32];
-            if key.len() == 32 { data_key.copy_from_slice(&key); }
-            let mut buf: Vec<u8> = Vec::new();
-            if let Some(chunks) = manifest["chunks"].as_array() {
-                for c in chunks {
-                    let cid = c["id"].as_str().unwrap_or("");
-                    let _len = c["len"].as_u64().unwrap_or(0) as usize;
-                    let q2 = json!({ "bucket": bucket, "chunk_id": cid }).to_string().into_bytes();
-                    // пробуем локальный чанк + реплики
-                    let mut got = node.local_chunk_get(&bucket, cid);
-                    for n in closest.iter() {
-                        if got.is_some() { break; }
-                        if node.ensure_dht_peer(n).await.is_ok() {
-                            if let Ok(resp) = node.request_to(n.id, "storage.fetch", q2.clone()).await {
-                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                                    if v["ok"].as_bool().unwrap_or(false) {
-                                        if let Some(b64) = v["data"].as_str() {
-                                            if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                                got = Some(b); break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    match got {
-                        Some(b) => buf.extend_from_slice(&b),
-                        None => { println!("chunk missing: {cid}"); return Ok(()); }
-                    }
-                }
-            }
-            let plain = infnode::node::e2e_decrypt(&data_key, &nonce, &buf)?;
             let nbytes = plain.len();
             std::fs::write(&out, &plain)?;
             println!("get ok: name={name} -> {} ({} bytes)", out.display(), nbytes);

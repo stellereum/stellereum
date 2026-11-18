@@ -2577,6 +2577,60 @@ impl InMemoryStateEngine {
     }
 }
 
+// ============================================================================
+// EVM address ↔ PQ account binding index — engine surface
+// ============================================================================
+//
+// The INDEX ITSELF lives in the EVM domain
+// (`crate::evm_adapter::binding::EvmBindingRegistry`): it is an address book
+// for the EVM WRITE path, not consensus state, and its records are the
+// committed `SysCallBindEvmAddress` / carrier transactions themselves.
+//
+// WHAT IT IS: a bounded, append-only `EVM address (20) → PQ account (32)` map
+// plus its inverse, replayed deterministically from COMMITTED records in block
+// order, FIRST-WRITER-WINS. A second claim on an already-bound EVM address is
+// refused, never silently re-bound (a re-bind would let a thief redirect an EVM
+// identity's routing).
+//
+// WHAT IT IS NOT: it is not folded into the state root, because the per
+// transaction domain-commit hook lives in `state_engine/apply.rs` (owned
+// elsewhere this wave). Every CONSENSUS fact is re-checked from signatures and
+// payload bytes alone — `evm_adapter::verify_binding_claim` /
+// `verify_carrier_intent` are PURE and the VM runs them at execution — so a
+// stale, empty or wrong index can only change which transactions a node ADMITS
+// and how it answers an address query. It can never make two nodes move
+// different money, which is why execution never reads it.
+//
+// These methods are the engine-level accessors so the RPC/admission paths do
+// not depend on the storage shape: replacing the process-local index with a
+// state-root domain later is a change HERE, not at every call site.
+
+impl InMemoryStateEngine {
+    /// The PQ account an EVM address is bound to, as this node knows it.
+    ///
+    /// Bridge between the RPC read surface and the index: `eth_getBalance` /
+    /// `eth_getTransactionCount` resolve a MetaMask address through here so a
+    /// wallet sees the balance of the account that can actually spend it.
+    pub async fn evm_binding_pq(&self, evm: &[u8; 20]) -> Option<[u8; 32]> {
+        crate::evm_adapter::lookup_bound_pq(evm)
+    }
+
+    /// Replay a block's (or a window's) COMMITTED transactions into the index,
+    /// in the order given. Returns how many binding statements were accepted.
+    ///
+    /// Deterministic and idempotent: replaying the same chain twice derives the
+    /// same map, and a conflicting second claim is dropped (first wins) instead
+    /// of overwriting.
+    pub fn observe_committed_evm_txs(&self, txs: &[crate::sharding::Transaction]) -> usize {
+        let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() else {
+            return 0;
+        };
+        txs.iter()
+            .filter(|tx| idx.observe_transaction(tx).is_some())
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

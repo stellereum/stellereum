@@ -1,7 +1,8 @@
-//! Ethereum JSON-RPC surface: read views are REAL, the EVM write path is an
-//! honest FULL-PQ refusal.
+//! Ethereum JSON-RPC surface: read views are REAL, and the EVM write path is a
+//! FULL-PQ **carrier** path (value transfers) with honest refusals everywhere
+//! else.
 //!
-//! # Design: what this module does, and why the write path refuses
+//! # Design: what this module does
 //!
 //! Stellereum's consensus credential is a post-quantum signature. Every
 //! admission path funnels through `Mempool::insert` -> `add_checked_ctx` ->
@@ -10,42 +11,52 @@
 //! `tx.from == derive_pq_address(scheme, pubkey, salt)`. A secp256k1 signature
 //! is **not** a consensus credential and there is no mode that makes it one.
 //!
-//! A `MetaMask` EIP-155 transaction is signed by a secp256k1 key and its
-//! sender is the EVM address derived from that key. Two facts make an honest
-//! one-step conversion impossible without a consensus change:
+//! A MetaMask EIP-155 transaction is signed by a secp256k1 key whose EVM
+//! address is `keccak256(pubkey)[12..]`; no Falcon-512 key derives that
+//! address, and `EV1` (the old Phase-2 envelope that embedded raw EVM bytes in
+//! `Transaction.signature`) is refused by `verify_inner_with_registry`, so the
+//! node can never let the secp signature decide anything. What DOES work is a
+//! two-part statement that only the user's PQ key can make:
 //!
-//! 1. `EV1` (the old Phase-2 carrier) embeds the raw EVM bytes inside
-//!    `Transaction.signature`; `Transaction::verify_inner_with_registry`
-//!    explicitly returns `false` for `EV1` in FULL-PQ builds, so the mempool
-//!    must refuse it (see the dedicated `EV1` branch in `mempool::insert`).
-//! 2. A PQ envelope's `from` is a PQ-derived address, not the zero-padded
-//!    20-byte EVM address, and no on-chain PQ<->EVM address binding exists.
-//!    Letting the node sign with its own configured key would spend the
-//!    NODE's funds (a custodial relayer), not the user's, and would turn the
-//!    node key into an authority over user transfers — not acceptable. The
-//!    only node-side PQ key path wired to a transaction builder today is the
-//!    optional faucet key (`rpc::faucet::Faucet`,
-//!    `sign_pq_explicit_transfer`); it would debit the
-//!    faucet account (testnet-only) rather than the EVM sender, so it is not
-//!    a settlement path for `eth_sendRawTransaction`.
+//! 1. **binding** — `SysCallBindEvmAddress` commits
+//!    `EVM address → PQ account`, Falcon-signed by the PQ account over
+//!    `keccak256("STELL_EVM_BIND_V1" || chain_id || evm || pq)`. It is the
+//!    on-chain record that lets this RPC route an EVM address to the account
+//!    that can spend its funds (`eth_getBalance` / `eth_getTransactionCount`
+//!    serve that account too).
+//! 2. **carrier** — a normal PQ1 transaction whose `SysCallEvmCarrier` payload
+//!    carries the canonical EIP-155 bytes, the EVM sender, the bound
+//!    Falcon-512 key and that key's signature over `keccak256(EVM tx)`.
+//!    `tx.from` is the bound PQ account, `tx.to` is the recipient's bound PQ
+//!    account, `tx.amount` is the EVM value in nano-STELL and `tx.nonce` is
+//!    the EVM nonce. Two independent Falcon statements must both verify (the
+//!    envelope's, over the whole Stell transaction including the payload, and
+//!    the payload's, over the EVM intent); the secp256k1 signature inside the
+//!    EVM bytes is verified for routing and UI only.
 //!
-//! Therefore `eth_sendRawTransaction`:
+//! So `eth_sendRawTransaction`:
 //! * decodes and strictly verifies the EVM intent (chain id, low-s,
-//!   ecrecover) so malformed / malleable / foreign-chain / unprotected input
+//!   ecrecover), so malformed / malleable / foreign-chain / unprotected input
 //!   keeps a precise error;
-//! * then refuses a WELL-FORMED intent with `-32000`, naming the exact PQ
-//!   requirement and the replacement call, and **files no pending intent**
-//!   (the old path left an intent that could never settle);
-//! * returns `error.data = { reason: "full-pq-admission", requires, submitWith,
-//!   evmHash, readOnly }` so a wallet can act on it programmatically.
+//! * with NO on-chain binding for the EVM sender, keeps the historical honest
+//!   refusal (`reason: "full-pq-admission"`, the native PQ path named,
+//!   **no pending intent filed**);
+//! * with a binding, refuses with `reason:
+//!   "pq-carrier-authorization-required"` and the exact bytes to Falcon-sign
+//!   (`intentSignThis`, then `signThis` once the intent signature is supplied),
+//!   and settles the transfer when both signatures arrive in the optional
+//!   `carrier` parameter (returning the EVM hash MetaMask tracks);
+//! * refuses contract creation and calldata honestly
+//!   (`evm-contract-execution-unsupported`): there is no EVM interpreter or
+//!   EVM state trie in this wave, so executing bytecode would be a lie;
+//! * refuses an EVM recipient with no PQ binding
+//!   (`recipient-evm-address-unbound`): crediting the bare 20-byte address
+//!   would make the funds unspendable.
 //!
-//! The full EVM execution path needs a consensus-level change, not a
-//! client-compatibility shim: an EVM state trie + execution domain, and an
-//! on-chain, PQ-signed binding between a PQ account and an EVM address (or a
-//! `PQEVM` carrier whose PQ envelope signs `keccak(EVM intent)` and whose
-//! source account is the bound PQ account). Until such a binding is committed
-//! and verified by every node, the only truthful write answer is the refusal
-//! above plus the native PQ path `stell_sendRawTransaction`.
+//! Operator surface: `stell_getEvmBinding` (read the binding),
+//! `stell_evmBindingSubmit` (submit a signed claim) and `stell_evmCarrierSubmit`
+//! (submit a signed carrier in one call). All three are self-authenticating —
+//! nothing moves without a Falcon signature from the bound key.
 //!
 //! Read-only methods stay fully served: `eth_call`, `eth_getProof` (real
 //! cpat2 inclusion/exclusion proof from the state trie), `eth_getCode` (real
@@ -723,7 +734,13 @@ pub(super) async fn dispatch_eth(
         // never executed).
         "eth_estimateGas" => {
             let sender = match estimate_sender(params) {
-                Ok(v) => v,
+                Ok(Some(raw)) => match crate::evm_adapter::resolve_evm_account(&st.engine, &raw)
+                    .await
+                {
+                    Ok(a) => Some(a),
+                    Err(e) => return Some(err(id, -32602, format!("invalid from address: {e}"))),
+                },
+                Ok(None) => None,
                 Err(e) => return Some(err(id, -32602, e)),
             };
             let floor = {
@@ -773,8 +790,39 @@ pub(super) async fn dispatch_eth(
             Err(e) => err(id, e.code, e.message),
         },
         "eth_getTransactionCount" => {
+            // On-chain nonce for the resolved account (a 20-byte EVM address
+            // resolves to its BOUND PQ account), plus — for the `pending` tag,
+            // which is what a wallet asks for when it composes the next
+            // transaction — the pooled head. Without the pending head a wallet
+            // that sends twice in a row reuses the same nonce and the second
+            // carrier is refused.
+            let (account, want_pending) =
+                match crate::evm_adapter::parse_address_and_tag_params(params) {
+                    Ok((addr, tag)) => {
+                        let want_pending = tag
+                            .map(|t| matches!(t, crate::evm_adapter::BlockTag::Pending))
+                            .unwrap_or(false);
+                        match crate::evm_adapter::resolve_evm_account(&st.engine, &addr).await {
+                            Ok(a) => (a, want_pending),
+                            Err(e) => return Some(rpc_error(id, e)),
+                        }
+                    }
+                    Err(e) => return Some(rpc_error(id, e)),
+                };
             match crate::evm_adapter::eth_get_transaction_count(&st.engine, params).await {
-                Ok(cnt) => ok(id, json!(cnt)),
+                Ok(cnt) => {
+                    if !want_pending {
+                        return Some(ok(id, json!(cnt)));
+                    }
+                    let onchain = crate::evm_adapter::parse_hex_u64(&cnt).unwrap_or(0);
+                    let pooled = st
+                        .mempool
+                        .read()
+                        .await
+                        .next_pending_nonce(&account)
+                        .unwrap_or(0);
+                    ok(id, json!(crate::evm_adapter::format_u64_hex(onchain.max(pooled))))
+                }
                 Err(e) => err(id, e.code, e.message),
             }
         }
@@ -896,23 +944,551 @@ pub(super) async fn dispatch_eth(
             Err(e) => err(id, e.code, e.message),
         },
         "eth_sendRawTransaction" => {
-            // FULL-PQ HONESTY CONTRACT (see the module header):
-            //  1. Decode + strictly verify the EVM intent (Phase-1 gate:
-            //     chain id, low-s, ecrecover). Malformed / malleable /
-            //     foreign-chain / unprotected input keeps its precise error.
-            //  2. A well-formed intent is REFUSED with the PQ requirement and
-            //     the replacement call. No pending intent is filed (the old
-            //     path pooled an EV1 transaction the mempool must reject, and
-            //     an intent that could never settle).
-            // Read-only eth_call / eth_getProof / eth_getCode stay served.
-            let evm_hash = match crate::evm_adapter::extract_raw_evm_bytes(params)
-                .and_then(|raw| crate::evm_adapter::verify_raw_evm_intent(&raw))
-            {
-                Ok(h) => h,
+            // FULL-PQ EVM WRITE PATH. What this method can and cannot do:
+            //
+            //  * a secp256k1/EIP-155 signature is NEVER a consensus
+            //    credential here, so a bare EVM intent can not move value;
+            //  * if the EVM sender has NO on-chain PQ binding, the historical
+            //    honest refusal stays verbatim (`full-pq-admission`) — there
+            //    is no account to debit and nothing to authorise;
+            //  * if it HAS a binding, the intent is refused with
+            //    `pq-carrier-authorization-required` naming the exact carrier
+            //    signing message (`error.data.signThis`) unless the caller
+            //    supplies the bound PQ account's Falcon-512 signatures in the
+            //    optional `carrier` parameter — in which case the carrier
+            //    transaction is built, verified and admitted, and the EVM hash
+            //    MetaMask tracks is returned.
+            //
+            // Malformed / malleable / foreign-chain / unprotected input keeps
+            // its precise Phase-1 error on every path.
+            let raw = match crate::evm_adapter::extract_raw_evm_bytes(params) {
+                Ok(r) => r,
                 Err(e) => return Some(rpc_error(id, e)),
             };
-            rpc_error(id, crate::evm_adapter::evm_send_refusal(Some(&evm_hash)))
+            let view = match crate::evm_adapter::decode_verify_raw_evm(&raw) {
+                Ok(v) => v,
+                Err(e) => return Some(rpc_error(id, e)),
+            };
+            let evm_from = match crate::evm_adapter::evm_address_from_hex(&view.from) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Some(err(
+                        id,
+                        -32603,
+                        format!("decoded EVM sender is not an address: {e}"),
+                    ))
+                }
+            };
+            let evm_hash = view.hash.clone();
+            let evm_from_hex = crate::evm_adapter::evm_address_to_hex(&evm_from);
+            // 1. No binding => the historical, unchanged refusal.
+            let Some(bound_pq) = st.engine.evm_binding_pq(&evm_from).await else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::evm_send_refusal(Some(&evm_hash)),
+                ));
+            };
+            // 2. A binding exists: the intent must be settleable at all.
+            let facts = match crate::evm_adapter::evm_transfer_facts(&raw) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Some(rpc_error(
+                        id,
+                        crate::evm_adapter::evm_intent_unsupported(Some(&evm_hash), &e),
+                    ))
+                }
+            };
+            // 3. The recipient must be routable: a bare EVM address has no PQ
+            //    key, so crediting it would burn the funds.
+            let recipient_evm = crate::evm_adapter::evm_address_to_hex(&facts.to);
+            let Some(to_pq) = st.engine.evm_binding_pq(&facts.to).await else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::recipient_unbound(&recipient_evm, Some(&evm_hash)),
+                ));
+            };
+            if to_pq == bound_pq {
+                // Self-send: allowed, but the carrier still has to be paid for
+                // and no binding can route a 20-byte address to itself. Keep
+                // the semantics explicit (the value leg is a no-op transfer).
+                tracing::debug!(
+                    "[evm] carrier self-send for {} (bound account {})",
+                    evm_from_hex,
+                    hex::encode(bound_pq)
+                );
+            }
+            // 4. Fee cap: the EVM gas figure is a resource cap, never the Stell
+            //    fee. Cover the live admission floor (which already includes
+            //    the PQ activation + carrier surcharges) and keep the builder
+            //    deterministic for a wallet that cannot query the floor.
+            let floor = {
+                let pool = st.mempool.read().await;
+                pool.effective_floor(&bound_pq)
+            };
+            let live_gas = floor
+                .saturating_add(crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS)
+                .saturating_add(crate::mempool::EVM_CARRIER_SURCHARGE_GAS)
+                .max(crate::evm_adapter::EVM_CARRIER_MIN_GAS);
+            let auth = match carrier_auth_params(params) {
+                Ok(a) => a,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let gas_limit = auth
+                .as_ref()
+                .and_then(|a| a.gas_limit)
+                .unwrap_or(live_gas)
+                .max(facts.gas_limit);
+            let intent_digest = crate::evm_adapter::evm_intent_digest(&raw);
+            // Step 1: no PQ key / no intent signature yet. Report the digest to
+            // Falcon-sign; the carrier message does not exist until then.
+            let Some(auth) = auth else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::carrier_authorization_required(
+                        &evm_hash,
+                        &evm_from_hex,
+                        &bound_pq,
+                        &recipient_evm,
+                        &to_pq,
+                        facts.value_nano,
+                        gas_limit,
+                        facts.nonce,
+                        &intent_digest,
+                        None,
+                    ),
+                ));
+            };
+            let pq_from = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &auth.pq_pubkey,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            if pq_from != bound_pq {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::JsonRpcError::with_data(
+                        -32000,
+                        format!(
+                            "carrier refused: the supplied PQ public key derives {}, but EVM \
+                             address {evm_from_hex} is bound to {}",
+                            hex::encode(pq_from),
+                            hex::encode(bound_pq)
+                        ),
+                        json!({
+                            "reason": "pq-key-not-the-bound-key",
+                            "evmFrom": evm_from_hex,
+                            "boundPqAddress": format!("0x{}", hex::encode(bound_pq)),
+                            "derivedPqAddress": format!("0x{}", hex::encode(pq_from)),
+                        }),
+                    ),
+                ));
+            }
+            let Some(intent_signature) = auth.intent_signature.as_deref() else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::carrier_authorization_required(
+                        &evm_hash,
+                        &evm_from_hex,
+                        &bound_pq,
+                        &recipient_evm,
+                        &to_pq,
+                        facts.value_nano,
+                        gas_limit,
+                        facts.nonce,
+                        &intent_digest,
+                        None,
+                    ),
+                ));
+            };
+            // Step 2: the intent signature is known, so the payload (and the
+            // exact carrier message that covers it) is deterministic.
+            let sign_this = match crate::evm_adapter::carrier_template_message(
+                &raw,
+                &auth.pq_pubkey,
+                intent_signature,
+                to_pq,
+                gas_limit,
+            ) {
+                Ok(m) => m,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let Some(tx_signature) = auth.tx_signature.as_deref() else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::carrier_authorization_required(
+                        &evm_hash,
+                        &evm_from_hex,
+                        &bound_pq,
+                        &recipient_evm,
+                        &to_pq,
+                        facts.value_nano,
+                        gas_limit,
+                        facts.nonce,
+                        &intent_digest,
+                        Some(&sign_this),
+                    ),
+                ));
+            };
+            // 3. Build exactly the transaction the signing message described.
+            let tx = match crate::evm_adapter::build_carrier_transaction(
+                &raw,
+                &auth.pq_pubkey,
+                intent_signature,
+                to_pq,
+                gas_limit,
+                tx_signature,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(rpc_error(
+                        id,
+                        carrier_signature_refusal(&e, &sign_this, &evm_hash),
+                    ))
+                }
+            };
+            match submit_carrier(st, tx).await {
+                Ok(stell_hash) => {
+                    // Map the EVM hash to the settlement L1 hash immediately, so
+                    // `eth_getTransactionByHash(evmHash)` (what MetaMask polls)
+                    // resolves to the pool/inclusion view instead of `null`.
+                    crate::evm_adapter::register_evm_settlement(&evm_hash, &stell_hash);
+                    ok(id, json!(evm_hash))
+                }
+                Err(e) => rpc_error(id, e),
+            }
         }
+        // EVM WRITE PATH — address binding (read).
+        //
+        // `stell_getEvmBinding(address)` accepts a 20-byte EVM address or a
+        // 32-byte PQ address and reports the current on-chain binding exactly as
+        // this node's deterministic index knows it. `bound: false` is the
+        // honest answer for an address this node has seen no committed claim
+        // for (it is never invented).
+        "stell_getEvmBinding" | "eth_getEvmBinding" => {
+            let arg = match params {
+                Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            };
+            let Some(arg) = arg else {
+                return Some(err(id, -32602, "missing address parameter"));
+            };
+            let trimmed = arg.trim();
+            let bare = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+                .unwrap_or(trimmed);
+            let result = if bare.len() == 40 {
+                let evm = match crate::evm_adapter::evm_address_from_hex(bare) {
+                    Ok(a) => a,
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+                let pq = st.engine.evm_binding_pq(&evm).await;
+                json!({
+                    "evmAddress": format!("0x{}", hex::encode(evm)),
+                    "pqAddress": pq.map(|p| format!("0x{}", hex::encode(p))),
+                    "bound": pq.is_some(),
+                    "source": "committed EVM binding index (node-local replay of \
+                               SysCallBindEvmAddress / carrier records)",
+                })
+            } else if bare.len() == 64 {
+                let mut pq = [0u8; 32];
+                if let Err(e) = hex::decode_to_slice(bare, &mut pq) {
+                    return Some(err(id, -32602, format!("invalid PQ address: {e}")));
+                }
+                let evm = crate::evm_adapter::lookup_bound_evm(&pq);
+                json!({
+                    "evmAddress": evm.map(|e| format!("0x{}", hex::encode(e))),
+                    "pqAddress": format!("0x{}", hex::encode(pq)),
+                    "bound": evm.is_some(),
+                    "source": "committed EVM binding index (node-local replay of \
+                               SysCallBindEvmAddress / carrier records)",
+                })
+            } else {
+                return Some(err(
+                    id,
+                    -32602,
+                    "address must be a 20-byte EVM address (0x + 40 hex) or a 32-byte PQ \
+                     address (0x + 64 hex)",
+                ));
+            };
+            ok(id, result)
+        }
+        // EVM WRITE PATH — binding registration.
+        //
+        // params: { "pqPublicKey": "0x<897 bytes>", "evmAddress": "0x<20 bytes>",
+        //           "bindingSignature": "0x<666 bytes Falcon over the claim>",
+        //           "txSignature": "0x<666 bytes Falcon over the tx message>",
+        //           "nonce": <u64, optional — defaults to the account's next nonce>,
+        //           "gasLimit": <u64, optional> }
+        //
+        // Self-authenticating (no API token): nothing can be bound without the
+        // PQ key's signature, and the transaction is admitted through the same
+        // mempool gate as any other. Returns the Stell transaction hash.
+        //
+        // The two signatures cover DIFFERENT preimages and the wallet must
+        // build them with the same `nonce`/`gasLimit` that are submitted:
+        //   claimSignThis = keccak256("STELL_EVM_BIND_V1" || chain_id ||
+        //                            evm_address || pq_address)
+        //   txSignThis    = the binding transaction's signing message
+        // A wrong preimage is refused with BOTH hex preimages in
+        // `error.data.claimSignThis` / `error.data.txSignThis` (plus the
+        // nonce/gasLimit that were used), so a wallet can sign exactly those
+        // and resubmit without guessing.
+        "stell_evmBindingSubmit" => {
+            let pq_pubkey = match hex_param(params, &["pqPublicKey", "pq_public_key"]) {
+                Ok(v) => v,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let evm_address: [u8; 20] =
+                match hex_param(params, &["evmAddress", "evm_address", "evm"]) {
+                    Ok(v) if v.len() == 20 => {
+                        let mut a = [0u8; 20];
+                        a.copy_from_slice(&v);
+                        a
+                    }
+                    Ok(v) => {
+                        return Some(err(
+                            id,
+                            -32602,
+                            format!("evmAddress must be 20 bytes, got {}", v.len()),
+                        ))
+                    }
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+            let binding_signature =
+                match hex_param(params, &["bindingSignature", "binding_signature", "claimSignature"])
+                {
+                    Ok(v) => v,
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+            let tx_signature =
+                match hex_param(params, &["txSignature", "tx_signature", "signature"]) {
+                    Ok(v) => v,
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+            let pq_from = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pq_pubkey,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            // A conflict is refused before any signature work: first claim wins.
+            if let Some(existing) = st.engine.evm_binding_pq(&evm_address).await {
+                if existing != pq_from {
+                    return Some(rpc_error(
+                        id,
+                        crate::evm_adapter::JsonRpcError::with_data(
+                            -32000,
+                            format!(
+                                "binding refused: EVM address 0x{} is already bound to PQ \
+                                 account {} (first claim wins)",
+                                hex::encode(evm_address),
+                                hex::encode(existing)
+                            ),
+                            json!({
+                                "reason": "evm-binding-conflict",
+                                "evmAddress": format!("0x{}", hex::encode(evm_address)),
+                                "boundPqAddress": format!("0x{}", hex::encode(existing)),
+                            }),
+                        ),
+                    ));
+                }
+            }
+            let acct = st.engine.get_account(&pq_from).await;
+            let nonce = match optional_u64(params, &["nonce"]) {
+                Ok(Some(n)) => n,
+                Ok(None) => acct.as_ref().map(|a| a.nonce).unwrap_or(0),
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let floor = {
+                let pool = st.mempool.read().await;
+                pool.effective_floor(&pq_from)
+            };
+            let gas_limit = match optional_u64(params, &["gasLimit", "gas_limit"]) {
+                Ok(Some(g)) => g,
+                Ok(None) => floor
+                    .saturating_add(crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS)
+                    .max(crate::evm_adapter::EVM_BINDING_MIN_GAS),
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let tx = match crate::evm_adapter::build_binding_transaction(
+                &pq_pubkey,
+                evm_address,
+                &binding_signature,
+                nonce,
+                gas_limit,
+                &tx_signature,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    let sign_this = crate::evm_adapter::binding_template_message(
+                        &pq_pubkey,
+                        evm_address,
+                        &binding_signature,
+                        nonce,
+                        gas_limit,
+                    )
+                    .unwrap_or_default();
+                    let claim_msg = crate::evm_adapter::binding_message(
+                        crate::evm_adapter::effective_chain_id(),
+                        &evm_address,
+                        &pq_from,
+                    );
+                    return Some(rpc_error(
+                        id,
+                        crate::evm_adapter::JsonRpcError::with_data(
+                            -32000,
+                            format!("binding refused: {e}"),
+                            json!({
+                                "reason": "evm-binding-signature-rejected",
+                                "evmAddress": format!("0x{}", hex::encode(evm_address)),
+                                "pqAddress": format!("0x{}", hex::encode(pq_from)),
+                                "claimSignThis": format!("0x{}", hex::encode(claim_msg)),
+                                "txSignThis": format!("0x{}", hex::encode(sign_this)),
+                                "nonce": nonce,
+                                "gasLimit": gas_limit,
+                            }),
+                        ),
+                    ));
+                }
+            };
+            match submit_carrier(st, tx).await {
+                Ok(hash) => {
+                    // Index immediately (node-local routing): the claim is now
+                    // admissible, so a carrier can follow without waiting for a
+                    // block. Consensus checks nothing from this index.
+                    let _ = crate::evm_adapter::record_evm_binding(evm_address, pq_from);
+                    ok(id, json!(hex::encode(hash)))
+                }
+                Err(e) => rpc_error(id, e),
+            }
+        }
+        // EVM WRITE PATH — carrier submission in one call.
+        //
+        // params: { "rawTransaction": "0x<canonical EIP-155/1559>",
+        //           "pqPublicKey": "0x<897 bytes>",
+        //           "intentSignature": "0x<666 bytes Falcon over keccak256(raw)>",
+        //           "txSignature": "0x<666 bytes Falcon over the carrier message>",
+        //           "gasLimit": <u64, optional> }
+        //
+        // Same construction as `eth_sendRawTransaction` with a `carrier` object;
+        // exposed under a `stell_` name so a wallet can use the native surface.
+        // Returns the EVM transaction hash.
+        "stell_evmCarrierSubmit" => {
+            let raw = match crate::evm_adapter::extract_raw_evm_bytes(params) {
+                Ok(r) => r,
+                Err(e) => return Some(rpc_error(id, e)),
+            };
+            let view = match crate::evm_adapter::decode_verify_raw_evm(&raw) {
+                Ok(v) => v,
+                Err(e) => return Some(rpc_error(id, e)),
+            };
+            let evm_from = match crate::evm_adapter::evm_address_from_hex(&view.from) {
+                Ok(a) => a,
+                Err(e) => return Some(err(id, -32603, e)),
+            };
+            let evm_from_hex = crate::evm_adapter::evm_address_to_hex(&evm_from);
+            let facts = match crate::evm_adapter::evm_transfer_facts(&raw) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Some(rpc_error(
+                        id,
+                        crate::evm_adapter::evm_intent_unsupported(Some(&view.hash), &e),
+                    ))
+                }
+            };
+            let Some(bound_pq) = st.engine.evm_binding_pq(&evm_from).await else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::evm_send_refusal(Some(&view.hash)),
+                ));
+            };
+            let recipient_evm = crate::evm_adapter::evm_address_to_hex(&facts.to);
+            let Some(to_pq) = st.engine.evm_binding_pq(&facts.to).await else {
+                return Some(rpc_error(
+                    id,
+                    crate::evm_adapter::recipient_unbound(&recipient_evm, Some(&view.hash)),
+                ));
+            };
+            let pq_pubkey = match hex_param(params, &["pqPublicKey", "pq_public_key"]) {
+                Ok(v) => v,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let intent_signature =
+                match hex_param(params, &["intentSignature", "intent_signature"]) {
+                    Ok(v) => v,
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+            let tx_signature =
+                match hex_param(params, &["txSignature", "tx_signature", "signature"]) {
+                    Ok(v) => v,
+                    Err(e) => return Some(err(id, -32602, e)),
+                };
+            let pq_from = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pq_pubkey,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            if pq_from != bound_pq {
+                return Some(err(
+                    id,
+                    -32000,
+                    format!(
+                        "carrier refused: the supplied PQ public key derives {}, but EVM \
+                         address {evm_from_hex} is bound to {}",
+                        hex::encode(pq_from),
+                        hex::encode(bound_pq)
+                    ),
+                ));
+            }
+            let floor = {
+                let pool = st.mempool.read().await;
+                pool.effective_floor(&bound_pq)
+            };
+            let gas_limit = match optional_u64(params, &["gasLimit", "gas_limit"]) {
+                Ok(Some(g)) => g.max(facts.gas_limit),
+                Ok(None) => floor
+                    .saturating_add(crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS)
+                    .saturating_add(crate::mempool::EVM_CARRIER_SURCHARGE_GAS)
+                    .max(crate::evm_adapter::EVM_CARRIER_MIN_GAS)
+                    .max(facts.gas_limit),
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let sign_this = match crate::evm_adapter::carrier_template_message(
+                &raw,
+                &pq_pubkey,
+                &intent_signature,
+                to_pq,
+                gas_limit,
+            ) {
+                Ok(m) => m,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let tx = match crate::evm_adapter::build_carrier_transaction(
+                &raw,
+                &pq_pubkey,
+                &intent_signature,
+                to_pq,
+                gas_limit,
+                &tx_signature,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(rpc_error(
+                        id,
+                        carrier_signature_refusal(&e, &sign_this, &view.hash),
+                    ))
+                }
+            };
+            match submit_carrier(st, tx).await {
+                Ok(stell_hash) => {
+                    crate::evm_adapter::register_evm_settlement(&view.hash, &stell_hash);
+                    ok(id, json!(view.hash))
+                }
+                Err(e) => rpc_error(id, e),
+            }
+        }
+
         "eth_getProof" => match crate::evm_adapter::eth_get_proof_rpc(st, params).await {
             Ok(v) => ok(id, v),
             Err(e) => rpc_error(id, e),
@@ -948,7 +1524,7 @@ fn rpc_error(id: Value, e: crate::evm_adapter::JsonRpcError) -> Json<RpcResponse
 /// `eth_estimateGas` accepts the same call object as `eth_call`; `from` is
 /// what selects the sender-specific admission floor (F10). A malformed `from`
 /// is a parameter error, never silently ignored.
-fn estimate_sender(params: &Value) -> Result<Option<[u8; 32]>, String> {
+fn estimate_sender(params: &Value) -> Result<Option<String>, String> {
     let obj = match params {
         Value::Null => return Ok(None),
         Value::Array(arr) => match arr.first() {
@@ -962,9 +1538,10 @@ fn estimate_sender(params: &Value) -> Result<Option<[u8; 32]>, String> {
     };
     match obj.get("from") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => crate::evm_adapter::parse_evm_or_stell_address(s)
-            .map(Some)
-            .map_err(|e| format!("invalid from address: {e}")),
+        // Validated + resolved by the caller through `resolve_evm_account`, so a
+        // 20-byte EVM address quotes the BOUND PQ account's floor (F10: the
+        // floor is per sender, so quoting the wrong account is a wrong quote).
+        Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err("invalid from address: expected a hex address string".to_string()),
     }
 }
@@ -985,4 +1562,256 @@ fn wants_pq_activation(params: &Value) -> bool {
         .or_else(|| obj.get("activation"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// EVM WRITE PATH: carrier helpers
+// ---------------------------------------------------------------------------
+
+/// The Falcon authorisation a caller attaches to an EVM submission.
+///
+/// Two signatures are required and both come from the BOUND PQ key:
+/// `intent_signature` over `keccak256(EVM raw)` (the EVM-intent authorisation
+/// carried in the payload) and `tx_signature` over the carrier signing message
+/// (the PQ1 consensus credential). Neither can be produced by a relayer, and
+/// neither is a node-held secret: the node only ever verifies them.
+struct CarrierAuth {
+    pq_pubkey: Vec<u8>,
+    /// Falcon-512 over `keccak256(EVM raw)`; absent on the first step.
+    intent_signature: Option<Vec<u8>>,
+    /// Falcon-512 over the carrier signing message; absent until the intent
+    /// signature exists (the message commits to it).
+    tx_signature: Option<Vec<u8>>,
+    gas_limit: Option<u64>,
+}
+
+/// Locate the optional `carrier` object on an `eth_sendRawTransaction` call.
+///
+/// Accepted shapes (MetaMask sends `[raw]`; a PQ signer sends
+/// `[raw, {"carrier": {...}}]` or `[raw, {...}]`):
+/// * `["0x.."]` -> `None` (no PQ authorisation attached);
+/// * `["0x..", {"carrier": {"pqPublicKey", "intentSignature", "txSignature"}}]`;
+/// * `["0x..", {"pqPublicKey", ...}]` (the object itself).
+///
+/// A `carrier` object that is present but malformed is a parameter error: it is
+/// never silently ignored (that would report a missing authorisation for an
+/// authorisation the caller actually tried to send).
+fn carrier_auth_params(params: &Value) -> Result<Option<CarrierAuth>, String> {
+    let outer = match params {
+        Value::Array(arr) => match arr.get(1) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::Object(map)) => map,
+            Some(_) => return Err("second parameter must be an object".to_string()),
+        },
+        Value::Object(map) => map,
+        Value::String(_) | Value::Null => return Ok(None),
+        _ => return Err("params must be an array or object".to_string()),
+    };
+    // Accept both `[{...carrier: {...}}]` and a bare `{...}` authorisation object.
+    let obj = match outer.get("carrier") {
+        Some(Value::Object(inner)) => inner,
+        Some(_) => return Err("carrier must be an object".to_string()),
+        None => outer,
+    };
+    // A plain second object without any carrier key is not an authorisation.
+    let has_any = ["pqPublicKey", "pq_public_key", "intentSignature", "intent_signature"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
+    if !has_any {
+        return Ok(None);
+    }
+    Ok(Some(CarrierAuth {
+        pq_pubkey: object_hex(obj, &["pqPublicKey", "pq_public_key"])?,
+        intent_signature: object_optional_hex(obj, &["intentSignature", "intent_signature"])?,
+        tx_signature: object_optional_hex(obj, &["txSignature", "tx_signature", "signature"])?,
+        gas_limit: object_u64(obj, &["gasLimit", "gas_limit"])?,
+    }))
+}
+
+/// Decode a required `0x`-hex byte parameter from a params object.
+fn object_hex(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Result<Vec<u8>, String> {
+    let raw = keys
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+        .ok_or_else(|| format!("missing {} parameter", keys[0]))?;
+    let bare = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    hex::decode(bare).map_err(|e| format!("invalid {} hex: {e}", keys[0]))
+}
+
+/// Optional `0x`-hex bytes from a params object.
+fn object_optional_hex(
+    obj: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<Vec<u8>>, String> {
+    if !keys.iter().any(|k| obj.contains_key(*k)) {
+        return Ok(None);
+    }
+    object_hex(obj, keys).map(Some)
+}
+
+/// Optional u64 from a params object (`0x`-hex or decimal string, or a number).
+fn object_u64(
+    obj: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<u64>, String> {
+    for k in keys {
+        match obj.get(*k) {
+            None | Some(Value::Null) => continue,
+            Some(Value::Number(n)) => {
+                return n
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| format!("{k} must be a non-negative integer"))
+            }
+            Some(Value::String(s)) => {
+                let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    Some(h) => u64::from_str_radix(h, 16),
+                    None => s.parse::<u64>(),
+                };
+                return parsed
+                    .map(Some)
+                    .map_err(|e| format!("invalid {k}: {e}"));
+            }
+            Some(_) => return Err(format!("{k} must be a number or a numeric string")),
+        }
+    }
+    Ok(None)
+}
+
+/// Decode a required `0x`-hex byte parameter from top-level params.
+fn hex_param(params: &Value, keys: &[&str]) -> Result<Vec<u8>, String> {
+    let obj = match params {
+        Value::Array(arr) => arr.first().and_then(|v| v.as_object()),
+        Value::Object(map) => Some(map),
+        _ => None,
+    };
+    // Accept either a positional single parameter or a named one.
+    if let Some(raw) = keys
+        .iter()
+        .find_map(|k| obj.and_then(|o| o.get(*k)).and_then(|v| v.as_str()))
+    {
+        let bare = raw
+            .strip_prefix("0x")
+            .or_else(|| raw.strip_prefix("0X"))
+            .unwrap_or(raw);
+        return hex::decode(bare).map_err(|e| format!("invalid {} hex: {e}", keys[0]));
+    }
+    if let Value::Object(map) = params {
+        if let Some(Value::String(raw)) = map.get("data") {
+            let bare = raw
+                .strip_prefix("0x")
+                .or_else(|| raw.strip_prefix("0X"))
+                .unwrap_or(raw);
+            return hex::decode(bare).map_err(|e| format!("invalid data hex: {e}"));
+        }
+    }
+    Err(format!("missing {} parameter", keys[0]))
+}
+
+/// Optional u64 from top-level params.
+fn optional_u64(params: &Value, keys: &[&str]) -> Result<Option<u64>, String> {
+    let obj = match params {
+        Value::Array(arr) => arr.first().and_then(|v| v.as_object()),
+        Value::Object(map) => Some(map),
+        _ => None,
+    };
+    match obj {
+        Some(map) => object_u64(map, keys),
+        None => Ok(None),
+    }
+}
+
+/// Refusal for a carrier whose signatures do not verify: names the exact
+/// preimages so the signer can retry with the right bytes.
+fn carrier_signature_refusal(
+    reason: &str,
+    sign_this: &[u8],
+    evm_hash: &str,
+) -> crate::evm_adapter::JsonRpcError {
+    crate::evm_adapter::JsonRpcError::with_data(
+        -32000,
+        format!("carrier refused: {reason}"),
+        json!({
+            "reason": "evm-carrier-signature-rejected",
+            "detail": reason,
+            "evmHash": evm_hash,
+            "signThis": format!("0x{}", hex::encode(sign_this)),
+            "requires": "Falcon-512 from the bound PQ key over keccak256(EVM transaction) \
+                         (intentSignature) and over signThis (txSignature)",
+        }),
+    )
+}
+
+/// Admit a fully built carrier to the mempool, mirroring
+/// `stell_sendRawTransaction` exactly (balance head, admission clock, chain
+/// binding gate, nonce-gap fail-fast, broadcast, throttled save).
+///
+/// The signature is verified once more here, so no caller can slip an
+/// unverified carrier into the pool through this helper.
+async fn submit_carrier(
+    st: &RpcState,
+    tx: crate::sharding::Transaction,
+) -> Result<[u8; 32], crate::evm_adapter::JsonRpcError> {
+    if !tx.verify_signature() {
+        return Err(crate::evm_adapter::JsonRpcError::with_data(
+            -32000,
+            "carrier refused: the PQ1 envelope signature does not verify".to_string(),
+            json!({"reason": "evm-carrier-signature-rejected"}),
+        ));
+    }
+    let next_height = st
+        .height
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if let Some(reason) =
+        crate::chain_binding::check_admission_from_env(tx.chain_id().is_some(), next_height, st.chain_id)
+            .err()
+    {
+        crate::metrics::global().inc_unbound_refused();
+        return Err(crate::evm_adapter::JsonRpcError::new(-32000, reason));
+    }
+    let acct = st.engine.get_account(&tx.from).await;
+    let balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
+    let onchain_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
+    let mut actx = crate::mempool::AdmissionCtx::wall_now().with_chain_height(next_height);
+    if let Some(sbal) = st.engine.sponsor_balance_of(&tx).await {
+        actx = actx.with_sponsor_balance(sbal);
+    }
+    let admitted = {
+        let mut pool = st.mempool.write().await;
+        if let Some(gap) = pool.check_nonce_gap(&tx.from, tx.nonce, onchain_nonce) {
+            return Err(crate::evm_adapter::JsonRpcError::with_data(
+                -32000,
+                format!("rejected: {gap}"),
+                json!({"reason": "evm-carrier-nonce"}),
+            ));
+        }
+        pool.add_checked_ctx(tx.clone(), balance, actx)
+    };
+    match admitted {
+        Ok(hash) => {
+            if let Some(bcast) = &st.tx_broadcast {
+                let _ = bcast.send(tx);
+            }
+            crate::evm_adapter::notify_pending_tx(crate::evm_adapter::stell_hash_to_evm(&hash));
+            st.save_mempool_throttled().await;
+            Ok(hash)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[mempool] EVM carrier admission refused from {} nonce={} gas={}: {e}",
+                hex::encode(&tx.from[..6]),
+                tx.nonce,
+                tx.gas_limit
+            );
+            Err(crate::evm_adapter::JsonRpcError::with_data(
+                -32000,
+                format!("rejected: {e}"),
+                json!({"reason": "evm-carrier-admission-refused", "detail": e.to_string()}),
+            ))
+        }
+    }
 }

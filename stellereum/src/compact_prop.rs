@@ -1,20 +1,26 @@
 //! Compact block / vote propagation — DESIGN DOC + WIRED CODECS.
 //!
-//! # Status: WIRED (compact µQC + compact proposal paths, INACTIVE on the wire)
+//! # Status: WIRED (compact proposal path ACTIVE from height 0; compact µQC
+//! codec active, its emitter call site still deferred)
 //!
 //! Wired via `consensus_net.rs` (`#[path = "compact_prop.rs"] pub mod
 //! compact_prop`, mirroring the `dandelion.rs` precedent). Two live-path
-//! consumers exist, both gated on `COMPACT_GOSSIP_ACTIVATION_HEIGHT =
-//! u64::MAX`:
+//! consumers exist, both gated on `COMPACT_GOSSIP_ACTIVATION_HEIGHT = 0`
+//! (this is a new chain: no pre-activation peers exist, so genesis may
+//! already gossip compactly):
 //!
 //! 1. the compact-µQC gossip frame (`encode_compact_qc` / `decode_compact_qc`);
 //! 2. the COMPACT PROPOSAL path (`CompactProposal` / `BodyPull` / `Body`,
 //!    receiver resolver `CompactResolver`): a block with hundreds of txs is
 //!    announced as a header + 6-byte short ids instead of the full body.
 //!
-//! No node emits or accepts either frame until the lead flips the const.
-//! Emission (`consensus_net::compact_proposal_from_block`), admission
-//! (`ConsensusMsg::decode`) and the receiver entry point
+//! The proposal path is wired end-to-end in `consensus_net` (emitter
+//! `compact_proposal_from_block`, receiver `CompactReceiver`, pull responder
+//! `CompactBodyServer`); the node call sites are reported in the
+//! `consensus_net` wiring note. The compact-µQC frame is decoded/admitted
+//! from the same gate but its broadcast hookup stays deferred (no node call
+//! site yet), so finality still gossips the full `Committed` envelope.
+//! Emission, admission (`ConsensusMsg::decode`) and the receiver entry point
 //! (`consensus_net::open_compact_proposal`) all consult the same gate.
 //!
 //! # 1. Measured current wire sizes (bincode 1.3.3, = stellereum/Cargo.toml:20)
@@ -134,9 +140,11 @@
 //!   as miss (`ShortIdIndex`), never mis-execute, mempool admission fees
 //!   make grinding cost real, short-id index lookups O(1) and bounded.
 //! * Wire change: the three variants are APPENDED after `Batch` (bincode
-//!   indices 4/5/6) and refused by `ConsensusMsg::decode` while
-//!   `COMPACT_GOSSIP_ACTIVATION_HEIGHT` is `u64::MAX`; `AGENTS.md` §7 still
-//!   requires a spec update + audit note before the lead flips the const.
+//!   indices 4/5/6), so every pre-existing variant keeps its tag. The
+//!   activation gate is `0` (active from genesis): `ConsensusMsg::decode`
+//!   still refuses the `u64::MAX` sentinel height and every frame whose
+//!   structural bounds are violated, and a non-zero gate can be restored for
+//!   a coordinated upgrade without touching the codec.
 
 use crate::sharding::{Block, Transaction};
 use serde::{Deserialize, Serialize};

@@ -421,3 +421,226 @@ async fn a_missing_body_in_the_middle_is_reported_not_silently_skipped() {
     let _ = vs;
     let _ = Transaction::sign;
 }
+
+// ============================================================================
+// Event-driven catch-up (2026-11-18): push-based propagation
+// ============================================================================
+//
+// The catch-up machine used to be a POLL: every `STELL_CATCHUP_INTERVAL_MS`
+// (2-3 s) the node asked the DHT whether any peer was ahead. With a dead peer
+// in the table one such query could burn the whole `STELL_CATCHUP_BUDGET_MS`
+// (measured live: 15 s on every tick). The architecture is now "react to what
+// peers tell you":
+//
+//   * a finalized block is PUSHED to every directly connected peer (see
+//     `node::sync::spawn_committed_push`), so a lagging peer RECEIVES the
+//     `Committed` instead of discovering it by polling;
+//   * a verified `Committed`/`Proposal`/`Vote` naming a height above ours (or a
+//     peer head pointer above ours) latches an IMMEDIATE catch-up attempt;
+//   * the periodic timer is a 30 s BACKSTOP for a node already known to be
+//     behind, and is skipped ENTIRELY when no peer is known to be ahead.
+//
+// The REAL policy file is included by path (the `upgrade_halt_tests.rs`
+// precedent), so these pin the shipped predicates, not a copy.
+#[path = "../src/node/policy.rs"]
+#[allow(dead_code)]
+mod catchup_policy;
+
+mod event_driven_catchup {
+    use super::catchup_policy::{
+        catchup_action, inbound_names_ahead, node_is_at_tip, should_probe_dht_head, CatchupAction,
+        CATCHUP_INTERVAL_DEFAULT_MS, REACTIVE_CATCHUP_MIN_GAP_MS,
+    };
+    use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+    use stellereum::consensus_net::ConsensusMsg;
+    use stellereum::sharding::Block;
+
+    fn committed_at(height: u64) -> ConsensusMsg {
+        let block = Block {
+            height,
+            ..Default::default()
+        };
+        let hash = block.compute_hash();
+        ConsensusMsg::Committed {
+            height,
+            block,
+            certificate: QuorumCertificate {
+                height,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some(hash),
+                signatures: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn committed_for_a_higher_height_schedules_catchup_immediately() {
+        // A pushed commit for height 101 while we are at 100.
+        let msg = committed_at(101);
+        assert_eq!(
+            inbound_names_ahead(100, &msg),
+            Some(101),
+            "a commit above our height must be recognised as ahead evidence"
+        );
+        // The reactive latch runs on the NEXT tick: 500 ms after the previous
+        // attempt, with the 30 s backstop still 29.5 s away.
+        assert_eq!(
+            catchup_action(
+                true,
+                REACTIVE_CATCHUP_MIN_GAP_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run,
+            "reactive evidence must not wait for the backstop timer"
+        );
+        // Same decision even if the last attempt was long ago: the trigger is
+        // the message, not the clock.
+        assert_eq!(
+            catchup_action(
+                true,
+                5 * CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run
+        );
+        // A burst of commits does not turn the tick into a DHT storm: below
+        // the reactive floor the latch waits for the next tick.
+        assert_eq!(
+            catchup_action(true, 0, CATCHUP_INTERVAL_DEFAULT_MS, false),
+            CatchupAction::Wait
+        );
+    }
+
+    #[test]
+    fn a_node_at_the_tip_skips_the_periodic_dht_probe() {
+        // No peer known to be ahead: our tip is also the tallest height any
+        // verified message / head pointer named.
+        assert!(node_is_at_tip(100, 100, Some(100)));
+        assert!(node_is_at_tip(100, 0, None));
+        // The backstop fires but the DHT is NOT probed.
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                true
+            ),
+            CatchupAction::SkipAtTip
+        );
+        // …and the head-read predicate is never even consulted at the tip: the
+        // SkipAtTip decision short-circuits the whole pass. (When a pass DOES
+        // run, a hint at our tip still needs the DHT read; an ahead hint skips
+        // it — see the sync suite.)
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                true
+            ),
+            CatchupAction::SkipAtTip
+        );
+        // Just before the interval the backstop simply waits.
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS - 1,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                true
+            ),
+            CatchupAction::Wait
+        );
+    }
+
+    #[test]
+    fn a_node_behind_catches_up_on_the_next_commit_not_the_next_timer() {
+        // Peer is 3 ahead and PUSHES a commit at 103.
+        let msg = committed_at(103);
+        assert_eq!(inbound_names_ahead(100, &msg), Some(103));
+        assert!(
+            !node_is_at_tip(100, 103, Some(103)),
+            "a named height ahead means not at tip"
+        );
+        // One tick later (500 ms) the attempt is already allowed, with the
+        // 30 s backstop nowhere near due.
+        assert_eq!(
+            catchup_action(
+                true,
+                REACTIVE_CATCHUP_MIN_GAP_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run
+        );
+        // The head pointer the push planted is enough: no blind DHT read.
+        assert!(!should_probe_dht_head(100, Some((103, [7u8; 32]))));
+        // If the walk had failed and only the persistent hint remained, the
+        // backstop may retry once it is due — but not before.
+        assert_eq!(
+            catchup_action(false, 0, CATCHUP_INTERVAL_DEFAULT_MS, false),
+            CatchupAction::Wait
+        );
+        assert_eq!(
+            catchup_action(
+                false,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                CATCHUP_INTERVAL_DEFAULT_MS,
+                false
+            ),
+            CatchupAction::Run
+        );
+    }
+
+    #[test]
+    fn commits_proposals_and_votes_all_name_ahead_heights() {
+        // Committed.
+        assert_eq!(inbound_names_ahead(100, &committed_at(105)), Some(105));
+        // Proposal.
+        let proposal = ConsensusMsg::Proposal {
+            height: 106,
+            round: 0,
+            block: Block {
+                height: 106,
+                ..Default::default()
+            },
+        };
+        assert_eq!(inbound_names_ahead(100, &proposal), Some(106));
+        // Vote (signature is irrelevant to the arithmetic helper; the driver
+        // only acts on it AFTER verification).
+        let vote = ConsensusMsg::Vote {
+            vote: Vote::signed_with([3u8; 32], 107, 0, VoteKind::Prevote, None, vec![0u8; 64]),
+            locked: None,
+        };
+        assert_eq!(inbound_names_ahead(100, &vote), Some(107));
+    }
+
+    #[test]
+    fn at_or_below_our_height_is_not_ahead_evidence() {
+        // A rebroadcast of the height we already hold must not wake catch-up.
+        assert_eq!(inbound_names_ahead(100, &committed_at(100)), None);
+        assert_eq!(inbound_names_ahead(100, &committed_at(99)), None);
+        // …nor may it make the node look behind.
+        assert!(node_is_at_tip(100, 100, Some(100)));
+        // A message with no height names nothing.
+        assert_eq!(
+            inbound_names_ahead(100, &ConsensusMsg::Batch(Vec::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn backstop_interval_default_is_thirty_seconds() {
+        // Documents the deliberate change from 2000 ms: the timer is a
+        // last-resort recheck, not the liveness mechanism.
+        assert_eq!(CATCHUP_INTERVAL_DEFAULT_MS, 30_000);
+        let reactive = std::hint::black_box(REACTIVE_CATCHUP_MIN_GAP_MS);
+        let backstop = std::hint::black_box(CATCHUP_INTERVAL_DEFAULT_MS);
+        assert!(
+            reactive < backstop,
+            "reactive must be far faster than the backstop"
+        );
+    }
+}

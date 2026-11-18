@@ -23,6 +23,19 @@ pub const MAX_ACTIVATION_BUFFER_NONCES_PER_ACCOUNT: usize = 4;
 /// raw post-quantum public keys (§2.2).
 pub const PQ_ACTIVATION_SURCHARGE_GAS: u64 = 45_000;
 
+/// Admission surcharge for a PQ EVM **carrier** transaction
+/// (`svm::OpCode::SysCallEvmCarrier` / `SysCallBindEvmAddress`).
+///
+/// A carrier is a normal PQ1 envelope plus ~2.3 KB of extra signed material
+/// that every node re-verifies: the canonical EVM bytes, a 897-byte Falcon-512
+/// public key and a 666-byte Falcon-512 signature (plus the strict RLP decode
+/// and secp256k1 recovery the secp signature forces). It is priced like the
+/// state-rent surcharge for the same reason: the fee must cover the work the
+/// carrier makes every node do, not just the plain transfer it settles. The
+/// floor is `base + D2 penalty + (activation ? 45k) + this`, see
+/// [`Mempool::effective_floor_for_tx`].
+pub const EVM_CARRIER_SURCHARGE_GAS: u64 = 30_000;
+
 /// Stable refusal for an `EV1` EVM settlement envelope at admission.
 ///
 /// `EV1` carries canonical EIP-155/EIP-1559 bytes in `Transaction.signature`
@@ -434,6 +447,18 @@ pub enum MempoolError {
     /// [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`] refusal every
     /// admission path returns, so wallets match one string.
     UnboundRefused(String),
+    /// The PQ EVM carrier (or binding claim) does not hold up: a wrong Falcon
+    /// signature, a mismatched EVM intent, a nonce/amount that disagrees with
+    /// the transaction, or an EVM contract call (no EVM interpreter exists).
+    /// The inner string is the precise reason, verbatim.
+    EvmCarrierRefused(String),
+    /// The carrier's EVM address has no on-chain binding (or is bound to a
+    /// DIFFERENT PQ account than the one claiming it). The inner string names
+    /// the exact requirement.
+    EvmUnbound(String),
+    /// A binding claim conflicts with an EVM address (or PQ account) that is
+    /// already bound. First claim wins; re-binding is refused.
+    EvmBindingConflict(String),
     /// Cross-network replay barrier: the envelope binds a FOREIGN chain id.
     /// A foreign-bound tx is cryptographically valid on ITS network, so this
     /// is refused purely on the replay domain (never on signature), mirroring
@@ -494,6 +519,9 @@ impl std::fmt::Display for MempoolError {
             MempoolError::SponsorBadSignature => "invalid sponsor signature",
             MempoolError::SponsorInsufficientBalance => "sponsor cannot pay the transaction fee",
             MempoolError::UnboundRefused(reason) => return write!(f, "{reason}"),
+            MempoolError::EvmCarrierRefused(reason) => return write!(f, "{reason}"),
+            MempoolError::EvmUnbound(reason) => return write!(f, "{reason}"),
+            MempoolError::EvmBindingConflict(reason) => return write!(f, "{reason}"),
             MempoolError::ChainIdMismatch(reason) => return write!(f, "{reason}"),
             MempoolError::Malformed(reason) => return write!(f, "malformed transaction: {reason}"),
             MempoolError::TxTooLarge { wire_bytes, cap } => {
@@ -869,6 +897,27 @@ impl Mempool {
             .saturating_add(self.failed_penalty.get(sender).copied().unwrap_or(0))
     }
 
+    /// The additive surcharges a transaction pays ON TOP of the base floor:
+    /// the PQ activation state-rent surcharge (raw key + signature bytes land in
+    /// the implicit-key store) and the EVM carrier surcharge (EVM bytes + a
+    /// second Falcon-512 signature every node re-verifies).
+    ///
+    /// Single definition: admission, reservation, sponsor pricing and the
+    /// proposer/packing view all price the same transaction the same way.
+    pub fn surcharges_for_tx(tx: &Transaction) -> u64 {
+        let activation = if tx.is_pq_activation() {
+            PQ_ACTIVATION_SURCHARGE_GAS
+        } else {
+            0
+        };
+        let carrier = if crate::evm_adapter::is_evm_carrier_tx(tx) {
+            EVM_CARRIER_SURCHARGE_GAS
+        } else {
+            0
+        };
+        activation.saturating_add(carrier)
+    }
+
     /// Full admission cost of one transaction: `amount + gas_limit`, plus the
     /// State Rent Surcharge for activation txs. This is exactly what execution
     /// charges (`state_engine`), so it is both the single-tx balance check and
@@ -882,11 +931,7 @@ impl Mempool {
     pub fn tx_cost(tx: &Transaction) -> u64 {
         tx.amount
             .saturating_add(tx.gas_limit)
-            .saturating_add(if tx.is_pq_activation() {
-                PQ_ACTIVATION_SURCHARGE_GAS
-            } else {
-                0
-            })
+            .saturating_add(Self::surcharges_for_tx(tx))
     }
 
     /// PAYMASTER: the fee execution will actually charge for `tx` —
@@ -909,11 +954,7 @@ impl Mempool {
     pub fn sponsor_fee_cost(&self, tx: &Transaction) -> u64 {
         tx.gas_limit
             .max(self.required_fee_for_tx(tx))
-            .saturating_add(if tx.is_pq_activation() {
-                PQ_ACTIVATION_SURCHARGE_GAS
-            } else {
-                0
-            })
+            .saturating_add(Self::surcharges_for_tx(tx))
     }
 
     /// PAYMASTER: the two PURE funding legs of an EFFECTIVE sponsored
@@ -932,16 +973,8 @@ impl Mempool {
     /// `None` on the legacy path and the self-sponsored path
     /// (`sponsor == from`, which fee-routes as plain).
     pub fn sponsored_pure_legs(tx: &Transaction) -> Option<(u64, u64)> {
-        tx.sponsored_grant().map(|_| {
-            (
-                tx.amount,
-                tx.gas_limit.saturating_add(if tx.is_pq_activation() {
-                    PQ_ACTIVATION_SURCHARGE_GAS
-                } else {
-                    0
-                }),
-            )
-        })
+        tx.sponsored_grant()
+            .map(|_| (tx.amount, tx.gas_limit.saturating_add(Self::surcharges_for_tx(tx))))
     }
 
     /// PAYMASTER: the two funding legs of an EFFECTIVE sponsored transaction
@@ -1088,11 +1121,17 @@ impl Mempool {
     /// transaction carrying raw public keys.
     pub fn effective_floor_for_tx(&self, tx: &Transaction) -> u64 {
         let base = self.effective_floor(&tx.from);
-        if tx.is_pq_activation() {
-            base.saturating_add(PQ_ACTIVATION_SURCHARGE_GAS)
+        let activation = if tx.is_pq_activation() {
+            PQ_ACTIVATION_SURCHARGE_GAS
         } else {
-            base
-        }
+            0
+        };
+        let carrier = if crate::evm_adapter::is_evm_carrier_tx(tx) {
+            EVM_CARRIER_SURCHARGE_GAS
+        } else {
+            0
+        };
+        base.saturating_add(activation).saturating_add(carrier)
     }
 
     /// Attach an explicit thread-safe implicit key registry for post-quantum validation.
@@ -2016,6 +2055,15 @@ impl Mempool {
                 cap: Self::MAX_BLOCK_PROOF_UNITS,
             });
         }
+        // EVM CARRIER / BINDING CLAIM (FULL-PQ, the EVM write path): the payload
+        // opcodes are admitted only with a valid Falcon-512 authorisation from
+        // the PQ account that sends them, an EVM intent that describes THIS
+        // transaction's payment, and an EVM address that is not bound to a
+        // different account. The identical pure checks run again at execution
+        // (`svm`), so a refusal here is node-local policy and can never make
+        // two nodes disagree about a block. `evm_statement` is recorded in the
+        // (non-consensus) binding index only AFTER admission succeeds.
+        let evm_statement = Self::check_evm_payload(&tx)?;
         // Session-key delegation policy next (expiry / scope / value cap /
         // budget / grant validity), so an unusable grant is reported as such
         // instead of a generic signature failure; the signature check below
@@ -2162,6 +2210,7 @@ impl Mempool {
             }
             *self.reserved.entry(tx.from).or_insert(0) =
                 self.reserved_for(&tx.from).saturating_add(cost);
+            Self::note_evm_statement(evm_statement);
             return Ok(hash);
         }
 
@@ -2320,6 +2369,10 @@ impl Mempool {
         }
         self.inserted_at.insert(hash, ctx.now);
         self.txs.insert(hash, tx);
+        // The transaction is IN the pool: its EVM binding statement can now be
+        // routed (a refused admission never reaches here, so a bad claim can
+        // never seed the index).
+        Self::note_evm_statement(evm_statement);
 
         // If this transaction activated the sender, drain any out-of-order nonces
         // that were waiting in the PendingActivationBuffer.
@@ -2361,6 +2414,172 @@ impl Mempool {
         }
 
         Ok(hash)
+    }
+
+    /// Record a verified EVM binding statement in the node-local index.
+    ///
+    /// The index is a ROUTING table, not consensus state: recording is
+    /// best-effort by design, so a poisoned index lock can never refuse an
+    /// otherwise admissible transaction. A conflict is logged and dropped (the
+    /// first claim wins, exactly like the replay of committed records).
+    fn note_evm_statement(statement: Option<crate::evm_adapter::EvmBindingStatement>) {
+        let Some((evm, pq)) = statement else {
+            return;
+        };
+        if let Err(e) = crate::evm_adapter::record_evm_binding(evm, pq) {
+            tracing::debug!(
+                "[mempool] EVM binding 0x{} -> {} not indexed: {e}",
+                hex::encode(evm),
+                hex::encode(pq)
+            );
+        }
+    }
+
+    /// Admission check for the EVM payload opcodes (PQ carrier / binding claim).
+    ///
+    /// WHY THIS IS POLICY, NOT CONSENSUS: the consensus fact is re-verified
+    /// from the transaction alone at execution (`svm` runs the SAME pure
+    /// functions: `verify_carrier_intent` / `verify_binding_claim`), so a
+    /// refusal here can only keep an unusable or unbound transaction out of
+    /// THIS node's pool. Inclusion is decided by `apply`, which never reads the
+    /// node-local binding index.
+    ///
+    /// What is enforced, in order:
+    /// 1. the payload must be EXACTLY one EVM opcode — a carrier's accounting
+    ///    is the whole transaction (`tx.to` / `tx.amount`), so hiding it next to
+    ///    other operations is refused;
+    /// 2. the PQ authorisation and the EVM intent verify
+    ///    ([`crate::evm_adapter::verify_carrier_intent`] /
+    ///    [`crate::evm_adapter::verify_binding_claim`], both pure), including
+    ///    the chain id;
+    /// 3. the EVM intent and the Stell leg describe the SAME payment:
+    ///    `evm.nonce == tx.nonce`, `wei_to_nano(evm.value) == tx.amount`;
+    /// 4. a binding claim moves nothing (`amount == 0`, `to == from`), a
+    ///    carrier has a real recipient;
+    /// 5. the EVM address must not be bound to a DIFFERENT PQ account, and —
+    ///    once this node has observed bindings — must be bound at all.
+    ///
+    /// Returns the `(evm, pq)` statement the caller may record in the binding
+    /// index AFTER admission succeeds (so a refused transaction never pollutes
+    /// it).
+    fn check_evm_payload(
+        tx: &Transaction,
+    ) -> Result<Option<crate::evm_adapter::EvmBindingStatement>, MempoolError> {
+        use crate::evm_adapter::EvmPayload;
+        let Some(payload) = crate::evm_adapter::classify_evm_payload(tx) else {
+            return Ok(None);
+        };
+        match payload {
+            EvmPayload::Mixed => Err(MempoolError::Malformed(
+                "an EVM carrier/binding opcode must be the transaction's whole payload: the \
+                 value leg (to/amount) IS the settlement, so it cannot be mixed with other \
+                 operations"
+                    .to_string(),
+            )),
+            EvmPayload::Binding(claim) => {
+                crate::evm_adapter::verify_binding_claim(claim, &tx.from, claim.chain_id)
+                    .map_err(MempoolError::EvmCarrierRefused)?;
+                if tx.amount != 0 {
+                    return Err(MempoolError::EvmCarrierRefused(
+                        "a binding claim moves no value: amount must be 0".to_string(),
+                    ));
+                }
+                if tx.to != tx.from {
+                    return Err(MempoolError::EvmCarrierRefused(
+                        "a binding claim must be a self-addressed transaction (to == from)"
+                            .to_string(),
+                    ));
+                }
+                if let Some(existing) = crate::evm_adapter::lookup_bound_pq(&claim.evm_address) {
+                    if existing != tx.from {
+                        return Err(MempoolError::EvmBindingConflict(format!(
+                            "EVM address 0x{} is already bound to PQ account {}; first claim \
+                             wins, so this claim from {} is refused",
+                            hex::encode(claim.evm_address),
+                            hex::encode(existing),
+                            hex::encode(tx.from)
+                        )));
+                    }
+                }
+                Ok(Some((claim.evm_address, tx.from)))
+            }
+            EvmPayload::Carrier(carrier) => {
+                let facts = crate::evm_adapter::verify_carrier_intent(carrier, &tx.from)
+                    .map_err(MempoolError::EvmCarrierRefused)?;
+                // The intent and the leg must be the SAME payment. The EVM
+                // nonce doubles as the Stell nonce (`eth_getTransactionCount`
+                // serves the bound PQ account's nonce to MetaMask), which is
+                // also what makes a replay impossible: the nonce is consumed
+                // exactly once, and a re-signed carrier for the same intent is
+                // not something a relayer can produce.
+                if facts.nonce != tx.nonce {
+                    return Err(MempoolError::EvmCarrierRefused(format!(
+                        "carrier nonce mismatch: the EVM intent says {}, the transaction says {} \
+                         (they must be equal so the intent can settle exactly once)",
+                        facts.nonce, tx.nonce
+                    )));
+                }
+                if facts.value_nano != tx.amount {
+                    return Err(MempoolError::EvmCarrierRefused(format!(
+                        "carrier amount mismatch: the EVM intent is worth {} nano-STELL, the \
+                         transaction moves {}",
+                        facts.value_nano, tx.amount
+                    )));
+                }
+                if tx.to == [0u8; 32] {
+                    return Err(MempoolError::EvmCarrierRefused(
+                        "carrier recipient must be a real PQ account (zero address refused)"
+                            .to_string(),
+                    ));
+                }
+                match crate::evm_adapter::lookup_bound_pq(&facts.from) {
+                    Some(pq) if pq != tx.from => {
+                        return Err(MempoolError::EvmUnbound(format!(
+                            "EVM address 0x{} is bound to PQ account {}, not to the sender {}: \
+                             only the bound key can authorise its intents",
+                            hex::encode(facts.from),
+                            hex::encode(pq),
+                            hex::encode(tx.from)
+                        )))
+                    }
+                    // Armed index: an EVM address this node has never seen a
+                    // binding for cannot be routed. A node that has replayed no
+                    // binding at all (fresh start) must NOT refuse every
+                    // carrier: the Falcon authorisation above is what makes the
+                    // carrier safe, the index only routes it.
+                    None if crate::evm_adapter::evm_binding_index_armed() => {
+                        return Err(MempoolError::EvmUnbound(format!(
+                            "EVM address 0x{} has no on-chain PQ binding; register one with \
+                             svm::OpCode::SysCallBindEvmAddress (stell_evmBindingSubmit) before \
+                             sending from it",
+                            hex::encode(facts.from)
+                        )));
+                    }
+                    _ => {}
+                }
+                Ok(Some((facts.from, tx.from)))
+            }
+        }
+    }
+
+    /// The next nonce a sender can use WITHOUT colliding with anything this
+    /// pool already holds: `max(pooled nonce, buffered nonce) + 1`, or `None`
+    /// when the sender has nothing pending.
+    ///
+    /// This is the `pending` half of `eth_getTransactionCount`: a wallet that
+    /// asks for the pending nonce of a bound PQ account must not be handed a
+    /// nonce it just used for a transaction still in the pool, or the second
+    /// transfer would be refused as a same-nonce retry. Pure read, no
+    /// allocation beyond the (bounded) per-sender maps.
+    pub fn next_pending_nonce(&self, account: &[u8; 32]) -> Option<u64> {
+        let pooled = self.sender_nonces.get(account);
+        let buffered = self.activation_buffer.nonces_for_account(account);
+        let max_pooled = pooled.and_then(|m| m.keys().next_back().copied());
+        let max_buffered = buffered.last().copied();
+        match (max_pooled, max_buffered) {
+            (None, None) => None,
+            (a, b) => a.max(b).map(|n| n.saturating_add(1)),
+        }
     }
 
     /// Gap check for admission (audit: blocks troubles): `nonce` must be

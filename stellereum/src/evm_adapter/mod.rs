@@ -22,6 +22,7 @@
 //! - `EvmFeeHistory`
 
 mod adapter;
+mod binding;
 mod crypto;
 mod filters;
 pub mod rlp;
@@ -32,6 +33,7 @@ mod types;
 mod tests;
 
 pub use adapter::*;
+pub use binding::*;
 pub use crypto::*;
 pub use filters::*;
 pub use tx::*;

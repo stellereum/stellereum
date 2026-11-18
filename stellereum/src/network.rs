@@ -390,8 +390,648 @@ pub fn plan_retained_prune(
     PruneDeletes { blobs, kv }
 }
 
+/// One direct-mesh transport failure marks a peer suspected after this many
+/// CONSECUTIVE failures (transport error, timeout, handshake failure).
+pub const VALIDATOR_MESH_EVICT_AFTER: u32 = 3;
+/// Default cooldown before one reconnect attempt is allowed again.
+pub const VALIDATOR_MESH_COOLDOWN_MS: u64 = 60_000;
+/// Upper bound on mesh members (the validator set is <= 250; this is the
+/// fail-closed table cap, not a consensus limit).
+pub const VALIDATOR_MESH_MAX_MEMBERS: usize = 1024;
+/// Heartbeat interval: how often a healthy mesh link is re-probed so the
+/// underlying QUIC connection stays warm instead of idling out.
+pub const VALIDATOR_MESH_HEARTBEAT_MS: u64 = 10_000;
+/// Per-peer direct-send budget. A mesh send must never stall consensus: the
+/// DHT fallback takes over at this point.
+pub const VALIDATOR_MESH_SEND_TIMEOUT_MS: u64 = 2_000;
+
+/// Boxed future used by [`ValidatorMeshTransport`] (object-safe async).
+pub type MeshFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Transport the validator mesh drives. The production implementation is
+/// [`InfnodeMeshTransport`] (direct `request_to` / pubsub and the pubsub
+/// overlay for the fallback); tests substitute a deterministic fake.
+pub trait ValidatorMeshTransport: Send + Sync {
+    /// Deliver a consensus payload DIRECTLY to one validator. No DHT lookup:
+    /// the peer id is already known and the connection is kept warm by
+    /// [`ValidatorMesh::maintain`].
+    fn deliver_direct<'a>(
+        &'a self,
+        peer: [u8; infnode::proto::NODEID_LEN],
+        topic: &'a str,
+        data: &'a str,
+    ) -> MeshFuture<'a, Result<(), String>>;
+
+    /// Heartbeat/reconnect attempt: proves the peer is reachable and keeps
+    /// its direct link warm.
+    fn probe<'a>(
+        &'a self,
+        peer: [u8; infnode::proto::NODEID_LEN],
+    ) -> MeshFuture<'a, Result<(), String>>;
+
+    /// Existing DHT/overlay publish path used as the mesh fallback. Returns
+    /// the number of local/relayed deliveries reported by the transport.
+    fn publish_overlay<'a>(
+        &'a self,
+        topic: &'a str,
+        data: &'a str,
+    ) -> MeshFuture<'a, Result<usize, String>>;
+}
+
+/// One pinned validator in the direct mesh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorMeshMember {
+    pub id: [u8; 20],
+    pub endpoints: Vec<String>,
+    pub label: String,
+}
+
+impl ValidatorMeshMember {
+    pub fn new(id: [u8; 20], endpoints: Vec<String>, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            endpoints,
+            label: label.into(),
+        }
+    }
+
+    /// Build a member from a pinned peer config (the identity is the PQ id,
+    /// endpoints are the dial targets). `None` when the peer has no pinned
+    /// PQ key — such a peer cannot be a direct-mesh member by construction.
+    pub fn from_peer(peer: &infnode::config::PeerConfig) -> Option<Self> {
+        let id = peer.primary_id().ok()?;
+        Some(Self::new(id, peer.endpoints.clone(), peer.name.clone()))
+    }
+}
+
+/// Result of installing a validator set. `generation` increments on every
+/// rotation so a caller can prove the mesh was refreshed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshRotation {
+    pub generation: u64,
+    pub added: usize,
+    pub removed: usize,
+    pub updated: usize,
+    pub members: usize,
+    /// Ids dropped by this rotation; the adapter closes their direct links.
+    pub removed_ids: Vec<[u8; 20]>,
+}
+
+/// Per-member mesh state (direct-link health only; identity/auth live in
+/// infnode).
+#[derive(Clone, Debug)]
+struct MeshMemberState {
+    endpoints: Vec<String>,
+    label: String,
+    consecutive_failures: u32,
+    suspected: bool,
+    suspect_until_ms: u64,
+    last_ok_ms: u64,
+    last_attempt_ms: u64,
+    evictions: u32,
+}
+
+impl MeshMemberState {
+    fn new(member: &ValidatorMeshMember, now_ms: u64) -> Self {
+        Self {
+            endpoints: member.endpoints.clone(),
+            label: member.label.clone(),
+            consecutive_failures: 0,
+            suspected: false,
+            suspect_until_ms: 0,
+            last_ok_ms: now_ms,
+            last_attempt_ms: now_ms,
+            evictions: 0,
+        }
+    }
+
+    fn routing_allowed(&self) -> bool {
+        !self.suspected
+    }
+
+    fn reconnect_due(&self, now_ms: u64) -> bool {
+        self.suspected && now_ms >= self.suspect_until_ms
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MeshState {
+    generation: u64,
+    members: std::collections::BTreeMap<[u8; 20], MeshMemberState>,
+}
+
+/// Outcome of one mesh delivery attempt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshDelivery {
+    /// Validators reached over a live direct link.
+    pub direct_ok: usize,
+    /// Validators whose direct link failed (their copy went to the fallback).
+    pub direct_failed: usize,
+    /// A DHT/overlay publish was attempted for the failed copies.
+    pub fallback_used: bool,
+    /// Overlay reported at least one delivery.
+    pub fallback_ok: bool,
+}
+
+impl MeshDelivery {
+    /// True when every targeted validator was reached directly or the
+    /// overlay accepted the fallback copy.
+    pub fn delivered(&self) -> bool {
+        self.direct_failed == 0 || self.fallback_ok
+    }
+}
+
+/// Outcome of one maintenance pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshMaintenance {
+    pub probed: usize,
+    pub recovered: usize,
+    pub still_down: usize,
+    pub skipped_cooldown: usize,
+}
+
+/// Direct validator mesh: a set of PERSISTENT direct connections to the
+/// pinned validator peers, refreshed on validator-set rotation.
+///
+/// Routing model: consensus payloads are addressed by validator id and sent
+/// over the warm direct link ([`Self::deliver`]); the DHT is only used as a
+/// fallback when a direct link fails (and remains the path for discovery,
+/// blob storage and non-validator peers).
+pub struct ValidatorMesh {
+    transport: Arc<dyn ValidatorMeshTransport>,
+    state: std::sync::Mutex<MeshState>,
+    evict_after: u32,
+    cooldown_ms: u64,
+    heartbeat_ms: u64,
+    evictions_total: std::sync::atomic::AtomicU64,
+    direct_total: std::sync::atomic::AtomicU64,
+    fallback_total: std::sync::atomic::AtomicU64,
+}
+
+impl ValidatorMesh {
+    pub fn new(transport: Arc<dyn ValidatorMeshTransport>) -> Self {
+        Self::with_policy(
+            transport,
+            VALIDATOR_MESH_EVICT_AFTER,
+            VALIDATOR_MESH_COOLDOWN_MS,
+            VALIDATOR_MESH_HEARTBEAT_MS,
+        )
+    }
+
+    /// Explicit policy (tests use a short cooldown; production keeps the
+    /// defaults above).
+    pub fn with_policy(
+        transport: Arc<dyn ValidatorMeshTransport>,
+        evict_after: u32,
+        cooldown_ms: u64,
+        heartbeat_ms: u64,
+    ) -> Self {
+        Self {
+            transport,
+            state: std::sync::Mutex::new(MeshState::default()),
+            evict_after: evict_after.max(1),
+            cooldown_ms: cooldown_ms.max(1),
+            heartbeat_ms: heartbeat_ms.max(1),
+            evictions_total: std::sync::atomic::AtomicU64::new(0),
+            direct_total: std::sync::atomic::AtomicU64::new(0),
+            fallback_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MeshState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Install/replace the member set (validator-set rotation).
+    ///
+    /// * members still present keep their health counters;
+    /// * a member whose endpoint list CHANGED is treated as a new link: the
+    ///   failure streak and suspicion flag reset so the new address is tried
+    ///   immediately;
+    /// * members no longer in the set are dropped (their links are closed by
+    ///   the transport on its next reconcile/idle timeout, and no further
+    ///   traffic is addressed to them).
+    pub fn install(
+        &self,
+        members: impl IntoIterator<Item = ValidatorMeshMember>,
+        now_ms: u64,
+    ) -> MeshRotation {
+        use std::collections::BTreeMap;
+        let mut new_set: BTreeMap<[u8; 20], ValidatorMeshMember> = BTreeMap::new();
+        for m in members {
+            if new_set.len() >= VALIDATOR_MESH_MAX_MEMBERS {
+                break;
+            }
+            new_set.insert(m.id, m);
+        }
+        let mut st = self.lock();
+        let old_ids: Vec<[u8; 20]> = st.members.keys().copied().collect();
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        for (id, member) in &new_set {
+            match st.members.get_mut(id) {
+                Some(existing) => {
+                    if existing.endpoints != member.endpoints {
+                        existing.endpoints = member.endpoints.clone();
+                        existing.label = member.label.clone();
+                        existing.consecutive_failures = 0;
+                        existing.suspected = false;
+                        existing.suspect_until_ms = 0;
+                        existing.last_ok_ms = now_ms;
+                        existing.last_attempt_ms = now_ms;
+                        updated += 1;
+                    } else if existing.label != member.label {
+                        existing.label = member.label.clone();
+                    }
+                }
+                None => {
+                    st.members
+                        .insert(*id, MeshMemberState::new(member, now_ms));
+                    added += 1;
+                }
+            }
+        }
+        let removed_ids: Vec<[u8; 20]> = old_ids
+            .iter()
+            .filter(|id| !new_set.contains_key(*id))
+            .copied()
+            .collect();
+        let removed = removed_ids.len();
+        st.members.retain(|id, _| new_set.contains_key(id));
+        st.generation = st.generation.saturating_add(1);
+        MeshRotation {
+            generation: st.generation,
+            added,
+            removed,
+            updated,
+            members: st.members.len(),
+            removed_ids,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn members(&self) -> Vec<ValidatorMeshMember> {
+        self.lock()
+            .members
+            .iter()
+            .map(|(id, st)| ValidatorMeshMember::new(*id, st.endpoints.clone(), st.label.clone()))
+            .collect()
+    }
+
+    pub fn is_member(&self, id: &[u8; 20]) -> bool {
+        self.lock().members.contains_key(id)
+    }
+
+    /// Validators eligible for DIRECT sends right now (suspected peers are
+    /// withheld until a successful reconnect).
+    pub fn direct_targets(&self, now_ms: u64) -> Vec<[u8; 20]> {
+        let st = self.lock();
+        st.members
+            .iter()
+            .filter(|(_, m)| m.routing_allowed() || m.reconnect_due(now_ms))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// All member ids, including suspected ones (explicit-destination set).
+    pub fn all_targets(&self) -> Vec<[u8; 20]> {
+        self.lock().members.keys().copied().collect()
+    }
+
+    pub fn consecutive_failures(&self, id: &[u8; 20]) -> u32 {
+        self.lock()
+            .members
+            .get(id)
+            .map(|m| m.consecutive_failures)
+            .unwrap_or(0)
+    }
+
+    pub fn is_suspected(&self, id: &[u8; 20]) -> bool {
+        self.lock()
+            .members
+            .get(id)
+            .map(|m| m.suspected)
+            .unwrap_or(false)
+    }
+
+    /// Whether the peer's cooldown elapsed and a reconnect is allowed.
+    pub fn reconnect_due(&self, id: &[u8; 20], now_ms: u64) -> bool {
+        self.lock()
+            .members
+            .get(id)
+            .map(|m| m.reconnect_due(now_ms))
+            .unwrap_or(false)
+    }
+
+    pub fn evictions_total(&self) -> u64 {
+        self.evictions_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn direct_deliveries_total(&self) -> u64 {
+        self.direct_total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn fallback_deliveries_total(&self) -> u64 {
+        self.fallback_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn evict_after(&self) -> u32 {
+        self.evict_after
+    }
+
+    pub fn cooldown_ms(&self) -> u64 {
+        self.cooldown_ms
+    }
+
+    pub fn heartbeat_ms(&self) -> u64 {
+        self.heartbeat_ms
+    }
+
+    /// Record a successful direct interaction: clears the failure streak,
+    /// suspicion flag and cooldown.
+    pub fn record_success(&self, id: [u8; 20], now_ms: u64) {
+        let mut st = self.lock();
+        if let Some(m) = st.members.get_mut(&id) {
+            let recovered = m.suspected;
+            m.consecutive_failures = 0;
+            m.suspected = false;
+            m.suspect_until_ms = 0;
+            m.last_ok_ms = now_ms;
+            m.last_attempt_ms = now_ms;
+            if recovered {
+                tracing::info!(
+                    "[mesh] validator {} recovered, direct link restored",
+                    hex::encode(id)
+                );
+            }
+        }
+    }
+
+    /// Record one consecutive direct failure. At [`Self::evict_after`] the
+    /// peer is marked suspected dead and withheld from direct targets for
+    /// [`Self::cooldown_ms`]; the loud line fires once per transition.
+    pub fn record_failure(&self, id: [u8; 20], now_ms: u64) {
+        let mut st = self.lock();
+        if let Some(m) = st.members.get_mut(&id) {
+            m.consecutive_failures = m.consecutive_failures.saturating_add(1);
+            m.last_attempt_ms = now_ms;
+            if m.suspected {
+                // Already withheld: this was the one allowed post-cooldown
+                // attempt (or an explicit retry). Re-arm the cooldown so a
+                // dead peer is not dialled on every delivery.
+                m.suspect_until_ms = now_ms.saturating_add(self.cooldown_ms);
+            } else if m.consecutive_failures >= self.evict_after {
+                m.suspected = true;
+                m.suspect_until_ms = now_ms.saturating_add(self.cooldown_ms);
+                m.evictions = m.evictions.saturating_add(1);
+                let total = self
+                    .evictions_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::warn!(
+                    "[mesh] validator {} SUSPECTED DEAD after {} consecutive direct failures; \
+                     withholding from routing for {} ms (total evictions {})",
+                    hex::encode(id),
+                    m.consecutive_failures,
+                    self.cooldown_ms,
+                    total
+                );
+            }
+        }
+    }
+
+    /// Direct delivery to one validator (no DHT lookup). Returns the outcome
+    /// of that single send; the caller decides whether to use the fallback.
+    pub async fn deliver_to(
+        &self,
+        id: [u8; 20],
+        topic: &str,
+        data: &str,
+        now_ms: u64,
+    ) -> bool {
+        if !self.is_member(&id) {
+            return false;
+        }
+        match self.transport.deliver_direct(id, topic, data).await {
+            Ok(()) => {
+                self.record_success(id, now_ms);
+                true
+            }
+            Err(_) => {
+                self.record_failure(id, now_ms);
+                false
+            }
+        }
+    }
+
+    /// Deliver a consensus payload to the whole mesh.
+    ///
+    /// Direct links are attempted concurrently; any failed copy (or an empty
+    /// direct target set) is handed to the DHT/overlay fallback ONCE, so a
+    /// message is never dropped merely because the mesh is degraded.
+    pub async fn deliver(&self, topic: &str, data: &str, now_ms: u64) -> MeshDelivery {
+        let targets = self.direct_targets(now_ms);
+        let mut delivery = MeshDelivery::default();
+        let mut sends = Vec::with_capacity(targets.len());
+        for id in targets {
+            sends.push(async move { (id, self.transport.deliver_direct(id, topic, data).await) });
+        }
+        let results = futures::future::join_all(sends).await;
+        for (id, result) in results {
+            match result {
+                Ok(()) => {
+                    self.record_success(id, now_ms);
+                    delivery.direct_ok += 1;
+                }
+                Err(_) => {
+                    self.record_failure(id, now_ms);
+                    delivery.direct_failed += 1;
+                }
+            }
+        }
+        if delivery.direct_ok > 0 {
+            self.direct_total
+                .fetch_add(delivery.direct_ok as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Fallback rule: any failed copy goes to the overlay; also use it
+        // when the mesh has no direct target at all (all suspected/mesh down).
+        if delivery.direct_failed > 0 || delivery.direct_ok == 0 {
+            delivery.fallback_used = true;
+            delivery.fallback_ok = self
+                .transport
+                .publish_overlay(topic, data)
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if delivery.fallback_ok {
+                self.fallback_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        delivery
+    }
+
+    /// Keep the mesh persistent: probe healthy links on the heartbeat and
+    /// attempt one reconnect for every suspected peer whose cooldown elapsed.
+    pub async fn maintain(&self, now_ms: u64) -> MeshMaintenance {
+        let mut report = MeshMaintenance::default();
+        let probes: Vec<[u8; 20]> = {
+            let st = self.lock();
+            st.members
+                .iter()
+                .filter_map(|(id, m)| {
+                    if m.suspected {
+                        if m.reconnect_due(now_ms) {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    } else if now_ms.saturating_sub(m.last_attempt_ms) >= self.heartbeat_ms {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        report.skipped_cooldown = {
+            let st = self.lock();
+            st.members
+                .values()
+                .filter(|m| m.suspected && !m.reconnect_due(now_ms))
+                .count()
+        };
+        for id in probes {
+            report.probed += 1;
+            match self.transport.probe(id).await {
+                Ok(()) => {
+                    let was_suspected = self.is_suspected(&id);
+                    self.record_success(id, now_ms);
+                    if was_suspected {
+                        report.recovered += 1;
+                    }
+                }
+                Err(_) => {
+                    self.record_failure(id, now_ms);
+                    report.still_down += 1;
+                }
+            }
+        }
+        report
+    }
+}
+
+/// Production transport: infnode direct sends over the persistent peer
+/// connections, with the pubsub overlay as the DHT fallback path.
+pub struct InfnodeMeshTransport {
+    node: Arc<Node>,
+}
+
+impl InfnodeMeshTransport {
+    pub fn new(node: Arc<Node>) -> Self {
+        Self { node }
+    }
+
+    fn envelope(topic: &str, data: &str) -> Vec<u8> {
+        serde_json::json!({ "topic": topic, "data": data })
+            .to_string()
+            .into_bytes()
+    }
+}
+
+impl ValidatorMeshTransport for InfnodeMeshTransport {
+    fn deliver_direct<'a>(
+        &'a self,
+        peer: [u8; 20],
+        topic: &'a str,
+        data: &'a str,
+    ) -> MeshFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let payload = Self::envelope(topic, data);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(VALIDATOR_MESH_SEND_TIMEOUT_MS),
+                self.node.send_to(peer, "pubsub.msg", payload),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("mesh direct send timeout".to_string()),
+            }
+        })
+    }
+
+    fn probe<'a>(&'a self, peer: [u8; 20]) -> MeshFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(VALIDATOR_MESH_SEND_TIMEOUT_MS),
+                self.node.warm_peer(peer),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("mesh probe timeout".to_string()),
+            }
+        })
+    }
+
+    fn publish_overlay<'a>(
+        &'a self,
+        topic: &'a str,
+        data: &'a str,
+    ) -> MeshFuture<'a, Result<usize, String>> {
+        Box::pin(async move { Ok(self.node.publish_overlay(topic, data).await) })
+    }
+}
+
+/// Wall clock in ms for mesh bookkeeping (monotonic enough for a cooldown;
+/// no test depends on exact epoch values).
+fn mesh_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Mesh membership from operator config.
+///
+/// When at least one pinned peer carries a consensus key, only those peers
+/// are validators and therefore mesh members (storage-only peers stay on the
+/// DHT path). A config with no consensus keys at all is a bootstrap/dev set:
+/// every pinned peer is treated as a validator.
+fn mesh_members_from_config(node: &Node) -> Vec<ValidatorMeshMember> {
+    let has_consensus_key = node
+        .cfg
+        .peers
+        .iter()
+        .any(|p| p.consensus_pub.is_some());
+    node.cfg
+        .peers
+        .iter()
+        .filter(|p| !has_consensus_key || p.consensus_pub.is_some())
+        .filter_map(ValidatorMeshMember::from_peer)
+        .collect()
+}
+
 pub struct P2pNetworkAdapter {
     pub node: Arc<Node>,
+    /// Direct validator mesh: persistent links to the pinned validator peers
+    /// plus the DHT/overlay fallback for failed direct sends.
+    mesh: Arc<ValidatorMesh>,
     /// Chain epoch, from the genesis fingerprint. Mixed into every published name so
     /// blobs from a different chain (or a previous run after a wipe) are invisible.
     ///
@@ -517,14 +1157,119 @@ struct SnapshotChunkMeta {
 
 impl P2pNetworkAdapter {
     pub fn new(node: Arc<Node>) -> Self {
+        let transport: Arc<dyn ValidatorMeshTransport> =
+            Arc::new(InfnodeMeshTransport::new(node.clone()));
+        let mesh = Arc::new(ValidatorMesh::new(transport));
+        // Bootstrap the mesh from the pinned peer set (the validators this
+        // node was configured with). A later validator-set rotation calls
+        // `refresh_validator_mesh`.
+        let members = mesh_members_from_config(&node);
+        mesh.install(members, mesh_now_ms());
+        // Persistent-link upkeep: probe healthy links on the heartbeat and
+        // retry suspected peers after their cooldown. Spawned only when a
+        // runtime is present (constructors used from sync test code stay
+        // inert until someone calls `maintain_validator_mesh` explicitly).
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let upkeep = Arc::clone(&mesh);
+            handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        upkeep.heartbeat_ms().max(1),
+                    ))
+                    .await;
+                    // No-op (one empty-map lock) until a validator set is
+                    // installed, so a rotation later is picked up by the
+                    // already-running loop.
+                    let _ = upkeep.maintain(mesh_now_ms()).await;
+                }
+            });
+        }
         Self {
             node,
+            mesh,
             epoch: std::sync::RwLock::new(EpochTag::default()),
             prune_cursor: std::sync::atomic::AtomicU64::new(0),
             prune_cursor_loaded: std::sync::atomic::AtomicBool::new(false),
             last_prune_tip: std::sync::atomic::AtomicU64::new(0),
             last_published_head: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The validator mesh handle (direct sends + fallback).
+    pub fn validator_mesh(&self) -> Arc<ValidatorMesh> {
+        Arc::clone(&self.mesh)
+    }
+
+    /// Install a rotated validator set. Members are transport identities
+    /// (PQ node ids) with their dial endpoints; the mesh is rebuilt in place
+    /// and the next `maintain_validator_mesh` establishes the new links.
+    /// Direct links of rotated-out validators are closed immediately.
+    pub async fn set_validator_mesh_members(
+        &self,
+        members: Vec<ValidatorMeshMember>,
+    ) -> MeshRotation {
+        let rotation = self.mesh.install(members, mesh_now_ms());
+        self.close_rotated_out(&rotation).await;
+        rotation
+    }
+
+    /// Refresh the mesh from the current pinned peer config (the static
+    /// validator bootstrap set). Returns the rotation report.
+    pub async fn refresh_validator_mesh_from_config(&self) -> MeshRotation {
+        let members = mesh_members_from_config(&self.node);
+        let rotation = self.mesh.install(members, mesh_now_ms());
+        self.close_rotated_out(&rotation).await;
+        rotation
+    }
+
+    /// Reconcile the mesh with a consensus validator pubkey set.
+    ///
+    /// Transport identities are PQ ids, so the mapping goes through each
+    /// pinned peer's `consensus-pub`: only peers whose consensus key is in
+    /// the active set become mesh members. Validators without a pinned peer
+    /// entry have no dial target here and are skipped (DHT discovery may
+    /// supply it later).
+    pub async fn refresh_validator_mesh(
+        &self,
+        validator_pubkeys: &[[u8; 32]],
+    ) -> MeshRotation {
+        let active: std::collections::HashSet<[u8; 32]> =
+            validator_pubkeys.iter().copied().collect();
+        let mut members: Vec<ValidatorMeshMember> = Vec::new();
+        for peer in &self.node.cfg.peers {
+            let Some(pk) = peer.consensus_bytes().ok().flatten() else {
+                continue;
+            };
+            if !active.contains(&pk) {
+                continue;
+            }
+            if let Some(member) = ValidatorMeshMember::from_peer(peer) {
+                members.push(member);
+            }
+        }
+        let rotation = self.mesh.install(members, mesh_now_ms());
+        self.close_rotated_out(&rotation).await;
+        rotation
+    }
+
+    /// Close the persistent direct links of validators removed by a rotation
+    /// (a warm QUIC connection would otherwise outlive its membership).
+    async fn close_rotated_out(&self, rotation: &MeshRotation) {
+        for id in &rotation.removed_ids {
+            self.node.invalidate_peer_conn(*id).await;
+        }
+    }
+
+    /// One maintenance pass (heartbeat/reconnect). Exposed for the driver and
+    /// for deterministic tests; the adapter also runs this on a timer.
+    pub async fn maintain_validator_mesh(&self) -> MeshMaintenance {
+        self.mesh.maintain(mesh_now_ms()).await
+    }
+
+    /// Consensus delivery over the mesh: direct links first, DHT/overlay
+    /// fallback for any failed copy (or when the mesh is entirely down).
+    pub async fn deliver_consensus_mesh(&self, topic: &str, data_hex: &str) -> MeshDelivery {
+        self.mesh.deliver(topic, data_hex, mesh_now_ms()).await
     }
 
     /// Scope this adapter to a chain epoch. Called once the genesis fingerprint is

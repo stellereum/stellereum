@@ -1258,19 +1258,23 @@ async fn the_activation_boundary_switches_the_protocol() {
         }
     }
 
-    // ---- The PRODUCTION switch is the chain-spec sentinel: frozen OFF and
-    // derived deterministically, never from an operator knob. ----
+    // ---- The PRODUCTION switch is the chain-spec constant: ACTIVE FROM
+    // GENESIS and derived deterministically, never from an operator knob. ----
     assert_eq!(
         stellereum::xshard2pc::XPC_ACTIVATION_HEIGHT,
-        u64::MAX,
-        "the frozen public protocol pins the 2PC off"
+        0,
+        "the compiled chain spec arms the 2PC from genesis"
     );
     assert_eq!(
         XpcActivation::from_chain_spec(),
-        XpcActivation::Disabled,
+        XpcActivation::FromHeight(0),
         "production activation comes from the chain spec only"
     );
-    assert_eq!(XpcActivation::from_chain_spec().boundary(), None);
+    assert_eq!(XpcActivation::from_chain_spec().boundary(), Some(0));
+    assert!(XpcActivation::from_chain_spec().is_active_at(0));
+    // The explicit off switch remains available for the legacy-path unit
+    // tests, but it is NOT what the production constructor returns.
+    assert!(!XpcActivation::Disabled.is_active_at(0));
 }
 
 // ===========================================================================

@@ -79,16 +79,15 @@ pub const HASH_POOL_ENABLED: bool = false;
 /// (`OpCode::SysCallGovPropose` / `OpCode::SysCallGovVote`, applied by
 /// [`InMemoryStateEngine::apply_gov_ops`]).
 ///
-/// INACTIVE by default (`u64::MAX`, so no reachable height activates): the
-/// lead flips this const to the ratified height with a spec update + audit
-/// (AGENTS.md §7 frozen-core rule) — never an env knob (every node applying
-/// the same blocks must reach the same verdict; an env knob would fork the
-/// chain). While inactive the scan refuses every gov op and moves no state,
-/// so the standard apply path is byte-identical (proven by the pre-activation
-/// pin test + the unmodified gov suites). Tests open the gate per-instance
-/// via [`InMemoryStateEngine::enable_gov_ops_for_tests`] (never on the live
-/// path); production opens it only by flipping this const.
-pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Re-exported from [`crate::governance::GOV_OPS_ACTIVATION_HEIGHT`], the
+/// single source of truth: `0` (active from genesis). The gate is a plain
+/// compile-time constant — never an env knob (every node applying the same
+/// blocks must reach the same verdict; an env knob would fork the chain).
+/// Tests can force a closed gate per thread through
+/// [`crate::governance::set_gov_ops_activation_override`]; the per-instance
+/// [`InMemoryStateEngine::enable_gov_ops_for_tests`] opener is retained for
+/// the existing block-path fixtures.
+pub use crate::governance::GOV_OPS_ACTIVATION_HEIGHT;
 
 /// Default scheme tag for an account that has not pinned a public key.
 ///

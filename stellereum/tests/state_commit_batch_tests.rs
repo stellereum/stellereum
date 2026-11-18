@@ -334,6 +334,10 @@ async fn state_root_survives_snapshot_and_storage_roundtrip() {
         let st = Storage::open(&dir).unwrap();
         st.put_state(42, &snap).unwrap();
         st.flush().unwrap();
+        // Explicit drop: sled holds an exclusive flock on the directory until
+        // the handle is gone, and the reopen below would otherwise race the
+        // previous store's teardown on a parallel gate run.
+        drop(st);
     }
     {
         let st = Storage::open(&dir).unwrap();

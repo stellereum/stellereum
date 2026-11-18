@@ -194,20 +194,59 @@ pub(super) enum PreviewCall<'a> {
     Abi(&'a [AbiValue]),
 }
 
+/// The execution context a PREVIEW shares with block application.
+///
+/// Block application (`svm::OpCode::SysCallCallContract` /
+/// `SysCallCallContractArgs`) executes with `caller = tx.from`, `value = 0`
+/// (the value leg is a separate debit/credit, never visible as `host.value`),
+/// `block_time = the block timestamp` and `block_hash = [0u8; 32]`. A preview
+/// MUST use the same shape, because `caller` is authenticated input to the
+/// contract: a zero caller turns an owner-guarded method into a FALSE REVERT
+/// (F3) and a `caller == 0x00..`-guarded method into a FALSE SUCCESS (F4).
+pub(super) fn preview_call_context(
+    caller: [u8; 32],
+    block_time: u64,
+) -> crate::contract::ContractCallContext {
+    crate::contract::ContractCallContext {
+        caller,
+        value: 0,
+        block_time,
+        block_hash: [0u8; 32],
+    }
+}
+
+/// The timestamp a preview executes with: the head block's committed
+/// timestamp (what the next block is closest to). `0` on a node with no
+/// committed block — never a wall-clock value the chain did not commit.
+pub(super) async fn preview_block_time(st: &RpcState) -> u64 {
+    st.recent_blocks
+        .read()
+        .await
+        .front()
+        .map(|b| b.timestamp)
+        .unwrap_or(0)
+}
+
 /// H-03: read-only contract-call preview executed on a CLONE of the contract
 /// registry. Returns the same
 /// [`crate::state_engine::ContractCallOutcome`] the block-applied execution
 /// would report (same return value, gas and events), but touches NO live
 /// state: no debit/credit, no balance syncs, no outbound-message routing, no
-/// trie writes. State changes happen exclusively when a transaction submitted
-/// via `stell_sendRawTransaction` is applied by a block (N-03: the previewed
-/// tx itself is dropped, never admitted).
+/// trie writes, and NO receipt (a preview is not an inclusion). State changes
+/// happen exclusively when a transaction submitted via
+/// `stell_sendRawTransaction` is applied by a block (N-03: the previewed tx
+/// itself is dropped, never admitted).
+///
+/// `caller` is the transaction's real `from` — the same address block
+/// application passes as `ctx.sender` — so an owner-authenticated call
+/// previews exactly as it would apply. The caller is never a default/zero
+/// address and never a node-chosen one (see [`preview_call_context`]).
 ///
 /// The `value` leg is simulated on the clone with the same failure modes the
 /// old direct path had: a sender that cannot cover `value` fails with
-/// `insufficient funds to transfer value: …` and nothing moves. Execution
-/// uses the default call context, exactly like the engine's structured-call
-/// helpers did, so previews are result-identical to the pre-fix answers.
+/// `insufficient funds to transfer value: …` and nothing moves.
+#[allow(clippy::too_many_arguments)]
+// GATE: preview needs the registry, the call shape, the caller, the value leg, gas and the block clock.
 pub(super) async fn preview_contract_call(
     st: &RpcState,
     contract_addr: &[u8; 32],
@@ -216,6 +255,7 @@ pub(super) async fn preview_contract_call(
     value: u64,
     sender: &[u8; 32],
     gas_limit: u64,
+    block_time: u64,
 ) -> crate::state_engine::ContractCallOutcome {
     let failed = |msg: String, gas_used: u64| crate::state_engine::ContractCallOutcome {
         status: "failed".to_string(),
@@ -258,25 +298,19 @@ pub(super) async fn preview_contract_call(
             c.balance = c.balance.max(acct_bal).saturating_add(value);
         }
     }
+    let ctx = preview_call_context(*sender, block_time);
     let exec: Result<
         (i64, u64, Vec<crate::contract::ContractEvent>),
         crate::contract::ContractError,
     > = match call {
         PreviewCall::Plain(args) => work
-            .call_args(contract_addr, method, args, gas_limit)
-            .map(|(r, u, e, _)| (r, u, e)),
+            .call_with_context_args(contract_addr, method, args, gas_limit, &ctx)
+            .map(|o| (o.result, o.fuel_used, o.events)),
         PreviewCall::RawArgs(args, calldata) => work
-            .call_with_context_args_calldata(
-                contract_addr,
-                method,
-                args,
-                calldata,
-                gas_limit,
-                &crate::contract::ContractCallContext::default(),
-            )
+            .call_with_context_args_calldata(contract_addr, method, args, calldata, gas_limit, &ctx)
             .map(|o| (o.result, o.fuel_used, o.events)),
         PreviewCall::Abi(args) => work
-            .call_abi(contract_addr, method, args, gas_limit)
+            .call_abi_with_context(contract_addr, method, args, gas_limit, &ctx)
             .map(|o| (o.result, o.fuel_used, o.events)),
     };
     // Same outcome mapping as the engine's structured-call helpers.
@@ -299,35 +333,27 @@ pub(super) async fn preview_contract_call(
 }
 
 /// N-03: the single choke point through which the contract arms answer a
-/// preview. It files the node-local receipt for the CLONE preview `outcome`
-/// and renders the canonical response shape — and NOTHING else: the
-/// transaction is DROPPED (never admitted to the mempool, never gossipped).
-/// State changes happen exclusively when a block applies a transaction
-/// submitted via `stell_sendRawTransaction`. It never touches consensus
-/// state itself.
+/// preview. It renders the canonical response shape and NOTHING else:
 ///
-/// (N-03 mempool-DoS fix: the old shape admitted every preview — including
-/// keyless ephemeral-vehicle txs the caller never funded — into the mempool,
-/// so an unauthenticated caller could fill the pool with unexecutable
-/// transactions at zero cost. Previews now return the result and drop the
-/// tx; callers that want on-chain execution sign locally and submit the
-/// sealed tx via `stell_sendRawTransaction`.)
-pub(super) async fn preview_contract_tx_and_respond(
-    st: &RpcState,
+/// * NO receipt is written — a preview is not an inclusion, and the receipt
+///   index answers `eth_getTransactionReceipt` for MINED transactions only
+///   (F5/F5b: the old shape filed a fake receipt with `blockHash = 0x00…` and
+///   `blockNumber = head` into the same ring that serves real chain history,
+///   so a preview could both lie about inclusion and evict real receipts);
+/// * NO mempool admission and NO gossip — the preview tx is dropped here;
+/// * state changes happen exclusively when a block applies a transaction
+///   submitted via `stell_sendRawTransaction`.
+///
+/// `tx_hash` is the hash of the transaction the caller previewed, when the
+/// request carried one (the signed `tx` form). For the direct form there is
+/// no transaction at all, so the hash is `null` instead of a fabricated one.
+/// `"preview_only": true` and `"mined": false` make the absence of a receipt
+/// explicit in the response itself.
+pub(super) fn preview_outcome_response(
     id: Value,
-    tx: Transaction,
-    contract_addr: [u8; 32],
-    raw_tx_hex: String,
     outcome: crate::state_engine::ContractCallOutcome,
+    tx_hash: Option<[u8; 32]>,
 ) -> Json<RpcResponse> {
-    let gas_limit = tx.gas_limit;
-    let tx_hash = tx.compute_tx_hash();
-
-    // N-03: NO mempool admission, NO gossip broadcast — the preview tx is
-    // dropped here. (The receipt below is a node-local preview record, not
-    // an admission.)
-
-    let is_success = outcome.status == "success";
     let events_view: Vec<Value> = outcome
         .events
         .iter()
@@ -341,30 +367,16 @@ pub(super) async fn preview_contract_tx_and_respond(
         })
         .collect();
 
-    // Record receipt in receipt index
-    st.receipts.write().await.insert(TxReceipt {
-        tx_hash,
-        height: st.height.load(std::sync::atomic::Ordering::Relaxed),
-        block_hash: [0u8; 32],
-        index: 0,
-        success: is_success,
-        gas_limit,
-        fee_charged: outcome.gas_used,
-        raw_tx: Some(raw_tx_hex),
-        return_value: outcome.return_value,
-        gas_used: Some(outcome.gas_used),
-        events: outcome.events.clone(),
-        contract_address: Some(contract_addr),
-    });
-
     ok(
         id,
         json!({
-            "tx_hash": hex::encode(tx_hash),
+            "tx_hash": tx_hash.map(|h| json!(hex::encode(h))).unwrap_or(Value::Null),
             "status": outcome.status,
             "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
             "gas_used": outcome.gas_used,
             "events": events_view,
+            "preview_only": true,
+            "mined": false,
             "outcome": {
                 "status": outcome.status,
                 "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
@@ -652,12 +664,12 @@ async fn dispatch_contracts_inner(
 
         // ---- contract deployment (TON StateInit / deterministic BLAKE3) ----
         "stell_deployContract" => {
-            // N-02/N-03: this arm deploys nothing itself (preview only), but
-            // it executes contract code on a clone and hands out chain
-            // predictions — so it takes the same fail-closed token gate as
-            // the governance writes: a valid token ALWAYS, on every bind.
-            // Without a token it is refused before parsing (same refusal
-            // properties as the gov arms).
+            // N-02/N-03: this arm deploys nothing itself (prediction only),
+            // but it validates untrusted code and hands out chain addresses —
+            // so it takes the same fail-closed token gate as the governance
+            // writes: a valid token ALWAYS, on every bind. Without a token it
+            // is refused before parsing (same refusal properties as the gov
+            // arms).
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
@@ -766,25 +778,9 @@ async fn dispatch_contracts_inner(
                 let tx_hash = tx.compute_tx_hash();
 
                 // N-03: the signed preview tx is DROPPED here — no mempool
-                // admission, no gossip broadcast. On-chain execution needs a
-                // `stell_sendRawTransaction` submission of the same sealed tx.
-
-                let gas_cost = crate::svm::contract_deploy_gas(code.len());
-                st.receipts.write().await.insert(TxReceipt {
-                    tx_hash,
-                    height: st.height.load(std::sync::atomic::Ordering::Relaxed),
-                    block_hash: [0u8; 32],
-                    index: 0,
-                    success: true,
-                    gas_limit: tx.gas_limit,
-                    fee_charged: gas_cost,
-                    raw_tx: Some(raw_tx_str.to_string()),
-                    return_value: None,
-                    gas_used: Some(gas_cost),
-                    events: Vec::new(),
-                    contract_address: Some(predicted),
-                });
-
+                // admission, no gossip broadcast, and NO receipt. A deploy
+                // that was never sent must never be reported as MINED (F5):
+                // the receipt index is reserved for block application.
                 return ok(
                     id,
                     json!({
@@ -792,6 +788,11 @@ async fn dispatch_contracts_inner(
                         "contract_address_stl57": predicted_stl57,
                         "code_hash": hex::encode(code_hash),
                         "tx_hash": hex::encode(tx_hash),
+                        "predicted": true,
+                        "deployed": false,
+                        "preview_only": true,
+                        "address_derivation": "contract_address(tx.from, tx.nonce)",
+                        "note": "prediction only: the contract exists once a block applies this signed transaction",
                     }),
                 );
             }
@@ -815,14 +816,6 @@ async fn dispatch_contracts_inner(
                 return err(id, -32000, format!("deploy contract failed: {e}"));
             }
 
-            let gas_limit = p
-                .get("gas_limit")
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-                })
-                .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
-
             // Optional typed ABI manifest: validated here (it would travel
             // inside a submitted tx's execution path at apply time, committed
             // next to the code hash by block application — never by this arm).
@@ -830,89 +823,86 @@ async fn dispatch_contracts_inner(
                 return err(id, -32602, format!("invalid abi parameter: {e}"));
             }
 
-            // Ephemeral vehicle only: the node cannot sign as the caller (no
-            // key is accepted), so the preview tx is signed by a fresh
-            // random key. Its only purpose is to carry the deploy through
-            // the CLONE preview; it is DROPPED afterwards (N-03: never
-            // admitted, never gossipped). The predicted address is what block
-            // application would derive for it.
-            // FULL-PQ: the vehicle is an explicit Falcon-512 tx
-            // (self-contained: verifies with no registry and no funding —
-            // the preview authenticates the envelope, as with the old ed25519
-            // vehicle; execution still fails closed on the unfunded balance).
-            let eph_key = crate::post_quantum::FalconKeypair::generate();
-            let from_addr = crate::post_quantum::derive_pq_address(
-                crate::post_quantum::PqScheme::Falcon512,
-                &eph_key.public_key,
-                &crate::post_quantum::DEFAULT_SALT,
-            );
-            let nonce = st
-                .engine
-                .get_account(&from_addr)
-                .await
-                .map(|a| a.nonce)
-                .unwrap_or(0);
-            let predicted = crate::contract::contract_address(&from_addr, nonce);
-            if st.engine.get_contract(&predicted).await.is_some() {
-                return err(
-                    id,
-                    -32000,
-                    "deploy contract failed: contract already exists",
-                );
-            }
-            let predicted_stl57 = crate::address::encode_stl57_address(&predicted);
+            // F6: the address is `contract_address(sender, nonce)` — a
+            // function of the SIGNER, never of a node-chosen random key. This
+            // form carries no signer (`from` is refused: the node cannot sign
+            // as the caller), so the address is predicted ONLY when the
+            // request names `sender` (plus an optional `nonce`, defaulting to
+            // that account's committed nonce — the position its next tx
+            // occupies). Without a sender the answer is `contract_address:
+            // null`, so two identical requests always return the SAME answer
+            // and the node never hands out an address nobody can deploy at.
             let code_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&code).into();
-
-            let mut tx = Transaction {
-                from: from_addr,
-                to: predicted,
-                amount: 0,
-                gas_limit,
-                nonce,
-                source_shard: 0,
-                target_shard: 0,
-                signature: Vec::new(),
-                payload: vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
-                priority_fee_per_gas: 0,
+            let sender = match p.get("sender").and_then(|v| v.as_str()) {
+                Some(s) => match parse_rpc_address(s) {
+                    Ok(a) => Some(a),
+                    Err(e) => return err(id, -32602, format!("invalid sender address: {e}")),
+                },
+                None => None,
             };
-            let msg = tx.signing_message();
-            let sig = eph_key.sign(&msg);
-            tx.signature = crate::sharding::PqSignatureEnvelope::new_explicit(
-                crate::post_quantum::PqScheme::Falcon512,
-                eph_key.public_key.clone(),
-                sig,
-            )
-            .encode();
-            let tx_hash = tx.compute_tx_hash();
-            let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
+            let requested_nonce = match p.get("nonce") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                {
+                    Some(n) => Some(n),
+                    None => return err(id, -32602, "invalid nonce: must be an unsigned integer"),
+                },
+            };
+            let prediction: Option<([u8; 32], u64)> = match sender {
+                Some(sender_addr) => {
+                    let nonce = match requested_nonce {
+                        Some(n) => n,
+                        None => st
+                            .engine
+                            .get_account(&sender_addr)
+                            .await
+                            .map(|a| a.nonce)
+                            .unwrap_or(0),
+                    };
+                    let predicted = crate::contract::contract_address(&sender_addr, nonce);
+                    // Only block application can create the contract, so an
+                    // existing entry here is a real refusal (never a preview
+                    // write).
+                    if st.engine.get_contract(&predicted).await.is_some() {
+                        return err(
+                            id,
+                            -32000,
+                            "deploy contract failed: contract already exists",
+                        );
+                    }
+                    Some((predicted, nonce))
+                }
+                None => None,
+            };
 
-            // N-03: the ephemeral preview tx is DROPPED here — no mempool
-            // admission, no gossip broadcast. On-chain execution needs a
-            // locally-signed `stell_sendRawTransaction` submission.
-
+            // Nothing is deployed, signed or receipted here: this arm only
+            // validates the code and predicts where a signed
+            // `SysCallDeployContract` from `sender` at `nonce` would land.
             let gas_cost = crate::svm::contract_deploy_gas(code.len());
-            st.receipts.write().await.insert(TxReceipt {
-                tx_hash,
-                height: st.height.load(std::sync::atomic::Ordering::Relaxed),
-                block_hash: [0u8; 32],
-                index: 0,
-                success: true,
-                gas_limit,
-                fee_charged: gas_cost,
-                raw_tx: Some(raw_tx_hex),
-                return_value: None,
-                gas_used: Some(gas_cost),
-                events: Vec::new(),
-                contract_address: Some(predicted),
-            });
-
+            let predicted_hex = prediction.map(|(a, _)| hex::encode(a));
+            let predicted_stl57 = prediction.map(|(a, _)| crate::address::encode_stl57_address(&a));
+            let predicted_nonce = prediction.map(|(_, n)| n);
             ok(
                 id,
                 json!({
-                    "contract_address": hex::encode(predicted),
+                    "contract_address": predicted_hex,
                     "contract_address_stl57": predicted_stl57,
                     "code_hash": hex::encode(code_hash),
-                    "tx_hash": hex::encode(tx_hash),
+                    "sender": sender.map(hex::encode).unwrap_or_default(),
+                    "nonce": predicted_nonce,
+                    "gas_estimate": gas_cost,
+                    "predicted": prediction.is_some(),
+                    "deployed": false,
+                    "preview_only": true,
+                    "tx_hash": Value::Null,
+                    "address_derivation": "contract_address(tx.from, tx.nonce)",
+                    "note": if prediction.is_some() {
+                        "prediction only: the contract exists once a block applies a signed SysCallDeployContract transaction from `sender` at `nonce`"
+                    } else {
+                        "no sender in this request, so no address can be predicted: pass `sender` (and optional `nonce`), or sign the deploy locally and submit it via the `tx` form"
+                    },
                 }),
             )
         }
@@ -936,8 +926,8 @@ async fn dispatch_contracts_inner(
             // without a key cannot be honored. Both are refused fail-closed:
             // sign locally (SDK `TxBuilder::contract_call` + `sign`) and
             // submit the sealed transaction via the `tx` form, or use the
-            // direct parameters for a keyless preview (an ephemeral vehicle
-            // carries the call through the CLONE preview; DROPPED afterwards).
+            // direct parameters with an explicit `caller` (the address the
+            // call would execute as — never a zero/random stand-in).
             if p.get("private_key").is_some() {
                 return err(
                     id,
@@ -955,8 +945,9 @@ async fn dispatch_contracts_inner(
 
             // Signed-tx form: a sealed `SysCallCallContract` /
             // `SysCallCallContractArgs` transaction. Verified exactly like
-            // `stell_sendRawTransaction`, previewed on a registry clone, and
-            // DROPPED — never executed against live state, never admitted.
+            // `stell_sendRawTransaction`, previewed on a registry clone with
+            // `tx.from` as the caller, and DROPPED — never executed against
+            // live state, never admitted, never receipted.
             if let Some(raw_tx_str) = p.get("tx").and_then(|v| v.as_str()) {
                 let raw_bytes =
                     match hex::decode(raw_tx_str.strip_prefix("0x").unwrap_or(raw_tx_str)) {
@@ -1045,18 +1036,13 @@ async fn dispatch_contracts_inner(
                     tx.amount,
                     &tx.from,
                     tx.gas_limit,
+                    preview_block_time(st).await,
                 )
                 .await;
-                let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
-                return preview_contract_tx_and_respond(
-                    st,
-                    id,
-                    tx,
-                    contract_addr,
-                    raw_tx_hex,
-                    outcome,
-                )
-                .await;
+                let tx_hash = tx.compute_tx_hash();
+                // No receipt is filed (F5): the signed tx is returned with its
+                // real hash so the caller can submit it, but it is NOT mined.
+                return preview_outcome_response(id, outcome, Some(tx_hash));
             }
 
             let contract_str = match p
@@ -1078,14 +1064,6 @@ async fn dispatch_contracts_inner(
             };
 
             let args_param = p.get("args").or_else(|| p.get("arg"));
-            let arg = if let Some(v) = args_param {
-                match parse_contract_call_arg(v) {
-                    Ok(n) => n,
-                    Err(e) => return err(id, -32602, format!("invalid args parameter: {e}")),
-                }
-            } else {
-                0i64
-            };
 
             // Multi-argument calls: every element of an argument array is one
             // parameter of the method. A missing `args` keeps the legacy
@@ -1114,18 +1092,6 @@ async fn dispatch_contracts_inner(
                 })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
-            // Ephemeral vehicle only (see above: no key is accepted). The
-            // preview tx is signed by a fresh random key and carries the
-            // call through the CLONE preview below; it is DROPPED afterwards
-            // (N-03: never admitted, never gossipped).
-            // FULL-PQ: explicit Falcon-512 vehicle (self-contained).
-            let eph_key = crate::post_quantum::FalconKeypair::generate();
-            let from_addr = crate::post_quantum::derive_pq_address(
-                crate::post_quantum::PqScheme::Falcon512,
-                &eph_key.public_key,
-                &crate::post_quantum::DEFAULT_SALT,
-            );
-
             // Execute the contract call. When the contract carries an ABI
             // manifest the manifest is authoritative: the method and its
             // arguments are validated and typed before execution.
@@ -1138,29 +1104,43 @@ async fn dispatch_contracts_inner(
                 None => None,
             };
 
-            // The replayable payload of the call: the wasm arguments plus the
-            // canonical ABI encoding of the arguments (the calldata blob a
-            // contract reads blob parameters from). Both are derived from the
-            // SAME values the execution below uses, so a node replaying the
-            // transaction executes exactly the same call.
-            let (payload_args, payload_calldata): (Vec<i64>, Vec<u8>) = match (&abi, &typed_args) {
-                (Some(a), Some(args)) => {
-                    let calldata = match a.encode_args(method_str, args) {
-                        Ok(c) => c,
-                        Err(e) => return err(id, -32602, format!("ABI encoding failed: {e}")),
-                    };
-                    let scalars = args.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
-                    (scalars, calldata)
+            // F3/F4: `caller` is authenticated input to the contract. This
+            // form carries no signed transaction, so the caller must be
+            // named explicitly (`from` stays refused: the node cannot sign as
+            // it). Without a caller the preview is REFUSED — the node never
+            // falls back to the zero address (which inverts every
+            // owner-guarded contract) and never invents a random one.
+            let caller = match p.get("caller").and_then(|v| v.as_str()) {
+                Some(s) => match parse_rpc_address(s) {
+                    Ok(a) => a,
+                    Err(e) => return err(id, -32602, format!("invalid caller address: {e}")),
+                },
+                None => {
+                    return err(
+                        id,
+                        -32602,
+                        "missing 'caller': a preview needs the address the call would execute as; pass `caller`, or sign the call locally and preview it via the `tx` form",
+                    )
                 }
-                _ => (call_args.clone(), Vec::new()),
             };
+
+            // The ABI encoding is validated here so an unencodable call is a
+            // strict parameter error (-32602), never a preview "failure". No
+            // transaction is built (this form has no signer), so the encoded
+            // blob is discarded after validation.
+            if let (Some(a), Some(args)) = (&abi, &typed_args) {
+                if let Err(e) = a.encode_args(method_str, args) {
+                    return err(id, -32602, format!("ABI encoding failed: {e}"));
+                }
+            }
 
             // H-03: the preview runs on a registry CLONE (see
             // `preview_contract_call`): the `value` leg is simulated with
             // the same failure modes, but no account, contract, trie or
-            // mailbox state moves. The previewed tx is DROPPED (N-03); only
-            // a `stell_sendRawTransaction` submission can change state, when
-            // a block applies it.
+            // mailbox state moves. The previewed call is never admitted and
+            // never produces a receipt — only a `stell_sendRawTransaction`
+            // submission can change state, when a block applies it.
+            let block_time = preview_block_time(st).await;
             let outcome = match &typed_args {
                 Some(args) => {
                     preview_contract_call(
@@ -1169,8 +1149,9 @@ async fn dispatch_contracts_inner(
                         method_str,
                         PreviewCall::Abi(args),
                         value,
-                        &from_addr,
+                        &caller,
                         gas_limit,
+                        block_time,
                     )
                     .await
                 }
@@ -1181,57 +1162,18 @@ async fn dispatch_contracts_inner(
                         method_str,
                         PreviewCall::Plain(&call_args),
                         value,
-                        &from_addr,
+                        &caller,
                         gas_limit,
+                        block_time,
                     )
                     .await
                 }
             };
 
-            let sender_acc = st.engine.get_account(&from_addr).await;
-            let nonce = sender_acc.map(|a| a.nonce).unwrap_or(0);
-
-            // The transaction payload carries the call: a multi-argument
-            // method (or an ABI-typed call) uses the argument-carrying opcode
-            // so every node replays exactly the same parameter list.
-            let call_opcode = if typed_args.is_some() || payload_args.len() > 1 {
-                crate::svm::OpCode::SysCallCallContractArgs {
-                    contract: contract_addr,
-                    method: method_str.as_bytes().to_vec(),
-                    args: payload_args,
-                    calldata: payload_calldata,
-                }
-            } else {
-                crate::svm::OpCode::SysCallCallContract {
-                    contract: contract_addr,
-                    method: method_str.as_bytes().to_vec(),
-                    arg,
-                }
-            };
-
-            let mut tx = Transaction {
-                from: from_addr,
-                to: contract_addr,
-                amount: value,
-                gas_limit,
-                nonce,
-                source_shard: 0,
-                target_shard: 0,
-                signature: Vec::new(),
-                payload: vec![call_opcode],
-                priority_fee_per_gas: 0,
-            };
-            let msg = tx.signing_message();
-            let sig = eph_key.sign(&msg);
-            tx.signature = crate::sharding::PqSignatureEnvelope::new_explicit(
-                crate::post_quantum::PqScheme::Falcon512,
-                eph_key.public_key.clone(),
-                sig,
-            )
-            .encode();
-            let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
-
-            preview_contract_tx_and_respond(st, id, tx, contract_addr, raw_tx_hex, outcome).await
+            // No transaction exists for this form (the node cannot sign as
+            // the caller), so `tx_hash` is null rather than the hash of a
+            // fabricated ephemeral vehicle.
+            preview_outcome_response(id, outcome, None)
         }
         // ---- the ABI manifest of a contract (typed interface discovery) ----
         "stell_getContractAbi" => {
@@ -1314,9 +1256,10 @@ async fn dispatch_contracts_inner(
             let source_hex_opt = p.get("source_hex").and_then(|v| v.as_str());
             let claimed_hash_opt = p.get("source_hash").and_then(|v| v.as_str());
 
-            // Hash-only check: no source text submitted (the indexer-fetched
-            // text path submits inline instead). Answers whether the claimed
-            // fingerprint is the registered one — it performs NO rebuild.
+            // Hash-only check: no source text submitted. It answers whether
+            // the claimed fingerprint is the REGISTERED one and NOTHING
+            // else: no bytecode was rebuilt, so it can never report
+            // `verified: true` (F7 — a hash claim is not a verification).
             if source_opt.is_none() && source_hex_opt.is_none() {
                 match claimed_hash_opt {
                     Some(h) => {
@@ -1330,17 +1273,24 @@ async fn dispatch_contracts_inner(
                             _ => return err(id, -32602, "invalid source_hash: expected 32 bytes hex"),
                         };
                         let registered = st.engine.get_contract_source_hash(&contract_addr).await;
-                        let verified = registered == Some(claimed);
+                        let hash_matches = registered == Some(claimed);
                         return ok(id, json!({
                             "contract": hex::encode(contract_addr),
                             "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
-                            "verified": verified,
+                            // `verified` is a BUILD attestation: a hash
+                            // comparison never earns it.
+                            "verified": false,
+                            "hash_matches_registered": hash_matches,
                             "onchain_code_hash": hex::encode(onchain),
                             "rebuilt_code_hash": Value::Null,
                             "source_hash": hex::encode(claimed),
                             "compiler": compiler,
                             "compiler_flags": flags,
-                            "reason": if verified { "ok: matches the registered source hash (no rebuild performed)" } else { "claimed source hash does not match the registered one" },
+                            "reason": if hash_matches {
+                                "hash-only check: matches the registered source hash, but NO rebuild was performed — submit the source text to verify"
+                            } else {
+                                "claimed source hash does not match the registered one (no rebuild performed)"
+                            },
                             "registered": registered.is_some(),
                         }));
                     }
@@ -1382,6 +1332,11 @@ async fn dispatch_contracts_inner(
         // unverified). The node stores only the fingerprint, never the text;
         // the verified text lives in the indexer
         // (`GET /api/v2/contract/:address/source`).
+        //
+        // F7: `verified: true` here is a BUILD attestation, not a bare hash
+        // claim — `stell_registerContractSource` only accepts a fingerprint
+        // after REBUILDING the submitted source and matching the deployed
+        // code hash, so a registered fingerprint is one the node reproduced.
         "stell_getContractSource" => {
             let p = if params.is_array() {
                 params.get(0).unwrap_or(params)
@@ -1405,6 +1360,7 @@ async fn dispatch_contracts_inner(
                 None => return err(id, -32602, "contract not found"),
             };
             let registered = st.engine.get_contract_source_hash(&contract_addr).await;
+            let verified = registered.is_some();
             ok(
                 id,
                 json!({
@@ -1412,19 +1368,33 @@ async fn dispatch_contracts_inner(
                     "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
                     "code_hash": hex::encode(onchain),
                     "source_hash": registered.map(hex::encode).unwrap_or_default(),
-                    "verified": registered.is_some(),
+                    "verified": verified,
+                    "verification": if verified {
+                        "rebuild_at_registration"
+                    } else {
+                        "none"
+                    },
+                    "verified_means": "the node rebuilt the registered source and matched this code_hash; a hash claim alone is never verified",
                 }),
             )
         }
 
         // Register a verified-source fingerprint. The ONLY state-changing half
         // of source verification, and it moves ONLY by an explicit,
-        // creator-signed action: `signature` is the contract creator's ed25519
+        // creator-signed action: `signature` is the contract creator's PQ
         // signature over `b"STELL_REGISTER_SOURCE" || contract || source_hash`.
         // Self-authenticating like `stell_sendRawTransaction` (no API token —
         // the signature IS the authority); anyone may submit, only the
-        // creator's signature verifies. Call `stell_verifyContractSource`
-        // first and register the `source_hash` it returns.
+        // creator's signature verifies.
+        //
+        // F7: the signature alone is NOT verification — it only proves the
+        // creator chose the fingerprint. Registration therefore ALSO requires
+        // the source text and REBUILDS it: the rebuilt bytecode hash must
+        // equal the deployed `code_hash`, and the claimed `source_hash` must
+        // be the digest of exactly that text. A hash that was never compared
+        // to the code is REFUSED, so `verified: true` (here and in
+        // `stell_getContractSource`) always means "this node reproduced the
+        // deployed bytes from the registered source".
         "stell_registerContractSource" => {
             let p = if params.is_array() {
                 params.get(0).unwrap_or(params)
@@ -1484,6 +1454,54 @@ async fn dispatch_contracts_inner(
             ) {
                 return err(id, -32602, e);
             }
+
+            // The rebuild half: without it the badge would be a signature
+            // over an unconstrained 32-byte claim.
+            let source_opt = p.get("source").and_then(|v| v.as_str());
+            let source_hex_opt = p.get("source_hex").and_then(|v| v.as_str());
+            if source_opt.is_none() && source_hex_opt.is_none() {
+                return err(
+                    id,
+                    -32602,
+                    "missing source: registration requires 'source' (wat text) or 'source_hex' so the node can rebuild it against the deployed code hash; a hash-only claim is not verifiable",
+                );
+            }
+            let source_bytes =
+                match crate::contract_source::decode_source_bytes(source_opt, source_hex_opt) {
+                    Ok(b) => b,
+                    Err(e) => return err(id, -32602, e),
+                };
+            let onchain = match st.engine.get_contract_code_hash(&contract_addr).await {
+                Some(h) => h,
+                None => return err(id, -32602, "contract not found"),
+            };
+            let compiler = p
+                .get("compiler")
+                .and_then(|v| v.as_str())
+                .unwrap_or("wat2wasm-1.0");
+            let flags = p
+                .get("compiler_flags")
+                .or_else(|| p.get("flags"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let verification = match crate::contract_source::verify_registration(
+                &onchain,
+                &source_bytes,
+                &shash,
+                compiler,
+                flags,
+            ) {
+                Ok(v) => v,
+                Err(e) => return err(id, -32000, e),
+            };
+            if !verification.verified {
+                return err(
+                    id,
+                    -32000,
+                    format!("registration refused: {}", verification.reason),
+                );
+            }
+
             if let Err(e) = st
                 .engine
                 .register_contract_source(&contract_addr, shash, creator)
@@ -1497,8 +1515,13 @@ async fn dispatch_contracts_inner(
                     "contract": hex::encode(contract_addr),
                     "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
                     "source_hash": hex::encode(shash),
+                    "onchain_code_hash": verification.onchain_code_hash,
+                    "rebuilt_code_hash": verification.rebuilt_code_hash,
+                    "compiler": verification.compiler,
+                    "compiler_flags": verification.compiler_flags,
                     "registered": true,
                     "verified": true,
+                    "rebuilt": true,
                 }),
             )
         }

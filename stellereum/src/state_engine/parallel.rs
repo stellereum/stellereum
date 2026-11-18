@@ -1211,6 +1211,7 @@ impl InMemoryStateEngine {
                                                     bridge_snapshot: None,
                                                     actor_snapshot: None,
                                                     pmm_native_snapshot: Vec::new(),
+                                                    pmm_minted_nano: 0,
                                                     clob_native_snapshot: Vec::new(),
                                                 },
                                             )
@@ -1427,6 +1428,7 @@ impl InMemoryStateEngine {
                                         bridge_snapshot: None,
                                         actor_snapshot: None,
                                         pmm_native_snapshot: Vec::new(),
+                                        pmm_minted_nano: 0,
                                         clob_native_snapshot: Vec::new(),
                                     },
                                 )

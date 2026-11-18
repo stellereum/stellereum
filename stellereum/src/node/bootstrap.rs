@@ -15,6 +15,13 @@ use stellereum::orderbook::OrderbookManager;
 use stellereum::sharding::{Block, ShardRegistry};
 use stellereum::state_engine::InMemoryStateEngine;
 
+// Upgrade-halt durability + startup guard (`docs/UPGRADE_AND_RECOVERY.md`
+// §1.2.3/§1.2.4). Declared here rather than in `node/mod.rs` so the module
+// travels with the guard that owns it; `tests/upgrade_halt_tests.rs` includes
+// the same file by path to test the real logic, not a copy.
+#[path = "upgrade_halt.rs"]
+pub(crate) mod upgrade_halt;
+
 /// Hydrate the process-shared C1 anchor registry from this shard's store and
 /// arm it with the node's persistence queue.
 ///
@@ -715,6 +722,27 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 vset.len()
             );
         }
+        // SUPPLY INVARIANT AT BOOT (fail closed): the pre-mined genesis
+        // allocation is folded into the engine's minted-supply counter on the
+        // first post-genesis mint, so a genesis above `TOTAL_SUPPLY_CAP` would
+        // refuse EVERY later reward, bridge deposit and PMM buy. Detect that
+        // here, loudly, instead of letting the node boot into a chain that can
+        // never emit again.
+        {
+            let genesis_nano = (vset.len() as u128)
+                .saturating_mul(GENESIS_VALIDATOR_BALANCE as u128)
+                .saturating_add(GENESIS_FAUCET_BALANCE as u128);
+            let cap = stellereum::tokenomics::TOTAL_SUPPLY_CAP as u128;
+            if genesis_nano > cap {
+                anyhow::bail!(
+                    "REFUSING genesis: the pre-mined allocation ({} validators x {} + faucet = {} nano-STELL) exceeds TOTAL_SUPPLY_CAP ({}). Lower GENESIS_VALIDATOR_BALANCE / GENESIS_FAUCET_BALANCE or the validator count; every post-genesis mint would otherwise fail closed.",
+                    vset.len(),
+                    GENESIS_VALIDATOR_BALANCE,
+                    genesis_nano,
+                    cap
+                );
+            }
+        }
         stellereum::runtime::fund_genesis(&state_engine, &vset, GENESIS_VALIDATOR_BALANCE).await;
         // A testnet faucet needs pre-funded genesis balance, and that
         // credit MUST be identical on every node or the genesis state
@@ -920,6 +948,49 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             "masterchain",
             true,
         );
+        // UPGRADE HALT SAFETY (missed-event hole, `docs/UPGRADE_AND_RECOVERY.md`
+        // §1.2.3): the finalize-lane trigger is an EVENT, so a node that was
+        // offline at the plan height -- or that restarted past it -- never
+        // fired and kept running the pre-upgrade rules while reporting
+        // healthy. The halt lane writes a durable marker before it exits 42;
+        // this guard is the PREDICATE that makes the halt un-missable. It runs
+        // before consensus is spawned (and before the RPC serves), so a stale
+        // marker can never turn into votes. With no marker the guard is a
+        // single `stat` and the old startup path is unchanged.
+        {
+            let marker_path = upgrade_halt::marker_path();
+            let store = persistence.storage();
+            let running_version = upgrade_halt::running_version();
+            let decision = upgrade_halt::guard_upgrade_halt(
+                &marker_path,
+                || {
+                    store
+                        .finalized()
+                        .map(|found| found.map(|(h, _)| h))
+                        .map_err(|e| format!("{e}"))
+                },
+                &running_version,
+                upgrade_halt::running_exe_sha256,
+            );
+            match decision {
+                upgrade_halt::HaltDecision::Proceed => {}
+                upgrade_halt::HaltDecision::Pending { marker } => info!(
+                    "[upgrade] halt marker {:?} names height {}; the finalized head is below it, \
+                     so this node halts when it reaches that height",
+                    marker_path, marker.height
+                ),
+                upgrade_halt::HaltDecision::Cleared { marker } => info!(
+                    "[upgrade] cleared the upgrade-halt marker {:?}: the running binary reports \
+                     the plan's target version '{}' — joining consensus normally",
+                    marker_path, marker.target_version
+                ),
+                upgrade_halt::HaltDecision::Refuse { message } => {
+                    eprintln!("{message}");
+                    tracing::error!("{message}");
+                    anyhow::bail!("{message}");
+                }
+            }
+        }
         // Graceful shutdown: persistence is a background queue, and a
         // SIGTERM used to drop queued bodies/snapshots on the floor --
         // the next start then missed bodies it had finalized (observed:

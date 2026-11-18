@@ -309,18 +309,33 @@ fn precompile_malformed_inputs_fail_clean() {
         "0x1111111111111111111111111111111111111111"
     );
 
-    // State-changing selectors are read-only emulation: pinned true, never error.
-    for sel in ["a9059cbb", "095ea7b3", "23b87266"] {
+    // State-changing selectors are NOT emulated as success (F2): no EVM
+    // interpreter exists, so `transfer`/`approve`/`transferFrom` answer empty
+    // — exactly what a call at an address with no code returns — and a
+    // preflight of a reverting call is never told `true`.
+    for sel in [
+        evm_adapter::SELECTOR_TRANSFER,
+        evm_adapter::SELECTOR_APPROVE,
+        evm_adapter::SELECTOR_TRANSFER_FROM,
+    ] {
         let out = adapter.emulate_erc20_call(&format!("0x{sel}"));
-        assert_eq!(
+        assert_eq!(out, "0x", "selector {sel} must not be answered as success");
+        assert_ne!(
             out,
             format!("0x{:0>64}", "1"),
-            "selector {sel} must emulate true"
+            "selector {sel} must never be `true`"
         );
     }
-    // Allowance emulation pins u128::MAX.
-    let out = adapter.emulate_erc20_call("0xdd62ed3e");
-    assert_eq!(out, format!("0x{:0>64x}", u128::MAX));
+    // The registered transferFrom selector is the standard one (F2b).
+    assert_eq!(evm_adapter::SELECTOR_TRANSFER_FROM, "23b872dd");
+    // The old typo selector is an ordinary unknown selector.
+    assert_eq!(adapter.emulate_erc20_call("0x23b87266"), "0x");
+    // Allowance is not invented either: no approvals are stored here.
+    assert_eq!(adapter.emulate_erc20_call("0xdd62ed3e"), "0x");
+    assert_ne!(
+        adapter.emulate_erc20_call("0xdd62ed3e"),
+        format!("0x{:0>64x}", u128::MAX)
+    );
 }
 
 // ---------------------------------------------------------------------------

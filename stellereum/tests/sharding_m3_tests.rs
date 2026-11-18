@@ -36,6 +36,278 @@ mod falcon_votes;
 
 const SHARD0: u32 = MASTERCHAIN_SHARD;
 const SHARD1: u32 = BASE_WORKCHAIN_SHARD_INITIAL;
+const TS: u64 = 1_760_000_000;
+
+/// FULL-PQ cross-shard transfer with a NON-ZERO amount, carrying the source /
+/// target shard pair of the §9 2PC tests below.
+fn pq_xpc_tx(sender_seed: u8, to: [u8; 32], amount: u64) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(sender_seed);
+    let from = pq_id(sender_seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: 5,
+        nonce: 0,
+        source_shard: SHARD0,
+        target_shard: SHARD1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, sender_seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
+/// A carrier block that delivers exactly one record to `shard_id`.
+fn xpc_carrier(shard_id: u32, height: u64, msg: stellereum::sharding::CrossShardMessage) -> Block {
+    Block {
+        shard_id,
+        height,
+        prev_hash: [0u8; 32],
+        state_root: [0u8; 32],
+        transactions: vec![],
+        cross_shard_out: vec![msg],
+        timestamp: TS,
+        proposer: [0x11u8; 32],
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
+        order_merkle_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+    }
+}
+
+/// REGRESSION (was F2 FINDING, refund leg): the §9 ABORT-ACK refunds value the
+/// source already ESCROWED, so it is a transfer of existing supply and must not
+/// be refused at the global mint cap. Exactly-once is an ATOMIC CLAIM (audit
+/// F3 twin): the `cross_shard_completed` insert decides which apply pays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xpc_abort_refund_at_the_cap_is_paid_exactly_once_under_concurrency() {
+    use stellereum::sharding::{CrossShardMessage, FinalizedHeaderRegistry};
+    use stellereum::tokenomics::TOTAL_SUPPLY_CAP;
+    use stellereum::xshard2pc::{XpcPhase, XpcRecord, XPC_ABORT_ACK};
+
+    const N: usize = 8;
+    let sender_seed = 0xB0u8;
+    let sender = pq_id(sender_seed);
+    let recipient = key(0xB1).verifying_key().to_bytes();
+    let amount = 320u64;
+    let tx = pq_xpc_tx(sender_seed, recipient, amount);
+    let tx_hash = tx.compute_tx_hash();
+
+    // The PEER (target) shard never prepared: its committed record is ABORTED.
+    let peer = InMemoryStateEngine::new();
+    let aborted = XpcRecord {
+        tx: tx.clone(),
+        tx_hash,
+        source_shard: SHARD0,
+        target_shard: SHARD1,
+        phase: XpcPhase::Aborted,
+        prepared_height: 5,
+        decided_height: 6,
+    };
+    assert!(aborted.is_consistent(), "precondition: well-formed record");
+    peer.restore_xpc_records(std::slice::from_ref(&aborted))
+        .await;
+    let peer_root = peer.get_state_root().await;
+    let peer_block = [0xB7u8; 32];
+    let proof = peer
+        .get_xpc_proof(&tx_hash)
+        .await
+        .expect("the ABORTED leaf is provable at the peer root");
+    let registry = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+    registry
+        .write()
+        .unwrap()
+        .note_finalized(SHARD1, peer_block, peer_root);
+
+    // The source under test: escrowed, then filled to the global cap.
+    let source = Arc::new(InMemoryStateEngine::new());
+    source.enable_cross_shard();
+    source.with_finalized_headers(registry);
+    source
+        .update_account(AccountState::new(sender, 1_000))
+        .await;
+    source
+        .restore_xpc_records(&[XpcRecord::prepared(tx.clone(), SHARD0, SHARD1, 4)])
+        .await;
+    // Fill EXACTLY to the cap: the seeded balance is pre-minted supply and is
+    // folded into the counter by this reservation (F4), so subtract it.
+    let seeded = source.genesis_allocation_nano().await;
+    source
+        .mint_native(&[0xB8u8; 32], TOTAL_SUPPLY_CAP - seeded)
+        .await
+        .expect("fill the source to the global cap");
+    assert_eq!(source.remaining_mint_headroom_nano(), 0);
+    let minted_before = source.total_minted_nano();
+
+    let msg = CrossShardMessage::new_xpc(
+        XPC_ABORT_ACK,
+        SHARD1,
+        SHARD0,
+        tx,
+        peer_root,
+        peer_block,
+        Some(proof),
+    );
+    assert!(msg.is_abort_ack());
+    assert!(msg.is_inbound_for(SHARD0));
+    let carrier = xpc_carrier(SHARD0, 7, msg);
+
+    // Deterministic race: hold the accounts write lock so every task reaches
+    // the claim window before any of them can credit.
+    let gate = source.accounts.write().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(N + 1));
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let source = source.clone();
+        let carrier = carrier.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            source.apply_cross_shard_consumptions(&carrier).await;
+        }));
+    }
+    barrier.wait().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(gate);
+    for t in tasks {
+        t.await.expect("no task may panic");
+    }
+
+    assert_eq!(
+        source.get_account(&sender).await.map(|a| a.balance),
+        Some(1_000 + amount),
+        "exactly one refund at zero mint headroom"
+    );
+    assert_eq!(
+        source.total_minted_nano(),
+        minted_before,
+        "a refund is a transfer, not a mint"
+    );
+    assert_eq!(source.remaining_mint_headroom_nano(), 0);
+    assert_eq!(
+        source.xpc_record(&tx_hash).await.map(|r| r.phase),
+        Some(XpcPhase::Aborted)
+    );
+    assert!(source.is_cross_shard_completed(&tx_hash).await);
+    assert!(
+        source.mint_native(&[0xB9u8; 32], 1).await.is_err(),
+        "issuance is still refused at the cap"
+    );
+}
+
+/// The COMMIT twin of the test above (audit F3, §9 credit): 8 concurrent
+/// applies of ONE COMMIT at zero mint headroom credit the recipient exactly
+/// once, through the uncapped transfer primitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_xpc_commit_at_the_cap_credits_exactly_once() {
+    use stellereum::sharding::{CrossShardMessage, FinalizedHeaderRegistry};
+    use stellereum::tokenomics::TOTAL_SUPPLY_CAP;
+    use stellereum::xshard2pc::{XpcPhase, XpcRecord, XPC_COMMIT};
+
+    const N: usize = 8;
+    let sender_seed = 0xB2u8;
+    let _sender = pq_id(sender_seed);
+    let recipient = key(0xB3).verifying_key().to_bytes();
+    let amount = 444u64;
+    let tx = pq_xpc_tx(sender_seed, recipient, amount);
+    let tx_hash = tx.compute_tx_hash();
+
+    // The SOURCE peer escrowed the value: its committed record is PREPARED and
+    // the COMMIT proves that leaf against its finalized root.
+    let peer = InMemoryStateEngine::new();
+    peer.restore_xpc_records(&[XpcRecord::prepared(tx.clone(), SHARD0, SHARD1, 4)])
+        .await;
+    let peer_root = peer.get_state_root().await;
+    let peer_block = [0xB4u8; 32];
+    let proof = peer
+        .get_xpc_proof(&tx_hash)
+        .await
+        .expect("the PREPARED leaf is provable at the source root");
+    let registry = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+    registry
+        .write()
+        .unwrap()
+        .note_finalized(SHARD0, peer_block, peer_root);
+
+    // The target under test: it voted YES (PREPARED), then the cap is filled.
+    let target = Arc::new(InMemoryStateEngine::new());
+    target.enable_cross_shard();
+    target.with_finalized_headers(registry);
+    target
+        .restore_xpc_records(&[XpcRecord::prepared(tx.clone(), SHARD0, SHARD1, 4)])
+        .await;
+    // Fill EXACTLY to the cap (pre-minted balances are folded into the counter
+    // by the reservation itself, F4).
+    let seeded = target.genesis_allocation_nano().await;
+    target
+        .mint_native(&[0xB5u8; 32], TOTAL_SUPPLY_CAP - seeded)
+        .await
+        .expect("fill the target to the global cap");
+    assert_eq!(target.remaining_mint_headroom_nano(), 0);
+    let minted_before = target.total_minted_nano();
+
+    let msg = CrossShardMessage::new_xpc(
+        XPC_COMMIT,
+        SHARD0,
+        SHARD1,
+        tx,
+        peer_root,
+        peer_block,
+        Some(proof),
+    );
+    assert!(msg.is_commit());
+    assert!(msg.is_inbound_for(SHARD1));
+    let carrier = xpc_carrier(SHARD1, 7, msg);
+
+    let gate = target.accounts.write().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(N + 1));
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let target = target.clone();
+        let carrier = carrier.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            target.apply_cross_shard_consumptions(&carrier).await;
+        }));
+    }
+    barrier.wait().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(gate);
+    for t in tasks {
+        t.await.expect("no task may panic");
+    }
+
+    assert_eq!(
+        target.get_account(&recipient).await.map(|a| a.balance),
+        Some(amount),
+        "exactly one credit at zero mint headroom"
+    );
+    assert_eq!(
+        target.total_minted_nano(),
+        minted_before,
+        "a COMMIT credit is a transfer, not a mint"
+    );
+    assert_eq!(target.remaining_mint_headroom_nano(), 0);
+    assert_eq!(
+        target.xpc_record(&tx_hash).await.map(|r| r.phase),
+        Some(XpcPhase::Committed)
+    );
+    assert_eq!(
+        target.cross_shard_consumed_len().await,
+        0,
+        "§9 value keys stay out of the legacy consumed set"
+    );
+}
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])

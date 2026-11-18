@@ -315,7 +315,10 @@ impl InMemoryStateEngine {
                     if let Some(rec) = escrow_map.get_mut(&key) {
                         let take = rec.locked_base_stell.min(t.amount);
                         rec.locked_base_stell -= take;
-                        self.credit_native(&buyer, take).await?;
+                        // Escrow RELEASE (the value was locked earlier): a
+                        // transfer, never new issuance — the capped mint path
+                        // would strand it at the supply cap.
+                        self.credit_native_transfer(&buyer, take).await?;
                     }
                 } else {
                     let q = Self::clob_quote_value(t.price, t.amount);
@@ -350,7 +353,7 @@ impl InMemoryStateEngine {
                     } else if let Some(rec) = escrow_map.get_mut(&key) {
                         let take = rec.locked_quote_native.min(qn);
                         rec.locked_quote_native -= take;
-                        self.credit_native(&buyer, take).await?;
+                        self.credit_native_transfer(&buyer, take).await?;
                     }
                 }
                 if let Some(rec) = escrow_map.get(&(pair, t.maker_order_id)) {
@@ -409,7 +412,7 @@ impl InMemoryStateEngine {
                 } else if qn > 0 && escrow_map.get(&maker_key).unwrap().locked_quote_native >= qn {
                     let rec = escrow_map.get_mut(&maker_key).unwrap();
                     rec.locked_quote_native -= qn;
-                    self.credit_native(&seller, qn).await?;
+                    self.credit_native_transfer(&seller, qn).await?;
                 } else {
                     // The record exists but cannot fund this fill. Refusing is
                     // the only safe answer: paying from live balance would take
@@ -457,12 +460,14 @@ impl InMemoryStateEngine {
                 // Maker seller: pay buyer from maker's locked base escrow
                 let rec = escrow_map.get_mut(&maker_key).unwrap();
                 rec.locked_base_stell -= t.amount;
-                // Credit buyer with native STELL:
-                self.credit_native(&buyer, t.amount).await?;
+                // Credit buyer with native STELL from the maker's escrow: a
+                // release of locked value, not issuance.
+                self.credit_native_transfer(&buyer, t.amount).await?;
             } else {
-                // Taker seller or non-escrowed maker: debit seller, credit buyer
+                // Taker seller or non-escrowed maker: debit seller, credit
+                // buyer — a pure transfer.
                 self.debit_native(&seller, t.amount).await?;
-                self.credit_native(&buyer, t.amount).await?;
+                self.credit_native_transfer(&buyer, t.amount).await?;
             }
 
             // If maker escrow is completely exhausted, clean it up:
@@ -604,7 +609,8 @@ impl InMemoryStateEngine {
         // quote). A record can only release what was deposited into it.
         if let Some(escrow) = self.order_escrow_write().await.remove(&(pair, order_id)) {
             if escrow.locked_base_stell > 0 || escrow.locked_quote_native > 0 {
-                self.credit_native(
+                // Cancel refund: releasing escrowed value, not minting.
+                self.credit_native_transfer(
                     &caller,
                     escrow
                         .locked_base_stell
@@ -1395,9 +1401,19 @@ impl InMemoryStateEngine {
     /// Apply the native half of a PMM swap: mint STELL to buyers, burn it from
     /// sellers, and commit every touched account to the state trie.
     ///
+    /// SUPPLY CAP (audit F5): every `Buy` is NEW issuance and reserves its
+    /// `stell_minted` against the engine's global counter
+    /// ([`InMemoryStateEngine::reserve_mint`]) BEFORE a single balance is
+    /// written. At the cap the whole swap is refused (the payload does not
+    /// apply, exactly like a direct `pmm_buy`), so the block path can no longer
+    /// mint past `TOTAL_SUPPLY_CAP`. Sells move existing value and are never
+    /// capped. The returned `u64` is the reservation the caller must release if
+    /// a LATER leg of the same payload fails (see [`Self::restore_pmm_native`]).
+    ///
     /// Validation runs BEFORE any write, so a refusal - an unaffordable sell,
-    /// an overflowing buy, or a swap that would eat the transaction's own
-    /// `amount + gas + payload transfers` reservation - moves no coins at all.
+    /// an overflowing buy, a swap that would eat the transaction's own
+    /// `amount + gas + payload transfers` reservation, or a buy past the global
+    /// supply cap - moves no coins at all.
     /// Returns the pre-swap snapshot (`None` = the account did not exist),
     /// which is what a failure later in the SAME payload needs in order to
     /// undo exactly this and nothing else (created accounts are removed, not
@@ -1409,18 +1425,27 @@ impl InMemoryStateEngine {
         events: &[crate::pmm::PmmEvent],
         payer: [u8; 32],
         floor: u64,
-    ) -> Result<Vec<([u8; 32], Option<(u64, u64)>)>, String> {
+    ) -> Result<(Vec<([u8; 32], Option<(u64, u64)>)>, u64), String> {
         // Net native delta per account. Every PMM syscall acts on
         // `ctx.sender`, so in practice this is one entry, but the map keeps
-        // the code correct if that ever changes.
+        // the code correct if that ever changes. `minted_nano` is the GROSS
+        // buy side: a burn does not restore headroom (the counter is gross
+        // lifetime emission), so buy->sell in one payload still reserves the
+        // buy exactly once.
         let mut delta: HashMap<[u8; 32], i128> = HashMap::new();
+        let mut minted_nano: u64 = 0;
         for ev in events {
             let (addr, d) = match ev {
                 crate::pmm::PmmEvent::Buy {
                     buyer,
                     stell_minted,
                     ..
-                } => (*buyer, *stell_minted as i128),
+                } => {
+                    minted_nano = minted_nano
+                        .checked_add(*stell_minted)
+                        .ok_or_else(|| "PMM settlement: buy amount overflows u64".to_string())?;
+                    (*buyer, *stell_minted as i128)
+                }
                 crate::pmm::PmmEvent::Sell {
                     seller, stell_nano, ..
                 } => (*seller, -(*stell_nano as i128)),
@@ -1428,6 +1453,9 @@ impl InMemoryStateEngine {
             *delta.entry(addr).or_insert(0) += d;
         }
 
+        // Capture the pre-mint genesis baseline BEFORE the write lock: the
+        // helper only reads the account set while the counter is still zero.
+        let genesis_nano = self.genesis_allocation_nano().await;
         let mut map = self.accounts.write().await;
 
         // Pass 1: validate against one consistent view of the balances.
@@ -1459,6 +1487,15 @@ impl InMemoryStateEngine {
             }
         }
 
+        // Supply cap BEFORE any balance write, under the SAME accounts lock as
+        // the validation and the apply: a buy is issuance. A refusal moves
+        // nothing (the map is still untouched) and the reservation is a pure
+        // atomic CAS, so no lock ordering issue arises.
+        if minted_nano > 0 {
+            self.reserve_mint_nano(minted_nano, genesis_nano)
+                .map_err(|e| format!("PMM settlement: {e}"))?;
+        }
+
         // Pass 2: apply, then mirror into the trie in the same order
         // `credit_native`/`debit_native` do it, so the account map and the
         // state root never disagree about the swap.
@@ -1476,7 +1513,7 @@ impl InMemoryStateEngine {
         for (addr, data) in touched {
             trie.insert(&addr, &data);
         }
-        Ok(snapshot)
+        Ok((snapshot, minted_nano))
     }
 
     /// Put back the native balances [`Self::settle_pmm_native`] moved, undoing
@@ -1587,13 +1624,22 @@ impl InMemoryStateEngine {
             return Ok(Some(BridgeSnapshot {
                 accounts: Vec::new(),
                 domain: before,
+                minted_nano: 0,
             }));
         }
 
         let mut delta: HashMap<[u8; 32], i128> = HashMap::new();
+        // NEW issuance this settlement creates: every `Credit` is a deposit
+        // mint (gross), never a move of existing value. `Unpark`/`Clawback`/
+        // `Park` move value between the recipient/escrow and `Burn` destroys
+        // escrowed funds, so none of them is counted here.
+        let mut minted_nano: u64 = 0;
         for effect in &plan.effects {
             match effect {
                 crate::bridge::BridgeEffect::Credit { recipient, amount } => {
+                    minted_nano = minted_nano.checked_add(*amount).ok_or_else(|| {
+                        "bridge settlement: credit amount overflows u64".to_string()
+                    })?;
                     *delta.entry(*recipient).or_insert(0) += *amount as i128;
                 }
                 crate::bridge::BridgeEffect::Park { amount } => {
@@ -1626,6 +1672,9 @@ impl InMemoryStateEngine {
             }
         }
 
+        // Capture the pre-mint genesis baseline BEFORE the write lock: the
+        // helper only reads the account set while the counter is still zero.
+        let genesis_nano = self.genesis_allocation_nano().await;
         let mut map = self.accounts.write().await;
 
         // Pass 1: validate against one consistent view of the balances.
@@ -1650,6 +1699,18 @@ impl InMemoryStateEngine {
                     "bridge withdrawal would leave {after} nano-STELL, {floor} is reserved for amount + gas + payload transfers"
                 ));
             }
+        }
+
+        // GLOBAL SUPPLY CAP (audit F1): a deposit mint is issuance exactly like
+        // `mint_native`, so reserve its gross amount under the same accounts
+        // lock as the validation and the apply. The bridge's LOCAL caps
+        // (`note_deposit_mint`: hourly window + 100M cumulative) are the first
+        // line; THIS reservation bounds the sum across every subsystem.
+        // Refusal moves nothing: the map is still untouched and the planned
+        // domain (replay set, queue, rate window) was never committed.
+        if minted_nano > 0 {
+            self.reserve_mint_nano(minted_nano, genesis_nano)
+                .map_err(|e| format!("bridge settlement: {e}"))?;
         }
 
         // Pass 2: apply, then mirror the trie so the account map and the state
@@ -1687,6 +1748,7 @@ impl InMemoryStateEngine {
         Ok(Some(BridgeSnapshot {
             accounts: snapshot,
             domain: before,
+            minted_nano,
         }))
     }
 
@@ -1698,10 +1760,18 @@ impl InMemoryStateEngine {
     /// re-submission, a leftover queue entry would be a phantom withdrawal.
     /// Accounts the leg created (`None` pre-state) are removed with their
     /// trie entries, mirroring `commit_native`'s own undo.
+    ///
+    /// The deposit MINT reservation taken by the settlement
+    /// ([`BridgeSnapshot::minted_nano`]) is released here too: a rolled-back
+    /// payload must not permanently burn global supply headroom (that would be
+    /// a cheap way to push the chain toward the cap with refused transactions).
     pub(super) async fn restore_bridge_native(&self, snap: Option<&BridgeSnapshot>) {
         let Some(snap) = snap else {
             return;
         };
+        if snap.minted_nano > 0 {
+            self.release_mint_nano(snap.minted_nano);
+        }
         let mut map = self.accounts.write().await;
         let mut touched: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(snap.accounts.len());
         let mut removed: Vec<[u8; 32]> = Vec::new();

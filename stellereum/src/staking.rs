@@ -235,6 +235,24 @@ pub const REWARDS_POOL: [u8; 32] = [0x52; 32];
 pub const REWARDS_EMISSION_CAP: u64 = 350_000_000 * 1_000_000_000;
 /// Minimum delegation amount (1 STELL).
 pub const MIN_DELEGATION: u64 = 1_000_000_000;
+
+/// Maximum number of ACTIVE delegation positions one validator may carry
+/// (4,096), enforced fail-closed by [`StakingLedger::delegate`].
+///
+/// WHY A CAP: [`StakingLedger::slash`] applies the pro-rata cut to every
+/// active delegation in ONE block. The minimum position is 1 STELL, so
+/// without a cap a 1B-cap-funded attacker could buy millions of positions
+/// and make a single downtime/equivocation slash walk all of them inside the
+/// block execution budget (pentest F9: 100k positions ≈ 42-70 ms in a debug
+/// build, extrapolating to seconds at 1% of the cap). At 4,096 positions a
+/// worst-case slash stays a bounded, deterministic scan (~2-3 ms debug on
+/// the measured per-position cost), independent of the attacker's balance.
+///
+/// The cap only gates NEW positions: topping up an existing delegation is
+/// always allowed, and exits shrink the count. It is a staking-domain
+/// admission rule, not consensus quorum math, and it changes NO slash
+/// arithmetic (`slash` still walks every position that exists).
+pub const MAX_DELEGATORS_PER_VALIDATOR: usize = 4_096;
 /// Unbonding cooldown before funds can be withdrawn (~2 days at 3s blocks).
 ///
 /// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
@@ -447,6 +465,12 @@ pub enum StakingError {
     /// same validator. Refused fail-closed (a same-validator "move" would
     /// otherwise launder the anti-long-range lock timestamp).
     InvalidRedelegation,
+    /// [`StakingLedger::delegate`] refused a NEW position because the
+    /// validator already carries [`MAX_DELEGATORS_PER_VALIDATOR`] active
+    /// delegators. Bounds the per-block work `slash` must do (pentest F9);
+    /// topping up an existing position is always allowed. Appended last so
+    /// existing serialized error indices are untouched.
+    DelegationCapReached,
 }
 
 impl std::fmt::Display for StakingError {
@@ -496,6 +520,9 @@ impl std::fmt::Display for StakingError {
             }
             StakingError::InvalidRedelegation => {
                 "redelegation source and destination must differ"
+            }
+            StakingError::DelegationCapReached => {
+                "validator delegation count cap reached: top up an existing position or pick another validator"
             }
         };
         write!(f, "{s}")
@@ -835,10 +862,13 @@ pub struct ValidatorStake {
     pub pending_rewards: u64,
     /// Slashing history (total burned) for transparency.
     pub total_slashed: u64,
-    /// Consecutive heights this validator failed to contribute to a finalised
-    /// quorum certificate, and the height at which the counter was last reset.
-    /// Both are derived from blocks, never from local observation, so every node
-    /// counts identically.
+    /// CUMULATIVE unrecovered downtime deficit: heights this validator
+    /// failed to contribute to a finalised quorum certificate, MINUS one
+    /// recovery credit per certificate it DID sign (floored at 0). It is a
+    /// leaky bucket, never a consecutive streak, so a single vote cannot
+    /// erase a near-threshold outage (pentest F8). Derived from blocks,
+    /// never from local observation, so every node counts identically; a
+    /// downtime slash and an `unjail` both reset it to 0.
     pub missed: u32,
     /// Height of the last downtime slash, so one outage is punished once and
     /// repeated replays of the same evidence cannot slash repeatedly.
@@ -1309,6 +1339,38 @@ pub struct StakingLedger {
     /// available. Empty until the first redelegation.
     #[serde(default)]
     pub redelegation_lock: HashMap<(ValidatorId, [u8; 32]), u64>,
+    /// FORENSIC-ONLY: fully-unbonded validators and the height at which the
+    /// exit became effective, with the power they held at the start of that
+    /// block: `validator -> (pre_exit_power, exit_height)`.
+    ///
+    /// WHY: the downtime evidence carried by block H is the `last_qc` for
+    /// H-1, but H's pre-state ledger is already the END of H-1. A validator
+    /// that included a full `SysCallUnbond` in H-1 is therefore absent from
+    /// [`Self::to_validator_set`] when H attributes the H-1 miss, and the
+    /// miss escapes (pentest F6: 0 burned instead of the 0.1% + jail).
+    /// `InMemoryStateEngine::apply_block_transition` records every validator
+    /// that left the set during that block here, and the attribution step
+    /// re-adds the ones whose `exit_height` equals the evidence height with
+    /// their PRE-EXIT power, i.e. the set that actually formed the QC (this
+    /// mirrors the "record `unbonded_at_height` on the entry" remedy in the
+    /// pentest report without touching the frozen unbonding shape).
+    ///
+    /// BOUNDED: only the current and previous height are retained (the
+    /// recorder prunes anything older), so the map holds at most the exits of
+    /// two blocks. Entries never move stake; they are attribution input.
+    ///
+    /// COMMITMENT: not folded into `staking_digest` (that would need a new
+    /// conditional domain and a root migration). It is derived identically
+    /// from the same applied block sequence on every node, so honest nodes
+    /// agree; the legacy V8 upgrade fills it empty at a snapshot boundary and
+    /// the next applied block repopulates it, which is the only window where
+    /// it can lag a peer (and never more than one evidence height).
+    ///
+    /// APPENDED AT THE END like every field added after the first, with
+    /// `#[serde(default)]`, so pre-change bytes stay an exact prefix (see the
+    /// `jail` comment above for the versioned-decoder rule).
+    #[serde(default)]
+    pub recent_full_exits: HashMap<ValidatorId, (u64, u64)>,
 }
 
 impl StakingLedger {
@@ -1816,6 +1878,58 @@ impl StakingLedger {
         Ok(())
     }
 
+    /// Number of ACTIVE delegation positions on `validator` (one per
+    /// delegator key, not per nano-STELL). Used by the
+    /// [`MAX_DELEGATORS_PER_VALIDATOR`] admission cap.
+    ///
+    /// O(delegations) and only called on a NEW position; topping up an
+    /// existing position skips it. At the cap this is a 4,096-entry scan, so
+    /// one delegate call stays bounded by the cap it enforces.
+    pub fn delegation_count(&self, validator: &ValidatorId) -> usize {
+        self.delegations
+            .keys()
+            .filter(|(val, _)| val == validator)
+            .count()
+    }
+
+    /// Record the validators that fully left the consensus set during the
+    /// block at `height`, with the power each held at that block's start.
+    ///
+    /// Called by the block-apply path (never by user code) so the NEXT
+    /// block's downtime attribution can judge the `last_qc` of `height`
+    /// against the set that formed it (pentest F6). Entries for heights
+    /// older than `height - 1` are pruned, bounding the map to two blocks.
+    /// Duplicate ids are last-write-wins; the caller derives them from a set
+    /// diff, so they are unique.
+    pub fn record_full_exits_at(&mut self, exits: &[(ValidatorId, u64)], height: u64) {
+        let keep_from = height.saturating_sub(1);
+        self.recent_full_exits
+            .retain(|_, (_, exit_height)| *exit_height >= keep_from);
+        for (validator, power) in exits {
+            self.recent_full_exits.insert(*validator, (*power, height));
+        }
+    }
+
+    /// The fully-exited validators attributed to `height`, with their
+    /// pre-exit power. Read-only input for downtime attribution.
+    pub fn full_exits_at(&self, height: u64) -> Vec<(ValidatorId, u64)> {
+        self.recent_full_exits
+            .iter()
+            .filter(|(_, (_, exit_height))| *exit_height == height)
+            .map(|(validator, (power, _))| (*validator, *power))
+            .collect()
+    }
+
+    /// `true` when [`Self::record_full_exits_at`] would prune an entry at
+    /// `height` (an entry older than the previous height is still present):
+    /// lets the apply path skip the staking write lock on the common block.
+    pub fn full_exits_need_prune(&self, height: u64) -> bool {
+        let keep_from = height.saturating_sub(1);
+        self.recent_full_exits
+            .values()
+            .any(|(_, exit_height)| *exit_height < keep_from)
+    }
+
     /// Delegate stake to a validator. Requires a minimum delegation.
     ///
     /// Fail-closed on the zero delegator (audit L2: the `(validator, [0;32])`
@@ -1855,6 +1969,12 @@ impl StakingLedger {
         // available; only entry is refused.
         if self.jail.contains_key(&validator) {
             return Err(StakingError::Jailed);
+        }
+        // PENTEST F9: a per-validator position cap keeps `slash`'s O(n) walk
+        // bounded and deterministic. Only a NEW position is counted/topped
+        // against the cap; topping up an existing delegation always works.
+        if held == 0 && self.delegation_count(&validator) >= MAX_DELEGATORS_PER_VALIDATOR {
+            return Err(StakingError::DelegationCapReached);
         }
         // Fail-closed arithmetic BEFORE any mutation: a refused delegation
         // leaves the ledger byte-identical (the lazy settle below is a
@@ -2026,6 +2146,11 @@ impl StakingLedger {
         // the ledger byte-identical.
         let to_delegated = self.validators.get(&to).map(|v| v.delegated).unwrap_or(0);
         let to_held = self.delegations.get(&(to, delegator)).copied().unwrap_or(0);
+        // PENTEST F9: redelegation must not bypass the per-validator position
+        // cap by shuttling many distinct delegator keys onto one target.
+        if to_held == 0 && self.delegation_count(&to) >= MAX_DELEGATORS_PER_VALIDATOR {
+            return Err(StakingError::DelegationCapReached);
+        }
         let new_to_delegated = to_delegated
             .checked_add(amount)
             .ok_or(StakingError::ArithmeticOverflow)?;
@@ -3253,6 +3378,17 @@ impl StakingLedger {
     /// timer, which is unsound (a node behind a partition would slash honest
     /// peers) and non-deterministic (nodes would disagree).
     ///
+    /// CUMULATIVE DEFICIT (pentest F8): `missed` is a leaky bucket, not a
+    /// consecutive-miss streak. A signed certificate earns ONE recovery
+    /// credit (`missed -= 1`, floored at 0) and NEVER resets the counter to
+    /// zero. A validator alternating 9 misses and 1 vote therefore accrues
+    /// +8 per 10 heights and reaches [`DOWNTIME_MISS_THRESHOLD`], instead of
+    /// resetting to 0 forever and paying nothing at 10% uptime. The
+    /// threshold and cooldown VALUES are unchanged (frozen); only the
+    /// forgiveness rule is. This mirrors the CN-VRF v3 abort counter
+    /// ([`CnVrfAbortState`]), where one present reveal also never erases the
+    /// accumulated misses.
+    ///
     /// Returns the burned amount if a slash fired, else 0.
     #[allow(clippy::nonminimal_bool)]
     // GATE: explicit cooldown guards wrap on old certificates; simplify would reintroduce wrap.
@@ -3287,8 +3423,10 @@ impl StakingLedger {
                 continue;
             };
             if signer(v) {
-                // Back online: forgive the streak.
-                rec.missed = 0;
+                // Back online: earn ONE recovery credit. The deficit is a
+                // leaky bucket (pentest F8) — a single vote never erases a
+                // near-threshold outage, so 9 misses + 1 vote accumulates.
+                rec.missed = rec.missed.saturating_sub(1);
                 continue;
             }
             rec.missed = rec.missed.saturating_add(1);
@@ -3904,6 +4042,7 @@ impl StakingLedgerV1 {
             // snapshot (the registry did not exist), so empty is not a guess.
             vesting_schedules: BTreeMap::new(),
             min_validator_bond: None,
+            recent_full_exits: HashMap::new(),
         }
     }
 }
@@ -3962,6 +4101,7 @@ impl StakingLedgerV2 {
             redelegation_lock: HashMap::new(),
             vesting_schedules: BTreeMap::new(),
             min_validator_bond: None,
+            recent_full_exits: HashMap::new(),
         }
     }
 }
@@ -4030,6 +4170,7 @@ impl StakingLedgerV3 {
             validator_pq_keys: self.validator_pq_keys,
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
+            recent_full_exits: HashMap::new(),
         }
     }
 }

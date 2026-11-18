@@ -434,6 +434,10 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // byte-identically (no existing payload carries these discriminants).
         OpCode::SysCallGovPropose { .. } => GAS_GOV_PROPOSE,
         OpCode::SysCallGovVote { .. } => GAS_GOV_VOTE,
+        // Unjail does the same ledger work as an unbond admission check and
+        // is rare; price it with the unbond table. The block-carried apply
+        // (not this dispatch) is authoritative, exactly like the gov ops.
+        OpCode::SysCallUnjail { .. } => GAS_STAKE_UNBOND,
         OpCode::Halt => GAS_HALT,
     }
 }
@@ -1091,6 +1095,35 @@ pub enum OpCode {
     // `SysCallSubmitPriceFeed` arm stays as the fail-closed refusal path —
     // its `verify()` is hardcoded false, so no valid Ed feed exists.
     SysCallSubmitPqPriceFeed(Box<crate::oracle::PqPriceFeedUpdate>),
+    // APPEND, never insert above: same bincode-discriminant rule (see the
+    // comment on `SysCallSubmitPqPriceFeed`).
+    //
+    // PENTEST F7 (live unjail): the ledger primitive
+    // `StakingLedger::unjail` existed with no opcode/RPC/CLI caller, so every
+    // downtime jail was permanent. This variant is the BLOCK-CARRIED half:
+    // the VM arm below charges gas and fails closed on a non-validator
+    // sender, a missing jail record or a self-bond below MIN+buffer, but it
+    // cannot check the RELEASE HEIGHT because `VmContext` has no block
+    // height. The authoritative apply is
+    // `InMemoryStateEngine::apply_staking_unjail_ops` at step 1c of
+    // `apply_block_transition`, which calls `unjail(validator,
+    // block.height)` — the same carrier pattern as the governance opcodes.
+    // It performs no stake movement, and a refusal leaves the jail record
+    // untouched (fail-closed). Pair it with `SysCallStake` in the SAME
+    // payload when a top-up is needed; the CLI builder does exactly that.
+    /// Re-admit a downtime-jailed validator to the consensus set once the
+    /// [`crate::staking::JAIL_RELEASE_DELAY_HEIGHTS`] release height has
+    /// passed AND its self-bond is back at MIN+buffer.
+    ///
+    /// Only the validator itself may call it (`ctx.sender` must equal
+    /// `validator`, like `SysCallUnbond`/`SysCallWithdrawSelfBond`).
+    /// Fail-closed: a missing jail record, a sender mismatch, or a bond below
+    /// [`crate::staking::required_bond_floor_nano`] reverts the transaction;
+    /// an early release height is refused by the block apply (no state
+    /// change, gas already paid, like every block-carried op).
+    SysCallUnjail {
+        validator: [u8; 32],
+    },
 }
 
 /// One actor send the VM accepted, handed to the ENGINE through
@@ -2110,6 +2143,45 @@ impl Svm {
                     };
                     if let Err(e) = ledger.unbond(*validator, *amount, ctx.timestamp) {
                         return VmExecutionResult::Reverted(format!("unbond failed: {e}"));
+                    }
+                    state.stack.push(1);
+                }
+                OpCode::SysCallUnjail { validator } => {
+                    charge!(GAS_STAKE_UNBOND);
+                    // Only the jailed validator itself may clear its own
+                    // jail (same grief rule as `SysCallUnbond`: a third party
+                    // must not drive another validator's lifecycle).
+                    if ctx.sender != *validator {
+                        return VmExecutionResult::Reverted(
+                            "only the validator may unjail itself".to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    // Fail-closed checks that DO NOT need the block height:
+                    // the jail record must exist and the bond must already be
+                    // back at MIN+buffer. The release-height check lives in
+                    // `apply_staking_unjail_ops`, the only place that knows
+                    // `block.height`; this arm is a pure carrier and mutates
+                    // no ledger state.
+                    if !ledger.is_jailed(validator) {
+                        return VmExecutionResult::Reverted("validator is not jailed".to_string());
+                    }
+                    let self_bond = ledger
+                        .validators
+                        .get(validator)
+                        .map(|v| v.self_bond)
+                        .unwrap_or(0);
+                    if self_bond < crate::staking::required_bond_floor_nano() {
+                        return VmExecutionResult::Reverted(format!(
+                            "self-bond {} is below MIN+buffer {}: top up with SysCallStake first",
+                            self_bond,
+                            crate::staking::required_bond_floor_nano()
+                        ));
                     }
                     state.stack.push(1);
                 }

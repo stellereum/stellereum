@@ -59,6 +59,79 @@ pub const PROPOSAL_MIN_STAKE_NANO: u64 = 10_000 * 1_000_000_000;
 /// Change requires spec update + audit note (AGENTS.md §7).
 pub const GOV_TIMELOCK_HEIGHTS: u64 = 7_200;
 
+/// Activation height for the DETERMINISTIC upgrade-execution sweep
+/// ([`Governance::execute_due_upgrades_at_height`], driven from
+/// `InMemoryStateEngine::apply_block_transition`).
+///
+/// Why a separate gate: the sweep is consensus-affecting (it flips a matured,
+/// voted `SoftwareUpgrade` to `Executed` and installs `AppliedParams::upgrade_plan`,
+/// which is committed in the state root). Every node applying the same block
+/// must reach the same verdict, so the gate is a plain compile-time constant —
+/// never an env knob (an env knob is a per-node fork window; see
+/// `docs/UPGRADE_AND_RECOVERY.md` §1.1).
+///
+/// INACTIVE by default (`u64::MAX`, no reachable height): the lead flips it to
+/// the ratified height with a spec update + audit (AGENTS.md §7). While
+/// inactive the sweep returns before ANY read or write, so the standard apply
+/// path is byte-identical (pinned by `tests/upgrade_plan_tests.rs`).
+/// Tests open the gate per-thread via [`set_upgrade_exec_activation_override`]
+/// (the `QC_SPLIT_ACTIVATION_HEIGHT` pattern; never reachable in a release
+/// build because the override module does not exist there).
+pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+// TEST-ONLY override of the upgrade-execution activation height, scoped to the
+// CALLING THREAD (the exact `QC_SPLIT_ACTIVATION_HEIGHT` pattern in
+// `consensus/sortition.rs`). The frozen constant stays `u64::MAX`, so a
+// process that never installs an override behaves byte-identically to before.
+// Thread-scoped because the test binary runs tests in parallel and one test's
+// activation window must not change an unrelated test's verdict. Release
+// builds have no override at all (`debug_assertions` is off).
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static UPGRADE_EXEC_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY upgrade-execution activation
+/// height for the CALLING THREAD.
+///
+/// `Some(h)` makes [`upgrade_exec_active_at`] true exactly for heights
+/// `>= h`; `None` restores the frozen [`UPGRADE_EXEC_ACTIVATION_HEIGHT`]
+/// (`u64::MAX`, inert). Available in test/debug builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn set_upgrade_exec_activation_override(activation: Option<u64>) {
+    UPGRADE_EXEC_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// The upgrade-execution activation height in force for the calling thread:
+/// the frozen [`UPGRADE_EXEC_ACTIVATION_HEIGHT`] unless a test/debug caller
+/// installed [`set_upgrade_exec_activation_override`].
+pub fn upgrade_exec_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(activation) = UPGRADE_EXEC_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return activation;
+    }
+    UPGRADE_EXEC_ACTIVATION_HEIGHT
+}
+
+/// True once the deterministic upgrade-execution sweep is active at `height`.
+///
+/// `>=` is the activation semantic every other gate uses (the first block at
+/// the ratified height runs the sweep; pre-activation blocks are untouched).
+pub fn upgrade_exec_active_at(height: u64) -> bool {
+    height >= upgrade_exec_activation_height()
+}
+
+/// The executor identity the deterministic sweep passes to
+/// [`Governance::execute_at_height`].
+///
+/// Execution is deliberately ANYONE-can-execute (there is no proposer-only
+/// rule, so a lost/rotated proposer key cannot brick a passed proposal). The
+/// value is a fixed constant rather than a caller-chosen address so the
+/// result is a pure function of committed state + block height: all zeroes is
+/// the canonical "system" identity.
+pub const UPGRADE_EXECUTOR: [u8; 32] = [0u8; 32];
+
 const BPS: u128 = 10_000;
 /// Basis points as u64 for parameter bounds checks.
 const BPS_U64: u64 = 10_000;
@@ -591,6 +664,15 @@ pub struct Governance {
 }
 
 /// Coordinated software upgrade plan.
+///
+/// `name` is the TARGET VERSION label of the build the plan authorises (the
+/// same string that names the staging directory `data/upgrades/<name>/`);
+/// `height` is the coordinated halt height; `sha256` is the SHA-256 of the
+/// target binary. The schema is frozen on purpose: it is embedded in
+/// bincode-serialised `AppliedParams`, so adding a field here would make every
+/// existing data directory undecodable (a hard fork). The plan's chain binding
+/// is therefore NOT a stored field — it comes from the vote that tallied it
+/// (§ [`Governance::execute_due_upgrades_at_height`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradePlan {
     pub name: String,
@@ -1667,6 +1749,228 @@ impl Governance {
         }
     }
 
+    /// Whether at least one upgrade action is DUE at `cur_height`: `Passed`,
+    /// mature under the KI-23 timelock, and either `SoftwareUpgrade` or
+    /// `CancelUpgrade`.
+    ///
+    /// Read-only: the apply-path fast check calls this so a block with nothing
+    /// due takes no governance write lock and bumps no commitment generation
+    /// (which is what keeps the pre-activation path and an ordinary block
+    /// byte-identical; the sweep itself re-derives the set under the lock).
+    pub fn has_due_upgrade(&self, cur_height: u64) -> bool {
+        self.proposals.values().any(|p| {
+            p.status == ProposalStatus::Passed
+                && matches!(
+                    p.action,
+                    GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
+                )
+                && self.is_mature(p.id, cur_height)
+        })
+    }
+
+    /// Deterministic upgrade-execution sweep: execute EVERY passed, matured
+    /// upgrade action at `cur_height`, in ascending proposal-id order.
+    ///
+    /// This is the piece that makes a voted upgrade execute without a
+    /// node-local RPC call (`stell_executeProposal`) or a wall-clock event:
+    /// it is a pure function of committed governance state + the block height,
+    /// so every node that applies the same blocks installs the same
+    /// `AppliedParams::upgrade_plan` at the same height and commits the same
+    /// state root.
+    ///
+    /// AUTHORITY (no new vote scheme): a candidate must be `Passed` (the only
+    /// terminal status `finalize`/`finalize_at_height` assigns after measuring
+    /// turnout against the proposal's FROZEN electorate), and the tally is
+    /// re-derived here from the committed values — `turnout >=
+    /// electorate * quorum_bps / 10_000`, `yes > no`, and a non-zero decisive
+    /// turnout. A proposal that fails that re-derivation stays `Passed` and is
+    /// refused loudly (fail-closed), so a smuggled/deserialised proposal can
+    /// never execute on the strength of a hand-written status.
+    ///
+    /// MATURITY is the existing KI-23 timelock (`executable_height_of`, i.e.
+    /// `pass_height + GOV_TIMELOCK_HEIGHTS`); `plan.height` is the separate
+    /// coordinated HALT height and must still be in the FUTURE at execution
+    /// time — a plan whose halt height has already passed is a silent dud in
+    /// the old event-based path (`docs/UPGRADE_AND_RECOVERY.md` §1.2.3) and is
+    /// refused loudly here instead.
+    ///
+    /// FAIL-CLOSED invalid plan: `name` (the target version), `height` and
+    /// `sha256` (the binary hash) must all be present and sane
+    /// ([`upgrade_name_is_safe`] re-checked, non-zero height and digest).
+    ///
+    /// CHAIN ID: `chain_id` is the chain applying the block
+    /// ([`crate::consensus::consensus_chain_id`], the id every vote preimage and
+    /// block hash binds). A call for any other chain refuses every candidate
+    /// loudly and touches nothing — a plan is only executable on the chain
+    /// whose governance state tallied its vote.
+    ///
+    /// COMMITTED-PLAN CONFLICT: if a plan is already committed and a matured
+    /// proposal names a DIFFERENT `(name, height, sha256)` at or before that
+    /// committed height, the proposal is refused (`hash does not match the
+    /// committed one`). A strictly later height is a legitimate follow-up
+    /// upgrade and is allowed.
+    ///
+    /// IDEMPOTENT: execution goes through [`Governance::execute_at_height`],
+    /// whose `Passed -> Executed` transition is single-shot; a replay at the
+    /// same or a later height finds no due proposal (status `Executed`) and
+    /// changes nothing, so re-applying/replaying a block is byte-identical.
+    pub fn execute_due_upgrades_at_height(
+        &mut self,
+        cur_height: u64,
+        chain_id: u64,
+    ) -> UpgradeExecOutcome {
+        let mut out = UpgradeExecOutcome::default();
+        let due = self.due_upgrade_ids(cur_height);
+        if due.is_empty() {
+            return out;
+        }
+        let this_chain = crate::consensus::consensus_chain_id();
+        if chain_id != this_chain {
+            let reason = format!(
+                "plan is not executable on this chain: supplied chain id {chain_id} != \
+                 this consensus chain id {this_chain} (a plan is bound to the chain whose \
+                 vote tallied it)"
+            );
+            for id in due {
+                out.checked += 1;
+                tracing::error!(
+                    "upgrade execution REFUSED at height {cur_height}: proposal {id}: {reason}"
+                );
+                out.refused.push((id, reason.clone()));
+            }
+            return out;
+        }
+        for id in due {
+            out.checked += 1;
+            match self.execute_one_due_upgrade(id, cur_height) {
+                Ok(()) => out.executed.push(id),
+                Err(reason) => {
+                    tracing::error!(
+                        "upgrade execution REFUSED at height {cur_height}: proposal {id}: {reason} \
+                         (proposal stays Passed; no plan was installed)"
+                    );
+                    out.refused.push((id, reason));
+                }
+            }
+        }
+        out
+    }
+
+    /// Ascending ids of the upgrade actions that are `Passed` and mature at
+    /// `cur_height` (the sweep's deterministic order).
+    fn due_upgrade_ids(&self, cur_height: u64) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .proposals
+            .values()
+            .filter(|p| {
+                p.status == ProposalStatus::Passed
+                    && matches!(
+                        p.action,
+                        GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
+                    )
+                    && self.is_mature(p.id, cur_height)
+            })
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Validate and execute ONE due upgrade action. `Err` is the loud reason;
+    /// on `Err` no state has moved (every check precedes
+    /// [`Governance::execute_at_height`], which is itself clone-free but only
+    /// writes after its own gates pass).
+    fn execute_one_due_upgrade(&mut self, proposal_id: u64, cur_height: u64) -> Result<(), String> {
+        // Snapshot everything the checks need so the `Proposal` borrow ends
+        // before the mutable execution call.
+        let (status, electorate, turnout, yes, no, action) = {
+            let p = self
+                .proposals
+                .get(&proposal_id)
+                .ok_or_else(|| "proposal not found".to_string())?;
+            (
+                p.status,
+                p.electorate,
+                p.turnout(),
+                p.yes,
+                p.no,
+                p.action.clone(),
+            )
+        };
+        if status != ProposalStatus::Passed {
+            return Err(format!(
+                "proposal is not Passed (status {status:?}): only a passed vote may execute"
+            ));
+        }
+        // AUTHORITY: reuse the existing tallies, exactly the finalize formula
+        // (frozen electorate, current governed quorum, yes > no, non-zero
+        // decisive turnout). No new vote scheme is introduced.
+        let quorum_needed = electorate * self.quorum_bps as u128 / BPS;
+        if turnout < quorum_needed || yes <= no || yes + no == 0 {
+            return Err(format!(
+                "vote did not carry quorum at execution time: turnout {turnout} < needed \
+                 {quorum_needed}, yes {yes} vs no {no} (electorate {electorate}, quorum {} bps)",
+                self.quorum_bps
+            ));
+        }
+        match &action {
+            GovAction::SoftwareUpgrade {
+                name,
+                height,
+                sha256,
+            } => {
+                // FAIL-CLOSED plan parsing (the backstops mirror propose and
+                // execute time, so a plan smuggled into committed state cannot
+                // install itself).
+                if name.is_empty() || name.len() > 64 || !upgrade_name_is_safe(name) {
+                    return Err(format!(
+                        "unparseable upgrade plan: target version {name:?} is not a safe \
+                         version label (1..=64 bytes, one ASCII path segment)"
+                    ));
+                }
+                if *height == 0 {
+                    return Err("unparseable upgrade plan: no coordinated halt height (0)".into());
+                }
+                if *sha256 == [0u8; 32] {
+                    return Err(format!(
+                        "unparseable upgrade plan {name:?}: no target binary hash (all-zero sha256)"
+                    ));
+                }
+                if *height <= cur_height {
+                    return Err(format!(
+                        "mismatched upgrade plan {name:?}: halt height {height} is not in the \
+                         future at execution height {cur_height} (stale plan refused instead of \
+                         silently never halting)"
+                    ));
+                }
+                if let Some(committed) = &self.applied.upgrade_plan {
+                    let same = committed.name == *name
+                        && committed.height == *height
+                        && committed.sha256 == *sha256;
+                    if !same && *height <= committed.height {
+                        return Err(format!(
+                            "plan hash {} does not match the committed plan for height {} \
+                             (committed {} at height {}, version {:?})",
+                            hex::encode(sha256),
+                            height,
+                            hex::encode(committed.sha256),
+                            committed.height,
+                            committed.name,
+                        ));
+                    }
+                }
+            }
+            GovAction::CancelUpgrade => {}
+            other => return Err(format!("not an upgrade action ({})", other.action_type())),
+        }
+        // Single-shot `Passed -> Executed` transition, timelock re-checked
+        // against `cur_height`; a plan is installed only when every check
+        // above passed.
+        self.execute_at_height(UPGRADE_EXECUTOR, proposal_id, cur_height)
+            .map(|_| ())
+            .map_err(|e| format!("execute refused: {e}"))
+    }
+
     fn execute_inner(
         &mut self,
         _executor: [u8; 32],
@@ -1922,6 +2226,19 @@ impl Governance {
                 .count(),
         }
     }
+}
+
+/// Outcome of one [`Governance::execute_due_upgrades_at_height`] sweep.
+///
+/// Pure counts + the ids that moved state: NOT committed (it is a report, not
+/// consensus state). `checked` counts the candidates the sweep considered,
+/// `executed` the ones whose action was applied, and `refused` the loud
+/// `(proposal id, reason)` pairs that stayed `Passed`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpgradeExecOutcome {
+    pub checked: usize,
+    pub executed: Vec<u64>,
+    pub refused: Vec<(u64, String)>,
 }
 
 /// Outcome of one [`Governance::migrate_gov_proposals_to_genesis`] run: pure

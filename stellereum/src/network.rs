@@ -2951,6 +2951,16 @@ fn accept_inbound(
     mut msg: CrossShardMessage,
 ) {
     msg.trusted = false;
+    // Address check FIRST (security: dedupe poisoning). `msg_id` is
+    // `SHA256(source || target || tx_hash || finalized_in_block)` — every field
+    // is public — so an attacker who learns a pending transfer can publish the
+    // SAME id addressed to another shard. Recording the id before the address
+    // check burned it here and the later, correctly addressed copy was dropped
+    // as a duplicate (proved by `pentest_network_wave` F2). Only a message this
+    // shard will actually consume may enter the dedupe window.
+    if !msg.is_inbound_for(shard_id) {
+        return;
+    }
     let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
     // Gossip duplicates are normal (the mesh relays, a peer may re-publish on
     // reconnect): the first copy wins, the rest are dropped.
@@ -2962,11 +2972,6 @@ fn accept_inbound(
         if let Some(old) = g.seen_order.pop_front() {
             g.seen.remove(&old);
         }
-    }
-    // Address check: a shard must only ever consume the messages addressed to
-    // it.
-    if !msg.is_inbound_for(shard_id) {
-        return;
     }
     match g.listeners.get(&shard_id) {
         Some(tx) => match tx.send(msg) {

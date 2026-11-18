@@ -131,7 +131,8 @@ async fn test_evm_get_balance() {
 async fn test_evm_call_erc20_stubs() {
     let adapter = evm::EvmAdapter::new();
 
-    // 1. ERC-20 transfer (0xa9059cbb) -> abi encoded true
+    // 1. ERC-20 transfer (0xa9059cbb) -> EMPTY: no EVM interpreter exists,
+    // so a state-changing call is never reported as successful (F2).
     let transfer_calldata = format!("0xa9059cbb{:0>64}{:0>64}", "11223344", "100");
     let res_transfer = adapter
         .dispatch(
@@ -139,22 +140,17 @@ async fn test_evm_call_erc20_stubs() {
             &json!([{ "data": transfer_calldata }, "latest"]),
         )
         .expect("transfer stub");
-    assert_eq!(
-        res_transfer,
-        json!("0x0000000000000000000000000000000000000000000000000000000000000001")
-    );
+    assert_eq!(res_transfer, json!("0x"));
 
-    // 2. ERC-20 approve (0x095ea7b3) -> abi encoded true
+    // 2. ERC-20 approve (0x095ea7b3) -> EMPTY, never `true` (F2)
     let approve_calldata = format!("0x095ea7b3{:0>64}{:0>64}", "11223344", "ffff");
     let res_approve = adapter
         .dispatch("eth_call", &json!([{ "data": approve_calldata }, "latest"]))
         .expect("approve stub");
-    assert_eq!(
-        res_approve,
-        json!("0x0000000000000000000000000000000000000000000000000000000000000001")
-    );
+    assert_eq!(res_approve, json!("0x"));
 
-    // 3. ERC-20 allowance (0xdd62ed3e) -> abi encoded u128::MAX
+    // 3. ERC-20 allowance (0xdd62ed3e) -> EMPTY: no approvals are stored, so
+    // an infinite approval is never invented (F2)
     let allowance_calldata = format!("0xdd62ed3e{:0>64}{:0>64}", "11223344", "55667788");
     let res_allowance = adapter
         .dispatch(
@@ -162,7 +158,8 @@ async fn test_evm_call_erc20_stubs() {
             &json!([{ "data": allowance_calldata }, "latest"]),
         )
         .expect("allowance stub");
-    assert_eq!(
+    assert_eq!(res_allowance, json!("0x"));
+    assert_ne!(
         res_allowance,
         json!("0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff")
     );

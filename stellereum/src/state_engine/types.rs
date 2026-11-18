@@ -96,6 +96,27 @@ pub(super) fn bincode_deserialize_limited<T: serde::de::DeserializeOwned>(
         .deserialize(bytes)
 }
 
+/// Bounded `bincode` deserializer that also requires the input to be consumed
+/// EXACTLY (no trailing bytes).
+///
+/// Snapshots have a declared shape: a blob whose byte length does not match
+/// what the declared struct decodes to is corrupt and MUST fail, never be
+/// silently truncated to a shorter struct (audit F10). `bincode`'s
+/// `DefaultOptions` already rejects trailing bytes; this wrapper states the
+/// requirement at the call site and keeps the same `fixint` wire format and
+/// decode limit as [`bincode_deserialize_limited`].
+pub(super) fn bincode_deserialize_exact<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+) -> Result<T, bincode::Error> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(bytes)
+}
+
 /// Unpack the bytes a queued message carries; anything else is a delivery
 /// failure for that message (it bounces - it is never half-delivered).
 pub(super) fn decode_actor_body(bytes: &[u8]) -> Result<ActorSendBody, String> {
@@ -573,6 +594,15 @@ pub(super) fn restore_oracle_after_failure(
 pub(super) struct BridgeSnapshot {
     pub(super) accounts: Vec<([u8; 32], Option<(u64, u64)>)>,
     pub(super) domain: crate::bridge::BridgeState,
+    /// Global-supply reservation this bridge settlement took for the NEW
+    /// issuance it credited (the gross sum of `BridgeEffect::Credit`).
+    ///
+    /// A deposit is a mint, not a move: [`super::InMemoryStateEngine::settle_bridge_native`]
+    /// reserves it against `TOTAL_SUPPLY_CAP` before writing a balance (audit
+    /// F1). If a LATER leg of the same payload fails,
+    /// [`super::InMemoryStateEngine::restore_bridge_native`] gives exactly this
+    /// amount back, so a refused transaction never burns supply headroom.
+    pub(super) minted_nano: u64,
 }
 
 /// Rollback record for one applied actor-send settlement: the pre-change
@@ -622,11 +652,16 @@ pub struct ExecPostActions {
     pub(super) bridge_snapshot: Option<BridgeSnapshot>,
     pub(super) actor_snapshot: Option<ActorSnapshot>,
     pub(super) pmm_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)>,
+    /// Global-supply reservation the PMM buy leg took for this payload
+    /// (`0` when no buy ran). A later `commit_native` refusal must give it
+    /// back together with the balances, or a refused payload would permanently
+    /// consume mint headroom (audit F5).
+    pub(super) pmm_minted_nano: u64,
     pub(super) clob_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)>,
 }
 
 /// The versioned state snapshot: the accounts PLUS the D2 consensus penalty
-/// map.
+/// map and the global minted-supply counter.
 ///
 /// WHY A NEW SHAPE: the penalty is not cosmetic - it enters the CONSENSUS fee
 /// floor (`consensus_floor_parts` -> the fee `commit_native` charges -> the
@@ -637,51 +672,164 @@ pub struct ExecPostActions {
 /// roots - a consensus split, triggered by nothing more exotic than a node
 /// restarting or syncing from a snapshot (audit W6.6).
 ///
-/// The legacy bare-`Vec<AccountState>` snapshot is still accepted (its
-/// penalty is empty, exactly as before this shape existed); see
-/// `parse_account_snapshot`.
+/// The legacy bare-`Vec<AccountState>` snapshot and the intermediate
+/// accounts+penalty shape (pre-`total_minted_nano`) are still accepted by
+/// `parse_account_snapshot`; see the format note below.
+///
+/// FORMAT (audit F10): every CURRENT snapshot is magic-prefixed
+/// ([`STATE_SNAPSHOT_MAGIC`]) and versioned ([`STATE_SNAPSHOT_FORMAT_VERSION`]),
+/// and every field - including the trailing `total_minted_nano` - is
+/// MANDATORY. A blob whose byte length does not match the declared struct is
+/// refused, never decoded as a shorter legacy shape: truncating the last 8
+/// bytes of a current snapshot used to erase the mint counter (restoring with
+/// headroom 0 -> a full second cap) while the already-minted balances
+/// survived. The magic is a PREFIX, so a truncated current blob still carries
+/// it and cannot be mistaken for any legacy shape; legacy blobs (which never
+/// carried the magic) are decoded by their own explicit fallbacks.
 ///
 /// PUBLIC because the OFF-TICK persistence path must write the SAME shape:
 /// see [`InMemoryStateEngine::capture_state_snapshot`] and
 /// `crate::storage::clone_account_snapshot`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct StateSnapshotV2 {
     /// The accounts, address-sorted.
     pub accounts: Vec<AccountState>,
     /// The D2 consensus penalty map (sender -> penalty).
     pub penalty: HashMap<[u8; 32], u64>,
-    /// The engine's GLOBAL post-genesis minted-supply counter.
+    /// The engine's GLOBAL minted-supply counter (genesis allocation folded in
+    /// at the first post-genesis mint, see
+    /// [`InMemoryStateEngine::genesis_allocation_nano`]).
     ///
     /// It is COMMITTED (`commitment::assemble_cached_digest_with_cnvrf_and_minted`
     /// mixes it in when non-zero), so a snapshot MUST carry it: restoring a
-    /// snapshot without it rebased the counter to the sum of balances, which
-    /// counts the PRE-MINED genesis allocation as emission and moves the root
-    /// of every later block. Trailing + EOF-tolerant, so a snapshot written
-    /// before the field existed still decodes (and reads as 0 = "nothing has
-    /// been minted since genesis yet").
-    #[serde(default, deserialize_with = "de_total_minted_nano")]
+    /// snapshot without it would leave a node free to mint a second cap on top
+    /// of the supply it just loaded.
     pub total_minted_nano: u64,
 }
 
-/// Bincode-tolerant reader for the trailing `total_minted_nano` field: a blob
-/// persisted before it existed ends one field early, which means "no
-/// post-genesis mint recorded" (the pre-field behaviour).
-fn de_total_minted_nano<'de, D>(d: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match u64::deserialize(d) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("end of file")
-                || msg.contains("failed to fill whole buffer")
-                || msg.contains("UnexpectedEOF")
+/// First bytes of every CURRENT state-snapshot blob: the ASCII tag
+/// `STELLSNP` as a numeric u64 (`0x5354_454C_4C53_4E50`). bincode's fixint
+/// encoding writes it little-endian on the wire; the value is compared after
+/// decoding (see `snapshot_has_magic`), so the endianness is internal.
+///
+/// A legacy bare-`Vec<AccountState>` blob starts with the vector's u64 length
+/// (at most the decode limit, ~millions), never with this value, so the magic
+/// is an unambiguous format discriminator without changing the legacy path.
+pub const STATE_SNAPSHOT_MAGIC: u64 = 0x5354_454C_4C53_4E50;
+
+/// Version of the magic-prefixed state-snapshot envelope. Bump it in the same
+/// change that alters the field set, so a blob from a newer node is refused
+/// loudly instead of being decoded with the wrong shape.
+pub const STATE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
+
+impl Serialize for StateSnapshotV2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("StateSnapshotV2", 5)?;
+        st.serialize_field("magic", &STATE_SNAPSHOT_MAGIC)?;
+        st.serialize_field("format_version", &STATE_SNAPSHOT_FORMAT_VERSION)?;
+        st.serialize_field("accounts", &self.accounts)?;
+        st.serialize_field("penalty", &self.penalty)?;
+        st.serialize_field("total_minted_nano", &self.total_minted_nano)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StateSnapshotV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SnapshotVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SnapshotVisitor {
+            type Value = StateSnapshotV2;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a magic-prefixed, versioned state snapshot")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
             {
-                Ok(0)
-            } else {
-                Err(e)
+                use serde::de::Error as _;
+                let magic: u64 = seq.next_element()?.ok_or_else(|| {
+                    A::Error::custom(
+                        "state snapshot: missing magic/version header (legacy or truncated blob)",
+                    )
+                })?;
+                if magic != STATE_SNAPSHOT_MAGIC {
+                    return Err(A::Error::custom(
+                        "state snapshot: bad magic (not a versioned snapshot)",
+                    ));
+                }
+                let version: u32 = seq.next_element()?.ok_or_else(|| {
+                    A::Error::custom("state snapshot: truncated before format version")
+                })?;
+                if version != STATE_SNAPSHOT_FORMAT_VERSION {
+                    return Err(A::Error::custom(format!(
+                        "state snapshot: unsupported format version {version} \
+                         (expected {STATE_SNAPSHOT_FORMAT_VERSION})"
+                    )));
+                }
+                let accounts: Vec<AccountState> = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::custom("state snapshot: truncated before accounts"))?;
+                let penalty: HashMap<[u8; 32], u64> = seq.next_element()?.ok_or_else(|| {
+                    A::Error::custom("state snapshot: truncated before penalty map")
+                })?;
+                let total_minted_nano: u64 = seq.next_element()?.ok_or_else(|| {
+                    A::Error::custom(
+                        "state snapshot: truncated before total_minted_nano \
+                         (refusing to default the mint counter to zero)",
+                    )
+                })?;
+                Ok(StateSnapshotV2 {
+                    accounts,
+                    penalty,
+                    total_minted_nano,
+                })
             }
         }
+
+        const FIELDS: &[&str] = &[
+            "magic",
+            "format_version",
+            "accounts",
+            "penalty",
+            "total_minted_nano",
+        ];
+        deserializer.deserialize_struct("StateSnapshotV2", FIELDS, SnapshotVisitor)
     }
+}
+
+/// The pre-`total_minted_nano` V2 envelope (`accounts` + `penalty` only).
+///
+/// EXPLICIT legacy shape, used only by the snapshot decoder after the
+/// magic-prefixed [`StateSnapshotV2`] route has been refused. It has no magic,
+/// so a TRUNCATED current blob (which keeps its magic prefix) can never decode
+/// as this: the magic would be read as an account-count length prefix and fail
+/// the decode limit. That is what makes accepting this legacy shape safe.
+#[derive(Deserialize)]
+pub(super) struct LegacyStateSnapshotV2 {
+    pub(super) accounts: Vec<AccountState>,
+    pub(super) penalty: HashMap<[u8; 32], u64>,
+}
+
+/// The unversioned V2 envelope that carried `total_minted_nano` but predates
+/// the magic+version prefix (the immediately preceding snapshot writer).
+///
+/// Same rule as [`LegacyStateSnapshotV2`]: no magic, decoded with an exact
+/// length, and unreachable for a truncated CURRENT blob (whose magic survives
+/// a suffix truncation). Its absence from the legacy fallbacks would refuse
+/// every snapshot written by the previous release.
+#[derive(Deserialize)]
+pub(super) struct LegacyStateSnapshotV2WithCounter {
+    pub(super) accounts: Vec<AccountState>,
+    pub(super) penalty: HashMap<[u8; 32], u64>,
+    pub(super) total_minted_nano: u64,
 }

@@ -1,14 +1,14 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 use stellereum::evm_adapter::{
-    abi_decode_string, abi_decode_u128, abi_decode_u256_be, abi_decode_u8, abi_encode_bool,
-    abi_encode_string, abi_encode_u128, abi_encode_u256_be, abi_encode_u8, ecrecover,
-    eth_blockNumber, eth_block_number, eth_call, eth_call_with_engine, eth_chain_id,
-    eth_estimateGas, eth_estimate_gas, eth_estimate_transfer_gas, eth_feeHistory_direct,
-    eth_fee_history, eth_fee_history_direct, eth_fee_history_with_head, eth_gasPrice,
-    eth_gas_price, eth_getBalance, eth_getCode, eth_getTransactionCount, eth_get_balance,
-    eth_get_code, eth_get_filter_changes, eth_get_filter_logs, eth_get_transaction_count,
-    eth_maxPriorityFeePerGas, eth_max_priority_fee_per_gas, eth_max_priority_fee_per_gas_choice,
+    abi_decode_string, abi_decode_u128, abi_decode_u256_be, abi_decode_u8, abi_encode_string,
+    abi_encode_u128, abi_encode_u256_be, abi_encode_u8, ecrecover, eth_blockNumber,
+    eth_block_number, eth_call, eth_call_with_engine, eth_chain_id, eth_estimateGas,
+    eth_estimate_gas, eth_estimate_transfer_gas, eth_feeHistory_direct, eth_fee_history,
+    eth_fee_history_direct, eth_fee_history_with_head, eth_gasPrice, eth_gas_price, eth_getBalance,
+    eth_getCode, eth_getTransactionCount, eth_get_balance, eth_get_code, eth_get_filter_changes,
+    eth_get_filter_logs, eth_get_transaction_count, eth_maxPriorityFeePerGas,
+    eth_max_priority_fee_per_gas, eth_max_priority_fee_per_gas_choice,
     eth_max_priority_fee_per_gas_zero, eth_new_block_filter, eth_new_filter,
     eth_new_pending_transaction_filter, eth_syncing, eth_uninstall_filter, evm_address_from_hex,
     evm_address_to_hex, evm_to_stell_address, evm_to_stell_address_from_hex,
@@ -1852,18 +1852,14 @@ async fn test_erc20_balance_of_with_state_engine() {
 fn test_erc20_unrecognized_selectors_and_edge_cases() {
     let adapter = EvmAdapter::new();
 
-    // 1. ERC-20 mutation simulations (transfer, approve) return true (F-03 fix)
+    // 1. ERC-20 state-changing selectors are answered EMPTY (F2): this node
+    // has no EVM interpreter, so `transfer`/`approve` must never be reported
+    // as successful. `0x` is the answer a call at a codeless address gets.
     let transfer_data = "0xa9059cbb00000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000001";
-    assert_eq!(
-        adapter.emulate_erc20_call(transfer_data),
-        abi_encode_bool(true)
-    );
+    assert_eq!(adapter.emulate_erc20_call(transfer_data), "0x");
 
     let approve_data = "0x095ea7b300000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000001";
-    assert_eq!(
-        adapter.emulate_erc20_call(approve_data),
-        abi_encode_bool(true)
-    );
+    assert_eq!(adapter.emulate_erc20_call(approve_data), "0x");
 
     // 2. Random unknown selector 0xdeadbeef
     assert_eq!(adapter.emulate_erc20_call("0xdeadbeef"), "0x");

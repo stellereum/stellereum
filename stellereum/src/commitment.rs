@@ -763,6 +763,30 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
         }
         None => put_u64(h, b"gov_applied_signal_present", 0),
     }
+    // The EXECUTED software-upgrade plan. Before this arm the plan was
+    // uncommitted local state: two nodes could hold different plans (different
+    // target version / halt height / binary hash) under the SAME state root, so
+    // the trigger that halts a node for an upgrade was never part of consensus.
+    //
+    // SELF-CONDITIONAL, exactly like `min_gas_limit` above: skipped entirely
+    // when no plan is installed, so the genesis root and every pre-upgrade root
+    // stay byte-identical (the genesis KAT is pinned) and no
+    // `COMMITMENT_VERSION` bump is needed. A set plan visibly enters the digest,
+    // so two nodes that disagree about the plan now disagree about the root —
+    // snapshot verification and block sync refuse it loudly instead of forking
+    // silently.
+    //
+    // `name` is the TARGET VERSION label (the upgrade staging directory and the
+    // operator-facing version), `height` the coordinated halt height and
+    // `sha256` the target binary digest. All three are hashed: any two of them
+    // alone would let two different plans collide (same version at a different
+    // halt height, or the same height with a different binary).
+    if let Some(plan) = &ap.upgrade_plan {
+        put_u64(h, b"gov_applied_upgrade_present", 1);
+        put_bytes(h, b"gov_applied_upgrade_version", plan.name.as_bytes());
+        put_u64(h, b"gov_applied_upgrade_height", plan.height);
+        put_addr(h, b"gov_applied_upgrade_sha256", &plan.sha256);
+    }
 }
 
 /// Explicit discriminants, so the committed value cannot drift if the enum is

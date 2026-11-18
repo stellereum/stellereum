@@ -182,6 +182,49 @@ pub(crate) fn build_bridge_intent_tx(
     sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload)
 }
 
+/// Build the LIVE unjail transaction (pentest F7).
+///
+/// The ledger's `unjail` is height-gated: it only succeeds at/after
+/// `release_height` AND when the self-bond is back at MIN+buffer. This
+/// builder emits, in ONE PQ-enveloped payload:
+///
+///   1. `SysCallStake { validator, amount }` when `top_up` is supplied
+///      (the ledger routes an existing validator through `add_bond`; the VM
+///      funds it from the signer and moves it into `STAKING_POOL`), then
+///   2. `SysCallUnjail { validator }`, applied by the block at
+///      `block.height` with the same signature/fee rules as every other
+///      transaction.
+///
+/// A `top_up` below the governed minimum is refused by the VM (same rule as
+/// any other stake), so callers that need to climb back to MIN+buffer must
+/// pass at least the current minimum. Without `top_up` the payload is a
+/// single unjail, which is correct when the bond already cleared the floor.
+///
+/// Gas is priced PER OPCODE and floored by the admission base fee, exactly
+/// like `build_bridge_intent_tx`.
+pub(crate) fn build_unjail_tx(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+) -> Transaction {
+    let from = falcon_pq_address(signer);
+    let mut payload = Vec::new();
+    let mut opcode_gas = stellereum::svm::GAS_STAKE_UNBOND;
+    if let Some(amount) = top_up {
+        assert!(
+            amount > 0,
+            "a top-up must be positive; omit --top-up instead of passing zero"
+        );
+        payload.push(stellereum::svm::OpCode::SysCallStake { validator, amount });
+        opcode_gas = opcode_gas.saturating_add(stellereum::svm::GAS_STAKE_BOND);
+    }
+    payload.push(stellereum::svm::OpCode::SysCallUnjail { validator });
+    let gas =
+        cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload)
+}
+
 /// Resolve the validator/relayer keys that will attest a deposit claim.
 ///
 /// Helpers for `wallet sign` / `wallet verify` (WALLET SIGNATURE STANDARD).
@@ -484,5 +527,40 @@ pub(crate) fn resolve_nonce(
     match nonce {
         Some(n) => Ok(n),
         None => rpc_account_nonce(rpc, account),
+    }
+}
+
+#[cfg(test)]
+mod unjail_builder_tests {
+    use super::*;
+
+    #[test]
+    fn unjail_builder_emits_optional_top_up_then_unjail() {
+        let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x71);
+        let validator = falcon_pq_address(&kp);
+
+        // No top-up: one unjail op, signed envelope verifies.
+        let tx = build_unjail_tx(&kp, validator, None, 3);
+        assert_eq!(tx.payload.len(), 1);
+        assert!(matches!(
+            tx.payload[0],
+            stellereum::svm::OpCode::SysCallUnjail { validator: v } if v == validator
+        ));
+        assert!(tx.verify_signature());
+
+        // With a top-up: stake FIRST, then unjail, same envelope rules.
+        let tx = build_unjail_tx(&kp, validator, Some(5_000_000_000), 4);
+        assert_eq!(tx.payload.len(), 2);
+        assert!(matches!(
+            tx.payload[0],
+            stellereum::svm::OpCode::SysCallStake { validator: v, amount }
+                if v == validator && amount == 5_000_000_000
+        ));
+        assert!(matches!(
+            tx.payload[1],
+            stellereum::svm::OpCode::SysCallUnjail { validator: v } if v == validator
+        ));
+        assert!(tx.verify_signature());
+        assert_eq!(tx.nonce, 4);
     }
 }

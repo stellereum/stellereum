@@ -636,6 +636,17 @@ impl EvmAdapter {
     /// structures (one selector match + at most one account read); input
     /// arrives via [`extract_calldata`] and is already bounded by the shared
     /// 128 KiB raw-tx cap plus the HTTP body/rate limits. No loop/DoS vector.
+    ///
+    /// HONESTY (F2/F2b): only READ-ONLY views are answered, and every answer
+    /// is either a committed account read (`balanceOf`) or a documented
+    /// constant of the native-token adapter (`name`/`symbol`/`decimals`/
+    /// `totalSupply`). State-changing selectors — `transfer`, `approve`,
+    /// `transferFrom` — and `allowance` return EMPTY (`"0x"`): this node
+    /// cannot execute EVM code and holds no approvals, so a preflight of a
+    /// call that would revert must never be answered `true`, and a claim of
+    /// an infinite allowance is never invented. `0x` is exactly what a node
+    /// returns for a call at an address with no code (`eth_getCode` is `0x`
+    /// here by design).
     pub fn handle_eth_call(&self, params: &Value) -> Result<Value, JsonRpcError> {
         let calldata = extract_calldata(params);
         let result = match calldata {
@@ -664,8 +675,11 @@ impl EvmAdapter {
             SELECTOR_SYMBOL => abi_encode_string(&self.token_symbol),
             SELECTOR_DECIMALS => abi_encode_u8(self.token_decimals),
             SELECTOR_TOTAL_SUPPLY => abi_encode_u128(self.total_supply),
-            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
-            SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
+            // State-changing / approval selectors: no EVM interpreter, no
+            // approvals, no token state → honest empty, never `true`.
+            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM | SELECTOR_ALLOWANCE => {
+                "0x".to_string()
+            }
             SELECTOR_BALANCE_OF => {
                 let address = match extract_address_from_calldata(rest) {
                     Some(a) => a,
@@ -691,6 +705,10 @@ impl EvmAdapter {
         Ok(json!(result))
     }
 
+    /// Engine-backed variant of [`EvmAdapter::emulate_erc20_call`]: identical
+    /// honesty contract — read-only views only; `transfer`/`approve`/
+    /// `transferFrom`/`allowance` answer empty (`"0x"`) because this node has
+    /// no EVM interpreter and no approvals to report (F2/F2b).
     pub async fn emulate_erc20_call_with_engine(
         &self,
         engine: &InMemoryStateEngine,
@@ -714,8 +732,12 @@ impl EvmAdapter {
             SELECTOR_SYMBOL => abi_encode_string(&self.token_symbol),
             SELECTOR_DECIMALS => abi_encode_u8(self.token_decimals),
             SELECTOR_TOTAL_SUPPLY => abi_encode_u128(self.total_supply),
-            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
-            SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
+            // No EVM execution: a state-changing call or an allowance query
+            // cannot be answered, so it is answered EMPTY (never `true`,
+            // never `u128::MAX`).
+            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM | SELECTOR_ALLOWANCE => {
+                "0x".to_string()
+            }
             SELECTOR_BALANCE_OF => {
                 let address = match extract_address_from_calldata(rest) {
                     Some(a) => a,

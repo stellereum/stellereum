@@ -664,6 +664,97 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 );
             }
 
+            WalletCommands::Unjail {
+                falcon_seed,
+                validator,
+                top_up,
+                rpc,
+                nonce,
+                dry_run,
+                verbose,
+                token,
+            } => {
+                let pq_key = falcon_from_hex_seed(&falcon_seed, "falcon_seed")?;
+                let signer_addr = falcon_pq_address(&pq_key);
+                let validator_addr = match validator {
+                    Some(v) => parse_wallet_address(&v)?,
+                    None => signer_addr,
+                };
+                if validator_addr != signer_addr {
+                    anyhow::bail!(
+                        "only the validator key may unjail itself: signer {} != validator {}",
+                        hex::encode(signer_addr),
+                        hex::encode(validator_addr),
+                    );
+                }
+
+                let query = |method: &str,
+                             params: serde_json::Value|
+                 -> anyhow::Result<serde_json::Value> {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                    })
+                    .to_string();
+                    if verbose {
+                        eprintln!("  rpc -> {method}: {body}");
+                    }
+                    let resp: serde_json::Value =
+                        ureq::post(&rpc).send_string(&body)?.into_json()?;
+                    if verbose {
+                        eprintln!("  rpc <- {method}: {resp}");
+                    }
+                    if let Some(e) = resp.get("error") {
+                        anyhow::bail!("RPC error: {e}");
+                    }
+                    Ok(resp
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null))
+                };
+
+                let nonce = match nonce {
+                    Some(n) => n,
+                    None => {
+                        let acc = query(
+                            "stell_getBalance",
+                            serde_json::json!({ "address": hex::encode(signer_addr) }),
+                        )?;
+                        acc.get("nonce").and_then(|n| n.as_u64()).ok_or_else(|| {
+                            anyhow::anyhow!("node did not return an account nonce")
+                        })?
+                    }
+                };
+
+                let tx = build_unjail_tx(&pq_key, validator_addr, top_up, nonce);
+                if !tx.verify_signature() {
+                    anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                println!("✅ Unjail transaction signed (Falcon-512, explicit PQ1 envelope):");
+                println!("  Hash:      {}", hex::encode(tx.compute_tx_hash()));
+                println!("  Validator: {}", hex::encode(validator_addr));
+                println!("  Top-up:    {} nano-STELL", top_up.unwrap_or(0));
+                println!("  Nonce:     {nonce}");
+                println!(
+                    "  Note: the block refuses the unjail before release_height or below MIN+buffer"
+                );
+
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+
+                let raw = hex::encode(bincode::serialize(&tx)?);
+                let mut params = serde_json::json!({ "tx": raw });
+                if let Some(t) = &token {
+                    params["token"] = serde_json::json!(t);
+                }
+                let result = query("stell_sendRawTransaction", params)?;
+                println!(
+                    "  Submitted, mempool tx hash: {}",
+                    result.as_str().unwrap_or("?")
+                );
+            }
+
             WalletCommands::DelegateSession {
                 master_key,
                 session_pub,
@@ -1641,6 +1732,56 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             let report =
                 stellereum::light_client_cli::rotate_anchor(&validators, &checkpoint, &rotation)?;
             println!("{report}");
+        }
+        Commands::UpgradeStatus { marker } => {
+            use crate::node::bootstrap::upgrade_halt as halt;
+            let path = marker.unwrap_or_else(halt::marker_path);
+            match halt::read_marker(&path) {
+                Ok(None) => {
+                    println!("No upgrade-halt marker at {}", path.display());
+                    println!(
+                        "This data directory is not halted for a software upgrade \
+                         (default marker: {}).",
+                        halt::marker_path().display()
+                    );
+                }
+                Ok(Some(m)) => {
+                    println!("Upgrade-halt marker: {}", path.display());
+                    print!("{}", m.render());
+                    let running = halt::running_version();
+                    let sha = halt::running_exe_sha256();
+                    println!("running binary version: {running}");
+                    println!(
+                        "running exe sha256:     {}",
+                        sha.map(hex::encode)
+                            .unwrap_or_else(|| "unknown".to_string())
+                    );
+                    if halt::marker_satisfied_by(&m, &running, sha) {
+                        println!(
+                            "STATUS: SATISFIED — this binary proves the plan's target version, so \
+                             the startup guard clears the marker and joins consensus."
+                        );
+                    } else {
+                        // Print the EXACT message the node's startup guard would
+                        // emit, using the marker's own halt height as the
+                        // finalized-head floor. READ-ONLY: preview never clears.
+                        println!("STATUS: NOT SATISFIED");
+                        if let halt::HaltDecision::Refuse { message } =
+                            halt::preview_halt_decision(&path, m.halted_at_height, &running, sha)
+                        {
+                            println!("{message}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "upgrade-halt marker {} cannot be read: {e}. A node that cannot prove it \
+                         is not halted must not vote; restore or remove the marker after \
+                         verifying out of band that no software upgrade is pending.",
+                        path.display()
+                    );
+                }
+            }
         }
         Commands::Network => {
             println!("╔═══════════════════════════════════════════════════════════════╗");

@@ -567,3 +567,60 @@ async fn double_apply_refused_after_snapshot_install() {
         "replay must not move the root"
     );
 }
+
+// ===========================================================================
+// 5. Reorg restore clears the §9 2PC records; the sync twin keeps them.
+// ===========================================================================
+
+/// REGRESSION (was F11 FINDING, low, latent): `restore_snapshot_chunked` cleared
+/// consumed/produced/completed but NOT `cross_shard_xpc`, while the monolithic
+/// `restore_snapshot` cleared all four. A chunked reorg therefore kept stale 2PC
+/// records whose state-trie leaves the restore had rebuilt away — a latent
+/// double-mint (a peer could still complete a transfer the reorg removed).
+///
+/// FIX: the chunked REORG restore clears `cross_shard_xpc` (and bumps its
+/// domain) exactly like the monolithic twin, so both paths reproduce the
+/// checkpoint root. The snapshot-sync twin stays deliberately non-clearing: its
+/// caller installs the replay blob behind `cross_shard_replay_covers`.
+#[tokio::test]
+async fn chunked_reorg_restore_clears_xpc_while_the_sync_twin_preserves_it() {
+    let checkpoint = funded([0x84u8; 32], 777_000).await;
+    let chunks = checkpoint.create_snapshot_chunked(Some(64)).await;
+    let rec = stellereum::xshard2pc::XpcRecord::prepared(
+        Transaction::sign(&key(92), [0x87u8; 32], 7, 10, 0, SHARD0, SHARD1),
+        SHARD0,
+        SHARD1,
+        3,
+    );
+    assert!(rec.is_consistent(), "precondition: well-formed record");
+
+    // Reorg path: cleared, root equals the checkpoint.
+    let reorg = InMemoryStateEngine::new();
+    reorg.restore_xpc_records(std::slice::from_ref(&rec)).await;
+    assert_eq!(reorg.xpc_len().await, 1);
+    reorg.restore_snapshot_chunked(&chunks).await.unwrap();
+    assert_eq!(
+        reorg.xpc_len().await,
+        0,
+        "the chunked reorg restore must clear cross_shard_xpc"
+    );
+    assert!(reorg.xpc_record(&rec.tx_hash).await.is_none());
+    assert_eq!(
+        reorg.get_state_root().await,
+        checkpoint.get_state_root().await,
+        "a chunked reorg restore must reproduce the checkpoint root"
+    );
+
+    // Snapshot-sync path: preserved for the coverage-gated replay install.
+    let sync = InMemoryStateEngine::new();
+    sync.restore_xpc_records(std::slice::from_ref(&rec)).await;
+    sync.restore_snapshot_chunked_preserve_replay_sets(&chunks)
+        .await
+        .unwrap();
+    assert_eq!(
+        sync.xpc_len().await,
+        1,
+        "the sync twin must not silently drop local 2PC state"
+    );
+    assert!(sync.xpc_record(&rec.tx_hash).await.is_some());
+}

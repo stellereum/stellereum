@@ -181,3 +181,60 @@ fn v7_pre_jail_trio_bytes_decode_with_empty_new_maps() {
         "garbage bytes must be refused"
     );
 }
+
+/// The `recent_full_exits` forensic map is the LAST field appended to
+/// `StakingLedger`; bytes written before it must still boot via the V8/V5
+/// fallback (pentest F6 wiring), while NEW bytes round-trip the map itself.
+#[test]
+fn v8_ledger_bytes_decode_with_empty_full_exit_map_and_current_roundtrips_it() {
+    use stellereum::staking::StakingLedger as Ledger;
+    use stellereum::storage::{DomainSnapshotV8, StakingLedgerV5};
+
+    let mut live = Ledger::default();
+    let v = [0x43u8; 32];
+    live.bond_genesis(v, MIN_VALIDATOR_BOND, 0).unwrap();
+    // Record a forensic exit in the CURRENT shape.
+    live.record_full_exits_at(&[(v, MIN_VALIDATOR_BOND)], 7);
+    assert_eq!(live.full_exits_at(7), vec![(v, MIN_VALIDATOR_BOND)]);
+
+    // Current shape keeps it.
+    let current = stellereum::storage::DomainSnapshot {
+        staking: live.clone(),
+        ..Default::default()
+    };
+    let bytes = bincode::serialize(&current).expect("current snapshot serializes");
+    let back =
+        stellereum::storage::decode_domain_snapshot(&bytes).expect("current bytes must decode");
+    assert_eq!(back.staking.full_exits_at(7), vec![(v, MIN_VALIDATOR_BOND)]);
+
+    // Pre-field shape (V5) drops to an empty map — exact at a block boundary.
+    let old = DomainSnapshotV8 {
+        staking: StakingLedgerV5 {
+            validators: live.validators.clone(),
+            delegations: live.delegations.clone(),
+            delegator_rewards: live.delegator_rewards.clone(),
+            unbonding: live.unbonding.clone(),
+            withdrawable: live.withdrawable.clone(),
+            total_burned: live.total_burned,
+            rewards_pool: live.rewards_pool,
+            rewards_minted: live.rewards_minted,
+            locked_governance: live.locked_governance.clone(),
+            pq_equivocation_dedup: live.pq_equivocation_dedup.clone(),
+            equivocation_dedup: live.equivocation_dedup.clone(),
+            validator_pq_keys: live.validator_pq_keys.clone(),
+            min_validator_bond: live.min_validator_bond,
+            vesting_schedules: live.vesting_schedules.clone(),
+            reward_accumulators: live.reward_accumulators.clone(),
+            delegator_reward_checkpoints: live.delegator_reward_checkpoints.clone(),
+            jail: live.jail.clone(),
+            commission_schedule: live.commission_schedule.clone(),
+            redelegation_lock: live.redelegation_lock.clone(),
+        },
+        ..Default::default()
+    };
+    let old_bytes = bincode::serialize(&old).expect("V8 snapshot serializes");
+    let migrated = stellereum::storage::decode_domain_snapshot(&old_bytes)
+        .expect("V8 bytes must decode through the legacy leg");
+    assert!(migrated.staking.full_exits_at(7).is_empty());
+    assert!(migrated.staking.to_validator_set().contains(&v));
+}

@@ -9,7 +9,7 @@ const TEST_TOKEN: &str = "test-token";
 
 use super::*;
 use crate::mempool::Mempool;
-use crate::sharding::{ShardId, ShardRegistry, Transaction};
+use crate::sharding::{ShardId, ShardRegistry};
 use crate::state_engine::{AccountState, InMemoryStateEngine};
 use axum::extract::Query;
 use ed25519_dalek::SigningKey;
@@ -165,6 +165,15 @@ async fn test_state_with_token() -> Arc<RpcState> {
 async fn call_with_token(st: &Arc<RpcState>, method: &str, mut params: Value) -> Value {
     if let Value::Object(map) = &mut params {
         map.insert("token".to_string(), json!(TEST_TOKEN));
+        // Fixture caller: since F3/F4 a direct-form `stell_callContract`
+        // preview REQUIRES an explicit caller (the node never falls back to
+        // the zero address). These tests are about call semantics, so they
+        // supply a fixed non-privileged caller; `pentest_api_wave` pins the
+        // refusal of a caller-less preview.
+        if method == "stell_callContract" && !map.contains_key("caller") && !map.contains_key("tx")
+        {
+            map.insert("caller".to_string(), json!(hex::encode([0xF1u8; 32])));
+        }
     }
     call(st, method, params).await
 }
@@ -992,7 +1001,13 @@ async fn evm_adapter_network_info_methods_through_rpc() {
         json!("Stellereum/v5.0.0-evm-adapter")
     );
     assert_eq!(call(&st, "net_listening", json!([])).await, json!(true));
-    assert_eq!(call(&st, "net_peerCount", json!([])).await, json!("0x2"));
+    // F8: the live observed count, never a fabricated constant.
+    assert_eq!(
+        call(&st, "net_peerCount", json!([])).await,
+        json!(crate::evm_adapter::format_peer_count_hex(
+            observed_peer_count()
+        ))
+    );
     // LIVE: same rule as `stell_syncing` — a recent verified peer height
     // above ours means syncing. `PEER_HEIGHT` is process-global and
     // monotonic, so the expectation is computed, not hardcoded.
@@ -1015,15 +1030,24 @@ async fn evm_adapter_network_info_methods_through_rpc() {
         call(&st, "eth_maxPriorityFeePerGas", json!([])).await,
         json!("0x3b9aca00")
     );
-    assert_eq!(
-        call(&st, "eth_estimateGas", json!([])).await,
-        json!("0x5208")
-    );
+    // F10: a sender-less estimate carries the worst-case D2 bond so it is
+    // never below a real sender's admission floor.
+    {
+        let base = st.mempool.read().await.base_fee;
+        let expected =
+            21_000u64.max(base.saturating_add(crate::mempool::MAX_FAILED_SENDER_PENALTY));
+        assert_eq!(
+            call(&st, "eth_estimateGas", json!([])).await,
+            json!(crate::evm_adapter::format_u64_hex(expected))
+        );
+    }
+    // F9: no EVM fee market is committed, so the method refuses explicitly
+    // instead of inventing a series.
     let fh = call(&st, "eth_feeHistory", json!([4, "latest", [25.0, 75.0]])).await;
-    assert_eq!(fh["oldestBlock"], json!("0x27"));
-    assert_eq!(fh["baseFeePerGas"].as_array().unwrap().len(), 5);
-    assert_eq!(fh["gasUsedRatio"].as_array().unwrap().len(), 4);
-    assert_eq!(fh["reward"].as_array().unwrap().len(), 4);
+    assert!(
+        fh["error"].as_str().unwrap_or("").contains("not served"),
+        "eth_feeHistory must refuse honestly: {fh}"
+    );
 }
 
 #[tokio::test]
@@ -2516,13 +2540,20 @@ async fn contract_previews_require_token_and_never_enter_mempool() {
         json!({ "code": hex::encode(sample_getter_wasm()) }),
     )
     .await;
+    // F6: the direct deploy form carries no signer, so it predicts NO address
+    // (and no transaction hash) instead of a phantom from a random key.
     assert!(
-        deploy["contract_address"].is_string(),
-        "token-authed deploy preview must succeed: {deploy}"
+        deploy["contract_address"].is_null(),
+        "sender-less deploy preview must predict no address: {deploy}"
+    );
+    assert_eq!(
+        deploy["deployed"],
+        json!(false),
+        "a deploy preview deploys nothing: {deploy}"
     );
     assert!(
-        deploy["tx_hash"].is_string(),
-        "token-authed deploy preview must return its (dropped) tx hash: {deploy}"
+        deploy["tx_hash"].is_null(),
+        "no transaction is built (or hashed) for the direct form: {deploy}"
     );
 
     let previewed = call_with_token(
@@ -2532,6 +2563,8 @@ async fn contract_previews_require_token_and_never_enter_mempool() {
             "contract": hex::encode(deployed),
             "method": "double",
             "args": 21,
+            // F3: a preview executes as an explicit caller, never as 0x00..
+            "caller": format!("0x{}", hex::encode([0xABu8; 32])),
         }),
     )
     .await;
@@ -2679,6 +2712,7 @@ async fn p5_call_contract_rejects_key_material_and_spoofed_sender() {
             "contract": hex::encode(contract),
             "method": "get",
             "value": 0u64,
+            "caller": hex::encode(victim_addr),
         }),
     )
     .await;
@@ -4492,7 +4526,8 @@ async fn verify_contract_source_round_trip() {
         "forged signature must be refused: {r}"
     );
 
-    // 6. The creator's signature registers the fingerprint.
+    // 6. The creator's signature registers the fingerprint — and, since F7,
+    // ONLY together with the source text: registration re-runs the build.
     let shash_bytes = hex::decode(&source_hash).unwrap();
     let mut shash = [0u8; 32];
     shash.copy_from_slice(&shash_bytes);
@@ -4504,17 +4539,36 @@ async fn verify_contract_source_round_trip() {
         sig,
     )
     .encode();
+    // A hash-only claim is REFUSED: the node cannot rebuild it, so it cannot
+    // attest it.
     let r = call(
         &st,
         "stell_registerContractSource",
         json!({ "contract": addr_hex, "source_hash": source_hash, "signature": hex::encode(&envelope) }),
     )
     .await;
+    assert!(
+        r["error"].as_str().unwrap_or_default().contains("source"),
+        "hash-only registration must be refused: {r}"
+    );
+    let r = call(
+        &st,
+        "stell_registerContractSource",
+        json!({
+            "contract": addr_hex,
+            "source_hash": source_hash,
+            "source": VERIFY_WAT,
+            "compiler": "wat2wasm-1.0",
+            "signature": hex::encode(&envelope),
+        }),
+    )
+    .await;
     assert_eq!(
         r["registered"],
         json!(true),
-        "signed registration must land: {r}"
+        "signed + rebuilt registration must land: {r}"
     );
+    assert_eq!(r["rebuilt"], json!(true));
 
     // 7. The label is now readable; verification itself never set it
     // (it was `false` in step 4 before any registration).
@@ -4531,7 +4585,8 @@ async fn verify_contract_source_round_trip() {
     );
     assert_eq!(r["source_hash"], json!(source_hash));
 
-    // 8. Hash-only check against the registered fingerprint.
+    // 8. Hash-only check against the registered fingerprint: it reports the
+    // COMPARISON, never `verified` — no rebuild ran (F7).
     let r = call(
         &st,
         "stell_verifyContractSource",
@@ -4539,10 +4594,16 @@ async fn verify_contract_source_round_trip() {
     )
     .await;
     assert_eq!(
-        r["verified"],
+        r["hash_matches_registered"],
         json!(true),
         "registered hash must match: {r}"
     );
+    assert_eq!(
+        r["verified"],
+        json!(false),
+        "a hash-only check is not verification: {r}"
+    );
+    assert!(r["rebuilt_code_hash"].is_null());
     let r = call(
         &st,
         "stell_verifyContractSource",
@@ -5177,44 +5238,35 @@ async fn deploy_contract_predicts_address_and_admits_without_writing_state() {
     let code = sample_getter_wasm();
     let root_before = st.engine.get_state_root().await;
 
+    // F6: the direct form carries no signer, so the address is predicted from
+    // the `sender`(+`nonce`) the request NAMES — the same
+    // `contract_address(tx.from, tx.nonce)` block application derives. No
+    // random key, no receipt, no transaction.
+    let (from, _kp) = pq_pair(0xC8);
+    let expected_addr = crate::contract::contract_address(&from, 0);
     let res = call_with_token(
         &st,
         "stell_deployContract",
         json!({
             "code": hex::encode(&code),
+            "sender": hex::encode(from),
+            "nonce": 0,
             "init_data": hex::encode(vec![0x12, 0x34, 0x56, 0x78]),
-            "gas_limit": 10_000_000,
         }),
     )
     .await;
 
-    let tx_hash = res["tx_hash"].as_str().expect("tx_hash present");
-    assert_eq!(tx_hash.len(), 64);
-    // N-03: the preview tx is dropped — the mempool stays EMPTY.
-    assert_eq!(
-        st.mempool.read().await.len(),
-        0,
-        "a deploy preview must never enter the mempool"
+    assert!(
+        res["tx_hash"].is_null(),
+        "the direct form builds no transaction, so it has no hash: {res}"
     );
-    // The predicted vehicle is a validly signed ephemeral tx; the
-    // prediction is derived from it, independent of the retired salt.
-    // The vehicle is recovered from the node-local preview receipt (the
-    // mempool no longer carries it).
-    let receipt = call(
-        &st,
-        "stell_getTransactionReceipt",
-        json!({ "hash": tx_hash }),
-    )
-    .await;
-    assert_eq!(receipt["status"], json!("success"));
-    let raw_hex = receipt["raw_tx"]
-        .as_str()
-        .expect("preview receipt carries the raw preview tx");
-    let vehicle: Transaction =
-        bincode::deserialize(&hex::decode(raw_hex).expect("raw_tx hex")).expect("raw_tx decodes");
-    assert!(vehicle.verify_signature());
-    let expected_addr = crate::contract::contract_address(&vehicle.from, vehicle.nonce);
-    assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
+    assert_eq!(res["deployed"], json!(false));
+    assert_eq!(res["predicted"], json!(true));
+    assert_eq!(
+        res["contract_address"],
+        json!(hex::encode(expected_addr)),
+        "the prediction is contract_address(sender, nonce)"
+    );
     assert_eq!(
         res["contract_address_stl57"],
         json!(crate::address::encode_stl57_address(&expected_addr))
@@ -5225,7 +5277,16 @@ async fn deploy_contract_predicts_address_and_admits_without_writing_state() {
             <sha2::Sha256 as sha2::Digest>::digest(&code).as_slice()
         ))
     );
-
+    // N-03/F5: nothing is pooled and NOTHING is receipted.
+    assert_eq!(
+        st.mempool.read().await.len(),
+        0,
+        "a deploy preview must never enter the mempool"
+    );
+    assert!(
+        st.receipts.read().await.is_empty(),
+        "a deploy preview must never file a receipt"
+    );
     // Nothing is visible in consensus state before a block applies it.
     assert_eq!(
         st.engine.get_state_root().await,
@@ -5239,30 +5300,25 @@ async fn deploy_contract_predicts_address_and_admits_without_writing_state() {
         .await
         .is_none());
 
-    // Verify receipt is recorded in st.receipts
-    assert_eq!(
-        receipt["contract_address"],
-        json!(hex::encode(expected_addr))
-    );
-    assert_eq!(
-        receipt["contract_address_stl57"],
-        json!(crate::address::encode_stl57_address(&expected_addr))
-    );
-
-    // The state change happens exactly once, at block application: fund
-    // the vehicle, apply it, and the predicted address materializes.
+    // The state change happens exactly once, at block application: fund the
+    // sender, apply a REAL signed deploy at the predicted (sender, nonce), and
+    // the predicted address materializes.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     st.engine
-        .update_account(AccountState::new(vehicle.from, 1_000_000_000))
+        .update_account(AccountState::new(from, 1_000_000_000))
         .await;
+    let vehicle = pq_tx_payload(
+        0xC8,
+        expected_addr,
+        0,
+        15_000_000,
+        0,
+        vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
+    );
     st.engine.apply_transaction(&vehicle, now).await.unwrap();
-    // Block application materializes the contract in the registry and
-    // commits its code hash (the code bytes live in the registry; the
-    // trie carries the code hash under the namespaced contract key —
-    // the raw-address code blob was deterministic-path-only).
     let stored = st
         .engine
         .get_contract(&expected_addr)
@@ -5427,26 +5483,27 @@ async fn call_contract_execution_and_receipt_structured_outcomes() {
     assert_eq!(call1["outcome"]["status"], json!("success"));
     assert_eq!(call1["outcome"]["return_value"], json!(42));
 
-    let tx_hash = call1["tx_hash"].as_str().unwrap();
-
-    // 2. Fetch receipt via stell_getTransactionReceipt
-    let receipt = call(
+    // 2. F5: a preview is NOT an inclusion. The direct form has no
+    // transaction at all, so there is no tx hash to look up and NO receipt may
+    // be filed (the receipt ring serves mined transactions only).
+    assert!(
+        call1["tx_hash"].is_null(),
+        "the direct form builds no transaction: {call1}"
+    );
+    assert_eq!(call1["preview_only"], json!(true));
+    assert_eq!(call1["mined"], json!(false));
+    assert!(
+        st.receipts.read().await.is_empty(),
+        "a preview must never file a receipt"
+    );
+    // 3. Unknown hashes stay unknown — nothing is fabricated.
+    let c_receipt = call(
         &st,
-        "stell_getTransactionReceipt",
-        json!({ "hash": tx_hash }),
+        "stell_getContractReceipt",
+        json!({ "hash": hex::encode([0u8; 32]) }),
     )
     .await;
-    assert_eq!(receipt["status"], json!("success"));
-    assert_eq!(receipt["return_value"], json!(42));
-    assert!(receipt["gas_used"].as_u64().unwrap() > 0);
-    assert_eq!(receipt["events"], json!([]));
-
-    // 3. Fetch receipt via stell_getContractReceipt
-    let c_receipt = call(&st, "stell_getContractReceipt", json!({ "hash": tx_hash })).await;
-    assert_eq!(c_receipt["status"], json!("success"));
-    assert_eq!(c_receipt["return_value"], json!(42));
-    assert!(c_receipt["gas_used"].as_u64().unwrap() > 0);
-    assert_eq!(c_receipt["events"], json!([]));
+    assert_eq!(c_receipt["status"], json!("unknown"));
 
     // 4. Call using branded Stl57 address format and hex args ("0x15")
     let call2 = call_with_token(
@@ -5660,18 +5717,16 @@ async fn call_contract_state_mutations_and_events() {
     assert_eq!(events[0]["topic"], json!(777));
     assert_eq!(events[0]["value"], json!(888));
 
-    // Verify events in receipt
-    let tx_hash = emit_call["tx_hash"].as_str().unwrap();
-    let receipt = call(
-        &st,
-        "stell_getTransactionReceipt",
-        json!({ "hash": tx_hash }),
-    )
-    .await;
-    let r_events = receipt["events"].as_array().expect("receipt events array");
-    assert_eq!(r_events.len(), 1);
-    assert_eq!(r_events[0]["topic"], json!(777));
-    assert_eq!(r_events[0]["value"], json!(888));
+    // F5: the preview's events live in the RESPONSE, never in a receipt (a
+    // preview is not mined).
+    assert!(
+        emit_call["tx_hash"].is_null(),
+        "the direct form builds no transaction: {emit_call}"
+    );
+    assert!(
+        st.receipts.read().await.is_empty(),
+        "a preview must never file a receipt, even when it emits events"
+    );
 }
 
 /// H-03 result-equivalence: the clone preview reports byte-identical
@@ -5704,14 +5759,12 @@ async fn call_contract_observable_failures() {
     .await;
     assert_eq!(trap_res["status"], json!("failed"));
     assert_eq!(trap_res["return_value"], Value::Null);
-    let trap_hash = trap_res["tx_hash"].as_str().unwrap();
-    let trap_receipt = call(
-        &st,
-        "stell_getTransactionReceipt",
-        json!({ "hash": trap_hash }),
-    )
-    .await;
-    assert_eq!(trap_receipt["status"], json!("failed"));
+    // F5: a failed preview is not a failed MINED transaction — no receipt.
+    assert!(trap_res["tx_hash"].is_null());
+    assert!(
+        st.receipts.read().await.is_empty(),
+        "a preview must never file a receipt"
+    );
 
     // 2. Unknown method failure
     let unknown_res = call_with_token(
@@ -9036,6 +9089,9 @@ async fn register_contract_source_supports_pq_falcon512() {
         json!({
             "contract": addr_hex,
             "source_hash": source_hash_hex,
+            // F7: registration re-runs the build; the source is mandatory.
+            "source": VERIFY_WAT,
+            "compiler": "wat2wasm-1.0",
             "signature": hex::encode(&env),
         }),
     )

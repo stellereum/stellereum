@@ -233,6 +233,26 @@ pub fn fresh_peer_height() -> Option<u64> {
     }
 }
 
+/// Live connected-peer count observed by this process.
+///
+/// `net_peerCount` must never invent a number (F8: it was the constant
+/// `"0x2"` on a node with no peer observer). The RPC layer reads this
+/// process-wide counter, which the node's network layer feeds via
+/// [`note_peer_count`]; `0` therefore means "no peer observed by this
+/// process", never "two peers".
+pub static LIVE_PEER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the live connected-peer count (`net_peerCount` source of truth).
+/// Called by the network layer wherever the peer table changes.
+pub fn note_peer_count(n: u64) {
+    LIVE_PEER_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The observed connected-peer count (0 = none observed, never a guess).
+pub fn observed_peer_count() -> u64 {
+    LIVE_PEER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Last connected-peer-reported chain id + when it was seen (0 = none yet).
 /// A peer reporting a different chain id than ours is on a DIFFERENT network:
 /// recording the sighting is not enough — the observer must abort (fail-closed,

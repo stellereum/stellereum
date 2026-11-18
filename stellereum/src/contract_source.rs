@@ -13,7 +13,10 @@
 //! * verification is strictly READ-ONLY: it never mutates state. The only
 //!   mutation is the optional `source_hash` registration, which is an
 //!   explicit, creator-signed action
-//!   ([`verify_register_signature`]/`stell_registerContractSource`).
+//!   ([`verify_register_signature`]/`stell_registerContractSource`) AND
+//!   requires the same rebuild ([`verify_registration`]): the signature only
+//!   proves the creator chose the fingerprint, the rebuild proves the
+//!   fingerprint is the deployed code. A hash-only claim is never verified.
 //!
 //! # Trust model (what "verified" actually proves)
 //!
@@ -270,6 +273,45 @@ pub fn verify_source_for_code_hash(
             "rebuilt bytecode hash does not match the on-chain code hash",
         ),
     }
+}
+
+/// Verify a source REGISTRATION claim end to end.
+///
+/// A creator signature over `(contract, source_hash)` proves only that the
+/// creator chose a fingerprint — it does not prove the fingerprint describes
+/// the deployed code. This function adds the missing half:
+///
+/// 1. `claimed_source_hash` MUST be [`source_hash`] of exactly `source_text`
+///    (otherwise the signed claim authorizes a different source than the one
+///    being registered);
+/// 2. `source_text` MUST rebuild to the deployed `onchain_code_hash`
+///    ([`verify_source_for_code_hash`]).
+///
+/// Returns the [`SourceVerification`] on success (`verified == true`). An
+/// `Err` is a claim mismatch — the request itself is inconsistent — while
+/// `Ok(v)` with `v.verified == false` is a failed rebuild, which callers MUST
+/// refuse to register (a hash claim is never verification).
+pub fn verify_registration(
+    onchain_code_hash: &[u8; 32],
+    source_text: &[u8],
+    claimed_source_hash: &[u8; 32],
+    compiler: &str,
+    compiler_flags: &str,
+) -> Result<SourceVerification, String> {
+    let actual = source_hash(source_text);
+    if actual != *claimed_source_hash {
+        return Err(format!(
+            "source_hash does not match the submitted source: claimed {}, rebuilt-from-text {}",
+            hex::encode(claimed_source_hash),
+            hex::encode(actual)
+        ));
+    }
+    Ok(verify_source_for_code_hash(
+        onchain_code_hash,
+        source_text,
+        compiler,
+        compiler_flags,
+    ))
 }
 
 /// The bytes the contract creator signs to register a source hash:
@@ -555,6 +597,46 @@ mod tests {
         assert_eq!(source_hash(b"a"), source_hash(b"a"));
         assert_ne!(source_hash(b"a"), source_hash(b"b"));
         assert_eq!(source_hash(b"a").len(), 32);
+    }
+
+    #[test]
+    fn registration_requires_the_claimed_hash_to_be_the_submitted_text() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        // The signed claim names the digest of OTHER text: refused outright —
+        // the signature would authorise a source that is not being registered.
+        let claimed = source_hash(b"some other source");
+        let err = verify_registration(&c.code_hash, KNOWN_WAT.as_bytes(), &claimed, "wat", "")
+            .expect_err("a mismatched claim must be refused");
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn registration_verifies_only_a_source_that_rebuilds_to_the_code() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        // Honest source: hash matches the text AND the rebuild matches.
+        let honest_hash = source_hash(KNOWN_WAT.as_bytes());
+        let v = verify_registration(&c.code_hash, KNOWN_WAT.as_bytes(), &honest_hash, "wat", "")
+            .expect("claim is consistent");
+        assert!(v.verified, "honest registration verifies: {}", v.reason);
+
+        // Benign, unrelated source: its own hash matches the text, but the
+        // rebuild does NOT match the deployed code — `verified: false`, so a
+        // caller must refuse to register it (F7).
+        let unrelated =
+            "(module (memory (export \"memory\") 1) (func (export \"safe\") (result i64) (i64.const 1)))";
+        let unrelated_hash = source_hash(unrelated.as_bytes());
+        let v = verify_registration(
+            &c.code_hash,
+            unrelated.as_bytes(),
+            &unrelated_hash,
+            "wat",
+            "",
+        )
+        .expect("claim is internally consistent");
+        assert!(!v.verified, "an unrelated source must NOT verify");
+        assert!(v.reason.contains("does not match"), "{}", v.reason);
     }
 
     #[test]

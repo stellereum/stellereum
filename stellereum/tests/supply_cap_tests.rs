@@ -306,6 +306,12 @@ async fn counter_is_monotone_across_mints_burns_and_refusals() {
 #[tokio::test]
 async fn failed_balance_credit_releases_the_reservation() {
     let engine = InMemoryStateEngine::new();
+    // Take the genesis-baseline fold FIRST (it happens only on the `0 -> x`
+    // counter transition, and it sums the current balances). This test is
+    // about the reservation/credit split, so start from a clean non-zero
+    // counter and a saturated account that is NOT pre-minted supply.
+    engine.mint_native(&addr(0x60), 1).await.unwrap();
+    assert_eq!(engine.total_minted_nano(), 1);
     // A balance one nano below u64::MAX: the account credit overflows, but
     // only AFTER the global reservation succeeded. The reservation must be
     // released, or a failed mint would permanently burn headroom.
@@ -320,14 +326,14 @@ async fn failed_balance_credit_releases_the_reservation() {
     assert!(err.contains("native overflow"), "unexpected error: {err}");
     assert_eq!(
         engine.total_minted_nano(),
-        0,
+        1,
         "a failed credit must release the reservation"
     );
-    assert_eq!(engine.remaining_mint_headroom_nano(), TOTAL_SUPPLY_CAP);
+    assert_eq!(engine.remaining_mint_headroom_nano(), TOTAL_SUPPLY_CAP - 1);
 
-    // The full cap remains mintable: nothing was leaked.
+    // The remaining cap stays mintable: nothing was leaked.
     engine
-        .mint_native(&addr(0x62), TOTAL_SUPPLY_CAP)
+        .mint_native(&addr(0x62), TOTAL_SUPPLY_CAP - 1)
         .await
         .expect("no headroom may be lost to a failed credit");
     assert_eq!(engine.total_minted_nano(), TOTAL_SUPPLY_CAP);

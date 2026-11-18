@@ -618,10 +618,16 @@ pub(super) async fn dispatch_eth(
         "net_version" => ok(id, json!(crate::evm_adapter::net_version())),
         "web3_clientVersion" => ok(id, json!(crate::evm_adapter::web3_client_version())),
         "net_listening" => ok(id, json!(crate::evm_adapter::net_listening())),
-        // TESTNET-KNOWN default ("0x2"): `RpcState` carries no peer table, so
-        // there is no live count to format here. The stateful `EvmAdapter`
-        // (`with_peer_count` + `format_peer_count_hex`) is the live path.
-        "net_peerCount" => ok(id, json!(crate::evm_adapter::net_peer_count())),
+        // REAL peer count (F8): the process-wide counter the network layer
+        // feeds via `rpc::note_peer_count`. `0x0` means "no peer observed by
+        // this process" — never an invented positive like the old constant
+        // `0x2`.
+        "net_peerCount" => ok(
+            id,
+            json!(crate::evm_adapter::format_peer_count_hex(
+                observed_peer_count()
+            )),
+        ),
         // LIVE (cheap): same rule as `stell_syncing` — a recent verified peer
         // height above ours means syncing. Was a hardcoded `false`.
         "eth_syncing" => {
@@ -641,28 +647,64 @@ pub(super) async fn dispatch_eth(
             id,
             json!(crate::evm_adapter::eth_max_priority_fee_per_gas()),
         ),
-        // Floor-aware admission estimate (audit 2026-10-14 F4): the EVM
-        // 21k-style figure alone disagrees with the mempool's declared-gas
-        // floor (`stell_baseFee`), so wallets are told the max of the two —
-        // the least gas this node will currently admit. Still an admission
-        // estimate, not execution metering (calldata is never executed).
+        // ADMISSION-FLOOR ESTIMATE (audit F4 + pentest F10): the EVM
+        // 21k-style figure alone disagrees with every component of this
+        // node's admission floor, so a wallet forwarding `gas_limit ==
+        // estimate` was refused as `FeeTooLow`. The served figure is
+        //   max(pure EVM figure, base_fee + sender D2 failure bond)
+        //   + PQ activation surcharge (when the request declares one)
+        // which is exactly `Mempool::required_fee_for_tx` for a zero priority
+        // bid — every admission floor component, nothing invented:
+        //   * `from` present  -> that sender's live `effective_floor`
+        //     (base + accumulated failure bond);
+        //   * `from` absent   -> the WORST-CASE bond (`MAX_FAILED_SENDER_PENALTY`),
+        //     so the quote is never below any real sender's floor;
+        //   * `pq_activation: true` -> plus `PQ_ACTIVATION_SURCHARGE_GAS`.
+        // Still an admission estimate, not execution metering (calldata is
+        // never executed).
         "eth_estimateGas" => {
-            let floor = st.mempool.read().await.base_fee;
-            match crate::evm_adapter::eth_estimate_gas_with_floor(params, floor) {
-                Ok(gas) => ok(id, json!(gas)),
+            let sender = match estimate_sender(params) {
+                Ok(v) => v,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            let floor = {
+                let pool = st.mempool.read().await;
+                match sender {
+                    Some(s) => pool.effective_floor(&s),
+                    None => pool
+                        .base_fee
+                        .saturating_add(crate::mempool::MAX_FAILED_SENDER_PENALTY),
+                }
+            };
+            let surcharge = if wants_pq_activation(params) {
+                crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+            } else {
+                0
+            };
+            match crate::evm_adapter::eth_estimate_gas_amount(params) {
+                Ok(pure) => ok(
+                    id,
+                    json!(crate::evm_adapter::format_u64_hex(
+                        pure.max(floor).saturating_add(surcharge)
+                    )),
+                ),
                 Err(e) => err(id, e.code, e.message),
             }
         }
-        "eth_feeHistory" => {
-            let cur_h = st.height.load(std::sync::atomic::Ordering::Relaxed);
-            match crate::evm_adapter::eth_fee_history_with_head(params, cur_h) {
-                Ok(fh) => match serde_json::to_value(fh) {
-                    Ok(v) => ok(id, v),
-                    Err(e) => err(id, crate::evm_adapter::INTERNAL_ERROR_CODE, e.to_string()),
-                },
-                Err(e) => err(id, e.code, e.message),
-            }
-        }
+        // REFUSED (F9): this chain commits no EVM fee market — no per-block
+        // base fee and no per-block gas-used figure exist, so any
+        // `baseFeePerGas`/`reward` series would be invented (the old answer
+        // priced blocks the same node served as `null`). There is nothing to
+        // derive from committed state, and substituting the mempool's
+        // admission floor (gas units) for a wei price would mix units. Advice
+        // the caller can actually use instead of a fabricated market.
+        "eth_feeHistory" => err(
+            id,
+            -32000,
+            "eth_feeHistory is not served: this node commits no EVM fee market \
+             (no per-block base fee / gas-used history). Price with eth_gasPrice \
+             and eth_maxPriorityFeePerGas; the admission floor is stell_baseFee",
+        ),
         "eth_getCode" => match crate::evm_adapter::handle_eth_get_code(params) {
             Ok(code) => ok(id, json!(code)),
             Err(e) => err(id, e.code, e.message),
@@ -864,4 +906,48 @@ pub(super) async fn dispatch_eth(
         }
         _ => return None,
     })
+}
+
+/// The `from` address of an `eth_estimateGas` call object, when present.
+///
+/// `eth_estimateGas` accepts the same call object as `eth_call`; `from` is
+/// what selects the sender-specific admission floor (F10). A malformed `from`
+/// is a parameter error, never silently ignored.
+fn estimate_sender(params: &Value) -> Result<Option<[u8; 32]>, String> {
+    let obj = match params {
+        Value::Null => return Ok(None),
+        Value::Array(arr) => match arr.first() {
+            None => return Ok(None),
+            Some(Value::Object(map)) => map,
+            Some(Value::Null) => return Ok(None),
+            Some(_) => return Err("call object must be an object".to_string()),
+        },
+        Value::Object(map) => map,
+        _ => return Err("params must be array or object".to_string()),
+    };
+    match obj.get("from") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => crate::evm_adapter::parse_evm_or_stell_address(s)
+            .map(Some)
+            .map_err(|e| format!("invalid from address: {e}")),
+        Some(_) => Err("invalid from address: expected a hex address string".to_string()),
+    }
+}
+
+/// True when an `eth_estimateGas` call object declares a PQ ACTIVATION (a tx
+/// that attaches a raw public key and therefore pays the state-rent
+/// surcharge). A plain EVM intent never is one, so this defaults to `false`.
+fn wants_pq_activation(params: &Value) -> bool {
+    let obj = match params {
+        Value::Array(arr) => match arr.first() {
+            Some(Value::Object(map)) => map,
+            _ => return false,
+        },
+        Value::Object(map) => map,
+        _ => return false,
+    };
+    obj.get("pq_activation")
+        .or_else(|| obj.get("activation"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }

@@ -240,6 +240,14 @@ pub const MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS: u32 = 100_000;
 /// proposer check to earlier rounds keeps the anti-reward-theft property
 /// (the named proposer must have held SOME slot at this height) without
 /// bricking re-proposed blocks.
+///
+/// PENTEST F-3 (LOW): the scan used to be widened to `qc_round + 4` when
+/// `qc_round > 0` ("nearby view changes"), so sync/snapshot accepted a
+/// proposer that held NO slot at the QC's round but one up to +4 rounds in
+/// the FUTURE. `adopt_committed` (exact round) refused the same block, and the
+/// proposer is credited fees/rewards by apply. The tolerance is now the
+/// documented one: every slot at or before `qc_round` (the re-proposal case),
+/// never a future slot.
 pub fn proposer_matches_schedule(
     validators: &crate::consensus::ValidatorSet,
     height: u64,
@@ -251,17 +259,7 @@ pub fn proposer_matches_schedule(
         return false;
     }
     let bound = qc_round.min(MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS);
-    if (0..=bound).any(|r| validators.proposer_for(height, r).as_ref() == Some(proposer)) {
-        return true;
-    }
-    // If qc_round > 0 (view change occurred), allow tolerance for nearby view changes
-    if qc_round > 0 {
-        let nearby = qc_round
-            .saturating_add(4)
-            .min(MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS);
-        return (0..=nearby).any(|r| validators.proposer_for(height, r).as_ref() == Some(proposer));
-    }
-    false
+    (0..=bound).any(|r| validators.proposer_for(height, r).as_ref() == Some(proposer))
 }
 
 /// One height's finality gate, shared by the header-anchor path and the body

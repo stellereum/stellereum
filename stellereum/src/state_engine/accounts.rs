@@ -1,6 +1,7 @@
 use super::memory_bounds;
 use super::types::{
-    bincode_deserialize_limited, write_contract_trie_entries, write_token_trie_entries,
+    bincode_deserialize_exact, bincode_deserialize_limited, write_contract_trie_entries,
+    write_token_trie_entries,
 };
 use super::{
     AccountState, ActorMessage, EscrowRecord, InMemoryStateEngine, StateSnapshotV2,
@@ -12,6 +13,22 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Does `bytes` start with the CURRENT state-snapshot magic?
+///
+/// bincode's fixint encoding writes integers little-endian, so the magic is
+/// read the same way. A legacy blob starts with a vector/map length (bounded by
+/// the decode limit), never with this value; a TRUNCATED current blob always
+/// keeps this prefix (truncation removes a suffix), which is what lets the
+/// decoder refuse it instead of reinterpreting it as a legacy shape.
+fn snapshot_has_magic(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(raw) == super::types::STATE_SNAPSHOT_MAGIC
+}
 
 impl InMemoryStateEngine {
     pub fn new() -> Self {
@@ -1750,33 +1767,109 @@ impl InMemoryStateEngine {
     }
 
     /// Nano-STELL still mintable under [`crate::tokenomics::TOTAL_SUPPLY_CAP`].
+    ///
+    /// The counter is a committed, monotone scalar. Before the FIRST
+    /// post-genesis reservation the pre-minted genesis allocation has not been
+    /// folded in yet (see [`Self::genesis_allocation_nano`]), so this getter
+    /// ALSO reads the committed balances in that state and subtracts the same
+    /// baseline the first reserve will fold in - an over-allocated genesis
+    /// therefore reports 0 headroom immediately, not a full cap.
+    ///
+    /// The balance read is `try_read` (never a blocking `read`): the getter is
+    /// sync, and a caller that already holds the accounts lock or races a
+    /// writer must not deadlock. In that case it falls back to the
+    /// counter-only view; ENFORCEMENT is always in
+    /// [`Self::reserve_mint_nano`], never in this read.
     pub fn remaining_mint_headroom_nano(&self) -> u64 {
-        crate::tokenomics::TOTAL_SUPPLY_CAP.saturating_sub(self.total_minted_nano())
+        let cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
+        let minted = self.total_minted_nano();
+        if minted != 0 {
+            return cap.saturating_sub(minted);
+        }
+        match self.accounts.try_read() {
+            Ok(map) => {
+                let genesis = map
+                    .values()
+                    .fold(0u64, |sum, a| sum.saturating_add(a.balance));
+                cap.saturating_sub(genesis)
+            }
+            Err(_) => cap,
+        }
     }
 
-    /// Fail-closed global-supply reservation for one mint.
+    /// Native supply that was PRE-MINTED before the first post-genesis mint.
+    ///
+    /// Genesis funding (validators, staking pool, faucet) creates balances via
+    /// `update_account` / `credit_native_transfer`, neither of which advances
+    /// the mint counter. Without a baseline the advertised hard cap would be
+    /// false at height 0: N validators x `GENESIS_VALIDATOR_BALANCE` can
+    /// already exceed `TOTAL_SUPPLY_CAP` while the engine still reports a full
+    /// cap of headroom (audit F4).
+    ///
+    /// The baseline is captured LAZILY, by the first reservation that moves
+    /// the counter off zero, as the sum of every native balance committed at
+    /// that instant. It is folded into `total_minted_nano` in the SAME CAS as
+    /// that reserve, which gives the invariant
+    ///
+    /// ```text
+    /// genesis_allocation + post_genesis_minted <= TOTAL_SUPPLY_CAP
+    /// ```
+    ///
+    /// from the first mint onward:
+    /// * it is counted exactly once - only one caller can win the `0 -> x`
+    ///   CAS, and a loser sees `current != 0` and adds nothing;
+    /// * no separate flag/field is needed, so genesis funding paths (which live
+    ///   outside the state engine) cannot forget to report it;
+    /// * a genesis allocation at/over the cap refuses EVERY mint (fail closed)
+    ///   instead of letting emission create a second cap on top of it;
+    /// * after the first mint the counter is non-zero, so this returns 0 and
+    ///   later mints only add their own amount.
+    ///
+    /// Transfers conserve value, so summing the balances at the first
+    /// reservation is exactly genesis + any pre-first-mint movement, all of
+    /// which is pre-mined supply.
+    pub async fn genesis_allocation_nano(&self) -> u64 {
+        if self.total_minted_nano() != 0 {
+            return 0;
+        }
+        let map = self.accounts.read().await;
+        map.values()
+            .fold(0u64, |sum, a| sum.saturating_add(a.balance))
+    }
+
+    /// Fail-closed global-supply reservation for one mint, folding the
+    /// pre-minted genesis baseline in on the first reservation.
     ///
     /// CAS loop on the counter: concurrent mints can never both see the same
     /// headroom and overshoot. The reservation is taken BEFORE the balance
     /// credit and released by the caller if the credit itself fails, so the
     /// counter always bounds "value the engine committed to create".
     ///
+    /// `genesis_nano` is added exactly once: only the reservation that moves
+    /// the counter from zero may include it (see
+    /// [`Self::genesis_allocation_nano`]). Callers that can be the first mint
+    /// must use [`Self::reserve_mint`], which computes the baseline.
+    ///
     /// `pub(super)` because the block-reward leg in `apply.rs` must reserve
     /// BEFORE it mutates the staking ledger: when the global cap is reached
     /// the ledger must never be touched (so there is no per-validator
     /// `pending_rewards` split to unwind).
-    pub(super) fn reserve_mint_nano(&self, amount: u64) -> Result<(), String> {
+    pub(super) fn reserve_mint_nano(&self, amount: u64, genesis_nano: u64) -> Result<(), String> {
         use std::sync::atomic::Ordering;
         let cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
         let mut current = self.total_minted_nano.load(Ordering::Acquire);
         loop {
-            let next = current
+            let base = if current == 0 { genesis_nano } else { 0 };
+            let with_genesis = current
+                .checked_add(base)
+                .ok_or_else(|| "global supply counter overflows u64: refusing mint".to_string())?;
+            let next = with_genesis
                 .checked_add(amount)
                 .ok_or_else(|| "global supply counter overflows u64: refusing mint".to_string())?;
             if next > cap {
                 return Err(format!(
-                    "global supply cap exceeded: minting {amount} nano-STELL would take total minted past {cap} (currently {current}, headroom {})",
-                    cap.saturating_sub(current)
+                    "global supply cap exceeded: minting {amount} nano-STELL would take total minted past {cap} (currently {current}, genesis allocation {base}, headroom {})",
+                    cap.saturating_sub(current).saturating_sub(base)
                 ));
             }
             match self.total_minted_nano.compare_exchange_weak(
@@ -1789,6 +1882,18 @@ impl InMemoryStateEngine {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    /// Reserve `amount` nanos against the global cap, folding in the pre-minted
+    /// genesis baseline on the first reservation.
+    ///
+    /// The async entry point every mint path uses ([`Self::mint_native`],
+    /// block rewards, bridge deposits, PMM buys): it reads the account set to
+    /// capture the append-only genesis baseline only while the counter is
+    /// still zero, so steady-state reservations never take the accounts lock.
+    pub(super) async fn reserve_mint(&self, amount: u64) -> Result<(), String> {
+        let genesis = self.genesis_allocation_nano().await;
+        self.reserve_mint_nano(amount, genesis)
     }
 
     /// Undo a reservation when the balance credit it paid for failed.
@@ -1861,7 +1966,7 @@ impl InMemoryStateEngine {
         if amount == 0 {
             return Ok(());
         }
-        self.reserve_mint_nano(amount)?;
+        self.reserve_mint(amount).await?;
         self.credit_reserved_native(addr, amount).await
     }
 
@@ -2280,20 +2385,21 @@ impl InMemoryStateEngine {
         Ok(())
     }
 
-    /// Rebase the global mint counter to the TOTAL BALANCE of a snapshot.
+    /// Rebase the global mint counter to the value carried by a snapshot.
     ///
     /// Used by both accounts restore paths. Without this, a node that
     /// restarts (or rewinds to a reorg checkpoint) would carry a counter of
     /// zero — or a stale higher value — while the accounts already hold the
-    /// chain's supply, and could mint up to a second `TOTAL_SUPPLY_CAP` on
-    /// top of it. Rebased to the restored supply, the headroom is exactly
-    /// `CAP - supply`.
+    /// chain's supply, and could mint up to a full `TOTAL_SUPPLY_CAP` on top of
+    /// it. The current snapshot format carries the counter explicitly (it is
+    /// a committed scalar, so it cannot be re-derived from balances without
+    /// counting the pre-mined genesis allocation as emission). A legacy
+    /// snapshot that predates the field installs 0, and the first later
+    /// reservation folds the pre-minted balances in exactly once, so the
+    /// `genesis + minted <= cap` invariant also holds after a legacy restore.
     ///
-    /// Summed in `u128` and clamped to `u64::MAX`, so a corrupt/absurd
-    /// snapshot saturates (every later mint fails closed) instead of
-    /// wrapping to a tiny counter. `restore_snapshot_chunked*` lives in
-    /// `memory_bounds.rs` (outside this change's scope) and must adopt the
-    /// same rebase — reported as a follow-up.
+    /// `restore_snapshot_chunked*` lives in `memory_bounds.rs` and calls this
+    /// same setter, so the two restore shapes cannot disagree.
     pub(super) fn set_total_minted_from_snapshot(&self, total_minted_nano: u64) {
         self.total_minted_nano
             .store(total_minted_nano, std::sync::atomic::Ordering::Release);
@@ -2309,71 +2415,111 @@ impl InMemoryStateEngine {
     /// restored only the accounts would charge a different fee than a node
     /// that applied the blocks (audit W6.6).
     ///
-    /// The decoder accepts the versioned [`StateSnapshotV2`] form and the
-    /// legacy bare-`Vec<AccountState>` form (whose penalty is empty - a
-    /// snapshot written before the penalty existed carries none).
+    /// FORMAT STRICTNESS (audit F10): a CURRENT snapshot is magic-prefixed and
+    /// versioned, and is decoded with an EXACT length - every field, including
+    /// the trailing `total_minted_nano`, is mandatory. A truncated current
+    /// blob keeps its magic prefix, so it is detected as "versioned but
+    /// corrupt" and REFUSED; it can never fall through to a legacy shape and
+    /// silently read a missing mint counter as 0.
+    ///
+    /// LEGACY shapes (no magic, so they predate the versioned envelope) are
+    /// still accepted, each with an exact-length decode:
+    /// * the intermediate `accounts + penalty` V2 envelope (pre-`total_minted`;
+    ///   reads as 0 and the first later reservation folds the pre-mined
+    ///   balances in), and
+    /// * the original bare `Vec<AccountState>` / bare V1-account vector (empty
+    ///   penalty, counter 0).
     #[allow(clippy::type_complexity)]
     // GATE: snapshot decoder returns full state tuple; alias would churn restore paths.
     fn parse_account_snapshot(
         bytes: &[u8],
     ) -> Result<(Vec<AccountState>, HashMap<[u8; 32], u64>, u64), String> {
-        // V2 FIRST: the legacy blob is a bare `Vec<AccountState>`, which
-        // decodes as V2 only if the trailing penalty map happens to be
-        // present - it never is, so a legacy blob fails here and falls
-        // through to the legacy decoders below.
-        if let Ok(v2) =
-            bincode_deserialize_limited::<StateSnapshotV2>(bytes, MAX_SNAPSHOT_DECODE_BYTES)
-        {
-            return Ok((v2.accounts, v2.penalty, v2.total_minted_nano));
-        }
-        match bincode_deserialize_limited(bytes, MAX_SNAPSHOT_DECODE_BYTES) {
-            Ok(s) => Ok((s, HashMap::new(), 0)),
-            Err(_) => {
-                #[derive(Deserialize)]
-                struct LegacyAccountState {
-                    address: [u8; 32],
-                    balance: u64,
-                    nonce: u64,
-                    code: Vec<u8>,
-                    code_hash: Option<CellHash>,
-                    storage_root: Option<CellHash>,
-                    inbox: VecDeque<ActorMessage>,
-                    outbox: VecDeque<ActorMessage>,
+        // CURRENT format FIRST. Exact length + mandatory fields.
+        match bincode_deserialize_exact::<StateSnapshotV2>(bytes, MAX_SNAPSHOT_DECODE_BYTES) {
+            Ok(v2) => return Ok((v2.accounts, v2.penalty, v2.total_minted_nano)),
+            Err(e) => {
+                // A blob that STARTS with the magic is a versioned snapshot;
+                // if it does not decode exactly it is truncated/corrupt and
+                // must fail rather than be reinterpreted as a legacy shape.
+                if snapshot_has_magic(bytes) {
+                    return Err(format!("Restore snapshot failed: {e:?}"));
                 }
-                let legacy: Vec<LegacyAccountState> =
-                    bincode_deserialize_limited(bytes, MAX_SNAPSHOT_DECODE_BYTES)
-                        .map_err(|e| format!("Restore snapshot failed: {:?}", e))?;
-                Ok((
-                    legacy
-                        .into_iter()
-                        .map(|l| AccountState {
-                            address: l.address,
-                            balance: l.balance,
-                            nonce: l.nonce,
-                            code: l.code,
-                            code_hash: l.code_hash,
-                            storage_root: l.storage_root,
-                            inbox: l.inbox,
-                            outbox: l.outbox,
-                            scheme: crate::post_quantum::PqScheme::Falcon512,
-                            pubkey_hash: None,
-                        })
-                        .collect(),
-                    HashMap::new(),
-                    0,
-                ))
             }
         }
+
+        // Legacy intermediate V2 that already carried the counter but had no
+        // magic prefix (the immediately preceding writer). Exact length.
+        if let Ok(legacy) = bincode_deserialize_exact::<
+            super::types::LegacyStateSnapshotV2WithCounter,
+        >(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+        {
+            return Ok((legacy.accounts, legacy.penalty, legacy.total_minted_nano));
+        }
+
+        // Legacy intermediate V2: accounts + penalty, no mint counter.
+        if let Ok(legacy) = bincode_deserialize_exact::<super::types::LegacyStateSnapshotV2>(
+            bytes,
+            MAX_SNAPSHOT_DECODE_BYTES,
+        ) {
+            return Ok((legacy.accounts, legacy.penalty, 0));
+        }
+
+        // Legacy bare account vector(s). The current AccountState shape first,
+        // then the pre-PQ-field shape.
+        if let Ok(states) =
+            bincode_deserialize_exact::<Vec<AccountState>>(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+        {
+            return Ok((states, HashMap::new(), 0));
+        }
+        #[derive(Deserialize)]
+        struct LegacyAccountState {
+            address: [u8; 32],
+            balance: u64,
+            nonce: u64,
+            code: Vec<u8>,
+            code_hash: Option<CellHash>,
+            storage_root: Option<CellHash>,
+            inbox: VecDeque<ActorMessage>,
+            outbox: VecDeque<ActorMessage>,
+        }
+        let legacy: Vec<LegacyAccountState> =
+            bincode_deserialize_exact(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+                .map_err(|e| format!("Restore snapshot failed: {e:?}"))?;
+        Ok((
+            legacy
+                .into_iter()
+                .map(|l| AccountState {
+                    address: l.address,
+                    balance: l.balance,
+                    nonce: l.nonce,
+                    code: l.code,
+                    code_hash: l.code_hash,
+                    storage_root: l.storage_root,
+                    inbox: l.inbox,
+                    outbox: l.outbox,
+                    scheme: crate::post_quantum::PqScheme::Falcon512,
+                    pubkey_hash: None,
+                })
+                .collect(),
+            HashMap::new(),
+            0,
+        ))
     }
 
     /// Decode the chunks produced by `create_snapshot_chunked` (validate phase,
     /// no locks held): the account groups AND the penalty map carried by the
     /// FIRST chunk.
     ///
-    /// The first chunk is the [`StateSnapshotV2`] shape (accounts + penalty);
-    /// the rest are bare account chunks. A legacy chunk set (no penalty) is
-    /// still accepted - the penalty is then empty, exactly as before the shape
-    /// existed.
+    /// The first chunk is the magic-prefixed [`StateSnapshotV2`] shape
+    /// (accounts + penalty + mint counter); the rest are bare account chunks.
+    /// A legacy chunk set (no magic) is still accepted through the explicit
+    /// legacy shapes - the penalty is then empty and the counter 0.
+    ///
+    /// STRICTNESS (audit F10): every chunk is decoded with an EXACT length. A
+    /// first chunk that starts with the magic but does not decode exactly is a
+    /// truncated/corrupt current snapshot and FAILS; it is never reinterpreted
+    /// as a legacy chunk (which would restore a zero mint counter over live
+    /// balances).
     #[allow(clippy::type_complexity)]
     // GATE: chunk decoder returns full state tuple; alias would churn restore paths.
     pub(super) fn decode_snapshot_chunks(
@@ -2384,17 +2530,46 @@ impl InMemoryStateEngine {
         let mut total_minted_nano = 0u64;
         for (i, raw) in chunks.iter().enumerate() {
             if i == 0 {
-                if let Ok(v2) =
-                    bincode_deserialize_limited::<StateSnapshotV2>(raw, MAX_SNAPSHOT_DECODE_BYTES)
+                match bincode_deserialize_exact::<StateSnapshotV2>(raw, MAX_SNAPSHOT_DECODE_BYTES) {
+                    Ok(v2) => {
+                        decoded.push(v2.accounts);
+                        penalty = v2.penalty;
+                        total_minted_nano = v2.total_minted_nano;
+                        continue;
+                    }
+                    Err(e) if snapshot_has_magic(raw) => {
+                        return Err(format!(
+                            "restore snapshot chunk 0 failed (versioned but truncated/corrupt): {e:?}"
+                        ));
+                    }
+                    Err(_) => {}
+                }
+                // Legacy unversioned envelope that already carried the counter
+                // (the immediately preceding writer), exact length.
+                if let Ok(legacy) = bincode_deserialize_exact::<
+                    super::types::LegacyStateSnapshotV2WithCounter,
+                >(raw, MAX_SNAPSHOT_DECODE_BYTES)
                 {
-                    decoded.push(v2.accounts);
-                    penalty = v2.penalty;
-                    total_minted_nano = v2.total_minted_nano;
+                    decoded.push(legacy.accounts);
+                    penalty = legacy.penalty;
+                    total_minted_nano = legacy.total_minted_nano;
+                    continue;
+                }
+                // Legacy intermediate envelope (accounts + penalty, no mint
+                // counter). Exact length; a truncated current chunk cannot
+                // reach here because it carries the magic and returned above.
+                if let Ok(legacy) = bincode_deserialize_exact::<super::types::LegacyStateSnapshotV2>(
+                    raw,
+                    MAX_SNAPSHOT_DECODE_BYTES,
+                ) {
+                    decoded.push(legacy.accounts);
+                    penalty = legacy.penalty;
+                    total_minted_nano = 0;
                     continue;
                 }
             }
             let states: Vec<AccountState> =
-                bincode_deserialize_limited(raw, MAX_SNAPSHOT_DECODE_BYTES)
+                bincode_deserialize_exact(raw, MAX_SNAPSHOT_DECODE_BYTES)
                     .map_err(|e| format!("restore snapshot chunk {i} failed: {e:?}"))?;
             decoded.push(states);
         }

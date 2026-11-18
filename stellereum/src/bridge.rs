@@ -725,6 +725,13 @@ impl TeleportBridgeEngine {
     /// could mint past the hard cap in one deposit. Window and clock are the
     /// block's (`now`), saturating throughout; a refusal leaves the engine
     /// untouched (the caller treats it as a whole-tx revert, same as quorum).
+    ///
+    /// This is the LOCAL (per-bridge) first line. The GLOBAL 1B cap is enforced
+    /// on top of it by `InMemoryStateEngine::settle_bridge_native`, which
+    /// reserves the gross credited amount with the engine's capped mint before
+    /// it writes a balance (audit F1) - local caps can each be respected while
+    /// their SUM blows past the hard cap, which is exactly the hole that fix
+    /// closes.
     pub fn note_deposit_mint(&mut self, amount: u64, now: u64) -> Result<(), String> {
         if now.saturating_sub(self.last_deposit_reset) >= 3600 {
             self.hourly_deposited = 0;

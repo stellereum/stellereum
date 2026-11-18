@@ -413,10 +413,18 @@ impl ValidatorRuntime {
                     if msg.is_bounce() {
                         // The refund: exactly `tx.amount` back to the sender.
                         // Gas went to the source proposer at produce time and
-                        // is not refunded. `credit_native` creates the account
-                        // if it vanished, and commits to the trie, so every
-                        // node applying this block derives the same root.
-                        if let Err(e) = self.state.credit_native(&msg.tx.from, msg.tx.amount).await
+                        // is not refunded. This is a REDEEM of value that was
+                        // already debited on the source shard, not new minting:
+                        // `credit_native` is the CAPPED mint path, so at the
+                        // global supply cap the refund would be silently
+                        // dropped and the sender's money lost. The transfer
+                        // primitive creates the account if it vanished and
+                        // commits to the trie, so every node applying this
+                        // block still derives the same root.
+                        if let Err(e) = self
+                            .state
+                            .credit_native_transfer(&msg.tx.from, msg.tx.amount)
+                            .await
                         {
                             tracing::warn!(
                                 "cross-shard bounce refund failed for {}: {e}",

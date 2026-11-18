@@ -208,6 +208,10 @@ impl InMemoryStateEngine {
                 | SysCallClaimDelegatorRewards { .. }
                 | SysCallWithdrawSelfBond { .. }
                 | SysCallRotateValidatorKey { .. }
+                // Carrier only: the VM validates jail/bond and the block
+                // apply performs the height-gated unjail, but the ledger is
+                // still read inside the VM, so snapshot it for rollback.
+                | SysCallUnjail { .. }
                 // The PQ equivocation report SLASHES the ledger inside the VM
                 // (it must: the verdict depends on the accused validator's
                 // registered post-quantum key), so the ledger must be
@@ -389,6 +393,11 @@ impl InMemoryStateEngine {
             .await;
         self.restore_actor_native(actions.actor_snapshot.as_ref())
             .await;
+        // The PMM buy leg's supply reservation is part of what this payload
+        // created: give it back with the balances (audit F5).
+        if actions.pmm_minted_nano > 0 {
+            self.release_mint_nano(actions.pmm_minted_nano);
+        }
         self.restore_pmm_native(&actions.pmm_native_snapshot).await;
         // Trie: drop touched keys, then re-add exactly what restored state holds.
         if !dead_keys.is_empty() {
@@ -468,6 +477,7 @@ impl InMemoryStateEngine {
                     bridge_snapshot: None,
                     actor_snapshot: None,
                     pmm_native_snapshot: Vec::new(),
+                    pmm_minted_nano: 0,
                     clob_native_snapshot: Vec::new(),
                 },
             ));
@@ -760,6 +770,9 @@ impl InMemoryStateEngine {
         // surviving wUSDT mint with no native debit would be free money, a
         // surviving burn with no mint would destroy it.
         let mut pmm_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::new();
+        // Global-supply reservation the PMM buy leg took (0 when no buy ran or
+        // the swap was refused). Rolled back with the swap on a later failure.
+        let mut pmm_minted_nano: u64 = 0;
         let mut clob_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::new();
         // Same idea for the bridge's native leg: the account halves settle here
         // so the escrow settlement below is priced against post-bridge balances,
@@ -792,7 +805,10 @@ impl InMemoryStateEngine {
                     0
                 };
                 match self.settle_pmm_native(&pmm_events, tx.from, floor).await {
-                    Ok(snapshot) => pmm_native_snapshot = snapshot,
+                    Ok((snapshot, minted_nano)) => {
+                        pmm_native_snapshot = snapshot;
+                        pmm_minted_nano = minted_nano;
+                    }
                     Err(e) => {
                         // Nothing native has moved yet, so undoing the
                         // clone-committed halves is the whole rollback.
@@ -870,6 +886,9 @@ impl InMemoryStateEngine {
                         // time-lock refusal) must undo the PMM swap too: the VM
                         // already committed its clone halves, and the payload as
                         // a whole did not apply.
+                        if pmm_minted_nano > 0 {
+                            self.release_mint_nano(pmm_minted_nano);
+                        }
                         self.restore_pmm_native(&pmm_native_snapshot).await;
                         if !pmm_events.is_empty() {
                             if let Some((before_pmm, before_tokens)) = pmm_before.take() {
@@ -947,6 +966,9 @@ impl InMemoryStateEngine {
                         // the PMM swap, the bridge transfer, the book - is
                         // the whole rollback, exactly like the bridge's own
                         // failure arm above.
+                        if pmm_minted_nano > 0 {
+                            self.release_mint_nano(pmm_minted_nano);
+                        }
                         self.restore_pmm_native(&pmm_native_snapshot).await;
                         self.restore_bridge_native(bridge_snapshot.as_ref()).await;
                         if !pmm_events.is_empty() {
@@ -1009,6 +1031,9 @@ impl InMemoryStateEngine {
                     // they share - every one of these snapshots predates the
                     // actor debit).
                     self.restore_actor_native(actor_snapshot.as_ref()).await;
+                    if pmm_minted_nano > 0 {
+                        self.release_mint_nano(pmm_minted_nano);
+                    }
                     self.restore_pmm_native(&pmm_native_snapshot).await;
                     self.restore_bridge_native(bridge_snapshot.as_ref()).await;
                     if !pmm_events.is_empty() {
@@ -1068,6 +1093,9 @@ impl InMemoryStateEngine {
                         // undo them (actor first: it was settled last), then undo
                         // the VM's halves.
                         self.restore_actor_native(actor_snapshot.as_ref()).await;
+                        if pmm_minted_nano > 0 {
+                            self.release_mint_nano(pmm_minted_nano);
+                        }
                         self.restore_pmm_native(&pmm_native_snapshot).await;
                         self.restore_bridge_native(bridge_snapshot.as_ref()).await;
                         if !pmm_events.is_empty() {
@@ -1129,6 +1157,7 @@ impl InMemoryStateEngine {
                         bridge_snapshot,
                         actor_snapshot,
                         pmm_native_snapshot,
+                        pmm_minted_nano,
                         clob_native_snapshot,
                     },
                 ))
@@ -1361,6 +1390,7 @@ impl InMemoryStateEngine {
                                 bridge_snapshot: None,
                                 actor_snapshot: None,
                                 pmm_native_snapshot: Vec::new(),
+                                pmm_minted_nano: 0,
                                 clob_native_snapshot: Vec::new(),
                             },
                         )
@@ -2491,6 +2521,67 @@ impl InMemoryStateEngine {
             )
             .await;
 
+        // 1a-BIS (pentest F6): record every validator that FULLY exited the
+        // set in THIS block, with the power it held at the block's start.
+        // The next block attributes this block's `last_qc` against the set
+        // in force HERE, so a validator that unbonds in the evidence block
+        // can no longer erase its own miss (the pre-state of H is already
+        // the END of H-1 and would otherwise drop it).
+        //
+        // Pure function of (pre-transition set, post-transaction set): every
+        // node applying the same block records the same ids and powers. A
+        // rotated-away key is skipped (its record no longer exists), and a
+        // record that is still bonded is not an exit. The ledger map is
+        // bounded to the current + previous height by the recorder.
+        let (exits, need_prune) = {
+            // A validator can only fall out of the set through a full
+            // `SysCallUnbond` (rotation moves the record, it does not create
+            // an exit candidate). Gate the set diff on that opcode so an
+            // ordinary block pays one O(1) payload scan, not a re-derivation.
+            let has_unbond = block.transactions.iter().any(|tx| {
+                tx.payload
+                    .iter()
+                    .any(|op| matches!(op, crate::svm::OpCode::SysCallUnbond { .. }))
+            });
+            let l = self.staking.read().await;
+            let need_prune = l.full_exits_need_prune(block.height);
+            if !has_unbond {
+                (Vec::new(), need_prune)
+            } else {
+                let post_tx_set = l.to_validator_set();
+                let min_bond = l
+                    .min_validator_bond
+                    .unwrap_or(crate::staking::MIN_VALIDATOR_BOND);
+                let exits: Vec<([u8; 32], u64)> = pre_transition_set
+                    .validators
+                    .keys()
+                    .filter(|v| !post_tx_set.validators.contains_key(*v))
+                    .filter(|v| {
+                        l.validators
+                            .get(*v)
+                            .map(|s| s.self_bond < min_bond)
+                            .unwrap_or(false)
+                    })
+                    .map(|v| (*v, pre_transition_set.power_of(v)))
+                    .collect();
+                (exits, need_prune)
+            }
+        };
+        if !exits.is_empty() || need_prune {
+            self.staking_write()
+                .await
+                .record_full_exits_at(&exits, block.height);
+        }
+
+        // 1b-BIS (pentest F7): block-carried `SysCallUnjail`. The VM arm is a
+        // validated carrier (sender/jail/bond); the release-height gate needs
+        // the block height, which only this path knows. Runs after the
+        // transactions so a `SysCallStake` top-up in the SAME payload is
+        // already in the ledger, and before the downtime step so a validator
+        // unjailed here is subject to this block's evidence like any other
+        // member. Deterministic: pure function of block bytes + pre-state.
+        let _unjailed = self.apply_staking_unjail_ops(block, &status).await;
+
         // 1a. §9 2PC, SOURCE side: the PREPARED state of every transfer this
         //     block ESCROWED. It runs AFTER the transactions, because the
         //     record means "the value is escrowed here" - which is only true
@@ -2532,7 +2623,7 @@ impl InMemoryStateEngine {
         //    there is nothing to unwind. Reversed (distribute-then-mint), a
         //    cap refusal would leave the validator's pending counter credited
         //    against a pool that holds no coins.
-        if block_reward > 0 && self.reserve_mint_nano(block_reward).is_ok() {
+        if block_reward > 0 && self.reserve_mint(block_reward).await.is_ok() {
             let distributed = self
                 .staking_write()
                 .await
@@ -2591,11 +2682,28 @@ impl InMemoryStateEngine {
         // skips attribution for that height — deterministic, since `None` is
         // canonical bytes.
         let evidence_height = block.height.saturating_sub(1);
+        // F6: judge the evidence against the set IN FORCE at `evidence_height`
+        // — the pre-transition set (which is the ledger as of the END of
+        // H-1) PLUS every validator recorded as having fully exited DURING
+        // H-1, restored with the power it held at H-1's start. Without the
+        // second half a full `SysCallUnbond` in the evidence block removes
+        // the offender from the set and its miss is never attributed.
+        // Adding the pre-exit power (not the post-exit 0/delegated total)
+        // keeps the quorum denominator identical to the one that formed the
+        // certificate, so a genuine H-1 QC still verifies.
+        let attribution_set = {
+            let mut s = pre_transition_set.clone();
+            let l = self.staking.read().await;
+            for (validator, power) in l.full_exits_at(evidence_height) {
+                s.add(validator, power);
+            }
+            s
+        };
         let slashed = self
             .apply_downtime_slash_with_set(
                 evidence_height,
                 block.last_qc.as_ref(),
-                &pre_transition_set,
+                &attribution_set,
             )
             .await;
 
@@ -2629,6 +2737,17 @@ impl InMemoryStateEngine {
         } else {
             0
         };
+
+        // 5e. DETERMINISTIC UPGRADE EXECUTION: install the plan of every
+        //     passed, matured `SoftwareUpgrade` at this exact height. This is
+        //     the piece that used to be missing (the plan was only ever
+        //     executed by a node-local RPC call), so a matured proposal now
+        //     executes on EVERY node applying the same blocks — same height,
+        //     same plan, same committed state root. Gated by
+        //     `UPGRADE_EXEC_ACTIVATION_HEIGHT` (inert `u64::MAX` default) and
+        //     a proven no-op while inactive: it returns before any lock is
+        //     taken, so the pre-activation root is byte-identical.
+        let _upgrade_exec = self.apply_upgrade_execution(block).await;
 
         BlockTransitionOutcome {
             applied,
@@ -3497,6 +3616,73 @@ impl InMemoryStateEngine {
             .await
     }
 
+    /// Apply every block-carried [`crate::svm::OpCode::SysCallUnjail`] whose
+    /// transaction applied. This is the live entry point for
+    /// [`crate::staking::StakingLedger::unjail`] (pentest F7).
+    ///
+    /// The VM arm validates everything that does NOT need the block height
+    /// (sender == validator, the jail record exists, the self-bond is back at
+    /// MIN+buffer) and reverts otherwise. The RELEASE-HEIGHT gate lives here
+    /// because `VmContext` carries no height; `block.height` is the
+    /// deterministic clock every node applies. A refusal (early release) is
+    /// fail-closed: the jail record is untouched, the sender has already paid
+    /// gas for the carrier exactly like a refused governance op, and the
+    /// block itself never fails.
+    ///
+    /// Order matters: this runs AFTER the transaction pass, so a
+    /// `SysCallStake` top-up in the same payload is already committed, and
+    /// BEFORE the downtime step, so the re-admitted validator is subject to
+    /// this block's evidence on the same terms as every other member.
+    ///
+    /// Returns the number of validators actually re-admitted (observability
+    /// only; never consensus state).
+    pub async fn apply_staking_unjail_ops(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> usize {
+        // Collect first: the common block carries no unjail op and must not
+        // take the staking write lock at all.
+        let mut requests: Vec<([u8; 32], [u8; 32])> = Vec::new();
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if !status.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            for op in &tx.payload {
+                if let crate::svm::OpCode::SysCallUnjail { validator } = op {
+                    requests.push((tx.from, *validator));
+                }
+            }
+        }
+        if requests.is_empty() {
+            return 0;
+        }
+        let mut ledger = self.staking_write().await;
+        let mut unjailed = 0usize;
+        for (sender, validator) in requests {
+            // Defense in depth: the VM already refused a mismatch, but a
+            // replayed/foreign envelope must never clear someone else's jail.
+            if sender != validator {
+                tracing::warn!(
+                    "SysCallUnjail refused at height {}: sender {} is not validator {}",
+                    block.height,
+                    hex::encode(sender),
+                    hex::encode(validator),
+                );
+                continue;
+            }
+            match ledger.unjail(validator, block.height) {
+                Ok(()) => unjailed += 1,
+                Err(e) => tracing::warn!(
+                    "SysCallUnjail refused at height {} for {}: {e} (jail stays; add_bond with SysCallStake, retry at/after release_height)",
+                    block.height,
+                    hex::encode(validator),
+                ),
+            }
+        }
+        unjailed
+    }
+
     /// Downtime attribution against an EXPLICIT validator set.
     ///
     /// W10.5 activation boundary: the evidence QC (height H-1) must be
@@ -3913,6 +4099,63 @@ impl InMemoryStateEngine {
                 }
                 _ => {}
             }
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Deterministic upgrade execution (default-OFF; see
+    // `UPGRADE_EXEC_ACTIVATION_HEIGHT`).
+    //
+    // The counterpart of the block-carried gov scan above, on the OUTPUT side:
+    // a passed, timelock-matured `SoftwareUpgrade` must be executed by every
+    // node applying the same block, at the same height, with no RPC and no
+    // wall-clock trigger. The plan it installs is committed in the state root
+    // (`commitment::governance_digest`), so a node that skips (or duplicates)
+    // the execution can no longer hide behind an identical root.
+    // -----------------------------------------------------------------------
+
+    /// Execute every due upgrade action at this block's height.
+    ///
+    /// Pure function of committed governance state + `block.height` (the
+    /// governance verdict is re-derived inside
+    /// [`crate::governance::Governance::execute_due_upgrades_at_height`]); no
+    /// env reads, no wall clock, no node-local input. Gated by
+    /// `crate::governance::upgrade_exec_active_at(block.height)`:
+    /// pre-activation (the `u64::MAX` default) this returns BEFORE taking any
+    /// lock or reading any state, so the block leaves the commitment
+    /// generation — and therefore the state root — byte-identical.
+    ///
+    /// The read-only fast path skips the write lock when nothing is due, which
+    /// is what an ordinary block (and every replay of an already-executed
+    /// upgrade) hits: no generation bump, identical root.
+    pub async fn apply_upgrade_execution(
+        &self,
+        block: &crate::sharding::Block,
+    ) -> crate::governance::UpgradeExecOutcome {
+        use crate::governance::{upgrade_exec_active_at, UpgradeExecOutcome};
+        if !upgrade_exec_active_at(block.height) {
+            return UpgradeExecOutcome::default();
+        }
+        // Read-only pre-check with the guard scoped to its own statement: no
+        // due action means no write lock and no generation bump.
+        let due = self.governance_read().await.has_due_upgrade(block.height);
+        if !due {
+            return UpgradeExecOutcome::default();
+        }
+        let mut gov = self.governance_write().await;
+        let out = gov
+            .execute_due_upgrades_at_height(block.height, crate::consensus::consensus_chain_id());
+        if !out.refused.is_empty() {
+            // The individual reasons are already logged loudly by the sweep;
+            // this line names the height once so an operator can grep the block
+            // and see that the state root did NOT move for these proposals.
+            tracing::error!(
+                "upgrade execution at height {}: {} of {} matured upgrade action(s) REFUSED, no plan installed (proposals stay Passed)",
+                block.height,
+                out.refused.len(),
+                out.checked,
+            );
         }
         out
     }

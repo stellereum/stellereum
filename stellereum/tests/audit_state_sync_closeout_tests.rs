@@ -573,7 +573,12 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         e.staking_write().await.bond(w, W_POWER, 0).unwrap();
         // Native legs the transition touches (else debits fail — ignored but
         // counted — and the test would pin noise instead of economics).
-        e.update_account(AccountState::new(STAKING_POOL, u64::MAX / 2))
+        // A REALISTIC pool balance: the global supply cap now folds the
+        // pre-mined genesis allocation into one counter, so prefunding the pool
+        // with `u64::MAX / 2` counted as genesis and exhausted the 1B cap — the
+        // reward was then (correctly) refused and this economics pin measured
+        // nothing. 10x the validator bond is ample for the scenario.
+        e.update_account(AccountState::new(STAKING_POOL, 10 * MIN_VALIDATOR_BOND))
             .await;
         e.update_account(AccountState::new(REWARDS_POOL, 0)).await;
         e.update_account(AccountState::new(v, 1_000_000)).await;

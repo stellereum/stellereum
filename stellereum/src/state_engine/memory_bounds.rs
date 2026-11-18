@@ -573,11 +573,21 @@ impl super::InMemoryStateEngine {
         self.set_total_minted_from_snapshot(total_minted_nano);
         // Phase 2 (commit): all chunks are known-good; install.
         // The replay sets below are CLEARED (a committed domain), so this
-        // is a domain bump, not a bare global one.
+        // is a domain bump, not a bare global one - and BOTH committed
+        // domains move, exactly as in the monolithic `restore_snapshot`.
         self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+        self.bump_domain_generation(crate::commitment::Domain::Xpc);
         self.cross_shard_consumed.write().await.clear();
         self.cross_shard_produced.write().await.clear();
         self.cross_shard_completed.write().await.clear();
+        // Audit F11: the §9 2PC records are a committed replay set too and are
+        // rebuilt away with the trie below, so a chunked REORG restore must
+        // clear them exactly like `restore_snapshot` does. Leaving them behind
+        // keeps a stale PREPARED record whose state-trie leaf no longer exists,
+        // so a peer's COMMIT can still land for a transfer whose source debit
+        // was reorged away - a latent double-mint.
+        // (The `_preserve_replay_sets` twin below deliberately keeps them.)
+        self.cross_shard_xpc.write().await.clear();
         // The penalty travels with the state; install it BEFORE the
         // accounts lock (documented lock order: penalty -> accounts).
         *self.consensus_penalty.write().await = penalty;

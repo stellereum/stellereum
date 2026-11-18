@@ -877,3 +877,124 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
         "survivor-only QC must verify against the rotated set"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pentest F7 regression: a downtime jail has a live, fail-closed exit.
+// ---------------------------------------------------------------------------
+
+/// The ledger's unjail path is reachable for a real downtime jail: refused one
+/// height before `release_height`, accepted exactly at it, and refused again
+/// once the record is gone (missing jail). The same checks gate the live
+/// `SysCallUnjail` carrier (see `tests/pentest_state_wave.rs`), which calls
+/// this primitive with `block.height`.
+#[test]
+fn downtime_jail_release_is_fail_closed_then_reachable() {
+    use stellereum::staking::{
+        StakingLedger, DEFAULT_COMMISSION_BPS, DOWNTIME_MISS_THRESHOLD, JAIL_RELEASE_DELAY_HEIGHTS,
+    };
+    let mut l = StakingLedger::new();
+    let v = [0xF7u8; 32];
+    l.bond(v, 2_000 * 1_000_000_000, DEFAULT_COMMISSION_BPS)
+        .unwrap();
+
+    let mut jailed_at = 0;
+    for h in 0..DOWNTIME_MISS_THRESHOLD as u64 {
+        l.note_missed_heights(h, &|_| false, &[v]);
+        if l.is_jailed(&v) {
+            jailed_at = h;
+        }
+    }
+    let rec = l.jail_record(&v).expect("downtime slash must jail");
+    assert_eq!(rec.jailed_at_height, jailed_at);
+    assert_eq!(rec.release_height, jailed_at + JAIL_RELEASE_DELAY_HEIGHTS);
+
+    // One height early: refused, nothing changes.
+    assert_eq!(
+        l.unjail(v, rec.release_height - 1),
+        Err(stellereum::staking::StakingError::CooldownNotElapsed)
+    );
+    assert!(l.is_jailed(&v));
+    // At the release height: accepted and back in the set.
+    l.unjail(v, rec.release_height).unwrap();
+    assert!(!l.is_jailed(&v));
+    assert!(l.to_validator_set().contains(&v));
+    // Missing jail record: refused (the live carrier surfaces this as a revert).
+    assert_eq!(
+        l.unjail(v, rec.release_height + 1),
+        Err(stellereum::staking::StakingError::NotJailed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pentest F6 regression: an exit recorded in the evidence block is still in
+// the set the NEXT block's `last_qc` is attributed against.
+// ---------------------------------------------------------------------------
+
+/// The ledger records a full exit at height 9 with its PRE-EXIT power.
+/// Applying block 10 with a genuine height-9 QC that verifies only under the
+/// set INCLUDING that power must still slash the exiting validator (0.1% of
+/// the pending unbonding) and jail it. Without the attribution-set fix the
+/// pre-transition set is `{witness}` only, the slash is 0 and no jail exists.
+#[tokio::test]
+async fn recorded_full_exit_is_still_attributed_on_the_block_path() {
+    use stellereum::consensus::VoteSet;
+    use stellereum::staking::{BPS_DENOMINATOR, DOWNTIME_SLASH_BPS, STAKING_POOL};
+
+    let (ks, _fks) = keys(2);
+    let w = ks[0].verifying_key().to_bytes();
+    let v = ks[1].verifying_key().to_bytes();
+    let fk_w = fk_for(&ks[0]);
+
+    let e = InMemoryStateEngine::new();
+    let w_power = 10 * floor();
+    let v_power = 2 * floor();
+    e.staking_write().await.bond(w, w_power, 0).unwrap();
+    e.staking_write().await.bond(v, v_power, 0).unwrap();
+    e.credit_native(&STAKING_POOL, 10 * floor()).await.unwrap();
+    // Victim is one miss short of the threshold.
+    {
+        let mut l = e.staking_write().await;
+        l.validators.get_mut(&v).unwrap().missed = stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1;
+        l.validators.get_mut(&v).unwrap().last_downtime_penalty = 0;
+        // Height 9: the victim FULLY unbonds and the block apply records the
+        // exit with the power it held at height 9's start.
+        l.unbond(v, v_power, 1_000).unwrap();
+        l.record_full_exits_at(&[(v, v_power)], 9);
+    }
+    // Pre-state for block 10 no longer contains the victim; the attribution
+    // set must add it back.
+    let live = e.staking_read().await.to_validator_set();
+    assert!(!live.contains(&v));
+    let mut at_9 = live.clone();
+    at_9.add(v, v_power);
+    assert!(at_9.contains(&v));
+
+    // Genuine height-9 precommit QC signed by the witness alone. It carries
+    // quorum power under `at_9` (witness is >2/3) and NOT under `live`.
+    let vote = falcon_votes::fvote(&ks[0], &fk_w, 9, 0, VoteKind::Precommit, None);
+    assert!(vote.verify());
+    let mut vs = VoteSet::new();
+    vs.add(vote, &at_9, 9, 0, VoteKind::Precommit).unwrap();
+    let qc = vs
+        .certificate_with_parent(None, &at_9, Some(&[0u8; 32]))
+        .expect("witness-alone quorum under the height-9 set");
+    assert!(qc.verify(&at_9));
+    assert!(
+        !qc.verify(&live),
+        "the QC must NOT verify under the post-exit set (proves the fixture)"
+    );
+
+    let root = e.get_state_root().await;
+    let mut blk = mkblock(&ks[0], 10, [0u8; 32], root);
+    blk.last_qc = Some(qc);
+    blk.validator_signatures.clear();
+    blk.sign_block_with_falcon(&ks[0], &fk_for(&ks[0]));
+    let out = e.apply_block_transition(&blk, 0).await;
+
+    let expected = v_power * DOWNTIME_SLASH_BPS / BPS_DENOMINATOR;
+    assert_eq!(out.slashed, expected, "the H-1 miss is attributed");
+    let l = e.staking_read().await;
+    assert_eq!(l.validators[&v].total_slashed, expected);
+    assert_eq!(l.validators[&v].missed, 0, "slash reset the deficit");
+    assert!(l.is_jailed(&v), "the exit cannot escape the jail");
+}

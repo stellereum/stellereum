@@ -227,6 +227,20 @@ pub(crate) enum Commands {
     },
     /// Network discovery and connectivity guide
     Network,
+    /// Inspect the software-upgrade halt marker (read-only).
+    ///
+    /// Prints the exact marker file, the plan's halt height and target
+    /// version, the version this binary reports, and whether the running
+    /// binary satisfies the plan. The node's own startup guard makes the same
+    /// comparison against the local finalized head before it joins consensus
+    /// (`docs/UPGRADE_AND_RECOVERY.md` §1.2.3/§1.2.4). This command NEVER
+    /// edits or clears the marker.
+    UpgradeStatus {
+        /// Marker file to inspect (default: $STELL_UPGRADE_HALT_MARKER, else
+        /// ./data/upgrade-halt.marker)
+        #[arg(long)]
+        marker: Option<PathBuf>,
+    },
     /// Node identity keys for validator/observer onboarding (one-command join).
     ///
     /// Uses the SAME `load_or_generate` mechanism as `run`, so keys created
@@ -330,6 +344,44 @@ pub(crate) enum WalletCommands {
         /// Print the raw JSON-RPC responses
         #[arg(long, default_value_t = false)]
         verbose: bool,
+    },
+    /// Re-admit a downtime-jailed validator (SysCallUnjail, pentest F7)
+    ///
+    /// Signs ONE PQ transaction carrying an optional `SysCallStake` top-up
+    /// followed by `SysCallUnjail`, and submits it to a node. The block
+    /// applies the unjail at its own height: it succeeds only at/after
+    /// `release_height` AND with the self-bond back at MIN+buffer. A missing
+    /// jail record, a sender/validator mismatch, a thin bond or an early
+    /// release all fail closed (the jail stays); the CLI cannot bypass any of
+    /// them.
+    Unjail {
+        /// Falcon-512 seed in hex (32 bytes) of the validator signing key
+        #[arg(long)]
+        falcon_seed: String,
+        /// Validator address in hex. Defaults to the signer's own address
+        /// (only that key may unjail itself).
+        #[arg(long)]
+        validator: Option<String>,
+        /// Optional self-bond top-up in nano-STELL (1 STELL = 1e9 nano).
+        /// Emitted BEFORE the unjail in the same payload; it must satisfy the
+        /// same governed minimum as any `SysCallStake`.
+        #[arg(long)]
+        top_up: Option<u64>,
+        /// JSON-RPC endpoint to submit to
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit nonce; by default the account's current nonce is queried
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Only print the signed transaction instead of submitting it
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Print the raw JSON-RPC responses
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+        /// Write-API token, when the node has one configured
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Delegate Session Key for autonomous AI trading bots
     DelegateSession {

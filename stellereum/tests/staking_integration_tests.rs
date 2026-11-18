@@ -495,3 +495,73 @@ async fn runtime_governance_flow_is_on_chain() {
     let applied = rt.gov_execute(ids[0], id).unwrap();
     assert_eq!(applied.block_reward, Some(stell(9)));
 }
+
+// ---------------------------------------------------------------------------
+// Pentest F8/F9 regressions: cumulative downtime deficit + bounded delegators.
+// ---------------------------------------------------------------------------
+
+/// A signed certificate earns ONE recovery credit and never resets the
+/// downtime counter, so 9 misses + 1 vote accumulates and eventually slashes
+/// and jails. (F8)
+#[test]
+fn downtime_deficit_accumulates_across_single_votes() {
+    use stellereum::staking::{BPS_DENOMINATOR, DOWNTIME_SLASH_BPS};
+    let mut l = StakingLedger::new();
+    let v = [0xD8u8; 32];
+    l.bond(v, stell(1_100), DEFAULT_COMMISSION_BPS).unwrap();
+
+    // 9 misses + 1 vote per cycle; stop at the jail.
+    for h in 0..200u64 {
+        let signed = h % 10 == 9;
+        l.note_missed_heights(h, &|id| signed && *id == v, &[v]);
+        if l.is_jailed(&v) {
+            break;
+        }
+    }
+    let rec = &l.validators[&v];
+    assert!(rec.total_slashed > 0, "10% uptime must not be free");
+    assert!(l.is_jailed(&v));
+    let expected = stell(1_100) * DOWNTIME_SLASH_BPS / BPS_DENOMINATOR;
+    assert_eq!(rec.total_slashed, expected);
+    assert_eq!(l.validators[&v].missed, 0, "the slash resets the deficit");
+}
+
+/// The per-validator delegation count is capped; a new position over the cap
+/// is refused, but a different validator and existing-position top-ups work.
+/// (F9)
+#[test]
+fn delegation_cap_is_per_validator() {
+    use stellereum::staking::{StakingError, MAX_DELEGATORS_PER_VALIDATOR, MIN_DELEGATION};
+    let mut l = StakingLedger::new();
+    let v = [0xD9u8; 32];
+    let w = [0xDAu8; 32];
+    l.bond(v, stell(1_100), DEFAULT_COMMISSION_BPS).unwrap();
+    l.bond(w, stell(1_100), DEFAULT_COMMISSION_BPS).unwrap();
+
+    let cap = MAX_DELEGATORS_PER_VALIDATOR;
+    for i in 0..cap {
+        let mut d = [0u8; 32];
+        d[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        d[31] = 0xD1;
+        l.delegate(d, v, MIN_DELEGATION).unwrap();
+    }
+    assert_eq!(l.delegation_count(&v), cap);
+    assert_eq!(
+        l.delegate([0xEEu8; 32], v, MIN_DELEGATION),
+        Err(StakingError::DelegationCapReached)
+    );
+    // Another validator has its own budget.
+    l.delegate([0xEFu8; 32], w, MIN_DELEGATION).unwrap();
+    assert_eq!(l.delegation_count(&w), 1);
+    // Topping up an existing position is not a new position.
+    let existing = *l.delegations.keys().find(|(val, _)| *val == v).unwrap();
+    l.delegate(existing.1, v, MIN_DELEGATION).unwrap();
+    assert_eq!(l.delegation_count(&v), cap);
+    // Redelegation cannot bypass the cap by shuttling a position onto a full
+    // validator (F9 covers both entry paths).
+    assert_eq!(
+        l.redelegate([0xEFu8; 32], w, v, MIN_DELEGATION, 0),
+        Err(StakingError::DelegationCapReached)
+    );
+    assert_eq!(l.delegation_count(&v), cap);
+}

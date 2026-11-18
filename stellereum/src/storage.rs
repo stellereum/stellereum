@@ -2362,6 +2362,73 @@ impl StakingLedgerV4 {
             validator_pq_keys: self.validator_pq_keys,
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
+            // Exact: pre-change bytes cannot carry a full-exit record (the
+            // recorder is applied per block and the map holds only the
+            // current + previous height), so empty is not a guess.
+            recent_full_exits: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Ledger shape written after the downtime-jail/commission/lock upgrade but
+/// BEFORE the forensic `recent_full_exits` map was appended (the pentest-F6
+/// attribution record: `validator -> (pre_exit_power, exit_height)`).
+///
+/// bincode has no field names and no "missing trailing field" rule, so those
+/// bytes do not decode as the current struct. NEVER written; `upgrade` fills
+/// the map EMPTY, which is EXACT: it only ever holds the current + previous
+/// block's exits, and a snapshot is taken at a block boundary (the next
+/// applied block repopulates it before any evidence is judged).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StakingLedgerV5 {
+    pub validators: HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorStake>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    pub rewards_pool: u64,
+    pub rewards_minted: u64,
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+    pub min_validator_bond: Option<u64>,
+    pub vesting_schedules:
+        std::collections::BTreeMap<[u8; 32], crate::tokenomics::TeamVestingSchedule>,
+    pub reward_accumulators:
+        HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorRewardState>,
+    pub delegator_reward_checkpoints: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
+    pub jail: HashMap<crate::consensus::ValidatorId, crate::staking::JailRecord>,
+    pub commission_schedule:
+        HashMap<crate::consensus::ValidatorId, crate::staking::CommissionSchedule>,
+    pub redelegation_lock: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+}
+
+impl StakingLedgerV5 {
+    pub fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedger {
+            validators: self.validators,
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            reward_accumulators: self.reward_accumulators,
+            delegator_reward_checkpoints: self.delegator_reward_checkpoints,
+            jail: self.jail,
+            commission_schedule: self.commission_schedule,
+            redelegation_lock: self.redelegation_lock,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            equivocation_dedup: self.equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+            vesting_schedules: self.vesting_schedules,
+            min_validator_bond: self.min_validator_bond,
+            recent_full_exits: HashMap::new(),
         }
     }
 }
@@ -2387,6 +2454,45 @@ pub struct DomainSnapshotV7 {
 }
 
 impl DomainSnapshotV7 {
+    pub fn upgrade(self) -> DomainSnapshot {
+        DomainSnapshot {
+            tokens: self.tokens,
+            contracts: self.contracts,
+            orderbooks: self.orderbooks,
+            pmm: self.pmm,
+            pmm_usdt_token: self.pmm_usdt_token,
+            pmm_treasury: self.pmm_treasury,
+            order_escrow: self.order_escrow,
+            staking: self.staking.upgrade(),
+            governance: self.governance,
+            oracle: self.oracle,
+        }
+    }
+}
+
+/// Domain shape written immediately before the forensic `recent_full_exits`
+/// ledger map was appended (pentest F6). Identical to the current
+/// [`DomainSnapshot`] except the staking ledger is [`StakingLedgerV5`].
+///
+/// This is the fallback that keeps an EXISTING current-shape data dir
+/// bootable: without it the added trailing map makes bincode run off the end
+/// of the ledger into `governance`. Upgrade fills the map empty (exact — it
+/// only ever holds the current + previous block's exits).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DomainSnapshotV8 {
+    pub tokens: crate::token::TokenRegistry,
+    pub contracts: crate::contract::ContractRegistry,
+    pub orderbooks: crate::orderbook::OrderbookManager,
+    pub pmm: crate::pmm::PrimaryMarketMaker,
+    pub pmm_usdt_token: Option<[u8; 32]>,
+    pub pmm_treasury: [u8; 32],
+    pub order_escrow: HashMap<(u32, u64), crate::state_engine::EscrowRecord>,
+    pub staking: StakingLedgerV5,
+    pub governance: crate::governance::Governance,
+    pub oracle: crate::oracle::OracleState,
+}
+
+impl DomainSnapshotV8 {
     pub fn upgrade(self) -> DomainSnapshot {
         DomainSnapshot {
             tokens: self.tokens,
@@ -2609,6 +2715,16 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
     if let Ok(snap) = bincode::deserialize::<DomainSnapshot>(bytes) {
         return Ok(snap);
     }
+    // V8: current domains written before the forensic `recent_full_exits`
+    // ledger map was appended. Closest to the current shape, so tried first.
+    // The map is empty on upgrade, which is exact at a snapshot boundary (it
+    // only ever holds the current + previous block's exits).
+    if let Ok(v8) = bincode::deserialize::<DomainSnapshotV8>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-full-exit-record V8 staking state: the forensic recent-full-exit map starts EMPTY (exact — it is repopulated by the next applied block)"
+        );
+        return Ok(v8.upgrade());
+    }
     // LEGACY CONTRACTS + GOVERNANCE (the live-cluster shape): the contract
     // registry without the per-contract balance/ABI and without
     // `last_return_data`, and the applied params without `upgrade_plan`.
@@ -2684,7 +2800,7 @@ pub const DOMAIN_SNAPSHOT_STRICT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 ///
 /// Accepts ONLY the current [`DomainSnapshot`] shape, with trailing bytes
 /// rejected (same wire contract as `ConsensusMsg::decode`: fixint bincode,
-/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V7`, pre-ABI
+/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V8`, pre-ABI
 /// governance, pre-lazy ledgers) or unknown/future version is a hard `Err`
 /// naming the refusal — NO warn-and-upgrade fallback, NO silent skip.
 ///

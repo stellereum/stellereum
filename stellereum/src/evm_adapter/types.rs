@@ -64,8 +64,9 @@ pub const NET_LISTENING: bool = true;
 /// Peer count hex string ("0x2").
 /// TESTNET-KNOWN default, not a live measurement: the stateless free function
 /// has no peer table handle. Live callers use the stateful [`EvmAdapter`]
-/// (`with_peer_count`) instead. `RpcState` likewise carries no peer count, so
-/// `net_peerCount` through `rpc::dispatch` honestly returns this default.
+/// (`with_peer_count`) or the process-wide observed count
+/// (`rpc::note_peer_count` / `rpc::observed_peer_count`) instead — the
+/// `rpc::dispatch` arm serves THAT, never this default (F8).
 pub const NET_PEER_COUNT: &str = "0x2";
 
 /// Default connected peer count integer (2).
@@ -140,7 +141,8 @@ pub const SELECTOR_TOTAL_SUPPLY: &str = "18160ddd";
 pub const SELECTOR_TRANSFER: &str = "a9059cbb";
 pub const SELECTOR_APPROVE: &str = "095ea7b3";
 pub const SELECTOR_ALLOWANCE: &str = "dd62ed3e";
-pub const SELECTOR_TRANSFER_FROM: &str = "23b87266";
+/// EIP-20 `transferFrom(address,address,uint256)`.
+pub const SELECTOR_TRANSFER_FROM: &str = "23b872dd";
 
 pub const SELECTOR_NAME_HEX: &str = "0x06fdde03";
 pub const SELECTOR_SYMBOL_HEX: &str = "0x95d89b41";
@@ -150,7 +152,8 @@ pub const SELECTOR_TOTAL_SUPPLY_HEX: &str = "0x18160ddd";
 pub const SELECTOR_TRANSFER_HEX: &str = "0xa9059cbb";
 pub const SELECTOR_APPROVE_HEX: &str = "0x095ea7b3";
 pub const SELECTOR_ALLOWANCE_HEX: &str = "0xdd62ed3e";
-pub const SELECTOR_TRANSFER_FROM_HEX: &str = "0x23b87266";
+/// EIP-20 `transferFrom(address,address,uint256)`.
+pub const SELECTOR_TRANSFER_FROM_HEX: &str = "0x23b872dd";
 
 /// Time-to-live for idle filters in seconds (300s = 5 min, Geth-compatible).
 /// A filter that has not been polled via `eth_getFilterChanges` / `eth_getFilterLogs`

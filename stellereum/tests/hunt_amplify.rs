@@ -377,7 +377,10 @@ fn repeated_slashing_cannot_underflow_the_delegated_aggregate() {
 /// money. Recorded here so the next reader does not retry it.
 #[test]
 fn slash_silently_forgives_the_rounding_remainder() {
-    for n_delegators in [2u16, 3, 7, 4_000, 40_000] {
+    // The per-validator delegation count is BOUNDED now
+    // (`MAX_DELEGATORS_PER_VALIDATOR`), so the sweep stops at the cap: the
+    // rounding question is about the slash walk, not about unbounded growth.
+    for n_delegators in [2u16, 3, 7, 4_000] {
         let mut l = StakingLedger::new();
         let val = v(1);
         l.bond(val, floor(), 0).unwrap();

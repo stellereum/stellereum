@@ -250,9 +250,18 @@ impl ValidatorRuntime {
             }
         }
         let set = self.validator_set_for_height(parent_h);
-        let signed = set.qc_signed_power(qc);
-        let required = set.quorum_power();
-        if signed < required {
+        // SAME VERDICT AS APPLY (PENTEST F-2): `apply_downtime_slash_with_set`
+        // accepts evidence only after `cert.verify(val_set)`. The gate used to
+        // use attribution (`qc_signed_power`, no verify) instead, so an
+        // over-cap `last_qc` carrying a genuine quorum passed the gate and was
+        // then silently skipped by apply: any proposer could suppress the
+        // downtime attribution for a height. Attribution is now capped (F-1),
+        // but the two paths must not merely agree on this input class — they
+        // must share ONE verdict. `qc.verify` is that verdict; attribution is
+        // consulted only to name the shortfall in the refusal message.
+        if !qc.verify(&set) {
+            let signed = set.qc_signed_power(qc);
+            let required = set.quorum_power();
             crate::metrics::global().inc_weak_qc_refused();
             return Err(format!(
                 "proposal: downtime evidence carries only {signed} of {required} required power at height {parent_h}"
@@ -262,7 +271,11 @@ impl ValidatorRuntime {
             if g.len() > 1024 {
                 g.clear();
             }
-            g.insert(bh, (true, signed));
+            // `verify` is the authoritative verdict (same one apply uses).
+            // Do NOT run attribution again just to fill a readout number: no
+            // caller reads the second tuple element, and a second Falcon pass
+            // per proposal is exactly the CPU cost the cap work removed.
+            g.insert(bh, (true, 0));
         }
         Ok(())
     }
@@ -282,6 +295,44 @@ impl ValidatorRuntime {
         self.last_decision
             .as_ref()
             .and_then(|(dh, _, qc)| if *dh == h { Some(qc.clone()) } else { None })
+    }
+
+    /// SHARD SCOPE, shared by every entry point that can apply a block.
+    ///
+    /// In a multi-shard process each consensus instance only accepts blocks
+    /// for its own shard, and only transactions it OWNS (`source_shard ==
+    /// this shard`). That covers same-shard transfers and OUTBOUND cross-shard
+    /// transfers; the destination receives value through a committed
+    /// consumption record, never through `transactions`. Single-shard mode
+    /// skips all of this, so the historical masterchain blocks that carry
+    /// source=1/target=1 txs still validate.
+    ///
+    /// PENTEST F-7 (LOW): `adopt_committed` re-implements a subset of
+    /// proposal validation and had no shard gate, so a quorum-signed foreign
+    /// block was applied to this shard's state while both siblings (proposal
+    /// and the body walk) refused it. One helper keeps the three entry points
+    /// on one rule.
+    pub(super) fn check_block_shard_scope(&self, block: &Block) -> Result<(), String> {
+        if !self.shard_registry.is_sharded() {
+            return Ok(());
+        }
+        if block.shard_id != self.shard_id {
+            return Err(format!(
+                "proposal: wrong shard {} (expected {})",
+                block.shard_id, self.shard_id
+            ));
+        }
+        if let Some(bad) = block
+            .transactions
+            .iter()
+            .find(|t| !crate::sharding::tx_belongs_to_shard(t, self.shard_id))
+        {
+            return Err(format!(
+                "proposal: transaction targets shard {} not {}",
+                bad.source_shard, self.shard_id
+            ));
+        }
+        Ok(())
     }
 
     /// Round-INDEPENDENT proposal checks: everything `validate_proposal` verifies
@@ -309,35 +360,15 @@ impl ValidatorRuntime {
         // with skewed clocks disagree about the same block), and there is no
         // grace or skip path — a bad or unresolvable timestamp is refused.
         self.check_block_timestamp(block)?;
-        // SHARD SCOPE (gated): in a multi-shard process each consensus instance
-        // only accepts blocks for its own shard, and only transactions it OWNS
-        // (`source_shard == this shard`). That covers same-shard transfers and
-        // OUTBOUND cross-shard transfers; the destination receives value through
-        // a committed consumption record, never through `transactions`.
-        // Single-shard mode skips all of this, so the historical masterchain
-        // blocks that carry source=1/target=1 txs still validate.
+        // SHARD SCOPE (gated): see `check_block_shard_scope` for the rule and
+        // the F-7 note (the same helper now gates the adopt path).
+        self.check_block_shard_scope(block)?;
+        // Cross-shard commit consistency: every OUTBOUND message must name a
+        // transaction actually in this block (so the debit happens), and
+        // every INBOUND consumption record must prove inclusion against the
+        // source root and must not be a replay of a message already
+        // credited on this chain.
         if self.shard_registry.is_sharded() {
-            if block.shard_id != self.shard_id {
-                return Err(format!(
-                    "proposal: wrong shard {} (expected {})",
-                    block.shard_id, self.shard_id
-                ));
-            }
-            if let Some(bad) = block
-                .transactions
-                .iter()
-                .find(|t| !crate::sharding::tx_belongs_to_shard(t, self.shard_id))
-            {
-                return Err(format!(
-                    "proposal: transaction targets shard {} not {}",
-                    bad.source_shard, self.shard_id
-                ));
-            }
-            // Cross-shard commit consistency: every OUTBOUND message must name a
-            // transaction actually in this block (so the debit happens), and
-            // every INBOUND consumption record must prove inclusion against the
-            // source root and must not be a replay of a message already
-            // credited on this chain.
             for msg in &block.cross_shard_out {
                 if msg.is_outbound_for(self.shard_id) {
                     if msg.is_xpc() {
@@ -919,7 +950,10 @@ impl ValidatorRuntime {
         // time, the dedup only covers replays). Each step is a signed,
         // attributable vote and the per-round jump budget caps the rate; a
         // quorum gate on the FIRST step would break behind-node catch-up, so
-        // the +8 unilateral nudge stays by design.
+        // the +8 unilateral nudge stays by design. The per-HEIGHT budget
+        // (`MAX_PEER_ROUND_ADVANCE_PER_HEIGHT`, PENTEST F-9) caps the
+        // cumulative drift, so a trickle of such votes can no longer walk the
+        // node out of the re-phase scan window however many timeouts it burns.
         //
         // The bounds are otherwise unchanged in aggregate: at most
         // MAX_SYNC_JUMPS_PER_ROUND capped jumps per call (the documented
@@ -2093,6 +2127,12 @@ impl ValidatorRuntime {
         if block.height != height {
             return Err("block height does not match the commit".to_string());
         }
+        // SHARD SCOPE (PENTEST F-7): adopt is the third entry point that can
+        // apply a block, and it must enforce the same rule the proposal path
+        // (`check_block_shard_scope`) and the body walk enforce. A quorum can
+        // exist for a foreign block in a misconfigured/overlapping set; without
+        // this gate that block is applied to THIS shard's state.
+        self.check_block_shard_scope(&block)?;
         // SECURITY: the certificate must be a COMMIT certificate. `certificate.kind`
         // was never read, and `QuorumCertificate::verify` signs over the
         // certificate's own fields, so a PREVOTE quorum verified just as well.

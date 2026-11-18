@@ -894,6 +894,20 @@ impl ValidatorRuntime {
             }
         }
         if let Some((locked_hash, _)) = self.hc.locked {
+            // PENTEST P1 (liveness): a lock may name a body ANOTHER validator
+            // authored (we locked on their proposal). Re-proposing it under our
+            // slot is refused by every peer (`block.proposer` no longer matches
+            // the schedule), wasting the whole round. Only OUR OWN body may be
+            // re-proposed; otherwise fall through to fresh selection, which
+            // still votes for the locked value through the lock rule.
+            // LOCK RESCUE (protocol-critical, NOT a bug): the locked value is
+            // re-proposed VERBATIM even when another validator authored it.
+            // Peers locked on that value vote it, and validation accepts it
+            // through `proposer_matches_schedule` against the QC round, so a
+            // body authored earlier in the height is legal in a later round.
+            // Substituting our own body would abandon a value the network is
+            // locked on — `sim_nil_grace_tests` shows the failure directly
+            // (nodes vote NIL instead of VALUE and the height churns).
             if let Some(body) = self.blocks.get(&locked_hash).cloned() {
                 // Info when bypassing a non-empty pool (audit: blocks
                 // troubles): locked re-proposals skip fresh selection, so an

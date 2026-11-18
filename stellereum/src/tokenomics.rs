@@ -19,11 +19,15 @@ use serde::{Deserialize, Serialize};
 /// Hard cap on all STELL that can ever exist, in nano-STELL (9 decimals).
 ///
 /// ENFORCED IN THE ENGINE: `InMemoryStateEngine` keeps a minted-supply counter
-/// that every POST-GENESIS mint goes through (`mint_native`, rewards, bridge,
-/// faucet drips) and fails closed one nano past this cap. The genesis
-/// allocation itself is PRE-MINTED (fixed by [`TokenAllocation`]) and is not
-/// counted, so the counter starts at zero and `assemble_cached_digest_*`
-/// stays byte-identical on a chain that has not minted anything yet.
+/// that every value-creating path goes through (`mint_native`, rewards, bridge
+/// deposits, PMM buys) and fails closed one nano past this cap. The GENESIS
+/// allocation (fixed by [`TokenAllocation`]: validators, staking pool, faucet)
+/// is folded into the SAME counter on the first post-genesis reservation, so
+/// `genesis + emission ≤ TOTAL_SUPPLY_CAP` is one invariant, checked in one
+/// place. Before that first reservation the counter is zero, which keeps
+/// `assemble_cached_digest_*` byte-identical on a chain that has not minted
+/// anything yet (the pinned genesis root). NOTE: a genesis allocation above
+/// this cap therefore refuses every later mint — fail closed by design.
 pub const TOTAL_SUPPLY_CAP: u64 = 1_000_000_000 * 1_000_000_000; // in nano-STELL (9 decimals)
 pub const GENESIS_VAULT_CAP: u64 = 250_000_000 * 1_000_000_000;
 pub const BASE_STELL_PRICE_MICRO_USD: u64 = 250_000; // $0.25 USD (6 decimals)

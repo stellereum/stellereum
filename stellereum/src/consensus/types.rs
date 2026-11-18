@@ -695,6 +695,38 @@ impl ValidatorSet {
         }
     }
 
+    /// Sum of the set's voting power, computed EXACTLY in `u128`.
+    ///
+    /// The per-validator powers are `u64` and the set is small (tens of
+    /// members), so `u128` can never overflow. This is the value quorum
+    /// accounting must use: [`Self::total_power`] saturates for wire/config
+    /// representability, and a saturated SUM is not a valid denominator for a
+    /// 2/3 threshold.
+    pub fn total_power_exact(&self) -> u128 {
+        self.validators.values().map(|&p| p as u128).sum()
+    }
+
+    /// True when [`Self::total_power_exact`] fits in `u64`, i.e. every
+    /// saturated power sum in this module is the TRUE sum.
+    ///
+    /// PENTEST F-6 (LOW): a set whose true total exceeds `u64::MAX` (four
+    /// validators at `2^63`) saturates at `u64::MAX`; `quorum_power` then
+    /// understates the real 2/3 threshold, and attribution
+    /// (`qc_signed_power`/`qc_meets_quorum`) accepted a 2-of-4 minority that
+    /// the exact `u128` verifier refuses. Such a set is an absurd
+    /// configuration (total supply above `u64::MAX`), so it is REFUSED at
+    /// the quorum-accounting boundary rather than silently weakened.
+    pub fn power_total_representable(&self) -> bool {
+        self.total_power_exact() <= u64::MAX as u128
+    }
+
+    /// Sum of the set's voting power, saturating at `u64::MAX`.
+    ///
+    /// Saturating is deliberate for display/serialization, but a saturated
+    /// total is NOT a usable quorum denominator when it differs from the true
+    /// sum. Use [`Self::total_power_exact`] for consensus math and gate on
+    /// [`Self::power_total_representable`] (as [`Self::qc_meets_quorum`] and
+    /// [`Self::quorum_power`] do).
     pub fn total_power(&self) -> u64 {
         self.validators
             .values()
@@ -706,8 +738,15 @@ impl ValidatorSet {
     ///
     /// FREEZE (protocol freeze 2026-11-03): quorum accounting is frozen core.
     /// Change requires spec update + audit note (AGENTS.md §7).
+    ///
+    /// EXACT TOTAL (PENTEST F-6): the threshold is computed over the `u128`
+    /// total, so it is the TRUE 2/3 even when `total_power()` saturates. When
+    /// the true total does not fit `u64` the quorum is unrepresentable and
+    /// this returns `u64::MAX` (fail closed); [`Self::qc_meets_quorum`] also
+    /// refuses such a set outright, so the `u64::MAX` value cannot be met by
+    /// a saturated attribution sum.
     pub fn quorum_power(&self) -> u64 {
-        let total = self.total_power();
+        let total = self.total_power_exact();
         if total == 0 {
             // An empty or zero-power validator set must never reach quorum.
             //
@@ -722,7 +761,11 @@ impl ValidatorSet {
             // says so, instead of running with no consensus in it.
             return u64::MAX;
         }
-        consensus_quorum_min(total)
+        if total > u64::MAX as u128 {
+            // True total above u64::MAX: no representable quorum exists.
+            return u64::MAX;
+        }
+        consensus_quorum_min(total as u64)
     }
 
     pub fn contains(&self, id: &ValidatorId) -> bool {
@@ -759,8 +802,14 @@ impl ValidatorSet {
     /// bare [`QuorumCertificate::verify`] at every decision boundary: it is
     /// the same check with the numbers attached, so a refusal can name the
     /// shortfall instead of just saying "no quorum".
+    ///
+    /// FAIL CLOSED ON AN UNREPRESENTABLE TOTAL (PENTEST F-6): when the true
+    /// power total exceeds `u64::MAX`, both the quorum and the attribution sum
+    /// saturate, and comparing two saturated numbers cannot prove a real 2/3.
+    /// Such a set has no representable quorum, so the answer is `false`
+    /// (matching the exact `u128` verifier, which also refuses).
     pub fn qc_meets_quorum(&self, qc: &QuorumCertificate) -> bool {
-        self.qc_signed_power(qc) >= self.quorum_power()
+        self.power_total_representable() && self.qc_signed_power(qc) >= self.quorum_power()
     }
 
     /// Cumulative voting power a quorum certificate carries under this set,
@@ -774,12 +823,16 @@ impl ValidatorSet {
     }
 
     /// True when `qc` carries quorum power under this set using [`Self::qc_signed_power_with_beacon`].
+    ///
+    /// Same unrepresentable-total fail-closed rule as [`Self::qc_meets_quorum`]
+    /// (PENTEST F-6).
     pub fn qc_meets_quorum_with_beacon(
         &self,
         qc: &QuorumCertificate,
         beacon: Option<&EpochBeacon>,
     ) -> bool {
-        self.qc_signed_power_with_beacon(qc, beacon) >= self.quorum_power()
+        self.power_total_representable()
+            && self.qc_signed_power_with_beacon(qc, beacon) >= self.quorum_power()
     }
 
     fn qc_signed_power_with_beacon_inner(
@@ -1538,6 +1591,15 @@ impl QuorumCertificate {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> bool {
+        // AMBIGUITY FAILS CLOSED (PENTEST F-4): `binds_to_parent` pins the
+        // µQC parent, while the loop below accepts ANY verifying envelope. If
+        // the markers disagree about the sortition parent, the two would
+        // describe different committees, so the certificate is refused before
+        // either verdict can disagree. A repeated identical marker still
+        // resolves and is handled by the loop unchanged.
+        if self.resolve_micro_certificate().is_err() {
+            return false;
+        }
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
@@ -1998,14 +2060,55 @@ impl QuorumCertificate {
         self.signatures.push((PQ_UQC_MARKER_ID, payload));
     }
 
-    /// Retrieve the post-quantum micro-certificate (µQC) from this QuorumCertificate, if present.
-    pub fn pq_micro_certificate(&self) -> Option<PqMicroCertificate> {
+    /// Resolve the single µQC this certificate carries, refusing AMBIGUITY.
+    ///
+    /// PENTEST F-4 (LOW): `pq_micro_certificate` used to return the FIRST
+    /// decodable `PQ_UQC_MARKER_ID` entry, while `pq_path_verify_with_beacon`
+    /// accepted ANY verifying envelope. A QC carrying a decoy µQC (elected
+    /// with the correct parent) followed by a genuine µQC elected with
+    /// another parent therefore had `binds_to_parent` inspect the decoy and
+    /// `verify` inspect the genuine one: the parent pin described a
+    /// certificate that was not the one that verified.
+    ///
+    /// Every decodable µQC marker must name the SAME `sortition_parent` (a
+    /// repeated identical marker is harmless and still resolves), otherwise
+    /// the certificate is ambiguous and is refused as a whole (`Err`).
+    /// An over-cap signer list is refused here too, so binding cannot walk an
+    /// unbounded attacker-supplied list before `verify`'s cap runs.
+    fn resolve_micro_certificate(&self) -> Result<Option<PqMicroCertificate>, ()> {
+        if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
+            return Err(());
+        }
+        let mut found: Option<PqMicroCertificate> = None;
         for (voter, payload) in &self.signatures {
-            if *voter == PQ_UQC_MARKER_ID {
-                return decode_pq_micro_envelope(payload);
+            if *voter != PQ_UQC_MARKER_ID {
+                continue;
+            }
+            // An undecodable marker can never verify (both the canonical and
+            // the bincode decode are tried by `decode_pq_micro_envelope`), so
+            // it carries no committee and is ignored — exactly as it
+            // contributes nothing to verification or attribution.
+            let Some(cert) = decode_pq_micro_envelope(payload) else {
+                continue;
+            };
+            match &found {
+                None => found = Some(cert),
+                Some(first) if first.sortition_parent != cert.sortition_parent => return Err(()),
+                Some(_) => {}
             }
         }
-        None
+        Ok(found)
+    }
+
+    /// Retrieve the post-quantum micro-certificate (µQC) from this
+    /// QuorumCertificate, if present.
+    ///
+    /// `None` when the certificate carries no µQC OR carries ambiguous µQC
+    /// markers (see [`Self::resolve_micro_certificate`]). Callers that need to
+    /// distinguish "no µQC" from "ambiguous" use [`Self::binds_to_parent`],
+    /// which fails closed on ambiguity.
+    pub fn pq_micro_certificate(&self) -> Option<PqMicroCertificate> {
+        self.resolve_micro_certificate().ok().flatten()
     }
 
     /// The parent block hash this certificate's sortition committee was
@@ -2028,10 +2131,18 @@ impl QuorumCertificate {
     /// A certificate WITHOUT a µQC has no committee and is therefore not
     /// bound by this rule (it must clear the stricter full-set quorum of the
     /// classical path instead).
+    ///
+    /// AMBIGUITY FAILS CLOSED (PENTEST F-4): a certificate carrying µQC
+    /// markers that name different sortition parents is refused (`false`)
+    /// rather than bound to whichever marker happened to come first. The
+    /// verifier refuses the same certificate (see
+    /// [`Self::resolve_micro_certificate`]), so binding and verification can
+    /// never describe different committees.
     pub fn binds_to_parent(&self, parent_hash: &[u8; 32]) -> bool {
-        match self.sortition_parent() {
-            Some(p) => &p == parent_hash,
-            None => true,
+        match self.resolve_micro_certificate() {
+            Err(()) => false,
+            Ok(Some(cert)) => &cert.sortition_parent == parent_hash,
+            Ok(None) => true,
         }
     }
 
@@ -2090,6 +2201,25 @@ impl QuorumCertificate {
         beacon: Option<&EpochBeacon>,
         cnvrf_v3_active: bool,
     ) -> HashSet<ValidatorId> {
+        // ANTI-DoS (pentest P1): `verify` already rejects an implausibly long
+        // signer list BEFORE touching crypto, but ATTRIBUTION (`signers_set` /
+        // `qc_signed_power` / `qc_meets_quorum`) walked the attacker-supplied
+        // marker list unconditionally: 4,100 markers cost ~921 ms on the
+        // proposal gate and ~971 ms in the sync refusal path, and a QC is
+        // excluded from `compute_hash`, so a public block could be re-served
+        // with a giant forged certificate WITHOUT any validator key. The same
+        // cap now gates attribution: an over-limit list attributes NOBODY,
+        // which is exactly the fail-closed verdict `verify` reaches.
+        if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
+            return HashSet::new();
+        }
+        // AMBIGUITY FAILS CLOSED (PENTEST F-4): attribution must describe the
+        // same µQC `verify`/`binds_to_parent` resolve. Markers naming
+        // different sortition parents attribute NOBODY, matching the
+        // verifier's refusal for the same input.
+        if self.resolve_micro_certificate().is_err() {
+            return HashSet::new();
+        }
         let mut signers = HashSet::new();
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
         for (voter, payload) in &self.signatures {

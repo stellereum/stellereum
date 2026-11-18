@@ -6091,7 +6091,18 @@ impl Node {
             }
             return plain;
         }
+        // AGGREGATE CAP (pentest F3): the chunk loop used to grow `buf` with no
+        // total bound and with an OPTIONAL per-chunk hash, so one small manifest
+        // could make the node allocate unbounded memory (an OOM primitive
+        // reachable from any DHT peer). Bound the assembled blob and require
+        // every chunk to carry a hash.
+        const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
         let mut buf: Vec<u8> = Vec::new();
+        let chunk_count = manifest["chunks"].as_array().map(|c| c.len()).unwrap_or(0);
+        if chunk_count > 65536 {
+            eprintln!("[node] fetch_blob {name}: manifest claims {chunk_count} chunks, refusing");
+            return None;
+        }
         if let Some(chunks) = manifest["chunks"].as_array() {
             for c in chunks {
                 let cid = c["id"].as_str().unwrap_or("");
@@ -6158,14 +6169,25 @@ impl Node {
                         }
                     }
                 }
-                // проверка целостности: хэш чанка должен совпасть с манифестом (подмена?)
-                if let Some(expected) = c["hash"].as_str() {
-                    if let Some(g) = &got {
-                        let actual = hex::encode(blake3::hash(g).as_bytes());
-                        if !actual.eq_ignore_ascii_case(expected) {
-                            eprintln!("[node] chunk tamper: {cid} in {name} (hash mismatch)");
-                            got = None;
-                        }
+                // Integrity is MANDATORY: a chunk without a manifest hash is
+                // refused (an attacker could otherwise hand over arbitrary
+                // bytes with no verification).
+                let Some(expected) = c["hash"].as_str() else {
+                    eprintln!("[node] fetch_blob {name}: chunk {cid} has no hash, refusing");
+                    return None;
+                };
+                {
+                    let g = got.as_ref()?;
+                    let actual = hex::encode(blake3::hash(g).as_bytes());
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        eprintln!("[node] chunk tamper: {cid} in {name} (hash mismatch)");
+                        return None;
+                    }
+                    if buf.len().saturating_add(g.len()) > MAX_BLOB_BYTES {
+                        eprintln!(
+                            "[node] fetch_blob {name}: assembled blob exceeds {MAX_BLOB_BYTES} bytes, refusing"
+                        );
+                        return None;
                     }
                 }
                 buf.extend_from_slice(&got?);
@@ -7286,6 +7308,21 @@ async fn handle_stream(
                 return Err(e);
             }
         };
+        // ADDRESS GATE (pentest F1): a CHALLENGE is only meaningful to the node
+        // it names. Without this check an attacker could RELAY a captured
+        // victim-signed CHALLENGE to a third node, which would burn the
+        // victim's one-shot nonce and insert routing/session state for material
+        // the victim never sent us — the victim's own dial then fails as
+        // "challenge replay" for the whole nonce window. Checked BEFORE any TOFU
+        // registration, nonce claim or route insert so a misaddressed frame
+        // leaves no trace.
+        // `dst == 0` is the "destination id unknown" form a dialer uses when it
+        // only has an address (and the legacy test harness shape); a NON-ZERO
+        // dst must name this node. A relayed victim challenge always carries
+        // the victim's intended target, so it dies here.
+        if f.dst != [0u8; NODEID_LEN] && f.dst != node.id {
+            bail!("challenge not addressed to this node");
+        }
         // Рамочный ts — ДО любых side-эффектов (регистрация TOFU-пира,
         // сессии, маршруты): протухший кадр не оставляет следов.
         if !ts_ok(f.ts) {
@@ -7577,6 +7614,21 @@ async fn handle_stream(
 
     match f.kind {
         proto::kind::PING => {
+            // PENTEST F4: PING used to bypass the per-peer rate limiter, so a
+            // pinned peer with a budget still had an unlimited CPU path (every
+            // frame pays one Falcon verify). The limiter now covers the cheap
+            // control frame as well; an over-budget PING is dropped without a
+            // PONG (the peer retries at its own pace).
+            if f.dst != node.id {
+                bail!("not addressed to me");
+            }
+            {
+                let rate = peer.cfg.rate_limit_per_sec;
+                if !peer.rate.lock().await.allow(rate) {
+                    node.rep_record_rate_violation(&pid).await;
+                    return Ok(None);
+                }
+            }
             // F8-rep: valid, authentic message from the proven identity.
             node.rep_record_valid(&pid).await;
             let mut r = Frame {

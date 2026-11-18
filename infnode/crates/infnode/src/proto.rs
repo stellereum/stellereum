@@ -136,6 +136,63 @@ const HDR: usize = 68;
 /// is no classical frame path in FULL-PQ.
 pub const FRAME_VERSION: u8 = 2;
 
+/// Frame versions this build can speak, as a closed range. Today the range is
+/// exactly `[2, 2]` (FULL-PQ is a flag day), but the negotiation helper below
+/// is written against a RANGE so widening it later is a constant change, not a
+/// new handshake.
+pub const FRAME_VERSION_MIN: u32 = FRAME_VERSION as u32;
+/// See [`FRAME_VERSION_MIN`].
+pub const FRAME_VERSION_MAX: u32 = FRAME_VERSION as u32;
+
+/// Pure frame-version negotiation: highest version in
+/// `[peer_min, peer_max] ∩ [FRAME_VERSION_MIN, FRAME_VERSION_MAX]`, or `None`
+/// when the ranges are disjoint (no common version: the peers cannot talk).
+///
+/// Picking the HIGHEST common version is the conventional rule (newer wins
+/// when both sides support it); because this build supports exactly one
+/// version today, the result is `Some(2)` iff the peer's range contains 2.
+pub fn negotiate_frame_version(peer_min: u32, peer_max: u32) -> Option<u32> {
+    if peer_min > peer_max {
+        return None;
+    }
+    let lo = peer_min.max(FRAME_VERSION_MIN);
+    let hi = peer_max.min(FRAME_VERSION_MAX);
+    (lo <= hi).then_some(hi)
+}
+
+/// Operator-facing diagnosis for a frame whose version byte is not ours:
+/// "peer speaks vX, we speak vY — coordinated upgrade required".
+///
+/// A mixed-version cluster fails closed FRAME BY FRAME (`Frame::decode`
+/// refuses any byte other than [`FRAME_VERSION`]) with no other
+/// operator-visible signal, so the decoder emits exactly one of these lines
+/// per process (see [`report_frame_version_mismatch`]).
+pub fn frame_version_mismatch_line(peer_version: u8) -> String {
+    let common = negotiate_frame_version(u32::from(peer_version), u32::from(peer_version))
+        .map(|v| format!("v{v}"))
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "[infnode] frame version mismatch: peer speaks v{peer_version}, we speak v{FRAME_VERSION} \
+         — coordinated upgrade required (supported range v{FRAME_VERSION_MIN}..=v{FRAME_VERSION_MAX}, \
+         common version: {common})"
+    )
+}
+
+/// Print [`frame_version_mismatch_line`] at most ONCE per process and return
+/// it. `Frame::decode` calls this from the version-mismatch branch; the
+/// `Once` is what keeps a mixed-version peer from flooding the log with one
+/// line per rejected frame (a busy node rejects thousands per second).
+///
+/// Side effect in a decoder is deliberate: the decode error itself carries the
+/// stable string callers already match on, and without this line the operator
+/// sees only silent fail-closed isolation.
+pub fn report_frame_version_mismatch(peer_version: u8) -> String {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    let line = frame_version_mismatch_line(peer_version);
+    REPORTED.call_once(|| eprintln!("{line}"));
+    line
+}
+
 impl Frame {
     /// Exact wire length of `encode()` output: prefix + payload + nonce +
     /// `sig_len` u16 + Falcon tag.
@@ -263,6 +320,10 @@ impl Frame {
         };
         // version check (v1 = classical Ed25519 trailer: refused, no fallback)
         if b[0] != FRAME_VERSION {
+            // ONE operator-visible line per process (never one per frame);
+            // the decode error string itself stays exactly what callers
+            // already match on.
+            report_frame_version_mismatch(b[0]);
             bail!("unsupported version (classical frame refused)");
         }
         // не допускаем переполнения индексов для нечётких пакетов

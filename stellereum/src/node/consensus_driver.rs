@@ -2883,7 +2883,27 @@ pub(crate) async fn run_consensus_node(
                     .upgrade_plan
                     .clone();
                 if let Some(plan) = upgrade_plan {
-                    if plan.height == height {
+                    // MISSED-EVENT SAFETY: `==` made the halt an EVENT — a node
+                    // that was offline at the plan height, or that restarted
+                    // past it, never fired and kept running the pre-upgrade
+                    // rules while reporting healthy (the silent straggler,
+                    // `docs/UPGRADE_AND_RECOVERY.md` §1.2.3). The predicate is
+                    // `height >= plan.height`: the first block this node
+                    // finalizes at/after the halt height halts it, and a late
+                    // fire is LOUD because it means the node ran past the
+                    // coordinated halt height.
+                    if plan.height <= height {
+                        if plan.height < height {
+                            tracing::warn!(
+                                "[upgrade] LATE halt at height {}: plan '{}' was scheduled at \
+                                 height {} and this node finalized past it (offline at the halt, \
+                                 or restarted after it). Halting now instead of continuing on the \
+                                 pre-upgrade rules.",
+                                height,
+                                plan.name,
+                                plan.height
+                            );
+                        }
                         info!(
                             "[upgrade] UPGRADE TRIGGERED at height {}: plan name='{}', target sha256={}",
                             height, plan.name, hex::encode(plan.sha256)
@@ -2894,6 +2914,82 @@ pub(crate) async fn run_consensus_node(
                             let ledger = rt.staking_read().await.clone();
                             let gov = rt.governance.clone().unwrap_or_default();
                             ap.snapshot_domains(&rt.state, &ledger, &gov, height).await;
+                        }
+
+                        // DRAIN BEFORE EXIT (docs/UPGRADE_AND_RECOVERY.md
+                        // §1.2.4): `request_flush` + the snapshot calls only
+                        // ENQUEUE jobs, and `std::process::exit(42)` skips the
+                        // SIGTERM drain, so the writer could still be holding
+                        // the final blocks/snapshots when the process dies.
+                        // Await the same bounded helper the SIGTERM path uses
+                        // (240 s cap + 10 s settle) — BOUNDED, so a dead disk
+                        // delays the halt but can never hang it.
+                        if let Some(ap) = &persistence {
+                            let outcome = crate::node::bootstrap::upgrade_halt::drain_for_halt(
+                                || ap.pending(),
+                                stellereum::storage::ShutdownDrainConfig::default(),
+                            )
+                            .await;
+                            if outcome.drained {
+                                info!(
+                                    "[upgrade] persistence drained (queue empty) before the \
+                                     upgrade halt at height {height}"
+                                );
+                            } else {
+                                tracing::error!(
+                                    "[upgrade] halt drain CAP reached with {} persist job(s) still \
+                                     queued (wedged writer or dead disk); halting anyway — the \
+                                     drain is bounded and the loss window is the pre-upgrade queue",
+                                    outcome.last_pending
+                                );
+                            }
+                        }
+
+                        // DURABLE HALT MARKER (closes the missed-event hole):
+                        // a node that is offline at the halt height (or that
+                        // restarts past it) never runs the finalize lane at
+                        // `plan.height`, so the halt itself must be a
+                        // PREDICATE on disk, not only an event. Written after
+                        // the drain (so it is never the only thing that
+                        // survived a torn flush) and BEFORE any `execve`, so
+                        // the NEW image's startup guard can validate and clear
+                        // it. `target_version` is the plan's name: the upgraded
+                        // binary proves it by matching the plan sha256 or by
+                        // declaring STELL_UPGRADE_VERSION=<plan name>.
+                        {
+                            let marker_path = crate::node::bootstrap::upgrade_halt::marker_path();
+                            let marker = crate::node::bootstrap::upgrade_halt::UpgradeHaltMarker {
+                                height: plan.height,
+                                halted_at_height: height,
+                                plan_name: plan.name.clone(),
+                                plan_sha256: plan.sha256,
+                                target_version: plan.name.clone(),
+                                running_version:
+                                    crate::node::bootstrap::upgrade_halt::running_version(),
+                                halted_unix: now_secs(),
+                            };
+                            let marker_written = crate::node::bootstrap::upgrade_halt::write_marker(
+                                &marker_path,
+                                &marker,
+                            );
+                            if let Err(e) = marker_written {
+                                tracing::error!(
+                                    "[upgrade] FAILED to write the halt marker {:?}: {e} — the \
+                                     node still halts, but a restart cannot prove it is halted; \
+                                     the finalize-lane predicate fires again on the next height",
+                                    marker_path
+                                );
+                            } else {
+                                info!(
+                                    "[upgrade] halt marker written to {:?} (plan '{}' at height \
+                                     {}, target version '{}'): a restarted node refuses to join \
+                                     consensus until the upgraded binary is running",
+                                    marker_path,
+                                    marker.plan_name,
+                                    marker.height,
+                                    marker.target_version
+                                );
+                            }
                         }
 
                         // LIVE MIGRATION ARMING (audit W8.3 / production

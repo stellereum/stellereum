@@ -578,7 +578,15 @@ impl VoteSet {
             }
             return Ok(()); // keep the first vote
         }
-        *self.power.entry(vote.block_hash).or_insert(0) += power;
+        // PENTEST F-5 (LOW): saturating like every other consensus sum
+        // (`total_power`, `qc_signed_power`, the verifiers). The raw `+=`
+        // panicked in debug and wrapped in release for absurd configured
+        // powers; a wrapped account can understate a quorum (liveness stall)
+        // or, worse, clear one it never reached. Saturation can only
+        // undercount, and `ValidatorSet::qc_meets_quorum` now refuses a set
+        // whose true total is unrepresentable (PENTEST F-6).
+        let entry = self.power.entry(vote.block_hash).or_insert(0);
+        *entry = entry.saturating_add(power);
         self.votes.insert(vote.voter, vote);
         Ok(())
     }
@@ -668,11 +676,18 @@ impl VoteSet {
     }
 
     pub fn quorum_reached(&self, target: Option<BlockHash>, validators: &ValidatorSet) -> bool {
-        self.power_for(target) >= validators.quorum_power()
+        // PENTEST F-6: an unrepresentable power total has no representable
+        // quorum; a saturated account must never clear a saturated threshold.
+        validators.power_total_representable()
+            && self.power_for(target) >= validators.quorum_power()
     }
 
     /// If any single target reached quorum, return it (nil is a valid outcome).
     pub fn quorum_target(&self, validators: &ValidatorSet) -> Option<Option<BlockHash>> {
+        // PENTEST F-6: same fail-closed rule as `quorum_reached`.
+        if !validators.power_total_representable() {
+            return None;
+        }
         let q = validators.quorum_power();
         for (target, p) in &self.power {
             if *p >= q {
@@ -1017,7 +1032,23 @@ pub struct HeightConsensus {
     /// At most this many jumps per ROUND (the budget resets on a view
     /// change); honest catch-up (a few jumps, then landing near stops
     /// further syncing) never notices.
+    ///
+    /// PENTEST F-9: the per-round reset is NOT the lifetime bound — see
+    /// [`Self::peer_round_advance_used`] and
+    /// [`MAX_PEER_ROUND_ADVANCE_PER_HEIGHT`].
     sync_jumps_used: u32,
+    /// Cumulative peer-driven round advance consumed at THIS height, in
+    /// rounds (PENTEST F-9).
+    ///
+    /// `sync_jumps_used` bounds a burst inside one round; this bounds the
+    /// LIFETIME of the height, because the per-round budget refills on every
+    /// `next_round`. Every forward move made by [`Self::sync_round_to`] —
+    /// the single choke point for peer round-following (vote path, drain,
+    /// phase alignment, deadlock bookkeeping) — consumes it, and
+    /// `next_round` never resets it. When the budget is exhausted, peer
+    /// votes stop moving the round; the node's own timeout path and the
+    /// corroborated deadlock breaker still can.
+    peer_round_advance_used: Round,
     /// Best-known round per peer at THIS height, learned from verified votes
     /// even when the vote itself is not votable (stale far-behind or absurd
     /// far-ahead). Voting still requires an exact-round vote in `VoteSet`;
@@ -1128,6 +1159,33 @@ pub struct HeightConsensus {
 /// single round's budget.
 pub const MAX_SYNC_JUMPS_PER_ROUND: u32 = 8;
 
+/// Cumulative peer-driven round advance allowed at ONE HEIGHT, in rounds.
+///
+/// PENTEST F-9 (HIGH liveness): the per-round budget above is reset by every
+/// local view change, so one Byzantine validator could ratchet an honest node
+/// by `MAX_SYNC_JUMPS_PER_ROUND * ROUND_LOOKBACK = 64` rounds per timeout,
+/// refill on `next_round`, and repeat for as long as it liked — after 100
+/// timeouts the node sat at round ~6500 against a network at ~100, far
+/// outside even [`REPHASE_SCAN_WINDOW`] (4096), with a forward-only counter
+/// and no way back except a restart.
+///
+/// This is the missing LIFETIME bound: peer-driven movement (every
+/// `sync_round_to` from a verified vote, phase alignment, or
+/// `observe_peer_round`) is capped cumulatively per height. The own-timeout
+/// path (`next_round`) does NOT consume this budget and is never blocked by
+/// it.
+///
+/// The value is HALF the widest re-phase scan window: the maximum peer-induced
+/// drift plus the node's own timeout drift still fits comfortably inside
+/// [`REPHASE_SCAN_WINDOW`], so the network's actual round remains visible to
+/// the widened quorum scan (`apply_deadlock_local_reset`) and can be
+/// committed without rewinding the round counter (rewinding would re-vote a
+/// round — a slashable self-equivocation). Honest catch-up is unaffected: the
+/// largest live desync this budget must cover is ~1232 rounds, and the
+/// corroborated deadlock breaker ([`MAX_DEADLOCK_JUMP`], 65 536) remains the
+/// escape hatch for anything larger.
+pub const MAX_PEER_ROUND_ADVANCE_PER_HEIGHT: Round = REPHASE_SCAN_WINDOW / 2;
+
 /// Absolute bound on ONE deadlock-breaker jump, in rounds.
 ///
 /// The breaker's whole job is to close a LARGE desync in ONE step (live
@@ -1217,6 +1275,7 @@ impl HeightConsensus {
             prevote_qc: HashMap::new(),
             precommit_qc: None,
             sync_jumps_used: 0,
+            peer_round_advance_used: 0,
             peer_rounds: HashMap::new(),
             scan_lookback: ROUND_LOOKBACK,
             rephase_applied: false,
@@ -1489,6 +1548,17 @@ impl HeightConsensus {
         let floor = anchor.saturating_sub(self.scan_lookback);
         let hard = self.round.saturating_sub(MAX_SCAN_SPAN);
         floor.max(hard).min(self.round)
+    }
+
+    /// True when the quorum scan currently reaches `round`, i.e. a vote set
+    /// retained at that round would be inspected by [`Self::rounds_to_inspect`].
+    ///
+    /// Read-only observability used by the liveness/residue tests and the
+    /// operator readout: after a re-phase it answers "can this node still see
+    /// the round the network is actually in?" without exposing the scan
+    /// internals. Never mutates consensus state.
+    pub fn scan_reaches(&self, round: Round) -> bool {
+        round >= self.scan_floor() && round <= self.round
     }
 
     /// Human-readable reasons finalization is currently blocked. Called when
@@ -1849,11 +1919,27 @@ impl HeightConsensus {
         // a MESSAGE BURST from ratcheting +8 per message without bound. Past
         // the per-round jump budget the sync is refused; the caller's own
         // view change advances us anyway and refills the budget.
+        //
+        // LIFETIME LIMIT (PENTEST F-9): the per-round budget above refills on
+        // every view change, so on its own it let one Byzantine validator
+        // ratchet an honest node +64 per timeout forever, off the end of every
+        // scan window. The cumulative per-height budget bounds the whole
+        // peer-driven drift; it is never reset by `next_round`.
         if self.sync_jumps_used >= MAX_SYNC_JUMPS_PER_ROUND {
             return;
         }
-        let target = round.min(self.round.saturating_add(ROUND_LOOKBACK));
+        let remaining =
+            MAX_PEER_ROUND_ADVANCE_PER_HEIGHT.saturating_sub(self.peer_round_advance_used);
+        if remaining == 0 {
+            return;
+        }
+        let target = round
+            .min(self.round.saturating_add(ROUND_LOOKBACK))
+            .min(self.round.saturating_add(remaining));
         if target > self.round {
+            self.peer_round_advance_used = self
+                .peer_round_advance_used
+                .saturating_add(target - self.round);
             self.round = target;
             self.step = Step::Propose;
             self.proposal = None;
@@ -1968,11 +2054,17 @@ impl HeightConsensus {
         // view-change backoff grows with the trouble this height is in (and
         // not with the absolute round number).
         self.timeouts = self.timeouts.saturating_add(1);
-        // A new round refills the peer-driven jump budget (see
+        // A new round refills the per-round peer-driven jump budget (see
         // `MAX_SYNC_JUMPS_PER_ROUND`): the runaway it guards is a burst
         // inside ONE round, and a node that has view-changed is starting a
         // fresh round in which following the network is exactly what it
         // should do.
+        //
+        // PENTEST F-9: the LIFETIME bound (`peer_round_advance_used`, see
+        // `MAX_PEER_ROUND_ADVANCE_PER_HEIGHT`) is deliberately NOT reset
+        // here. Resetting both budgets on every timeout is exactly the
+        // ratchet: one liar buys +64 per view change, forever, and the
+        // round counter never comes back.
         self.sync_jumps_used = 0;
         self.step = Step::Propose;
         self.proposal = None;

@@ -1590,6 +1590,9 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             choice,
             ..
         } => format!("gov-vote id={proposal_id} choice={choice:?}"),
+        Op::SysCallUnjail { validator } => {
+            format!("unjail validator={}", hex::encode(validator))
+        }
         Op::Reserved33ConfidentialTransfer(_)
         | Op::Reserved40ConfidentialTransfer2(_)
         | Op::Reserved41ConfidentialShield(_)

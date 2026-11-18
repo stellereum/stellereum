@@ -383,8 +383,18 @@ impl InMemoryStateEngine {
     /// transaction path, not here). Each credit requires the message's Merkle
     /// inclusion proof against the source state root — the local `trusted`
     /// shortcut is IGNORED because the flag is part of attacker-supplied block
-    /// content. The replay key is inserted only after the credit succeeds, so a
-    /// duplicate cannot mint a second time.
+    /// content.
+    ///
+    /// ATOMIC PER ENGINE (audit F3): the replay key is CLAIMED with one
+    /// `HashSet::insert` under the `cross_shard_consumed` write lock BEFORE the
+    /// credit, and the claim is rolled back only if the credit itself refuses.
+    /// `insert` is the linearization point: of N concurrent consumptions of the
+    /// same message exactly one observes "absent -> present" and only that one
+    /// proceeds to the credit, so the message is credited exactly once. The
+    /// previous order (check -> credit -> insert) let every overlapping apply
+    /// observe "absent" and credit, i.e. free native STELL per duplicate.
+    /// The claim is taken AFTER the cryptographic checks so a forged/not-ready
+    /// message never touches the committed set.
     ///
     /// Recording rules (all deterministic functions of the block, hence
     /// identical on every node that applied it):
@@ -392,8 +402,9 @@ impl InMemoryStateEngine {
     ///   first height wins - the same predicate the runtime uses, recorded
     ///   BEFORE the inbound pass so same-block linkage reads it, exactly like
     ///   the runtime's apply order;
-    /// * consumed (transfers): unchanged - proof-checked credit, key inserted
-    ///   only on success;
+    /// * consumed (transfers): the replay key is CLAIMED (atomic insert) before
+    ///   the credit and released only if the credit refuses, so exactly one
+    ///   concurrent consumer credits and the key is present iff it was paid;
     /// * consumed + completed (acks/bounces): the runtime's linkage rule,
     ///   mirrored - proof-less, untrusted, produced entry known, lifecycle not
     ///   already complete, bounce past the height timeout - processed in the
@@ -555,10 +566,43 @@ impl InMemoryStateEngine {
             if !msg.verify_inclusion_strict() {
                 continue;
             }
-            if self.credit_native(&msg.tx.to, msg.tx.amount).await.is_err() {
+            // THE ATOMIC CLAIM (audit F3). `HashSet::insert` under the write
+            // lock is the single linearization point of "is this message
+            // already consumed": exactly one concurrent consumer can move the
+            // key from absent to present. Every other consumer sees `false`
+            // and skips BEFORE it can credit, so a duplicate never pays.
+            {
+                let mut consumed = self.cross_shard_consumed.write().await;
+                if !consumed.insert(key) {
+                    continue;
+                }
+            }
+            // THE CREDIT (audit F2): the value already existed on the source
+            // shard (it was debited/burned when the source block applied), so
+            // this is a TRANSFER of existing supply, not a mint. Using the
+            // capped `credit_native` here made a full global cap drop the
+            // credit (and, before F3, burn the message): an inbound transfer
+            // must never consume mint headroom and must never be refused for
+            // it. `credit_native_transfer` is the uncapped transfer primitive.
+            if let Err(e) = self.credit_native_transfer(&msg.tx.to, msg.tx.amount).await {
+                // Roll the claim back so the message stays replayable instead
+                // of being lost: the source debit is real, so the target must
+                // be able to credit it on a later apply. Only the consumer
+                // that won the claim above can remove it, so no concurrent
+                // winner's claim is ever dropped here.
+                self.cross_shard_consumed.write().await.remove(&key);
+                // The claim moved the committed replay domain and the rollback
+                // restored it, so the net state is unchanged; bump anyway so a
+                // digest cached INSIDE the claim window cannot be served for
+                // the restored set (the bump only keys the digest cache, it is
+                // not part of the digest, so an extra bump cannot fork).
+                self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+                tracing::warn!(
+                    "cross-shard inbound credit refused for {}: {e} (message left replayable)",
+                    hex::encode(&msg.msg_id[..8])
+                );
                 continue;
             }
-            self.cross_shard_consumed.write().await.insert(key);
             mutated = true;
             credited += 1;
         }
@@ -825,13 +869,34 @@ impl InMemoryStateEngine {
                 };
                 // THE credit. Only reachable from PREPARED, so the recipient
                 // is credited exactly once and never for an aborted transfer.
-                if self.credit_native(&tx.to, tx.amount).await.is_err() {
+                //
+                // ATOMICITY (audit F3, 2PC twin): `cross_shard_completed` is
+                // the atomic claim for this value movement. Two concurrent
+                // COMMIT applies can both read the same PREPARED record and
+                // both pass the transition check, so the insert below - not
+                // the read above - decides which one pays. A failed credit
+                // releases the claim so the decision stays replayable.
+                if !self.cross_shard_completed.write().await.insert(tx_hash) {
+                    return false;
+                }
+                // Audit F2: an inbound cross-shard credit moves value that the
+                // source already escrowed, so it is a TRANSFER, never a mint.
+                // The capped `credit_native` would drop it at the global cap.
+                if let Err(e) = self.credit_native_transfer(&tx.to, tx.amount).await {
+                    self.cross_shard_completed.write().await.remove(&tx_hash);
+                    // The claim moved a committed domain; a rollback must move
+                    // it again so a digest cached inside the window is not
+                    // served for the restored set.
+                    self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+                    tracing::warn!(
+                        "xpc commit credit refused for {}: {e} (decision left replayable)",
+                        hex::encode(&tx_hash[..8])
+                    );
                     return false;
                 }
                 rec.phase = XpcPhase::Committed;
                 rec.decided_height = height;
                 self.write_xpc_record(&rec).await;
-                self.cross_shard_completed.write().await.insert(tx_hash);
                 true
             }
             // TARGET side: the source asks us to abort. The proof is the
@@ -877,13 +942,30 @@ impl InMemoryStateEngine {
                 // THE refund: the escrow goes back to the sender, exactly
                 // once. A transfer that is already COMMITTED never reaches
                 // this arm (the transition is refused above).
-                if self.credit_native(&tx.from, tx.amount).await.is_err() {
+                //
+                // ATOMICITY (audit F3, refund twin): the `cross_shard_completed`
+                // insert is the claim, so two concurrent ABORT-ACK applies
+                // cannot both refund. Released on a failed credit.
+                if !self.cross_shard_completed.write().await.insert(tx_hash) {
+                    return false;
+                }
+                // Audit F2: the refund returns value the source already held
+                // (it was escrowed, not minted), so it is a TRANSFER and must
+                // not be refused at the global supply cap.
+                if let Err(e) = self.credit_native_transfer(&tx.from, tx.amount).await {
+                    self.cross_shard_completed.write().await.remove(&tx_hash);
+                    // See the COMMIT arm: a rolled-back claim must invalidate
+                    // any digest cached inside the claim window.
+                    self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+                    tracing::warn!(
+                        "xpc abort refund refused for {}: {e} (decision left replayable)",
+                        hex::encode(&tx_hash[..8])
+                    );
                     return false;
                 }
                 rec.phase = XpcPhase::Aborted;
                 rec.decided_height = height;
                 self.write_xpc_record(&rec).await;
-                self.cross_shard_completed.write().await.insert(tx_hash);
                 true
             }
             _ => false,

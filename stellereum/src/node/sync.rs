@@ -707,19 +707,25 @@ pub(crate) async fn walk_chain(
         return None;
     }
     let fetch_adapter = adapter.clone();
-    let mut blocks =
-        match stellereum::sync::collect_missing_blocks(peer_hash, our_last, walk_cap, move |h| {
+    let mut blocks = match stellereum::sync::collect_missing_blocks(
+        peer_hash,
+        our_last,
+        // `max_walk_gap()` is clamped to 256..=4096 (`node/policy.rs`), so the
+        // u64 -> usize conversion is lossless on every supported target.
+        walk_cap as usize,
+        move |h| {
             let a = fetch_adapter.clone();
             async move { a.fetch_block(&h).await }
-        })
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[sync] {e}");
-                return None;
-            }
-        };
+        },
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[sync] {e}");
+            return None;
+        }
+    };
     if blocks.is_empty() {
         return None;
     }

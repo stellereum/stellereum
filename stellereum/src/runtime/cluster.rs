@@ -438,7 +438,13 @@ impl ChainState {
                     continue;
                 }
                 if msg.is_bounce() {
-                    let _ = self.state.credit_native(&msg.tx.from, msg.tx.amount).await;
+                    // REDEEM, not mint: the value was debited at produce time,
+                    // so the capped mint path would drop the refund at the
+                    // supply cap (pentest P2 / F2 handoff).
+                    let _ = self
+                        .state
+                        .credit_native_transfer(&msg.tx.from, msg.tx.amount)
+                        .await;
                 }
             }
         }

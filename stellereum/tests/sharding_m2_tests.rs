@@ -245,6 +245,79 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
     );
 }
 
+/// REGRESSION (was F2 FINDING, high): an inbound cross-shard credit moves
+/// value the SOURCE shard already debited, so it must be a transfer of
+/// existing supply, never a mint. The old code credited through the capped
+/// `credit_native`; a target at the global cap refused the credit, never
+/// marked the message consumed and lost the value.
+///
+/// This drives the LIVE target path (`ShardedCluster::run_height`, i.e.
+/// `apply_block_transition`) with zero mint headroom: the recipient must still
+/// be credited exactly once, the mint counter must not move, and a later
+/// target height must not credit again.
+#[tokio::test]
+async fn inbound_credit_at_the_supply_cap_still_credits_on_the_live_target() {
+    use stellereum::tokenomics::TOTAL_SUPPLY_CAP;
+
+    let validator = key(50);
+    let sender_addr = pq_id(51);
+    let recipient_addr = key(52).verifying_key().to_bytes();
+    let amount = 250u64;
+    let gas = 5u64;
+
+    let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
+    let tx = pq_tx(51, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
+    sc.shard_mut(SHARD0).broadcast_tx(tx).await;
+    sc.run_height(SHARD0, 1).await;
+    assert_eq!(
+        balance(sc.shard(SHARD0), &sender_addr).await,
+        1_000 - amount - gas,
+        "precondition: the source already debited the amount"
+    );
+
+    // Exhaust the TARGET shard's global mint cap before it applies the block.
+    let target = sc.shard(SHARD1).nodes[0].state.clone();
+    let seeded = target.genesis_allocation_nano().await;
+    target
+        .mint_native(&[0xF9u8; 32], TOTAL_SUPPLY_CAP - seeded)
+        .await
+        .expect("fill the target's global cap");
+    assert_eq!(target.remaining_mint_headroom_nano(), 0);
+    let minted_before = target.total_minted_nano();
+
+    sc.run_height(SHARD1, 2).await;
+
+    assert_eq!(
+        balance(sc.shard(SHARD1), &recipient_addr).await,
+        amount,
+        "an inbound transfer must be credited at zero mint headroom"
+    );
+    assert_eq!(
+        target.total_minted_nano(),
+        minted_before,
+        "a transfer must not move the mint counter"
+    );
+    assert_eq!(
+        target.remaining_mint_headroom_nano(),
+        0,
+        "the credit consumed no headroom"
+    );
+    assert_eq!(
+        target.cross_shard_consumed_len().await,
+        1,
+        "replay set size matches the single credit"
+    );
+    assert!(
+        target.mint_native(&[0xFAu8; 32], 1).await.is_err(),
+        "real issuance stays refused at the cap"
+    );
+
+    // A later target height never credits the (already consumed) message again.
+    sc.run_height(SHARD1, 3).await;
+    assert_eq!(balance(sc.shard(SHARD1), &recipient_addr).await, amount);
+    assert_eq!(target.cross_shard_consumed_len().await, 1);
+}
+
 /// The replay proof, at the state-engine level: applying the SAME inbound
 /// message twice credits exactly once and never mints a second time. This is
 /// the guard that makes a rebuilding/caught-up shard deterministic.

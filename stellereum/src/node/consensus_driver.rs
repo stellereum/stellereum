@@ -15,6 +15,27 @@ use stellereum::sharding::ShardRegistry;
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::tokenomics::BLOCK_REWARD_NANO;
 
+/// Re-enter the inbound drain as a FULL proposal.
+///
+/// A compact proposal resolves into a complete `Block`. Handing it straight to
+/// `on_proposal` would duplicate the attribution, H+1 deferral, hint and vote
+/// machinery of the plain-Proposal arm. Instead the resolved block is encoded
+/// exactly like a wire `Proposal` and pushed back into the bounded deferred
+/// queue, so it is parsed, verified and handled by the ONE existing path —
+/// there is no second implementation to drift.
+fn encode_full_proposal_loopback(
+    block: &stellereum::sharding::Block,
+    round: u32,
+) -> Option<String> {
+    let msg = ConsensusMsg::Proposal {
+        height: block.height,
+        round,
+        block: block.clone(),
+    };
+    let bytes = msg.encode().ok()?;
+    Some(serde_json::json!({ "data": hex::encode(bytes) }).to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 // GATE: 15 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
 #[allow(unused_assignments)]
@@ -843,11 +864,17 @@ pub(crate) async fn run_consensus_node(
         std::collections::VecDeque::new();
     // Times an over-budget Batch was deferred (limiter pacing, not loss).
     let mut inbound_defer_count: u64 = 0;
-    // Compact-gossip frames refused by the inbound drain. Activation is frozen
-    // OFF (`COMPACT_GOSSIP_ACTIVATION_HEIGHT = u64::MAX`), so a compact frame
-    // is either a pre-activation probe or junk: refused LOUDLY and dropped,
-    // never reinterpreted as a full proposal.
+    // Compact gossip is ACTIVE from genesis. A frame that fails validation is
+    // counted and dropped LOUDLY — never reinterpreted as a full proposal.
     let mut inbound_compact_refused: u64 = 0;
+    // One long-lived receiver (parked resolutions bounded) and one body server
+    // (announced blocks bounded) per node.
+    let mut compact_rx = stellereum::consensus_net::CompactReceiver::new();
+    let mut compact_server = stellereum::consensus_net::CompactBodyServer::new();
+    // Resolved compact proposals re-enter the drain as FULL proposals; counted
+    // so a silent loopback failure is visible instead of a stalled round.
+    let mut compact_looped: u64 = 0;
+    let mut compact_served: u64 = 0;
     // Liveness probe timer (see probe_peers).
     let mut last_probe = std::time::Instant::now() - Duration::from_secs(60);
     // Mempool persistence timer (see the periodic save below).
@@ -1127,6 +1154,72 @@ pub(crate) async fn run_consensus_node(
         let (mut catchup_ran, mut retro_ran, mut probe_ran, mut join_ran) =
             (false, false, false, false);
         let mut outbox_flushes: u32 = 0;
+        // One settle path for a compact resolution (proposal AND body): every
+        // outcome is handled identically, so the two receive arms cannot drift.
+        macro_rules! settle_compact {
+            ($inbound:expr) => {{
+                match $inbound {
+                    stellereum::consensus_net::CompactInbound::Ready { round, block } => {
+                        // Re-enter the SAME drain as a full proposal: attribution,
+                        // H+1 deferral, hints, `on_proposal` and the vote all run
+                        // once, in the one place they are already correct.
+                        match encode_full_proposal_loopback(&block, round) {
+                            Some(raw) => {
+                                inbound_deferred.push_back((Instant::now(), raw));
+                                compact_looped += 1;
+                                if compact_looped == 1 {
+                                    info!(
+                                        "[consensus] compact gossip LIVE: first proposal resolved from the local mempool and re-entered the drain as a full proposal"
+                                    );
+                                }
+                            }
+                            None => tracing::warn!(
+                                "[consensus] compact gossip: resolved block #{} r{} could not be re-encoded for loopback",
+                                block.height,
+                                round,
+                            ),
+                        }
+                    }
+                    stellereum::consensus_net::CompactInbound::Pull(pull) => {
+                        enqueue_outbox(&mut outbox, ConsensusMsg::BodyPull { pull });
+                        flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
+                        outbox_flushes += 1;
+                        last_flush = std::time::Instant::now();
+                    }
+                    stellereum::consensus_net::CompactInbound::FetchFull {
+                        height,
+                        round,
+                        block_hash,
+                        reason,
+                    } => {
+                        // Never prevote a partial body: fall back to the plain
+                        // full-proposal fetch. A far-ahead announcement is real
+                        // catch-up evidence (the height above is the block's).
+                        tracing::warn!(
+                            "[consensus] compact gossip fell back to the full proposal #{} r{} ({reason:?})",
+                            height,
+                            round,
+                        );
+                        if height > rt.hc.height {
+                            let hint = (height.saturating_sub(1), block_hash);
+                            if rt.peer_hint.map(|(h, _)| h < hint.0).unwrap_or(true) {
+                                rt.peer_hint = Some(hint);
+                            }
+                            catchup_pending = true;
+                            peer_named_height = peer_named_height.max(height.saturating_sub(1));
+                        }
+                    }
+                    stellereum::consensus_net::CompactInbound::Refused(why) => {
+                        inbound_compact_refused += 1;
+                        if inbound_compact_refused % 20 == 1 {
+                            tracing::warn!(
+                                "[consensus] refused compact frame ({inbound_compact_refused} refused): {why}"
+                            );
+                        }
+                    }
+                }
+            }};
+        }
         // Per-section milliseconds for THIS tick (profiling only, no behavior
         // change): stamped next to each section and wired into the `[perf]
         // tick` line below, so a slow tick names its binding cost inline
@@ -1854,11 +1947,11 @@ pub(crate) async fn run_consensus_node(
                 let bh = block.compute_hash();
                 let ntx = block.transactions.len();
                 // P3-H4: enqueue; proposals carry bodies so they flush at once.
-                let msg = ConsensusMsg::Proposal {
-                    height,
-                    round,
-                    block,
-                };
+                // COMPACT GOSSIP: announce the compact header; the announced
+                // block stays servable for bounded body pulls. The full body
+                // still goes to the DHT for catch-up.
+                compact_server.remember(&block, round);
+                let msg = stellereum::consensus_net::proposal_gossip_msg(&block, round);
                 let large = msg.is_large();
                 enqueue_outbox(&mut outbox, msg);
                 if large {
@@ -2127,7 +2220,9 @@ pub(crate) async fn run_consensus_node(
                     // is catch-up proof, and the alarm watches live traffic).
                     if matches!(
                         msg,
-                        ConsensusMsg::Proposal { .. } | ConsensusMsg::Vote { .. }
+                        ConsensusMsg::Proposal { .. }
+                            | ConsensusMsg::CompactProposal { .. }
+                            | ConsensusMsg::Vote { .. }
                     ) {
                         last_consensus_rx_ms = liveness_alarm::now_ms();
                     }
@@ -2179,59 +2274,59 @@ pub(crate) async fn run_consensus_node(
                         // a panic. `ConsensusMsg::decode` already rejects them
                         // pre-activation; these arms are defense in depth for a
                         // frame that decoded while the gate says off.
+                        // COMPACT GOSSIP is ACTIVE. Resolve against the local
+                        // mempool; a complete resolution re-enters the drain as
+                        // a FULL proposal (one code path for every check); a
+                        // miss emits a BOUNDED pull; an unresolvable proposal
+                        // falls back to the plain full fetch.
                         ConsensusMsg::CompactProposal { proposal } => {
-                            inbound_compact_refused += 1;
-                            if inbound_compact_refused % 20 == 1 {
-                                tracing::warn!(
-                                    "[consensus] REFUSED compact proposal #{} r{} ({} short ids, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
-                                    proposal.height,
-                                    proposal.round,
-                                    proposal.short_ids.len(),
-                                    if stellereum::consensus_net::compact_gossip_active(
-                                        proposal.height
-                                    ) {
-                                        "receiver wiring not installed"
-                                    } else {
-                                        "gate inactive"
-                                    },
-                                );
-                            }
+                            let txs = rt.mempool.read().await.all();
+                            let inbound = compact_rx.on_proposal(proposal, txs);
+                            settle_compact!(inbound);
                         }
+                        // Serve missing txs for a block WE announced, from the
+                        // mempool only (never from arbitrary storage), bounded.
                         ConsensusMsg::BodyPull { pull } => {
-                            inbound_compact_refused += 1;
-                            if inbound_compact_refused % 20 == 1 {
-                                tracing::warn!(
-                                    "[consensus] REFUSED compact body pull #{} r{} ({} ids, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
-                                    pull.height,
-                                    pull.round,
-                                    pull.ids.len(),
-                                    if stellereum::consensus_net::compact_gossip_active(
-                                        pull.height
-                                    ) {
-                                        "receiver wiring not installed"
-                                    } else {
-                                        "gate inactive"
-                                    },
-                                );
+                            let txs = rt.mempool.read().await.all();
+                            match compact_server.serve(&pull, txs) {
+                                Ok(Some(body)) => {
+                                    enqueue_outbox(&mut outbox, ConsensusMsg::Body { body });
+                                    flush_outbox(
+                                        &net_sender,
+                                        &mut outbox,
+                                        rt.hc.height,
+                                        rt.hc.round,
+                                    );
+                                    outbox_flushes += 1;
+                                    last_flush = std::time::Instant::now();
+                                    compact_served += 1;
+                                    if compact_served == 1 {
+                                        info!(
+                                            "[consensus] compact gossip LIVE: first body pull served from the local mempool"
+                                        );
+                                    }
+                                }
+                                // We did not announce that block (or its ids
+                                // left the mempool): silence — the requester
+                                // falls back to the full proposal.
+                                Ok(None) => {}
+                                Err(why) => {
+                                    inbound_compact_refused += 1;
+                                    if inbound_compact_refused % 20 == 1 {
+                                        tracing::warn!(
+                                            "[consensus] refused compact body pull #{} r{}: {why}",
+                                            pull.height,
+                                            pull.round,
+                                        );
+                                    }
+                                }
                             }
                         }
+                        // Complete a parked resolution with the served body.
                         ConsensusMsg::Body { body } => {
-                            inbound_compact_refused += 1;
-                            if inbound_compact_refused % 20 == 1 {
-                                tracing::warn!(
-                                    "[consensus] REFUSED compact body #{} r{} ({} txs, {}): compact gossip is not active, message dropped ({inbound_compact_refused} refused)",
-                                    body.height,
-                                    body.round,
-                                    body.txs.len(),
-                                    if stellereum::consensus_net::compact_gossip_active(
-                                        body.height
-                                    ) {
-                                        "receiver wiring not installed"
-                                    } else {
-                                        "gate inactive"
-                                    },
-                                );
-                            }
+                            let txs = rt.mempool.read().await.all();
+                            let inbound = compact_rx.on_body(&body, txs);
+                            settle_compact!(inbound);
                         }
                         ConsensusMsg::Proposal {
                             round: r, block, ..
@@ -3625,11 +3720,8 @@ pub(crate) async fn run_consensus_node(
                     let round = rt.hc.round;
                     let bh = block.compute_hash();
                     let ntx = block.transactions.len();
-                    let msg = ConsensusMsg::Proposal {
-                        height,
-                        round,
-                        block,
-                    };
+                    compact_server.remember(&block, round);
+                    let msg = stellereum::consensus_net::proposal_gossip_msg(&block, round);
                     let large = msg.is_large();
                     enqueue_outbox(&mut outbox, msg);
                     if large {
@@ -3865,13 +3957,10 @@ pub(crate) async fn run_consensus_node(
             if rt.hc.has_live_proposal() {
                 if let Some((_, ph)) = rt.hc.proposal {
                     if let Some(b) = rt.blocks.get(&ph).cloned() {
+                        compact_server.remember(&b, rt.hc.round);
                         requeued |= enqueue_outbox(
                             &mut outbox,
-                            ConsensusMsg::Proposal {
-                                height: rt.hc.height,
-                                round: rt.hc.round,
-                                block: b,
-                            },
+                            stellereum::consensus_net::proposal_gossip_msg(&b, rt.hc.round),
                         );
                     }
                 }
@@ -3910,13 +3999,10 @@ pub(crate) async fn run_consensus_node(
                 let have_body = target.and_then(|h| rt.blocks.get(&h).cloned());
                 if let Some(body) = have_body {
                     let h = body.compute_hash();
+                    compact_server.remember(&body, rt.hc.round);
                     enqueue_outbox(
                         &mut outbox,
-                        ConsensusMsg::Proposal {
-                            height: rt.hc.height,
-                            round: rt.hc.round,
-                            block: body,
-                        },
+                        stellereum::consensus_net::proposal_gossip_msg(&body, rt.hc.round),
                     );
                     flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
                     outbox_flushes += 1;
@@ -4077,11 +4163,11 @@ pub(crate) async fn run_consensus_node(
                         if b.transactions.len() <= 32
                             && !outbox_has_proposal(&outbox, rt.hc.height, rt.hc.round)
                         {
-                            outbox.push_back(ConsensusMsg::Proposal {
-                                height: rt.hc.height,
-                                round: rt.hc.round,
-                                block: b,
-                            });
+                            compact_server.remember(&b, rt.hc.round);
+                            outbox.push_back(stellereum::consensus_net::proposal_gossip_msg(
+                                &b,
+                                rt.hc.round,
+                            ));
                             resent = true;
                         }
                     }

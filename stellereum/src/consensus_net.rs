@@ -2096,24 +2096,35 @@ pub mod compact_prop;
 /// height is still refused by admission regardless of this value.
 pub const COMPACT_GOSSIP_ACTIVATION_HEIGHT: u64 = 0;
 
-/// Test-only activation override (never set on the live path).
-///
-/// `u64::MAX` means "unset ⇒ use [`COMPACT_GOSSIP_ACTIVATION_HEIGHT`]". The
-/// compact-gossip suite drives the REAL emitter/decoder/receiver below a
-/// concrete gate through [`with_compact_gossip_gate`] (the production const
-/// is `0` and is never written). No production code path writes this
-/// (grep-proof: only the helper below and tests touch it), so the live gate
-/// remains the const.
-static COMPACT_GOSSIP_TEST_GATE: AtomicU64 = AtomicU64::new(u64::MAX);
+// Test-only activation override (never set on the live path).
+//
+// `u64::MAX` means "unset ⇒ use `COMPACT_GOSSIP_ACTIVATION_HEIGHT`". The
+// compact-gossip suite drives the REAL emitter/decoder/receiver below a
+// concrete gate through `with_compact_gossip_gate` (the production const
+// is `0` and is never written). No production code path writes this
+// (grep-proof: only the helper below and tests touch it), so the live gate
+// remains the const.
+thread_local! {
+    /// THREAD-LOCAL on purpose: the test matrix runs in parallel, and a
+    /// process-wide override let a below-gate test arm `u64::MAX` while an
+    /// unrelated test expected the production gate (`receiver_park_budget_is_
+    /// bounded` flaked exactly this way). A thread-local override cannot leak
+    /// into another test's thread; production never writes it.
+    static COMPACT_GOSSIP_TEST_GATE: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(u64::MAX)
+    };
+}
 
 /// Effective gate: the live const unless a test override is installed.
 fn compact_gossip_gate() -> u64 {
-    let over = COMPACT_GOSSIP_TEST_GATE.load(Ordering::SeqCst);
-    if over == u64::MAX {
-        COMPACT_GOSSIP_ACTIVATION_HEIGHT
-    } else {
-        over
-    }
+    COMPACT_GOSSIP_TEST_GATE.with(|g| {
+        let over = g.get();
+        if over == u64::MAX {
+            COMPACT_GOSSIP_ACTIVATION_HEIGHT
+        } else {
+            over
+        }
+    })
 }
 
 /// True once compact gossip (proposals and µQC) is live for `height`.
@@ -2140,14 +2151,15 @@ fn compact_gossip_admits(height: u64) -> bool {
 /// restored, so a panic inside `f` cannot leak an armed gate into the next
 /// test. The frozen production const is never written.
 pub fn with_compact_gossip_gate<T>(gate: u64, f: impl FnOnce() -> T) -> T {
-    static GATE_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = GATE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = COMPACT_GOSSIP_TEST_GATE.swap(gate, Ordering::SeqCst);
-    let out = f();
-    COMPACT_GOSSIP_TEST_GATE.store(previous, Ordering::SeqCst);
-    out
+    let previous = COMPACT_GOSSIP_TEST_GATE.with(|g| g.replace(gate));
+    // Restore even if `f` panics, so the override can never leak into a
+    // later assertion on this thread.
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    COMPACT_GOSSIP_TEST_GATE.with(|g| g.set(previous));
+    match out {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Encode a live QC as a compact gossip frame.

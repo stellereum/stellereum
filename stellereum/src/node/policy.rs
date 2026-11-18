@@ -762,10 +762,9 @@ pub(crate) fn outbox_has_proposal(
     round: u32,
 ) -> bool {
     outbox.iter().any(|m| {
-        matches!(
-            m,
-            ConsensusMsg::Proposal { height: h, round: r, .. } if *h == height && *r == round
-        )
+        // One predicate for BOTH proposal representations: COMPACT_GOSSIP is
+        // active, and a compact announcement occupies the same slot.
+        stellereum::consensus_net::proposal_gossip_height_round(m) == Some((height, round))
     })
 }
 
@@ -775,17 +774,8 @@ pub(crate) fn outbox_has_proposal(
 /// the receiver refuses stale rounds, so it can no longer form a quorum).
 /// Never true for votes, commits, or batches.
 pub(crate) fn is_superseded_proposal(msg: &ConsensusMsg, height: u64, round: u32) -> bool {
-    match msg {
-        ConsensusMsg::Proposal {
-            height: h,
-            round: r,
-            ..
-        } => {
-            *h != height
-                || r.saturating_add(stellereum::consensus_net::SUPERSEDED_ROUND_LAG) <= round
-        }
-        _ => false,
-    }
+    // Delegated so a compact announcement is pruned exactly like a full one.
+    stellereum::consensus_net::is_superseded_proposal(msg, height, round)
 }
 
 /// Flatten an inbound message for the drain (P3-H4): a `Batch` expands to its

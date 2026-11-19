@@ -120,14 +120,20 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     assert_eq!(hex::encode(block.compute_hash()), GOLDEN_BLOCK_HASH);
     // The shard-head set (TON `shard_hashes`), the TRANSACTION-ORDER
     // commitment, the EPOCH-KEY commitment, the canonical downtime-evidence
-    // slot (`last_qc`, W10.5) and the EPOCH-MMR root (V5 Tier-2) were APPENDED
-    // to the block layout: the legacy bytes are the untouched PREFIX of the
-    // encoding and the re-encoding adds exactly the empty shard-head set
-    // (8 bytes), the all-zero order root (32 bytes), the all-zero epoch-key
-    // commitment (32 bytes), the `None` downtime-evidence byte (1 byte) plus
-    // the all-zero epoch-MMR root (32 bytes). The HASH — the thing the chain
-    // agrees on — is unchanged: a legacy block commits to no order, to no
-    // epoch key and to no epoch MMR, so none of them is mixed into its hash.
+    // slot (`last_qc`, W10.5), the EPOCH-MMR root (V5 Tier-2) and the SIGNED
+    // ROUND (ruleset v4/v5) were APPENDED to the block layout: the legacy
+    // bytes are the untouched PREFIX of the encoding and the re-encoding adds
+    // exactly the empty shard-head set (8 bytes), the all-zero order root
+    // (32 bytes), the all-zero epoch-key commitment (32 bytes), the `None`
+    // downtime-evidence byte (1 byte), the all-zero epoch-MMR root (32 bytes),
+    // the `None` CN-VRF v3 payload byte (1 byte) and the round-0 `u32`
+    // (4 bytes). The HASH — the thing the chain agrees on — is unchanged: a
+    // legacy block commits to no order, no epoch key, no epoch MMR and no
+    // round, so none of them is mixed into its hash.
+    //
+    // The round IS appended, but round 0 is the canonical default and
+    // re-encodes byte-for-byte; strict WIRE decoding of the legacy body still
+    // FAILS CLOSED (the missing trailing field is not silently read as 0).
     let re = bincode::serialize(&block).unwrap();
     assert_eq!(
         &re[..raw_block.len()],
@@ -136,8 +142,8 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     );
     assert_eq!(
         re.len(),
-        raw_block.len() + 8 + 32 + 32 + 1 + 32 + 1,
-        "only the empty shard-head set, the zero order root, the zero epoch-key commitment, the None last_qc byte, the zero epoch-MMR root and the None CN-VRF v3 payload byte are appended (W10.5 canonical downtime evidence; V5 Tier-2 MMR; CN-VRF v3)"
+        raw_block.len() + 8 + 32 + 32 + 1 + 32 + 1 + 4,
+        "only the empty shard-head set, the zero order root, the zero epoch-key commitment, the None last_qc byte, the zero epoch-MMR root, the None CN-VRF v3 payload byte and the u32 signed round are appended (W10.5 canonical downtime evidence; V5 Tier-2 MMR; CN-VRF v3; ruleset v4 signed round)"
     );
     assert_eq!(
         block.order_merkle_root, [0u8; 32],
@@ -146,6 +152,25 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     assert_eq!(
         block.mmr_epoch_root, [0u8; 32],
         "a legacy block commits to no epoch MMR root"
+    );
+    assert_eq!(
+        block.round, 0,
+        "a pre-round body decodes as the canonical round 0"
+    );
+    // Round 0 must round-trip through the CURRENT strict wire layout: the
+    // appended u32 is present and reads back as 0, without moving the hash.
+    let round_tripped: Block = bincode::deserialize(&re).expect("round-0 block must round-trip");
+    assert_eq!(round_tripped.round, 0);
+    assert_eq!(
+        round_tripped.compute_hash(),
+        block.compute_hash(),
+        "round 0 must keep the legacy block identity byte-for-byte"
+    );
+    // ...while the LEGACY payload (no trailing fields at all) is refused by
+    // the strict wire decoder: tolerance is for the local store only.
+    assert!(
+        bincode::deserialize::<Block>(&raw_block).is_err(),
+        "a legacy payload must FAIL CLOSED on the wire, never silently decode as round 0"
     );
 }
 

@@ -23,6 +23,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 
@@ -33,7 +34,13 @@ fn single_node() -> ValidatorRuntime {
     let id = key.verifying_key().to_bytes();
     let vset = ValidatorSet::from_list(vec![(id, 1)]);
     let state = Arc::new(InMemoryStateEngine::new());
-    ValidatorRuntime::new(key, vset, state, 1)
+    // FULL-PQ: the demanded path RE-VALIDATES the body before re-serving it,
+    // and proposal admission requires the Falcon-512 half. Without a Falcon
+    // key the re-validation fails and `propose` falls through to a FRESH
+    // body, which looks like a re-stamp but is just the fixture missing the
+    // PQ signer. The body itself is reused verbatim by production.
+    let fk = FalconKeypair::generate_from_seed(id[0]);
+    ValidatorRuntime::new(key, vset, state, 1).with_falcon_key(fk)
 }
 
 /// The section-1 gate predicate from main.rs (minus pacing, which only admits

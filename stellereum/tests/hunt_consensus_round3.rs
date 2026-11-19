@@ -294,8 +294,9 @@ fn hunt22_negative_vote_scope_is_enforced() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };}
+        round: 0,
+    };
+}
 
 // ===========================================================================
 // ATTACK 23  (HIGH) — `adopt_committed` never checks that the block's proposer
@@ -381,8 +382,12 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    // FULL-PQ: proposal signatures are verified Falcon-only; `imposter` owns
+        // SIGNED ROUND (ruleset v4): the imposter signs the body for the slot
+        // it owns. The live path phase-aligns to exactly this round, so the
+        // block's signed round matches the proposal it is accepted under.
+        round: owned_round,
+    };
+    // FULL-PQ: proposal signatures are verified Falcon-only; `imposter` owns
     // a near-future slot, so the block must carry its registered Falcon half.
     let imposter_idx = ks
         .iter()
@@ -416,6 +421,9 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
     // ...but ACCEPTED on the peer-commit path.
     // Compiled by the committee path and bound to the block's parent, so it
     // verifies on its own terms; adopt refuses it on the proposer slot.
+    // The certificate is harvested at round 0 (where the block's proposer is
+    // NOT the schedule's choice), so adopt must refuse on the PROPOSER slot
+    // before it ever compares signed rounds: that is the property under test.
     let mut cset = stellereum::consensus::VoteSet::new();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
         cset.add(

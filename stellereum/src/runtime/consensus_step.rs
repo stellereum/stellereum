@@ -790,13 +790,38 @@ impl ValidatorRuntime {
         // proposal is for, not merely carry the right proposer slot. The round
         // is inside the block hash, so a mismatch is both a signature-covered
         // claim and a cheap deterministic refusal.
-        if block.round != self.hc.round {
+        if !self.accepts_block_round(block) {
             return Err(format!(
                 "proposal: block round {} does not match proposal round {}",
                 block.round, self.hc.round
             ));
         }
         Ok(())
+    }
+
+    /// Whether `block`'s SIGNED round is legal for the proposal we are
+    /// accepting at our current round.
+    ///
+    /// The normal case is exact equality (ruleset v4): both sides of the
+    /// bid signed the same round.
+    ///
+    /// The lock-rescue / demanded-rescue paths deliberately re-serve a LOCKED
+    /// value VERBATIM (`propose` returns the stored body unchanged), because
+    /// the hash is the value peers are locked on: re-signing that body for the
+    /// new round would change its identity and every locked peer would (and
+    /// must) nil it. Such a re-proposal therefore carries the round it was
+    /// ORIGINALLY signed under, which is necessarily EARLIER than the round
+    /// it is re-proposed in.
+    ///
+    /// We accept that exception ONLY for a body we already hold: it was
+    /// admitted here at its own signed round, so this is a re-proposal of a
+    /// known value, not a novel stale body. A previously unseen body with an
+    /// old signed round is still refused — accepting those would let a
+    /// proposer equivocate across rounds using bodies whose signed rounds
+    /// differ, which is exactly the false-slash gap the signed round closes.
+    fn accepts_block_round(&self, block: &Block) -> bool {
+        block.round == self.hc.round
+            || (block.round < self.hc.round && self.blocks.contains_key(&block.compute_hash()))
     }
 
     /// Timed proposal validation (BACKPRESSURE HONESTY).
@@ -1267,10 +1292,13 @@ impl ValidatorRuntime {
             return Err("proposal: wrong proposer".to_string());
         }
         // SIGNED ROUND (ruleset v4): after any near-future alignment above,
-        // the block's SIGNED round must be exactly the round we are accepting
-        // it for. This is what makes an honest cross-round re-proposal
-        // distinguishable from a double-propose for the slasher.
-        if block.round != self.hc.round {
+        // the block's SIGNED round must be the round we are accepting it for.
+        // The one exception is a VERBATIM re-proposal of a body we already
+        // hold (lock rescue / demanded rescue), which keeps the round it was
+        // originally signed under; see `accepts_block_round`. This is what
+        // makes an honest cross-round re-proposal distinguishable from a
+        // double-propose for the slasher.
+        if !self.accepts_block_round(&block) {
             return Err(format!(
                 "proposal: block round {} does not match proposal round {}",
                 block.round, self.hc.round
@@ -2356,11 +2384,18 @@ impl ValidatorRuntime {
             return Err("committed block's proposer is not the expected proposer".to_string());
         }
         // SIGNED ROUND (ruleset v4, adopt side): the block header commits the
-        // round it was proposed in, and the certificate commits a round too.
-        // They must name the SAME round, or a body produced for one round could
-        // be adopted under a quorum harvested for another (and the same-round
-        // proposal-slash rule would rest on inconsistent evidence).
-        if block.round != certificate.round {
+        // round it was SIGNED under, and the certificate commits the round the
+        // quorum voted in. Normally they are the same round.
+        //
+        // A lock-rescue / demanded-rescue re-proposal is the one exception:
+        // the verbatim signed body keeps its ORIGINAL round while the network
+        // (including us, in the local path) finalizes it at a LATER round. A
+        // lagging node must be able to adopt that same certificate, or it can
+        // never catch up on a height won through the rescue. The certificate
+        // still signs the exact block hash, so the body is bound; only the
+        // signed round may be older. A FUTURE signed round is always refused
+        // (a body cannot have been proposed after the quorum that adopted it).
+        if block.round > certificate.round {
             return Err(format!(
                 "committed block round {} does not match certificate round {}",
                 block.round, certificate.round

@@ -58,9 +58,12 @@ fn fk_for(k: &SigningKey) -> FalconKeypair {
     fk
 }
 
-/// A block genuinely built by `proposer_key` on top of `rt`'s current state.
-/// Blocks carry no round, so this is valid for whatever round the proposer owns.
-async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Block {
+/// A block genuinely built by `proposer_key` on top of `rt`'s current state,
+/// for an explicit SIGNED round (ruleset v4): the round is inside the block
+/// hash, so a body proposed for round `round` must sign THAT round. A body
+/// delivered as a near-future proposal signs the proposer's own round, which
+/// may be ahead of the receiver's current round.
+async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey, round: u32) -> Block {
     let mut b = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: rt.hc.height,
@@ -78,8 +81,9 @@ async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Bloc
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
+        round,
+    };
+    b.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
     b
 }
 
@@ -112,7 +116,7 @@ async fn proposal_phase_align_accepts_next_round_and_votes() {
     let r = rt.hc.round;
     assert_ne!(rt.hc.proposer().unwrap(), id(&peer));
 
-    let block = genuine_block(&rt, &peer).await;
+    let block = genuine_block(&rt, &peer, r + 1).await;
     let bh = block.compute_hash();
     let res = rt.on_proposal(id(&peer), block, r + 1).await;
     assert!(
@@ -191,7 +195,7 @@ async fn far_vote_syncs_despite_live_proposal() {
         rt.hc.next_round();
     }
     let r = rt.hc.round;
-    let block = genuine_block(&rt, &peer).await;
+    let block = genuine_block(&rt, &peer, r).await;
     let er = rt.hc.round;
     assert!(rt.on_proposal(id(&peer), block, er).await.is_ok());
 
@@ -239,7 +243,7 @@ async fn forged_proposal_never_moves_round() {
     let r = rt.hc.round;
 
     // Garbage naming the peer (who owns R+1) but signed by NOBODY.
-    let mut bad = genuine_block(&rt, &peer).await;
+    let mut bad = genuine_block(&rt, &peer, r + 1).await;
     bad.validator_signatures.clear();
     let er = rt.hc.round;
     assert!(rt.on_proposal(id(&peer), bad, er).await.is_err());
@@ -446,7 +450,7 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
     // Timely envelope for our round: accepted.
     let er = rt.hc.round;
     assert!(rt
-        .on_proposal(id(&peer), genuine_block(&rt, &peer).await, er)
+        .on_proposal(id(&peer), genuine_block(&rt, &peer, er).await, er)
         .await
         .is_ok());
     assert!(rt.hc.has_live_proposal());
@@ -456,7 +460,7 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
     rt.hc.next_round();
     assert_eq!(rt.hc.round, r + 1);
     let err = rt
-        .on_proposal(id(&peer), genuine_block(&rt, &peer).await, r)
+        .on_proposal(id(&peer), genuine_block(&rt, &peer, r).await, r)
         .await
         .expect_err("stale envelope must be rejected");
     assert!(
@@ -469,7 +473,7 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
     // vote still syncs (stale holds never pin).
     let er = rt.hc.round;
     assert!(rt
-        .on_proposal(id(&peer), genuine_block(&rt, &peer).await, er)
+        .on_proposal(id(&peer), genuine_block(&rt, &peer, er).await, er)
         .await
         .is_ok());
     assert!(rt.note_peer_vote_round(rt.hc.height, r + 100));
@@ -597,7 +601,7 @@ async fn lock_hint_ignores_foreign_and_missing_bodies() {
     // Hint for an unknown hash: ignored, fresh proposal still built.
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some([7u8; 32]));
     // Hint for a body WE did not author: ignored too.
-    let mut foreign = genuine_block(&rt, &peer).await;
+    let mut foreign = genuine_block(&rt, &peer, rt.hc.round).await;
     foreign.proposer = id(&peer);
     let fh = foreign.compute_hash();
     rt.blocks.insert(fh, foreign);
@@ -756,7 +760,7 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
     while rt.hc.proposer().unwrap() != bid {
         rt.hc.next_round();
     }
-    let peer_block = genuine_block(&rt, &ks[1]).await;
+    let peer_block = genuine_block(&rt, &ks[1], rt.hc.round).await;
     let h = rt.hc.height;
     let r = rt.hc.round;
     let peer_nil = falcon_votes::fvote(&ks[1], &fks[1], h, r, VoteKind::Prevote, None);
@@ -829,13 +833,13 @@ async fn refused_proposal_still_records_peer_head() {
     assert!(rt.peer_hint.is_none());
     // A genuine proposal for a height above ours: we must refuse it (wrong
     // height) AND still learn finalized height-1 from its prev_hash.
-    let mut high = genuine_block(&rt, &peer).await;
+    let r = rt.hc.round;
+    let mut high = genuine_block(&rt, &peer, r).await;
     high.height = rt.hc.height + 5;
     // The re-signed body must not keep the stale Falcon signature: a matching
     // slot with a bad signature refuses immediately (no fallback).
     high.validator_signatures.clear();
     high.sign_block_with_falcon(&peer, &fk_for(&peer));
-    let r = rt.hc.round;
     let res = rt.on_proposal(id(&peer), high.clone(), r).await;
     assert!(res.is_err(), "must refuse the wrong height, got {res:?}");
     assert_eq!(
@@ -844,7 +848,7 @@ async fn refused_proposal_still_records_peer_head() {
         "refusal must still record the peer head"
     );
     // A LOWER (stale or maliciously rewound) claim never moves the hint back.
-    let mut low = genuine_block(&rt, &peer).await;
+    let mut low = genuine_block(&rt, &peer, r).await;
     low.height = rt.hc.height; // timely height...
     low.validator_signatures.clear();
     low.sign_block_with_falcon(&peer, &fk_for(&peer));

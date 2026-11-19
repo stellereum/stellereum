@@ -92,6 +92,7 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 |---|---|---|
 | SLASH-A | `Vote` не содержит `shard_id` и не подписывает его → честный мультишард-валидатор слэшится за нормальную работу | **FIXED** (V3-preimage + QC/evidence/offense key) |
 | SLASH-B | `Block` не содержит `round` → честный пропозер после view change слэшится как double-propose | **FIXED** (ruleset 4: `round` в подписанной identity, slashing включён) |
+| RE-PROP-ROUND | ruleset 4/5: lock-rescue/demanded rescue честно пере-отправляет ТО ЖЕ подписанное тело (его hash — значение, на котором держат lock), но admission требовал `block.round == hc.round` → тело старого раунда отвергалось, высота зависала; adopt тем же требованием блокировал catch-up | **FIXED** (admission принимает более ранний signed round только для тела, которое уже держим — повтор известного значения; новое stale-тело по-прежнему fail-closed; adopt принимает `block.round <= certificate.round`, QC подписывает точный hash; тесты `locked_proposer_reproposes_locked_value`, `lock_hint_rescue_converges`, `demanded_reproposal_records_live_proposal_and_broadcasts_once`) |
 | SLASH-C | рестарт откатывает раунд до ≤64, голоса не персистятся → self-equivocation и потеря голоса | **FIXED** (fsync watermark до голосования + round floor) |
 | DOWNTIME | `DOWNTIME_MISS_THRESHOLD = 10` при 240 мс = 2.4 с → слэш за WAN-блип | **FIXED** (ruleset v2: 42 = 10.08 s) |
 | CNVRF-WINDOW | `V3_COMMIT_LOOKAHEAD = 360` = 86 с; VDF обязан успеть, иначе boundary без beacon | **FIXED** (682 = 163.7 s, замер VDF 20.5 s × 8) |

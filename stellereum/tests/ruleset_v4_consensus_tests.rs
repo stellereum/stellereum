@@ -298,12 +298,24 @@ async fn block_round_must_match_the_proposal_round() {
         b
     };
 
-    let b = build(4); // the proposal is for round 5
+    // An EARLIER signed round is the lock-rescue / re-proposal shape and is
+    // admitted (the body's hash is the value peers are locked on). Ruleset
+    // v5 allows `block.round <= hc.round`; see `accepts_block_round`.
+    let b = build(4);
+    assert!(
+        rt.validate_proposal(&b, rt.state.get_state_root().await)
+            .is_ok(),
+        "an earlier (re-proposed) signed round must be admitted"
+    );
+
+    // A FUTURE signed round is never admitted: the proposer cannot claim a
+    // round the network has not reached.
+    let b = build(6);
     let err = rt
         .validate_proposal(&b, rt.state.get_state_root().await)
-        .expect_err("a block whose signed round is not the proposal round must be refused");
+        .expect_err("a future signed round must be refused");
     assert!(
-        err.contains("block round 4 does not match proposal round 5"),
+        err.contains("block round 6 does not match proposal round 5"),
         "{err}"
     );
 

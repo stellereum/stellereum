@@ -436,7 +436,7 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
 // ===========================================================================
 
 #[tokio::test]
-async fn stale_envelope_is_rejected_but_timely_aligns() {
+async fn stale_envelope_beyond_the_lag_is_rejected_but_one_round_late_aligns() {
     let (mut rt, _us, peer, _fks) = two_node().await;
     while rt
         .validators
@@ -455,19 +455,30 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
         .is_ok());
     assert!(rt.hc.has_live_proposal());
 
-    // Same genuine body re-presented with an OLD envelope (delayed duplicate):
-    // refused, and our live proposal survives the attempt.
+    // ONE round late is INSIDE the lag window and must be accepted: a node
+    // that timed out to r+1 still votes the body proposed at r, otherwise a
+    // single late frame desynchronises the cluster forever (observed live).
     rt.hc.next_round();
     assert_eq!(rt.hc.round, r + 1);
+    assert!(
+        rt.on_proposal(id(&peer), genuine_block(&rt, &peer, r).await, r)
+            .await
+            .is_ok(),
+        "a body one round late must align, not be refused"
+    );
+
+    // BEYOND the lag window it is refused, and the reason is named.
+    for _ in 0..stellereum::consensus_net::SUPERSEDED_ROUND_LAG {
+        rt.hc.next_round();
+    }
     let err = rt
         .on_proposal(id(&peer), genuine_block(&rt, &peer, r).await, r)
         .await
-        .expect_err("stale envelope must be rejected");
+        .expect_err("an envelope beyond the lag must be rejected");
     assert!(
         err.contains("stale round"),
         "must name the reason, got: {err}"
     );
-    assert!(!rt.hc.has_live_proposal(), "round advanced, nothing live");
 
     // Liveness gate still retires nothing early: timely accept, then a FAR
     // vote still syncs (stale holds never pin).

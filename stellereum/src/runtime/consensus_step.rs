@@ -815,13 +815,20 @@ impl ValidatorRuntime {
     ///
     /// We accept that exception ONLY for a body we already hold: it was
     /// admitted here at its own signed round, so this is a re-proposal of a
-    /// known value, not a novel stale body. A previously unseen body with an
-    /// old signed round is still refused — accepting those would let a
-    /// proposer equivocate across rounds using bodies whose signed rounds
-    /// differ, which is exactly the false-slash gap the signed round closes.
+    /// `block.round <= self.hc.round` — a proposal signed at an EARLIER round
+    /// is accepted (that is the lock-rescue / one-round-lag path: a node that
+    /// timed out to round r+1 must still be able to vote for the body proposed
+    /// at round r, or a single late frame desynchronises the cluster forever).
+    /// A FUTURE signed round is refused: the proposer cannot claim a round the
+    /// network has not reached.
+    ///
+    /// Safety is unchanged: votes carry their own round, the QC commits to the
+    /// exact block hash (which includes the signed round), and
+    /// proposal-equivocation evidence still requires the SAME signed round
+    /// with different hashes — an older-round body is never evidence by
+    /// itself.
     fn accepts_block_round(&self, block: &Block) -> bool {
-        block.round == self.hc.round
-            || (block.round < self.hc.round && self.blocks.contains_key(&block.compute_hash()))
+        block.round <= self.hc.round
     }
 
     /// Timed proposal validation (BACKPRESSURE HONESTY).
@@ -981,6 +988,35 @@ impl ValidatorRuntime {
     /// the peer's round, never past it, so following cannot overshoot into a
     /// leapfrog: landing near stops further syncing.
     pub fn note_peer_vote_round(&mut self, vote_height: Height, vote_round: Round) -> bool {
+        self.note_peer_vote_round_for(vote_height, vote_round, None)
+    }
+
+    /// [`Self::note_peer_vote_round`] with the vote's TARGET.
+    ///
+    /// The target is what makes the signed-round re-proposal coherent: when a
+    /// verified peer votes for the SAME body we already hold a live proposal
+    /// for, the peer's round is the round that body is being voted in, so we
+    /// follow all the way to it and KEEP the proposal live there. Without
+    /// this, the forward sync wiped the proposal and the node arrived at the
+    /// peer's round unarmed — it could not vote the body the rest of the
+    /// network was voting without waiting for another copy of the same
+    /// (older-signed) proposal, and on a WAN the proposer had already moved
+    /// on. Live v5 shape: the same locked body prevoted at r505/r507/r515
+    /// and no round ever collected three votes.
+    ///
+    /// Safety: the body was already validated and accepted; its signed round
+    /// is <= the round we move to (forward-only), the value is one this node
+    /// already holds, and the watermark still refuses a vote at or below the
+    /// last signed round. A nil or different-target vote keeps the old
+    /// conservative path (wipe an unlocked proposal, chase at most one step
+    /// without corroboration), so the accept-wipe protection is unchanged
+    /// for values the network is not voting.
+    pub fn note_peer_vote_round_for(
+        &mut self,
+        vote_height: Height,
+        vote_round: Round,
+        vote_target: Option<BlockHash>,
+    ) -> bool {
         // Any verified lead pulls us up -- including 1 round. Callers invoke this
         // only AFTER `Vote::verify` + membership (see the F2 fix in the drain),
         // and `sync_round_to` is capped at ROUND_LOOKBACK=8, so this cannot be
@@ -1013,8 +1049,30 @@ impl ValidatorRuntime {
         // round reported by 2+ distinct validators (1 on a 2-member set) is
         // new evidence, not a replay, so it bypasses the dedup and re-runs
         // the chase. A lone liar replaying its own vote stays suppressed.
+        // SAME-VALUE COHERENCE (the signed-round liveness rule): a verified
+        // vote for the body we already hold is evidence that the network is
+        // voting that body in THIS round. Follow it all the way and keep the
+        // proposal live (restored after the sync below). Any other vote keeps
+        // the conservative corroboration path.
+        //
+        // CORROBORATION WINDOW: in a 3-node cluster only ONE node can be at
+        // the head. Requiring two peers at the EXACT target made the gate
+        // unsatisfiable exactly when it mattered (live: r505 / r507 / r515,
+        // `supporting_peers_count(515)` was 1). Two distinct peers whose
+        // reported rounds are within one ROUND_LOOKBACK BELOW the target
+        // certify that the network has moved to the target region, so the
+        // loop may finish the jump. The window is deliberately one cap step:
+        // a lone far reporter still buys only the first step, and two peers
+        // at a stale round cannot re-open a replay of a much newer claim
+        // (pinned by `spent_budget_blocks_fresh_votes_until_view_change`).
+        let held_proposal = self.hc.proposal;
+        let same_value = vote_target.is_some()
+            && held_proposal.map(|(_, h)| h) == vote_target;
         let min_supporters = if self.validators.len() >= 3 { 2 } else { 1 };
-        let corroborated = self.hc.supporting_peers_count(vote_round) >= min_supporters;
+        let corroboration_floor =
+            vote_round.saturating_sub(crate::consensus::ROUND_LOOKBACK);
+        let corroborated = same_value
+            || self.hc.supporting_peers_count(corroboration_floor) >= min_supporters;
         if !corroborated && self.last_followed_round == Some((vote_height, vote_round)) {
             return false;
         }
@@ -1041,8 +1099,10 @@ impl ValidatorRuntime {
         // network's cliff one budget at a time -- a round-DoS with a single
         // key. `peer_rounds` already includes this vote (`observe_peer_vote`
         // runs before this on the vote path), so an actually-ahead network
-        // (2+ distinct voters at/above the target) still opens the full
-        // chase, and a 2-member set still follows its single peer.
+        // (2+ distinct voters within one ROUND_LOOKBACK of the target) still
+        // opens the full chase, and a 2-member set still follows its single
+        // peer. The corroboration window is what lets a 3-node cluster finish
+        // the jump when only ONE node is at the head (live r505/r507/r515).
         //
         // Residual: a lone liar still buys +8 per vote (fresh round each
         // time, the dedup only covers replays). Each step is a signed,
@@ -1061,7 +1121,7 @@ impl ValidatorRuntime {
         // because we are already there.
         let mut first_step = true;
         while vote_round > self.hc.round {
-            if !first_step && self.hc.supporting_peers_count(vote_round) < min_supporters {
+            if !first_step && !corroborated {
                 break; // lone reporter: keep the nudge, refuse the cliff
             }
             first_step = false;
@@ -1069,6 +1129,16 @@ impl ValidatorRuntime {
             self.hc.sync_round_to(vote_round);
             if self.hc.round == r {
                 break; // jump budget exhausted; our own view change refills it
+            }
+        }
+        // Keep an accepted SAME-VALUE proposal live in the round the peers
+        // are voting it (see `note_peer_vote_round_for`). This is what makes
+        // every acceptor prevote the re-served locked body in the SAME round
+        // instead of each at its own local round.
+        if same_value && self.hc.round != before {
+            if let Some((proposer, hash)) = held_proposal {
+                self.hc.proposal = Some((proposer, hash));
+                self.hc.proposal_round = Some(self.hc.round);
             }
         }
         self.hc.round != before
@@ -1238,7 +1308,18 @@ impl ValidatorRuntime {
         // garbage dies above without moving anything; a forged envelope on a
         // genuine body is indistinguishable from network delay, which is
         // harmless (idempotent at worst).
-        if envelope_round < self.hc.round {
+        // ONE lag predicate everywhere: the driver, the compact layer and the
+        // vote filter all use SUPERSEDED_ROUND_LAG. Rejecting ANY older
+        // envelope here made a single late frame fatal: a node that timed out
+        // to r+1 could never accept the body proposed at r, so a staggered
+        // 3-node cluster advanced in lockstep forever and never finalised
+        // (observed live at ruleset v5). A body within the lag window is still
+        // a signed block for this height; voting it costs at most one round,
+        // while rejecting it costs liveness.
+        if envelope_round
+            .saturating_add(crate::consensus_net::SUPERSEDED_ROUND_LAG)
+            <= self.hc.round
+        {
             return Err("proposal: stale round".to_string());
         }
         // Phase-align: if the block is genuinely this height's proposer's work
@@ -1387,12 +1468,46 @@ impl ValidatorRuntime {
         Some(vote)
     }
 
+    /// The round a prevote for the CURRENT live proposal would carry.
+    ///
+    /// Ruleset v4/v5 put the BFT round inside the block identity, and the
+    /// lock-rescue/demanded-rescue paths deliberately re-serve the SAME body
+    /// VERBATIM. That body keeps the round it was SIGNED under, which is
+    /// older than the local round it is re-served in. Stamping the prevote
+    /// with the LOCAL round made every acceptor vote the same hash in a
+    /// DIFFERENT bucket (live: r505/r507/r515, no round ever reaching a
+    /// quorum). The signed round is signed by the proposer and is identical
+    /// on every node holding the body, so it is the coherent vote round.
+    ///
+    /// Safety: the runtime only accepts `block.round <= hc.round`, so this is
+    /// never a FUTURE round; the local round counter itself is untouched
+    /// (no rewind — a node that already voted in a later round keeps its
+    /// counter and the driver's fsynced watermark refuses this vote instead,
+    /// see `round_at_or_below_vote_floor`). Nil votes (no proposal) keep the
+    /// local round.
+    pub fn prevote_round(&self) -> Round {
+        match (self.hc.proposal, self.hc.decide_prevote()) {
+            (Some((_, bh)), Some(_)) => self
+                .blocks
+                .get(&bh)
+                .map(|b| b.round)
+                .unwrap_or(self.hc.round),
+            _ => self.hc.round,
+        }
+    }
+
     pub fn make_prevote(&self) -> Option<Vote> {
         if self.hc.step != Step::Propose && self.hc.step != Step::Prevote {
             return None;
         }
         let target = self.hc.decide_prevote();
-        self.make_vote(VoteKind::Prevote, target)
+        // A nil vote has no body, so it keeps the local round (the shared
+        // `make_vote` path). A value vote carries the BODY's signed round,
+        // identical on every node that holds it. See `prevote_round`.
+        match target {
+            None => self.make_vote(VoteKind::Prevote, None),
+            Some(_) => self.make_vote_at(VoteKind::Prevote, target, self.prevote_round()),
+        }
     }
 
     pub fn on_prevote(&mut self, v: Vote) -> Result<(), String> {
@@ -1439,7 +1554,7 @@ impl ValidatorRuntime {
         // ahead) still syncs, bounded: the F2 finding is that a verified far
         // vote is evidence of where the network is.
         if verified {
-            self.note_peer_vote_round(v.height, v.round);
+            self.note_peer_vote_round_for(v.height, v.round, v.block_hash);
         }
         res
     }
@@ -1530,7 +1645,7 @@ impl ValidatorRuntime {
         // bounded) while forged votes move nothing.
         if self.observe_peer_vote(&v) {
             // FUTURE ROUND RULE: see `on_prevote`.
-            self.note_peer_vote_round(v.height, v.round);
+            self.note_peer_vote_round_for(v.height, v.round, v.block_hash);
         }
         res
     }

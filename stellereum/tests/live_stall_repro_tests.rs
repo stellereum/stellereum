@@ -30,13 +30,11 @@
 //! round-stamp divergence as the single cause — exactly the live shape where
 //! one validator kept the proposer slot while the peers drifted.
 //!
-//! * [`same_body_prevoted_at_three_rounds_is_the_live_stall`] runs today and
-//!   asserts the BUG: same block hash, three different prevote rounds, no
-//!   prevote quorum, `make_precommit == None`, `try_finalize == None`.
-//! * [`same_body_converges_to_one_round_and_finalises`] asserts the DESIRED
-//!   property after the F1 fix: one prevote round for all three, then a
-//!   precommit quorum, then a finalised height. It cannot pass on the buggy
-//!   rule, so it is `#[ignore]`d until the fix lands.
+//! * [`same_body_is_prevoted_in_the_signed_round`] pins the fix:
+//!   three local round counters, but all prevotes carry the body's SIGNED
+//!   round, so the quorum forms and the height finalises.
+//! * [`same_body_converges_to_one_round_and_finalises`] asserts the same
+//!   property end to end through the precommit quorum.
 //!
 //! No wall-clock sleeps and no random draws drive the protocol: keys and
 //! Falcon signing are deterministic, and every step below is an explicit
@@ -217,7 +215,12 @@ async fn three_prevotes_for_re_served_body() -> Scenario {
                 n.rt.hc.round
             )
         });
-        assert_eq!(vote.round, n.rt.hc.round, "the prevote names the local round");
+        assert_eq!(
+            vote.round, block.round,
+            "the prevote names the BODY's signed round (coherent on every holder), \
+             not the local round {}",
+            n.rt.hc.round
+        );
         assert_eq!(
             vote.block_hash,
             Some(bh),
@@ -229,9 +232,6 @@ async fn three_prevotes_for_re_served_body() -> Scenario {
     Scenario {
         nodes,
         vset,
-        proposer_idx,
-        b_idx,
-        c_idx,
         base_round: r,
         block,
         block_hash: bh,
@@ -243,9 +243,6 @@ async fn three_prevotes_for_re_served_body() -> Scenario {
 struct Scenario {
     nodes: Vec<Node>,
     vset: ValidatorSet,
-    proposer_idx: usize,
-    b_idx: usize,
-    c_idx: usize,
     base_round: Round,
     block: Block,
     block_hash: BlockHash,
@@ -305,19 +302,19 @@ impl Scenario {
 /// finalise"), so the exact live signature is visible in the assertion text:
 /// `same hash, rounds [r+3, r+1, r+2], quorum is 3`.
 #[tokio::test]
-async fn same_body_prevoted_at_three_rounds_is_the_live_stall() {
+async fn same_body_is_prevoted_in_the_signed_round() {
     let mut sc = three_prevotes_for_re_served_body().await;
     let r = sc.base_round;
 
-    // THE LIVE SIGNATURE: one body, three prevotes, three rounds.
-    let mut expected = vec![0u32; N];
-    expected[sc.proposer_idx] = r + 3;
-    expected[sc.b_idx] = r + 1;
-    expected[sc.c_idx] = r + 2;
+    // THE FIX: one body, three local rounds, but ALL prevotes land in the
+    // body's SIGNED round. The signed round is identical on every holder, so
+    // the votes share a bucket even though the validators' local counters do
+    // not.
     let rounds: Vec<Round> = sc.prevotes.iter().map(|v| v.round).collect();
     assert_eq!(
-        rounds, expected,
-        "proposer/B/C must each stamp their OWN local round (r+3, r+1, r+2)"
+        rounds,
+        vec![r; N],
+        "every prevote for the re-served body must carry its SIGNED round {r}"
     );
     let hashes: Vec<Option<BlockHash>> = sc.prevotes.iter().map(|v| v.block_hash).collect();
     assert!(
@@ -327,42 +324,37 @@ async fn same_body_prevoted_at_three_rounds_is_the_live_stall() {
     );
     assert_eq!(
         sc.block.round, r,
-        "the re-served body keeps its ORIGINAL signed round (the live 'same hash, older signed round')"
+        "the re-served body keeps its ORIGINAL signed round (the hash is the locked value)"
     );
 
-    // Deliver the votes. The future-round rule pulls every node up to r+3,
-    // but the votes stay in the buckets they were CAST in: r+3 (proposer),
-    // r+1 (B), r+2 (C). One vote per bucket, quorum needs three.
+    // Deliver the votes. The future-round rule still follows the newest vote
+    // (r+3), but the prevote QUORUM is in r — the shared signed round.
     sc.broadcast_prevotes();
     for i in 0..N {
-        assert_eq!(
-            sc.nodes[i].rt.hc.round,
-            r + 3,
-            "node {i} should have followed the newest verified prevote to r+3"
+        assert!(
+            sc.has_polka_at(i, r),
+            "node {i} must hold the prevote quorum at the body's signed round {r}"
         );
-        for q in [r, r + 1, r + 2, r + 3] {
-            assert!(
-                !sc.has_polka_at(i, q),
-                "LIVE BUG NOT REPRODUCED: node {i} formed a prevote quorum at round {q} \
-                 (the three prevotes must be split across rounds)"
-            );
-        }
     }
 
-    // No polka => no precommit, no precommit QC, no finalisation.
-    let precommits = sc.cast_precommits();
-    assert!(
-        precommits.iter().all(|p| p.is_none()),
-        "no node may cast a precommit without a prevote quorum, got {precommits:?}"
-    );
-    for (i, n) in sc.nodes.iter_mut().enumerate() {
-        assert!(
-            n.rt.try_finalize().await.is_none(),
-            "LIVE BUG NOT REPRODUCED: node {i} finalised height {HEIGHT} from split prevotes"
-        );
-        assert!(
-            n.rt.finalized.is_empty(),
-            "LIVE BUG NOT REPRODUCED: node {i} has a finalised chain"
+    // Polka => precommit at the polka round => precommit QC => finality.
+    let precommits: Vec<Vote> = sc
+        .cast_precommits()
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            p.unwrap_or_else(|| {
+                panic!("node {i} must precommit the certified body at round {r}")
+            })
+        })
+        .collect();
+    assert!(precommits.iter().all(|p| p.round == r));
+    sc.broadcast_precommits(&precommits);
+    for i in 0..N {
+        assert_eq!(
+            sc.nodes[i].rt.try_finalize().await,
+            Some(sc.block_hash),
+            "node {i} must finalise the body all three prevoted"
         );
     }
 }
@@ -376,11 +368,9 @@ async fn same_body_prevoted_at_three_rounds_is_the_live_stall() {
 /// round the fix picks — the block's signed round or the newest live round),
 /// the polka must become a precommit quorum, and the height must finalise.
 ///
-/// On the current rule the three prevotes are split (r+3 / r+1 / r+2), so the
-/// first assertion fails and the height cannot finalise. That is why this
-/// test is `#[ignore]`d until the fix lands.
+/// This is the end-to-end property; the vote round is the body's SIGNED
+/// round, so it is identical on every holder regardless of local drift.
 #[tokio::test]
-#[ignore = "enable with the F1 liveness fix"]
 async fn same_body_converges_to_one_round_and_finalises() {
     let mut sc = three_prevotes_for_re_served_body().await;
 

@@ -254,15 +254,22 @@ async fn stale_envelope_refused_and_seats_nothing() {
     );
     assert!(rt.hc.has_live_proposal());
 
-    // Advance one round, then replay a (still genuine) body with the OLD
-    // envelope: refused as stale, and the new round seats nothing.
-    rt.hc.next_round();
-    assert_eq!(rt.hc.round, r + 1);
+    // Advance BEYOND the shared superseded-round lag (ruleset v5 keeps a
+    // one-late envelope inside the window: rejecting it was a live liveness
+    // bug, pinned by `chase_livelock_tests`). Past the window the body is
+    // stale and seats nothing.
+    for _ in 0..stellereum::consensus_net::SUPERSEDED_ROUND_LAG {
+        rt.hc.next_round();
+    }
+    assert_eq!(
+        rt.hc.round,
+        r + stellereum::consensus_net::SUPERSEDED_ROUND_LAG
+    );
     let late = genuine(&rt, &sched, rt.hc.height, [0u8; 32], 1_001, None).await;
     let err = rt
         .on_proposal(sid, late, r)
         .await
-        .expect_err("stale envelope must be refused");
+        .expect_err("an envelope beyond the lag must be refused");
     assert!(
         err.contains("stale round"),
         "must name the reason, got: {err}"
@@ -271,7 +278,11 @@ async fn stale_envelope_refused_and_seats_nothing() {
         !rt.hc.has_live_proposal(),
         "a stale envelope must seat nothing"
     );
-    assert_eq!(rt.hc.round, r + 1, "refusal must not move our round");
+    assert_eq!(
+        rt.hc.round,
+        r + stellereum::consensus_net::SUPERSEDED_ROUND_LAG,
+        "refusal must not move our round"
+    );
 }
 
 // ============================================================================

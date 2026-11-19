@@ -2245,8 +2245,14 @@ pub(crate) async fn run_consensus_node(
                 // COMPACT GOSSIP: announce the compact header; the announced
                 // block stays servable for bounded body pulls AND for the
                 // full-proposal fallback (same-height round-trip).
-                compact_server.remember(&block, round);
-                let msg = stellereum::consensus_net::proposal_gossip_msg(&block, round);
+                // The block is stamped with `rt.hc.round` INSIDE `propose()`;
+                // a view change earlier in this tick would leave the tick-local
+                // `round` stale, so the envelope would name an older round and
+                // every peer would refuse the frame as `stale round` while the
+                // signed block was current. Always take the envelope round from
+                // the block we just signed.
+                compact_server.remember(&block, block.round);
+                let msg = stellereum::consensus_net::proposal_gossip_msg(&block, block.round);
                 let large = msg.is_large();
                 enqueue_outbox(&mut outbox, msg);
                 if large {
@@ -2272,11 +2278,19 @@ pub(crate) async fn run_consensus_node(
         // Dynamic franchise: see the note at the propose gate above (`can_vote`
         // is computed once per tick there). Proposing stays equally gated: a
         // newcomer that never proposes leaves every third round empty.
-        // 2. prevote once we have a proposal
+        // 2. prevote once we have a proposal.
+        //
+        // The vote round is the PROPOSAL's SIGNED round, not the local round:
+        // a lock-rescue/demanded re-proposal keeps the round it was signed
+        // under, so every node holding it must stamp the SAME round (ruleset
+        // v4/v5 identity). The fsynced watermark is checked against THAT
+        // round — a node that already voted in a later round stays silent
+        // rather than voting below its floor.
+        let prevote_round = rt.prevote_round();
         if can_vote
             && rt.hc.has_live_proposal()
-            && last_prevoted != Some((height, round))
-            && !round_at_or_below_vote_floor(vote_floor, height, round)
+            && last_prevoted != Some((height, prevote_round))
+            && !round_at_or_below_vote_floor(vote_floor, height, prevote_round)
         {
             if let Some(v) = rt.make_prevote() {
                 // WRITE-AHEAD: the watermark is durable before the outbox can
@@ -2296,8 +2310,9 @@ pub(crate) async fn run_consensus_node(
                 flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
                 outbox_flushes += 1;
                 last_flush = std::time::Instant::now();
+                let cast_round = v.round;
                 cast_prevote = Some(v);
-                last_prevoted = Some((height, round));
+                last_prevoted = Some((height, cast_round));
             }
         }
         // 2b. nil prevote on proposal-timeout (Tendermint liveness): a
@@ -2968,13 +2983,14 @@ pub(crate) async fn run_consensus_node(
                                     // can only form the same QC sooner, never a
                                     // different one. Refused proposals (the Err
                                     // arm) never vote.
+                                    let cast_round = rt.prevote_round();
                                     if can_vote
                                         && rt.hc.has_live_proposal()
-                                        && last_prevoted != Some((rt.hc.height, rt.hc.round))
+                                        && last_prevoted != Some((rt.hc.height, cast_round))
                                         && !round_at_or_below_vote_floor(
                                             vote_floor,
                                             rt.hc.height,
-                                            rt.hc.round,
+                                            cast_round,
                                         )
                                     {
                                         if let Some(v) = rt.make_prevote() {
@@ -2999,8 +3015,10 @@ pub(crate) async fn run_consensus_node(
                                             );
                                             outbox_flushes += 1;
                                             last_flush = std::time::Instant::now();
+                                            let voted_round = v.round;
                                             cast_prevote = Some(v);
-                                            last_prevoted = Some((rt.hc.height, rt.hc.round));
+                                            last_prevoted =
+                                                Some((rt.hc.height, voted_round));
                                         }
                                     }
                                 }
@@ -3170,10 +3188,12 @@ pub(crate) async fn run_consensus_node(
                             // far; it only runs for a vote that already verified.
                             if vh == rt.hc.height {
                                 peer_round_seen = Some((vh, vr, std::time::Instant::now()));
-                                // `note_peer_vote_round` skips the jump while we hold a
-                                // live proposal for a near round (accept-wipe livelock),
-                                // and jumps otherwise (phase alignment).
-                                if rt.note_peer_vote_round(vh, vr) {
+                                // SAME-VALUE COHERENCE: a vote for the body we
+                                // already hold pulls us to the round the
+                                // network is voting it in, and keeps the
+                                // proposal live there; other votes use the
+                                // conservative corroborated chase.
+                                if rt.note_peer_vote_round_for(vh, vr, vbh) {
                                     // The round moved under us: restart the round
                                     // timer. Without this the elapsed-time check
                                     // already exceeded the timeout, so on the very

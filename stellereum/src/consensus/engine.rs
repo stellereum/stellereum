@@ -2202,13 +2202,44 @@ impl HeightConsensus {
             .min(self.round.saturating_add(ROUND_LOOKBACK))
             .min(self.round.saturating_add(remaining));
         if target > self.round {
+            // LOCK-RESCUE ACROSS A FORWARD SYNC (ruleset v4/v5 liveness).
+            //
+            // A proposal that is ALSO our lock is the one value Tendermint
+            // requires us to prevote in every later round. The old code wiped
+            // it unconditionally, so a node that chased a peer into round r+k
+            // arrived there ARMED BUT EMPTY: `has_live_proposal()` was false,
+            // it prevoted nil (or nothing), and the proposer's re-served
+            // locked body — signed at an older round — had to be delivered
+            // AGAIN before the node could vote it. On a WAN the proposer has
+            // already moved on by then, so the votes never share a round
+            // (observed live: the same body prevoted at r505/r507/r515, no
+            // round ever holding three votes).
+            //
+            // Keeping a LOCKED proposal live is safe and is exactly the
+            // Tendermint locked-value rule: the body was already validated
+            // and accepted at its signed round (<= the new round), the round
+            // only moved FORWARD, and the value is the one this node is
+            // locked on. An UNLOCKED accepted proposal is still wiped (the
+            // accept-wipe livelock protection: voting a stale value that no
+            // one else is locked on can only waste the round).
+            let keep_locked_proposal = matches!(
+                (self.proposal, self.locked),
+                (Some((_, proposed)), Some((locked, _))) if proposed == locked
+            );
             self.peer_round_advance_used = self
                 .peer_round_advance_used
                 .saturating_add(target - self.round);
             self.round = target;
             self.step = Step::Propose;
-            self.proposal = None;
-            self.proposal_round = None;
+            if keep_locked_proposal {
+                // The value is re-proposed for the new round by US; the body
+                // bytes and its signed round are unchanged (the hash is the
+                // locked value). Only the local acceptance round moves.
+                self.proposal_round = Some(self.round);
+            } else {
+                self.proposal = None;
+                self.proposal_round = None;
+            }
             self.sync_jumps_used += 1;
             self.prune_old_rounds();
         }

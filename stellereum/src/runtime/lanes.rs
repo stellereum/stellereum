@@ -109,6 +109,7 @@ pub fn shard_genesis_block(
         // `crate::mmr::commits_epoch_root`): it commits to no epoch root.
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
+        round: 0,
     }
 }
 

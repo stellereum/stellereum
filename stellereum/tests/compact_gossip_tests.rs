@@ -28,9 +28,12 @@ use stellereum::consensus_net::compact_prop::{
 use stellereum::consensus_net::{
     compact_gossip_active, compact_proposal_from_block, compact_proposal_from_block_with_full,
     is_superseded_proposal, open_compact_proposal, proposal_gossip_height_round,
-    proposal_gossip_msg, short_id_index_for, with_compact_gossip_gate, CompactBodyServer,
-    CompactInbound, CompactReceiver, ConsensusMsg, COMPACT_GOSSIP_ACTIVATION_HEIGHT,
-    COMPACT_MAX_PARKED,
+    proposal_gossip_msg, short_id_index_for, with_compact_gossip_gate, BodyReplyFallback,
+    BodyReplyRoute, CompactBodyServer, CompactInbound, CompactReceiver, CompactReplyCounters,
+    ConsensusMsg, COMPACT_GOSSIP_ACTIVATION_HEIGHT, COMPACT_MAX_PARKED,
+};
+use stellereum::consensus_net::{
+    dispatch_compact_body_reply, peer_id_from_inbound_key, INBOUND_BROADCAST_PEER_KEY,
 };
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
@@ -1238,5 +1241,250 @@ async fn compact_proposal_end_to_end_votes_and_finalizes() {
             root,
             "every validator must commit the same state root"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. UNICAST body replies: one addressed send per requester, never a
+//     broadcast fan-out, with the bounded fallback kept for unknown senders.
+// ---------------------------------------------------------------------------
+
+fn requester_id(seed: u8) -> [u8; 20] {
+    let mut id = [0u8; 20];
+    id[0] = seed;
+    id[19] = seed.wrapping_mul(11);
+    id
+}
+
+fn one_id_pull(block: &Block, salt: &[u8; 32], round: u32, idx: usize) -> BodyPull {
+    BodyPull {
+        height: block.height,
+        round,
+        block_hash: block.compute_hash(),
+        ids: vec![short_id(&block.transactions[idx].compute_tx_hash(), salt)],
+        attempt: 1,
+    }
+}
+
+#[test]
+fn peer_ids_parse_only_from_a_full_40_hex_envelope_sender() {
+    let id = requester_id(7);
+    assert_eq!(peer_id_from_inbound_key(&hex::encode(id)), Some(id));
+    assert_eq!(
+        peer_id_from_inbound_key(&format!("inf1:{}", hex::encode(id))),
+        Some(id),
+        "infnode's canonical prefix is stripped exactly like inbound_peer_key"
+    );
+    // The shared bucket, a legacy short src and a non-hex src are NOT an
+    // identity: the reply must fail open to the bounded broadcast instead of
+    // guessing a peer.
+    assert_eq!(peer_id_from_inbound_key(INBOUND_BROADCAST_PEER_KEY), None);
+    assert_eq!(peer_id_from_inbound_key("aabbccdd"), None);
+    assert_eq!(peer_id_from_inbound_key(&"zz".repeat(20)), None);
+    assert_eq!(peer_id_from_inbound_key(""), None);
+}
+
+#[tokio::test]
+async fn ten_requesters_get_ten_unicast_replies_not_a_broadcast() {
+    let block = block_with((0..10).map(tx).collect(), 41);
+    let salt = salt_for_header(&block);
+    let mut server = CompactBodyServer::new();
+    server.remember(&block, 0);
+
+    let counters = CompactReplyCounters::new();
+    let mut unicast_peers = Vec::new();
+    let mut broadcast_frames = Vec::new();
+    let mut unicast_writes = 0usize;
+    let mut broadcast_writes = 0usize;
+
+    for i in 0..10usize {
+        let id = requester_id(i as u8 + 1);
+        let key = hex::encode(id);
+        let pull = one_id_pull(&block, &salt, 0, i);
+        let body = server
+            .serve_for(&key, &pull, 0)
+            .expect("pull is structurally valid")
+            .expect("a remembered block answers its own ids");
+
+        let route = dispatch_compact_body_reply(
+            &key,
+            ConsensusMsg::Body { body },
+            &counters,
+            |peer, _msg| {
+                unicast_peers.push(peer);
+                unicast_writes += 1;
+                async { Ok::<(), (ConsensusMsg, String)>(()) }
+            },
+            |msg| {
+                broadcast_frames.push(msg);
+                // The bounded fallback reaches every peer: model the 10-peer
+                // stand so an accidental broadcast is unmistakable here.
+                broadcast_writes += 10;
+            },
+        )
+        .await;
+        assert_eq!(route, BodyReplyRoute::Unicast(id));
+    }
+
+    assert_eq!(counters.unicast_sends(), 10, "one reply per requester");
+    assert_eq!(
+        counters.broadcast_sends(),
+        0,
+        "the compact path must not broadcast a body reply"
+    );
+    assert_eq!(unicast_peers.len(), 10);
+    assert!(broadcast_frames.is_empty());
+    assert_eq!(
+        unicast_writes + broadcast_writes,
+        10,
+        "10 requesters cost 10 addressed sends, not 10 broadcasts x 10 peers = 100"
+    );
+    // And every reply went to ITS requester, not to a shared set.
+    for (i, peer) in unicast_peers.iter().enumerate() {
+        assert_eq!(*peer, requester_id(i as u8 + 1));
+    }
+}
+
+#[tokio::test]
+async fn replayed_pull_gets_no_second_reply() {
+    let block = block_with((0..4).map(tx).collect(), 43);
+    let salt = salt_for_header(&block);
+    let mut server = CompactBodyServer::new();
+    server.remember(&block, 0);
+
+    let id = requester_id(21);
+    let key = hex::encode(id);
+    let pull = one_id_pull(&block, &salt, 0, 2);
+    let counters = CompactReplyCounters::new();
+    let mut writes = 0usize;
+
+    let body = server
+        .serve_for(&key, &pull, 0)
+        .expect("valid")
+        .expect("served once");
+    dispatch_compact_body_reply(
+        &key,
+        ConsensusMsg::Body { body },
+        &counters,
+        |_peer, _msg| {
+            writes += 1;
+            async { Ok::<(), (ConsensusMsg, String)>(()) }
+        },
+        |_msg| panic!("a known requester must never broadcast"),
+    )
+    .await;
+    assert_eq!((counters.unicast_sends(), writes), (1, 1));
+
+    // The exact same (requester, pull) replay is refused by the served-once
+    // set BEFORE any reply is planned: no second unicast, no broadcast.
+    assert!(server
+        .serve_for(&key, &pull, 0)
+        .expect("structurally valid")
+        .is_none());
+    assert_eq!(counters.unicast_sends(), 1);
+    assert_eq!(counters.broadcast_sends(), 0);
+    assert_eq!(writes, 1);
+    assert_eq!(server.served_count(), 1);
+}
+
+#[tokio::test]
+async fn unknown_requester_falls_back_to_the_bounded_broadcast_and_delivers() {
+    let block = block_with((0..3).map(tx).collect(), 45);
+    let salt = salt_for_header(&block);
+    let mut server = CompactBodyServer::new();
+    server.remember(&block, 0);
+    let pull = one_id_pull(&block, &salt, 0, 1);
+    let counters = CompactReplyCounters::new();
+    let mut broadcast = Vec::new();
+
+    // No usable sender identity: the envelope carried no `src`/`from`, so the
+    // drain keyed the request to the shared bucket. The reply must still be
+    // delivered — over the existing bounded outbox broadcast.
+    let body = server
+        .serve_for(INBOUND_BROADCAST_PEER_KEY, &pull, 0)
+        .expect("valid")
+        .expect("served once");
+    let route = dispatch_compact_body_reply(
+        INBOUND_BROADCAST_PEER_KEY,
+        ConsensusMsg::Body { body },
+        &counters,
+        |_peer, _msg| async { panic!("no identity => no unicast destination") },
+        |msg| broadcast.push(msg),
+    )
+    .await;
+    assert_eq!(
+        route,
+        BodyReplyRoute::BoundedBroadcast(BodyReplyFallback::UnknownRequester)
+    );
+    assert_eq!(counters.unicast_sends(), 0);
+    assert_eq!(counters.broadcast_sends(), 1);
+    assert_eq!(broadcast.len(), 1, "the fallback still delivers the body");
+    match &broadcast[0] {
+        ConsensusMsg::Body { body } => {
+            assert_eq!(body.block_hash, block.compute_hash());
+            assert_eq!(body.txs.len(), 1);
+        }
+        other => panic!("expected the served Body frame, got {other:?}"),
+    }
+
+    // A legacy short `src` (valid for the limiter, not a 20-byte node id) is
+    // the same fail-open path, not a guessed peer.
+    let mut server2 = CompactBodyServer::new();
+    server2.remember(&block, 0);
+    let body = server2
+        .serve_for("aabbccdd", &pull, 0)
+        .expect("valid")
+        .expect("served once");
+    let mut delivered = 0usize;
+    let route = dispatch_compact_body_reply(
+        "aabbccdd",
+        ConsensusMsg::Body { body },
+        &counters,
+        |_peer, _msg| async { panic!("a short src is not a node id") },
+        |_msg| delivered += 1,
+    )
+    .await;
+    assert!(matches!(
+        route,
+        BodyReplyRoute::BoundedBroadcast(BodyReplyFallback::UnknownRequester)
+    ));
+    assert_eq!(delivered, 1);
+    assert_eq!(counters.broadcast_sends(), 2);
+}
+
+#[tokio::test]
+async fn failed_unicast_hands_the_body_to_the_bounded_fallback() {
+    let block = block_with((0..2).map(tx).collect(), 47);
+    let salt = salt_for_header(&block);
+    let mut server = CompactBodyServer::new();
+    server.remember(&block, 0);
+    let id = requester_id(31);
+    let key = hex::encode(id);
+    let pull = one_id_pull(&block, &salt, 0, 0);
+    let counters = CompactReplyCounters::new();
+    let body = server
+        .serve_for(&key, &pull, 0)
+        .expect("valid")
+        .expect("served once");
+
+    let mut delivered = None;
+    let route = dispatch_compact_body_reply(
+        &key,
+        ConsensusMsg::Body { body },
+        &counters,
+        |_peer, msg| async move { Err((msg, "encode refused".to_string())) },
+        |msg| delivered = Some(msg),
+    )
+    .await;
+    assert_eq!(
+        route,
+        BodyReplyRoute::BoundedBroadcast(BodyReplyFallback::UnicastFailed)
+    );
+    assert_eq!(counters.unicast_sends(), 0);
+    assert_eq!(counters.broadcast_sends(), 1);
+    // The SAME frame is handed on, so a preflight refusal never loses a body.
+    match delivered.expect("fallback delivered") {
+        ConsensusMsg::Body { body } => assert_eq!(body.block_hash, block.compute_hash()),
+        other => panic!("expected Body, got {other:?}"),
     }
 }

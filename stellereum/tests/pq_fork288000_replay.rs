@@ -133,6 +133,7 @@ fn mk_block(tx: Transaction, proposer: [u8; 32]) -> Block {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
+        round: 0,
     }
 }
 

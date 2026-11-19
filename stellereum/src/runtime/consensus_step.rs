@@ -2,8 +2,7 @@ use super::lanes::{block_actor_sends_exceed_cap, count_block_actor_sends};
 use super::{
     master_set_stamp, publish_master_set_stamp, set_fingerprint, workchain_set_activation_height,
     BlockHash, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS, MAX_COMMIT_CERT_SIGNERS,
-    MAX_TIMESTAMP_JUMP_SECS, PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS,
-    VALIDATOR_SET_HISTORY_CAP,
+    PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS, VALIDATOR_SET_HISTORY_CAP,
 };
 use crate::consensus::{Height, Round, Step, ValidatorId, ValidatorSet, Vote, VoteKind};
 use crate::sharding::{Block, CrossShardKey, Transaction, ValidatorSetSource};
@@ -20,8 +19,10 @@ impl ValidatorRuntime {
     /// it - so that value is checkable, and it was not being checked at all. A
     /// proposer could put any root in the header and every validator accepted the
     /// block, which left the whole state commitment decorative on the live path.
-    /// Fail-closed block-timestamp gate (A3): refuse on a bad or missing
-    /// timestamp using deterministic rules only.
+    /// Fail-closed block-timestamp gate (A3/S8): refuse on a bad or missing
+    /// timestamp using deterministic rules only. The bound is
+    /// [`crate::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS`]: monotone versus the
+    /// parent and at most that drift ahead of it.
     ///
     /// The parent timestamp resolves from, in order: (1) the stored parent
     /// body (`blocks[prev_hash]`, the common live case); (2) `last_decision`
@@ -77,7 +78,7 @@ impl ValidatorRuntime {
             return Err("proposal: timestamp moved backwards".to_string());
         }
         if !from_genesis_anchor
-            && block.timestamp > parent_ts.saturating_add(MAX_TIMESTAMP_JUMP_SECS)
+            && !crate::protocol::timestamp_within_bounds(parent_ts, block.timestamp)
         {
             return Err("proposal: timestamp too far ahead of parent".to_string());
         }
@@ -397,9 +398,9 @@ impl ValidatorRuntime {
         // unbonding, order stamps) — an unbounded proposer could skew all of
         // them. Both bounds are deterministic functions of (parent, child):
         // (a) monotone vs the parent block's timestamp (agreed state, no
-        // clock involved); (b) at most MAX_TIMESTAMP_JUMP_SECS ahead of the
-        // parent. There is deliberately NO wall-clock read here: a
-        // `now_secs()` bound makes the verdict node-local (two validators
+        // clock involved); (b) at most MAX_BLOCK_TIMESTAMP_DRIFT_MS ahead of
+        // the parent (ruleset v4 S8). There is deliberately NO wall-clock read
+        // here: a `now_secs()` bound makes the verdict node-local (two validators
         // with skewed clocks disagree about the same block), and there is no
         // grace or skip path — a bad or unresolvable timestamp is refused.
         self.check_block_timestamp(block)?;
@@ -784,6 +785,16 @@ impl ValidatorRuntime {
         self.validate_proposal_unaligned(block, expected_state_root)?;
         if Some(block.proposer) != self.expected_proposer_now() {
             return Err("proposal: wrong proposer".to_string());
+        }
+        // SIGNED ROUND (ruleset v4): the block must belong to the round this
+        // proposal is for, not merely carry the right proposer slot. The round
+        // is inside the block hash, so a mismatch is both a signature-covered
+        // claim and a cheap deterministic refusal.
+        if block.round != self.hc.round {
+            return Err(format!(
+                "proposal: block round {} does not match proposal round {}",
+                block.round, self.hc.round
+            ));
         }
         Ok(())
     }
@@ -1254,6 +1265,16 @@ impl ValidatorRuntime {
         // so the accept/refuse verdict is byte-identical to before.
         if Some(block.proposer) != self.expected_proposer_now() {
             return Err("proposal: wrong proposer".to_string());
+        }
+        // SIGNED ROUND (ruleset v4): after any near-future alignment above,
+        // the block's SIGNED round must be exactly the round we are accepting
+        // it for. This is what makes an honest cross-round re-proposal
+        // distinguishable from a double-propose for the slasher.
+        if block.round != self.hc.round {
+            return Err(format!(
+                "proposal: block round {} does not match proposal round {}",
+                block.round, self.hc.round
+            ));
         }
         // CN-VRF v3 payload (commit carriers + proposer reveal + epoch-boundary
         // MinRoot beacon). No-op below the activation gate.
@@ -2333,6 +2354,17 @@ impl ValidatorRuntime {
         if Some(block.proposer) != self.expected_proposer_at(&validators, height, certificate.round)
         {
             return Err("committed block's proposer is not the expected proposer".to_string());
+        }
+        // SIGNED ROUND (ruleset v4, adopt side): the block header commits the
+        // round it was proposed in, and the certificate commits a round too.
+        // They must name the SAME round, or a body produced for one round could
+        // be adopted under a quorum harvested for another (and the same-round
+        // proposal-slash rule would rest on inconsistent evidence).
+        if block.round != certificate.round {
+            return Err(format!(
+                "committed block round {} does not match certificate round {}",
+                block.round, certificate.round
+            ));
         }
         // The block must still be a valid extension of what we finalized.
         // Checked here (before any signature loop) so a commit for a forked head

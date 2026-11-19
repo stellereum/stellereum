@@ -1666,6 +1666,18 @@ fn snark_proof_leaves_inputs_and_outputs_public_no_hiding() {
     assert!(caps.sound);
     assert!(!caps.zero_knowledge && !caps.succinct && !caps.hiding);
     assert!(caps.protocol.contains("re-execution"));
+    // A verify is an EVENT, not a branch: the machine-readable statement must
+    // not pretend the chain can consume the verdict.
+    assert!(
+        !caps.verdict_is_branch,
+        "no opcode branches on the verify verdict"
+    );
+    assert!(
+        caps.verdict_observable_as
+            .contains("transaction success/failure"),
+        "the only observable is tx success/failure: {}",
+        caps.verdict_observable_as
+    );
 }
 
 // ---------------------------------------------------------------------------

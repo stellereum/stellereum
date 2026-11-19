@@ -33,6 +33,26 @@ pub struct ShardHeaderCommitment {
     pub state_root: [u8; 32],
     /// The timestamp of the committed shard block.
     pub timestamp: u64,
+    /// The shard's CUMULATIVE gross minted nano-STELL at this head, INCLUDING
+    /// its genesis pre-mine (0 when the shard has minted nothing yet), bounded
+    /// by its static chain-wide supply share. The bound is safe because the
+    /// engine can never mint past that share; it keeps the lazy genesis
+    /// baseline's conservative over-count (a pre-first-mint inbound transfer)
+    /// from declaring a total the masterchain would have to refuse.
+    ///
+    /// This is the chain-wide supply accounting value: the masterchain's
+    /// committed header set is the only place a workchain's minted total is
+    /// signed by a quorum, and the masterchain aggregates the values to
+    /// enforce [`crate::tokenomics::TOTAL_SUPPLY_CAP`] across EVERY shard.
+    /// A single engine's counter is a per-engine bound; this field is what
+    /// makes the cap CHAIN-WIDE.
+    ///
+    /// BACKWARD COMPATIBILITY: appended and zero-skipped in
+    /// [`Self::commitment_bytes`], so a header with no minted supply hashes
+    /// exactly as it did before the field existed. `serde(default)` reads a
+    /// legacy persisted head as 0.
+    #[serde(default)]
+    pub minted_total_nano: u64,
 }
 
 impl ShardHeaderCommitment {
@@ -43,15 +63,30 @@ impl ShardHeaderCommitment {
     /// same preimage. The set is domain-separated by
     /// [`SHARD_HEADERS_COMMITMENT_TAG`] where it enters the block hash.
     pub fn commitment_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 8 + 32 + 32 + 8);
+        let mut out = Vec::with_capacity(4 + 8 + 32 + 32 + 8 + 16);
         out.extend_from_slice(&self.shard_id.to_be_bytes());
         out.extend_from_slice(&self.height.to_be_bytes());
         out.extend_from_slice(&self.block_hash);
         out.extend_from_slice(&self.state_root);
         out.extend_from_slice(&self.timestamp.to_be_bytes());
+        // SUPPLY ACCOUNTING (zero-skipped): a head with a zero minted total
+        // keeps the legacy preimage byte-for-byte, while any real total is
+        // domain-separated so it can never be confused with another field.
+        if self.minted_total_nano != 0 {
+            out.extend_from_slice(SHARD_HEADER_MINTED_TOTAL_TAG);
+            out.extend_from_slice(&self.minted_total_nano.to_be_bytes());
+        }
         out
     }
 }
+
+/// Domain separator for a shard head's CUMULATIVE minted supply inside the
+/// shard-header commitment (and therefore inside the masterchain block hash).
+///
+/// Kept separate from the head fields so a non-zero minted total is
+/// unambiguous, and zero-skipped so a legacy/zero-mint head hashes exactly as
+/// it did before chain-wide supply accounting existed.
+pub const SHARD_HEADER_MINTED_TOTAL_TAG: &[u8; 8] = b"SHMINT01";
 
 /// Domain separator for the shard-head commitment inside a block hash.
 ///
@@ -116,6 +151,25 @@ pub const XSHARD_FULL_COMMITMENT_TAG: &[u8; 8] = b"XSHARD01";
 /// every block with `cnvrf_v3: None` (including all legacy blocks) keeps its
 /// pre-existing block hash byte-for-byte.
 pub const CNVRF_V3_COMMITMENT_TAG: &[u8; 8] = b"CNVRFV31";
+
+/// Domain separator for the SIGNED ROUND inside a block hash (ruleset v4).
+///
+/// The BFT round a proposal belongs to used to travel only in the UNSIGNED
+/// wire envelope ([`crate::consensus_net::ConsensusMsg::Proposal::round`]),
+/// so two honest proposals of different bodies at the SAME height but
+/// DIFFERENT rounds (exactly what a view change produces) were byte-for-byte
+/// indistinguishable from a double-propose. Mixing the round into the block
+/// hash makes it a header field the proposer signs and every validator
+/// re-checks (`block.round == the proposal round`), which is what lets
+/// proposal-equivocation slashing run without a false-slash primitive.
+///
+/// VERSION RULE: mixed in ONLY when `round != 0`, exactly like the other
+/// zero-skipped commitments above. Round 0 is the canonical default (the
+/// first round of a height) and a legacy body has no round to commit, so
+/// every pre-v4 block and every round-0 block keeps its pre-existing hash,
+/// signatures and QCs byte-for-byte. A non-zero round is domain-separated,
+/// so it can never be confused with any other preimage field.
+pub const ROUND_COMMITMENT_TAG: &[u8; 8] = b"ROUND001";
 
 mod bytes48_serde {
     use serde::de::{Error, SeqAccess, Visitor};
@@ -445,6 +499,28 @@ pub struct Block {
     /// closed. Mixed into [`Block::compute_hash`] ONLY when `Some(...)`.
     #[serde(default, deserialize_with = "de_cnvrf_v3")]
     pub cnvrf_v3: Option<CnVrfV3BlockPayload>,
+    /// The BFT round this block was proposed in (ruleset v4).
+    ///
+    /// CONSENSUS SIGNED FIELD: the round is mixed into [`Block::compute_hash`]
+    /// under [`ROUND_COMMITMENT_TAG`] whenever it is non-zero, so the proposer
+    /// signature and every vote/QC cover it. Validators require
+    /// `block.round == the round the proposal is for` on BOTH the admission
+    /// and the adopt path (see `runtime::consensus_step`). Without that
+    /// binding an honest proposer's cross-round re-proposal (A in round r,
+    /// B in r+1, same height) was indistinguishable from a double-propose and
+    /// proposal-equivocation slashing had to stay disabled.
+    ///
+    /// HARD FORK (ruleset v4): this is a new-genesis field. The bincode layout
+    /// gained a trailing field; a pre-v4 body decoded under the LOCAL STORE's
+    /// legacy tolerance reads as round 0 (the only value a pre-v4 block can
+    /// mean), while the strict WIRE path fails closed on the missing bytes.
+    /// Round 0 hashes byte-identically to the legacy layout (the commitment is
+    /// zero-skipped), so replaying an old zero-round body still re-derives the
+    /// hash the chain voted for. Any non-zero round is a new identity, which
+    /// is why mixed v3/v4 fleets must not share a chain: the handshake fork id
+    /// refuses that by construction.
+    #[serde(default, deserialize_with = "de_round")]
+    pub round: u32,
 }
 
 impl Default for Block {
@@ -479,6 +555,7 @@ impl Default for Block {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32],
             cnvrf_v3: None,
+            round: 0,
         }
     }
 }
@@ -675,6 +752,35 @@ where
     }
 }
 
+/// Bincode-tolerant reader for the trailing `round` field of a block.
+///
+/// A block persisted BEFORE ruleset v4 (the signed round) ends its byte stream
+/// right after `cnvrf_v3`. Under `legacy_block_tolerance()`, a missing trailing
+/// field decodes as round 0 — the only value a pre-v4 block can mean (the wire
+/// envelope never had a signed round). Strict wire decoding propagates the
+/// error unchanged (fail closed), so a truncated message can never be
+/// reinterpreted as a different round.
+fn de_round<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match u32::deserialize(d) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if legacy_block_tolerance()
+                && (msg.contains("end of file")
+                    || msg.contains("failed to fill whole buffer")
+                    || msg.contains("UnexpectedEof"))
+            {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Bincode-tolerant reader for the trailing `shard_headers` field of a block.
 ///
 /// A block persisted BEFORE the shard-head commitment existed ends its byte
@@ -781,6 +887,12 @@ impl Block {
         self
     }
 
+    /// Set the signed BFT round this block was proposed in (ruleset v4).
+    pub fn with_round(mut self, round: u32) -> Self {
+        self.round = round;
+        self
+    }
+
     /// Set the declared proposer (the validator public key that signed it).
     pub fn with_proposer(mut self, proposer: [u8; 32]) -> Self {
         self.proposer = proposer;
@@ -824,6 +936,17 @@ impl Block {
         hasher.update(crate::consensus::consensus_chain_id().to_be_bytes());
         hasher.update(self.shard_id.to_be_bytes());
         hasher.update(self.height.to_be_bytes());
+        // SIGNED ROUND (ruleset v4): commit the BFT round this proposal
+        // belongs to, so a same-height pair of proposals from DIFFERENT rounds
+        // (an honest view-change re-proposal) has two visibly different
+        // signed identities and cannot be framed as a double-propose. The
+        // section is zero-skipped: round 0 is the canonical default and the
+        // only value a pre-v4 body can mean, so every legacy block keeps its
+        // pre-existing hash, signatures and QCs byte-for-byte.
+        if self.round != 0 {
+            hasher.update(ROUND_COMMITMENT_TAG);
+            hasher.update(self.round.to_be_bytes());
+        }
         hasher.update(self.prev_hash);
         hasher.update(self.state_root);
         // CRITICAL: commit to EVERY transaction field (nonce, gas_limit, shards

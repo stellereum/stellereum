@@ -84,6 +84,16 @@ pub struct ZkMlCapabilities {
     pub hiding: bool,
     /// The check is SOUND (a forged proof is rejected). **`true`.**
     pub sound: bool,
+    /// A verify verdict may be used as an on-chain BRANCH condition.
+    /// **Always `false` today**: no opcode branches on the stack value the
+    /// verify handler pushes, and `apply.rs` drops
+    /// `VmExecutionResult::Success.return_value`. A verify is an EVENT, not a
+    /// branch; any value-bearing decision must be made off chain.
+    pub verdict_is_branch: bool,
+    /// What a successful verify is observable as. Today: transaction
+    /// success/failure only. No event and no committed state carries the
+    /// verdict.
+    pub verdict_observable_as: String,
     /// Is there a trusted setup? `false` — there is nothing to set up.
     pub trusted_setup: bool,
     /// A human-readable statement of what the "setup attestation" is.
@@ -111,6 +121,10 @@ pub fn zkml_capabilities() -> ZkMlCapabilities {
         succinct: false,
         hiding: false,
         sound: true,
+        verdict_is_branch: false,
+        verdict_observable_as: "transaction success/failure only - no branch, no event and no \
+                                 committed state carries the verdict"
+            .to_string(),
         trusted_setup: false,
         setup_note: "There is NO setup: no ceremony, no proving key, no toxic waste and no \
                      Powers-of-Tau - there is nothing to set up. The registered 'setup \

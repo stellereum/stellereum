@@ -67,7 +67,8 @@ fn test_commit(height: u64) -> ConsensusMsg {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        },
+                round: 0,
+},
         certificate: stellereum::consensus::QuorumCertificate {
             shard_id: 0,
             height,
@@ -100,7 +101,8 @@ fn test_proposal(height: u64) -> ConsensusMsg {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        },
+                round: 0,
+},
     }
 }
 

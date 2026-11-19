@@ -78,8 +78,8 @@ async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Bloc
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
+            round: 0,
+    };    b.sign_block_with_falcon(proposer_key, &fk_for(proposer_key));
     b
 }
 

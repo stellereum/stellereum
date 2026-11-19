@@ -130,6 +130,23 @@ async fn genuine(
     ts: u64,
     last_qc: Option<QuorumCertificate>,
 ) -> Block {
+    genuine_at_round(rt, proposer, height, prev, ts, last_qc, rt.hc.round).await
+}
+
+/// [`genuine`] for an explicit SIGNED round (ruleset v4): the round is inside
+/// the block hash, so a proposal aligned to a future round must sign THAT
+/// round, not the receiver's current one.
+#[allow(clippy::too_many_arguments)]
+// GATE: fixture parameters mirror the block header fields it fills.
+async fn genuine_at_round(
+    rt: &ValidatorRuntime,
+    proposer: &SigningKey,
+    height: u64,
+    prev: [u8; 32],
+    ts: u64,
+    last_qc: Option<QuorumCertificate>,
+    round: u32,
+) -> Block {
     let mut b = Block::new_for_test(
         MASTERCHAIN_SHARD,
         height,
@@ -140,6 +157,7 @@ async fn genuine(
     b.timestamp = ts;
     b.proposer = id(proposer);
     b.last_qc = last_qc;
+    b.round = round;
     b.sign_block_with_falcon(proposer, &fk_for(proposer));
     b
 }
@@ -288,7 +306,7 @@ async fn future_envelope_within_window_aligns_and_accepts() {
     let (r, t) = found.expect("schedule must offer a near-future peer slot");
     assert_eq!(rt.hc.round, r);
 
-    let block = genuine(&rt, &peer, rt.hc.height, [0u8; 32], 1_000, None).await;
+    let block = genuine_at_round(&rt, &peer, rt.hc.height, [0u8; 32], 1_000, None, t).await;
     let bh = block.compute_hash();
     assert_eq!(
         rt.on_proposal(peer_id, block, t)
@@ -335,7 +353,7 @@ async fn far_future_envelope_beyond_window_refused_without_moving() {
     rt.hc.round = r0;
     assert!(rt.hc.proposal.is_none());
 
-    let block = genuine(&rt, &ks[1], 1, [0u8; 32], 1_000, None).await;
+    let block = genuine_at_round(&rt, &ks[1], 1, [0u8; 32], 1_000, None, r0 + 9).await;
     let err = rt
         .on_proposal(peer_id, block, r0 + 9)
         .await

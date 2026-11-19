@@ -74,8 +74,8 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32]) -> Block {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    b.sign_block(&sk);
+        round: 0,
+    };    b.sign_block(&sk);
     b
 }
 

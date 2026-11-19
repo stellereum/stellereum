@@ -470,7 +470,15 @@ pub struct CrossShardKey {
 /// that cannot decode its own blob starts with an EMPTY registry (fail closed,
 /// see [`FinalizedHeaderRegistry::restore_from_bytes`]), and every cross-shard
 /// message produced before that restart becomes unverifiable until re-anchored.
-const REGISTRY_SNAPSHOT_VERSION: u32 = 1;
+/// Registry snapshot layout version.
+///
+/// v2 (ruleset v5) appended `minted_total_nano` to
+/// [`ShardHeaderCommitment`]. Bincode is positional, so a v1 blob would be
+/// decoded with shifted bytes; the version bump makes an upgraded node REFUSE
+/// the old blob (fail closed, registry left empty) instead of trusting a
+/// misread head. The chain-wide aggregate is then rebuilt from committed
+/// headers as the node re-syncs.
+const REGISTRY_SNAPSHOT_VERSION: u32 = 2;
 
 /// How many non-genesis `(shard, block_hash) -> root` anchors are retained PER
 /// SHARD, both in memory and in the persisted blob.
@@ -554,7 +562,7 @@ struct RegistryPayloadV1 {
 }
 
 /// Domain tag mixed into the registry snapshot checksum.
-const REGISTRY_SNAPSHOT_TAG: &[u8] = b"STELLEREUM_XSHARD_HEADERS_V1";
+const REGISTRY_SNAPSHOT_TAG: &[u8] = b"STELLEREUM_XSHARD_HEADERS_V2";
 
 /// Process-local registry of finalized block headers, shared by every shard
 /// runtime in the process (C1 anchor). Maps (shard, source block hash) to the
@@ -762,6 +770,37 @@ impl FinalizedHeaderRegistry {
             .filter(|h| h.shard_id != MASTERCHAIN_SHARD)
             .cloned()
             .collect()
+    }
+
+    /// The shard's last committed cumulative minted total, including its
+    /// genesis pre-mine (`None` when this process has not committed a head for
+    /// the shard).
+    pub fn committed_minted_for(&self, shard: ShardId) -> Option<u64> {
+        self.latest.get(&shard).map(|h| h.minted_total_nano)
+    }
+
+    /// The CHAIN-WIDE committed minted aggregate: the sum of every shard's
+    /// latest committed cumulative total (masterchain included).
+    ///
+    /// This is a PURE function of the committed header set, so every node that
+    /// committed the same heads derives the same value; there is no local,
+    /// environment or wall-clock input. It is recomputed on demand rather than
+    /// stored as a second ledger that could drift from the headers.
+    ///
+    /// `u128` on purpose: a forged header may carry values whose naive `u64`
+    /// sum overflows. Saturating/overflowing arithmetic here must never wrap
+    /// into a small "under the cap" value — the masterchain's refusal check
+    /// compares this aggregate (or its `u128` inputs) against the cap.
+    pub fn committed_minted_total_nano(&self) -> u128 {
+        self.latest
+            .values()
+            .map(|h| h.minted_total_nano as u128)
+            .sum()
+    }
+
+    /// The masterchain's last committed own minted total, if any.
+    pub fn committed_masterchain_minted_nano(&self) -> Option<u64> {
+        self.committed_minted_for(MASTERCHAIN_SHARD)
     }
 
     /// Number of retained `(shard, block_hash) -> root` anchors (bounded by

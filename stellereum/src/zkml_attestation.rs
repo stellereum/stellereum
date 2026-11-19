@@ -43,7 +43,9 @@
 //! act on the verdict: there is no branch, no event, and `apply.rs` drops the
 //! execution result's `return_value`. A verify is an EVENT, not a branch
 //! condition; a value-bearing decision has to be made off chain from the
-//! (public) payload.
+//! (public) payload. The machine-readable statement carries this as
+//! `zkml_capabilities().verdict_is_branch == false` and
+//! `verdict_observable_as = "transaction success/failure only"`.
 //!
 //! # What is TRUSTED
 //!

@@ -85,8 +85,8 @@ async fn live_block_for(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    // Canonical downtime evidence (W10.5): a live block above the genesis
+            round: 0,
+    };    // Canonical downtime evidence (W10.5): a live block above the genesis
     // child carries the QC that decided its parent (production
     // `decided_parent_qc`), and an adopter that knows the parent decision
     // REFUSES a block that omits it. The observer learns each height's QC

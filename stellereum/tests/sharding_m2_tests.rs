@@ -196,8 +196,8 @@ async fn escrow_backed_legacy_message(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let out = source.apply_block_transition(&escrow_block, 0).await;
+            round: 0,
+    };    let out = source.apply_block_transition(&escrow_block, 0).await;
     assert_eq!(out.status, vec![true], "the escrow tx must apply");
     let post_root = source.get_state_root().await;
     assert_eq!(
@@ -251,8 +251,8 @@ fn carrier(shard_id: u32, height: u64, msgs: Vec<CrossShardMessage>) -> Block {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 // ===========================================================================
 // XSHARD-01: the affordability-only inbound credit is REFUSED.
@@ -577,7 +577,6 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 /// height must not credit again.
 #[tokio::test]
 async fn inbound_credit_at_the_supply_cap_still_credits_on_the_live_target() {
-    use stellereum::tokenomics::TOTAL_SUPPLY_CAP;
     use stellereum::xshard2pc::XpcActivation;
 
     let validator = key(50);
@@ -598,13 +597,17 @@ async fn inbound_credit_at_the_supply_cap_still_credits_on_the_live_target() {
         "precondition: the source already escrowed the amount"
     );
 
-    // Exhaust the TARGET shard's global mint cap before it can commit.
+    // Exhaust the TARGET shard's CHAIN-WIDE mint share before it can commit.
+    // With two shards the share is cap/2 (ruleset v5); the property under test
+    // is "a transfer still credits at ZERO mint headroom", not the size of the
+    // share.
     let target = sc.shard(SHARD1).nodes[0].state.clone();
     let seeded = target.genesis_allocation_nano().await;
+    let share = target.chain_mint_limit_nano();
     target
-        .mint_native(&[0xF9u8; 32], TOTAL_SUPPLY_CAP - seeded)
+        .mint_native(&[0xF9u8; 32], share - seeded)
         .await
-        .expect("fill the target's global cap");
+        .expect("fill the target's chain-wide supply share");
     assert_eq!(target.remaining_mint_headroom_nano(), 0);
     let minted_before = target.total_minted_nano();
 
@@ -771,8 +774,8 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    forged.sign_block(&validator);
+        round: 0,
+    };    forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
         .expect_err("a replayed consumption must be refused");

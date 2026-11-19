@@ -94,8 +94,8 @@ async fn build_chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        // FULL-PQ: the proposal signature is verified Falcon-only by
+                    round: 0,
+        };        // FULL-PQ: the proposal signature is verified Falcon-only by
         // `consensus::verify_proposer_signature`, so the block carries both
         // halves (Ed id + registered Falcon half).
         b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
@@ -286,8 +286,8 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block_with_falcon(&proposer, &fks[0]);
+            round: 0,
+    };    b.sign_block_with_falcon(&proposer, &fks[0]);
     let bh = b.compute_hash();
     attach_quorum(&mut b, &ks, &fks, &vs, 6, bh, [0xAB; 32]);
     forked.push(b);
@@ -607,7 +607,7 @@ mod event_driven_catchup {
             block: Block {
                 height: 106,
                 ..Default::default()
-            },
+},
         };
         assert_eq!(inbound_names_ahead(100, &proposal), Some(106));
         // Vote (signature is irrelevant to the arithmetic helper; the driver

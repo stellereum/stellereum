@@ -13,6 +13,34 @@ cargo/test invocation (cargo is serialized and other agents were compiling).
 Line numbers are from the working tree at the timestamp above and can shift by
 a line or two as the concurrent fixes land.
 
+> **POST-SWEEP STATUS (HEAD `9832e97a9`).** This is a historical snapshot at
+> `24656a6ac`; the tree moved. Verified resolutions since then, from
+> `docs/OPEN_DEFECTS.md` and the cited commits:
+>
+> | # | Status at `9832e97a9` |
+> |---:|---|
+> | 1 | **FIXED** — 2PC retirement + bounded COMMIT re-emit (`XPC_TERMINAL_RETENTION_HEIGHTS = 360_000`, slow heartbeat + final copy; `xshard2pc.rs`). |
+> | 2 | **FIXED** — mesh "complete" now means every ATTEMPTED direct copy (`24656a6ac`, `network.rs` / `consensus_net.rs`). |
+> | 3 | **FIXED** — validators enforce the producer's wire/proof budgets (`runtime/consensus_step.rs`, `mempool.rs`). |
+> | 4 | **FIXED** — sealed ∪ plain selections pass through the block caps (`runtime/mev_sync.rs`). |
+> | 5 | **FIXED** — the QC split predicate is power, not count (`consensus/sortition.rs`, `consensus/types.rs`). |
+> | 6 | **SUPERSEDED for numbers** — ruleset v2 rescaled every 3 s-era window; v3 inherited it. See the note below. |
+> | 7 | not re-verified in this pass (no regression evidence either way). |
+> | 8 | **FIXED** — the mesh shortcut no longer swallows `Committed` for a suspected peer (`consensus_net.rs`). |
+> | 9 | **RESOLVED** — the transient revert was restored; the live/sequenced finalize path calls the epoch hooks (`runtime/apply.rs`). |
+> | 10–14 | not re-verified in this pass; treat the line numbers as historical. |
+>
+> **Numbers in item #6 and elsewhere are v1 (3 s-era).** Ruleset v2
+> (`docs/RULESET_V2.md` §1) and v3 (`docs/RULESET_V3.md` §2) changed them:
+> `DOWNTIME_MISS_THRESHOLD` 10 → **42** (2.4 s → 10.08 s),
+> `JAIL_RELEASE_DELAY_HEIGHTS` 1,000 → **4,000** (4 min → 16 min),
+> `PQ_ROTATION_DELAY_HEIGHTS` / `COMMISSION_*` 7,200 → **30,000**
+> (28.8 min → 2 h), `cn_vrf::EPOCH_LEN` 7,200 → **30,000**,
+> 2PC terminal retention is now `XPC_TERMINAL_RETENTION_HEIGHTS = 360_000`
+> (24 h at 240 ms), and mailbox quarantine is
+> `XPC_MAILBOX_QUARANTINE_HEIGHTS = 64` (15.36 s). Read the findings below as
+> the v1/v2 snapshot they are; do not reuse their wall-clock conversions.
+
 **Ranking below is by blast radius, not by checklist number.** The checklist
 sections follow; every hit is tagged with the checklist item(s) it belongs to.
 

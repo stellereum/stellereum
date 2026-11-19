@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use infnode::config::NodeConfig;
@@ -209,9 +210,13 @@ enum Cmd {
         /// Omit to seal to this node's own KEM key (owner = operator).
         #[arg(long)]
         owner_ek: Option<String>,
-        /// Owner ML-KEM-768 seed (hex, secret) used to AUTHENTICATE the sealed
-        /// manifest. Required when `--owner-ek` names a foreign owner; omit to
-        /// use this node's own KEM seed (owner = operator).
+        /// Read the owner ML-KEM-768 seed from a 0600 file (`-` = stdin).
+        /// Preferred over `--owner-key`: a file is not exposed in `ps`.
+        #[arg(long, value_name = "PATH")]
+        owner_key_file: Option<PathBuf>,
+        /// DEPRECATED: owner ML-KEM-768 seed (hex, secret) passed on argv.
+        /// It is visible in `ps` / `/proc/<pid>/cmdline`; use
+        /// `--owner-key-file`, `$INFNODE_OWNER_KEY`, or stdin instead.
         #[arg(long)]
         owner_key: Option<String>,
     },
@@ -227,8 +232,13 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value = "files")]
         bucket: String,
-        /// Owner ML-KEM-768 seed (hex, secret) used to open an owner-sealed
-        /// blob. Omit to use this node's own KEM seed (owner = operator).
+        /// Read the owner ML-KEM-768 seed from a 0600 file (`-` = stdin).
+        /// Preferred over `--owner-key`: a file is not exposed in `ps`.
+        #[arg(long, value_name = "PATH")]
+        owner_key_file: Option<PathBuf>,
+        /// DEPRECATED: owner ML-KEM-768 seed (hex, secret) passed on argv.
+        /// It is visible in `ps` / `/proc/<pid>/cmdline`; use
+        /// `--owner-key-file`, `$INFNODE_OWNER_KEY`, or stdin instead.
         #[arg(long)]
         owner_key: Option<String>,
     },
@@ -350,6 +360,101 @@ fn load(
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     Ok((cfg_obj, keys, pq, data_dir, cfg.to_path_buf()))
+}
+
+/// Environment fallback for the owner ML-KEM seed.
+const OWNER_KEY_ENV: &str = "INFNODE_OWNER_KEY";
+
+/// Read the owner seed from a file, or from stdin when `path` is `-`.
+///
+/// A file carrying a secret must not be readable by group/other; on Unix a
+/// mode with any `0o077` bit set is refused (fail closed) instead of silently
+/// using a world-readable key.
+fn read_owner_key_file(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("read owner key from stdin")?;
+        return Ok(buf);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("owner key file {}: cannot stat", path.display()))?;
+        if !meta.is_file() {
+            bail!("owner key file {} is not a regular file", path.display());
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "owner key file {} is readable by group/other (mode {mode:03o}); \
+                 chmod 600 it (or use --owner-key-file - / ${OWNER_KEY_ENV})",
+                path.display()
+            );
+        }
+    }
+    std::fs::read_to_string(path).with_context(|| format!("read owner key file {}", path.display()))
+}
+
+/// Trim and validate an ML-KEM-768 seed supplied by a file/env/argv.
+fn normalize_owner_key(raw: &str, source: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let key = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+        .trim();
+    if key.is_empty() {
+        bail!("owner key from {source} is empty");
+    }
+    let bytes = hex::decode(key).with_context(|| format!("owner key from {source} is not hex"))?;
+    let want = infnode::mailbox::KEM_SEED_LEN;
+    if bytes.len() != want {
+        bail!(
+            "owner key from {source} must be exactly {} hex chars ({want}-byte ML-KEM-768 seed); \
+             got {} bytes",
+            want * 2,
+            bytes.len()
+        );
+    }
+    Ok(key.to_string())
+}
+
+/// Resolve the owner seed in safety order: `--owner-key-file` (0600 / `-` for
+/// stdin), then `$INFNODE_OWNER_KEY`, then the DEPRECATED argv form.
+///
+/// `None` means "no owner key supplied"; the caller keeps its existing
+/// fallback (this node's own KEM seed). The argv form is kept working for
+/// compatibility but warns loudly because argv is world-readable on Linux.
+fn resolve_owner_key(argv: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    if let Some(path) = file {
+        if argv.is_some() {
+            eprintln!(
+                "[infnode] WARNING: ignoring --owner-key because --owner-key-file was supplied"
+            );
+        }
+        let raw = read_owner_key_file(&path)?;
+        return Ok(Some(normalize_owner_key(
+            &raw,
+            &format!("{}", path.display()),
+        )?));
+    }
+    if let Ok(raw) = std::env::var(OWNER_KEY_ENV) {
+        if !raw.trim().is_empty() {
+            return Ok(Some(normalize_owner_key(&raw, OWNER_KEY_ENV)?));
+        }
+    }
+    if let Some(raw) = argv {
+        eprintln!(
+            "[infnode] WARNING: --owner-key is DEPRECATED and UNSAFE: the ML-KEM seed is \
+             visible in `ps`, /proc/<pid>/cmdline and shell history. Use \
+             --owner-key-file (0600 file, or `-` for stdin) or ${OWNER_KEY_ENV} instead."
+        );
+        return Ok(Some(normalize_owner_key(&raw, "--owner-key")?));
+    }
+    Ok(None)
 }
 
 #[tokio::main]
@@ -863,7 +968,7 @@ async fn main() -> Result<()> {
             let id = hex::encode(blake3::hash(format!("{from}:{dest}:{}", infnode::proto::now_ms()).as_bytes()).as_bytes());
             // 3) храним письмо в storage (репликация)
             let mname = format!("mail:{dest}:{id}");
-            let stored = node.store_mail(&mname, &blob).await;
+            let stored = node.store_mail(&mname, &blob).await?;
             // 4) индекс ящика: append id
             let ikey = format!("mail:{dest}:index");
             let i_h = blake3::hash(ikey.as_bytes());
@@ -1000,6 +1105,7 @@ async fn main() -> Result<()> {
             file,
             bucket,
             owner_ek,
+            owner_key_file,
             owner_key,
         } => {
             let data = std::fs::read(&file)?;
@@ -1007,13 +1113,14 @@ async fn main() -> Result<()> {
             let node_ek = keys.kem_ek_hex();
             let node_seed = hex::encode(keys.kem_seed);
             let owner_ek = owner_ek.unwrap_or_else(|| node_ek.clone());
-            let owner_key = match owner_key {
+            let owner_key = match resolve_owner_key(owner_key, owner_key_file)? {
                 Some(k) => k,
                 None => {
                     if !owner_ek.eq_ignore_ascii_case(&node_ek) {
                         anyhow::bail!(
                             "put refused: sealing to a foreign --owner-ek requires --owner-key \
-                             (the owner's ML-KEM seed) so the manifest can be authenticated"
+                             (or --owner-key-file / $INFNODE_OWNER_KEY) so the manifest can be \
+                             authenticated"
                         );
                     }
                     node_seed
@@ -1059,10 +1166,12 @@ async fn main() -> Result<()> {
             name,
             out,
             bucket,
+            owner_key_file,
             owner_key,
         } => {
             let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
-            let owner_key = owner_key.unwrap_or_else(|| hex::encode(keys.kem_seed));
+            let owner_key = resolve_owner_key(owner_key, owner_key_file)?
+                .unwrap_or_else(|| hex::encode(keys.kem_seed));
             let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             // Owner-aware fetch: opens an owner-sealed manifest, falls back to
             // the legacy at-rest-obfuscation format when the blob predates

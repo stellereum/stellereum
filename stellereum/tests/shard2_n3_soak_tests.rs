@@ -884,8 +884,8 @@ async fn shard2_n3_double_spend_refused_everywhere() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        forged.sign_block_with_falcon(&skey, fk);
+                round: 0,
+        };        forged.sign_block_with_falcon(&skey, fk);
         let err = node
             .validate_proposal(&forged, root)
             .expect_err("replayed consumption must be refused");

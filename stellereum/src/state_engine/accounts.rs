@@ -52,6 +52,9 @@ impl InMemoryStateEngine {
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_minted_nano: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            chain_mint_limit_nano: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::tokenomics::TOTAL_SUPPLY_CAP,
+            )),
             domain_gens: Arc::new(crate::commitment::DomainGenerations::default()),
             domain_cache: Arc::new(std::sync::Mutex::new(
                 crate::commitment::DomainCache::default(),
@@ -164,6 +167,13 @@ impl InMemoryStateEngine {
             // counter must not move when the sandbox is discarded.
             total_minted_nano: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.total_minted_nano
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            // The sandbox executes on behalf of the same shard: it inherits
+            // the same static chain-wide share (a value, not a shared atomic,
+            // so a sandbox cannot move the live engine's limit).
+            chain_mint_limit_nano: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.chain_mint_limit_nano
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
             // FORK SAFETY: the deep copy holds equal state at equal
@@ -1766,6 +1776,66 @@ impl InMemoryStateEngine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Install this shard's CHAIN-WIDE mint share (nano-STELL).
+    ///
+    /// Called deterministically from the committed shard set (see
+    /// [`crate::tokenomics::SupplyPartition`] and
+    /// `ValidatorRuntime::with_shard`), never from an environment variable or
+    /// a peer message. Idempotent and monotone in effect: a mint that already
+    /// committed is never unwound; future mints are simply refused sooner.
+    /// The effective ceiling is `min(TOTAL_SUPPLY_CAP, limit)`, so a caller
+    /// can never widen the advertised global cap, only narrow this shard's
+    /// slice of it.
+    pub fn set_chain_mint_limit_nano(&self, limit: u64) {
+        use std::sync::atomic::Ordering;
+        let limit = limit.min(crate::tokenomics::TOTAL_SUPPLY_CAP);
+        let mut current = self.chain_mint_limit_nano.load(Ordering::Acquire);
+        // Monotone DOWNWARD: a second call can only narrow the shard's slice.
+        // Without this, a stale or buggy caller could re-widen a limit that a
+        // previous block already committed against, reopening headroom the
+        // chain-wide accounting has already spent.
+        loop {
+            if limit >= current {
+                return;
+            }
+            match self.chain_mint_limit_nano.compare_exchange_weak(
+                current,
+                limit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// The effective chain-wide mint ceiling for THIS engine:
+    /// `min(TOTAL_SUPPLY_CAP, the installed shard share)`.
+    pub fn chain_mint_limit_nano(&self) -> u64 {
+        self.chain_mint_limit_nano
+            .load(std::sync::atomic::Ordering::Acquire)
+            .min(crate::tokenomics::TOTAL_SUPPLY_CAP)
+    }
+
+    /// The shard's CUMULATIVE minted total INCLUDING its pre-mined genesis
+    /// allocation, which is what the chain-wide accounting commits.
+    ///
+    /// [`Self::total_minted_nano`] is 0 until the first post-genesis mint
+    /// folds the genesis baseline in (see [`Self::genesis_allocation_nano`]),
+    /// so a freshly funded shard would otherwise report "minted nothing" and
+    /// the masterchain aggregate would undercount its genesis allocation. This
+    /// getter closes that: before the first mint it returns the committed
+    /// native balance sum (exactly the baseline the first reservation will
+    /// fold in); after it, the monotone counter.
+    pub async fn committed_minted_nano(&self) -> u64 {
+        let minted = self.total_minted_nano();
+        if minted != 0 {
+            return minted;
+        }
+        self.genesis_allocation_nano().await
+    }
+
     /// Nano-STELL still mintable under [`crate::tokenomics::TOTAL_SUPPLY_CAP`].
     ///
     /// The counter is a committed, monotone scalar. Before the FIRST
@@ -1781,19 +1851,19 @@ impl InMemoryStateEngine {
     /// counter-only view; ENFORCEMENT is always in
     /// [`Self::reserve_mint_nano`], never in this read.
     pub fn remaining_mint_headroom_nano(&self) -> u64 {
-        let cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
+        let limit = self.chain_mint_limit_nano();
         let minted = self.total_minted_nano();
         if minted != 0 {
-            return cap.saturating_sub(minted);
+            return limit.saturating_sub(minted);
         }
         match self.accounts.try_read() {
             Ok(map) => {
                 let genesis = map
                     .values()
                     .fold(0u64, |sum, a| sum.saturating_add(a.balance));
-                cap.saturating_sub(genesis)
+                limit.saturating_sub(genesis)
             }
-            Err(_) => cap,
+            Err(_) => limit,
         }
     }
 
@@ -1856,7 +1926,11 @@ impl InMemoryStateEngine {
     /// `pending_rewards` split to unwind).
     pub(super) fn reserve_mint_nano(&self, amount: u64, genesis_nano: u64) -> Result<(), String> {
         use std::sync::atomic::Ordering;
-        let cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
+        let global_cap = crate::tokenomics::TOTAL_SUPPLY_CAP;
+        // The chain-wide ceiling for THIS shard: its static share of the cap,
+        // never above the advertised global cap. With `share_i` summing to at
+        // most `global_cap`, no interleaving of shard mints can exceed it.
+        let cap = self.chain_mint_limit_nano().min(global_cap);
         let mut current = self.total_minted_nano.load(Ordering::Acquire);
         loop {
             let base = if current == 0 { genesis_nano } else { 0 };
@@ -1868,7 +1942,7 @@ impl InMemoryStateEngine {
                 .ok_or_else(|| "global supply counter overflows u64: refusing mint".to_string())?;
             if next > cap {
                 return Err(format!(
-                    "global supply cap exceeded: minting {amount} nano-STELL would take total minted past {cap} (currently {current}, genesis allocation {base}, headroom {})",
+                    "global supply cap exceeded: minting {amount} nano-STELL would take this shard's total minted past {cap} (global cap {global_cap}, currently {current}, genesis allocation {base}, headroom {})",
                     cap.saturating_sub(current).saturating_sub(base)
                 ));
             }

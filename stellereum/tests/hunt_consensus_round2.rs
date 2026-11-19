@@ -60,8 +60,8 @@ fn block_at(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    // FULL-PQ: Ed-only proposals are refused by `verify_proposer_signature`.
+        round: 0,
+    };    // FULL-PQ: Ed-only proposals are refused by `verify_proposer_signature`.
     b.sign_block_with_falcon(&ks[idx], &fks[idx]);
     b
 }
@@ -334,8 +334,8 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    block.sign_block(&ks[0]);
+            round: 0,
+    };    block.sign_block(&ks[0]);
     rt.blocks.insert(block.compute_hash(), block);
     let decided = rt.try_finalize().await;
     assert_eq!(
@@ -403,8 +403,8 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        b.sign_block(pk);
+                    round: 0,
+        };        b.sign_block(pk);
         let bhash = b.compute_hash();
         prev = bhash;
         rt.blocks.insert(bhash, b);

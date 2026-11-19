@@ -11,7 +11,7 @@ use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::mailbox::MailKeys;
 use infnode::node::BLOB_SEAL_V1;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("infnode-cli-seal-{tag}-{}", std::process::id()));
@@ -55,15 +55,49 @@ fn infnode_bin() -> &'static str {
 }
 
 fn run(args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(infnode_bin())
-        .args(args)
-        .output()
-        .expect("spawn infnode");
+    run_full(args, &[], None)
+}
+
+/// Run the binary with a clean owner-key environment and optional env/stdin.
+/// Removes `INFNODE_OWNER_KEY` so an ambient value cannot make a negative
+/// test accidentally pass (or a positive one use a foreign key).
+fn run_full(args: &[&str], envs: &[(&str, &str)], stdin: Option<&str>) -> (bool, String, String) {
+    let mut cmd = Command::new(infnode_bin());
+    cmd.args(args).env_remove("INFNODE_OWNER_KEY");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    if let Some(input) = stdin {
+        use std::io::Write;
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn infnode");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write owner key to stdin");
+        let out = child.wait_with_output().expect("wait infnode");
+        return (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        );
+    }
+    let out = cmd.output().expect("spawn infnode");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
 #[test]
@@ -94,6 +128,10 @@ fn cli_storage_put_seals_to_the_owner_key_and_get_requires_it() {
         &owner_seed,
     ]);
     assert!(ok, "storage-put failed: {stdout}\n{stderr}");
+    assert!(
+        stderr.contains("--owner-key is DEPRECATED"),
+        "the argv form must warn loudly: {stderr}"
+    );
     assert!(
         stdout.contains("sealed=owner"),
         "put must report owner sealing: {stdout}"
@@ -207,6 +245,215 @@ fn cli_storage_put_defaults_to_the_node_owner_key() {
     ]);
     assert!(ok, "storage-get failed: {stdout}\n{stderr}");
     assert_eq!(std::fs::read(&out).expect("output"), payload);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1: the owner seed must be usable from a 0600 file and from stdin, never
+/// only from argv.
+#[test]
+fn cli_owner_key_file_and_stdin_round_trip() {
+    let dir = setup("owner-key-file");
+    let cfg_path = dir.join("node.yaml");
+    let src = dir.join("plain.txt");
+    let payload = b"owner key from a 0600 file, not from ps";
+    std::fs::write(&src, payload).expect("input");
+
+    let owner = MailKeys::generate();
+    let owner_ek = hex::encode(&owner.kem_ek);
+    let owner_seed = hex::encode(owner.kem_seed);
+    let key_file = dir.join("owner.seed");
+    // Trailing whitespace must be tolerated (editors add a newline).
+    std::fs::write(&key_file, format!("{owner_seed}\n")).expect("key file");
+    #[cfg(unix)]
+    set_mode(&key_file, 0o600);
+
+    let (ok, stdout, stderr) = run(&[
+        "storage-put",
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--to",
+        "test",
+        "--name",
+        "file-key.txt",
+        "--file",
+        src.to_str().unwrap(),
+        "--owner-ek",
+        &owner_ek,
+        "--owner-key-file",
+        key_file.to_str().unwrap(),
+    ]);
+    assert!(
+        ok,
+        "storage-put via --owner-key-file failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("DEPRECATED"),
+        "the file form must not emit the argv deprecation: {stderr}"
+    );
+
+    // Read it back with the seed on stdin (`--owner-key-file -`).
+    let out = dir.join("out.txt");
+    let (ok, stdout, stderr) = run_full(
+        &[
+            "storage-get",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--to",
+            "test",
+            "--name",
+            "file-key.txt",
+            "--out",
+            out.to_str().unwrap(),
+            "--owner-key-file",
+            "-",
+        ],
+        &[],
+        Some(&format!("{owner_seed}\n")),
+    );
+    assert!(ok, "storage-get via stdin failed: {stdout}\n{stderr}");
+    assert_eq!(std::fs::read(&out).expect("output"), payload);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1: `$INFNODE_OWNER_KEY` is the fallback when no file flag is given.
+#[test]
+fn cli_owner_key_env_round_trip() {
+    let dir = setup("owner-key-env");
+    let cfg_path = dir.join("node.yaml");
+    let src = dir.join("plain.txt");
+    let payload = b"owner key from the environment";
+    std::fs::write(&src, payload).expect("input");
+
+    let owner = MailKeys::generate();
+    let owner_ek = hex::encode(&owner.kem_ek);
+    let owner_seed = hex::encode(owner.kem_seed);
+
+    let put_args = [
+        "storage-put",
+        "--config",
+        cfg_path.to_str().unwrap(),
+        "--to",
+        "test",
+        "--name",
+        "env-key.txt",
+        "--file",
+        src.to_str().unwrap(),
+        "--owner-ek",
+        &owner_ek,
+    ];
+    let (ok, stdout, stderr) = run_full(&put_args, &[("INFNODE_OWNER_KEY", &owner_seed)], None);
+    assert!(ok, "storage-put via env failed: {stdout}\n{stderr}");
+
+    let out = dir.join("out.txt");
+    let (ok, stdout, stderr) = run_full(
+        &[
+            "storage-get",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--to",
+            "test",
+            "--name",
+            "env-key.txt",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        &[("INFNODE_OWNER_KEY", &owner_seed)],
+        None,
+    );
+    assert!(ok, "storage-get via env failed: {stdout}\n{stderr}");
+    assert_eq!(std::fs::read(&out).expect("output"), payload);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L1: a missing, empty or group/world-readable key file must fail BEFORE
+/// anything is stored, and must say why.
+#[test]
+fn cli_owner_key_file_fails_closed() {
+    let dir = setup("owner-key-fail");
+    let cfg_path = dir.join("node.yaml");
+    let src = dir.join("plain.txt");
+    std::fs::write(&src, b"must not be stored without a usable key").expect("input");
+    let owner = MailKeys::generate();
+    let owner_ek = hex::encode(&owner.kem_ek);
+    let owner_seed = hex::encode(owner.kem_seed);
+
+    let put = |key_file: &Path| {
+        run(&[
+            "storage-put",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--to",
+            "test",
+            "--name",
+            "refused.txt",
+            "--file",
+            src.to_str().unwrap(),
+            "--owner-ek",
+            &owner_ek,
+            "--owner-key-file",
+            key_file.to_str().unwrap(),
+        ])
+    };
+
+    // Missing file.
+    let (ok, stdout, stderr) = put(&dir.join("does-not-exist"));
+    assert!(!ok, "a missing owner key file must fail closed: {stdout}");
+    assert!(
+        stderr.contains("owner key file"),
+        "the refusal must name the key file: {stderr}"
+    );
+    assert!(!stdout.contains("put ok"), "no success may be reported");
+
+    // Empty file.
+    let empty = dir.join("empty.seed");
+    std::fs::write(&empty, "\n").expect("empty key file");
+    #[cfg(unix)]
+    set_mode(&empty, 0o600);
+    let (ok, stdout, stderr) = put(&empty);
+    assert!(!ok, "an empty owner key must fail closed: {stdout}");
+    assert!(
+        stderr.contains("empty"),
+        "the refusal must say the key was empty: {stderr}"
+    );
+    assert!(!stdout.contains("put ok"));
+
+    // Wrong length (not an ML-KEM-768 seed).
+    let short = dir.join("short.seed");
+    std::fs::write(&short, "deadbeef\n").expect("short key file");
+    #[cfg(unix)]
+    set_mode(&short, 0o600);
+    let (ok, stdout, stderr) = put(&short);
+    assert!(!ok, "a wrong-length owner key must fail closed: {stdout}");
+    assert!(
+        stderr.contains("64-byte ML-KEM-768 seed"),
+        "the refusal must state the expected size: {stderr}"
+    );
+    assert!(!stdout.contains("put ok"));
+
+    // Group/world-readable file (Unix only; mode bits are meaningless elsewhere).
+    #[cfg(unix)]
+    {
+        let open = dir.join("open.seed");
+        std::fs::write(&open, format!("{owner_seed}\n")).expect("open key file");
+        set_mode(&open, 0o644);
+        let (ok, stdout, stderr) = put(&open);
+        assert!(!ok, "a 0644 owner key file must fail closed: {stdout}");
+        assert!(
+            stderr.contains("chmod 600"),
+            "the refusal must tell the operator how to fix it: {stderr}"
+        );
+        assert!(!stdout.contains("put ok"));
+    }
+
+    // Nothing was stored by any of the refused attempts.
+    let kv = std::fs::read_to_string(dir.join("kv.json")).unwrap_or_default();
+    assert!(
+        !kv.contains("refused.txt"),
+        "fail-closed attempts must not write a manifest: {kv}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

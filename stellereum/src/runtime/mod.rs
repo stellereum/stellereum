@@ -242,11 +242,11 @@ pub const MAX_BLOCK_GAS: u64 = 500_000_000;
 ///
 /// Bounds proposer clock skew WITHOUT any wall-clock read: the verdict is a
 /// pure function of (parent, child), so two validators with different local
-/// times derive the same answer from the same two blocks. One hour is generous
-/// on purpose — honest proposers stamp seconds apart, and operational gaps and
-/// catch-up produce ~1000s single-step jumps in this repo's own suites — while
-/// still refusing absurd far-future stamps that would poison every
-/// timestamp-driven rule (session expiry, unbonding maturity) for years.
+/// times derive the same answer from the same two blocks. Must stay equal to
+/// [`crate::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS`] / 1000 (ruleset v4 S8:
+/// one hour is ~15,000 slots at the 240 ms tempo, the envelope this repo's
+/// suites use for honest gaps and catch-up, while still refusing stamps that
+/// would poison timestamp-driven rules for days).
 pub const MAX_TIMESTAMP_JUMP_SECS: u64 = 3_600;
 
 /// Near-future proposal phase-alignment window (rounds).

@@ -44,8 +44,8 @@ fn consensus_duplicate_signatures_do_not_fake_quorum() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
+            round: 0,
     };
-
     // Sign the SAME block three times with the SAME key
     block.sign_block(&attacker);
     block.sign_block(&attacker);
@@ -84,8 +84,8 @@ fn consensus_block_signature_not_replayable_across_height() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    block.sign_block(&val);
+            round: 0,
+    };    block.sign_block(&val);
     assert!(block.verify_signatures(1));
 
     // Replay the same signatures onto a different height

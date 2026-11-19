@@ -303,23 +303,24 @@ fn fork_id_is_stable_for_equal_inputs_and_changes_with_the_ruleset() {
     }
 }
 
-/// Ruleset v3 pin: the SDKs ship `FORK_ID = 0xb13baff4` (protocol 1.0,
-/// `CONSENSUS_RULESET_VERSION = 3`) from the same 20-entry rules list. The
+/// Ruleset v5 pin: the SDKs ship `FORK_ID = 0x9d59096b` (protocol 1.0,
+/// `CONSENSUS_RULESET_VERSION = 5`) from the same 23-entry rules list. The
 /// node MUST produce exactly that value or every SDK builder refuses to sign.
 #[test]
-fn fork_id_v3_is_pinned_and_matches_the_sdk_guard() {
+fn fork_id_v5_is_pinned_and_matches_the_sdk_guard() {
     /// The value pinned by `stellereum-sdk/src/protocol.rs` and
-    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0xb13baff4"`).
-    const SDK_FORK_ID: u32 = 0xb13b_aff4;
+    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0x9d59096b"`).
+    const SDK_FORK_ID: u32 = 0x9d59_096b;
 
     assert_eq!(FORK_ID, SDK_FORK_ID);
-    assert_eq!(CONSENSUS_RULESET_VERSION, 3);
-    assert_eq!(FORK_ID_RULES.len(), 20, "SDKs fold 20 rules");
+    assert_eq!(CONSENSUS_RULESET_VERSION, 5);
+    assert_eq!(FORK_ID_RULES.len(), 23, "SDKs fold 23 rules");
 
     // Exact order matters: the fold is sequential. This is the SDK list,
     // constant-for-constant. The first 19 keep the v2 order; the 20th is the
-    // ruleset-v3 proposal-slashing activation sentinel.
-    let expected: [u64; 20] = [
+    // now-ACTIVE proposal-slashing height (0), the 21st is the ruleset-v4
+    // deterministic block-timestamp drift bound.
+    let expected: [u64; 23] = [
         stellereum::consensus::MAX_COMMIT_CERT_SIGNERS as u64,
         stellereum::consensus::MAX_ROUND_AHEAD as u64,
         stellereum::consensus::MAX_ROUND_ADVANCE_PER_MESSAGE as u64,
@@ -340,6 +341,9 @@ fn fork_id_v3_is_pinned_and_matches_the_sdk_guard() {
         stellereum::mmr::MMR_EPOCH_BLOCKS,
         stellereum::minroot_vdf::DEFAULT_VDF_STEPS_PER_EPOCH,
         stellereum::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
+        stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS,
+        stellereum::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION,
+        stellereum::tokenomics::TOTAL_SUPPLY_CAP,
     ];
     assert_eq!(
         FORK_ID_RULES, &expected,
@@ -360,7 +364,13 @@ fn fork_id_v3_is_pinned_and_matches_the_sdk_guard() {
         stellereum::consensus::VOTE_SIGN_DOMAIN,
         b"STELLEREUM_BFT_VOTE_V3"
     );
-    assert_eq!(stellereum::protocol::DOMAIN_SET_VERSION, 2);
+    assert_eq!(stellereum::protocol::DOMAIN_SET_VERSION, 3);
+    // Ruleset v4 is ACTIVE, not a sentinel: slashing fires from genesis.
+    assert_eq!(
+        stellereum::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
+        0
+    );
+    assert_eq!(stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS, 3_600_000);
 }
 
 /// Historical ruleset v2: version 2, domain set 1, the 19 v2 rules and the

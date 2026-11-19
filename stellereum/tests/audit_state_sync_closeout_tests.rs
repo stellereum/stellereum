@@ -99,8 +99,8 @@ fn test_block(height: u64, prev: [u8; 32], proposer: [u8; 32], state_root: [u8; 
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 // ===========================================================================
 // F1: boot restores the FULL replay snapshot (produced/completed included)
@@ -257,8 +257,8 @@ fn f2_push_policy_classes() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    // Prune is the ONLY droppable class (re-scheduled next cadence).
+            round: 0,
+    };    // Prune is the ONLY droppable class (re-scheduled next cadence).
     assert_eq!(
         persist_push_policy(&PersistJob::Prune { keep_from: 9 }),
         PersistPushPolicy::DropFirst
@@ -677,8 +677,8 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let out = e.apply_block_transition(&block, REWARD).await;
+                    round: 0,
+        };        let out = e.apply_block_transition(&block, REWARD).await;
         (e, out)
     }
 

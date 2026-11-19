@@ -2572,12 +2572,10 @@ pub(super) async fn dispatch_reads(
             }
             handle_estimate_fee(st, id, params).await
         }
-        // TEMPORARY diagnostic for the empty-blocks hunt: list pending
-        // (sender, nonce, hash). No signatures or amounts leave the node.
-        // Gated by the deployment's `auth_token` (when configured) like the
-        // signed-payload arms: pending mempool contents are non-public and
-        // can aid front-running, so they must not be readable by an anonymous
-        // caller. (The send paths stay OPEN — see the module docs.)
+        // Pending mempool contents are non-public: they can aid front-running,
+        // so listing them requires the deployment's `auth_token` (when
+        // configured), like the signed-payload arms. (The send paths stay OPEN
+        // — see the module docs.)
         "stell_mempoolDump" => {
             let Some(expected) = &st.auth_token else {
                 return err(

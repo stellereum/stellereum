@@ -3,7 +3,7 @@ use super::lanes::{
 };
 use super::{
     DropReason, ValidatorRuntime, DKG_REPUBLISH_INTERVAL, MAX_BLOCK_GAS, MAX_BLOCK_TXS,
-    MAX_TIMESTAMP_JUMP_SECS, SEAL_PARTIAL_POLL_MS,
+    SEAL_PARTIAL_POLL_MS,
 };
 use crate::consensus::{Height, Step};
 use crate::mempool::Mempool;
@@ -1989,8 +1989,14 @@ impl ValidatorRuntime {
                     }
                 })
             }) {
+            // SAME deterministic bound the validator gate applies
+            // (`consensus_step::check_block_timestamp`): the honest proposer
+            // clamps into [parent, parent + MAX_BLOCK_TIMESTAMP_DRIFT_MS/1000]
+            // so a slightly fast local clock can never build a body that every
+            // validator must refuse.
+            let max_drift_secs = crate::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS / 1_000;
             timestamp
-                .min(parent_ts.saturating_add(MAX_TIMESTAMP_JUMP_SECS))
+                .min(parent_ts.saturating_add(max_drift_secs))
                 .max(parent_ts)
         } else {
             timestamp
@@ -2054,6 +2060,11 @@ impl ValidatorRuntime {
             // quorum signs.
             mmr_epoch_root: self.epoch_mmr_commitment(),
             cnvrf_v3,
+            // RULESET v4: the signed BFT round this proposal belongs to. The
+            // proposer knows it (`self.hc.round`); validators require the
+            // block's round to equal the round the proposal is for on the
+            // admission AND adopt paths.
+            round: self.hc.round,
         };
         // Sign the proposer slot with whichever signer is configured. `sign_block`
         // signs with an in-process key, so when a remote signer is present the

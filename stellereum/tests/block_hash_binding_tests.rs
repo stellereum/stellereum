@@ -26,8 +26,8 @@ fn mk(sk: &SigningKey, txs: Vec<Transaction>, cross: Vec<CrossShardMessage>) -> 
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block(sk);
+            round: 0,
+    };    b.sign_block(sk);
     b
 }
 

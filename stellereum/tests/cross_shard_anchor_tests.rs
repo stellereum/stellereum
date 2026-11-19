@@ -151,6 +151,7 @@ fn commitment(shard: u32, height: u64, tag: u8) -> ShardHeaderCommitment {
         block_hash,
         state_root: [tag.wrapping_add(0x40); 32],
         timestamp: 1_760_000_000 + height,
+        minted_total_nano: 0,
     }
 }
 

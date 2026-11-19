@@ -142,8 +142,8 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block_with_falcon(proposer_key, proposer_fk);
+            round: 0,
+    };    b.sign_block_with_falcon(proposer_key, proposer_fk);
     b
 }
 

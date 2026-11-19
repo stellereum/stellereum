@@ -28,8 +28,171 @@ use serde::{Deserialize, Serialize};
 /// `assemble_cached_digest_*` byte-identical on a chain that has not minted
 /// anything yet (the pinned genesis root). NOTE: a genesis allocation above
 /// this cap therefore refuses every later mint — fail closed by design.
+///
+/// CHAIN-WIDE (ruleset v5): a per-engine counter alone let N shards each mint
+/// a full cap. Each shard engine is now installed with a deterministic static
+/// share of this cap ([`SupplyPartition`]); the shares sum to at most the cap,
+/// so the SUM over shards cannot exceed it under any interleaving. The
+/// masterchain also aggregates the signed shard-head commitments
+/// (`sharding::ShardHeaderCommitment::minted_total_nano`) and refuses a head
+/// that would take the committed aggregate past this value. See
+/// `docs/SUPPLY_CAP.md`.
 pub const TOTAL_SUPPLY_CAP: u64 = 1_000_000_000 * 1_000_000_000; // in nano-STELL (9 decimals)
 pub const GENESIS_VAULT_CAP: u64 = 250_000_000 * 1_000_000_000;
+
+/// Version of the CHAIN-WIDE supply partition rule (ruleset v5).
+///
+/// Folded into the protocol fork id so a fleet that disagrees about how the
+/// 1 B cap is split across shards refuses consensus instead of diverging.
+pub const CHAIN_SUPPLY_PARTITION_VERSION: u64 = 1;
+
+/// The CHAIN-WIDE partition of [`TOTAL_SUPPLY_CAP`] across the configured
+/// shards (masterchain included).
+///
+/// WHY A STATIC PARTITION. A per-engine counter bounds one engine; with N
+/// engines the advertised 1 B cap was `N x cap`. Sharing the remaining
+/// headroom dynamically ("every shard may use what is left") is NOT safe under
+/// asynchronous interleaving: two shards that both observe `headroom = H` may
+/// each mint `H` before either commits, so the committed total reaches
+/// `2H`. Even a fair `H / N` allowance per shard is unsafe when different
+/// shards act on different (stale) views of the aggregate. A static,
+/// genesis-committed partition is the only scheme that is safe without a
+/// two-phase quota-handoff protocol:
+///
+/// ```text
+/// minted(shard_i) <= quota_i   for every i, and   sum(quota_i) <= TOTAL_SUPPLY_CAP
+/// =>  sum(minted_i) <= TOTAL_SUPPLY_CAP  for EVERY interleaving and EVERY lag.
+/// ```
+///
+/// The partition is derived deterministically from the committed shard set
+/// ([`Self::uniform`]), so every node computes the same shares without any
+/// local or environment input. [`Self::bounded_limit_nano`] expresses the
+/// additional MONOTONE tightening a shard can derive from the last
+/// masterchain-committed aggregate: it can only make a shard mint less, never
+/// let it borrow another shard's unused quota. Production installs the STATIC
+/// share on the engine (a view-dependent engine limit would make `apply()`
+/// non-deterministic across nodes with different header views); the helper is
+/// the safe under-mint rule for callers that have a committed view. The
+/// consequence is honest under-mint (stranded headroom) when some shards are
+/// idle; see `docs/SUPPLY_CAP.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupplyPartition {
+    quotas: std::collections::BTreeMap<u32, u64>,
+}
+
+impl SupplyPartition {
+    /// Split the cap EQUALLY across `shards`, deterministically.
+    ///
+    /// Shards are sorted ascending; the first `TOTAL_SUPPLY_CAP % n` shards get
+    /// one extra nano each. No float, no environment, no insertion-order
+    /// dependence, so two nodes with the same committed shard set derive
+    /// byte-identical quotas. An empty set yields an empty partition (nobody
+    /// may mint) — fail closed.
+    pub fn uniform<I: IntoIterator<Item = u32>>(shards: I) -> Self {
+        let mut ids: Vec<u32> = shards.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut quotas = std::collections::BTreeMap::new();
+        let n = ids.len() as u64;
+        if n == 0 {
+            return Self { quotas };
+        }
+        let base = TOTAL_SUPPLY_CAP / n;
+        let mut remainder = TOTAL_SUPPLY_CAP % n;
+        for id in ids {
+            let extra = u64::from(remainder > 0);
+            remainder = remainder.saturating_sub(1);
+            quotas.insert(id, base.saturating_add(extra));
+        }
+        Self { quotas }
+    }
+
+    /// Build an EXPLICIT partition (tests, deterministic genesis configs).
+    ///
+    /// Fails closed if the quotas sum above the cap or an id is duplicated:
+    /// such a partition could never be chain-wide safe.
+    pub fn from_quotas<I: IntoIterator<Item = (u32, u64)>>(quotas: I) -> Result<Self, String> {
+        let mut map = std::collections::BTreeMap::new();
+        for (shard, quota) in quotas {
+            if map.insert(shard, quota).is_some() {
+                return Err(format!("supply partition: duplicate shard {shard}"));
+            }
+        }
+        let partition = Self { quotas: map };
+        partition.validate()?;
+        Ok(partition)
+    }
+
+    /// The shard's cumulative mint limit, or 0 when the shard is not part of
+    /// the committed partition (fail closed: an unknown shard may not mint).
+    pub fn quota_for(&self, shard: u32) -> u64 {
+        self.quotas.get(&shard).copied().unwrap_or(0)
+    }
+
+    /// True when the committed partition assigns this shard a share.
+    pub fn contains_shard(&self, shard: u32) -> bool {
+        self.quotas.contains_key(&shard)
+    }
+
+    /// Every `(shard, quota)` pair in ascending shard order.
+    pub fn quotas(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.quotas.iter().map(|(shard, quota)| (*shard, *quota))
+    }
+
+    /// Sum of all quotas, in nano-STELL. Never above [`TOTAL_SUPPLY_CAP`] for
+    /// a constructed partition.
+    pub fn total_nano(&self) -> u128 {
+        self.quotas.values().map(|q| *q as u128).sum()
+    }
+
+    /// True when the partition covers at least one shard.
+    pub fn is_empty(&self) -> bool {
+        self.quotas.is_empty()
+    }
+
+    /// Fail closed unless the partition is a valid static split of the cap.
+    pub fn validate(&self) -> Result<(), String> {
+        let total = self.total_nano();
+        if total > TOTAL_SUPPLY_CAP as u128 {
+            return Err(format!(
+                "supply partition sums to {total} nano-STELL, above TOTAL_SUPPLY_CAP {}",
+                TOTAL_SUPPLY_CAP
+            ));
+        }
+        Ok(())
+    }
+
+    /// The shard's mint limit TIGHTENED by the last masterchain-committed
+    /// aggregate, never loosened above its static share.
+    ///
+    /// `committed_aggregate` is the sum of every committed shard's cumulative
+    /// minted total (including this shard's own committed total
+    /// `committed_own`), or `None` when this node has no committed aggregate
+    /// view yet. The result is:
+    ///
+    /// * static share when no view exists — safe by construction, so an
+    ///   isolated/restarted shard UNDER-mints rather than over-mints;
+    /// * `min(share, cap - committed_others)` otherwise, where
+    ///   `committed_others = aggregate - committed_own`. A lagging view can
+    ///   only make `committed_others` smaller and therefore this bound LOOSER,
+    ///   but it can never exceed the shard's static share, which is the actual
+    ///   invariant. This is the honest lag bound: the aggregate is an
+    ///   additional ceiling, not the primary one.
+    pub fn bounded_limit_nano(
+        &self,
+        shard: u32,
+        committed_aggregate: Option<u128>,
+        committed_own: u64,
+    ) -> u64 {
+        let share = self.quota_for(shard);
+        let Some(aggregate) = committed_aggregate else {
+            return share;
+        };
+        let others = aggregate.saturating_sub(committed_own as u128);
+        let global_room = (TOTAL_SUPPLY_CAP as u128).saturating_sub(others);
+        share.min(global_room.min(u64::MAX as u128) as u64)
+    }
+}
 pub const BASE_STELL_PRICE_MICRO_USD: u64 = 250_000; // $0.25 USD (6 decimals)
 
 /// Undivided per-block emission, in nano-STELL: the pool this is divided by

@@ -17,7 +17,7 @@ use infnode::keyring::{NodeKeys, PqKeys};
 use infnode::mailbox::MailKeys;
 use infnode::node::{
     blob_content_hash, blob_key_nonce, blob_seal_aad, box_unwrap_key, e2e_decrypt, e2e_decrypt_aad,
-    Node, BLOB_SEAL_V1,
+    Node, StoreMailError, BLOB_SEAL_V1,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -250,6 +250,67 @@ async fn invalid_owner_key_fails_closed_instead_of_storing_a_plaintext_key() {
             .await
             .is_none(),
         "no manifest may be written on a refused owner-sealed store"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PENTEST2 L2: `store_mail(_boxed|_ec)` used to fall back to writing the
+/// plaintext data key when the owner ek could not be boxed. Pin the new
+/// fail-closed contract: a typed error, no manifest, and no chunk written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_mail_with_unboxable_owner_key_fails_closed() {
+    let (node, dir) = test_node("mail-invalid-owner").await;
+    let blob = b"mail body that must never be stored unsealed".to_vec();
+
+    let err = node
+        .store_mail_boxed("mail:bad", &blob, Some("deadbeef"))
+        .await
+        .expect_err("an unboxable owner ek must be refused");
+    assert_eq!(
+        err,
+        StoreMailError::InvalidOwnerKey,
+        "the refusal must name the owner key, not degrade to a plaintext key"
+    );
+    assert!(
+        node.get_local_kv("m:mail:bad").await.is_none(),
+        "no mail manifest may be written on a refused owner-sealed store"
+    );
+    let chunk_dir = dir.join("chunks").join("mail");
+    let chunks = std::fs::read_dir(&chunk_dir)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(
+        chunks, 0,
+        "the key must be boxed (fail closed) BEFORE any chunk is written"
+    );
+
+    // The EC path has the same contract.
+    let err = node
+        .store_mail_ec("mail:bad-ec", &blob, Some("not-hex"), 3, 5)
+        .await
+        .expect_err("an unboxable owner ek must be refused on the EC path too");
+    assert_eq!(err, StoreMailError::InvalidOwnerKey);
+    assert!(node.get_local_kv("m:mail:bad-ec").await.is_none());
+
+    // A valid owner key still produces a key_box and never a plaintext key.
+    let owner = MailKeys::generate();
+    let n = node
+        .store_mail_boxed("mail:good", &blob, Some(&hex::encode(owner.kem_ek)))
+        .await
+        .expect("a valid owner ek must be accepted");
+    assert!(n > 0, "stored chunks must be counted");
+    let manifest = node
+        .get_local_kv("m:mail:good")
+        .await
+        .expect("manifest written");
+    assert!(
+        manifest.contains("key_box"),
+        "owner-sealed mail must wrap the data key"
+    );
+    assert!(
+        !manifest.contains("\"key\":\""),
+        "owner-sealed mail must never publish the plaintext data key"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -184,6 +184,7 @@ fn block_h2_with_bond(
         cnvrf_v3: None,
         order_merkle_root: stellereum::mev::compute_order_merkle_root(&txs),
         epoch_key_commitment: [0u8; 32],
+        round: 0,
     }
 }
 

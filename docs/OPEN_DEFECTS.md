@@ -2,6 +2,7 @@
 
 Snapshot: после пентеста-2 и кросс-кат свипа. Источники: `docs/PENTEST2_*.md`,
 `docs/REVIEW_WAVE_REGRESSIONS.md`, `docs/LOGIC_BUG_SWEEP.md`.
+Обновлено на HEAD `9832e97a9` (закрыты `--owner-key` и `store_mail`).
 
 Статусы: **FIXED** — код исправлен и есть тест «падало до»; **DEPLOYED** — то же,
 плюс бинарь на A/B/D; **FIXED** — в работе у агента; **OPEN** — не начато;
@@ -23,6 +24,7 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | S3 | COMMIT'ы не ретайрились, записи не чистились | DEPLOYED | xshard2pc.rs / xshard.rs |
 | mesh-complete | «полная доставка» сравнивалась с сырым числом пиров → двойная отправка | DEPLOYED | consensus_net.rs |
 | H2 | sealed-манифест не аутентифицирован (downgrade пиром) | DEPLOYED | infnode/node.rs |
+| CHAIN-SUPPLY | 1B cap считался на движок, а не на цепь | **FIXED** (ruleset 5: статический раздел + masterchain aggregate) | tokenomics / sharding |
 
 ## P1 — высокий риск
 
@@ -75,9 +77,9 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | F-12 | nil-breaker ре-бродкастит тело старого раунда | ASSIGNED (HUNT-1) |
 | S8 | timestamp блока выбирает продюсер | ASSIGNED (HUNT-1/4) |
 | S9 | вес голоса можно вывести перед голосом | ASSIGNED (HUNT-4) |
-| unicast Body | нет `send_to_peer`, ответы broadcast (bounded) | OPEN (нужен transport API) |
-| `--owner-key` | seed в argv | OPEN |
-| store_mail | fail-open на неоткрываемом ключе | OPEN |
+| unicast Body | нет `send_to_peer`, ответы broadcast (bounded) | **FIXED** (`send_to_peer`, 10→10 unicast) |
+| `--owner-key` | seed в argv | **FIXED** (HEAD `9832e97a9`: `--owner-key-file` 0600/stdin, `$INFNODE_OWNER_KEY`; argv deprecated with a loud warning; `cli_seal_tests`) |
+| store_mail | fail-open на неоткрываемом ключе | **FIXED** (HEAD `9832e97a9`: `StoreMailError`, key boxed before any chunk/manifest; `store_mail_with_unboxable_owner_key_fails_closed`) |
 | sub-nano | усечение при переводе в nano | ACCEPTED (документировано) |
 | pre-auth sealed | старые sealed-блобы отклоняются | ACCEPTED (требуют переопубликации) |
 | zkML | re-execution, не ZK | ACCEPTED (отдельная система позже) |
@@ -89,7 +91,7 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | ID | Дефект | Статус |
 |---|---|---|
 | SLASH-A | `Vote` не содержит `shard_id` и не подписывает его → честный мультишард-валидатор слэшится за нормальную работу | **FIXED** (V3-preimage + QC/evidence/offense key) |
-| SLASH-B | `Block` не содержит `round` → честный пропозер после view change слэшится как double-propose | **MITIGATED** (slashing выключен сентинелом `u64::MAX`; полный фикс требует `round` в identity блока — `runtime/mev_sync.rs`) |
+| SLASH-B | `Block` не содержит `round` → честный пропозер после view change слэшится как double-propose | **FIXED** (ruleset 4: `round` в подписанной identity, slashing включён) |
 | SLASH-C | рестарт откатывает раунд до ≤64, голоса не персистятся → self-equivocation и потеря голоса | **FIXED** (fsync watermark до голосования + round floor) |
 | DOWNTIME | `DOWNTIME_MISS_THRESHOLD = 10` при 240 мс = 2.4 с → слэш за WAN-блип | **FIXED** (ruleset v2: 42 = 10.08 s) |
 | CNVRF-WINDOW | `V3_COMMIT_LOOKAHEAD = 360` = 86 с; VDF обязан успеть, иначе boundary без beacon | **FIXED** (682 = 163.7 s, замер VDF 20.5 s × 8) |

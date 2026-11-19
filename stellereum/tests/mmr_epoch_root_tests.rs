@@ -110,8 +110,8 @@ async fn record_epoch(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         b.precommit_qc = Some(cert(ks, fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
         prev = bh;
@@ -182,8 +182,8 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let boundary_hash = boundary.compute_hash();
+            round: 0,
+    };    let boundary_hash = boundary.compute_hash();
     boundary.precommit_qc = Some(cert(&ks, &fks, E, boundary_hash, &leaves[(E - 1) as usize]));
     st.record_finalized_header(&boundary).await;
 

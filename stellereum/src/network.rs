@@ -1201,6 +1201,44 @@ struct SnapshotChunkMeta {
     hash: Option<String>,
 }
 
+/// Result of a UNICAST consensus frame: which transport carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnicastPath {
+    /// Delivered over the warm direct validator-mesh link.
+    MeshDirect,
+    /// Delivered over the existing per-peer direct transport (mesh not a
+    /// member, or its direct copy failed).
+    PeerDirect,
+}
+
+/// Route ONE consensus frame to exactly ONE peer.
+///
+/// The warm mesh direct link is used when `peer` is a member; any other case
+/// (non-member, or a failed direct copy) goes through the supplied per-peer
+/// direct transport. Only ONE copy is ever sent — this never falls back to the
+/// overlay broadcast, so a per-requester reply cannot become an all-peer fan
+/// out. Split out of [`P2pNetworkAdapter::deliver_consensus_to_peer`] so the
+/// routing rule is testable with a fake mesh transport.
+pub async fn deliver_unicast<F, Fut>(
+    mesh: &ValidatorMesh,
+    peer: [u8; 20],
+    topic: &str,
+    data: &str,
+    direct: F,
+) -> Result<UnicastPath, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if mesh.is_member(&peer) && mesh.deliver_to(peer, topic, data, mesh_now_ms()).await {
+        return Ok(UnicastPath::MeshDirect);
+    }
+    // Not a member, or the direct mesh copy failed: the existing per-peer
+    // direct transport is the fallback, still addressed to this one peer.
+    direct().await?;
+    Ok(UnicastPath::PeerDirect)
+}
+
 impl P2pNetworkAdapter {
     pub fn new(node: Arc<Node>) -> Self {
         let transport: Arc<dyn ValidatorMeshTransport> =
@@ -1313,6 +1351,34 @@ impl P2pNetworkAdapter {
     /// fallback for any failed copy (or when the mesh is entirely down).
     pub async fn deliver_consensus_mesh(&self, topic: &str, data_hex: &str) -> MeshDelivery {
         self.mesh.deliver(topic, data_hex, mesh_now_ms()).await
+    }
+
+    /// Deliver ONE consensus frame to exactly ONE peer (unicast).
+    ///
+    /// Direct mesh link when the peer is a member, then the existing per-peer
+    /// direct transport on any miss. Never the overlay broadcast: a body
+    /// reply addressed to its requester must not fan out to the peer set.
+    /// Returns which transport carried the frame; `Err` when both failed (the
+    /// caller takes its liveness fallback).
+    pub async fn deliver_consensus_to_peer(
+        &self,
+        peer: [u8; 20],
+        topic: &str,
+        data_hex: &str,
+    ) -> Result<UnicastPath, String> {
+        let payload = serde_json::json!({ "topic": topic, "data": data_hex })
+            .to_string()
+            .into_bytes();
+        let node = Arc::clone(&self.node);
+        let timeout = std::time::Duration::from_millis(mesh_send_timeout_ms());
+        deliver_unicast(&self.mesh, peer, topic, data_hex, move || async move {
+            match tokio::time::timeout(timeout, node.send_to(peer, "pubsub.msg", payload)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("unicast direct send timeout".to_string()),
+            }
+        })
+        .await
     }
 
     /// Scope this adapter to a chain epoch. Called once the genesis fingerprint is
@@ -4822,6 +4888,7 @@ mod retention_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
+            round: 0,
         };
         let writes = plan_block_body_publish(&epoch, &block).expect("plan");
         assert_eq!(writes.len(), 1);

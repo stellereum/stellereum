@@ -52,6 +52,7 @@ fn det_block(height: u64, ntx: usize) -> Block {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
+        round: 0,
     }
 }
 

@@ -343,6 +343,7 @@ fn root_block() -> Block {
         shard_headers: vec![],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
+        round: 0,
     }
 }
 
@@ -449,6 +450,7 @@ async fn block_at(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
+        round,
     };
     b.sign_block_with_falcon(pk, fk);
     b

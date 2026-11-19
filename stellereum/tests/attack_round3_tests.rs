@@ -61,8 +61,8 @@ fn consensus_zero_quorum_must_not_accept_unsigned_block() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    assert!(
+            round: 0,
+    };    assert!(
         !block.verify_signatures(0),
         "an unsigned block must NEVER pass a zero quorum (footgun)"
     );

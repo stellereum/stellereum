@@ -72,8 +72,8 @@ fn bare_block(k: &SigningKey, h: u64, prev: [u8; 32]) -> Block {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block(k);
+            round: 0,
+    };    b.sign_block(k);
     b
 }
 
@@ -109,8 +109,8 @@ fn qc_block(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block(pkey);
+            round: 0,
+    };    b.sign_block(pkey);
     let hash = b.compute_hash();
     // Genuine committee-compiled QC against the full set `vs`, bound to the
     // block's real parent (the F8 schedule gate and the chain binding both

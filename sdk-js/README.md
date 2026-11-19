@@ -72,7 +72,7 @@ const signer = new HttpFalconSigner({
 Every new-shape builder refuses a chain id / fork id that is not the
 configured node identity (`ProtocolError`, codes `chain_id_mismatch`,
 `fork_id_mismatch`, `protocol_version_mismatch`). The current identity is
-protocol 1.0, consensus ruleset v3, fork id `0xb13baff4`, chain 5757.
+protocol 1.0, consensus ruleset v5, fork id `0x9d59096b`, chain 5757.
 
 ```ts
 import { buildEvmCarrier, buildGovPropose } from "@stellereum/sdk";

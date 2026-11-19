@@ -739,6 +739,9 @@ pub struct ConsensusNetwork {
     /// Peer evictions imposed by the target policy (see
     /// [`PEER_EVICT_TARGET_MAX`]). Monotonic test/monitoring counter.
     peer_evicted_total: AtomicU64,
+    /// Compact-gossip `Body` reply routing counters (unicast vs bounded
+    /// broadcast). Test/monitoring only; see [`CompactReplyCounters`].
+    compact_body_replies: Arc<CompactReplyCounters>,
     /// Resolved static peer ids, cached once every peer resolves. The config
     /// is immutable after construction, so re-decoding every peer's PQ hex on
     /// every frame (the mesh check AND the per-peer send resolve independently)
@@ -1189,6 +1192,7 @@ impl ConsensusNetwork {
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
             inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
             peer_evicted_total: AtomicU64::new(0),
+            compact_body_replies: Arc::new(CompactReplyCounters::new()),
             peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
@@ -1220,6 +1224,7 @@ impl ConsensusNetwork {
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
             inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
             peer_evicted_total: AtomicU64::new(0),
+            compact_body_replies: Arc::new(CompactReplyCounters::new()),
             peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
@@ -1632,6 +1637,76 @@ impl ConsensusNetwork {
     /// 1-item wrapper over [`Self::broadcast_batch`] (P3-H4).
     pub async fn broadcast(&self, msg: &ConsensusMsg) {
         self.broadcast_batch(std::slice::from_ref(msg)).await;
+    }
+
+    /// Compact-gossip `Body` reply counters (unicast vs bounded broadcast).
+    pub fn compact_reply_counters(&self) -> Arc<CompactReplyCounters> {
+        Arc::clone(&self.compact_body_replies)
+    }
+
+    /// Deliver ONE consensus message to exactly ONE peer (unicast).
+    ///
+    /// Routing: when `peer` is a validator-mesh member the frame goes over the
+    /// warm direct mesh link; if that copy fails — or the peer is not a mesh
+    /// member — the SAME frame is delivered over the existing per-peer direct
+    /// transport (`pubsub.msg` addressed to that peer). There is:
+    ///
+    /// * NO broadcast amplification: exactly one destination, never the peer set;
+    /// * NO new wire variant: the bytes are the single-message
+    ///   [`ConsensusMsg::encode`] frame wrapped in the historical
+    ///   `{topic,data}` envelope, so wire format v2 is unchanged;
+    /// * a bounded size ([`MAX_CONSENSUS_MSG`]) and a bounded send (the mesh /
+    ///   direct timeout), and the transport work is DETACHED from the consensus
+    ///   tick exactly like [`Self::send_payload_to`], so one slow requester can
+    ///   never stretch the round clock.
+    ///
+    /// `Err` therefore reports a PREFLIGHT refusal only: an oversized message,
+    /// an encode failure, or a peer refused for consensus (fork/version). Those
+    /// are the cases where the caller should take its liveness fallback.
+    pub async fn send_to_peer(&self, peer: [u8; 20], msg: &ConsensusMsg) -> Result<(), String> {
+        // Same admission gate as the broadcast: a refused peer never receives
+        // consensus traffic, addressed or otherwise.
+        if !self.peer_consensus_admitted(&peer) {
+            return Err(format!(
+                "peer {} is refused for consensus (fork/version)",
+                hex::encode(peer)
+            ));
+        }
+        let bytes = msg.encode()?;
+        if bytes.len() > MAX_CONSENSUS_MSG {
+            return Err(format!(
+                "unicast consensus message too large: {} bytes",
+                bytes.len()
+            ));
+        }
+        let data = hex::encode(bytes);
+        let adapter = Arc::clone(&self.adapter);
+        let topic = self.topic.clone();
+        let health = Arc::clone(&self.peer_health);
+        // Detached: the drain loop must never await one peer's transport (see
+        // `flush_outbox`). One task per unicast reply, and the mesh/direct
+        // transport applies its own bounded timeout.
+        tokio::spawn(async move {
+            match adapter.deliver_consensus_to_peer(peer, &topic, &data).await {
+                Ok(path) => {
+                    tracing::debug!(
+                        "[consensus] unicast body reply to {} via {:?}",
+                        hex::encode(peer),
+                        path,
+                    );
+                }
+                Err(e) => {
+                    // A failed unicast is not delivery proof either way; it is
+                    // still a transport miss for the health ledger.
+                    ConsensusNetwork::record_health(&health, peer, false);
+                    tracing::warn!(
+                        "[consensus] unicast body reply to {} failed on the mesh AND the direct link: {e}",
+                        hex::encode(peer),
+                    );
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Broadcast several consensus messages as ONE encoded batch with ONE
@@ -3414,6 +3489,143 @@ impl CompactBodyServer {
     }
 }
 
+/// Test-visible accounting for compact-gossip `Body` replies.
+///
+/// Every answered pull is dispatched exactly once through
+/// [`dispatch_compact_body_reply`], which increments ONE of the two counters
+/// **at dispatch time**. A unicast reply addresses exactly one peer; a
+/// broadcast reply is the bounded, fail-open fallback (unknown requester or a
+/// unicast that could not be addressed). This is the measurement the compact
+/// path is pinned on: ten requesters must read as ten unicast sends, not as
+/// ten broadcasts to ten peers (which would be 100 peer sends).
+#[derive(Debug, Default)]
+pub struct CompactReplyCounters {
+    unicast: AtomicU64,
+    broadcast: AtomicU64,
+}
+
+impl CompactReplyCounters {
+    pub const fn new() -> Self {
+        Self {
+            unicast: AtomicU64::new(0),
+            broadcast: AtomicU64::new(0),
+        }
+    }
+
+    /// Replies dispatched to exactly ONE peer (the requester).
+    pub fn unicast_sends(&self) -> u64 {
+        self.unicast.load(Ordering::Relaxed)
+    }
+
+    /// Replies dispatched through the bounded all-peer broadcast fallback.
+    pub fn broadcast_sends(&self) -> u64 {
+        self.broadcast.load(Ordering::Relaxed)
+    }
+
+    /// Reset both counters (test/measurement window; never called live).
+    pub fn reset(&self) {
+        self.unicast.store(0, Ordering::Relaxed);
+        self.broadcast.store(0, Ordering::Relaxed);
+    }
+
+    fn record_unicast(&self) {
+        self.unicast.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_broadcast(&self) {
+        self.broadcast.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Why a compact `Body` reply could not be unicast and took the bounded
+/// broadcast fallback instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyReplyFallback {
+    /// The inbound envelope carried no usable 20-byte node id (`src`/`from`
+    /// missing, non-hex, wrong length, or infnode's shared `broadcast` key).
+    UnknownRequester,
+    /// The requester WAS known but the unicast hand-off failed (encode /
+    /// admission preflight); liveness wins, so the bounded broadcast still
+    /// delivers the body.
+    UnicastFailed,
+}
+
+/// Which route one compact `Body` reply actually took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyReplyRoute {
+    /// Delivered to exactly one peer.
+    Unicast([u8; 20]),
+    /// The bounded fail-open fallback (never unbounded: one broadcast per
+    /// served pull, already gated by the served-once set and rate cap).
+    BoundedBroadcast(BodyReplyFallback),
+}
+
+/// Parse an inbound peer key (the `src`/`from` form normalised by
+/// [`inbound_peer_key`]) into the 20-byte node id used by the mesh/direct
+/// transports.
+///
+/// Returns `None` for anything that is not exactly 40 ASCII hex chars: the
+/// shared [`INBOUND_BROADCAST_PEER_KEY`] bucket, a legacy short tag, an
+/// oversized/non-hex `src`, or an empty key. Never guesses an identity.
+pub fn peer_id_from_inbound_key(key: &str) -> Option<[u8; 20]> {
+    let bare = key.trim();
+    let bare = bare.strip_prefix("inf1:").unwrap_or(bare);
+    if bare.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    hex::decode_to_slice(bare, &mut out).ok()?;
+    Some(out)
+}
+
+/// Dispatch ONE compact-gossip `Body` reply to the requester only.
+///
+/// * A requester that parses to a 20-byte node id goes out over `unicast`
+///   (see [`ConsensusNetwork::send_to_peer`]) and is counted as a UNICAST
+///   send. Nothing is broadcast.
+/// * A missing/unknown requester, or a unicast that fails its preflight, is
+///   counted as a BROADCAST and handed to `broadcast` — the existing bounded
+///   outbox path (served-once + per-requester rate cap already ran in
+///   [`CompactBodyServer::serve_for`]), so liveness is never traded for
+///   silence and amplification never becomes unbounded.
+///
+/// Split out from the node driver so the routing contract (and the counter)
+/// is directly testable: the driver supplies the two delivery closures.
+pub async fn dispatch_compact_body_reply<U, Fut, B>(
+    requester_key: &str,
+    msg: ConsensusMsg,
+    counters: &CompactReplyCounters,
+    unicast: U,
+    broadcast: B,
+) -> BodyReplyRoute
+where
+    U: FnOnce([u8; 20], ConsensusMsg) -> Fut,
+    Fut: Future<Output = Result<(), (ConsensusMsg, String)>>,
+    B: FnOnce(ConsensusMsg),
+{
+    let Some(peer) = peer_id_from_inbound_key(requester_key) else {
+        counters.record_broadcast();
+        broadcast(msg);
+        return BodyReplyRoute::BoundedBroadcast(BodyReplyFallback::UnknownRequester);
+    };
+    match unicast(peer, msg).await {
+        Ok(()) => {
+            counters.record_unicast();
+            BodyReplyRoute::Unicast(peer)
+        }
+        Err((msg, why)) => {
+            tracing::warn!(
+                "[consensus] unicast compact body reply to {} failed ({why}); \
+                 falling back to the bounded broadcast",
+                hex::encode(peer),
+            );
+            counters.record_broadcast();
+            broadcast(msg);
+            BodyReplyRoute::BoundedBroadcast(BodyReplyFallback::UnicastFailed)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dandelion tx-publish wiring (publish path only; default OFF, no env knob).
 //
@@ -4897,6 +5109,7 @@ mod tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
+            round: 0,
         };
         b.sign_block(&sk);
         b

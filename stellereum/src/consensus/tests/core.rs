@@ -930,17 +930,11 @@ fn signed_block_with_falcon_shard(
 }
 
 #[test]
-fn proposal_evidence_is_disabled_by_the_false_slash_sentinel() {
-    // FINDING B (false-slash primitive). Two validly-signed, same-height,
-    // DIFFERENT bodies used to be treated as a double-propose. That pair is
-    // exactly what an honest proposer produces across rounds after a view
-    // change (A in round r, B in r+1), and the wire block carries no SIGNED
-    // round to tell the cases apart. The compiled sentinel therefore makes
-    // the wired path refuse EVERY proposal evidence: no slash is strictly
-    // better than slashing an honest proposer.
-    //
-    // (This test previously asserted the verifier ACCEPTED the pair — the
-    // vulnerable behavior Finding B removes. It fails on the pre-fix code.)
+fn proposal_evidence_same_round_is_an_offense_but_cross_round_is_not() {
+    // RULESET v4: the block now commits a SIGNED round, so the false-slash
+    // primitive Finding B described is gone. Two validly-signed, same-height,
+    // SAME-ROUND, different bodies ARE a double-propose; the honest cross-round
+    // pair (A in round r, B in r+1) is NOT.
     let ks = keys(3);
     let fk0 = FalconKeypair::generate_from_seed(0xD0);
     let vs = vset(&ks);
@@ -956,18 +950,19 @@ fn proposal_evidence_is_disabled_by_the_false_slash_sentinel() {
         verify_proposer_signature(&a) && verify_proposer_signature(&b),
         "PQ-signed proposals must verify under the registered key"
     );
-    assert_eq!(PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT, u64::MAX);
+    assert_eq!(PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT, 0);
+    // Both fixtures are round 0: same signed round, different bodies => slash.
     let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a.clone(), b.clone());
     assert!(
-        !verify_proposal_equivocation_evidence(&ev, &member),
-        "the false-slash sentinel must refuse every proposal evidence"
+        verify_proposal_equivocation_evidence(&ev, &member),
+        "same signed round with different bodies is a double-propose"
     );
-    assert!(
-        canonicalize_proposal_equivocation_evidence(vec![ev], &member).is_empty(),
-        "nothing may survive shaping into a block-carried slash"
+    assert_eq!(
+        canonicalize_proposal_equivocation_evidence(vec![ev], &member).len(),
+        1,
+        "a genuine same-round offense must survive shaping into a slash"
     );
-    // The SAME-ROUND rule is ready behind the sentinel: the pair is an
-    // offense once the (future, signed) round is equal...
+    // The SAME-ROUND rule: the pair is an offense when the rounds match...
     assert!(proposal_equivocation_offense_rule(
         a.shard_id,
         b.shard_id,
@@ -1032,9 +1027,8 @@ fn proposal_evidence_refuses_cross_shard_blocks() {
         !verify_proposal_equivocation_evidence(&ev, &member),
         "blocks from different shards are not a double-propose"
     );
-    // The same-shard, same-round rule still treats a distinct-body pair as
-    // an offense — but the wired verifier stays behind the false-slash
-    // sentinel, so it refuses it for now (Finding B fallback).
+    // The same-shard, same-round rule treats a distinct-body pair as an
+    // offense, and ruleset v4 activates the wired verifier for it.
     let a2 = signed_block_with_falcon_shard(&ks[0], &fk0, 0, 5, 2_000);
     assert!(proposal_equivocation_offense_rule(
         a.shard_id,
@@ -1046,8 +1040,32 @@ fn proposal_evidence_refuses_cross_shard_blocks() {
         &a.compute_hash(),
         &a2.compute_hash(),
     ));
-    let same = ProposalEquivocationEvidence::new(ids(&ks)[0], a, a2);
-    assert!(!verify_proposal_equivocation_evidence(&same, &member));
+    let mk_round3 = |timestamp: u64| {
+        let proposer = ks[0].verifying_key().to_bytes();
+        let mut b = crate::sharding::Block {
+            shard_id: 0,
+            height: 5,
+            proposer,
+            timestamp,
+            round: 3,
+            ..Default::default()
+        };
+        b.sign_block(&ks[0]);
+        let hash = b.compute_hash();
+        let falcon_sig = fk0.sign(&hash);
+        b.validator_signatures.push((fk0.validator_id(), falcon_sig));
+        b
+    };
+    let same = ProposalEquivocationEvidence::new_at_round(
+        ids(&ks)[0],
+        3,
+        mk_round3(1_000),
+        mk_round3(2_000),
+    );
+    assert!(
+        verify_proposal_equivocation_evidence(&same, &member),
+        "same-shard, same-SIGNED-round, distinct bodies must be slashable"
+    );
 }
 
 #[test]
@@ -1177,13 +1195,13 @@ fn proposal_evidence_canonicalize_sorts_and_dedupes() {
         ],
         &member,
     );
-    // FINDING B fallback: the wired path is behind the false-slash sentinel,
-    // so nothing survives shaping into a slash. What is still exercised here
-    // is that the candidates are REJECTED deterministically (no ordering or
-    // dedup dependence), and the offense keys stay canonical.
+    // Ruleset v4: the two genuine same-round offenses survive shaping, the
+    // same-body garbage does not, and duplicates (including the swapped pair)
+    // collapse to ONE canonical entry.
+    assert_eq!(out.len(), 2, "two distinct offenses must survive shaping");
     assert!(
-        out.is_empty(),
-        "the sentinel must refuse every proposal evidence"
+        !out.iter().any(|ev| ev.block_a.compute_hash() == ev.block_b.compute_hash()),
+        "the same-body pair must be refused"
     );
     assert_eq!(e1.offense_key(), e1dup.offense_key());
     assert_eq!(e1.offense_key(), e1swapped.offense_key());

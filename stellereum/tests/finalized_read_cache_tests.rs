@@ -155,8 +155,8 @@ async fn publish_height(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let fbh = b.compute_hash();
+            round: 0,
+    };    let fbh = b.compute_hash();
     let prev = b.prev_hash;
     b.precommit_qc = Some(qc_for(ks, fks, h, fbh, &prev));
     st.record_finalized_header(&b).await;
@@ -255,8 +255,8 @@ async fn fixed_workload() -> Arc<RpcState> {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         let prev = b.prev_hash;
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
@@ -370,8 +370,8 @@ async fn finalized_read_cache_soundness_and_invalidation() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         let prev = b.prev_hash;
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
@@ -720,8 +720,8 @@ async fn finalized_read_cache_bounded_growth() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         let prev = b.prev_hash;
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
@@ -816,8 +816,8 @@ async fn finalized_read_cache_before_after() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         let prev = b.prev_hash;
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;

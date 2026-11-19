@@ -78,8 +78,8 @@ fn block_of(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
     engine.get_account(a).await.map(|x| x.balance).unwrap_or(0)

@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use stellereum::consensus_net::{mesh_may_substitute, mesh_shortcut_allowed};
 use stellereum::network::{
-    MeshDelivery, MeshFuture, ValidatorMesh, ValidatorMeshMember, ValidatorMeshTransport,
-    VALIDATOR_MESH_COOLDOWN_MS, VALIDATOR_MESH_EVICT_AFTER,
+    deliver_unicast, MeshDelivery, MeshFuture, UnicastPath, ValidatorMesh, ValidatorMeshMember,
+    ValidatorMeshTransport, VALIDATOR_MESH_COOLDOWN_MS, VALIDATOR_MESH_EVICT_AFTER,
 };
 
 #[derive(Default)]
@@ -585,4 +585,114 @@ async fn rotation_adds_removes_and_resets_a_changed_link() {
     // Default policy constants stay pinned for operators.
     assert_eq!(VALIDATOR_MESH_EVICT_AFTER, 3);
     assert_eq!(VALIDATOR_MESH_COOLDOWN_MS, 60_000);
+}
+
+// ---------------------------------------------------------------------------
+// UNICAST consensus delivery: one addressed copy, mesh first, direct on a miss.
+// This is the transport under `ConsensusNetwork::send_to_peer`, which the
+// compact-gossip Body reply uses so a requester is answered without a
+// broadcast.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicast_prefers_the_mesh_and_never_publishes_to_the_overlay() {
+    let transport = Arc::new(FakeTransport::new(0, 0));
+    let mesh = mesh(Arc::clone(&transport));
+    let a = member(1);
+    let b = member(2);
+    mesh.install(vec![a.clone(), b.clone()], 1_000);
+
+    let path = deliver_unicast(&mesh, a.id, "stell/consensus/t", "beef", || async {
+        panic!("the warm mesh link must carry a member's copy")
+    })
+    .await
+    .expect("mesh member is reachable");
+    assert_eq!(path, UnicastPath::MeshDirect);
+
+    // ONE copy, to the addressed peer only. `b` is untouched and the overlay
+    // (the broadcast path) is never used: no amplification.
+    assert_eq!(
+        transport.direct_calls(),
+        vec![(a.id, "stell/consensus/t:beef".to_string())]
+    );
+    assert_eq!(transport.overlay_calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicast_falls_back_to_the_direct_link_when_the_mesh_copy_fails() {
+    let transport = Arc::new(FakeTransport::new(0, 0));
+    let mesh = mesh(Arc::clone(&transport));
+    let a = member(1);
+    let b = member(2);
+    mesh.install(vec![a.clone(), b.clone()], 1_000);
+    transport.set_direct(a.id, false);
+
+    let delivered = Arc::new(Mutex::new(Vec::<([u8; 20], String)>::new()));
+    let sink = Arc::clone(&delivered);
+    let path = deliver_unicast(
+        &mesh,
+        a.id,
+        "stell/consensus/t",
+        "c0ffee",
+        move || async move {
+            sink.lock().unwrap().push((a.id, "c0ffee".to_string()));
+            Ok(())
+        },
+    )
+    .await
+    .expect("the direct fallback delivered the same frame");
+    assert_eq!(path, UnicastPath::PeerDirect);
+
+    // The message was NOT lost: exactly one fallback copy, still addressed to
+    // the requester, and still no overlay/broadcast.
+    assert_eq!(
+        *delivered.lock().unwrap(),
+        vec![(a.id, "c0ffee".to_string())]
+    );
+    assert_eq!(transport.overlay_calls(), 0);
+    assert_eq!(
+        transport.direct_calls().len(),
+        1,
+        "only the failed mesh try"
+    );
+
+    // Non-members go straight to the direct transport (no mesh attempt).
+    let outsider = {
+        let mut id = [0x99u8; 20];
+        id[1] = 0x01;
+        id
+    };
+    let sink = Arc::clone(&delivered);
+    let path = deliver_unicast(&mesh, outsider, "t", "dead", move || async move {
+        sink.lock().unwrap().push((outsider, "dead".to_string()));
+        Ok(())
+    })
+    .await
+    .expect("direct transport reaches a non-member");
+    assert_eq!(path, UnicastPath::PeerDirect);
+    assert_eq!(
+        transport.direct_calls().len(),
+        1,
+        "no mesh call for a non-member"
+    );
+    assert_eq!(delivered.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicast_reports_an_error_only_when_both_transports_fail() {
+    let transport = Arc::new(FakeTransport::new(0, 0));
+    let mesh = mesh(Arc::clone(&transport));
+    let a = member(1);
+    mesh.install(vec![a.clone()], 1_000);
+    transport.set_direct(a.id, false);
+
+    let err = deliver_unicast(&mesh, a.id, "t", "baad", || async {
+        Err("direct link down".to_string())
+    })
+    .await
+    .expect_err("both transports failed");
+    assert!(err.contains("direct link down"));
+    // The caller's liveness fallback is now legitimately responsible; the
+    // unicast path never substitutes an overlay broadcast on its own.
+    assert_eq!(transport.overlay_calls(), 0);
 }

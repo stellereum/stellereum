@@ -293,6 +293,18 @@ impl ShardRegistry {
         self.shards.iter().copied()
     }
 
+    /// The CHAIN-WIDE static split of [`crate::tokenomics::TOTAL_SUPPLY_CAP`]
+    /// over exactly this committed shard set.
+    ///
+    /// Deterministic (ascending ids, integer division, remainder to the lowest
+    /// ids) so every node computes identical shares from the same shard set.
+    /// This is what turns the per-engine mint counters into a chain-wide cap:
+    /// each shard engine is installed with its own immutable share, and the
+    /// shares sum to at most the cap.
+    pub fn supply_partition(&self) -> crate::tokenomics::SupplyPartition {
+        crate::tokenomics::SupplyPartition::uniform(self.ids())
+    }
+
     pub fn len(&self) -> usize {
         self.shards.len()
     }

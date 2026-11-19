@@ -174,8 +174,8 @@ fn chain(n: u64) -> Vec<Block> {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        b.sign_block(&sk);
+                    round: 0,
+        };        b.sign_block(&sk);
         prev = b.compute_hash();
         out.push(b);
     }

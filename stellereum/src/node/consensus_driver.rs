@@ -2750,15 +2750,51 @@ pub(crate) async fn run_consensus_node(
                             }
                             match compact_server.serve_for(&peer_key, &pull, now_ms) {
                                 Ok(Some(body)) => {
-                                    enqueue_outbox(&mut outbox, ConsensusMsg::Body { body });
-                                    flush_outbox(
-                                        &net_sender,
-                                        &mut outbox,
-                                        rt.hc.height,
-                                        rt.hc.round,
-                                    );
-                                    outbox_flushes += 1;
-                                    last_flush = std::time::Instant::now();
+                                    // UNICAST REPLY (no broadcast amplification):
+                                    // the requester is the inbound envelope's
+                                    // peer id (`peer_key`, derived at the top of
+                                    // this drain from `inbound_peer_key`), which
+                                    // `serve_for` already used for the
+                                    // served-once set and rate cap. A 40-hex id
+                                    // gets one addressed send; an unknown key
+                                    // (shared `broadcast` bucket, legacy short
+                                    // src) keeps the bounded outbox broadcast.
+                                    let counters = net.compact_reply_counters();
+                                    let net_unicast = Arc::clone(&net);
+                                    let route =
+                                        stellereum::consensus_net::dispatch_compact_body_reply(
+                                            &peer_key,
+                                            ConsensusMsg::Body { body },
+                                            &counters,
+                                            |peer, msg| async move {
+                                                match net_unicast.send_to_peer(peer, &msg).await {
+                                                    Ok(()) => Ok(()),
+                                                    Err(e) => Err((msg, e)),
+                                                }
+                                            },
+                                            |msg| {
+                                                enqueue_outbox(&mut outbox, msg);
+                                                flush_outbox(
+                                                    &net_sender,
+                                                    &mut outbox,
+                                                    rt.hc.height,
+                                                    rt.hc.round,
+                                                );
+                                                outbox_flushes += 1;
+                                                last_flush = std::time::Instant::now();
+                                            },
+                                        )
+                                        .await;
+                                    if let stellereum::consensus_net::BodyReplyRoute::BoundedBroadcast(
+                                        why,
+                                    ) = route
+                                    {
+                                        tracing::debug!(
+                                            "[consensus] compact body reply #{} r{} used the bounded broadcast ({why:?})",
+                                            pull.height,
+                                            pull.round,
+                                        );
+                                    }
                                     compact_served += 1;
                                     if compact_served == 1 {
                                         info!(

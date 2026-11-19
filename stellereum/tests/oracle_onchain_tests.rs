@@ -862,8 +862,8 @@ async fn oracle_state_roundtrips_through_snapshot_domains_and_load_full_state() 
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        b.sign_block(&sk);
+                round: 0,
+        };        b.sign_block(&sk);
         b
     };
     let h0 = store

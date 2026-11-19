@@ -570,8 +570,8 @@ async fn double_apply_refused_after_snapshot_install() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let credited = fresh.apply_cross_shard_consumptions(&carrier).await;
+            round: 0,
+    };    let credited = fresh.apply_cross_shard_consumptions(&carrier).await;
     assert_eq!(credited, 0, "replayed receipt must credit nothing");
     assert_eq!(
         fresh.cross_shard_consumed_len().await,

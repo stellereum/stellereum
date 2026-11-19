@@ -6549,14 +6549,23 @@ impl Node {
         owner_pub: Option<&str>,
         k: usize,
         n: usize,
-    ) -> usize {
+    ) -> Result<usize, StoreMailError> {
         if k == 0 || n <= k {
-            return 0;
+            return Err(StoreMailError::InvalidErasureParams { k, n });
         }
         // детерминированное шифрование + content-адресные id шардов (см. blob_key_nonce):
         // повторный store_mail_ec того же письма пишет в те же пути
         let content_hash = blob_content_hash(blob);
         let (data_key, nonce) = blob_key_nonce("mail", name, &content_hash);
+        // FAIL CLOSED (PENTEST2 L2): wrap the data key BEFORE writing any
+        // chunk. An unusable owner ek must not degrade to a plaintext `"key"`
+        // (that would unseal the whole mailbox) and must not leave orphans.
+        let key_box = match owner_pub {
+            Some(pub_hex) => {
+                Some(box_wrap_key(pub_hex, &data_key).ok_or(StoreMailError::InvalidOwnerKey)?)
+            }
+            None => None,
+        };
         let ct = e2e_encrypt_det(&data_key, &nonce, blob);
         let shards = Self::ec_encode(&ct, k, n);
         let have_mail_role = self.role_allows("mail");
@@ -6592,12 +6601,8 @@ impl Node {
             "ec": { "k": k, "n": n, "ct_len": ct.len(), "shard_len": shards.first().map(|s| s.len()).unwrap_or(0) },
             "chunks": chunks,
         });
-        if let Some(pub_hex) = owner_pub {
-            if let Some(kb) = box_wrap_key(pub_hex, &data_key) {
-                manifest["key_box"] = kb;
-            } else {
-                manifest["key"] = json!(hex::encode(data_key));
-            }
+        if let Some(kb) = key_box {
+            manifest["key_box"] = kb;
         } else {
             manifest["key"] = json!(hex::encode(data_key));
         }
@@ -6619,10 +6624,14 @@ impl Node {
                 node.store_chunk_replicated("mail", &cid, &data).await;
             }
         });
-        stored
+        Ok(stored)
     }
 
-    pub async fn store_mail(self: &Arc<Self>, name: &str, blob: &[u8]) -> usize {
+    pub async fn store_mail(
+        self: &Arc<Self>,
+        name: &str,
+        blob: &[u8],
+    ) -> Result<usize, StoreMailError> {
         self.store_mail_boxed(name, blob, None).await
     }
 
@@ -6634,15 +6643,28 @@ impl Node {
     /// ИДЕМПОТЕНТНОСТЬ: key/nonce и chunk_id выводятся из содержимого (blob_key_nonce /
     /// chunk_id_for) — повторный store того же письма перезаписывает те же файлы чанков,
     /// а не добавляет новые (иначе ретраи федерации раздували каталог chunks/mail).
+    ///
+    /// FAIL CLOSED (PENTEST2 L2): if `owner_pub` is supplied but cannot be
+    /// boxed, returns [`StoreMailError::InvalidOwnerKey`] **before** writing any
+    /// chunk or manifest. It never falls back to a plaintext `"key"`.
     pub async fn store_mail_boxed(
         self: &Arc<Self>,
         name: &str,
         blob: &[u8],
         owner_pub: Option<&str>,
-    ) -> usize {
+    ) -> Result<usize, StoreMailError> {
         const CHUNK: usize = 1024 * 1024;
         let content_hash = blob_content_hash(blob);
         let (data_key, nonce) = blob_key_nonce("mail", name, &content_hash);
+        // FAIL CLOSED (PENTEST2 L2): wrap the data key BEFORE writing any
+        // chunk. An unusable owner ek must not degrade to a plaintext `"key"`
+        // and must not leave orphan chunks behind.
+        let key_box = match owner_pub {
+            Some(pub_hex) => {
+                Some(box_wrap_key(pub_hex, &data_key).ok_or(StoreMailError::InvalidOwnerKey)?)
+            }
+            None => None,
+        };
         let ct = e2e_encrypt_det(&data_key, &nonce, blob);
         let mut chunks: Vec<serde_json::Value> = Vec::new();
         let mut offset = 0usize;
@@ -6689,12 +6711,8 @@ impl Node {
             "nonce": hex::encode(nonce),
             "chunks": chunks,
         });
-        if let Some(pub_hex) = owner_pub {
-            if let Some(kb) = box_wrap_key(pub_hex, &data_key) {
-                manifest["key_box"] = kb;
-            } else {
-                manifest["key"] = json!(hex::encode(data_key));
-            }
+        if let Some(kb) = key_box {
+            manifest["key_box"] = kb;
         } else {
             manifest["key"] = json!(hex::encode(data_key));
         }
@@ -6716,11 +6734,11 @@ impl Node {
         // результат: если валидатор хранит почту — число локальных чанков;
         // если нет (чистый валидатор) — 1, если хотя бы одна нода приняла чанки (иначе 0).
         if have_mail_role {
-            local_chunks
+            Ok(local_chunks)
         } else if repl_ok {
-            1
+            Ok(1)
         } else {
-            0
+            Ok(0)
         }
     }
 
@@ -9062,6 +9080,40 @@ pub const BLOB_SEAL_V1: &str = "infnode-blob-seal-v1";
 ///   signed by a different key.
 pub const BLOB_MANIFEST_AUTH_V1: &str = "infnode-blob-manifest-hmac-v1";
 
+/// Why a mail write was refused.
+///
+/// [`Node::store_mail_boxed`] / [`Node::store_mail_ec`] used to fall back to
+/// writing the plaintext data key into the manifest when the supplied owner ek
+/// could not be boxed. That is a fail-open downgrade (PENTEST2 L2): one bad
+/// key at a call site would silently unseal every mail. They now return this
+/// error BEFORE writing any chunk or manifest; no key material is ever
+/// published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreMailError {
+    /// `owner_pub` is not a valid ML-KEM-768 encapsulation key.
+    InvalidOwnerKey,
+    /// `store_mail_ec` was called with impossible erasure-coding parameters.
+    InvalidErasureParams { k: usize, n: usize },
+}
+
+impl std::fmt::Display for StoreMailError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOwnerKey => write!(
+                f,
+                "owner ek is not a valid ML-KEM-768 encapsulation key; \
+                 refusing to write a plaintext data key (fail closed)"
+            ),
+            Self::InvalidErasureParams { k, n } => write!(
+                f,
+                "invalid erasure-coding parameters k={k} n={n} (need 0 < k < n)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StoreMailError {}
+
 /// Hard cap on `chunks[]` in a blob manifest (4 GiB at the 1 MiB chunk size).
 /// The manifest itself is capped at 1 MiB by the DHT value bound, but a tiny
 /// manifest can name tens of thousands of chunks; each miss costs a full DHT
@@ -10819,7 +10871,10 @@ mod disk_growth_tests {
         let (node, tmp) = test_node("mail").await;
         let blob = sample_blob(2_000_000);
 
-        let n1 = node.store_mail("mail:abc", &blob).await;
+        let n1 = node
+            .store_mail("mail:abc", &blob)
+            .await
+            .expect("store mail");
         let files1 = chunk_files(&node, "mail");
         assert!(n1 > 0);
         assert_eq!(files1.len(), n1);
@@ -10827,7 +10882,10 @@ mod disk_growth_tests {
         // повтор в пределах dedup-окна: запись пропускается (dedup_hit), но чанки
         // есть локально — store_mail обязан вернуть n1, а не 0 (web трактует 0
         // как отказ и откатывает квоту)
-        let n2 = node.store_mail("mail:abc", &blob).await;
+        let n2 = node
+            .store_mail("mail:abc", &blob)
+            .await
+            .expect("republish mail");
         let files2 = chunk_files(&node, "mail");
         assert_eq!(
             n1, n2,

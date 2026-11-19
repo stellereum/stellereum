@@ -1883,8 +1883,8 @@ async fn faucet_masterchain_drip_finalizes_on_shard_0() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    let outcome = st.engine.apply_block_transition(&block, 0).await;
+        round: 0,
+    };    let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 0");
     assert_eq!(outcome.failed, 0);
     let acc = st
@@ -1938,8 +1938,8 @@ async fn faucet_workchain_drip_finalizes_on_its_shard() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    let outcome = st.engine.apply_block_transition(&block, 0).await;
+        round: 0,
+    };    let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 1");
     let acc = st
         .engine
@@ -3701,6 +3701,7 @@ async fn get_shards_reports_every_committed_shard_head() {
             block_hash: [0x11u8; 32],
             state_root: [0x22u8; 32],
             timestamp: 1_700_000_000,
+            minted_total_nano: 0,
         });
         w.note_finalized_commitment(crate::sharding::ShardHeaderCommitment {
             shard_id: crate::sharding::BASE_WORKCHAIN_SHARD_INITIAL,
@@ -3708,6 +3709,7 @@ async fn get_shards_reports_every_committed_shard_head() {
             block_hash: [0x33u8; 32],
             state_root: [0x44u8; 32],
             timestamp: 1_700_000_001,
+            minted_total_nano: 0,
         });
     }
 
@@ -3861,8 +3863,8 @@ async fn archive_fixture() -> (Arc<RpcState>, ArchiveFixture) {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-        };
-        b.sign_block(&signer);
+                    round: 0,
+        };        b.sign_block(&signer);
         b
     };
     let b_h = mk(height, [0u8; 32], [0xAAu8; 32]);
@@ -4203,8 +4205,8 @@ async fn rpc_hydrates_from_the_durable_receipt_store() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    b.sign_block(&sk);
+        round: 0,
+    };    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store
@@ -4261,8 +4263,8 @@ async fn rpc_accepts_stl57_address_and_archive_store_fallback() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    b.sign_block(&sk);
+        round: 0,
+    };    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store
@@ -7041,8 +7043,8 @@ async fn a_runtime_invalidation_reaches_the_rpc_feed() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-        };
-        b.sign_block(&key);
+                round: 0,
+        };        b.sign_block(&key);
         b
     };
 
@@ -8067,6 +8069,7 @@ fn gov_block(
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
+        round: 0,
     }
 }
 
@@ -9392,8 +9395,8 @@ async fn eth_tx_lookup_rebuilds_restart_hydrated_body_from_archive_store() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    b.sign_block(&sk);
+        round: 0,
+    };    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store

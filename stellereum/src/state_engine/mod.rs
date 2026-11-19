@@ -304,6 +304,22 @@ pub struct InMemoryStateEngine {
     /// about minted supply still agree on the root (see the wiring note on
     /// the getter).
     total_minted_nano: Arc<std::sync::atomic::AtomicU64>,
+    /// CHAIN-WIDE mint limit for THIS shard, in nano-STELL.
+    ///
+    /// The engine's [`Self::total_minted_nano`] is a PER-ENGINE counter; with
+    /// N shard engines it would allow `N x TOTAL_SUPPLY_CAP`. This limit is
+    /// the shard's static share of the chain-wide cap (see
+    /// [`crate::tokenomics::SupplyPartition`]), installed deterministically
+    /// from the committed shard set by `ValidatorRuntime::with_shard`. Every
+    /// mint reserves against `min(TOTAL_SUPPLY_CAP, this limit)`, so no
+    /// interleaving of shard mints can push the SUM over the chain cap.
+    ///
+    /// It is deliberately NOT serialized into the state snapshot: it is a
+    /// chain-configuration value, identical on every node that runs the shard,
+    /// and restoring it from a local blob would let a stale snapshot widen it.
+    /// Default [`crate::tokenomics::TOTAL_SUPPLY_CAP`] (the single-shard
+    /// pre-sharding behaviour).
+    chain_mint_limit_nano: Arc<std::sync::atomic::AtomicU64>,
     /// Per-domain content-generation counters (see
     /// [`crate::commitment::DomainGenerations`]).
     ///

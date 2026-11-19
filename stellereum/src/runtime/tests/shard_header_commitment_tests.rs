@@ -129,8 +129,8 @@ fn workchain_block(height: u64, root: [u8; 32]) -> Block {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    }
-}
+        round: 0,
+    }}
 
 /// A masterchain block must commit to the latest finalized header of
 /// every workchain shard: the shard id, the height, the block hash, the
@@ -162,6 +162,7 @@ async fn masterchain_block_commits_workchain_shard_headers_and_roots() {
             block_hash: shard_block.compute_hash(),
             state_root: shard_block.state_root,
             timestamp: shard_block.timestamp,
+            minted_total_nano: 0,
         });
     }
 
@@ -216,6 +217,7 @@ async fn workchain_block_publishes_no_shard_heads() {
             block_hash: [0x44; 32],
             state_root: [0x55; 32],
             timestamp: 1_700_000_007,
+            minted_total_nano: 0,
         });
     }
 
@@ -263,6 +265,7 @@ async fn validator_refuses_a_contradicting_shard_head() {
             block_hash: shard_block.compute_hash(),
             state_root: shard_block.state_root,
             timestamp: shard_block.timestamp,
+            minted_total_nano: 0,
         });
     }
 
@@ -300,6 +303,7 @@ async fn validator_refuses_a_contradicting_shard_head() {
         block_hash: [0x01; 32],
         state_root: [0x02; 32],
         timestamp: 1,
+        minted_total_nano: 0,
     });
     unsorted.shard_headers.push(ShardHeaderCommitment {
         shard_id: 1,
@@ -307,6 +311,7 @@ async fn validator_refuses_a_contradicting_shard_head() {
         block_hash: [0x03; 32],
         state_root: [0x04; 32],
         timestamp: 1,
+        minted_total_nano: 0,
     });
     unsorted.validator_signatures.clear();
     unsorted.sign_block(&key);
@@ -380,6 +385,7 @@ async fn snapshot_jump_reanchors_light_client_for_tail_walk() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
+            round: 0,
         }
     }
 

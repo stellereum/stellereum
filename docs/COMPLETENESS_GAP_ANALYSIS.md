@@ -26,6 +26,30 @@ The system is large and unusually well tested for its age (3,924 test attributes
 
 ---
 
+## 0. Post-analysis status (HEAD `9832e97a9`)
+
+This document is a historical snapshot: line numbers and claims are anchored to
+`be52ce87c` / `f1b10b263`. Later waves (`0fdf1eefc`, `0b7280af6`, `11c9a2f3c`,
+`1aacf8002`, `9832e97a9`) closed several items. The sections below are **not
+rewritten**; this table is the delta, so the original analysis stays
+reproducible.
+
+| Original gap | Status at `9832e97a9` | Evidence |
+|---|---|---|
+| §1 — binary/upgrade execution gated forever in a constant | **PARTLY RESOLVED.** The gate is now a per-chain **genesis** value (`GenesisChainSpec`), installed once before the first block and listed in `chain_spec`. The compiled default is still `u64::MAX`, so an operator must opt in at genesis — but it is no longer an unreachable constant. | `stellereum/src/chain_spec.rs:1-145`, `stellereum/src/chain_spec.rs:303-309`; `docs/OPEN_DEFECTS.md` UP-2 |
+| §2 — no protocol/ruleset version, no migration framework | **PARTLY RESOLVED.** `CONSENSUS_RULESET_VERSION = 3`, `DOMAIN_SET_VERSION = 2` and `FORK_ID = 0xb13baff4` are exchanged in the control handshake; a v1/v2 peer is refused. `Block` still has no version field and there is still no state-schema migration framework. | `stellereum/src/protocol.rs:77,82,94-215`; `docs/RULESET_V3.md` §4 |
+| §3 — `chain_spec` tracks only 7 gates and omits `UPGRADE_EXEC` | **PARTLY RESOLVED.** The schedule now carries 8 gates including `UPGRADE_EXEC_ACTIVATION_HEIGHT`. `GOV_OPS`, `MEV_RESHARE`, `SPRT_TIER3`, `CHAIN_BINDING` and `ZKML_CONTEXT_BINDING` are still absent. | `stellereum/src/chain_spec.rs:261-312` |
+| §4 — validator lifecycle dead-ends (no unjail / commission change / redelegation) | **PARTLY RESOLVED.** `unjail` now has a live block-path caller. `announce_commission` / `apply_commission` and `redelegate` still have no opcode/RPC/wallet caller. | `stellereum/src/state_engine/apply.rs:3926` |
+| §6.2 #1 — genesis premine sits outside the cap | **RESOLVED.** `GENESIS_VALIDATOR_BALANCE` is 1M STELL (was 100M); the genesis allocation is checked against `TOTAL_SUPPLY_CAP` and folded into the minted counter, so a 250-validator set plus faucet fits. | `stellereum/src/node/policy.rs:733-745`; commit `0fdf1eefc` |
+| §6.2 #4 — fixed fee, no gas-used refund | **PARTLY RESOLVED.** Fees now charge `max(min(gas_limit, gas_used + intrinsic), floor)` and refund unused gas (FEE-01). A dynamic base fee / burn is still absent. | commit `0b7280af6` (`state_engine/apply.rs`) |
+| Baseline — hosted CI workflow directories: 0 | **RESOLVED.** CI and nightly workflows are checked in. | `.github/workflows/ci.yml`, `.github/workflows/nightly.yml`; `docs/CI.md` |
+
+Items not listed here (topology split/merge, treasury, cap-exact emission,
+commission change, redelegation, `TokenAllocation`, vesting) remain as written
+unless `docs/OPEN_DEFECTS.md` says otherwise.
+
+---
+
 ## 1. Executive summary — the 10 biggest gaps, ranked by what blocks mainnet
 
 ### 1. On-chain governance now works on N>1; only binary execution is still gated

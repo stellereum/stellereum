@@ -196,8 +196,8 @@ impl Fixture {
                 cnvrf_v3: None,
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-            };
-            // 3 of 4 signatures: a genuine power quorum, so these headers also
+                        round: 0,
+            };            // 3 of 4 signatures: a genuine power quorum, so these headers also
             // satisfy the block-level quorum check.
             for k in keys.iter().take(3) {
                 b.sign_block(k);

@@ -74,12 +74,49 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(PROTOCOL_MAJO
 /// ([`crate::consensus::VOTE_SIGN_DOMAIN`] = `STELLEREUM_BFT_VOTE_V3`), so the
 /// domain set and the vote domain moved the fork id. The proposal-slashing
 /// activation sentinel is folded as its own rule. See `docs/RULESET_V3.md`.
-pub const CONSENSUS_RULESET_VERSION: u32 = 3;
+///
+/// RULESET v4 (2026-11-19): the block gained a SIGNED `round` (mixed into the
+/// block hash whenever non-zero), proposal-equivocation slashing is ACTIVE
+/// (`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT = 0`), and the block timestamp
+/// gained a deterministic parent-relative bound
+/// ([`MAX_BLOCK_TIMESTAMP_DRIFT_MS`]). This is a hard fork / new genesis. See
+/// `docs/RULESET_V4.md`.
+pub const CONSENSUS_RULESET_VERSION: u32 = 5;
 
 /// Version of the set of domain-separation strings folded into [`FORK_ID`].
 /// Bump when a domain string is added/renamed without changing a hashed
 /// constant's value.
-pub const DOMAIN_SET_VERSION: u32 = 2;
+pub const DOMAIN_SET_VERSION: u32 = 3;
+
+/// Deterministic ceiling for a block timestamp ahead of its parent, in
+/// MILLISECONDS (ruleset v4, S8).
+///
+/// Block timestamps are `u64` SECONDS (the same unit as
+/// [`crate::zkml::now_secs`]); this rule is stated in milliseconds because the
+/// ~240 ms tempo is sub-second and an operator reading the rule needs the
+/// resolution to reason about it: one hour is ~15,000 tempo slots, which is the
+/// envelope this repo's own suites use for operational gaps and catch-up
+/// (single-step jumps of ~1000s), while still refusing a validator that tries
+/// to poison every timestamp-driven rule (session expiry, unbonding maturity,
+/// order stamps) for days or years.
+///
+/// The verdict is a PURE function of `(parent.timestamp, block.timestamp)`:
+/// no wall-clock read, no node-local state (see [`timestamp_within_bounds`]
+/// and `runtime::consensus_step::check_block_timestamp`). Both validators and
+/// the honest proposer use this SAME constant, so a fast local clock can
+/// never build a body its peers must refuse.
+pub const MAX_BLOCK_TIMESTAMP_DRIFT_MS: u64 = 60 * 60 * 1_000;
+
+/// True when `block_ts` is a deterministic extension of `parent_ts`:
+/// monotone and at most [`MAX_BLOCK_TIMESTAMP_DRIFT_MS`] ahead.
+///
+/// Pure and constant-only, so every validator derives the same verdict from the
+/// same two headers (S8). Height 0/genesis is handled by the caller: genesis
+/// carries no parent and keeps its fixed timestamp.
+pub const fn timestamp_within_bounds(parent_ts: u64, block_ts: u64) -> bool {
+    block_ts >= parent_ts
+        && block_ts <= parent_ts.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_MS / 1_000)
+}
 
 /// The consensus rule constants folded into [`FORK_ID`] after the domain
 /// strings. Keeping the list in one place lets the fork-id test derive the
@@ -89,8 +126,11 @@ pub const DOMAIN_SET_VERSION: u32 = 2;
 /// height-based consensus windows (re)scaled by ruleset v2 plus the VDF step
 /// count, so a future edit to any of them is provably visible in the fork id.
 /// The 20th entry (appended by ruleset v3, keeping the first 19 in the SAME
-/// order) is the proposal-equivocation activation sentinel: it changes the
-/// fork id the moment proposal slashing is activated.
+/// order) is the proposal-equivocation activation height — now `0` (ACTIVE),
+/// so it changes the fork id exactly like every other rule. The 21st
+/// (ruleset v4) is the deterministic block-timestamp drift bound. The 22nd and
+/// 23rd (ruleset v5) are the chain-wide supply partition version and the cap
+/// itself, so a change to either is visible in the fork id.
 pub const FORK_ID_RULES: &[u64] = &[
     crate::consensus::MAX_COMMIT_CERT_SIGNERS as u64,
     crate::consensus::MAX_ROUND_AHEAD as u64,
@@ -112,6 +152,9 @@ pub const FORK_ID_RULES: &[u64] = &[
     crate::mmr::MMR_EPOCH_BLOCKS,
     crate::minroot_vdf::DEFAULT_VDF_STEPS_PER_EPOCH,
     crate::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
+    MAX_BLOCK_TIMESTAMP_DRIFT_MS,
+    crate::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION,
+    crate::tokenomics::TOTAL_SUPPLY_CAP,
 ];
 
 const fn fold_u64(h: u32, v: u64) -> u32 {

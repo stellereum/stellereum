@@ -5,6 +5,29 @@ MinRoot VDF, on-chain state and runtime wiring") and `6e6384940` ("Wave 1a: conv
 stale Ed25519 fixture to FULL-PQ"). The gate is **OFF** at the snapshot: the activation
 constant is `u64::MAX` (`stellereum/src/consensus/sortition.rs:507`).
 
+> **SUPERSEDED FOR CONSTANTS (still valid for the checklist).** This document is
+> a snapshot at `HEAD = 6e6384940` under ruleset **v1**. Ruleset **v2**
+> (`docs/RULESET_V2.md` §1) rescaled every height-derived constant and ruleset
+> **v3** (`docs/RULESET_V3.md` §2) inherited those values into fork
+> `0xb13baff4`. The gate itself is still `u64::MAX` at HEAD `9832e97a9`
+> (`stellereum/src/consensus/sortition.rs:664`); only the line numbers and the
+> height values moved. **Do not copy the numbers from this page.**
+>
+> | constant | this snapshot (v1) | current (ruleset v3) |
+> |---|---:|---:|
+> | `cn_vrf::EPOCH_LEN` / `CNVRF_V3_EPOCH_LEN` | 7,200 | **30,000** |
+> | `V3_SEGMENT_LEN` | 450 | **1,875** |
+> | `V3_COMMIT_LOOKAHEAD_BLOCKS` | 360 | **682** |
+> | `JAIL_RELEASE_DELAY_HEIGHTS` | 1,000 | **4,000** |
+> | `PQ_ROTATION_DELAY_HEIGHTS` | 7,200 | **30,000** |
+> | `COMMISSION_EFFECT_DELAY_HEIGHTS` | 7,200 | **30,000** |
+> | `DOWNTIME_MISS_THRESHOLD` | 10 | **42** |
+> | `MEV_EPOCH_BLOCKS` / `MMR_EPOCH_BLOCKS` | 128 | **500** |
+>
+> `CNVRF_V3_ACTIVATION_HEIGHT` and `BEACON_DRAW_ACTIVATION_HEIGHT` are still
+> `u64::MAX` (off). The rollout steps, the commit/reveal flow and the
+> abort-slash conditions below are unchanged.
+
 Every constant and behaviour below was read from the files cited next to it. Wall-clock
 numbers that I did not measure on the target hosts are marked **UNVERIFIED — must be measured**.
 

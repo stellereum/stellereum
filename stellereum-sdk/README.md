@@ -62,7 +62,7 @@ fn main() -> Result<(), stellereum_sdk::SdkError> {
 | `EvmCarrierBuilder::new(identity, raw_evm_tx, to_pq)?` | `SysCallEvmCarrier` (nonce/value from the intent) |
 
 Every builder runs the protocol/fork guard first: `ProtocolIdentity::local()`
-is chain 5757, protocol 1.0, ruleset v3, fork id `0xb13baff4`. A foreign chain
+is chain 5757, protocol 1.0, ruleset v5, fork id `0x9d59096b`. A foreign chain
 id is `SdkError::ChainIdMismatch`; a foreign fork id is
 `SdkError::ForkIdMismatch`. Configure the node's identity with
 `.identity(identity)` (or `Wallet::with_identity`).

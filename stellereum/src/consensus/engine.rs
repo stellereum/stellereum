@@ -312,12 +312,10 @@ pub fn canonicalize_equivocation_evidence(
 // signs two different blocks for the same height leaves no Vote pair behind,
 // so the vote-slash path is inapplicable by construction (pinned by
 // `p3_eq_double_propose_escapes_vote_slash_path`). This section is the
-// proposal mirror of the vote wiring above — but it is DISABLED behind
-// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] (Finding B, false-slash): a
-// block carries no SIGNED round, so an honest cross-round re-proposal is
-// indistinguishable from a double-propose, and refusing to slash is strictly
-// safer than burning an honest proposer. The contract below is kept for the
-// activation and is not reachable while the sentinel is `u64::MAX`:
+// proposal mirror of the vote wiring above. It is ACTIVE from genesis under
+// ruleset v4: `Block` commits a SIGNED `round`, so an honest cross-round
+// re-proposal is distinguishable from a double-propose and the verifier reads
+// the round from the signed bodies instead of trusting the envelope.
 //
 //   * carrier: the block BODY, as `OpCode::SysCallReportProposalEquivocation`
 //     (appended terminal variant — the codebase-blessed proof-in-opcode
@@ -327,15 +325,13 @@ pub fn canonicalize_equivocation_evidence(
 //   * content: BOTH conflicting blocks FULLY included (`block_a`,
 //     `block_b`), so verification needs no external data beyond the
 //     validator set every node derives identically from its staking ledger.
-//     The offense is "same proposer, same shard, same height, same ROUND,
-//     two different bodies". The envelope carries the claimed round so the
-//     evidence shape is ready, but the round is NOT signed by the block yet;
-//     that is exactly why the wired gate stays at `u64::MAX` until `Block`
-//     commits one (see `proposal_equivocation_offense_rule`).
+//     The offense is "same proposer, same shard, same height, same SIGNED
+//     round, two different bodies". The envelope's claimed round must equal
+//     BOTH blocks' signed round; a mismatch is refused.
 //   * verification: [`verify_proposal_equivocation_evidence`] — fail-closed.
-//     Same height, differing block hashes, `proposer` matches both blocks'
-//     `proposer`, membership, and BOTH proposer signatures verify (Ed25519
-//     strict; Falcon/PQ halves handled inside
+//     Same shard/height/round, differing block hashes, `proposer` matches
+//     both blocks' `proposer`, membership, and BOTH proposer signatures
+//     verify (Ed25519 strict; Falcon/PQ halves handled inside
 //     [`verify_proposer_signature`], exactly like the vote path's
 //     `Vote::verify`). A same-body pair (one block repeated) is not an
 //     offense; a forged signature is refused.
@@ -359,19 +355,14 @@ pub const PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN: &[u8] =
 
 /// Activation height of the PROPOSAL-equivocation slash.
 ///
-/// DISABLED (`u64::MAX`) — the compiled-in sentinel. Rationale (false-slash
-/// primitive, Finding B): the wire `Block` carries no ROUND, so two honest
-/// proposals of DIFFERENT bodies at the same height (one per round, exactly
-/// what a view change produces) are indistinguishable from a double-propose.
-/// Slashing that pair burns an honest proposer, which is strictly worse than
-/// not slashing at all, so the wired gate refuses every proposal evidence
-/// until blocks commit a SIGNED round.
-///
-/// The same-shard/same-round rule is implemented and tested behind this gate
-/// ([`proposal_equivocation_offense_rule`]); activation is a one-line change
-/// to this constant AFTER `Block` gains a signed `round` and this verifier
-/// reads it. Until then the sentinel makes a false slash impossible.
-pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: Height = u64::MAX;
+/// ACTIVE from genesis (`0`) under ruleset v4. The false-slash primitive that
+/// forced this gate shut (Finding B) is gone: [`crate::sharding::Block`] now
+/// carries a SIGNED `round` (mixed into `compute_hash` whenever non-zero), so
+/// the verifier can require the same `(shard, height, round)` and differing
+/// bodies on BOTH proposals. An honest proposer's cross-round re-proposal
+/// (A in round r, B in r+1, same height) therefore fails the rule and is NOT
+/// slashable, while a same-round double-propose is.
+pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: Height = 0;
 
 /// Hard cap on one proposal-evidence envelope's wire size (fail-closed:
 /// larger is refused, never truncated). Two full blocks ride inside, so the
@@ -402,13 +393,11 @@ pub struct ProposalEquivocationEvidence {
     pub proposer: ValidatorId,
     /// The round both proposals are claimed to belong to.
     ///
-    /// REPORTED, NOT YET SIGNED: `Block` does not commit a round, so this is
-    /// envelope metadata and the verifier stays behind the
-    /// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] sentinel — a reporter could
-    /// otherwise claim one round for two honest cross-round proposals. The
-    /// field exists so the evidence shape already carries the round when the
-    /// signed-round block change lands (no half-change: the wired gate stays
-    /// shut until then).
+    /// SIGNED CHECK: ruleset v4 puts the round INSIDE the block hash, so this
+    /// envelope value must equal BOTH `block_a.round` and `block_b.round`.
+    /// The round is no longer reporter metadata: a reporter cannot claim one
+    /// round for two honest cross-round proposals because the signatures cover
+    /// each block's own round.
     pub round: Round,
     /// First conflicting block (fully signed by `proposer`).
     pub block_a: crate::sharding::Block,
@@ -417,15 +406,16 @@ pub struct ProposalEquivocationEvidence {
 }
 
 impl ProposalEquivocationEvidence {
-    /// Build the envelope from a recorded pair with round `0` (unknown). No
-    /// verification here — call [`verify_proposal_equivocation_evidence`]
-    /// (fail-closed) before trusting it.
+    /// Build the envelope from a recorded pair, using `block_a`'s SIGNED
+    /// round. No verification here — call
+    /// [`verify_proposal_equivocation_evidence`] (fail-closed) before trusting
+    /// it.
     pub fn new(
         proposer: ValidatorId,
         block_a: crate::sharding::Block,
         block_b: crate::sharding::Block,
     ) -> Self {
-        Self::new_at_round(proposer, 0, block_a, block_b)
+        Self::new_at_round(proposer, block_a.round, block_a, block_b)
     }
 
     /// Build the envelope for an explicit claimed round.
@@ -476,11 +466,10 @@ impl ProposalEquivocationEvidence {
 /// Canonical per-offense key:
 /// `BLAKE3(domain ‖ proposer ‖ shard ‖ height ‖ round ‖ hash_lo ‖ hash_hi)`,
 /// with the two block hashes in canonical (lexicographic) order so block
-/// order never matters. The envelope's claimed round is part of the key so
+/// order never matters. The envelope's claimed round is part of the key; the
+/// verifier additionally requires it to equal BOTH blocks' signed round, so
 /// the same blocks re-slid under a different claimed round are a different
-/// offense — which is exactly why the wired verifier stays behind
-/// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] until that round is SIGNED by
-/// the block: an unsigned round is reporter metadata, not a proof.
+/// (and refused) envelope, never a second slash for one offense.
 pub fn proposal_offense_key(
     proposer: &ValidatorId,
     shard_id: ShardId,
@@ -508,12 +497,10 @@ pub fn proposal_offense_key(
 /// The proposal-equivocation RULE, parameterized by the rounds of the two
 /// proposals. Same shard, same height, same ROUND, different signed bodies.
 ///
-/// This is the rule that must gate the wired slash: an honest proposer that
+/// This is the rule the wired slash gates on. An honest proposer that
 /// proposes A in round r and B in r+1 at the same height (normal after a view
-/// change) fails it because `round_a != round_b`. The wired verifier cannot
-/// read a SIGNED round off `Block` yet, so it stays behind
-/// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`]; this function is the tested,
-/// ready rule behind that gate.
+/// change) fails it because `round_a != round_b`; the rounds it receives here
+/// are the blocks' SIGNED rounds (ruleset v4), not envelope metadata.
 #[allow(clippy::too_many_arguments)]
 // GATE: the four identity pairs ARE the rule's inputs; grouping them into a
 // struct would hide that each block contributes its own shard/height/round/hash
@@ -536,14 +523,16 @@ pub fn proposal_equivocation_offense_rule(
 /// Every refusal returns `false` (never panics, never errors): the caller
 /// skips the evidence and logs loudly. Checks, in cheap-first order:
 ///  1. envelope size cap (DoS bound);
-///  2. activation sentinel: while [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`]
-///     is `u64::MAX` (no signed block round yet) every evidence is refused;
-///  3. same shard/height/round, DIFFERING block hashes (one block repeated,
-///     cross-round re-proposals and cross-shard proposals are not offenses);
+///  2. activation height: evidence below
+///     [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] is refused (ruleset v4
+///     activates at `0`, so this is a real gate, not a disable switch);
+///  3. same shard/height/SIGNED round, DIFFERING block hashes (one block
+///     repeated, cross-round re-proposals and cross-shard proposals are not
+///     offenses); the envelope's claimed round must equal both signed rounds;
 ///  4. `proposer` matches BOTH blocks' `proposer` (framing another
 ///     validator's block is refused);
-///  4. proposer membership via `is_validator` (unknown keys are refused);
-///  5. BOTH proposer signatures verify via [`verify_proposer_signature`]
+///  5. proposer membership via `is_validator` (unknown keys are refused);
+///  6. BOTH proposer signatures verify via [`verify_proposer_signature`]
 ///     (Ed25519 strict; Falcon/PQ halves handled inside — forged blocks
 ///     are refused).
 pub fn verify_proposal_equivocation_evidence(
@@ -554,15 +543,11 @@ pub fn verify_proposal_equivocation_evidence(
         return false;
     }
     let (a, b) = (&ev.block_a, &ev.block_b);
-    // FALSE-SLASH SENTINEL (Finding B). Blocks carry no SIGNED round, so a
-    // cross-round pair of honest proposals (different bodies, one per round,
-    // same height) is indistinguishable from a double-propose. Slashing on
-    // that would burn an honest proposer, and no slashing is strictly better
-    // than a false one — so every proposal evidence refuses until `Block`
-    // commits a signed round and this verifier can read it. The same-shard /
-    // same-round rule lives in [`proposal_equivocation_offense_rule`] and is
-    // exercised by tests behind this gate.
-    if a.height < PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT {
+    // Activation height (ruleset v4: 0 = active from genesis). Kept as a real
+    // comparison through a local binding so a future re-gating is a constant
+    // change, not a code edit, and the active-at-0 case is explicit.
+    let activation_height = PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT;
+    if activation_height != 0 && a.height < activation_height {
         return false;
     }
     // SAME SHARD, not just the same height. A validator is scheduled per
@@ -576,13 +561,19 @@ pub fn verify_proposal_equivocation_evidence(
     if a.height != b.height {
         return false;
     }
+    // The envelope's claimed round is not trusted: it must equal BOTH blocks'
+    // SIGNED rounds (ruleset v4). A reporter cannot fabricate a same-round
+    // pair out of two honest cross-round proposals.
+    if ev.round != a.round || ev.round != b.round {
+        return false;
+    }
     if !proposal_equivocation_offense_rule(
         a.shard_id,
         b.shard_id,
         a.height,
         b.height,
-        ev.round,
-        ev.round,
+        a.round,
+        b.round,
         &a.compute_hash(),
         &b.compute_hash(),
     ) {

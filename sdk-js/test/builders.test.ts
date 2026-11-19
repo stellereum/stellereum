@@ -88,11 +88,11 @@ test("keccak256 matches the EVM vectors (not SHA3-256)", () => {
   );
 });
 
-test("fork id mirrors the node's ruleset-v3 derivation", () => {
-  assert.equal(FORK_ID_HEX, "0xb13baff4");
-  assert.equal(FORK_ID_RULES.length, 20);
+test("fork id mirrors the node's ruleset-v5 derivation", () => {
+  assert.equal(FORK_ID_HEX, "0x9d59096b");
+  assert.equal(FORK_ID_RULES.length, 23);
   assert.equal(
-    deriveForkId(5757n, 3, FORK_ID_RULES),
+    deriveForkId(5757n, 5, FORK_ID_RULES),
     FORK_ID,
   );
 });

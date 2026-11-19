@@ -683,8 +683,8 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
+            round: 0,
     };
-
     let credited = target_engine.apply_cross_shard_consumptions(&block).await;
     // XSHARD-01: the pinned-account proof above is an AFFORDABILITY proof
     // (the sender could pay), not proof that shard 1 DEBITED the sender. The

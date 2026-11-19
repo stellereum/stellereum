@@ -1,26 +1,22 @@
 //! Node bootstrap: masterchain genesis + workchain shard startup.
 //!
-//! # KNOWN LIMITATION — the supply cap is PER ENGINE, not chain-wide (SUPPLY-01)
+//! # CHAIN-WIDE supply cap (SUPPLY-01, closed in ruleset v5)
 //!
-//! [`stellereum::tokenomics::TOTAL_SUPPLY_CAP`] is enforced by a counter that
-//! lives in ONE [`InMemoryStateEngine`] (`reserve_mint_nano`, folded into that
-//! engine's committed root and snapshot). Every shard runs its OWN engine, so
-//! with N shards the enforced ceiling is N x the cap plus N genesis
-//! allocations: nothing aggregates the counters, and an inbound cross-shard
-//! credit arrives as a plain balance that the target shard's lazy baseline
-//! then treats as pre-mined genesis, permanently reducing that shard's
-//! headroom.
+//! [`stellereum::tokenomics::TOTAL_SUPPLY_CAP`] used to be enforced by a
+//! counter that lived in ONE [`InMemoryStateEngine`], so N shards could each
+//! mint a full cap. Bootstrap now installs each shard with a deterministic
+//! STATIC share of the cap ([`stellereum::tokenomics::SupplyPartition`],
+//! derived from the committed shard set) before any block is produced, and
+//! refuses a genesis allocation that exceeds its shard's share. The masterchain
+//! additionally aggregates the signed shard-head commitments
+//! (`ShardHeaderCommitment::minted_total_nano`) and refuses a head that would
+//! take the committed total past the cap.
 //!
-//! This is NOT a bug in the single-shard deployment that ships today (one
-//! engine, one counter, invariant holds), but it means the "1 B STELL hard
-//! cap" headline is single-shard-only. Making it real needs a CHAIN-WIDE
-//! supply registry that shard mints reserve against — the same shape as the
-//! masterchain-only bridge — or an explicit spec decision that the cap is
-//! per-shard. Both are design changes (a new cross-shard committed value, an
-//! activation height, and a coordinated rollout), so they are deliberately
-//! NOT attempted here; the code below only adds the same boot-time
-//! genesis-allocation refusal the masterchain already has, which is the part
-//! that can be made true today.
+//! Inbound cross-shard credits remain TRANSFERS (the source shard escrowed the
+//! value), so they neither mint nor consume the target's mint headroom; the
+//! target's lazy genesis baseline therefore no longer treats an inbound credit
+//! as pre-mined supply. See `docs/SUPPLY_CAP.md` for the invariant, the lag
+//! bound and the failure modes.
 
 use ed25519_dalek::SigningKey;
 use infnode::config as node_config;
@@ -210,10 +206,17 @@ pub(crate) async fn start_workchain_shard(
         {
             let genesis_nano = GENESIS_FAUCET_BALANCE as u128;
             let cap = stellereum::tokenomics::TOTAL_SUPPLY_CAP as u128;
-            if genesis_nano > cap {
+            // CHAIN-WIDE: this shard's genesis counts against its STATIC share
+            // of the global cap (the masterchain aggregates every shard head).
+            // A genesis above that share would make the shard's very first
+            // committed head already over its slice, so refuse to boot instead
+            // of starting a shard whose header the masterchain must reject.
+            let share = registry.supply_partition().quota_for(shard) as u128;
+            if genesis_nano > share {
                 anyhow::bail!(
-                    "[shard {shard}] REFUSING genesis: the workchain pre-mined allocation (faucet = {} nano-STELL) exceeds TOTAL_SUPPLY_CAP ({}). Lower GENESIS_FAUCET_BALANCE; every post-genesis mint on this shard would otherwise fail closed.",
+                    "[shard {shard}] REFUSING genesis: the workchain pre-mined allocation (faucet = {} nano-STELL) exceeds this shard's chain-wide supply share ({} of TOTAL_SUPPLY_CAP {}). Lower GENESIS_FAUCET_BALANCE or add fewer shards; every post-genesis mint on this shard would otherwise fail closed.",
                     GENESIS_FAUCET_BALANCE,
+                    share,
                     cap
                 );
             }
@@ -263,6 +266,10 @@ pub(crate) async fn start_workchain_shard(
     {
         // Scoped: the write guard must drop before any await (std RwLock
         // guards are !Send across tasks).
+        // CHAIN-WIDE SUPPLY ACCOUNTING: the genesis head carries the shard's
+        // PRE-MINED allocation, so the masterchain aggregate counts it from
+        // height 0 instead of only after the first post-genesis mint.
+        let genesis_minted_nano = state_engine.committed_minted_nano().await;
         if let Ok(mut r) = header_registry.write() {
             // The genesis is also the shard's FIRST shard head: the
             // masterchain publishes it (TON `shard_hashes`) until the shard
@@ -273,6 +280,7 @@ pub(crate) async fn start_workchain_shard(
                 block_hash: genesis_block.compute_hash(),
                 state_root: genesis_root,
                 timestamp: genesis_block.timestamp,
+                minted_total_nano: genesis_minted_nano,
             });
         }
     }
@@ -858,12 +866,19 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 .saturating_mul(GENESIS_VALIDATOR_BALANCE as u128)
                 .saturating_add(GENESIS_FAUCET_BALANCE as u128);
             let cap = stellereum::tokenomics::TOTAL_SUPPLY_CAP as u128;
-            if genesis_nano > cap {
+            // CHAIN-WIDE: the masterchain's genesis is one shard's slice of
+            // the global cap. Every share sums to at most the cap, so a genesis
+            // inside its share is automatically inside the chain-wide budget.
+            let share = registry
+                .supply_partition()
+                .quota_for(stellereum::sharding::MASTERCHAIN_SHARD) as u128;
+            if genesis_nano > share {
                 anyhow::bail!(
-                    "REFUSING genesis: the pre-mined allocation ({} validators x {} + faucet = {} nano-STELL) exceeds TOTAL_SUPPLY_CAP ({}). Lower GENESIS_VALIDATOR_BALANCE / GENESIS_FAUCET_BALANCE or the validator count; every post-genesis mint would otherwise fail closed.",
+                    "REFUSING genesis: the pre-mined allocation ({} validators x {} + faucet = {} nano-STELL) exceeds the masterchain's chain-wide supply share ({} of TOTAL_SUPPLY_CAP {}). Lower GENESIS_VALIDATOR_BALANCE / GENESIS_FAUCET_BALANCE, the validator count, or add fewer shards; every post-genesis mint would otherwise fail closed.",
                     vset.len(),
                     GENESIS_VALIDATOR_BALANCE,
                     genesis_nano,
+                    share,
                     cap
                 );
             }
@@ -990,6 +1005,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
+            round: 0,
         };
 
         let block_hash = adapter

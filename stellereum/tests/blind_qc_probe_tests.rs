@@ -69,8 +69,8 @@ fn finalized_block(
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    b.sign_block_with_falcon(proposer, &fks[proposer_idx]);
+        round: 0,
+    };    b.sign_block_with_falcon(proposer, &fks[proposer_idx]);
     let hash = b.compute_hash();
     let mut set = VoteSet::new();
     for (k, fk) in keys.iter().zip(fks.iter()) {

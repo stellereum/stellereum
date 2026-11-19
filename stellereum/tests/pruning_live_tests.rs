@@ -116,8 +116,8 @@ fn exec_chain(store: &Storage, n: u64) -> (Vec<BlockHash>, Vec<Block>) {
             cross_shard_out: vec![],
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-        };
-        prev = store.put_block(&b).expect("persist block");
+                    round: 0,
+        };        prev = store.put_block(&b).expect("persist block");
         out_hashes.push(prev);
         out_blocks.push(b);
     }

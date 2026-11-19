@@ -294,8 +294,8 @@ fn hunt22_negative_vote_scope_is_enforced() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-}
+            round: 0,
+    };}
 
 // ===========================================================================
 // ATTACK 23  (HIGH) — `adopt_committed` never checks that the block's proposer
@@ -381,8 +381,8 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    // FULL-PQ: proposal signatures are verified Falcon-only; `imposter` owns
+            round: 0,
+    };    // FULL-PQ: proposal signatures are verified Falcon-only; `imposter` owns
     // a near-future slot, so the block must carry its registered Falcon half.
     let imposter_idx = ks
         .iter()

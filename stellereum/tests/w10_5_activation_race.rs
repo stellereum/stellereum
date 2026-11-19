@@ -157,8 +157,8 @@ fn empty_block(
         shard_headers: vec![],
         order_merkle_root: stellereum::mev::compute_order_merkle_root(&[]),
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 /// 1. The activation boundary: a join at H takes effect at H+1 on EVERY node.
 #[tokio::test]

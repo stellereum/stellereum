@@ -2395,8 +2395,8 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-            };
-            b.sign_block(&sk);
+                            round: 0,
+            };            b.sign_block(&sk);
             // Falconize: Ed-only refuses `verify_proposer_signature` (no
             // classical fallback); mirror the runtime proposal path
             // (`runtime.rs` pushes `(self.id, ed_sig)` + `(falcon_id,
@@ -2494,8 +2494,8 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-            };
-            b.sign_block(&proposer);
+                            round: 0,
+            };            b.sign_block(&proposer);
             // Falconize (same envelope as `chain` above): the proposer half
             // under the derived Falcon address, registered for the Ed id.
             {
@@ -2698,8 +2698,8 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-            };
-            b.sign_block(&keys[proposer_idx]);
+                            round: 0,
+            };            b.sign_block(&keys[proposer_idx]);
             // Falconize: the derived-address half registered for this Ed id
             // above, mirroring the runtime proposal path.
             {
@@ -3396,8 +3396,8 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-            };
-            eb.sign_block(&proposer);
+                            round: 0,
+            };            eb.sign_block(&proposer);
             let hash = eb.compute_hash();
             eb.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &evil_vs, &evil_all));
             let link = qc_link(&eb);
@@ -3598,8 +3598,8 @@ mod repl_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-        };
-        b.sign_block(&sk);
+                round: 0,
+        };        b.sign_block(&sk);
         b
     }
 

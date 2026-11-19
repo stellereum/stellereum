@@ -8,7 +8,10 @@
 //! Ruleset v2 (2026-11-19) rescaled the height-based windows for the ~240 ms
 //! tempo. Ruleset v3 (2026-11-19) bound the shard id into the vote preimage
 //! (domain `STELLEREUM_BFT_VOTE_V3`) and folded the proposal-slashing
-//! activation sentinel. A change to any of these values moves the fork id.
+//! activation sentinel. Ruleset v4 (2026-11-19) ACTIVATES proposal slashing
+//! (height 0), signs the block round, and folds the deterministic
+//! parent-relative block-timestamp drift bound. A change to any of these
+//! values moves the fork id.
 
 // Bound / round constants (v1).
 pub const MAX_COMMIT_CERT_SIGNERS: u64 = 4_096;
@@ -33,10 +36,16 @@ pub const MEV_EPOCH_BLOCKS: u64 = 500;
 pub const MMR_EPOCH_BLOCKS: u64 = 500;
 pub const DEFAULT_VDF_STEPS_PER_EPOCH: u64 = 3_000_000;
 
-// Ruleset v3: proposal-slashing activation sentinel, folded as the 20th rule.
-// `u64::MAX` means DISABLED (see `docs/RULESET_V3.md`); activating it moves
-// the fork id by construction.
-pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: u64 = u64::MAX;
+// Ruleset v3/v4: proposal-slashing activation height, folded as the 20th rule.
+// `0` means ACTIVE from genesis under ruleset v4 (the block's signed round is
+// what makes the same-round rule safe); any change moves the fork id.
+pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: u64 = 0;
+
+// Ruleset v4: deterministic ceiling for `block.timestamp` ahead of the parent,
+// in MILLISECONDS (the node compares `MAX_BLOCK_TIMESTAMP_DRIFT_MS / 1_000`
+// seconds). Folded as the 21st rule so tightening/widening it moves the fork
+// id.
+pub const MAX_BLOCK_TIMESTAMP_DRIFT_MS: u64 = 60 * 60 * 1_000;
 
 // Consensus wire/signature domains (ruleset v2, vote domain v3).
 pub const SORTITION_DRAW_DOMAIN: &str = "STELL_SORTITION_V5";
@@ -49,3 +58,11 @@ pub const VOTE_SIGN_DOMAIN: &[u8] = b"STELLEREUM_BFT_VOTE_V3";
 pub const VOTE_FALCON_MAGIC: &[u8; 16] = b"STELL_VOTEFAL_V1";
 pub const QC_UQC_MAGIC: &[u8; 16] = b"STELL_UQC_PQ_V5_";
 pub const QC_PQ_MAGIC: &[u8; 16] = b"STELL_QC_PQ_V5__";
+
+/// Chain-wide supply partition version (ruleset v5). The cap is split across
+/// the committed shard set, so this constant is a consensus rule.
+pub const CHAIN_SUPPLY_PARTITION_VERSION: u64 = 1;
+
+/// The chain-wide total supply cap in nano-STELL (9 decimals), folded into the
+/// fork id because changing it redefines what a valid mint is.
+pub const TOTAL_SUPPLY_CAP: u64 = 1_000_000_000 * 1_000_000_000;

@@ -21,6 +21,7 @@ use stellereum::consensus_net::{
     VOTE_SEND_DEDUP_TTL_MS,
 };
 use stellereum::mempool::PendingActivationBuffer;
+use stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS;
 use stellereum::runtime::{
     MAX_BLOCK_GAS, MAX_BLOCK_TXS, MAX_TIMESTAMP_JUMP_SECS, PROPOSAL_ALIGN_WINDOW_ROUNDS,
 };
@@ -90,6 +91,11 @@ fn transport_and_block_bounds_are_pinned() {
     assert_eq!(MAX_BLOCK_TXS, 10_000);
     assert_eq!(MAX_BLOCK_GAS, 500_000_000);
     assert_eq!(MAX_TIMESTAMP_JUMP_SECS, 3_600);
+    assert_eq!(
+        MAX_TIMESTAMP_JUMP_SECS,
+        MAX_BLOCK_TIMESTAMP_DRIFT_MS / 1_000,
+        "the proposer clamp and the validator gate must share one bound"
+    );
     assert_eq!(PROPOSAL_ALIGN_WINDOW_ROUNDS, 8);
     assert_eq!(PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS, 2048);
     assert_eq!(PendingActivationBuffer::MAX_NONCES_PER_ACCOUNT, 4);

@@ -418,8 +418,8 @@ fn legacy_block_rehash_is_unchanged() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    rebuilt.sign_block(&sk);
+            round: 0,
+    };    rebuilt.sign_block(&sk);
     assert_eq!(
         hex::encode(rebuilt.compute_hash()),
         GOLDEN_BLOCK_HASH_CURRENT,
@@ -475,11 +475,11 @@ fn legacy_block_rehash_is_unchanged() {
     );
     assert_eq!(
         re.len(),
-        raw_block.len() + 73 + 32 + 1,
+        raw_block.len() + 73 + 32 + 1 + 4,
         "only the empty shard-head set (8B), the order root (32B), the epoch-key \
          commitment (32B), the None last_qc byte (1B, W10.5 canonical downtime evidence), \
-         the zero epoch-MMR root (32B, V5 Tier-2) and the None CN-VRF v3 payload byte \
-         (1B, CN-VRF v3) are appended"
+         the zero epoch-MMR root (32B, V5 Tier-2), the None CN-VRF v3 payload byte \
+         (1B, CN-VRF v3) and the ruleset-v4 signed round (4B) are appended"
     );
     assert!(rebuilt.verify_proposer_signature());
 }

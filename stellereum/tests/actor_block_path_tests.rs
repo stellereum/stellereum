@@ -170,8 +170,8 @@ fn mk_block(height: u64, ts: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> 
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 // ===========================================================================
 // 1. The queue: a send reaches the recipient's inbox via the block's
@@ -913,8 +913,8 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    // FULL-PQ: the live adoption path verifies the proposer's Falcon
+        round: 0,
+    };    // FULL-PQ: the live adoption path verifies the proposer's Falcon
     // signature (Ed25519-only blocks are refused).
     blk.sign_block_with_falcon(&ks[0], &fks[0]);
     let bh = certify(&mut live, &ks, &fks, &mut blk).await;

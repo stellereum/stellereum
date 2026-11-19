@@ -115,8 +115,8 @@ fn mkblock(signer: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    b.sign_block(signer);
+            round: 0,
+    };    b.sign_block(signer);
     b
 }
 
@@ -144,8 +144,8 @@ fn mkblock_falcon(
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    b.sign_block_with_falcon(signer, fk);
+            round: 0,
+    };    b.sign_block_with_falcon(signer, fk);
     b
 }
 
@@ -702,8 +702,8 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-        };
-        b.sign_block(&atk[0]);
+                    round: 0,
+        };        b.sign_block(&atk[0]);
         for k in atk.iter().skip(1) {
             use ed25519_dalek::Signer;
             b.validator_signatures

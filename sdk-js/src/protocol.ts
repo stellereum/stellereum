@@ -30,8 +30,8 @@ export class ProtocolError extends Error {
 
 export const PROTOCOL_MAJOR = 1;
 export const PROTOCOL_MINOR = 0;
-export const CONSENSUS_RULESET_VERSION = 3;
-export const DOMAIN_SET_VERSION = 2;
+export const CONSENSUS_RULESET_VERSION = 5;
+export const DOMAIN_SET_VERSION = 3;
 export const DEFAULT_CHAIN_ID = 5757;
 export const CAP_COMPACT_GOSSIP = 1n << 0n;
 export const CAP_MESH_DIRECT = 1n << 1n;
@@ -58,7 +58,10 @@ export const FORK_ID_RULES: readonly bigint[] = [
   500n, // MEV_EPOCH_BLOCKS
   500n, // MMR_EPOCH_BLOCKS
   3_000_000n, // DEFAULT_VDF_STEPS_PER_EPOCH
-  (2n ** 64n) - 1n, // PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT (u64::MAX, disabled)
+  0n, // PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT (0 = active from genesis, ruleset v4)
+  3_600_000n, // MAX_BLOCK_TIMESTAMP_DRIFT_MS (1 hour; ruleset v4)
+  1n, // CHAIN_SUPPLY_PARTITION_VERSION (ruleset v5)
+  1_000_000_000_000_000_000n, // TOTAL_SUPPLY_CAP (ruleset v5)
 ];
 
 const FORK_DOMAINS: readonly Uint8Array[] = [
@@ -114,7 +117,7 @@ export function deriveForkId(
   return h >>> 0;
 }
 
-/** The fork id this package was built for (ruleset v3). */
+/** The fork id this package was built for (ruleset v4). */
 export const FORK_ID = deriveForkId(
   BigInt(DEFAULT_CHAIN_ID),
   CONSENSUS_RULESET_VERSION,

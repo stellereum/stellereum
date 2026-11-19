@@ -4022,16 +4022,13 @@ mod tests {
         )
     }
 
-    /// FINDING B FALLBACK: while the proposal-equivocation slash is behind the
-    /// false-slash sentinel (`u64::MAX`), even a perfectly signed same-shard
-    /// pair cannot pass the carrier — blocks carry no SIGNED round, so the
-    /// pair may be an honest cross-round re-proposal and slashing it would
-    /// burn an honest proposer. The carrier must REVERT and move nothing.
-    ///
-    /// (Before the sentinel this carrier accepted the same fixture and the
-    /// block step then slashed it — the false-slash bug this finding removes.)
+    /// RULESET v4: proposal equivocation is ACTIVE, and the block commits a
+    /// SIGNED round, so a same-round, same-shard pair of distinct signed
+    /// bodies is genuine evidence. The CARRIER itself verifies and succeeds;
+    /// the burn happens once at the block step (ledger dedup), so this test
+    /// pins that the carrier accepts and moves no money.
     #[test]
-    fn proposal_equivocation_report_is_refused_while_the_sentinel_is_active() {
+    fn proposal_equivocation_report_is_accepted_under_ruleset_v4() {
         const NANO: u64 = 1_000_000_000;
         let sk = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
         let proposer = sk.verifying_key().to_bytes();
@@ -4054,19 +4051,19 @@ mod tests {
         }];
         assert_eq!(
             crate::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
-            u64::MAX
+            0
         );
-        match Svm::execute(&ops, 10_000_000, &mut ctx) {
-            VmExecutionResult::Reverted(reason) => assert!(
-                reason.contains("proposal equivocation evidence rejected"),
-                "the sentinel refusal must name the reason: {reason}"
+        assert!(
+            matches!(
+                Svm::execute(&ops, 10_000_000, &mut ctx),
+                VmExecutionResult::Success { .. }
             ),
-            other => panic!("expected the sentinel to refuse the report, got {other:?}"),
-        }
+            "ruleset v4 must accept genuine same-round proposal evidence"
+        );
 
         assert_eq!(
             ledger.validators[&proposer].self_bond, before,
-            "the carrier must not slash"
+            "the carrier must not slash (the block step does)"
         );
         assert_eq!(ledger.total_burned, 0);
         assert!(

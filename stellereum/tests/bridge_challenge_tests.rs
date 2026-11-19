@@ -201,8 +201,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 fn ops_list(intents: Vec<BridgeIntent>) -> Vec<OpCode> {
     intents

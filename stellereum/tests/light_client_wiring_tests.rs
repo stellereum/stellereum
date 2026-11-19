@@ -376,8 +376,8 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let bh = b.compute_hash();
+            round: 0,
+    };    let bh = b.compute_hash();
     b.precommit_qc = Some(cert(&ks, &fks, &vs, 43, bh, &b.prev_hash));
     st.record_finalized_header(&b).await;
 
@@ -610,8 +610,8 @@ fn chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        let bh = b.compute_hash();
+                    round: 0,
+        };        let bh = b.compute_hash();
         let parent = b.prev_hash;
         b.precommit_qc = Some(cert(keys, fks, vs, h, bh, &parent));
         prev = bh;

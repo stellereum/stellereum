@@ -55,8 +55,8 @@ fn chain(store: &Storage, n: u64) -> Vec<stellereum::storage::BlockHash> {
             cross_shard_out: vec![],
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-        };
-        prev = store.put_block(&b).expect("persist block");
+                round: 0,
+        };        prev = store.put_block(&b).expect("persist block");
         out.push(prev);
     }
     out
@@ -323,8 +323,8 @@ fn header_record_fields_match_the_block() {
         cross_shard_out: vec![],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    let rec = BlockHeaderRecord::of(&b);
+        round: 0,
+    };    let rec = BlockHeaderRecord::of(&b);
     assert_eq!(rec.height, 42);
     assert_eq!(rec.prev_hash, [7u8; 32]);
     assert_eq!(rec.state_root, [3u8; 32]);

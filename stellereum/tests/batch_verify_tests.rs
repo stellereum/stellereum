@@ -483,8 +483,8 @@ fn signed_block(n: usize) -> (Block, Vec<SigningKey>) {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    for k in &ks {
+            round: 0,
+    };    for k in &ks {
         block.sign_block(k);
     }
     (block, ks)

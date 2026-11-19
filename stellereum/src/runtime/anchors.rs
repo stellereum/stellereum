@@ -1111,6 +1111,15 @@ impl ValidatorRuntime {
         if registry.is_sharded() {
             self.state.enable_cross_shard();
         }
+        // CHAIN-WIDE SUPPLY CAP: install this shard's deterministic share of
+        // the 1 B cap. This is the ONLY place the engine learns it, and it is
+        // derived purely from the committed shard set — no env, no clock, no
+        // peer input. With every share <= cap / N, the SUM over shards can
+        // never exceed the cap under any interleaving (see
+        // `tokenomics::SupplyPartition`). A single-shard registry allocates
+        // the full cap to the masterchain, preserving pre-sharding behaviour.
+        self.state
+            .set_chain_mint_limit_nano(registry.supply_partition().quota_for(shard_id));
         self.shard_registry = registry;
         self
     }
@@ -1174,6 +1183,23 @@ impl ValidatorRuntime {
         // next block will be built on - the root a cross-shard message
         // produced by the next block carries.
         let post_apply_root = self.state.get_state_root().await;
+        // CHAIN-WIDE SUPPLY ACCOUNTING: the committed head carries this
+        // shard's CUMULATIVE minted total INCLUDING its genesis pre-mine.
+        // Read AFTER the apply (this runs on the finalize/adopt/replay paths),
+        // so it is exactly the value the masterchain must aggregate. Every
+        // node applies the same block to the same pre-state, so the value is
+        // deterministic.
+        // Bounded by this shard's chain-wide share: the engine can never
+        // mint past it, and the lazy genesis baseline can OVER-count balances
+        // received before the first mint (inbound transfers). Publishing the
+        // bound keeps an over-counted head inside the shard's share instead of
+        // making the masterchain refuse an otherwise-valid head; it can never
+        // under-state a legal total, because no legal total exceeds the share.
+        let minted_total_nano = self
+            .state
+            .committed_minted_nano()
+            .await
+            .min(self.state.chain_mint_limit_nano());
         if let Some(reg) = self.finalized_headers.as_ref() {
             if let Ok(mut r) = reg.write() {
                 let block_hash = block.compute_hash();
@@ -1187,6 +1213,7 @@ impl ValidatorRuntime {
                         block_hash,
                         state_root: block.state_root,
                         timestamp: block.timestamp,
+                        minted_total_nano,
                     },
                     post_apply_root,
                 );
@@ -1507,7 +1534,123 @@ impl ValidatorRuntime {
                         h.shard_id, h.height
                     ));
                 }
+                // SUPPLY ACCOUNTING IS MONOTONE: the shard's cumulative
+                // minted total can only grow. A proposal that rolls it BACK
+                // would hide already-committed supply from the chain-wide
+                // aggregate, so it is refused outright (fail closed).
+                if h.minted_total_nano < mine.minted_total_nano {
+                    return Err(format!(
+                        "proposal: shard {} minted total {} is below the committed {} \
+                         (chain-wide supply accounting must be monotone)",
+                        h.shard_id, h.minted_total_nano, mine.minted_total_nano
+                    ));
+                }
             }
+        }
+        self.check_chain_supply_commitment(block)
+    }
+
+    /// Enforce the CHAIN-WIDE supply cap over a masterchain proposal's
+    /// committed shard heads (ruleset v5).
+    ///
+    /// The masterchain block is the only place a workchain's cumulative
+    /// minted total is signed by a quorum. This check rebuilds the chain-wide
+    /// aggregate from:
+    ///
+    /// * the masterchain's own last committed total (or the live engine
+    ///   counter before the first committed head), and
+    /// * every workchain head: the PROPOSED value for shards this block
+    ///   publishes, the last COMMITTED value for the others.
+    ///
+    /// and refuses the proposal when the sum would exceed
+    /// [`crate::tokenomics::TOTAL_SUPPLY_CAP`]. It also refuses any single
+    /// head above its static [`crate::tokenomics::SupplyPartition`] share,
+    /// which is the invariant that makes the aggregate safe under EVERY
+    /// interleaving rather than only under this validator's view.
+    ///
+    /// The view used here is the committed header set this node holds; a node
+    /// that has not finalized a shard yet simply contributes less to the
+    /// aggregate, so it can never ACCEPT an over-cap sum that a fully synced
+    /// node would refuse — the quorum that signs the block is the backstop,
+    /// and the per-shard shares are the hard bound.
+    pub fn check_chain_supply_commitment(&self, block: &Block) -> Result<(), String> {
+        if block.shard_id != MASTERCHAIN_SHARD {
+            if !block.shard_headers.is_empty() {
+                return Err(
+                    "proposal: shard heads published by a non-masterchain block".to_string()
+                );
+            }
+            return Ok(());
+        }
+        let cap = crate::tokenomics::TOTAL_SUPPLY_CAP as u128;
+        let partition = self.shard_registry.supply_partition();
+        let guard = self.finalized_headers.as_ref().and_then(|r| r.read().ok());
+
+        // 1. Every proposed head must be a valid cumulative total on its own.
+        for h in &block.shard_headers {
+            let minted = h.minted_total_nano as u128;
+            if minted > cap {
+                return Err(format!(
+                    "proposal: shard {} declares {} nano-STELL minted, above the chain-wide \
+                     TOTAL_SUPPLY_CAP {}",
+                    h.shard_id, h.minted_total_nano, crate::tokenomics::TOTAL_SUPPLY_CAP
+                ));
+            }
+            if partition.contains_shard(h.shard_id) {
+                let share = partition.quota_for(h.shard_id) as u128;
+                if minted > share {
+                    return Err(format!(
+                        "proposal: shard {} declares {} nano-STELL minted, above its \
+                         chain-wide supply share {}",
+                        h.shard_id, h.minted_total_nano, share
+                    ));
+                }
+            }
+        }
+
+        // 2. Sum the aggregate with proposed values replacing committed ones.
+        let proposed_shards: std::collections::BTreeSet<u32> =
+            block.shard_headers.iter().map(|h| h.shard_id).collect();
+        let committed_own = match guard.as_ref() {
+            Some(reg) => reg
+                .committed_masterchain_minted_nano()
+                .unwrap_or_else(|| self.state.total_minted_nano()),
+            None => self.state.total_minted_nano(),
+        };
+        if committed_own as u128 > cap {
+            return Err(format!(
+                "proposal: masterchain committed {committed_own} nano-STELL minted, above \
+                 TOTAL_SUPPLY_CAP {}",
+                crate::tokenomics::TOTAL_SUPPLY_CAP
+            ));
+        }
+        if partition.contains_shard(MASTERCHAIN_SHARD) {
+            let share = partition.quota_for(MASTERCHAIN_SHARD) as u128;
+            if committed_own as u128 > share {
+                return Err(format!(
+                    "proposal: masterchain committed {committed_own} nano-STELL minted, above \
+                     its chain-wide supply share {share}"
+                ));
+            }
+        }
+        let mut aggregate = committed_own as u128;
+        if let Some(reg) = guard.as_ref() {
+            for h in reg.workchain_headers() {
+                if !proposed_shards.contains(&h.shard_id) {
+                    aggregate = aggregate.saturating_add(h.minted_total_nano as u128);
+                }
+            }
+        }
+        for h in &block.shard_headers {
+            aggregate = aggregate.saturating_add(h.minted_total_nano as u128);
+        }
+        if aggregate > cap {
+            return Err(format!(
+                "proposal: chain-wide supply cap exceeded: committed aggregate would be {} \
+                 nano-STELL, above TOTAL_SUPPLY_CAP {}",
+                aggregate,
+                crate::tokenomics::TOTAL_SUPPLY_CAP
+            ));
         }
         Ok(())
     }
@@ -2919,6 +3062,7 @@ mod cnvrf_v3_activation_unit_tests {
             }),
             order_merkle_root: crate::mev::compute_order_merkle_root(&[]),
             epoch_key_commitment: [0u8; 32],
+            round: 0,
         }
     }
 

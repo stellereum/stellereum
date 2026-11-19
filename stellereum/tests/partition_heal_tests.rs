@@ -128,8 +128,8 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    // FULL-PQ: Ed-only bodies are refused by `verify_proposer_signature`.
+        round: 0,
+    };    // FULL-PQ: Ed-only bodies are refused by `verify_proposer_signature`.
     b.sign_block_with_falcon(proposer, proposer_pq);
     b
 }

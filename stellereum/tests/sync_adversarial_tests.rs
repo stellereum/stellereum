@@ -178,8 +178,8 @@ fn honest_blocks(keys: &[SigningKey], vs: &ValidatorSet, n: u64, root: [u8; 32])
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        b.sign_block_with_falcon(proposer, &fk_for(proposer));
+                    round: 0,
+        };        b.sign_block_with_falcon(proposer, &fk_for(proposer));
         let bh = b.compute_hash();
         b.precommit_qc = Some(qc_for(keys, vs, h, bh, prev));
         prev = bh;
@@ -622,8 +622,8 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        // Sign with the rotation-correct proposer; QC from the height's set.
+                    round: 0,
+        };        // Sign with the rotation-correct proposer; QC from the height's set.
         b.validator_signatures.clear();
         b.sign_block_with_falcon(proposer, &fk_for(proposer));
         let bh = b.compute_hash();
@@ -877,8 +877,8 @@ fn block_with_schedules(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block_with_falcon(sk, &fks[idx]);
+        round: 0,
+    };    b.sign_block_with_falcon(sk, &fks[idx]);
     let bh = b.compute_hash();
     let mut votes = VoteSet::new();
     for (k, fk) in keys.iter().zip(fks.iter()) {

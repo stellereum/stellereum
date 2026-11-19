@@ -158,8 +158,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    }
-}
+        round: 0,
+    }}
 
 /// Wrap an attested deposit as one transaction's payload.
 fn ops(att: BridgeIntent, intent: BridgeIntent) -> Vec<OpCode> {
@@ -313,8 +313,8 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    anchor.sign_block(&sk);
+            round: 0,
+    };    anchor.sign_block(&sk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
     store
         .set_finalized(NEXT_H, &anchor_hash)

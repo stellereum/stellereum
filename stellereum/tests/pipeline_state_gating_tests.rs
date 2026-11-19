@@ -248,8 +248,8 @@ async fn on_proposal_deferred_while_apply_pending() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    let h_before = rt.height();
+            round: 0,
+    };    let h_before = rt.height();
     let fin_before = rt.finalized.len();
     let err = rt
         .on_proposal(rt.id, next, 0)
@@ -568,8 +568,8 @@ async fn overcap_actor_block_rejected_at_propose() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    assert!(count_block_actor_sends(&__overcap_block) > MAX_ACTOR_MSGS_PER_BLOCK);
+            round: 0,
+    };    assert!(count_block_actor_sends(&__overcap_block) > MAX_ACTOR_MSGS_PER_BLOCK);
     rt.add_tx(over_tx).await;
     assert!(
         rt.propose(TS).await.is_none(),
@@ -633,8 +633,8 @@ async fn overcap_actor_block_rejected_at_adopt() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    let vfk = val_fk(&val_sk);
+            round: 0,
+    };    let vfk = val_fk(&val_sk);
     block.validator_signatures.clear();
     block.sign_block_with_falcon(&val_sk, &vfk);
     let bh = block.compute_hash();
@@ -731,8 +731,8 @@ async fn actor_cap_counts_backlog_plus_block() {
             cnvrf_v3: None,
             order_merkle_root: root,
             epoch_key_commitment: [0u8; 32],
-        }
-    };
+                    round: 0,
+        }    };
 
     let over = mk(4000);
     assert_eq!(count_block_actor_sends(&over), 4000);
@@ -796,6 +796,6 @@ async fn actor_cap_counts_backlog_plus_block() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-    };
-    assert_eq!(count_block_actor_sends(&nested), 3);
+            round: 0,
+    };    assert_eq!(count_block_actor_sends(&nested), 3);
 }

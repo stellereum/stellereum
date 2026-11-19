@@ -14,6 +14,7 @@ fn head(shard_id: ShardId, height: u64, tag: u8) -> ShardHeaderCommitment {
         block_hash: [tag; 32],
         state_root: [tag.wrapping_add(1); 32],
         timestamp: 1_700_000_000 + height,
+        minted_total_nano: 0,
     }
 }
 
@@ -35,6 +36,7 @@ fn block_with(headers: Vec<ShardHeaderCommitment>) -> Block {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
+        round: 0,
     }
 }
 
@@ -153,8 +155,8 @@ fn epoch_mmr_root_keeps_legacy_hashes_and_moves_hash_when_set() {
         epoch_key_commitment: legacy.epoch_key_commitment,
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    assert_eq!(legacy_shaped.compute_hash(), legacy_hash);
+            round: 0,
+    };    assert_eq!(legacy_shaped.compute_hash(), legacy_hash);
 }
 
 #[test]
@@ -377,8 +379,8 @@ fn legacy_block_bytes_still_decode() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-    };
-    assert_eq!(decoded.compute_hash(), rebuilt.compute_hash());
+            round: 0,
+    };    assert_eq!(decoded.compute_hash(), rebuilt.compute_hash());
 
     // A block WITH the field round-trips through bincode.
     let modern = block_with(vec![head(1, 5, 0x01)]);
@@ -392,16 +394,17 @@ fn legacy_block_bytes_still_decode() {
     // trailing order commitment (32 bytes), the trailing epoch-key
     // commitment (32 bytes), the trailing canonical-evidence QC
     // (`None` => 1-byte option tag), the trailing epoch-MMR root
-    // (32 bytes), and the trailing CN-VRF v3 payload (`None` => 1-byte
-    // option tag).
+    // (32 bytes), the trailing CN-VRF v3 payload (`None` => 1-byte
+    // option tag), and the ruleset-v4 trailing signed round (4 bytes).
     let empty = block_with(vec![]);
     let empty_bytes = bincode::serialize(&empty).expect("empty encodes");
     assert_eq!(
         empty_bytes.len(),
-        bytes_len_legacy + 8 + 32 + 32 + 1 + 32 + 1,
+        bytes_len_legacy + 8 + 32 + 32 + 1 + 32 + 1 + 4,
         "the shard-head set adds its (empty) length prefix, the order root adds 32 bytes, \
          the epoch-key commitment adds 32 bytes, the absent evidence QC adds its 1-byte tag, \
-         the zero epoch-MMR root adds 32 bytes, and the absent cnvrf_v3 adds its 1-byte tag"
+         the zero epoch-MMR root adds 32 bytes, the absent cnvrf_v3 adds its 1-byte tag, \
+         and the ruleset-v4 signed round adds 4 bytes"
     );
 }
 
@@ -682,8 +685,8 @@ fn xshard_empty_block_hash_is_byte_identical_to_the_legacy_preimage() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    let mut legacy = Sha256::new();
+            round: 0,
+    };    let mut legacy = Sha256::new();
     legacy.update(b"STELLEREUM_BLOCK_V3");
     legacy.update(crate::consensus::consensus_chain_id().to_be_bytes());
     legacy.update(block.shard_id.to_be_bytes());
@@ -723,8 +726,8 @@ fn xshard_full_message_commitment_binds_the_body_beyond_msg_id() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-    };
-    let honest_hash = block.compute_hash();
+            round: 0,
+    };    let honest_hash = block.compute_hash();
 
     // A body swap that keeps the stale `msg_id` MUST move the block hash:
     // the commitment binds the body, not just the id.

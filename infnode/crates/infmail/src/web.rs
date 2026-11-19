@@ -2150,7 +2150,7 @@ async fn deliver_system_mail(st: &WebState, to_email: &str, subject: &str, body:
     })
     .to_string()
     .into_bytes();
-    st.node.store_mail(&format!("mail:{id}"), &envelope).await;
+    let _ = st.node.store_mail(&format!("mail:{id}"), &envelope).await;
     index_add(&st.node, &mail_index_key(to_email, "Inbox"), &id).await;
 }
 
@@ -3349,6 +3349,12 @@ async fn mail_send(
         Some((k, n)) => st.node.store_mail_ec(&name, &blob, None, k, n).await,
         None => st.node.store_mail(&name, &blob).await,
     };
+    // A refusal is specific (e.g. an unusable owner key on a future caller),
+    // and must not be reported as a generic storage failure.
+    let (stored, store_err) = match stored {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
     // если письмо не записалось нигде (0 чанков) — откатываем квоту (не списывать зря)
     if stored == 0 {
         let mut db = st.db.lock().await;
@@ -3361,7 +3367,11 @@ async fn mail_send(
             }
         }
         save_db(&st.db_path, &db).await;
-        return err_json(StatusCode::BAD_GATEWAY, "failed to save email (storage)");
+        let msg = match store_err {
+            Some(e) => format!("failed to save email (storage): {e}"),
+            None => "failed to save email (storage)".to_string(),
+        };
+        return err_json(StatusCode::BAD_GATEWAY, &msg);
     }
     // вложения пишем после конверта (id вложений детерминированы от id письма)
     for (aname, adata) in att_blobs {
@@ -3440,7 +3450,7 @@ only encrypted chunks spread across independent nodes.\n\n\
     .to_string()
     .into_bytes();
     let name = format!("mail:{id}");
-    st.node.store_mail(&name, &blob).await;
+    let _ = st.node.store_mail(&name, &blob).await;
     let meta = json!({
         "sender": "team@infmail.org",
         "to": email,
@@ -3509,7 +3519,7 @@ async fn mail_draft(
         .to_string()
         .into_bytes();
     let name = format!("mail:{id}");
-    st.node.store_mail(&name, &blob).await;
+    let _ = st.node.store_mail(&name, &blob).await;
     // локальная meta: список Drafts не должен зависеть от сети (иначе при
     // несходившемся меше черновик временно не виден — fetch по таймауту).
     let preview = if body_stored.starts_with("s1.") {
@@ -5069,7 +5079,7 @@ async fn smtp_relay_external(
             .to_string()
             .into_bytes();
             let name = format!("mail:{id}");
-            st.node.store_mail(&name, &blob).await;
+            let _ = st.node.store_mail(&name, &blob).await;
             // ВАЖНО: мета включает body — иначе список писем вынужден тянуть тело
             // из сети при каждом открытии, а при таймауте показывает пустое письмо
             // (наблюдалось: внешнее письмо открывалось без текста).

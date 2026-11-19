@@ -248,8 +248,8 @@ async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
             cnvrf_v3: None,
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-        };
-        // FULL-PQ: the proposer slot must carry a Falcon signature; the key
+                    round: 0,
+        };        // FULL-PQ: the proposer slot must carry a Falcon signature; the key
         // is registered so consensus verification resolves it.
         let block_key = SigningKey::from_bytes(&[7u8; 32]);
         let block_fk = FalconKeypair::generate_from_seed(7);

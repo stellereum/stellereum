@@ -29,8 +29,8 @@ fn block(height: u64, prev: [u8; 32], tag: u8, signer: &SigningKey) -> Block {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block(signer);
+        round: 0,
+    };    b.sign_block(signer);
     b
 }
 

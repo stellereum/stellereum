@@ -178,8 +178,8 @@ async fn build_live_chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        // FULL-PQ: the proposer slot must carry the proposer's registered
+                    round: 0,
+        };        // FULL-PQ: the proposer slot must carry the proposer's registered
         // Falcon signature; an Ed-only block is refused by block sync.
         let proposer_idx = ks
             .iter()

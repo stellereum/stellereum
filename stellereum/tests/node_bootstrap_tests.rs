@@ -132,8 +132,8 @@ async fn build_live_chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-        };
-        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
+                    round: 0,
+        };        b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, fks, &vs, h, bh);
         prev = bh;

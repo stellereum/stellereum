@@ -110,8 +110,8 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-    };
-    b.sign_block_with_falcon(pkey, pfk);
+            round: 0,
+    };    b.sign_block_with_falcon(pkey, pfk);
     b
 }
 

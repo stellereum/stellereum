@@ -821,7 +821,10 @@ pub(super) async fn dispatch_eth(
                         .await
                         .next_pending_nonce(&account)
                         .unwrap_or(0);
-                    ok(id, json!(crate::evm_adapter::format_u64_hex(onchain.max(pooled))))
+                    ok(
+                        id,
+                        json!(crate::evm_adapter::format_u64_hex(onchain.max(pooled))),
+                    )
                 }
                 Err(e) => err(id, e.code, e.message),
             }
@@ -1147,11 +1150,12 @@ pub(super) async fn dispatch_eth(
                 }
             };
             match submit_carrier(st, tx).await {
-                Ok(stell_hash) => {
-                    // Map the EVM hash to the settlement L1 hash immediately, so
-                    // `eth_getTransactionByHash(evmHash)` (what MetaMask polls)
-                    // resolves to the pool/inclusion view instead of `null`.
-                    crate::evm_adapter::register_evm_settlement(&evm_hash, &stell_hash);
+                Ok(_stell_hash) => {
+                    // PENTEST2 H1: the EVM↔Stell settlement map is written by
+                    // the COMMITTED block apply (and rebuilt at startup), never
+                    // by admission. A pooled carrier is not settled yet, so
+                    // mapping it here would make `eth_getTransactionReceipt`
+                    // claim a settlement the chain does not have.
                     ok(id, json!(evm_hash))
                 }
                 Err(e) => rpc_error(id, e),
@@ -1189,7 +1193,8 @@ pub(super) async fn dispatch_eth(
                     "pqAddress": pq.map(|p| format!("0x{}", hex::encode(p))),
                     "bound": pq.is_some(),
                     "source": "committed EVM binding index (node-local replay of \
-                               SysCallBindEvmAddress / carrier records)",
+                               APPLIED SysCallBindEvmAddress / carrier transactions only; \
+                               mempool-only claims are never reported as bound)",
                 })
             } else if bare.len() == 64 {
                 let mut pq = [0u8; 32];
@@ -1202,7 +1207,8 @@ pub(super) async fn dispatch_eth(
                     "pqAddress": format!("0x{}", hex::encode(pq)),
                     "bound": evm.is_some(),
                     "source": "committed EVM binding index (node-local replay of \
-                               SysCallBindEvmAddress / carrier records)",
+                               APPLIED SysCallBindEvmAddress / carrier transactions only; \
+                               mempool-only claims are never reported as bound)",
                 })
             } else {
                 return Some(err(
@@ -1256,9 +1262,17 @@ pub(super) async fn dispatch_eth(
                     }
                     Err(e) => return Some(err(id, -32602, e)),
                 };
-            let binding_signature =
-                match hex_param(params, &["bindingSignature", "binding_signature", "claimSignature"])
-                {
+            let binding_signature = match hex_param(
+                params,
+                &["bindingSignature", "binding_signature", "claimSignature"],
+            ) {
+                Ok(v) => v,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
+            // C1/S1: proof of possession of the EVM key. Without it the claim
+            // is refused (consensus and admission both require it).
+            let evm_signature =
+                match hex_param(params, &["evmSignature", "evm_signature", "evmProof"]) {
                     Ok(v) => v,
                     Err(e) => return Some(err(id, -32602, e)),
                 };
@@ -1315,6 +1329,7 @@ pub(super) async fn dispatch_eth(
                 &pq_pubkey,
                 evm_address,
                 &binding_signature,
+                &evm_signature,
                 nonce,
                 gas_limit,
                 &tx_signature,
@@ -1325,6 +1340,7 @@ pub(super) async fn dispatch_eth(
                         &pq_pubkey,
                         evm_address,
                         &binding_signature,
+                        &evm_signature,
                         nonce,
                         gas_limit,
                     )
@@ -1354,10 +1370,12 @@ pub(super) async fn dispatch_eth(
             };
             match submit_carrier(st, tx).await {
                 Ok(hash) => {
-                    // Index immediately (node-local routing): the claim is now
-                    // admissible, so a carrier can follow without waiting for a
-                    // block. Consensus checks nothing from this index.
-                    let _ = crate::evm_adapter::record_evm_binding(evm_address, pq_from);
+                    // PENTEST2 M1/H1: do NOT write the binding index here. The
+                    // claim is only admitted, not committed; the index is fed
+                    // from applied blocks (and rebuilt from persisted blocks at
+                    // startup), so `stell_getEvmBinding` never reports an
+                    // uncommitted claim as bound and mempool-only claims do
+                    // not freeze routing.
                     ok(id, json!(hex::encode(hash)))
                 }
                 Err(e) => rpc_error(id, e),
@@ -1414,11 +1432,11 @@ pub(super) async fn dispatch_eth(
                 Ok(v) => v,
                 Err(e) => return Some(err(id, -32602, e)),
             };
-            let intent_signature =
-                match hex_param(params, &["intentSignature", "intent_signature"]) {
-                    Ok(v) => v,
-                    Err(e) => return Some(err(id, -32602, e)),
-                };
+            let intent_signature = match hex_param(params, &["intentSignature", "intent_signature"])
+            {
+                Ok(v) => v,
+                Err(e) => return Some(err(id, -32602, e)),
+            };
             let tx_signature =
                 match hex_param(params, &["txSignature", "tx_signature", "signature"]) {
                     Ok(v) => v,
@@ -1481,8 +1499,8 @@ pub(super) async fn dispatch_eth(
                 }
             };
             match submit_carrier(st, tx).await {
-                Ok(stell_hash) => {
-                    crate::evm_adapter::register_evm_settlement(&view.hash, &stell_hash);
+                Ok(_stell_hash) => {
+                    // H1/M1: settlement is recorded only from committed blocks.
                     ok(id, json!(view.hash))
                 }
                 Err(e) => rpc_error(id, e),
@@ -1614,9 +1632,14 @@ fn carrier_auth_params(params: &Value) -> Result<Option<CarrierAuth>, String> {
         None => outer,
     };
     // A plain second object without any carrier key is not an authorisation.
-    let has_any = ["pqPublicKey", "pq_public_key", "intentSignature", "intent_signature"]
-        .iter()
-        .any(|k| obj.contains_key(*k));
+    let has_any = [
+        "pqPublicKey",
+        "pq_public_key",
+        "intentSignature",
+        "intent_signature",
+    ]
+    .iter()
+    .any(|k| obj.contains_key(*k));
     if !has_any {
         return Ok(None);
     }
@@ -1653,10 +1676,7 @@ fn object_optional_hex(
 }
 
 /// Optional u64 from a params object (`0x`-hex or decimal string, or a number).
-fn object_u64(
-    obj: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Result<Option<u64>, String> {
+fn object_u64(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, String> {
     for k in keys {
         match obj.get(*k) {
             None | Some(Value::Null) => continue,
@@ -1671,9 +1691,7 @@ fn object_u64(
                     Some(h) => u64::from_str_radix(h, 16),
                     None => s.parse::<u64>(),
                 };
-                return parsed
-                    .map(Some)
-                    .map_err(|e| format!("invalid {k}: {e}"));
+                return parsed.map(Some).map_err(|e| format!("invalid {k}: {e}"));
             }
             Some(_) => return Err(format!("{k} must be a number or a numeric string")),
         }
@@ -1766,9 +1784,12 @@ async fn submit_carrier(
         .height
         .load(std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);
-    if let Some(reason) =
-        crate::chain_binding::check_admission_from_env(tx.chain_id().is_some(), next_height, st.chain_id)
-            .err()
+    if let Some(reason) = crate::chain_binding::check_admission_from_env(
+        tx.chain_id().is_some(),
+        next_height,
+        st.chain_id,
+    )
+    .err()
     {
         crate::metrics::global().inc_unbound_refused();
         return Err(crate::evm_adapter::JsonRpcError::new(-32000, reason));

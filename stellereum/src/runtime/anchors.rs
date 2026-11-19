@@ -71,6 +71,7 @@ impl ValidatorRuntime {
             completed_cross_shard: HashSet::new(),
             xpc_activation: crate::xshard2pc::XpcActivation::Disabled,
             xpc_records: HashMap::new(),
+            xpc_mailbox_seen: HashMap::new(),
             apply_lane: None,
             apply_in_flight: None,
             snapshot_in_flight: None,
@@ -1546,15 +1547,19 @@ impl ValidatorRuntime {
         use crate::xshard2pc::XpcPhase;
         let tx_hash = msg.tx.compute_tx_hash();
         // BOUNDED RE-EMIT: a shard may publish at most
-        // `XPC_MAX_REEMITS_PER_HEIGHT` 2PC control messages per block, chosen
+        // `XPC_MAX_REEMITS_PER_HEIGHT` 2PC control records per block, chosen
         // deterministically. Validation enforces the same bound on the
         // incoming block, so an over-eager proposer cannot amplify traffic.
+        // A COMMIT is a decision re-publication, not a value transfer, and is
+        // counted too: otherwise a Byzantine proposer could flood a block with
+        // uncapped historical COMMITs for every retained record.
         if matches!(
             msg.kind(),
             CrossShardKind::Prepare
                 | CrossShardKind::PrepareAck
                 | CrossShardKind::AbortRequest
                 | CrossShardKind::AbortAck
+                | CrossShardKind::Commit
         ) {
             let control = block
                 .cross_shard_out
@@ -1566,6 +1571,7 @@ impl ValidatorRuntime {
                             | CrossShardKind::PrepareAck
                             | CrossShardKind::AbortRequest
                             | CrossShardKind::AbortAck
+                            | CrossShardKind::Commit
                     )
                 })
                 .count();
@@ -1652,6 +1658,37 @@ impl ValidatorRuntime {
         if rec.phase != phase {
             return false;
         }
+        // The same deterministic cadence the proposer's bounded plan uses.
+        // Without this a Byzantine proposer could re-publish an already
+        // decided COMMIT (or an ACK outside its window) every block: the
+        // apply is a no-op, but the block/gossip amplification is unbounded.
+        match msg.kind() {
+            CrossShardKind::Commit => {
+                if !matches!(
+                    crate::xshard2pc::source_action(rec, block.height),
+                    crate::xshard2pc::SourceAction::Commit
+                ) {
+                    return false;
+                }
+            }
+            CrossShardKind::PrepareAck => {
+                if !matches!(
+                    crate::xshard2pc::target_action_at(rec, block.height),
+                    crate::xshard2pc::TargetAction::PrepareAck
+                ) {
+                    return false;
+                }
+            }
+            CrossShardKind::AbortAck => {
+                if !matches!(
+                    crate::xshard2pc::target_action_at(rec, block.height),
+                    crate::xshard2pc::TargetAction::AbortAck
+                ) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
         // The abort request is only admissible once the prepare window
         // elapsed (the same rule the proposer used).
         if msg.kind() == CrossShardKind::AbortRequest
@@ -1718,11 +1755,13 @@ impl ValidatorRuntime {
     /// Set the §9 two-phase-commit activation switch.
     ///
     /// `FromHeight(h)` makes every transfer PRODUCED at height `h` or later
-    /// run the 2PC; transfers produced before `h` keep running the legacy
-    /// outbox/inbox/ack/bounce flow. The switch is node configuration (like
-    /// the shard registry), but the HEIGHT it names is consensus-visible: it
-    /// decides which flow a transfer takes, so every node of a shard must
-    /// agree on it.
+    /// run the 2PC; transfers produced before `h` keep the legacy
+    /// outbox/inbox/ack/bounce flow, which on an upgraded chain is
+    /// REFUND-ONLY: the target refuses the one-step legacy credit (XSHARD-01)
+    /// and the source's height-timeout bounce returns the value. The switch is
+    /// node configuration (like the shard registry), but the HEIGHT it names
+    /// is consensus-visible: it decides which flow a transfer takes, so every
+    /// node of a shard must agree on it.
     pub fn with_xpc_activation(mut self, activation: crate::xshard2pc::XpcActivation) -> Self {
         self.xpc_activation = activation;
         self

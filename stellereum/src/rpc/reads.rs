@@ -19,6 +19,20 @@ pub(super) fn parse_addr_or_hash(s: &str) -> Result<[u8; 32], String> {
     crate::address::parse_address(s).map_err(|e| format!("{e}"))
 }
 
+/// Extract a transaction hash from the accepted parameter shapes of the
+/// receipt/status reads:
+/// * `{ "hash": "<hex>" }` (object form)
+/// * `"<hex>"` (bare string)
+/// * `["<hex>"]` (standard JSON-RPC positional form)
+fn tx_hash_param(params: &Value) -> Option<[u8; 32]> {
+    params
+        .get("hash")
+        .and_then(Value::as_str)
+        .or_else(|| params.as_str())
+        .or_else(|| params.get(0).and_then(Value::as_str))
+        .and_then(|s| parse_hash(s).ok())
+}
+
 /// Parse a 32-byte hex address (with or without 0x).
 #[allow(dead_code)]
 pub fn parse_addr(s: &str) -> Result<[u8; 32], String> {
@@ -1849,12 +1863,9 @@ pub(super) async fn dispatch_reads(
         // ---- receipts (P0-3) ----
         // Without these a wallet can only ask "is my hash in the mempool", and
         // can never learn whether its transaction was finalised or failed.
+        // Params accept all three common shapes: `{"hash": h}`, `h`, `[h]`.
         "stell_getTransactionReceipt" => {
-            let h = match params["hash"]
-                .as_str()
-                .or_else(|| params.as_str())
-                .and_then(|s| parse_hash(s).ok())
-            {
+            let h = match tx_hash_param(params) {
                 Some(h) => h,
                 None => return err(id, -32602, "missing tx hash"),
             };
@@ -2055,11 +2066,7 @@ pub(super) async fn dispatch_reads(
             err(id, -32602, "missing 'tx_hash' or 'contract' parameter")
         }
         "stell_getTransactionStatus" => {
-            let h = match params["hash"]
-                .as_str()
-                .or_else(|| params.as_str())
-                .and_then(|s| parse_hash(s).ok())
-            {
+            let h = match tx_hash_param(params) {
                 Some(h) => h,
                 None => return err(id, -32602, "missing tx hash"),
             };
@@ -2644,8 +2651,9 @@ pub(super) async fn dispatch_reads(
             }
             Err(e) => err(id, -32602, e),
         },
-        // Remove a subscription. `true` when it existed, `false` when the id
-        // was unknown (idempotent, like the EVM `eth_uninstallFilter`).
+        // Remove a subscription. `true` when it existed AND belongs to the
+        // calling client, `false` for an unknown id or another client's id
+        // (indistinguishable, so the method is not an id oracle).
         "stell_unsubscribe" => {
             let sub_id = params
                 .get(0)
@@ -2655,19 +2663,27 @@ pub(super) async fn dispatch_reads(
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             match sub_id {
-                Some(s) => ok(id, json!(hub().unsubscribe(s))),
+                Some(s) => {
+                    let client = peer_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| LOCAL_SUBSCRIBER_ID.to_string());
+                    ok(id, json!(hub().unsubscribe_for(s, Some(client.as_str()))))
+                }
                 None => err(id, -32602, "missing subscription id"),
             }
         }
-        // The live subscriptions of this node (diagnostics / introspection).
-        // Privacy: the registry records which client (IP) owns each
-        // subscription for the per-client budget, and the ids are bearer
-        // capabilities for the unauthenticated `stell_unsubscribe`. Neither
-        // is enumerable here: serve the diagnostics shape (id, filter,
-        // age, attachment) without the owner field.
+        // The live subscriptions of THIS client (diagnostics / introspection).
+        //
+        // Subscription ids are capabilities for unsubscribe and SSE attach, so
+        // the listing is scoped to the caller's own subscriptions: an
+        // unauthenticated caller cannot enumerate another client's ids and
+        // tear its streams down. The owner field (client IP) is never served.
         "stell_getSubscriptions" => {
+            let client = peer_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| LOCAL_SUBSCRIBER_ID.to_string());
             let view: Vec<Value> = hub()
-                .list()
+                .list_for(Some(client.as_str()))
                 .iter()
                 .map(|s| {
                     json!({

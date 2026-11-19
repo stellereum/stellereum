@@ -486,6 +486,9 @@ async fn execution_requires_a_real_quorum_from_the_committed_tally() {
 /// into every vote preimage and block hash).
 #[tokio::test]
 async fn wrong_chain_id_is_refused() {
+    // The executor itself is gated (PENTEST2 S7); open it so this test
+    // exercises the chain-id rule rather than the activation gate.
+    let _gate = Gate::at(1);
     let (engine, validators) = engine_with(3).await;
     let pass_height = 1_000u64;
     let id = pass_upgrade(

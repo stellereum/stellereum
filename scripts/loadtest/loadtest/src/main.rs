@@ -1183,6 +1183,20 @@ fn drain(
     }
 }
 
+/// Receipt sampling is deliberately patient: drain only means the on-chain
+/// nonce caught up, while the receipt index is filed by the application on
+/// finalize/adopt and can lag by a block. One immediate query used to report
+/// `unknown` for receipts that appeared a moment later; sample with a short
+/// bounded backoff instead (total wait is further capped by the deadline).
+const RECEIPT_SAMPLE_ATTEMPTS: u32 = 6;
+const RECEIPT_SAMPLE_BASE_MS: u64 = 100;
+
+fn receipt_retry_delay_ms(attempt: u32) -> u64 {
+    RECEIPT_SAMPLE_BASE_MS
+        .saturating_mul(1u64 << attempt.min(4))
+        .min(2_000)
+}
+
 fn sample_receipts(
     cfg: &Config,
     clients: &[RpcClient],
@@ -1206,39 +1220,58 @@ fn sample_receipts(
         };
         n += 1;
         sample.queried += 1;
-        if !read_gate.acquire(Some(deadline), &stop) {
-            sample.unknown += 1;
-            continue;
-        }
         let client = &clients[(o.index as usize) % clients.len()];
-        let status = match client.call_retry(
-            "stell_getTransactionStatus",
-            json!({ "hash": hash }),
-            2,
-            100,
-        ) {
-            Ok(v) => v.as_str().unwrap_or("unknown").to_string(),
-            Err(e) => {
-                stats.read_errors.fetch_add(1, Ordering::Relaxed);
-                stats.record_error(&e);
-                "unknown".to_string()
+        let mut status = "unknown".to_string();
+        for attempt in 0..RECEIPT_SAMPLE_ATTEMPTS {
+            if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+                break;
             }
-        };
+            if !read_gate.acquire(Some(deadline), &stop) {
+                break;
+            }
+            match client.call("stell_getTransactionStatus", json!({ "hash": hash })) {
+                Ok(v) => {
+                    let s = v.as_str().unwrap_or("unknown").to_string();
+                    if s != "unknown" {
+                        status = s;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Transport/HTTP errors are transient too; keep the
+                    // bounded retry (the deadline still applies).
+                    stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                    stats.record_error(&e);
+                }
+            }
+            if attempt + 1 < RECEIPT_SAMPLE_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(receipt_retry_delay_ms(attempt)));
+            }
+        }
         match status.as_str() {
             "success" => sample.success += 1,
             "failed" => sample.failed += 1,
             _ => sample.unknown += 1,
         }
         let height = if sample.details.len() < 3 && status != "unknown" {
-            client
-                .call_retry(
+            let mut height = None;
+            for attempt in 0..3u32 {
+                if let Ok(v) = client.call_retry(
                     "stell_getTransactionReceipt",
                     json!({ "hash": hash }),
                     1,
                     100,
-                )
-                .ok()
-                .and_then(|v| v.get("height").and_then(parse_u64_any))
+                ) {
+                    height = v.get("height").and_then(parse_u64_any);
+                    if height.is_some() {
+                        break;
+                    }
+                }
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(receipt_retry_delay_ms(attempt)));
+                }
+            }
+            height
         } else {
             None
         };
@@ -1507,6 +1540,25 @@ mod tests {
         assert!(fixed_gas_error(&cfg, 280_000, PqMode::Implicit).is_none());
         let cfg = Config::default();
         assert!(fixed_gas_error(&cfg, 280_000, PqMode::Explicit).is_none());
+    }
+
+    #[test]
+    fn receipt_sampling_backoff_is_short_and_bounded() {
+        let delays: Vec<u64> = (0..RECEIPT_SAMPLE_ATTEMPTS)
+            .map(receipt_retry_delay_ms)
+            .collect();
+        assert!(delays[0] >= 50, "first retry must wait a little: {delays:?}");
+        for w in delays.windows(2) {
+            assert!(w[1] >= w[0], "backoff must be non-decreasing: {delays:?}");
+        }
+        assert!(
+            delays.iter().all(|d| *d <= 2_000),
+            "per-attempt backoff must stay bounded: {delays:?}"
+        );
+        let total: u64 = delays.iter().sum();
+        assert!(total < 6_000, "total sample retry wait stays short: {total}");
+        assert_eq!(receipt_retry_delay_ms(0), 100);
+        assert_eq!(receipt_retry_delay_ms(99), 1_600);
     }
 
     #[test]

@@ -454,6 +454,9 @@ pub fn coalesce_live_for_send<'a>(
 pub struct BroadcastFrame {
     /// The exact bytes handed to the transport (JSON `{topic,data}` frame).
     pub payload: Vec<u8>,
+    /// The hex `data` field (the direct-mesh path wraps it in the same
+    /// `{topic,data}` envelope, so it must not be re-framed).
+    pub data: String,
     /// Length of the inner (bincode) encoding before hex/JSON framing.
     pub encoded_len: usize,
     /// True when the frame carries a `Batch` of several messages.
@@ -499,11 +502,12 @@ pub fn encode_broadcast_payload(
     };
     let encoded_len = bytes.len();
     let data = hex::encode(bytes);
-    let payload = serde_json::json!({ "topic": topic, "data": data })
+    let payload = serde_json::json!({ "topic": topic, "data": &data })
         .to_string()
         .into_bytes();
     Ok(BroadcastFrame {
         payload,
+        data,
         encoded_len,
         is_batch,
     })
@@ -1596,6 +1600,7 @@ impl ConsensusNetwork {
             }
         };
         let nbytes = frame.encoded_len;
+        let data = frame.data;
         let payload = frame.payload;
         log_stage(
             &ENCODE_STAGE_GATE,
@@ -1603,6 +1608,29 @@ impl ConsensusNetwork {
             &format!("items={} bytes={nbytes}", msgs.len()),
             t_encode.elapsed(),
         );
+        // DIRECT VALIDATOR MESH (pentest-2 R10/M6 wiring): when the mesh covers
+        // the complete configured peer set, deliver over the warm direct links
+        // first. The mesh publishes ONE overlay fallback when any direct copy
+        // fails. If even one direct copy failed (or coverage is partial) the
+        // normal per-peer broadcast below still runs, so a lost link can never
+        // lose the message; receiver-side dedup makes the duplicate harmless.
+        let mesh_peers = self.peer_ids();
+        if self.adapter.validator_mesh().covers(&mesh_peers) {
+            let delivery = self
+                .adapter
+                .deliver_consensus_mesh(&self.topic, &data)
+                .await;
+            if delivery.targets == mesh_peers.len() && delivery.direct_ok == delivery.targets {
+                return;
+            }
+            tracing::warn!(
+                "[consensus] mesh direct delivery incomplete (ok={} failed={} targets={} fallback_ok={}): using the per-peer broadcast fallback",
+                delivery.direct_ok,
+                delivery.direct_failed,
+                delivery.targets,
+                delivery.fallback_ok,
+            );
+        }
         let exempt = batch_bypasses_skip_refs(msgs.iter().map(|m| &**m));
         // Fire-and-forget for votes/proposals: the peer's ACK carries no
         // information the sender needs, but it costs a full round trip
@@ -2311,10 +2339,11 @@ pub fn parse_compact_qc_incoming(raw: &str) -> Option<QuorumCertificate> {
 //   `ConsensusMsg::Proposal { .. }` construction with
 //   `proposal_gossip_msg(&block, round)` and call
 //   `CompactBodyServer::remember(&block, round)` before enqueueing it;
-// * receiver: `src/node/consensus_driver.rs:2133-2182` — feed the three
-//   `??` compact arms to `CompactReceiver::on_proposal` / `on_body` and
-//   `CompactBodyServer::serve`, and hand `CompactInbound::Ready`'s block to
-//   `rt.on_proposal(block.proposer, block, round)` (the full-Proposal arm);
+// * receiver: `src/node/consensus_driver.rs` compact arms feed
+//   `CompactReceiver::on_proposal_indexed` / `on_body_indexed` and
+//   `CompactBodyServer::serve_for` / `serve_full_for`, and hand
+//   `CompactInbound::Ready`'s block to `rt.on_proposal(block.proposer, block,
+//   round)` (the full-Proposal arm);
 // * outbox policy: `src/node/policy.rs:616-645` — `outbox_has_proposal` and
 //   `is_superseded_proposal` must also match `CompactProposal` (helpers
 //   [`proposal_gossip_height_round`] / [`is_superseded_proposal`] exist here);
@@ -2367,6 +2396,81 @@ pub fn short_id_index_for(
     txs: impl IntoIterator<Item = crate::sharding::Transaction>,
 ) -> compact_prop::ShortIdIndex {
     compact_prop::ShortIdIndex::from_txs(compact_prop::salt_for_header(header), txs)
+}
+
+/// Lifetime of one cached mempool short-id index (pentest-2 F-8/C2).
+///
+/// Short: the index is a snapshot of `Mempool::all()`, and a tx that arrives
+/// after the snapshot is simply a MISS (a pull or the full fallback), never a
+/// wrong resolution. Two seconds bounds staleness while still amortizing the
+/// whole-pool hash pass across every duplicate announcement inside a round.
+pub const COMPACT_INDEX_CACHE_TTL_MS: u64 = 2_000;
+
+/// How many `(height, prev_hash)` short-id indexes are retained.
+///
+/// One live proposal plus one H+1 (the only heights the receiver accepts) is
+/// enough; a third would only be stale mempool state held for two seconds.
+pub const COMPACT_INDEX_CACHE_MAX: usize = 2;
+
+/// A tiny TTL cache of [`compact_prop::ShortIdIndex`], keyed by the header
+/// salt `(height, prev_hash)`.
+///
+/// This is the receive-side fix for the amplification finding C2/F-8: the old
+/// path called `Mempool::all()` and rebuilt a salted index for EVERY compact
+/// frame (a ~400 B frame cost an O(mempool) clone + hash pass). The cache is
+/// consulted before touching the mempool at all, so a duplicate/replayed
+/// announcement costs one lookup. `builds` is a test/visibility counter (the
+/// regression test asserts a burst of frames builds at most once per salt).
+#[derive(Debug, Default)]
+pub struct CompactIndexCache {
+    entries: Vec<([u8; 32], compact_prop::ShortIdIndex, Instant)>,
+    builds: u64,
+}
+
+impl CompactIndexCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of indexes actually built (cache misses).
+    pub fn builds(&self) -> u64 {
+        self.builds
+    }
+
+    /// Cached index for `header`'s salt, if it is still inside the TTL.
+    pub fn get(&self, header: &Block, now: Instant) -> Option<&compact_prop::ShortIdIndex> {
+        let salt = compact_prop::salt_for_header(header);
+        self.entries
+            .iter()
+            .find(|(s, _, at)| *s == salt && now.duration_since(*at).as_millis() as u64 <= COMPACT_INDEX_CACHE_TTL_MS)
+            .map(|(_, index, _)| index)
+    }
+
+    /// Build and cache the index for `header` from `txs`, returning a borrow to
+    /// the cached entry. Expired entries and any entry beyond
+    /// [`COMPACT_INDEX_CACHE_MAX`] are dropped first (oldest first).
+    pub fn insert(
+        &mut self,
+        header: &Block,
+        txs: impl IntoIterator<Item = crate::sharding::Transaction>,
+        now: Instant,
+    ) -> &compact_prop::ShortIdIndex {
+        let salt = compact_prop::salt_for_header(header);
+        self.entries.retain(|(_, _, at)| {
+            now.duration_since(*at).as_millis() as u64 <= COMPACT_INDEX_CACHE_TTL_MS
+        });
+        self.entries.retain(|(s, _, _)| *s != salt);
+        while self.entries.len() >= COMPACT_INDEX_CACHE_MAX {
+            self.entries.remove(0);
+        }
+        self.builds += 1;
+        self.entries.push((
+            salt,
+            compact_prop::ShortIdIndex::from_txs(salt, txs),
+            now,
+        ));
+        &self.entries.last().expect("just pushed").1
+    }
 }
 
 /// Sender-side selector used by `propose()`.
@@ -2494,18 +2598,16 @@ impl CompactReceiver {
     /// Handle a decoded [`ConsensusMsg::CompactProposal`].
     ///
     /// `local_txs` is the local mempool view (`Mempool::all()` at the reported
-    /// call site); the salt is derived from the announced header.
+    /// call site); the salt is derived from the announced header. The live
+    /// driver uses [`Self::on_proposal_indexed`] with
+    /// [`CompactIndexCache`] so this whole-pool view is built at most once per
+    /// `(height, prev_hash)` instead of once per frame.
     pub fn on_proposal(
         &mut self,
         proposal: compact_prop::CompactProposal,
         local_txs: impl IntoIterator<Item = crate::sharding::Transaction>,
     ) -> CompactInbound {
         let hash = proposal.block_hash;
-        // A re-announcement keeps the EXISTING resolver: its attempt counter
-        // is the amplification bound, so replacing it would let a peer reset
-        // the budget by repeating the same announcement. The salt comes from
-        // the PARKED header (the signed object we are already completing),
-        // not from a peer-supplied duplicate that merely repeats the hash.
         if let Some(parked) = self.take(&hash) {
             let mut resolver = parked.resolver;
             let index = short_id_index_for(&resolver.proposal().header, local_txs);
@@ -2519,6 +2621,42 @@ impl CompactReceiver {
         let index = short_id_index_for(&resolver.proposal().header, local_txs);
         let result = resolver.resolve_against(&index);
         self.settle(hash, resolver, result)
+    }
+
+    /// [`Self::on_proposal`] with a caller-supplied (cached) index.
+    ///
+    /// The index salt must equal the parked/announced header's salt; a mismatch
+    /// is a fail-closed refusal, never a wrong resolution. A re-announcement
+    /// keeps the EXISTING resolver, so its attempt counter cannot be reset by
+    /// repeating the same announcement.
+    pub fn on_proposal_indexed(
+        &mut self,
+        proposal: compact_prop::CompactProposal,
+        index: &compact_prop::ShortIdIndex,
+    ) -> CompactInbound {
+        let hash = proposal.block_hash;
+        if let Some(parked) = self.take(&hash) {
+            let mut resolver = parked.resolver;
+            let result = resolver.resolve_against(index);
+            return self.settle(hash, resolver, result);
+        }
+        let mut resolver = match open_compact_proposal(proposal) {
+            Ok(resolver) => resolver,
+            Err(e) => return CompactInbound::Refused(e),
+        };
+        let result = resolver.resolve_against(index);
+        self.settle(hash, resolver, result)
+    }
+
+    /// Header of the parked proposal for `hash`, if any (cheap pre-check so a
+    /// `Body` cannot force a mempool clone when nothing is parked).
+    pub fn parked_header(&self, hash: &[u8; 32]) -> Option<&Block> {
+        self.parked.get(hash).map(|p| &p.resolver.proposal().header)
+    }
+
+    /// True when a resolution for `hash` is parked.
+    pub fn is_parked(&self, hash: &[u8; 32]) -> bool {
+        self.parked.contains_key(hash)
     }
 
     /// Handle a decoded [`ConsensusMsg::Body`] for a parked proposal.
@@ -2540,6 +2678,29 @@ impl CompactReceiver {
         let mut resolver = parked.resolver;
         let index = short_id_index_for(&resolver.proposal().header, local_txs);
         let result = resolver.accept_body(body, &index);
+        if let Err(refusal) = &result {
+            let message = format!("compact body: {refusal}");
+            self.park(hash, resolver);
+            return CompactInbound::Refused(message);
+        }
+        self.settle(hash, resolver, result)
+    }
+
+    /// [`Self::on_body`] with a caller-supplied (cached) index.
+    pub fn on_body_indexed(
+        &mut self,
+        body: &compact_prop::Body,
+        index: &compact_prop::ShortIdIndex,
+    ) -> CompactInbound {
+        let hash = body.block_hash;
+        let Some(parked) = self.take(&hash) else {
+            return CompactInbound::Refused(format!(
+                "compact body: no parked proposal for {}",
+                hex::encode(hash)
+            ));
+        };
+        let mut resolver = parked.resolver;
+        let result = resolver.accept_body(body, index);
         if let Err(refusal) = &result {
             let message = format!("compact body: {refusal}");
             self.park(hash, resolver);
@@ -2610,21 +2771,63 @@ struct ServedBlock {
     round: u32,
     hash: [u8; 32],
     block: Block,
+    /// short id -> index into `block.transactions`, built once when the block
+    /// is remembered. The old responder rebuilt a whole-mempool salted index
+    /// (and scanned the block again) for EVERY pull (H2/R5); this map makes a
+    /// served pull O(ids).
+    tx_ids: HashMap<[u8; compact_prop::SHORT_ID_LEN], usize>,
     weight: usize,
+}
+
+/// Bound on the responder's served-once dedupe set.
+pub const COMPACT_SERVED_ONCE_MAX: usize = 512;
+
+/// Per-requester pull rate window and cap. A replayed pull is answered once
+/// from the dedupe set; this additionally bounds a peer that varies id order
+/// or block hash.
+pub const COMPACT_PULL_RATE_WINDOW_MS: u64 = 1_000;
+pub const COMPACT_PULL_RATE_MAX: u32 = 8;
+
+/// Pull replay cooldown bucket for FULL-proposal requests. A full body is
+/// large, so a requester gets at most one reply per this window; a genuinely
+/// lost reply is retried after the window instead of being suppressed forever.
+pub const COMPACT_FULL_REPLY_COOLDOWN_MS: u64 = 5_000;
+
+/// One `(requester, request)` already answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServedKey {
+    requester: String,
+    block_hash: [u8; 32],
+    round: u32,
+    ids: Vec<[u8; compact_prop::SHORT_ID_LEN]>,
+    full: bool,
+    /// Body pulls: the attempt number (a NEW attempt is a new request, so a
+    /// lost body is recoverable). Full requests: `now / cooldown` bucket.
+    bucket: u64,
 }
 
 /// Responder side of compact PROPOSAL gossip: a bounded cache of blocks this
 /// node announced (or is willing to serve) plus the bounded
 /// [`compact_prop::BodyPull`] resolver.
 ///
-/// Serving is deliberately limited to transactions that are BOTH in the
-/// announced block AND still in the local mempool: a private/sealed slot that
-/// travelled inline is never re-served, and an index collision can never
-/// answer a pull with a transaction the announcement did not name.
+/// Serving is deliberately limited to the block THIS node announced (matched
+/// by hash, height and round). The old responder required every requested id
+/// to still be in `mempool.all()` as well, which made sealed/MEV slots (and any
+/// tx that left the pool) unservable even for its own block; the announced
+/// block body is public by construction, so it is the authoritative source.
+///
+/// Amplification bounds (H2/R5):
+/// * one reply per `(requester, block_hash, round, id-set)` — a replayed pull
+///   produces NO second reply;
+/// * per-requester rate window ([`COMPACT_PULL_RATE_MAX`] / 1 s);
+/// * only the current/previous announced blocks are cached.
 #[derive(Debug, Default)]
 pub struct CompactBodyServer {
     recent: VecDeque<ServedBlock>,
     bytes: usize,
+    served: VecDeque<ServedKey>,
+    rates: HashMap<String, (u64, u32)>,
+    served_total: u64,
 }
 
 impl CompactBodyServer {
@@ -2646,6 +2849,13 @@ impl CompactBodyServer {
             .ok()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(usize::MAX);
+        let salt = compact_prop::salt_for_header(block);
+        let tx_ids = block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| (compact_prop::short_id(&tx.compute_tx_hash(), &salt), i))
+            .collect();
         while !self.recent.is_empty()
             && (self.recent.len() >= COMPACT_SERVED_BLOCKS
                 || self.bytes.saturating_add(weight) > COMPACT_SERVED_BYTES)
@@ -2659,6 +2869,7 @@ impl CompactBodyServer {
             round,
             hash,
             block: block.clone(),
+            tx_ids,
             weight,
         });
     }
@@ -2668,46 +2879,97 @@ impl CompactBodyServer {
         self.recent.len()
     }
 
-    /// Answer one bounded pull from the local mempool.
+    /// True when this node can answer for `block_hash` (cheap pre-check before
+    /// any body/mempool work).
+    pub fn knows(&self, block_hash: &[u8; 32]) -> bool {
+        self.recent.iter().any(|b| b.hash == *block_hash)
+    }
+
+    /// Number of pulls actually answered (visibility/test counter).
+    pub fn served_count(&self) -> u64 {
+        self.served_total
+    }
+
+    fn cached(&self, pull: &compact_prop::BodyPull) -> Option<usize> {
+        self.recent.iter().position(|b| {
+            b.hash == pull.block_hash && b.block.height == pull.height && b.round == pull.round
+        })
+    }
+
+    /// Consume one served-once + rate-limit slot for `(requester, pull)`.
+    /// `None` means "do not answer" (replay, rate limit, or structurally bad).
+    fn admit_request(&mut self, requester: &str, pull: &compact_prop::BodyPull, now_ms: u64) -> bool {
+        let mut ids = pull.ids.clone();
+        ids.sort_unstable();
+        let key = ServedKey {
+            requester: requester.to_string(),
+            block_hash: pull.block_hash,
+            round: pull.round,
+            ids,
+            full: pull.is_full_request(),
+            bucket: if pull.is_full_request() {
+                now_ms / COMPACT_FULL_REPLY_COOLDOWN_MS.max(1)
+            } else {
+                pull.attempt as u64
+            },
+        };
+        if self.served.contains(&key) {
+            return false;
+        }
+        let entry = self
+            .rates
+            .entry(requester.to_string())
+            .or_insert((now_ms, 0));
+        if now_ms.saturating_sub(entry.0) >= COMPACT_PULL_RATE_WINDOW_MS {
+            *entry = (now_ms, 0);
+        }
+        if entry.1 >= COMPACT_PULL_RATE_MAX {
+            return false;
+        }
+        entry.1 += 1;
+        self.served.push_back(key);
+        while self.served.len() > COMPACT_SERVED_ONCE_MAX {
+            self.served.pop_front();
+        }
+        true
+    }
+
+    /// Answer one bounded pull from the announced block body.
     ///
     /// `Ok(None)` means "cannot answer" (inactive gate, unknown/stale
-    /// proposal, or at least one requested id is not in the local mempool):
-    /// the caller sends nothing rather than a partial or fabricating body.
-    /// `Err` is a structurally invalid pull, which the caller drops loudly.
-    pub fn serve(
-        &self,
+    /// proposal, replay, rate limit, or an id the announced block does not
+    /// contain): the caller sends nothing rather than a partial or fabricated
+    /// body. `Err` is a structurally invalid pull, which the caller drops
+    /// loudly.
+    pub fn serve_for(
+        &mut self,
+        requester: &str,
         pull: &compact_prop::BodyPull,
-        local_txs: impl IntoIterator<Item = crate::sharding::Transaction>,
+        now_ms: u64,
     ) -> Result<Option<compact_prop::Body>, compact_prop::CompactRefusal> {
         pull.validate()?;
-        if !compact_gossip_admits(pull.height) {
+        if !compact_gossip_admits(pull.height) || pull.is_full_request() {
             return Ok(None);
         }
-        let Some(entry) = self.recent.iter().find(|b| b.hash == pull.block_hash) else {
+        let Some(pos) = self.cached(pull) else {
             return Ok(None);
         };
-        if entry.block.height != pull.height || entry.round != pull.round {
+        if !self.admit_request(requester, pull, now_ms) {
             return Ok(None);
         }
+        let entry = &self.recent[pos];
         let salt = compact_prop::salt_for_header(&entry.block);
-        let index = compact_prop::ShortIdIndex::from_txs(salt, local_txs);
         let mut txs = Vec::with_capacity(pull.ids.len());
         for id in &pull.ids {
-            let Some(local) = index.resolve(id) else {
+            let Some(idx) = entry.tx_ids.get(id) else {
                 return Ok(None);
             };
-            let Some(in_block) = entry
+            let tx = entry
                 .block
                 .transactions
-                .iter()
-                .find(|tx| compact_prop::short_id(&tx.compute_tx_hash(), &salt) == *id)
-            else {
-                return Ok(None);
-            };
-            if in_block.compute_tx_hash() != local.compute_tx_hash() {
-                return Ok(None);
-            }
-            txs.push((*id, in_block.clone()));
+                .get(*idx)
+                .expect("tx_ids is built from this block");
+            txs.push((*id, tx.clone()));
         }
         let body = compact_prop::Body {
             height: pull.height,
@@ -2716,7 +2978,37 @@ impl CompactBodyServer {
             txs,
         };
         body.validate(&salt)?;
+        self.served_total = self.served_total.saturating_add(1);
         Ok(Some(body))
+    }
+
+    /// Answer a FULL-proposal request (`BodyPull::is_full_request`) with the
+    /// exact block this node announced at `(height, round, hash)`.
+    ///
+    /// This is the F-6/H3 fallback: the resolver could not complete from
+    /// bounded pulls (cold/divergent mempool, or more misses than three pages),
+    /// so the proposer re-sends the full body it already cached. Same
+    /// served-once and rate bounds as a normal pull; `Ok(None)` on replay or
+    /// when the block is no longer cached.
+    pub fn serve_full_for(
+        &mut self,
+        requester: &str,
+        pull: &compact_prop::BodyPull,
+        now_ms: u64,
+    ) -> Result<Option<Block>, compact_prop::CompactRefusal> {
+        pull.validate()?;
+        if !pull.is_full_request() || !compact_gossip_admits(pull.height) {
+            return Ok(None);
+        }
+        let Some(pos) = self.cached(pull) else {
+            return Ok(None);
+        };
+        if !self.admit_request(requester, pull, now_ms) {
+            return Ok(None);
+        }
+        let block = self.recent[pos].block.clone();
+        self.served_total = self.served_total.saturating_add(1);
+        Ok(Some(block))
     }
 }
 

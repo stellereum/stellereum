@@ -538,12 +538,16 @@ async fn subscription_topics_are_capped() {
 
 #[tokio::test]
 async fn get_subscriptions_redacts_client_attribution() {
-    use stellereum::rpc::SubscriptionTopic;
-    // An attributed subscription (owned by 9.9.9.9 for the per-client
-    // budget) must not leak its owner through the public listing — and the
-    // bearer ids it lists must not carry attribution either.
-    let id = hub()
+    use stellereum::rpc::{SubscriptionTopic, LOCAL_SUBSCRIBER_ID};
+    // A foreign subscription (owned by 9.9.9.9 for the per-client budget)
+    // must not appear in the local caller's listing at all — its id is a
+    // capability for unsubscribe/attach. Only the caller's own id is served,
+    // and the owner field is never exposed.
+    let foreign = hub()
         .subscribe_for(SubscriptionTopic::NewHeads, Some("9.9.9.9"))
+        .expect("subscribe");
+    let mine_id = hub()
+        .subscribe_for(SubscriptionTopic::NewHeads, Some(LOCAL_SUBSCRIBER_ID))
         .expect("subscribe");
     let st = base_state(None, None).await;
     let r = st.call("stell_getSubscriptions", json!({})).await;
@@ -556,14 +560,48 @@ async fn get_subscriptions_redacts_client_attribution() {
         !body.contains("\"client\""),
         "owner field must not be served: {body}"
     );
+    assert!(
+        !body.contains(&foreign),
+        "another client's subscription id must not be listed: {body}"
+    );
     let mine = r
         .as_array()
         .expect("listing is an array")
         .iter()
-        .find(|e| e["id"] == json!(id))
+        .find(|e| e["id"] == json!(mine_id))
         .expect("own subscription is listed");
     assert_eq!(mine["attached"], json!(false));
-    assert!(hub().unsubscribe(&id), "cleanup must remove the sub");
+    assert!(hub().unsubscribe(&mine_id), "cleanup must remove the sub");
+    assert!(hub().unsubscribe(&foreign), "cleanup must remove the sub");
+}
+
+/// M5: `stell_unsubscribe` is bound to the subscription owner. An id learned
+/// from a previous listing (or guessed) cannot cancel another client's stream.
+#[tokio::test]
+async fn unsubscribe_is_bound_to_the_subscription_owner() {
+    use stellereum::rpc::{SubscriptionTopic, LOCAL_SUBSCRIBER_ID};
+    let foreign = hub()
+        .subscribe_for(SubscriptionTopic::NewHeads, Some("8.8.8.8"))
+        .expect("subscribe");
+    let mine = hub()
+        .subscribe_for(SubscriptionTopic::NewHeads, Some(LOCAL_SUBSCRIBER_ID))
+        .expect("subscribe");
+    let st = base_state(None, None).await;
+
+    let r = st
+        .call("stell_unsubscribe", json!([foreign.clone()]))
+        .await;
+    assert_eq!(r, json!(false), "foreign id must not be removable");
+    assert!(
+        hub().get(&foreign).is_some(),
+        "another client's subscription must survive a foreign unsubscribe"
+    );
+
+    let r = st.call("stell_unsubscribe", json!([mine.clone()])).await;
+    assert_eq!(r, json!(true), "owner can unsubscribe");
+    assert!(hub().get(&mine).is_none());
+
+    assert!(hub().unsubscribe(&foreign), "cleanup must remove the sub");
 }
 
 // ---------------------------------------------------------------------------
@@ -856,4 +894,29 @@ async fn in_process_subscribe_is_attributed_to_the_local_bucket() {
         e.contains("per-client"),
         "over-cap subscribe must name the per-client budget: {e}"
     );
+}
+
+/// M5: SSE `?sub_id=` attach is owner-bound too, so an id cannot be used to
+/// tap another client's notification stream (and the status code does not
+/// distinguish "unknown" from "not yours").
+#[tokio::test]
+async fn sse_attach_is_bound_to_the_subscription_owner() {
+    use stellereum::rpc::SubscriptionTopic;
+    let id = hub()
+        .subscribe_for(SubscriptionTopic::NewHeads, Some("6.6.6.6"))
+        .expect("subscribe");
+    assert!(
+        !hub().attach_for(&id, Some("7.7.7.7")),
+        "a foreign client must not attach"
+    );
+    assert!(
+        !hub().get(&id).expect("still live").attached,
+        "a refused attach must not mark the subscription attached"
+    );
+    assert!(
+        hub().attach_for(&id, Some("6.6.6.6")),
+        "the owner can attach its own stream"
+    );
+    assert!(hub().get(&id).expect("live").attached);
+    assert!(hub().unsubscribe(&id), "cleanup must remove the sub");
 }

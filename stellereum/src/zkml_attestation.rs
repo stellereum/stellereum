@@ -52,8 +52,11 @@
 //!   first writer wins) plus the model hash. Off chain it is the registered
 //!   spec the verifier was given.
 //! * **The registry's append-only discipline.** A model id cannot be
-//!   re-registered, so the weights a proof is checked against cannot be
-//!   swapped after the fact.
+//!   re-pointed to different weights: re-registering the SAME id with
+//!   byte-identical bytes is idempotent (`Ok`, same hash) and is not a
+//!   replacement, while a different weight set under a taken id is refused.
+//!   So the weights a proof is checked against cannot be swapped after the
+//!   fact.
 //! * **The constrained format.** i8 weights, u16 inputs, a bounded
 //!   accumulator, capped dimensions — so the re-execution cannot overflow or
 //!   become unbounded work.

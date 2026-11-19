@@ -90,11 +90,17 @@ fn cli_storage_put_seals_to_the_owner_key_and_get_requires_it() {
         src.to_str().unwrap(),
         "--owner-ek",
         &owner_ek,
+        "--owner-key",
+        &owner_seed,
     ]);
     assert!(ok, "storage-put failed: {stdout}\n{stderr}");
     assert!(
         stdout.contains("sealed=owner"),
         "put must report owner sealing: {stdout}"
+    );
+    assert!(
+        stdout.contains("replicas=1"),
+        "put must report the real replica count (this node stores the bucket): {stdout}"
     );
 
     // The manifest on disk must be owner-sealed: seal marker + key_box, and
@@ -180,6 +186,10 @@ fn cli_storage_put_defaults_to_the_node_owner_key() {
     ]);
     assert!(ok, "storage-put failed: {stdout}\n{stderr}");
     assert!(stdout.contains("sealed=owner"), "{stdout}");
+    assert!(
+        stdout.contains("replicas=1"),
+        "default owner path must report its local replica: {stdout}"
+    );
 
     // Even without --owner-key the CLI uses the node's own KEM seed, which
     // matches the default owner ek, so the round trip succeeds.

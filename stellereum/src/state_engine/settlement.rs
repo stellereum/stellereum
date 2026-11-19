@@ -1950,3 +1950,126 @@ impl InMemoryStateEngine {
         }
     }
 }
+
+// ============================================================================
+// EVM carrier settlement: committed exactly-once nullifiers + index replay
+// ============================================================================
+
+impl InMemoryStateEngine {
+    /// Committed trie key for a settled EVM intent nullifier.
+    ///
+    /// Namespaced and hashed so it can never collide with an account address,
+    /// a token balance/supply leaf, a contract leaf or a HashPool nullifier.
+    fn evm_settled_key(digest: &[u8; 32]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(24 + 32);
+        buf.extend_from_slice(b"STELL_EVM_SETTLED_V1");
+        buf.extend_from_slice(digest);
+        crate::evm_adapter::keccak256(&buf)
+    }
+
+    /// True when this exact signed EVM intent has already settled in a
+    /// COMMITTED block. Consensus-visible (the trie is part of the state
+    /// root), so a restart/catch-up derives the same answer.
+    pub async fn evm_intent_is_settled(&self, digest: &[u8; 32]) -> bool {
+        let key = Self::evm_settled_key(digest);
+        self.state_trie.read().await.get(&key).is_some()
+    }
+
+    /// Mark a signed EVM intent as settled. Called ONLY after the carrying
+    /// transaction committed successfully, so a failed/reverted carrier never
+    /// consumes the nullifier and a retry can still settle.
+    pub async fn mark_evm_intent_settled(&self, digest: &[u8; 32]) {
+        let key = Self::evm_settled_key(digest);
+        let mut trie = self.state_trie.write().await;
+        trie.insert(&key, &[1u8]);
+        drop(trie);
+        // The trie is folded into the state root; invalidate the cached
+        // commitment exactly like any other committed-domain write.
+        self.bump_commitment_generation();
+    }
+
+    /// Feed ONE committed-and-applied transaction into the deterministic
+    /// routing/settlement indexes (PENTEST2 H1).
+    ///
+    /// * binding index (`EVM address → PQ account`): only an applied
+    ///   transaction that proves both keys can insert;
+    /// * settlement map (`keccak(EVM raw) ↔ Stell hash`): only a carrier that
+    ///   really committed, never a pooled one;
+    /// * `SC1` secp settlement envelopes are linked the same way the receipt
+    ///   path links them.
+    ///
+    /// Pure function of the transaction: replaying the same committed block
+    /// sequence reproduces the same maps on every node and after a restart.
+    pub fn observe_committed_evm_tx(&self, tx: &crate::sharding::Transaction) {
+        // Fast path: the overwhelmingly common transaction carries neither an
+        // EVM payload nor a secp settlement envelope, and neither index can
+        // learn anything from it.
+        if crate::evm_adapter::classify_evm_payload(tx).is_none()
+            && !crate::evm_adapter::is_secp_settlement_tx(tx)
+        {
+            return;
+        }
+        if let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() {
+            let _ = idx.observe_transaction(tx);
+        }
+        if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
+            crate::evm_adapter::register_evm_settlement(
+                &format!("0x{}", hex::encode(digest)),
+                &tx.compute_tx_hash(),
+            );
+        }
+        crate::evm_adapter::link_secp_settlement(tx);
+    }
+
+    /// Replay a committed block's APPLIED transactions in block order into
+    /// both indexes. `status` parallels `block.transactions` (step-1
+    /// receipts), so a refused transaction never claims a binding or a
+    /// settlement.
+    pub fn observe_committed_evm_block(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> usize {
+        let mut accepted = 0usize;
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if !status.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if crate::evm_adapter::classify_evm_payload(tx).is_some() {
+                accepted += 1;
+            }
+            self.observe_committed_evm_tx(tx);
+        }
+        accepted
+    }
+
+    /// Rebuild both process-local EVM indexes from a persisted, ordered window
+    /// of committed blocks (startup replay, PENTEST2 H1).
+    ///
+    /// `successful` holds the tx hashes that committed with `success == true`
+    /// (from the durable receipt store). The binding and settlement indexes
+    /// are rebuilt from scratch in block order, so a restart derives the same
+    /// maps as the node that applied the blocks live. Idempotent: replaying
+    /// the same window twice gives the same maps.
+    pub fn rebuild_evm_indexes_from_blocks(
+        &self,
+        blocks: &[crate::sharding::Block],
+        successful: &HashSet<[u8; 32]>,
+    ) -> usize {
+        crate::evm_adapter::clear_evm_bindings();
+        crate::evm_adapter::clear_evm_settlements();
+        let mut replayed = 0usize;
+        for block in blocks {
+            for tx in &block.transactions {
+                if !successful.contains(&tx.compute_tx_hash()) {
+                    continue;
+                }
+                if crate::evm_adapter::classify_evm_payload(tx).is_some() {
+                    replayed += 1;
+                }
+                self.observe_committed_evm_tx(tx);
+            }
+        }
+        replayed
+    }
+}

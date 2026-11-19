@@ -115,17 +115,6 @@ pub fn shard_genesis_block(
 /// The reward a block pays its proposer: the governed value when governance
 /// has set one, else the node's configured default.
 ///
-/// The governed value wins when set: a passed `SetBlockReward` proposal must
-/// actually change what the next produced block pays, or governance is
-/// decorative and the commitment records a parameter nothing reads.
-///
-/// SHARED by both block-apply paths - `ValidatorRuntime::apply_block_fees_rewards`
-/// (live consensus) and `ChainState::apply_block` (reorg) - so a re-applied
-/// block cannot pay a different reward than the node that produced it did.
-pub fn block_reward_for(gov: Option<&crate::governance::Governance>, default: u64) -> u64 {
-    gov.and_then(|g| g.applied.block_reward).unwrap_or(default)
-}
-
 /// Static actor-mailbox load of one block: every `SysCallActorSend` its
 /// transactions carry, counting nested bodies transitively.
 ///

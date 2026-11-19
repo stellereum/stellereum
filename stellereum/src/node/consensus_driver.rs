@@ -26,6 +26,7 @@ use stellereum::tokenomics::BLOCK_REWARD_NANO;
 fn encode_full_proposal_loopback(
     block: &stellereum::sharding::Block,
     round: u32,
+    src: &str,
 ) -> Option<String> {
     let msg = ConsensusMsg::Proposal {
         height: block.height,
@@ -33,7 +34,15 @@ fn encode_full_proposal_loopback(
         block: block.clone(),
     };
     let bytes = msg.encode().ok()?;
-    Some(serde_json::json!({ "data": hex::encode(bytes) }).to_string())
+    // Carry the originating peer id so admission/accounting can attribute the
+    // re-injected frame instead of charging a shared "broadcast" bucket. Local
+    // loopbacks ride their own bounded queue and are not re-charged to the
+    // bulk limiter (the compact frame already paid); attribution still lets
+    // scoring/rate decisions see who caused the work.
+    Some(
+        serde_json::json!({ "data": hex::encode(bytes), "src": src })
+            .to_string(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +871,31 @@ pub(crate) async fn run_consensus_node(
     // is handled inline with a loud count instead of growing memory.
     let mut inbound_deferred: std::collections::VecDeque<(Instant, String)> =
         std::collections::VecDeque::new();
+    // Bounded LOCAL loopback queue for resolved compact proposals (pentest-2
+    // F-1/H5): drained with priority, never behind future-dated peer traffic,
+    // and independent of `INBOUND_DEFERRED_CAP` so a compact flood can never
+    // grow memory without bound. Each entry carries the source peer id.
+    let mut loopback_queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
+    let mut loopback_dropped: u64 = 0;
+    // Per-(height, prev_hash) short-id index cache (C2/F-8): the mempool is
+    // cloned and hashed at most once per salt per TTL, not once per frame.
+    let mut compact_index = stellereum::consensus_net::CompactIndexCache::new();
+    // Per-peer per-tick compact work budgets, cleared at each tick top.
+    let mut compact_peer_frames: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut compact_peer_pulls: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut compact_budget_dropped: u64 = 0;
+    let mut compact_full_requests: u64 = 0;
+    // Whole-node index-build budget for the current tick (see policy).
+    let mut compact_index_builds_tick: u32 = 0;
+    // When the current verified `rt.peer_hint` was planted (expiry below).
+    // A hint restored/persisted before the loop gets a fresh lease; runtime
+    // code that raises it later is covered by the same 60 s expiry (the lease
+    // simply ages from here, which is the conservative choice).
+    let mut peer_hint_at: Option<Instant> = rt.peer_hint.map(|_| Instant::now());
+    let mut peer_hint_seen: Option<(u64, [u8; 32])> = rt.peer_hint;
     // Times an over-budget Batch was deferred (limiter pacing, not loss).
     let mut inbound_defer_count: u64 = 0;
     // Compact gossip is ACTIVE from genesis. A frame that fails validation is
@@ -1150,22 +1184,44 @@ pub(crate) async fn run_consensus_node(
     let mut split_join_n: u64 = 0;
     loop {
         _tick_no += 1;
+        // Per-peer compact-work budgets are per TICK (C2/F-8/H1): a peer can
+        // force at most a bounded number of index lookups/pull replies each
+        // tick, no matter how many envelopes its bucket admits.
+        compact_peer_frames.clear();
+        compact_peer_pulls.clear();
+        compact_index_builds_tick = 0;
         let tick_t0 = std::time::Instant::now();
         let (mut catchup_ran, mut retro_ran, mut probe_ran, mut join_ran) =
             (false, false, false, false);
         let mut outbox_flushes: u32 = 0;
         // One settle path for a compact resolution (proposal AND body): every
         // outcome is handled identically, so the two receive arms cannot drift.
+        // `$src` is the peer id that produced the compact frame (attribution).
         macro_rules! settle_compact {
-            ($inbound:expr) => {{
+            ($inbound:expr, $src:expr) => {{
                 match $inbound {
                     stellereum::consensus_net::CompactInbound::Ready { round, block } => {
                         // Re-enter the SAME drain as a full proposal: attribution,
                         // H+1 deferral, hints, `on_proposal` and the vote all run
                         // once, in the one place they are already correct.
-                        match encode_full_proposal_loopback(&block, round) {
+                        match encode_full_proposal_loopback(&block, round, $src) {
                             Some(raw) => {
-                                inbound_deferred.push_back((Instant::now(), raw));
+                                // Bounded + priority-drained (F-1/H5): on overflow
+                                // the oldest loopback goes (counted loudly), never
+                                // unbounded memory.
+                                if push_bounded_loopback(
+                                    &mut loopback_queue,
+                                    raw,
+                                    LOOPBACK_QUEUE_CAP,
+                                ) {
+                                    loopback_dropped += 1;
+                                    if loopback_dropped == 1 || loopback_dropped.is_multiple_of(50) {
+                                        tracing::warn!(
+                                            "[consensus] compact loopback queue full ({} entries); dropped the oldest resolved proposal ({loopback_dropped} dropped)",
+                                            LOOPBACK_QUEUE_CAP
+                                        );
+                                    }
+                                }
                                 compact_looped += 1;
                                 if compact_looped == 1 {
                                     info!(
@@ -1181,10 +1237,24 @@ pub(crate) async fn run_consensus_node(
                         }
                     }
                     stellereum::consensus_net::CompactInbound::Pull(pull) => {
-                        enqueue_outbox(&mut outbox, ConsensusMsg::BodyPull { pull });
-                        flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-                        outbox_flushes += 1;
-                        last_flush = std::time::Instant::now();
+                        // H1: a pull is consensus traffic to EVERY peer. Cap the
+                        // number one peer can force per tick, and never let a
+                        // pull-born flood share the ordered vote/proposal queue
+                        // without bound.
+                        let budget = compact_peer_pulls
+                            .entry($src.to_string())
+                            .or_insert(0);
+                        if compact_frame_within_peer_budget(
+                            budget,
+                            COMPACT_PULLS_PER_PEER_PER_TICK,
+                        ) {
+                            enqueue_outbox(&mut outbox, ConsensusMsg::BodyPull { pull });
+                            flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
+                            outbox_flushes += 1;
+                            last_flush = std::time::Instant::now();
+                        } else {
+                            compact_budget_dropped += 1;
+                        }
                     }
                     stellereum::consensus_net::CompactInbound::FetchFull {
                         height,
@@ -1192,21 +1262,44 @@ pub(crate) async fn run_consensus_node(
                         block_hash,
                         reason,
                     } => {
-                        // Never prevote a partial body: fall back to the plain
-                        // full-proposal fetch. A far-ahead announcement is real
-                        // catch-up evidence (the height above is the block's).
+                        // NEVER prevote a partial body. An UNRESOLVABLE compact
+                        // announcement is not evidence: neither the block nor
+                        // its proposer signature was ever checked, so this arm
+                        // must not plant `peer_hint`/`peer_named_height` or
+                        // re-arm catch-up (pentest-2 F-2/C1). It only asks the
+                        // proposer for the full body through the existing
+                        // pull frame; the normal Proposal arm authenticates it
+                        // and only THEN may evidence be recorded.
                         tracing::warn!(
                             "[consensus] compact gossip fell back to the full proposal #{} r{} ({reason:?})",
                             height,
                             round,
                         );
-                        if height > rt.hc.height {
-                            let hint = (height.saturating_sub(1), block_hash);
-                            if rt.peer_hint.map(|(h, _)| h < hint.0).unwrap_or(true) {
-                                rt.peer_hint = Some(hint);
-                            }
-                            catchup_pending = true;
-                            peer_named_height = peer_named_height.max(height.saturating_sub(1));
+                        compact_full_requests += 1;
+                        if compact_full_requests == 1 {
+                            info!(
+                                "[consensus] compact gossip LIVE: first full-proposal fallback requested (the unresolved announcement is not treated as evidence)"
+                            );
+                        }
+                        if full_proposal_request_is_relevant(
+                            rt.hc.height,
+                            height,
+                        ) {
+                            let pull = stellereum::consensus_net::compact_prop::BodyPull::full_request(
+                                height, round, block_hash,
+                            );
+                            enqueue_outbox(
+                                &mut outbox,
+                                ConsensusMsg::BodyPull { pull },
+                            );
+                            flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
+                            outbox_flushes += 1;
+                            last_flush = std::time::Instant::now();
+                        } else {
+                            tracing::debug!(
+                                "[sync] compact full-proposal request at #{height} ignored (local hc #{}, outside the live window); catch-up owns far-ahead announcements",
+                                rt.hc.height
+                            );
                         }
                     }
                     stellereum::consensus_net::CompactInbound::Refused(why) => {
@@ -1329,10 +1422,33 @@ pub(crate) async fn run_consensus_node(
             }
         };
         // Event-driven decision (`policy::catchup_action`): reactive evidence
-        // runs NOW; the periodic timer is only a backstop and is SKIPPED
-        // entirely when no peer is known to be ahead (at-tip), so an in-sync
-        // node does not poll the DHT at all.
+        // runs NOW; the periodic timer is only a backstop. At-tip nodes skip
+        // the EXPENSIVE walk, but still run one cheap blind head/tip+1 probe
+        // per `AT_TIP_PROBE_INTERVAL_MS` — silence is not equality (F-3/R8).
         let our_tip_now = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        // Expire/downgrade a stale peer hint BEFORE it can suppress the DHT
+        // head read (F-2/C1). Only verified sources write `rt.peer_hint`, but
+        // even a verified hint must not pin catch-up forever after a failed
+        // walk or once our tip reaches it. The runtime can also plant one
+        // inside `on_proposal`; detect the change so it gets a fresh lease.
+        if rt.peer_hint != peer_hint_seen {
+            peer_hint_seen = rt.peer_hint;
+            peer_hint_at = rt.peer_hint.map(|_| Instant::now());
+        }
+        if let Some(hint) = rt.peer_hint {
+            let age_ms = peer_hint_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            if peer_hint_effective(our_tip_now, Some(hint), age_ms).is_none() {
+                tracing::debug!(
+                    "[sync] dropping stale/reached peer hint #{:?} (ours=#{our_tip_now}, age={age_ms}ms)",
+                    hint.0
+                );
+                rt.peer_hint = None;
+                peer_hint_at = None;
+                peer_hint_seen = None;
+            }
+        }
         let at_tip = node_is_at_tip(our_tip_now, peer_named_height, rt.peer_hint.map(|(h, _)| h));
         let catchup_decision = catchup_action(
             reactive_catchup_due,
@@ -1341,19 +1457,26 @@ pub(crate) async fn run_consensus_node(
             at_tip,
         );
         if catchup_decision == CatchupAction::SkipAtTip {
-            // At the tip: nothing to fetch. Do NOT spend a DHT round trip
-            // (the blind query is the part that burns the tick on a dead
-            // peer); the next reactive message re-arms catch-up.
-            last_catchup = std::time::Instant::now();
+            // At the tip: skip the expensive DHT/body walk, but do NOT reset
+            // `last_catchup` — the elapsed clock is what reaches the low-
+            // frequency blind-probe window below. The next reactive message
+            // still re-arms catch-up immediately.
             catchup_at_tip_skips += 1;
             if catchup_at_tip_skips.is_multiple_of(20) {
                 tracing::debug!(
                     "[sync] backstop catch-up skipped at the tip #{our_tip_now} \
-                     ({catchup_at_tip_skips} skips): no peer known to be ahead, no DHT probe"
+                     ({catchup_at_tip_skips} skips): no peer known to be ahead, \
+                     blind probe due in {}ms",
+                    AT_TIP_PROBE_INTERVAL_MS
+                        .saturating_sub(last_catchup.elapsed().as_millis() as u64)
                 );
             }
         }
-        if catchup_decision == CatchupAction::Run && !rt.has_pending_apply() && !defer_for_live {
+        let catchup_due = matches!(
+            catchup_decision,
+            CatchupAction::Run | CatchupAction::BlindProbe
+        );
+        if catchup_due && !rt.has_pending_apply() && !defer_for_live {
             catchup_ran = true;
             last_catchup = std::time::Instant::now();
             let split_catchup_t0 = std::time::Instant::now();
@@ -1948,8 +2071,8 @@ pub(crate) async fn run_consensus_node(
                 let ntx = block.transactions.len();
                 // P3-H4: enqueue; proposals carry bodies so they flush at once.
                 // COMPACT GOSSIP: announce the compact header; the announced
-                // block stays servable for bounded body pulls. The full body
-                // still goes to the DHT for catch-up.
+                // block stays servable for bounded body pulls AND for the
+                // full-proposal fallback (same-height round-trip).
                 compact_server.remember(&block, round);
                 let msg = stellereum::consensus_net::proposal_gossip_msg(&block, round);
                 let large = msg.is_large();
@@ -2109,18 +2232,30 @@ pub(crate) async fn run_consensus_node(
         // `wake_at` time and are only popped when `rx` has no immediate messages,
         // preventing bulk deferrals from starving real-time consensus votes.
         'drain: for _ in 0..MAX_INBOUND_PER_TICK {
-            let raw: String = match rx.try_recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    let now = Instant::now();
-                    if inbound_deferred
-                        .front()
-                        .map(|(wake_at, _)| now >= *wake_at)
-                        .unwrap_or(false)
-                    {
-                        inbound_deferred.pop_front().unwrap().1
-                    } else {
-                        break;
+            // LOCAL LOOPBACKS FIRST: a resolved compact proposal re-enters the
+            // drain here, ahead of peer traffic, so an honest block is never
+            // starved behind future-dated deferrals or a flood (F-1/H5). These
+            // entries are local-only, bounded, and already accounted to the
+            // compact frame that produced them; they skip the per-peer bulk
+            // limiter (no double charge) but still pay the inner verify budget.
+            let (raw, from_loopback): (String, bool) = if let Some(raw) =
+                loopback_queue.pop_front()
+            {
+                (raw, true)
+            } else {
+                match rx.try_recv() {
+                    Ok(r) => (r, false),
+                    Err(_) => {
+                        let now = Instant::now();
+                        if inbound_deferred
+                            .front()
+                            .map(|(wake_at, _)| now >= *wake_at)
+                            .unwrap_or(false)
+                        {
+                            (inbound_deferred.pop_front().unwrap().1, false)
+                        } else {
+                            break;
+                        }
                     }
                 }
             };
@@ -2155,14 +2290,13 @@ pub(crate) async fn run_consensus_node(
             // mean an honest peer's votes still pass while the flooder's own
             // bucket is empty. The envelope already counted as liveness
             // evidence below even when deferred.
-            {
-                // Per-peer bucket: the pubsub envelope carries the SENDER's
-                // node id in `src` (infnode adds it — it is the only place
-                // that knows the connection's peer id), `from` is the legacy
-                // spelling. Without it every peer's bulk traffic shared ONE
-                // token bucket and one noisy neighbour could defer everybody
-                // else's batches.
-                let peer_key = stellereum::consensus_net::inbound_peer_key(&raw);
+            //
+            // A LOCAL LOOPBACK is already budgeted (it is the resolved block
+            // for a compact frame that paid admission) and is bounded by
+            // `LOOPBACK_QUEUE_CAP`, so it is not re-charged to the shared bulk
+            // limiter. It still carries the originating `src` for attribution.
+            let peer_key = stellereum::consensus_net::inbound_peer_key(&raw);
+            if !from_loopback {
                 match net.admit_inbound(&peer_key, &msg, raw.len()) {
                     stellereum::consensus_net::InboundDecision::Allow => {}
                     stellereum::consensus_net::InboundDecision::Defer { wait_ms } => {
@@ -2280,15 +2414,171 @@ pub(crate) async fn run_consensus_node(
                         // miss emits a BOUNDED pull; an unresolvable proposal
                         // falls back to the plain full fetch.
                         ConsensusMsg::CompactProposal { proposal } => {
-                            let txs = rt.mempool.read().await.all();
-                            let inbound = compact_rx.on_proposal(proposal, txs);
-                            settle_compact!(inbound);
+                            // C2/F-8: authenticate/structurally pre-filter and
+                            // budget BEFORE any mempool clone or index build.
+                            // Far/stale heights and over-budget peers are
+                            // dropped loudly without touching the pool.
+                            let over = {
+                                let count = compact_peer_frames
+                                    .entry(peer_key.clone())
+                                    .or_insert(0);
+                                !compact_frame_within_peer_budget(
+                                    count,
+                                    COMPACT_FRAMES_PER_PEER_PER_TICK,
+                                )
+                            };
+                            if over {
+                                compact_budget_dropped += 1;
+                                inbound_compact_refused += 1;
+                                if compact_budget_dropped == 1
+                                    || compact_budget_dropped.is_multiple_of(50)
+                                {
+                                    tracing::warn!(
+                                        "[consensus] compact frame budget exceeded for peer {} ({compact_budget_dropped} dropped): per-tick cap {}",
+                                        peer_key,
+                                        COMPACT_FRAMES_PER_PEER_PER_TICK,
+                                    );
+                                }
+                                continue;
+                            }
+                            if !compact_proposal_height_is_relevant(
+                                rt.hc.height,
+                                proposal.height,
+                            ) {
+                                inbound_compact_refused += 1;
+                                tracing::debug!(
+                                    "[consensus] compact proposal #{} r{} outside live window (hc #{}) — catch-up owns it",
+                                    proposal.height,
+                                    proposal.round,
+                                    rt.hc.height,
+                                );
+                                continue;
+                            }
+                            // STRUCTURAL VALIDATION FIRST (C2/F-8): a malformed
+                            // frame must not be able to trigger an index build.
+                            if let Err(why) = proposal.validate() {
+                                inbound_compact_refused += 1;
+                                if inbound_compact_refused % 20 == 1 {
+                                    tracing::warn!(
+                                        "[consensus] refused compact frame before mempool work ({} refused): {why}",
+                                        inbound_compact_refused
+                                    );
+                                }
+                                continue;
+                            }
+                            // Parent plausibility: at OUR height the header must
+                            // build on our finalized tip, so a peer cannot mint
+                            // unlimited distinct salts with random prev_hashes.
+                            let (tip_h, tip_hash) = rt
+                                .finalized
+                                .last()
+                                .copied()
+                                .unwrap_or((0, [0u8; 32]));
+                            if !compact_parent_is_plausible(
+                                proposal.height,
+                                proposal.header.prev_hash,
+                                rt.hc.height,
+                                tip_hash,
+                            ) {
+                                inbound_compact_refused += 1;
+                                tracing::debug!(
+                                    "[consensus] compact proposal #{} does not build on our tip #{tip_h} (prev {}); dropped before mempool work",
+                                    proposal.height,
+                                    hex::encode(&proposal.header.prev_hash[..6]),
+                                );
+                                continue;
+                            }
+                            let inbound = if proposal.short_ids.is_empty() {
+                                // Zero-id block: no index work at all.
+                                compact_rx.on_proposal(proposal, std::iter::empty())
+                            } else {
+                                let now = Instant::now();
+                                let cached = compact_index.get(&proposal.header, now).is_some();
+                                let index = if cached {
+                                    compact_index
+                                        .get(&proposal.header, now)
+                                        .expect("just checked")
+                                } else {
+                                    // Whole-node per-tick build budget: the
+                                    // cache key is the salt, and a peer can
+                                    // vary it; this is the hard bound on
+                                    // whole-mempool work per tick.
+                                    if compact_index_builds_tick
+                                        >= COMPACT_INDEX_BUILDS_PER_TICK
+                                    {
+                                        compact_budget_dropped += 1;
+                                        continue;
+                                    }
+                                    compact_index_builds_tick += 1;
+                                    let txs = rt.mempool.read().await.all();
+                                    compact_index.insert(&proposal.header, txs, now)
+                                };
+                                compact_rx.on_proposal_indexed(proposal, index)
+                            };
+                            settle_compact!(inbound, &peer_key);
                         }
                         // Serve missing txs for a block WE announced, from the
-                        // mempool only (never from arbitrary storage), bounded.
+                        // cached announced body (bounded), never from arbitrary
+                        // storage and never by cloning the whole mempool.
                         ConsensusMsg::BodyPull { pull } => {
-                            let txs = rt.mempool.read().await.all();
-                            match compact_server.serve(&pull, txs) {
+                            let over = {
+                                let count = compact_peer_frames
+                                    .entry(peer_key.clone())
+                                    .or_insert(0);
+                                !compact_frame_within_peer_budget(
+                                    count,
+                                    COMPACT_FRAMES_PER_PEER_PER_TICK,
+                                )
+                            };
+                            if over {
+                                compact_budget_dropped += 1;
+                                continue;
+                            }
+                            let now_ms = liveness_alarm::now_ms();
+                            if pull.is_full_request() {
+                                match compact_server.serve_full_for(
+                                    &peer_key, &pull, now_ms,
+                                ) {
+                                    Ok(Some(block)) => {
+                                        let round = pull.round;
+                                        enqueue_outbox(
+                                            &mut outbox,
+                                            ConsensusMsg::Proposal {
+                                                height: block.height,
+                                                round,
+                                                block,
+                                            },
+                                        );
+                                        flush_outbox(
+                                            &net_sender,
+                                            &mut outbox,
+                                            rt.hc.height,
+                                            rt.hc.round,
+                                        );
+                                        outbox_flushes += 1;
+                                        last_flush = std::time::Instant::now();
+                                        compact_served += 1;
+                                        if compact_served == 1 {
+                                            info!(
+                                                "[consensus] compact gossip LIVE: first full-proposal fallback served from the announced body"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(why) => {
+                                        inbound_compact_refused += 1;
+                                        if inbound_compact_refused % 20 == 1 {
+                                            tracing::warn!(
+                                                "[consensus] refused compact full-proposal request #{} r{}: {why}",
+                                                pull.height,
+                                                pull.round,
+                                            );
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            match compact_server.serve_for(&peer_key, &pull, now_ms) {
                                 Ok(Some(body)) => {
                                     enqueue_outbox(&mut outbox, ConsensusMsg::Body { body });
                                     flush_outbox(
@@ -2302,13 +2592,12 @@ pub(crate) async fn run_consensus_node(
                                     compact_served += 1;
                                     if compact_served == 1 {
                                         info!(
-                                            "[consensus] compact gossip LIVE: first body pull served from the local mempool"
+                                            "[consensus] compact gossip LIVE: first body pull served from the announced block"
                                         );
                                     }
                                 }
-                                // We did not announce that block (or its ids
-                                // left the mempool): silence — the requester
-                                // falls back to the full proposal.
+                                // We did not announce that block, or this
+                                // (peer, pull) was already answered: silence.
                                 Ok(None) => {}
                                 Err(why) => {
                                     inbound_compact_refused += 1;
@@ -2324,9 +2613,40 @@ pub(crate) async fn run_consensus_node(
                         }
                         // Complete a parked resolution with the served body.
                         ConsensusMsg::Body { body } => {
-                            let txs = rt.mempool.read().await.all();
-                            let inbound = compact_rx.on_body(&body, txs);
-                            settle_compact!(inbound);
+                            let over = {
+                                let count = compact_peer_frames
+                                    .entry(peer_key.clone())
+                                    .or_insert(0);
+                                !compact_frame_within_peer_budget(
+                                    count,
+                                    COMPACT_FRAMES_PER_PEER_PER_TICK,
+                                )
+                            };
+                            if over {
+                                compact_budget_dropped += 1;
+                                continue;
+                            }
+                            // Cheap first: no parked proposal => no mempool
+                            // clone and no index build (C2/F-8).
+                            let Some(header) = compact_rx.parked_header(&body.block_hash).cloned()
+                            else {
+                                inbound_compact_refused += 1;
+                                tracing::debug!(
+                                    "[consensus] compact body for an un-parked proposal {} (ignored before mempool work)",
+                                    hex::encode(&body.block_hash[..6]),
+                                );
+                                continue;
+                            };
+                            let now = Instant::now();
+                            let cached = compact_index.get(&header, now).is_some();
+                            let index = if cached {
+                                compact_index.get(&header, now).expect("just checked")
+                            } else {
+                                let txs = rt.mempool.read().await.all();
+                                compact_index.insert(&header, txs, now)
+                            };
+                            let inbound = compact_rx.on_body_indexed(&body, index);
+                            settle_compact!(inbound, &peer_key);
                         }
                         ConsensusMsg::Proposal {
                             round: r, block, ..
@@ -2394,6 +2714,7 @@ pub(crate) async fn run_consensus_node(
                                         let h = (block.height - 1, block.prev_hash);
                                         if rt.peer_hint.map(|(ph, _)| ph < h.0).unwrap_or(true) {
                                             rt.peer_hint = Some(h);
+                                            peer_hint_at = Some(std::time::Instant::now());
                                         }
                                     }
                                 }
@@ -2409,7 +2730,11 @@ pub(crate) async fn run_consensus_node(
                                 // A proposal AT height H says the author's
                                 // FINALIZED tip is at least H-1 (the parent it
                                 // builds on) — that is the at-tip evidence.
-                                peer_named_height = peer_named_height.max(height.saturating_sub(1));
+                                let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                                peer_named_height = clamp_peer_named_height(
+                                    tip,
+                                    peer_named_height.max(height.saturating_sub(1)),
+                                );
                                 catchup_pending = true;
                                 stellereum::rpc::note_peer_height(height);
                             }
@@ -2555,7 +2880,11 @@ pub(crate) async fn run_consensus_node(
                                 if named_ahead.is_some() && vote_verified {
                                     // A vote AT height H says the voter has
                                     // decided H-1 at least — at-tip evidence.
-                                    peer_named_height = peer_named_height.max(vh.saturating_sub(1));
+                                    let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                                    peer_named_height = clamp_peer_named_height(
+                                        tip,
+                                        peer_named_height.max(vh.saturating_sub(1)),
+                                    );
                                     catchup_pending = true;
                                     stellereum::rpc::note_peer_height(vh);
                                 }
@@ -2592,7 +2921,11 @@ pub(crate) async fn run_consensus_node(
                             // backstop interval while we burn view changes
                             // collecting "wrong height".
                             if named_ahead.is_some() {
-                                peer_named_height = peer_named_height.max(vh.saturating_sub(1));
+                                let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                                peer_named_height = clamp_peer_named_height(
+                                    tip,
+                                    peer_named_height.max(vh.saturating_sub(1)),
+                                );
                                 catchup_pending = true;
                                 stellereum::rpc::note_peer_height(vh);
                             }
@@ -2663,28 +2996,50 @@ pub(crate) async fn run_consensus_node(
                             // us on the backstop timer).
                             let our_tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
                             if height > our_tip {
-                                let block_hash = block.compute_hash();
-                                let proven = certificate.kind == VoteKind::Precommit
-                                    && certificate.height == height
-                                    && certificate.block_hash == Some(block_hash)
-                                    && certificate.verify_with_schedule(
-                                        &rt.validator_set_for_height(height),
-                                        rt.committee_schedule_at(height),
-                                    );
-                                if proven {
-                                    peer_named_height = peer_named_height.max(height);
-                                    if rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true) {
-                                        rt.peer_hint = Some((height, block_hash));
+                                // CHEAP HEIGHT GATE FIRST (F-5): `Committed` is
+                                // byte-limiter-exempt and may carry a 32 MiB
+                                // block plus thousands of µQC markers. A
+                                // far-ahead height is not adoptable under ANY
+                                // certificate (`adopt_committed` refuses it),
+                                // so do not hash the block or verify the QC;
+                                // the DHT head/walk is the catch-up path.
+                                if !committed_height_is_cheaply_relevant(our_tip, height) {
+                                    inbound_overcap_count += 1;
+                                    if inbound_overcap_count % 20 == 1 {
+                                        tracing::warn!(
+                                            "[sync][push] ignoring far-ahead commit #{height} (tip #{our_tip}, max lookahead {MAX_COMMITTED_LOOKAHEAD}) BEFORE QC verification; {inbound_overcap_count} time(s)"
+                                        );
                                     }
-                                    catchup_pending = true;
-                                    stellereum::rpc::note_peer_height(height);
-                                    info!(
-                                        "[sync][push] peer committed #{height} ahead of our tip #{our_tip}: catch-up scheduled for the next tick"
-                                    );
+                                    // Still let `adopt_committed` cheaply refuse
+                                    // it below (it checks height first); no
+                                    // crypto was paid here.
+                                    continue;
                                 } else {
-                                    tracing::debug!(
-                                        "[sync][push] ignoring commit at #{height} above our tip #{our_tip}: certificate does not prove it"
-                                    );
+                                    let block_hash = block.compute_hash();
+                                    let proven = certificate.kind == VoteKind::Precommit
+                                        && certificate.height == height
+                                        && certificate.block_hash == Some(block_hash)
+                                        && certificate.verify_with_schedule(
+                                            &rt.validator_set_for_height(height),
+                                            rt.committee_schedule_at(height),
+                                        );
+                                    if proven {
+                                        peer_named_height =
+                                            clamp_peer_named_height(our_tip, peer_named_height.max(height));
+                                        if rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true) {
+                                            rt.peer_hint = Some((height, block_hash));
+                                            peer_hint_at = Some(std::time::Instant::now());
+                                        }
+                                        catchup_pending = true;
+                                        stellereum::rpc::note_peer_height(height);
+                                        info!(
+                                            "[sync][push] peer committed #{height} ahead of our tip #{our_tip}: catch-up scheduled for the next tick"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "[sync][push] ignoring commit at #{height} above our tip #{our_tip}: certificate does not prove it"
+                                        );
+                                    }
                                 }
                             }
                             // §7 Phase 2: adopting means executing, and the worker
@@ -2857,14 +3212,18 @@ pub(crate) async fn run_consensus_node(
         // chain (QC per height, anchored on our finalized head), so a false
         // hint costs at most one loudly-failing walk.
         //
-        // A peer_hint above our tip is PERSISTENT evidence: keep the latch
-        // armed so a node that stays behind retries (paced by
-        // `REACTIVE_CATCHUP_MIN_GAP_MS`), never the timer.
-        if rt
-            .peer_hint
-            .is_some_and(|(ph, _)| ph > rt.finalized.last().map(|(h, _)| *h).unwrap_or(0))
+        // A verified peer height above our tip is PERSISTENT evidence: keep
+        // the latch armed so a node that stays behind retries (paced by
+        // `REACTIVE_CATCHUP_MIN_GAP_MS`), never the timer. F-9: Vote and
+        // far-ahead Proposal evidence only set `peer_named_height`, so testing
+        // the hint alone dropped that evidence to the 30 s backstop after one
+        // failed attempt.
         {
-            catchup_pending = true;
+            let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+            peer_named_height = clamp_peer_named_height(tip, peer_named_height);
+            if rt.peer_hint.is_some_and(|(ph, _)| ph > tip) || peer_named_height > tip {
+                catchup_pending = true;
+            }
         }
 
         // 4. precommit once a prevote quorum exists

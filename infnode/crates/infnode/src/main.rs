@@ -209,6 +209,11 @@ enum Cmd {
         /// Omit to seal to this node's own KEM key (owner = operator).
         #[arg(long)]
         owner_ek: Option<String>,
+        /// Owner ML-KEM-768 seed (hex, secret) used to AUTHENTICATE the sealed
+        /// manifest. Required when `--owner-ek` names a foreign owner; omit to
+        /// use this node's own KEM seed (owner = operator).
+        #[arg(long)]
+        owner_key: Option<String>,
     },
     /// Storage: получить файл/данные по имени
     StorageGet {
@@ -995,34 +1000,56 @@ async fn main() -> Result<()> {
             file,
             bucket,
             owner_ek,
+            owner_key,
         } => {
             let data = std::fs::read(&file)?;
             let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
-            let owner_ek = owner_ek.unwrap_or_else(|| keys.kem_ek_hex());
+            let node_ek = keys.kem_ek_hex();
+            let node_seed = hex::encode(keys.kem_seed);
+            let owner_ek = owner_ek.unwrap_or_else(|| node_ek.clone());
+            let owner_key = match owner_key {
+                Some(k) => k,
+                None => {
+                    if !owner_ek.eq_ignore_ascii_case(&node_ek) {
+                        anyhow::bail!(
+                            "put refused: sealing to a foreign --owner-ek requires --owner-key \
+                             (the owner's ML-KEM seed) so the manifest can be authenticated"
+                        );
+                    }
+                    node_seed
+                }
+            };
             let node = Node::new(cfg_obj, keys, pq, data_dir, config_path).await?;
             // Owner-sealed path: random data key wrapped to the owner's
-            // ML-KEM-768 ek, payload AEAD-bound to (bucket, name, H(plain)).
-            // Invalid ek fails closed (store returns 0, no manifest written).
-            let stored = node
-                .store_blob_boxed(&bucket, &name, &data, Some(&owner_ek))
+            // ML-KEM-768 ek, payload AEAD-bound to (bucket, name, H(plain)),
+            // manifest MAC'd with the owner seed. Invalid/mismatched keys fail
+            // closed (chunks == 0, no manifest written).
+            let report = node
+                .store_blob_boxed(&bucket, &name, &data, Some(&owner_ek), Some(&owner_key))
                 .await;
-            // `store_blob_boxed` returns 0 both for a refused owner key and
-            // for an empty blob (no chunks); only the manifest tells them
-            // apart. A refused key writes no manifest (fail-closed).
-            if stored == 0
+            if report.chunks == 0
                 && node
                     .get_local_kv(&Node::blob_manifest_key(&bucket, &name))
                     .await
                     .is_none()
             {
-                anyhow::bail!("put refused: owner ek is not a valid ML-KEM-768 key");
+                anyhow::bail!("put refused: owner ek/seed is not a valid ML-KEM-768 key pair");
             }
-            // One-shot CLI process: flush the manifest to kv.json before exit.
+            // One-shot CLI process: the bounded replication wait already
+            // completed inside `store_blob_boxed`; flush the manifest to
+            // kv.json and never report success for zero durable replicas.
             node.flush_kv().await;
+            if report.replicas == 0 {
+                anyhow::bail!(
+                    "put failed: no durable replica accepted the manifest/chunks (chunks={})",
+                    report.chunks
+                );
+            }
             println!(
-                "put ok: name={name} bytes={} chunks={} sealed=owner (owner ek {}…)",
+                "put ok: name={name} bytes={} chunks={} replicas={} sealed=owner (owner ek {}…)",
                 data.len(),
-                stored,
+                report.chunks,
+                report.replicas,
                 &owner_ek[..owner_ek.len().min(16)],
             );
         }

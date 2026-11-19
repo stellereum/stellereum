@@ -192,9 +192,9 @@ mod mev_sync;
 
 pub use cluster::{ChainState, Cluster, ShardedCluster};
 pub use lanes::{
-    block_reward_for, count_block_actor_sends, fund_genesis, fund_shard_genesis,
-    missing_sender_accounts, shard_genesis_block, ApplyCompleted, PackFilterCtx, PrebuiltSelection,
-    SnapBundle, VdfJobOutput, VdfLane,
+    count_block_actor_sends, fund_genesis, fund_shard_genesis, missing_sender_accounts,
+    shard_genesis_block, ApplyCompleted, PackFilterCtx, PrebuiltSelection, SnapBundle,
+    VdfJobOutput, VdfLane,
 };
 use lanes::{ApplyInflight, ApplyLane};
 
@@ -449,6 +449,16 @@ pub struct ValidatorRuntime {
     /// replay snapshot on startup, so the two never disagree about a
     /// decision.
     xpc_records: HashMap<[u8; 32], crate::xshard2pc::XpcRecord>,
+    /// §9/S10: node-local first-seen height of every inbound cross-shard
+    /// message id currently in the mailbox. A message that keeps failing
+    /// admission is quarantined and pruned once it has been seen for
+    /// [`crate::xshard2pc::XPC_MAILBOX_QUARANTINE_HEIGHTS`] heights, so a peer
+    /// cannot grow the mailbox with records that can never be admitted. The
+    /// map is bounded to
+    /// [`crate::xshard2pc::XPC_MAILBOX_MAX_TRACKED`] entries (oldest evicted
+    /// and pruned first). It is transport bookkeeping, NOT consensus state:
+    /// it is not hashed into the root and never changes block validity.
+    xpc_mailbox_seen: HashMap<[u8; 32], u64>,
     /// §7 Phase 2: the single ordered execution worker (spawned lazily on the
     /// first submit, so construction never needs a tokio context) and the one
     /// in-flight apply, if any. At most one decided block is ever queued or

@@ -294,6 +294,57 @@ impl InMemoryStateEngine {
         true
     }
 
+    /// Retire every terminal 2PC record whose deterministic retention window
+    /// has elapsed at `height`.
+    ///
+    /// This is the S3 fix: a COMMITTED/ABORTED record is part of the committed
+    /// state only while it can still be needed. Once the decision is in
+    /// `cross_shard_completed` and the bounded COMMIT re-publication window is
+    /// over, the record (and its state-trie leaf) is removed, so historical
+    /// transfers stop being cloned into the runtime, re-hashed into the state
+    /// root and re-published every block.
+    ///
+    /// DETERMINISTIC: [`crate::xshard2pc::is_retired`] is a pure function of
+    /// the committed record and the applied block height. Every node applying
+    /// the same block prunes exactly the same set, at exactly the same height,
+    /// so the state root and the persisted replay snapshot agree.
+    ///
+    /// SAFE REPLAY: a duplicate decisive record arriving after the retirement
+    /// finds no local record; `target_on_commit` / `source_on_prepare_ack` /
+    /// `source_on_abort_ack` refuse an absent record, so no value can move a
+    /// second time. The `cross_shard_completed` set is deliberately NOT
+    /// pruned: it is the permanent exactly-once marker the mailbox prune also
+    /// relies on.
+    pub async fn prune_terminal_xpc_records(&self, height: u64) -> usize {
+        if !self.cross_shard_enabled() {
+            return 0;
+        }
+        let victims: Vec<([u8; 32], [u8; 32])> = {
+            let map = self.cross_shard_xpc.read().await;
+            map.values()
+                .filter(|rec| crate::xshard2pc::is_retired(rec, height))
+                .map(|rec| (rec.tx_hash, crate::xshard2pc::xpc_state_key(&rec.tx_hash)))
+                .collect()
+        };
+        if victims.is_empty() {
+            return 0;
+        }
+        {
+            let mut map = self.cross_shard_xpc.write().await;
+            for (tx_hash, _) in &victims {
+                map.remove(tx_hash);
+            }
+        }
+        {
+            let mut trie = self.state_trie.write().await;
+            for (_, key) in &victims {
+                trie.remove(key);
+            }
+        }
+        self.bump_domain_generation(crate::commitment::Domain::Xpc);
+        victims.len()
+    }
+
     /// True once an ack or bounce for `tx_hash` committed on this chain.
     pub async fn is_cross_shard_completed(&self, tx_hash: &[u8; 32]) -> bool {
         self.cross_shard_completed.read().await.contains(tx_hash)
@@ -490,7 +541,15 @@ impl InMemoryStateEngine {
     ///   stays the runtime's job; the engine only records, never pays, so a
     ///   recorded bounce can never double-pay against the runtime's refund.
     pub async fn apply_cross_shard_consumptions(&self, block: &crate::sharding::Block) -> usize {
-        if !self.cross_shard_enabled() || block.cross_shard_out.is_empty() {
+        if !self.cross_shard_enabled() {
+            return 0;
+        }
+        // S3: retire terminal 2PC records whose deterministic retention window
+        // elapsed at this height. This runs on EVERY applied block (even one
+        // with no cross-shard records), so the retained set stays bounded when
+        // the chain is otherwise idle and every node/pruner path agrees.
+        self.prune_terminal_xpc_records(block.height).await;
+        if block.cross_shard_out.is_empty() {
             return 0;
         }
         let mut mutated = false;

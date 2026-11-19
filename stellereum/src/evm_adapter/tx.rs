@@ -399,6 +399,17 @@ pub fn register_evm_settlement(evm_hash_hex: &str, stell_hash: &[u8; 32]) {
     }
 }
 
+/// Drop both settlement maps (process-local; used by tests and by an
+/// operator/diagnostic reset before a deterministic rebuild).
+pub fn clear_evm_settlements() {
+    if let Ok(mut fwd) = EVM_TO_STELL.lock() {
+        fwd.clear();
+    }
+    if let Ok(mut rev) = STELL_TO_EVM.lock() {
+        rev.clear();
+    }
+}
+
 /// Resolve `keccak(EVM raw)` -> stell `compute_tx_hash()`, if settled.
 pub fn evm_to_stell_hash(evm_hash_hex: &str) -> Option<[u8; 32]> {
     let norm = normalize_hash(evm_hash_hex).ok()?;
@@ -560,10 +571,8 @@ pub fn link_secp_settlement(tx: &crate::sharding::Transaction) -> Option<(String
 
 /// Link one PQ EVM carrier / binding transaction into the EVM hash map and the
 /// binding index (`None` for every non-EVM transaction).
-fn link_evm_carrier_settlement(
-    tx: &crate::sharding::Transaction,
-) -> Option<(String, [u8; 32])> {
-    use crate::evm_adapter::{EvmPayload, classify_evm_payload};
+fn link_evm_carrier_settlement(tx: &crate::sharding::Transaction) -> Option<(String, [u8; 32])> {
+    use crate::evm_adapter::{classify_evm_payload, EvmPayload};
     let payload = classify_evm_payload(tx)?;
     // Replay the statement into the (node-local, non-consensus) index. A claim
     // that does not verify, or a conflicting first claim, is dropped: the index
@@ -641,7 +650,9 @@ pub fn stell_tx_to_evm_with_chain(
     // `eth_getTransactionByHash(evmHash)` and block transaction lists readable
     // by MetaMask instead of showing a PQ address it has never seen.
     let carrier_facts = match crate::evm_adapter::classify_evm_payload(tx) {
-        Some(crate::evm_adapter::EvmPayload::Carrier(c)) => Some((c, evm_transfer_facts(&c.evm_tx).ok())),
+        Some(crate::evm_adapter::EvmPayload::Carrier(c)) => {
+            Some((c, evm_transfer_facts(&c.evm_tx).ok()))
+        }
         _ => None,
     };
     if let Some((carrier, facts)) = carrier_facts {

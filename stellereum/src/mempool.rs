@@ -973,8 +973,12 @@ impl Mempool {
     /// `None` on the legacy path and the self-sponsored path
     /// (`sponsor == from`, which fee-routes as plain).
     pub fn sponsored_pure_legs(tx: &Transaction) -> Option<(u64, u64)> {
-        tx.sponsored_grant()
-            .map(|_| (tx.amount, tx.gas_limit.saturating_add(Self::surcharges_for_tx(tx))))
+        tx.sponsored_grant().map(|_| {
+            (
+                tx.amount,
+                tx.gas_limit.saturating_add(Self::surcharges_for_tx(tx)),
+            )
+        })
     }
 
     /// PAYMASTER: the two funding legs of an EFFECTIVE sponsored transaction
@@ -2061,9 +2065,14 @@ impl Mempool {
         // transaction's payment, and an EVM address that is not bound to a
         // different account. The identical pure checks run again at execution
         // (`svm`), so a refusal here is node-local policy and can never make
-        // two nodes disagree about a block. `evm_statement` is recorded in the
-        // (non-consensus) binding index only AFTER admission succeeds.
-        let evm_statement = Self::check_evm_payload(&tx)?;
+        // two nodes disagree about a block.
+        //
+        // PENTEST2 M1: admission does NOT write the binding index. A
+        // mempool-only claim is not committed, so it must neither be reported
+        // as `bound` by `stell_getEvmBinding` nor freeze routing for everybody
+        // else until a block actually includes it. The index is fed from
+        // COMMITTED blocks only (`apply_block_transition` / startup replay).
+        Self::check_evm_payload(&tx)?;
         // Session-key delegation policy next (expiry / scope / value cap /
         // budget / grant validity), so an unusable grant is reported as such
         // instead of a generic signature failure; the signature check below
@@ -2210,7 +2219,6 @@ impl Mempool {
             }
             *self.reserved.entry(tx.from).or_insert(0) =
                 self.reserved_for(&tx.from).saturating_add(cost);
-            Self::note_evm_statement(evm_statement);
             return Ok(hash);
         }
 
@@ -2369,10 +2377,8 @@ impl Mempool {
         }
         self.inserted_at.insert(hash, ctx.now);
         self.txs.insert(hash, tx);
-        // The transaction is IN the pool: its EVM binding statement can now be
-        // routed (a refused admission never reaches here, so a bad claim can
-        // never seed the index).
-        Self::note_evm_statement(evm_statement);
+        // PENTEST2 M1: no binding-index write here (see the admission note
+        // above). Only a COMMITTED claim may move routing.
 
         // If this transaction activated the sender, drain any out-of-order nonces
         // that were waiting in the PendingActivationBuffer.
@@ -2416,25 +2422,6 @@ impl Mempool {
         Ok(hash)
     }
 
-    /// Record a verified EVM binding statement in the node-local index.
-    ///
-    /// The index is a ROUTING table, not consensus state: recording is
-    /// best-effort by design, so a poisoned index lock can never refuse an
-    /// otherwise admissible transaction. A conflict is logged and dropped (the
-    /// first claim wins, exactly like the replay of committed records).
-    fn note_evm_statement(statement: Option<crate::evm_adapter::EvmBindingStatement>) {
-        let Some((evm, pq)) = statement else {
-            return;
-        };
-        if let Err(e) = crate::evm_adapter::record_evm_binding(evm, pq) {
-            tracing::debug!(
-                "[mempool] EVM binding 0x{} -> {} not indexed: {e}",
-                hex::encode(evm),
-                hex::encode(pq)
-            );
-        }
-    }
-
     /// Admission check for the EVM payload opcodes (PQ carrier / binding claim).
     ///
     /// WHY THIS IS POLICY, NOT CONSENSUS: the consensus fact is re-verified
@@ -2459,15 +2446,13 @@ impl Mempool {
     /// 5. the EVM address must not be bound to a DIFFERENT PQ account, and —
     ///    once this node has observed bindings — must be bound at all.
     ///
-    /// Returns the `(evm, pq)` statement the caller may record in the binding
-    /// index AFTER admission succeeds (so a refused transaction never pollutes
-    /// it).
-    fn check_evm_payload(
-        tx: &Transaction,
-    ) -> Result<Option<crate::evm_adapter::EvmBindingStatement>, MempoolError> {
+    /// Returns `Ok(())` for an admissible EVM payload (or a transaction with
+    /// no EVM payload). Nothing is written to any index here: only a COMMITTED
+    /// claim settles routing (PENTEST2 M1).
+    fn check_evm_payload(tx: &Transaction) -> Result<(), MempoolError> {
         use crate::evm_adapter::EvmPayload;
         let Some(payload) = crate::evm_adapter::classify_evm_payload(tx) else {
-            return Ok(None);
+            return Ok(());
         };
         match payload {
             EvmPayload::Mixed => Err(MempoolError::Malformed(
@@ -2477,7 +2462,7 @@ impl Mempool {
                     .to_string(),
             )),
             EvmPayload::Binding(claim) => {
-                crate::evm_adapter::verify_binding_claim(claim, &tx.from, claim.chain_id)
+                crate::evm_adapter::verify_binding_claim(claim, &tx.from)
                     .map_err(MempoolError::EvmCarrierRefused)?;
                 if tx.amount != 0 {
                     return Err(MempoolError::EvmCarrierRefused(
@@ -2501,7 +2486,7 @@ impl Mempool {
                         )));
                     }
                 }
-                Ok(Some((claim.evm_address, tx.from)))
+                Ok(())
             }
             EvmPayload::Carrier(carrier) => {
                 let facts = crate::evm_adapter::verify_carrier_intent(carrier, &tx.from)
@@ -2557,7 +2542,7 @@ impl Mempool {
                     }
                     _ => {}
                 }
-                Ok(Some((facts.from, tx.from)))
+                Ok(())
             }
         }
     }

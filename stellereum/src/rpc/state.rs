@@ -731,6 +731,46 @@ pub async fn hydrate_rpc_from_store(st: &RpcState, store: &crate::storage::Stora
     for r in &all {
         st.import_stored_receipt(r).await;
     }
+    // PENTEST2 H1: rebuild the process-local EVM binding + settlement indexes
+    // from the PERSISTED, COMMITTED block window, in block order. The live
+    // apply path feeds the same indexes (see
+    // `InMemoryStateEngine::observe_committed_evm_block`), so a restart now
+    // derives the same maps instead of starting empty. Only transactions whose
+    // durable receipt says `success == true` are replayed: a refused claim is
+    // not a binding and a refused carrier is not a settlement.
+    {
+        const EVM_INDEX_REPLAY_WINDOW: u64 = 50_000;
+        let successful: std::collections::HashSet<[u8; 32]> = all
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.tx_hash)
+            .collect();
+        if let Ok(Some(tip_rec)) = store.latest_header() {
+            let tip = tip_rec.height;
+            let lo = tip.saturating_sub(EVM_INDEX_REPLAY_WINDOW - 1);
+            let mut blocks = Vec::new();
+            for h in lo..=tip {
+                if let Ok(Some(rec)) = store.header_at(h) {
+                    if let Ok(Some(block)) = store.get_block(&rec.block_hash) {
+                        blocks.push(block);
+                    }
+                }
+            }
+            // EVM carriers/bindings are masterchain payloads; a workchain
+            // hydrate must not clear the process-global index built by the
+            // masterchain. Only rebuild when this window actually carries an
+            // EVM payload.
+            let has_evm = blocks.iter().any(|b| {
+                b.transactions
+                    .iter()
+                    .any(|tx| crate::evm_adapter::classify_evm_payload(tx).is_some())
+            });
+            if has_evm {
+                st.engine
+                    .rebuild_evm_indexes_from_blocks(&blocks, &successful);
+            }
+        }
+    }
     // Rebuild the explorer window from header records (which survive body
     // pruning), tip-ward, newest-first like `record_block` maintains.
     if let Ok(Some(tip_rec)) = store.latest_header() {

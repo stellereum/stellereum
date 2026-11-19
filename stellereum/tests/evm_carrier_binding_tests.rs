@@ -64,8 +64,9 @@ fn falcon_kp(seed_byte: u8) -> FalconKeypair {
 
 fn secp_signer(seed_byte: u8) -> (k256::ecdsa::SigningKey, [u8; 20]) {
     let key = k256::ecdsa::SigningKey::from_slice(&[seed_byte; 32]).expect("secp key");
-    let addr = evm_adapter::pubkey_to_address(key.verifying_key().to_encoded_point(false).as_bytes())
-        .expect("secp address");
+    let addr =
+        evm_adapter::pubkey_to_address(key.verifying_key().to_encoded_point(false).as_bytes())
+            .expect("secp address");
     (key, addr)
 }
 
@@ -129,9 +130,51 @@ fn evm_transfer_raw(
     .encode()
 }
 
+/// 65-byte `r || s || recovery_id` EVM proof of possession over the canonical
+/// binding message (C1/S1).
+fn evm_binding_proof(
+    secp: &k256::ecdsa::SigningKey,
+    chain: u64,
+    evm: &[u8; 20],
+    pq: &[u8; 32],
+) -> Vec<u8> {
+    let msg = evm_adapter::binding_message(chain, evm, pq);
+    let (sig, recid) = secp
+        .sign_prehash_recoverable(&msg)
+        .expect("recoverable sign");
+    let raw = sig.to_bytes();
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&raw[32..64]);
+    let mut rec = recid.to_byte();
+    if !evm_adapter::is_low_s(&s) {
+        // Normalize to low-s (EIP-2) exactly like the secp envelope builder.
+        let n = evm_adapter::SECP256K1_N;
+        let mut out = [0u8; 32];
+        let mut borrow: i32 = 0;
+        for i in (0..32).rev() {
+            let v = n[i] as i32 - s[i] as i32 - borrow;
+            if v < 0 {
+                out[i] = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = v as u8;
+                borrow = 0;
+            }
+        }
+        s = out;
+        rec ^= 1;
+    }
+    let mut proof = Vec::with_capacity(65);
+    proof.extend_from_slice(&raw[..32]);
+    proof.extend_from_slice(&s);
+    proof.push(rec);
+    proof
+}
+
 /// Build and sign a binding claim transaction for `(evm → pq)`.
 fn signed_binding_tx(
     kp: &FalconKeypair,
+    secp: &k256::ecdsa::SigningKey,
     evm_address: [u8; 20],
     nonce: u64,
     gas_limit: u64,
@@ -141,17 +184,27 @@ fn signed_binding_tx(
     let pq = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
     let claim_msg = evm_adapter::binding_message(chain, &evm_address, &pq);
     let binding_sig = kp.sign(&claim_msg);
+    let evm_proof = evm_binding_proof(secp, chain, &evm_address, &pq);
     let sign_this = evm_adapter::binding_template_message(
         &pk,
         evm_address,
         &binding_sig,
+        &evm_proof,
         nonce,
         gas_limit,
     )
     .expect("template");
     let tx_sig = kp.sign(&sign_this);
-    evm_adapter::build_binding_transaction(&pk, evm_address, &binding_sig, nonce, gas_limit, &tx_sig)
-        .expect("binding transaction")
+    evm_adapter::build_binding_transaction(
+        &pk,
+        evm_address,
+        &binding_sig,
+        &evm_proof,
+        nonce,
+        gas_limit,
+        &tx_sig,
+    )
+    .expect("binding transaction")
 }
 
 /// Build and sign a carrier for `raw`.
@@ -175,13 +228,15 @@ fn admission_ctx() -> stellereum::mempool::AdmissionCtx {
 }
 
 async fn fund(engine: &InMemoryStateEngine, addr: [u8; 32], nano: u64) {
-    engine
-        .update_account(AccountState::new(addr, nano))
-        .await;
+    engine.update_account(AccountState::new(addr, nano)).await;
 }
 
 async fn balance(engine: &InMemoryStateEngine, addr: [u8; 32]) -> u64 {
-    engine.get_account(&addr).await.map(|a| a.balance).unwrap_or(0)
+    engine
+        .get_account(&addr)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
 /// A pool with the flags a live node sets, so admission is exercised exactly
@@ -210,12 +265,12 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
     let recipient_kp = falcon_kp(0x12);
     let (recipient_pq, _) = falcon(0x12);
     let (sender_secp, sender_evm) = secp_signer(0x71);
-    let (_recipient_secp, recipient_evm) = secp_signer(0x72);
+    let (recipient_secp, recipient_evm) = secp_signer(0x72);
 
     fund(&engine, sender_pq, START_BALANCE).await;
 
     // --- binding 1: sender EVM address → sender PQ account --------------
-    let bind_tx = signed_binding_tx(&sender_kp, sender_evm, 0, 600_000);
+    let bind_tx = signed_binding_tx(&sender_kp, &sender_secp, sender_evm, 0, 600_000);
     assert!(bind_tx.verify_signature(), "binding envelope must verify");
     assert!(
         evm_adapter::is_evm_binding_tx(&bind_tx),
@@ -235,7 +290,8 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
 
     // --- binding 2: recipient EVM address → recipient PQ account --------
     fund(&engine, recipient_pq, START_BALANCE).await;
-    let recipient_bind = signed_binding_tx(&recipient_kp, recipient_evm, 0, 600_000);
+    let recipient_bind =
+        signed_binding_tx(&recipient_kp, &recipient_secp, recipient_evm, 0, 600_000);
     mem.add_checked_ctx(recipient_bind.clone(), START_BALANCE, admission_ctx())
         .expect("recipient binding admitted");
     engine
@@ -249,7 +305,15 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
 
     // --- the EVM intent MetaMask produced -------------------------------
     let value_wei = (TRANSFER_NANO as u128) * evm_adapter::WEI_PER_NANO;
-    let raw = evm_transfer_raw(&sender_secp, chain, 1, recipient_evm, value_wei, 21_000, vec![]);
+    let raw = evm_transfer_raw(
+        &sender_secp,
+        chain,
+        1,
+        recipient_evm,
+        value_wei,
+        21_000,
+        vec![],
+    );
     // The intent is strictly verified (chain id, low-s, ecrecover).
     let view: EvmTransaction =
         evm_adapter::decode_verify_raw_evm(&raw).expect("EVM intent verifies");
@@ -263,7 +327,10 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
     // --- carrier --------------------------------------------------------
     let carrier = signed_carrier_tx(&sender_kp, &raw, recipient_pq, 1_200_000);
     assert_eq!(carrier.from, sender_pq, "the carrier debits the PQ account");
-    assert_eq!(carrier.to, recipient_pq, "and credits the recipient's PQ account");
+    assert_eq!(
+        carrier.to, recipient_pq,
+        "and credits the recipient's PQ account"
+    );
     assert_eq!(carrier.amount, TRANSFER_NANO);
     assert_eq!(carrier.nonce, 1, "the EVM nonce IS the Stell nonce");
     assert!(carrier.verify_signature(), "PQ1 envelope must verify");
@@ -287,15 +354,13 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
     );
     let fee = before_sender - after_sender - TRANSFER_NANO;
     assert!(fee >= 45_000, "the PQ activation surcharge is charged");
-    assert!(fee <= 1_200_000, "the fee is capped by the declared gas_limit");
+    assert!(
+        fee <= 1_200_000,
+        "the fee is capped by the declared gas_limit"
+    );
 
     // --- the EVM view of the carrier is the intent the wallet signed ----
-    let evm_view = evm_adapter::stell_tx_to_evm(
-        &carrier,
-        Some([0x11u8; 32]),
-        Some(7),
-        Some(0),
-    );
+    let evm_view = evm_adapter::stell_tx_to_evm(&carrier, Some([0x11u8; 32]), Some(7), Some(0));
     assert_eq!(
         evm_view.from,
         format!("0x{}", hex::encode(sender_evm)),
@@ -322,12 +387,10 @@ async fn binding_then_carrier_moves_value_between_bound_accounts() {
     assert_eq!(linked.1, carrier.compute_tx_hash());
 
     // --- the read surface routes the EVM address to the PQ account ------
-    let bal = evm_adapter::eth_get_balance(
-        &engine,
-        &json!([format!("0x{}", hex::encode(sender_evm))]),
-    )
-    .await
-    .expect("eth_getBalance");
+    let bal =
+        evm_adapter::eth_get_balance(&engine, &json!([format!("0x{}", hex::encode(sender_evm))]))
+            .await
+            .expect("eth_getBalance");
     assert_eq!(
         bal,
         evm_adapter::nano_to_wei_hex(after_sender),
@@ -777,15 +840,17 @@ async fn rpc_binding_and_carrier_roundtrip() {
     let (sender_pq, sender_pk) = falcon(0x61);
     let (recipient_pq, _) = falcon(0x62);
     let (secp, sender_evm) = secp_signer(0x79);
-    let (_rsecp, recipient_evm) = secp_signer(0x7a);
+    let (rsecp, recipient_evm) = secp_signer(0x7a);
     fund(&engine, sender_pq, START_BALANCE).await;
 
     // --- bind the sender through the RPC ---------------------------------
     let claim_msg = evm_adapter::binding_message(chain, &sender_evm, &sender_pq);
     let claim_sig = sender_kp.sign(&claim_msg);
-    let bind_sign_this =
-        evm_adapter::binding_template_message(&sender_pk, sender_evm, &claim_sig, 0, 600_000)
-            .expect("tpl");
+    let evm_proof = evm_binding_proof(&secp, chain, &sender_evm, &sender_pq);
+    let bind_sign_this = evm_adapter::binding_template_message(
+        &sender_pk, sender_evm, &claim_sig, &evm_proof, 0, 600_000,
+    )
+    .expect("tpl");
     let bind_tx_sig = sender_kp.sign(&bind_sign_this);
     let r = rpc_call(
         h.addr,
@@ -794,18 +859,47 @@ async fn rpc_binding_and_carrier_roundtrip() {
             "pqPublicKey": format!("0x{}", hex::encode(&sender_pk)),
             "evmAddress": format!("0x{}", hex::encode(sender_evm)),
             "bindingSignature": format!("0x{}", hex::encode(&claim_sig)),
+            "evmSignature": format!("0x{}", hex::encode(&evm_proof)),
             "txSignature": format!("0x{}", hex::encode(&bind_tx_sig)),
             "nonce": 0,
             "gasLimit": 600_000,
         }]),
     )
     .await;
-    assert!(
-        r["result"].is_string(),
-        "stell_evmBindingSubmit returns the Stell tx hash, got {r}"
+    let submitted = r["result"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stell_evmBindingSubmit returns the Stell tx hash, got {r}"));
+    let submitted: [u8; 32] = hex::decode(submitted)
+        .expect("hash hex")
+        .try_into()
+        .expect("32-byte hash");
+
+    // M1: an ADMITTED (mempool-only) claim is not committed, so it must not be
+    // reported as bound yet...
+    let r = rpc_call(
+        h.addr,
+        "stell_getEvmBinding",
+        json!([format!("0x{}", hex::encode(sender_evm))]),
+    )
+    .await;
+    assert_eq!(
+        r["result"]["bound"],
+        json!(false),
+        "a mempool-only claim must not be reported as committed: {r}"
     );
 
-    // The binding is readable and exact.
+    // ...and once the block path applies it, the routing index is exact.
+    let bind_tx =
+        h.st.mempool
+            .read()
+            .await
+            .get(&submitted)
+            .cloned()
+            .expect("the submitted claim is pooled");
+    engine
+        .apply_transaction(&bind_tx, 1_700_000_000)
+        .await
+        .expect("committed binding applies");
     let r = rpc_call(
         h.addr,
         "stell_getEvmBinding",
@@ -818,21 +912,28 @@ async fn rpc_binding_and_carrier_roundtrip() {
         json!(format!("0x{}", hex::encode(sender_pq)))
     );
 
-    // Bind the recipient (it must exist on chain to be credited).
-    fund(&engine, recipient_pq, 0).await;
+    // Bind the recipient (it must exist on chain to be credited, and a
+    // committed binding pays its own gas).
+    fund(&engine, recipient_pq, START_BALANCE).await;
     let recipient_kp = falcon_kp(0x62);
-    let recipient_bind = signed_binding_tx(&recipient_kp, recipient_evm, 0, 600_000);
+    let recipient_bind = signed_binding_tx(&recipient_kp, &rsecp, recipient_evm, 0, 600_000);
     h.st.mempool
         .write()
         .await
-        .add_checked_ctx(recipient_bind, START_BALANCE, admission_ctx())
+        .add_checked_ctx(recipient_bind.clone(), START_BALANCE, admission_ctx())
         .expect("recipient binding admitted");
+    // M1/H1: routing is fed by COMMITTED blocks, so the recipient must be
+    // applied before the sender's carrier can route to it.
+    engine
+        .apply_transaction(&recipient_bind, 1_700_000_000)
+        .await
+        .expect("recipient binding applies");
 
     // --- an EVM-only submission: no Falcon authorisation yet -------------
     let raw = evm_transfer_raw(
         &secp,
         chain,
-        0,
+        1,
         recipient_evm,
         (TRANSFER_NANO as u128) * evm_adapter::WEI_PER_NANO,
         21_000,
@@ -856,7 +957,11 @@ async fn rpc_binding_and_carrier_roundtrip() {
     );
     // Step 1 reports the EVM-intent digest (the carrier message cannot exist
     // until that signature is part of the payload).
-    assert_eq!(r["error"]["data"]["next"], json!("intent-signature"), "got {r}");
+    assert_eq!(
+        r["error"]["data"]["next"],
+        json!("intent-signature"),
+        "got {r}"
+    );
     let intent_digest_hex = r["error"]["data"]["intentSignThis"]
         .as_str()
         .expect("step 1 reports the intent digest")
@@ -886,7 +991,11 @@ async fn rpc_binding_and_carrier_roundtrip() {
         json!(evm_adapter::EVM_CARRIER_AUTH_REASON),
         "got {r}"
     );
-    assert_eq!(r["error"]["data"]["next"], json!("carrier-signature"), "got {r}");
+    assert_eq!(
+        r["error"]["data"]["next"],
+        json!("carrier-signature"),
+        "got {r}"
+    );
     let sign_this_hex = r["error"]["data"]["signThis"]
         .as_str()
         .expect("step 2 carries the exact bytes to sign")
@@ -927,7 +1036,7 @@ async fn rpc_binding_and_carrier_roundtrip() {
         json!([format!("0x{}", hex::encode(sender_evm)), "latest"]),
     )
     .await;
-    assert_eq!(latest["result"], json!("0x0"), "got {latest}");
+    assert_eq!(latest["result"], json!("0x1"), "got {latest}");
     let pending = rpc_call(
         h.addr,
         "eth_getTransactionCount",
@@ -936,25 +1045,28 @@ async fn rpc_binding_and_carrier_roundtrip() {
     .await;
     assert_eq!(
         pending["result"],
-        json!("0x1"),
+        json!("0x2"),
         "the pending nonce skips the pooled carrier, got {pending}"
     );
 
     // --- the carrier applies and moves the value -------------------------
-    let carrier_tx: Transaction = h
-        .st
-        .mempool
-        .read()
-        .await
-        .all()
-        .into_iter()
-        .find(|t| t.amount == TRANSFER_NANO)
-        .expect("carrier in the pool");
+    let carrier_tx: Transaction =
+        h.st.mempool
+            .read()
+            .await
+            .all()
+            .into_iter()
+            .find(|t| t.amount == TRANSFER_NANO)
+            .expect("carrier in the pool");
+    let recipient_before = balance(&engine, recipient_pq).await;
     engine
         .apply_transaction(&carrier_tx, 1_700_000_400)
         .await
         .expect("carrier applies");
-    assert_eq!(balance(&engine, recipient_pq).await, TRANSFER_NANO);
+    assert_eq!(
+        balance(&engine, recipient_pq).await,
+        recipient_before + TRANSFER_NANO
+    );
 
     // The EVM hash resolves to the carrier (so a wallet polling
     // eth_getTransactionByHash does not see null).
@@ -1025,17 +1137,23 @@ async fn binding_index_replays_committed_records_and_refuses_conflicts() {
     let (pq_a, _) = falcon(0x81);
     let kp_b = falcon_kp(0x82);
     let (pq_b, _) = falcon(0x82);
-    let (_sx, evm_x) = secp_signer(0x91);
+    let (sx, evm_x) = secp_signer(0x91);
 
     fund(&engine, pq_a, START_BALANCE).await;
-    let bind_a = signed_binding_tx(&kp_a, evm_x, 0, 600_000);
+    let bind_a = signed_binding_tx(&kp_a, &sx, evm_x, 0, 600_000);
 
     // Deterministic replay of a COMMITTED record reconstructs the binding (the
     // restart path: the index is derived, never authoritative).
-    assert_eq!(engine.observe_committed_evm_txs(std::slice::from_ref(&bind_a)), 1);
+    assert_eq!(
+        engine.observe_committed_evm_txs(std::slice::from_ref(&bind_a)),
+        1
+    );
     assert_eq!(evm_adapter::lookup_bound_pq(&evm_x), Some(pq_a));
     // Idempotent: replaying the same chain again derives the same map.
-    assert_eq!(engine.observe_committed_evm_txs(std::slice::from_ref(&bind_a)), 1);
+    assert_eq!(
+        engine.observe_committed_evm_txs(std::slice::from_ref(&bind_a)),
+        1
+    );
     assert_eq!(evm_adapter::lookup_bound_pq(&evm_x), Some(pq_a));
 
     // A claim settles no EVM intent: the settlement hook indexes it but links
@@ -1049,7 +1167,7 @@ async fn binding_index_replays_committed_records_and_refuses_conflicts() {
     // A second claim on an ALREADY-BOUND EVM address is refused: first claim
     // wins, so a thief cannot re-point an EVM identity's routing.
     assert_ne!(pq_a, pq_b);
-    let hostile = signed_binding_tx(&kp_b, evm_x, 0, 600_000);
+    let hostile = signed_binding_tx(&kp_b, &sx, evm_x, 0, 600_000);
     let err = mem
         .add_checked_ctx(hostile, START_BALANCE, admission_ctx())
         .expect_err("a conflicting claim must be refused");

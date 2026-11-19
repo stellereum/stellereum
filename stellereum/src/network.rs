@@ -523,6 +523,8 @@ struct MeshState {
 /// Outcome of one mesh delivery attempt.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MeshDelivery {
+    /// Validators in the direct-target set for this delivery.
+    pub targets: usize,
     /// Validators reached over a live direct link.
     pub direct_ok: usize,
     /// Validators whose direct link failed (their copy went to the fallback).
@@ -536,8 +538,12 @@ pub struct MeshDelivery {
 impl MeshDelivery {
     /// True when every targeted validator was reached directly or the
     /// overlay accepted the fallback copy.
+    ///
+    /// L3 fix: an EMPTY target set is not a success. The caller uses this to
+    /// decide whether the normal broadcast must still run, so "reached
+    /// nobody" must read as false.
     pub fn delivered(&self) -> bool {
-        self.direct_failed == 0 || self.fallback_ok
+        (self.targets > 0 && self.direct_failed == 0) || self.fallback_ok
     }
 }
 
@@ -709,6 +715,17 @@ impl ValidatorMesh {
         self.lock().members.keys().copied().collect()
     }
 
+    /// True when EVERY id in `ids` is a mesh member.
+    ///
+    /// The consensus send path only substitutes the mesh for the normal
+    /// per-peer broadcast when the mesh covers the complete configured peer
+    /// set; otherwise a non-member validator would be skipped. Pure state
+    /// query, so callers can decide without touching the transport.
+    pub fn covers(&self, ids: &[[u8; 20]]) -> bool {
+        let st = self.lock();
+        !ids.is_empty() && ids.iter().all(|id| st.members.contains_key(id))
+    }
+
     pub fn consecutive_failures(&self, id: &[u8; 20]) -> u32 {
         self.lock()
             .members
@@ -844,7 +861,10 @@ impl ValidatorMesh {
     /// message is never dropped merely because the mesh is degraded.
     pub async fn deliver(&self, topic: &str, data: &str, now_ms: u64) -> MeshDelivery {
         let targets = self.direct_targets(now_ms);
-        let mut delivery = MeshDelivery::default();
+        let mut delivery = MeshDelivery {
+            targets: targets.len(),
+            ..MeshDelivery::default()
+        };
         let mut sends = Vec::with_capacity(targets.len());
         for id in targets {
             sends.push(async move { (id, self.transport.deliver_direct(id, topic, data).await) });
@@ -962,7 +982,7 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
         Box::pin(async move {
             let payload = Self::envelope(topic, data);
             match tokio::time::timeout(
-                std::time::Duration::from_millis(VALIDATOR_MESH_SEND_TIMEOUT_MS),
+                std::time::Duration::from_millis(mesh_send_timeout_ms()),
                 self.node.send_to(peer, "pubsub.msg", payload),
             )
             .await
@@ -977,7 +997,7 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
     fn probe<'a>(&'a self, peer: [u8; 20]) -> MeshFuture<'a, Result<(), String>> {
         Box::pin(async move {
             match tokio::time::timeout(
-                std::time::Duration::from_millis(VALIDATOR_MESH_SEND_TIMEOUT_MS),
+                std::time::Duration::from_millis(mesh_send_timeout_ms()),
                 self.node.warm_peer(peer),
             )
             .await
@@ -1005,6 +1025,20 @@ fn mesh_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Effective direct-mesh send/probe timeout.
+///
+/// Honours the same `STELL_SEND_TIMEOUT_MS` knob operators already use for
+/// WAN links (M6): the fixed 2 s default marked a healthy slow validator dead
+/// on every send/probe. Clamped to a sane range; unset/invalid keeps the
+/// documented 2 s default.
+pub fn mesh_send_timeout_ms() -> u64 {
+    std::env::var("STELL_SEND_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(500, 60_000))
+        .unwrap_or(VALIDATOR_MESH_SEND_TIMEOUT_MS)
 }
 
 /// Mesh membership from operator config.

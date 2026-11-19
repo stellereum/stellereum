@@ -1,5 +1,4 @@
 use super::apply::sweep_gov_finalize;
-use super::lanes::block_reward_for;
 use super::{BlockHash, ValidatorRuntime};
 use crate::consensus::{FalconKeypair, Height, ValidatorSet, Vote};
 use crate::sharding::{
@@ -283,8 +282,9 @@ impl ShardedCluster {
 ///
 /// REORG PARITY: `apply_block` delegates to the SAME core the live consensus
 /// path uses (`InMemoryStateEngine::apply_block_transition`), fed with the SAME
-/// inputs (the block itself, plus a reward resolved by `block_reward_for`), so
-/// a re-applied block produces byte-identical state - state root, receipts and
+/// inputs (the block itself and the static reward default; the transition
+/// resolves the governed value from committed state), so a re-applied block
+/// produces byte-identical state - state root, receipts and
 /// applied counters - to the node that finalized it. It used to loop
 /// `apply_transaction` over the transactions instead, which charged a different
 /// fee (gas actually consumed rather than the declared limit) and skipped the
@@ -380,8 +380,13 @@ impl ChainState {
     /// per-block outcome is recorded in `applied_statuses` / `applied_txs`,
     /// the same bookkeeping `ValidatorRuntime` keeps for receipts.
     pub async fn apply_block(&mut self, block: &Block) {
-        let reward = block_reward_for(self.governance.as_ref(), self.block_reward);
-        let out = self.state.apply_block_transition(block, reward).await;
+        // R1/DET-01: the governed reward is resolved by the shared transition
+        // from committed state; this path (like the live one) only supplies
+        // its static configuration default.
+        let out = self
+            .state
+            .apply_block_transition(block, self.block_reward)
+            .await;
         self.applied_statuses = out.status;
         self.applied_fees = out.tx_fees;
         self.applied_events = out.events;

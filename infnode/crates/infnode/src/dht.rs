@@ -467,7 +467,12 @@ impl KvStore {
         self.entries
             .iter()
             .filter(|(k, v)| {
-                !k.starts_with("dedup:") && v.expires > now && now - v.stored_at > v.ttl_ms / 2
+                !k.starts_with("dedup:")
+                    // Local-authoritative sealed-manifest pins: a peer refuses
+                    // them, so republishing is pure traffic.
+                    && !k.starts_with("sealed-owner:")
+                    && v.expires > now
+                    && now - v.stored_at > v.ttl_ms / 2
             })
             .map(|(k, v)| (k.clone(), v.value.clone(), v.ttl_ms, v.origin, v.stored_at))
             .collect()
@@ -728,6 +733,10 @@ mod kv_sweep_tests {
             "mail:alice:index".into(),
             value(now, now - 600_000, 600_000),
         );
+        kv.restore(
+            "sealed-owner:files:doc.bin".into(),
+            value(now, now - 600_000, 600_000),
+        );
 
         let mut keys: Vec<String> = kv
             .keys_to_republish(now)
@@ -738,7 +747,7 @@ mod kv_sweep_tests {
         assert_eq!(
             keys,
             vec!["mail:alice:index".to_string()],
-            "dedup must not be republished"
+            "dedup and local-only sealed-owner pins must not be republished"
         );
     }
 

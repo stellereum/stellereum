@@ -268,11 +268,13 @@ fn partial_mempool_pulls_only_the_misses() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Zero mempool: do NOT amplify into pulls, fall back to the full proposal.
+// 3. Cold mempool: PAGE bounded pulls; fall back to the full proposal only
+//    after the bounded attempt budget is exhausted (F-6: the old immediate
+//    fallback never fetched anything, so a >64-miss block was lost).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zero_mempool_falls_back_to_full_proposal() {
+fn cold_mempool_pages_pulls_then_falls_back_to_full_proposal() {
     with_compact_gossip_gate(0, || {
         let block = block_with((0..400).map(tx).collect(), 11);
         let msg = compact_proposal_from_block(&block, 4).expect("armed emitter");
@@ -282,18 +284,29 @@ fn zero_mempool_falls_back_to_full_proposal() {
         let header = resolver.proposal().header.clone();
         let empty = short_id_index_for(&header, Vec::new());
 
+        // F-6: the FIRST resolution must be a bounded pull (64 ids), never an
+        // immediate give-up. The attempt counter bounds the total work.
         match resolver.resolve_against(&empty).expect("resolve") {
-            Resolution::FullProposal(FallbackReason::TooManyMissing { missing }) => {
-                assert_eq!(missing, 400);
-                assert!(missing > COMPACT_PULL_MAX_IDS);
+            Resolution::Pull(pull) => {
+                assert_eq!(pull.ids.len(), COMPACT_PULL_MAX_IDS);
+                assert_eq!(pull.attempt, 1);
             }
-            other => panic!("a cold mempool must fall back to the full proposal, got {other:?}"),
+            other => panic!("a cold mempool must page a bounded pull, got {other:?}"),
         }
-        assert_eq!(
-            resolver.attempts(),
-            0,
-            "fallback must not burn pull attempts"
-        );
+        // Two more pages are allowed...
+        for attempt in 2..=COMPACT_PULL_MAX_ATTEMPTS {
+            match resolver.resolve_against(&empty).expect("resolve") {
+                Resolution::Pull(pull) => assert_eq!(pull.attempt, attempt),
+                other => panic!("expected pull page {attempt}, got {other:?}"),
+            }
+        }
+        // ...then the attempt budget is exhausted and the FULL proposal fetch
+        // is the only remaining (and now implemented) fallback.
+        match resolver.resolve_against(&empty).expect("resolve") {
+            Resolution::FullProposal(FallbackReason::AttemptsExhausted) => {}
+            other => panic!("exhausted attempts must request the full proposal, got {other:?}"),
+        }
+        assert_eq!(resolver.attempts(), COMPACT_PULL_MAX_ATTEMPTS);
 
         // The fallback path is the untouched full `Proposal`, whose hash is
         // the same block the compact frame announced.
@@ -835,25 +848,26 @@ fn receiver_resolves_full_mempool_and_falls_back_when_cold() {
     }
     assert_eq!(receiver.parked_len(), 0);
 
-    // Cold mempool (400 slots): never amplify into pulls, fetch the full
-    // proposal through the existing path instead.
+    // Cold mempool (400 slots): page BOUNDED pulls first; only an exhausted
+    // attempt budget falls back to the full proposal (F-6 — the old immediate
+    // fallback never fetched anything and lost the block).
     let big = block_with((0..400).map(tx).collect(), 36);
     let big_msg = compact_proposal_from_block(&big, 2).expect("active emitter");
     let proposal = decode_proposal(&big_msg.encode().expect("encode"));
     match receiver.on_proposal(proposal, Vec::new()) {
-        CompactInbound::FetchFull {
-            height,
-            round,
-            reason: FallbackReason::TooManyMissing { missing },
-            ..
-        } => {
-            assert_eq!(height, 36);
-            assert_eq!(round, 2);
-            assert_eq!(missing, 400);
+        CompactInbound::Pull(pull) => {
+            assert_eq!(pull.height, 36);
+            assert_eq!(pull.round, 2);
+            assert_eq!(pull.ids.len(), COMPACT_PULL_MAX_IDS);
+            assert_eq!(pull.attempt, 1);
         }
-        other => panic!("cold mempool must fall back, got {other:?}"),
+        other => panic!("cold mempool must page a bounded pull, got {other:?}"),
     }
-    assert_eq!(receiver.parked_len(), 0, "fallback must not park state");
+    assert_eq!(
+        receiver.parked_len(),
+        1,
+        "a paged pull parks the resolution for its body"
+    );
 }
 
 #[test]
@@ -876,7 +890,7 @@ fn receiver_pulls_misses_then_completes_from_a_bounded_body() {
     let mut server = CompactBodyServer::new();
     server.remember(&block, 3);
     let body = server
-        .serve(&pull, block.transactions.clone())
+        .serve_for("peer-a", &pull, 0)
         .expect("pull is structurally valid")
         .expect("proposer must answer a resolvable pull");
     assert_eq!(body.txs.len(), 2);
@@ -903,12 +917,21 @@ fn receiver_pulls_misses_then_completes_from_a_bounded_body() {
     }
     assert_eq!(receiver.parked_len(), 0);
 
-    // A pull for a tx the responder no longer holds in its mempool is NOT
-    // answered (no private/inline leak, no fabricated body).
+    // H2/R5: the SAME pull replayed by the SAME peer is answered at most once.
+    // A first answer came from peer-a above; peer-b is a different requester
+    // and gets one copy, and its replay is suppressed.
     assert!(server
-        .serve(&pull, Vec::new())
+        .serve_for("peer-b", &pull, 0)
+        .expect("structurally valid")
+        .is_some());
+    assert!(server
+        .serve_for("peer-b", &pull, 0)
         .expect("structurally valid")
         .is_none());
+    assert_eq!(server.served_count(), 2, "one reply per requester, no replay");
+    // Serving comes from the ANNOUNCED block body, so a tx that left the
+    // proposer's mempool (or a sealed/MEV slot) is still answerable.
+    assert_eq!(server.cached_len(), 1);
 }
 
 #[test]
@@ -1137,7 +1160,7 @@ async fn compact_proposal_end_to_end_votes_and_finalizes() {
     assert!(pull.ids.len() <= COMPACT_PULL_MAX_IDS);
     assert_eq!(pull.attempt, 1);
     let body = server
-        .serve(&pull, nodes[0].mempool.read().await.all())
+        .serve_for("peer-c", &pull, 0)
         .expect("bounded pull is valid")
         .expect("proposer must serve the missing tx");
     let resolved_2 = match receivers[1].on_body(&body, held_2) {

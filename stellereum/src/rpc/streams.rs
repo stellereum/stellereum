@@ -84,11 +84,12 @@ pub struct Subscription {
     pub attached: bool,
     /// The client that created it (its IP), when the caller was attributed.
     ///
-    /// Used only for the PER-CLIENT budget (`MAX_SUBSCRIPTIONS_PER_CLIENT`,
-    /// audit W6.7): the global cap bounds the node's memory, but a single
-    /// caller could otherwise take the WHOLE registry and starve every other
-    /// subscriber. `None` for a subscription created over a transport that
-    /// carries no attribution.
+    /// Used for the PER-CLIENT budget (`MAX_SUBSCRIPTIONS_PER_CLIENT`, audit
+    /// W6.7) and as the OWNERSHIP check for `stell_unsubscribe` / SSE attach:
+    /// the global cap bounds the node's memory, but a single caller could
+    /// otherwise take the WHOLE registry and starve every other subscriber.
+    /// `None` for a subscription created over a transport that carries no
+    /// attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
 }
@@ -243,9 +244,27 @@ impl SubscriptionHub {
     }
 
     /// Remove a subscription. Returns true when it existed.
+    ///
+    /// INTERNAL use only (transport guards and tests). Network callers must
+    /// use [`Self::unsubscribe_for`] so an id from the listing cannot tear
+    /// down another client's stream.
     pub fn unsubscribe(&self, id: &str) -> bool {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         reg.remove(id).is_some()
+    }
+
+    /// Remove a subscription only when `client` owns it.
+    ///
+    /// Subscription ids are returned to their creator, but the registry also
+    /// serves a diagnostics listing; binding unsubscribe to the recorded
+    /// owner means an id learned out of band (or from a previous listing) is
+    /// not a bearer capability for another client's stream.
+    pub fn unsubscribe_for(&self, id: &str, client: Option<&str>) -> bool {
+        let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        match reg.get(id) {
+            Some(s) if s.client.as_deref() == client => reg.remove(id).is_some(),
+            _ => false,
+        }
     }
 
     /// The subscription with this id, if it is still live.
@@ -258,6 +277,22 @@ impl SubscriptionHub {
     pub fn list(&self) -> Vec<Subscription> {
         let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<Subscription> = reg.values().cloned().collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+
+    /// The live subscriptions owned by `client` (sorted by id).
+    ///
+    /// The public listing is scoped: ids are capabilities for
+    /// `stell_unsubscribe`/SSE attach, so handing every id to every caller
+    /// would let any client cancel every stream.
+    pub fn list_for(&self, client: Option<&str>) -> Vec<Subscription> {
+        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<Subscription> = reg
+            .values()
+            .filter(|s| s.client.as_deref() == client)
+            .cloned()
+            .collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
@@ -279,6 +314,19 @@ impl SubscriptionHub {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = reg.get_mut(id) {
             s.attached = true;
+        }
+    }
+
+    /// Attach a transport only when `client` owns the subscription.
+    /// Returns false for an unknown id or a different owner (no id oracle).
+    pub fn attach_for(&self, id: &str, client: Option<&str>) -> bool {
+        let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        match reg.get_mut(id) {
+            Some(s) if s.client.as_deref() == client => {
+                s.attached = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -852,13 +900,14 @@ pub async fn sse_handler(
         .unwrap_or_else(|| LOCAL_SUBSCRIBER_ID.to_string());
 
     if let Some(want) = q.sub_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        match hub.get(want) {
-            Some(s) => {
-                hub.attach(&s.id);
-                attached.push(s.id.clone());
-                ids.push(s.id);
-            }
-            None => return Err(axum::http::StatusCode::NOT_FOUND),
+        // Attach is owner-bound: the id (and the events on it) belongs to the
+        // client that created it. An unknown id and another client's id are
+        // indistinguishable (404), so the endpoint is not an id oracle.
+        if hub.attach_for(want, Some(client.as_str())) {
+            attached.push(want.to_string());
+            ids.push(want.to_string());
+        } else {
+            return Err(axum::http::StatusCode::NOT_FOUND);
         }
     } else {
         let topics = match parse_stream_topics(&q) {

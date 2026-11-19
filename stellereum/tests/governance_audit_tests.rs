@@ -527,8 +527,17 @@ fn attack_slash_bps_matches_staking_cap() {
     g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
     g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
         .unwrap();
-    g.execute(ids[0], id).unwrap();
-    assert_eq!(g.applied.equivocation_slash_bps, Some(10_000));
+    // PENTEST2 S5: the parameter has no wired consumer (slashing uses the
+    // frozen staking constant), so execution REFUSES it instead of committing
+    // a decorative value. The proposal stays Passed for an explicit future
+    // migration; the bound itself is still enforced above.
+    assert_eq!(
+        g.execute(ids[0], id),
+        Err(GovError::InvalidAction),
+        "an unconsumed slash-rate change must fail closed, not silently no-op"
+    );
+    assert_eq!(g.applied.equivocation_slash_bps, None);
+    assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
     let mut ls = StakingLedger::new();
     ls.bond(vid(5), stell(10_000), DEFAULT_COMMISSION_BPS)
         .unwrap();

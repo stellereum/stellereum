@@ -60,11 +60,16 @@
 //!
 //! # What is NOT here
 //!
-//! * The legacy outbox/inbox/ack/bounce flow is untouched and still runs for
-//!   transfers produced before the activation height
-//!   ([`XpcActivation`]). The switch is NOT an operator knob: it comes from
-//!   the compile-time chain spec ([`XPC_ACTIVATION_HEIGHT`] /
-//!   [`XpcActivation::from_chain_spec`]).
+//! * The legacy outbox/inbox/ack/bounce flow is untouched for transfers
+//!   produced before the activation height ([`XpcActivation`]). On an
+//!   UPGRADED chain such a legacy transfer can NOT deliver value: the target
+//!   refuses the one-step legacy credit because the message proves only the
+//!   sender's pre-transfer balance, not the source-side escrow (XSHARD-01).
+//!   The value is therefore returned to the sender by the deterministic
+//!   timeout bounce, not delivered; `XPC_ACTIVATION_HEIGHT = 0` means a fresh
+//!   chain never produces such a transfer at all. The switch is NOT an
+//!   operator knob: it comes from the compile-time chain spec
+//!   ([`XPC_ACTIVATION_HEIGHT`] / [`XpcActivation::from_chain_spec`]).
 //! * The liveness cost is real and deliberate: a transfer whose target shard
 //!   is unreachable stays ESCROWED (the value is neither credited nor
 //!   refunded) until the target answers. That is the price of not letting the
@@ -132,17 +137,21 @@ pub const XPC_PREPARE_TIMEOUT_HEIGHTS: u64 = 64;
 /// value transfer through the legacy one-way flow. That flow is still
 /// REFUSED at the target's credit gate (XSHARD-01: a one-step message cannot
 /// prove the source-side escrow), which is why the atomic path must be the
-/// only path new value can take. Transfers produced BEFORE the activation
-/// height (relevant when this binary upgrades an existing chain) keep running
-/// the legacy outbox/inbox/ack/bounce flow to completion; the two flows never
-/// interleave on one transfer.
+/// only path new value can take.
 ///
-/// This constant — and only this constant — is the production source of
-/// [`XpcActivation`] (see [`XpcActivation::from_chain_spec`]): the protocol
-/// freeze forbids env-driven protocol switches, so an operator variable can
-/// never arm the 2PC on a running chain, and every node derives the same
-/// boundary from the same compiled value. Flipping it is a protocol change and
-/// ships together with this gate in a release.
+/// HONEST UPGRADE BEHAVIOUR: on a chain upgraded from a build with the 2PC
+/// off, a transfer that was already produced under the legacy flow keeps
+/// being handled by that flow, but it does NOT "complete" by delivering
+/// value. The target refuses the legacy credit (XSHARD-01), and the
+/// deterministic height-timeout bounce refunds the sender on the source. Such
+/// a transfer is therefore refund-only, never delivered; only the 2PC
+/// (PREPARE → PREPARE-ACK → COMMIT) moves cross-shard value. This constant —
+/// and only this constant — is the production source of [`XpcActivation`]
+/// (see [`XpcActivation::from_chain_spec`]): the protocol freeze forbids
+/// env-driven protocol switches, so an operator variable can never arm the
+/// 2PC on a running chain, and every node derives the same boundary from the
+/// same compiled value. Flipping it is a protocol change and ships together
+/// with this gate in a release.
 pub const XPC_ACTIVATION_HEIGHT: u64 = 0;
 
 /// The phase of one 2PC transfer, as recorded by the shard that owns it.
@@ -303,9 +312,10 @@ pub fn xpc_state_value(phase: XpcPhase, tx_hash: &[u8; 32]) -> Vec<u8> {
 /// `Disabled` keeps the legacy flow for every transfer — the mode the
 /// already-deployed chain state runs in, and the mode the pre-2PC
 /// integration tests exercise. `FromHeight(h)` switches transfers PRODUCED at
-/// height `h` or later to the 2PC; transfers produced before `h` keep
-/// running the legacy flow to completion, so the two never interleave on one
-/// transfer.
+/// height `h` or later to the 2PC; transfers produced before `h` keep the
+/// legacy flow, which on an upgraded chain is REFUND-ONLY (the target refuses
+/// the one-step legacy credit under XSHARD-01 and the source's timeout bounce
+/// returns the value). The two never interleave on one transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XpcActivation {
     /// The 2PC is off (legacy flow only).
@@ -550,6 +560,14 @@ pub fn should_reprepare(record: &XpcRecord, height: u64) -> bool {
 }
 
 /// What the SOURCE shard must do for one of its 2PC records at `height`.
+///
+/// A COMMITTED record is terminal: the source owes at most a BOUNDED burst of
+/// COMMIT re-publications so a lost COMMIT can still reach the target. It
+/// publishes on [`XPC_COMMIT_REEMIT_INTERVAL`] and stops at
+/// [`XPC_TERMINAL_RETENTION_HEIGHTS`]; after that the record is retired by the
+/// state engine (see [`is_retired`]), so a historical transfer is never
+/// re-published, re-cloned or re-hashed forever. The schedule is a pure
+/// function of (record, height), so every node derives the same set.
 pub fn source_action(record: &XpcRecord, height: u64) -> SourceAction {
     match record.phase {
         XpcPhase::Prepared => {
@@ -563,7 +581,19 @@ pub fn source_action(record: &XpcRecord, height: u64) -> SourceAction {
                 SourceAction::Reprepare
             }
         }
-        XpcPhase::Committed => SourceAction::Commit,
+        XpcPhase::Committed => {
+            let Some(elapsed) = height.checked_sub(record.decided_height) else {
+                return SourceAction::Idle;
+            };
+            if elapsed == 0 || elapsed >= XPC_TERMINAL_RETENTION_HEIGHTS {
+                return SourceAction::Idle;
+            }
+            if elapsed == 1 || elapsed % XPC_COMMIT_REEMIT_INTERVAL == 0 {
+                SourceAction::Commit
+            } else {
+                SourceAction::Idle
+            }
+        }
         XpcPhase::Aborted => SourceAction::Idle,
     }
 }
@@ -600,6 +630,98 @@ pub fn target_action(record: &XpcRecord) -> TargetAction {
 /// So the target emits it one height after the phase was recorded, then at
 /// most once per window of this many heights.
 pub const XPC_ACK_REEMIT_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
+
+/// How many heights a TERMINAL (COMMITTED or ABORTED) 2PC record is retained
+/// after its decision before the state engine retires it.
+///
+/// The record becomes terminal when this shard CONSUMED the decisive record
+/// (`PREPARE-ACK` / `COMMIT` / `ABORT-ACK`), i.e. it is already in the
+/// committed `cross_shard_completed` set. The source still gets a bounded
+/// COMMIT re-publication window (see [`source_action`]) so a lost COMMIT is
+/// recoverable; after this many heights neither side needs the record again:
+///
+///  * a replay of a decisive record finds no record and is refused (never
+///    credited/refunded twice), and
+///  * the target's mailbox prune already drops terminal copies
+///    (`completed_cross_shard`), so retiring the record loses no information.
+///
+/// The retirement height is `decided_height + XPC_TERMINAL_RETENTION_HEIGHTS`
+/// on every node: a pure function of the committed record and the applied
+/// block height, never a local clock. A decision that is older than this when
+/// a node restores an old snapshot is retired on that node's next applied
+/// block, so all nodes converge to the same bounded record set.
+pub const XPC_TERMINAL_RETENTION_HEIGHTS: u64 = 256;
+
+/// The cadence of a terminal COMMIT re-publication, in heights.
+///
+/// A healthy exchange needs one COMMIT; the retries only cover a lost one. One
+/// emission one height after the decision, then at most one per window, keeps
+/// the source's per-block footprint bounded without making a single lost
+/// COMMIT unrecoverable.
+pub const XPC_COMMIT_REEMIT_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
+
+/// Control-record budget reserved for INBOUND re-emissions from the peer
+/// shard (its PREPARE-ACK / ABORT-ACK / COMMIT records).
+///
+/// The per-height cap covers every 2PC control record in a block, both the
+/// ones this shard derives from its committed state and the ones pulled from
+/// its mailbox. Without a reservation a stream of new outbound transfers could
+/// fill the whole budget every block and starve the acks that complete the
+/// transfers already in flight.
+pub const XPC_INBOUND_CONTROL_RESERVE: usize = 4;
+
+/// How many heights an inbound cross-shard message may stay in the node-local
+/// mailbox without being admitted before it is QUARANTINED (pruned) as
+/// never-admissible.
+///
+/// Some rejections are permanent (a bad proof, a record for an unknown or
+/// already-completed transfer, an anchor that aged out of the finalized-header
+/// window). Before this bound such a message was skipped forever: it was never
+/// included, so apply never pruned it, and a peer could grow the mailbox
+/// without limit. The expiry height is `first_seen_height + this`; the clock is
+/// the locally applied chain height (deterministic per node) and the map is
+/// node-local transport bookkeeping, never consensus state.
+pub const XPC_MAILBOX_QUARANTINE_HEIGHTS: u64 = 64;
+
+/// Hard cap on the number of distinct inbound message ids tracked at once.
+///
+/// Expiry alone still allows a same-height burst of unbounded records, so the
+/// tracker is also bounded: when it exceeds this, the oldest-tracked entries
+/// (lowest first-seen height, then msg id) are pruned from the mailbox first.
+/// A valid message pruned this way can be re-published; the bound is what stops
+/// a remote peer from forcing unbounded memory use.
+pub const XPC_MAILBOX_MAX_TRACKED: usize = 4096;
+
+/// How many OPENING PREPAREs the proposer may add at a height, given that
+/// `plan_len` control records are already due from the committed state.
+///
+/// The total (plan + inbound + opening) never exceeds
+/// [`XPC_MAX_REEMITS_PER_HEIGHT`], so the proposer can never build a block its
+/// own validator set rejects. Up to [`XPC_INBOUND_CONTROL_RESERVE`] slots are
+/// held back for the peer's control records; the rest ride this height and
+/// the remaining outbound transfers are carried to later heights in the same
+/// deterministic selection order.
+pub fn opening_prepare_budget(plan_len: usize) -> usize {
+    let remaining = XPC_MAX_REEMITS_PER_HEIGHT.saturating_sub(plan_len);
+    remaining.saturating_sub(XPC_INBOUND_CONTROL_RESERVE.min(remaining))
+}
+
+/// True when this record is terminal AND old enough to be retired at
+/// `height`.
+///
+/// PURE function of the committed record and the applied height, so every
+/// node retires exactly the same records at exactly the same height (and the
+/// resulting state root and replay snapshot agree). PREPARED records are
+/// never retired here: their escrow is still open and the protocol must keep
+/// the state needed to reach a decision.
+pub fn is_retired(record: &XpcRecord, height: u64) -> bool {
+    match record.phase {
+        XpcPhase::Prepared => false,
+        XpcPhase::Committed | XpcPhase::Aborted => {
+            height >= record.decided_height.saturating_add(XPC_TERMINAL_RETENTION_HEIGHTS)
+        }
+    }
+}
 
 /// The hard cap on the number of 2PC/control records a shard may re-emit in
 /// ONE block, across every transfer it owns.
@@ -1417,5 +1539,86 @@ mod model_tests {
             source_on_abort_ack(Some(&c)),
             XpcTransition::Refused(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn committed_at(decided: u64) -> XpcRecord {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let tx = crate::sharding::Transaction::sign(&signer, [4u8; 32], 10, 280_000, 0, 0, 1);
+        let mut rec = XpcRecord::prepared(tx, 0, 1, decided.saturating_sub(1));
+        rec.phase = XpcPhase::Committed;
+        rec.decided_height = decided;
+        assert!(rec.is_consistent());
+        rec
+    }
+
+    #[test]
+    fn a_committed_source_re_emits_on_a_bounded_cadence_then_stops() {
+        let rec = committed_at(10);
+        // One emission the height after the decision, then one per interval,
+        // never at the decision height itself.
+        assert_eq!(source_action(&rec, 10), SourceAction::Idle);
+        assert_eq!(source_action(&rec, 11), SourceAction::Commit);
+        assert_eq!(source_action(&rec, 12), SourceAction::Idle);
+        assert_eq!(
+            source_action(&rec, 10 + XPC_COMMIT_REEMIT_INTERVAL),
+            SourceAction::Commit
+        );
+        // Bounded: after the retention window the source owes nothing.
+        assert_eq!(
+            source_action(&rec, 10 + XPC_TERMINAL_RETENTION_HEIGHTS - 1),
+            SourceAction::Idle
+        );
+        assert_eq!(
+            source_action(&rec, 10 + XPC_TERMINAL_RETENTION_HEIGHTS),
+            SourceAction::Idle
+        );
+        assert_eq!(source_action(&rec, u64::MAX), SourceAction::Idle);
+    }
+
+    #[test]
+    fn only_terminal_records_are_retired_and_only_at_the_fixed_height() {
+        let prepared = {
+            let signer = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+            let tx = crate::sharding::Transaction::sign(&signer, [5u8; 32], 10, 280_000, 0, 0, 1);
+            XpcRecord::prepared(tx, 0, 1, 10)
+        };
+        assert!(!is_retired(&prepared, u64::MAX));
+        let committed = committed_at(20);
+        assert!(!is_retired(
+            &committed,
+            20 + XPC_TERMINAL_RETENTION_HEIGHTS - 1
+        ));
+        assert!(is_retired(
+            &committed,
+            20 + XPC_TERMINAL_RETENTION_HEIGHTS
+        ));
+        assert!(is_retired(&committed, u64::MAX));
+    }
+
+    #[test]
+    fn the_opening_budget_plus_the_plan_never_exceeds_the_cap() {
+        for plan_len in 0..=XPC_MAX_REEMITS_PER_HEIGHT {
+            let opening = opening_prepare_budget(plan_len);
+            assert!(
+                plan_len + opening <= XPC_MAX_REEMITS_PER_HEIGHT,
+                "plan={plan_len} opening={opening}"
+            );
+            let reserved =
+                XPC_INBOUND_CONTROL_RESERVE.min(XPC_MAX_REEMITS_PER_HEIGHT - plan_len);
+            assert_eq!(
+                plan_len + opening + reserved,
+                XPC_MAX_REEMITS_PER_HEIGHT,
+                "the plan, the opening budget and the inbound reserve partition the cap"
+            );
+        }
+        assert_eq!(
+            opening_prepare_budget(0),
+            XPC_MAX_REEMITS_PER_HEIGHT - XPC_INBOUND_CONTROL_RESERVE
+        );
     }
 }

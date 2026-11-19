@@ -236,25 +236,28 @@ mod tip_probe_budget {
     use super::catchup_policy::{catchup_action, CatchupAction, CATCHUP_INTERVAL_DEFAULT_MS};
 
     /// Simulate 10 minutes of 50 ms ticks exactly the way the driver consumes
-    /// `catchup_action`: run -> probe + reset, skip-at-tip -> reset (no probe),
-    /// wait -> keep counting.
+    /// `catchup_action`: run/blind-probe -> probe + reset, skip-at-tip -> keep
+    /// counting (no probe, but the elapsed clock must still reach the low-
+    /// frequency blind-probe window), wait -> keep counting.
     fn probes_over_ten_minutes(at_tip: bool, commit_at_tick: Option<usize>) -> (u64, usize) {
         const TICK_MS: u64 = 50;
-        const TICKS: usize = 12_000; // 10 minutes
+        const TICKS: usize = 12_001; // 10 minutes + one tick, so the blind probe is due
         let mut since = 0u64;
         let mut probes = 0u64;
         let mut first_probe_tick = None;
         for tick in 0..TICKS {
             let reactive = commit_at_tick == Some(tick);
             match catchup_action(reactive, since, CATCHUP_INTERVAL_DEFAULT_MS, at_tip) {
-                CatchupAction::Run => {
+                CatchupAction::Run | CatchupAction::BlindProbe => {
                     probes += 1;
                     since = 0;
                     if first_probe_tick.is_none() {
                         first_probe_tick = Some(tick);
                     }
                 }
-                CatchupAction::SkipAtTip => since = 0,
+                // At-tip skip: no DHT work, but do NOT reset the clock — the
+                // blind-probe backstop needs the elapsed time.
+                CatchupAction::SkipAtTip => since += TICK_MS,
                 CatchupAction::Wait => since += TICK_MS,
             }
         }
@@ -262,11 +265,15 @@ mod tip_probe_budget {
     }
 
     #[test]
-    fn a_node_at_the_tip_never_probes_the_dht_over_ten_minutes() {
-        let (probes, _) = probes_over_ten_minutes(true, None);
+    fn a_node_at_the_tip_does_one_blind_probe_per_backstop_window() {
+        let (probes, first_tick) = probes_over_ten_minutes(true, None);
         assert_eq!(
-            probes, 0,
-            "an in-sync node must not poll the DHT on the backstop timer at all"
+            probes, 1,
+            "an in-sync node must not poll every backstop, but silence cannot disable catch-up forever"
+        );
+        assert_eq!(
+            first_tick, 12_000,
+            "the blind probe fires at AT_TIP_PROBE_INTERVAL_MS, not on the 30 s timer"
         );
     }
 

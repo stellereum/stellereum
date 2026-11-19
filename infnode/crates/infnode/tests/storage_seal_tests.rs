@@ -4,9 +4,10 @@
 //! (`bucket:name:H(plaintext)`), so anyone holding the manifest and the chunks
 //! could decrypt. These tests pin the two guarantees we now claim:
 //!
-//! 1. `store_blob_boxed(.., Some(owner_ek))` seals the payload to the owner's
-//!    ML-KEM-768 key: a non-owner with the FULL stored blob (manifest + every
-//!    chunk) cannot decrypt it, while the owner can (`fetch_blob_owner`).
+//! 1. `store_blob_boxed(.., Some(owner_ek), Some(owner_seed))` seals the
+//!    payload to the owner's ML-KEM-768 key and MACs the manifest: a non-owner
+//!    with the FULL stored blob (manifest + every chunk) cannot decrypt it,
+//!    cannot forge/replace the manifest, and the owner can (`fetch_blob_owner`).
 //! 2. `store_blob` (no owner key) remains at-rest OBFUSCATION, not encryption:
 //!    its key is publicly derivable and a third party CAN decrypt it. That test
 //!    exists so nobody re-labels the legacy path as E2E confidentiality.
@@ -104,9 +105,16 @@ async fn owner_sealed_blob_is_not_decryptable_by_a_non_owner() {
     let attacker_seed_hex = hex::encode(attacker.kem_seed);
 
     let stored = node
-        .store_blob_boxed("files", "secret.bin", &blob, Some(&owner_ek_hex))
+        .store_blob_boxed(
+            "files",
+            "secret.bin",
+            &blob,
+            Some(&owner_ek_hex),
+            Some(&owner_seed_hex),
+        )
         .await;
-    assert!(stored > 0, "owner-sealed store must persist chunks");
+    assert!(stored.chunks > 0, "owner-sealed store must persist chunks");
+    assert!(stored.replicas > 0, "the local node keeps one replica");
 
     let (manifest, ct) = stored_blob(&node, &dir, "files", "secret.bin").await;
     assert_eq!(
@@ -226,10 +234,17 @@ async fn invalid_owner_key_fails_closed_instead_of_storing_a_plaintext_key() {
     let (node, dir) = test_node("invalid-owner").await;
     let blob = b"must not be stored under a downgraded key".to_vec();
 
+    let owner = MailKeys::generate();
     let stored = node
-        .store_blob_boxed("files", "downgrade.bin", &blob, Some("deadbeef"))
+        .store_blob_boxed(
+            "files",
+            "downgrade.bin",
+            &blob,
+            Some("deadbeef"),
+            Some(&hex::encode(owner.kem_seed)),
+        )
         .await;
-    assert_eq!(stored, 0, "invalid owner ek must be refused");
+    assert_eq!(stored.chunks, 0, "invalid owner ek must be refused");
     assert!(
         node.get_local_kv(&Node::blob_manifest_key("files", "downgrade.bin"))
             .await
@@ -248,8 +263,14 @@ async fn owner_sealed_fetch_rejects_tampered_chunk() {
     let owner_seed_hex = hex::encode(owner.kem_seed);
     let blob = sample_blob(1800);
 
-    node.store_blob_boxed("files", "tamper.bin", &blob, Some(&owner_ek_hex))
-        .await;
+    node.store_blob_boxed(
+        "files",
+        "tamper.bin",
+        &blob,
+        Some(&owner_ek_hex),
+        Some(&owner_seed_hex),
+    )
+    .await;
     let (mut manifest, _) = stored_blob(&node, &dir, "files", "tamper.bin").await;
     let first_id = manifest["chunks"][0]["id"]
         .as_str()
@@ -278,6 +299,202 @@ async fn owner_sealed_fetch_rejects_tampered_chunk() {
             .await
             .is_none(),
         "tampered ciphertext must fail closed (chunk hash / AEAD)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// H2: a storage peer cannot downgrade a sealed manifest to the legacy
+/// (plaintext-key) format, even if it replaces BOTH the manifest and the
+/// chunk file on the victim's disk/DHT cache. The owner can still re-publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_manifest_cannot_be_downgraded_by_a_peer() {
+    let (node, dir) = test_node("seal-downgrade").await;
+    let owner = MailKeys::generate();
+    let owner_ek_hex = hex::encode(&owner.kem_ek);
+    let owner_seed_hex = hex::encode(owner.kem_seed);
+    let original = sample_blob(2600);
+    let attacker_blob = b"attacker-controlled replacement".repeat(40);
+
+    let report = node
+        .store_blob_boxed(
+            "files",
+            "secret.bin",
+            &original,
+            Some(&owner_ek_hex),
+            Some(&owner_seed_hex),
+        )
+        .await;
+    assert!(report.chunks > 0 && report.replicas > 0);
+    assert_eq!(
+        node.fetch_blob_owner("files", "secret.bin", &owner_seed_hex)
+            .await
+            .expect("owner reads the sealed blob"),
+        original
+    );
+
+    // A second node produces a self-consistent LEGACY manifest + chunks (the
+    // exact bytes a malicious storage peer can serve).
+    let (attacker, attacker_dir) = test_node("seal-downgrade-attacker").await;
+    attacker
+        .store_blob("files", "secret.bin", &attacker_blob)
+        .await;
+    let (legacy_manifest, legacy_ct) =
+        stored_blob(&attacker, &attacker_dir, "files", "secret.bin").await;
+    assert!(legacy_manifest.get("seal").is_none());
+    assert!(legacy_manifest.get("key").is_some());
+
+    // Overwrite the victim's local manifest AND every referenced chunk.
+    node.kv_store_local_with_ttl(
+        &Node::blob_manifest_key("files", "secret.bin"),
+        &legacy_manifest.to_string(),
+        30 * 24 * 3600 * 1000,
+    )
+    .await;
+    let chunk_dir = dir.join("chunks").join("files");
+    std::fs::create_dir_all(&chunk_dir).expect("chunk dir");
+    for c in legacy_manifest["chunks"].as_array().expect("chunks") {
+        let id = c["id"].as_str().expect("chunk id");
+        let off = c["off"].as_u64().expect("off") as usize;
+        let len = c["len"].as_u64().expect("len") as usize;
+        std::fs::write(chunk_dir.join(id), &legacy_ct[off..off + len]).expect("inject chunk");
+    }
+
+    // Downgrade refused: the pin says this name is sealed, and an owner fetch
+    // never falls back to an unauthenticated format.
+    assert!(
+        node.fetch_blob_owner("files", "secret.bin", &owner_seed_hex)
+            .await
+            .is_none(),
+        "a legacy manifest must not downgrade a sealed blob"
+    );
+    assert!(
+        node.fetch_blob("files", "secret.bin").await.is_none(),
+        "a pinned sealed name must not be served through the legacy reader"
+    );
+
+    // The owner (same key) can re-publish and read again.
+    let replacement = b"owner replacement v2".repeat(60);
+    let report = node
+        .store_blob_boxed(
+            "files",
+            "secret.bin",
+            &replacement,
+            Some(&owner_ek_hex),
+            Some(&owner_seed_hex),
+        )
+        .await;
+    assert!(report.chunks > 0, "owner re-publish must be accepted");
+    assert_eq!(
+        node.fetch_blob_owner("files", "secret.bin", &owner_seed_hex)
+            .await
+            .expect("owner reads the replacement"),
+        replacement
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&attacker_dir);
+}
+
+/// H2: a DIFFERENT owner cannot replace (re-seal) a pinned sealed manifest;
+/// the owner's bytes and manifest stay intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_manifest_replacement_requires_the_same_owner_key() {
+    let (node, dir) = test_node("seal-replace").await;
+    let owner = MailKeys::generate();
+    let attacker = MailKeys::generate();
+    let original = sample_blob(1900);
+
+    let report = node
+        .store_blob_boxed(
+            "files",
+            "owned.bin",
+            &original,
+            Some(&hex::encode(&owner.kem_ek)),
+            Some(&hex::encode(owner.kem_seed)),
+        )
+        .await;
+    assert!(report.chunks > 0);
+    let mkey = Node::blob_manifest_key("files", "owned.bin");
+    let before = node.get_local_kv(&mkey).await.expect("manifest");
+
+    let stolen = node
+        .store_blob_boxed(
+            "files",
+            "owned.bin",
+            b"attacker bytes",
+            Some(&hex::encode(&attacker.kem_ek)),
+            Some(&hex::encode(attacker.kem_seed)),
+        )
+        .await;
+    assert_eq!(stolen.chunks, 0, "another owner must not replace the manifest");
+    assert_eq!(
+        node.get_local_kv(&mkey).await.expect("manifest"),
+        before,
+        "a refused replacement must not touch the stored manifest"
+    );
+    assert_eq!(
+        node.fetch_blob_owner("files", "owned.bin", &hex::encode(owner.kem_seed))
+            .await
+            .expect("owner still reads"),
+        original
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M4: the manifest chunk table is bounded/validated before any network
+/// lookup. An inconsistent `size`, a non-contiguous `off`, or a chunk count
+/// beyond the hard cap is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_chunk_table_is_bounded_and_consistent() {
+    let (node, dir) = test_node("seal-bounds").await;
+    let blob = sample_blob(4096);
+    node.store_blob("files", "bounds.bin", &blob).await;
+    let mkey = Node::blob_manifest_key("files", "bounds.bin");
+    let (good, _) = stored_blob(&node, &dir, "files", "bounds.bin").await;
+    assert_eq!(
+        node.fetch_blob("files", "bounds.bin").await.expect("fetch"),
+        blob
+    );
+
+    // Declared size disagrees with the ciphertext length.
+    let mut bad = good.clone();
+    bad["size"] = serde_json::json!(blob.len() as u64 - 1);
+    node.kv_store_local_with_ttl(&mkey, &bad.to_string(), 30 * 24 * 3600 * 1000)
+        .await;
+    assert!(
+        node.fetch_blob("files", "bounds.bin").await.is_none(),
+        "size/content-length mismatch must be refused"
+    );
+
+    // Non-contiguous offsets.
+    let mut bad = good.clone();
+    bad["chunks"][0]["off"] = serde_json::json!(1u64);
+    node.kv_store_local_with_ttl(&mkey, &bad.to_string(), 30 * 24 * 3600 * 1000)
+        .await;
+    assert!(
+        node.fetch_blob("files", "bounds.bin").await.is_none(),
+        "non-contiguous chunk table must be refused"
+    );
+
+    // Chunk count beyond the hard cap (count alone is enough; no lookups).
+    let mut bad = good.clone();
+    let one = bad["chunks"][0].clone();
+    let many: Vec<serde_json::Value> = (0..infnode::node::MAX_BLOB_CHUNKS + 1)
+        .map(|i| {
+            let mut c = one.clone();
+            c["off"] = serde_json::json!((i * 1024 * 1024) as u64);
+            c["len"] = serde_json::json!(1024 * 1024u64);
+            c
+        })
+        .collect();
+    bad["chunks"] = serde_json::json!(many);
+    node.kv_store_local_with_ttl(&mkey, &bad.to_string(), 30 * 24 * 3600 * 1000)
+        .await;
+    assert!(
+        node.fetch_blob("files", "bounds.bin").await.is_none(),
+        "an over-cap chunk array must be refused"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

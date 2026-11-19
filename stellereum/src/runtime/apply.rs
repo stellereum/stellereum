@@ -1,6 +1,5 @@
 use super::lanes::{
-    block_reward_for, count_block_actor_sends, ApplyInflight, ApplyJob, ApplyLane, LaneJob,
-    SnapshotJob,
+    count_block_actor_sends, ApplyInflight, ApplyJob, ApplyLane, LaneJob, SnapshotJob,
 };
 use super::{ApplyCompleted, BlockHash, SnapBundle, ValidatorRuntime};
 use crate::consensus::{Height, HeightConsensus};
@@ -208,10 +207,11 @@ impl ValidatorRuntime {
         // applying this block passes the SAME value, so the resulting state is
         // deterministic.
         //
-        // The reward is the governed value when governance set one, else the
-        // node default - resolved by the SAME helper the reorg path uses.
-        let reward = block_reward_for(self.governance.as_ref(), self.block_reward);
-        let (outcome, root) = self.run_on_apply_lane(block, reward).await;
+        // R1/DET-01: pass only the STATIC default. The transition resolves the
+        // governed value itself from the committed pre-state (its own
+        // governance read), so no caller-held copy can make this path mint a
+        // different amount than the catch-up/walk path for the same block.
+        let (outcome, root) = self.run_on_apply_lane(block, self.block_reward).await;
         self.record_apply_outcome(block, &outcome).await;
         (outcome, root)
     }
@@ -792,10 +792,10 @@ impl ValidatorRuntime {
             self.state.set_parallel_exec(true);
         }
         let (height, bh, block) = self.prepare_decided_block().await?;
-        // The reward is resolved NOW, from the same helper the inline path
-        // uses, so the worker executes byte-identically with no governance
-        // read of its own.
-        let reward = block_reward_for(self.governance.as_ref(), self.block_reward);
+        // R1/DET-01: only the STATIC default travels to the worker; the
+        // governed reward is derived inside `apply_block_transition` from the
+        // committed pre-state, identically on every path.
+        let reward = self.block_reward;
         let lane = self.ensure_apply_lane();
         let (tx, rx) = tokio::sync::oneshot::channel();
         if lane

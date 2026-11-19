@@ -328,6 +328,18 @@ pub const COMPACT_PULL_MAX_IDS: usize = 64;
 /// proposal through the existing path (design §2c: "3 attempts").
 pub const COMPACT_PULL_MAX_ATTEMPTS: u32 = 3;
 
+/// Reserved short id that turns a structural [`BodyPull`] into a request for
+/// the proposer's FULL proposal (the compact-gossip fallback).
+///
+/// A real short id is `BLAKE3`-derived and 6 bytes wide, so the chance that an
+/// honest body slot collides with this literal is 2⁻⁴⁸. Even in that case the
+/// responder only re-sends a block it ALREADY announced (`CompactBodyServer`'s
+/// cached entry, matched by height/round/hash), so a forged request cannot
+/// extract anything that was not already public gossip. Keeping the request in
+/// the existing `BodyPull` frame avoids introducing a new wire variant (the v2
+/// enum stays byte-identical and old peers keep their exhaustive matches).
+pub const FULL_PROPOSAL_REQUEST_ID: [u8; SHORT_ID_LEN] = *b"STFULL";
+
 /// Max bytes of one `Body` response. Same hard ceiling as every consensus
 /// frame; [`COMPACT_PULL_MAX_IDS`] already keeps an honest response near
 /// 64 × tx size, so the ceiling only ever catches abuse.
@@ -476,6 +488,29 @@ pub struct BodyPull {
 }
 
 impl BodyPull {
+    /// A bounded request for the proposer's FULL proposal at
+    /// `(height, round, block_hash)`.
+    ///
+    /// It rides the existing [`BodyPull`] frame under the reserved
+    /// [`FULL_PROPOSAL_REQUEST_ID`]; the responder answers with the plain
+    /// `ConsensusMsg::Proposal` it already announced (see
+    /// `CompactBodyServer::serve_full_for`). This is the fallback the compact
+    /// resolver uses when a bounded pull cannot complete the body.
+    pub fn full_request(height: u64, round: u32, block_hash: [u8; 32]) -> Self {
+        Self {
+            height,
+            round,
+            block_hash,
+            ids: vec![FULL_PROPOSAL_REQUEST_ID],
+            attempt: 1,
+        }
+    }
+
+    /// True when this pull asks for the FULL proposal, not short ids.
+    pub fn is_full_request(&self) -> bool {
+        self.ids.len() == 1 && self.ids[0] == FULL_PROPOSAL_REQUEST_ID
+    }
+
     /// Structural, fail-closed validation (bounded ids, no duplicates,
     /// bounded attempt, byte ceiling).
     pub fn validate(&self) -> Result<(), CompactRefusal> {
@@ -867,11 +902,14 @@ impl CompactResolver {
         if missing.is_empty() {
             return self.complete().map(|b| Resolution::Complete(Box::new(b)));
         }
-        if missing.len() > COMPACT_PULL_MAX_IDS {
-            return Ok(Resolution::FullProposal(FallbackReason::TooManyMissing {
-                missing: missing.len(),
-            }));
-        }
+        // PULL PAGING (pentest-2 F-6): a cold or divergent mempool can miss
+        // far more than one bounded pull. The old code fell back to
+        // `FullProposal` immediately at >64 misses, which made the documented
+        // fallback a no-op (nothing fetched the body, so the block was
+        // silently lost). Keep issuing bounded pulls page by page instead; the
+        // response size is already capped at `COMPACT_PULL_MAX_IDS` and the
+        // attempt counter still bounds the total work. Only a genuinely
+        // exhausted attempt budget falls back to the full-proposal fetch.
         if self.attempts >= COMPACT_PULL_MAX_ATTEMPTS {
             return Ok(Resolution::FullProposal(FallbackReason::AttemptsExhausted));
         }
@@ -880,7 +918,7 @@ impl CompactResolver {
             height: self.proposal.height,
             round: self.proposal.round,
             block_hash: self.proposal.block_hash,
-            ids: missing,
+            ids: missing.into_iter().take(COMPACT_PULL_MAX_IDS).collect(),
             attempt: self.attempts,
         }))
     }

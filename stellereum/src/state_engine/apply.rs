@@ -8,7 +8,7 @@ use super::verify_once::require_pq_tx_envelope;
 use super::{
     AccountState, ActorMessage, BlockTransitionOutcome, ExecPostActions, GovOpsOutcome,
     HashPoolApplyOutcome, HashPoolBlockOps, HashPoolOpError, InMemoryStateEngine,
-    HASH_POOL_ENABLED, MAX_ACTOR_MSGS_PER_BLOCK, MAX_ACTOR_ROUNDS, PQ_ACTIVATION_SURCHARGE_GAS,
+    HASH_POOL_ENABLED, MAX_ACTOR_MSGS_PER_BLOCK, MAX_ACTOR_ROUNDS,
 };
 use crate::token::TokenRegistry;
 use std::collections::{HashMap, HashSet};
@@ -433,6 +433,28 @@ impl InMemoryStateEngine {
         // spend) - so an empty-payload session transfer cannot bypass the
         // budget any more than it can bypass expiry.
         self.session_gate(tx, timestamp).await?;
+
+        // R7/S6 (consensus, not admission): re-derive the EVM payload's
+        // agreement with its own transaction from block bytes alone. A
+        // hand-built block that bypassed the mempool cannot settle a
+        // different nonce/amount than the EVM intent signed, and a `Mixed`
+        // payload is refused here too (the block path never called the
+        // admission classifier before).
+        crate::evm_adapter::verify_evm_payload_against_tx(tx)?;
+
+        // R7/C2: one signed EVM intent settles at most ONCE. The nullifier
+        // (keccak256 of the raw EVM intent) is committed state; the check is
+        // here, before any value moves, and the mark is written by the apply
+        // path only after the transaction commits successfully.
+        if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
+            if self.evm_intent_is_settled(&digest).await {
+                return Err(format!(
+                    "EVM intent 0x{} already settled: refusing a second settlement of the \
+                     same signed intent",
+                    hex::encode(digest)
+                ));
+            }
+        }
 
         // §1 CROSS-SHARD (out of scope for v1): an actor message is delivered
         // by the mailbox pass of the shard that runs this block, and there is
@@ -1509,6 +1531,15 @@ impl InMemoryStateEngine {
         if let Some(contracts) = deployed_contracts.as_ref() {
             write_contract_trie_entries(&mut trie, contracts);
         }
+        drop(trie);
+        // R7/C2: the carrier committed, so consume its intent nullifier (the
+        // check ran before execution in `execute_payload_with_preverify`).
+        if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
+            self.mark_evm_intent_settled(&digest).await;
+        }
+        // H1: a committed single transaction feeds the same routing/settlement
+        // indexes as a block apply.
+        self.observe_committed_evm_tx(tx);
 
         Ok(())
     }
@@ -1554,11 +1585,12 @@ impl InMemoryStateEngine {
             .copied()
             .unwrap_or(0);
         let floor_base = governed.saturating_add(penalty);
-        let surcharge = if tx.is_pq_activation() {
-            PQ_ACTIVATION_SURCHARGE_GAS
-        } else {
-            0
-        };
+        // R6: ONE definition, the same one admission/reservation/packing use.
+        // It includes the PQ activation surcharge AND the EVM carrier
+        // surcharge, so an admitted carrier cannot be included below the
+        // advertised floor: execution charges the surcharge too, not just
+        // admission.
+        let surcharge = crate::mempool::Mempool::surcharges_for_tx(tx);
         (floor_base, surcharge)
     }
 
@@ -1609,11 +1641,10 @@ impl InMemoryStateEngine {
     ) -> (u64, u64) {
         let floor_base =
             governed_base.saturating_add(penalties.get(&tx.from).copied().unwrap_or(0));
-        let surcharge = if tx.is_pq_activation() {
-            PQ_ACTIVATION_SURCHARGE_GAS
-        } else {
-            0
-        };
+        // R6: identical to `consensus_floor_parts` (PQ activation + EVM carrier
+        // surcharges), so the block path and the single-tx path charge the
+        // same execution fee.
+        let surcharge = crate::mempool::Mempool::surcharges_for_tx(tx);
         (floor_base, surcharge)
     }
 
@@ -2541,11 +2572,22 @@ impl InMemoryStateEngine {
     /// instead of silently forking a second chain under the same height.
     ///
     /// Everything it reads is either block content (`transactions`,
-    /// `timestamp`, `proposer`, `height`, `precommit_qc`) or the one value the
-    /// caller resolves from governance - see `crate::runtime::block_reward_for`,
-    /// which both callers use. Nothing is read from the caller's local
-    /// consensus state (`HeightConsensus`), which is why the two paths cannot
+    /// `timestamp`, `proposer`, `height`, `precommit_qc`) or COMMITTED state
+    /// read from this engine at the block's own pre-state. Nothing is read
+    /// from the caller's local consensus state (`HeightConsensus`) or from a
+    /// caller-held governance copy, which is why the two paths cannot
     /// disagree about what a block does.
+    ///
+    /// BLOCK REWARD (PENTEST2 R1/DET-01): the reward is resolved HERE, from
+    /// the governance state this block is applied against (the PRE-block
+    /// state, before step 5e executes this block's actions), exactly like the
+    /// downtime-attribution set above. The `default_block_reward` argument is
+    /// a STATIC node configuration value used only while governance has never
+    /// set `applied.block_reward`; it can never be a per-tick governance copy.
+    /// Resolving the GOVERNED value in the caller made a `SetBlockReward`
+    /// executed at 5e visible to the live path (which refreshes once per
+    /// tick) but not to a catch-up/walk/restart path, so the same block paid
+    /// different rewards and committed different state roots.
     ///
     /// Order is load-bearing and is exactly the order the live path has always
     /// run in: txs -> actor mailbox -> fees -> reward -> unbonding -> downtime
@@ -2594,8 +2636,17 @@ impl InMemoryStateEngine {
     pub async fn apply_block_transition(
         &self,
         block: &crate::sharding::Block,
-        block_reward: u64,
+        default_block_reward: u64,
     ) -> BlockTransitionOutcome {
+        // R1/DET-01: resolve the block reward from the COMMITTED governance
+        // pre-state, inside the one function every apply path runs. The
+        // caller-supplied value is only the static fallback for a chain whose
+        // governance has never executed `SetBlockReward`; the governed value
+        // itself is never taken from a caller copy.
+        let block_reward = {
+            let gov = self.governance_read().await;
+            gov.applied.block_reward.unwrap_or(default_block_reward)
+        };
         // Downtime-attribution oracle (W10.5 activation boundary): the
         // validator set the `last_qc` downtime evidence (height H-1) is
         // verified and attributed against is snapshotted HERE, from the
@@ -2642,6 +2693,30 @@ impl InMemoryStateEngine {
                 block.height,
             )
             .await;
+
+        // 1a-TER (PENTEST2 H1/M1/S6): feed the deterministic routing /
+        // settlement indexes from COMMITTED, APPLIED transactions and consume
+        // the EVM-intent nullifier of every carrier that actually settled.
+        // Both operations are pure functions of the block bytes + `status`;
+        // they do not move the state root and every apply path (live, adopt,
+        // walk, replay, reorg) runs them, so a restart/catch-up rebuilds the
+        // same maps.
+        //
+        // A duplicate carrier with the same signed intent inside one block is
+        // already refused by the sender nonce (the intent nonce must equal the
+        // Stell nonce, which the first settlement consumes), so the nullifier
+        // written here also protects the block boundary onward; the
+        // pre-execution nullifier check covers every later block and every
+        // hand-built replay.
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if !status.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
+                self.mark_evm_intent_settled(&digest).await;
+            }
+            self.observe_committed_evm_tx(tx);
+        }
 
         // 1a-BIS (pentest F6): record every validator that FULLY exited the
         // set in THIS block, with the power it held at the block's start.
@@ -4268,33 +4343,75 @@ impl InMemoryStateEngine {
     /// loop (no `.await` inside), so the scan is a single critical section.
     /// The two write accessors bump `commitment_generation`, so an applied
     /// proposal/vote moves the state root exactly like the direct path.
+    /// Maximum number of block-carried governance carriers (`GovPropose` /
+    /// `GovVote`) one transaction may APPLY. Every one the VM ran has already
+    /// paid its own `GAS_GOV_*` charge; the cap bounds the committed-state
+    /// growth a single transaction can cause (S4) even when it declares a
+    /// large gas limit. Deterministic: the same block bytes apply the same
+    /// prefix on every node.
+    pub const MAX_GOV_OPS_PER_TX: usize = 8;
+
+    /// Maximum number of block-carried governance carriers one BLOCK may
+    /// apply, across all transactions. Same rationale as
+    /// [`Self::MAX_GOV_OPS_PER_TX`] at block granularity; the excess is
+    /// counted as refused (and was still charged by the VM, which is
+    /// fail-closed in the safe direction).
+    pub const MAX_GOV_OPS_PER_BLOCK: usize = 32;
+
     pub async fn apply_gov_ops(
         &self,
         block: &crate::sharding::Block,
         status: &[bool],
     ) -> GovOpsOutcome {
         use crate::svm::OpCode::*;
-        // Collect first (no locks): the scan order IS the apply order (tx
-        // order, payload order), fixed by the block bytes.
+        // EXECUTED-PREFIX ONLY (PENTEST2 S4). The SVM stops a transaction's
+        // payload at `OpCode::Halt` (`Svm::execute_inner`: `if state.halted
+        // { break }`), so only opcodes BEFORE the halt ran, were verified and
+        // were charged gas. The authoritative scan must apply exactly that
+        // set: a gov op after `Halt` has never been executed by the VM and
+        // settling it would be a free, uncharged state write.
+        //
+        // COLLECT first (no locks): the scan order IS the apply order (tx
+        // order, payload order), fixed by the block bytes. Per-tx and
+        // per-block caps bound the number of proposals/votes one transaction
+        // (and one block) can commit, so a floor-fee transaction cannot bloat
+        // the governance domain without paying per-op gas (the VM charges
+        // GAS_GOV_* for every pre-halt carrier) and without a hard ceiling.
         let mut ops: Vec<(usize, &crate::svm::OpCode)> = Vec::new();
+        let mut out = GovOpsOutcome::default();
         for (i, tx) in block.transactions.iter().enumerate() {
+            let mut per_tx = 0usize;
             for op in &tx.payload {
+                if matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
                 if matches!(op, SysCallGovPropose { .. } | SysCallGovVote { .. }) {
+                    if per_tx >= Self::MAX_GOV_OPS_PER_TX
+                        || ops.len() >= Self::MAX_GOV_OPS_PER_BLOCK
+                    {
+                        // Deterministic refusal: the VM may have executed and
+                        // charged this carrier, but consensus applies at most
+                        // the caps above. Charging more than is applied is
+                        // fail-closed; applying more than is capped is not.
+                        out.refused += 1;
+                        continue;
+                    }
                     ops.push((i, op));
+                    per_tx += 1;
                 }
             }
         }
-        let mut out = GovOpsOutcome::default();
         if ops.is_empty() {
-            // Fast path: legacy blocks queue nothing, so the scan takes no
-            // lock and allocates nothing measurable.
+            // Fast path: legacy blocks (and blocks whose only gov carriers
+            // sit behind a `Halt`) queue nothing, so the scan takes no lock
+            // and allocates nothing measurable.
             return out;
         }
         // Activation gate FIRST (before any lock, read or write):
         // pre-activation every gov op refuses and nothing moves — the
         // standard apply path stays byte-identical.
         if !self.gov_ops_active_at(block.height) {
-            out.refused = ops.len();
+            out.refused += ops.len();
             tracing::warn!(
                 "gov ops refused: block-carried governance is inactive at height {} ({} op(s) skipped, activation = {})",
                 block.height,
@@ -4434,7 +4551,6 @@ impl InMemoryStateEngine {
         let mut gov = self.governance_write().await;
         let mut ledger = self.staking_write().await;
         let finalized = gov.finalize_due_at_height(&mut ledger, block.timestamp, block.height);
-        drop(ledger);
         let mut out = if gov.has_due_oracle_action(block.height) {
             let mut oracle = self.oracle_write().await;
             gov.execute_due_governance_at_height(
@@ -4450,6 +4566,23 @@ impl InMemoryStateEngine {
             )
         };
         out.finalized = finalized;
+        // PENTEST2 S5: a passed `SetMinValidatorBond` must actually change
+        // the CONSENSUS SET FILTER, which reads `staking.min_validator_bond`
+        // (`to_validator_set` / `elected_count`), not just the committed
+        // `applied` snapshot the VM reads for new bonds. The write happens in
+        // the same deterministic apply step, under the same governance+staking
+        // lock order, only when an action EXECUTED in this block — so every
+        // node applying the block derives the same set at the next height
+        // boundary and an ordinary block is byte-identical.
+        if !out.executed.is_empty() {
+            if let Some(min_bond) = gov.applied.min_validator_bond {
+                if ledger.min_validator_bond != Some(min_bond) {
+                    ledger.min_validator_bond = Some(min_bond);
+                }
+            }
+        }
+        drop(ledger);
+        drop(gov);
         if !out.refused.is_empty() {
             // The individual reasons are already logged loudly by the sweep;
             // this line names the height once so an operator can grep the block

@@ -4806,9 +4806,12 @@ impl Node {
         // (утечка/подмена = захват аккаунта). Индексы ящиков (mail:) и файлов (files:) можно
         // реплицировать ТОЛЬКО пирам с соответствующей role хранения — ноды становятся
         // реальными держателями «каталога» писем/файлов для восстановления после потери kv.
+        // `sealed-owner:` is the LOCAL pin that makes a sealed manifest downgrade-proof;
+        // it is never accepted from (or served to) a peer.
         if key.starts_with("recovery:")
             || key.starts_with("blacklist:")
             || key.starts_with("share:")
+            || key.starts_with("sealed-owner:")
         {
             return Some(
                 json!({ "ok": false, "err": "key is local-authoritative" })
@@ -4829,6 +4832,72 @@ impl Node {
                     .to_string()
                     .into_bytes(),
             );
+        }
+        // Sealed-manifest replacement guard (H2): a storage peer may not
+        // downgrade a sealed manifest to the legacy format, nor swap it for
+        // another owner's seal. The MAC itself is verified by the owner on
+        // fetch (a peer does not hold the owner seed), but this stops the
+        // overwrite from destroying the only good copy.
+        if let Some(incoming) = manifest_owner_of(&value) {
+            // A sealed manifest without an owner/auth marker cannot be
+            // authenticated by the owner and must never be stored (it could
+            // otherwise pin an empty identity and shadow the real one).
+            if incoming.is_some() {
+                let parsed = serde_json::from_str::<serde_json::Value>(&value).ok();
+                let has_auth = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("auth").and_then(|a| a.as_str()))
+                    .map(|a| a == BLOB_MANIFEST_AUTH_V1)
+                    .unwrap_or(false);
+                if !has_auth {
+                    return Some(
+                        json!({ "ok": false, "err": "unauthenticated sealed manifest" })
+                            .to_string()
+                            .into_bytes(),
+                    );
+                }
+                // Public signature check: a storage peer refuses a manifest
+                // re-sealed/signed by anyone other than the pinned owner.
+                let pk_ok = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("owner_pk").and_then(|p| p.as_str()))
+                    .map(|pk| {
+                        parsed
+                            .as_ref()
+                            .map(|v| blob_manifest_verify_signature(v, pk))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !pk_ok {
+                    return Some(
+                        json!({ "ok": false, "err": "bad sealed manifest signature" })
+                            .to_string()
+                            .into_bytes(),
+                    );
+                }
+            }
+            let pin_key = format!("sealed-owner:{key}");
+            let pinned = match self.get_local_kv(&pin_key).await {
+                Some(p) => Some(p),
+                None => self
+                    .get_local_kv(&key)
+                    .await
+                    .and_then(|v| manifest_owner_of(&v))
+                    .flatten(),
+            };
+            if let Some(owner) = pinned {
+                if incoming.as_deref() != Some(owner.as_str()) {
+                    return Some(
+                        json!({ "ok": false, "err": "sealed manifest owner mismatch" })
+                            .to_string()
+                            .into_bytes(),
+                    );
+                }
+            }
+            if let Some(owner) = incoming {
+                self.kv_store_local_with_ttl(&pin_key, &owner, ttl * 1000)
+                    .await;
+            }
         }
         // LWW по stored_at (если отправитель прислал): не затирать свежую локальную запись
         // устаревшей репликацией. Если stored_at не прислан — сохраняем текущее поведение.
@@ -4906,6 +4975,7 @@ impl Node {
         if key.starts_with("recovery:")
             || key.starts_with("blacklist:")
             || key.starts_with("share:")
+            || key.starts_with("sealed-owner:")
         {
             return Some(
                 json!({ "ok": true, "found": false })
@@ -4983,6 +5053,7 @@ impl Node {
                 if k.starts_with("recovery:")
                     || k.starts_with("blacklist:")
                     || k.starts_with("share:")
+                    || k.starts_with("sealed-owner:")
                 {
                     continue;
                 }
@@ -5030,6 +5101,7 @@ impl Node {
                         if k.starts_with("share:")
                             || k.starts_with("recovery:")
                             || k.starts_with("blacklist:")
+                            || k.starts_with("sealed-owner:")
                         {
                             continue;
                         }
@@ -6640,8 +6712,9 @@ impl Node {
         blob: &[u8],
         ttl_ms: i64,
     ) -> usize {
-        self.store_blob_boxed_with_ttl(bucket, name, blob, None, ttl_ms)
+        self.store_blob_impl(bucket, name, blob, None, None, ttl_ms, false)
             .await
+            .chunks
     }
 
     /// store_blob с владельческим запечатыванием: если owner_pub задан
@@ -6651,8 +6724,17 @@ impl Node {
     /// только владелец ML-KEM-сида (через `fetch_blob_owner`). Payload
     /// AEAD-привязан к (bucket, name, H(plaintext)) — см. `blob_seal_aad`.
     ///
-    /// Fail-closed: если owner_pub задан, но не является валидным ML-KEM-768
-    /// ek, запись ОТКАЗЫВАЕТСЯ (0), а не деградирует до plaintext-key.
+    /// `owner_secret` — the owner's ML-KEM **seed** (64 bytes hex). It is
+    /// REQUIRED whenever `owner_pub` is set: the manifest is MAC'd with a key
+    /// derived from that seed AND signed by a Falcon key derived from it, so a
+    /// storage peer can neither forge a manifest nor replace/downgrade an
+    /// existing sealed one for the same (bucket, name). Passing only the
+    /// public ek is not enough to sign, so that call is refused (0) rather
+    /// than writing an unauthenticated manifest.
+    ///
+    /// Fail-closed: if owner_pub is set but is not a valid ML-KEM-768 ek or
+    /// `owner_secret` does not correspond to it, the write is REFUSED (0) —
+    /// it never degrades to a plaintext key or an unsigned seal.
     ///
     /// ИДЕМПОТЕНТНОСТЬ: chunk_id по-прежнему считается от H(plaintext)
     /// (`chunk_id_for`), поэтому повторный publish того же имени пишет в ТЕ ЖЕ
@@ -6666,27 +6748,119 @@ impl Node {
         name: &str,
         blob: &[u8],
         owner_pub: Option<&str>,
-    ) -> usize {
-        self.store_blob_boxed_with_ttl(bucket, name, blob, owner_pub, 30 * 24 * 3600 * 1000)
-            .await
+        owner_secret: Option<&str>,
+    ) -> BlobStoreReport {
+        self.store_blob_boxed_with_ttl(
+            bucket,
+            name,
+            blob,
+            owner_pub,
+            owner_secret,
+            30 * 24 * 3600 * 1000,
+        )
+        .await
     }
 
     /// `store_blob_boxed` с явным TTL манифеста (мс). См. `store_blob_with_ttl`.
+    ///
+    /// Replication is AWAITED (bounded at 20 s) so the returned
+    /// [`BlobStoreReport::replicas`] is a real count, not a promise. A one-shot
+    /// CLI no longer kills the spawned task on exit, and a zero-replica write
+    /// is visible to the caller.
     pub async fn store_blob_boxed_with_ttl(
         self: &Arc<Self>,
         bucket: &str,
         name: &str,
         blob: &[u8],
         owner_pub: Option<&str>,
+        owner_secret: Option<&str>,
         ttl_ms: i64,
-    ) -> usize {
-        const CHUNK: usize = 1024 * 1024;
+    ) -> BlobStoreReport {
+        self.store_blob_impl(
+            bucket,
+            name,
+            blob,
+            owner_pub,
+            owner_secret,
+            ttl_ms,
+            true,
+        )
+        .await
+    }
+
+    /// Shared sealed/unsealed write path.
+    ///
+    /// `await_replication`: owner-sealed writes (CLI + web) wait for the
+    /// bounded replica count; the chain's high-volume `store_blob` path keeps
+    /// the old background replication (it reports chunk count, not durability).
+    #[allow(clippy::too_many_arguments)] // GATE: full blob context + durability mode
+    async fn store_blob_impl(
+        self: &Arc<Self>,
+        bucket: &str,
+        name: &str,
+        blob: &[u8],
+        owner_pub: Option<&str>,
+        owner_secret: Option<&str>,
+        ttl_ms: i64,
+        await_replication: bool,
+    ) -> BlobStoreReport {
+        const CHUNK: usize = BLOB_CHUNK_BYTES;
         let content_hash = blob_content_hash(blob);
         // Два режима:
         //  - owner_pub: настоящая конфиденциальность (случайный DEK + ML-KEM box, AAD);
         //  - None: legacy at-rest обфускация (публично выводимый ключ + "key" в манифесте).
         let (data_key, nonce, key_box, sealed) = match owner_pub {
             Some(pub_hex) => {
+                let Some(secret_hex) = owner_secret else {
+                    eprintln!(
+                        "[node] store_blob {bucket}/{name}: owner_secret (ML-KEM seed) is required \
+                         to authenticate a sealed manifest; refusing"
+                    );
+                    return BlobStoreReport::default();
+                };
+                let _owner_id = match (
+                    blob_owner_id_from_pub(pub_hex),
+                    blob_owner_id_from_seed(secret_hex),
+                ) {
+                    (Some(a), Some(b)) if a == b => a,
+                    _ => {
+                        eprintln!(
+                            "[node] store_blob {bucket}/{name}: owner_secret does not match owner_pub \
+                             (or is not a 64-byte ML-KEM seed); refusing"
+                        );
+                        return BlobStoreReport::default();
+                    }
+                };
+                let signer = match blob_manifest_signer(secret_hex) {
+                    Some(s) => s,
+                    None => return BlobStoreReport::default(),
+                };
+                let signer_id = match blob_manifest_signer_id(&signer.pq_pub_hex()) {
+                    Some(id) => id,
+                    None => return BlobStoreReport::default(),
+                };
+                // Refuse a sealed write that would replace another owner's
+                // sealed manifest. The owner may re-publish their own name.
+                if let Some(prev) = self.get_local_kv(&Self::blob_manifest_key(bucket, name)).await
+                {
+                    if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&prev) {
+                        if prev.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1) {
+                            let prev_signer = prev
+                                .get("owner_pk")
+                                .and_then(|v| v.as_str())
+                                .and_then(blob_manifest_signer_id);
+                            if let Some(prev_signer) = prev_signer {
+                                if prev_signer != signer_id {
+                                    eprintln!(
+                                        "[node] store_blob {bucket}/{name}: existing sealed manifest \
+                                         belongs to a different owner; refusing replacement"
+                                    );
+                                    return BlobStoreReport::default();
+                                }
+                            }
+                        }
+                    }
+                }
                 let (k, n) = random_blob_key_nonce();
                 match box_wrap_key(pub_hex, &k) {
                     Some(kb) => (k, n, Some(kb), true),
@@ -6696,15 +6870,29 @@ impl Node {
                              ({} hex chars expected); refusing to write a plaintext data key",
                             crate::mailbox::KEM_EK_LEN * 2
                         );
-                        return 0;
+                        return BlobStoreReport::default();
                     }
                 }
             }
             None => {
+                // A legacy write must not silently downgrade a sealed name.
+                if let Some(prev) = self.get_local_kv(&Self::blob_manifest_key(bucket, name)).await
+                {
+                    if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&prev) {
+                        if prev.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1) {
+                            eprintln!(
+                                "[node] store_blob {bucket}/{name}: refusing to downgrade an \
+                                 authenticated sealed manifest to the legacy format"
+                            );
+                            return BlobStoreReport::default();
+                        }
+                    }
+                }
                 let (k, n) = blob_key_nonce(bucket, name, &content_hash);
                 (k, n, None, false)
             }
         };
+
         let aad = if sealed {
             blob_seal_aad(bucket, name, &content_hash)
         } else {
@@ -6718,7 +6906,8 @@ impl Node {
         // СИНХРОННО на storage-ноды (ждём хотя бы одну реплику) — иначе манифест есть,
         // а чанк теряется (баг: файл "загружен", но не скачивается).
         let have_role = self.role_allows(bucket);
-        let mut repl_ok = false;
+        // Minimum per-chunk peer replicas (usize::MAX until at least one chunk).
+        let mut min_chunk_replicas = usize::MAX;
         while offset < ct.len() {
             let end = (offset + CHUNK).min(ct.len());
             let chunk = &ct[offset..end];
@@ -6726,13 +6915,13 @@ impl Node {
             if have_role {
                 let dir = self.chunks_dir(bucket);
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = write_chunk_atomic(&dir, &chunk_id, chunk);
-                local_chunks += 1;
+                if write_chunk_atomic(&dir, &chunk_id, chunk).is_ok() {
+                    local_chunks += 1;
+                }
             } else {
                 // синхронная репликация чанка на storage-ноды
-                if self.store_chunk_replicated(bucket, &chunk_id, chunk).await > 0 {
-                    repl_ok = true;
-                }
+                let n = self.store_chunk_replicated(bucket, &chunk_id, chunk).await;
+                min_chunk_replicas = min_chunk_replicas.min(n);
             }
             chunks.push(json!({
                 "id": chunk_id,
@@ -6755,6 +6944,35 @@ impl Node {
             manifest["seal"] = json!(BLOB_SEAL_V1);
             manifest["content_hash"] = json!(hex::encode(content_hash));
             manifest["key_box"] = kb;
+            // Authenticate every field the reader trusts. Without an owner
+            // seed there is no sealed write at all (checked above), so the
+            // `expect` is unreachable for this branch.
+            let secret_hex = owner_secret.expect("sealed branch requires owner_secret");
+            let owner_id = blob_owner_id_from_seed(secret_hex).expect("owner id validated above");
+            manifest["owner"] = json!(owner_id);
+            manifest["auth"] = json!(BLOB_MANIFEST_AUTH_V1);
+            let mac = blob_manifest_mac(secret_hex, &manifest)
+                .expect("sealed manifest must be MAC-able");
+            manifest["mac"] = json!(mac);
+            // Public signature: any storage peer can verify authorship and
+            // refuse a replacement signed by a different key, without holding
+            // the owner seed.
+            let signer = blob_manifest_signer(secret_hex).expect("signer derived from seed");
+            let pk = signer.pq_pub();
+            let signer_id =
+                blob_manifest_signer_id(&hex::encode(&pk)).expect("signer id from pk");
+            let digest =
+                blob_manifest_sig_digest(&manifest, &pk).expect("sealed manifest must sign");
+            manifest["owner_pk"] = json!(hex::encode(&pk));
+            manifest["sig"] = json!(hex::encode(signer.sign_digest(&digest)));
+            // Pin the signer so a later fetch can detect a downgrade even if
+            // the replacement is self-consistent.
+            self.kv_store_local_with_ttl(
+                &sealed_owner_key(bucket, name),
+                &signer_id,
+                ttl_ms,
+            )
+            .await;
         } else {
             // Legacy at-rest обфускация (owner_pub == None). Не E2E.
             manifest["key"] = json!(hex::encode(data_key));
@@ -6762,33 +6980,66 @@ impl Node {
         let mkey = Self::blob_manifest_key(bucket, name);
         self.kv_store_local_with_ttl(&mkey, &manifest.to_string(), ttl_ms)
             .await;
-        let node = self.clone();
-        let name = name.to_string();
-        let bucket = bucket.to_string();
-        let ct = ct.clone();
+        // Replication is awaited: a one-shot CLI must not print "put ok"
+        // before the manifest/chunks actually left the machine, and the
+        // caller needs a real replica count. The 20 s bound matches the old
+        // background timeout.
         let manifest_str = manifest.to_string();
-        let mkey2 = mkey.clone();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(
+        let mut peer_replicas = if await_replication {
+            tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                node.replicate_blob(
-                    &bucket,
-                    &name,
+                self.replicate_blob(
+                    bucket,
+                    name,
                     &ct,
                     &manifest_str,
-                    &mkey2,
+                    &mkey,
                     &content_hash,
                     ttl_ms,
                 ),
             )
-            .await;
-        });
-        if have_role {
-            local_chunks
-        } else if repl_ok {
-            1
+            .await
+            .unwrap_or_default()
         } else {
+            // High-volume chain path: replicate in the background exactly as
+            // before (the caller reports chunk count, not a replica promise).
+            let node = self.clone();
+            let bucket_owned = bucket.to_string();
+            let name_owned = name.to_string();
+            let ct_owned = ct.clone();
+            let manifest_owned = manifest_str.clone();
+            let mkey_owned = mkey.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    node.replicate_blob(
+                        &bucket_owned,
+                        &name_owned,
+                        &ct_owned,
+                        &manifest_owned,
+                        &mkey_owned,
+                        &content_hash,
+                        ttl_ms,
+                    ),
+                )
+                .await;
+            });
             0
+        };
+        let local_replica = have_role && local_chunks == chunks.len();
+        if !have_role && chunks.is_empty() {
+            peer_replicas = 0;
+        }
+        let replicas = if local_replica {
+            1 + peer_replicas
+        } else if have_role || chunks.is_empty() {
+            peer_replicas
+        } else {
+            min_chunk_replicas.min(peer_replicas)
+        };
+        BlobStoreReport {
+            chunks: chunks.len(),
+            replicas,
         }
     }
 
@@ -6808,9 +7059,9 @@ impl Node {
         mkey: &str,
         content_hash: &[u8; 32],
         ttl_ms: i64,
-    ) {
+    ) -> usize {
         let mut offset = 0usize;
-        const CHUNK: usize = 1024 * 1024;
+        const CHUNK: usize = BLOB_CHUNK_BYTES;
         while offset < ct.len() {
             let end = (offset + CHUNK).min(ct.len());
             let chunk = &ct[offset..end];
@@ -6827,11 +7078,21 @@ impl Node {
         // life by a full TTL per hop.
         let stored_at = self.kv.read().await.stored_at(mkey);
         let payload = json!({ "key": mkey, "value": manifest_str, "ttl": ttl_ms / 1000, "stored_at": stored_at }).to_string().into_bytes();
+        let mut replicas = 0usize;
         for n in closest {
             if self.ensure_dht_peer(&n).await.is_ok() {
-                let _ = self.request_to(n.id, "dht.store", payload.clone()).await;
+                if let Ok(resp) = self.request_to(n.id, "dht.store", payload.clone()).await {
+                    if serde_json::from_slice::<serde_json::Value>(&resp)
+                        .ok()
+                        .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+                        .unwrap_or(false)
+                    {
+                        replicas += 1;
+                    }
+                }
             }
         }
+        replicas
     }
 
     /// Скачать блоб из произвольного бакета (манифест + чанки + расшифровка).
@@ -6848,6 +7109,12 @@ impl Node {
     /// Скачать owner-sealed блоб, распаковав `key_box` ML-KEM-768 сидом
     /// владельца (64 байта hex). Только владелец (или получивший его сид)
     /// может прочитать данные.
+    ///
+    /// Sealed manifests MUST carry the v1 owner MAC (`auth` + `owner` + `mac`).
+    /// Pre-auth sealed manifests (written before `BLOB_MANIFEST_AUTH_V1`) are
+    /// refused fail-closed: accepting them would re-open the downgrade /
+    /// substitution hole (the AAD and content hash are self-referential).
+    /// Such blobs must be re-published by the owner.
     pub async fn fetch_blob_owner(
         self: &Arc<Self>,
         bucket: &str,
@@ -6894,10 +7161,32 @@ impl Node {
         let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
         let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).ok()?;
         let sealed = manifest.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1);
+        let pin = self.get_local_kv(&sealed_owner_key(bucket, name)).await;
         // (data_key, aad, claimed content hash after decrypt)
         let (dk, aad, want_hash): ([u8; 32], Vec<u8>, Option<[u8; 32]>) = if sealed {
             // Owner-sealed: ключ только в key_box (ML-KEM-768 на владельца).
             let priv_hex = owner_priv?;
+            // Authentication FIRST: a storage peer can replace the whole
+            // manifest (and its chunks) through dht.store, and the AAD /
+            // content-hash checks below are self-referential. The owner MAC
+            // binds every field to the owner seed, which a peer does not have.
+            if !blob_manifest_verify(&manifest, priv_hex) {
+                eprintln!(
+                    "[node] fetch_blob {bucket}/{name}: sealed manifest authentication failed"
+                );
+                return None;
+            }
+            let owner_pk = manifest.get("owner_pk").and_then(|v| v.as_str())?;
+            let signer_id = blob_manifest_signer_id(owner_pk)?;
+            if let Some(pinned) = pin.as_deref() {
+                if pinned != signer_id {
+                    eprintln!(
+                        "[node] fetch_blob {bucket}/{name}: sealed manifest owner changed \
+                         (pinned {pinned}); refusing"
+                    );
+                    return None;
+                }
+            }
             let kb = manifest.get("key_box")?;
             let dk = box_unwrap_key(kb, priv_hex).ok()?;
             let ch = hex::decode(manifest["content_hash"].as_str()?).ok()?;
@@ -6908,10 +7197,21 @@ impl Node {
             h.copy_from_slice(&ch);
             let aad = blob_seal_aad(bucket, name, &h);
             (dk, aad, Some(h))
-        } else if let Some(kb) = manifest.get("key_box") {
-            // Legacy boxed-манифест (до BLOB_SEAL_V1): key_box есть, AAD нет.
-            let priv_hex = owner_priv?;
-            (box_unwrap_key(kb, priv_hex).ok()?, Vec::new(), None)
+        } else if owner_priv.is_some() || pin.is_some() {
+            // Downgrade refused: once a name is sealed (pinned) an unsealed
+            // manifest is never trusted, and an owner-key fetch never opens
+            // an unauthenticated format (the legacy at-rest format is only
+            // reachable through `fetch_blob`, which does not take a key).
+            eprintln!(
+                "[node] fetch_blob {bucket}/{name}: refusing unsealed manifest for an \
+                 owner/pinned fetch (downgrade)"
+            );
+            return None;
+        } else if manifest.get("key_box").is_some() {
+            // Pre-BLOB_SEAL_V1 boxed manifests have no content binding and no
+            // MAC. They are not accepted through the owner path; `fetch_blob`
+            // cannot open them without a key either.
+            return None;
         } else {
             let key = hex::decode(manifest["key"].as_str().unwrap_or("")).ok()?;
             if key.len() != 32 {
@@ -6921,52 +7221,102 @@ impl Node {
             k.copy_from_slice(&key);
             (k, Vec::new(), None)
         };
+        // Manifest bounds (M4): a tiny manifest must not name tens of
+        // thousands of chunks. Validate the chunk table (count, contiguity,
+        // lengths, hash shape) BEFORE any network lookup, and require the
+        // declared `size` to be consistent with the ciphertext length
+        // (`size + 16` for the single AEAD tag).
+        let size = manifest["size"].as_u64()? as usize;
+        let chunks = manifest["chunks"].as_array()?;
+        let max_by_size = size.div_ceil(BLOB_CHUNK_BYTES).saturating_add(2);
+        if chunks.is_empty() || chunks.len() > MAX_BLOB_CHUNKS || chunks.len() > max_by_size {
+            eprintln!(
+                "[node] fetch_blob {bucket}/{name}: manifest chunk count {} exceeds bounds \
+                 (size {size}, max {})",
+                chunks.len(),
+                max_by_size.min(MAX_BLOB_CHUNKS)
+            );
+            return None;
+        }
+        let mut expected_off = 0usize;
+        for c in chunks {
+            let cid = c["id"].as_str().unwrap_or("");
+            if !self.valid_chunk_id(cid) {
+                return None;
+            }
+            let off = c["off"].as_u64()? as usize;
+            let len = c["len"].as_u64()? as usize;
+            if off != expected_off || len == 0 || len > BLOB_CHUNK_BYTES {
+                eprintln!("[node] fetch_blob {bucket}/{name}: non-contiguous chunk table");
+                return None;
+            }
+            // Sealed manifests always carry a chunk hash (it is MAC-covered).
+            // Legacy manifests may omit it; keep the old optional check there.
+            if let Some(h) = c.get("hash").and_then(|h| h.as_str()) {
+                let hash = hex::decode(h).ok()?;
+                if hash.len() != 32 {
+                    return None;
+                }
+            } else if sealed {
+                return None;
+            }
+            expected_off = expected_off.checked_add(len)?;
+        }
+        // A sealed writer emits the whole ciphertext (plaintext + one AEAD
+        // tag); legacy manifests written by `store_blob` do too. Synthetic /
+        // hand-built legacy manifests may declare only the plaintext length,
+        // which is still bounded by the same consistency rule.
+        let exact = size.checked_add(16)?;
+        if expected_off != exact && (sealed || expected_off != size) {
+            eprintln!(
+                "[node] fetch_blob {bucket}/{name}: manifest size {size} inconsistent with \
+                 {expected_off} ciphertext bytes"
+            );
+            return None;
+        }
         let mut buf: Vec<u8> = Vec::new();
-        if let Some(chunks) = manifest["chunks"].as_array() {
-            for c in chunks {
-                let cid = c["id"].as_str().unwrap_or("");
-                let mut got = self.local_chunk_get(bucket, cid);
-                if got.is_none() {
-                    // таргет = blake3("{bucket}:{cid}") — совпадает с записью (store_chunk_replicated)
-                    let h = blake3::hash(format!("{bucket}:{cid}").as_bytes());
-                    let mut target = [0u8; NODEID_LEN];
-                    target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
-                    let closest = self.dht_find_node(&target).await;
-                    // ДВА ПРОХОДА (см. fetch_mail_inner): живые соединения первыми.
-                    for pass in 0..2u8 {
+        for c in chunks {
+            let cid = c["id"].as_str().unwrap_or("");
+            let mut got = self.local_chunk_get(bucket, cid);
+            if got.is_none() {
+                // таргет = blake3("{bucket}:{cid}") — совпадает с записью (store_chunk_replicated)
+                let h = blake3::hash(format!("{bucket}:{cid}").as_bytes());
+                let mut target = [0u8; NODEID_LEN];
+                target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
+                let closest = self.dht_find_node(&target).await;
+                // ДВА ПРОХОДА (см. fetch_mail_inner): живые соединения первыми.
+                for pass in 0..2u8 {
+                    if got.is_some() {
+                        break;
+                    }
+                    for n in closest.iter() {
                         if got.is_some() {
                             break;
                         }
-                        for n in closest.iter() {
-                            if got.is_some() {
-                                break;
-                            }
-                            let live = self.pick_conn(None, n.id).await.is_some();
-                            if (pass == 0) != live {
-                                continue;
-                            }
-                            if self.ensure_dht_peer(n).await.is_ok() {
-                                if let Ok(resp) = self
-                                    .request_to(
-                                        n.id,
-                                        "storage.fetch",
-                                        json!({ "bucket": bucket, "chunk_id": cid })
-                                            .to_string()
-                                            .into_bytes(),
-                                    )
-                                    .await
+                        let live = self.pick_conn(None, n.id).await.is_some();
+                        if (pass == 0) != live {
+                            continue;
+                        }
+                        if self.ensure_dht_peer(n).await.is_ok() {
+                            if let Ok(resp) = self
+                                .request_to(
+                                    n.id,
+                                    "storage.fetch",
+                                    json!({ "bucket": bucket, "chunk_id": cid })
+                                        .to_string()
+                                        .into_bytes(),
+                                )
+                                .await
+                            {
+                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp)
                                 {
-                                    if let Ok(v) =
-                                        serde_json::from_slice::<serde_json::Value>(&resp)
-                                    {
-                                        if v["ok"].as_bool().unwrap_or(false) {
-                                            if let Some(b64) = v["data"].as_str() {
-                                                got = base64::Engine::decode(
-                                                    &base64::engine::general_purpose::STANDARD,
-                                                    b64,
-                                                )
-                                                .ok();
-                                            }
+                                    if v["ok"].as_bool().unwrap_or(false) {
+                                        if let Some(b64) = v["data"].as_str() {
+                                            got = base64::Engine::decode(
+                                                &base64::engine::general_purpose::STANDARD,
+                                                b64,
+                                            )
+                                            .ok();
                                         }
                                     }
                                 }
@@ -6974,18 +7324,18 @@ impl Node {
                         }
                     }
                 }
-                // проверка целостности: хэш чанка должен совпасть с манифестом (подмена?)
-                if let Some(expected) = c["hash"].as_str() {
-                    if let Some(g) = &got {
-                        let actual = hex::encode(blake3::hash(g).as_bytes());
-                        if !actual.eq_ignore_ascii_case(expected) {
-                            eprintln!("[node] chunk tamper: {cid} in {name} (hash mismatch)");
-                            got = None;
-                        }
+            }
+            // проверка целостности: хэш чанка должен совпасть с манифестом (подмена?)
+            if let Some(expected) = c["hash"].as_str() {
+                if let Some(g) = &got {
+                    let actual = hex::encode(blake3::hash(g).as_bytes());
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        eprintln!("[node] chunk tamper: {cid} in {name} (hash mismatch)");
+                        got = None;
                     }
                 }
-                buf.extend_from_slice(&got?);
             }
+            buf.extend_from_slice(&got?);
         }
         let plain = e2e_decrypt_aad(&dk, &nonce, &aad, &buf).ok()?;
         if let Some(want) = want_hash {
@@ -8372,6 +8722,259 @@ pub fn e2e_encrypt(key: &[u8; 32], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// ML-KEM-768 encapsulation key, payload AEAD-bound to the canonical AAD
 /// from [`blob_seal_aad`].
 pub const BLOB_SEAL_V1: &str = "infnode-blob-seal-v1";
+
+/// Manifest authentication scheme for owner-sealed blobs (see
+/// [`blob_manifest_mac`] and [`blob_manifest_sign`]). The AAD/content-hash
+/// checks in [`Node::fetch_blob_inner`] are self-referential: they compare the
+/// payload to values carried by the same manifest, so a storage peer could
+/// substitute a whole manifest and its chunks. Every sealed manifest therefore
+/// carries:
+/// * `mac` — keyed hash over the canonical manifest, keyed by the owner's
+///   ML-KEM seed (proves the writer knew the owner secret to the owner);
+/// * `owner_pk` + `sig` — a Falcon-512 signature by a key derived from the
+///   same seed, so ANY peer can verify authorship and refuse a replacement
+///   signed by a different key.
+pub const BLOB_MANIFEST_AUTH_V1: &str = "infnode-blob-manifest-hmac-v1";
+
+/// Hard cap on `chunks[]` in a blob manifest (4 GiB at the 1 MiB chunk size).
+/// The manifest itself is capped at 1 MiB by the DHT value bound, but a tiny
+/// manifest can name tens of thousands of chunks; each miss costs a full DHT
+/// lookup. A manifest whose count is also inconsistent with its declared
+/// `size` is refused before any network work.
+pub const MAX_BLOB_CHUNKS: usize = 4096;
+
+/// Ciphertext chunk size used by [`Node::store_blob_boxed_with_ttl`].
+pub const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Outcome of a sealed bucket write.
+///
+/// `chunks` is the number of ciphertext chunks the write produced (0 means the
+/// seal was refused and NOTHING was written). `replicas` is the number of
+/// durable holders known AFTER the bounded replication wait: 1 when this node
+/// stores the bucket locally, plus one per peer that accepted the manifest
+/// (and, when the node holds no storage role, capped by the minimum number of
+/// peers that accepted each chunk). A caller must not report "put ok" when
+/// `replicas == 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlobStoreReport {
+    pub chunks: usize,
+    pub replicas: usize,
+}
+
+
+fn blob_owner_id_from_ek(ek: &[u8]) -> String {
+    hex::encode(blake3::hash(ek).as_bytes())
+}
+
+/// Stable identity of a manifest signer (hash of the Falcon public key).
+fn blob_manifest_signer_id(pk_hex: &str) -> Option<String> {
+    let pk = hex::decode(pk_hex).ok()?;
+    if pk.is_empty() {
+        return None;
+    }
+    Some(hex::encode(blake3::hash(&pk).as_bytes()))
+}
+
+/// Owner identity of an ML-KEM seed (hex): the hash of its encapsulation key.
+fn blob_owner_id_from_seed(seed_hex: &str) -> Option<String> {
+    let seed = hex::decode(seed_hex).ok()?;
+    if seed.len() != crate::mailbox::KEM_SEED_LEN {
+        return None;
+    }
+    let seed: [u8; crate::mailbox::KEM_SEED_LEN] = seed.try_into().ok()?;
+    Some(blob_owner_id_from_ek(&crate::mailbox::kem_ek_from_seed(
+        &seed,
+    )))
+}
+
+fn blob_owner_id_from_pub(ek_hex: &str) -> Option<String> {
+    let ek = hex::decode(ek_hex).ok()?;
+    if ek.len() != crate::mailbox::KEM_EK_LEN {
+        return None;
+    }
+    Some(blob_owner_id_from_ek(&ek))
+}
+
+/// Keyed-hash key for the manifest MAC. Derived from the owner's KEM seed so
+/// the seed is never used directly as a key and the MAC domain is separated
+/// from the blob encryption key.
+fn blob_manifest_mac_key(seed_hex: &str) -> Option<[u8; 32]> {
+    let seed = hex::decode(seed_hex).ok()?;
+    if seed.len() != crate::mailbox::KEM_SEED_LEN {
+        return None;
+    }
+    Some(blake3::derive_key(BLOB_MANIFEST_AUTH_V1, &seed))
+}
+
+fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Canonical byte string covered by the manifest MAC. Every field that affects
+/// what the reader trusts is included: bucket, name, size, nonce, seal,
+/// owner, key_box, content hash and the full chunk table. JSON object order is
+/// NOT relied on.
+fn blob_manifest_mac_input(m: &serde_json::Value) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(b"infnode-blob-manifest-v1");
+    for field in [
+        "bucket",
+        "name",
+        "seal",
+        "owner",
+        "nonce",
+        "content_hash",
+    ] {
+        push_len_prefixed(&mut out, m[field].as_str()?.as_bytes());
+    }
+    out.extend_from_slice(&m["size"].as_u64()?.to_be_bytes());
+    let key_box = serde_json::to_vec(&m["key_box"]).ok()?;
+    push_len_prefixed(&mut out, &key_box);
+    let chunks = m["chunks"].as_array()?;
+    out.extend_from_slice(&(chunks.len() as u64).to_be_bytes());
+    for c in chunks {
+        push_len_prefixed(&mut out, c["id"].as_str()?.as_bytes());
+        out.extend_from_slice(&c["off"].as_u64()?.to_be_bytes());
+        out.extend_from_slice(&c["len"].as_u64()?.to_be_bytes());
+        push_len_prefixed(&mut out, c["hash"].as_str()?.as_bytes());
+    }
+    Some(out)
+}
+
+/// Compute the owner MAC for a sealed manifest (hex). `None` when the seed is
+/// not a 64-byte ML-KEM seed or the manifest lacks a signed field.
+pub fn blob_manifest_mac(owner_seed_hex: &str, manifest: &serde_json::Value) -> Option<String> {
+    let key = blob_manifest_mac_key(owner_seed_hex)?;
+    let input = blob_manifest_mac_input(manifest)?;
+    Some(hex::encode(blake3::keyed_hash(&key, &input).as_bytes()))
+}
+
+/// Sign a sealed manifest with the owner-derived Falcon key. Returns
+/// `(owner_pk_hex, sig_hex)`; the caller stores them as `owner_pk` / `sig`.
+pub fn blob_manifest_sign(
+    owner_seed_hex: &str,
+    manifest: &serde_json::Value,
+) -> Option<(String, String)> {
+    let signer = blob_manifest_signer(owner_seed_hex)?;
+    let pk = signer.pq_pub();
+    let digest = blob_manifest_sig_digest(manifest, &pk)?;
+    let sig = signer.sign_digest(&digest);
+    Some((hex::encode(pk), hex::encode(sig)))
+}
+
+/// Verify `owner` + `auth` + `mac` on a sealed manifest against the owner seed.
+/// Fail-closed on any missing/malformed/mismatching field.
+pub fn blob_manifest_verify(manifest: &serde_json::Value, owner_seed_hex: &str) -> bool {
+    if manifest.get("auth").and_then(|v| v.as_str()) != Some(BLOB_MANIFEST_AUTH_V1) {
+        return false;
+    }
+    let Some(expected_owner) = blob_owner_id_from_seed(owner_seed_hex) else {
+        return false;
+    };
+    if manifest.get("owner").and_then(|v| v.as_str()) != Some(expected_owner.as_str()) {
+        return false;
+    }
+    match (
+        manifest.get("mac").and_then(|v| v.as_str()),
+        blob_manifest_mac(owner_seed_hex, manifest),
+    ) {
+        (Some(got), Some(want)) => {
+            if !got.eq_ignore_ascii_case(&want) {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    // Public verifiability: the manifest is signed by a Falcon key DETERMINED
+    // by the owner seed, so a storage peer can verify authorship without the
+    // seed and an owner fetch can pin the signer to the seed.
+    let Some(signer) = blob_manifest_signer(owner_seed_hex) else {
+        return false;
+    };
+    blob_manifest_verify_signature(manifest, &signer.pq_pub_hex())
+}
+
+/// Deterministic Falcon-512 signer for a sealed manifest. The key is derived
+/// from the owner's ML-KEM seed with a dedicated domain: possessing the seed
+/// is what makes an owner able to replace a manifest, and every peer can
+/// verify the result with the public key carried in the manifest.
+fn blob_manifest_signer(owner_seed_hex: &str) -> Option<PqKeys> {
+    let seed = hex::decode(owner_seed_hex).ok()?;
+    if seed.len() != crate::mailbox::KEM_SEED_LEN {
+        return None;
+    }
+    // `falcon-rust` keygen can panic on rare seeds; derive deterministically
+    // and retry with the next domain-separated seed (never crash a fetch).
+    for attempt in 0u8..32 {
+        let mut h = blake3::Hasher::new_derive_key("infnode-blob-manifest-sign-v1");
+        h.update(&seed);
+        h.update(&[attempt]);
+        let key_seed = *h.finalize().as_bytes();
+        if let Ok(keys) = std::panic::catch_unwind(|| PqKeys::from_seed(key_seed)) {
+            return Some(keys);
+        }
+    }
+    None
+}
+
+fn blob_manifest_sig_digest(manifest: &serde_json::Value, pk: &[u8]) -> Option<[u8; 32]> {
+    let input = blob_manifest_mac_input(manifest)?;
+    let mut buf = Vec::with_capacity(input.len() + pk.len() + 64);
+    buf.extend_from_slice(b"infnode-blob-manifest-signature-v1");
+    push_len_prefixed(&mut buf, &input);
+    push_len_prefixed(&mut buf, pk);
+    Some(*blake3::hash(&buf).as_bytes())
+}
+
+/// Public verification used by storage peers and by the owner fetch.
+///
+/// Covers the FULL canonical manifest plus the signer key. Returns false on
+/// any malformed field, a key mismatch, or an invalid Falcon tag.
+fn blob_manifest_verify_signature(manifest: &serde_json::Value, expected_pk_hex: &str) -> bool {
+    let Some(pk_hex) = manifest.get("owner_pk").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !pk_hex.eq_ignore_ascii_case(expected_pk_hex) {
+        return false;
+    }
+    let Some(sig_hex) = manifest.get("sig").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let (Ok(pk), Ok(sig)) = (hex::decode(pk_hex), hex::decode(sig_hex)) else {
+        return false;
+    };
+    let Some(digest) = blob_manifest_sig_digest(manifest, &pk) else {
+        return false;
+    };
+    crate::proto::pq_falcon_verify(&pk, &digest, &sig)
+}
+
+
+fn sealed_owner_key(bucket: &str, name: &str) -> String {
+    format!("sealed-owner:{bucket}:{name}")
+}
+
+/// Parse a DHT value that looks like a blob manifest.
+/// `None` = not a manifest; `Some(None)` = unsealed legacy manifest;
+/// `Some(Some(owner))` = sealed manifest claiming `owner`.
+fn manifest_owner_of(value: &str) -> Option<Option<String>> {
+    let v: serde_json::Value = serde_json::from_str(value).ok()?;
+    v.get("chunks").and_then(|c| c.as_array())?;
+    if v.get("seal").and_then(|s| s.as_str()) == Some(BLOB_SEAL_V1) {
+        // Prefer the public signer identity (cryptographically verifiable).
+        // Pre-auth sealed manifests have neither; treat them as unknown so the
+        // owner can migrate them (a sealed name with an unknown owner is not a
+        // usable pin).
+        Some(
+            v.get("owner_pk")
+                .and_then(|p| p.as_str())
+                .and_then(blob_manifest_signer_id),
+        )
+    } else {
+        Some(None)
+    }
+}
 
 /// Canonical AAD for an owner-sealed blob. Binds the ciphertext to
 /// (format, bucket, name, H(plaintext)) so a chunk (or a whole blob) moved to
@@ -10878,5 +11481,162 @@ mod pentest_net_tests {
         );
         assert_eq!(std::fs::read(&landed).expect("chunk"), b"legit-bytes");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod sealed_manifest_store_tests {
+    //! H2 at the remote ingress: `dht.store` from a peer cannot downgrade a
+    //! sealed manifest or swap it for another owner's seal.
+    use super::*;
+
+    fn cfg() -> NodeConfig {
+        NodeConfig {
+            name: "sealed-store-test".to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: vec![],
+            allow_unknown: false,
+            unknown_allow: vec![],
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: vec![],
+            validators: vec![],
+            domain: None,
+            web_listen: None,
+            wallet: None,
+            web_static: None,
+        }
+    }
+
+    async fn make_node() -> (Arc<Node>, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!(
+            "infnode-sealed-store-{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmpdir");
+        let node = Node::new(
+            cfg(),
+            NodeKeys::generate(),
+            PqKeys::generate(),
+            tmp.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
+        (node, tmp)
+    }
+
+    async fn dht_store(node: &Arc<Node>, key: &str, value: &str) -> serde_json::Value {
+        let body = json!({
+            "key": key,
+            "value": value,
+            "ttl": 3600,
+            "stored_at": now_ms() + 1_000,
+        })
+        .to_string()
+        .into_bytes();
+        let resp = node
+            .handle_dht_store(
+                &serde_json::from_slice(&body).expect("json"),
+                [0x42u8; NODEID_LEN],
+            )
+            .await
+            .expect("response");
+        serde_json::from_slice(&resp).expect("json response")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_cannot_downgrade_or_reseal_a_stored_manifest() {
+        let (node, tmp) = make_node().await;
+        let owner = crate::mailbox::MailKeys::generate();
+        let attacker = crate::mailbox::MailKeys::generate();
+        let report = node
+            .store_blob_boxed(
+                "files",
+                "doc.bin",
+                b"owner bytes",
+                Some(&hex::encode(&owner.kem_ek)),
+                Some(&hex::encode(owner.kem_seed)),
+            )
+            .await;
+        assert!(report.chunks > 0 && report.replicas > 0);
+        let mkey = Node::blob_manifest_key("files", "doc.bin");
+        let before = node.get_local_kv(&mkey).await.expect("manifest");
+
+        // Legacy downgrade manifest (valid shape, plaintext "key").
+        let legacy = json!({
+            "bucket": "files",
+            "name": "doc.bin",
+            "size": 0,
+            "nonce": "00",
+            "chunks": [],
+            "key": "00".repeat(32),
+        });
+        let r = dht_store(&node, &mkey, &legacy.to_string()).await;
+        assert_eq!(r["ok"], json!(false), "downgrade must be refused: {r}");
+
+        // Another owner's seal.
+        let mut other = serde_json::from_str::<serde_json::Value>(&before).expect("json");
+        other["owner"] = json!(hex::encode(blake3::hash(&attacker.kem_ek).as_bytes()));
+        let r = dht_store(&node, &mkey, &other.to_string()).await;
+        assert_eq!(r["ok"], json!(false), "re-seal must be refused: {r}");
+
+        // A VALIDLY signed manifest from a different owner key is refused too
+        // (the peer verifies the signature, then the pinned signer differs).
+        let (attacker_node, attacker_tmp) = make_node().await;
+        attacker_node
+            .store_blob_boxed(
+                "files",
+                "doc.bin",
+                b"attacker bytes",
+                Some(&hex::encode(&attacker.kem_ek)),
+                Some(&hex::encode(attacker.kem_seed)),
+            )
+            .await;
+        let forged = attacker_node
+            .get_local_kv(&mkey)
+            .await
+            .expect("attacker manifest");
+        let r = dht_store(&node, &mkey, &forged).await;
+        assert_eq!(
+            r["ok"],
+            json!(false),
+            "a manifest signed by another owner must be refused: {r}"
+        );
+
+        // The local pin is not remotely writable (otherwise the guard is moot).
+        let pin_key = format!("sealed-owner:{mkey}");
+        let r = dht_store(&node, &pin_key, "attacker-owner").await;
+        assert_eq!(r["ok"], json!(false), "pin must be local-authoritative: {r}");
+
+        // A sealed replacement missing auth is refused outright.
+        let mut unauthenticated = serde_json::from_str::<serde_json::Value>(&before).expect("json");
+        let _ = unauthenticated.as_object_mut().expect("obj").remove("auth");
+        let r = dht_store(&node, &mkey, &unauthenticated.to_string()).await;
+        assert_eq!(r["ok"], json!(false), "missing auth must be refused: {r}");
+
+        assert_eq!(
+            node.get_local_kv(&mkey).await.expect("manifest"),
+            before,
+            "refused replicas must not touch the stored manifest"
+        );
+        assert_eq!(
+            node.fetch_blob_owner("files", "doc.bin", &hex::encode(owner.kem_seed))
+                .await
+                .expect("owner still reads"),
+            b"owner bytes"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&attacker_tmp);
     }
 }

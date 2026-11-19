@@ -46,6 +46,60 @@ pub(crate) const CATCHUP_INTERVAL_DEFAULT_MS: u64 = 30_000;
 /// it; 2 s (the old interval value) preserved the proven defer behavior.
 pub(crate) const LIVE_ADOPT_FRESH_MS: u64 = 2_000;
 
+/// Hard expiry for a peer head hint (`rt.peer_hint`).
+///
+/// A hint is only ever planted from VERIFIED evidence (a QC-backed
+/// `Committed`, or a proposal whose proposer signature + membership checked).
+/// Even then it must not pin catch-up forever: a walk can fail (peer gone,
+/// transport wedged, hash no longer on the canonical chain), and the DHT head
+/// read it suppresses is the only alternative. After this window the hint is
+/// dropped, `should_probe_dht_head` becomes true again, and the next pass can
+/// read a real head. Node-local recovery policy — never consensus.
+pub(crate) const PEER_HINT_TTL_MS: u64 = 60_000;
+
+/// Low-frequency blind probe even when the node believes it is at the tip.
+///
+/// "At tip" is inferred from the ABSENCE of ahead evidence, so a behind-but-
+/// silent node (one-way push loss, DHT-only follower, restored high round)
+/// would otherwise skip `try_catch_up` forever and never reach the blind-QC
+/// `tip+1` rescue. One cheap head/QC probe per this window is the backstop.
+pub(crate) const AT_TIP_PROBE_INTERVAL_MS: u64 = 600_000;
+
+/// How far above our FINALIZED tip a peer-named height may be before it is
+/// treated as "not this chain" for cheap pre-checks.
+///
+/// A `Committed` beyond this is rejected BEFORE any block hashing or QC
+/// verification (pentest-2 F-5); the DHT head/walk remains the path for a
+/// genuinely far-behind node. Local DoS bound — never a quorum rule.
+pub(crate) const MAX_COMMITTED_LOOKAHEAD: u64 = 64;
+
+/// Compact frames one peer may force us to process (index/mempool work) in a
+/// single tick. Honest traffic is a handful of frames per round; beyond this
+/// the extra frames are dropped loudly, so a flood cannot turn a 400 B frame
+/// into unbounded whole-pool work.
+pub(crate) const COMPACT_FRAMES_PER_PEER_PER_TICK: u32 = 16;
+
+/// Bounded pulls one peer may cause us to EMIT per tick (pentest-2 H1).
+pub(crate) const COMPACT_PULLS_PER_PEER_PER_TICK: u32 = 8;
+
+/// Whole-node cap on compact short-id index BUILDS per tick.
+///
+/// A build clones and hashes the whole mempool (~50k txs), so per-peer frame
+/// budgets alone are not enough: one peer can vary `prev_hash` on a
+/// same-height header and force a fresh salt each time. Two builds/tick cover
+/// the only two relevant heights (`hc.height`, `hc.height+1`); anything else
+/// is dropped and retried next tick.
+pub(crate) const COMPACT_INDEX_BUILDS_PER_TICK: u32 = 2;
+
+/// Cap on resolved compact loopbacks waiting for re-entry into the drain.
+///
+/// Every entry holds a full proposal, so it must be bounded independently of
+/// `INBOUND_DEFERRED_CAP` (the loopback is local and is drained with priority,
+/// never parked behind peer traffic). On overflow the OLDEST loopback is
+/// dropped with a loud counter: the originating peer re-announces, and an
+/// attacker can never pin memory.
+pub(crate) const LOOPBACK_QUEUE_CAP: usize = 64;
+
 /// Default wall-time budget for one catch-up pass (`STELL_CATCHUP_BUDGET_MS`).
 ///
 /// Deliberately small: this loop IS the consensus clock, so a DHT/body walk
@@ -70,9 +124,14 @@ pub enum CatchupAction {
     /// fired on a node that is NOT at the tip).
     Run,
     /// The backstop timer fired, but no peer is known to be ahead: skip the
-    /// DHT probe entirely. This is the event-driven default on an idle,
+    /// expensive DHT/body work. This is the event-driven default on an idle,
     /// in-sync node.
     SkipAtTip,
+    /// At-tip backstop window elapsed ([`AT_TIP_PROBE_INTERVAL_MS`]): run the
+    /// CHEAP blind probe (`try_catch_up` reads the head and probes tip+1; with
+    /// no peer ahead the walk is a no-op). This is what rescues a silent
+    /// behind node that never receives ahead evidence.
+    BlindProbe,
     /// Nothing to do this tick (reactive event too recent, timer not due, or
     /// no reactive evidence yet).
     Wait,
@@ -106,7 +165,13 @@ pub fn catchup_action(
         return CatchupAction::Wait;
     }
     if at_tip {
-        CatchupAction::SkipAtTip
+        // Silence is not equality. Keep a low-frequency backstop probe so a
+        // behind-but-silent node still runs the cheap head/tip+1 read.
+        if since_last_ms >= AT_TIP_PROBE_INTERVAL_MS {
+            CatchupAction::BlindProbe
+        } else {
+            CatchupAction::SkipAtTip
+        }
     } else {
         CatchupAction::Run
     }
@@ -138,7 +203,11 @@ pub fn node_is_at_tip(our_tip: u64, peer_named_height: u64, peer_hint_height: Op
 pub fn inbound_names_ahead(our_height: u64, msg: &ConsensusMsg) -> Option<u64> {
     let named = match msg {
         ConsensusMsg::Committed { height, .. } => *height,
-        ConsensusMsg::Proposal { height, .. } => *height,
+        // SIGNED value only: `block.height` is part of the proposer-signed
+        // block hash, while the envelope `height` is unauthenticated duplicate
+        // metadata (pentest-2 F-4). Replaying a public signed block with a
+        // mutated envelope field must never re-arm catch-up.
+        ConsensusMsg::Proposal { block, .. } => block.height,
         ConsensusMsg::Vote { vote, .. } => vote.height,
         _ => return None,
     };
@@ -154,6 +223,102 @@ pub fn inbound_names_ahead(our_height: u64, msg: &ConsensusMsg) -> Option<u64> {
 /// Pure.
 pub fn should_probe_dht_head(our_height: u64, peer_hint: Option<(u64, [u8; 32])>) -> bool {
     !peer_hint.is_some_and(|(h, _)| stellereum::network::peer_head_is_ahead(our_height, h))
+}
+
+/// Validated hint: `Some` only when it is AHEAD of `our_tip` and still inside
+/// [`PEER_HINT_TTL_MS`]. A stale or reached hint must not keep suppressing the
+/// DHT head read (pentest-2 F-2).
+pub fn peer_hint_effective(
+    our_tip: u64,
+    hint: Option<(u64, [u8; 32])>,
+    age_ms: u64,
+) -> Option<(u64, [u8; 32])> {
+    let hint = hint?;
+    if age_ms > PEER_HINT_TTL_MS
+        || !stellereum::network::peer_head_is_ahead(our_tip, hint.0)
+        || hint.0 > our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD)
+    {
+        return None;
+    }
+    Some(hint)
+}
+
+/// True when a `Committed` height is inside the cheap pre-verification window.
+///
+/// Far-ahead commits are refused before `compute_hash`/QC work (F-5); the DHT
+/// head read is their catch-up path.
+pub fn committed_height_is_cheaply_relevant(our_tip: u64, height: u64) -> bool {
+    height <= our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD)
+}
+
+/// Clamp a peer-named height to what this chain could plausibly be at.
+///
+/// A verified-but-absurd claim (a byzantine member signing `height = 10⁹`, or a
+/// replayed member vote) must not keep the at-tip predicate false forever.
+/// Clamping is arithmetic only; the evidence itself was already verified.
+pub fn clamp_peer_named_height(our_tip: u64, named: u64) -> u64 {
+    named.min(our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD))
+}
+
+/// Compact announcements are only worth resolving at the height we are about
+/// to decide (or the next one after a push). Anything else is catch-up's job
+/// and must not force mempool/index work (C2/F-8).
+pub fn compact_proposal_height_is_relevant(our_hc_height: u64, height: u64) -> bool {
+    height == our_hc_height || height == our_hc_height.saturating_add(1)
+}
+
+/// Parent plausibility for a compact announcement (cheap, before any index
+/// build): a proposal at OUR height must build on our finalized tip; the only
+/// other accepted height is the next one (whose parent is the in-flight block).
+pub fn compact_parent_is_plausible(
+    header_height: u64,
+    prev_hash: [u8; 32],
+    our_hc_height: u64,
+    our_tip_hash: [u8; 32],
+) -> bool {
+    if header_height == our_hc_height {
+        prev_hash == our_tip_hash
+    } else {
+        header_height == our_hc_height.saturating_add(1)
+    }
+}
+
+/// Whether `FetchFull` should ask the proposer for the full body.
+///
+/// Only for the live/next height. A far-ahead or stale announcement is not
+/// evidence and gets no request (it would only amplify), while the peer's own
+/// re-announcement still reaches the normal catch-up path.
+pub fn full_proposal_request_is_relevant(our_hc_height: u64, height: u64) -> bool {
+    compact_proposal_height_is_relevant(our_hc_height, height)
+}
+
+/// Charge one compact frame against a peer's per-tick budget. Returns false
+/// when the peer is over budget (caller counts/drops before any heavy work).
+pub fn compact_frame_within_peer_budget(count: &mut u32, max: u32) -> bool {
+    if *count >= max {
+        return false;
+    }
+    *count = count.saturating_add(1);
+    true
+}
+
+/// Insert into a bounded loopback queue, dropping the OLDEST entry on
+/// overflow. Returns true when an older entry was dropped (caller counts it
+/// loudly). Bounded memory is the invariant; dropping the oldest admits the
+/// newest honest resolution (the attacker's earlier flood is what is lost).
+pub fn push_bounded_loopback<T>(
+    q: &mut std::collections::VecDeque<T>,
+    item: T,
+    cap: usize,
+) -> bool {
+    let dropped = if q.len() >= cap {
+        q.pop_front();
+        true
+    } else {
+        false
+    };
+    q.push_back(item);
+    dropped
 }
 
 /// Effective retro-publish interval (`STELL_RETRO_PUBLISH_INTERVAL_MS`, default 30000).

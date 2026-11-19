@@ -1356,3 +1356,265 @@ async fn the_2pc_state_is_committed_in_the_digest_and_the_snapshot() {
         "the reloaded node derives the same root"
     );
 }
+
+// ===========================================================================
+// 10. S2: more outbound transfers than the per-block control cap.
+// ===========================================================================
+
+/// 20 distinct senders each submit one source-0 -> target-1 transfer. The
+/// proposer must NEVER build a block with more than the validator's
+/// `XPC_MAX_REEMITS_PER_HEIGHT` 2PC control records: it caps the OPENING
+/// PREPAREs, leaves the rest in the mempool, and carries them on later
+/// heights. The old proposer emitted one PREPARE per transfer with no cap, so
+/// the two-validator shard rejected the block and `run_height` panicked.
+#[tokio::test]
+async fn more_than_the_control_cap_of_outbound_transfers_finalizes_in_order() {
+    use stellereum::xshard2pc::XPC_MAX_REEMITS_PER_HEIGHT;
+
+    let v1 = key(60);
+    let v2 = key(61);
+    let recipient_addrs: Vec<[u8; 32]> = (0..20u8)
+        .map(|i| key(120 + i).verifying_key().to_bytes())
+        .collect();
+    let senders: Vec<(FalconKeypair, [u8; 32])> =
+        (0..20u8).map(|i| pq_sender(160 + i)).collect();
+    let initial = 5_000_000_000u64;
+    let amount = 1_000_000u64;
+    let fee = 280_000u64;
+
+    let s0a = Arc::new(InMemoryStateEngine::new());
+    let s0b = Arc::new(InMemoryStateEngine::new());
+    for e in [&s0a, &s0b] {
+        for (_, addr) in &senders {
+            e.update_account(AccountState::new(*addr, initial)).await;
+        }
+    }
+    let s1 = Arc::new(InMemoryStateEngine::new());
+    let mut cluster = ShardedCluster::new(
+        sharded(),
+        vec![
+            (SHARD0, vec![(v1.clone(), s0a), (v2.clone(), s0b)]),
+            (SHARD1, vec![(v1.clone(), s1)]),
+        ],
+        CrossShardTransport::local(),
+    );
+    cluster.with_xpc_activation(XpcActivation::FromHeight(0));
+
+    let mut transfer_txs: Vec<Transaction> = Vec::with_capacity(senders.len());
+    for (i, (sender, _)) in senders.iter().enumerate() {
+        let tx = sign_pq_tx(sender, recipient_addrs[i], amount, fee, 0, SHARD0, SHARD1);
+        transfer_txs.push(tx.clone());
+        cluster.broadcast_tx(tx).await;
+    }
+
+    // Source height 1: the block must be VALID (both validators accept it) and
+    // its opening-PREPARE count must fit the shared cap. On the old proposer
+    // this block carried 20 PREPAREs and `run_height` panicked.
+    let h1 = cluster.run_height(SHARD0, TS).await;
+    let block1 = cluster.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&h1)
+        .cloned()
+        .expect("source block retained");
+    let prepares1 = block1
+        .cross_shard_out
+        .iter()
+        .filter(|m| m.is_prepare())
+        .count();
+    assert!(
+        prepares1 <= XPC_MAX_REEMITS_PER_HEIGHT,
+        "the proposer must never exceed the validator cap: {prepares1} PREPAREs"
+    );
+    assert!(
+        prepares1 < senders.len(),
+        "precondition: the cap must defer some of the {} transfers",
+        senders.len()
+    );
+
+    // Later source heights carry the deferred transfers (the mempool keeps
+    // them, and none is ever included without its PREPARE).
+    for i in 1..8u64 {
+        cluster.run_height(SHARD0, TS + i).await;
+    }
+    let mut prepared = 0usize;
+    for tx in &transfer_txs {
+        if xpc_record(&cluster, SHARD0, &tx.compute_tx_hash())
+            .await
+            .map(|r| r.phase)
+            == Some(XpcPhase::Prepared)
+        {
+            prepared += 1;
+        }
+    }
+    assert_eq!(
+        prepared,
+        senders.len(),
+        "every deferred transfer must eventually be prepared"
+    );
+
+    // Drive the handshake. Each source/target height may carry at most the
+    // control cap, so a backlog needs several rounds; the deterministic
+    // rotation must nevertheless serve every transfer.
+    for i in 0..120u64 {
+        cluster.run_height(SHARD0, TS + 100 + i * 2).await;
+        cluster.run_height(SHARD1, TS + 101 + i * 2).await;
+    }
+
+    // Exactly once, in order: each distinct recipient holds exactly its own
+    // amount, and every sender was debited exactly amount+fee+surcharge once.
+    for (i, addr) in recipient_addrs.iter().enumerate() {
+        assert_eq!(
+            balance(&cluster, SHARD1, addr).await,
+            amount,
+            "recipient {i} must be credited exactly once"
+        );
+    }
+    for (i, (_, sender_addr)) in senders.iter().enumerate() {
+        assert_eq!(
+            balance(&cluster, SHARD0, sender_addr).await,
+            initial - amount - fee - PQ_ACTIVATION_SURCHARGE_GAS,
+            "sender {i} must be debited exactly once"
+        );
+    }
+}
+
+// ===========================================================================
+// 11. S3: a terminal 2PC record is retired after its deterministic window.
+// ===========================================================================
+
+/// A completed transfer stops being re-published and is retired from the
+/// committed state after `XPC_TERMINAL_RETENTION_HEIGHTS`. The old code kept
+/// `source_action(Committed) = Commit` forever: every later block carried the
+/// COMMIT + proof and the record stayed in the cloned set/root forever.
+#[tokio::test]
+async fn a_terminal_2pc_record_is_retired_and_stops_re_publishing() {
+    use stellereum::xshard2pc::XPC_TERMINAL_RETENTION_HEIGHTS;
+
+    let validator = key(70);
+    let (sender, sender_addr) = pq_sender(71);
+    let recipient = key(72);
+    let recipient_addr = recipient.verifying_key().to_bytes();
+    let initial = 5_000_000_000u64;
+    let amount = 1_000_000_000u64;
+    let fee = 280_000u64;
+
+    let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx_hash = tx.compute_tx_hash();
+    cluster.broadcast_tx(tx.clone()).await;
+
+    // Complete prepare / ack / commit / credit.
+    run_2pc_to_completion(&mut cluster, 4).await;
+    assert_eq!(
+        balance(&cluster, SHARD1, &recipient_addr).await,
+        amount,
+        "precondition: the transfer completed"
+    );
+    let decided = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("source record")
+        .decided_height;
+    assert!(
+        decided > 0,
+        "precondition: the source committed the transfer"
+    );
+
+    // Run past the retention window on BOTH shards, then a few extra heights.
+    for i in 0..(XPC_TERMINAL_RETENTION_HEIGHTS + 8) {
+        cluster.run_height(SHARD0, TS + 1000 + i * 2).await;
+        cluster.run_height(SHARD1, TS + 1001 + i * 2).await;
+    }
+
+    assert!(
+        xpc_record(&cluster, SHARD0, &tx_hash).await.is_none(),
+        "the terminal source record must be retired after the retention window"
+    );
+    assert!(
+        xpc_record(&cluster, SHARD1, &tx_hash).await.is_none(),
+        "the terminal target record must be retired after the retention window"
+    );
+    let last = cluster.shard(SHARD0).nodes[0]
+        .blocks
+        .values()
+        .max_by_key(|b| b.height)
+        .cloned()
+        .expect("a source block");
+    assert!(
+        !last
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_commit() && m.tx.compute_tx_hash() == tx_hash),
+        "a retired record must never be re-published (height {})",
+        last.height
+    );
+    assert_eq!(
+        balance(&cluster, SHARD1, &recipient_addr).await,
+        amount,
+        "retirement must never move value twice"
+    );
+}
+
+// ===========================================================================
+// 12. S10: a never-admissible mailbox record expires deterministically.
+// ===========================================================================
+
+/// A message that can never be admitted (here: a 2PC PREPARE with no proof
+/// and a fabricated anchor) is skipped by every propose. Before the fix it was
+/// never pruned, so a peer could grow the node-local mailbox forever. It must
+/// be quarantined after `XPC_MAILBOX_QUARANTINE_HEIGHTS` heights.
+#[tokio::test]
+async fn a_never_admissible_mailbox_record_is_quarantined() {
+    use stellereum::xshard2pc::{XPC_MAILBOX_QUARANTINE_HEIGHTS, XPC_PREPARE};
+
+    let validator = key(80);
+    let mut cluster = xpc_cluster(&validator, &[], &[]).await;
+    let (sender, _) = pq_sender(81);
+    let forged_tx = sign_pq_tx(
+        &sender,
+        key(82).verifying_key().to_bytes(),
+        1_000,
+        280_000,
+        0,
+        SHARD0,
+        SHARD1,
+    );
+    let forged = CrossShardMessage::new_xpc(
+        XPC_PREPARE,
+        SHARD0,
+        SHARD1,
+        forged_tx,
+        [0xAAu8; 32],
+        [0xBBu8; 32],
+        None,
+    );
+    cluster
+        .transport
+        .broadcast_cross_shard(&forged)
+        .await
+        .expect("mailbox publish");
+
+    // It is never admitted, but it is also not pruned on the first height.
+    cluster.run_height(SHARD1, TS).await;
+    assert_eq!(
+        cluster
+            .transport
+            .fetch_cross_shard_inbound(SHARD1)
+            .await
+            .len(),
+        1,
+        "precondition: the never-admissible record is in the mailbox"
+    );
+
+    // After the quarantine window it is gone.
+    for i in 1..=XPC_MAILBOX_QUARANTINE_HEIGHTS + 2 {
+        cluster.run_height(SHARD1, TS + i).await;
+    }
+    assert!(
+        cluster
+            .transport
+            .fetch_cross_shard_inbound(SHARD1)
+            .await
+            .is_empty(),
+        "a never-admissible record must be quarantined after {XPC_MAILBOX_QUARANTINE_HEIGHTS} heights"
+    );
+}

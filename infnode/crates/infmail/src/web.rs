@@ -163,6 +163,16 @@ pub struct Account {
     /// секрет для web3-ключей браузера (per-account)
     #[serde(default)]
     pub e2e_secret: Option<String>,
+    /// Per-account Files key seed (32 bytes hex), generated on first use.
+    ///
+    /// Files blobs are sealed to a KEM key derived from THIS account-scoped
+    /// secret, never from the node's KEM seed: a node re-key / restore no
+    /// longer changes every account's Files key, and two accounts on one node
+    /// do not share a key family. The value is server-side (like `pw_hash`):
+    /// the web tier can open Files (server-side at-rest sealing, NOT E2E) and
+    /// this field is deliberately NOT replicated in `account_public_profile`.
+    #[serde(default)]
+    pub files_key_secret: Option<String>,
     /// план: "free" | "paid" (подписка через Storage-контракт)
     #[serde(default)]
     pub plan: String,
@@ -1842,6 +1852,7 @@ async fn register(
         wallet: None,
         wallet_pub: None,
         e2e_secret: None,
+        files_key_secret: None,
         plan: "free".into(),
         paid_until_ms: 0,
         totp_secret: None,
@@ -3085,11 +3096,31 @@ async fn mail_attachment_save(
         }
     }
     let blob_name = file_blob_key(&email, &final_name);
-    // Owner-sealed: files are sealed to the account's derived owner key, so
-    // storage/replica nodes cannot read the plaintext.
-    st.node
-        .store_blob_boxed("files", &blob_name, &data, Some(&file_owner_ek(&st.node, &email)))
+    // Owner-sealed: files are sealed to the account-scoped owner key, so
+    // storage/replica nodes cannot read the plaintext. The account secret is
+    // required to sign the manifest and is never derived from the node key.
+    let Some(secret) = account_files_secret(&st, &email).await else {
+        return err_json(StatusCode::UNAUTHORIZED, "account not found");
+    };
+    let report = st
+        .node
+        .store_blob_boxed(
+            "files",
+            &blob_name,
+            &data,
+            Some(&files_owner_ek(&secret, &email)),
+            Some(&files_owner_key(&secret, &email)),
+        )
         .await;
+    if report.chunks == 0 || report.replicas == 0 {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "file seal failed (chunks={}, replicas={})",
+                report.chunks, report.replicas
+            ),
+        );
+    }
     list.push(json!({ "name": final_name, "size": data.len(), "at": proto::now_ms() }));
     kv_set(
         &st.node,
@@ -5109,19 +5140,46 @@ fn file_blob_key(email: &str, name: &str) -> String {
     format!("file:{email}:{}", hex::encode(h.as_bytes()))
 }
 
+/// Domain separation for the account-scoped Files key.
+const FILES_OWNER_DOMAIN: &str = "infmail-files-owner-v2";
+/// Legacy node-scoped derivation (read-only compatibility, see below).
+const LEGACY_FILES_OWNER_DOMAIN: &[u8] = b"infmail-files-owner-v1";
+
 /// Per-account owner ML-KEM seed for Files blobs.
 ///
-/// The web backend never holds the account's transport/KEM secret, so Files
-/// are sealed to an owner key DERIVED here: `blake3_xof(node KEM seed ||
-/// account email)` domain-separated by `infmail-files-owner-v1`. Properties:
-/// * deterministic across restarts and index rebuilds on the same node;
-/// * different accounts get different keys (one account's blob cannot be
-///   opened by another account's web session);
-/// * storage/replica nodes only ever see the sealed manifest (no plaintext
-///   data key), exactly like the owner-sealed mail envelope path.
-fn file_owner_seed(node: &Node, email: &str) -> [u8; infnode::mailbox::KEM_SEED_LEN] {
+/// The seed is derived from an ACCOUNT secret (`Account::files_key_secret`,
+/// 32 random bytes generated on first use and stored next to `pw_hash`), not
+/// from the node's KEM seed. Consequences:
+/// * two accounts on the same node have unrelated Files keys;
+/// * re-keying/restoring the NODE KEM key no longer changes every account's
+///   Files key (the old `blake3_xof(node KEM seed || email)` did);
+/// * the web tier still holds the account secret (like `pw_hash`), so this is
+///   **server-side at-rest sealing, NOT end-to-end encryption**. A node that
+///   has `accounts.json` can open the account's Files; a storage/replica node
+///   (sealed manifest only) cannot.
+///
+/// Hard limitation (documented, fail-closed): a web node that does NOT have
+/// the account record has no Files key. There is no node-wide fallback and
+/// `files_download` refuses rather than deriving anything from the node KEM
+/// seed. The legacy v1 derivation exists only to READ blobs written before
+/// this change (and those are re-sealed on the next upload).
+fn files_owner_seed(
+    account_secret: &[u8; 32],
+    email: &str,
+) -> [u8; infnode::mailbox::KEM_SEED_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key(FILES_OWNER_DOMAIN);
+    hasher.update(account_secret);
+    hasher.update(email.as_bytes());
+    let mut seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
+    hasher.finalize_xof().fill(&mut seed);
+    seed
+}
+
+/// LEGACY (v1) node-scoped derivation. READ-ONLY: never used to seal a new
+/// blob, only to open files written before `files_key_secret` existed.
+fn legacy_file_owner_seed(node: &Node, email: &str) -> [u8; infnode::mailbox::KEM_SEED_LEN] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"infmail-files-owner-v1");
+    hasher.update(LEGACY_FILES_OWNER_DOMAIN);
     hasher.update(&node.keys.kem_seed);
     hasher.update(email.as_bytes());
     let mut seed = [0u8; infnode::mailbox::KEM_SEED_LEN];
@@ -5130,34 +5188,77 @@ fn file_owner_seed(node: &Node, email: &str) -> [u8; infnode::mailbox::KEM_SEED_
 }
 
 /// Owner encapsulation key (hex) for Files blobs of `email`.
-fn file_owner_ek(node: &Node, email: &str) -> String {
-    hex::encode(infnode::mailbox::kem_ek_from_seed(&file_owner_seed(
-        node, email,
+fn files_owner_ek(account_secret: &[u8; 32], email: &str) -> String {
+    hex::encode(infnode::mailbox::kem_ek_from_seed(&files_owner_seed(
+        account_secret,
+        email,
     )))
 }
 
 /// Owner seed (hex, secret) used to open Files blobs of `email`.
-fn file_owner_key(node: &Node, email: &str) -> String {
-    hex::encode(file_owner_seed(node, email))
+fn files_owner_key(account_secret: &[u8; 32], email: &str) -> String {
+    hex::encode(files_owner_seed(account_secret, email))
 }
 
-/// Fetch a Files blob with the owner key, falling back to the legacy
-/// unsealed manifest for files stored before this wiring.
-async fn fetch_file_blob(node: &Arc<Node>, email: &str, name: &str) -> Option<Vec<u8>> {
+/// Load (or create once) the account's Files secret.
+///
+/// Fail-closed: `None` when the account record does not exist. A malformed
+/// stored value is replaced with a fresh random secret (the blob then fails
+/// closed at AEAD, never decrypts under a guessable key).
+async fn account_files_secret(st: &WebState, email: &str) -> Option<[u8; 32]> {
+    let mut db = st.db.lock().await;
+    let acc = db.accounts.get_mut(email)?;
+    let parsed = acc
+        .files_key_secret
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    match parsed {
+        Some(secret) => Some(secret),
+        None => {
+            use rand::RngCore;
+            let mut secret = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut secret);
+            acc.files_key_secret = Some(hex::encode(secret));
+            save_db(&st.db_path, &db).await;
+            Some(secret)
+        }
+    }
+}
+
+/// Fetch a Files blob for `email`: account-scoped key first, the legacy
+/// node-scoped key only for blobs written before the account secret existed,
+/// then the (unsealed) legacy at-rest format.
+async fn fetch_file_blob(st: &WebState, email: &str, name: &str) -> Option<Vec<u8>> {
+    // Fail closed without the account secret: a node that cannot load the
+    // account record must NOT derive a key from the node KEM seed. (The v1
+    // branch below is only a compatibility read for blobs written before the
+    // account secret existed; it still requires the account to exist.)
+    let secret = account_files_secret(st, email).await?;
     let blob_name = file_blob_key(email, name);
-    match node
-        .fetch_blob_owner("files", &blob_name, &file_owner_key(node, email))
+    if let Some(v) = st
+        .node
+        .fetch_blob_owner("files", &blob_name, &files_owner_key(&secret, email))
         .await
     {
+        return Some(v);
+    }
+    let legacy_key = hex::encode(legacy_file_owner_seed(&st.node, email));
+    if let Some(v) = st
+        .node
+        .fetch_blob_owner("files", &blob_name, &legacy_key)
+        .await
+    {
+        return Some(v);
+    }
+    match st.node.fetch_blob("files", &blob_name).await {
         Some(v) => Some(v),
-        None => match node.fetch_blob("files", &blob_name).await {
-            Some(v) => Some(v),
-            None => {
-                // raw-name layout (files before folders existed)
-                node.fetch_blob("files", &format!("file:{email}:{name}"))
-                    .await
-            }
-        },
+        None => {
+            // raw-name layout (files before folders existed)
+            st.node
+                .fetch_blob("files", &format!("file:{email}:{name}"))
+                .await
+        }
     }
 }
 
@@ -5255,19 +5356,23 @@ async fn files_upload(
         save_db(&st.db_path, &db).await;
     }
     let blob_name = file_blob_key(&email, &req.name);
-    // Owner-sealed upload (account-derived owner key; see file_owner_seed).
-    let stored = st
+    // Owner-sealed upload (account-scoped owner key; see `files_owner_seed`).
+    // The account secret is required both to seal AND to authenticate the
+    // manifest, so a node without the account record fails closed here.
+    let Some(secret) = account_files_secret(&st, &email).await else {
+        return err_json(StatusCode::UNAUTHORIZED, "account not found");
+    };
+    let report = st
         .node
         .store_blob_boxed(
             "files",
             &blob_name,
             &data,
-            Some(&file_owner_ek(&st.node, &email)),
+            Some(&files_owner_ek(&secret, &email)),
+            Some(&files_owner_key(&secret, &email)),
         )
         .await;
-    // An empty blob (folder `.keep`) legitimately has zero chunks; only a
-    // missing manifest means the owner-key seal was refused.
-    if stored == 0
+    if report.chunks == 0
         && st
             .node
             .get_local_kv(&Node::blob_manifest_key("files", &blob_name))
@@ -5277,6 +5382,14 @@ async fn files_upload(
         return err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "file seal failed (owner key refused by storage)",
+        );
+    }
+    // Honest durability: a write that no node kept (replicas == 0) is not
+    // reported as success.
+    if report.replicas == 0 {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "file stored locally but no durable replica accepted it",
         );
     }
     // индекс файлов владельца
@@ -5305,32 +5418,17 @@ async fn files_download(
     if !safe_filename(&name) {
         return err_json(StatusCode::BAD_REQUEST, "invalid file name");
     }
-    let blob_name = file_blob_key(&email, &name);
     // web-путь: файл юзера живёт на нодах (репликация f:*) — fetch_blob сам сделает
     // DHT-fallback манифеста и чанков, если локально нет (не только локальный манифест).
-    // Owner-key fetch: the manifest is sealed to the account's derived key.
-    match st
-        .node
-        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &email))
-        .await
-    {
+    // The account-scoped key is required; there is no node-key derivation here.
+    let data = fetch_file_blob(&st, &email, &name).await;
+    match data {
         Some(data) => ok_json(json!({
             "name": name,
             "size": data.len(),
             "data": base64::engine::general_purpose::STANDARD.encode(&data),
         })),
-        None => {
-            // backward compatibility: legacy unsealed / raw-name files
-            if let Some(data) = fetch_file_blob(&st.node, &email, &name).await {
-                ok_json(json!({
-                    "name": name,
-                    "size": data.len(),
-                    "data": base64::engine::general_purpose::STANDARD.encode(&data),
-                }))
-            } else {
-                err_json(StatusCode::NOT_FOUND, "file not found")
-            }
-        }
+        None => err_json(StatusCode::NOT_FOUND, "file not found"),
     }
 }
 
@@ -5348,18 +5446,7 @@ async fn files_share_create(
         return err_json(StatusCode::BAD_REQUEST, "invalid file name");
     }
     // проверяем, что файл реально существует (владелец)
-    let blob_name = file_blob_key(&email, &name);
-    let has = st
-        .node
-        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &email))
-        .await
-        .is_some()
-        || st.node.fetch_blob("files", &blob_name).await.is_some()
-        || st
-            .node
-            .fetch_blob("files", &format!("file:{email}:{name}"))
-            .await
-            .is_some();
+    let has = fetch_file_blob(&st, &email, &name).await.is_some();
     if !has {
         return err_json(StatusCode::NOT_FOUND, "file not found");
     }
@@ -5457,15 +5544,7 @@ async fn files_share_download(State(st): State<WebState>, Path(token): Path<Stri
     if owner.is_empty() || !safe_filename(&name) {
         return err_json(StatusCode::NOT_FOUND, "invalid link");
     }
-    let blob_name = file_blob_key(&owner, &name);
-    let data = match st
-        .node
-        .fetch_blob_owner("files", &blob_name, &file_owner_key(&st.node, &owner))
-        .await
-    {
-        Some(d) => Some(d),
-        None => fetch_file_blob(&st.node, &owner, &name).await,
-    };
+    let data = fetch_file_blob(&st, &owner, &name).await;
     match data {
         Some(data) => ok_json(json!({
             "name": name,
@@ -6555,6 +6634,7 @@ async fn create_web3_account(
         wallet: Some(wallet.to_string()),
         wallet_pub: wallet_pub.clone(),
         e2e_secret: None,
+        files_key_secret: None,
         plan: "free".into(),
         paid_until_ms: 0,
         totp_secret: None,
@@ -7178,6 +7258,45 @@ mod mime_tests {
         assert!(
             ctype.to_lowercase().starts_with("content-type: text/plain"),
             "письмо без вложений должно остаться text/plain, получили: {ctype}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod files_key_tests {
+    use super::{files_owner_ek, files_owner_key, files_owner_seed};
+
+    /// M2: the Files key is account-scoped. Same email + different account
+    /// secrets must produce unrelated KEM keys, and the key must never be a
+    /// function of the node (the helpers take no `Node` argument at all).
+    #[test]
+    fn files_key_is_derived_from_the_account_secret_not_the_node() {
+        let email = "alice@infmail.org";
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+
+        let seed_a = files_owner_seed(&a, email);
+        let seed_b = files_owner_seed(&b, email);
+        assert_eq!(seed_a.len(), infnode::mailbox::KEM_SEED_LEN);
+        assert_ne!(
+            seed_a, seed_b,
+            "two account secrets must not share a Files key"
+        );
+        assert_ne!(files_owner_ek(&a, email), files_owner_ek(&b, email));
+        assert_ne!(files_owner_key(&a, email), files_owner_key(&b, email));
+
+        // Same account secret, different account email: also distinct.
+        assert_ne!(
+            files_owner_ek(&a, "bob@infmail.org"),
+            files_owner_ek(&a, email)
+        );
+        assert_eq!(
+            files_owner_key(&a, email).len(),
+            infnode::mailbox::KEM_SEED_LEN * 2
+        );
+        assert_eq!(
+            files_owner_ek(&a, email).len(),
+            infnode::mailbox::KEM_EK_LEN * 2
         );
     }
 }

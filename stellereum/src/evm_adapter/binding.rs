@@ -12,7 +12,10 @@
 //! arithmetic on the addresses.
 //!
 //! That statement is a **binding**: `EVM address (20) → PQ address (32)`,
-//! signed with the PQ key that owns the PQ address:
+//! signed by BOTH keys — a Falcon-512 signature by the PQ account AND a
+//! secp256k1 proof of possession by the EVM key whose address is being bound
+//! (without the latter, any PQ key could first-claim somebody else's EVM
+//! identity; see [`verify_binding_claim`]):
 //!
 //! ```text
 //! binding_message(chain_id, evm, pq) =
@@ -163,7 +166,10 @@ pub fn evm_transfer_facts(raw: &[u8]) -> Result<EvmTransferFacts, String> {
         .verify_signature()
         .map_err(|e| format!("EVM intent signature rejected: {e}"))?;
     let to = decoded.to().ok_or_else(|| {
-        format!("{} (contract creation: to == null)", EVM_CONTRACT_EXECUTION_REFUSAL)
+        format!(
+            "{} (contract creation: to == null)",
+            EVM_CONTRACT_EXECUTION_REFUSAL
+        )
     })?;
     if !decoded.data().is_empty() {
         return Err(format!(
@@ -174,8 +180,9 @@ pub fn evm_transfer_facts(raw: &[u8]) -> Result<EvmTransferFacts, String> {
     }
     let value_wei = decoded.value();
     if value_wei == 0 {
-        return Err("EVM carrier settles value transfers only: the intent carries no value"
-            .to_string());
+        return Err(
+            "EVM carrier settles value transfers only: the intent carries no value".to_string(),
+        );
     }
     let value_nano = wei_to_nano(value_wei);
     if value_nano == 0 {
@@ -266,17 +273,68 @@ pub fn verify_carrier_intent(
     Ok(facts)
 }
 
+/// Length of the secp256k1 proof-of-possession carried by a binding claim:
+/// `r(32) || s(32) || recovery_id(1)`.
+pub const EVM_BINDING_PROOF_LEN: usize = 65;
+
+/// The chain id a binding claim is verified against.
+///
+/// Deliberately NOT a caller-supplied argument (PENTEST2 S7 tautology): every
+/// verifier used to compare `claim.chain_id` against a value the caller passed
+/// as `claim.chain_id`, which proved nothing. The expected id now comes from
+/// [`effective_chain_id`] in one place, so a claim minted for another chain is
+/// refused on every path.
+fn expected_binding_chain_id() -> u64 {
+    effective_chain_id()
+}
+
+/// Recover the EVM address that produced a claim's proof of possession.
+///
+/// `proof` is `r(32) || s(32) || recovery_id(1)`, low-s (EIP-2), over the
+/// canonical [`binding_message`] digest. Strictly fail-closed: wrong length,
+/// zero r/s, high-s or a bad recovery id is an error.
+pub fn recover_binding_claim_signer(
+    chain_id: u64,
+    evm: &[u8; 20],
+    pq: &[u8; 32],
+    proof: &[u8],
+) -> Result<[u8; 20], String> {
+    if proof.len() != EVM_BINDING_PROOF_LEN {
+        return Err(format!(
+            "binding EVM proof of possession must be {EVM_BINDING_PROOF_LEN} bytes \
+             (r || s || recovery_id), got {}",
+            proof.len()
+        ));
+    }
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&proof[..32]);
+    s.copy_from_slice(&proof[32..64]);
+    let recid = proof[64];
+    if recid > 1 {
+        return Err(format!("invalid binding EVM recovery id: {recid}"));
+    }
+    if r == [0u8; 32] || s == [0u8; 32] {
+        return Err("invalid binding EVM signature (zero r/s)".to_string());
+    }
+    if !is_low_s(&s) {
+        return Err("binding EVM signature s is not canonical (EIP-2)".to_string());
+    }
+    let msg = binding_message(chain_id, evm, pq);
+    ecrecover(&msg, recid as u64, &r, &s)
+        .map_err(|e| format!("binding EVM signature does not recover a sender: {e}"))
+}
+
 /// Verify a binding claim against the claiming PQ address — PURE.
 ///
-/// The claim must be signed by the very key that owns `sender`, over
-/// [`binding_message`] for this chain. No registry is read: a claim that
-/// conflicts with an existing binding is refused by the admission policy, and
-/// the *first* committed claim in block order is the one the index keeps.
-pub fn verify_binding_claim(
-    claim: &EvmAddressClaim,
-    sender: &[u8; 32],
-    chain_id: u64,
-) -> Result<(), String> {
+/// The claim must be signed by the very key that owns `sender` (Falcon-512)
+/// AND by the EVM key whose address is being bound (secp256k1 proof of
+/// possession over the same [`binding_message`]). The EVM half is what stops
+/// an unrelated PQ key from claiming somebody else's address (PENTEST2
+/// C1/S1). No registry is read: a claim that conflicts with an existing
+/// binding is refused by the admission policy, and the *first* committed
+/// claim in block order is the one the index keeps.
+pub fn verify_binding_claim(claim: &EvmAddressClaim, sender: &[u8; 32]) -> Result<(), String> {
     if claim.pq_pubkey.len() != FALCON512_PUBKEY_LEN {
         return Err(format!(
             "binding PQ public key must be a {FALCON512_PUBKEY_LEN}-byte Falcon-512 key, got {}",
@@ -297,8 +355,8 @@ pub fn verify_binding_claim(
                 .to_string(),
         );
     }
-    let chain = effective_chain_id();
-    if claim.chain_id != chain || chain_id != chain {
+    let chain = expected_binding_chain_id();
+    if claim.chain_id != chain {
         return Err(format!(
             "binding chain id {} does not match this chain ({chain})",
             claim.chain_id
@@ -316,6 +374,23 @@ pub fn verify_binding_claim(
              keccak256(STELL_EVM_BIND_V1 || chain_id || evm_address || pq_address) does not verify"
                 .to_string(),
         );
+    }
+    // C1/S1: PROOF OF POSSESSION of the EVM key. The recovered secp256k1
+    // signer must be exactly the address being bound, otherwise any PQ key
+    // could first-claim an unrelated EVM identity and poison routing.
+    let recovered = recover_binding_claim_signer(
+        claim.chain_id,
+        &claim.evm_address,
+        sender,
+        &claim.evm_signature,
+    )?;
+    if recovered != claim.evm_address {
+        return Err(format!(
+            "binding EVM proof of possession rejected: the secp256k1 signature recovers {}, \
+             not the EVM address being bound {}",
+            evm_address_to_hex(&recovered),
+            evm_address_to_hex(&claim.evm_address)
+        ));
     }
     Ok(())
 }
@@ -364,6 +439,82 @@ pub fn classify_evm_payload(tx: &Transaction) -> Option<EvmPayload<'_>> {
     }
 }
 
+/// CONSENSUS re-check of an EVM payload against its OWN transaction — the
+/// block-path enforcement of the invariants admission also enforces
+/// (PENTEST2 R7/S6).
+///
+/// Admission is node-local policy: a hand-built block can bypass the mempool.
+/// Execution must therefore re-derive, from the same bytes every node sees,
+/// that the payload and the native leg describe the SAME payment:
+///
+/// * `Mixed` payloads are refused (a carrier's accounting is the whole tx);
+/// * a carrier's EVM `nonce`/`value_nano` MUST equal `tx.nonce`/`tx.amount`,
+///   and its recipient must be a real PQ account (non-zero);
+/// * a binding claim moves no value (`amount == 0`, `to == from`) and both
+///   signatures (Falcon + EVM proof of possession) verify.
+///
+/// This is deterministic and pure; it reads no registry, no clock, no state.
+pub fn verify_evm_payload_against_tx(tx: &Transaction) -> Result<(), String> {
+    match classify_evm_payload(tx) {
+        None => Ok(()),
+        Some(EvmPayload::Mixed) => Err(
+            "EVM carrier/binding opcode must be the transaction's whole payload: the value leg \
+             (to/amount) IS the settlement, so it cannot be mixed with other operations"
+                .to_string(),
+        ),
+        Some(EvmPayload::Binding(claim)) => {
+            verify_binding_claim(claim, &tx.from)?;
+            if tx.amount != 0 {
+                return Err("a binding claim moves no value: amount must be 0".to_string());
+            }
+            if tx.to != tx.from {
+                return Err(
+                    "a binding claim must be a self-addressed transaction (to == from)".to_string(),
+                );
+            }
+            Ok(())
+        }
+        Some(EvmPayload::Carrier(carrier)) => {
+            let facts = verify_carrier_intent(carrier, &tx.from)?;
+            if facts.nonce != tx.nonce {
+                return Err(format!(
+                    "carrier nonce mismatch at execution: the EVM intent says {}, the \
+                     transaction says {} (they must be equal so the intent can settle exactly \
+                     once)",
+                    facts.nonce, tx.nonce
+                ));
+            }
+            if facts.value_nano != tx.amount {
+                return Err(format!(
+                    "carrier amount mismatch at execution: the EVM intent is worth {} \
+                     nano-STELL, the transaction moves {}",
+                    facts.value_nano, tx.amount
+                ));
+            }
+            if tx.to == [0u8; 32] {
+                return Err(
+                    "carrier recipient must be a real PQ account (zero address refused)"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The settlement nullifier of a carrier transaction: `keccak256(EVM raw)`.
+///
+/// `None` for every non-carrier transaction. This is the SAME digest the
+/// Falcon intent authorisation signs, so it identifies the signed EVM intent
+/// uniquely and is the key the committed settled-intent set uses to enforce
+/// exactly-once settlement.
+pub fn carrier_intent_digest(tx: &Transaction) -> Option<[u8; 32]> {
+    match classify_evm_payload(tx)? {
+        EvmPayload::Carrier(carrier) => Some(evm_intent_digest(&carrier.evm_tx)),
+        _ => None,
+    }
+}
+
 /// True when `tx` carries a PQ EVM carrier opcode.
 pub fn is_evm_carrier_tx(tx: &Transaction) -> bool {
     matches!(classify_evm_payload(tx), Some(EvmPayload::Carrier(_)))
@@ -393,8 +544,9 @@ pub fn build_carrier_transaction(
     let chain = effective_chain_id();
     let facts = evm_transfer_facts(raw)?;
     if to_pq == [0u8; 32] {
-        return Err("carrier recipient must be a real PQ account (zero address refused)"
-            .to_string());
+        return Err(
+            "carrier recipient must be a real PQ account (zero address refused)".to_string(),
+        );
     }
     let sender = derive_pq_address(PqScheme::Falcon512, pq_pubkey, &DEFAULT_SALT);
     let carrier = EvmCarrierIntent {
@@ -429,14 +581,21 @@ pub fn build_carrier_transaction(
     Ok(tx)
 }
 
-/// Build the binding-claim transaction.///
+/// Build the binding-claim transaction.
+///
 /// `to == from` and `amount == 0`: the claim moves no value, it only commits
 /// the statement. `nonce` must be the PQ account's current nonce and
-/// `gas_limit` must cover the admission floor.
+/// `gas_limit` must cover the admission floor. `evm_signature` is the 65-byte
+/// secp256k1 proof of possession (see [`EvmAddressClaim::evm_signature`]).
+#[allow(clippy::too_many_arguments)]
+// GATE: the binding builder threads (PQ key, EVM address, PQ signature, EVM
+// proof, nonce, gas limit, carrier signature); grouping would just add a type
+// with the same fields.
 pub fn build_binding_transaction(
     pq_pubkey: &[u8],
     evm_address: [u8; 20],
     binding_signature: &[u8],
+    evm_signature: &[u8],
     nonce: u64,
     gas_limit: u64,
     carrier_signature: &[u8],
@@ -448,8 +607,9 @@ pub fn build_binding_transaction(
         evm_address,
         pq_pubkey: pq_pubkey.to_vec(),
         binding_signature: binding_signature.to_vec(),
+        evm_signature: evm_signature.to_vec(),
     };
-    verify_binding_claim(&claim, &from, chain)?;
+    verify_binding_claim(&claim, &from)?;
     let tx = Transaction::new_pq_explicit_with_chain(
         PqScheme::Falcon512,
         pq_pubkey.to_vec(),
@@ -627,8 +787,9 @@ pub fn carrier_template_message(
         ));
     }
     if to_pq == [0u8; 32] {
-        return Err("carrier recipient must be a real PQ account (zero address refused)"
-            .to_string());
+        return Err(
+            "carrier recipient must be a real PQ account (zero address refused)".to_string(),
+        );
     }
     let chain = effective_chain_id();
     let facts = evm_transfer_facts(raw)?;
@@ -663,12 +824,13 @@ pub fn carrier_template_message(
 
 /// The binding claim's signing message WITHOUT the envelope signature, for a
 /// wallet that has produced the claim signature but not the transaction one
-/// yet (deterministic in `(pq_pubkey, evm_address, binding_signature, nonce,
-/// gas_limit)`).
+/// yet (deterministic in `(pq_pubkey, evm_address, binding_signature,
+/// evm_signature, nonce, gas_limit)`).
 pub fn binding_template_message(
     pq_pubkey: &[u8],
     evm_address: [u8; 20],
     binding_signature: &[u8],
+    evm_signature: &[u8],
     nonce: u64,
     gas_limit: u64,
 ) -> Result<Vec<u8>, String> {
@@ -684,9 +846,10 @@ pub fn binding_template_message(
         chain_id: chain,
         evm_address,
         pq_pubkey: pq_pubkey.to_vec(),
-        // Same rule as the carrier: the claim signature is part of the signed
-        // payload, so the template takes it as input.
+        // Same rule as the carrier: the claim signatures are part of the
+        // signed payload, so the template takes both as inputs.
         binding_signature: binding_signature.to_vec(),
+        evm_signature: evm_signature.to_vec(),
     };
     let tx = Transaction::new_pq_explicit_with_chain(
         PqScheme::Falcon512,
@@ -727,21 +890,22 @@ pub fn binding_template_message(
 // query. It can never make two nodes move different money, which is why this
 // index is deliberately not consulted inside execution.
 //
-// HOW IT IS FED:
-//   * mempool admission registers a binding claim / carrier it admits (so a
-//     wallet can bind and immediately send);
-//   * `observe_committed_evm_txs` replays committed transactions in block
-//     order for any caller that holds them (the RPC receipt window does), which
-//     makes the index reconstructible after a restart.
+// HOW IT IS FED (committed-only, PENTEST2 H1/M1):
+//   * `state_engine` feeds every APPLIED binding/carrier at its commit point
+//     (`observe_committed_evm_tx`), on every apply path;
+//   * startup replays the persisted committed block window through
+//     `rebuild_evm_indexes_from_blocks`, so a restart derives the same map;
+//   * mempool admission NEVER writes it: an admitted-but-unmined claim is not
+//     a binding and must not freeze routing or be reported as committed.
 //
 // The map is process-local and bounded so a flood of binds cannot grow it
 // without limit.
 
-/// Upper bound on index entries (DoS guard). Binding is a per-address fact, so
-/// the cap is generous; the oldest entry is evicted on overflow, and a later
-/// re-bind of an evicted address is accepted again (first-writer-wins only
-/// among the entries the index still remembers — the authoritative record is
-/// always the committed claim).
+/// Upper bound on index entries (DoS guard). Binding is a per-address
+/// COMMITTED fact, so the cap is generous and there is NO eviction: evicting a
+/// live binding would reopen first-writer-wins and let anybody claim the
+/// address again (PENTEST2 S1/M1). Overflow refuses the new claim instead,
+/// deterministically; the authoritative record is always the committed claim.
 pub const EVM_BINDING_INDEX_CAP: usize = 100_000;
 
 /// Deterministic, bounded `EVM address → PQ account` index. See the module
@@ -804,12 +968,16 @@ impl EvmBindingRegistry {
                 ));
             }
         }
+        // NO EVICTION (PENTEST2 S1/M1): a committed binding is permanent.
+        // Popping the oldest entry would make the evicted address claimable
+        // again by anyone (first-writer-wins only among remembered entries)
+        // and could silently redirect routing. Refuse the NEW claim instead.
         if self.order.len() >= EVM_BINDING_INDEX_CAP {
-            if let Some(old) = self.order.pop_front() {
-                if let Some(old_pq) = self.by_evm.remove(&old) {
-                    self.by_pq.remove(&old_pq);
-                }
-            }
+            return Err(format!(
+                "EVM binding index is full ({} entries): refusing a new binding instead of \
+                 evicting a committed one (eviction would reopen first-writer-wins)",
+                EVM_BINDING_INDEX_CAP
+            ));
         }
         self.by_evm.insert(evm, pq);
         self.by_pq.insert(pq, evm);
@@ -830,8 +998,7 @@ impl EvmBindingRegistry {
     ) -> Option<EvmBindingStatement> {
         match crate::evm_adapter::classify_evm_payload(tx)? {
             crate::evm_adapter::EvmPayload::Binding(claim) => {
-                if crate::evm_adapter::verify_binding_claim(claim, &tx.from, claim.chain_id).is_err()
-                {
+                if crate::evm_adapter::verify_binding_claim(claim, &tx.from).is_err() {
                     return None;
                 }
                 if self.bind(claim.evm_address, tx.from).is_err() {
@@ -905,4 +1072,3 @@ pub fn clear_evm_bindings() {
         *idx = EvmBindingRegistry::new();
     }
 }
-

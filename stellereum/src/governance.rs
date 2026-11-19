@@ -2302,10 +2302,29 @@ impl Governance {
                 self.applied.min_validator_bond = Some(v)
             }
             GovAction::SetEquivocationSlashBps(v) => {
+                // PENTEST2 S5: this parameter has NO consumer. The wired
+                // slashing primitives (`slash_equivocation_verified`,
+                // the proposal/XMSS mirrors and `slash`) burn the frozen
+                // `staking::EQUIVOCATION_SLASH_BPS`; persisting a different
+                // value here would make the committed `applied` field claim
+                // a rule the chain does not enforce — a silent no-op.
+                //
+                // Refuse deterministically at apply (every node identical,
+                // `Passed -> Executed` never happens, the proposal stays
+                // `Passed` for an explicit future migration) instead of
+                // committing a decorative parameter. `v` is still range
+                // checked first so an out-of-range action reports the same
+                // invalid-action bound as every other parameter.
                 if v > BPS_U64 {
                     return Err(GovError::InvalidAction);
                 }
-                self.applied.equivocation_slash_bps = Some(v)
+                tracing::error!(
+                    "governance SetEquivocationSlashBps({v}) REFUSED: the equivocation slash \
+                     rate has no wired consumer (slashing uses \
+                     staking::EQUIVOCATION_SLASH_BPS); refusing instead of committing a \
+                     parameter that does nothing"
+                );
+                return Err(GovError::InvalidAction);
             }
             GovAction::SetDefaultCommissionBps(v) => {
                 if v > BPS_U64 {
@@ -2385,6 +2404,25 @@ impl Governance {
                 {
                     return Err(GovError::InvalidAction);
                 }
+                // PENTEST2 S7: the upgrade gate belongs HERE, in the one
+                // executor every path funnels through (deterministic sweep,
+                // direct RPC arm, legacy `execute`, oracle-aware variant).
+                // `due_governance_ids` already filters upgrades while the gate
+                // is closed, but a direct caller bypassed that filter and
+                // installed a plan (and the halt predicate reads the committed
+                // plan). A gated-off executor refuses fail-closed and leaves
+                // the proposal `Passed`. `cur_height = None` (legacy,
+                // height-less `execute`) cannot prove the gate is open and is
+                // refused too.
+                if !upgrade_exec_active_at(cur_height.unwrap_or(0)) {
+                    tracing::error!(
+                        "upgrade execution REFUSED: `upgrade_exec_active_at` is false at \
+                         height {:?} (activation {})",
+                        cur_height,
+                        upgrade_exec_activation_height(),
+                    );
+                    return Err(GovError::Timelocked);
+                }
                 self.applied.upgrade_plan = Some(UpgradePlan {
                     name,
                     height,
@@ -2392,6 +2430,16 @@ impl Governance {
                 });
             }
             GovAction::CancelUpgrade => {
+                // Same upgrade gate as `SoftwareUpgrade` (PENTEST2 S7).
+                if !upgrade_exec_active_at(cur_height.unwrap_or(0)) {
+                    tracing::error!(
+                        "upgrade execution REFUSED: `upgrade_exec_active_at` is false at \
+                         height {:?} (activation {})",
+                        cur_height,
+                        upgrade_exec_activation_height(),
+                    );
+                    return Err(GovError::Timelocked);
+                }
                 self.applied.upgrade_plan = None;
             }
         }

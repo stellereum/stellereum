@@ -1210,19 +1210,21 @@ pub enum OpCode {
     ///
     /// The VALUE LEG is the transaction itself (`tx.from` → `tx.to`,
     /// `tx.amount` nano-STELL), settled by the engine's normal native commit —
-    /// the VM has no account map. Admission additionally requires
-    /// `evm.nonce == tx.nonce` and `wei_to_nano(evm.value) == tx.amount`, so
-    /// the intent and the leg cannot describe different payments.
+    /// the VM has no account map. Admission AND execution (the block path
+    /// re-checks from block bytes, PENTEST2 R7) require `evm.nonce ==
+    /// tx.nonce` and `wei_to_nano(evm.value) == tx.amount`, so the intent and
+    /// the leg cannot describe different payments even in a hand-built block.
     SysCallEvmCarrier(Box<EvmCarrierIntent>),
     // APPEND, never insert above: same bincode-discriminant rule.
     /// Register an on-chain EVM address ↔ PQ account binding.
     ///
-    /// The claim is signed by the PQ key that owns `ctx.sender`, over
-    /// `keccak256("STELL_EVM_BIND_V1" || chain_id || evm_address || pq_address)`,
-    /// so nobody can bind an EVM address to an account they do not control.
-    /// Moves no value: the record IS this committed transaction, which the
-    /// deterministic binding index replays in block order (first claim wins);
-    /// a conflicting claim is refused at admission.
+    /// The claim is signed by the PQ key that owns `ctx.sender` AND by the
+    /// EVM key whose address is bound (a secp256k1 proof of possession over
+    /// `keccak256("STELL_EVM_BIND_V1" || chain_id || evm_address || pq_address)`),
+    /// so a PQ key cannot claim an EVM address it does not control (PENTEST2
+    /// C1/S1). Moves no value: the record IS this committed transaction, which
+    /// the deterministic binding index replays in block order (first claim
+    /// wins, never evicted); a conflicting claim is refused at admission.
     SysCallBindEvmAddress(Box<EvmAddressClaim>),
 }
 
@@ -1260,6 +1262,20 @@ pub struct EvmAddressClaim {
     /// Falcon-512 signature over
     /// `keccak256("STELL_EVM_BIND_V1" || chain_id || evm_address || pq_address)`.
     pub binding_signature: Vec<u8>,
+    /// secp256k1 PROOF OF POSSESSION of the EVM key being bound (PENTEST2
+    /// C1/S1). The PQ signature above proves the PQ account asked for the
+    /// binding; this signature proves the EVM key itself agrees, so an
+    /// unrelated PQ key can no longer first-claim somebody else's address.
+    ///
+    /// Encoding: 65 bytes `r(32) || s(32) || recovery_id(1)` (recovery id
+    /// 0/1, EIP-2 low-s) over the SAME 32-byte [`binding_message`] digest
+    /// (the canonical binding statement; no EIP-191 prefix is applied because
+    /// the digest already commits the domain separator, chain id, EVM address
+    /// and PQ address). Verified by `ecrecover`; the recovered address MUST
+    /// equal [`Self::evm_address`]. This is a CONSENSUS check (VM execution
+    /// and mempool admission), not advisory.
+    #[serde(default)]
+    pub evm_signature: Vec<u8>,
 }
 
 /// One actor send the VM accepted, handed to the ENGINE through
@@ -2575,11 +2591,7 @@ impl Svm {
                     // (first claim wins), and a conflicting claim is refused
                     // at admission. Nothing is written here, so execution
                     // stays a pure function of the block.
-                    match crate::evm_adapter::verify_binding_claim(
-                        claim,
-                        &ctx.sender,
-                        claim.chain_id,
-                    ) {
+                    match crate::evm_adapter::verify_binding_claim(claim, &ctx.sender) {
                         Ok(()) => state.stack.push(1),
                         Err(e) => {
                             return VmExecutionResult::Reverted(format!(

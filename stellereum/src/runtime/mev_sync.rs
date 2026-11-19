@@ -1469,6 +1469,70 @@ impl ValidatorRuntime {
             }
             kept
         };
+        // §9 deterministic control-record budget (S2). The proposer derives
+        // the SAME bounded re-emission plan the protocol defines BEFORE it
+        // chooses how many new outbound transfers may ride this height, and
+        // caps the OPENING PREPAREs so the total never exceeds
+        // `XPC_MAX_REEMITS_PER_HEIGHT`. Every validator rejects a block above
+        // that cap, so building an over-cap block would halt the chain (17
+        // outbound transfers used to do exactly that). Transfers that do not
+        // fit are simply not selected this block: their transactions stay in
+        // the mempool and are proposed, in the same deterministic order, on a
+        // later height. A transaction is NEVER included without its PREPARE
+        // (that would escrow value with no peer-facing record).
+        let xpc_on = self.xpc_activation.boundary().is_some();
+        let xpc_active = xpc_on && self.xpc_activation.is_active_at(self.hc.height);
+        let xpc_plan = if xpc_on {
+            let mut records: Vec<crate::xshard2pc::XpcRecord> =
+                self.xpc_records.values().cloned().collect();
+            records.sort_by_key(|r| r.tx_hash);
+            crate::xshard2pc::bounded_reemit_plan(&records, self.shard_id, self.hc.height)
+        } else {
+            Vec::new()
+        };
+        let opening_budget = if xpc_active {
+            crate::xshard2pc::opening_prepare_budget(xpc_plan.len())
+        } else {
+            usize::MAX
+        };
+        let txs = if xpc_active {
+            let mut kept: Vec<Transaction> = Vec::with_capacity(txs.len());
+            // A dropped outbound transfer also invalidates every LATER
+            // transaction from the same sender (their nonce sequence assumed
+            // the dropped one applied). Both stay in the mempool for a later
+            // block, so no value is lost and the order is preserved.
+            let mut dropped_senders: HashSet<[u8; 32]> = HashSet::new();
+            let mut openings = 0usize;
+            for tx in txs {
+                if dropped_senders.contains(&tx.from) {
+                    continue;
+                }
+                if crate::sharding::tx_is_outbound_cross_shard(&tx, my_shard) {
+                    if openings >= opening_budget {
+                        dropped_senders.insert(tx.from);
+                        continue;
+                    }
+                    openings += 1;
+                }
+                kept.push(tx);
+            }
+            if openings < opening_budget {
+                tracing::debug!(
+                    "propose h={}: opening 2PC budget {}/{} (plan={})",
+                    self.hc.height,
+                    openings,
+                    opening_budget,
+                    xpc_plan.len()
+                );
+            }
+            kept
+        } else {
+            txs
+        };
+        let opening_count = txs
+            .iter()
+            .filter(|t| crate::sharding::tx_is_outbound_cross_shard(t, my_shard))
+            .count();
         let prev_hash = self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
         // TRANSACTION-ORDER COMMITMENT: computed over the EXACT ordered list
         // this block packs, and put into the block BEFORE it is signed, so
@@ -1522,10 +1586,10 @@ impl ValidatorRuntime {
             // value on the source and asks the target to prepare, and the
             // target votes with a PREPARE-ACK. Transfers produced BEFORE the
             // activation keep running the legacy outbox/inbox/ack/bounce
-            // flow to completion, so the two never interleave on one
-            // transfer.
-            let xpc_on = self.xpc_activation.boundary().is_some();
-            let xpc_active = xpc_on && self.xpc_activation.is_active_at(self.hc.height);
+            // flow; on an upgraded chain that flow is REFUND-ONLY (the target
+            // refuses the legacy credit under XSHARD-01), never a delivery.
+            // `xpc_on` / `xpc_active` / `xpc_plan` were derived above, before
+            // the transaction selection was capped.
             for tx in &txs {
                 if !crate::sharding::tx_is_outbound_cross_shard(tx, my_shard) {
                     continue;
@@ -1573,12 +1637,51 @@ impl ValidatorRuntime {
                 // Deterministic order, independent of KV enumeration order.
                 inbound.sort_by_key(CrossShardKey::of);
                 let mut prune_ids: Vec<[u8; 32]> = Vec::new();
+                // S2: every 2PC control record in the block counts against the
+                // SAME per-height cap the validator enforces. The opening
+                // PREPAREs were capped above; reserve the plan's slots too, and
+                // admit inbound control records only while the budget lasts
+                // (the rest stay in the mailbox for a later height).
+                let mut control_used = xpc_plan.len().saturating_add(opening_count);
+                // S10: expire/quarantine tracked mailbox entries that are no
+                // longer even fetched, so the tracker cannot grow forever.
+                let cutoff = self
+                    .hc
+                    .height
+                    .saturating_sub(crate::xshard2pc::XPC_MAILBOX_QUARANTINE_HEIGHTS);
+                let expired: Vec<[u8; 32]> = self
+                    .xpc_mailbox_seen
+                    .iter()
+                    .filter(|(_, first)| **first <= cutoff)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired {
+                    self.xpc_mailbox_seen.remove(&id);
+                    prune_ids.push(id);
+                }
                 for msg in inbound {
                     if !msg.is_inbound_for(my_shard) {
                         continue;
                     }
+                    // S10: deterministic first-seen age. A record that never
+                    // becomes admissible is quarantined (pruned) after
+                    // XPC_MAILBOX_QUARANTINE_HEIGHTS heights instead of being
+                    // rescanned by every propose forever. Node-local transport
+                    // bookkeeping; never consensus state.
+                    let first_seen = *self
+                        .xpc_mailbox_seen
+                        .entry(msg.msg_id)
+                        .or_insert(self.hc.height);
+                    if self.hc.height.saturating_sub(first_seen)
+                        >= crate::xshard2pc::XPC_MAILBOX_QUARANTINE_HEIGHTS
+                    {
+                        self.xpc_mailbox_seen.remove(&msg.msg_id);
+                        prune_ids.push(msg.msg_id);
+                        continue;
+                    }
                     let key = CrossShardKey::of(&msg);
                     if self.consumed_cross_shard.contains(&key) {
+                        self.xpc_mailbox_seen.remove(&msg.msg_id);
                         continue;
                     }
                     // Belt beyond the runtime mirrors: the PERSISTED engine
@@ -1589,7 +1692,24 @@ impl ValidatorRuntime {
                     // a restarted proposer would re-propose it forever (its
                     // mirrors are empty) while every apply refuses it.
                     if self.state.is_cross_shard_consumed(&key).await {
+                        self.xpc_mailbox_seen.remove(&msg.msg_id);
                         prune_ids.push(msg.msg_id);
+                        continue;
+                    }
+                    // S2 budget: Commit is counted with the other control
+                    // records (it is a decision re-publication, not a value
+                    // transfer), so a Byzantine proposer cannot flood a block
+                    // with uncapped historical COMMITs either.
+                    let is_control = matches!(
+                        msg.kind(),
+                        crate::sharding::CrossShardKind::Prepare
+                            | crate::sharding::CrossShardKind::PrepareAck
+                            | crate::sharding::CrossShardKind::AbortRequest
+                            | crate::sharding::CrossShardKind::AbortAck
+                            | crate::sharding::CrossShardKind::Commit
+                    );
+                    if is_control && control_used >= crate::xshard2pc::XPC_MAX_REEMITS_PER_HEIGHT {
+                        // Leave it in the mailbox: a later height has budget.
                         continue;
                     }
                     // §5 M3 kind-dispatched admission: transfers prove
@@ -1606,22 +1726,21 @@ impl ValidatorRuntime {
                         }
                         // STALE AFTER COMPLETION: a terminal 2PC transfer can
                         // never need another control record, and the SOURCE
-                        // re-publishes its COMMIT every block until the
-                        // target's mailbox is drained. Check completion
-                        // BEFORE the anchor gate and PRUNE such a record:
-                        // once the target has credited (or refunded), later
-                        // copies are worthless, and an old copy whose parent
-                        // block has already aged out of the finalized-header
-                        // window fails `xpc_admissible` FOREVER. Leaving it
-                        // in the node-local mailbox made every propose rescan
-                        // an ever-growing set of dead records (they are never
-                        // included, so apply never prunes them); under a high
-                        // solo block rate the set grew by one COMMIT per
-                        // height for the life of the process.
+                        // re-publishes its COMMIT until the target's mailbox
+                        // is drained. Check completion BEFORE the anchor gate
+                        // and PRUNE such a record: once the target has
+                        // credited (or refunded), later copies are
+                        // worthless, and an old copy whose parent block has
+                        // already aged out of the finalized-header window
+                        // fails `xpc_admissible` FOREVER. Leaving it in the
+                        // node-local mailbox made every propose rescan an
+                        // ever-growing set of dead records (they are never
+                        // included, so apply never prunes them).
                         if self
                             .completed_cross_shard
                             .contains(&msg.tx.compute_tx_hash())
                         {
+                            self.xpc_mailbox_seen.remove(&msg.msg_id);
                             prune_ids.push(msg.msg_id);
                             continue;
                         }
@@ -1656,109 +1775,89 @@ impl ValidatorRuntime {
                     if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
                         continue;
                     }
+                    if is_control {
+                        control_used = control_used.saturating_add(1);
+                    }
+                    self.xpc_mailbox_seen.remove(&msg.msg_id);
                     cross_shard_out.push(msg);
+                }
+                // S10 hard bound: even a same-height burst cannot leave the
+                // tracker above XPC_MAILBOX_MAX_TRACKED. Oldest entries are
+                // pruned first (deterministic within this node).
+                if self.xpc_mailbox_seen.len() > crate::xshard2pc::XPC_MAILBOX_MAX_TRACKED {
+                    let mut entries: Vec<([u8; 32], u64)> = self
+                        .xpc_mailbox_seen
+                        .iter()
+                        .map(|(id, first)| (*id, *first))
+                        .collect();
+                    entries.sort_by_key(|(id, first)| (*first, *id));
+                    let overflow = self
+                        .xpc_mailbox_seen
+                        .len()
+                        .saturating_sub(crate::xshard2pc::XPC_MAILBOX_MAX_TRACKED);
+                    for (id, _) in entries.into_iter().take(overflow) {
+                        self.xpc_mailbox_seen.remove(&id);
+                        if !prune_ids.contains(&id) {
+                            prune_ids.push(id);
+                        }
+                    }
                 }
                 if !prune_ids.is_empty() {
                     transport.prune_consumed(my_shard, &prune_ids).await;
                 }
                 // §9 2PC: the OUTBOUND records of the transfers this shard
-                // owns are a pure function of its committed 2PC state:
-                //   * the TARGET of a PREPARED transfer answers with a
-                //     PREPARE-ACK (its vote: "I am prepared, I will credit
-                //     on the COMMIT"),
-                //   * the TARGET of an ABORTED transfer answers with an
-                //     ABORT-ACK (its authorisation for the source's refund),
-                //   * the SOURCE of a COMMITTED transfer sends the COMMIT,
-                //   * the SOURCE of a PREPARED transfer re-publishes the
-                //     PREPARE (on the re-publication cadence) while it waits
-                //     for the vote,
-                //   * the SOURCE of a PREPARED transfer whose prepare window
-                //     elapsed asks the target to abort.
+                // owns are the DETERMINISTIC, BOUNDED plan computed above
+                // (`bounded_reemit_plan`): at most XPC_MAX_REEMITS_PER_HEIGHT
+                // records for this height, rotated so a busy shard cannot
+                // starve the tail. It is the SAME pure function of the
+                // committed records and the height that the validator
+                // re-derives, so the proposer never invents a re-emission the
+                // validator refuses (and never exceeds the control cap).
                 // Deriving them from the committed state (and not from a
-                // message) is what makes the protocol RECOVERABLE: a node
-                // that crashed mid-2PC re-derives exactly the same records
-                // and reaches the same decision.
-                if xpc_on {
-                    let records: Vec<crate::xshard2pc::XpcRecord> =
-                        self.xpc_records.values().cloned().collect();
-                    for rec in records {
-                        // The record decides, per side, what this shard owes
-                        // the peer: the source owes a COMMIT (or an
-                        // ABORT-REQUEST), the target owes a vote.
-                        let (phase, from_shard, to_shard) = if rec.source_shard == my_shard {
-                            match crate::xshard2pc::source_action(&rec, self.hc.height) {
-                                crate::xshard2pc::SourceAction::Commit => (
-                                    crate::xshard2pc::XPC_COMMIT,
-                                    rec.source_shard,
-                                    rec.target_shard,
-                                ),
-                                crate::xshard2pc::SourceAction::AbortRequest => (
-                                    crate::xshard2pc::XPC_ABORT_REQUEST,
-                                    rec.source_shard,
-                                    rec.target_shard,
-                                ),
-                                crate::xshard2pc::SourceAction::Reprepare => {
-                                    // The PREPARE is re-published on the
-                                    // cadence only: the opening PREPARE went
-                                    // out with the block that escrowed the
-                                    // value, and the re-publication exists
-                                    // only for the case where it never
-                                    // arrived. Its proof is the source's
-                                    // PREPARED leaf (the escrow), not the
-                                    // sender's account leaf (which the
-                                    // escrow already invalidated).
-                                    if !crate::xshard2pc::should_reprepare(&rec, self.hc.height) {
-                                        continue;
-                                    }
-                                    (
-                                        crate::xshard2pc::XPC_PREPARE,
-                                        rec.source_shard,
-                                        rec.target_shard,
-                                    )
-                                }
-                                crate::xshard2pc::SourceAction::Idle => continue,
+                // message) is what makes the protocol RECOVERABLE: a node that
+                // crashed mid-2PC re-derives exactly the same records and
+                // reaches the same decision.
+                for reemit in &xpc_plan {
+                    let Some(rec) = self.xpc_records.get(&reemit.tx_hash) else {
+                        continue;
+                    };
+                    let (phase, from_shard, to_shard) = match reemit.phase {
+                        crate::xshard2pc::XPC_PREPARE
+                        | crate::xshard2pc::XPC_COMMIT
+                        | crate::xshard2pc::XPC_ABORT_REQUEST => {
+                            if rec.source_shard != my_shard {
+                                continue;
                             }
-                        } else if rec.target_shard == my_shard {
-                            // Height-aware cadence: one ACK per window while
-                            // Prepared, none after Committed, one abort
-                            // authorisation after Aborted.
-                            match crate::xshard2pc::target_action_at(&rec, self.hc.height) {
-                                crate::xshard2pc::TargetAction::PrepareAck => (
-                                    crate::xshard2pc::XPC_PREPARE_ACK,
-                                    rec.target_shard,
-                                    rec.source_shard,
-                                ),
-                                crate::xshard2pc::TargetAction::AbortAck => (
-                                    crate::xshard2pc::XPC_ABORT_ACK,
-                                    rec.target_shard,
-                                    rec.source_shard,
-                                ),
-                                crate::xshard2pc::TargetAction::Idle => continue,
+                            (reemit.phase, rec.source_shard, rec.target_shard)
+                        }
+                        crate::xshard2pc::XPC_PREPARE_ACK | crate::xshard2pc::XPC_ABORT_ACK => {
+                            if rec.target_shard != my_shard {
+                                continue;
                             }
-                        } else {
-                            continue;
-                        };
-                        // The proof of THIS shard's committed 2PC state: the
-                        // peer verifies it against the peer's own state root
-                        // and the anchor, so the vote cannot be forged.
-                        let proof = self.state.get_xpc_proof(&rec.tx_hash).await;
-                        if proof.is_none() {
-                            continue;
+                            (reemit.phase, rec.target_shard, rec.source_shard)
                         }
-                        let msg = CrossShardMessage::new_xpc(
-                            phase,
-                            from_shard,
-                            to_shard,
-                            rec.tx.clone(),
-                            state_root,
-                            prev_hash,
-                            proof,
-                        );
-                        if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
-                            continue;
-                        }
-                        cross_shard_out.push(msg);
+                        _ => continue,
+                    };
+                    // The proof of THIS shard's committed 2PC state: the
+                    // peer verifies it against the peer's own state root and
+                    // the anchor, so the vote cannot be forged.
+                    let proof = self.state.get_xpc_proof(&rec.tx_hash).await;
+                    if proof.is_none() {
+                        continue;
                     }
+                    let msg = CrossShardMessage::new_xpc(
+                        phase,
+                        from_shard,
+                        to_shard,
+                        rec.tx.clone(),
+                        state_root,
+                        prev_hash,
+                        proof,
+                    );
+                    if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
+                        continue;
+                    }
+                    cross_shard_out.push(msg);
                 }
                 // §5 M3 timeout bounces: outbounds this chain produced that
                 // never completed and aged past the height timeout are

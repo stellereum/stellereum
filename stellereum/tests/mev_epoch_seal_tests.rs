@@ -993,15 +993,20 @@ fn the_order_commitment_is_bound_to_its_round() {
 fn a_contribution_from_a_non_contributor_is_refused() {
     let members: Vec<Member> = (0..5).map(|_| member()).collect();
     let committee = committee(19, &members);
+    // The committee is sorted by validator id (the Shamir abscissa is the
+    // 1-based position), so find the non-contributor on the COMMITTEE, then
+    // map it back to the test member holding that identity.
+    let non_contributor_index = (1..=committee.members.len() as u32)
+        .find(|&index| !committee.is_contributor(index))
+        .expect("threshold < member count leaves non-contributors");
+    let non_contributor_id = committee
+        .member_at(non_contributor_index)
+        .expect("the non-contributor index is in range")
+        .validator_id;
     let non_contributor = members
         .iter()
-        .enumerate()
-        .find(|(i, m)| {
-            !committee.is_contributor(committee.index_of(&m.id).unwrap_or(0))
-                && *i != committee.index_of(&m.id).unwrap_or(0) as usize - 1
-        })
-        .map(|(_, m)| m)
-        .expect("the committee has non-contributors");
+        .find(|m| m.id == non_contributor_id)
+        .expect("the committee member is one of the inputs");
 
     let keys = kem_ek_map(&committee, &members);
     let mut dkg = EpochDkg::new(committee.clone(), non_contributor.id);

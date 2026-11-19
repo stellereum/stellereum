@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use stellereum::consensus_net::mesh_may_substitute;
+use stellereum::consensus_net::{mesh_may_substitute, mesh_shortcut_allowed};
 use stellereum::network::{
     MeshDelivery, MeshFuture, ValidatorMesh, ValidatorMeshMember, ValidatorMeshTransport,
     VALIDATOR_MESH_COOLDOWN_MS, VALIDATOR_MESH_EVICT_AFTER,
@@ -400,10 +400,23 @@ fn exempt_committed_frames_never_take_the_mesh_shortcut() {
         "votes/proposals may use the mesh"
     );
 
-    let src = include_str!("../src/consensus_net.rs");
+    // The shortcut gate itself: even with a fully capable mesh that covers
+    // every peer, an exempt (`Committed`) frame must take the per-peer path.
     assert!(
-        src.contains("mesh_may_substitute(exempt) &&"),
-        "the mesh shortcut must be gated on the exempt/Committed rule"
+        !mesh_shortcut_allowed(true, true, true),
+        "Committed must never take the mesh shortcut, even on complete coverage"
+    );
+    assert!(
+        mesh_shortcut_allowed(true, false, true),
+        "non-exempt frames may take a fully covered mesh"
+    );
+    assert!(
+        !mesh_shortcut_allowed(false, false, true),
+        "a non-mesh-capable peer set must use the per-peer path"
+    );
+    assert!(
+        !mesh_shortcut_allowed(true, false, false),
+        "an incomplete mesh must use the per-peer path"
     );
 }
 

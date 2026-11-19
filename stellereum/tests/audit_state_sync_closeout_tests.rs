@@ -546,18 +546,21 @@ fn bond_genesis_callers_only_fund_genesis() {
 async fn f5_slash_after_reward_net_outcome_pinned() {
     use stellereum::consensus::{Vote, VoteKind};
     use stellereum::staking::{
-        DOWNTIME_SLASH_BPS, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, UNBONDING_PERIOD_SECS,
+        DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS, MIN_VALIDATOR_BOND, REWARDS_POOL,
+        STAKING_POOL, UNBONDING_PERIOD_SECS,
     };
 
     // POLICY (W10.5 canonical downtime evidence + V-P34 fail-closed QC):
     // downtime attribution reads `block.last_qc` (the proposer-chosen QC for
     // height-1, verified against the pre-transition set) and an unverifiable
     // QC moves no stake. The pre-W10.5 shape (empty-sig `precommit_qc` as the
-    // 10th miss) is therefore correctly refused with slash 0. This pin keeps
-    // the F5 economics (slash burns bonded only, reward survives, maturation
-    // intact, deterministic) under a GENUINE QC: a second witness with
-    // quorum-alone power signs height 9 omitting the victim, casting the 10th
-    // miss for height-9 evidence carried by the height-10 block.
+    // threshold-th miss) is therefore correctly refused with slash 0. This pin
+    // keeps the F5 economics (slash burns bonded only, reward survives,
+    // maturation intact, deterministic) under a GENUINE QC: a second witness
+    // with quorum-alone power signs the height just before the threshold,
+    // omitting the victim, casting the threshold-th miss for that evidence
+    // carried by the next block. Miss count and heights derive from
+    // `DOWNTIME_MISS_THRESHOLD`, not a literal.
     let w_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let w: [u8; 32] = w_key.verifying_key().to_bytes();
     const W_POWER: u64 = 10 * MIN_VALIDATOR_BOND;
@@ -589,10 +592,11 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             .await
             .unbond(v, MIN_VALIDATOR_BOND / 2, TS)
             .unwrap();
-        // 9 recorded misses for the victim (threshold 10): the witness signs
-        // every height, so only the victim's streak grows.
+        // `DOWNTIME_MISS_THRESHOLD - 1` recorded misses for the victim: the
+        // witness signs every height, so only the victim's streak grows. The
+        // QC attributed by the next block supplies the final miss.
         let _ = w_key;
-        for h in 1..10u64 {
+        for h in 1..DOWNTIME_MISS_THRESHOLD as u64 {
             let burned =
                 e.staking_write()
                     .await
@@ -625,17 +629,26 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         use stellereum::consensus::{register_validator_pq_key, VoteSet};
         use stellereum::post_quantum::{FalconKeypair, PqScheme};
         let (e, v) = prepared_engine(w_key, w).await;
-        // Genuine height-9 QC signed by the witness alone (quorum-alone power,
-        // omits the victim): verifies under the pre-transition set and casts
-        // the victim's 10th miss. FULL-PQ: Falcon-half vote + compiled µQC
-        // envelope (a raw ed entry carries no power).
+        // Genuine QC at the height before the threshold, signed by the witness
+        // alone (quorum-alone power, omits the victim): verifies under the
+        // pre-transition set and casts the victim's final miss. FULL-PQ:
+        // Falcon-half vote + compiled µQC envelope (a raw ed entry carries no
+        // power).
+        let evidence_height = DOWNTIME_MISS_THRESHOLD as u64 - 1;
         let w_fk = FalconKeypair::generate_from_seed(0xF5);
         register_validator_pq_key(w, PqScheme::Falcon512, w_fk.public_key.clone());
-        let vote = Vote::sign_with_falcon(w_key, &w_fk, 9, 0, VoteKind::Precommit, None);
+        let vote = Vote::sign_with_falcon(
+            w_key,
+            &w_fk,
+            evidence_height,
+            0,
+            VoteKind::Precommit,
+            None,
+        );
         assert!(vote.verify(), "witness vote must verify");
         let set0 = e.staking_read().await.to_validator_set();
         let mut vs = VoteSet::new();
-        vs.add(vote, &set0, 9, 0, VoteKind::Precommit)
+        vs.add(vote, &set0, evidence_height, 0, VoteKind::Precommit)
             .expect("genuine witness vote admits");
         let qc = vs
             .certificate_with_parent(None, &set0, Some(&[0u8; 32]))
@@ -644,12 +657,12 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             let set = e.staking_read().await.to_validator_set();
             assert!(
                 qc.verify(&set),
-                "height-9 witness QC must verify under the pre-transition set"
+                "the witness QC must verify under the pre-transition set"
             );
         }
         let block = Block {
             shard_id: MASTERCHAIN_SHARD,
-            height: 10,
+            height: DOWNTIME_MISS_THRESHOLD as u64,
             prev_hash: [0u8; 32],
             state_root: [0u8; 32],
             transactions: vec![],

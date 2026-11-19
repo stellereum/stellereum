@@ -375,6 +375,15 @@ pub fn mesh_may_substitute(exempt_skip: bool) -> bool {
     !exempt_skip
 }
 
+/// Whether the direct mesh may stand in for the per-peer broadcast.
+///
+/// All three conditions are load-bearing: the peer set must be mesh-capable,
+/// the payload must not be exempt (`Committed` always takes the per-peer
+/// path), and the mesh must actually cover every addressed peer.
+pub fn mesh_shortcut_allowed(mesh_capable: bool, exempt_skip: bool, covered: bool) -> bool {
+    mesh_capable && mesh_may_substitute(exempt_skip) && covered
+}
+
 fn batch_bypasses_skip_refs<'a>(msgs: impl Iterator<Item = &'a ConsensusMsg>) -> bool {
     msgs.into_iter().any(committed_bypasses_skip)
 }
@@ -1713,10 +1722,11 @@ impl ConsensusNetwork {
         let mesh_capable = mesh_peers.iter().all(|pid| {
             self.peer_consensus_admitted(pid) && protocol::mesh_may_use_direct(self.peer_caps(pid))
         });
-        if mesh_capable
-            && mesh_may_substitute(exempt)
-            && self.adapter.validator_mesh().covers(&mesh_peers)
-        {
+        if mesh_shortcut_allowed(
+            mesh_capable,
+            exempt,
+            self.adapter.validator_mesh().covers(&mesh_peers),
+        ) {
             let delivery = self
                 .adapter
                 .deliver_consensus_mesh(&self.topic, &data)

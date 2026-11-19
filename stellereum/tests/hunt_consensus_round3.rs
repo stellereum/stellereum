@@ -157,7 +157,9 @@ async fn hunt20_equivocation_evidence_is_never_cleared_after_charging() {
 
 #[test]
 fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
-    use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+    use stellereum::staking::{
+        StakingLedger, DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER,
+    };
     let ks = keys(3);
     let mut l = StakingLedger::new();
     for k in &ks {
@@ -171,7 +173,7 @@ fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
     let eligible: Vec<[u8; 32]> = ks.iter().map(id).collect();
 
     let mut l2 = l.clone();
-    for h in 1..=11u64 {
+    for h in 1..=DOWNTIME_MISS_THRESHOLD as u64 {
         l2.note_missed_heights(h, &|v: &[u8; 32]| claimed_signers.contains(v), &eligible);
     }
     let forgave = l2.validators[&honest].missed;
@@ -181,7 +183,7 @@ fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
     );
 
     let mut l3 = l.clone();
-    for h in 1..=11u64 {
+    for h in 1..=DOWNTIME_MISS_THRESHOLD as u64 {
         l3.note_missed_heights(h, &|_v: &[u8; 32]| false, &eligible);
     }
     let punished = l3.validators[&honest].total_slashed;

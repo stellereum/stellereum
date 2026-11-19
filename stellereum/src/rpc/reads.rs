@@ -1301,8 +1301,13 @@ pub(super) async fn dispatch_reads(
             };
             let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
             let want = tag.resolve(tip);
-            if let Some(hit) = finalized_read_cache_get("stell_getBlock", want, params, tip) {
-                return ok(id, hit);
+            // Only finalized heights may consult the cache. An above-tip read
+            // is an error, and errors bypass the cache entirely (no lookup, no
+            // miss counter): it may resolve as replication catches up.
+            if want <= tip {
+                if let Some(hit) = finalized_read_cache_get("stell_getBlock", want, params, tip) {
+                    return ok(id, hit);
+                }
             }
             let rb = st.recent_blocks.read().await;
             let found = rb.iter().find(|b| b.height == want);

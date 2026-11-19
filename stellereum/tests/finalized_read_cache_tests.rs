@@ -24,6 +24,7 @@ use std::time::Instant;
 
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::mempool::{AdmissionCtx, Mempool};
+use stellereum::mmr::{epoch_end, epoch_of_height, epoch_start, MMR_EPOCH_BLOCKS};
 use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -336,8 +337,8 @@ async fn finalized_read_latency_probe() {
 
 /// Soundness: byte-identical cached vs fresh; unfinalized churn changes
 /// nothing; height advance invalidates; late adopt evicts; TTL expiry
-/// recomputes identical bytes. Uses heights 4000..4011 and epoch 40
-/// (5120..=5247 + boundary 5248) — unique to this test.
+/// recomputes identical bytes. Uses heights 4000..4011 and a full MMR epoch
+/// (derived from `MMR_EPOCH_BLOCKS`) plus its boundary — unique to this test.
 #[tokio::test]
 async fn finalized_read_cache_soundness_and_invalidation() {
     let _g = TEST_LOCK.lock().await;
@@ -346,8 +347,12 @@ async fn finalized_read_cache_soundness_and_invalidation() {
     for h in 4000u64..=4010 {
         publish_height(&st, &ks, &fks, h, 3).await;
     }
-    // Full epoch 40 plus its boundary commitment, then pin the tip there.
-    for h in 5120u64..=5248 {
+    // A full epoch after the block workload, plus its boundary commitment.
+    let complete_epoch = epoch_of_height(4010 + MMR_EPOCH_BLOCKS);
+    let epoch_start_height = epoch_start(complete_epoch);
+    let epoch_end_height = epoch_end(complete_epoch);
+    let boundary_height = epoch_end_height + 1;
+    for h in epoch_start_height..=boundary_height {
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -371,12 +376,15 @@ async fn finalized_read_cache_soundness_and_invalidation() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height.store(5248, std::sync::atomic::Ordering::Relaxed);
+    st.height
+        .store(boundary_height, std::sync::atomic::Ordering::Relaxed);
 
     let block_p = json!({ "height": 4005u64 });
     let blocktx_p = json!({ "height": 4005u64 });
-    let header_p = json!({ "height": 5200u64 });
-    let epoch_p = json!({ "epoch": 40u64 });
+    let header_p = json!({
+        "height": epoch_start_height + MMR_EPOCH_BLOCKS / 2
+    });
+    let epoch_p = json!({ "epoch": complete_epoch });
 
     // 1. Fill: first call misses, second call hits, bytes identical.
     for (m, p) in [
@@ -389,7 +397,10 @@ async fn finalized_read_cache_soundness_and_invalidation() {
         let first = st.call(m, p.clone()).await;
         assert!(first.get("error").is_none(), "{m} must serve: {first}");
         if m == "stell_getEpochRoot" {
-            assert_eq!(first["complete"], true, "epoch 40 must be complete");
+            assert_eq!(
+                first["complete"], true,
+                "epoch {complete_epoch} must be complete"
+            );
             assert!(first["committed_root"].is_string(), "boundary must commit");
         }
         let (l1, h1, m1) = stats();
@@ -475,9 +486,10 @@ async fn finalized_read_cache_soundness_and_invalidation() {
     // 4. Height advance invalidates (miss) but serves identical bytes; the
     // new height serves fresh and then caches.
     {
-        publish_height(&st, &ks, &fks, 5249, 2).await;
+        let next_height = boundary_height + 1;
+        publish_height(&st, &ks, &fks, next_height, 2).await;
         let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(tip, 5249);
+        assert_eq!(tip, next_height);
         let (l0, h0, m0) = stats();
         let after = st.call("stell_getBlock", block_p.clone()).await;
         let (l1, h1, m1) = stats();
@@ -498,7 +510,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
         };
         assert_eq!(after, fresh, "post-advance bytes must match fresh");
         // New height: miss then hit.
-        let new_p = json!({ "height": 5249u64 });
+        let new_p = json!({ "height": next_height });
         let r1 = st.call("stell_getFinalizedHeader", new_p.clone()).await;
         assert!(r1.get("error").is_none(), "new header must serve");
         let r2 = st.call("stell_getFinalizedHeader", new_p.clone()).await;
@@ -567,7 +579,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
     // 7. Incomplete epoch never fills (lookups miss, nothing cached).
     {
         let (l0, h0, m0) = stats();
-        let inc_p = json!({ "epoch": 41u64 });
+        let inc_p = json!({ "epoch": complete_epoch + 1 });
         let i1 = st.call("stell_getEpochRoot", inc_p.clone()).await;
         assert!(i1.get("error").is_some() || i1["complete"] == false);
         let i2 = st.call("stell_getEpochRoot", inc_p.clone()).await;
@@ -683,9 +695,14 @@ async fn finalized_read_cache_bounded_growth() {
     for h in 6000u64..6100 {
         publish_height(&st, &ks, &fks, h, 2).await;
     }
-    // 350 finalized headers -> 350 header keys. Epoch 55 (7040..7167) is
-    // fully covered plus its boundary 7168, so one epoch key joins too.
-    for h in 7000u64..=7350 {
+    // One full epoch after the block workload, plus its boundary commitment,
+    // so every header in the epoch and the epoch root itself are finalized.
+    let header_epoch =
+        epoch_of_height(st.height.load(std::sync::atomic::Ordering::Relaxed) + MMR_EPOCH_BLOCKS);
+    let header_start_height = epoch_start(header_epoch);
+    let header_end_height = epoch_end(header_epoch);
+    let boundary_height = header_end_height + 1;
+    for h in header_start_height..=boundary_height {
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -709,17 +726,18 @@ async fn finalized_read_cache_bounded_growth() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height.store(7350, std::sync::atomic::Ordering::Relaxed);
+    st.height
+        .store(boundary_height, std::sync::atomic::Ordering::Relaxed);
 
     let mut keys: Vec<(&str, Value)> = Vec::new();
     for h in 6000u64..6100 {
         keys.push(("stell_getBlock", json!({ "height": h })));
         keys.push(("stell_getBlockTransactions", json!({ "height": h })));
     }
-    for h in 7000u64..=7349 {
+    for h in header_start_height..=header_end_height {
         keys.push(("stell_getFinalizedHeader", json!({ "height": h })));
     }
-    keys.push(("stell_getEpochRoot", json!({ "epoch": 55u64 })));
+    keys.push(("stell_getEpochRoot", json!({ "epoch": header_epoch })));
     assert!(
         keys.len() > stellereum::rpc::FINALIZED_READ_CACHE_CAP,
         "must overfill the cap: {} keys",
@@ -774,7 +792,13 @@ async fn finalized_read_cache_before_after() {
     for h in 8000u64..=8010 {
         publish_height(&st, &ks, &fks, h, 5).await;
     }
-    for h in 8192u64..=8320 {
+    // A full epoch after the block workload, plus its boundary commitment.
+    let header_epoch =
+        epoch_of_height(st.height.load(std::sync::atomic::Ordering::Relaxed) + MMR_EPOCH_BLOCKS);
+    let header_start_height = epoch_start(header_epoch);
+    let header_end_height = epoch_end(header_epoch);
+    let boundary_height = header_end_height + 1;
+    for h in header_start_height..=boundary_height {
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
             height: h,
@@ -798,13 +822,17 @@ async fn finalized_read_cache_before_after() {
         b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
-    st.height.store(8320, std::sync::atomic::Ordering::Relaxed);
+    st.height
+        .store(boundary_height, std::sync::atomic::Ordering::Relaxed);
 
     let cases: Vec<(&str, Value)> = vec![
         ("stell_getBlock", json!({ "height": 8005u64 })),
         ("stell_getBlockTransactions", json!({ "height": 8005u64 })),
-        ("stell_getFinalizedHeader", json!({ "height": 8250u64 })),
-        ("stell_getEpochRoot", json!({ "epoch": 64u64 })),
+        (
+            "stell_getFinalizedHeader",
+            json!({ "height": header_start_height + MMR_EPOCH_BLOCKS / 2 }),
+        ),
+        ("stell_getEpochRoot", json!({ "epoch": header_epoch })),
     ];
     eprintln!("=== finalized-read cache before/after (ms per call) ===");
     for (m, p) in &cases {

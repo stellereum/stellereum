@@ -340,13 +340,15 @@ async fn plan_installs_exactly_once_and_replays_are_no_ops() {
 
 #[tokio::test]
 async fn cancel_upgrade_clears_the_plan_before_and_after_the_gate_opens() {
-    let gate_h = 10_000u64;
-    let _gate = ChainSpecGate::at(gate_h);
-    let (engine, validators) = engine_with(3).await;
-
     // BEFORE the gate: a cancel is a safety valve and must still execute.
+    // Place the gate AFTER the first plan matures, so this scenario stays
+    // "before the gate" under the shipped timelock instead of pinning a
+    // height that the v2/v3 timelock change made unreachable.
     let before_pass_height = 1_000u64;
     let before_maturity = before_pass_height + GOV_TIMELOCK_HEIGHTS;
+    let gate_h = before_maturity + 1;
+    let _gate = ChainSpecGate::at(gate_h);
+    let (engine, validators) = engine_with(3).await;
     assert!(before_maturity < gate_h);
     pass_action(
         &engine,

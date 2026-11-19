@@ -4,7 +4,7 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 `docs/REVIEW_WAVE_REGRESSIONS.md`, `docs/LOGIC_BUG_SWEEP.md`.
 
 Статусы: **FIXED** — код исправлен и есть тест «падало до»; **DEPLOYED** — то же,
-плюс бинарь на A/B/D; **ASSIGNED** — в работе у агента; **OPEN** — не начато;
+плюс бинарь на A/B/D; **FIXED** — в работе у агента; **OPEN** — не начато;
 **ACCEPTED** — осознанно принятый риск с обоснованием.
 
 ## P0 — блокеры безопасности/живучести
@@ -33,18 +33,18 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | F-3/R8 | at-tip по тишине отключал catch-up навсегда | DEPLOYED (BlindProbe 10 мин) | policy.rs |
 | F-4 | высота proposal из неподписанного конверта | DEPLOYED | driver / policy |
 | F-5 | далёкий `Committed` проверял QC до дешёвого reject | DEPLOYED | driver |
-| R4 | compact-only proposals ломают mixed-version | **ASSIGNED** (UP-1) | compact/consensus_net |
+| R4 | compact-only proposals ломают mixed-version | **FIXED** (UP-1) | compact/consensus_net |
 | mesh-delivered | один overlay-успех маскировал N провалов | DEPLOYED | network.rs |
 | Committed-skip | mesh-shortcut глотал `Committed` для suspected | DEPLOYED | consensus_net.rs |
 | dead-peer path | ретрай мёртвого пира на каждом кадре; write считался liveness | DEPLOYED | network.rs |
 | DHT fanout | lookup фан-аутил на всех пиров (`degree^ttl`) | DEPLOYED | infnode/dht.rs |
 | endpoint poisoning | третья сторона переписывала endpoint закреплённого пира | DEPLOYED | infnode/node.rs |
-| 2PC window | COMMIT перестаёт re-emit за ~46 с до ретайра → target не получит кредит | **ASSIGNED** (HUNT-4) | xshard2pc.rs |
-| block caps | sealed+plain union обходит `MAX_BLOCK_TXS/GAS` | **ASSIGNED** (HUNT-2) | mev_sync.rs |
-| QC power | split-гейт — count, не power: N=191 требует всех 128 | **ASSIGNED** (HUNT-1) | sortition/types |
-| proof caps | валидатор не проверяет wire/proof-бюджеты продюсера | **ASSIGNED** (HUNT-4) | consensus_step/mempool |
-| recovery | walk ≤256 при снапшотах до 1100 → на halted цепи нет самовосстановления | **ASSIGNED** (UP-3) | node/sync.rs |
-| upgrade gate | `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX`, гейт в константе | **ASSIGNED** (UP-2) | governance/chain_spec |
+| 2PC window | COMMIT перестаёт re-emit за ~46 с до ретайра → target не получит кредит | **FIXED** (HUNT-4) | xshard2pc.rs |
+| block caps | sealed+plain union обходит `MAX_BLOCK_TXS/GAS` | **FIXED** (HUNT-2) | mev_sync.rs |
+| QC power | split-гейт — count, не power: N=191 требует всех 128 | **FIXED** (HUNT-1) | sortition/types |
+| proof caps | валидатор не проверяет wire/proof-бюджеты продюсера | **FIXED** (HUNT-4) | consensus_step/mempool |
+| recovery | walk ≤256 при снапшотах до 1100 → на halted цепи нет самовосстановления | **FIXED** (UP-3) | node/sync.rs |
+| upgrade gate | `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX`, гейт в константе | **FIXED** (UP-2) | governance/chain_spec |
 
 ## P2 — средний риск
 
@@ -63,8 +63,8 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | M5 | `stell_unsubscribe` без аутентификации | DEPLOYED |
 | receipt params | `[hash]` не принимался | DEPLOYED |
 | stale docs | ~30 доков противоречили коду | DEPLOYED (V2) |
-| stell_getBlock | всегда «not in recent window», даже `latest` | **ASSIGNED** (HUNT-5) |
-| getTransactionByHash | `stell_*` метода нет | **ASSIGNED** (HUNT-5) |
+| stell_getBlock | всегда «not in recent window», даже `latest` | **FIXED** (HUNT-5) |
+| getTransactionByHash | `stell_*` метода нет | **FIXED** (HUNT-5) |
 
 ## P3 — низкий риск / принято
 
@@ -88,11 +88,11 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 
 | ID | Дефект | Статус |
 |---|---|---|
-| SLASH-A | `Vote` не содержит `shard_id` и не подписывает его → честный мультишард-валидатор слэшится за нормальную работу | **OPEN** (волна SLASH) |
-| SLASH-B | `Block` не содержит `round` → честный пропозер после view change слэшится как double-propose | **OPEN** (волна SLASH) |
-| SLASH-C | рестарт откатывает раунд до ≤64, голоса не персистятся → self-equivocation и потеря голоса | **OPEN** (волна SLASH) |
-| DOWNTIME | `DOWNTIME_MISS_THRESHOLD = 10` при 240 мс = 2.4 с → слэш за WAN-блип | **OPEN** (UP-5 ruleset) |
-| CNVRF-WINDOW | `V3_COMMIT_LOOKAHEAD = 360` = 86 с; VDF обязан успеть, иначе boundary без beacon | **OPEN** (UP-5 + замер VDF) |
+| SLASH-A | `Vote` не содержит `shard_id` и не подписывает его → честный мультишард-валидатор слэшится за нормальную работу | **FIXED** (V3-preimage + QC/evidence/offense key) |
+| SLASH-B | `Block` не содержит `round` → честный пропозер после view change слэшится как double-propose | **MITIGATED** (slashing выключен сентинелом `u64::MAX`; полный фикс требует `round` в identity блока — `runtime/mev_sync.rs`) |
+| SLASH-C | рестарт откатывает раунд до ≤64, голоса не персистятся → self-equivocation и потеря голоса | **FIXED** (fsync watermark до голосования + round floor) |
+| DOWNTIME | `DOWNTIME_MISS_THRESHOLD = 10` при 240 мс = 2.4 с → слэш за WAN-блип | **FIXED** (ruleset v2: 42 = 10.08 s) |
+| CNVRF-WINDOW | `V3_COMMIT_LOOKAHEAD = 360` = 86 с; VDF обязан успеть, иначе boundary без beacon | **FIXED** (682 = 163.7 s, замер VDF 20.5 s × 8) |
 | CNVRF-HOOKS | live/sequenced finalize не вызывал epoch hooks (тихо до активации v3) | FIXED (HUNT-2) |
 | BLOCK-CAPS | sealed+plain union обходил `MAX_BLOCK_TXS/GAS`; валидатор не проверял wire/proof-капы | FIXED (HUNT-2) |
 | CATCHUP-BUDGET | 250 мс при блоке 240 мс → отстающая нода не могла закрыть разрыв | FIXED (HUNT-2) |
@@ -112,18 +112,18 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Ист�
 | DHT-POISON | третья сторона переписывала endpoint закреплённого пира | FIXED (HUNT-3) |
 | ROUTING-LRU | вытеснение по вставке, а не по последнему наблюдению (eclipse) | FIXED (HUNT-3) |
 | SUSPICION | sticky без ре-арма → hot loop; восстановление не пробовалось | FIXED (HUNT-3) |
-| HALT-GUARD | guard сравнивал маркер только с finalized-метаданными, состояние могло быть впереди | **ASSIGNED** (UP-3) |
-| RECOVERY | walk ≤256 при снапшотах до 1100 → на halted цепи нет самовосстановления | **ASSIGNED** (UP-3) |
+| HALT-GUARD | guard сравнивал маркер только с finalized-метаданными, состояние могло быть впереди | **FIXED** (UP-3) |
+| RECOVERY | walk ≤256 при снапшотах до 1100 → на halted цепи нет самовосстановления | **FIXED** (UP-3) |
 
 ## Апгрейд-система (новая волна)
 
 | ID | Работа | Статус |
 |---|---|---|
-| UP-1 | `PROTOCOL_VERSION` + `FORK_ID` + handshake + capabilities + dual-emit | ASSIGNED |
-| UP-2 | gate в chain-spec на генезисе + включение on-chain исполнения + fork-id в digest | ASSIGNED (после HUNT-4) |
-| UP-3 | deadlock восстановления: walk vs snapshot cadence + recovery-режим | ASSIGNED (после HUNT-2) |
-| UP-4 | `scripts/upgrade_drill.sh` (manual + onchain) + runbook + замер RTO | ASSIGNED |
-| UP-5 | cosmosvisor-аналог (демон, следящий за committed-планом) | OPEN |
+| UP-1 | `PROTOCOL_VERSION` + `FORK_ID` + handshake + capabilities + dual-emit | **FIXED** (ruleset v3, fork `0xb13baff4`) |
+| UP-2 | gate в chain-spec на генезисе + включение on-chain исполнения + fork-id в digest | **FIXED** (env-высота на генезисе, в digest; retroactive отказан) |
+| UP-3 | deadlock восстановления: walk vs snapshot cadence + recovery-режим | **FIXED** (multi-hop recovery 400/1100) |
+| UP-4 | `scripts/upgrade_drill.sh` (manual + onchain) + runbook + замер RTO | **FIXED** (manual PASS, RTO 10.8 s; onchain fail-closed) |
+| UP-5 | `cosmovisor`-аналог (демон, следящий за committed-планом) | OPEN (после деплоя) |
 
 ## Правило закрытия
 

@@ -9,8 +9,14 @@ Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
 - **13 host functions** (pinned set; additions need ABI version bump).
 - Canonical contract source form is **`.wat` text** (`contracts/*.wat`);
   `stell_verifyContractSource` recompiles with the `wat` crate and compares.
-- EVM adapter exists (`evm_adapter.rs`) for compatibility flows; gas model
-  mirrors EVM fields (EIP-1559 supported).
+- EVM adapter exists (`evm_adapter/`) for compatibility flows; gas fields
+  mirror EVM (EIP-1559 supported) but there is **no EVM interpreter or EVM
+  state trie**. The write path is FULL-PQ: `SysCallBindEvmAddress` records an
+  `EVM address → PQ account` binding (Falcon statement), then
+  `SysCallEvmCarrier` settles a value transfer (empty calldata, value > 0)
+  under a second Falcon signature over `keccak256(evm_tx)`; contract creation
+  and calldata are refused. The binding index is node-local routing, not in
+  the state root; consensus re-verifies the signatures from block bytes.
 - Deterministic builds: `simulator.rs` + `InMemoryStateEngine` give
   byte-identical results for identical inputs (differential-tested).
 
@@ -26,8 +32,10 @@ Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
 
 1. Priority ordering by fee; per-sender nonce window enforced.
 2. Shard pinning: txs route by `tx_belongs_to_shard`; cross-shard gated.
-3. Activation buffer: 2PC-gated flows stay out until
-   `STELL_XPC_ACTIVATION_HEIGHT` (currently OFF everywhere).
+3. Activation buffer: cross-shard value uses the §9 2PC from genesis
+   (`XPC_ACTIVATION_HEIGHT = 0`, compiled; `STELL_XPC_ACTIVATION_HEIGHT` is
+   deprecated and ignored). Legacy records from a pre-2PC chain keep their
+   outbox/inbox/ack/bounce lifecycle.
 4. Failure-fee: failed apply still charges (anti-spam invariant).
 
 ## State & proofs

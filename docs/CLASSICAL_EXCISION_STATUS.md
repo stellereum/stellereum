@@ -233,8 +233,12 @@ it (`rpc/eth.rs:797-812`), and `evm_adapter::evm_to_stell_address` is used acros
 It is **not** a consensus validity rule today. `Transaction::verify_evm_signature`
 (`sharding/transaction.rs:741-781`) exists — and is deliberately **never called** on the
 mempool/apply path: `rg -n "verify_evm_signature" src/` returns only its definition and two doc
-references. Admission instead refuses the envelope outright at
-`sharding/transaction.rs:1250-1254`. So:
+references. Admission instead refuses the `EV1` envelope outright at
+`sharding/transaction.rs:1250-1254`. The supported EVM write path is a **PQ1 carrier**:
+`SysCallBindEvmAddress` binds `EVM address → PQ account`, and `SysCallEvmCarrier` carries the
+EIP-155/1559 bytes under a Falcon signature over `keccak256(evm_tx)`; the secp signature inside
+those bytes is advisory (routing/UI), never the consensus credential (`evm_adapter/binding.rs`).
+So:
 
 * removing `k256` would remove the EVM compatibility API, not a consensus rule;
 * the existing consensus-side re-verifier is currently unreachable, which is worth a separate

@@ -662,21 +662,24 @@ must also land with Stage 0 (they prove Stage 0 changed nothing).
 - `docs/specs/03_VM_AND_EXECUTION_PHASE2.md:17` correctly prices zkML-verify at
   5,000; `docs/site/06-security.md:54` records KI-31/33.
 
-### 5.2 Strings that still overclaim (fix before mainnet marketing)
+### 5.2 Strings that still say STARK/ZK (post-wave status)
 
-| Where | String | Why it is wrong |
+The earlier overclaims were corrected as **text only** in module headers,
+doc comments, the RPC capability statement and `docs/CODE_INDEX.md`; the
+mechanism was not changed. The remaining occurrences are deliberate legacy
+names or error tags, not claims:
+
+| Where | String | Status |
 |---|---|---|
-| `zkml_attestation.rs:130` | `/// A Post-Quantum STARK proof of quantized inference.` | It is neither post-quantum-specific nor a STARK. This is the single worst offender. |
-| `zkml_attestation.rs:110` | `ZKML_ATTESTATION_PROTOCOL_TAG = b"STELLEREUM_PQ_STARK_BLAKE3_V1"` | A **committed** constant that literally says STARK. Changing it changes every FS transcript (hard fork) — so the honest move is a doc note + a v2 tag when the FS domain is next forked. |
-| `zkml_attestation.rs:317` | section header `Post-Quantum STARK Prover & Verifier` | wrong |
-| `zkml_attestation.rs:266-268` | `Setup Functions (Transparent / Zero-Knowledge)` | there is no setup and no ZK |
-| `zkml_attestation.rs:530` | `// Cryptographic Soundness: Assert that trace_root commits ...` | the trace root commits to the prover's own activations; soundness comes from re-execution alone |
-| `svm.rs:2891-2893` | `(A larger value would fail the pairing check anyway; this names the reason.)` | **There is no pairing check.** Flatly false in live consensus code. |
-| `svm.rs:388-390` | `// §2 succinct halves: fully priced here` | no succinctness exists; "succinct halves" is the old name |
-| `zkml.rs:1481` | `Verify inference computational correctness at consensus level without heavy TEE/SGX.` | the following WARNING contradicts the first line; the first line is the one people quote |
-| `zkml.rs:1583-1585` | "In-memory only ... extending the record changes no persisted encoding" | false; see G8 / `storage.rs:1241-1252` |
-| `docs/CODE_INDEX.md:381` | "PQ-STARK-BLAKE3 (`STELLEREUM_PQ_STARK_BLAKE3_V1`)" | repeats the tag as if it were a proof-system claim |
-| `zkml.rs:1421-1422`, `zkml_attestation.rs:40-41` | "what makes a value-bearing decision sound" | the chain has **no way to act on the verdict** (G1): no branch, no event, no stored return value. Sound as a statement; unusable as a gate. |
+| `zkml_attestation.rs:125` | `ZKML_ATTESTATION_PROTOCOL_TAG = b"STELLEREUM_PQ_STARK_BLAKE3_V1"` | **Remains.** A committed Fiat–Shamir preimage; changing it changes every transcript (hard fork). Its doc says it is a legacy name and the mechanism is re-execution with a BLAKE3 Merkle trace root. |
+| `zkml_attestation.rs` | `"stark: ..."` error strings (`validate`, proof decode, spec checks) | **Remains.** Internal error prefixes; no proof-system claim. Rename only with a compatible error-contract change. |
+| `docs/specs/02_CRYPTO_AND_PQ.md` | `STELLEREUM_PQ_STARK_BLAKE3_V1` | Kept as the honest legacy-tag note: NOT a STARK, NOT a SNARK, verifier re-executes. |
+| `docs/CODE_INDEX.md` | "legacy protocol tag ... not a STARK" | Fixed to state the limitation explicitly. |
+| `zkml.rs:1421-1422`, `zkml_attestation.rs:40-41` | "what makes a value-bearing decision sound" | Already qualified: the chain has no branch/event/stored return value, so a verify is an EVENT, not a gate. |
+
+Remaining semantic caveat (unchanged): the chain cannot act on a zkML verdict
+in-transaction (G1), and re-registering the byte-identical model is now an
+idempotent no-op (different weights under a taken id still revert).
 
 ### 5.3 Fields the capability statement should add (RPC-only, JSON — safe)
 

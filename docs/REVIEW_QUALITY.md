@@ -124,7 +124,7 @@ was split in `9607dbd85` and stripped of classical crypto in `3d59b9dce`.
 | 4.9 | `docs/COMPLETENESS_GAP_ANALYSIS.md:23,90,164` | No `.github` directory / no hosted CI at all | `stellereum/.github/workflows/ci.yml` exists (lint + build + test jobs). The root has no `.github`, but "CI is absent" is false for the core crate. | S3 | no |
 | 4.10 | `docs/COMPLETENESS_GAP_ANALYSIS.md:19` table | "`unjail` has no opcode, no RPC, no wallet command" (and commission/redelegate dead ends) | Unjail **is** wired: `OpCode::SysCallUnjail` (`svm.rs:1124,2149`), applied via `apply_staking_unjail_ops`. Redelegate and commission-change remain unwired. Split the claim. | S3 | mainnet |
 | 4.11 | `docs/UPGRADE_AND_RECOVERY.md:40-41,155-156,850` | "`upgrade_plan` is **not** in the commitment digest (`commitment.rs:726-757` has no arm)" | The arm exists at `commitment.rs:784-788` (presence, name, height, sha256) — `COMPLETENESS_GAP_ANALYSIS.md:471-473` says the same. The two docs contradict each other. | S2 | mainnet |
-| 4.12 | `docs/UPGRADE_AND_RECOVERY.md:79` | "Ten constants" is the inventory of every `*_ACTIVATION_HEIGHT` | There are **eleven**: the list omits `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX` (`governance.rs:80`). An operator reading the gate inventory misses the upgrade-execution gate. | S3 | mainnet |
+| 4.12 | `docs/UPGRADE_AND_RECOVERY.md:70-82` | "Ten constants" is the inventory of every `*_ACTIVATION_HEIGHT` | There are **thirteen** gate constants, including `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX` (`governance.rs:80`), `CHAIN_BINDING_ACTIVATION_HEIGHT` (`chain_binding.rs:48`) and `ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT` (`zkml_attestation.rs:144`). An operator reading the old inventory missed the upgrade-execution gate. | S3 | mainnet |
 | 4.13 | `docs/specs/04_NETWORK_AND_CONSENSUS_PHASE2.md:15` | µQC power rule = `max(2/3 committee, 1/2 network+1)`, committee cap 64 | Code: `max(2/3 committee, 2/3 network)` (`consensus/sortition.rs:155-164`) and `MICRO_COMMITTEE_MAX_SIZE = 128` (`:89`). The code comment explicitly documents the old 1/2 rule as a **broken** rule (`sortition.rs:110-135`). | S1 (audit artefact is wrong about the safety threshold) | public + mainnet |
 | 4.14 | `docs/specs/04_NETWORK_AND_CONSENSUS_PHASE2.md:37` | Round-timeout base comes from `STELL_ROUND_TIMEOUT_MS`, must match across validators | Env removed; base is `FROZEN_ROUND_TIMEOUT_BASE_MS = 3000` (`consensus/sortition.rs:709-710`; `node/consensus_driver.rs:879-881`). | S2 | public |
 | 4.15 | `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md:25,56,60-66` | `STELL_PURE_PQ` is a switch; BLS (`bls.rs`, `DEFAULT_BLS_ACTIVATION_HEIGHT`) and ECVRF (`STELL_VRF_ACTIVATION_HEIGHT`, `vrf.rs:128`) exist | `bls.rs` deleted; ECVRF deleted; `vrf.rs` is 133 lines with no activation type. `STELL_PURE_PQ` is parsed-and-ignored on the node (override `Some(true)` at `node/consensus_driver.rs:94`). | S2 | public |
@@ -150,8 +150,8 @@ because AGENTS.md §1 makes `docs/specs/` the technical truth):
 | `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md` | `:3-4,54-66,109-130` | Source list includes `bls.rs`; all Falcon/BLS/ECVRF line numbers shifted; "35-method"/`cn_vrf` claims stale (see 4.15-4.16). |
 | `docs/specs/03_VM_AND_EXECUTION_PHASE2.md` | `:3-5,27-64` | Sources `state_engine.rs`, `runtime.rs`, `evm_adapter.rs`; entries `runtime.rs:8184`, `state_engine.rs:6437`, `rpc.rs:274` all invalid. |
 | `docs/specs/04_NETWORK_AND_CONSENSUS_PHASE2.md` | `:3,9-13,41-42` | `consensus.rs:3905` etc; `main.rs:974-978`/`:150-156` in a 35-line file. |
-| `docs/UPGRADE_AND_RECOVERY.md` | `:67,88` | `consensus_net.rs:1999` → actual `2093`; `:79` missing gate (4.12). |
-| `docs/COMPLETENESS_GAP_ANALYSIS.md` | `:54,55,107,239,277` | `consensus_net.rs:1999` → `2093`; `tokenomics.rs:51` → `55`. (Header pins refs to `be52ce87c`, so this class is disclosed — but the file is dated 2026-11-18 and read as current.) |
+| `docs/UPGRADE_AND_RECOVERY.md` | `:67,88` | **Fixed post-wave (`24e2a1dca`):** gate inventory is now `0/0/0` for compact/XPC/GOV_OPS, `UPGRADE_EXEC` is listed, and catch-up says 30 s backstop. |
+| `docs/COMPLETENESS_GAP_ANALYSIS.md` | `:54,55,107,239,277` | **Fixed post-wave (`24e2a1dca`):** compact/XPC/governance are active from genesis; only the remaining `u64::MAX` gates are listed. |
 
 **Recommended fix, one PR:** regenerate the specs from the current tree (or add a "superseded by
 `00_PROJECT_MAP.md` + `CODE_INDEX.md`" banner and delete the stale ones). Do not hand-patch line numbers;
@@ -163,26 +163,28 @@ they will drift again. Until then, treat `docs/specs/` as historical, not truth.
 
 ### 5a. Every `*_ACTIVATION_HEIGHT`
 
-All are documented in code; none is reachable except the two noted.
+All are documented in code. `COMPACT_GOSSIP`, `XPC` and `GOV_OPS` are active at `0`; `PQ_TRANSPORT_H` is a legacy schedule entry. The rest are `u64::MAX`/never.
 
 | Constant | Value | Declared | Reader | Consensus effect | Verdict |
 |---|---|---|---|---|---|
 | `QC_SPLIT_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:179` | `qc_split_active_at` `:231` | µQC advisory vs finality split | off, documented |
 | `BEACON_DRAW_ACTIVATION_HEIGHT` | `u64::MAX` | `:464` | `:473` | XMSS beacon committee draw | off, documented |
 | `CNVRF_V3_ACTIVATION_HEIGHT` | `u64::MAX` | `:552` | `:568` | CN-VRF v3 sortition/proposer | off, documented |
-| `COMPACT_GOSSIP_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus_net.rs:2093` | `:2116` | compact µQC gossip | off; receiver not wired (refuses loudly) |
+| `COMPACT_GOSSIP_ACTIVATION_HEIGHT` | `0` | `consensus_net.rs:2097` | `compact_gossip_active` | compact proposal gossip + compact µQC codec | **active from genesis**; proposal path wired end to end, µQC emit/admit call sites deferred |
 | `EMISSIONCapEXACT_ACTIVATION_HEIGHT` | `u64::MAX` | `tokenomics.rs:55` | `:395` | emission schedule | off, documented |
 | `PQ_TRANSPORT_H_ACTIVATION_HEIGHT` | `10_000` | `mev_epoch.rs:995` | `:1003` | **none** — function returns `true` always | retained for frozen schedule only |
-| `XPC_ACTIVATION_HEIGHT` | `u64::MAX` | `xshard2pc.rs:137` | `XpcActivation::from_chain_spec` | cross-shard 2PC | off; env ignored with WARN (`node/policy.rs:896-905`) |
+| `XPC_ACTIVATION_HEIGHT` | `0` | `xshard2pc.rs:146` | `XpcActivation::from_chain_spec` | cross-shard 2PC | **active from genesis**; env ignored with WARN (`node/policy.rs:1016-1047`) |
 | `MEV_RESHARE_ACTIVATION_HEIGHT` | `u64::MAX` | `mev_epoch.rs:1703` | `:1715` | proactive reshare | off, documented |
-| `GOV_OPS_ACTIVATION_HEIGHT` | `u64::MAX` | `state_engine/mod.rs:91` | `state_engine/apply.rs:3011` | block-carried governance | off, documented |
-| `UPGRADE_EXEC_ACTIVATION_HEIGHT` | `u64::MAX` | `governance.rs:80` | `:114` | upgrade sweep | off, documented; **not in `chain_spec`** |
+| `GOV_OPS_ACTIVATION_HEIGHT` | `0` | `governance.rs:151` | `gov_ops_active_at` | block-carried governance | **active from genesis**; propose/vote apply, deterministic finalize+execute |
+| `UPGRADE_EXEC_ACTIVATION_HEIGHT` | `u64::MAX` | `governance.rs:80` | `upgrade_exec_active_at` | upgrade sweep | off, documented; **not in `chain_spec`**; blocks `SoftwareUpgrade`/`CancelUpgrade` execution only |
 | `SPRT_TIER3_ACTIVATION_HEIGHT` | `u64::MAX` | `oracle.rs:205` | `:224` | advisory oracle only | off, documented |
+| `CHAIN_BINDING_ACTIVATION_HEIGHT` | `CHAIN_BINDING_NEVER` | `chain_binding.rs:48` | `check_admission*` | chain-binding rollout | never; the env form is the remaining consensus switch |
+| `ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT` | `u64::MAX` | `zkml_attestation.rs:144` | context-bound transcript | zkML context binding | off, opt-in seam |
 
-`chain_spec::current_activation_schedule()` lists 7 (`chain_spec.rs:117-176`): QC split, beacon, CN-VRF,
+`chain_spec::current_activation_schedule()` lists 7 (`chain_spec.rs:130-180`): QC split, beacon, CN-VRF,
 compact, emission, PQ transport, XPC. Missing from the operator-visible schedule: `MEV_RESHARE`, `GOV_OPS`,
-`UPGRADE_EXEC`, `SPRT_TIER3`. Acceptable only if the schedule is explicitly labelled "not exhaustive" — it
-is not. **S3, mainnet.**
+`UPGRADE_EXEC`, `SPRT_TIER3`, `CHAIN_BINDING`, `ZKML_CONTEXT_BINDING`. Acceptable only if the schedule is
+explicitly labelled "not exhaustive" — it is not. **S3, mainnet.**
 
 Theoretical nit (not a finding): every gate uses `height >= CONST`, so a chain that reached height
 `u64::MAX` would activate all of them for exactly one block. Unreachable (>10^19 blocks); `tokenomics`

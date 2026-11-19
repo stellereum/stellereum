@@ -36,7 +36,7 @@ Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 | Storage/state | `cpat2.rs` (trie), `storage.rs`, `chain.rs`, `mmr.rs` | exclusion proofs, MMR epoch roots (epoch 128) |
 | Economics | `staking.rs`, `token.rs`, `clob*.rs`, `amm*.rs`, `perps*.rs`, `mev*.rs` | F1 reward accumulator, failure-fee on apply-fail |
 | Privacy | `crypto_privacy.rs`, `wallet_signing.rs` | shielded transfer/unshield, `STELL-MSGSIG-V1` |
-| Cross-shard/bridge | `xshard2pc.rs`, `bridge.rs`, `bridge_adapters.rs` | 2PC gated by `STELL_XPC_ACTIVATION_HEIGHT` (OFF), truth-gate bridge |
+| Cross-shard/bridge | `xshard2pc.rs`, `bridge.rs`, `bridge_adapters.rs` | 2PC armed by compiled `XPC_ACTIVATION_HEIGHT = 0` (active from genesis), truth-gate bridge |
 | Crypto | `post_quantum.rs`, `bls.rs`, `vrf.rs` | Falcon FIPS-206, BLS12-381 (no PoP — structural), VRF planned |
 | Interfaces | `rpc.rs`, `native_api.rs`, `light_client.rs`, `simulator.rs`, `mempool.rs` | 22 native APIs, mempool priority+shard-pin+nonce-window |
 

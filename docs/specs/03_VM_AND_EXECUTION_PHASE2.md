@@ -84,8 +84,9 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter/`,
 - Bridge: withdrawal 50k threshold (`bridge.rs:33`), 1 h timelock (`:34`),
   500k/h rate limit (`:35`), 100M mint cap (`:46`), 24 h refund grace (`:48`).
 - 2PC: prepare timeout 64 heights (`XPC_PREPARE_TIMEOUT_HEIGHTS`,
-  `xshard2pc.rs:126`), activation `XPC_ACTIVATION_HEIGHT = u64::MAX`
-  (`:137`, `XpcActivation` `:301`), pre-activation transfers grandfathered.
+  `xshard2pc.rs`), activation `XPC_ACTIVATION_HEIGHT = 0` (active from genesis;
+  `xshard2pc.rs:146`, `XpcActivation` `:301`), pre-activation transfers
+  grandfathered.
 - Gov: quorum 6 666 bps (`governance.rs:30`).
 - Staking: bond floor (`staking.rs:62`), active/target validators
   (`:209,:214`), slashes 500/10 000/10 bps (`:265,:270,:275`), commission
@@ -108,9 +109,10 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter/`,
   `SOAK_HEIGHTS`, `SHARD0/1` via `ShardRegistry`).
 - Pins: both-shards-finalize, cross-shard supply conservation, rotation
   propagation to the workchain, freeze-and-heal.
-- Activation gate: `XpcActivation` (`xshard2pc.rs:301-329`,
-  `XpcActivation::Disabled` default); the old `main.rs:2723` pointer is STALE
-  — see `stellereum/src/xshard2pc.rs`.
+- Activation gate: `XpcActivation::from_chain_spec()` (`xshard2pc.rs:301-345`),
+  which is `FromHeight(0)` because `XPC_ACTIVATION_HEIGHT = 0`
+  (`xshard2pc.rs:146`). `Disabled` remains only the `u64::MAX` sentinel; the
+  old env/`main.rs:2723` pointer is STALE.
 - Boot topology: `{0}` and the fixed public pair `{0,1}` are the only
   registries accepted without `STELL_EXPERIMENTAL_SHARDS`
   (`sharding/topology.rs:89-124`).

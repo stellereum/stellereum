@@ -59,7 +59,7 @@ Pinned deps (consensus-relevant): `ed25519-dalek v2`
 | `oracle.rs`, `orderbook.rs`, `pmm.rs` | Price feeds, CLOB, PMM |
 | `parallel_exec.rs` | Parallel execution engine |
 | `post_quantum.rs`, `pq_registry.rs` | Falcon-512 verify (`post_quantum.rs:534`, `:2213`), PQ key registry |
-| `sharding/topology.rs`, `xshard2pc.rs` | Shards (`MASTERCHAIN_SHARD 0`, `sharding/topology.rs:8`); 2PC gated |
+| `sharding/topology.rs`, `xshard2pc.rs` | Shards (`MASTERCHAIN_SHARD 0`, `sharding/topology.rs:8`); 2PC active from genesis (`XPC_ACTIVATION_HEIGHT = 0`) |
 | `staking.rs`, `token.rs`, `tokenomics.rs` | Staking math (`staking.rs:62`), token, emission cap (`:235`) |
 | `turnstile.rs`, `client_ip.rs` | Anti-bot gate, client IP policy |
 | `vrf.rs` | Sortition MATH only — no key material, no env, no activation gate |

@@ -40,8 +40,10 @@ Broader `shard_id|ShardId|shard_registry|ShardRegistry` footprint:
    `registry.is_sharded() && *s != MASTERCHAIN_SHARD` — `main.rs:8111`
    (loop at `main.rs:8108`, spawn at `main.rs:8133`).
 7. Secondary gates: `STELL_WORKCHAIN_OBSERVER` observer mode —
-   `main.rs:8118`; `STELL_XPC_ACTIVATION_HEIGHT` → `XpcActivation::Disabled`
-   default — `main.rs:2723`, `xshard2pc.rs:242`.
+   `main.rs:8118`; 2PC activation is the compiled chain-spec constant
+   `XPC_ACTIVATION_HEIGHT = 0` (active from genesis) — `xshard2pc.rs:146`,
+   `node/policy.rs:1033-1047`. `STELL_XPC_ACTIVATION_HEIGHT` is deprecated
+   and ignored (warns if set).
 
 ### Tests covering workchain paths
 
@@ -129,8 +131,9 @@ Cutting requires deleting/rewriting 11 integration files plus unit tests in
   config/ops: set `STELL_SHARDS=0,1`, provision `./data/store-shard1` +
   `./data/mempool-shard1.bin` (`main.rs:350`, `main.rs:364`), fund faucet via
   `STELL_FAUCET_KEY_FILE` (`main.rs:405`), decide `STELL_WORKCHAIN_OBSERVER`
-  (`main.rs:8118`) and `STELL_XPC_ACTIVATION_HEIGHT` (`main.rs:2723`,
-  default `Disabled` = legacy outbox flow), then soak on testnet.
+  (`main.rs:8118`). 2PC is already armed by the compiled
+  `XPC_ACTIVATION_HEIGHT = 0`; `STELL_XPC_ACTIVATION_HEIGHT` is ignored.
+  Then soak on testnet.
 
 ## 3. CUT plan (file-by-file, if chosen)
 
@@ -145,8 +148,8 @@ Cutting requires deleting/rewriting 11 integration files plus unit tests in
    (`runtime.rs:1119`), header-commitment collect/check (`runtime.rs:1361`,
    `runtime.rs:1450`), `refresh_workchain_set_from_master`
    (`runtime.rs:7484`), `Cluster::new_sharded` helpers (`runtime.rs:7859`).
-4. `xshard2pc.rs`: delete whole module + activation enum (`xshard2pc.rs:242`)
-   if 2PC is cut with it; else keep `Disabled` only.
+4. `xshard2pc.rs`: delete whole module + activation enum if 2PC is cut with
+   it; else keep the compile-time `XPC_ACTIVATION_HEIGHT` (currently `0`).
 5. `network.rs`: delete `CrossShardTransport`, cross-shard KV, topic helpers
    (`network.rs:134`, `network.rs:1753`–`network.rs:1852`).
 6. `rpc.rs`: delete shard-type/routing/faucet-shard branches
@@ -165,13 +168,15 @@ Cutting requires deleting/rewriting 11 integration files plus unit tests in
    provide `STELL_FAUCET_KEY_FILE`; confirm `GENESIS_FAUCET_BALANCE`.
 3. Observe-first: start with `STELL_WORKCHAIN_OBSERVER=1` (`main.rs:8118`)
    to dodge N=3 equal-power quorum deadlock, then promote to validating.
-4. Protocol: leave `STELL_XPC_ACTIVATION_HEIGHT` unset (legacy outbox flow,
-   the tested mode) until 2PC (`xshard2pc.rs`) passes testnet soak.
+4. Protocol: nothing to set — `XPC_ACTIVATION_HEIGHT = 0` is compiled in.
+   `STELL_XPC_ACTIVATION_HEIGHT` is deprecated/ignored. Run the two-shard
+   soak (`scripts/soak_two_shard.sh`, see `docs/TWO_SHARD_DEPLOY.md`).
 5. Test live: run the 54 integration tests + a 2-shard testnet soak
    (finality on both shards, one cross-shard transfer, one masterchain
    rotation propagating via `refresh_workchain_set_from_master`).
 6. Mainnet: monitor per-shard stores, header-registry lag
-   (`workchain_headers`), XPC activation boundary agreement across operators.
+   (`workchain_headers`), and 2PC record/credit parity across operators
+   (the activation boundary itself is compiled and identical on every node).
 
 ## 5. RECOMMENDATION
 
@@ -198,6 +203,7 @@ not code risk.
   coverage; re-adding sharding later costs far more than keeping the gate.
 - UNPARK risks: workchain liveness/quorum ops (N=3 deadlock note,
   `main.rs:8116`); faucet key management; storage doubling (second store);
-  XPC 2PC still default-off so cross-shard value runs legacy flow until
-  activation; needs testnet proof before mainnet — never enable
-  `STELL_SHARDS=0,1` on mainnet without the §4 soak.
+  2PC is active from genesis, so cross-shard value uses prepare/vote/commit
+  immediately (legacy records from an older chain keep their lifecycle);
+  needs the two-shard soak before mainnet — never enable `STELL_SHARDS=0,1`
+  on mainnet without the §4 soak.

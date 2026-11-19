@@ -33,6 +33,9 @@ derived from them, not guessed.
 - Chain id default 5757 (`STELL_CHAIN_ID` unset everywhere).
 - Timeouts: `STELL_ROUND_TIMEOUT_MS=10000`,
   `STELL_BROADCAST_JOIN_MS=2000`, `STELL_CATCHUP_BUDGET_MS=8000`.
+- Catch-up is event-driven: the 30 s `STELL_CATCHUP_INTERVAL_MS` backstop is
+  skipped at tip; reactive evidence runs after a 500 ms floor. The 8000 ms
+  budget above is a WAN tuning override of the 250 ms code default.
 - Read-only recon rule: never touch `multinode/`, live configs,
   `/root/*`. `down`/`reset` only affect `run/cluster/`.
 
@@ -83,9 +86,10 @@ derived from them, not guessed.
 
 ### 0.2 Spec sections that govern the demos
 
-- `docs/specs/03_VM_AND_EXECUTION.md`: mempool rule 3 — 2PC-gated
-  flows stay out until `STELL_XPC_ACTIVATION_HEIGHT` (currently OFF
-  everywhere); cross-shard txs gated; workchain Parked (see below).
+- `docs/specs/03_VM_AND_EXECUTION.md`: mempool rule 3 — cross-shard value
+  uses the §9 2PC from genesis (`XPC_ACTIVATION_HEIGHT = 0`; the old
+  `STELL_XPC_ACTIVATION_HEIGHT` env is ignored); workchain shard-1 is
+  Parked on live (see below).
 - `docs/specs/04_NETWORK_AND_CONSENSUS.md`: BFT V5 (live N=4,
   quorum 2f+1; leader = parent-hash sortition); `adopt_committed`
   uniformity; `DIVERGENCE their_root=… our_root=…` = the fork alarm
@@ -255,14 +259,16 @@ bounce-after-prepare is refused (no double spend).
   a **2-shard process** (`STELL_SHARDS=0,1` over one `Node` — the
   cross-shard KV helpers in `network.rs` are node-local, so both
   consensus instances must share one process; `sharding.rs:389-392`),
-  `STELL_XPC_ACTIVATION_HEIGHT=<h>` set identically on all validators
-  (`main.rs:2589-2612`, `xpc_activation_from_env`; unset/parse-fail =
-  `Disabled`, logged), and a funded account on the workchain
-  (`fund_shard_genesis` funds ONLY the dev/faucet account;
-  `STELL_FAUCET_KEY` seed).
-- Spec note: workchain shard-1 is PARKED on live (no user txs);
-  `STELL_XPC_ACTIVATION_HEIGHT` is OFF everywhere
-  (`docs/specs/03_VM_AND_EXECUTION.md` rule 3).
+  and a funded account on the workchain (`fund_shard_genesis` funds ONLY
+  the dev/faucet account; `STELL_FAUCET_KEY` seed).
+- Activation: **nothing to set.** `XPC_ACTIVATION_HEIGHT = 0` is compiled
+  into the chain spec (`xshard2pc.rs:146`, `node/policy.rs:1033-1047`).
+  `STELL_XPC_ACTIVATION_HEIGHT` is deprecated and ignored (it only logs a
+  WARN if present). `scripts/local-cluster.sh up2` still writes it as a
+  legacy env line, but the node ignores it.
+- Spec note: workchain shard-1 is PARKED on live (no user txs), so the live
+  deployment is single-shard in practice even though the 2PC protocol is
+  armed from genesis.
 
 ### Steps — local-cluster: BLOCKED (do not attempt stock)
 
@@ -280,9 +286,10 @@ Requirement to unblock (for the lead): a 2-shard local-cluster mode
 boot each node with `STELL_SHARDS=0,1` preserved (stop unsetting it),
 one process driving both shards per node (cf.
 `scripts/run-observer.sh` which already sets `STELL_SHARDS=0,1`),
-`--shard` handling per shard instance, `STELL_XPC_ACTIVATION_HEIGHT`
-in `env.i`, faucet-funded workchain genesis, and an RPC that can
-route `--target-shard 1` sends. Then the demo is:
+`--shard` handling per shard instance, faucet-funded workchain genesis, and
+an RPC that can route `--target-shard 1` sends. No XPC env is needed: the
+activation is the compiled `XPC_ACTIVATION_HEIGHT = 0` (and
+`scripts/local-cluster.sh up2` already exercises this). Then the demo is:
 
 ```bash
 # UNVERIFIED sketch (blocked on the above — commands follow wallet/RPC code, never executed):
@@ -314,9 +321,9 @@ mode exists. Matrix row: `xshard-2pc` in `scripts/feature_matrix.sh:80`.
 
 ### What changes on the live VPS chain
 
-- Set the SAME `STELL_XPC_ACTIVATION_HEIGHT` on all 4 validators
-  (a mismatch splits the protocol: pre-boundary legacy flow vs 2PC).
-  Requires unparking shard 1 (funded demo + serving RPC per spec §04).
+- Run the same binary on all 4 validators (the gate is compiled, not env).
+  Unparking shard 1 (funded demo + serving RPC per spec §04) is what makes
+  a live cross-shard transfer possible; the protocol is already active.
 - Live topics are sharded (`…/shard/1`); cross-shard transport is P2P,
   not node-local — watch for dropped/lost PREPARE (the re-publish
   path covers it: source re-sends PREPARE with a new `msg_id`).
@@ -509,11 +516,12 @@ long-running processes were started for this runbook.)
 ./scripts/local-cluster.sh status
 ```
 
-**2PC (blocked — local proof only, no cluster needed):**
+**2PC (2-shard process ready; live blocked because shard-1 is parked):**
 
 ```bash
 cargo test -p stellereum --test xshard_2pc_tests
-# live/local demo blocked on: 2-shard local-cluster mode (STELL_SHARDS=0,1 + STELL_XPC_ACTIVATION_HEIGHT)
+./scripts/local-cluster.sh up2 3        # one process drives both shards
+scripts/soak_two_shard.sh --dev --duration 300
 ./scripts/feature_matrix.sh   # optional: full matrix incl. xshard-2pc + split rows
 ```
 
@@ -530,7 +538,7 @@ cargo test -p stellereum --test mev_epoch_seal_tests
 | Demo | Verdict | Blocker / note |
 |---|---|---|
 | split | **READY-NOW** (partition-recovery half) + **BLOCKED** (true state-root split forensics) | `chaos` + `status` + log/RPC checks runnable today. True-split half needs a real divergence (none exists while live is down); `stelops diverge` path documented but **UNVERIFIED** live. In-process divergence proofs green (`hunt_finalize_split`, matrix row `split`). |
-| xshard 2PC | **BLOCKED-ON-X** | X = 2-shard local-cluster mode: script unsets `STELL_SHARDS`, boots `--shard 0` only; needs `STELL_SHARDS=0,1` multi-shard process + `STELL_XPC_ACTIVATION_HEIGHT` + funded workchain. Also live-blocked (shard-1 PARKED, activation OFF). Local proof = `xshard_2pc_tests` (11 tests) + matrix row `xshard-2pc`. |
+| xshard 2PC | **LOCAL-READY / LIVE-BLOCKED** | Protocol is active from genesis (`XPC_ACTIVATION_HEIGHT = 0`); `scripts/local-cluster.sh up2` + `scripts/soak_two_shard.sh` exercise a real two-shard process (`docs/TWO_SHARD_DEPLOY.md`). Live remains blocked because shard-1 is PARKED, not because activation is off. In-process proof = `xshard_2pc_tests` + matrix row `xshard-2pc`. |
 | DKG (EpochDkg) | **READY-NOW** (attenuated) | Epoch-0 DKG observable via `[mev-seal]` logs + `stell_epochKey` on any fresh cluster; full rotation needs height ≥ 128 (**UNVERIFIED** timing). In-process proofs green (`mev_epoch_seal_tests`, matrix row `mev-seal`; no dedicated DKG row). |
 
 All `UNVERIFIED` marks above mean: derived from code actually read
@@ -679,9 +687,10 @@ same epoch on all 3 at shutdown.
   chain — expectation flips to the N≥4 branch (survivors keep
   finalizing through the kill); `stelops diverge` forensics needs a
   real divergence (none exists).
-- 2PC: still blocked-on-X (2-shard local-cluster mode +
-  `STELL_XPC_ACTIVATION_HEIGHT` + funded workchain; live additionally
-  needs shard-1 unparked). In-process suite green (11/11, this log).
+- 2PC: at the time of this log, blocked on the old env gate + 2-shard
+  local mode. Current code: `XPC_ACTIVATION_HEIGHT = 0` (compiled), and
+  `local-cluster.sh up2` + `soak_two_shard.sh` exercise both shards; live
+  still needs shard-1 unparked. In-process suite green (11/11, this log).
 - DKG: needs a live observation of `stell_epochKey` convergence across
   the 4 validators + epoch-boundary rotation at height multiple of
   128; local observation here was partial (1/3 nodes serving).
@@ -689,6 +698,11 @@ same epoch on all 3 at shutdown.
 ---
 
 ## Execution log — 2026-11-01 (local 2-shard XPC mode, EXECUTED; 2PC transfer BLOCKED with reason)
+
+> **Post-wave note (2026-11-19):** this log records the old env-driven gate
+> (`STELL_XPC_ACTIVATION_HEIGHT=5`). The shipped gate is now compiled at
+> `XPC_ACTIVATION_HEIGHT = 0`; the env is deprecated and ignored. The log is
+> kept as the historical execution record.
 
 Executed on the LOCAL simulator only (`scripts/local-cluster.sh up2`,
 2-shard opt-in added this date; debug binary, ports P2P 19411-13 / RPC

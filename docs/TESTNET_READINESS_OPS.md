@@ -139,8 +139,10 @@ live values are whatever the per-node env files hold — **UNVERIFIED** live):
   `stellereum/src/main.rs:3645`), `STELL_ROUND_ZERO_TIMEOUT_MS` (650),
   `STELL_DOWN_PROPOSER_TIMEOUT_MS` (800), `STELL_MIN_BLOCK_MS` (code default
   400; live templates pin 400 — `stellereum/scripts/four-node/env.C.template:36`),
-  `STELL_TICK_MS`, `STELL_CATCHUP_BUDGET_MS` / `STELL_CATCHUP_INTERVAL_MS`,
-  `STELL_BROADCAST_JOIN_MS` (500), `STELL_SEND_TIMEOUT_MS`,
+  `STELL_TICK_MS`, `STELL_CATCHUP_BUDGET_MS` (default 250) /
+  `STELL_CATCHUP_INTERVAL_MS` (default 30 000; a backstop only — catch-up is
+  event-driven and skipped at tip), `STELL_BROADCAST_JOIN_MS` (500),
+  `STELL_SEND_TIMEOUT_MS`,
   `STELL_CONS_BCAST_MIN_INTERVAL_MS`, `STELL_CONS_PROBE_MIN_INTERVAL_MS`,
   `STELL_PROBE_EVICT_AFTER`, `STELL_DIAL_BACKOFF_BASE/MAX_MS`,
   `STELL_DIAL_BUDGET_PER_SEC`, `STELL_INBOUND_BULK_BYTES_PER_SEC/BURST`,
@@ -148,7 +150,9 @@ live values are whatever the per-node env files hold — **UNVERIFIED** live):
   (300), `STELL_LIVENESS_ALARM_MS`, `STELL_RETRO_PUBLISH_INTERVAL_MS` /
   `STELL_RETRO_BEHIND_WINDOW_SECS`, `STELL_MEV_UNSEAL_WAIT_MS`.
 - Sharding/execution: `STELL_SHARDS` (`stellereum/src/sharding.rs:379`),
-  `STELL_XPC_ACTIVATION_HEIGHT`, `STELL_CHAIN_BIND_ACTIVATION_HEIGHT`,
+  `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` (2PC is compiled:
+  `XPC_ACTIVATION_HEIGHT = 0`; `STELL_XPC_ACTIVATION_HEIGHT` is deprecated
+  and ignored),
   `STELL_WORKCHAIN_OBSERVER`, `STELL_OBSERVER`, `STELL_PARALLEL_EXEC`,
   `STELL_SNAPSHOT_INTERVAL` (default 1000, min 50), `STELL_NEW_CHAIN`
   (`stellereum/src/bootstrap.rs:116`), `STELL_DNS_SEEDS`.
@@ -156,7 +160,9 @@ live values are whatever the per-node env files hold — **UNVERIFIED** live):
   50000; conf expects 8000; docs recommend 1000000 — reconcile per §8),
   `STELL_DHT_KEEP_BLOCKS_DEFAULT`, `STELL_DHT_PRUNE_INTERVAL_HEIGHTS`,
   `STELL_DHT_PRUNE_MAX_PER_RUN`, `STELL_DHT_FOREVER_TTL_MS`,
-  `INFNODE_KV_DEBOUNCE_MS` (30 min live), `STELL_SLED_CACHE_BYTES` (1 GiB),
+  `INFNODE_KV_DEBOUNCE_MS` (30 min live),
+  `INFNODE_PEER_EVICT_COOLDOWN_MS` (60 000; peer suspicion cooldown after 3
+  consecutive DHT/direct failures), `STELL_SLED_CACHE_BYTES` (1 GiB),
   `STELL_SLED_FLUSH_MS` (500), `STELL_SLED_COMPRESSION`, `STELL_DATA_DIR`.
 - Mempool/fees: `STELL_MEMPOOL_CAP`, `STELL_MEMPOOL_PER_SENDER`,
   `STELL_MIN_GAS_LIMIT`, `STELL_ESTIMATE_FEE_RATE_LIMIT` (5/s),

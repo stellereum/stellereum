@@ -125,8 +125,11 @@ queues, weak subjectivity).
    exotic paths widen rather than narrow the audit surface. Keep flags off until a PQ-only
    testnet drills them.
 - **Single-shard PARK (workchain shard-1 empty).** Pragmatic, not principled: it removes an
-   entire cross-shard fault surface (cf. 2PC gated off, `xshard2pc.rs`). Cost: every "sharded"
-   claim is currently single-shard; unparking needs funding + serving RPC, not just a flag flip.
+   entire cross-shard fault surface from the live deployment. Note the 2PC itself is now
+   **active from genesis** (`XPC_ACTIVATION_HEIGHT = 0`, `xshard2pc.rs:146`) and tested by the
+   two-shard soak; the live chain remains single-shard because shard-1 is parked, not because
+   the protocol gate is off. Cost: every "sharded" claim is currently single-shard; unparking
+   needs funding + serving RPC, not just a flag flip.
 - **Downtime-as-deterministic-input (canonical QC evidence, both propose + adopt paths).**
    Unusual in a good way: downtime accounting derives from committed QCs every node replays
    identically, instead of local wall-clock counters. Residual: thresholds (10 misses, 100-height

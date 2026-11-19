@@ -43,7 +43,7 @@ Everything else below is P1–P3: per-engine (not chain-wide) supply cap, slashe
 | **SLASH-01** | Matured-but-unwithdrawn stake is outside the slashable base | **P1** | `staking.rs:2494-2508`, `:2200-2226` | No |
 | **SLASH-02** | Slash/abort pool debits are `let _ = …` (fail-open → pool/ledger drift) | **P1** | `apply.rs:3734`, `:3838`, `:3888`, `:2980-2989` | No |
 | **SUPPLY-02** | Value-conserving moves routed through the *capped mint* in latent helpers | **P2** | `runtime/anchors.rs:2183`, `contracts.rs:397`, `settlement.rs:1392` | No (no production callers) |
-| **DET-01** | Block reward resolved from local governance state, not block bytes | **P2** (latent) | `runtime/apply.rs:213`, `runtime/cluster.rs:383`, `runtime/lanes.rs:306` | No (gov inert) |
+| **DET-01** | Block reward resolved from local governance state, not block bytes | **P1** (now reachable) | `runtime/apply.rs:213`, `runtime/cluster.rs:383`, `runtime/lanes.rs:125-126` | **Yes** — governance is active from genesis (`GOV_OPS_ACTIVATION_HEIGHT = 0`); a `SetBlockReward` can change the reward between pipeline points |
 | **SNAP-01** | Empty chunk list accepted as a valid snapshot → mint headroom reset; `unwrap_or_default` snapshots | **P2** | `accounts.rs:2525-2531`, `memory_bounds.rs:522-543`, `accounts.rs:2261` | No (latent, no production caller) |
 | **DET-02** | Node-local switches (`cross_shard_enabled`, `STELL_PARALLEL_EXEC`) select committed behaviour | **P2** (latent) | `apply.rs:1981`, `xshard.rs:414`, `accounts.rs:457-465` | No |
 | **COMMIT-01** | Minted counter joins the digest with no activation height / version gate | **P3** | `commitment.rs:2046-2060`, `accounts.rs:916` | No (rollout hazard) |
@@ -278,7 +278,7 @@ Three helpers move existing value but call the *mint* primitive, which both cons
 
 ---
 
-## 8. DET-01 — the block reward is resolved from local state, not block bytes (P2, latent)
+## 8. DET-01 — the block reward is resolved from local state, not block bytes (P1, now reachable)
 
 `runtime/apply.rs:213` and `runtime/cluster.rs:383`:
 
@@ -296,7 +296,7 @@ pub fn block_reward_for(gov: Option<&crate::governance::Governance>, default: u6
 
 `runtime/lanes.rs:306` then applies `job.reward`, captured at submit time.
 
-**Explanation.** `apply_block_transition(block, block_reward)` takes the mint amount as a *parameter*, and that parameter is derived from the node's own governance state at submit time. The correct deterministic source is the block (a committed field) or the committed pre-state at the applied height. Today this is safe only because governance is inert: `GOV_OPS_ACTIVATION_HEIGHT = u64::MAX` (`state_engine/mod.rs:91`) and the legacy RPC write path refuses on N>1 nodes. The moment governance activates, a node that applied a `SetBlockReward` at a slightly different pipeline point — or that missed it — mints a different reward for the same block and forks the root.
+**Explanation.** `apply_block_transition(block, block_reward)` takes the mint amount as a *parameter*, and that parameter is derived from the node's own governance state at submit time (`block_reward_for` reads `gov.applied.block_reward`). The correct deterministic source is the block (a committed field) or the committed pre-state at the applied height. Governance is now **active from genesis** (`GOV_OPS_ACTIVATION_HEIGHT = 0`, `governance.rs:151`), so this is no longer a latent issue: a node that applies a `SetBlockReward` at a slightly different pipeline point — or that missed it — can mint a different reward for the same block and fork the root. This is a code finding, not a doc-only drift; do not mark it safe because an old doc said governance was inert.
 
 **Economic impact.** Inflation rate becomes node-local at the moment governance becomes useful — precisely when the reward parameter starts to move.
 

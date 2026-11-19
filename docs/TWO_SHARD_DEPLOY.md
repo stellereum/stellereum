@@ -17,6 +17,7 @@ the compiled chain-spec constant, not by an operator variable.
 | Activation | `xshard2pc::XPC_ACTIVATION_HEIGHT = 0` (`active_from_genesis`) |
 | Chain-spec gate | `chain_spec::current_activation_schedule()` → `XPC_ACTIVATION_HEIGHT [stellereum::xshard2pc]: active_from_genesis (0)` |
 | Transport | shared in-process infnode node-local KV (`CrossShardTransport::from_node`) |
+| Credit accounting | a target-side `COMMIT` counts as **one** inbound credit in the `cross-shard inbound credited N` log/counter (duplicate COMMITs are no-ops); consumed mailbox records are pruned by `msg_id` on apply (idempotent, node-local KV hygiene) |
 | Validator set of shard 1 | **the masterchain staking ledger** (one registry, no second opinion) |
 | Boot guard | `{0,1}` is accepted **without** `STELL_EXPERIMENTAL_SHARDS` |
 
@@ -34,11 +35,12 @@ height `0` or later runs PREPARE/vote/COMMIT.
   chain-height coordination between operators.
 * The value is deterministic: it is a compiled `const`; every node derives
   `XpcActivation::FromHeight(0)` from the same source.
-* The legacy path below the boundary is not deleted. Transfers produced before
-  the activation height keep running outbox/inbox/ack/bounce to completion; the
-  two flows never interleave on one transfer. (On a chain upgraded from a
-  pre-2PC binary, an in-flight legacy transfer can still time out and refund on
-  the source; it cannot be credited by the XSHARD-01 gate.)
+* The legacy code path is not deleted, but there is no reachable height below
+  `0` on an upgraded chain: every in-flight legacy transfer is re-read as
+  "produced at height >= 0". It is still refused by the target's XSHARD-01
+  credit gate and can time out/refund on the source, so a chain with in-flight
+  legacy transfers must drain them **before** running this binary. (A fresh
+  chain has no pre-0 history and is unaffected.)
 
 `STELL_XPC_ACTIVATION_HEIGHT` is **deprecated and ignored**. The node logs a
 warning if it is set. Do not use it: two nodes with different local values
@@ -302,9 +304,11 @@ must run the same build.
 * Mixed versions are unsafe. A pre-activation binary reports the gate off and
   ignores `XPC_*` records; a new source producing PREPARE against an old target
   stalls the transfer (liveness loss, not a double spend). Roll out together.
-* In-flight legacy transfers from before the upgrade: they keep their legacy
-  lifecycle, but the XSHARD-01 target gate refuses the one-step credit, so they
-  time out and refund on the source.
+* In-flight legacy transfers from before the upgrade: after the switch every
+  transfer is classified as produced at height `>= 0`, so the new binary does
+  not continue their old lifecycle. The XSHARD-01 target gate still refuses the
+  one-step credit, so they time out and refund on the source. Drain them before
+  upgrading if a clean legacy completion is required.
 * Rollback to an older binary has the same mixed-version hazard in reverse:
   2PC records already committed stay in state, but the old binary will not
   process new XPC records. Roll forward is the safe direction.

@@ -14,7 +14,7 @@
 - `stellereum/src/client_ip.rs` (604 ln) — Real client IP behind a reverse proxy.
 - `stellereum/src/cn_vrf.rs` (732 ln) — Committed-Nonce VRF (CN-VRF) — SANDBOX pure module.
 - `stellereum/src/commitment.rs` (3086 ln) — Canonical commitment to every consensus-visible subsystem that does NOT
-- `stellereum/src/compact_prop.rs` (316 ln) — Compact block / vote propagation — DESIGN DOC + KAT PROTOTYPE (UNWIRED).
+- `stellereum/src/compact_prop.rs` — Compact proposal gossip (wired, active from genesis) + compact µQC codec (active, emitter call site deferred). Includes short-id KATs and bounded `BodyPull`/`Body` resolver/server.
 - `stellereum/src/consensus.rs` (7737 ln) — Pipelined BFT Consensus Engine (Tendermint/HotStuff-inspired)
 - `stellereum/src/consensus_net.rs` (4462 ln) — Consensus P2P transport: carries proposals and votes between validators over
 - `stellereum/src/contract.rs` (2993 ln) — On-chain WASM smart contracts (deterministic, metered).
@@ -23,7 +23,7 @@
 - `stellereum/src/cpat2.rs` (2108 ln) — Compressed Patricia-Merkle trie — v2, relative-skip model.
 - `stellereum/src/crypto_privacy.rs` (2234 ln) — Confidentiality module: Pedersen Commitments & Stealth Addresses
 - `stellereum/src/dns_seeds.rs` (1245 ln) — DNS seed discovery: bootstrap peers from public DNS TXT records.
-- `stellereum/src/evm_adapter.rs` (9214 ln) — Ethereum JSON-RPC 2.0 types and network info adapter for Stellereum.
+- `stellereum/src/evm_adapter/` — Ethereum JSON-RPC 2.0 adapter: read views, strict EIP-155/1559 decode, and the FULL-PQ EVM write path (`binding.rs`: `SysCallBindEvmAddress` binding + `SysCallEvmCarrier` value-transfer carrier; no EVM interpreter).
 - `stellereum/src/explorer.rs` (2439 ln) — Public block explorer + rate-limited gateway.
 - `stellereum/src/governance.rs` (2653 ln) — On-chain Governance: stake-weighted proposals and voting.
 - `stellereum/src/lib.rs` (62 ln)
@@ -65,8 +65,8 @@
 - `stellereum/src/wallet.rs` (1737 ln) — Lightweight Wallet Module for Stellereum (SPV & Light Client)
 - `stellereum/src/wallet_signing.rs` (1036 ln) — Wallet Signature Standard for Stellereum (audit P2 item 15).
 - `stellereum/src/xshard2pc.rs` (611 ln) — §9 CROSS-SHARD TWO-PHASE COMMIT (2PC) for native value transfers.
-- `stellereum/src/zkml.rs` (2061 ln) — Session keys and zkML lightweight proof verification engine
-- `stellereum/src/zkml_attestation.rs` (587 ln) — Post-quantum **attestation** engine for quantized inference.
+- `stellereum/src/zkml.rs` — Session keys and zkML **verifiable-inference-by-re-execution** engine (SOUND, not zero-knowledge/succinct; `zkml_capabilities()` is the machine-readable claim).
+- `stellereum/src/zkml_attestation.rs` — **Re-execution attestation** for quantized inference: verifier re-runs the forward pass and recomputes the BLAKE3 Merkle trace root + Fiat–Shamir hash. NOT a STARK/SNARK and NOT zero-knowledge; `STELLEREUM_PQ_STARK_BLAKE3_V1` is a legacy committed tag.
 - `stellereum/src/bin/abi_codegen.rs` (835 ln) — ABI code generator: reads a JSON ABI manifest and emits typed Rust and
 - `stellereum/src/bin/ledger_tool.rs` (209 ln) — Ops tool: inspect (and, with `--demote`, surgically demote) the staking
 
@@ -378,7 +378,7 @@
 - `stellereum/tests/workchain_guard_tests.rs` (116 ln) — Workchain boot-guard tests (fail-closed text + hatch only).
 - `stellereum/tests/xshard_2pc_tests.rs` (1140 ln) — §9 CROSS-SHARD TWO-PHASE COMMIT (2PC) for native value transfers.
 - `stellereum/tests/xshard_replay_tests.rs` (513 ln) — Audit F1 (HIGH): cross-shard replay sets vs snapshot install.
-- `stellereum/tests/zkml_attestation_tests.rs` (1597 ln) — §2 zkML, ATTESTATION half: PQ-STARK-BLAKE3 (`STELLEREUM_PQ_STARK_BLAKE3_V1`)
+- `stellereum/tests/zkml_attestation_tests.rs` — §2 zkML ATTESTATION half: re-execution + BLAKE3 Merkle trace root. The legacy protocol tag is `STELLEREUM_PQ_STARK_BLAKE3_V1`, but the mechanism is **not a STARK** and not ZK; the tests pin that honestly.
 - `stellereum/tests/zkml_live_tests.rs` (921 ln) — §2 zkML on the live block path: reachable + sound-checked.
 - `stellereum/tests/zz_committed_rt.rs` (58 ln)
 - `stellereum/tests/zz_inspect_qc.rs` (60 ln)

@@ -30,11 +30,16 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 
 ## zkML (verifiable inference by re-execution — NOT succinct ZK)
 
-- Protocol tag `STELLEREUM_PQ_STARK_BLAKE3_V1` (`zkml_attestation.rs`):
-  BLAKE3 Merkle-trace attestations, verifier recomputes. Groth16/arkworks
+- Protocol tag `STELLEREUM_PQ_STARK_BLAKE3_V1` (`zkml_attestation.rs`) is a
+  **legacy committed name**: despite `PQ_STARK_BLAKE3` it is NOT a STARK and
+  NOT a SNARK. The verifier **re-executes** the quantized forward pass and
+  recomputes the BLAKE3 Merkle trace root + Fiat–Shamir hash. Groth16/arkworks
   were removed (no ark dependency); legacy `snark_*` helper names remain.
 - `zkml_capabilities()`: sound, NOT zero-knowledge, NOT succinct, NOT hiding;
   TEST-ONLY deterministic setups are refused a VK on the live path.
+  Re-registering the byte-identical model under an existing id is an
+  idempotent no-op; different weights under a taken id revert (first writer
+  wins).
 - ML-DSA-44 (`0x03`): fail-closed DISABLED — `from_id(3)` errs, verify
   returns false, registry refuses (pinned by `mldsa_*` tests).
 - Phase-1 tracks live in `stellereum/docs/PLAN-VRF.md` (VRF: math bound, NOT wired into

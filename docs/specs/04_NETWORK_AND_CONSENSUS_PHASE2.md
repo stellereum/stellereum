@@ -112,6 +112,11 @@ Sources: `stellereum/src/consensus/`, `consensus_net.rs`, `network.rs`,
   set-binding check `check_snapshot_set_binding` (`:1197`).
 - Retry backoff: base 100 ms (`FETCH_RETRY_BASE_BACKOFF_MS`, `:1600`), max
   1000 ms (`:1602`), jitter cap 100 ms (`:1612`).
+- Scheduling: event-driven. A verified peer message (or head pointer) above
+  our tip schedules the next attempt; the reactive floor is 500 ms, the
+  `STELL_CATCHUP_INTERVAL_MS` backstop defaults to 30 s, and a node at tip
+  skips the probe. A pass is bounded by `STELL_CATCHUP_BUDGET_MS` (default
+  250 ms).
 - Gap-0 / checkpoint invariants: no `GAP_0` const exists in the tree; the
   gap-adjacent consts are `RETRO_SKIP_BEHIND_GAP = 100` (`sync.rs:1856`) and
   `LIVE_ADOPT_GAP_THRESHOLD = 16` (`:1976`). Resync depends on the

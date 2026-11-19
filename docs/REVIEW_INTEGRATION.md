@@ -141,23 +141,19 @@ Mitigations that keep this from being High: finality (not the checkpoint) is the
 
 **Fix:** never drop `Consensus`/`Finalized` — block (bounded) or fail the process loudly instead; at minimum, assert the production runtime flavour at startup and refuse to boot on `CurrentThread` when persistence is armed.
 
-### F3 — `eth_call` answers for any address (Medium)
+### F3 — `eth_call` answers for any address (Medium; FIXED)
 
-```rust
-// evm_adapter/adapter.rs:695-706
-pub async fn handle_eth_call_with_engine(&self, engine: &InMemoryStateEngine, params: &Value, ...) {
-    let calldata = extract_calldata(params);
-    let result = match calldata {
-        Some(data) => self.emulate_erc20_call_with_engine(engine, data).await,
-        None => "0x".to_string(),
-    };
-    Ok(json!(result))
-}
-```
+`eth_call` now reads `params["to"]` and delegates to
+`eth_call_target_code_status`, which uses the same committed lookup as
+`eth_getCode`. A target with no committed code returns `"0x"`; a
+target-less call keeps the legacy native-token view. State-changing selectors
+(`transfer`/`approve`/`transferFrom`) and `allowance` also return `"0x"`, never
+a fabricated success (`evm_adapter/adapter.rs:673-810`).
 
-`params["to"]` is never read. A wallet probing an arbitrary contract with selector `06fdde03` receives this node's token name; with `70a08231` it receives a balance derived from the address argument. That is a fabricated answer attributed to a contract that may not exist. The rest of the `eth_*` surface is notably honest (`eth_feeHistory` refused, uncles `null`, `eth_getProof` actually verified at `adapter.rs:2506-2527`), so this one is a consistency bug.
-
-**Fix:** require `to` to equal the one known token address (or the zero/absent address) before answering metadata; otherwise return `"0x"` plus the same "no EVM execution" error used elsewhere.
+Residual (unchanged): the price is still a native-token adapter, not an EVM
+interpreter — a metadataless call object can still get the documented
+native-token constants. That is an intentional emulation, not a per-address
+fabrication.
 
 ### F4 — Snapshot probe window vs. snapshot interval (Medium)
 

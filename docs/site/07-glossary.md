@@ -31,7 +31,9 @@ One line per term; protocol terms first, resilience/ops terms after.
 - **D2 penalty:** per-sender admission-floor surcharge after apply
   failures, mirrored in consensus (`src/state_engine.rs:481`).
 - **epoch / activation boundary:** height-gated rule switches (2PC
-  `STELL_XPC_ACTIVATION_HEIGHT`); every node of a shard must agree.
+  `XPC_ACTIVATION_HEIGHT`, compiled and `0` from genesis; the old
+  `STELL_XPC_ACTIVATION_HEIGHT` env is ignored); every node of a shard must
+  agree.
 - **commitment digest:** hash folding all non-trie subsystems into the
   single trie key `sha256("STELL_CONSENSUS_COMMITMENT_V1")`.
 - **view change:** round-timeout advance (3 s default) when a height

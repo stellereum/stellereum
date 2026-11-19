@@ -1,6 +1,15 @@
 # Gov Block-Carried Design (C-01 full fix)
 
-Status: DESIGN ONLY. No code changed. All section references verified against
+Status: **IMPLEMENTED and ACTIVE from genesis**
+(`GOV_OPS_ACTIVATION_HEIGHT = 0`, `stellereum/src/governance.rs:151`). This
+document retains the original design rationale; the implementation differs in
+two places: only **two** carrier opcodes exist (`SysCallGovPropose` /
+`SysCallGovVote`), and finalize/execute run in the deterministic block sweep
+(`apply_governance_transition`), not as separate opcodes. `SoftwareUpgrade` /
+`CancelUpgrade` execution still requires the separate
+`UPGRADE_EXEC_ACTIVATION_HEIGHT` gate (`governance.rs:80`, `u64::MAX`).
+
+All section references were verified against
 `stellereum/src/{governance,svm,mempool,state_engine,staking,pq_registry,rpc,consensus_net}.rs`.
 
 ## 0. Problem
@@ -47,10 +56,17 @@ mempool + apply); (c) tx nonce covers replay within chain; (d) sender is
 address field exists to forge. Gov-level idempotence (`AlreadyVoted`,
 proposer stake gate, execute-once) is the second layer, not the first.
 
-- `SysCallGovPropose { title: String, action: GovAction }` — handler: `title.len()<=256` pre-check, `gov.propose(ledger, ctx.sender, title, action, ctx.timestamp)` on clone-committed `Governance`+`StakingLedger`; revert whole tx on `Err`.
-- `SysCallGovVote { proposal_id: u64, choice: VoteChoice }` — handler: `gov.vote(ledger, ctx.sender, proposal_id, choice, ctx.timestamp)`; revert on `Err` (double-vote, closed, zero-weight all revert, reporter wastes gas).
-- `SysCallGovFinalize { proposal_id: u64 }` — handler: `gov.finalize_at_height(ledger, proposal_id, ctx.timestamp, block_height)` where `block_height` is threaded from `execute_payload` like `timestamp` is today; revert on `VotingStillOpen`; idempotent re-finalize returns status (no-op success, no schedule touch).
-- `SysCallGovExecute { proposal_id: u64 }` — handler: `gov.execute_with_oracle_at_height(ctx.sender, proposal_id, oracle, block_height)` (oracle handle wired like the price-feed/oracle path; non-oracle actions ignore the oracle half; oracle actions without a wired oracle revert `InvalidAction` exactly as today); revert on `Timelocked`/`NotPassed`/`AlreadyExecuted`.
+Implemented carrier opcodes (SVM dispatch only charges gas and pushes; the
+authoritative apply is the block scan — see §3):
+
+- `SysCallGovPropose { proposal_id: u64, title: String, action: Box<GovAction>, height_observed: u64 }` — apply requires `proposal_id == governance.next_id` and `height_observed == block.height`, then runs `gov.propose(ledger, tx.from, title, action, block.timestamp)`.
+- `SysCallGovVote { proposal_id: u64, choice: VoteChoice, height_observed: u64 }` — apply requires `height_observed == block.height`, then runs `gov.vote(ledger, tx.from, proposal_id, choice, block.timestamp)` (same one-vote/idempotent-replay semantics as the direct path).
+
+There are **no** `SysCallGovFinalize` / `SysCallGovExecute` opcodes in the
+shipped implementation. Finalize and execute are deterministic block steps:
+
+- `Governance::finalize_due_at_height(ledger, block.timestamp, block.height)` finalizes every `Open` proposal whose voting window closed, in ascending id order.
+- `Governance::execute_due_governance_at_height(block.height, chain_id, oracle)` executes every `Passed`, matured action in ascending id order, re-deriving authority from the committed tally. All 13 action types go through this sweep; `SoftwareUpgrade` / `CancelUpgrade` are included only when `upgrade_exec_active_at(height)` is also true.
 
 Gas (new consts in `svm.rs`, anchored to existing table): propose =
 `GAS_STAKE_BOND` scale (ledger scan + snapshot write, the most expensive);
@@ -130,43 +146,35 @@ paths and re-risks the observed 18-day wrong-topic isolation outage
 replays. No code change needed beyond gov txs being submittable via
 `stell_sendRawTransaction` (already open, self-authenticating).
 
-## 5. Migration
+## 5. Migration (shipped)
 
-RECOMMENDATION: deprecate-but-working until `GOV_BLOCK_CARRIED_ACTIVATION`
-(const height,žd default = implementation-merged height + 21,600 ≈ 18h at
-3s blocks; single-node dev may set `STELL_GOV_DIRECT_OK=1` to keep direct
-writes past activation for local flows), then RPC-direct gov writes refuse
-fail-closed (`-32000 "governance is block-carried; submit via
-stell_sendRawTransaction"`). Reasons: immediate cut breaks single-node dev
-loops and in-flight test harnesses; indefinite dual-write keeps the fork
-vector (two writers of committed state). The const (never env on mainnet)
-keeps activation identical on all nodes (AGENTS.md §7 frozen-core rule).
-
-Rollout: (i) land opcodes + handlers + admission bounds + RPC tx-builder
-arms (RPC builds the tx, signs as today, submits to local mempool/gossip —
-same UX, new transport); (ii) single-node dev: verify proposal→vote→
-finalize→mature→execute across one timelock on one node; (iii) multi-node:
-2-3 node testnet, assert identical `governance_digest` + state root after
-each transition, kill one node mid-vote and re-sync; (iv) flip activation;
-(v) delete direct-write arms (separate change, after activation + one
-release). Pre-activation committed state (open/passed proposals, locks,
-`timelocks`) migrates untouched — handlers operate on the same structs.
+The shipped activation is `GOV_OPS_ACTIVATION_HEIGHT = 0` (active from
+genesis), not a delayed `GOV_BLOCK_CARRIED_ACTIVATION`; there is no
+`STELL_GOV_DIRECT_OK`. The block form is primary:
+`stell_submitProposal` / `stell_vote` accept a signed transaction carrying
+`SysCallGovPropose` / `SysCallGovVote` and only admit it to the mempool. The
+legacy direct-parameter RPC form still exists for single-node dev but is
+refused on `validator_set.len() > 1`; `STELL_GOV_ALLOW_MULTINODE_WRITES=1`
+remains the documented fork switch and should not be used on a real network.
+Pre-activation committed state (open/passed proposals, locks, `timelocks`)
+needs no migration — handlers operate on the same structs.
 
 ## 6. Lock/finalize/timelock state machine (exact, unchanged semantics, new callers)
 
-States: `Open → Passed | Rejected` (finalize tx only), `Passed → Executed`
-(execute tx only). Transitions: `propose` tx (stake≥10k, title≤256B,
-`action.validate()`, freezes `electorate`+`electorate_weights`, locks
-proposer own-stake via `lock_governance`) → `Open`; `vote` tx (`now <
-voting_end`, one vote, weight from snapshot, `lock_governance(weight)`) →
-tallies; `finalize` tx (`now ≥ voting_end`; `turnout ≥ electorate*Q/10000 &&
-yes>no && yes+no>0` → `Passed` + `timelocks[id]=finalize_height+7200`,
-else `Rejected`; BOTH release proposer+voter locks exactly once) →
-terminal-pending; `execute` tx (`status==Passed && height ≥ maturity`, or
+States: `Open → Passed | Rejected` (deterministic finalize sweep), `Passed →
+Executed` (deterministic execute sweep). Transitions: `propose` tx
+(stake≥10k, title≤256B, `action.validate()`, freezes
+`electorate`+`electorate_weights`, locks proposer own-stake via
+`lock_governance`) → `Open`; `vote` tx (`now < voting_end`, one vote, weight
+from snapshot, `lock_governance(weight)`) → tallies; `finalize_due_at_height`
+(`now ≥ voting_end`; `turnout ≥ electorate*Q/10000 && yes>no && yes+no>0` →
+`Passed` + `timelocks[id]=finalize_height+7200`, else `Rejected`; BOTH
+release proposer+voter locks exactly once) → terminal-pending;
+`execute_due_governance_at_height` (`status==Passed && height ≥ maturity`, or
 unscheduled-legacy `None`→immediate one-time migration; applies action
 bounds again, oracle half atomically for oracle actions; sets `Executed`
 only after all domain writes) → `Executed`. `rotate_key` refused while
-`locked_governance>0` (existing). `finalize` of non-Open / `execute` of
+`locked_governance>0` (existing). Finalize of non-Open / execute of
 non-Passed are deterministic no-ops/failures that move nothing.
 
 ## 7. Test plan
@@ -187,27 +195,21 @@ bond→vote→finalize ordering test asserting tally invariance (G1 snapshot).
 - Multi-node harness: proposal→vote→finalize→7200-height wait→execute on a
 3-node testnet incl. one node down mid-vote + resync; all roots equal;
 equivocation-5b step unaffected (gov txs present in same blocks).
-- Sunset: pre-activation direct writes work; post-activation refuse with the
-documented string; `STELL_GOV_DIRECT_OK=1` keeps single-node dev green.
 - Gate: `cargo clippy --all-targets -- -D warnings` + full `cargo test`
 + `consensus_liveness_harness` per AGENTS.md §4.
 
 ## REPORT
 
-- `SysCallGovPropose { title: String, action: GovAction }` — sender-is-proposer, snapshot+lock at apply.
-- `SysCallGovVote { proposal_id: u64, choice: VoteChoice }` — snapshot-weighted, one-vote, lock backing stake.
-- `SysCallGovFinalize { proposal_id: u64 }` — height/timestamp from block, schedules `+7200`, releases locks once.
-- `SysCallGovExecute { proposal_id: u64 }` — maturity-gated, oracle-atomic, exactly-once.
-- SPAM RULE: 10k stake gate (locked, not slashed) + 4 open proposals/proposer (admission+apply) + base-fee gas + D2 escalation; no slash-on-rejected.
-- MIGRATION: dual-write until const `GOV_BLOCK_CARRIED_ACTIVATION`
-(+21,600 heights; `STELL_GOV_DIRECT_OK=1` dev override), then RPC-direct
-refuses fail-closed; single-node first, multi-node digest-equality second.
-- OPEN QUESTIONS: (1) exact gas numbers for the four opcodes (needs
-benchmark of snapshot write cost); (2) activation height value + who picks
-it (lead + audit note per frozen-core rule); (3) should `GovAction` gain a
-`bincode`-stable discriminant pin test before first gov tx signs (recommended
-yes); (4) RPC tx-builder signing UX (server-side key vs client-signed
-`sendRawTransaction` — latter preferred, needs wallet support);
-(5) per-proposer cap value 4 — tune after mempool pressure test;
-(6) oracle-action execute needs the oracle working-copy threading spec'd in
-`execute_payload` (bridge/price-feed precedent to confirm exact handle).
+- `SysCallGovPropose { proposal_id, title, action, height_observed }` — sender-is-proposer, snapshot+lock at apply; id and height pinned.
+- `SysCallGovVote { proposal_id, choice, height_observed }` — snapshot-weighted, one-vote, lock backing stake; height pinned.
+- Deterministic finalize sweep — block timestamp/height, schedules `+7200`, releases locks once, ascending id.
+- Deterministic execute sweep — maturity-gated, oracle-atomic, exactly-once, ascending id; all 13 actions, with `SoftwareUpgrade`/`CancelUpgrade` gated by `UPGRADE_EXEC_ACTIVATION_HEIGHT`.
+- SPAM RULE: 10k stake gate (locked, not slashed) + base-fee gas + D2 escalation; no slash-on-rejected. (The proposed per-proposer 4-open cap is not implemented in this wave.)
+- MIGRATION: `GOV_OPS_ACTIVATION_HEIGHT = 0` from genesis; RPC direct form
+stays solo-only; block form is the supported multi-node transport.
+- OPEN QUESTIONS: (1) ratify `UPGRADE_EXEC_ACTIVATION_HEIGHT` and wire it
+into `chain_spec`; (2) decide whether to add the per-proposer open-proposal
+cap; (3) RPC tx-builder signing UX (server-side key vs client-signed
+`sendRawTransaction` — latter preferred, needs wallet support); (4) oracle
+actions already execute through the oracle working copy in
+`execute_due_governance_at_height`; confirm that remains the only writer.

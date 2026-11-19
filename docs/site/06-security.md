@@ -47,7 +47,7 @@ Severity + status quoted from `docs/audits/KNOWN_ISSUES.md`:
 | KI-08 | equivocation evidence locally observed | MEDIUM | open — needs evidence in the commit cert |
 | KI-09 | restarted node resumes stale round | MEDIUM (liveness) | open — coordinated wipe; see lockclear |
 | KI-19 | RPC token is the only write gate (optional) | MEDIUM | open — set `STELL_RPC_AUTH_TOKEN`, keep RPC on loopback |
-| KI-23 | governance has no timelock | MEDIUM | open — 3-day vote, immediate execution |
+| KI-23 | governance timelock is short in wall-clock terms | MEDIUM | governed actions are scheduled `+7,200` heights after finalize (`GOV_TIMELOCK_HEIGHTS`), which is minutes at the 50 ms floor — not a long human review window |
 | KI-25 | oracle rule is a per-publisher cap, not median | MEDIUM | open — 5 %/feed, 10 % latches 3-day breaker |
 | KI-28 | no per-sender bridge rate limit | MEDIUM | open — global caps hold regardless |
 | KI-30 | no live-network shard split performed | MEDIUM | open — synthetic-set tests only |

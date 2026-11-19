@@ -409,7 +409,7 @@ The SDK exposes `SessionGrant::new`, `.encode()`, `.decode()`,
 | `rejected: transaction already in mempool` (`mempool.rs:465`) | Success for submission: the exact transaction is already pooled. The SDK returns success (and the local hash). |
 | `rejected: unbound transaction refused ...` (`chain_binding.rs:144-160`) | Bind to the node's chain id (`TxBuilder::chain_id`, default 5757). |
 | `Transaction chain_id mismatch: chain id A does not match this chain (B)` (`chain_binding.rs:161-170`) | You signed for another chain. Re-sign bound to B. |
-| `eth_sendRawTransaction` error with `data.reason = "full-pq-admission"` (`rpc/eth.rs:898-916`) | EVM/secp256k1 writes are refused. Use a PQ envelope via `stell_sendRawTransaction`. |
+| `eth_sendRawTransaction` error with `data.reason = "full-pq-admission"` | That EVM sender has no on-chain PQ binding. Register one with `stell_evmBindingSubmit`; after that, `data.reason = "pq-carrier-authorization-required"` names the Falcon bytes to sign, or use `stell_evmCarrierSubmit` / the native `stell_sendRawTransaction` PQ path. |
 | HTTP 5xx / timeout | Transport failure. Retry the **same** signed bytes; the request may already have landed. |
 | `-32602` / `bad hex` / `decode: ...` (`writes.rs:695-712`) | Malformed params or wire bytes; rebuild from the SDK instead of hand-encoding. |
 
@@ -424,9 +424,10 @@ keeps `code`, `message`, `data`.
 | Not supported | Why / what to do instead |
 | --- | --- |
 | Native Falcon-512 signing in JavaScript | No WASM binding in-tree. Use the Rust CLI subprocess or localhost HTTP helper. |
-| EVM contract execution | There is no EVM execution domain. `eth_sendRawTransaction` is refused (`rpc/eth.rs:1-30,898-916`); `eth_call`/`eth_getCode`/`eth_getProof` are reads over the node's mapping. |
+| EVM contract execution | There is no EVM interpreter or EVM state trie. Contract creation and calldata are refused (`evm-contract-execution-unsupported`); `eth_call`/`eth_getCode`/`eth_getProof` are honest reads. |
+| EVM value transfer without a carrier | A bare EIP-155/1559 intent cannot move value (no PQ binding → `full-pq-admission`). Bind the EVM address with `stell_evmBindingSubmit`, then submit a `SysCallEvmCarrier` PQ1 transaction (or `stell_evmCarrierSubmit` / `eth_sendRawTransaction` with the `carrier` object). |
 | EVM account / `eth_sendTransaction` / `eth_sign` | The provider has no secp256k1 account; these throw 4200. |
-| EVM ↔ PQ address binding | No on-chain binding exists; an EVM address is not a PQ identity. |
+| EVM ↔ PQ address binding as consensus state | The binding is a node-local routing/replay index, not a state-root domain; this wave does not wire a bootstrap replay. A restart can under-report balances/refuse a carrier until the binding is re-observed, but execution re-verifies the pure signatures. |
 | `eth_subscribe` / WebSocket subscriptions | The node refuses `eth_subscribe`; `stell_subscribe` exists but the JS package does not implement its framing. |
 | JSON-RPC batching | One request per call. |
 | STS token operations, contract deploy, orderbook/PMM, bridge, governance, price feeds, zkML, actor mailbox, session publish/revoke, claim rewards, key rotation, delegate/unbond | Real opcodes, but outside this client's four wallet shapes. Use the node wallet/CLI or extend the SDK with a parity-tested encoder. |
@@ -500,7 +501,7 @@ The parity suite covers:
 | `stell_getTransactionReceipt` | `stellereum/src/rpc/reads.rs:1852` |
 | `stell_getValidators` | `stellereum/src/rpc/reads.rs:2168` |
 | `stell_baseFee` | `stellereum/src/rpc/reads.rs:2355` |
-| `eth_*` surface / EVM write refusal | `stellereum/src/rpc/eth.rs:1-30,676,771,865,898-916` |
+| `eth_*` surface / EVM binding + carrier | `stellereum/src/rpc/eth.rs` (`eth_sendRawTransaction`, `stell_evmBindingSubmit`, `stell_evmCarrierSubmit`), `stellereum/src/evm_adapter/binding.rs` |
 | SVM opcodes and gas table | `stellereum/src/svm.rs:38,83,92,94,467,548,994,1124` |
 | Session grant struct / signature / scopes | `stellereum/src/zkml.rs:180,247-263,276,554,584,669,752` |
 | Stl57 address format | `stellereum/src/address.rs:57` |

@@ -14,11 +14,54 @@ Three spellings, one key (`src/address.rs`):
 | --- | --- | --- |
 | raw/hex | `1e6281…8920a` (`0x` optional) | what RPC takes everywhere |
 | branded | `Stl57…` (also `stl57…`, `STL57…`) | Base58 + 4-byte BLAKE3 checksum (`STELLEREUM_ADDRESS_CHECKSUM_V1`); typo-detecting, homoglyph-rejecting |
-| EVM-compat | `0x…` 20-byte via adapter | EVM JSON-RPC served (`eth_chainId` = `0x167d` = 5757); EVM calldata is **not executed** — plain-transfer settlement only (`docs/RPC.md` §4, `src/evm_adapter.rs`) |
+| EVM-compat | `0x…` 20-byte via adapter | EVM JSON-RPC served (`eth_chainId` = `0x167d` = 5757); value transfers need a PQ binding + carrier, calldata/contract calls are **not executed** (see “EVM compatibility” below) |
 
 `Stl57` = Stellereum L1, chain id 5757 (`src/address.rs:4`). RPC accepts
 hex and `Stl57` for proofs; receipts carry both (`contract_address` +
 `contract_address_stl57`).
+
+## EVM compatibility (MetaMask)
+
+A secp256k1 signature is **never** a consensus credential here. The EVM
+write path is a two-part PQ statement:
+
+1. **Binding** — `SysCallBindEvmAddress` records `EVM address (20) → PQ
+   account (32)`, Falcon-signed by the PQ key over
+   `keccak256("STELL_EVM_BIND_V1" || chain_id || evm || pq)`.
+2. **Carrier** — a normal PQ1 transaction whose `SysCallEvmCarrier` payload
+   carries the canonical EIP-155/EIP-1559 bytes, the bound Falcon key, and
+   that key's signature over `keccak256(evm_tx)`. `tx.from` is the bound PQ
+   account, `tx.to` the recipient's bound PQ account, `tx.amount` the value
+   in nano-STELL, and `tx.nonce` the EVM nonce. Both Falcon statements must
+   verify; the secp256k1 signature inside the EVM bytes is advisory (routing
+   and UI only).
+
+What MetaMask can do: add the chain (`eth_chainId` 5757), read balances and
+nonces (a bound 20-byte address resolves to its PQ account), and track a
+value transfer once a wallet supplies the Falcon carrier signatures via the
+optional `carrier` parameter on `eth_sendRawTransaction` (or
+`stell_evmCarrierSubmit`). What it cannot do: move value on its own (no
+binding = honest `full-pq-admission` refusal), deploy a contract, or call
+contract bytecode — contract creation and any calldata are refused with
+`evm-contract-execution-unsupported` because there is no EVM interpreter or
+EVM state trie. Use the native SVM (`stell_deployContract` /
+`stell_callContract`) for contracts.
+
+Honest limitations: the binding is a PQ-signed routing statement, **not** a
+proof of possession of the EVM (secp256k1) key — first claim wins, so an
+unbound address can be claimed by any PQ key (a naming/hijack grief, reviewed
+as C1 in `docs/PENTEST2_API.md`). The binding index is a node-local
+routing/replay index, **not** part of the state root, and it is process-local:
+this wave does not
+wire a bootstrap replay from committed blocks, so a restarted node starts with
+an empty index until bindings are re-observed (balances can under-report and a
+carrier can be refused until then). Consensus re-checks the pure signatures at
+execution, so a stale or empty index can change admission/routing and what
+`eth_getBalance` reports, never whether money moves. The EVM gas field is only
+a resource cap; admission prices the carrier separately
+(`EVM_CARRIER_SURCHARGE_GAS = 30_000` on top of the base/PQ-activation floor),
+while execution charges the Stell gas schedule, not EVM gas. The 30k surcharge
+is an **admission floor**, not a separate execution debit.
 
 ## Shards and the routing rule
 

@@ -16,25 +16,31 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=optional">
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=11">
-<link rel="stylesheet" href="assets/css/base.css?v=11">
-<link rel="stylesheet" href="assets/css/layout.css?v=11">
-<link rel="stylesheet" href="assets/css/components.css?v=11">
-<link rel="stylesheet" href="assets/css/sections.css?v=11">
-<link rel="stylesheet" href="assets/css/responsive.css?v=11">
+<link rel="stylesheet" href="assets/css/tokens.css?v=12">
+<link rel="stylesheet" href="assets/css/base.css?v=12">
+<link rel="stylesheet" href="assets/css/layout.css?v=12">
+<link rel="stylesheet" href="assets/css/components.css?v=12">
+<link rel="stylesheet" href="assets/css/sections.css?v=12">
+<link rel="stylesheet" href="assets/css/responsive.css?v=12">
 
 <script>
 document.documentElement.classList.add('js');
+try {
+  if (window.localStorage.getItem('stell-invert') === '1') {
+    document.documentElement.classList.add('is-inverted');
+    var theme = document.querySelector('meta[name="theme-color"]');
+    if (theme) theme.setAttribute('content', '#eef2ff');
+  }
+} catch (e) {}
 window.setTimeout(function () {
   if (!window.StellMotion) document.documentElement.classList.remove('js');
 }, 3000);
 </script>
-<script defer src="assets/js/app.js?v=11"></script>
-<script defer src="assets/js/motion.js?v=11"></script>
+<noscript><style>[data-invert-toggle] { display: none; }</style></noscript>
+<script defer src="assets/js/app.js?v=12"></script>
+<script defer src="assets/js/motion.js?v=12"></script>
 </head>
 <body>
 
@@ -51,6 +57,10 @@ window.setTimeout(function () {
       <span class="brand-tag" aria-hidden="true">PQ–L1</span>
     </a>
     <a class="btn btn--electric btn--sm header-home" href="/">Back home <span class="arrow" aria-hidden="true">↗</span></a>
+    <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
+      <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
+      <span class="invert-label" aria-hidden="true">Invert</span>
+    </button>
   </div>
 </header>
 
@@ -81,7 +91,7 @@ window.setTimeout(function () {
       <div><dt>Protocol</dt><dd>1.0</dd></div>
       <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
       <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
-      <div><dt>Site build</dt><dd>static-v11 · 2026.11.19</dd></div>
+      <div><dt>Site build</dt><dd>static-v12 · 2026.11.19</dd></div>
     </dl>
     <div class="footer-bottom">
       <span class="footer-genesis">

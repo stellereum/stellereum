@@ -29,7 +29,7 @@
           io.unobserve(entry.target);
         }
       });
-    }, { threshold: 0.12, rootMargin: '0px 0px -5% 0px' });
+    }, { threshold: 0.05, rootMargin: '0px 0px -2% 0px' });
 
     Array.prototype.forEach.call(els, function (el) { io.observe(el); });
 
@@ -166,6 +166,33 @@
     win.addEventListener('scroll', onScroll, { passive: true });
   }
 
+  /* ------------------------------------------------- kinetic type shear */
+  function initKinetic() {
+    var row = doc.querySelector('[data-kinetic]');
+    if (!row || reduce.matches) return;
+    var ticking = false;
+
+    function update() {
+      ticking = false;
+      var r = row.getBoundingClientRect();
+      var vh = win.innerHeight;
+      if (r.bottom < -120 || r.top > vh + 120) return;
+
+      var p = (vh * 0.5 - (r.top + r.height * 0.5)) / (vh * 0.5 + r.height * 0.5);
+      p = Math.max(-1, Math.min(1, p));
+      row.style.setProperty('--kx', (p * 90).toFixed(1) + 'px');
+      row.style.setProperty('--ks', (p * -6).toFixed(2) + 'deg');
+    }
+
+    function onScroll() {
+      if (!ticking) { ticking = true; requestAnimationFrame(update); }
+    }
+
+    update();
+    win.addEventListener('scroll', onScroll, { passive: true });
+    win.addEventListener('resize', onScroll, { passive: true });
+  }
+
   /* ---------------------------------------------------------- magnetic */
   function initMagnetic() {
     if (reduce.matches || !precise.matches) return;
@@ -237,6 +264,7 @@
     initSectionCounters();
     initProgress();
     initParallax();
+    initKinetic();
     initMagnetic();
     initCursor();
   }

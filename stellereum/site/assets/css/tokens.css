@@ -14,6 +14,10 @@
   --surface-2: #101731;
   --surface-3: #151d3b;
   --ink: #060811;
+  --on-accent: #060811;            /* text on the electric gradient          */
+  --on-accent-2: rgba(6, 8, 17, .82);
+  --on-accent-line: rgba(6, 8, 17, .32);
+  --on-accent-soft: rgba(6, 8, 17, .1);
 
   /* --- type colour ------------------------------------------------------- */
   --text: #d8e6ff;          /* body / headings on --bg                       */
@@ -90,7 +94,10 @@
 }
 
 /* Light inversion is a reference effect worth keeping: same components,
-   remapped tokens. It is opt-in through the header pill. */
+   remapped tokens. It is opt-in through the header pill. The class is set on
+   <html> by the inline boot script (before first paint) and on <body> by
+   app.js, so both selectors share one token map. */
+html.is-inverted,
 body.is-inverted {
   color-scheme: light;
   --bg: #eef2ff;
@@ -99,6 +106,10 @@ body.is-inverted {
   --surface-2: #dde5ff;
   --surface-3: #cfd9ff;
   --ink: #060811;
+  --on-accent: #f4f7ff;
+  --on-accent-2: rgba(244, 247, 255, .92);
+  --on-accent-line: rgba(244, 247, 255, .38);
+  --on-accent-soft: rgba(244, 247, 255, .16);
   --text: #060811;
   --text-2: #26325a;
   --text-3: #4a5780;

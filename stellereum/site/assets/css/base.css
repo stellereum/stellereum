@@ -88,7 +88,7 @@ code, kbd, pre, samp { font-family: var(--font-mono); }
 
 ::selection {
   background: var(--indigo);
-  color: var(--ink);
+  color: var(--on-accent);
 }
 
 /* --- global grain + scanline texture ------------------------------------ */
@@ -103,7 +103,18 @@ code, kbd, pre, samp { font-family: var(--font-mono); }
   mix-blend-mode: overlay;
 }
 
+html.is-inverted .grain,
 body.is-inverted .grain { opacity: .035; mix-blend-mode: multiply; }
+
+/* The dark page wash (radial blues + a black floor) would turn muddy grey on
+   a light palette; remap it instead of stacking light sections over it. */
+html.is-inverted body,
+body.is-inverted {
+  background-image:
+    radial-gradient(1100px 620px at 8% -12%, rgba(29, 78, 216, .1), transparent 62%),
+    radial-gradient(900px 560px at 96% 2%, rgba(124, 58, 237, .09), transparent 60%),
+    linear-gradient(180deg, transparent 0%, rgba(238, 242, 255, .5) 55%, var(--bg) 100%);
+}
 
 /* --- accessibility ------------------------------------------------------- */
 .sr-only {
@@ -124,7 +135,8 @@ body.is-inverted .grain { opacity: .035; mix-blend-mode: multiply; }
   top: 10px;
   left: 10px;
   z-index: 200;
-  padding: 12px 18px;
+  min-height: 44px;
+  padding: 13px 18px;
   border: 2px solid var(--line-strong);
   border-radius: var(--r);
   background: var(--surface);
@@ -237,9 +249,9 @@ input:focus-visible,
   to   { transform: translate3d(-50%, 0, 0); }
 }
 
-@keyframes mark-spin {
-  from { transform: rotate(0deg); }
-  to   { transform: rotate(360deg); }
+@keyframes mark-glow {
+  0%, 100% { opacity: .08; }
+  50%      { opacity: .13; }
 }
 
 @keyframes hero-in {
@@ -276,4 +288,10 @@ input:focus-visible,
   }
 
   .marquee-track { animation: none !important; }
+
+  .kinetic-row {
+    transform: translate3d(-50%, 0, 0) !important;
+  }
+
+  .signal-cells span { animation: none !important; }
 }

@@ -43,10 +43,10 @@
   background-image: var(--grad);
   background-size: 220% 220%;
   animation: electric-shimmer 8s ease infinite;
-  color: var(--ink);
+  color: var(--on-accent);
 }
 
-.btn--electric:hover { color: var(--ink); filter: brightness(1.08); }
+.btn--electric:hover { color: var(--on-accent); filter: brightness(1.08); }
 
 .btn--outline {
   background: var(--surface);
@@ -55,7 +55,7 @@
 
 .btn--outline:hover {
   background-image: var(--grad);
-  color: var(--ink);
+  color: var(--on-accent);
 }
 
 .btn--ink {
@@ -71,7 +71,7 @@
 }
 
 .btn--sm {
-  min-height: 40px;
+  min-height: 44px;
   padding: 10px 14px;
   font-size: 10px;
 }
@@ -117,7 +117,7 @@
 
 .sticker--accent {
   background-image: var(--grad);
-  color: var(--ink);
+  color: var(--on-accent);
   border-color: var(--line-strong);
 }
 
@@ -150,6 +150,29 @@
 .badge--active { color: var(--blue); border-color: rgba(94, 184, 255, .4); background: rgba(94, 184, 255, .09); }
 .badge--todo { color: var(--text-2); border-color: var(--line); background: var(--surface); }
 .badge--soon { color: var(--telemetry-alt); border-color: rgba(157, 140, 255, .42); background: rgba(157, 140, 255, .1); }
+
+html.is-inverted .badge--done,
+body.is-inverted .badge--done {
+  color: #0a6b56;
+  border-color: rgba(10, 107, 86, .4);
+  background: rgba(10, 107, 86, .08);
+}
+
+html.is-inverted .badge--active,
+body.is-inverted .badge--active {
+  border-color: rgba(29, 78, 216, .38);
+  background: rgba(29, 78, 216, .09);
+}
+
+html.is-inverted .brand-mark,
+body.is-inverted .brand-mark {
+  filter: invert(1) hue-rotate(180deg) drop-shadow(0 0 10px rgba(29, 78, 216, .32));
+}
+
+html.is-inverted .status-line.is-offline,
+body.is-inverted .status-line.is-offline,
+html.is-inverted .status-chip.is-offline,
+body.is-inverted .status-chip.is-offline { color: #b3123b; }
 
 /* --- brutal card + hover invert ----------------------------------------- */
 .invert-card {
@@ -184,7 +207,7 @@
   background-image: var(--grad);
   background-size: 200% 200%;
   border-color: var(--line-strong);
-  color: var(--ink);
+  color: var(--on-accent);
   box-shadow: 7px 7px 0 var(--shadow-alt);
   transform: translate(-2px, -2px);
 }
@@ -201,14 +224,14 @@
 .invert-card:hover .kv,
 .invert-card:hover .kv b,
 .invert-card:hover .tag {
-  color: var(--ink);
+  color: var(--on-accent);
 }
 
 .invert-card:hover .tag,
 .invert-card:hover .sticker {
-  border-color: rgba(6, 8, 17, .5);
-  background: rgba(6, 8, 17, .1);
-  color: var(--ink);
+  border-color: var(--on-accent-line);
+  background: var(--on-accent-soft);
+  color: var(--on-accent);
   box-shadow: none;
 }
 
@@ -338,6 +361,7 @@
 .marquee {
   position: relative;
   overflow: hidden;
+  min-height: 40px;
   border-top: 1px solid var(--line-strong);
   background: var(--surface);
 }
@@ -361,9 +385,12 @@
   width: max-content;
   animation: marquee-run 44s linear infinite;
   will-change: transform;
+  backface-visibility: hidden;
 }
 
-.marquee:hover .marquee-track { animation-play-state: paused; }
+@media (hover: hover) and (pointer: fine) {
+  .marquee:hover .marquee-track { animation-play-state: paused; }
+}
 
 .marquee-group {
   display: flex;
@@ -415,7 +442,10 @@
 .tablist { display: flex; flex-wrap: wrap; gap: 4px; }
 
 .tab {
-  padding: 7px 10px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 9px 12px;
   border: 1px solid transparent;
   border-radius: var(--r);
   color: var(--text-2);
@@ -430,7 +460,7 @@
 .tab:hover { color: var(--text); background: var(--surface-2); }
 
 .tab[aria-selected="true"] {
-  color: var(--ink);
+  color: var(--on-accent);
   background-image: var(--grad);
   border-color: var(--line-strong);
 }
@@ -440,8 +470,8 @@
   align-items: center;
   justify-content: center;
   gap: 7px;
-  min-height: 34px;
-  padding: 7px 10px;
+  min-height: 44px;
+  padding: 9px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--field);
@@ -455,7 +485,7 @@
 }
 
 .icon-btn:hover {
-  color: var(--ink);
+  color: var(--on-accent);
   background: var(--indigo);
   border-color: var(--line-strong);
 }

@@ -48,6 +48,8 @@
   grid-template-columns: minmax(0, 1fr);
   gap: var(--sp-5);
   margin-bottom: clamp(32px, 5vw, 64px);
+  padding-top: clamp(14px, 1.6vw, 20px);
+  border-top: 1px solid var(--line-strong);
 }
 
 .sec-marker {
@@ -63,17 +65,28 @@
   color: var(--telemetry);
 }
 
+/* Hairline that runs from the marker to the right edge of the shell. */
+.sec-marker::after {
+  content: "";
+  flex: 1 1 48px;
+  min-width: 24px;
+  height: 1px;
+  background: linear-gradient(90deg, var(--line-strong), transparent);
+}
+
 .sec-marker .num {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 34px;
-  height: 24px;
-  padding-inline: 6px;
+  min-width: 42px;
+  height: 30px;
+  padding-inline: 8px;
   border: 1px solid var(--line-strong);
-  background: var(--surface);
-  color: var(--text);
+  background-image: var(--grad);
+  color: var(--on-accent);
+  font-size: 12px;
   letter-spacing: .08em;
+  box-shadow: 3px 3px 0 var(--shadow-alt);
 }
 
 .sec-marker .slash { color: var(--telemetry-alt); }
@@ -106,15 +119,17 @@
   position: sticky;
   top: 0;
   z-index: var(--z-header);
-  overflow-x: clip;
-  background: rgba(6, 8, 17, .86);
+  /* No overflow clipping here: it used to cut the focus ring of the last
+     nav item. The header is sized to fit at every breakpoint instead. */
+  background: rgba(6, 8, 17, .9);
   -webkit-backdrop-filter: blur(16px) saturate(150%);
   backdrop-filter: blur(16px) saturate(150%);
   border-bottom: 1px solid var(--line-strong);
   box-shadow: 0 1px 0 rgba(255, 255, 255, .04) inset;
 }
 
-body.is-inverted .site-header { background: rgba(238, 242, 255, .9); }
+html.is-inverted .site-header,
+body.is-inverted .site-header { background: rgba(238, 242, 255, .95); }
 
 .header-inner {
   display: flex;
@@ -184,6 +199,73 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .9); }
 .header-meta b { color: var(--telemetry); font-weight: 700; }
 .header-meta .slash { color: var(--telemetry-alt); }
 
+/* --- invert pill (reference control, wired to body.is-inverted) --------- */
+.invert-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
+  margin-inline: 10px;
+  padding: 6px 12px 6px 7px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text);
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+
+.invert-pill:hover,
+.invert-pill:focus-visible {
+  background-image: var(--grad);
+  color: var(--on-accent);
+  border-color: var(--line-strong);
+}
+
+.invert-track {
+  display: flex;
+  align-items: center;
+  width: 26px;
+  height: 14px;
+  flex: 0 0 auto;
+  padding: 2px;
+  border: 1.5px solid currentColor;
+  border-radius: var(--r-pill);
+}
+
+.invert-thumb {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  transition: transform var(--t-base) var(--ease);
+}
+
+html.is-inverted .invert-thumb,
+body.is-inverted .invert-thumb { transform: translateX(11px); }
+
+.invert-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.nav-panel-top .invert-pill {
+  order: 0;
+  margin: 0 8px 0 auto;
+  border-color: var(--line);
+}
+
+@media (max-width: 679.98px) {
+  .invert-label { display: none; }
+  .invert-pill { padding-inline: 7px; }
+}
+
 .header-home {
   align-self: center;
   margin-left: auto;
@@ -203,7 +285,7 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .9); }
   transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
 }
 
-.nav-toggle:hover { background: var(--indigo); color: var(--ink); }
+.nav-toggle:hover { background: var(--indigo); color: var(--on-accent); }
 
 .nav-toggle .bars {
   display: flex;
@@ -283,14 +365,14 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .9); }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   border: 1px solid var(--line);
   color: var(--text);
   transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
 }
 
-.nav-close:hover { background: var(--indigo); color: var(--ink); }
+.nav-close:hover { background: var(--indigo); color: var(--on-accent); }
 
 .nav-list {
   display: flex;
@@ -324,12 +406,12 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .9); }
 .nav-link:hover,
 .nav-link[aria-current="true"] {
   background: var(--indigo);
-  color: var(--ink);
+  color: var(--on-accent);
   padding-left: 14px;
 }
 
 .nav-link:hover .nav-num,
-.nav-link[aria-current="true"] .nav-num { color: var(--ink); }
+.nav-link[aria-current="true"] .nav-num { color: var(--on-accent); }
 
 .nav-cta { width: 100%; }
 
@@ -366,6 +448,8 @@ body.nav-is-open { overflow: hidden; }
 .footer-brand { min-width: 0; }
 
 .footer-brand .brand {
+  display: inline-flex;
+  min-height: 44px;
   border: 0;
   padding: 0;
   background: none;
@@ -399,13 +483,13 @@ body.nav-is-open { overflow: hidden; }
 .footer-links {
   display: flex;
   flex-direction: column;
-  gap: 9px;
 }
 
 .footer-links a {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 7px;
+  min-height: 44px;
   color: var(--text-2);
   font-size: 14px;
 }

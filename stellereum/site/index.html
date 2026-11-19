@@ -30,19 +30,24 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=optional">
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=11">
-<link rel="stylesheet" href="assets/css/base.css?v=11">
-<link rel="stylesheet" href="assets/css/layout.css?v=11">
-<link rel="stylesheet" href="assets/css/components.css?v=11">
-<link rel="stylesheet" href="assets/css/sections.css?v=11">
-<link rel="stylesheet" href="assets/css/responsive.css?v=11">
+<link rel="stylesheet" href="assets/css/tokens.css?v=12">
+<link rel="stylesheet" href="assets/css/base.css?v=12">
+<link rel="stylesheet" href="assets/css/layout.css?v=12">
+<link rel="stylesheet" href="assets/css/components.css?v=12">
+<link rel="stylesheet" href="assets/css/sections.css?v=12">
+<link rel="stylesheet" href="assets/css/responsive.css?v=12">
 
 <script>
 document.documentElement.classList.add('js');
+try {
+  if (window.localStorage.getItem('stell-invert') === '1') {
+    document.documentElement.classList.add('is-inverted');
+    var theme = document.querySelector('meta[name="theme-color"]');
+    if (theme) theme.setAttribute('content', '#eef2ff');
+  }
+} catch (e) { /* storage blocked: stay on the dark palette */ }
 window.setTimeout(function () {
   if (!window.StellMotion) document.documentElement.classList.remove('js');
 }, 3000);
@@ -50,11 +55,18 @@ window.setTimeout(function () {
 <noscript>
 <style>
   @media (max-width: 899.98px) { .nav-toggle { display: none; } }
+  [data-invert-toggle] { display: none; }
+  /* Tabs and copy buttons need JS: show every snippet, drop dead controls. */
+  .tablist,
+  [data-copy],
+  [data-copy-from],
+  [data-copy-active] { display: none !important; }
+  .code-body[hidden] { display: block !important; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=11"></script>
+<script defer src="assets/js/app.js?v=12"></script>
 <script defer src="assets/js/starfield.js?v=11"></script>
-<script defer src="assets/js/motion.js?v=11"></script>
+<script defer src="assets/js/motion.js?v=12"></script>
 <script defer src="assets/js/metrics.js?v=20261119b"></script>
 </head>
 <body>
@@ -87,6 +99,10 @@ window.setTimeout(function () {
     <nav class="nav-panel" id="nav-panel" aria-label="Primary">
       <div class="nav-panel-top">
         <span class="nav-panel-title">Index</span>
+        <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
+          <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
+          <span class="invert-label" aria-hidden="true">Invert</span>
+        </button>
         <button class="nav-close" type="button" aria-label="Close menu">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
@@ -101,6 +117,11 @@ window.setTimeout(function () {
 
       <a class="btn btn--electric nav-cta" href="https://testnet.stellereum.org">Enter testnet <span class="arrow" aria-hidden="true">↗</span></a>
     </nav>
+
+    <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
+      <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
+      <span class="invert-label" aria-hidden="true">Invert</span>
+    </button>
   </div>
 </header>
 
@@ -158,12 +179,11 @@ window.setTimeout(function () {
           <a class="btn btn--outline" href="https://explorer.stellereum.org">Open explorer <span class="arrow" aria-hidden="true">↗</span></a>
         </div>
 
-        <ul class="hero-tags" aria-label="Protocol traits">
-          <li class="tag"><b>PQ</b> Falcon-512</li>
-          <li class="tag"><b>KEM</b> ML-KEM-768</li>
-          <li class="tag"><b>BFT</b> µQC / 66.7%</li>
-          <li class="tag"><b>VM</b> SVM + zkML</li>
-        </ul>
+        <a class="hero-scroll" href="#network">
+          <span class="rule-dot" aria-hidden="true"></span>
+          Scroll · network metrics
+          <span class="hero-scroll-arrow" aria-hidden="true">↓</span>
+        </a>
       </div>
 
       <aside class="hero-slab" aria-hidden="true">
@@ -183,54 +203,29 @@ window.setTimeout(function () {
       </aside>
     </div>
 
-    <div class="hero-telemetry shell">
-      <div class="telemetry-grid">
-        <div class="tcell" data-metric="height">
-          <span class="tlabel">Block height</span>
-          <strong class="tvalue" data-value>&#8212;</strong>
-          <span class="tnote">Finalised</span>
-        </div>
-        <div class="tcell" data-metric="validators">
-          <span class="tlabel">Validators</span>
-          <strong class="tvalue tvalue--alt" data-value>&#8212;</strong>
-          <span class="tnote">µQC committee</span>
-        </div>
-        <div class="tcell" data-metric="blockTime">
-          <span class="tlabel">Block time</span>
-          <strong class="tvalue" data-value>&#8212;</strong>
-          <span class="tnote">Measured</span>
-        </div>
-        <div class="tcell">
-          <span class="tlabel">Chain ID</span>
-          <strong class="tvalue">5757</strong>
-          <span class="tnote">STELL / RPC</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="marquee" role="group" aria-label="Live chain telemetry">
+    <!-- Protocol facts, not live numbers: the authoritative telemetry block
+         is #network. The second group exists only to close the loop seamlessly. -->
+    <div class="marquee" role="group" aria-label="Protocol facts">
       <div class="marquee-track">
         <div class="marquee-group">
-          <span class="marquee-item"><b>BLOCK</b><span class="v" data-metric="height"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>VALIDATORS</b><span class="v" data-metric="validators"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>BLOCK TIME</b><span class="v" data-metric="blockTime"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>BASE FEE</b><span class="v" data-metric="baseFee"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>CHAIN</b><span class="v">5757</span></span>
-          <span class="marquee-item"><b>PROTOCOL</b><span class="v">1.0</span></span>
+          <span class="marquee-item"><b>PQ SIGNATURE</b><span class="v">FALCON-512</span></span>
+          <span class="marquee-item"><b>PQ KEM</b><span class="v">ML-KEM-768</span></span>
+          <span class="marquee-item"><b>COMMITTEE</b><span class="v">16</span></span>
+          <span class="marquee-item"><b>FINALITY</b><span class="v">µQC</span><span class="sep">/</span><span class="v">66.7%</span></span>
+          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT v5</span></span>
+          <span class="marquee-item"><b>EXECUTION</b><span class="v">SEALEVEL-LITE</span></span>
           <span class="marquee-item"><b>RULESET</b><span class="v v--alt">V5</span></span>
           <span class="marquee-item"><b>FORK</b><span class="v v--alt">0x9d59096b</span></span>
-          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT</span><span class="sep">/</span><span class="v">µQC</span></span>
         </div>
         <div class="marquee-group" aria-hidden="true">
-          <span class="marquee-item"><b>BLOCK</b><span class="v" data-metric="height"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>VALIDATORS</b><span class="v" data-metric="validators"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>BLOCK TIME</b><span class="v" data-metric="blockTime"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>BASE FEE</b><span class="v" data-metric="baseFee"><span data-value>—</span></span></span>
-          <span class="marquee-item"><b>CHAIN</b><span class="v">5757</span></span>
-          <span class="marquee-item"><b>PROTOCOL</b><span class="v">1.0</span></span>
+          <span class="marquee-item"><b>PQ SIGNATURE</b><span class="v">FALCON-512</span></span>
+          <span class="marquee-item"><b>PQ KEM</b><span class="v">ML-KEM-768</span></span>
+          <span class="marquee-item"><b>COMMITTEE</b><span class="v">16</span></span>
+          <span class="marquee-item"><b>FINALITY</b><span class="v">µQC</span><span class="sep">/</span><span class="v">66.7%</span></span>
+          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT v5</span></span>
+          <span class="marquee-item"><b>EXECUTION</b><span class="v">SEALEVEL-LITE</span></span>
           <span class="marquee-item"><b>RULESET</b><span class="v v--alt">V5</span></span>
           <span class="marquee-item"><b>FORK</b><span class="v v--alt">0x9d59096b</span></span>
-          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT</span><span class="sep">/</span><span class="v">µQC</span></span>
         </div>
       </div>
     </div>
@@ -324,6 +319,17 @@ window.setTimeout(function () {
 
       <div class="sec-rule" aria-hidden="true"></div>
 
+      <div class="signal-strip" aria-hidden="true">
+        <span class="signal-label">BAYER 4×4 / SIGNAL</span>
+        <span class="signal-cells">
+          <span style="--i:0;--o:.06"></span><span style="--i:1;--o:.55"></span><span style="--i:2;--o:.18"></span><span style="--i:3;--o:.68"></span>
+          <span style="--i:4;--o:.82"></span><span style="--i:5;--o:.30"></span><span style="--i:6;--o:.94"></span><span style="--i:7;--o:.43"></span>
+          <span style="--i:8;--o:.24"></span><span style="--i:9;--o:.74"></span><span style="--i:10;--o:.12"></span><span style="--i:11;--o:.62"></span>
+          <span style="--i:12;--o:1"></span><span style="--i:13;--o:.49"></span><span style="--i:14;--o:.87"></span><span style="--i:15;--o:.36"></span>
+        </span>
+        <span class="signal-label signal-label--alt">16 LEVELS</span>
+      </div>
+
       <div class="features-grid">
         <article class="feature invert-card" data-reveal>
           <div class="feature-top"><span class="feature-num">01 / SIGNATURE</span><span class="sticker">FALCON-512</span></div>
@@ -369,6 +375,31 @@ window.setTimeout(function () {
       </div>
     </div>
   </section>
+
+  <!-- ========================================================= MANIFESTO -->
+  <aside class="manifesto" aria-labelledby="manifesto-title">
+    <div class="shell">
+      <div class="manifesto-head">
+        <b>Manifesto</b>
+        <h2 id="manifesto-title" class="sr-only">Protocol principles</h2>
+        <span>03 rules, no slogans</span>
+      </div>
+      <div class="manifesto-grid">
+        <div class="manifesto-cell">
+          <span class="manifesto-label">01 / Posture</span>
+          <p>Falcon-512 on every vote. No second, classical lane.</p>
+        </div>
+        <div class="manifesto-cell">
+          <span class="manifesto-label">02 / Finality</span>
+          <p>Finality is one quorum certificate, not a probability curve.</p>
+        </div>
+        <div class="manifesto-cell">
+          <span class="manifesto-label">03 / Method</span>
+          <p>A number appears only if the repository can reproduce it.</p>
+        </div>
+      </div>
+    </div>
+  </aside>
 
   <!-- ====================================================== PERFORMANCE -->
   <section id="performance" class="section section--tint" aria-labelledby="perf-title">
@@ -416,6 +447,17 @@ window.setTimeout(function () {
       </div>
     </div>
   </section>
+
+  <!-- ================================================== KINETIC TYPE ROW -->
+  <div class="kinetic-band" aria-hidden="true">
+    <div class="shell kinetic-meta">
+      <span>Scroll / deform</span>
+      <span>Axis warp <b>±6°</b></span>
+    </div>
+    <div class="kinetic-viewport">
+      <p class="kinetic-row" data-kinetic><span class="k-fill">Form follows</span> <span class="k-stroke">finality</span><span class="k-dot"> · </span><span class="k-fill">Form follows</span> <span class="k-stroke">finality</span><span class="k-dot"> · </span><span class="k-fill">Form follows</span> <span class="k-stroke">finality</span><span class="k-dot"> ·</span></p>
+    </div>
+  </div>
 
   <!-- ============================================================ BUILD -->
   <section id="build" class="section" aria-labelledby="build-title">
@@ -542,7 +584,7 @@ curl -s -X POST \
 
       <div class="eco-grid">
         <article class="eco-card invert-card" data-reveal>
-          <div class="eco-top"><span class="eco-index">L2 / 01</span><span class="badge badge--soon">Coming soon</span></div>
+          <div class="eco-top"><span class="eco-index">L2 / 01</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
           <div class="eco-glyph" aria-hidden="true"></div>
           <h3>L2-Private</h3>
           <p>Shielded execution and confidential state for applications that must keep counterparties and amounts private by default.</p>
@@ -550,7 +592,7 @@ curl -s -X POST \
         </article>
 
         <article class="eco-card invert-card" data-reveal data-delay="1">
-          <div class="eco-top"><span class="eco-index">L2 / 02</span><span class="badge badge--soon">Coming soon</span></div>
+          <div class="eco-top"><span class="eco-index">L2 / 02</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
           <div class="eco-glyph" aria-hidden="true"></div>
           <h3>Rollup track</h3>
           <p>Still in development — no details to share yet. The name and the launch date stay unpublished until they are true.</p>
@@ -558,7 +600,7 @@ curl -s -X POST \
         </article>
 
         <article class="eco-card invert-card" data-reveal data-delay="2">
-          <div class="eco-top"><span class="eco-index">L2 / 03</span><span class="badge badge--soon">Coming soon</span></div>
+          <div class="eco-top"><span class="eco-index">L2 / 03</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
           <div class="eco-glyph" aria-hidden="true"></div>
           <h3>Liquidity track</h3>
           <p>Still in development — details will follow later. No token, no date and no numbers are claimed before they exist.</p>
@@ -701,7 +743,7 @@ curl -s -X POST \
       <div><dt>Protocol</dt><dd>1.0</dd></div>
       <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
       <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
-      <div><dt>Site build</dt><dd>static-v11 · 2026.11.19</dd></div>
+      <div><dt>Site build</dt><dd>static-v12 · 2026.11.19</dd></div>
     </dl>
 
     <div class="footer-bottom">

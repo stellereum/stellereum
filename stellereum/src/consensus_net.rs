@@ -1620,7 +1620,15 @@ impl ConsensusNetwork {
                 .adapter
                 .deliver_consensus_mesh(&self.topic, &data)
                 .await;
-            if delivery.targets == mesh_peers.len() && delivery.direct_ok == delivery.targets {
+            // COMPLETE means every ATTEMPTED direct copy succeeded. `direct_targets`
+            // already excludes peers the scoring marks dead (`routing_allowed`
+            // false and no reconnect due), so comparing against the raw config
+            // peer count made a healthy mesh look "incomplete" forever whenever
+            // one configured peer was down: every consensus frame was sent
+            // twice (direct + broadcast) and the warning fired every minute.
+            // A peer excluded as dead is covered by the DHT catch-up path, not
+            // by re-broadcasting at it on every frame.
+            if delivery.targets > 0 && delivery.direct_ok == delivery.targets {
                 return;
             }
             // Mesh coverage is a property of the PEER SET, not of one message:

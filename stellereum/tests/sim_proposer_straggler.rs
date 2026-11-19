@@ -15,14 +15,20 @@
 //! (total 3, quorum 3 = unanimity), one slow member (5x round-timeout factor,
 //! 250ms inbound + propose delay: the live 250ms+ WAN link, exact), a tight
 //! 100ms base the slow link always outruns (the compressed analogue of the
-//! live coupling where the 3.5s base could not cover the slow link) — and the
-//! collapse of that shape under the SIM-ONLY straggler-aware round extension
-//! ([`StragglerPolicy`], harness-only test code, NOT a production change):
+//! live coupling where the 3.5s base could not cover the slow link) — and how
+//! the SIM-ONLY straggler-aware round extension
+//! ([`StragglerPolicy`], harness-only test code, NOT a production change)
+//! collapses its CHURN (not its finals: the signed-round rule already lets the
+//! stale arrivals count):
 //!
-//! * `proposer_stale_chase_control_stalls` — control (policy disabled, exact
-//!   old harness): the chase runs with ~zero finals while most vote arrivals
-//!   land one round stale and rounds burn by the thousand (voting without
-//!   deciding).
+//! * `proposer_stale_chase_control_churns` — control (policy disabled): the
+//!   signed-round rule now lets stale arrivals COUNT (the same body is voted
+//!   in its signed round), so the total stall is gone: the control finalizes
+//!   ~1.7k heights in the window. It still carries the stale-chase signature —
+//!   ~70% stale arrivals on the fast pair, ~35% of arrivals in buckets that
+//!   never decide, ~10 view changes per final. The grace's remaining win is
+//!   the CHURN (<=3 view changes/final, <1% waste), not a zero-vs-some finals
+//!   gap. The zero-finals pin below was the OLD (pre-signed-round) accounting.
 //! * `proposer_straggler_grace_finalizes` — SAME seed, policy enabled: finals
 //!   flow steadily, the WASTED-vote share collapses (arrivals in buckets that
 //!   never decide anything), every post-transient height is decided in its FIRST round, the grace is shown
@@ -41,8 +47,10 @@
 //! never decided anything. That is the load-bearing half of "stale", since the
 //! late-quorum path can still absorb and count a merely late arrival.
 //!
-//! All four are passive or policy-gated: control behaviour is bit-identical
-//! to the old harness.
+//! All four are passive or policy-gated: control runs exercise the production
+//! rules unchanged. (The old "bit-identical to the previous harness" note is
+//! stale since the signed-round liveness fix: control now finalizes, with the
+//! churn signature pinned by `proposer_stale_chase_control_churns`.)
 //!
 //! DETERMINISM: fixed [`SEED`], virtual clock only, no OS randomness.
 //!
@@ -155,7 +163,7 @@ fn metrics_line(report: &consensus_cluster::ClusterReport) -> String {
 }
 
 #[tokio::test]
-async fn proposer_stale_chase_control_stalls() {
+async fn proposer_stale_chase_control_churns() {
     let mut c = build_control();
     assert_eq!(c.validators().quorum_power(), 3);
     assert_eq!(c.validators().total_power(), 3);
@@ -169,21 +177,31 @@ async fn proposer_stale_chase_control_stalls() {
     );
     println!("{}", report.diagnostics());
 
-    // LIVENESS (absent): the chase must burn the hour with ~no finals.
-    // Bound, not exact-zero: the late-quorum path may occasionally complete
-    // one height — the pin is "stall-rate", i.e. orders of magnitude below
-    // the fix, while rounds spin by the thousand.
+    // LIVENESS (RESTORED BY THE SIGNED-ROUND RULE): the old control stalled
+    // completely because the same body was prevoted in three different local
+    // rounds. Votes now carry the body's SIGNED round, so the late arrivals
+    // share a bucket and a QC can form even without the sim grace. The pin is
+    // no longer "zero finals"; it is "the chase still completes heights" —
+    // hundreds in the twenty-virtual-minute window — so the control cannot be
+    // mistaken for a silent stall. (`proposer_straggler_grace_finalizes` pins
+    // the same window at a slightly higher, steadier rate.)
     assert!(
-        report.common_height == 0 && report.best_height <= 1,
-        "control must stall: unanimity + slow member + tight base = votes \
-         land stale every round.\n{}",
+        report.common_height >= 100,
+        "the signed-round rule must let the stale chase complete heights: \
+         {} finalized in {}ms.\n{}",
+        report.common_height,
+        BUDGET_MS,
         report.diagnostics()
     );
-    // STALENESS: the fast pair's vote arrivals land one round late, every
-    // time (the incident signature — votes absorbed into old buckets, never
-    // counting). The slow member's own arrivals are never "stale" by this
-    // definition — it is BEHIND, so everything it receives names a round
-    // ahead of it; its chase signature is the jump count below.
+    assert!(
+        report.best_height - report.common_height <= 1,
+        "the slow member may trail by at most one height (mid-round budget \
+         cut), it must not fall permanently behind.\n{}",
+        report.diagnostics()
+    );
+    // STALENESS: the fast pair's vote arrivals still land one round late —
+    // the incident signature (votes absorbed into old buckets) survives; what
+    // changed is that the signed round makes those buckets coherent.
     for n in report.nodes.iter().take(2) {
         assert!(
             n.vote_arrivals > 100,
@@ -193,41 +211,58 @@ async fn proposer_stale_chase_control_stalls() {
         assert!(
             n.stale_share() > 0.5,
             "node {}: control stale share {:.3} must exceed one half \
-             (votes constantly one round stale).\n{}",
+             (votes still arrive a round late).\n{}",
             n.index,
             n.stale_share(),
             report.diagnostics()
         );
     }
-    // THE CHASE: the slow member burns its future-rule jump budget following
-    // a network it never joins (thousands of `sync_round_to` jumps, zero
-    // finals) — the "whoever is 1 round behind votes stale forever" half of
-    // the incident.
+    // THE CHASE: the slow member still burns its future-rule jump budget
+    // following a network it cannot join in step (thousands of
+    // `sync_round_to` jumps) — the "whoever is 1 round behind votes stale"
+    // half of the incident.
     assert!(
         report.nodes[2].sync_jumps > 1_000,
-        "slow member must chase via round jumps without converging.\n{}",
+        "slow member must chase via round jumps.\n{}",
         report.diagnostics()
     );
-    // WASTE: with zero finals, EVERY arrival sits in a bucket that never
-    // decides — the stall, in one number.
+    // WASTE (NOT TOTAL ANY MORE, STILL HIGH): the signed-round fix removes the
+    // total stall, but a third of the control's arrivals still sit in buckets
+    // that never decide. The bar is a quarter; the grace run pins < 10%, so
+    // the compositions are cleanly separated. (The pre-fix control pinned
+    // exactly 1.0 here; that equality is the stale part — it described the
+    // zero-finals bug, not a property the fixed rules must preserve.)
     for n in &report.nodes {
-        assert_eq!(
-            n.wasted_share(),
-            1.0,
-            "node {}: control waste must be total (nothing ever decides).\n{}",
+        assert!(
+            n.wasted_share() >= 0.25,
+            "node {}: control waste {:.3} must stay high — the stale chase \
+             still parks arrivals in buckets that never decide.\n{}",
             n.index,
+            n.wasted_share(),
             report.diagnostics()
         );
     }
-    // ROUNDS BURNED: voting without deciding — the fast pair spins thousands
-    // of view changes in the window.
+    // ROUNDS BURNED: voting without deciding efficiently — far more view
+    // changes per final than the grace run's <=3 ceiling. The observed shape
+    // is ~10.5 (well above the 5x floor, so seed drift cannot make the two
+    // compositions look alike).
     let total_changes: u64 = report.nodes.iter().map(|n| n.view_changes).sum();
+    let finals = report.common_height.max(1);
     assert!(
         total_changes > 10_000,
-        "control must burn rounds (stall = voting without deciding).\n{}",
+        "control must burn rounds (stale chase = voting through extra rounds).\n{}",
         report.diagnostics()
     );
-    // SAFETY (vacuous but pinned): no fork, no double-votes.
+    assert!(
+        total_changes / finals >= 5,
+        "control must burn clearly more view changes per final than the grace \
+         run ({} changes for {finals} finals).\n{}",
+        total_changes,
+        report.diagnostics()
+    );
+    // SAFETY: now that the control finalizes, this is no longer vacuous. The
+    // signed-round rule restored liveness; it must not have restored it with a
+    // fork, a double-vote, or diverging state.
     for (h, entries) in report.finalized_by_height() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
@@ -241,6 +276,12 @@ async fn proposer_stale_chase_control_stalls() {
     assert!(
         report.double_votes(&[]).is_empty(),
         "slow-but-honest voters never double-vote.\n{}",
+        report.diagnostics()
+    );
+    let roots: Vec<_> = report.nodes.iter().map(|n| n.state_root).collect();
+    assert!(
+        roots.windows(2).all(|w| w[0] == w[1]),
+        "finalizing nodes must agree on state.\n{}",
         report.diagnostics()
     );
 }

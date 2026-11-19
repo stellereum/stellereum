@@ -26,9 +26,14 @@
 //!
 //! Both decide the SAME rounds (round 0 on fast-proposer heights, round 1 on
 //! slow-proposer heights — the extension still covers the slow round trip),
-//! burn the SAME view changes, finalize the SAME heights — but the subsumed
-//! run converges ~550ms sooner per slow-proposer height: rung dwell drops,
-//! finals rate is preserved (improved, never harmed).
+//! finalize the SAME heights, and the subsumed run converges ~550ms sooner per
+//! slow-proposer height: rung dwell drops, finals rate is preserved (improved,
+//! never harmed). View-change COUNTS may differ by at most one extra round-0
+//! exit per slow height: with votes stamped by the body's signed round, the
+//! longer stacked dwell can still be in Propose when a slow height's old body
+//! lands and phase-align to accept it, while the shorter subsumed dwell has
+//! already refused it as stale. The deciding rounds stay identical, which is
+//! the invariant (see the assertion block below).
 //!
 //! HARNESS FIDELITY (read before reusing): the harness models no peer-active
 //! hold — the comparison is faithful anyway because the scenario operates in
@@ -219,43 +224,65 @@ async fn subsumed_grace_holds_dwell_down_finals_steady() {
         stacked_report.diagnostics()
     );
 
-    // SAME ROUNDS BURNED: the fix shortens failing rungs, it must not add or
-    // remove view changes (identical round trajectories).
+    // SAME DECISIONS, NOT NECESSARILY THE SAME ROUND COUNT. The fix shortens
+    // failing rungs; the `decide_rounds` equality above is the invariant (it
+    // changes WHEN a failing rung expires, never WHAT decides). The exact
+    // view-change count is no longer identical: with votes stamped by the
+    // body's SIGNED round (ruleset v4/v5), a late round-0 body can land in the
+    // STACKED composition while the fast node is still in round 1/Propose, be
+    // accepted, and phase-align to the slot its author owns (a bounded forward
+    // step); the SUBSUMED composition times out earlier and refuses the same
+    // body as stale before any align. Both still decide the height in round 1.
+    // The only round that can fail on a slow height is round 0, so the count
+    // may differ by at most one extra deadline exit per slow height.
     let stacked_changes: u64 = stacked_report.nodes.iter().map(|n| n.view_changes).sum();
     let subsumed_changes: u64 = subsumed_report.nodes.iter().map(|n| n.view_changes).sum();
-    assert_eq!(
-        stacked_changes,
-        subsumed_changes,
-        "view-change counts must match (same trajectories).\n{}\n{}",
+    let change_delta = stacked_changes.abs_diff(subsumed_changes);
+    assert!(
+        change_delta <= slow_heights,
+        "view-change counts may differ only by the signed-round timing shift \
+         (at most one extra round-0 exit per slow height): stacked \
+         {stacked_changes}, subsumed {subsumed_changes}, slow heights \
+         {slow_heights}.\n{}\n{}",
         stacked_report.diagnostics(),
         subsumed_report.diagnostics()
     );
 
     // RUNG DWELL DROP: fewer virtual ms for the same heights in the same
-    // rounds. Mechanism, pinned structurally: fast nodes never jump
-    // (`jumps == 0` both runs — asserted below), and no round-0 QC is
-    // possible on slow-proposer heights (the proposal lands at ~2400ms,
-    // past BOTH round-0 deadlines), so every failing round-0 exits by
-    // timeout at its deadline — 2150ms stacked (`650` round-0 cap + `1500`
-    // grace) vs 1600ms subsumed (`650 + min(1500, 2*800 - 650)`): exactly
-    // 550ms saved per failing round-0, i.e. per round-1 height. Later-round
-    // QC alignment can absorb at most ~1 tick per height, hence the floor
-    // `550 − 100 = 450`. (Multi-round slow heights save MORE — their
-    // round-1+ deadlines shrink too, 2300→1600 — so this is a lower bound.)
+    // rounds. Mechanism, pinned structurally: no round-0 QC is possible on
+    // slow-proposer heights (the proposal lands at ~2400ms, past BOTH round-0
+    // deadlines), so every failing round-0 exits by timeout at its deadline —
+    // 2150ms stacked (`650` round-0 cap + `1500` grace) vs 1600ms subsumed
+    // (`650 + min(1500, 2*800 - 650)`): exactly 550ms saved per failing
+    // round-0, i.e. per round-1 height. The stacked run may ALSO phase-align
+    // once per slow height to accept that height's late signed body (see the
+    // view-change note above); a forward-only align costs time in the stacked
+    // run, so it makes this floor conservative, and `decide_rounds` proves it
+    // did not change what decided. Later-round QC alignment can absorb at most
+    // ~1 tick per height, hence the floor `550 − 100 = 450`. (Multi-round slow
+    // heights save MORE — their round-1+ deadlines shrink too, 2300→1600 — so
+    // this is a lower bound.)
     assert!(
         subsumed_report.virtual_ms < stacked_report.virtual_ms,
         "subsumed run must converge sooner (dwell drop).\n{}\n{}",
         stacked_report.diagnostics(),
         subsumed_report.diagnostics()
     );
+    // JUMPS: the signed-round acceptance path may phase-align a fast node
+    // forward when it accepts a slow height's old round-0 body (one bounded
+    // step per slow height, at most). The subsumed run's shorter dwell rejects
+    // that body as stale before the align, so it jumps less. This is only an
+    // upper bound, never a licence to re-decide a height: the `decide_rounds`
+    // equality above is the load-bearing pin.
     for (tag, report) in [("stacked", &stacked_report), ("subsumed", &subsumed_report)] {
         for n in &report.nodes {
             if n.index < 2 {
-                assert_eq!(
+                assert!(
+                    n.sync_jumps <= slow_heights as u32,
+                    "[{tag}] fast nodes may phase-align at most once per slow \
+                     height ({} jumps for {slow_heights} slow heights); more \
+                     means a chase, not an acceptance.\n{}",
                     n.sync_jumps,
-                    0,
-                    "[{tag}] fast nodes must never jump (else round-0 exits \
-                     are not all deadline timeouts).\n{}",
                     report.diagnostics()
                 );
             }

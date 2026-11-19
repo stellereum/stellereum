@@ -55,7 +55,11 @@
 //!   1x past-round-0, zero honest NILs either way, no fork, state agrees.
 //! * slow (unanimity, 1700ms build, 12 heights): control 8 round-0 + 4
 //!   past-round-0 decisions at 8 view-changes/node; graced 11 round-0 + 1
-//!   past-round-0 at 5-6 view-changes/node, zero NILs (all value votes).
+//!   past-round-0 at 5-6 view-changes/node, zero NILs on every covered height
+//!   (the only NIL is the documented t=0 genesis transient at height 1, cast
+//!   in round 2 — a round that height did not use, since it decided in
+//!   round 1; no value proposal exists for round 2 because the t=0 body is
+//!   refused as a missing-timestamp block; see `nils_after_genesis`).
 //! * gap window: capped NIL 1600ms < earliest slow arrival 1800ms <=
 //!   additive NIL 3100ms — the cap would NIL-burn the covered heights.
 //!
@@ -114,6 +118,30 @@ fn total_nils(report: &consensus_cluster::ClusterReport) -> u64 {
 /// Total view changes across the cluster.
 fn total_view_changes(report: &consensus_cluster::ClusterReport) -> u64 {
     report.nodes.iter().map(|n| n.view_changes).sum()
+}
+
+/// NIL prevotes cast ABOVE `first_height` (the genesis transient), with the
+/// casting node, height and local round.
+///
+/// The grace's promise is about the heights it covers: a slow proposer's value
+/// must be awaited rather than nilled. Height 1 is excluded because its round-0
+/// body is built at t=0 and refused by every peer as `missing block timestamp`
+/// (the documented genesis transient): in that height a lagging node can reach
+/// its NIL wait in a later round with NO value proposal in existence at all,
+/// so the NIL is the only honest vote there. Any NIL ABOVE it is a real miss.
+fn nils_after_genesis(
+    report: &consensus_cluster::ClusterReport,
+    first_height: u64,
+) -> Vec<(usize, u64, u32)> {
+    let mut out = Vec::new();
+    for n in &report.nodes {
+        for v in &n.cast_votes {
+            if v.kind == VoteKind::Prevote && v.target.is_none() && v.height > first_height {
+                out.push((n.index, v.height, v.round));
+            }
+        }
+    }
+    out
 }
 
 /// Shared metrics line (mirrors `sim_proposer_straggler` / accounting).
@@ -425,12 +453,58 @@ async fn slow_proposer_waits_churn_down() {
         control_report.diagnostics(),
         graced_report.diagnostics()
     );
-    assert_eq!(
-        total_nils(&graced_report),
-        0,
-        "graced slow heights vote VALUE, never NIL (the wait covers the build).\n{}",
+    // THE WAIT, SCOPED TO THE HEIGHTS IT COVERS. The grace must cover every
+    // slow-proposer height: a NIL above the genesis transient means the wait
+    // ended before the body landed (a real miss). Height 1 is the documented
+    // t=0 transient -- its round-0 body carries timestamp 0 and is refused by
+    // every peer as `missing block timestamp`, so a lagging node can reach its
+    // NIL wait in a later round with no value proposal in existence. That NIL
+    // is correct (there is nothing to vote) and is pinned to a round the
+    // height did not use: it decides in round 1 while the NIL is cast in
+    // round 2 (measured; see the seed-pinned header).
+    let first_height = graced_report
+        .nodes
+        .iter()
+        .filter_map(|n| n.finalized.first().map(|(h, _)| *h))
+        .min()
+        .expect("the graced run must finalize at least one height");
+    let stray_nils = nils_after_genesis(&graced_report, first_height);
+    assert!(
+        stray_nils.is_empty(),
+        "the grace must cover every slow-proposer height: NILs above the \
+         genesis transient {first_height} mean the wait ended before the \
+         build landed (node, height, round) {stray_nils:?}.\n{}",
         graced_report.diagnostics()
     );
+    for n in &graced_report.nodes {
+        for v in &n.cast_votes {
+            if v.kind != VoteKind::Prevote || v.target.is_some() {
+                continue;
+            }
+            // Only the genesis-transient NIL remains. It must spend a round
+            // the height did NOT decide in, or it would be a real miss.
+            assert_eq!(
+                v.height,
+                first_height,
+                "node {}: only the genesis-transient height may NIL.\n{}",
+                n.index,
+                graced_report.diagnostics()
+            );
+            let idx = (v.height - first_height) as usize;
+            let decided = n.decide_rounds.get(idx).copied();
+            assert!(
+                decided.is_some_and(|r| v.round > r),
+                "node {}: the genesis-transient NIL at h={} r={} must be in a \
+                 round after the height's deciding round {:?} (it cannot have \
+                 spent the deciding round).\n{}",
+                n.index,
+                v.height,
+                v.round,
+                decided,
+                graced_report.diagnostics()
+            );
+        }
+    }
 
     // MECHANISM: the grace engaged in the graced run and never in control.
     let graced_extends: u64 = graced_report.nodes.iter().map(|n| n.grace_extends).sum();

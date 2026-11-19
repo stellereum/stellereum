@@ -62,6 +62,11 @@ disaster today?* This document answers that for the live 4-validator topology in
 6. **Rollback is supported only before the halt height.** After it, finalized blocks cannot
    be rewound; restoring a pre-upgrade data directory puts the node behind a chain its old
    binary cannot validate. The only "rollback" is a coordinated new genesis.
+7. **Ruleset v5 is a new-genesis hard fork.** It makes the 1 B STELL cap CHAIN-WIDE
+   (`SupplyPartition` quotas + `minted_total_nano` in the signed shard-head commitment +
+   a masterchain aggregate refusal) and moves `FORK_ID` to `0x9d59096b`. A mixed v4/v5
+   fleet is refused at the handshake; pre-v5 state must not be assumed valid under the
+   new cap. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
 
 ---
 
@@ -72,41 +77,44 @@ disaster today?* This document answers that for the live 4-validator topology in
 `rg -n "pub const \w*ACTIVATION_HEIGHT\s*:\s*u64\s*=" stellereum/src infnode/crates` (pasted):
 
 ```
-stellereum/src/consensus_net.rs:2097:pub const COMPACT_GOSSIP_ACTIVATION_HEIGHT: u64 = 0;
-stellereum/src/xshard2pc.rs:146:pub const XPC_ACTIVATION_HEIGHT: u64 = 0;
-stellereum/src/governance.rs:151:pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = 0;
-stellereum/src/mev_epoch.rs:995:pub const PQ_TRANSPORT_H_ACTIVATION_HEIGHT: u64 = 10_000;
-stellereum/src/mev_epoch.rs:1703:pub const MEV_RESHARE_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/consensus_net.rs:2503:pub const COMPACT_GOSSIP_ACTIVATION_HEIGHT: u64 = 0;
+stellereum/src/xshard2pc.rs:156:pub const XPC_ACTIVATION_HEIGHT: u64 = 0;
+stellereum/src/governance.rs:144:pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = 0;
+stellereum/src/mev_epoch.rs:1005:pub const PQ_TRANSPORT_H_ACTIVATION_HEIGHT: u64 = 10_000;
+stellereum/src/mev_epoch.rs:1713:pub const MEV_RESHARE_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/consensus/sortition.rs:179:pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
-stellereum/src/consensus/sortition.rs:539:pub const BEACON_DRAW_ACTIVATION_HEIGHT: u64 = u64::MAX;
-stellereum/src/consensus/sortition.rs:650:pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
-stellereum/src/governance.rs:80:pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;  // compiled default only
+stellereum/src/consensus/sortition.rs:553:pub const BEACON_DRAW_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/consensus/sortition.rs:664:pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/consensus/engine.rs:365:pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: Height = 0;
+stellereum/src/governance.rs:87:pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;  // compiled default only
 stellereum/src/chain_spec.rs: GenesisChainSpec { upgrade_exec_activation_height: u64 }  // effective (genesis)
-stellereum/src/tokenomics.rs:55:pub const EMISSIONCapEXACT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/tokenomics.rs:218:pub const EMISSIONCapEXACT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/oracle.rs:205:pub const SPRT_TIER3_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/chain_binding.rs:48:pub const CHAIN_BINDING_ACTIVATION_HEIGHT: u64 = CHAIN_BINDING_NEVER;
-stellereum/src/zkml_attestation.rs:144:pub const ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/zkml_attestation.rs:149:pub const ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT: u64 = u64::MAX;
 ```
 
-Thirteen constants (one env-adjacent `CHAIN_BINDING_NEVER` is the explicit never sentinel;
-`DEFAULT_BLS_ACTIVATION_HEIGHT` quoted in `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md:56` has
-**no code declaration** and is a docs-only name, not a gate).
+Fourteen `u64` constants plus `PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT` (typed `Height`,
+`0` = ACTIVE since ruleset v4; one env-adjacent `CHAIN_BINDING_NEVER` is the explicit never
+sentinel; `DEFAULT_BLS_ACTIVATION_HEIGHT` quoted in `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md:56`
+has **no code declaration** and is a docs-only name, not a gate).
 
 | # | Gate | Value | Declared | Reader / effect | Flip requires |
 |---|------|-------|----------|-----------------|---------------|
 | 1 | `QC_SPLIT_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:179` | `qc_split_active_at` (`:215-225`); used by `consensus/types.rs:1677,1823,2057` and `consensus/qc_split.rs` | **Binary swap.** Test/debug-only thread override (`sortition.rs:191-213`); release builds have none |
-| 2 | `BEACON_DRAW_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:539` | `beacon_draw_active_at` (`:548-556`); parent-hash draw stays canonical | **Binary swap.** No env, no override |
-| 3 | `CNVRF_V3_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:650` | `cnvrf_v3_active_at` (`:666-674`); epoch length 7 200 | **Binary swap.** Test-only instance override exists |
-| 4 | `COMPACT_GOSSIP_ACTIVATION_HEIGHT` | `0` | `consensus_net.rs:2097` | `compact_gossip_gate` / `compact_gossip_active`; proposal path wired in the node (`proposal_gossip_msg`, `CompactReceiver`, `CompactBodyServer`) | **Active from genesis.** Compact µQC emit/admit call sites are still deferred, so finality uses the full `Committed` envelope |
-| 5 | `EMISSIONCapEXACT_ACTIVATION_HEIGHT` | `u64::MAX` | `tokenomics.rs:55` | `calculate_block_reward_at_height` | **Binary swap.** Changes consensus state from the activation height |
-| 6 | `PQ_TRANSPORT_H_ACTIVATION_HEIGHT` | `10_000` | `mev_epoch.rs:995` | `is_pq_transport_active` (`:1003-1006`) returns `true` unconditionally | **Nothing.** Retained only for the frozen schedule (`:990-994`) |
-| 7 | `XPC_ACTIVATION_HEIGHT` | `0` | `xshard2pc.rs:146` | `XpcActivation::from_chain_spec` (`:327-342`) | **Active from genesis.** Env `STELL_XPC_ACTIVATION_HEIGHT` is deprecated, logged and **ignored** (`node/policy.rs:1016-1047`) |
-| 8 | `MEV_RESHARE_ACTIVATION_HEIGHT` | `u64::MAX` | `mev_epoch.rs:1703` | `is_reshare_active` (`:1714-1717`), `runtime/mev_sync.rs:357` | **Binary swap.** Not registered in `chain_spec` |
-| 9 | `GOV_OPS_ACTIVATION_HEIGHT` | `0` | `governance.rs:151` | `gov_ops_active_at`; `apply_gov_ops` + deterministic `apply_governance_transition` (`state_engine/apply.rs`) | **Active from genesis.** Block-carried propose/vote and finalize/execute run on every node. Still not registered in `chain_spec` |
+| 2 | `BEACON_DRAW_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:553` | `beacon_draw_active_at` (`:562-570`); parent-hash draw stays canonical | **Binary swap.** No env, no override |
+| 3 | `CNVRF_V3_ACTIVATION_HEIGHT` | `u64::MAX` | `consensus/sortition.rs:664` | `cnvrf_v3_active_at` (`:681-688`); epoch length 30 000 (`cn_vrf::EPOCH_LEN`) | **Binary swap.** Test-only instance override exists |
+| 4 | `COMPACT_GOSSIP_ACTIVATION_HEIGHT` | `0` | `consensus_net.rs:2503` | `compact_gossip_gate` / `compact_gossip_active`; proposal path wired in the node (`proposal_gossip_msg`, `CompactReceiver`, `CompactBodyServer`) | **Active from genesis.** Compact µQC emit/admit call sites are still deferred, so finality uses the full `Committed` envelope |
+| 5 | `EMISSIONCapEXACT_ACTIVATION_HEIGHT` | `u64::MAX` | `tokenomics.rs:218` | `calculate_block_reward_at_height` | **Binary swap.** Changes consensus state from the activation height |
+| 6 | `PQ_TRANSPORT_H_ACTIVATION_HEIGHT` | `10_000` | `mev_epoch.rs:1005` | `is_pq_transport_active` (`:1013-1016`) returns `true` unconditionally | **Nothing.** Retained only for the frozen schedule (`:1000-1004`) |
+| 7 | `XPC_ACTIVATION_HEIGHT` | `0` | `xshard2pc.rs:156` | `XpcActivation::from_chain_spec` (`:337-352`) | **Active from genesis.** Env `STELL_XPC_ACTIVATION_HEIGHT` is deprecated, logged and **ignored** (`node/policy.rs:1016-1047`) |
+| 8 | `MEV_RESHARE_ACTIVATION_HEIGHT` | `u64::MAX` | `mev_epoch.rs:1713` | `is_reshare_active` (`:1724-1727`), `runtime/mev_sync.rs:357` | **Binary swap.** Not registered in `chain_spec` |
+| 9 | `GOV_OPS_ACTIVATION_HEIGHT` | `0` | `governance.rs:144` | `gov_ops_active_at`; `apply_gov_ops` + deterministic `apply_governance_transition` (`state_engine/apply.rs`) | **Active from genesis.** Block-carried propose/vote and finalize/execute run on every node. Still not registered in `chain_spec` |
 | 10 | `SPRT_TIER3_ACTIVATION_HEIGHT` | `u64::MAX` | `oracle.rs:205` | `sprt_tier3_active_at` (`:223-227`) | **Binary swap.** Not in `chain_spec` |
-| 11 | `UPGRADE_EXEC_ACTIVATION_HEIGHT` | compiled default `u64::MAX`; effective value from the genesis chain spec | `governance.rs:80` (default); `chain_spec.rs` (`GenesisChainSpec::upgrade_exec_activation_height`) | `upgrade_exec_active_at` reads the chain spec; `due_governance_ids`, direct RPC, legacy `execute`, oracle variant all funnel through it | **Genesis chain-spec value.** `SoftwareUpgrade` installs at/after `H`; a chain that does not set `H` keeps the old inert `u64::MAX` behaviour. `CancelUpgrade` is ungated (safety valve) |
+| 11 | `UPGRADE_EXEC_ACTIVATION_HEIGHT` | compiled default `u64::MAX`; effective value from the genesis chain spec | `governance.rs:87` (default); `chain_spec.rs` (`GenesisChainSpec::upgrade_exec_activation_height`) | `upgrade_exec_active_at` reads the chain spec; `due_governance_ids`, direct RPC, legacy `execute`, oracle variant all funnel through it | **Genesis chain-spec value.** `SoftwareUpgrade` installs at/after `H`; a chain that does not set `H` keeps the old inert `u64::MAX` behaviour. `CancelUpgrade` is ungated (safety valve) |
 | 12 | `CHAIN_BINDING_ACTIVATION_HEIGHT` | `CHAIN_BINDING_NEVER` | `chain_binding.rs:48` | `check_admission*` | **Binary swap.** Retire the env form (§4 item 11) |
-| 13 | `ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT` | `u64::MAX` | `zkml_attestation.rs:144` | context-bound attestation transcript | **Binary swap.** Opt-in seam, not in `chain_spec` |
+| 13 | `ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT` | `u64::MAX` | `zkml_attestation.rs:149` | context-bound attestation transcript | **Binary swap.** Opt-in seam, not in `chain_spec` |
+| 14 | `PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT` | `0` (ACTIVE) | `consensus/engine.rs:365` | `verify_proposal_equivocation_evidence`; same shard/height/**signed round**, differing hashes | **Active since ruleset v4.** Fork-id rule 20; no env/gate flip |
 
 The consolidated registry `chain_spec::current_activation_schedule()` now lists eight of
 these (`stellereum/src/chain_spec.rs`): QC split, beacon draw, CN-VRF v3, compact gossip,
@@ -303,9 +311,12 @@ A validator-set change is therefore a hard partition, not a fork of one chain.
    (`commitment.rs:1686`).
 2. **Wire identity:** `FRAME_VERSION` and the handshake suite/transcript version
    (`infnode/.../proto.rs:137,319-321`). All nodes must switch together.
-3. **Signature domains:** the block domain `STELLEREUM_BLOCK_V3` (`sharding/block.rs:821`)
-   and the vote domain `STELLEREUM_BFT_VOTE_V2` (`consensus/types.rs:991`). Changing either
-   invalidates all historical hashes/signatures.
+3. **Signature domains:** the block domain `STELLEREUM_BLOCK_V3`
+   (`sharding/block.rs:933`) and the vote domain `STELLEREUM_BFT_VOTE_V3`
+   (`consensus/types.rs:1121`; `V1`/`V2` votes are refused). Since ruleset v3 the
+   vote preimage also carries the **shard id**; since v4 the block hash carries
+   the signed `round`. Changing any of these invalidates all historical
+   hashes/signatures.
 4. **Snapshot readability:** the new binary must read every old shape it may encounter
    (the V1..V7 fallback chain, `storage.rs:2600-2700`); old binaries need not read new
    shapes.
@@ -528,6 +539,11 @@ single most important change is **making the on-chain path work** — today the 
 ### 2.2 Components, each mapped onto an existing mechanism
 
 #### C1. Protocol version + negotiation (reuse `chain_spec`, vote domain)
+
+> **Implemented since this proposal:** the node now has
+> `PROTOCOL_VERSION`/`FORK_ID` in `protocol.rs` and a `Hello` handshake; the
+> current vote domain is `STELLEREUM_BFT_VOTE_V3`, not the `V2` named below.
+> The paragraph is kept as the design rationale, not as current code.
 
 - Add `pub const PROTOCOL_VERSION: u16` and
   `pub const PROTOCOL_VERSION_ACTIVATION_HEIGHT: u64` to `chain_spec.rs` (same shape as

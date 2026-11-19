@@ -7,6 +7,12 @@ ECVRF activation, and no `STELL_PURE_PQ` switch on the node. Every `file:line`
 below was re-grepped on this tree; anything that is no longer resolvable is
 marked `STALE — see <path>`.
 
+> **Ruleset snapshot — historical for constants.** Verified under ruleset
+> **v2**; the CN-VRF height windows shown here (7 200 / 450 / 360) are the v1
+> values, not current. Ruleset v5 is current (`FORK_ID = 0x9d59096b`); current
+> values are `EPOCH_LEN = 30_000`, `V3_SEGMENT_LEN = 1_875`,
+> `V3_COMMIT_LOOKAHEAD_BLOCKS = 682` (`docs/RULESET_V5.md`).
+
 Sources: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `vrf.rs`,
 `cn_vrf.rs`, `minroot_vdf.rs`, `staking.rs`, `wallet_signing.rs`,
 `stellereum/Cargo.toml`.

@@ -504,4 +504,23 @@
 
 - `stellereum-sdk/src/lib.rs` (672 ln) — Minimal canonical transaction-builder SDK for Stellereum (kills B2:
 
+## Ruleset v5 / consensus reference (docs; hand-maintained)
+
+- `docs/RULESET_V2.md` — 240 ms height re-scale (historical, superseded).
+- `docs/RULESET_V3.md` — shard-bound vote preimage `STELLEREUM_BFT_VOTE_V3` (historical fork id).
+- `docs/RULESET_V4.md` — signed block `round`, deterministic timestamp bound, proposal-equivocation ON.
+- `docs/RULESET_V5.md` — current ruleset: `FORK_ID 0x9d59096b`, 23 rules, chain-wide supply cap.
+- `docs/SUPPLY_CAP.md` — `SupplyPartition` + `minted_total_nano` + masterchain aggregate model.
+- `docs/LIVENESS_ROUND_SYNC_AUDIT.md` — live round-divergence liveness defect (IN PROGRESS; not fixed).
+- `stellereum/docs/OBSERVABILITY.md` — metrics/logs/alert surfaces.
+- `docs/CI.md` — continuous-integration gate and job layout.
+
+Code anchors: `stellereum/src/protocol.rs` (`FORK_ID`, `FORK_ID_RULES`,
+`MAX_BLOCK_TIMESTAMP_DRIFT_MS`); `sharding/block.rs` (`STELLEREUM_BLOCK_V3`,
+`ROUND001`, `SHARDHDR`, `SHMINT01`, `Block::compute_hash`);
+`consensus/types.rs` (`VOTE_SIGN_DOMAIN`, `vote_sign_bytes_for_shard`);
+`runtime/consensus_step.rs` (`accepts_block_round`, `check_block_timestamp`);
+`tokenomics.rs` (`TOTAL_SUPPLY_CAP`, `SupplyPartition`);
+`runtime/anchors.rs` (`check_chain_supply_commitment`).
+
 Total: 473 Rust files.

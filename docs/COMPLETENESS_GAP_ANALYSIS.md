@@ -34,6 +34,11 @@ This document is a historical snapshot: line numbers and claims are anchored to
 rewritten**; this table is the delta, so the original analysis stays
 reproducible.
 
+> **Status is pinned at `9832e97a9` (ruleset v3).** The current tree is ruleset
+> **v5**: `CONSENSUS_RULESET_VERSION = 5`, `DOMAIN_SET_VERSION = 3`,
+> `FORK_ID = 0x9d59096b`, and a pre-v5 peer is refused. The §2 row below still
+> reads v3 values as history; see `docs/RULESET_V5.md`.
+
 | Original gap | Status at `9832e97a9` | Evidence |
 |---|---|---|
 | §1 — binary/upgrade execution gated forever in a constant | **PARTLY RESOLVED.** The gate is now a per-chain **genesis** value (`GenesisChainSpec`), installed once before the first block and listed in `chain_spec`. The compiled default is still `u64::MAX`, so an operator must opt in at genesis — but it is no longer an unreachable constant. | `stellereum/src/chain_spec.rs:1-145`, `stellereum/src/chain_spec.rs:303-309`; `docs/OPEN_DEFECTS.md` UP-2 |

@@ -5,6 +5,8 @@ Curated map. One line per doc. Paths relative to the repo root unless noted.
 ## Protocol freeze (read first)
 
 - `docs/PUBLIC_TESTNET_CODE_GAPS.md` — canonical freeze doc: single-shard canon, five decisions, removals, neural-audit gate (lead working doc, in Russian).
+- `docs/RULESET_V5.md` — **current consensus ruleset**: `FORK_ID 0x9d59096b`, 23 rules, chain-wide supply cap (v2–v4 pages are historical).
+- `docs/SUPPLY_CAP.md` — chain-wide `TOTAL_SUPPLY_CAP` model, `SupplyPartition`, failure modes.
 
 ## Specs
 
@@ -39,7 +41,7 @@ Curated map. One line per doc. Paths relative to the repo root unless noted.
 
 ## Crypto decisions
 
-- `docs/PQ_CN_VRF_SPEC.md` — CN-VRF spec only; consensus wiring forbidden before external audit.
+- `docs/PQ_CN_VRF_SPEC.md` — CN-VRF **v1 construction** (historical constants); v3 is implemented with the sortition gate off.
 - `docs/CLASSICAL_INVENTORY.md` — known classical paths (25-hole list).
 - `docs/CLASSICAL_REMOVAL_PHASE23.md` — classical-removal phases 2+3, design-only.
 - `docs/WORKCHAIN_DECISION.md` — why single-shard is canonical.

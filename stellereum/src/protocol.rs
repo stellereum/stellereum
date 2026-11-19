@@ -81,6 +81,13 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(PROTOCOL_MAJO
 /// gained a deterministic parent-relative bound
 /// ([`MAX_BLOCK_TIMESTAMP_DRIFT_MS`]). This is a hard fork / new genesis. See
 /// `docs/RULESET_V4.md`.
+///
+/// RULESET v5 (2026-11-20): the 1B supply cap became CHAIN-WIDE. The two new
+/// rules are [`crate::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION`] and
+/// [`crate::tokenomics::TOTAL_SUPPLY_CAP`]; the shard header commitment gained
+/// `minted_total_nano`, so the block-hash domain set moved
+/// ([`DOMAIN_SET_VERSION`] = 3). Hard fork / new genesis; fork id
+/// `0x9d59096b`. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
 pub const CONSENSUS_RULESET_VERSION: u32 = 5;
 
 /// Version of the set of domain-separation strings folded into [`FORK_ID`].

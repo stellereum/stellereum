@@ -7,13 +7,15 @@ constant is `u64::MAX` (`stellereum/src/consensus/sortition.rs:507`).
 
 > **SUPERSEDED FOR CONSTANTS (still valid for the checklist).** This document is
 > a snapshot at `HEAD = 6e6384940` under ruleset **v1**. Ruleset **v2**
-> (`docs/RULESET_V2.md` §1) rescaled every height-derived constant and ruleset
-> **v3** (`docs/RULESET_V3.md` §2) inherited those values into fork
-> `0xb13baff4`. The gate itself is still `u64::MAX` at HEAD `9832e97a9`
-> (`stellereum/src/consensus/sortition.rs:664`); only the line numbers and the
-> height values moved. **Do not copy the numbers from this page.**
+> (`docs/RULESET_V2.md` §1) rescaled every height-derived constant, ruleset
+> **v3** (`docs/RULESET_V3.md` §2) made votes shard-bound, rulesets **v4/v5**
+> added the signed block round and the chain-wide supply cap. The current
+> ruleset is **v5** (`FORK_ID = 0x9d59096b`). The CN-VRF gate itself is still
+> `u64::MAX` at this tree (`stellereum/src/consensus/sortition.rs:664`); only
+> the line numbers and height values moved. **Do not copy the numbers from this
+> page.**
 >
-> | constant | this snapshot (v1) | current (ruleset v3) |
+> | constant | this snapshot (v1) | current (ruleset v5) |
 > |---|---:|---:|
 > | `cn_vrf::EPOCH_LEN` / `CNVRF_V3_EPOCH_LEN` | 7,200 | **30,000** |
 > | `V3_SEGMENT_LEN` | 450 | **1,875** |

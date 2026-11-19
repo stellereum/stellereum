@@ -1,5 +1,10 @@
 # Consensus ruleset v4 — signed block round, deterministic timestamp bound, fork id `0x611600c9` (new genesis)
 
+> **SUPERSEDED by ruleset v5** (`docs/RULESET_V5.md`, `FORK_ID = 0x9d59096b`).
+> The v4 signed-round, timestamp-bound and proposal-slashing rules are still
+> current; the v4 fork id and its 21-rule pin are historical. V5 appends the
+> chain-wide supply rules (22–23).
+
 **Status:** deliberate consensus change (ruleset v4). **Activation:** new
 genesis; there is no in-place activation height. Ruleset v3 and ruleset v4
 binaries refuse consensus participation with each other because `FORK_ID`
@@ -58,14 +63,21 @@ With the round inside the signed hash:
 - the wired verifier (`verify_proposal_equivocation_evidence`) no longer
   refuses unconditionally: it verifies the pair and activates at height 0.
 
-Validators also require `block.round == the round the proposal is for` on
+Validators also require `block.round` to be legal for the proposal round on
 **both** paths:
 
-- admission: `on_proposal` after any bounded near-future phase alignment
-  (`block.round == self.hc.round`), and `validate_proposal`;
-- adopt: `block.round == certificate.round` beside the proposer-schedule
+- admission: `on_proposal` / `validate_proposal` use
+  `accepts_block_round`, i.e. `block.round <= self.hc.round` — exact equality
+  in the normal case, and an EARLIER signed round for the lock-rescue /
+  one-round-lag re-proposal (a FUTURE round is refused);
+- adopt: `block.round <= certificate.round` beside the proposer-schedule
   check. A body produced for one round can never be adopted under a quorum
   harvested for another.
+
+> Historical wording: the first v4 cut required strict equality
+> (`block.round == hc.round`) on admission. That rejected a re-served locked
+> body signed at an earlier round and was relaxed to `<=` on the current tree;
+> the signed-round identity and the adopt bound are unchanged.
 
 ### Serde / bincode
 
@@ -103,7 +115,10 @@ block.height > 0  =>  parent.timestamp <= block.timestamp
   (`mev_sync::propose`), so a fast local clock cannot build a body its peers
   must refuse.
 - Height 0 (genesis) keeps its fixed timestamp: it has no parent and the
-  parent-relative rule does not apply.
+  parent-relative rule does not apply. Height 1 whose parent is the
+  zero-genesis anchor is exempt from the FORWARD bound (the anchor carries no
+  timestamp), while monotonicity still holds; a missing parent timestamp fails
+  closed.
 
 ## 3. Fork-id rules (exact order; the SDKs mirror this list)
 

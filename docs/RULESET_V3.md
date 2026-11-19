@@ -1,5 +1,10 @@
 # Consensus ruleset v3 — shard-bound votes, fork id `0xb13baff4` (new genesis)
 
+> **SUPERSEDED by ruleset v5** (`docs/RULESET_V5.md`, `FORK_ID = 0x9d59096b`).
+> This page is the historical v3 rationale; the shard-bound vote preimage
+> (`STELLEREUM_BFT_VOTE_V3`) is still current, but the fork id and all
+> subsequent rules (signed round, timestamp bound, supply cap) are not.
+
 **Status:** deliberate consensus change (ruleset v3). **Activation:** new
 genesis; there is no in-place activation height. Ruleset v2 and ruleset v3
 binaries refuse consensus participation with each other because `FORK_ID`

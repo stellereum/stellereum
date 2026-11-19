@@ -42,6 +42,10 @@ Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
 
 - Compressed Patricia Trie (`cpat2.rs`) with exclusion proofs
   (pinned by `test_exclusion_proof_*`).
-- MMR epoch roots committed in blocks (epoch length 128,
+- MMR epoch roots committed in blocks (epoch length 500,
   `stell_getEpochRoot`).
+- Chain-wide native supply: every mint path reserves against
+  `TOTAL_SUPPLY_CAP` through `SupplyPartition`; the masterchain also aggregates
+  committed `ShardHeaderCommitment::minted_total_nano` and refuses an
+  over-cap head (ruleset v5, `docs/SUPPLY_CAP.md`).
 - Archive proofs + historical roots via `stell_getArchiveProof`.

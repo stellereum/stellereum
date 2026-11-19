@@ -124,21 +124,23 @@ automatically (`scripts/stell-sync.sh:1050-1070`).
 
 Preflight-enforced (must agree cluster-wide):
 `STELL_SHARDS` (`EXPECT_STELL_SHARDS=0,1`, `scripts/cluster-nodes.conf:68`),
-`STELL_ROUND_TIMEOUT_MS` (expect 3500),
 `STELL_DOWN_PROPOSER_TIMEOUT_MS` (expect 800),
 `STELL_MIN_BLOCK_MS` (expect 50),
 `STELL_KEEP_BLOCKS` (expect 8000),
 `STELL_ARCHIVE` (expect 0),
 `STELL_CHAIN_ID` (expect 5757, frozen once read),
 base-fee floor via `STELL_MIN_GAS_LIMIT` (expect 280000 base fee).
+The base round timeout is **not** an env setting: `FROZEN_ROUND_TIMEOUT_BASE_MS = 3_000`
+is compiled (ruleset v2+; the old `STELL_ROUND_TIMEOUT_MS` is gone), so agreement
+means running the same binary/ruleset.
 
 Full inventory seen via repo grep (defaults where the source states one;
 live values are whatever the per-node env files hold — **UNVERIFIED** live):
 
-- Consensus/timing: `STELL_ROUND_TIMEOUT_MS` (code default 3000,
-  `stellereum/src/main.rs:3645`), `STELL_ROUND_ZERO_TIMEOUT_MS` (650),
+- Consensus/timing: base round timeout compiled `FROZEN_ROUND_TIMEOUT_BASE_MS = 3_000`
+  (no `STELL_ROUND_TIMEOUT_MS` env; removed), `STELL_ROUND_ZERO_TIMEOUT_MS` (650),
   `STELL_DOWN_PROPOSER_TIMEOUT_MS` (800), `STELL_MIN_BLOCK_MS` (code default
-  400; live templates pin 400 — `stellereum/scripts/four-node/env.C.template:36`),
+  50 — `node/policy.rs::DEFAULT_MIN_BLOCK_MS`),
   `STELL_TICK_MS`, `STELL_CATCHUP_BUDGET_MS` (default 250) /
   `STELL_CATCHUP_INTERVAL_MS` (default 30 000; a backstop only — catch-up is
   event-driven and skipped at tip), `STELL_BROADCAST_JOIN_MS` (500),

@@ -13,7 +13,7 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 | Key exchange (mail/overlay) | X25519 + ChaCha20Poly1305 | infnode/infmail |
 | Hashing | BLAKE3 (primary), SHA-2/3 where protocol pins | Address checksum = BLAKE3 |
 | KDF (wallet) | Argon2id + XChaCha20Poly1305 | POSIx 0600/0700 enforced |
-| VRF | phase-1 wiring live behind `STELL_VRF_ACTIVATION_HEIGHT` (default off); deterministic-Schnorr proofs, NOT audited ECVRF — do not present as ECVRF |
+| VRF | no live VRF: sortition uses the parent-hash draw (`STELL_SORTITION_V5`). Beacon/CN-VRF gates are compiled off (`u64::MAX`); there is no `STELL_VRF_ACTIVATION_HEIGHT` env switch |
 
 ## Key/signature sizes (pinned)
 
@@ -25,7 +25,9 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 ## Signing standards
 
 - Wallet messages: `STELL-MSGSIG-V1`, chain-id bound (replay across chains fails).
-- Consensus votes: chain-id + height/round bound preimages (see spec 04).
+- Consensus votes: chain-id **+ shard-id** + height/round bound preimage under
+  `STELLEREUM_BFT_VOTE_V3` (`consensus/types.rs::vote_sign_bytes_for_shard`;
+  v1/v2 bytes are refused). See spec 04.
 - `STELL-MSGSIG-V1` envelopes also carry paymaster sponsor fields.
 
 ## zkML (verifiable inference by re-execution — NOT succinct ZK)

@@ -5,7 +5,7 @@ One line per term; protocol terms first, resilience/ops terms after.
 - **µQC (micro-certificate):** fast finality path — a small stake-weighted
   sample signs a block instead of the full Ed25519 set (`PROTOCOL.md` §6).
 - **sortition:** parent-hash-seeded (`STELL_SORTITION_V5`) stake-weighted
-  committee draw, size `min(N, 64)` (`src/consensus.rs:635`).
+  committee draw, size `min(N, 128)` (`MICRO_COMMITTEE_MAX_SIZE`).
 - **network-anchored quorum:** µQC needs `max(2/3 of committee, strict
   majority of whole-network stake)` (`PROTOCOL.md` §6.3).
 - **Stl57:** branded Base58 address (`Stl57…` + 4-byte BLAKE3 checksum),
@@ -19,7 +19,11 @@ One line per term; protocol terms first, resilience/ops terms after.
 - **order commitment:** block's Merkle root over tx order (`ORDROOT1`),
   re-verified by every validator before voting.
 - **shard-header commitment:** masterchain block's commits to workchain
-  heads (`SHARDHDR`), TON `shard_hashes` model.
+  heads (`SHARDHDR`), TON `shard_hashes` model; since ruleset v5 each head
+  also carries cumulative `minted_total_nano` (`SHMINT01`).
+- **chain-wide supply cap:** `TOTAL_SUPPLY_CAP` (1 B STELL) split across the
+  committed shards by `SupplyPartition`; the masterchain refuses an aggregate
+  above the cap (`docs/SUPPLY_CAP.md`).
 - **lock_hint:** the lock a node advertises alongside its vote so peers
   reason about its locked value (`src/main.rs:1028`).
 - **polka:** 2/3+ prevotes for one block at a round — a network fact that

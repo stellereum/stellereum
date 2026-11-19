@@ -188,17 +188,17 @@ chain-wide accounting must still see it:
     fills the target's chain-wide SHARE; inbound value still credits at zero
     headroom because it is a transfer, not a mint.
 
-## 8. Protocol / fork-id rule (reported, not edited here)
+## 8. Protocol / fork-id rule (implemented)
 
-`src/protocol.rs` is owned by the protocol change. To move the fork id for
-ruleset v5, append to `FORK_ID_RULES`:
+`src/protocol.rs` carries the v5 rules. `FORK_ID_RULES` ends with:
 
 ```text
 crate::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION   // value 1
 crate::tokenomics::TOTAL_SUPPLY_CAP                 // value 1_000_000_000_000_000_000
 ```
 
-and bump `CONSENSUS_RULESET_VERSION` from 4 to 5 (the rule logic — a new
-consensus refusal and a new signed shard-head field — is more than a constant
-change). A mixed v4/v5 fleet must refuse consensus at handshake instead of
-accepting a masterchain block whose supply accounting it cannot interpret.
+and `CONSENSUS_RULESET_VERSION` is **5** (`DOMAIN_SET_VERSION` 3, `FORK_ID`
+`0x9d59096b`, 23 rules). The rule logic — a new consensus refusal and a new
+signed shard-head field — is more than a constant change. A mixed v4/v5 fleet
+refuses consensus at the handshake instead of accepting a masterchain block
+whose supply accounting it cannot interpret.

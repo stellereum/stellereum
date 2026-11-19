@@ -1,5 +1,10 @@
 # 01 — Architecture Overview (HDAE canonical, 2026-10-29)
 
+> **Current consensus ruleset: v5** (`FORK_ID = 0x9d59096b`, 23 rules).
+> Consensus-rule changes since this page was written: v2 height re-scale,
+> v3 shard-bound vote preimage, v4 signed block round + timestamp bound,
+> v5 chain-wide supply cap. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
+
 Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 (full list in `.archive/README.md`). Canonical audit: root
 `COMPREHENSIVE_AUDIT_REPORT.md` (PART I byte-frozen). Master protocol spec:
@@ -31,10 +36,10 @@ Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 | Domain | Files | Frozen surface |
 |---|---|---|
 | Primitives/addressing | `address.rs`, `cell.rs`, `chain_binding.rs` | `Stl57` format (Base58 + BLAKE3 checksum), chain-id binding |
-| Consensus/BFT | `consensus.rs`, `runtime.rs`, `main.rs` (loop), `consensus_net.rs` | V5 sortition (parent-hash), µQC k=64, tick 50ms |
+| Consensus/BFT | `consensus/`, `runtime/`, `node/`, `consensus_net.rs` | V5 sortition (parent-hash), µQC `min(N, 128)` seats, tick floor 50 ms, base timeout 3 000 ms (ruleset v5) |
 | Execution/VM | `contract.rs`, `contract_abi.rs`, `contract_source.rs`, `state_engine.rs`, `evm_adapter.rs` | wasmi, 13 host fns, canonical `.wat` source form |
-| Storage/state | `cpat2.rs` (trie), `storage.rs`, `chain.rs`, `mmr.rs` | exclusion proofs, MMR epoch roots (epoch 128) |
-| Economics | `staking.rs`, `token.rs`, `clob*.rs`, `amm*.rs`, `perps*.rs`, `mev*.rs` | F1 reward accumulator, failure-fee on apply-fail |
+| Storage/state | `cpat2.rs` (trie), `storage.rs`, `chain.rs`, `mmr.rs` | exclusion proofs, MMR epoch roots (epoch 500) |
+| Economics | `staking.rs`, `token.rs`, `tokenomics.rs`, `clob*.rs`, `amm*.rs`, `perps*.rs`, `mev*.rs` | chain-wide `TOTAL_SUPPLY_CAP` (`SupplyPartition` + committed aggregate), F1 reward accumulator, failure-fee on apply-fail |
 | Privacy | `crypto_privacy.rs`, `wallet_signing.rs` | shielded transfer/unshield, `STELL-MSGSIG-V1` |
 | Cross-shard/bridge | `xshard2pc.rs`, `bridge.rs`, `bridge_adapters.rs` | 2PC armed by compiled `XPC_ACTIVATION_HEIGHT = 0` (active from genesis), truth-gate bridge |
 | Crypto | `post_quantum.rs`, `bls.rs`, `vrf.rs` | Falcon FIPS-206, BLS12-381 (no PoP — structural), VRF planned |
@@ -43,7 +48,7 @@ Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 ## Frozen core contracts (change = audit + spec update)
 
 1. Wire format of blocks/votes/QCs (any byte change forks the chain).
-2. Quorum values (2f+1, µQC k=64) and timeout constants' safety roles.
+2. Quorum values (2f+1, µQC `min(N, 128)`) and timeout constants' safety roles.
 3. State-transition function (apply) — differential tests pin it.
 4. Address format `Stl57`, chain-id binding, signature domains.
 5. Snapshot/restore layout compatibility (resync depends on it).

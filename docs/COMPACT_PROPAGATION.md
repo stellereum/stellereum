@@ -72,6 +72,12 @@ authorises execution.
 blocks can answer bounded pulls. The full body still goes to the DHT/sync
 catch-up path.
 
+> Since ruleset v4 the announced `block_hash` covers the block's **signed**
+> `round` (when non-zero), not just the body. The compact envelope's `round`
+> is routing/response metadata and must match the reconstructed body's
+> `block.round`; the receiver still refuses unless the rebuild hashes to the
+> announced `block_hash`.
+
 **Receiver.** `CompactReceiver` opens via `open_compact_proposal` (gate +
 structural bounds), builds `ShortIdIndex` from `Mempool::all()`, and resolves.
 Outcomes are concrete (`CompactInbound`):

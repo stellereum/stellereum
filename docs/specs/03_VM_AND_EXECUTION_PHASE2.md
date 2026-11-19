@@ -6,6 +6,11 @@ old sources `evm_adapter.rs`, `state_engine.rs` and `runtime.rs` are now
 directories; `main.rs` is 35 lines. Every `file:line` below was re-grepped;
 sections that cannot be re-verified are marked `STALE — see <module dir>`.
 
+> **Ruleset snapshot — historical for consensus values.** Verified under
+> ruleset **v2**. Height windows quoted here (e.g. commission delay 7 200) were
+> rescaled by v2 (now 30 000) and ruleset v5 is current
+> (`FORK_ID = 0x9d59096b`); see `docs/RULESET_V2.md` and `docs/RULESET_V5.md`.
+
 Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter/`,
 `state_engine/`, `runtime/`, `sharding/`, `mempool.rs`, `native_api.rs`,
 `orderbook.rs`, `pmm.rs`, `oracle.rs`, `bridge.rs`, `xshard2pc.rs`,

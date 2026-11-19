@@ -274,7 +274,7 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "CNVRF_V3_ACTIVATION_HEIGHT",
                 "stellereum::consensus::sortition",
                 CNVRF_V3_ACTIVATION_HEIGHT,
-                "7,200-block epoch CN-VRF v3 sortition and proposer beacon draw",
+                "30,000-block epoch CN-VRF v3 sortition and proposer beacon draw (ruleset v2 rescaled EPOCH_LEN from 7,200)",
             ),
             ActivationGate::new(
                 "COMPACT_GOSSIP_ACTIVATION_HEIGHT",

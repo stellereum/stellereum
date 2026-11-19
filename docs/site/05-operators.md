@@ -14,9 +14,12 @@ Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-network.sh`,
    live binary → 203/EXEC crash-loop).
 2. **Configure:** `node.yaml` (`peers:`, `validators:`, DNS seeds) + env
    file (mode 600). Values that must match **every** node: `STELL_SHARDS`,
-   chain id, `STELL_ROUND_TIMEOUT_MS`/`STELL_DOWN_PROPOSER_TIMEOUT_MS`/
-   `STELL_MIN_BLOCK_MS` (default 400), `STELL_KEEP_BLOCKS`, admission base
-   fee — drift = split or silent isolation (`OPERATIONS.md` §15.3).
+   chain id, `STELL_MIN_BLOCK_MS` (default 50), `STELL_KEEP_BLOCKS`, admission
+   base fee — drift = split or silent isolation (`OPERATIONS.md` §15.3). The
+   base round timeout is **compiled** (`FROZEN_ROUND_TIMEOUT_BASE_MS = 3 000`);
+   the former `STELL_ROUND_TIMEOUT_MS` env override is gone, so it must match
+   by running the same binary/ruleset. `STELL_DOWN_PROPOSER_TIMEOUT_MS`
+   (default 800) stays node-local policy.
 3. **Keygen:** `stellereum keys init` (0700/0600, encrypted `enc2:` by
    default; passphrase via `STELL_NODE_PASSPHRASE`, never in history).
    Falcon pre-FIPS keys still load; migrate with

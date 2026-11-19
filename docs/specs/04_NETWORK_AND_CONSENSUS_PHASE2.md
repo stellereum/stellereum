@@ -7,6 +7,14 @@ edits; line numbers match that tree), **after** the module split:
 Every `file:line` below was re-grepped on that tree; a claim that could not be
 re-verified is marked STALE with the module directory to read instead.
 
+> **Ruleset snapshot — historical for consensus values.** This page was verified
+> on the 2026-11-18 tree under ruleset **v2**. Rulesets v3–v5 superseded it:
+> the vote preimage gained the shard id (`STELLEREUM_BFT_VOTE_V3`), the block
+> gained a SIGNED `round`, the timestamp bound was added, and the supply cap
+> became chain-wide. §4 (vote preimage), the CN-VRF height numbers, and any
+> block-hash/identity claim below are historical; current values live in
+> `docs/RULESET_V3.md`..`docs/RULESET_V5.md` and `stellereum/src/protocol.rs`.
+
 Sources: `stellereum/src/consensus/`, `consensus_net.rs`, `network.rs`,
 `sync.rs`, `mempool.rs`, `staking.rs`, `cn_vrf.rs`, `minroot_vdf.rs`,
 `node/consensus_driver.rs`, `zkml.rs`.

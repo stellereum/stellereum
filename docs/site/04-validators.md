@@ -7,10 +7,10 @@ Full click-by-click runbook: `docs/VALIDATOR_ONBOARDING.md`.
 
 | Rule | Value | Source |
 | --- | --- | --- |
-| `MIN_VALIDATOR_BOND` | **1000 STELL** | `src/staking.rs:59` |
-| `STELL_MIN_BOND_BUFFER` | **100 STELL** admission buffer | `src/staking.rs:72` |
-| New-bond floor | **1100 STELL** self-bond | `required_bond_floor_nano` (`:62`) |
-| Election | auto, top **250** by total stake | `MAX_ACTIVE_VALIDATORS` (`:190`) |
+| `MIN_VALIDATOR_BOND` | **1000 STELL** | `src/staking.rs:62` |
+| `STELL_MIN_BOND_BUFFER` | **100 STELL** admission buffer | `src/staking.rs:78` |
+| New-bond floor | **1100 STELL** self-bond | `required_bond_floor_nano` (`:82`) |
+| Election | auto, top **250** by total stake | `MAX_ACTIVE_VALIDATORS` (`:209`) |
 | Genesis bond | 1000 STELL, power 1 | `fund_genesis` (`docs/RPC.md` §5) |
 
 A bare 1000-STELL bond is refused at admission. Below the top 250 you
@@ -24,7 +24,7 @@ Quorum is `floor(2·power/3)+1`: 1→1, 2→2, 3→3, 4→3, 5→4 — so 2- and
 
 Commission is set **once at bond time** from governance
 (`ctx.default_commission_bps`, default `DEFAULT_COMMISSION_BPS` =
-**1000 bps = 10 %**, `src/staking.rs:232`); the ledger has **no setter**,
+**1000 bps = 10 %**, `src/staking.rs:327`); the ledger has **no setter**,
 the opcode carries no commission field, and the wallet `stake` command
 offers no `--commission-bps` — deliberately unimplemented
 (`docs/RPC.md` §5). A later `SetDefaultCommissionBps` vote prices **new**
@@ -57,21 +57,21 @@ Evidence-driven only, never local timers (`PROTOCOL.md` I5):
 
 | Offence | Penalty | Cooldown | Source |
 | --- | --- | --- | --- |
-| downtime (10 consecutive misses) | **0.1 %** burn (`DOWNTIME_SLASH_BPS`=10 bps) | 100 heights (`DOWNTIME_PENALTY_COOLDOWN`) | `src/staking.rs:226–231` |
-| equivocation (double-vote) | **5 %** burn (`EQUIVOCATION_SLASH_BPS`=500 bps) | none | `src/staking.rs:222` |
+| downtime (42 consecutive misses) | **0.1 %** burn (`DOWNTIME_SLASH_BPS`=10 bps) | 500 heights (`DOWNTIME_PENALTY_COOLDOWN`) | `src/staking.rs:275,289,299` |
+| equivocation (double-vote) | **5 %** burn (`EQUIVOCATION_SLASH_BPS`=500 bps) | none | `src/staking.rs:265` |
 
 Misses derive from the finalized block's embedded parent QC, so every
 node counts identically; signing again resets the counter; the cooldown
-skips the first offence (chains < 100 blocks). Burns debit the staking
+skips the first offence (chains < 500 blocks). Burns debit the staking
 pool for real. Genesis math: 1000 STELL bond loses 1 STELL per downtime
-hit, 50 per equivocation. At the 400 ms block floor, 10 misses ≈ 4 s —
-a GC pause can cost you (`OPERATIONS.md` §5). A halted 2-validator net
-slashes nobody (no blocks, no evidence). `missed` has no RPC — watch
+hit, 50 per equivocation. At the ~240 ms ruleset-v2 tempo, 42 misses
+≈ 10.1 s — a GC pause can cost you (`OPERATIONS.md` §5). A halted 2-validator
+net slashes nobody (no blocks, no evidence). `missed` has no RPC — watch
 `stell_stakeOf` for a `total` below your bond.
 
 ## Unbonding window
 
-`UNBONDING_PERIOD_SECS` = **2 days** (`src/staking.rs:206`). Only the
+`UNBONDING_PERIOD_SECS` = **2 days** (`src/staking.rs:260`). Only the
 validator itself may unbond (`src/svm.rs:1788–1798`); partial unbonds
 allowed, remainder keeps validating. Withdraw after maturity
 (`withdraw-unbond` → `SysCallUndelegate`); delegations use

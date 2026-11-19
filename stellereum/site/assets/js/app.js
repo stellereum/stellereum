@@ -1,25 +1,27 @@
 /* Stellereum — app.js
-   Бургер-меню, smooth-scroll, active-nav, табы, копирование, мелочи. */
+   Swiss nav drawer, smooth anchor travel, active section, tabs, copy, year.
+   No dependencies; every enhancement is additive. */
 (function () {
   'use strict';
 
   var doc = document;
   var win = window;
   var reduceMotion = win.matchMedia('(prefers-reduced-motion: reduce)');
-  var desktopNav = win.matchMedia('(min-width: 992px)');
+  var desktopNav = win.matchMedia('(min-width: 900px)');
 
-  /* ---------------------------------------------------------------- шапка */
+  /* --------------------------------------------------------------- header */
   var header = doc.querySelector('.site-header');
 
   function onScrollHeader() {
     if (!header) return;
-    header.classList.toggle('is-scrolled', win.scrollY > 8);
+    header.classList.toggle('is-scrolled', (win.scrollY || 0) > 8);
   }
   onScrollHeader();
   win.addEventListener('scroll', onScrollHeader, { passive: true });
 
-  /* ------------------------------------------------------------ бургер ---- */
+  /* --------------------------------------------------------- nav drawer */
   var toggle = doc.querySelector('.nav-toggle');
+  var close = doc.querySelector('.nav-close');
   var panel = doc.getElementById('nav-panel');
   var backdrop = doc.querySelector('.nav-backdrop');
   var navOpen = false;
@@ -29,6 +31,7 @@
     if (!toggle || !panel) return;
     if (open === navOpen) return;
     navOpen = open;
+
     toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     toggle.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
     panel.classList.toggle('is-open', open);
@@ -38,35 +41,35 @@
     if (open) {
       lastFocused = doc.activeElement;
       var first = panel.querySelector('a[href], button:not([disabled])');
-      if (first) first.focus();
+      if (first) win.setTimeout(function () { first.focus(); }, 20);
     } else if (lastFocused && typeof lastFocused.focus === 'function') {
       lastFocused.focus();
       lastFocused = null;
     }
   }
 
-  if (toggle) {
-    toggle.addEventListener('click', function () { setNav(!navOpen); });
-  }
-  if (backdrop) {
-    backdrop.addEventListener('click', function () { setNav(false); });
-  }
+  if (toggle) toggle.addEventListener('click', function () { setNav(!navOpen); });
+  if (close) close.addEventListener('click', function () { setNav(false); });
+  if (backdrop) backdrop.addEventListener('click', function () { setNav(false); });
+
   if (panel) {
     panel.addEventListener('click', function (e) {
       var link = e.target.closest ? e.target.closest('a[href]') : null;
       if (link && !desktopNav.matches) setNav(false);
     });
   }
+
   doc.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && navOpen) setNav(false);
   });
+
   if (desktopNav.addEventListener) {
     desktopNav.addEventListener('change', function (e) { if (e.matches) setNav(false); });
   }
 
-  /* --------------------------------------------------- smooth scroll ------ */
+  /* ------------------------------------------------------- smooth travel */
   function headerOffset() {
-    return header ? header.offsetHeight : 64;
+    return header ? header.offsetHeight : 68;
   }
 
   doc.addEventListener('click', function (e) {
@@ -74,6 +77,7 @@
     if (!link) return;
     var hash = link.getAttribute('href');
     if (!hash || hash === '#' || hash.length < 2) return;
+
     var target = null;
     try { target = doc.querySelector(hash); } catch (err) { return; }
     if (!target) return;
@@ -89,13 +93,13 @@
     if (history.replaceState) history.replaceState(null, '', hash);
     if (target.focus) {
       target.setAttribute('tabindex', '-1');
-      window.setTimeout(function () { target.focus({ preventScroll: true }); }, behavior === 'auto' ? 0 : 500);
+      win.setTimeout(function () { target.focus({ preventScroll: true }); }, behavior === 'auto' ? 0 : 520);
     }
   });
 
-  /* ------------------------------------------------------- active nav ----- */
+  /* ---------------------------------------------------------- active nav */
   var navLinks = Array.prototype.slice.call(doc.querySelectorAll('.nav-link[href^="#"]'));
-  var watched = ['network', 'build', 'ecosystem', 'roadmap']
+  var watched = ['network', 'features', 'performance', 'build', 'ecosystem', 'roadmap']
     .map(function (id) { return doc.getElementById(id); })
     .filter(Boolean);
 
@@ -124,7 +128,7 @@
     watched.forEach(function (section) { navObserver.observe(section); });
   }
 
-  /* ----------------------------------------------------------- табы ------- */
+  /* --------------------------------------------------------------- tabs */
   Array.prototype.forEach.call(doc.querySelectorAll('[role="tablist"]'), function (list) {
     var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
     if (!tabs.length) return;
@@ -153,7 +157,7 @@
     });
   });
 
-  /* -------------------------------------------------------- копирование --- */
+  /* -------------------------------------------------------------- copy */
   function legacyCopy(text) {
     return new Promise(function (resolve, reject) {
       try {
@@ -220,13 +224,18 @@
     copyText(text.trim()).then(function () { flashCopied(btn); });
   });
 
-  /* ------------------------------------------------------------- мелочи --- */
+  /* ------------------------------------------------------------ details */
   Array.prototype.forEach.call(doc.querySelectorAll('[data-year]'), function (el) {
     el.textContent = String(new Date().getFullYear());
   });
 
-  win.StellereumApp = {
-    copyText: copyText,
-    setNav: setNav
-  };
+  /* If motion.js fails to load, never leave reveal content hidden. */
+  win.setTimeout(function () {
+    Array.prototype.forEach.call(doc.querySelectorAll('[data-reveal]:not(.is-visible)'), function (el) {
+      var r = el.getBoundingClientRect();
+      if (r.top < win.innerHeight && r.bottom > 0) el.classList.add('is-visible');
+    });
+  }, 3200);
+
+  win.StellereumApp = { copyText: copyText, setNav: setNav };
 })();

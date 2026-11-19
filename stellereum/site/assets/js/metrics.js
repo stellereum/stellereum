@@ -1,48 +1,59 @@
 /* Stellereum — metrics.js
-   Живые метрики сети. Ничего не выдумываем: при недоступности эндпоинта
-   показываем «—» и бейдж reconnecting.
-   Источник: POST https://rpc.stellereum.org (CORS: access-control-allow-origin: *),
-   методы stell_chainId, stell_blockNumber, stell_baseFee, stell_getValidators,
-   stell_getStateRoot, stell_syncing.
-   GET https://testnet.stellereum.org/api/stats и /health сюда сознательно не
-   идут: сервер отдаёт заголовок access-control-allow-origin дважды («*, *»),
-   и браузер блокирует такой ответ с ошибкой в консоли.
-*/
+   Live network metrics. Nothing is invented: when an endpoint is unavailable
+   the value falls back to an em dash and the status flips to reconnecting.
+   Source: POST https://rpc.stellereum.org (CORS: access-control-allow-origin: *).
+   Methods: stell_chainId, stell_blockNumber, stell_baseFee,
+   stell_getValidators, stell_getStateRoot, stell_syncing, stell_latestBlocks.
+   GET https://testnet.stellereum.org/api/stats and /health are intentionally
+   not used: the server emits access-control-allow-origin twice («*, *») and the
+   browser rejects that response. */
 (function () {
   'use strict';
 
   var RPC = 'https://rpc.stellereum.org';
 
-  var POLL_MS = 15000;     /* обновление каждые 15 с */
-  var BOOTSTRAP_MS = 2500; /* первое повторное измерение — чтобы посчитать block time */
-  var TIMEOUT_MS = 8000;   /* таймаут через AbortController */
+  var POLL_MS = 15000;     /* refresh cadence */
+  var BOOTSTRAP_MS = 2500; /* second sample, enough to derive block time */
+  var TIMEOUT_MS = 8000;   /* AbortController timeout */
 
   var reduce = window.matchMedia('(prefers-reduced-motion: reduce)');
 
-  /* ------------------------------------------------------------- утилиты - */
-  function valueNode(name) {
-    var box = document.querySelector('[data-metric="' + name + '"]');
-    if (!box) return null;
-    return box.querySelector('[data-value]') || box;
+  /* ------------------------------------------------------------- helpers - */
+  function boxes(name) {
+    return document.querySelectorAll('[data-metric="' + name + '"]');
   }
 
-  function noteNode(name) {
-    var box = document.querySelector('[data-metric="' + name + '"]');
-    return box ? box.querySelector('.metric-note') : null;
+  function valueNodes(name) {
+    var out = [];
+    Array.prototype.forEach.call(boxes(name), function (box) {
+      var node = box.querySelector('[data-value]') || box;
+      if (node) out.push(node);
+    });
+    return out;
+  }
+
+  function valueNode(name) {
+    return valueNodes(name)[0] || null;
+  }
+
+  function noteNodes(name) {
+    var out = [];
+    Array.prototype.forEach.call(boxes(name), function (box) {
+      var note = box.querySelector('.metric-note');
+      if (note) out.push(note);
+    });
+    return out;
   }
 
   function fail(name) {
-    var el = valueNode(name);
-    if (el) {
+    valueNodes(name).forEach(function (el) {
       el._seeded = true;
       el.textContent = '—';
       if (el.removeAttribute) el.removeAttribute('data-full');
-    }
+    });
   }
 
   function setNumber(name, num, opts) {
-    var el = valueNode(name);
-    if (!el) return;
     opts = opts || {};
     var dec = opts.decimals || 0;
     var suffix = opts.suffix || '';
@@ -53,15 +64,17 @@
         ? function (v) { return prefix + v.toFixed(dec) + suffix; }
         : function (v) { return prefix + Math.round(v).toLocaleString('en-US') + suffix; });
 
-    var first = !el._seeded;
-    el._seeded = true;
+    valueNodes(name).forEach(function (el) {
+      var first = !el._seeded;
+      el._seeded = true;
 
-    if (first && window.StellMotion && !reduce.matches && isFinite(num)) {
-      window.StellMotion.count(el, num, { format: format, duration: 950 });
-    } else {
-      if (el._countRaf) { cancelAnimationFrame(el._countRaf); el._countRaf = null; }
-      el.textContent = format(num);
-    }
+      if (first && window.StellMotion && !reduce.matches && isFinite(num)) {
+        window.StellMotion.count(el, num, { format: format, duration: 950 });
+      } else {
+        if (el._countRaf) { cancelAnimationFrame(el._countRaf); el._countRaf = null; }
+        el.textContent = format(num);
+      }
+    });
   }
 
   function hexToNumber(hex) {
@@ -87,16 +100,16 @@
   }
 
   function setStateRoot(hex) {
-    var el = valueNode('stateRoot');
-    if (!el) return;
     var s = String(hex);
     if (s.slice(0, 2).toLowerCase() === '0x') s = s.slice(2);
-    el.setAttribute('data-full', s);
-    el._seeded = true;
-    el.textContent = truncateHash(s);
+    valueNodes('stateRoot').forEach(function (el) {
+      el.setAttribute('data-full', s);
+      el._seeded = true;
+      el.textContent = truncateHash(s);
+    });
   }
 
-  /* -------------------------------------------------------------- fetch --- */
+  /* --------------------------------------------------------------- fetch - */
   function request(url, options) {
     var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
     var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, TIMEOUT_MS);
@@ -113,13 +126,18 @@
     });
   }
 
-  function rpc(method) {
+  function rpc(method, params) {
     return request(RPC, {
       method: 'POST',
       mode: 'cors',
       cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: method, params: [] })
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: method,
+        params: params || []
+      })
     }).then(function (data) {
       if (data && data.error) throw new Error(data.error.message || 'rpc error');
       if (!data || typeof data.result === 'undefined' || data.result === null) {
@@ -133,24 +151,27 @@
     return promise.then(function (v) { return v; }, function () { return null; });
   }
 
-  /* ------------------------------------------------------------- статус --- */
-  var statusBox = document.querySelector('[data-status]');
-  var statusText = statusBox ? statusBox.querySelector('[data-status-text]') : null;
+  /* -------------------------------------------------------------- status - */
+  var statusBoxes = document.querySelectorAll('[data-status]');
+  var statusTexts = document.querySelectorAll('[data-status-text]');
   var online = null;
 
   function setStatus(isOnline) {
     if (online === isOnline) return;
     online = isOnline;
-    if (!statusBox) return;
-    statusBox.classList.toggle('is-offline', !isOnline);
-    if (statusText) {
-      statusText.textContent = isOnline
-        ? 'Live \u00b7 testnet.stellereum.org'
-        : 'reconnecting \u00b7 testnet.stellereum.org';
-    }
+
+    Array.prototype.forEach.call(statusBoxes, function (box) {
+      box.classList.toggle('is-offline', !isOnline);
+    });
+
+    Array.prototype.forEach.call(statusTexts, function (el) {
+      el.textContent = isOnline
+        ? 'Live · testnet.stellereum.org'
+        : 'reconnecting · testnet.stellereum.org';
+    });
   }
 
-  /* ----------------------------------------------------- block time ------ */
+  /* ----------------------------------------------------------- block time */
   var sample = { start: null, height: null };
 
   function fetchLiveBlockTime() {
@@ -189,7 +210,7 @@
     }
   }
 
-  /* -------------------------------------------------------------- poll ---- */
+  /* ---------------------------------------------------------------- poll - */
   var pollCount = 0;
 
   function poll() {
@@ -222,10 +243,11 @@
     var now = Date.now();
 
     /* chain id ---------------------------------------------------------- */
-    var elChain = valueNode('chainId');
-    if (elChain) {
-      elChain.textContent = '5757';
-      elChain._seeded = true;
+    if (map.chainId !== null && typeof map.chainId !== 'undefined') {
+      valueNodes('chainId').forEach(function (el) {
+        el.textContent = '5757';
+        el._seeded = true;
+      });
     }
 
     /* block height ------------------------------------------------------ */
@@ -241,9 +263,8 @@
     /* base fee ---------------------------------------------------------- */
     if (map.baseFee && map.baseFee.base_fee !== undefined) {
       var fee = Number(map.baseFee.base_fee);
-      if (isFinite(fee)) {
-        setNumber('baseFee', fee);
-      } else { fail('baseFee'); }
+      if (isFinite(fee)) setNumber('baseFee', fee);
+      else fail('baseFee');
     } else {
       fail('baseFee');
     }
@@ -251,13 +272,11 @@
     /* validators -------------------------------------------------------- */
     if (map.validators && Array.isArray(map.validators.validators)) {
       setNumber('validators', map.validators.validators.length);
-      var note = noteNode('validators');
-      if (note) {
-        var q = Number(map.validators.quorum);
-        var t = Number(map.validators.total_power);
-        if (isFinite(q) && isFinite(t) && t > 0) {
-          note.textContent = 'quorum ' + (q / t * 100).toFixed(2) + '% of ' + t.toLocaleString('en-US');
-        }
+      var q = Number(map.validators.quorum);
+      var t = Number(map.validators.total_power);
+      if (isFinite(q) && isFinite(t) && t > 0) {
+        var note = 'quorum ' + (q / t * 100).toFixed(2) + '% of ' + t.toLocaleString('en-US');
+        noteNodes('validators').forEach(function (el) { el.textContent = note; });
       }
     } else {
       fail('validators');
@@ -270,7 +289,7 @@
       fail('stateRoot');
     }
 
-    /* узел в курсе состояния сети (true = отстаёт) ----------------------- */
+    /* node health (true = syncing / behind) ------------------------------ */
     var healthy =
       map.chainId !== null &&
       map.height !== null &&
@@ -287,7 +306,7 @@
     window.setTimeout(poll, delay);
   }
 
-  /* -------------------------------------------------------------- старт -- */
+  /* --------------------------------------------------------------- boot - */
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', poll);
   } else {

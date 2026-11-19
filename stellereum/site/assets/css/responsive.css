@@ -1,81 +1,93 @@
 /* ==========================================================================
-   Stellereum — ВСЕ медиазапросы (breakpoints: 480 / 768 / 992 / 1280 / 1536)
-   Mobile-first: база выше (в base/layout/components/sections) — здесь только
-   min-width overrides. Единственное исключение по духу файла — «тонкий»
-   pointer/hover-безопасность и max-width для 320px.
+   STELLEREUM — responsive overrides
+   Mobile-first. Breakpoints: 420 / 680 / 900 / 1200 / 1500.
    ========================================================================== */
 
-/* --- очень узкие экраны (320–479) ---------------------------------------- */
-@media (max-width: 479.98px) {
-  :root {
-    --section-y: 56px;
-  }
-
-  .metric { padding: var(--sp-4) var(--sp-5); min-height: 120px; }
-  .perf-grid { grid-template-columns: minmax(0, 1fr); gap: var(--sp-6); }
-  .code-body { padding: var(--sp-4); }
-  .code-body pre { font-size: 12.5px; }
-  .cta-panel { padding: var(--sp-9) var(--sp-5); }
-  .card { padding: var(--sp-5); }
-  .timeline { padding-left: 34px; }
-  .timeline-item::before { left: -34px; width: 22px; height: 22px; }
-  .timeline-item::after { left: -27px; top: 10px; }
-  .timeline::before { left: 9px; }
+/* --- narrow phones (360–419) -------------------------------------------- */
+@media (max-width: 899.98px) {
+  .nf-code { font-size: clamp(6rem, 32vw, 12rem); }
 }
 
-/* --- 480+ --------------------------------------------------------------- */
+@media (max-width: 419.98px) {
+  :root { --gutter: 14px; }
+
+  .brand { padding-inline: 10px; gap: 8px; }
+  .brand-mark { width: 24px; height: 24px; }
+  .brand-word { font-size: 11.5px; }
+
+  .hero-title { font-size: clamp(1.95rem, 8.6vw, 2.6rem); }
+  .hero-sub { font-size: 14px; }
+
+  .perf-grid { grid-template-columns: minmax(0, 1fr); }
+  .perf-value { font-size: 34px; }
+
+  .code-body pre { font-size: 11.5px; }
+  .step { grid-template-columns: 34px minmax(0, 1fr); gap: 8px; }
+  .timeline-item { grid-template-columns: 30px minmax(0, 1fr); gap: 8px; }
+
+  .footer-colophon { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* --- 480+ ---------------------------------------------------------------- */
 @media (min-width: 480px) {
+  .btn { min-height: 50px; padding-inline: 24px; }
+  .hero-actions .btn { flex: 0 1 auto; }
+}
+
+/* --- 680+ ---------------------------------------------------------------- */
+@media (min-width: 680px) {
   :root {
-    --gutter: 24px;
+    --gutter: 26px;
+    --header-h: 66px;
   }
+
+  .brand { padding-inline: 18px; }
+  .brand-word { font-size: 14px; }
+  .brand-tag { display: inline-block; }
+
+  .nav-panel { width: min(390px, 82vw); }
+
+  .hero-hud { font-size: 10px; }
+
+  .telemetry-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .tcell--wide { grid-column: auto; }
 
   .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .footer-grid { gap: var(--sp-8) var(--sp-7); }
-  .perf-band { padding: var(--sp-9) var(--sp-7); }
+  .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .eco-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+  .footer-top { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .footer-brand { grid-column: 1 / -1; }
+
+  .footer-colophon { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+  .net-strip { grid-template-columns: minmax(0, 1.6fr) minmax(0, .7fr) minmax(0, .7fr); }
 }
 
-/* --- 768+ --------------------------------------------------------------- */
-@media (min-width: 768px) {
+/* --- 900+ : desktop nav, two-column hero/build -------------------------- */
+@media (min-width: 900px) {
   :root {
-    --gutter: 32px;
-    --section-y: 80px;
+    --gutter: 34px;
+    --header-h: 68px;
   }
 
-  .section-head { margin-bottom: var(--sp-10); gap: var(--sp-4); }
-
-  .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-5); }
-  .eco-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-5); }
-
-  .perf-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-6); }
-  .perf-item { text-align: left; }
-
-  .hero { padding-block: var(--sp-13) var(--sp-14); }
-  .hero-visual { max-width: 520px; }
-
-  .net-strip { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
-
-  .cta-panel { padding: var(--sp-13) var(--sp-9); }
-
-  /* монозначение state root держит свой кегль и не перекрывается */
-  .metric-value:not(.metric-value--mono) { font-size: clamp(30px, 3.4vw, 36px); }
-}
-
-/* --- 992+ (десктопная навигация, двухколоночные секции) ------------------ */
-@media (min-width: 992px) {
-  :root {
-    --section-y: 96px;
-  }
-
-  /* header: drawer → inline nav */
+  /* header: drawer → Swiss bar */
   .nav-toggle,
   .nav-close,
   .nav-backdrop,
   .nav-panel-top { display: none; }
 
+  .header-meta { display: flex; }
+
   .nav-panel {
     position: static;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 0;
     width: auto;
     height: auto;
+    margin-left: auto;
     padding: 0;
     border: 0;
     background: none;
@@ -83,83 +95,117 @@
     overflow: visible;
     visibility: visible;
     transform: none;
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-end;
-    gap: var(--sp-5);
-    flex: 1 1 auto;
-    min-width: 0;
     transition: none;
   }
 
   .nav-list {
     flex-direction: row;
-    align-items: center;
-    gap: 2px;
+    align-items: stretch;
+    border-top: 0;
   }
 
   .nav-link {
-    padding: 9px 14px;
-    font-size: 15px;
-    border-radius: var(--r-pill);
-    white-space: nowrap;
+    height: 100%;
+    align-items: center;
+    padding: 0 16px;
+    border-bottom: 0;
+    border-left: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .12em;
   }
 
-  .nav-cta { width: auto; }
+  .nav-link:hover,
+  .nav-link[aria-current="true"] { padding-left: 16px; }
 
-  /* hero: 1 колонка → 2 */
-  .hero-grid {
-    grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr);
-    gap: var(--sp-8);
+  .nav-cta {
+    width: auto;
+    min-height: 100%;
+    padding-inline: 20px;
+    border: 0;
+    border-left: 2px solid var(--line-strong);
+    border-radius: 0;
+    box-shadow: none;
   }
 
-  .hero-visual { max-width: 100%; margin-inline: 0; }
+  .nav-cta:hover { transform: none; box-shadow: none; }
 
-  /* metrics: 3 × 2 */
-  .metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-4); }
-
-  /* features: 3 × 2 */
-  .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-
-  /* quickstart: текст + код */
-  .quickstart-grid {
-    grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
-    gap: var(--sp-9);
+  /* hero */
+  .hero-inner {
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, .7fr);
+    gap: clamp(32px, 4vw, 64px);
   }
 
-  /* footer: 4 колонки */
-  .footer-grid { grid-template-columns: minmax(0, 1.5fr) repeat(3, minmax(0, 1fr)); }
+  .hero-slab { display: block; }
+
+  /* section head */
+  .sec-head {
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, .7fr);
+    align-items: end;
+  }
+
+  .sec-marker { grid-column: 1 / -1; }
+  .sec-lead { justify-self: end; padding-left: 18px; border-left: 1px solid var(--line); }
+
+  .metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .perf-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+  .build-grid { grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr); }
+
+  .notfound { grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); }
+
+  .footer-top { grid-template-columns: minmax(0, 1.35fr) repeat(3, minmax(0, .82fr)); }
   .footer-brand { grid-column: auto; }
 }
 
-/* --- 1280+ -------------------------------------------------------------- */
-@media (min-width: 1280px) {
+/* --- 1200+ --------------------------------------------------------------- */
+@media (min-width: 1200px) {
   :root {
-    --gutter: 40px;
-    --header-h: 76px;
-    --section-y: 112px;
+    --gutter: 44px;
+    --header-h: 72px;
   }
 
-  .hero { padding-block: var(--sp-14) var(--sp-15); }
-  .hero-grid { gap: var(--sp-10); }
-  .section-head { margin-bottom: var(--sp-11); }
+  .brand { padding-inline: 22px; }
+  .brand-mark { width: 32px; height: 32px; }
+  .brand-word { font-size: 15px; }
 
-  .card { padding: var(--sp-7); }
-  .metric { padding: var(--sp-6) var(--sp-7); }
-  .perf-band { padding: var(--sp-10) var(--sp-9); }
+  .nav-link { padding-inline: 20px; font-size: 10.5px; }
+  .nav-link:hover,
+  .nav-link[aria-current="true"] { padding-left: 20px; }
+  .nav-cta { padding-inline: 28px; }
+
+  .hero-slab { max-width: 460px; }
+  .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .hero-watermark { right: -8%; width: min(820px, 52vw); }
 }
 
-/* --- 1536+ -------------------------------------------------------------- */
-@media (min-width: 1536px) {
-  :root {
-    --section-y: 128px;
-  }
+/* --- 1500+ --------------------------------------------------------------- */
+@media (min-width: 1500px) {
+  :root { --gutter: 56px; }
+
+  .hero-title { font-size: clamp(6.8rem, 6.4vw, 9rem); }
+  .sec-title { font-size: 92px; }
+  .metric { min-height: 158px; }
 }
 
-/* --- только устройства с точным указателем: hover-эффекты ---------------- */
+/* --- short phones: keep the hero telemetry above the fold --------------- */
+@media (max-width: 899.98px) and (max-height: 820px) {
+  .hero-hud { padding-block: 9px; }
+  .hero-inner { padding-block: 8px; }
+  .hero-kicker { margin-bottom: 10px; }
+  .hero-sub { margin-top: 12px; }
+  .hero-actions { margin-top: 14px; }
+  .hero-tags { margin-top: 12px; }
+  .hero-title { font-size: clamp(1.95rem, 8vw, 2.5rem); }
+}
+
+/* --- coarse pointers: no hover lift, no custom cursor -------------------- */
 @media (hover: none), (pointer: coarse) {
-  .card:hover,
-  .btn:hover { transform: none; }
+  .btn:hover,
+  .invert-card:hover { transform: none; }
 
-  .card.is-tilting { transform: none; }
+  .cursor { display: none !important; }
+
+  .card:hover { transform: none; }
 }

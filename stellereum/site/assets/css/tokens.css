@@ -1,57 +1,60 @@
 /* ==========================================================================
-   Stellereum — design tokens
-   Только переменные. Никаких селекторов компонентов.
-   Брейкпоинты (mobile-first, как у ethereum.org):
-   480 / 768 / 992 / 1280 / 1536  — см. responsive.css
+   STELLEREUM — design tokens
+   Swiss-brutalist grid / electric blue–indigo–violet / Bayer 4×4.
+   Only custom properties live here. Breakpoints: 420 / 680 / 900 / 1200 / 1500.
    ========================================================================== */
 
 :root {
   color-scheme: dark;
 
-  /* --- surfaces --------------------------------------------------------- */
-  --bg-0: #04060c;              /* страница */
-  --bg-1: #070b14;              /* секция-альтерната */
-  --bg-2: #0b1120;              /* панель */
-  --surface: rgba(255, 255, 255, .045);
-  --surface-2: rgba(255, 255, 255, .07);
-  --border: rgba(255, 255, 255, .09);
-  --border-strong: rgba(255, 255, 255, .16);
+  /* --- electric surfaces ------------------------------------------------- */
+  --bg: #060811;
+  --bg-1: #080b16;
+  --surface: #0b0f1d;
+  --surface-2: #101731;
+  --surface-3: #151d3b;
+  --ink: #060811;
 
-  /* --- text ------------------------------------------------------------- */
-  --text-1: #eaf0fb;            /* заголовки (15.9:1 на --bg-0) */
-  --text-2: #9aa6bf;            /* основной текст (8.1:1) */
-  --text-3: #616d87;            /* мутный — только декор */
+  /* --- type colour ------------------------------------------------------- */
+  --text: #d8e6ff;          /* body / headings on --bg                       */
+  --text-2: #a9b8d8;        /* secondary, 7.4:1 on --bg                      */
+  --text-3: #7b89ad;        /* meta, large / decorative only                 */
+  --telemetry: #7aa2ff;
+  --telemetry-alt: #9d8cff;
 
-  /* --- accent ----------------------------------------------------------- */
-  --accent: #3fa9ff;
-  --accent-2: #8b6cff;
-  --accent-3: #5ef0c8;
-  --danger: #ff6b8a;
-  --grad: linear-gradient(120deg, var(--accent) 0%, var(--accent-2) 100%);
-  --grad-text: linear-gradient(120deg, #7cc7ff 0%, #a99bff 100%);
+  /* --- electric spectrum ------------------------------------------------- */
+  --blue: #5eb8ff;
+  --indigo: #7c8dff;
+  --violet: #a875ff;
+  --grad: linear-gradient(115deg, var(--blue) 0%, var(--indigo) 52%, var(--violet) 100%);
+  --grad-soft: linear-gradient(115deg, rgba(94, 184, 255, .19), rgba(124, 141, 255, .12) 52%, rgba(168, 117, 255, .19));
+  --grad-text: linear-gradient(110deg, #8fd2ff 0%, #9aa4ff 48%, #c49aff 100%);
 
-  /* --- radii ------------------------------------------------------------ */
-  --r-sm: 10px;
-  --r-md: 16px;
-  --r-lg: 24px;
-  --r-pill: 999px;
+  /* --- rules & elevation ------------------------------------------------- */
+  --line: rgba(124, 141, 255, .28);
+  --line-soft: rgba(124, 141, 255, .17);
+  --line-strong: #7c8dff;
+  --field: rgba(94, 184, 255, .055);
+  --shadow: #5eb8ff;
+  --shadow-alt: #a875ff;
+  --dot: rgba(124, 141, 255, .42);
 
-  /* --- elevation -------------------------------------------------------- */
-  --shadow-1: 0 1px 0 rgba(255, 255, 255, .05) inset, 0 20px 60px -30px rgba(0, 0, 0, .9);
-  --glow: 0 0 0 1px rgba(63, 169, 255, .25), 0 20px 80px -30px rgba(63, 169, 255, .55);
-  --glow-violet: 0 0 0 1px rgba(139, 108, 255, .25), 0 20px 80px -30px rgba(139, 108, 255, .5);
-
-  /* --- typography ------------------------------------------------------- */
+  /* --- typography -------------------------------------------------------- */
+  --font-display: "Unbounded", "Arial Black", "Helvetica Neue", Arial, sans-serif;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-serif: "Cormorant Garamond", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
 
-  /* --- layout ----------------------------------------------------------- */
-  --max: 1240px;
-  --gutter: 16px;               /* боковой отступ контейнера */
-  --header-h: 64px;             /* высота шапки */
-  --section-y: 64px;            /* вертикальный ритм секций */
+  /* --- geometry ---------------------------------------------------------- */
+  --r: 2px;
+  --r-pill: 999px;
+  --gutter: 18px;
+  --max: 1560px;
+  --header-h: 62px;
+  --section-y: clamp(58px, 8.5vw, 124px);
+  --hair: 1px;
 
-  /* --- spacing scale ---------------------------------------------------- */
+  /* --- spacing scale ----------------------------------------------------- */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -64,19 +67,54 @@
   --sp-10: 56px;
   --sp-11: 64px;
   --sp-12: 72px;
-  --sp-13: 80px;
-  --sp-14: 96px;
-  --sp-15: 112px;
-  --sp-16: 128px;
+  --sp-13: 88px;
+  --sp-14: 104px;
 
-  /* --- motion ----------------------------------------------------------- */
-  --t-fast: 150ms;
-  --t-base: 250ms;
-  --t-slow: 600ms;
-  --ease: cubic-bezier(.22, .61, .36, 1);
+  /* --- motion ------------------------------------------------------------ */
+  --t-fast: 140ms;
+  --t-base: 260ms;
+  --t-slow: 680ms;
+  --ease: cubic-bezier(.16, 1, .3, 1);
+  --ease-sharp: cubic-bezier(.2, .8, .2, 1);
 
-  /* --- z-index ---------------------------------------------------------- */
+  /* --- layers ------------------------------------------------------------ */
+  --z-progress: 80;
   --z-header: 60;
+  --z-backdrop: 55;
   --z-drawer: 70;
-  --z-backdrop: 55; /* ниже шапки: шапка с backdrop-filter — containing block */
+  --z-cursor: 90;
+  --z-grain: 95;
+
+  /* --- textures ---------------------------------------------------------- */
+  --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.78' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.58'/%3E%3C/svg%3E");
+}
+
+/* Light inversion is a reference effect worth keeping: same components,
+   remapped tokens. It is opt-in through the header pill. */
+body.is-inverted {
+  color-scheme: light;
+  --bg: #eef2ff;
+  --bg-1: #e6ebff;
+  --surface: #e9eeff;
+  --surface-2: #dde5ff;
+  --surface-3: #cfd9ff;
+  --ink: #060811;
+  --text: #060811;
+  --text-2: #26325a;
+  --text-3: #4a5780;
+  --telemetry: #1d4ed8;
+  --telemetry-alt: #6d28d9;
+  --blue: #1d4ed8;
+  --indigo: #4f46e5;
+  --violet: #7c3aed;
+  --grad: linear-gradient(115deg, #1d4ed8 0%, #4f46e5 52%, #7c3aed 100%);
+  --grad-soft: linear-gradient(115deg, rgba(29, 78, 216, .14), rgba(79, 70, 229, .09) 52%, rgba(124, 58, 237, .14));
+  --grad-text: linear-gradient(110deg, #1d4ed8 0%, #4f46e5 48%, #7c3aed 100%);
+  --line: rgba(79, 70, 229, .34);
+  --line-soft: rgba(79, 70, 229, .2);
+  --line-strong: #4f46e5;
+  --field: rgba(29, 78, 216, .05);
+  --shadow: #4f46e5;
+  --shadow-alt: #7c3aed;
+  --dot: rgba(79, 70, 229, .36);
 }

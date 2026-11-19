@@ -1,6 +1,7 @@
 /* Stellereum — motion.js
-   reveal-on-scroll, параллакс орб, tilt карточек, счётчики.
-   Всё отключается при prefers-reduced-motion. */
+   Reveal-on-scroll, animated counters, scroll progress, magnetic buttons,
+   custom cursor and a light hero parallax. Everything is optional and is
+   disabled under prefers-reduced-motion. */
 (function () {
   'use strict';
 
@@ -9,7 +10,7 @@
   var reduce = win.matchMedia('(prefers-reduced-motion: reduce)');
   var precise = win.matchMedia('(hover: hover) and (pointer: fine)');
 
-  /* --------------------------------------------------- reveal-on-scroll --- */
+  /* ------------------------------------------------------ reveal-on-scroll */
   function showAll() {
     Array.prototype.forEach.call(doc.querySelectorAll('[data-reveal]'), function (el) {
       el.classList.add('is-visible');
@@ -28,11 +29,10 @@
           io.unobserve(entry.target);
         }
       });
-    }, { threshold: 0.1, rootMargin: '0px 0px -6% 0px' });
+    }, { threshold: 0.12, rootMargin: '0px 0px -5% 0px' });
 
     Array.prototype.forEach.call(els, function (el) { io.observe(el); });
 
-    // страховка: если что-то не всплыло за 4 c — показать
     win.setTimeout(function () {
       Array.prototype.forEach.call(doc.querySelectorAll('[data-reveal]:not(.is-visible)'), function (el) {
         var r = el.getBoundingClientRect();
@@ -41,7 +41,7 @@
     }, 4000);
   }
 
-  /* ------------------------------------------------------------- счётчик -- */
+  /* ------------------------------------------------------------- counters */
   function formatInt(value) {
     return Math.round(value).toLocaleString('en-US');
   }
@@ -74,53 +74,6 @@
     el._countRaf = requestAnimationFrame(frame);
   }
 
-  /* --------------------------------------------------- параллакс орб ------ */
-  function initParallax() {
-    var el = doc.querySelector('[data-parallax]');
-    if (!el || reduce.matches) return;
-
-    var ticking = false;
-    function update() {
-      ticking = false;
-      var y = win.scrollY || win.pageYOffset || 0;
-      if (y > 1400) return;
-      var offset = Math.max(-46, Math.min(46, -y * 0.055));
-      el.style.setProperty('--par', offset.toFixed(2) + 'px');
-    }
-    function onScroll() {
-      if (!ticking) { ticking = true; requestAnimationFrame(update); }
-    }
-    update();
-    win.addEventListener('scroll', onScroll, { passive: true });
-    win.addEventListener('resize', onScroll, { passive: true });
-  }
-
-  /* ---------------------------------------------------------- tilt ------- */
-  function initTilt() {
-    var cards = doc.querySelectorAll('[data-tilt]');
-    if (!cards.length || reduce.matches || !precise.matches) return;
-
-    Array.prototype.forEach.call(cards, function (card) {
-      card.addEventListener('pointermove', function (e) {
-        if (e.pointerType === 'touch') return;
-        var rect = card.getBoundingClientRect();
-        var px = (e.clientX - rect.left) / rect.width - 0.5;
-        var py = (e.clientY - rect.top) / rect.height - 0.5;
-        var rx = (-py * 7).toFixed(2);
-        var ry = (px * 9).toFixed(2);
-        card.classList.add('is-tilting');
-        card.style.transform =
-          'perspective(900px) rotateX(' + rx + 'deg) rotateY(' + ry + 'deg) translateY(-5px)';
-      });
-
-      card.addEventListener('pointerleave', function () {
-        card.classList.remove('is-tilting');
-        card.style.transform = '';
-      });
-    });
-  }
-
-  /* ---------------------------------------------------- счётчики секций -- */
   function makeFormat(prefix, suffix, decimals) {
     prefix = prefix || '';
     suffix = suffix || '';
@@ -160,7 +113,7 @@
         if (el._counted) return;
         el._counted = true;
         count(el, parseFloat(el.getAttribute('data-count-to')), {
-          duration: 1100,
+          duration: 1150,
           format: readFormat(el)
         });
       });
@@ -169,12 +122,123 @@
     Array.prototype.forEach.call(nodes, function (el) { io.observe(el); });
   }
 
-  /* ---------------------------------------------------------------- init -- */
+  /* -------------------------------------------------------- scroll progress */
+  function initProgress() {
+    var bar = doc.querySelector('[data-scroll-progress]');
+    if (!bar) return;
+    var ticking = false;
+
+    function update() {
+      ticking = false;
+      var max = doc.documentElement.scrollHeight - win.innerHeight;
+      var y = win.scrollY || win.pageYOffset || 0;
+      var p = max > 0 ? Math.min(1, Math.max(0, y / max)) : 0;
+      bar.style.width = (p * 100).toFixed(2) + '%';
+    }
+
+    function onScroll() {
+      if (!ticking) { ticking = true; requestAnimationFrame(update); }
+    }
+
+    update();
+    win.addEventListener('scroll', onScroll, { passive: true });
+    win.addEventListener('resize', onScroll, { passive: true });
+  }
+
+  /* ---------------------------------------------------------- hero parallax */
+  function initParallax() {
+    var mark = doc.querySelector('.hero-watermark');
+    if (!mark || reduce.matches) return;
+    var ticking = false;
+
+    function update() {
+      ticking = false;
+      var y = win.scrollY || win.pageYOffset || 0;
+      if (y > win.innerHeight * 1.4) return;
+      mark.style.translate = '0 ' + (-y * 0.08).toFixed(1) + 'px';
+    }
+
+    function onScroll() {
+      if (!ticking) { ticking = true; requestAnimationFrame(update); }
+    }
+
+    update();
+    win.addEventListener('scroll', onScroll, { passive: true });
+  }
+
+  /* ---------------------------------------------------------- magnetic */
+  function initMagnetic() {
+    if (reduce.matches || !precise.matches) return;
+    var els = doc.querySelectorAll('.btn');
+    if (!els.length) return;
+
+    Array.prototype.forEach.call(els, function (el) {
+      el.addEventListener('pointermove', function (e) {
+        if (e.pointerType === 'touch') return;
+        var r = el.getBoundingClientRect();
+        var x = ((e.clientX - r.left) / r.width - 0.5) * 6;
+        var y = ((e.clientY - r.top) / r.height - 0.5) * 6;
+        el.style.translate = x.toFixed(1) + 'px ' + y.toFixed(1) + 'px';
+      });
+
+      el.addEventListener('pointerleave', function () {
+        el.style.translate = '';
+      });
+    });
+  }
+
+  /* ------------------------------------------------------------ cursor */
+  function initCursor() {
+    var cursor = doc.getElementById('custom-cursor');
+    if (!cursor || reduce.matches || !precise.matches) return;
+
+    doc.documentElement.classList.add('has-cursor');
+
+    var px = win.innerWidth / 2;
+    var py = win.innerHeight / 2;
+    var x = px;
+    var y = py;
+    var raf = null;
+
+    function loop() {
+      x += (px - x) * 0.2;
+      y += (py - y) * 0.2;
+      cursor.style.left = x.toFixed(1) + 'px';
+      cursor.style.top = y.toFixed(1) + 'px';
+      if (Math.abs(px - x) > 0.2 || Math.abs(py - y) > 0.2) {
+        raf = requestAnimationFrame(loop);
+      } else {
+        raf = null;
+      }
+    }
+
+    doc.addEventListener('pointermove', function (e) {
+      if (e.pointerType === 'touch') return;
+      px = e.clientX;
+      py = e.clientY;
+      if (!raf) raf = requestAnimationFrame(loop);
+    }, { passive: true });
+
+    doc.addEventListener('pointerover', function (e) {
+      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .bayer') : null;
+      cursor.classList.toggle('is-expanded', !!target);
+    });
+
+    doc.addEventListener('visibilitychange', function () {
+      if (doc.hidden) {
+        if (raf) { cancelAnimationFrame(raf); raf = null; }
+      }
+    });
+  }
+
+  /* --------------------------------------------------------------- init */
   function init() {
     initReveal();
-    initParallax();
-    initTilt();
     initSectionCounters();
+    initProgress();
+    initParallax();
+    initMagnetic();
+    initCursor();
   }
 
   if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', init);

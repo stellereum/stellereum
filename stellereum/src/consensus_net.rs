@@ -1623,13 +1623,28 @@ impl ConsensusNetwork {
             if delivery.targets == mesh_peers.len() && delivery.direct_ok == delivery.targets {
                 return;
             }
-            tracing::warn!(
-                "[consensus] mesh direct delivery incomplete (ok={} failed={} targets={} fallback_ok={}): using the per-peer broadcast fallback",
-                delivery.direct_ok,
-                delivery.direct_failed,
-                delivery.targets,
-                delivery.fallback_ok,
-            );
+            // Mesh coverage is a property of the PEER SET, not of one message:
+            // while a configured validator is down, every frame legitimately
+            // falls back and warning per frame floods the log at block rate.
+            // One line a minute carries the same information.
+            const MESH_INCOMPLETE_WARN_GAP_MS: u64 = 60_000;
+            static MESH_INCOMPLETE_WARN: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now_ms.saturating_sub(MESH_INCOMPLETE_WARN.load(Ordering::Relaxed))
+                >= MESH_INCOMPLETE_WARN_GAP_MS
+            {
+                MESH_INCOMPLETE_WARN.store(now_ms, Ordering::Relaxed);
+                tracing::warn!(
+                    "[consensus] mesh direct delivery incomplete (ok={} failed={} targets={} fallback_ok={}): using the per-peer broadcast fallback (throttled to 1/min)",
+                    delivery.direct_ok,
+                    delivery.direct_failed,
+                    delivery.targets,
+                    delivery.fallback_ok,
+                );
+            }
         }
         let exempt = batch_bypasses_skip_refs(msgs.iter().map(|m| &**m));
         // Fire-and-forget for votes/proposals: the peer's ACK carries no

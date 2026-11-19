@@ -15,54 +15,20 @@
   isolation: isolate;
 }
 
-.hero-canvas {
-  position: absolute;
-  inset: 0;
-  z-index: -3;
-  width: 100%;
-  height: 100%;
-  opacity: .55;
-}
-
-.hero-grid-bg {
+/* Swiss dot field + two soft spectrum pools behind the copy. No filter. */
+.hero::before {
+  content: "";
   position: absolute;
   inset: 0;
   z-index: -2;
   pointer-events: none;
   background-image:
-    linear-gradient(to right, rgba(124, 141, 255, .13) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(124, 141, 255, .13) 1px, transparent 1px),
-    radial-gradient(70% 70% at 18% 28%, rgba(94, 184, 255, .19), transparent 68%),
-    radial-gradient(60% 60% at 86% 62%, rgba(168, 117, 255, .16), transparent 68%);
-  background-size: 64px 64px, 64px 64px, 100% 100%, 100% 100%;
-  mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .65) 62%, transparent 100%);
-  -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .65) 62%, transparent 100%);
-}
-
-/* The mark lives entirely inside the right hero column. Its width is capped
-   to 34vw so its left edge always clears the copy column at >=900px, and it
-   is removed below that breakpoint (see responsive.css) instead of drifting
-   over the headline. No negative offsets, so it can never widen the page. */
-.hero-watermark {
-  position: absolute;
-  top: clamp(72px, 10vh, 132px);
-  right: clamp(0px, 1.6vw, 28px);
-  z-index: -1;
-  width: min(600px, 34vw);
-  height: auto;
-  opacity: .1;
-  pointer-events: none;
-  user-select: none;
-  /* Opacity/glow only: a rotating square would grow its rotated bounding box
-     and periodically reach back into the copy column. */
-  animation: mark-glow 11s ease-in-out infinite;
-  filter: drop-shadow(0 0 42px rgba(94, 184, 255, .55));
-}
-
-html.is-inverted .hero-watermark,
-body.is-inverted .hero-watermark {
-  opacity: .12;
-  filter: invert(1) hue-rotate(180deg) drop-shadow(0 0 42px rgba(29, 78, 216, .35));
+    radial-gradient(var(--dot) .7px, transparent .8px),
+    radial-gradient(58% 62% at 8% 22%, rgba(94, 184, 255, .14), transparent 70%),
+    radial-gradient(52% 58% at 88% 64%, rgba(168, 117, 255, .13), transparent 70%);
+  background-size: 26px 26px, 100% 100%, 100% 100%;
+  mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .7) 62%, transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .7) 62%, transparent 100%);
 }
 
 .hero-hud {
@@ -72,11 +38,11 @@ body.is-inverted .hero-watermark {
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px 16px;
-  padding-top: 14px;
-  padding-bottom: 14px;
+  gap: 10px 16px;
+  padding-top: 16px;
+  padding-bottom: 16px;
   border-bottom: 1px solid var(--line-soft);
-  color: var(--text-3);
+  color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 9.5px;
   font-weight: 600;
@@ -91,16 +57,16 @@ body.is-inverted .hero-watermark {
   gap: 8px 14px;
 }
 
-.hero-hud b { color: var(--text-2); font-weight: 700; }
+.hero-hud b { color: var(--text); font-weight: 700; }
 
 .hero-inner {
   position: relative;
   z-index: 2;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: clamp(32px, 5vw, 64px);
+  gap: clamp(28px, 4vw, 56px);
   align-items: center;
-  padding-block: clamp(24px, 4vh, 48px);
+  padding-block: clamp(28px, 5vh, 56px);
 }
 
 .hero-copy { min-width: 0; }
@@ -110,7 +76,7 @@ body.is-inverted .hero-watermark {
   flex-wrap: wrap;
   align-items: center;
   gap: 9px;
-  margin-bottom: clamp(18px, 2.5vw, 28px);
+  margin-bottom: clamp(16px, 2.2vw, 24px);
   color: var(--telemetry);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -119,16 +85,22 @@ body.is-inverted .hero-watermark {
   text-transform: uppercase;
 }
 
+/* Fluid scale is checked against the narrowest cell: the longest line
+   "POST-QUANTUM" is ~9.9em wide at 800 weight with this tracking. The cap
+   is the widest value that still fits inside the copy column at 1920. */
 .hero-title {
   margin: 0;
-  font-size: clamp(2.05rem, 6.1vw, 6.4rem);
-  line-height: .86;
-  letter-spacing: -.045em;
+  max-width: 100%;
+  font-size: clamp(1.75rem, 9vw, 6.6rem);
+  line-height: 1.14;
+  letter-spacing: -.05em;
   text-transform: uppercase;
 }
 
 .hero-line {
   display: block;
+  width: fit-content;
+  max-width: 100%;
   white-space: nowrap;
   animation: hero-in .95s var(--ease) both;
 }
@@ -156,13 +128,13 @@ body.is-inverted .hero-watermark {
 
 .hero-sub {
   max-width: 54ch;
-  margin-top: clamp(20px, 3vw, 30px);
+  margin-top: clamp(20px, 2.8vw, 30px);
   color: var(--text-2);
-  font-size: clamp(14.5px, 1.5vw, 18px);
-  line-height: 1.68;
+  font-size: clamp(14.5px, 1.45vw, 17.5px);
+  line-height: 1.7;
 }
 
-.hero-sub b { color: var(--text); font-weight: 600; }
+.hero-sub b { color: var(--text); font-weight: 600; white-space: nowrap; }
 .hero-sub .mono { color: var(--telemetry); font-size: .92em; }
 
 .hero-actions {
@@ -190,75 +162,74 @@ body.is-inverted .hero-watermark {
 .hero-scroll .hero-scroll-arrow { color: var(--telemetry-alt); }
 .hero-scroll:hover .hero-scroll-arrow { color: var(--text); }
 
-.hero-slab {
+/* --- reference object: four isometric electric slabs -------------------- */
+.hero-object {
   position: relative;
   display: none;
   width: 100%;
-  max-width: 440px;
+  max-width: 460px;
   justify-self: end;
-  padding: 12px;
-  border: 1px solid var(--line);
-  background: rgba(11, 15, 29, .72);
-  box-shadow: 10px 10px 0 var(--shadow);
-  transform: rotate(1.2deg);
-  transition: transform var(--t-base) var(--ease), box-shadow var(--t-base) var(--ease);
+  align-self: center;
+  pointer-events: none;
+  user-select: none;
 }
 
-.hero-slab:hover { transform: rotate(0deg); box-shadow: 12px 12px 0 var(--shadow-alt); }
-
-html.is-inverted .hero-slab,
-body.is-inverted .hero-slab { background: rgba(233, 238, 255, .82); }
-
-html.is-inverted .hero-slab-mark img,
-body.is-inverted .hero-slab-mark img {
-  filter: invert(1) hue-rotate(180deg) drop-shadow(0 0 26px rgba(238, 242, 255, .9));
+.hero-object-inner {
+  position: relative;
+  animation: object-float 14s var(--ease) infinite;
 }
 
-html.is-inverted .hero-canvas,
-body.is-inverted .hero-canvas { opacity: .24; }
+.hero-object-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
 
-.hero-slab-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding-bottom: 9px;
-  color: var(--text-3);
+.hero-object-tag {
+  position: absolute;
+  top: 5%;
+  right: -2%;
+  padding: 5px 9px;
+  border: 1.5px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--text);
   font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 700;
   letter-spacing: .14em;
   text-transform: uppercase;
+  transform: rotate(-6deg);
+  box-shadow: 4px 4px 0 var(--shadow);
 }
 
-.hero-slab-bar b { color: var(--telemetry); }
-.hero-slab-bar--foot { padding-top: 9px; padding-bottom: 0; }
-
-.hero-slab .bayer { box-shadow: none; }
-
-.hero-slab-mark {
+.hero-object-meta {
   position: absolute;
-  inset: 24% 22%;
-  display: grid;
-  place-items: center;
-  pointer-events: none;
+  bottom: 1%;
+  left: 0;
+  color: var(--telemetry-alt);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .16em;
+  text-transform: uppercase;
 }
 
-.hero-slab-mark img {
-  width: 72%;
-  height: auto;
-  filter: drop-shadow(0 0 26px rgba(6, 8, 17, .9));
+@keyframes object-float {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(-.4deg); }
+  50%      { transform: translate3d(0, -10px, 0) rotate(.4deg); }
 }
 
 /* Single authoritative live-metrics block now lives in #network; the hero
    keeps only the status chip and the protocol marquee. */
 
 /* ============================ NETWORK =================================== */
-.metrics-grid {
+/* One telemetry sheet, not six dashboard tiles: a dominant height block
+   plus a ruled list of sampled values. */
+.metric-sheet {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 1px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   background: var(--line);
 }
 
@@ -268,13 +239,23 @@ body.is-inverted .hero-canvas { opacity: .24; }
   flex-direction: column;
   gap: 8px;
   min-width: 0;
-  min-height: 138px;
-  padding: clamp(16px, 2vw, 24px);
+  padding: clamp(18px, 2.2vw, 26px);
   background: var(--surface);
   transition: background-color var(--t-base) var(--ease), color var(--t-base) var(--ease);
 }
 
 .metric:hover { background: var(--surface-2); }
+
+.metric--lead {
+  justify-content: flex-end;
+  min-height: 280px;
+  padding: clamp(24px, 3.4vw, 44px);
+  background-color: var(--surface);
+  background-image:
+    radial-gradient(120% 100% at 0% 0%, rgba(94, 184, 255, .16), transparent 64%),
+    radial-gradient(100% 100% at 100% 100%, rgba(168, 117, 255, .14), transparent 64%);
+  border-bottom: 1px solid var(--line-strong);
+}
 
 .metric-head {
   display: flex;
@@ -306,6 +287,29 @@ body.is-inverted .hero-canvas { opacity: .24; }
   overflow-wrap: anywhere;
 }
 
+.metric--lead .metric-value {
+  margin-block: 10px 14px;
+  font-size: clamp(48px, 7vw, 132px);
+  line-height: .82;
+  letter-spacing: -.07em;
+}
+
+/* A missing value is a small mono dash, never a giant skeleton bar. */
+.metric-value.is-empty {
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: .06em;
+}
+
+.metric--lead .metric-value.is-empty {
+  margin-block: 26px 24px;
+  font-size: 30px;
+  line-height: 1;
+  color: var(--text-2);
+}
+
 .metric-value--mono {
   font-family: var(--font-mono);
   font-size: clamp(11px, 1.4vw, 13px);
@@ -322,6 +326,49 @@ body.is-inverted .hero-canvas { opacity: .24; }
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+
+.metric--lead .metric-note {
+  max-width: 34ch;
+  margin-top: 0;
+  font-size: 13px;
+}
+
+.metric-index {
+  position: absolute;
+  top: clamp(18px, 2.4vw, 28px);
+  right: clamp(18px, 2.4vw, 28px);
+  color: var(--telemetry-alt);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .14em;
+}
+
+.metric-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1px;
+  background: var(--line);
+}
+
+.metric--row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "label tag"
+    "value value"
+    "note action";
+  align-items: end;
+  gap: 6px 12px;
+  padding: 15px clamp(16px, 2vw, 22px);
+}
+
+.metric--row .metric-label { grid-area: label; align-self: center; }
+.metric--row .metric-value { grid-area: value; text-align: left; }
+.metric--row .metric-value--mono { padding-block: 2px; }
+.metric--row .metric-note { grid-area: note; margin-top: 2px; }
+.metric--row .tag { grid-area: tag; justify-self: end; align-self: start; }
+.metric--row .metric-action { grid-area: action; justify-self: end; margin-top: 2px; }
 
 .metric-action { flex: 0 0 auto; }
 
@@ -343,14 +390,11 @@ body.is-inverted .hero-canvas { opacity: .24; }
 .features-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 1px;
-  border: 1px solid var(--line);
-  background: var(--line);
+  gap: clamp(12px, 1.6vw, 20px);
 }
 
 .feature {
-  min-height: 230px;
-  border: 0;
+  min-height: 236px;
   border-radius: 0;
 }
 
@@ -371,9 +415,9 @@ body.is-inverted .hero-canvas { opacity: .24; }
 }
 
 .feature h3 {
-  font-size: clamp(17px, 1.7vw, 22px);
-  line-height: 1.05;
-  letter-spacing: -.025em;
+  font-size: clamp(19px, 1.9vw, 25px);
+  line-height: 1.02;
+  letter-spacing: -.03em;
 }
 
 .feature p {
@@ -385,51 +429,78 @@ body.is-inverted .hero-canvas { opacity: .24; }
 
 .feature .card-meta { margin-top: auto; }
 
-/* --- Bayer 4x4 signal strip (protocol section) -------------------------- */
-.signal-strip {
-  display: flex;
+/* --- shard schematic (protocol section) --------------------------------- */
+/* A hairline drawing replaces the old 16-cell strip: asymmetric type on the
+   left, the real {0,1} topology in the middle, status notes on the right. */
+.shard-schematic {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px 22px;
   align-items: center;
-  gap: clamp(8px, 1.6vw, 18px);
-  margin-bottom: clamp(24px, 3.4vw, 40px);
-  padding-block: 10px;
-  border-top: 1px solid var(--line);
+  margin-bottom: clamp(26px, 3.6vw, 44px);
+  padding-block: clamp(14px, 2vw, 22px);
+  border-top: 1px solid var(--line-strong);
   border-bottom: 1px solid var(--line);
+  color: var(--line-strong);
 }
 
-.signal-label {
-  flex: 0 0 auto;
+.schematic-index {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.schematic-big {
+  font-family: var(--font-display);
+  font-size: clamp(2.6rem, 6vw, 4.6rem);
+  font-weight: 900;
+  line-height: .8;
+  letter-spacing: -.06em;
+  background-image: var(--grad-text);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.schematic-label {
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 700;
   letter-spacing: .16em;
   text-transform: uppercase;
-  white-space: nowrap;
 }
 
-.signal-label--alt { color: var(--telemetry-alt); }
-
-.signal-cells {
-  flex: 1 1 auto;
-  display: grid;
-  grid-template-columns: repeat(16, minmax(0, 1fr));
-  gap: 3px;
+.schematic-drawing {
+  display: block;
+  width: 100%;
   min-width: 0;
-  height: 24px;
+  height: auto;
+  overflow: visible;
 }
 
-.signal-cells span {
-  background-image: var(--grad);
-  opacity: var(--o, .2);
-  transform-origin: 50% 100%;
-  animation: signal-tick 2.8s ease-in-out infinite;
-  animation-delay: calc(var(--i, 0) * -0.16s);
+.schematic-drawing text {
+  fill: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .1em;
 }
 
-@keyframes signal-tick {
-  0%, 100% { transform: scaleY(.34); }
-  50%      { transform: scaleY(1); }
+.schematic-note {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
 }
+
+.schematic-note span:last-child { color: var(--telemetry-alt); }
 
 /* --- manifesto band ------------------------------------------------------ */
 .manifesto {
@@ -576,7 +647,7 @@ body.is-inverted .hero-canvas { opacity: .24; }
 }
 
 .perf-band::before {
-  content: "MEASURED";
+  content: "LIMITS";
   position: absolute;
   right: -2%;
   bottom: -18%;
@@ -666,6 +737,41 @@ body.is-inverted .hero-canvas { opacity: .24; }
   letter-spacing: .03em;
 }
 
+/* Honest status rows: a numbered editorial list, not another card grid. */
+.limit-list {
+  margin-top: clamp(26px, 4vw, 46px);
+  border-top: 1px solid var(--line-strong);
+}
+
+.limit-list li {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 12px;
+  padding: clamp(16px, 2.2vw, 24px) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.limit-index {
+  color: var(--telemetry-alt);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .1em;
+}
+
+.limit-list h3 {
+  font-size: clamp(17px, 1.8vw, 22px);
+  line-height: 1.05;
+}
+
+.limit-list p {
+  max-width: 76ch;
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+
 /* ============================== BUILD =================================== */
 .build-grid {
   display: grid;
@@ -735,19 +841,28 @@ body.is-inverted .hero-canvas { opacity: .24; }
 .eco-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 1px;
-  border: 1px solid var(--line);
-  background: var(--line);
+  gap: clamp(12px, 1.8vw, 22px);
 }
 
-.eco-card { min-height: 250px; border: 0; border-radius: 0; }
+.eco-card {
+  position: relative;
+  min-height: 300px;
+  overflow: hidden;
+}
+
+.eco-card:first-child {
+  min-height: 340px;
+  background-image:
+    radial-gradient(120% 120% at 0% 0%, rgba(94, 184, 255, .15), transparent 62%),
+    radial-gradient(90% 90% at 100% 100%, rgba(168, 117, 255, .12), transparent 60%);
+}
 
 .eco-top {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: clamp(24px, 3.4vw, 40px);
+  margin-bottom: clamp(18px, 2.6vw, 30px);
 }
 
 .eco-chips {
@@ -766,37 +881,50 @@ body.is-inverted .hero-canvas { opacity: .24; }
   letter-spacing: .14em;
 }
 
-.eco-glyph {
-  position: relative;
-  width: 54px;
-  height: 54px;
-  flex: 0 0 auto;
-  border: 1px solid var(--line-strong);
-  background:
-    linear-gradient(to right, var(--line-soft) 1px, transparent 1px) 0 0 / 9px 9px,
-    linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px) 0 0 / 9px 9px,
-    var(--surface-2);
-  overflow: hidden;
-}
-
-.eco-glyph::before {
-  content: "";
+/* Oversized outlined numeral instead of a small calendar glyph. */
+.eco-numeral {
   position: absolute;
-  inset: 30%;
-  background-image: var(--grad);
-  transform: rotate(45deg);
+  right: clamp(8px, 1.4vw, 18px);
+  bottom: 8px;
+  color: transparent;
+  font-family: var(--font-display);
+  font-size: clamp(84px, 13vw, 168px);
+  font-weight: 900;
+  line-height: .72;
+  letter-spacing: -.08em;
+  -webkit-text-stroke: 1px var(--line-strong);
+  pointer-events: none;
+  opacity: .2;
 }
 
-.eco-card h3 { font-size: clamp(20px, 2.2vw, 28px); line-height: 1; }
+@supports not ((-webkit-text-stroke: 1px #000) or (text-stroke: 1px #000)) {
+  .eco-numeral { color: var(--line); }
+}
+
+.eco-card h3 {
+  position: relative;
+  z-index: 1;
+  max-width: 12ch;
+  font-size: clamp(24px, 2.8vw, 38px);
+  line-height: .98;
+  letter-spacing: -.04em;
+}
 
 .eco-card p {
-  margin-top: 10px;
+  position: relative;
+  z-index: 1;
+  max-width: 44ch;
+  margin-top: 12px;
   color: var(--text-2);
   font-size: 13.5px;
   line-height: 1.65;
 }
 
-.eco-card .card-meta { margin-top: auto; }
+.eco-card .card-meta {
+  position: relative;
+  z-index: 1;
+  max-width: calc(100% - 70px);
+}
 
 /* ============================= ROADMAP ================================== */
 .timeline {
@@ -851,7 +979,7 @@ body.is-inverted .hero-canvas { opacity: .24; }
 html.is-inverted .timeline-item--done .timeline-step,
 body.is-inverted .timeline-item--done .timeline-step { color: #0a6b56; }
 .timeline-item--active .timeline-step { color: var(--blue); }
-.timeline-item--active { border-left: 3px solid var(--blue); padding-left: 11px; }
+.timeline-item--active { box-shadow: inset 3px 0 0 var(--blue); }
 
 /* ============================= TRANSMIT ================================= */
 .cta-panel {

@@ -137,12 +137,15 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .95); }
   min-height: var(--header-h);
 }
 
+/* The brand's left edge is the grid axis shared by the hero copy and the
+   footer mark. No left padding: the mark starts on the same x as .shell
+   content at every breakpoint. */
 .brand {
   display: inline-flex;
   align-items: center;
   gap: 10px;
   flex: 0 0 auto;
-  padding: 0 14px;
+  padding: 0 14px 0 0;
   border-right: 1px solid var(--line);
   background-image: var(--grad-soft);
   color: var(--text);
@@ -186,7 +189,7 @@ body.is-inverted .site-header { background: rgba(238, 242, 255, .95); }
   flex: 1 1 auto;
   min-width: 0;
   padding-inline: 18px;
-  color: var(--text-3);
+  color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 500;
@@ -328,11 +331,15 @@ body.is-inverted .invert-thumb { transform: translateX(11px); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  width: min(360px, 90vw);
+  width: min(390px, 92vw);
   height: 100vh;
   height: 100dvh;
   padding: var(--sp-5);
-  background: var(--surface);
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(180deg, var(--grad-soft), transparent 42%),
+    linear-gradient(to right, var(--line-soft) 1px, transparent 1px);
+  background-size: 100% 100%, 48px 100%;
   border-left: 2px solid var(--line-strong);
   box-shadow: -40px 0 100px -48px #000;
   overflow-y: auto;
@@ -384,11 +391,12 @@ body.is-inverted .invert-thumb { transform: translateX(11px); }
   display: flex;
   align-items: baseline;
   gap: 12px;
+  min-height: 52px;
   padding: 14px 8px;
   border-bottom: 1px solid var(--line);
   color: var(--text);
   font-family: var(--font-display);
-  font-size: 17px;
+  font-size: 19px;
   font-weight: 800;
   letter-spacing: -.02em;
   text-transform: uppercase;
@@ -436,6 +444,28 @@ body.nav-is-open { overflow: hidden; }
     linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px) 0 0 / 64px 64px;
   mask-image: linear-gradient(180deg, rgba(0, 0, 0, .6), transparent 78%);
   -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, .6), transparent 78%);
+}
+
+/* Oversized footer masthead: the reference's display type closes the page. */
+.footer-masthead {
+  position: relative;
+  margin: 0 0 clamp(24px, 4vw, 44px);
+  padding-bottom: clamp(12px, 2vw, 20px);
+  border-bottom: 2px solid var(--line-strong);
+  color: transparent;
+  font-family: var(--font-display);
+  font-size: clamp(1.7rem, 9.4vw, 10rem);
+  font-weight: 900;
+  line-height: .78;
+  letter-spacing: -.07em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  -webkit-text-stroke: 1px var(--line-strong);
+  overflow: hidden;
+}
+
+@supports not ((-webkit-text-stroke: 1px #000) or (text-stroke: 1px #000)) {
+  .footer-masthead { color: var(--text); }
 }
 
 .footer-top {

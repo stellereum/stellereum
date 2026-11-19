@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stellereum — Pure Post-Quantum Layer 1</title>
-<meta name="description" content="Stellereum is a pure post-quantum Layer 1: PQ-BFT v5 consensus, Falcon-512 validator signatures, ML-KEM-768 confidential notes, Sealevel-lite parallel execution and SVM programs. Public testnet, chain ID 5757.">
+<title>Stellereum — Post-Quantum Layer 1 · Testnet</title>
+<meta name="description" content="Stellereum is a post-quantum Layer 1 written in Rust. Falcon-512 validator votes, two shards {0,1}, chain ID 5757, ruleset v5. Testnet only; no external audit.">
 <meta name="theme-color" content="#060811">
 <meta name="color-scheme" content="dark">
 <link rel="canonical" href="https://stellereum.org/">
@@ -13,31 +13,31 @@
 <meta property="og:site_name" content="Stellereum">
 <meta property="og:locale" content="en_US">
 <meta property="og:url" content="https://stellereum.org/">
-<meta property="og:title" content="Stellereum — Pure Post-Quantum Layer 1">
-<meta property="og:description" content="PQ-BFT v5 consensus, Falcon-512 validator votes, ML-KEM-768 confidential notes, Sealevel-lite execution. Live public testnet, chain ID 5757.">
+<meta property="og:title" content="Stellereum — Post-Quantum Layer 1">
+<meta property="og:description" content="Falcon-512 validator votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only; no external audit.">
 <meta property="og:image" content="https://stellereum.org/assets/img/og-image.png">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Stellereum — Pure Post-Quantum Layer 1">
-<meta name="twitter:description" content="PQ-BFT v5, Falcon-512, ML-KEM-768, Sealevel-lite. Public testnet, chain ID 5757.">
+<meta name="twitter:title" content="Stellereum — Post-Quantum Layer 1">
+<meta name="twitter:description" content="Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
 <meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png">
 
-<link rel="icon" href="favicon.ico?v=11" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=11">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=11">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=11">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=11">
-<link rel="manifest" href="site.webmanifest">
+<link rel="icon" href="favicon.ico?v=13" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=13">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=13">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=13">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=13">
+<link rel="manifest" href="site.webmanifest?v=13">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=optional">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap">
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=12">
-<link rel="stylesheet" href="assets/css/base.css?v=12">
-<link rel="stylesheet" href="assets/css/layout.css?v=12">
-<link rel="stylesheet" href="assets/css/components.css?v=12">
-<link rel="stylesheet" href="assets/css/sections.css?v=12">
-<link rel="stylesheet" href="assets/css/responsive.css?v=12">
+<link rel="stylesheet" href="assets/css/tokens.css?v=13">
+<link rel="stylesheet" href="assets/css/base.css?v=13">
+<link rel="stylesheet" href="assets/css/layout.css?v=13">
+<link rel="stylesheet" href="assets/css/components.css?v=13">
+<link rel="stylesheet" href="assets/css/sections.css?v=13">
+<link rel="stylesheet" href="assets/css/responsive.css?v=13">
 
 <script>
 document.documentElement.classList.add('js');
@@ -64,10 +64,9 @@ window.setTimeout(function () {
   .code-body[hidden] { display: block !important; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=12"></script>
-<script defer src="assets/js/starfield.js?v=11"></script>
-<script defer src="assets/js/motion.js?v=12"></script>
-<script defer src="assets/js/metrics.js?v=20261119b"></script>
+<script defer src="assets/js/app.js?v=13"></script>
+<script defer src="assets/js/motion.js?v=13"></script>
+<script defer src="assets/js/metrics.js?v=13"></script>
 </head>
 <body>
 
@@ -78,16 +77,16 @@ window.setTimeout(function () {
 
 <!-- ============================================================ HEADER -->
 <header class="site-header" id="site-header">
-  <div class="header-inner">
+  <div class="header-inner shell">
     <a class="brand" href="#top" aria-label="Stellereum — home">
-      <img class="brand-mark" src="assets/img/stell-mark.png?v=11" alt="" width="32" height="32">
+      <img class="brand-mark" src="assets/img/stell-mark.png?v=13" alt="" width="32" height="32">
       <span class="brand-word">Stellereum</span>
       <span class="brand-tag" aria-hidden="true">PQ–L1</span>
     </a>
 
     <p class="header-meta" aria-hidden="true">
       <span class="rule-dot blink"></span>
-      CHAIN ID <b>5757</b> <span class="slash">/</span> RULESET <b>V5</b> <span class="slash">/</span> FALCON-512
+      CHAIN <b>5757</b> <span class="slash">/</span> V5 <span class="slash">/</span> FALCON-512
     </p>
 
     <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-panel" aria-label="Open menu">
@@ -142,14 +141,15 @@ window.setTimeout(function () {
 
   <!-- ============================================================= HERO -->
   <section class="hero" id="top" aria-labelledby="hero-title">
-    <canvas id="starfield" class="hero-canvas" aria-hidden="true"></canvas>
-    <div class="hero-grid-bg" aria-hidden="true"></div>
-    <img class="hero-watermark" src="assets/img/stell-mark.png?v=11" alt="" width="760" height="760" aria-hidden="true" decoding="async">
+    <span class="hud-corner hud-corner--tl" aria-hidden="true"></span>
+    <span class="hud-corner hud-corner--tr" aria-hidden="true"></span>
+    <span class="hud-corner hud-corner--bl" aria-hidden="true"></span>
+    <span class="hud-corner hud-corner--br" aria-hidden="true"></span>
 
     <div class="hero-hud shell">
       <span class="status-chip" data-status>
         <span class="status-dot" aria-hidden="true"></span>
-        <span data-status-text>Connecting · testnet.stellereum.org</span>
+        <span data-status-text>Connecting · rpc.stellereum.org</span>
       </span>
       <span class="hero-hud-right">
         <span>SIGNAL <b>01 / 07</b></span>
@@ -160,7 +160,7 @@ window.setTimeout(function () {
 
     <div class="hero-inner shell">
       <div class="hero-copy">
-        <p class="hero-kicker"><span class="rule-dot" aria-hidden="true"></span>PUBLIC TESTNET · CHAIN ID 5757 · STELL</p>
+        <p class="hero-kicker"><span class="rule-dot" aria-hidden="true"></span>TESTNET · CHAIN ID 5757 · STELL</p>
 
         <h1 class="hero-title" id="hero-title">
           <span class="hero-line grad-text">Stellereum</span>
@@ -169,9 +169,9 @@ window.setTimeout(function () {
         </h1>
 
         <p class="hero-sub">
-          A Layer 1 built after the quantum deadline, not before it. Validator votes are
-          signed with <b>Falcon-512</b>, confidential notes use <b>ML-KEM-768</b>, and
-          <b>PQ-BFT v5</b> finalises blocks through a quantum-compact quorum certificate.
+          Stellereum is a post-quantum Layer 1 written in Rust. Validator votes use
+          <b>Falcon-512</b>; classical signatures are refused. Two shards run today:
+          masterchain <b>0</b> and workchain <b>1</b>. This is a testnet.
         </p>
 
         <div class="hero-actions">
@@ -181,49 +181,111 @@ window.setTimeout(function () {
 
         <a class="hero-scroll" href="#network">
           <span class="rule-dot" aria-hidden="true"></span>
-          Scroll · network metrics
+          Scroll / live telemetry
           <span class="hero-scroll-arrow" aria-hidden="true">↓</span>
         </a>
       </div>
 
-      <aside class="hero-slab" aria-hidden="true">
-        <div class="hero-slab-bar"><span>BAYER 4×4 / SIGNAL FIELD</span><b class="blink">●</b></div>
-        <div class="bayer">
-          <span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span>
+      <!-- Decorative reference object: an isometric stack of Bayer-dithered
+           electric slabs. Static SVG, no filters, never overlaps the copy. -->
+      <div class="hero-object" aria-hidden="true">
+        <div class="hero-object-inner">
+          <svg class="hero-object-svg" viewBox="0 0 560 640" role="presentation" focusable="false">
+            <defs>
+              <linearGradient id="slab-top" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#5eb8ff"/>
+                <stop offset=".52" stop-color="#7c8dff"/>
+                <stop offset="1" stop-color="#a875ff"/>
+              </linearGradient>
+              <linearGradient id="slab-left" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#273b86"/>
+                <stop offset="1" stop-color="#0b0f1d"/>
+              </linearGradient>
+              <linearGradient id="slab-right" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#1b2c68"/>
+                <stop offset="1" stop-color="#080b16"/>
+              </linearGradient>
+              <pattern id="bayer-dots" width="12" height="12" patternUnits="userSpaceOnUse">
+                <circle cx="2" cy="2" r="1.05" fill="#060811" opacity=".55"/>
+                <circle cx="8" cy="2" r=".45" fill="#060811" opacity=".4"/>
+                <circle cx="2" cy="8" r=".7" fill="#060811" opacity=".45"/>
+                <circle cx="8" cy="8" r=".35" fill="#060811" opacity=".35"/>
+              </pattern>
+              <pattern id="slab-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">
+                <line x1="0" y1="0" x2="0" y2="8" stroke="#7c8dff" stroke-opacity=".22" stroke-width="1"/>
+              </pattern>
+            </defs>
+
+            <circle cx="278" cy="330" r="252" fill="none" stroke="#7c8dff" stroke-opacity=".14"/>
+            <circle cx="278" cy="330" r="196" fill="none" stroke="#7c8dff" stroke-opacity=".1"/>
+            <path d="M196 300v264M280 270v294M364 300v264" stroke="#7c8dff" stroke-opacity=".3" stroke-dasharray="2 7"/>
+
+            <!-- top plate (back) -->
+            <g transform="translate(280 330) scale(.82) translate(-280 -330)">
+              <path d="M60 330 280 220 500 330 280 440Z" fill="url(#slab-top)"/>
+              <path d="M60 330 280 440V472L60 362Z" fill="url(#slab-left)"/>
+              <path d="M500 330 280 440V472L500 362Z" fill="url(#slab-right)"/>
+              <path d="M60 330 280 220 500 330 280 440Z" fill="url(#slab-hatch)"/>
+              <path d="M60 330 280 220 500 330 280 440Z" fill="none" stroke="#eef2ff" stroke-opacity=".7"/>
+            </g>
+
+            <g transform="translate(280 390) scale(.88) translate(-280 -390)">
+              <path d="M60 390 280 280 500 390 280 500Z" fill="url(#slab-top)"/>
+              <path d="M60 390 280 500V532L60 422Z" fill="url(#slab-left)"/>
+              <path d="M500 390 280 500V532L500 422Z" fill="url(#slab-right)"/>
+              <path d="M60 390 280 280 500 390 280 500Z" fill="url(#bayer-dots)"/>
+              <path d="M60 390 280 280 500 390 280 500Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
+            </g>
+
+            <g transform="translate(280 450) scale(.94) translate(-280 -450)">
+              <path d="M60 450 280 340 500 450 280 560Z" fill="url(#slab-top)"/>
+              <path d="M60 450 280 560V592L60 482Z" fill="url(#slab-left)"/>
+              <path d="M500 450 280 560V592L500 482Z" fill="url(#slab-right)"/>
+              <path d="M60 450 280 340 500 450 280 560Z" fill="url(#bayer-dots)"/>
+              <path d="M60 450 280 340 500 450 280 560Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
+              <path d="M60 450 280 560 500 450" fill="none" stroke="#a9b8d8" stroke-opacity=".3"/>
+            </g>
+
+            <!-- base plate (front) -->
+            <g>
+              <path d="M60 510 280 400 500 510 280 620Z" fill="url(#slab-top)"/>
+              <path d="M60 510 280 620V652L60 542Z" fill="url(#slab-left)"/>
+              <path d="M500 510 280 620V652L500 542Z" fill="url(#slab-right)"/>
+              <path d="M60 510 280 400 500 510 280 620Z" fill="url(#bayer-dots)"/>
+              <path d="M60 510 280 400 500 510 280 620Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
+              <path d="M60 510 280 620 500 510" fill="none" stroke="#a9b8d8" stroke-opacity=".3"/>
+            </g>
+
+            <path d="M60 664h440" stroke="#7c8dff" stroke-opacity=".5"/>
+            <path d="M60 658v12M500 658v12M280 658v12" stroke="#7c8dff" stroke-opacity=".7"/>
+            <path d="M280 250v300" stroke="#9d8cff" stroke-opacity=".35" stroke-dasharray="2 7"/>
+            <path d="M280 286h28M280 386h28M280 486h28" stroke="#9d8cff" stroke-opacity=".7"/>
+          </svg>
+          <span class="hero-object-tag">BAYER 4×4</span>
+          <span class="hero-object-meta">SLAB / 04 · 5757</span>
         </div>
-        <div class="hero-slab-mark">
-          <img src="assets/img/stell-mark.png?v=11" alt="" width="220" height="220" loading="lazy" decoding="async">
-        </div>
-        <div class="hero-slab-bar hero-slab-bar--foot">
-          <span>16 LEVELS</span><span>ELECTRIC SPECTRUM</span>
-        </div>
-      </aside>
+      </div>
     </div>
 
-    <!-- Protocol facts, not live numbers: the authoritative telemetry block
-         is #network. The second group exists only to close the loop seamlessly. -->
     <div class="marquee" role="group" aria-label="Protocol facts">
       <div class="marquee-track">
         <div class="marquee-group">
           <span class="marquee-item"><b>PQ SIGNATURE</b><span class="v">FALCON-512</span></span>
-          <span class="marquee-item"><b>PQ KEM</b><span class="v">ML-KEM-768</span></span>
-          <span class="marquee-item"><b>COMMITTEE</b><span class="v">16</span></span>
-          <span class="marquee-item"><b>FINALITY</b><span class="v">µQC</span><span class="sep">/</span><span class="v">66.7%</span></span>
-          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT v5</span></span>
-          <span class="marquee-item"><b>EXECUTION</b><span class="v">SEALEVEL-LITE</span></span>
+          <span class="marquee-item"><b>SHARDS</b><span class="v">0–1</span></span>
+          <span class="marquee-item"><b>FINALITY</b><span class="v">1 BLOCK</span></span>
+          <span class="marquee-item"><b>EXECUTION</b><span class="v">WASM</span></span>
+          <span class="marquee-item"><b>SUPPLY CAP</b><span class="v">1B STELL</span></span>
+          <span class="marquee-item"><b>EVM</b><span class="v">READ-ONLY</span></span>
           <span class="marquee-item"><b>RULESET</b><span class="v v--alt">V5</span></span>
           <span class="marquee-item"><b>FORK</b><span class="v v--alt">0x9d59096b</span></span>
         </div>
         <div class="marquee-group" aria-hidden="true">
           <span class="marquee-item"><b>PQ SIGNATURE</b><span class="v">FALCON-512</span></span>
-          <span class="marquee-item"><b>PQ KEM</b><span class="v">ML-KEM-768</span></span>
-          <span class="marquee-item"><b>COMMITTEE</b><span class="v">16</span></span>
-          <span class="marquee-item"><b>FINALITY</b><span class="v">µQC</span><span class="sep">/</span><span class="v">66.7%</span></span>
-          <span class="marquee-item"><b>CONSENSUS</b><span class="v">PQ-BFT v5</span></span>
-          <span class="marquee-item"><b>EXECUTION</b><span class="v">SEALEVEL-LITE</span></span>
+          <span class="marquee-item"><b>SHARDS</b><span class="v">0–1</span></span>
+          <span class="marquee-item"><b>FINALITY</b><span class="v">1 BLOCK</span></span>
+          <span class="marquee-item"><b>EXECUTION</b><span class="v">WASM</span></span>
+          <span class="marquee-item"><b>SUPPLY CAP</b><span class="v">1B STELL</span></span>
+          <span class="marquee-item"><b>EVM</b><span class="v">READ-ONLY</span></span>
           <span class="marquee-item"><b>RULESET</b><span class="v v--alt">V5</span></span>
           <span class="marquee-item"><b>FORK</b><span class="v v--alt">0x9d59096b</span></span>
         </div>
@@ -240,62 +302,70 @@ window.setTimeout(function () {
         </div>
         <h2 class="sec-title" id="network-title"><span class="outline-text">Live</span> from<br>the testnet</h2>
         <p class="sec-lead">
-          Every value is read from the public RPC gateway and refreshed every fifteen
-          seconds. When the source stops answering, the number returns to a dash instead
-          of a guess.
+          Every value below is read from the public RPC gateway and refreshed every
+          fifteen seconds. When the source stops answering, the value becomes a dash.
+          No number is cached or invented.
         </p>
       </header>
 
       <div class="sec-rule" aria-hidden="true"></div>
 
-      <div class="metrics-grid">
-        <article class="metric" data-metric="height" data-reveal>
-          <div class="metric-head"><span class="metric-label">Block height</span><span class="tag">FINALISED</span></div>
-          <strong class="metric-value" data-value>&#8212;</strong>
-          <span class="metric-note">blocks finalised on testnet</span>
-        </article>
-
-        <article class="metric" data-metric="blockTime" data-reveal data-delay="1">
-          <div class="metric-head"><span class="metric-label">Block time</span><span class="tag">SAMPLED</span></div>
-          <strong class="metric-value" data-value>&#8212;</strong>
-          <span class="metric-note">seconds per block, sampled from height deltas</span>
-        </article>
-
-        <article class="metric" data-metric="baseFee" data-reveal data-delay="2">
-          <div class="metric-head"><span class="metric-label">Base fee</span><span class="tag">STELL</span></div>
-          <strong class="metric-value" data-value>&#8212;</strong>
-          <span class="metric-note">equal to GAS_BASIC_TRANSFER (280000)</span>
-        </article>
-
-        <article class="metric" data-metric="chainId" data-reveal data-delay="1">
-          <div class="metric-head"><span class="metric-label">Chain ID</span><span class="tag">5757</span></div>
-          <strong class="metric-value" data-value>5757</strong>
-          <span class="metric-note">used by wallets and RPC clients</span>
-        </article>
-
-        <article class="metric" data-metric="validators" data-reveal data-delay="2">
-          <div class="metric-head"><span class="metric-label">Validators</span><span class="tag">µQC</span></div>
-          <strong class="metric-value" data-value>&#8212;</strong>
-          <span class="metric-note">committee size, Falcon-512 votes</span>
-        </article>
-
-        <article class="metric" data-metric="stateRoot" data-reveal data-delay="3">
+      <div class="metric-sheet">
+        <article class="metric metric--lead" data-metric="height" data-reveal>
           <div class="metric-head">
+            <span class="metric-label">Block height</span>
+            <span class="tag">FINALISED</span>
+          </div>
+          <strong class="metric-value is-empty" data-value>&#8212;</strong>
+          <span class="metric-note">blocks finalised on this testnet</span>
+          <span class="metric-index" aria-hidden="true">01 / 06</span>
+        </article>
+
+        <div class="metric-list">
+          <article class="metric metric--row" data-metric="blockTime" data-reveal>
+            <span class="metric-label">Block time</span>
+            <strong class="metric-value is-empty" data-value>&#8212;</strong>
+            <span class="metric-note">seconds per block, from height deltas</span>
+            <span class="tag">SAMPLED</span>
+          </article>
+
+          <article class="metric metric--row" data-metric="baseFee" data-reveal>
+            <span class="metric-label">Base fee</span>
+            <strong class="metric-value is-empty" data-value>&#8212;</strong>
+            <span class="metric-note">admission floor; GAS_BASIC_TRANSFER = 280,000</span>
+            <span class="tag">STELL</span>
+          </article>
+
+          <article class="metric metric--row" data-metric="chainId" data-reveal>
+            <span class="metric-label">Chain ID</span>
+            <strong class="metric-value metric-value--mono" data-value>5757</strong>
+            <span class="metric-note">used by wallets and RPC clients</span>
+            <span class="tag">Fixed</span>
+          </article>
+
+          <article class="metric metric--row" data-metric="validators" data-reveal>
+            <span class="metric-label">Validators</span>
+            <strong class="metric-value is-empty" data-value>&#8212;</strong>
+            <span class="metric-note">set returned by stell_getValidators</span>
+            <span class="tag">FALCON-512</span>
+          </article>
+
+          <article class="metric metric--row" data-metric="stateRoot" data-reveal>
             <span class="metric-label">State root</span>
+            <strong class="metric-value metric-value--mono is-empty" id="state-root-value" data-value>&#8212;</strong>
+            <span class="metric-note">32-byte Merkle root of world state</span>
             <button class="icon-btn metric-action" type="button" data-copy-from="#state-root-value" aria-label="Copy full state root">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
               <span data-copy-label>Copy</span>
             </button>
-          </div>
-          <strong class="metric-value metric-value--mono" id="state-root-value" data-value>&#8212;</strong>
-          <span class="metric-note">32-byte Merkle root of world state</span>
-        </article>
+          </article>
+        </div>
       </div>
 
       <div class="metrics-foot" data-status role="status" aria-live="polite">
         <span class="status-line">
           <span class="status-dot" aria-hidden="true"></span>
-          <span class="status-host" data-status-text>Connecting · testnet.stellereum.org</span>
+          <span class="status-host" data-status-text>Connecting · rpc.stellereum.org</span>
         </span>
         <span class="badge">polling every 15s · rpc.stellereum.org</span>
       </div>
@@ -309,68 +379,79 @@ window.setTimeout(function () {
         <div class="sec-marker">
           <span class="num">02</span><span>Protocol</span><span class="slash">//</span><span>Base layer</span>
         </div>
-        <h2 class="sec-title" id="features-title">Six decisions,<br><span class="outline-text">no legacy</span> curves</h2>
+        <h2 class="sec-title" id="features-title">Six parts,<br><span class="outline-text">one base layer</span></h2>
         <p class="sec-lead">
-          The base layer is hardened end to end: no classical fallback, a compact
-          post-quantum committee, parallel execution and confidentiality that ships with
-          the chain.
+          Each card states what exists in the repository. Where a part has a limit,
+          the limit is written in the card. Nothing is marked live without a source.
         </p>
       </header>
 
       <div class="sec-rule" aria-hidden="true"></div>
 
-      <div class="signal-strip" aria-hidden="true">
-        <span class="signal-label">BAYER 4×4 / SIGNAL</span>
-        <span class="signal-cells">
-          <span style="--i:0;--o:.06"></span><span style="--i:1;--o:.55"></span><span style="--i:2;--o:.18"></span><span style="--i:3;--o:.68"></span>
-          <span style="--i:4;--o:.82"></span><span style="--i:5;--o:.30"></span><span style="--i:6;--o:.94"></span><span style="--i:7;--o:.43"></span>
-          <span style="--i:8;--o:.24"></span><span style="--i:9;--o:.74"></span><span style="--i:10;--o:.12"></span><span style="--i:11;--o:.62"></span>
-          <span style="--i:12;--o:1"></span><span style="--i:13;--o:.49"></span><span style="--i:14;--o:.87"></span><span style="--i:15;--o:.36"></span>
-        </span>
-        <span class="signal-label signal-label--alt">16 LEVELS</span>
+      <!-- Hairline schematic, not a grid of equal cells. -->
+      <div class="shard-schematic" aria-hidden="true">
+        <div class="schematic-index">
+          <span class="schematic-big">0–1</span>
+          <span class="schematic-label">SHARD SET / FIXED PAIR</span>
+        </div>
+        <svg class="schematic-drawing" viewBox="0 0 520 78" role="presentation" focusable="false">
+          <rect x="4" y="20" width="150" height="38" fill="none" stroke="currentColor"/>
+          <rect x="366" y="20" width="150" height="38" fill="none" stroke="currentColor"/>
+          <path d="M158 39h204" stroke="currentColor" stroke-dasharray="3 5"/>
+          <path d="M350 34l12 5-12 5" fill="none" stroke="currentColor"/>
+          <path d="M174 39l-12-5v10z" fill="currentColor" opacity=".5"/>
+          <text x="18" y="44">SHARD 0 · MASTERCHAIN</text>
+          <text x="380" y="44">SHARD 1 · WORKCHAIN</text>
+          <text x="226" y="30">2PC COMMIT</text>
+          <text x="226" y="62">prepare → vote → commit</text>
+        </svg>
+        <div class="schematic-note">
+          <span>2PC ACTIVE FROM GENESIS</span>
+          <span>NO LIVE SPLIT / MERGE</span>
+        </div>
       </div>
 
       <div class="features-grid">
         <article class="feature invert-card" data-reveal>
           <div class="feature-top"><span class="feature-num">01 / SIGNATURE</span><span class="sticker">FALCON-512</span></div>
-          <h3>Pure post-quantum</h3>
-          <p>Validator votes are signed with Falcon-512 and Ed25519 signatures are rejected at the protocol level, so no legacy curve can weaken consensus.</p>
-          <div class="card-meta"><span class="kv"><b>Falcon-512</b> · signatures</span></div>
+          <h3>Post-quantum votes</h3>
+          <p>Every validator vote verifies under Falcon-512. Ed25519 is refused at intake; there is no second, classical lane.</p>
+          <div class="card-meta"><span class="kv"><b>Falcon-512</b> · vote signatures</span></div>
         </article>
 
         <article class="feature invert-card" data-reveal data-delay="1">
-          <div class="feature-top"><span class="feature-num">02 / CONSENSUS</span><span class="sticker">16 · 66.7%</span></div>
-          <h3>PQ-BFT v5 + µQC</h3>
-          <p>The committee is chosen by BLAKE3 sortition and finalises every block through a quantum-compact quorum certificate of micro-quorums.</p>
-          <div class="card-meta"><span class="kv">committee <b>16</b> · quorum <b>66.7%</b></span></div>
+          <div class="feature-top"><span class="feature-num">02 / CONSENSUS</span><span class="sticker">1-BLOCK</span></div>
+          <h3>BFT finality</h3>
+          <p>Propose, prevote, precommit, commit. Quorum is floor(2·power/3)+1. One finalized block is final and does not roll back.</p>
+          <div class="card-meta"><span class="kv">quorum <b>floor(2·power/3)+1</b></span></div>
         </article>
 
         <article class="feature invert-card" data-reveal data-delay="2">
-          <div class="feature-top"><span class="feature-num">03 / EXECUTION</span><span class="sticker">5.16×</span></div>
-          <h3>Sealevel-lite</h3>
-          <p>Transactions declare their read and write sets, so independent calls run in parallel. Benchmarked at 5.16× against sequential execution.</p>
-          <div class="card-meta"><span class="kv"><b>5.16×</b> parallel speed-up</span></div>
+          <div class="feature-top"><span class="feature-num">03 / SHARDS</span><span class="sticker">0–1</span></div>
+          <h3>Two shards, fixed</h3>
+          <p>The supported topology is masterchain 0 plus workchain 1. Cross-shard transfers use two-phase commit and credit only a proven commit.</p>
+          <div class="card-meta"><span class="kv"><b>{0,1}</b> · 2PC from genesis</span></div>
         </article>
 
         <article class="feature invert-card" data-reveal data-delay="1">
-          <div class="feature-top"><span class="feature-num">04 / RUNTIME</span><span class="sticker">SVM + zkML</span></div>
-          <h3>SVM + zkML</h3>
-          <p>A Solana-compatible runtime for programs, extended with verifiable zero-knowledge machine-learning inference anchored on chain.</p>
-          <div class="card-meta"><span class="kv">SVM programs · verifiable inference</span></div>
+          <div class="feature-top"><span class="feature-num">04 / CONTRACTS</span><span class="sticker">13 HOST FNS</span></div>
+          <h3>WASM contracts</h3>
+          <p>Contracts run on wasmi as (i64)→i64 functions. There are 13 host imports, fuel is charged before each effect, and upgrade means redeploy.</p>
+          <div class="card-meta"><span class="kv">wasmi · <b>13</b> host imports · 5M read fuel</span></div>
         </article>
 
         <article class="feature invert-card" data-reveal data-delay="2">
-          <div class="feature-top"><span class="feature-num">05 / PRIVACY</span><span class="sticker">ML-KEM-768</span></div>
-          <h3>Confidential transfers</h3>
-          <p>Shielded notes hide amounts and counterparties while the total supply stays auditable by anyone. The KEM leg is ML-KEM-768, not a classical DH group.</p>
-          <div class="card-meta"><span class="kv">shielded notes · auditable supply</span></div>
+          <div class="feature-top"><span class="feature-num">05 / EVM</span><span class="sticker">READ-ONLY</span></div>
+          <h3>EVM adapter, no contracts</h3>
+          <p>The adapter serves eth_* reads and bound value transfers that carry a Falcon signature. Calldata and contract deployment are refused: there is no EVM interpreter.</p>
+          <div class="card-meta"><span class="kv">reads + bound transfers · <b>no Solidity</b></span></div>
         </article>
 
         <article class="feature invert-card" data-reveal data-delay="3">
-          <div class="feature-top"><span class="feature-num">06 / SCALE</span><span class="sticker">L1 + L2</span></div>
-          <h3>Bridges &amp; L2</h3>
-          <p>Canonical bridge contracts plus three L2 tracks carry liquidity, privacy and rollup throughput above the base layer.</p>
-          <div class="card-meta"><span class="kv">3 L2 tracks · canonical bridge</span></div>
+          <div class="feature-top"><span class="feature-num">06 / zkML</span><span class="sticker">RE-EXECUTION</span></div>
+          <h3>zkML is not a ZK proof</h3>
+          <p>A zkML check re-runs the full forward pass and compares the output. The attestation path also rebuilds a BLAKE3 Merkle tree over the neuron leaves.</p>
+          <div class="card-meta"><span class="kv">full re-execution · <b>Merkle trace</b></span></div>
         </article>
       </div>
     </div>
@@ -382,69 +463,93 @@ window.setTimeout(function () {
       <div class="manifesto-head">
         <b>Manifesto</b>
         <h2 id="manifesto-title" class="sr-only">Protocol principles</h2>
-        <span>03 rules, no slogans</span>
+        <span>Three rules, no slogans</span>
       </div>
       <div class="manifesto-grid">
         <div class="manifesto-cell">
-          <span class="manifesto-label">01 / Posture</span>
-          <p>Falcon-512 on every vote. No second, classical lane.</p>
+          <span class="manifesto-label">01 / Signatures</span>
+          <p>Falcon-512 signs every vote. Classical signatures are refused.</p>
         </div>
         <div class="manifesto-cell">
           <span class="manifesto-label">02 / Finality</span>
-          <p>Finality is one quorum certificate, not a probability curve.</p>
+          <p>One finalized block is final. Finalized blocks do not roll back.</p>
         </div>
         <div class="manifesto-cell">
-          <span class="manifesto-label">03 / Method</span>
-          <p>A number appears only if the repository can reproduce it.</p>
+          <span class="manifesto-label">03 / Numbers</span>
+          <p>A number is published only if a command in the repository reproduces it.</p>
         </div>
       </div>
     </div>
   </aside>
 
-  <!-- ====================================================== PERFORMANCE -->
+  <!-- ====================================================== LIMITS -->
   <section id="performance" class="section section--tint" aria-labelledby="perf-title">
     <div class="shell">
       <header class="sec-head">
         <div class="sec-marker">
-          <span class="num">03</span><span>Measurement</span><span class="slash">//</span><span>Lab benchmarks</span>
+          <span class="num">03</span><span>Limits</span><span class="slash">//</span><span>Constants and status</span>
         </div>
-        <h2 class="sec-title" id="perf-title">Throughput <span class="outline-text">measured</span>, not promised</h2>
+        <h2 class="sec-title" id="perf-title">Hard limits,<br><span class="outline-text">written down</span></h2>
         <p class="sec-lead">
-          Results of the in-repo benchmark suite. These are lab numbers, not figures from
-          the public testnet; the method is reproducible from the repository.
+          These are protocol constants and audit results, not live telemetry.
+          The live block height and fee are in section 01.
         </p>
       </header>
 
       <div class="perf-band" data-reveal>
         <div class="perf-top">
-          <span>REFERENCE ENVIRONMENT · 150 MS PACING · FULL CONSENSUS PATH</span>
-          <span class="sticker">LAB / NOT TESTNET</span>
+          <span>PROTOCOL CONSTANTS · RULESET V5</span>
+          <span class="sticker">NOT LIVE TELEMETRY</span>
         </div>
 
         <div class="perf-grid">
           <div class="perf-item">
-            <span class="perf-value" data-count-to="257996">257,996</span>
-            <span class="perf-label">tx/s, in-engine</span>
+            <span class="perf-value">0</span>
+            <span class="perf-label">external audits completed</span>
           </div>
           <div class="perf-item">
-            <span class="perf-value" data-count-to="2645">2,645</span>
-            <span class="perf-label">end-to-end TPS</span>
+            <span class="perf-value">2</span>
+            <span class="perf-label">shards: 0 masterchain, 1 workchain</span>
           </div>
           <div class="perf-item">
-            <span class="perf-value" data-count-to="5.16" data-count-decimals="2" data-count-suffix="×">5.16×</span>
-            <span class="perf-label">parallel execution speed-up</span>
+            <span class="perf-value">1B</span>
+            <span class="perf-label">STELL supply cap, chain-wide</span>
           </div>
           <div class="perf-item">
-            <span class="perf-value" data-count-to="-0.06" data-count-decimals="2" data-count-prefix="−" data-count-suffix="%">−0.06%</span>
-            <span class="perf-label">PQ vs Ed25519 delta</span>
+            <span class="perf-value">1100</span>
+            <span class="perf-label">STELL minimum new validator bond</span>
           </div>
         </div>
 
         <p class="perf-note">
-          Reference benchmark environment · 150 ms block pacing · full consensus path ·
-          reproducible from the in-repo suite.
+          Reference host measurement: 571–792 TPS on a Ryzen 5 3600, 6-core / 16 GB.
+          A 1 vCPU validator is explicitly insufficient for consensus
+          (docs/site/04-validators.md, Hardware). No figure here is a mainnet promise.
         </p>
       </div>
+
+      <ul class="limit-list">
+        <li>
+          <span class="limit-index" aria-hidden="true">01</span>
+          <div><h3>No external audit</h3><p>Internal review waves and 36 documented known issues exist. No independent party has attested the code.</p></div>
+        </li>
+        <li>
+          <span class="limit-index" aria-hidden="true">02</span>
+          <div><h3>No L2 execution</h3><p>The shard layer only orders external L2 batches. Data availability, bridging and execution are out of scope. No shard split has ever run on a live network.</p></div>
+        </li>
+        <li>
+          <span class="limit-index" aria-hidden="true">03</span>
+          <div><h3>No shielded transfers</h3><p>The shielded-transfer module was deleted. Stealth-address prototypes exist; they hide the address, not the amount.</p></div>
+        </li>
+        <li>
+          <span class="limit-index" aria-hidden="true">04</span>
+          <div><h3>No EVM contracts</h3><p>The EVM adapter reads balances and settles bound value transfers. It cannot deploy or call Solidity.</p></div>
+        </li>
+        <li>
+          <span class="limit-index" aria-hidden="true">05</span>
+          <div><h3>zkML is not ZK</h3><p>Verification re-executes the model. There is no succinct proof, no trusted setup and no hiding.</p></div>
+        </li>
+      </ul>
     </div>
   </section>
 
@@ -466,9 +571,10 @@ window.setTimeout(function () {
         <div class="sec-marker">
           <span class="num">04</span><span>Build</span><span class="slash">//</span><span>Zero to transaction</span>
         </div>
-        <h2 class="sec-title" id="build-title">From zero to a transaction in <span class="outline-text">three steps</span></h2>
+        <h2 class="sec-title" id="build-title">Zero to a transaction in <span class="outline-text">three steps</span></h2>
         <p class="sec-lead">
-          No allowlist, no private RPC. Everything you need is public and works today.
+          The commands below are in the repository. Testnet STELL has no value.
+          Use keys you can lose.
         </p>
       </header>
 
@@ -481,21 +587,21 @@ window.setTimeout(function () {
               <span class="step-num" aria-hidden="true">01</span>
               <div>
                 <h3>Connect a network</h3>
-                <p>Point your wallet or SDK at <span class="mono">https://rpc.stellereum.org</span> with chain ID <span class="mono">5757</span> and the symbol STELL.</p>
+                <p>Point a wallet or the Rust SDK at <span class="mono">https://rpc.stellereum.org</span> with chain ID <span class="mono">5757</span> and the symbol STELL.</p>
               </div>
             </li>
             <li class="step" data-reveal data-delay="1">
               <span class="step-num" aria-hidden="true">02</span>
               <div>
-                <h3>Get test STELL</h3>
-                <p>Request gas from the faucet: <span class="mono">POST /api/faucet-public/&lt;address&gt;</span> on the testnet host, 5 STELL per address every 45 minutes.</p>
+                <h3>Request test STELL</h3>
+                <p>The public faucet sends 5 STELL per address every 45 minutes, with 20 requests per hour per IP and a 1,000 STELL lifetime cap.</p>
               </div>
             </li>
             <li class="step" data-reveal data-delay="2">
               <span class="step-num" aria-hidden="true">03</span>
               <div>
                 <h3>Send a transaction</h3>
-                <p>Submit a signed transfer over JSON-RPC, then follow it block by block in the explorer until it is final.</p>
+                <p>Build with the SDK, sign with a Falcon-512 key, and submit over <span class="mono">stell_sendRawTransaction</span>. One finalized block is final.</p>
               </div>
             </li>
           </ol>
@@ -573,10 +679,10 @@ curl -s -X POST \
         <div class="sec-marker">
           <span class="num">05</span><span>Ecosystem</span><span class="slash">//</span><span>Above the base layer</span>
         </div>
-        <h2 class="sec-title" id="ecosystem-title">Scaling tracks <span class="outline-text">above</span> the base layer</h2>
+        <h2 class="sec-title" id="ecosystem-title">What is <span class="outline-text">above</span> the base layer</h2>
         <p class="sec-lead">
-          Three L2 directions extend L1 without moving trust off the post-quantum core.
-          Only what ships is named; the rest stays marked as upcoming.
+          Three items, three different statuses. Nothing here is a launch date,
+          a token or a throughput claim.
         </p>
       </header>
 
@@ -584,27 +690,36 @@ curl -s -X POST \
 
       <div class="eco-grid">
         <article class="eco-card invert-card" data-reveal>
-          <div class="eco-top"><span class="eco-index">L2 / 01</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
-          <div class="eco-glyph" aria-hidden="true"></div>
-          <h3>L2-Private</h3>
-          <p>Shielded execution and confidential state for applications that must keep counterparties and amounts private by default.</p>
-          <div class="card-meta"><span class="kv">confidential state · stealth notes</span></div>
+          <div class="eco-top">
+            <span class="eco-index">05 / 01</span>
+            <span class="eco-chips"><span class="badge badge--active"><span class="dot" aria-hidden="true"></span>Live</span><span class="sticker">High risk</span></span>
+          </div>
+          <span class="eco-numeral" aria-hidden="true">01</span>
+          <h3>Governed bridge</h3>
+          <p>A relayer-based bridge with timelocked withdrawals. It has no light client, and the signer set is its main target (KI-26).</p>
+          <div class="card-meta"><span class="kv">live · <b>relayer-based</b> · no light client</span></div>
         </article>
 
         <article class="eco-card invert-card" data-reveal data-delay="1">
-          <div class="eco-top"><span class="eco-index">L2 / 02</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
-          <div class="eco-glyph" aria-hidden="true"></div>
-          <h3>Rollup track</h3>
-          <p>Still in development — no details to share yet. The name and the launch date stay unpublished until they are true.</p>
-          <div class="card-meta"><span class="kv">announcement pending</span></div>
+          <div class="eco-top">
+            <span class="eco-index">05 / 02</span>
+            <span class="eco-chips"><span class="badge badge--soon">Research</span><span class="sticker">Prototype</span></span>
+          </div>
+          <span class="eco-numeral" aria-hidden="true">02</span>
+          <h3>Stealth addresses</h3>
+          <p>SilentPay and HashPool derive one-time addresses with ML-KEM-768. The amount stays public, and no shielded-transfer path exists in the client.</p>
+          <div class="card-meta"><span class="kv">prototype · <b>ML-KEM-768</b> · amount not hidden</span></div>
         </article>
 
         <article class="eco-card invert-card" data-reveal data-delay="2">
-          <div class="eco-top"><span class="eco-index">L2 / 03</span><span class="eco-chips"><span class="badge badge--soon">Coming soon</span><span class="sticker">Research</span></span></div>
-          <div class="eco-glyph" aria-hidden="true"></div>
-          <h3>Liquidity track</h3>
-          <p>Still in development — details will follow later. No token, no date and no numbers are claimed before they exist.</p>
-          <div class="card-meta"><span class="kv">details pending</span></div>
+          <div class="eco-top">
+            <span class="eco-index">05 / 03</span>
+            <span class="eco-chips"><span class="badge badge--todo">Partial</span><span class="sticker">No execution</span></span>
+          </div>
+          <span class="eco-numeral" aria-hidden="true">03</span>
+          <h3>Rollups / L2</h3>
+          <p>The shard layer exposes an append-only L2 batch ordering interface. Data availability, bridging and execution of L2 state are explicitly out of scope. The supported topology is the fixed pair {0,1}.</p>
+          <div class="card-meta"><span class="kv">ordering only · <b>no execution</b></span></div>
         </article>
       </div>
     </div>
@@ -619,8 +734,8 @@ curl -s -X POST \
         </div>
         <h2 class="sec-title" id="roadmap-title">From testnet <span class="outline-text">to mainnet</span></h2>
         <p class="sec-lead">
-          Four steps, tracked in the open. Statuses reflect the current testnet release,
-          not a marketing calendar.
+          Statuses describe the current tree. A ruleset change is a hard fork with
+          a new genesis, not an in-place upgrade.
         </p>
       </header>
 
@@ -634,7 +749,7 @@ curl -s -X POST \
               <h3>Testnet launch</h3>
               <span class="badge badge--done"><span class="dot" aria-hidden="true"></span>Shipped</span>
             </div>
-            <p>Genesis v5 is live with Falcon-512 verification and the KAT beacon <span class="mono break-anywhere">61336779…fcd6e</span>.</p>
+            <p>Genesis ruleset v5 is live on chain 5757. Falcon-512 votes and the 1B STELL cap are in force. No external audit has been completed.</p>
           </div>
         </li>
 
@@ -642,10 +757,10 @@ curl -s -X POST \
           <span class="timeline-step" aria-hidden="true">02</span>
           <div class="timeline-body">
             <div class="timeline-top">
-              <h3>Independent validator network</h3>
+              <h3>Independent validators</h3>
               <span class="badge badge--active"><span class="dot" aria-hidden="true"></span>In progress</span>
             </div>
-            <p>Independent operators on separate hosts, so fault tolerance stays above the 66.7% quorum line. Admission is operator-managed today and moves to staking-driven onboarding for mainnet.</p>
+            <p>Operators run nodes on separate hosts. A new node joins through the operator runbook and an admin-provided peer set; there is no public permissionless join flow.</p>
           </div>
         </li>
 
@@ -653,10 +768,10 @@ curl -s -X POST \
           <span class="timeline-step" aria-hidden="true">03</span>
           <div class="timeline-body">
             <div class="timeline-top">
-              <h3>Innovations in the live network</h3>
+              <h3>Upgrade and lifecycle</h3>
               <span class="badge badge--todo"><span class="dot" aria-hidden="true"></span>Queued</span>
             </div>
-            <p>Confidential transfers and SVM tooling already ship in the client; further items land through coordinated network upgrades.</p>
+            <p>Binary upgrade execution is off by default and must be enabled at genesis. Commission change and redelegation have ledger code but no opcode, RPC or wallet path.</p>
           </div>
         </li>
 
@@ -667,7 +782,7 @@ curl -s -X POST \
               <h3>Mainnet</h3>
               <span class="badge badge--todo"><span class="dot" aria-hidden="true"></span>Queued</span>
             </div>
-            <p>Economic security with a 1,000 STELL validator bond, independent operators and production SLAs.</p>
+            <p>Blocked by an external audit, public endpoint hardening, and the upgrade and validator lifecycle gaps. No date is set.</p>
           </div>
         </li>
       </ol>
@@ -679,9 +794,9 @@ curl -s -X POST \
     <div class="shell">
       <div class="cta-panel" data-reveal>
         <div class="cta-inner">
-          <span class="cta-kicker">07 / TRANSMIT · TESTNET IS LIVE</span>
-          <h2 id="cta-title">Deploy on<br>Stellereum</h2>
-          <p>Chain ID 5757, a public RPC, a faucet around the clock and an explorer that shows every finalised block. The quantum-safe layer is already running.</p>
+          <span class="cta-kicker">07 / TRANSMIT · TESTNET ONLY</span>
+          <h2 id="cta-title">Run a node.<br>Send a transaction.</h2>
+          <p>Chain ID 5757, a public RPC, a faucet and an explorer. WASM contracts run today; EVM contracts do not. Testnet STELL has no value, so use keys you can lose.</p>
           <div class="cta-actions">
             <a class="btn btn--ink" href="https://testnet.stellereum.org">Open testnet <span class="arrow" aria-hidden="true">↗</span></a>
             <a class="btn btn--outline" href="#build">Start building <span class="arrow" aria-hidden="true">↓</span></a>
@@ -696,15 +811,17 @@ curl -s -X POST \
 <!-- ============================================================ FOOTER -->
 <footer class="site-footer">
   <div class="shell">
+    <p class="footer-masthead" aria-hidden="true">Stellereum</p>
+
     <div class="footer-top">
       <div class="footer-brand">
         <a class="brand" href="#top" aria-label="Stellereum — back to top">
-          <img class="brand-mark" src="assets/img/stell-mark.png?v=11" alt="" width="34" height="34">
+          <img class="brand-mark" src="assets/img/stell-mark.png?v=13" alt="" width="34" height="34">
           <span class="brand-word">Stellereum</span>
         </a>
         <p class="footer-note">
-          A pure post-quantum Layer 1: PQ-BFT v5 consensus, Falcon-512 signatures,
-          ML-KEM-768 confidential notes and Sealevel-lite parallel execution.
+          A post-quantum Layer 1 written in Rust. Two shards, Falcon-512 votes,
+          WASM contracts. Testnet only; no external audit.
         </p>
       </div>
 
@@ -730,11 +847,11 @@ curl -s -X POST \
 
       <div class="footer-col">
         <h3>Protocol</h3>
-        <ul class="footer-links">
-          <li><span class="mono">PQ-BFT v5 · µQC</span></li>
+        <ul class="footer-links footer-facts">
           <li><span class="mono">Falcon-512 · ML-KEM-768</span></li>
+          <li><span class="mono">Two shards · {0,1} · 2PC</span></li>
           <li><span class="mono">Chain ID 5757 · STELL</span></li>
-          <li><span class="mono">SVM · zkML · Sealevel-lite</span></li>
+          <li><span class="mono">WASM · zkML re-execution</span></li>
         </ul>
       </div>
     </div>
@@ -743,15 +860,16 @@ curl -s -X POST \
       <div><dt>Protocol</dt><dd>1.0</dd></div>
       <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
       <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
-      <div><dt>Site build</dt><dd>static-v12 · 2026.11.19</dd></div>
+      <div><dt>Supply cap</dt><dd>1B STELL</dd></div>
+      <div><dt>Site build</dt><dd>static-v13 · 2026.11.20</dd></div>
     </dl>
 
     <div class="footer-bottom">
       <span class="footer-genesis">
-        <span>GENESIS</span>
-        <b title="c840d1dc2e6c70eb7c639a193715c0a57375fc78ae1f9749dc3cc73cb4c8ee77">c840d1dc2e6c70eb…c8ee77</b>
+        <span>GENESIS ROOT</span>
+        <b title="Pinned genesis root for ruleset v5 (src/runtime/mod.rs:307)">61336779…</b>
       </span>
-      <span>© <span data-year>2026</span> STELLEREUM · <span class="mark">BAYER 4×4 / ELECTRIC SWISS</span></span>
+      <span>© <span data-year>2026</span> STELLEREUM · TESTNET ONLY · NO EXTERNAL AUDIT</span>
     </div>
   </div>
 </footer>

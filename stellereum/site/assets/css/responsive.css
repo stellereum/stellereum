@@ -1,34 +1,40 @@
 /* ==========================================================================
    STELLEREUM — responsive overrides
-   Mobile-first. Breakpoints: 420 / 680 / 900 / 1200 / 1400 / 1500.
+   Mobile-first. Breakpoints: 420 / 480 / 680 / 900 / 1200 / 1400.
    ========================================================================== */
 
 /* --- phones and small tablets (<900) ------------------------------------ */
 @media (max-width: 899.98px) {
   .nf-code { font-size: clamp(6rem, 32vw, 12rem); }
 
-  /* The watermark only exists where there is a free right column. On phones
-     it is removed rather than allowed to drift across the headline. */
-  .hero-watermark { display: none; }
+  /* Below the two-column breakpoint the object sits in the free lower-right
+     space after the copy. It never enters the H1/lede/CTA boxes. */
+  .hero-object {
+    display: block;
+    width: min(210px, 42vw);
+    margin-top: 6px;
+    justify-self: end;
+    align-self: end;
+  }
+  .hero-object-tag { top: 2%; right: 0; font-size: 8px; padding: 4px 6px; }
+  .hero-object-meta { font-size: 8px; }
 
   .invert-pill { order: 2; margin-left: auto; margin-right: 0; }
   .nav-toggle { order: 3; margin-left: 0; }
 }
 
 @media (max-width: 679.98px) {
-  .signal-label--alt { display: none; }
+  .header-home { display: none; }
 }
 
 @media (max-width: 419.98px) {
   :root { --gutter: 14px; }
 
-  .signal-label { display: none; }
-
-  .brand { padding-inline: 10px; gap: 8px; }
+  .brand { padding: 0 10px 0 0; gap: 8px; }
   .brand-mark { width: 24px; height: 24px; }
   .brand-word { font-size: 11.5px; }
 
-  .hero-title { font-size: clamp(1.95rem, 8.6vw, 2.6rem); }
+  .hero-title { font-size: clamp(1.75rem, 9vw, 6.6rem); }
   .hero-sub { font-size: 14px; }
 
   .perf-grid { grid-template-columns: minmax(0, 1fr); }
@@ -54,7 +60,7 @@
     --header-h: 66px;
   }
 
-  .brand { padding-inline: 18px; }
+  .brand { padding: 0 18px 0 0; }
   .brand-word { font-size: 14px; }
   .brand-tag { display: inline-block; }
 
@@ -62,15 +68,21 @@
 
   .hero-hud { font-size: 10px; }
 
-  .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric--row {
+    grid-template-columns: minmax(0, 1.15fr) auto auto;
+    grid-template-areas:
+      "label value tag"
+      "note note action";
+    align-items: center;
+  }
+  .metric--row .metric-value { text-align: right; }
   .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .eco-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .manifesto-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
   .footer-top { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .footer-brand { grid-column: 1 / -1; }
 
-  .footer-colophon { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .footer-colophon { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
   .net-strip { grid-template-columns: minmax(0, 1.6fr) minmax(0, .7fr) minmax(0, .7fr); }
 }
@@ -142,13 +154,26 @@
 
   .nav-cta:hover { transform: none; box-shadow: none; }
 
-  /* hero */
+  /* hero: copy owns the left column; the slab object owns the right one. */
   .hero-inner {
-    grid-template-columns: minmax(0, 1.3fr) minmax(0, .7fr);
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 34%);
     gap: clamp(32px, 4vw, 64px);
   }
 
-  .hero-slab { display: block; }
+  .hero-object { display: block; }
+  .hero-title { font-size: clamp(2.4rem, 5.7vw, 5.75rem); }
+
+  .metric-sheet { grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); }
+  .metric--lead { border-right: 1px solid var(--line-strong); border-bottom: 0; }
+
+  .shard-schematic {
+    grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr) auto;
+  }
+
+  .eco-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .eco-card:first-child { grid-column: 1 / -1; }
+
+  .footer-colophon { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 
   /* section head */
   .sec-head {
@@ -159,7 +184,6 @@
   .sec-marker { grid-column: 1 / -1; }
   .sec-lead { justify-self: end; padding-left: 18px; border-left: 1px solid var(--line); }
 
-  .metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .perf-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 
   .build-grid { grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr); }
@@ -177,7 +201,7 @@
     --header-h: 72px;
   }
 
-  .brand { padding-inline: 22px; }
+  .brand { padding: 0 22px 0 0; }
   .brand-mark { width: 32px; height: 32px; }
   .brand-word { font-size: 15px; }
 
@@ -186,8 +210,10 @@
   .nav-link[aria-current="true"] { padding-left: 20px; }
   .nav-cta { padding-inline: 28px; }
 
-  .hero-slab { max-width: 460px; }
   .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .eco-grid { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .eco-card { grid-column: span 3; }
+  .eco-card:first-child { grid-column: span 6; }
 }
 
 /* --- 1400+: the header meta copy fits beside brand, nav, pill and CTA ---- */
@@ -199,9 +225,7 @@
 @media (min-width: 1500px) {
   :root { --gutter: 56px; }
 
-  .hero-title { font-size: clamp(6.8rem, 6.4vw, 9rem); }
   .sec-title { font-size: 92px; }
-  .metric { min-height: 158px; }
 }
 
 /* --- short phones: keep the hero copy and actions above the fold -------- */
@@ -211,7 +235,7 @@
   .hero-kicker { margin-bottom: 10px; }
   .hero-sub { margin-top: 12px; }
   .hero-actions { margin-top: 14px; }
-  .hero-title { font-size: clamp(1.95rem, 8vw, 2.5rem); }
+  .hero-title { font-size: clamp(1.75rem, 9vw, 6.6rem); }
 }
 
 /* --- coarse pointers: no hover lift, no custom cursor -------------------- */

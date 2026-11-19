@@ -147,7 +147,7 @@
 
   /* ---------------------------------------------------------- hero parallax */
   function initParallax() {
-    var mark = doc.querySelector('.hero-watermark');
+    var mark = doc.querySelector('.hero-object');
     if (!mark || reduce.matches) return;
     var ticking = false;
 
@@ -155,7 +155,7 @@
       ticking = false;
       var y = win.scrollY || win.pageYOffset || 0;
       if (y > win.innerHeight * 1.4) return;
-      mark.style.translate = '0 ' + (-y * 0.08).toFixed(1) + 'px';
+      mark.style.translate = '0 ' + (-y * 0.06).toFixed(1) + 'px';
     }
 
     function onScroll() {
@@ -247,7 +247,7 @@
     }, { passive: true });
 
     doc.addEventListener('pointerover', function (e) {
-      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .bayer') : null;
+      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-object-tag') : null;
       cursor.classList.toggle('is-expanded', !!target);
     });
 

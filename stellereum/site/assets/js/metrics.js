@@ -49,6 +49,7 @@
     valueNodes(name).forEach(function (el) {
       el._seeded = true;
       el.textContent = '—';
+      el.classList.add('is-empty');
       if (el.removeAttribute) el.removeAttribute('data-full');
     });
   }
@@ -67,6 +68,7 @@
     valueNodes(name).forEach(function (el) {
       var first = !el._seeded;
       el._seeded = true;
+      el.classList.remove('is-empty');
 
       if (first && window.StellMotion && !reduce.matches && isFinite(num)) {
         window.StellMotion.count(el, num, { format: format, duration: 950 });
@@ -105,6 +107,7 @@
     valueNodes('stateRoot').forEach(function (el) {
       el.setAttribute('data-full', s);
       el._seeded = true;
+      el.classList.remove('is-empty');
       el.textContent = truncateHash(s);
     });
   }
@@ -166,8 +169,8 @@
 
     Array.prototype.forEach.call(statusTexts, function (el) {
       el.textContent = isOnline
-        ? 'Live · testnet.stellereum.org'
-        : 'reconnecting · testnet.stellereum.org';
+        ? 'Live · rpc.stellereum.org'
+        : 'reconnecting · rpc.stellereum.org';
     });
   }
 
@@ -243,10 +246,13 @@
     var now = Date.now();
 
     /* chain id ---------------------------------------------------------- */
-    if (map.chainId !== null && typeof map.chainId !== 'undefined') {
+    /* Chain id is a protocol constant: keep 5757 when the RPC is down. */
+    var chainId = typeof map.chainId === 'number' ? map.chainId : hexToNumber(map.chainId);
+    if (chainId !== null) {
       valueNodes('chainId').forEach(function (el) {
-        el.textContent = '5757';
+        el.textContent = String(chainId);
         el._seeded = true;
+        el.classList.remove('is-empty');
       });
     }
 

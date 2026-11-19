@@ -24,6 +24,8 @@ The full runbook is in [`../stellereum/docs/OPERATIONS.md`](../stellereum/docs/O
 | `doctor.sh` | The same diagnosis, standalone, ON a node. | no |
 | `node-prune-cron.sh` | The orphan-chunk + snapshot retention sweeper. **Run it on every node.** | **yes** |
 | `cluster-watchdog.sh` | Watches the cluster, alerts, auto-heals the safe cases. | **yes** |
+| `cluster_liveness.sh` | Read-only height / finality / divergence check with per-node `/health`, round, peers, and rejected-proposal diagnostics. Exit 1 = STALLED, 2 = DIVERGED. | no |
+| `fresh_genesis.sh` | Coordinated new-chain boot: stop all, replace binary, wipe `./data`, set `STELL_NEW_CHAIN=1`, start, wait height > 0, remove the flag. Dry-run by default; `--yes` required. | **yes** (gated) |
 | `tools/stelops/` | The ops tool that reads the store (consensus checkpoint, genesis root) and clears the lock. | **yes** (the lock only) |
 | `cluster-nodes.conf` | The cluster topology and the values every node must agree on. | no |
 | `lib/nodeprobe.sh` | The per-node probe (run locally or piped over ssh). | no |
@@ -31,6 +33,21 @@ The full runbook is in [`../stellereum/docs/OPERATIONS.md`](../stellereum/docs/O
 
 Every script takes `--help`, is non-interactive, is idempotent, and is safe
 to run concurrently on several nodes.
+
+## Liveness versus fresh genesis
+
+```sh
+# Is the cluster advancing, and do the nodes agree? (read-only, no restarts)
+STELL_RPCS="A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
+  scripts/cluster_liveness.sh --expected-block-time 2 --window 30
+
+# Rehearse a coordinated new chain; nothing is changed without --yes.
+scripts/fresh_genesis.sh --nodes "A=ssh:root@host:/root/nodeA,B=local:/path/nodeB" \
+  --binary stellereum/target/release/stellereum
+```
+
+The full decision procedure, identity checks, verification, and the rollback
+limits are in [`../docs/FRESH_GENESIS_RUNBOOK.md`](../docs/FRESH_GENESIS_RUNBOOK.md).
 
 ## Quick start
 

@@ -60,6 +60,7 @@ fn qc(
         return qc;
     }
     QuorumCertificate {
+        shard_id: 0,
         height: h,
         round: r,
         kind,
@@ -267,7 +268,7 @@ fn hunt_neg_p5_no_prevote_precommit_height_or_round_replay() {
     let mut wrong_h = good.clone();
     wrong_h.height = 6;
     assert!(!wrong_h.verify(&vs));
-    println!("[NEG P5] domain separator STELLEREUM_BFT_VOTE_V2 binds kind+height+round: all 4 replays rejected");
+    println!("[NEG P5] domain separator STELLEREUM_BFT_VOTE_V3 binds kind+height+round: all 4 replays rejected");
 }
 
 #[test]
@@ -877,6 +878,7 @@ fn hunt_neg_p15_far_future_votes_are_bounded_per_message() {
 fn hunt_neg_p16_verifying_key_and_signature_parsing_fails_closed() {
     // A 32-byte "voter" that is not a valid curve point must be refused, not panic.
     let mut v = Vote {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Prevote,
@@ -893,6 +895,7 @@ fn hunt_neg_p16_verifying_key_and_signature_parsing_fails_closed() {
     assert!(!v.verify());
     // And a certificate with the same junk.
     let c = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Prevote,

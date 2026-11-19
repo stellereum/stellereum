@@ -536,14 +536,23 @@ pub struct MeshDelivery {
 }
 
 impl MeshDelivery {
-    /// True when every targeted validator was reached directly or the
-    /// overlay accepted the fallback copy.
+    /// True only when every targeted validator was reached over a DIRECT
+    /// link. The overlay fallback is deliberately NOT delivery proof here.
     ///
-    /// L3 fix: an EMPTY target set is not a success. The caller uses this to
-    /// decide whether the normal broadcast must still run, so "reached
-    /// nobody" must read as false.
+    /// `fallback_ok` means `publish_overlay` reported at least one accepted
+    /// copy — "SOME subscriber took it", not "every failed target received
+    /// it" (the API returns a count, not per-peer coverage). Treating that as
+    /// coverage could let ONE overlay publish hide N lost direct copies: the
+    /// caller would skip the per-peer broadcast and those validators would
+    /// miss the frame. A partial failure therefore stays `false`, so the
+    /// normal broadcast (which addresses every peer) still runs; the overlay
+    /// publish remains a best-effort extra copy, never a substitute.
+    ///
+    /// L3 fix: an EMPTY target set is not success either. With no attempted
+    /// direct copy there is no proof at all, and "reached nobody" must read
+    /// as false so the caller broadcasts.
     pub fn delivered(&self) -> bool {
-        (self.targets > 0 && self.direct_failed == 0) || self.fallback_ok
+        self.targets > 0 && self.direct_ok == self.targets
     }
 }
 
@@ -651,8 +660,7 @@ impl ValidatorMesh {
                     }
                 }
                 None => {
-                    st.members
-                        .insert(*id, MeshMemberState::new(member, now_ms));
+                    st.members.insert(*id, MeshMemberState::new(member, now_ms));
                     added += 1;
                 }
             }
@@ -701,11 +709,17 @@ impl ValidatorMesh {
 
     /// Validators eligible for DIRECT sends right now (suspected peers are
     /// withheld until a successful reconnect).
-    pub fn direct_targets(&self, now_ms: u64) -> Vec<[u8; 20]> {
+    ///
+    /// A peer whose cooldown has elapsed is STILL withheld here. Reconnect is
+    /// an explicit, off-tick action ([`Self::maintain`], which probes with an
+    /// acknowledged round trip); it must not ride the per-frame send path,
+    /// where a dead peer would cost the full mesh timeout on every consensus
+    /// frame after each cooldown expires. `now_ms` is kept for API stability.
+    pub fn direct_targets(&self, _now_ms: u64) -> Vec<[u8; 20]> {
         let st = self.lock();
         st.members
             .iter()
-            .filter(|(_, m)| m.routing_allowed() || m.reconnect_due(now_ms))
+            .filter(|(_, m)| m.routing_allowed())
             .map(|(id, _)| *id)
             .collect()
     }
@@ -832,21 +846,18 @@ impl ValidatorMesh {
 
     /// Direct delivery to one validator (no DHT lookup). Returns the outcome
     /// of that single send; the caller decides whether to use the fallback.
-    pub async fn deliver_to(
-        &self,
-        id: [u8; 20],
-        topic: &str,
-        data: &str,
-        now_ms: u64,
-    ) -> bool {
+    pub async fn deliver_to(&self, id: [u8; 20], topic: &str, data: &str, now_ms: u64) -> bool {
         if !self.is_member(&id) {
             return false;
         }
         match self.transport.deliver_direct(id, topic, data).await {
-            Ok(()) => {
-                self.record_success(id, now_ms);
-                true
-            }
+            // The production transport's direct send is a fire-and-forget
+            // WRITE: it proves the local stream accepted the frame, not that
+            // the peer processed it. Treating it as liveness let a peer that
+            // accepts writes and never answers stay "healthy" forever (and
+            // cleared an existing suspicion). Only an acknowledged probe
+            // (see `maintain`) may mark a peer healthy.
+            Ok(()) => true,
             Err(_) => {
                 self.record_failure(id, now_ms);
                 false
@@ -873,7 +884,10 @@ impl ValidatorMesh {
         for (id, result) in results {
             match result {
                 Ok(()) => {
-                    self.record_success(id, now_ms);
+                    // Fire-and-forget WRITE only: not a delivery proof and not
+                    // evidence of peer liveness. The acknowledged heartbeat
+                    // ([`Self::maintain`]) owns recovery, so a blackholing
+                    // peer cannot be kept healthy (or cleared) by local writes.
                     delivery.direct_ok += 1;
                 }
                 Err(_) => {
@@ -883,8 +897,10 @@ impl ValidatorMesh {
             }
         }
         if delivery.direct_ok > 0 {
-            self.direct_total
-                .fetch_add(delivery.direct_ok as u64, std::sync::atomic::Ordering::Relaxed);
+            self.direct_total.fetch_add(
+                delivery.direct_ok as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         // Fallback rule: any failed copy goes to the overlay; also use it
         // when the mesh has no direct target at all (all suspected/mesh down).
@@ -1048,11 +1064,7 @@ pub fn mesh_send_timeout_ms() -> u64 {
 /// DHT path). A config with no consensus keys at all is a bootstrap/dev set:
 /// every pinned peer is treated as a validator.
 fn mesh_members_from_config(node: &Node) -> Vec<ValidatorMeshMember> {
-    let has_consensus_key = node
-        .cfg
-        .peers
-        .iter()
-        .any(|p| p.consensus_pub.is_some());
+    let has_consensus_key = node.cfg.peers.iter().any(|p| p.consensus_pub.is_some());
     node.cfg
         .peers
         .iter()
@@ -1263,10 +1275,7 @@ impl P2pNetworkAdapter {
     /// the active set become mesh members. Validators without a pinned peer
     /// entry have no dial target here and are skipped (DHT discovery may
     /// supply it later).
-    pub async fn refresh_validator_mesh(
-        &self,
-        validator_pubkeys: &[[u8; 32]],
-    ) -> MeshRotation {
+    pub async fn refresh_validator_mesh(&self, validator_pubkeys: &[[u8; 32]]) -> MeshRotation {
         let active: std::collections::HashSet<[u8; 32]> =
             validator_pubkeys.iter().copied().collect();
         let mut members: Vec<ValidatorMeshMember> = Vec::new();

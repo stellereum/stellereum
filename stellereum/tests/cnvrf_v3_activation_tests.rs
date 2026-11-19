@@ -50,10 +50,11 @@ use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 
-/// Height used as the activation point in the beacon-schedule tests: `7201`,
-/// i.e. one block into epoch 1. Epoch 1's `H_freeze` is `6840 < 7201`, so it is
-/// the BOOTSTRAP epoch (its beacon is `cn_vrf::epoch_bootstrap_beacon`), which
-/// is exactly the case that used to make the first boundary unverifiable.
+/// Height used as the activation point in the beacon-schedule tests:
+/// `EPOCH_LEN + 1`, i.e. one block into epoch 1. Epoch 1's `H_freeze` is
+/// `EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS < EPOCH_LEN + 1`, so it is the
+/// BOOTSTRAP epoch (its beacon is `cn_vrf::epoch_bootstrap_beacon`), which is
+/// exactly the case that used to make the first boundary unverifiable.
 const ACTIVATION: u64 = EPOCH_LEN + 1;
 
 fn chain_id() -> u64 {
@@ -306,8 +307,8 @@ fn first_boundary_seed_agrees_between_producer_and_validator() {
     let freeze_hash = [0xA7u8; 32];
     let rolling_mix = [0x3Cu8; V3_LINK_LEN];
 
-    // The first boundary under ACTIVATION is block 14400 (epoch 2); its
-    // predecessor (epoch 1) is the bootstrap epoch.
+    // The first boundary under ACTIVATION is block 2*EPOCH_LEN (epoch 2);
+    // its predecessor (epoch 1) is the bootstrap epoch.
     let boundary_epoch = 2u64;
     let prev_epoch = boundary_epoch - 1;
     assert!(

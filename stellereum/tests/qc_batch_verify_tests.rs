@@ -397,6 +397,7 @@ fn qc_verify_edges_empty_overcap_one_corrupt() {
     let ks = det_keys(4, 0xE1);
     let vs = val_set(&ks);
     let empty = QuorumCertificate {
+        shard_id: 0,
         height: HH,
         round: RR,
         kind: VoteKind::Precommit,

@@ -39,10 +39,97 @@ fn encode_full_proposal_loopback(
     // loopbacks ride their own bounded queue and are not re-charged to the
     // bulk limiter (the compact frame already paid); attribution still lets
     // scoring/rate decisions see who caused the work.
-    Some(
-        serde_json::json!({ "data": hex::encode(bytes), "src": src })
-            .to_string(),
-    )
+    Some(serde_json::json!({ "data": hex::encode(bytes), "src": src }).to_string())
+}
+
+/// Signed-preimage kind tag of a vote (0 = prevote, 1 = precommit).
+fn vote_watermark_kind(kind: VoteKind) -> u8 {
+    match kind {
+        VoteKind::Prevote => 0,
+        VoteKind::Precommit => 1,
+    }
+}
+
+/// WRITE-AHEAD the vote watermark BEFORE the vote can reach the wire.
+///
+/// The record carries the exact `(height, round, kind, target, shard)` the node
+/// signed and is fsynced, so a crash right after the broadcast can never lose
+/// it: on restart the node restores the watermark and refuses to vote again at
+/// or below that round (Finding C). Failing to persist is LOUD; consensus is
+/// not blocked, because a wedged disk must not stop the network — but an
+/// operator sees the exact loss window.
+fn persist_vote_watermark_before_broadcast(
+    persistence: Option<&Arc<stellereum::storage::AsyncPersistence>>,
+    vote: &stellereum::consensus::Vote,
+) {
+    let Some(ap) = persistence else {
+        return;
+    };
+    let storage = ap.storage();
+    let mut wm = match storage.vote_watermark() {
+        Ok(Some(wm)) => wm,
+        Ok(None) => stellereum::storage::VoteWatermark::default(),
+        Err(e) => {
+            tracing::error!(
+                "[consensus] could not read the vote watermark ({e}); writing a fresh one \
+                 (the new vote is still recorded)"
+            );
+            stellereum::storage::VoteWatermark::default()
+        }
+    };
+    wm.note(stellereum::storage::VoteWatermarkEntry {
+        height: vote.height,
+        round: vote.round,
+        kind: vote_watermark_kind(vote.kind),
+        target: vote.block_hash,
+        shard_id: vote.shard_id,
+    });
+    if let Err(e) = storage.persist_vote_watermark(&wm) {
+        tracing::error!(
+            "[consensus] FAILED to persist the write-ahead vote watermark for h={} r={} \
+             ({e}): a crash before the next checkpoint could lose this vote",
+            vote.height,
+            vote.round
+        );
+    }
+}
+
+/// True when `round` is at or below the highest round already signed at
+/// `height`. Such a vote is refused — the round was already used (possibly
+/// before a crash), so re-voting there is exactly the double-sign the
+/// watermark exists to prevent.
+fn round_at_or_below_vote_floor(floor: Option<(u64, u32)>, height: u64, round: u32) -> bool {
+    matches!(floor, Some((h, r)) if h == height && round <= r)
+}
+
+/// Liveness cap for the persisted CONSENSUS round on restart.
+///
+/// This is a LIVENESS bound only (a runaway view-change loop must not resume
+/// at round 806 while peers sit at round 0). It is NEVER a cap on the vote
+/// watermark: a round this node already signed must not be re-entered, so the
+/// watermark is a hard FLOOR applied after this cap (Finding C).
+const MAX_RESTORED_ROUND: u32 = 64;
+
+/// The round a restart resumes at: the persisted consensus round clamped for
+/// liveness, then raised — never lowered — to the vote watermark floor.
+///
+/// Pure and shared with the regression test, so the test exercises the exact
+/// production arithmetic instead of re-deriving it.
+fn restored_round(persisted_round: u32, vote_watermark_floor: Option<u32>) -> u32 {
+    let capped = persisted_round.min(MAX_RESTORED_ROUND);
+    vote_watermark_floor.map_or(capped, |floor| capped.max(floor))
+}
+
+/// Raise the in-memory floor after a vote was cast this process.
+fn advance_vote_floor(floor: &mut Option<(u64, u32)>, height: u64, round: u32) {
+    match floor {
+        Some((h, r)) if *h == height => {
+            if round > *r {
+                *r = round;
+            }
+        }
+        _ => *floor = Some((height, round)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,6 +451,9 @@ pub(crate) async fn run_consensus_node(
     // with engine < head forks the node -- see the healing block after seeding.
     let mut restored_state_height: u64 = 0;
     let mut restored_checkpoint: Option<stellereum::storage::ConsensusCheckpoint> = None;
+    // Write-ahead vote watermark (Finding C): read inside the persistence
+    // block below, consumed by the vote-history restore after it.
+    let mut restored_watermark: Option<stellereum::storage::VoteWatermark> = None;
     if let Some(ap) = &persistence {
         match stellereum::storage::load_full_state_into(&ap.storage(), &rt.state).await {
             Ok(Some((h, ledger, mut gov))) => {
@@ -667,12 +757,18 @@ pub(crate) async fn run_consensus_node(
             }
         }
 
+        // Write-ahead vote watermark (Finding C). Read BEFORE the checkpoint
+        // restore: the watermark is the authoritative record of the last
+        // votes this node SIGNED, and it is the only record that survives a
+        // crash between a vote and the next checkpoint.
+        restored_watermark = ap.storage().vote_watermark().ok().flatten();
+
         // Restore the consensus safety checkpoint so a node that restarted
         // mid-height cannot double-vote / prevote a conflicting value for a
         // height it already locked (Tendermint safety across a crash).
         if let Ok(Some(cp)) = ap.storage().consensus() {
             if cp.height == rt.hc.height {
-                // Restore the ROUND too, but with a cap.
+                // Restore the ROUND too, but with a LIVENESS cap.
                 //
                 // Safety needs the round: a node that restarted mid-height must not
                 // prevote or precommit a conflicting value for a height at which it
@@ -683,14 +779,31 @@ pub(crate) async fn run_consensus_node(
                 // operator wipes both data directories, which is exactly what happened
                 // on the stand.
                 //
-                // So a stale persisted round is treated as stale: beyond
+                // So a stale persisted CONSENSUS round is treated as stale: beyond
                 // MAX_RESTORED_ROUND we restart at the current round and let the peers
-                // pull us up through normal view changes. The lock is still honoured
-                // unconditionally -- that is the safety half and it does not expire.
-                const MAX_RESTORED_ROUND: u32 = 64;
-                let restored = cp.round.min(MAX_RESTORED_ROUND);
+                // pull us up through normal view changes. The cap is LIVENESS ONLY: it
+                // must never rewind BELOW a round this node already VOTED in, or the
+                // node would re-vote a round it used. The write-ahead vote watermark
+                // below is therefore a hard FLOOR on the restored round. The lock is
+                // still honoured unconditionally -- that is the safety half and it
+                // does not expire.
+                let watermark_floor = restored_watermark
+                    .as_ref()
+                    .and_then(|wm| wm.floor_round(cp.height));
+                let capped = cp.round.min(MAX_RESTORED_ROUND);
+                let restored = restored_round(cp.round, watermark_floor);
+                if let Some(floor) = watermark_floor {
+                    if restored > capped {
+                        info!(
+                            "[consensus] persisted round {} at height {} is below the vote \
+                             watermark round {} (already signed this round); resuming at {} \
+                             -- the liveness cap must never rewind below a cast vote",
+                            cp.round, cp.height, floor, floor
+                        );
+                    }
+                }
                 rt.hc.round = restored;
-                if restored != cp.round {
+                if capped != cp.round {
                     info!(
                         "[consensus] persisted round {} at height {} looks stale; resuming at \
                          round {} instead so peers can re-converge",
@@ -710,6 +823,23 @@ pub(crate) async fn run_consensus_node(
                     );
                 }
                 restored_checkpoint = Some(cp);
+            }
+        }
+
+        // The watermark is a per-height floor even when there is NO matching
+        // checkpoint (the crash happened before one was written): a node that
+        // signed a prevote at round 300 must not come back at round 0.
+        if let Some(floor) = restored_watermark
+            .as_ref()
+            .and_then(|wm| wm.floor_round(rt.hc.height))
+        {
+            if rt.hc.round < floor {
+                info!(
+                    "[consensus] vote watermark at height {} round {} raises the resumed round \
+                     from {} (no checkpoint had recorded it yet)",
+                    rt.hc.height, floor, rt.hc.round
+                );
+                rt.hc.round = floor;
             }
         }
     }
@@ -853,10 +983,31 @@ pub(crate) async fn run_consensus_node(
 
     // BFT-02: Restore vote history from persisted checkpoint to guarantee crash-resilience
     // and strictly forbid accidental self-equivocation across restarts.
+    //
+    // The write-ahead watermark is the AUTHORITATIVE record: it was fsynced
+    // before the vote hit the wire, so it is exact even when the crash landed
+    // between the vote and the next checkpoint (Finding C). It overrides the
+    // coarser checkpoint-derived values for the current height.
     let mut last_prevoted: Option<(u64, u32)> =
         restored_checkpoint.as_ref().map(|cp| (cp.height, cp.round));
     let mut last_precommitted: Option<(u64, u32)> =
         restored_checkpoint.as_ref().map(|cp| (cp.height, cp.round));
+    if let Some(wm) = &restored_watermark {
+        if let Some(e) = wm.prevote_at(rt.hc.height) {
+            last_prevoted = Some((e.height, e.round));
+        }
+        if let Some(e) = wm.precommit_at(rt.hc.height) {
+            last_precommitted = Some((e.height, e.round));
+        }
+    }
+    // Hard floor: never cast a vote at a round <= the highest round already
+    // SIGNED at this height. Enforced at the cast sites below (the prevote
+    // sites are inherently above it because `rt.hc.round` starts at the
+    // floor; the precommit site follows a POLKA round, which may be older).
+    let mut vote_floor: Option<(u64, u32)> = restored_watermark
+        .as_ref()
+        .and_then(|wm| wm.floor_round(rt.hc.height))
+        .map(|r| (rt.hc.height, r));
     // Throttle for the finalize-blocker diagnostic below: one line per round.
     let mut last_blockers_log: Option<(u64, u32)> = None;
     // Throttle for the propose-gate diagnostic: one line per round.
@@ -875,8 +1026,7 @@ pub(crate) async fn run_consensus_node(
     // F-1/H5): drained with priority, never behind future-dated peer traffic,
     // and independent of `INBOUND_DEFERRED_CAP` so a compact flood can never
     // grow memory without bound. Each entry carries the source peer id.
-    let mut loopback_queue: std::collections::VecDeque<String> =
-        std::collections::VecDeque::new();
+    let mut loopback_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut loopback_dropped: u64 = 0;
     // Per-(height, prev_hash) short-id index cache (C2/F-8): the mempool is
     // cloned and hashed at most once per salt per TTL, not once per frame.
@@ -1349,36 +1499,30 @@ pub(crate) async fn run_consensus_node(
         // timers too (measured: rounds took ~8s with an 800ms timeout because
         // the tick blocked on network I/O). A slow fetch is skipped and
         // retried next interval -- liveness beats freshness here.
-        let net_budget = Duration::from_millis(
-            // Catch-up does DHT head+body walks (seconds on a slow net); the
-            // old timeout/2 budget (~400ms live) always expired first, so a
-            // 1-block-behind node never healed (audit 2026-10-06).
-            (round_timeout.as_millis() as u64 * 2).max(5_000),
-        );
+        // Catch-up does DHT head+body walks (seconds on a slow net); the old
+        // timeout/2 budget (~400ms live) always expired first, so a
+        // 1-block-behind node never healed (audit 2026-10-06).
+        let near_tip_net_ms = (round_timeout.as_millis() as u64 * 2).max(5_000);
         // Snapshot territory needs minutes, not seconds: a far-behind node
-        // (hint gap > 100) fetching state+domains+anchor over a weak link
-        // can never fit in 5s, so every attempt died at the budget with zero
-        // progress and retried forever. While far behind, this node validates
-        // nothing anyway (its height is useless to the network), so a long
-        // tick costs nothing and is the only way to converge. Near-tip nodes
-        // keep the tight budget (fast rounds matter there).
+        // (gap > 100) fetching state+domains+anchor over a weak link can never
+        // fit in 5s, so every attempt died at the budget with zero progress and
+        // retried forever. While far behind, this node validates nothing
+        // anyway (its height is useless to the network), so a long tick costs
+        // nothing and is the only way to converge. Near-tip nodes keep the
+        // tight budget (fast rounds matter there).
+        //
+        // The gap is the TALLEST verified evidence we hold: a peer head hint
+        // (a QC-backed commit) and the at-tip evidence a verified vote or
+        // proposal names. Using only the hint left a node rescued by vote
+        // evidence on the at-tip/5 s path even when it was known to be behind.
         let our_tip_for_budget = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
         let hint_gap_for_budget = rt
             .peer_hint
             .map(|(ph, _)| ph.saturating_sub(our_tip_for_budget))
             .unwrap_or(0);
-        const SNAPSHOT_BUDGET_MS: u64 = 180_000;
-        let net_budget = if hint_gap_for_budget > 100 {
-            Duration::from_millis(SNAPSHOT_BUDGET_MS)
-        } else if hint_gap_for_budget > 0 {
-            // A node 10-99 blocks behind needs ~100-200ms per block body over
-            // WAN (40 blocks = ~8s). The 5s budget expired before the walk could
-            // complete, discarding progress and retrying forever. Allow 30s so
-            // small-to-medium gaps heal in one pass.
-            Duration::from_millis(30_000)
-        } else {
-            net_budget
-        };
+        let budget_gap =
+            hint_gap_for_budget.max(peer_named_height.saturating_sub(our_tip_for_budget));
+        let net_budget = Duration::from_millis(catchup_pass_budget_ms(near_tip_net_ms, budget_gap));
         // §7 Phase 2: catch-up replays whole blocks through `apply_and_advance`.
         // While a decided block is still executing on the sequenced worker the
         // engine is mid-transition (PRE-H reads would misvalidate the walk),
@@ -1480,7 +1624,16 @@ pub(crate) async fn run_consensus_node(
             catchup_ran = true;
             last_catchup = std::time::Instant::now();
             let split_catchup_t0 = std::time::Instant::now();
-            let catchup_budget = catchup_budget();
+            // The pass must be able to clear a whole live-sized burst (or, far
+            // behind, fetch/snapshot at all): the configured value is the
+            // at-tip floor, the gap scales it. A flat 250 ms admitted ~one
+            // WAN round trip, while the chain now produces a block every
+            // ~240 ms — a behind node retried forever without ever closing the
+            // gap (and snapshot-sync could never fit at all).
+            let catchup_budget = Duration::from_millis(catchup_pass_budget_ms(
+                catchup_budget().as_millis() as u64,
+                budget_gap,
+            ));
             let caught = tokio::time::timeout(
                 catchup_budget,
                 try_catch_up(&adapter, &mut rt, block_shard, persistence.as_ref(), &rpc),
@@ -1498,7 +1651,7 @@ pub(crate) async fn run_consensus_node(
                     eprintln!(
                         "[sync] catch-up skipped (network budget of {}ms exhausted, {n} times; \
                          peers unreachable or DHT too slow)",
-                        net_budget.as_millis()
+                        catchup_budget.as_millis()
                     );
                 } else {
                     tracing::debug!("[sync] catch-up skipped (network budget exhausted)");
@@ -1530,12 +1683,18 @@ pub(crate) async fn run_consensus_node(
                 // height + no proposal yet => the vote is nil by construction.
                 // (`can_vote` is computed later at the propose gate; inline it
                 // here — same franchise, same tick.)
-                if rt.effective_can_vote(is_validator) && !rt.hc.has_live_proposal() {
+                if rt.effective_can_vote(is_validator)
+                    && !rt.hc.has_live_proposal()
+                    && !round_at_or_below_vote_floor(vote_floor, rt.hc.height, rt.hc.round)
+                {
                     if let Some(v) = rt.make_prevote() {
                         debug_assert!(
                             v.block_hash.is_none(),
                             "fresh catchup height has no proposal yet"
                         );
+                        // WRITE-AHEAD before the vote can be enqueued.
+                        persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
+                        advance_vote_floor(&mut vote_floor, v.height, v.round);
                         let _ = rt.on_prevote(v.clone());
                         enqueue_outbox(
                             &mut outbox,
@@ -1551,6 +1710,19 @@ pub(crate) async fn run_consensus_node(
                             rt.hc.height,
                             rt.hc.round
                         );
+                    }
+                }
+                // PERSISTENT EVIDENCE ACROSS A SUCCESSFUL PASS: this tick
+                // `continue`s, so the end-of-tick latch re-arm never runs. A
+                // pass can stop SHORT of the peer's head (snapshot-sync lands
+                // on a boundary and hands the rest to the body walk); the
+                // verified evidence that scheduled it is then still ahead.
+                // Re-arm here so the next reactive tick continues the walk on
+                // the 500 ms floor instead of dropping to the 30 s backstop.
+                {
+                    let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                    if catchup_still_behind(tip, rt.peer_hint, peer_named_height) {
+                        catchup_pending = true;
                     }
                 }
                 split_catchup_ms += split_catchup_t0.elapsed().as_millis() as u64;
@@ -2101,8 +2273,16 @@ pub(crate) async fn run_consensus_node(
         // is computed once per tick there). Proposing stays equally gated: a
         // newcomer that never proposes leaves every third round empty.
         // 2. prevote once we have a proposal
-        if can_vote && rt.hc.has_live_proposal() && last_prevoted != Some((height, round)) {
+        if can_vote
+            && rt.hc.has_live_proposal()
+            && last_prevoted != Some((height, round))
+            && !round_at_or_below_vote_floor(vote_floor, height, round)
+        {
             if let Some(v) = rt.make_prevote() {
+                // WRITE-AHEAD: the watermark is durable before the outbox can
+                // flush this vote.
+                persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
+                advance_vote_floor(&mut vote_floor, v.height, v.round);
                 let _ = rt.on_prevote(v.clone());
                 // P3-H4: guards are set at ENQUEUE time, so the vote is cast
                 // exactly once even though the wire flush happens later.
@@ -2189,12 +2369,15 @@ pub(crate) async fn run_consensus_node(
             && last_prevoted != Some((height, round))
             && round_started.elapsed() >= 2 * round_timeout + nil_grace
             && !peer_alive_in_round
+            && !round_at_or_below_vote_floor(vote_floor, height, round)
         {
             if let Some(v) = rt.make_prevote() {
                 debug_assert!(
                     v.block_hash.is_none(),
                     "no live proposal must prevote nil, never a value"
                 );
+                persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
+                advance_vote_floor(&mut vote_floor, v.height, v.round);
                 let _ = rt.on_prevote(v.clone());
                 enqueue_outbox(
                     &mut outbox,
@@ -2238,8 +2421,7 @@ pub(crate) async fn run_consensus_node(
             // entries are local-only, bounded, and already accounted to the
             // compact frame that produced them; they skip the per-peer bulk
             // limiter (no double charge) but still pay the inner verify budget.
-            let (raw, from_loopback): (String, bool) = if let Some(raw) =
-                loopback_queue.pop_front()
+            let (raw, from_loopback): (String, bool) = if let Some(raw) = loopback_queue.pop_front()
             {
                 (raw, true)
             } else {
@@ -2419,9 +2601,8 @@ pub(crate) async fn run_consensus_node(
                             // Far/stale heights and over-budget peers are
                             // dropped loudly without touching the pool.
                             let over = {
-                                let count = compact_peer_frames
-                                    .entry(peer_key.clone())
-                                    .or_insert(0);
+                                let count =
+                                    compact_peer_frames.entry(peer_key.clone()).or_insert(0);
                                 !compact_frame_within_peer_budget(
                                     count,
                                     COMPACT_FRAMES_PER_PEER_PER_TICK,
@@ -2441,10 +2622,7 @@ pub(crate) async fn run_consensus_node(
                                 }
                                 continue;
                             }
-                            if !compact_proposal_height_is_relevant(
-                                rt.hc.height,
-                                proposal.height,
-                            ) {
+                            if !compact_proposal_height_is_relevant(rt.hc.height, proposal.height) {
                                 inbound_compact_refused += 1;
                                 tracing::debug!(
                                     "[consensus] compact proposal #{} r{} outside live window (hc #{}) — catch-up owns it",
@@ -2469,11 +2647,8 @@ pub(crate) async fn run_consensus_node(
                             // Parent plausibility: at OUR height the header must
                             // build on our finalized tip, so a peer cannot mint
                             // unlimited distinct salts with random prev_hashes.
-                            let (tip_h, tip_hash) = rt
-                                .finalized
-                                .last()
-                                .copied()
-                                .unwrap_or((0, [0u8; 32]));
+                            let (tip_h, tip_hash) =
+                                rt.finalized.last().copied().unwrap_or((0, [0u8; 32]));
                             if !compact_parent_is_plausible(
                                 proposal.height,
                                 proposal.header.prev_hash,
@@ -2503,9 +2678,7 @@ pub(crate) async fn run_consensus_node(
                                     // cache key is the salt, and a peer can
                                     // vary it; this is the hard bound on
                                     // whole-mempool work per tick.
-                                    if compact_index_builds_tick
-                                        >= COMPACT_INDEX_BUILDS_PER_TICK
-                                    {
+                                    if compact_index_builds_tick >= COMPACT_INDEX_BUILDS_PER_TICK {
                                         compact_budget_dropped += 1;
                                         continue;
                                     }
@@ -2522,9 +2695,8 @@ pub(crate) async fn run_consensus_node(
                         // storage and never by cloning the whole mempool.
                         ConsensusMsg::BodyPull { pull } => {
                             let over = {
-                                let count = compact_peer_frames
-                                    .entry(peer_key.clone())
-                                    .or_insert(0);
+                                let count =
+                                    compact_peer_frames.entry(peer_key.clone()).or_insert(0);
                                 !compact_frame_within_peer_budget(
                                     count,
                                     COMPACT_FRAMES_PER_PEER_PER_TICK,
@@ -2536,9 +2708,7 @@ pub(crate) async fn run_consensus_node(
                             }
                             let now_ms = liveness_alarm::now_ms();
                             if pull.is_full_request() {
-                                match compact_server.serve_full_for(
-                                    &peer_key, &pull, now_ms,
-                                ) {
+                                match compact_server.serve_full_for(&peer_key, &pull, now_ms) {
                                     Ok(Some(block)) => {
                                         let round = pull.round;
                                         enqueue_outbox(
@@ -2614,9 +2784,8 @@ pub(crate) async fn run_consensus_node(
                         // Complete a parked resolution with the served body.
                         ConsensusMsg::Body { body } => {
                             let over = {
-                                let count = compact_peer_frames
-                                    .entry(peer_key.clone())
-                                    .or_insert(0);
+                                let count =
+                                    compact_peer_frames.entry(peer_key.clone()).or_insert(0);
                                 !compact_frame_within_peer_budget(
                                     count,
                                     COMPACT_FRAMES_PER_PEER_PER_TICK,
@@ -2766,8 +2935,18 @@ pub(crate) async fn run_consensus_node(
                                     if can_vote
                                         && rt.hc.has_live_proposal()
                                         && last_prevoted != Some((rt.hc.height, rt.hc.round))
+                                        && !round_at_or_below_vote_floor(
+                                            vote_floor,
+                                            rt.hc.height,
+                                            rt.hc.round,
+                                        )
                                     {
                                         if let Some(v) = rt.make_prevote() {
+                                            persist_vote_watermark_before_broadcast(
+                                                persistence.as_ref(),
+                                                &v,
+                                            );
+                                            advance_vote_floor(&mut vote_floor, v.height, v.round);
                                             let _ = rt.on_prevote(v.clone());
                                             enqueue_outbox(
                                                 &mut outbox,
@@ -3024,8 +3203,10 @@ pub(crate) async fn run_consensus_node(
                                             rt.committee_schedule_at(height),
                                         );
                                     if proven {
-                                        peer_named_height =
-                                            clamp_peer_named_height(our_tip, peer_named_height.max(height));
+                                        peer_named_height = clamp_peer_named_height(
+                                            our_tip,
+                                            peer_named_height.max(height),
+                                        );
                                         if rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true) {
                                             rt.peer_hint = Some((height, block_hash));
                                             peer_hint_at = Some(std::time::Instant::now());
@@ -3235,7 +3416,15 @@ pub(crate) async fn run_consensus_node(
         // precommit" case that cost 31 of 180 rounds live) or duplicated it.
         if can_vote {
             if let Some(v) = rt.make_precommit() {
-                if last_precommitted != Some((height, v.round)) {
+                // FLOOR: a precommit is stamped with the POLKA's round, which
+                // may be older than the local round — and after a crash the
+                // node must not re-enter a round it already voted in. Refuse
+                // anything at/below the restored watermark round.
+                if last_precommitted != Some((height, v.round))
+                    && !round_at_or_below_vote_floor(vote_floor, height, v.round)
+                {
+                    persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
+                    advance_vote_floor(&mut vote_floor, v.height, v.round);
                     let _ = rt.on_precommit(v.clone());
                     // P3-H4: guards are set at ENQUEUE time (same reason as prevotes).
                     enqueue_outbox(
@@ -4610,5 +4799,146 @@ pub(crate) async fn run_consensus_node(
             split_join_n = 0;
         }
         tokio::time::sleep(Duration::from_millis(tick_ms)).await;
+    }
+}
+
+#[cfg(test)]
+mod vote_watermark_tests {
+    use super::*;
+    use stellereum::storage::{ConsensusCheckpoint, Storage, VoteWatermark, VoteWatermarkEntry};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "stell-vote-watermark-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    /// FINDING C: a crash AFTER a prevote at round 300 but BEFORE the next
+    /// consensus checkpoint must not lose the vote. The write-ahead watermark
+    /// survives the reopen, raises the resumed round above the liveness cap
+    /// (64), and forbids every vote at a round <= 300 for that height.
+    ///
+    /// (Fails before the fix: there was no watermark at all — only the
+    /// checkpoint, which still says round 0 — so the node resumed at round 0
+    /// and could re-vote 0..=300.)
+    #[test]
+    fn crash_after_prevote_never_rewinds_or_revotes() {
+        let dir = temp_dir("prevote300");
+        {
+            let st = Storage::open(&dir).expect("open");
+            // The checkpoint predates the vote: round 0 at height 7.
+            st.set_consensus(&ConsensusCheckpoint {
+                height: 7,
+                round: 0,
+                locked_hash: None,
+                locked_round: 0,
+                finalized_height: 6,
+                finalized_hash: [9u8; 32],
+            })
+            .expect("checkpoint");
+            // The vote was cast at round 300, fsynced BEFORE the broadcast.
+            let mut wm = VoteWatermark::default();
+            wm.note(VoteWatermarkEntry {
+                height: 7,
+                round: 300,
+                kind: 0, // prevote
+                target: Some([1u8; 32]),
+                shard_id: 1,
+            });
+            st.persist_vote_watermark(&wm).expect("watermark durable");
+        } // "crash": drop the storage handle
+
+        let st = Storage::open(&dir).expect("reopen after crash");
+        let wm = st
+            .vote_watermark()
+            .expect("read watermark")
+            .expect("watermark survived the crash");
+        let cp = st
+            .consensus()
+            .expect("read checkpoint")
+            .expect("checkpoint");
+        assert_eq!(cp.round, 0, "the checkpoint still predates the vote");
+        let entry = wm.prevote_at(7).expect("prevote at height 7");
+        assert_eq!(entry.round, 300);
+        assert_eq!(entry.shard_id, 1);
+        assert_eq!(entry.target, Some([1u8; 32]));
+
+        // The restore rule (the PRODUCTION helper): `min(cap)` is LIVENESS;
+        // the vote watermark is a hard FLOOR that the cap must never rewind
+        // below.
+        let floor = wm.floor_round(7).expect("floor at height 7");
+        let restored = restored_round(cp.round, Some(floor));
+        assert_eq!(
+            restored, 300,
+            "the resumed round must not rewind below the cast vote"
+        );
+
+        // And no vote at any round <= 300 for this height may be cast.
+        for round in 0..=300u32 {
+            assert!(
+                round_at_or_below_vote_floor(Some((7, floor)), 7, round),
+                "round {round} must be refused"
+            );
+        }
+        assert!(!round_at_or_below_vote_floor(Some((7, floor)), 7, 301));
+        // A different height is not governed by this height's floor.
+        assert!(!round_at_or_below_vote_floor(Some((7, floor)), 8, 0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FINDING C: the precommit watermark is independent of the prevote one,
+    /// so a crash between the two does not let the node lose (or duplicate)
+    /// either statement.
+    #[test]
+    fn prevote_and_precommit_watermarks_are_independent() {
+        let dir = temp_dir("two-kinds");
+        {
+            let st = Storage::open(&dir).expect("open");
+            let mut wm = VoteWatermark::default();
+            wm.note(VoteWatermarkEntry {
+                height: 4,
+                round: 11,
+                kind: 0,
+                target: Some([2u8; 32]),
+                shard_id: 0,
+            });
+            st.persist_vote_watermark(&wm).expect("prevote");
+            wm.note(VoteWatermarkEntry {
+                height: 4,
+                round: 11,
+                kind: 1,
+                target: Some([2u8; 32]),
+                shard_id: 0,
+            });
+            st.persist_vote_watermark(&wm).expect("precommit");
+        }
+        let st = Storage::open(&dir).expect("reopen");
+        let wm = st.vote_watermark().unwrap().unwrap();
+        assert_eq!(wm.prevote_at(4).unwrap().round, 11);
+        assert_eq!(wm.precommit_at(4).unwrap().round, 11);
+        assert_eq!(wm.floor_round(4), Some(11));
+
+        // A nil prevote is a real signed statement: `target == None` must
+        // round-trip (it is not "no vote").
+        let mut wm2 = wm.clone();
+        wm2.note(VoteWatermarkEntry {
+            height: 5,
+            round: 12,
+            kind: 0,
+            target: None,
+            shard_id: 0,
+        });
+        st.persist_vote_watermark(&wm2).unwrap();
+        let wm3 = st.vote_watermark().unwrap().unwrap();
+        assert_eq!(wm3.prevote_at(5).unwrap().target, None);
+        assert_eq!(wm3.floor_round(5), Some(12));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

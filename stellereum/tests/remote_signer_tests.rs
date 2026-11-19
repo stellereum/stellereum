@@ -494,7 +494,7 @@ fn signer_forwards_the_callers_bytes_to_the_transport_unchanged() {
 
     // A message full of bytes a signer might be tempted to touch: a tag, a NUL,
     // a high byte, something that is not valid UTF-8.
-    let message = b"STELLEREUM_BFT_VOTE_V2\0\xff tagged by the caller, and left alone";
+    let message = b"STELLEREUM_BFT_VOTE_V3\0\xff tagged by the caller, and left alone";
     remote.sign(message).expect("remote sign");
 
     // Byte for byte: nothing prepended, stripped, hashed or re-encoded.
@@ -512,9 +512,9 @@ fn signer_signs_consensus_tagged_bytes_and_never_retags_them() {
     let remote = remote_over(&mock);
 
     // The shape of `consensus::vote_sign_bytes`: the caller owns the
-    // `STELLEREUM_BFT_VOTE_V2` tag (and the chain id that follows it) and
+    // `STELLEREUM_BFT_VOTE_V3` tag (and the chain id that follows it) and
     // hands over the finished bytes.
-    let tag = b"STELLEREUM_BFT_VOTE_V2";
+    let tag = b"STELLEREUM_BFT_VOTE_V3";
     let mut vote = Vec::new();
     vote.extend_from_slice(tag);
     vote.extend_from_slice(&5757u64.to_be_bytes()); // chain id

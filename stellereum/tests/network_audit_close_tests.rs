@@ -35,6 +35,7 @@ use stellereum::network::{
 fn test_vote(height: u64) -> ConsensusMsg {
     ConsensusMsg::Vote {
         vote: stellereum::consensus::Vote {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Prevote,
@@ -68,6 +69,7 @@ fn test_commit(height: u64) -> ConsensusMsg {
             epoch_key_commitment: [0u8; 32],
         },
         certificate: stellereum::consensus::QuorumCertificate {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Precommit,

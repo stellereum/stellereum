@@ -13,6 +13,8 @@
 //! scope; everything else is deliberately absent from this client.
 
 use crate::error::{Result, SdkError};
+use crate::evm::put_vec;
+use crate::governance::{put_string, put_u64, GovAction, VoteChoice};
 
 /// Bincode discriminant of `OpCode::SysCallStake`
 /// (`stellereum/src/svm.rs:548`, 22nd variant).
@@ -20,14 +22,32 @@ pub const OP_STAKE: u32 = 21;
 /// Bincode discriminant of `OpCode::SysCallCallContractArgs`
 /// (`stellereum/src/svm.rs:994`).
 pub const OP_CALL_CONTRACT_ARGS: u32 = 50;
+/// Bincode discriminant of `OpCode::SysCallGovPropose`.
+pub const OP_GOV_PROPOSE: u32 = 53;
+/// Bincode discriminant of `OpCode::SysCallGovVote`.
+pub const OP_GOV_VOTE: u32 = 54;
 /// Bincode discriminant of `OpCode::SysCallUnjail`
 /// (`stellereum/src/svm.rs:1124`).
 pub const OP_UNJAIL: u32 = 56;
+/// Bincode discriminant of `OpCode::SysCallEvmCarrier`.
+pub const OP_EVM_CARRIER: u32 = 57;
+/// Bincode discriminant of `OpCode::SysCallBindEvmAddress`.
+pub const OP_BIND_EVM_ADDRESS: u32 = 58;
 
 /// `GAS_BASIC_TRANSFER` (`stellereum/src/svm.rs:36`).
 pub const GAS_BASIC_TRANSFER: u64 = 280_000;
 /// `GAS_STAKE_BOND` (`stellereum/src/svm.rs:92`).
 pub const GAS_STAKE_BOND: u64 = 2_000;
+/// `GAS_GOV_PROPOSE` (`stellereum/src/svm.rs`).
+pub const GAS_GOV_PROPOSE: u64 = 2_000;
+/// `GAS_GOV_VOTE` (`stellereum/src/svm.rs`).
+pub const GAS_GOV_VOTE: u64 = 600;
+/// Base gas for the EVM carrier/binding opcodes (`svm.rs`).
+pub const GAS_EVM_CARRIER_BASE: u64 = 2_000;
+/// Base gas of one Falcon verify (`svm.rs:GAS_PQ_VERIFY_BASE`).
+pub const GAS_PQ_VERIFY_BASE: u64 = 1_500;
+/// Per-byte gas of one Falcon verify (`svm.rs:GAS_PQ_VERIFY_PER_BYTE`).
+pub const GAS_PQ_VERIFY_PER_BYTE: u64 = 2;
 /// `GAS_STAKE_UNBOND` (`stellereum/src/svm.rs:94`).
 pub const GAS_STAKE_UNBOND: u64 = 800;
 /// `GAS_CONTRACT_CALL` (`stellereum/src/svm.rs:63`).
@@ -151,6 +171,35 @@ pub enum Op {
         args: Vec<i64>,
         calldata: Vec<u8>,
     },
+    /// `SysCallGovPropose { proposal_id, title, action, height_observed }`.
+    GovPropose {
+        proposal_id: u64,
+        title: String,
+        action: GovAction,
+        height_observed: u64,
+    },
+    /// `SysCallGovVote { proposal_id, choice, height_observed }`.
+    GovVote {
+        proposal_id: u64,
+        choice: VoteChoice,
+        height_observed: u64,
+    },
+    /// `SysCallEvmCarrier(EvmCarrierIntent)`.
+    EvmCarrier {
+        chain_id: u64,
+        evm_tx: Vec<u8>,
+        evm_address: [u8; 20],
+        pq_pubkey: Vec<u8>,
+        evm_signature: Vec<u8>,
+    },
+    /// `SysCallBindEvmAddress(EvmAddressClaim)`.
+    BindEvmAddress {
+        chain_id: u64,
+        evm_address: [u8; 20],
+        pq_pubkey: Vec<u8>,
+        binding_signature: Vec<u8>,
+        evm_signature: Vec<u8>,
+    },
 }
 
 impl Op {
@@ -196,6 +245,56 @@ impl Op {
                 out.extend_from_slice(&(calldata.len() as u64).to_le_bytes());
                 out.extend_from_slice(calldata);
             }
+            Op::GovPropose {
+                proposal_id,
+                title,
+                action,
+                height_observed,
+            } => {
+                out.extend_from_slice(&OP_GOV_PROPOSE.to_le_bytes());
+                out.extend_from_slice(&proposal_id.to_le_bytes());
+                put_string(&mut out, title);
+                out.extend_from_slice(&action.encode());
+                out.extend_from_slice(&height_observed.to_le_bytes());
+            }
+            Op::GovVote {
+                proposal_id,
+                choice,
+                height_observed,
+            } => {
+                out.extend_from_slice(&OP_GOV_VOTE.to_le_bytes());
+                out.extend_from_slice(&proposal_id.to_le_bytes());
+                out.extend_from_slice(&choice.encode());
+                out.extend_from_slice(&height_observed.to_le_bytes());
+            }
+            Op::EvmCarrier {
+                chain_id,
+                evm_tx,
+                evm_address,
+                pq_pubkey,
+                evm_signature,
+            } => {
+                out.extend_from_slice(&OP_EVM_CARRIER.to_le_bytes());
+                put_u64(&mut out, *chain_id);
+                put_vec(&mut out, evm_tx);
+                out.extend_from_slice(evm_address);
+                put_vec(&mut out, pq_pubkey);
+                put_vec(&mut out, evm_signature);
+            }
+            Op::BindEvmAddress {
+                chain_id,
+                evm_address,
+                pq_pubkey,
+                binding_signature,
+                evm_signature,
+            } => {
+                out.extend_from_slice(&OP_BIND_EVM_ADDRESS.to_le_bytes());
+                put_u64(&mut out, *chain_id);
+                out.extend_from_slice(evm_address);
+                put_vec(&mut out, pq_pubkey);
+                put_vec(&mut out, binding_signature);
+                put_vec(&mut out, evm_signature);
+            }
         }
         out
     }
@@ -206,6 +305,25 @@ impl Op {
         match self {
             Op::Stake { .. } => GAS_STAKE_BOND,
             Op::Unjail { .. } => GAS_STAKE_UNBOND,
+            Op::GovPropose { .. } => GAS_GOV_PROPOSE,
+            Op::GovVote { .. } => GAS_GOV_VOTE,
+            Op::EvmCarrier {
+                evm_tx,
+                pq_pubkey,
+                evm_signature,
+                ..
+            } => GAS_EVM_CARRIER_BASE
+                .saturating_add(pq_verify_gas(pq_pubkey.len(), 32, evm_signature.len()))
+                .saturating_add((evm_tx.len() as u64).saturating_mul(GAS_PQ_VERIFY_PER_BYTE)),
+            Op::BindEvmAddress {
+                pq_pubkey,
+                binding_signature,
+                ..
+            } => GAS_EVM_CARRIER_BASE.saturating_add(pq_verify_gas(
+                pq_pubkey.len(),
+                32,
+                binding_signature.len(),
+            )),
             Op::CallContractArgs {
                 method,
                 args,
@@ -219,6 +337,15 @@ impl Op {
                 ),
         }
     }
+}
+
+/// `pq_verify_gas(pubkey_len, message_len, signature_len)`
+/// (`stellereum/src/svm.rs`).
+pub fn pq_verify_gas(pubkey_len: usize, message_len: usize, signature_len: usize) -> u64 {
+    let wire_bytes = (pubkey_len as u64)
+        .saturating_add(message_len as u64)
+        .saturating_add(signature_len as u64);
+    GAS_PQ_VERIFY_BASE.saturating_add(wire_bytes.saturating_mul(GAS_PQ_VERIFY_PER_BYTE))
 }
 
 /// Encode a whole payload (`Vec<OpCode>`): `u64 LE count || op*`.

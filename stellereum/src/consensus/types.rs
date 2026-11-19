@@ -14,6 +14,12 @@ pub type Height = u64;
 pub type Round = u32;
 pub type BlockHash = [u8; 32];
 pub type ValidatorId = [u8; 32];
+/// A shard id, re-exported so consensus types do not depend on the sharding
+/// module's internal layout.
+pub type ShardId = crate::sharding::ShardId;
+/// The masterchain (shard 0). Votes and certificates built by legacy helpers
+/// (and by every single-shard fixture) are bound to this shard explicitly.
+pub const MASTERCHAIN_SHARD: ShardId = crate::sharding::MASTERCHAIN_SHARD;
 
 /// Epoch-bound 48-byte CN-VRF v3 randomness beacon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1091,9 +1097,30 @@ pub struct Vote {
     pub block_hash: Option<BlockHash>,
     pub voter: ValidatorId,
     pub signature: Vec<u8>,
+    /// The shard this vote was cast in.
+    ///
+    /// CRITICAL (false-slash primitive): the SAME validator key may run on
+    /// more than one shard at once, and each shard has its own block space —
+    /// so the same key legitimately signs DIFFERENT targets at the same
+    /// (height, round, kind): one per shard. The field is therefore part of
+    /// the SIGNED preimage (see [`vote_sign_bytes_for_shard`]); without it an
+    /// observer could take the honest shard-0 and shard-1 votes, relabel both
+    /// with one shard id, and present a cryptographically valid
+    /// `EquivocationEvidence` pair that slashes an honest validator.
+    ///
+    /// A vote from before the shard binding (wire V2) has no such field; the
+    /// payload shape changed with the V3 signing domain, so old votes simply
+    /// fail verification (fail closed) instead of being reinterpreted.
+    #[serde(default)]
+    pub shard_id: ShardId,
 }
 
-/// The exact bytes a validator signs for a vote.
+/// Domain tag of the CURRENT vote preimage. Bumped `V2 -> V3` because the
+/// shard binding was added: signatures produced under V2 do not verify and
+/// must not be accepted as V3 votes.
+pub const VOTE_SIGN_DOMAIN: &[u8] = b"STELLEREUM_BFT_VOTE_V3";
+
+/// The exact bytes a validator signs for a vote IN ONE SHARD.
 ///
 /// Public so a node whose key lives in an HSM / remote signer can produce the
 /// signature out of process and hand back the bytes. Exposing the preimage does not
@@ -1102,21 +1129,24 @@ pub struct Vote {
 /// stops the remote path from drifting from the local one.
 ///
 /// CHAIN BINDING: the preimage starts with the domain tag, then the CHAIN ID
-/// ([`consensus_chain_id`]), then the vote fields. A vote signed on one
-/// deployment therefore has a different preimage — and a different signature —
-/// than the same vote on another, so a testnet vote can never be replayed on
-/// mainnet (and vice versa) even with the very same validator key. The domain
-/// tag was bumped `V1 -> V2` because the preimage layout changed; `V1` bytes
-/// are not accepted any more.
-pub fn vote_sign_bytes(
+/// ([`consensus_chain_id`]), then the SHARD ID, then the vote fields. A vote
+/// signed on one deployment (or in one shard) therefore has a different
+/// preimage — and a different signature — than the same vote on another, so a
+/// testnet vote can never be replayed on mainnet and a shard-0 vote can never
+/// be replayed on shard 1 (and vice versa) even with the very same validator
+/// key. The domain tag was bumped `V2 -> V3` because the shard binding was
+/// added; `V1`/`V2` bytes are not accepted any more.
+pub fn vote_sign_bytes_for_shard(
+    shard_id: ShardId,
     height: Height,
     round: Round,
     kind: VoteKind,
     block_hash: &Option<BlockHash>,
 ) -> Vec<u8> {
-    let mut m = Vec::with_capacity(80);
-    m.extend_from_slice(b"STELLEREUM_BFT_VOTE_V2");
+    let mut m = Vec::with_capacity(88);
+    m.extend_from_slice(VOTE_SIGN_DOMAIN);
     m.extend_from_slice(&consensus_chain_id().to_be_bytes());
+    m.extend_from_slice(&shard_id.to_be_bytes());
     m.extend_from_slice(&height.to_be_bytes());
     m.extend_from_slice(&round.to_be_bytes());
     m.push(match kind {
@@ -1133,7 +1163,25 @@ pub fn vote_sign_bytes(
     m
 }
 
+/// Masterchain-shard shorthand for [`vote_sign_bytes_for_shard`].
+///
+/// Every fixture that constructs a shard-0 vote (the only shard most
+/// single-shard tests know about) keeps using this name. PRODUCTION CODE MUST
+/// NOT CALL THIS: a producer has to sign under its own shard id, or the vote
+/// would be replayable across shards. All node/runtime producers call
+/// [`vote_sign_bytes_for_shard`] with the runtime's shard.
+pub fn vote_sign_bytes(
+    height: Height,
+    round: Round,
+    kind: VoteKind,
+    block_hash: &Option<BlockHash>,
+) -> Vec<u8> {
+    vote_sign_bytes_for_shard(MASTERCHAIN_SHARD, height, round, kind, block_hash)
+}
+
 impl Vote {
+    /// Sign a MASTERCHAIN-shard vote. Production nodes must use
+    /// [`Self::sign_in_shard`] with their own shard id.
     pub fn sign(
         key: &SigningKey,
         height: Height,
@@ -1141,8 +1189,20 @@ impl Vote {
         kind: VoteKind,
         block_hash: Option<BlockHash>,
     ) -> Self {
+        Self::sign_in_shard(key, MASTERCHAIN_SHARD, height, round, kind, block_hash)
+    }
+
+    /// Sign a vote bound to `shard_id`.
+    pub fn sign_in_shard(
+        key: &SigningKey,
+        shard_id: ShardId,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        block_hash: Option<BlockHash>,
+    ) -> Self {
         let voter = key.verifying_key().to_bytes();
-        let msg = vote_sign_bytes(height, round, kind, &block_hash);
+        let msg = vote_sign_bytes_for_shard(shard_id, height, round, kind, &block_hash);
         let sig = key.sign(&msg);
         let signature = sig.to_vec();
         Self {
@@ -1152,16 +1212,47 @@ impl Vote {
             block_hash,
             voter,
             signature,
+            shard_id,
         }
     }
 
-    /// Build a vote from a signature produced elsewhere (HSM / remote signer).
+    /// Build a MASTERCHAIN-shard vote from a signature produced elsewhere
+    /// (HSM / remote signer).
     ///
-    /// The caller must have signed `vote_sign_bytes(height, round, kind, block_hash)`
-    /// with the key behind `voter`. `Vote::verify` checks it, so an incorrect signature
-    /// is rejected at the same place a locally produced one would be.
+    /// The caller must have signed
+    /// `vote_sign_bytes_for_shard(MASTERCHAIN_SHARD, height, round, kind, block_hash)`
+    /// with the key behind `voter`. `Vote::verify` checks it, so an incorrect
+    /// signature is rejected at the same place a locally produced one would be.
     pub fn signed_with(
         voter: ValidatorId,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        block_hash: Option<BlockHash>,
+        signature: Vec<u8>,
+    ) -> Self {
+        Self::signed_with_in_shard(
+            voter,
+            MASTERCHAIN_SHARD,
+            height,
+            round,
+            kind,
+            block_hash,
+            signature,
+        )
+    }
+
+    /// Build a vote for `shard_id` from a signature produced elsewhere (HSM /
+    /// remote signer / out-of-process signer).
+    ///
+    /// The caller must have signed
+    /// `vote_sign_bytes_for_shard(shard_id, height, round, kind, block_hash)`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: the seven fields ARE the wire identity of a vote; grouping them
+    // would obscure the shard binding this constructor exists to make explicit.
+    pub fn signed_with_in_shard(
+        voter: ValidatorId,
+        shard_id: ShardId,
         height: Height,
         round: Round,
         kind: VoteKind,
@@ -1175,6 +1266,7 @@ impl Vote {
             block_hash,
             voter,
             signature,
+            shard_id,
         }
     }
 
@@ -1215,7 +1307,13 @@ impl Vote {
     /// verifies; before it only the old one; a validator with no key at
     /// this height refuses fail-closed (`None`).
     fn verify_uncached(&self) -> bool {
-        let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        let msg = vote_sign_bytes_for_shard(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.kind,
+            &self.block_hash,
+        );
 
         // FULL-PQ: Falcon-only. Ed25519 branches deleted (no compat).
         if let Some(falcon_sig) = self.falcon_signature() {
@@ -1322,7 +1420,8 @@ impl Vote {
         }
     }
 
-    /// Sign a vote carrying both Ed25519 and Falcon-512 signatures.
+    /// Sign a MASTERCHAIN-shard vote carrying both Ed25519 and Falcon-512
+    /// signatures. Production nodes must use [`Self::sign_with_falcon_in_shard`].
     pub fn sign_with_falcon(
         key: &SigningKey,
         falcon_key: &FalconKeypair,
@@ -1331,8 +1430,32 @@ impl Vote {
         kind: VoteKind,
         block_hash: Option<BlockHash>,
     ) -> Self {
+        Self::sign_with_falcon_in_shard(
+            key,
+            falcon_key,
+            MASTERCHAIN_SHARD,
+            height,
+            round,
+            kind,
+            block_hash,
+        )
+    }
+
+    /// Sign a vote bound to `shard_id`, carrying both Ed25519 and Falcon-512
+    /// signatures.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: mirrors `sign_with_falcon` plus the shard the preimage must bind.
+    pub fn sign_with_falcon_in_shard(
+        key: &SigningKey,
+        falcon_key: &FalconKeypair,
+        shard_id: ShardId,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        block_hash: Option<BlockHash>,
+    ) -> Self {
         let voter = key.verifying_key().to_bytes();
-        let msg = vote_sign_bytes(height, round, kind, &block_hash);
+        let msg = vote_sign_bytes_for_shard(shard_id, height, round, kind, &block_hash);
         let ed_sig = key.sign(&msg).to_bytes();
         let falcon_sig = falcon_key.sign(&msg);
         let mut signature = Vec::with_capacity(VOTE_FALCON_PART_LEN);
@@ -1346,6 +1469,7 @@ impl Vote {
             block_hash,
             voter,
             signature,
+            shard_id,
         }
     }
 }
@@ -1438,6 +1562,8 @@ struct VerifiedVoteCacheKey {
     round: Round,
     kind: u8,
     block_hash: Option<BlockHash>,
+    /// Shard the signed preimage is bound to (the V3 domain includes it).
+    shard_id: ShardId,
     signature: Vec<u8>,
     /// PQ registry entry for `voter` AT `height` at verify time (trigger 2).
     pq_key: Option<(u8, Vec<u8>)>,
@@ -1523,6 +1649,7 @@ fn vote_cache_key(vote: &Vote) -> VerifiedVoteCacheKey {
             VoteKind::Precommit => 1,
         },
         block_hash: vote.block_hash,
+        shard_id: vote.shard_id,
         signature: vote.signature.clone(),
         pq_key: pq_key_at_height(&vote.voter, vote.height).map(|(scheme, pk)| (scheme as u8, pk)),
         pure_pq: crate::post_quantum::is_pure_pq_enforced(),
@@ -1608,9 +1735,28 @@ pub struct QuorumCertificate {
     pub kind: VoteKind,
     pub block_hash: Option<BlockHash>,
     pub signatures: Vec<(ValidatorId, Vec<u8>)>,
+    /// The shard whose vote preimage the signatures are bound to.
+    ///
+    /// Every signature in this certificate was produced over
+    /// [`vote_sign_bytes_for_shard`] with THIS shard id, so verification must
+    /// reconstruct the same preimage. Votes are signed per shard (Finding A:
+    /// one key may legitimately run on several shards at once), and a
+    /// certificate aggregates one shard's votes only.
+    ///
+    /// Wire/body payload layout changed here (the field is part of the
+    /// certificate encoding). Old certificates decode as the masterchain
+    /// shard, matching every pre-shard-binding fixture and the only shard a
+    /// legacy single-shard deployment had.
+    #[serde(default)]
+    pub shard_id: ShardId,
 }
 
 impl QuorumCertificate {
+    /// The certificate's shard id (wire-compatible default: masterchain).
+    pub fn shard(&self) -> ShardId {
+        self.shard_id
+    }
+
     /// Verify the QC carries a real quorum of valid, distinct validator signatures.
     /// FULL-PQ (nodes wiped, no compat): Falcon µQC / CEC envelopes only.
     /// Classical Ed25519 threshold legs deleted.
@@ -1749,7 +1895,13 @@ impl QuorumCertificate {
         if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
             return (false, 0);
         }
-        let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        let msg = vote_sign_bytes_for_shard(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.kind,
+            &self.block_hash,
+        );
         // Same ambiguity refusal as `verify` (PENTEST F-4). `signers_set`
         // returns an empty set for the same input, so power is 0.
         if self.resolve_micro_certificate().is_err() {
@@ -1851,7 +2003,13 @@ impl QuorumCertificate {
         if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
             return false;
         }
-        let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        let msg = vote_sign_bytes_for_shard(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.kind,
+            &self.block_hash,
+        );
 
         // 1. Post-Quantum path: µQC (PQ_UQC_MARKER_ID) or CEC Epoch (PQ_QC_MARKER_ID)
         if self.pq_path_verify_with_schedule(validators, &msg, pq_keys, schedule) {
@@ -2515,7 +2673,13 @@ impl QuorumCertificate {
             return HashSet::new();
         }
         let mut signers = HashSet::new();
-        let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        let msg = vote_sign_bytes_for_shard(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.kind,
+            &self.block_hash,
+        );
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 // Verify-grade: exactly what `verify_micro_cert_with_beacon` accepts
@@ -2595,6 +2759,7 @@ mod audit_tests {
             [0u8; 32],
         );
         let qc = QuorumCertificate {
+            shard_id: 0,
             height: 10,
             round: 1,
             kind: VoteKind::Precommit,
@@ -2649,6 +2814,7 @@ mod audit_tests {
             [0u8; 32],
         );
         let valid_qc = QuorumCertificate {
+            shard_id: 0,
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2661,6 +2827,7 @@ mod audit_tests {
         let mut trailing_cert = valid_cert.clone();
         trailing_cert.signers_bitmask = vec![0b0000_1111];
         let trailing_qc = QuorumCertificate {
+            shard_id: 0,
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2674,6 +2841,7 @@ mod audit_tests {
         let mut zero_cert = valid_cert.clone();
         zero_cert.committee_size = 0;
         let zero_qc = QuorumCertificate {
+            shard_id: 0,
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2687,6 +2855,7 @@ mod audit_tests {
         let mut mismatch_cert = valid_cert.clone();
         mismatch_cert.committee_size = 4;
         let mismatch_qc = QuorumCertificate {
+            shard_id: 0,
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2700,6 +2869,7 @@ mod audit_tests {
         let mut extra_sig_cert = valid_cert;
         extra_sig_cert.signatures.push(vec![0u8; 666]);
         let extra_sig_qc = QuorumCertificate {
+            shard_id: 0,
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2752,6 +2922,7 @@ mod audit_tests {
             [0u8; 32],
         );
         let one_qc = QuorumCertificate {
+            shard_id: 0,
             height: 7,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2771,6 +2942,7 @@ mod audit_tests {
             [0u8; 32],
         );
         let full_qc = QuorumCertificate {
+            shard_id: 0,
             height: 7,
             round: 0,
             kind: VoteKind::Precommit,
@@ -2835,6 +3007,7 @@ mod audit_tests {
             parent,
         );
         let qc = QuorumCertificate {
+            shard_id: 0,
             height: H,
             round: R,
             kind: VoteKind::Precommit,
@@ -2865,6 +3038,7 @@ mod audit_tests {
             parent,
         );
         let one_qc = QuorumCertificate {
+            shard_id: 0,
             height: H,
             round: R,
             kind: VoteKind::Precommit,
@@ -2879,6 +3053,7 @@ mod audit_tests {
         let mut bad_cert = cert.clone();
         bad_cert.signatures[0][0] ^= 0xFF;
         let bad_qc = QuorumCertificate {
+            shard_id: 0,
             height: H,
             round: R,
             kind: VoteKind::Precommit,

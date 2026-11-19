@@ -547,6 +547,15 @@ impl ValidatorRuntime {
         self.hc.set_parent_hash(bh);
         // CN-VRF v3: install the new height's committee schedule (review F2).
         self.install_committee_schedule();
+        // PARITY with `try_finalize` and `apply_and_advance`: this is the
+        // SEQUENCED/live finalize install (the node loop collects it with
+        // `try_poll_apply`), and the epoch hooks are part of "every finalized
+        // block advance" — refresh the mirrors, prepare next epoch's commit
+        // before H_freeze, and dispatch the VDF at H_freeze. Omitting it here
+        // meant the production path never dispatched an epoch VDF: at
+        // activation the boundary block would have no beacon and the
+        // fail-closed committee schedule would carry no proposer.
+        self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
     }
 
     /// Shared DECISION half of finalization: quorum, presence, order and cap

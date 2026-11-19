@@ -68,6 +68,7 @@ fn cert(
         return qc;
     }
     QuorumCertificate {
+        shard_id: 0,
         height,
         round: 0,
         kind: VoteKind::Precommit,

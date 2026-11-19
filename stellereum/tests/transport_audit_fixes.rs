@@ -42,6 +42,7 @@ fn sample_commit() -> ConsensusMsg {
         height: 9,
         block: sample_block(),
         certificate: QuorumCertificate {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Precommit,
@@ -90,6 +91,7 @@ fn committed_bypasses_skip_while_votes_and_proposals_do_not() {
     assert!(!committed_bypasses_skip(&proposal));
     let vote = ConsensusMsg::Vote {
         vote: Vote {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Prevote,

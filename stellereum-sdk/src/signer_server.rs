@@ -173,6 +173,65 @@ fn handle_connection(
                 Err(e) => respond_json(&mut stream, 400, &SignErrorResponse::from_error(&e)),
             }
         }
+        ("POST", "/sign-digest") => {
+            if let Some(expected) = token {
+                let ok = authorization
+                    .as_deref()
+                    .and_then(|a| a.strip_prefix("Bearer "))
+                    .is_some_and(|t| t == expected);
+                if !ok {
+                    return respond_json(
+                        &mut stream,
+                        401,
+                        &serde_json::json!({ "ok": false, "error": { "code": "unauthorized", "message": "missing or bad bearer token", "retryable": false } }),
+                    );
+                }
+            }
+            let value: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond_json(
+                        &mut stream,
+                        400,
+                        &serde_json::json!({ "ok": false, "error": { "code": "bad_request", "message": e.to_string(), "retryable": false } }),
+                    )
+                }
+            };
+            let Some(digest) = value.get("digest").and_then(|v| v.as_str()) else {
+                return respond_json(
+                    &mut stream,
+                    400,
+                    &serde_json::json!({ "ok": false, "error": { "code": "bad_request", "message": "missing 'digest'", "retryable": false } }),
+                );
+            };
+            let clean = digest.trim();
+            let clean = clean.strip_prefix("0x").unwrap_or(clean);
+            let bytes = match hex::decode(clean) {
+                Ok(b) if b.len() == 32 => b,
+                Ok(b) => {
+                    return respond_json(
+                        &mut stream,
+                        400,
+                        &serde_json::json!({ "ok": false, "error": { "code": "invalid_argument", "message": format!("digest must be 32 bytes, got {}", b.len()), "retryable": false } }),
+                    )
+                }
+                Err(e) => {
+                    return respond_json(
+                        &mut stream,
+                        400,
+                        &serde_json::json!({ "ok": false, "error": { "code": "invalid_argument", "message": format!("digest: bad hex: {e}"), "retryable": false } }),
+                    )
+                }
+            };
+            match key.sign(&bytes) {
+                Ok(signature) => respond_json(
+                    &mut stream,
+                    200,
+                    &serde_json::json!({ "ok": true, "signature": hex::encode(signature) }),
+                ),
+                Err(e) => respond_json(&mut stream, 400, &SignErrorResponse::from_error(&e)),
+            }
+        }
         _ => respond(&mut stream, 404, "text/plain", b"not found"),
     }
 }

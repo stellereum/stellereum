@@ -724,7 +724,7 @@ fn cnvrf_group8_rotation_interplay() {
     let old_pk = old.pubkey().to_vec();
     let new_pk = new.pubkey().to_vec();
     let third_pk = third.pubkey().to_vec();
-    // Rotation effective at the epoch boundary (delay 7200, pq_registry.rs:97).
+    // Rotation effective at the epoch boundary (delay 30_000 = one epoch).
     let effective: u64 = epoch_start_height(EPOCH + 1);
     let draw_old = effective - 1;
     let draw_new = effective + 1;
@@ -920,15 +920,23 @@ fn cnvrf_group9_kat_sizes() {
 
 #[test]
 fn cnvrf_epochs_o1_o9() {
-    assert_eq!(EPOCH_LEN, 7200);
+    assert_eq!(EPOCH_LEN, 30_000);
     assert_eq!(epoch_of_height(0), 0);
-    assert_eq!(epoch_of_height(7199), 0);
-    assert_eq!(epoch_of_height(7200), 1);
-    assert_eq!(epoch_of_height(14399), 1);
-    assert_eq!(epoch_of_height(14400), 2);
-    assert_eq!(epoch_start_height(1), 7200);
-    // epoch(N) covers [N*7200, (N+1)*7200).
-    for h in [0, 1, 7199, 7200, 7201, 14399, 14400] {
+    assert_eq!(epoch_of_height(EPOCH_LEN - 1), 0);
+    assert_eq!(epoch_of_height(EPOCH_LEN), 1);
+    assert_eq!(epoch_of_height(2 * EPOCH_LEN - 1), 1);
+    assert_eq!(epoch_of_height(2 * EPOCH_LEN), 2);
+    assert_eq!(epoch_start_height(1), EPOCH_LEN);
+    // epoch(N) covers [N*EPOCH_LEN, (N+1)*EPOCH_LEN).
+    for h in [
+        0,
+        1,
+        EPOCH_LEN - 1,
+        EPOCH_LEN,
+        EPOCH_LEN + 1,
+        2 * EPOCH_LEN - 1,
+        2 * EPOCH_LEN,
+    ] {
         let e = epoch_of_height(h);
         assert!(h >= epoch_start_height(e) && h < epoch_start_height(e + 1));
     }
@@ -1320,9 +1328,9 @@ const V3_SECRET: [u8; V3_LINK_LEN] = [0x5Au8; V3_LINK_LEN];
 fn cnvrf_v3_constants_dsts_and_blake3_xof_48() {
     assert_eq!(V3_LINK_LEN, 48);
     assert_eq!(V3_SEGMENTS, 16);
-    assert_eq!(V3_SEGMENT_LEN, 450);
+    assert_eq!(V3_SEGMENT_LEN, 1_875);
     assert_eq!(V3_SEGMENTS as u64 * V3_SEGMENT_LEN, EPOCH_LEN);
-    assert_eq!(V3_COMMIT_LOOKAHEAD_BLOCKS, 360);
+    assert_eq!(V3_COMMIT_LOOKAHEAD_BLOCKS, 682);
     assert_eq!(COMMIT_CARRIER_V3_LEN, 1474);
 
     let dsts = [
@@ -1368,7 +1376,7 @@ fn cnvrf_v3_chain_anchors_commit_verify_and_serde() {
     assert_eq!(chain.anchors(), &anchors_o1);
     assert_eq!(chain.root_anchor(), anchors_o1[0]);
 
-    // Slot 7199 reveals x_{7200} = s_{i,N}; slot 7200 is out of bounds.
+    // Slot EPOCH_LEN-1 reveals x_{EPOCH_LEN} = s_{i,N}; slot EPOCH_LEN is out of bounds.
     assert_eq!(chain.reveal_for_slot(EPOCH_LEN - 1), Some(V3_SECRET));
     assert_eq!(chain.reveal_for_slot(EPOCH_LEN), None);
     assert_eq!(
@@ -1458,41 +1466,45 @@ fn cnvrf_v3_slot_by_slot_skip_ahead_and_replay_rejection() {
     // Replay of slot 0 fails.
     assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 0, &rev0).is_err());
 
-    // Skip ahead within segment 0 to slot 449: verifies against head (x_1) in 449 steps!
-    let rev449 = chain.reveal_for_slot(449).unwrap();
+    // Skip ahead within segment 0 to slot S-1 (S = V3_SEGMENT_LEN): verifies
+    // against head (x_1) in S-1 steps!
+    let last0 = V3_SEGMENT_LEN - 1;
+    let rev_last0 = chain.reveal_for_slot(last0).unwrap();
     assert_eq!(
-        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 449, &rev449),
-        Ok(449)
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, last0, &rev_last0),
+        Ok(last0)
     );
-    rec.head = rev449;
-    rec.last_step = 450;
+    rec.head = rev_last0;
+    rec.last_step = V3_SEGMENT_LEN;
 
-    // Replay of any earlier slot (< 450) fails.
-    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 449, &rev449).is_err());
-    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 100, &rev449).is_err());
+    // Replay of any earlier slot (< S) fails.
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, last0, &rev_last0).is_err());
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 100, &rev_last0).is_err());
 
-    // Cross-segment skip: jump straight to slot 899 (last slot of segment 1):
-    // verifies against anchors[1] (x_450) in exactly 450 steps.
-    let rev899 = chain.reveal_for_slot(899).unwrap();
+    // Cross-segment skip: jump straight to slot 2S-1 (last slot of segment 1):
+    // verifies against anchors[1] (x_S) in exactly S steps.
+    let last1 = 2 * V3_SEGMENT_LEN - 1;
+    let rev_last1 = chain.reveal_for_slot(last1).unwrap();
     assert_eq!(
-        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 899, &rev899),
-        Ok(450)
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, last1, &rev_last1),
+        Ok(V3_SEGMENT_LEN)
     );
-    rec.head = rev899;
-    rec.last_step = 900;
+    rec.head = rev_last1;
+    rec.last_step = 2 * V3_SEGMENT_LEN;
 
-    // Multi-segment jump straight to the very last slot 7199 (segment 15):
-    // verifies against anchors[15] (x_6750) in <= 450 steps (exact 450).
-    let rev7199 = chain.reveal_for_slot(7199).unwrap();
+    // Multi-segment jump straight to the very last slot EPOCH_LEN-1
+    // (segment 15): verifies against anchors[15] (x_{15S}) in exactly S steps.
+    let last_slot = EPOCH_LEN - 1;
+    let rev_last = chain.reveal_for_slot(last_slot).unwrap();
     assert_eq!(
-        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 7199, &rev7199),
-        Ok(450)
+        cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, last_slot, &rev_last),
+        Ok(V3_SEGMENT_LEN)
     );
-    rec.head = rev7199;
-    rec.last_step = 7200;
+    rec.head = rev_last;
+    rec.last_step = EPOCH_LEN;
 
-    // Out-of-bounds slot 7200 rejected; wrong reveal rejected.
-    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, 7200, &rev7199).is_err());
+    // Out-of-bounds slot EPOCH_LEN rejected; wrong reveal rejected.
+    assert!(cnvrf_v3_verify_reveal(&rec, CHAIN_MAIN, &VID, EPOCH, EPOCH_LEN, &rev_last).is_err());
     let mut bad_rev = chain.reveal_for_slot(1000).unwrap();
     bad_rev[0] ^= 0xFF;
     let fresh_rec = CnVrfV3Record {
@@ -1509,8 +1521,8 @@ fn cnvrf_v3_slot_by_slot_skip_ahead_and_replay_rejection() {
 fn cnvrf_v3_commit_cutoff_lookahead_and_state_machine() {
     let sk = key(0xD3);
     let mut state = CnVrfV3State::new();
-    let target_epoch = EPOCH; // epoch 5 starts at height 36_000
-    let h_freeze = target_epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS; // 35_640
+    let target_epoch = EPOCH; // epoch 5 starts at 5 * EPOCH_LEN
+    let h_freeze = target_epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS;
     let carrier = cnvrf_v3_commit(&sk, CHAIN_MAIN, &VID, target_epoch, &V3_SECRET);
 
     // Wrong epoch (stale / current / too far ahead) refused.
@@ -1528,7 +1540,7 @@ fn cnvrf_v3_commit_cutoff_lookahead_and_state_machine() {
         Err(CnVrfError::CommitState(CommitError::TooFarAhead))
     );
 
-    // At exactly H_freeze and inside the final 360 blocks: refused!
+    // At exactly H_freeze and inside the final V3_COMMIT_LOOKAHEAD_BLOCKS: refused!
     assert_eq!(
         state.admit_commit(&carrier, h_freeze, CHAIN_MAIN, sk.pubkey()),
         Err(CnVrfError::CommitState(CommitError::PastCommitCutoff))
@@ -1597,10 +1609,13 @@ fn cnvrf_v3_key_rotation_migration_preserves_anchor_validator_id() {
 
     // Double rotation new_id -> third_id still preserves anchor_validator_id == old_id!
     state.migrate_validator(&new_id, &third_id, EPOCH);
-    let rev500 = chain.reveal_for_slot(500).unwrap();
-    let h500 = EPOCH * EPOCH_LEN + 500;
+    // Cross-segment: the first slot of segment 1 plus 50 verifies against
+    // anchors[1] in exactly 51 steps.
+    let cross_slot = V3_SEGMENT_LEN + 50;
+    let rev_cross = chain.reveal_for_slot(cross_slot).unwrap();
+    let h_cross = EPOCH * EPOCH_LEN + cross_slot;
     assert_eq!(
-        state.apply_slot_reveal(CHAIN_MAIN, &third_id, h500, Some(&rev500)),
+        state.apply_slot_reveal(CHAIN_MAIN, &third_id, h_cross, Some(&rev_cross)),
         SlotRevealOutcome::Revealed { steps: 51 }
     );
     assert_eq!(

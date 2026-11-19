@@ -235,6 +235,7 @@ fn attach_quorum(
     let mut signatures = sigs;
     signatures.push((PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc)));
     b.precommit_qc = Some(QuorumCertificate {
+        shard_id: 0,
         height,
         round: 0,
         kind: VoteKind::Precommit,

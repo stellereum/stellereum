@@ -427,7 +427,10 @@ async fn sealed_manifest_replacement_requires_the_same_owner_key() {
             Some(&hex::encode(attacker.kem_seed)),
         )
         .await;
-    assert_eq!(stolen.chunks, 0, "another owner must not replace the manifest");
+    assert_eq!(
+        stolen.chunks, 0,
+        "another owner must not replace the manifest"
+    );
     assert_eq!(
         node.get_local_kv(&mkey).await.expect("manifest"),
         before,

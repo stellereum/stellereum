@@ -262,6 +262,7 @@ fn hunt22_negative_vote_scope_is_enforced() {
     // cannot choose the set the certificate is judged against.
     let _ = (&mut hc, &ks);
     let cert = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

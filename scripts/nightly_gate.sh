@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# ===========================================================================
+# HISTORICAL (2026-11-19): this five-stage cron gate is superseded by
+# `.github/workflows/nightly.yml` and documented in `docs/CI.md`. It is kept
+# for manual/ops reference only, is NOT wired into the GitHub workflows, and
+# its behaviour is unchanged. Prefer the workflow (or `scripts/test_parallel.sh`
+# locally); see "Historical scripts" in docs/CI.md.
+# ===========================================================================
 # nightly_gate.sh — wave-4 nightly QA gate (clippy + lib + fuzz + matrix + repro).
 #
 # Manual cron (root has no .github/workflows — checked — so the schedule lives here):

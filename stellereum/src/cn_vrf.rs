@@ -15,8 +15,8 @@
 //! are caller-supplied arguments — never resolved here.
 //!
 //! Lead decisions on the spec open questions (baked in as consts, documented):
-//! - O1: [`EPOCH_LEN`] = 7200 heights (== `PQ_ROTATION_DELAY_HEIGHTS`); one
-//!   rotation window = one epoch. `epoch(N)` = heights `[N*7200, (N+1)*7200)`.
+//! - O1: [`EPOCH_LEN`] = 30000 heights (== `PQ_ROTATION_DELAY_HEIGHTS`); one
+//!   rotation window = one epoch. `epoch(N)` = heights `[N*30000, (N+1)*30000)`.
 //! - O2: per-draw tickets (each validator's verified beta is their ticket);
 //!   missing beta → [`cnvrf_verify`] returns `None`, caller falls back to the
 //!   legacy draw (mirrors `vrf_verify`'s `Option` shape).
@@ -59,10 +59,14 @@ use crate::post_quantum::{
 
 /// Epoch length in heights (O1): one PQ rotation window = one epoch.
 ///
-/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h at 3 s blocks
+/// RULESET v2: 30,000 heights x 240 ms = **7,200 s (2 h)**. The v1 value of
+/// 7,200 heights was calibrated at 3 s blocks but had shrunk to ~28.8 min at
+/// the live ~240 ms tempo. Full table: `docs/RULESET_V2.md`.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env
 /// (spec docs/specs/02_CRYPTO_AND_PQ_PHASE2.md §6, == PQ_ROTATION_DELAY_HEIGHTS).
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const EPOCH_LEN: u64 = 7200;
+pub const EPOCH_LEN: u64 = 30_000;
 
 /// Domain separation: commitment preimage (spec §1.2).
 pub const CNVRF_COMMIT_DST: &[u8] = b"STELL_CNVRF_COMMIT_V1";
@@ -594,7 +598,7 @@ pub fn cnvrf_verify_with_resolver(
 // Epoch helpers (O1, O9)
 // ---------------------------------------------------------------------------
 
-/// `epoch(h) = h / EPOCH_LEN`; `epoch(N)` covers `[N*7200, (N+1)*7200)` (O1).
+/// `epoch(h) = h / EPOCH_LEN`; `epoch(N)` covers `[N*EPOCH_LEN, (N+1)*EPOCH_LEN)` (O1).
 pub const fn epoch_of_height(height: u64) -> u64 {
     height / EPOCH_LEN
 }
@@ -1013,10 +1017,19 @@ pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
 pub const V3_LINK_LEN: usize = 48;
 /// Number of segments partitioning an epoch's reverse hash-chain.
 pub const V3_SEGMENTS: usize = 16;
-/// Number of slots per segment (`16 * 450 == 7200 == EPOCH_LEN`).
-pub const V3_SEGMENT_LEN: u64 = 450;
-/// Lookahead cutoff before epoch `N+1` starts (`H_freeze = (N+1)*EPOCH_LEN - 360`).
-pub const V3_COMMIT_LOOKAHEAD_BLOCKS: u64 = 360;
+/// Number of slots per segment (`16 * 1875 == 30000 == EPOCH_LEN`).
+pub const V3_SEGMENT_LEN: u64 = 1_875;
+/// Lookahead cutoff before epoch `N+1` starts
+/// (`H_freeze = (N+1)*EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`).
+///
+/// RULESET v2: 682 heights x 240 ms = **163.68 s**. Derived from the measured
+/// MinRoot evaluation (3,000,000 steps = 20.455 s on one core of the
+/// measurement host), with a 4x allowance for the weakest 1-vCPU validator
+/// class and a further 2x scheduling headroom:
+/// `ceil(20.455 s * 4 * 2 / 0.24 s) = 682`. The epoch VDF therefore has at
+/// least 2x headroom even on a 4x-slower host. Measurement and trade-off:
+/// `docs/RULESET_V2.md` §VDF.
+pub const V3_COMMIT_LOOKAHEAD_BLOCKS: u64 = 682;
 
 const _: () = assert!(V3_SEGMENTS as u64 * V3_SEGMENT_LEN == EPOCH_LEN);
 
@@ -1213,7 +1226,7 @@ fn v3_chain_step(
     )
 }
 
-/// Compute the 16 segment anchors `anchors[seg] = x_{seg * 450}` in O(1) memory.
+/// Compute the 16 segment anchors `anchors[seg] = x_{seg * V3_SEGMENT_LEN}` in O(1) memory.
 pub fn compute_v3_anchors(
     chain_id: u64,
     validator_id: &[u8; 32],
@@ -1235,7 +1248,7 @@ pub fn compute_v3_anchors(
 
 /// Validator-side precomputed 16-segment reverse hash-chain for a single `(chain_id, validator_id, epoch_n)`.
 ///
-/// Links `x_0 ..= x_{7200}` are zeroized on drop. Slot `t` (`0..7200`) reveals `x_{t+1}`.
+/// Links `x_0 ..= x_{EPOCH_LEN}` are zeroized on drop. Slot `t` (`0..EPOCH_LEN`) reveals `x_{t+1}`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct CnVrfV3Chain {
     chain_id: u64,
@@ -1257,7 +1270,7 @@ impl core::fmt::Debug for CnVrfV3Chain {
 }
 
 impl CnVrfV3Chain {
-    /// Generate the complete 7,201-link reverse hash-chain from `s_secret = x_{7200}`.
+    /// Generate the complete `EPOCH_LEN + 1`-link reverse hash-chain from `s_secret = x_{EPOCH_LEN}`.
     pub fn generate(
         chain_id: u64,
         validator_id: &[u8; 32],
@@ -1285,7 +1298,7 @@ impl CnVrfV3Chain {
         }
     }
 
-    /// Return the 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    /// Return the 16 segment anchors `[x_0, x_{S}, ..., x_{15*S}]` (`S = V3_SEGMENT_LEN`).
     pub const fn anchors(&self) -> &[[u8; V3_LINK_LEN]; V3_SEGMENTS] {
         &self.anchors
     }
@@ -1376,7 +1389,7 @@ pub struct CommitCarrierV3 {
     pub validator_id: [u8; 32],
     /// Future epoch `N` being committed to.
     pub epoch_n: u64,
-    /// 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    /// 16 segment anchors `[x_0, x_{S}, ..., x_{15*S}]` (`S = V3_SEGMENT_LEN`).
     #[serde(with = "serde_anchors_16_48")]
     pub anchors: [[u8; V3_LINK_LEN]; V3_SEGMENTS],
     /// Falcon-512 signature over [`commit_v3_sig_message_bytes`].
@@ -1445,7 +1458,7 @@ pub fn cnvrf_v3_verify_commit(
 /// On-chain commitment record for a validator in an epoch (CN-VRF v3).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CnVrfV3Record {
-    /// 16 segment anchors `[x_0, x_450, ..., x_6750]`.
+    /// 16 segment anchors `[x_0, x_{S}, ..., x_{15*S}]` (`S = V3_SEGMENT_LEN`).
     #[serde(with = "serde_anchors_16_48")]
     pub anchors: [[u8; V3_LINK_LEN]; V3_SEGMENTS],
     /// Most recently revealed link `x_{last_step}` (initialized to `anchors[0] = x_0`).
@@ -1460,9 +1473,9 @@ pub struct CnVrfV3Record {
     pub anchor_validator_id: [u8; 32],
 }
 
-/// Verify a reveal `x_{slot_t + 1}` against `state` in at most `V3_SEGMENT_LEN` (`450`) BLAKE3 steps.
+/// Verify a reveal `x_{slot_t + 1}` against `state` in at most `V3_SEGMENT_LEN` BLAKE3 steps.
 ///
-/// Returns the number of hash steps checked (`1..=450`), or a static error reason on failure.
+/// Returns the number of hash steps checked (`1..=V3_SEGMENT_LEN`), or a static error reason on failure.
 pub fn cnvrf_v3_verify_reveal(
     state: &CnVrfV3Record,
     chain_id: u64,
@@ -1499,7 +1512,7 @@ pub fn cnvrf_v3_verify_reveal(
 /// Outcome of [`CnVrfV3State::apply_slot_reveal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotRevealOutcome {
-    /// Committed proposer supplied a valid reveal; verified in `steps <= 450` BLAKE3 calls.
+    /// Committed proposer supplied a valid reveal; verified in `steps <= V3_SEGMENT_LEN` BLAKE3 calls.
     Revealed {
         /// Number of reverse hash-chain steps verified.
         steps: u64,

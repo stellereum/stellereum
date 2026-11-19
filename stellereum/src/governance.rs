@@ -57,69 +57,60 @@ pub const PROPOSAL_MIN_STAKE_NANO: u64 = 10_000 * 1_000_000_000;
 ///
 /// FREEZE (protocol freeze 2026-11-03 style): 7,200 heights, never env.
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const GOV_TIMELOCK_HEIGHTS: u64 = 7_200;
+///
+/// HEIGHT-TEMPO NOTE (LOGIC_BUG_SWEEP §7.1): at the live ~240 ms tempo this
+/// is ~28.8 minutes, not the ~6 h the design assumed at 3 s blocks. The
+/// timelock still enforces a real delay, so it is not unsafe in the same way
+/// as the downtime threshold, but a longer reaction window is desirable. A
+/// retune is a consensus change and must ship behind an activation height, so
+/// it is deliberately deferred here (see `docs/LOGIC_BUG_SWEEP.md` §7.1).
+/// Six hours at the 240 ms target tempo (`90_000 x 240 ms`). Ruleset v2
+/// re-scaled this from the 7_200-height value that meant six hours at the old
+/// ~3 s block time; the wall-clock intent, not the height count, is the
+/// invariant.
+pub const GOV_TIMELOCK_HEIGHTS: u64 = 90_000;
 
-/// Activation height for the DETERMINISTIC upgrade-execution sweep
-/// ([`Governance::execute_due_upgrades_at_height`], driven from
-/// `InMemoryStateEngine::apply_block_transition`).
+/// COMPILED DEFAULT for the DETERMINISTIC upgrade-execution gate.
+///
+/// The EFFECTIVE value lives in the genesis chain spec
+/// ([`crate::chain_spec::GenesisChainSpec::upgrade_exec_activation_height`]);
+/// this constant is only the fallback for a chain whose genesis spec does not
+/// set one. Leaving it at `u64::MAX` keeps every existing chain and test
+/// byte-identical: the sweep is inert at every reachable height.
 ///
 /// Why a separate gate: the sweep is consensus-affecting (it flips a matured,
 /// voted `SoftwareUpgrade` to `Executed` and installs `AppliedParams::upgrade_plan`,
 /// which is committed in the state root). Every node applying the same block
-/// must reach the same verdict, so the gate is a plain compile-time constant —
-/// never an env knob (an env knob is a per-node fork window; see
-/// `docs/UPGRADE_AND_RECOVERY.md` §1.1).
-///
-/// INACTIVE by default (`u64::MAX`, no reachable height): the lead flips it to
-/// the ratified height with a spec update + audit (AGENTS.md §7). While
-/// inactive the sweep returns before ANY read or write, so the standard apply
-/// path is byte-identical (pinned by `tests/upgrade_plan_tests.rs`).
-/// Tests open the gate per-thread via [`set_upgrade_exec_activation_override`]
-/// (the `QC_SPLIT_ACTIVATION_HEIGHT` pattern; never reachable in a release
-/// build because the override module does not exist there).
+/// must reach the same verdict, so the value is fixed at genesis — never an
+/// env knob (an env knob is a per-node fork window; see
+/// `docs/UPGRADE_AND_RECOVERY.md` §1.1/§1.2).
 pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
-// TEST-ONLY override of the upgrade-execution activation height, scoped to the
-// CALLING THREAD (the exact `QC_SPLIT_ACTIVATION_HEIGHT` pattern in
-// `consensus/sortition.rs`). The frozen constant stays `u64::MAX`, so a
-// process that never installs an override behaves byte-identically to before.
-// Thread-scoped because the test binary runs tests in parallel and one test's
-// activation window must not change an unrelated test's verdict. Release
-// builds have no override at all (`debug_assertions` is off).
-#[cfg(any(test, debug_assertions))]
-thread_local! {
-    static UPGRADE_EXEC_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Set (or clear with `None`) the TEST-ONLY upgrade-execution activation
-/// height for the CALLING THREAD.
-///
-/// `Some(h)` makes [`upgrade_exec_active_at`] true exactly for heights
-/// `>= h`; `None` restores the frozen [`UPGRADE_EXEC_ACTIVATION_HEIGHT`]
-/// (`u64::MAX`, inert). Available in test/debug builds only.
+/// TEST-ONLY override of the genesis chain spec's upgrade-execution gate for
+/// the CALLING THREAD. Delegates to
+/// [`crate::chain_spec::set_upgrade_exec_activation_override`] so tests keep
+/// the existing narrow entry point while the chain spec remains the single
+/// source of truth. Release builds have no override.
 #[cfg(any(test, debug_assertions))]
 pub fn set_upgrade_exec_activation_override(activation: Option<u64>) {
-    UPGRADE_EXEC_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+    crate::chain_spec::set_upgrade_exec_activation_override(activation);
 }
 
-/// The upgrade-execution activation height in force for the calling thread:
-/// the frozen [`UPGRADE_EXEC_ACTIVATION_HEIGHT`] unless a test/debug caller
-/// installed [`set_upgrade_exec_activation_override`].
+/// The upgrade-execution activation height in force: the genesis chain spec's
+/// value (compiled default `u64::MAX` for chains that do not set it). This is
+/// a thin, read-only delegate; the chain spec owns the value.
 pub fn upgrade_exec_activation_height() -> u64 {
-    #[cfg(any(test, debug_assertions))]
-    if let Some(activation) = UPGRADE_EXEC_ACTIVATION_OVERRIDE.with(|c| c.get()) {
-        return activation;
-    }
-    UPGRADE_EXEC_ACTIVATION_HEIGHT
+    crate::chain_spec::upgrade_exec_activation_height()
 }
 
-/// True once the deterministic upgrade-execution sweep is active at `height`.
+/// True once the deterministic upgrade-execution gate is open at `height`.
 ///
 /// `>=` is the activation semantic every other gate uses (the first block at
-/// the ratified height runs the sweep; pre-activation blocks are untouched).
+/// the genesis-spec height runs the sweep; pre-activation blocks are
+/// untouched). Every execution path (deterministic sweep, direct RPC,
+/// legacy `execute`, oracle variant) funnels through this predicate.
 pub fn upgrade_exec_active_at(height: u64) -> bool {
-    height >= upgrade_exec_activation_height()
+    crate::chain_spec::upgrade_exec_active_at(height)
 }
 
 /// Activation height for BLOCK-CARRIED governance: the propose/vote opcode
@@ -140,10 +131,12 @@ pub fn upgrade_exec_active_at(height: u64) -> bool {
 ///    env knob (an env knob is a per-node fork window).
 ///
 /// The gate covers proposals, votes, deterministic finalization and the
-/// execution of every `GovAction`. `SoftwareUpgrade`/`CancelUpgrade` execute
-/// only when their own coordinated [`UPGRADE_EXEC_ACTIVATION_HEIGHT`] gate is
-/// also open: a binary rollout is a heavier, separately ratified decision and
-/// must never ride in on a parameter-change activation.
+/// execution of every `GovAction`. `SoftwareUpgrade` installs a plan only when
+/// the separate [`upgrade_exec_active_at`] chain-spec gate is also open: a
+/// binary rollout is a heavier, separately ratified decision and must never
+/// ride in on a parameter-change activation. `CancelUpgrade` is deliberately
+/// ungated — it can only clear a plan, so it must remain available as a safety
+/// valve before and after that gate opens.
 ///
 /// Tests can force a closed gate per thread through
 /// [`set_gov_ops_activation_override`] (debug builds only, the
@@ -1263,22 +1256,36 @@ impl Governance {
         // Audit G1: weight comes from the PROPOSE-time snapshot when present
         // (late-bonded stake votes at zero — it is simply absent from the
         // map). `None` = pre-upgrade proposal: live weights, old behavior.
+        //
+        // S9 (vote weight backed by LIVE stake): the snapshot is only an
+        // UPPER BOUND. A voter can `unbond`/`undelegate` its position between
+        // propose and vote; no lock exists yet, so the exit succeeds. Without
+        // the min() below the vote still counted the departed stake at full
+        // weight and `lock_governance` recorded a lock with nothing behind
+        // it (the E7 guarantee was false). Cap the recorded weight at what
+        // the voter actually holds NOW: `self_bond + delegated-out`, exactly
+        // the live formula used when the snapshot is absent. Stake bonded
+        // after propose still cannot vote (the snapshot cap stays), and the
+        // lock is taken for the same capped amount, so unbond/undelegate can
+        // no longer remove a counted vote.
+        let live_self_bond: u128 = ledger
+            .validators
+            .get(&voter)
+            .map(|v| v.self_bond as u128)
+            .unwrap_or(0);
+        let live_delegated_out: u128 = ledger
+            .delegations
+            .iter()
+            .filter(|((_, d), _)| *d == voter)
+            .map(|(_, amount)| *amount as u128)
+            .sum();
+        let live_weight = live_self_bond.saturating_add(live_delegated_out);
         let weight = match &p.electorate_weights {
-            Some(snap) => snap.get(&voter).copied().ok_or(GovError::NotStaker)?,
-            None => {
-                let self_bond = ledger
-                    .validators
-                    .get(&voter)
-                    .map(|v| v.self_bond as u128)
-                    .unwrap_or(0);
-                let delegated_out: u128 = ledger
-                    .delegations
-                    .iter()
-                    .filter(|((_, d), _)| *d == voter)
-                    .map(|(_, amount)| *amount as u128)
-                    .sum();
-                self_bond + delegated_out
+            Some(snap) => {
+                let snap_weight = snap.get(&voter).copied().ok_or(GovError::NotStaker)?;
+                snap_weight.min(live_weight)
             }
+            None => live_weight,
         };
         if weight == 0 {
             return Err(GovError::NotStaker);
@@ -2081,8 +2088,10 @@ impl Governance {
     /// Ascending ids of every `Passed`, mature governance action that the
     /// deterministic block-path executor may run at `cur_height`.
     ///
-    /// `SoftwareUpgrade`/`CancelUpgrade` are included only while the separate
-    /// [`upgrade_exec_active_at`] gate is open; every other action is governed
+    /// `SoftwareUpgrade` is included only while the separate
+    /// [`upgrade_exec_active_at`] gate is open. `CancelUpgrade` is always
+    /// included: it is a safety valve that can only clear a plan, and must
+    /// work before AND after the gate opens. Every other action is governed
     /// solely by [`GOV_OPS_ACTIVATION_HEIGHT`]. Ordering is ascending id, so
     /// two nodes applying the same block execute the same actions in the same
     /// order (last-write-wins parameter actions therefore converge).
@@ -2094,11 +2103,7 @@ impl Governance {
             .filter(|p| {
                 p.status == ProposalStatus::Passed
                     && self.is_mature(p.id, cur_height)
-                    && (upgrades
-                        || !matches!(
-                            p.action,
-                            GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
-                        ))
+                    && (upgrades || !matches!(p.action, GovAction::SoftwareUpgrade { .. }))
             })
             .map(|p| p.id)
             .collect();
@@ -2119,11 +2124,7 @@ impl Governance {
             (p.status == ProposalStatus::Open && now >= p.voting_end)
                 || (p.status == ProposalStatus::Passed
                     && self.is_mature(p.id, cur_height)
-                    && (upgrades
-                        || !matches!(
-                            p.action,
-                            GovAction::SoftwareUpgrade { .. } | GovAction::CancelUpgrade
-                        )))
+                    && (upgrades || !matches!(p.action, GovAction::SoftwareUpgrade { .. })))
         })
     }
 
@@ -2411,9 +2412,7 @@ impl Governance {
                 // is closed, but a direct caller bypassed that filter and
                 // installed a plan (and the halt predicate reads the committed
                 // plan). A gated-off executor refuses fail-closed and leaves
-                // the proposal `Passed`. `cur_height = None` (legacy,
-                // height-less `execute`) cannot prove the gate is open and is
-                // refused too.
+                // the proposal `Passed`.
                 if !upgrade_exec_active_at(cur_height.unwrap_or(0)) {
                     tracing::error!(
                         "upgrade execution REFUSED: `upgrade_exec_active_at` is false at \
@@ -2422,6 +2421,29 @@ impl Governance {
                         upgrade_exec_activation_height(),
                     );
                     return Err(GovError::Timelocked);
+                }
+                // NO RETROACTIVE PLAN: installing a plan whose halt height is
+                // already at/below the block being applied would be a local
+                // "we should have halted yesterday" decision that a node
+                // catching up could make differently from one that was live.
+                // The height-aware path proves the current height; the legacy
+                // height-less `execute` cannot, so it refuses a plan
+                // fail-closed instead of guessing (CancelUpgrade stays
+                // available). The sweep has the same rule before it calls
+                // this executor.
+                let Some(cur_height) = cur_height else {
+                    tracing::error!(
+                        "upgrade plan {name:?} REFUSED: legacy execute supplied no block height, \
+                         so a retroactive halt height cannot be ruled out"
+                    );
+                    return Err(GovError::InvalidAction);
+                };
+                if height <= cur_height {
+                    tracing::error!(
+                        "upgrade plan {name:?} REFUSED: halt height {height} is not in the future \
+                         at execution height {cur_height} (retroactive plans are not installable)"
+                    );
+                    return Err(GovError::InvalidAction);
                 }
                 self.applied.upgrade_plan = Some(UpgradePlan {
                     name,
@@ -2430,16 +2452,12 @@ impl Governance {
                 });
             }
             GovAction::CancelUpgrade => {
-                // Same upgrade gate as `SoftwareUpgrade` (PENTEST2 S7).
-                if !upgrade_exec_active_at(cur_height.unwrap_or(0)) {
-                    tracing::error!(
-                        "upgrade execution REFUSED: `upgrade_exec_active_at` is false at \
-                         height {:?} (activation {})",
-                        cur_height,
-                        upgrade_exec_activation_height(),
-                    );
-                    return Err(GovError::Timelocked);
-                }
+                // Cancellation is a SAFETY VALVE, not plan installation: it
+                // can only remove a plan, never create or retarget one. It is
+                // deliberately NOT behind the activation gate, so a passed
+                // cancel works before AND after the gate opens (and can clear
+                // a plan restored from a snapshot even while installs are
+                // still inert). It remains a single-shot, committed action.
                 self.applied.upgrade_plan = None;
             }
         }
@@ -3668,6 +3686,78 @@ mod tests {
         l.undelegate(del(1), vid(1), stell(9_000), 3).unwrap();
     }
 
+    /// S9 (vote weight removed before it is counted): a delegator that
+    /// undelegates its ENTIRE propose-time position BEFORE voting must not
+    /// vote at the snapshot weight — no lock exists yet, so the exit is
+    /// legal — and must not record a governance lock with no stake behind it.
+    ///
+    /// On the vulnerable code this fails: `vote` returns `Ok(9_000)` and the
+    /// tally counts 9k that already left the ledger.
+    #[test]
+    fn vote_cannot_count_stake_that_exited_before_the_vote() {
+        let mut l = StakingLedger::new();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.delegate(del(1), vid(1), stell(9_000)).unwrap();
+        let mut g = Governance::new();
+        // vid(2) proposes, so the delegator is not the proposer and holds no
+        // propose-time lock of its own.
+        let id = g
+            .propose(&mut l, vid(2), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        // The delegator exits BEFORE casting a vote: no lock exists yet.
+        l.undelegate(del(1), vid(1), stell(9_000), 1).unwrap();
+        assert_eq!(l.locked_governance_of(&del(1)), 0);
+
+        assert_eq!(
+            g.vote(&mut l, del(1), id, VoteChoice::Yes, 2),
+            Err(GovError::NotStaker),
+            "a vote must be backed by stake the voter still holds"
+        );
+        let p = g.get(id).unwrap();
+        assert_eq!(p.turnout(), 0, "no unbacked weight may enter the tally");
+        assert_eq!(
+            l.locked_governance_of(&del(1)),
+            0,
+            "no lock may be recorded against departed stake"
+        );
+    }
+
+    /// S9 partial exit: the recorded vote is capped at the LIVE position, so
+    /// a partial undelegate lowers the weight and only the remaining stake is
+    /// locked (still enough to keep the counted part from exiting).
+    #[test]
+    fn vote_weight_is_capped_at_the_live_position_after_a_partial_exit() {
+        use crate::staking::StakingError;
+
+        let mut l = StakingLedger::new();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.delegate(del(1), vid(1), stell(9_000)).unwrap();
+        let mut g = Governance::new();
+        let id = g
+            .propose(&mut l, vid(2), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        l.undelegate(del(1), vid(1), stell(4_000), 1).unwrap();
+
+        let weight = g.vote(&mut l, del(1), id, VoteChoice::Yes, 2).unwrap();
+        assert_eq!(
+            weight,
+            stell(5_000) as u128,
+            "only the 5k still delegated out may back the vote"
+        );
+        assert_eq!(l.locked_governance_of(&del(1)), stell(5_000));
+        // The remaining 5k cannot exit either: it is the vote's backing.
+        assert_eq!(
+            l.undelegate(del(1), vid(1), stell(5_000), 3),
+            Err(StakingError::LockedInGovernanceVote)
+        );
+    }
+
     #[test]
     fn validate_bounds_min_validator_bond_and_block_reward() {
         // Below MIN_VALIDATOR_BOND: invalid
@@ -4120,13 +4210,17 @@ mod tests {
     }
 
     #[test]
-    fn timelock_const_is_7200_heights_no_env() {
-        // Pinned: same exit-window philosophy as the commission delay.
-        assert_eq!(GOV_TIMELOCK_HEIGHTS, 7_200);
+    fn timelock_const_is_six_hours_at_the_target_tempo_no_env() {
+        // Ruleset v2: the invariant is WALL-CLOCK (six hours), not a height
+        // count. 90_000 x 240 ms = 6 h. The commission window is separately
+        // re-scaled to two hours (30_000 x 240 ms), so the two no longer share
+        // a number -- they share a derivation.
+        assert_eq!(GOV_TIMELOCK_HEIGHTS, 90_000);
+        assert_eq!(GOV_TIMELOCK_HEIGHTS * 240, 21_600_000, "6 h in ms");
         assert_eq!(
-            crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS,
-            7_200,
-            "timelock mirrors the commission exit window"
+            crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS * 240,
+            7_200_000,
+            "the commission window is 2 h in ms"
         );
     }
 
@@ -4322,9 +4416,14 @@ mod tests {
             l.locked_governance.is_empty(),
             "finalize must release every gov lock exactly once"
         );
-        // Exact maturity: pass_height + 7200, boundary-checked both sides.
+        // Exact maturity: pass_height + the ruleset-v3 timelock (90_000
+        // heights = 6 h at 240 ms), boundary-checked both sides.
         let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
-        assert_eq!(maturity, 14_200);
+        assert_eq!(
+            maturity,
+            pass_height + 90_000,
+            "ruleset v3 timelock is 90_000 heights"
+        );
         assert_eq!(g.executable_height_of(id), Some(maturity));
         assert_eq!(
             g.execute_at_height(ids[0], id, maturity - 1),

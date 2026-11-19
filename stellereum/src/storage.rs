@@ -954,6 +954,34 @@ impl Storage {
         }
     }
 
+    /// Persist the write-ahead vote watermark (one sled ACID insert).
+    ///
+    /// Callers MUST call this BEFORE broadcasting the vote. It is a separate
+    /// meta key from the consensus checkpoint on purpose: finalization rewrites
+    /// the checkpoint, and the watermark must survive that.
+    pub fn set_vote_watermark(&self, wm: &VoteWatermark) -> Result<()> {
+        let bytes = bincode::serialize(wm)?;
+        self.set_meta("vote_watermark", &bytes)
+    }
+
+    /// Write-ahead vote watermark: insert + durability barrier.
+    ///
+    /// The barrier is what makes the record survive a power loss, not just a
+    /// process crash, so the node can never re-vote a round it already used.
+    /// A vote is cast at most once per round and kind, so the fsync cost is
+    /// bounded by the round cadence (seconds), not by transaction throughput.
+    pub fn persist_vote_watermark(&self, wm: &VoteWatermark) -> Result<()> {
+        self.set_vote_watermark(wm)?;
+        self.flush()
+    }
+
+    pub fn vote_watermark(&self) -> Result<Option<VoteWatermark>> {
+        match self.get_meta("vote_watermark")? {
+            Some(b) => Ok(Some(bincode::deserialize(&b)?)),
+            None => Ok(None),
+        }
+    }
+
     // ---------- State snapshots ----------
 
     pub fn put_state(&self, height: u64, snapshot: &[u8]) -> Result<()> {
@@ -974,6 +1002,29 @@ impl Storage {
                 Ok(Some((u64::from_be_bytes(h), v.to_vec())))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Height of the most recent state snapshot, WITHOUT copying the blob.
+    ///
+    /// Boot-time predicates (the upgrade-halt guard) only need "how far has
+    /// applied state advanced". [`Self::latest_state`] clones the whole
+    /// snapshot value (`v.to_vec()`), which can be tens of megabytes, just to
+    /// read the 8-byte key. This reads the same key ordering but drops the
+    /// value IVec immediately, so the whole blob is never materialised.
+    pub fn latest_state_height(&self) -> Result<Option<u64>> {
+        // `keys()` (unlike `last()`) never hands the stored value to this
+        // caller at all, so boot cost is one key read regardless of snapshot
+        // size.
+        match self.state.iter().keys().next_back() {
+            Some(Ok(k)) if k.len() == 8 => {
+                let mut h = [0u8; 8];
+                h.copy_from_slice(&k);
+                Ok(Some(u64::from_be_bytes(h)))
+            }
+            Some(Ok(_)) => Ok(None),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
         }
     }
 
@@ -2101,6 +2152,72 @@ pub struct ConsensusCheckpoint {
     pub locked_round: u32,
     pub finalized_height: u64,
     pub finalized_hash: [u8; 32],
+}
+
+/// One write-ahead vote watermark entry: the EXACT `(height, round, kind,
+/// target, shard)` the node signed.
+///
+/// Persisted BEFORE the vote is broadcast, so a crash between the vote and the
+/// next consensus checkpoint can never lose it and let the node re-vote in a
+/// round it already used (Finding C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoteWatermarkEntry {
+    pub height: u64,
+    pub round: u32,
+    /// 0 = prevote, 1 = precommit (same tag as the signed preimage).
+    pub kind: u8,
+    /// `None` is a NIL vote — a real, signed statement, not "no vote".
+    pub target: Option<[u8; 32]>,
+    pub shard_id: u32,
+}
+
+/// Write-ahead vote watermark for ONE height: the last prevote and the last
+/// precommit this node signed, each with its exact target and shard.
+///
+/// Stored under its own meta key (NOT inside [`ConsensusCheckpoint`]) for two
+/// reasons:
+///  * the checkpoint is rewritten with `round: 0` on every finalize; sharing
+///    the record would erase the watermark for the new height's first round;
+///  * the vote must be durable BEFORE it is broadcast, while the checkpoint is
+///    written after finality — different durability points.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoteWatermark {
+    pub prevote: Option<VoteWatermarkEntry>,
+    pub precommit: Option<VoteWatermarkEntry>,
+}
+
+impl VoteWatermark {
+    /// Record a signed vote (overwrites the entry of the same kind).
+    pub fn note(&mut self, entry: VoteWatermarkEntry) {
+        match entry.kind {
+            0 => self.prevote = Some(entry),
+            1 => self.precommit = Some(entry),
+            _ => {}
+        }
+    }
+
+    /// The highest round at which this node signed ANY vote at `height`.
+    ///
+    /// `None` means no recorded vote at that height. Used as the round FLOOR
+    /// on restore and as the "never vote below" guard.
+    pub fn floor_round(&self, height: u64) -> Option<u32> {
+        [self.prevote, self.precommit]
+            .into_iter()
+            .flatten()
+            .filter(|e| e.height == height)
+            .map(|e| e.round)
+            .max()
+    }
+
+    /// The prevote entry recorded at `height`, if any.
+    pub fn prevote_at(&self, height: u64) -> Option<VoteWatermarkEntry> {
+        self.prevote.filter(|e| e.height == height)
+    }
+
+    /// The precommit entry recorded at `height`, if any.
+    pub fn precommit_at(&self, height: u64) -> Option<VoteWatermarkEntry> {
+        self.precommit.filter(|e| e.height == height)
+    }
 }
 
 /// A full snapshot of every non-account consensus domain. Persisted alongside the
@@ -4131,6 +4248,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// FINDING C: the write-ahead vote watermark is a SEPARATE durable record
+    /// (one fsynced meta key), so it survives a crash between the vote and the
+    /// next consensus checkpoint. The checkpoint stays at round 0 while the
+    /// watermark says round 300 — which is exactly the state a restart must
+    /// restore from.
+    #[test]
+    fn vote_watermark_survives_a_crash_before_the_checkpoint() {
+        let dir = tmp();
+        {
+            let st = Storage::open(&dir).unwrap();
+            st.set_consensus(&ConsensusCheckpoint {
+                height: 7,
+                round: 0,
+                locked_hash: None,
+                locked_round: 0,
+                finalized_height: 6,
+                finalized_hash: [3u8; 32],
+            })
+            .unwrap();
+            let mut wm = VoteWatermark::default();
+            wm.note(VoteWatermarkEntry {
+                height: 7,
+                round: 300,
+                kind: 0,
+                target: Some([4u8; 32]),
+                shard_id: 1,
+            });
+            st.persist_vote_watermark(&wm).unwrap();
+        }
+        let st = Storage::open(&dir).unwrap();
+        let wm = st.vote_watermark().unwrap().unwrap();
+        assert_eq!(wm.floor_round(7), Some(300));
+        assert_eq!(wm.prevote_at(7).unwrap().shard_id, 1);
+        // The checkpoint rewrite path cannot erase it (separate key).
+        st.set_consensus(&ConsensusCheckpoint {
+            height: 8,
+            round: 0,
+            locked_hash: None,
+            locked_round: 0,
+            finalized_height: 7,
+            finalized_hash: [5u8; 32],
+        })
+        .unwrap();
+        assert_eq!(
+            st.vote_watermark().unwrap().unwrap().floor_round(7),
+            Some(300)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn state_snapshot_roundtrip_and_prune() {
         let dir = tmp();
@@ -4139,9 +4306,13 @@ mod tests {
         st.put_state(2, b"two").unwrap();
         st.put_state(3, b"three").unwrap();
         assert_eq!(st.latest_state().unwrap().unwrap(), (3, b"three".to_vec()));
+        // Key-only read used by the upgrade-halt boot guard: same height as
+        // `latest_state`, without materialising the snapshot value.
+        assert_eq!(st.latest_state_height().unwrap(), Some(3));
         let pruned = st.prune_state_below(3).unwrap();
         assert_eq!(pruned, 2);
         assert_eq!(st.latest_state().unwrap().unwrap(), (3, b"three".to_vec()));
+        assert_eq!(st.latest_state_height().unwrap(), Some(3));
         std::fs::remove_dir_all(&dir).ok();
     }
 

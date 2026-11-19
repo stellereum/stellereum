@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::qc_split::produce_decision_certificate_with_schedule;
 use super::rotation::pq_key_at_height;
 use super::sortition::{committee_for_height, micro_committee_size, pq_micro_required_power};
 use super::types::{
     note_validator_set_for_vote_cache, verify_proposer_signature, BlockHash, CommitteeSchedule,
-    Height, PqMicroCertificate, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote,
-    VoteKind,
+    Height, PqMicroCertificate, QuorumCertificate, Round, ShardId, ValidatorId, ValidatorSet, Vote,
+    VoteKind, MASTERCHAIN_SHARD,
 };
 
 /// Anti-DoS bound: ignore votes for rounds more than this far ahead of ours.
@@ -95,7 +95,10 @@ pub const ROUND_LOOKBACK: Round = 8;
 // schedule, lock and certificate code below is untouched.
 
 /// Domain separator for [`EquivocationEvidence::offense_key`].
-pub const EQUIVOCATION_OFFENSE_DOMAIN: &[u8] = b"STELLEREUM_EQUIVOCATION_OFFENSE_V1";
+///
+/// Bumped `V1 -> V2` with the shard binding: an offense is now scoped to ONE
+/// shard, and its key commits to that shard.
+pub const EQUIVOCATION_OFFENSE_DOMAIN: &[u8] = b"STELLEREUM_EQUIVOCATION_OFFENSE_V2";
 
 /// Hard cap on one evidence envelope's wire size (fail-closed: larger is
 /// refused, never truncated). Two Falcon-enveloped votes fit comfortably;
@@ -116,6 +119,10 @@ pub const MAX_BLOCK_EQUIVOCATION_EVIDENCES: usize = 64;
 pub struct EquivocationEvidence {
     /// The accused validator (must equal both votes' `voter`).
     pub voter: ValidatorId,
+    /// The shard the offense happened in. A validator running several shards
+    /// with one key legitimately signs different targets in each at the same
+    /// (height, round, kind), so an offense is only ever WITHIN one shard.
+    pub shard_id: ShardId,
     /// First conflicting vote (fully signed).
     pub vote_a: Vote,
     /// Second conflicting vote (fully signed).
@@ -125,9 +132,14 @@ pub struct EquivocationEvidence {
 impl EquivocationEvidence {
     /// Build the envelope from a recorded pair. No verification here —
     /// call [`verify_equivocation_evidence`] (fail-closed) before trusting it.
+    ///
+    /// The envelope's shard is taken from `vote_a`; the verifier requires it
+    /// to equal BOTH votes' shard, so a mismatched pair is refused rather than
+    /// silently re-scoped.
     pub fn new(voter: ValidatorId, vote_a: Vote, vote_b: Vote) -> Self {
         Self {
             voter,
+            shard_id: vote_a.shard_id,
             vote_a,
             vote_b,
         }
@@ -140,6 +152,7 @@ impl EquivocationEvidence {
     pub fn offense_key(&self) -> [u8; 32] {
         equivocation_offense_key(
             &self.voter,
+            self.shard_id,
             self.vote_a.height,
             self.vote_a.round,
             self.vote_a.kind,
@@ -171,6 +184,7 @@ impl EquivocationEvidence {
 /// so nil-vs-value counts as conflicting while nil-vs-nil does not.
 pub fn equivocation_offense_key(
     voter: &ValidatorId,
+    shard_id: ShardId,
     height: Height,
     round: Round,
     kind: VoteKind,
@@ -194,6 +208,10 @@ pub fn equivocation_offense_key(
     let mut hasher = blake3::Hasher::new();
     hasher.update(EQUIVOCATION_OFFENSE_DOMAIN);
     hasher.update(voter);
+    // SHARD SCOPE: one offense per (shard, voter, height, round, kind, pair).
+    // The same key double-voting on two shards is two different offenses (and
+    // an honest multi-shard validator produces neither).
+    hasher.update(&shard_id.to_be_bytes());
     hasher.update(&height.to_be_bytes());
     hasher.update(&round.to_be_bytes());
     hasher.update(&[match kind {
@@ -227,6 +245,15 @@ pub fn verify_equivocation_evidence(
         return false;
     }
     let (a, b) = (&ev.vote_a, &ev.vote_b);
+    // SAME SHARD FIRST (false-slash primitive). One validator key may run on
+    // several shards at once, and each shard has its own block space, so two
+    // votes at one (height, round, kind) from different shards are NORMAL, not
+    // a double-sign. The shard is inside the V3 signed preimage
+    // (`vote_sign_bytes_for_shard`), so a relabelled copy cannot pass: the
+    // signature only verifies under the shard it was produced for.
+    if a.shard_id != b.shard_id || ev.shard_id != a.shard_id {
+        return false;
+    }
     if a.height != b.height || a.round != b.round || a.kind != b.kind {
         return false;
     }
@@ -280,12 +307,17 @@ pub fn canonicalize_equivocation_evidence(
 // Block-carried PROPOSAL equivocation evidence (deterministic slashing input)
 // ============================================================================
 //
-// P3-EQ-ESCAPE variant 2 (double-propose) CLOSED HERE. The vote envelope
+// P3-EQ-ESCAPE variant 2 (double-propose). The vote envelope
 // (`EquivocationEvidence`) covers Vote pairs only: a scheduled proposer that
 // signs two different blocks for the same height leaves no Vote pair behind,
 // so the vote-slash path is inapplicable by construction (pinned by
 // `p3_eq_double_propose_escapes_vote_slash_path`). This section is the
-// proposal mirror of the vote wiring above, with the same contract:
+// proposal mirror of the vote wiring above — but it is DISABLED behind
+// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] (Finding B, false-slash): a
+// block carries no SIGNED round, so an honest cross-round re-proposal is
+// indistinguishable from a double-propose, and refusing to slash is strictly
+// safer than burning an honest proposer. The contract below is kept for the
+// activation and is not reachable while the sentinel is `u64::MAX`:
 //
 //   * carrier: the block BODY, as `OpCode::SysCallReportProposalEquivocation`
 //     (appended terminal variant — the codebase-blessed proof-in-opcode
@@ -295,11 +327,11 @@ pub fn canonicalize_equivocation_evidence(
 //   * content: BOTH conflicting blocks FULLY included (`block_a`,
 //     `block_b`), so verification needs no external data beyond the
 //     validator set every node derives identically from its staking ledger.
-//     Blocks — unlike votes — carry no round: the offense is "same proposer,
-//     same height, two different bodies". A claimed round would be unsigned
-//     metadata (any reporter could invent it), so the type carries none and
-//     the dedup key excludes it: one slash per (proposer, height), never one
-//     per claimed round.
+//     The offense is "same proposer, same shard, same height, same ROUND,
+//     two different bodies". The envelope carries the claimed round so the
+//     evidence shape is ready, but the round is NOT signed by the block yet;
+//     that is exactly why the wired gate stays at `u64::MAX` until `Block`
+//     commits one (see `proposal_equivocation_offense_rule`).
 //   * verification: [`verify_proposal_equivocation_evidence`] — fail-closed.
 //     Same height, differing block hashes, `proposer` matches both blocks'
 //     `proposer`, membership, and BOTH proposer signatures verify (Ed25519
@@ -308,9 +340,9 @@ pub fn canonicalize_equivocation_evidence(
 //     `Vote::verify`). A same-body pair (one block repeated) is not an
 //     offense; a forged signature is refused.
 //   * dedup: [`ProposalEquivocationEvidence::offense_key`] —
-//     `BLAKE3(domain ‖ proposer ‖ height ‖ hash_lo ‖ hash_hi)` with canonical
-//     body order. Either block order, any number of rebroadcasts or
-//     re-inclusions key identically: one burn per (proposer, height).
+//     `BLAKE3(domain ‖ proposer ‖ shard ‖ height ‖ round ‖ hash_lo ‖ hash_hi)`
+//     with canonical body order. Either block order, any number of
+//     rebroadcasts or re-inclusions key identically.
 //   * order: [`canonicalize_proposal_equivocation_evidence`] verifies, sorts
 //     by offense key and dedupes. Sequential 5% burns do NOT commute, so
 //     canonical order is what makes every node compute the same remainder.
@@ -323,7 +355,23 @@ pub fn canonicalize_equivocation_evidence(
 
 /// Domain separator for [`ProposalEquivocationEvidence::offense_key`].
 pub const PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN: &[u8] =
-    b"STELLEREUM_PROPOSAL_EQUIVOCATION_OFFENSE_V1";
+    b"STELLEREUM_PROPOSAL_EQUIVOCATION_OFFENSE_V2";
+
+/// Activation height of the PROPOSAL-equivocation slash.
+///
+/// DISABLED (`u64::MAX`) — the compiled-in sentinel. Rationale (false-slash
+/// primitive, Finding B): the wire `Block` carries no ROUND, so two honest
+/// proposals of DIFFERENT bodies at the same height (one per round, exactly
+/// what a view change produces) are indistinguishable from a double-propose.
+/// Slashing that pair burns an honest proposer, which is strictly worse than
+/// not slashing at all, so the wired gate refuses every proposal evidence
+/// until blocks commit a SIGNED round.
+///
+/// The same-shard/same-round rule is implemented and tested behind this gate
+/// ([`proposal_equivocation_offense_rule`]); activation is a one-line change
+/// to this constant AFTER `Block` gains a signed `round` and this verifier
+/// reads it. Until then the sentinel makes a false slash impossible.
+pub const PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT: Height = u64::MAX;
 
 /// Hard cap on one proposal-evidence envelope's wire size (fail-closed:
 /// larger is refused, never truncated). Two full blocks ride inside, so the
@@ -352,6 +400,16 @@ pub const MAX_BLOCK_PROPOSAL_EQUIVOCATION_EVIDENCES: usize = 8;
 pub struct ProposalEquivocationEvidence {
     /// The accused proposer (must equal both blocks' `proposer`).
     pub proposer: ValidatorId,
+    /// The round both proposals are claimed to belong to.
+    ///
+    /// REPORTED, NOT YET SIGNED: `Block` does not commit a round, so this is
+    /// envelope metadata and the verifier stays behind the
+    /// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] sentinel — a reporter could
+    /// otherwise claim one round for two honest cross-round proposals. The
+    /// field exists so the evidence shape already carries the round when the
+    /// signed-round block change lands (no half-change: the wired gate stays
+    /// shut until then).
+    pub round: Round,
     /// First conflicting block (fully signed by `proposer`).
     pub block_a: crate::sharding::Block,
     /// Second conflicting block (fully signed by `proposer`).
@@ -359,15 +417,27 @@ pub struct ProposalEquivocationEvidence {
 }
 
 impl ProposalEquivocationEvidence {
-    /// Build the envelope from a recorded pair. No verification here —
-    /// call [`verify_proposal_equivocation_evidence`] (fail-closed) before trusting it.
+    /// Build the envelope from a recorded pair with round `0` (unknown). No
+    /// verification here — call [`verify_proposal_equivocation_evidence`]
+    /// (fail-closed) before trusting it.
     pub fn new(
         proposer: ValidatorId,
         block_a: crate::sharding::Block,
         block_b: crate::sharding::Block,
     ) -> Self {
+        Self::new_at_round(proposer, 0, block_a, block_b)
+    }
+
+    /// Build the envelope for an explicit claimed round.
+    pub fn new_at_round(
+        proposer: ValidatorId,
+        round: Round,
+        block_a: crate::sharding::Block,
+        block_b: crate::sharding::Block,
+    ) -> Self {
         Self {
             proposer,
+            round,
             block_a,
             block_b,
         }
@@ -379,7 +449,9 @@ impl ProposalEquivocationEvidence {
     pub fn offense_key(&self) -> [u8; 32] {
         proposal_offense_key(
             &self.proposer,
+            self.block_a.shard_id,
             self.block_a.height,
+            self.round,
             &self.block_a.compute_hash(),
             &self.block_b.compute_hash(),
         )
@@ -402,14 +474,18 @@ impl ProposalEquivocationEvidence {
 }
 
 /// Canonical per-offense key:
-/// `BLAKE3(domain ‖ proposer ‖ height ‖ hash_lo ‖ hash_hi)`, with the two
-/// block hashes in canonical (lexicographic) order so block order never
-/// matters. No round: blocks do not carry one, and a reporter-supplied
-/// round would be unsigned metadata — keying on it would let one offense
-/// burn twice under two claimed rounds.
+/// `BLAKE3(domain ‖ proposer ‖ shard ‖ height ‖ round ‖ hash_lo ‖ hash_hi)`,
+/// with the two block hashes in canonical (lexicographic) order so block
+/// order never matters. The envelope's claimed round is part of the key so
+/// the same blocks re-slid under a different claimed round are a different
+/// offense — which is exactly why the wired verifier stays behind
+/// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`] until that round is SIGNED by
+/// the block: an unsigned round is reporter metadata, not a proof.
 pub fn proposal_offense_key(
     proposer: &ValidatorId,
+    shard_id: ShardId,
     height: Height,
+    round: Round,
     hash_a: &BlockHash,
     hash_b: &BlockHash,
 ) -> [u8; 32] {
@@ -421,10 +497,38 @@ pub fn proposal_offense_key(
     let mut hasher = blake3::Hasher::new();
     hasher.update(PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN);
     hasher.update(proposer);
+    hasher.update(&shard_id.to_be_bytes());
     hasher.update(&height.to_be_bytes());
+    hasher.update(&round.to_be_bytes());
     hasher.update(lo);
     hasher.update(hi);
     *hasher.finalize().as_bytes()
+}
+
+/// The proposal-equivocation RULE, parameterized by the rounds of the two
+/// proposals. Same shard, same height, same ROUND, different signed bodies.
+///
+/// This is the rule that must gate the wired slash: an honest proposer that
+/// proposes A in round r and B in r+1 at the same height (normal after a view
+/// change) fails it because `round_a != round_b`. The wired verifier cannot
+/// read a SIGNED round off `Block` yet, so it stays behind
+/// [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`]; this function is the tested,
+/// ready rule behind that gate.
+#[allow(clippy::too_many_arguments)]
+// GATE: the four identity pairs ARE the rule's inputs; grouping them into a
+// struct would hide that each block contributes its own shard/height/round/hash
+// (the whole point of the check is that they must MATCH).
+pub fn proposal_equivocation_offense_rule(
+    shard_a: ShardId,
+    shard_b: ShardId,
+    height_a: Height,
+    height_b: Height,
+    round_a: Round,
+    round_b: Round,
+    hash_a: &BlockHash,
+    hash_b: &BlockHash,
+) -> bool {
+    shard_a == shard_b && height_a == height_b && round_a == round_b && hash_a != hash_b
 }
 
 /// Fail-closed verification of block-carried proposal-equivocation evidence.
@@ -432,9 +536,11 @@ pub fn proposal_offense_key(
 /// Every refusal returns `false` (never panics, never errors): the caller
 /// skips the evidence and logs loudly. Checks, in cheap-first order:
 ///  1. envelope size cap (DoS bound);
-///  2. same height, DIFFERING block hashes (one block repeated is not a
-///     double-propose);
-///  3. `proposer` matches BOTH blocks' `proposer` (framing another
+///  2. activation sentinel: while [`PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT`]
+///     is `u64::MAX` (no signed block round yet) every evidence is refused;
+///  3. same shard/height/round, DIFFERING block hashes (one block repeated,
+///     cross-round re-proposals and cross-shard proposals are not offenses);
+///  4. `proposer` matches BOTH blocks' `proposer` (framing another
 ///     validator's block is refused);
 ///  4. proposer membership via `is_validator` (unknown keys are refused);
 ///  5. BOTH proposer signatures verify via [`verify_proposer_signature`]
@@ -448,10 +554,38 @@ pub fn verify_proposal_equivocation_evidence(
         return false;
     }
     let (a, b) = (&ev.block_a, &ev.block_b);
+    // FALSE-SLASH SENTINEL (Finding B). Blocks carry no SIGNED round, so a
+    // cross-round pair of honest proposals (different bodies, one per round,
+    // same height) is indistinguishable from a double-propose. Slashing on
+    // that would burn an honest proposer, and no slashing is strictly better
+    // than a false one — so every proposal evidence refuses until `Block`
+    // commits a signed round and this verifier can read it. The same-shard /
+    // same-round rule lives in [`proposal_equivocation_offense_rule`] and is
+    // exercised by tests behind this gate.
+    if a.height < PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT {
+        return false;
+    }
+    // SAME SHARD, not just the same height. A validator is scheduled per
+    // shard and may legitimately propose one block per shard at the same
+    // height (every workchain reads the masterchain validator set), so two
+    // different-shard blocks are not a double-propose. The blocks carry
+    // their shard id, so this is cheap and unambiguous.
+    if a.shard_id != b.shard_id {
+        return false;
+    }
     if a.height != b.height {
         return false;
     }
-    if a.compute_hash() == b.compute_hash() {
+    if !proposal_equivocation_offense_rule(
+        a.shard_id,
+        b.shard_id,
+        a.height,
+        b.height,
+        ev.round,
+        ev.round,
+        &a.compute_hash(),
+        &b.compute_hash(),
+    ) {
         return false;
     }
     if ev.proposer != a.proposer || ev.proposer != b.proposer {
@@ -549,6 +683,15 @@ impl VoteSet {
         let power = validators.power_of(&vote.voter);
         if power == 0 {
             return Err("vote from non-validator".to_string());
+        }
+        // ONE SHARD PER SET. A certificate aggregates the votes of exactly one
+        // shard (each was signed over that shard's preimage), so a set that
+        // mixed shards could never produce a certificate that verifies — and
+        // keeping the invariant here is what lets `shard()` be a single value.
+        if let Some(first) = self.votes.values().next() {
+            if first.shard_id != vote.shard_id {
+                return Err("vote from another shard".to_string());
+            }
         }
         if let Some(existing) = self.votes.get(&vote.voter) {
             if existing.block_hash != vote.block_hash {
@@ -755,6 +898,14 @@ impl VoteSet {
             .map(|v| (v.height, v.round, v.kind))
     }
 
+    /// The shard shared by every admitted vote, if any.
+    ///
+    /// Admission refuses a vote from another shard (see `add_verified`), so
+    /// the value is single even though the backing map's order is not.
+    pub fn shard(&self) -> Option<ShardId> {
+        self.votes.values().next().map(|v| v.shard_id)
+    }
+
     /// Falcon-512 signatures of the votes for `target`, in CANONICAL order.
     ///
     /// Sorted by voter id (the same order the epoch/CEC certificate
@@ -864,6 +1015,11 @@ impl VoteSet {
             kind: self.votes.values().next()?.kind,
             block_hash: target,
             signatures,
+            // The certificate inherits the shard its votes were signed in, so
+            // verification reconstructs the same V3 preimage. Admission keeps
+            // one shard per set (see `VoteSet::add_verified`), so any entry is
+            // the set's shard.
+            shard_id: self.shard().unwrap_or(MASTERCHAIN_SHARD),
         };
 
         // Post-Quantum Micro-Certificate (µQC) compilation:
@@ -1253,9 +1409,9 @@ pub const MAX_PEER_ROUND_ADVANCE_PER_HEIGHT: Round = REPHASE_SCAN_WINDOW / 2;
 /// cannot close at all (the round counter only moves forward).
 ///
 /// It bounds the JUMP SIZE, not the peer's claim: the target is additionally
-/// CORROBORATED by more than one validator (see
-/// [`HeightConsensus::deadlock_breaker_target`]), so a single Byzantine peer
-/// cannot drag this node off the network.
+/// CORROBORATED by validators holding more than one third of the network's
+/// power (see [`HeightConsensus::deadlock_breaker_target`]), so a sub-one-
+/// third Byzantine coalition cannot drag this node off the network.
 pub const MAX_DEADLOCK_JUMP: Round = 65_536;
 
 /// The round window a deadlock re-phase installs: how far back the quorum
@@ -1486,16 +1642,24 @@ impl HeightConsensus {
         if vote.height != self.height || vote.kind != VoteKind::Prevote {
             return Err("vote out of scope".to_string());
         }
+        // A refused vote must not materialize a round bucket either:
+        // `VoteSet::add` would create the empty set via `entry(..).or_default()`
+        // and then reject the vote, leaving a trace that counts toward
+        // `MAX_RETAINED_VOTE_ROUNDS` (and can evict real votes). Admission is
+        // therefore completed BEFORE the bucket is created; the vote is moved
+        // into the set's already-verified path so the signature is checked
+        // exactly once.
+        note_validator_set_for_vote_cache(&self.validators);
+        if self.validators.power_of(&vote.voter) == 0 {
+            return Err("vote from non-validator".to_string());
+        }
+        if !vote.verify() {
+            return Err("bad vote signature".to_string());
+        }
         let round = vote.round;
         let res = {
             let set = self.prevotes.entry(round).or_default();
-            set.add(
-                vote,
-                &self.validators,
-                self.height,
-                round,
-                VoteKind::Prevote,
-            )
+            set.add_verified(vote, &self.validators)
         };
         // THE POLKA LEDGER (liveness fix, live 2026-10-21: the masterchain
         // parked at height 285027 with a prevote QC and NO precommit QC).
@@ -1517,15 +1681,20 @@ impl HeightConsensus {
         if vote.height != self.height || vote.kind != VoteKind::Precommit {
             return Err("vote out of scope".to_string());
         }
+        // Same fail-closed admission as `add_prevote`: a refused signature or
+        // a non-member must not leave an empty round bucket behind. Scope,
+        // membership and signature are checked before the bucket; the moved
+        // vote then uses the already-verified path.
+        note_validator_set_for_vote_cache(&self.validators);
+        if self.validators.power_of(&vote.voter) == 0 {
+            return Err("vote from non-validator".to_string());
+        }
+        if !vote.verify() {
+            return Err("bad vote signature".to_string());
+        }
         let round = vote.round;
         let set = self.precommits.entry(round).or_default();
-        set.add(
-            vote,
-            &self.validators,
-            self.height,
-            round,
-            VoteKind::Precommit,
-        )
+        set.add_verified(vote, &self.validators)
     }
 
     pub fn prevote_set(&self, round: Round) -> Option<&VoteSet> {
@@ -1913,38 +2082,62 @@ impl HeightConsensus {
                 candidates.push(r);
             }
         }
-        let round = candidates.into_iter().find(|r| {
-            self.precommits
-                .get(r)
+        // THE WHOLE CANDIDATE LIST IS TESTED (liveness, WAN skew). The scan
+        // used to stop at the NEWEST round carrying a non-nil precommit
+        // quorum. That round may be undecidable here for a reason that says
+        // nothing about an older round: this node may have received the
+        // precommits but not the prevotes of the newer round (a partial
+        // delivery), or the newer certificate may contradict our lock. The
+        // old code returned `None` on the first such miss and never looked at
+        // an OLDER round that is fully proven locally (prevote QC AND
+        // precommit QC for the same block, consistent with the lock) — the
+        // height parked although it was decidable.
+        let mut chosen: Option<(Round, BlockHash)> = None;
+        for round in candidates {
+            let Some(target) = self
+                .precommits
+                .get(&round)
                 .and_then(|s| s.quorum_target(&self.validators))
-                .flatten()
-                .is_some()
-        })?;
+            else {
+                continue;
+            };
+            // A nil precommit quorum decides no block; keep looking.
+            let Some(block) = target else {
+                continue;
+            };
+            // SAFETY: a block may only be decided on a prevote quorum for the
+            // SAME block. Without this, any precommit quorum alone finalises
+            // whatever it names, and a peer can hand us precommits for a block
+            // nobody prevoted for. The two quorums have to agree on the target,
+            // otherwise a pre-vote-certified block A and a precommit-certified
+            // block B could both reach quorum and the node would pick whichever
+            // it checked first.
+            let prevoted = self
+                .prevotes
+                .get(&round)
+                .and_then(|s| s.quorum_target(&self.validators));
+            if prevoted.flatten() != Some(block) {
+                continue;
+            }
+            // And a locked validator must not decide a block that contradicts
+            // its own lock: that is what makes a reorg past a locked round
+            // impossible. A FULLY PROVEN newer round for another block is a
+            // deliberate refusal, not a reason to fall back: the network may
+            // have certified a conflicting value and this node may only leave
+            // its lock through the higher-round polka path (handled by the
+            // precommit producer via `try_prevote_quorum_at`). Refuse the
+            // whole scan, exactly as before.
+            if let Some((locked_block, _)) = self.locked {
+                if locked_block != block {
+                    return None;
+                }
+            }
+            chosen = Some((round, block));
+            break;
+        }
+        let (round, block) = chosen?;
         let set = self.precommits.get(&round)?;
         let target = set.quorum_target(&self.validators)?;
-        let block = target?; // nil precommit quorum does not decide a block
-
-        // SAFETY: a block may only be decided on a prevote quorum for the SAME
-        // block. Without this, any precommit quorum alone finalises whatever it
-        // names, and a peer can hand us precommits for a block nobody prevoted
-        // for. The two quorums have to agree on the target, otherwise a
-        // pre-vote-certified block A and a precommit-certified block B could both
-        // reach quorum and the node would pick whichever it checked first.
-        let prevoted = self
-            .prevotes
-            .get(&round)
-            .and_then(|s| s.quorum_target(&self.validators));
-        if prevoted.flatten() != Some(block) {
-            return None;
-        }
-
-        // And a locked validator must not decide a block that contradicts its
-        // own lock: that is what makes a reorg past a locked round impossible.
-        if let Some((locked_block, _)) = self.locked {
-            if locked_block != block {
-                return None;
-            }
-        }
 
         if let Some(qc) = produce_decision_certificate_with_schedule(
             set,
@@ -2063,42 +2256,34 @@ impl HeightConsensus {
         self.prevotes.retain(|&r, _| r >= floor);
         self.precommits.retain(|&r, _| r >= floor);
         self.prevote_qc.retain(|&r, _| r >= floor);
-        while self.retained_round_count() > MAX_RETAINED_VOTE_ROUNDS {
-            let Some(oldest) = self.oldest_retained_round() else {
-                break;
-            };
-            // The polka's round is kept even if it is the oldest one: it is
-            // the round the decision is made in.
-            if self
-                .observed_polka
-                .map(|(r, _)| r == oldest)
-                .unwrap_or(false)
-            {
+        // Enforce the cap by evicting the OLDEST rounds — but never the polka's
+        // round (its prevote set is the proof of the decision). The old loop
+        // `break`-ed as soon as the oldest retained round WAS the polka, which
+        // left every newer round in place: once a height had lived through the
+        // cap with a low-round polka, the retention cap stopped enforcing at
+        // all, and one accepted vote per round grew the maps without bound.
+        let polka_round = self.observed_polka.map(|(r, _)| r);
+        let mut rounds: Vec<Round> = self
+            .prevotes
+            .keys()
+            .chain(self.precommits.keys())
+            .copied()
+            .collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        let mut excess = rounds.len().saturating_sub(MAX_RETAINED_VOTE_ROUNDS);
+        for round in rounds {
+            if excess == 0 {
                 break;
             }
-            self.prevotes.remove(&oldest);
-            self.precommits.remove(&oldest);
-            self.prevote_qc.remove(&oldest);
+            if Some(round) == polka_round {
+                continue;
+            }
+            self.prevotes.remove(&round);
+            self.precommits.remove(&round);
+            self.prevote_qc.remove(&round);
+            excess -= 1;
         }
-    }
-
-    /// How many distinct rounds still carry votes.
-    fn retained_round_count(&self) -> usize {
-        let mut set: HashSet<Round> = self.prevotes.keys().copied().collect();
-        set.extend(self.precommits.keys().copied());
-        set.len()
-    }
-
-    /// The LOWEST round still carrying votes (the eviction order).
-    fn oldest_retained_round(&self) -> Option<Round> {
-        let mut oldest: Option<Round> = None;
-        for r in self.prevotes.keys().chain(self.precommits.keys()) {
-            oldest = Some(match oldest {
-                Some(m) => m.min(*r),
-                None => *r,
-            });
-        }
-        oldest
     }
 
     /// View change: advance to the next round, resetting per-round proposal state.
@@ -2123,7 +2308,10 @@ impl HeightConsensus {
         // proposer that never got its proposal accepted this round misses.
         // `proposal_round == Some(left)` means WE accepted its proposal; any
         // other state (none, or a stale round) means the slot went empty.
-        if let Some(sched) = self.validators.proposer_for(self.height, left) {
+        if let Some(sched) =
+            self.validators
+                .proposer_for_with_schedule(self.height, left, self.committee_schedule)
+        {
             let proposed =
                 self.proposal_round == Some(left) && self.proposal.map(|(p, _)| p) == Some(sched);
             self.note_proposer_missed(sched, proposed);
@@ -2326,24 +2514,47 @@ impl HeightConsensus {
         self.peer_rounds.values().filter(|&&r| r >= round).count()
     }
 
-    /// The highest peer round that is CORROBORATED by more than one
-    /// validator (see [`Self::breaker_corroboration`]), if any.
+    /// Voting power of the validators that have reported being at or above
+    /// `round`. This is the quantity the deadlock breaker corroborates with:
+    /// under the BFT threat model fewer than one third of the POWER is
+    /// Byzantine, so a round is network evidence only when its reporters carry
+    /// MORE than one third of the power. A fixed count of two validator ids is
+    /// not enough on a set of seven or more: two colluding validators (2/7 of
+    /// the power) are a sub-one-third coalition and could otherwise steer the
+    /// forward-only breaker with a fabricated round.
+    pub fn supporting_peer_power(&self, round: Round) -> u128 {
+        self.peer_rounds
+            .iter()
+            .filter(|(_, &r)| r >= round)
+            .map(|(voter, _)| self.validators.power_of(voter) as u128)
+            .sum::<u128>()
+    }
+
+    /// True when `round` is reported by validators holding MORE than one third
+    /// of the network's total power (strictly more, so the BFT floor
+    /// `B_w < W/3` guarantees at least one honest reporter).
+    fn corroborated_round(&self, round: Round) -> bool {
+        let total = self.validators.total_power_exact();
+        total > 0 && self.supporting_peer_power(round).saturating_mul(3) > total
+    }
+
+    /// The highest peer round that is CORROBORATED by more than one third of
+    /// the network's voting power, if any.
     ///
     /// `peer_rounds` records what each peer CLAIMED, and a Byzantine
-    /// validator can claim any round — including `u32::MAX`. A round only one
-    /// peer reports is therefore not evidence of where the network is, and
-    /// neither the deadlock breaker nor the local re-phase may act on it.
+    /// validator can claim any round — including `u32::MAX`. A round only a
+    /// sub-one-third coalition reports is therefore not evidence of where the
+    /// network is, and neither the deadlock breaker nor the local re-phase may
+    /// act on it.
     ///
-    /// With a validator set too small to have two peers, the single peer is
-    /// the only evidence there is (and a 2-member set is 50% Byzantine by
-    /// construction).
+    /// With a uniform two-member set the single peer holds half the power, so
+    /// it clears the one-third floor on its own (a 2-member set is 50%
+    /// Byzantine by construction).
     pub fn corroborated_peer_round(&self) -> Option<Round> {
-        let min = self.breaker_corroboration();
         let mut rounds: Vec<Round> = self.peer_rounds.values().copied().collect();
         rounds.sort_unstable_by(|a, b| b.cmp(a));
-        rounds
-            .into_iter()
-            .find(|r| self.supporting_peers_count(*r) >= min)
+        rounds.dedup();
+        rounds.into_iter().find(|r| self.corroborated_round(*r))
     }
 
     /// Highest verified peer round seen at this height, if any. Drives the
@@ -2367,17 +2578,18 @@ impl HeightConsensus {
     /// Fail-safe is enforced by the caller + `apply_deadlock_jump` (forward
     /// only); this only computes the target.
     ///
-    /// CORROBORATION (audit W6.4b): the round we jump to must be reported by
-    /// MORE THAN ONE validator. `peer_rounds` records what each peer CLAIMED,
-    /// and a Byzantine validator can claim any round at all — including
-    /// `u32::MAX`. Without corroboration, one liar could drag this node off
-    /// the network permanently: the round counter only moves forward, so a
-    /// node that jumped to a bogus round can never come back.
+    /// CORROBORATION (audit W6.4b, power-weighted): the round we jump to must
+    /// be reported by validators holding MORE THAN ONE THIRD of the network's
+    /// voting power. `peer_rounds` records what each peer CLAIMED, and a
+    /// Byzantine validator can claim any round at all — including
+    /// `u32::MAX`. Without corroboration, a sub-one-third coalition could drag
+    /// this node off the network permanently: the round counter only moves
+    /// forward, so a node that jumped to a bogus round can never come back.
     ///
-    /// The requirement is relaxed for a validator set too small to have two
-    /// peers at all (a 2-member set): there the single peer IS 50% of the
-    /// network by construction, and stalling such a chain is not a new
-    /// attack surface.
+    /// A *count* of two is not that rule on a set of seven or more: two
+    /// Byzantine validators out of seven are below one third of the power and
+    /// must not corroborate anything. The power floor is also why a 2-member
+    /// set still works: its single peer holds half the power.
     ///
     /// The JUMP SIZE is bounded by [`MAX_DEADLOCK_JUMP`] — deliberately much
     /// larger than `MAX_ROUND_AHEAD` (1000), because the breaker exists
@@ -2393,28 +2605,14 @@ impl HeightConsensus {
         if no_progress_secs < timeout_secs {
             return None;
         }
-        // CORROBORATED round only: one Byzantine peer must not steer this
-        // node. `corroborated_peer_round` returns the highest round reported
-        // by more than one validator.
+        // CORROBORATED round only: a sub-one-third coalition must not steer
+        // this node. `corroborated_peer_round` returns the highest round
+        // reported by validators holding more than one third of the power.
         let target = self.corroborated_peer_round()?;
         if target <= self.round {
             return None;
         }
         Some(target.min(self.round.saturating_add(MAX_DEADLOCK_JUMP)))
-    }
-
-    /// How many DISTINCT peers must report a round before the deadlock
-    /// breaker is willing to jump to it.
-    ///
-    /// Two for any set that can have two peers (so a single Byzantine
-    /// validator cannot steer the jump); one for a 2-member set, where the
-    /// peer count cannot exceed one.
-    fn breaker_corroboration(&self) -> usize {
-        if self.validators.len() >= 3 {
-            2
-        } else {
-            1
-        }
     }
 
     /// One-shot bounded jump to a breaker target (deadlock fix 2026-10-14).
@@ -2451,12 +2649,12 @@ impl HeightConsensus {
         if no_progress_secs < timeout_secs {
             return false;
         }
-        // The SAME corroboration rule as the breaker: a round only ONE peer
-        // reports is not evidence of where the network is. Without this the
-        // two paths could BOTH be dead: a lone Byzantine peer claiming a
-        // huge round would keep the breaker from firing (no corroboration)
-        // AND keep the local re-phase from firing (a peer is "ahead"), so
-        // the node would wedge with no way out (audit W6.4b).
+        // The SAME corroboration rule as the breaker: a round reported only by
+        // a sub-one-third coalition is not evidence of where the network is.
+        // Without this the two paths could BOTH be dead: such a coalition
+        // claiming a huge round would keep the breaker from firing (no
+        // corroboration) AND keep the local re-phase from firing (a peer is
+        // "ahead"), so the node would wedge with no way out (audit W6.4b).
         !matches!(self.corroborated_peer_round(), Some(p) if p > self.round)
     }
 
@@ -2613,12 +2811,21 @@ impl ConsensusDriver {
     }
 
     /// Finalize the current height and advance to the next.
+    ///
+    /// The next height's sortition parent is the block hash this height just
+    /// decided (the `prev_hash` its children commit), so it is installed
+    /// explicitly. A bare `HeightConsensus::new` would leave
+    /// `parent_hash_known == false` for every height above 1: no µQC could be
+    /// compiled (fail-closed) and a producer would derive no committee its
+    /// peers agree with.
     pub fn advance(&mut self) {
         if let Some(cur) = &self.current {
             if let Some(block) = cur.decided {
                 self.finalized.insert(cur.height, block);
                 let next = cur.height + 1;
-                self.current = Some(HeightConsensus::new(next, self.validators.clone()));
+                let mut fresh = HeightConsensus::new(next, self.validators.clone());
+                fresh.set_parent_hash(block);
+                self.current = Some(fresh);
             }
         }
     }

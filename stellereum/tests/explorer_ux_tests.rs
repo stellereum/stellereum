@@ -572,6 +572,7 @@ async fn block_detail_happy_path() {
     // Unique heights: the finalized-header window is process-wide, so the
     // enrichment row must not collide with any other test's headers.
     let qc = stellereum::consensus::QuorumCertificate {
+        shard_id: 0,
         height: 700_131,
         round: 3,
         kind: stellereum::consensus::VoteKind::Precommit,

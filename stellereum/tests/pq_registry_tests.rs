@@ -47,7 +47,7 @@ fn rotation_delay_matches_commission_exit_window_philosophy() {
     // The rotation delay is deliberately the SAME window as the commission
     // delegator-exit delay: observers get one full window to sync the
     // announcement before any key (or rate) changes authority.
-    assert_eq!(PQ_ROTATION_DELAY_HEIGHTS, 7_200);
+    assert_eq!(PQ_ROTATION_DELAY_HEIGHTS, 30_000);
     assert_eq!(
         PQ_ROTATION_DELAY_HEIGHTS, COMMISSION_EFFECT_DELAY_HEIGHTS,
         "rotation and commission delays must move together (same exit-window philosophy)"
@@ -128,14 +128,15 @@ fn rotation_announce_effective_then_old_invalid() {
         .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, new.clone(), 100)
         .expect("announce must succeed");
     let pending = reg.pending_of(&id).expect("rotation must be pending");
+    let eff = 100 + PQ_ROTATION_DELAY_HEIGHTS;
     assert_eq!(pending.announced_height, 100);
-    assert_eq!(pending.effective_height, 100 + PQ_ROTATION_DELAY_HEIGHTS); // 7300
+    assert_eq!(pending.effective_height, eff);
     assert_eq!(pending.pubkey, new);
 
     // Old key stays authoritative until the effective height — including in
     // the committed mirror existing readers use.
     assert_eq!(
-        reg.get_active_key(&id, 7_299),
+        reg.get_active_key(&id, eff - 1),
         Some((PqScheme::Falcon512, old.clone()))
     );
     assert_eq!(
@@ -145,26 +146,26 @@ fn rotation_announce_effective_then_old_invalid() {
     // At the effective height the pending key resolves even BEFORE apply runs
     // (readers never depend on apply timing).
     assert_eq!(
-        reg.get_active_key(&id, 7_300),
+        reg.get_active_key(&id, eff),
         Some((PqScheme::Falcon512, new.clone()))
     );
 
     // Late apply still stamps the ANNOUNCED effective height (deterministic
     // windows regardless of when apply lands).
     ledger
-        .pq_apply_rotation(&mut reg, id, 8_000)
+        .pq_apply_rotation(&mut reg, id, eff + 700)
         .expect("late apply must succeed");
     let rec = reg.record_of(&id).expect("record must exist");
-    assert_eq!(rec.activated_at, 7_300);
+    assert_eq!(rec.activated_at, eff);
     assert!(rec.pending.is_none());
     assert_eq!(rec.history.len(), 1);
     assert_eq!(rec.history[0].pubkey, old);
     assert_eq!(rec.history[0].activated_at, 10);
-    assert_eq!(rec.history[0].superseded_at, 7_300);
+    assert_eq!(rec.history[0].superseded_at, eff);
 
     // New key authoritative at/after effective; old serves only its window.
     assert_eq!(
-        reg.get_active_key(&id, 7_300),
+        reg.get_active_key(&id, eff),
         Some((PqScheme::Falcon512, new.clone()))
     );
     assert_eq!(
@@ -191,14 +192,15 @@ fn sweep_applies_only_due_rotations_in_id_order() {
             .pq_register_key(&mut reg, id, PqScheme::Falcon512, falcon_key(fill), 0, 0)
             .unwrap();
     }
+    let delay = PQ_ROTATION_DELAY_HEIGHTS;
     ledger
         .pq_announce_rotation(&mut reg, a, PqScheme::Falcon512, falcon_key(0x01), 0)
-        .unwrap(); // effective 7200
+        .unwrap(); // effective at `delay`
     ledger
         .pq_announce_rotation(&mut reg, b, PqScheme::Falcon512, falcon_key(0x02), 100)
-        .unwrap(); // effective 7300
+        .unwrap(); // effective at `delay + 100`
 
-    let applied = ledger.pq_apply_due_rotations(&mut reg, 7_250);
+    let applied = ledger.pq_apply_due_rotations(&mut reg, delay + 50);
     assert_eq!(applied, vec![a]);
     assert_eq!(
         ledger.get_pq_key(&a),
@@ -206,7 +208,7 @@ fn sweep_applies_only_due_rotations_in_id_order() {
     );
     assert!(reg.pending_of(&b).is_some(), "b not due yet");
 
-    let applied = ledger.pq_apply_due_rotations(&mut reg, 7_300);
+    let applied = ledger.pq_apply_due_rotations(&mut reg, delay + 150);
     assert_eq!(applied, vec![b]);
     assert!(reg.pending_of(&b).is_none());
 }

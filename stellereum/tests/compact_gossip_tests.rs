@@ -928,7 +928,11 @@ fn receiver_pulls_misses_then_completes_from_a_bounded_body() {
         .serve_for("peer-b", &pull, 0)
         .expect("structurally valid")
         .is_none());
-    assert_eq!(server.served_count(), 2, "one reply per requester, no replay");
+    assert_eq!(
+        server.served_count(),
+        2,
+        "one reply per requester, no replay"
+    );
     // Serving comes from the ANNOUNCED block body, so a tx that left the
     // proposer's mempool (or a sealed/MEV slot) is still answerable.
     assert_eq!(server.cached_len(), 1);

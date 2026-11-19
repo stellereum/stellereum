@@ -271,11 +271,11 @@ impl ModelView {
         let n_layers = self.dims.len();
         if n_layers == 0 || n_layers > ATTEST_MAX_LAYERS {
             return Err(format!(
-                "stark: need 1..={ATTEST_MAX_LAYERS} layers, got {n_layers}"
+                "attestation: need 1..={ATTEST_MAX_LAYERS} layers, got {n_layers}"
             ));
         }
         if self.weights.len() != n_layers || self.biases.len() != n_layers {
-            return Err("stark: weights/biases/dims length mismatch".to_string());
+            return Err("attestation: weights/biases/dims length mismatch".to_string());
         }
 
         let mut expect_in: Option<usize> = None;
@@ -283,33 +283,35 @@ impl ModelView {
         for l in 0..n_layers {
             let (in_dim, out_dim) = self.dims[l];
             if in_dim == 0 || in_dim > ATTEST_MAX_DIM || out_dim == 0 || out_dim > ATTEST_MAX_DIM {
-                return Err(format!("stark: layer {l} dims out of bounds"));
+                return Err(format!("attestation: layer {l} dims out of bounds"));
             }
             if let Some(want) = expect_in {
                 if in_dim != want {
                     return Err(format!(
-                        "stark: layer {l} not chained (in={in_dim}, want={want})"
+                        "attestation: layer {l} not chained (in={in_dim}, want={want})"
                     ));
                 }
             }
             expect_in = Some(out_dim);
 
             if self.weights[l].len() != in_dim * out_dim {
-                return Err(format!("stark: layer {l} weights length mismatch"));
+                return Err(format!("attestation: layer {l} weights length mismatch"));
             }
             if self.biases[l].len() != out_dim {
-                return Err(format!("stark: layer {l} biases length mismatch"));
+                return Err(format!("attestation: layer {l} biases length mismatch"));
             }
 
             for &b in &self.biases[l] {
                 if !(ATTEST_MIN_BIAS..=ATTEST_MAX_BIAS).contains(&b) {
-                    return Err(format!("stark: layer {l} bias {b} outside i32 bounds"));
+                    return Err(format!(
+                        "attestation: layer {l} bias {b} outside i32 bounds"
+                    ));
                 }
             }
 
             for &w in &self.weights[l] {
                 if !(ATTEST_MIN_WEIGHT..=ATTEST_MAX_WEIGHT).contains(&w) {
-                    return Err(format!("stark: layer {l} weight {w} outside i8"));
+                    return Err(format!("attestation: layer {l} weight {w} outside i8"));
                 }
             }
 
@@ -326,7 +328,7 @@ impl ModelView {
             }
             if layer_worst > ATTEST_ACC_MAX {
                 return Err(format!(
-                    "stark: layer {l} worst-case accumulator {layer_worst} exceeds 2^31-1"
+                    "attestation: layer {l} worst-case accumulator {layer_worst} exceeds 2^31-1"
                 ));
             }
             max_input_act = layer_worst;
@@ -334,7 +336,9 @@ impl ModelView {
 
         let total_pub = self.n_public_inputs();
         if total_pub == 0 || total_pub > ATTEST_MAX_PUBLIC_INPUTS {
-            return Err(format!("stark: public inputs {total_pub} out of bounds"));
+            return Err(format!(
+                "attestation: public inputs {total_pub} out of bounds"
+            ));
         }
         Ok(())
     }
@@ -373,7 +377,7 @@ pub fn model_spec_with_attestation(
     view.check_compatible()?;
     if attestation.is_empty() || attestation.len() > MAX_SETUP_ATTESTATION_BYTES {
         return Err(format!(
-            "stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES} bytes"
+            "attestation: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES} bytes"
         ));
     }
     build_model_spec(view, attestation)
@@ -384,9 +388,11 @@ fn build_model_spec(
     attestation: Vec<u8>,
 ) -> Result<(Vec<u8>, ModelSpec), String> {
     let spec_bytes =
-        bincode::serialize(view).map_err(|e| format!("stark: vk serialize failed: {e}"))?;
+        bincode::serialize(view).map_err(|e| format!("attestation: vk serialize failed: {e}"))?;
     if spec_bytes.len() > MAX_MODEL_SPEC_BYTES {
-        return Err(format!("stark: spec_bytes exceeds {MAX_MODEL_SPEC_BYTES}"));
+        return Err(format!(
+            "attestation: spec_bytes exceeds {MAX_MODEL_SPEC_BYTES}"
+        ));
     }
     let spec_hash = spec_hash_of(&spec_bytes);
 
@@ -496,14 +502,14 @@ fn prove_attestation_inner(
     view.check_compatible()?;
     if inputs.len() != view.in_dim() {
         return Err(format!(
-            "stark: inputs len {} != model in_dim {}",
+            "attestation: inputs len {} != model in_dim {}",
             inputs.len(),
             view.in_dim()
         ));
     }
     for &x in inputs {
         if x < 0 || (x as u64) > ATTEST_MAX_INPUT {
-            return Err(format!("stark: input {x} outside u16"));
+            return Err(format!("attestation: input {x} outside u16"));
         }
     }
 
@@ -522,7 +528,7 @@ fn prove_attestation_inner(
                 sum = sum.saturating_add((c as i128) * (view.weights[l][i * out_dim + j] as i128));
             }
             if !(ATTEST_ACC_MIN..=ATTEST_ACC_MAX).contains(&sum) {
-                return Err("stark: accumulator outside bounds".to_string());
+                return Err("attestation: accumulator outside bounds".to_string());
             }
             let z_val = sum as i64;
             let a_val = if z_val > 0 { z_val } else { 0 };
@@ -585,8 +591,8 @@ fn prove_attestation_inner(
         query_samples: vec![(trace_root, current.clone())],
     };
 
-    let proof_bytes =
-        bincode::serialize(&payload).map_err(|e| format!("stark: serialize proof failed: {e}"))?;
+    let proof_bytes = bincode::serialize(&payload)
+        .map_err(|e| format!("attestation: serialize proof failed: {e}"))?;
 
     let proof = AttestationProof {
         model_hash,
@@ -756,28 +762,30 @@ pub fn check_model_spec(view: &ModelView, vk: &ModelSpec) -> Result<(), String> 
     view.check_compatible()?;
     if vk.spec_bytes.is_empty() || vk.spec_bytes.len() > MAX_MODEL_SPEC_BYTES {
         return Err(format!(
-            "stark: spec_bytes must be 1..={MAX_MODEL_SPEC_BYTES}"
+            "attestation: spec_bytes must be 1..={MAX_MODEL_SPEC_BYTES}"
         ));
     }
     if vk.setup_attestation.is_empty() || vk.setup_attestation.len() > MAX_SETUP_ATTESTATION_BYTES {
         return Err(format!(
-            "stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES}"
+            "attestation: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES}"
         ));
     }
     if vk.spec_hash != spec_hash_of(&vk.spec_bytes) {
-        return Err("stark: spec_hash does not match spec_bytes".to_string());
+        return Err("attestation: spec_hash does not match spec_bytes".to_string());
     }
     let Ok(deserialized_view) = bincode::deserialize::<ModelView>(&vk.spec_bytes) else {
-        return Err("stark: spec_bytes failed to parse as valid model view".to_string());
+        return Err("attestation: spec_bytes failed to parse as valid model view".to_string());
     };
     if &deserialized_view != view {
-        return Err("stark: spec_bytes does not match registered model constraints".to_string());
+        return Err(
+            "attestation: spec_bytes does not match registered model constraints".to_string(),
+        );
     }
     if vk.in_dim != view.in_dim() as u64 || vk.out_dim != view.out_dim() as u64 {
-        return Err("stark: vk shape does not match model".to_string());
+        return Err("attestation: vk shape does not match model".to_string());
     }
     if vk.n_public_inputs != view.n_public_inputs() as u64 {
-        return Err("stark: vk n_public_inputs inconsistent".to_string());
+        return Err("attestation: vk n_public_inputs inconsistent".to_string());
     }
     Ok(())
 }
@@ -811,6 +819,33 @@ mod context_binding_tests {
             height: 42,
             sender: [0x77; 32],
         }
+    }
+
+    /// Regression for the honesty rule: a user-visible refusal from this
+    /// subsystem must never describe itself as a STARK/ZK proof. The error
+    /// prefix used to be `stark:` — the mechanism never had a STARK.
+    #[test]
+    fn user_visible_errors_never_claim_stark_or_zero_knowledge() {
+        let m = model();
+        let view = m.attestation_view();
+        let bad = ModelSpec {
+            spec_hash: [0u8; 32],
+            spec_bytes: Vec::new(),
+            setup_attestation: b"label".to_vec(),
+            n_public_inputs: 2,
+            in_dim: 2,
+            out_dim: 2,
+        };
+        let err = check_model_spec(&view, &bad).expect_err("empty spec_bytes must be refused");
+        let lower = err.to_lowercase();
+        assert!(
+            !lower.contains("stark") && !lower.contains("zero-knowledge") && !lower.contains("zk"),
+            "refusal must not claim a STARK/ZK proof: {err}"
+        );
+        assert!(
+            err.starts_with("attestation:"),
+            "refusal must name the real mechanism: {err}"
+        );
     }
 
     #[test]

@@ -24,7 +24,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::time::{Duration, Instant};
 use stellereum::consensus::{
-    vote_sign_bytes, QuorumCertificate, ValidatorSet, Vote, VoteKind, MAX_COMMIT_CERT_SIGNERS,
+    vote_sign_bytes, vote_sign_bytes_for_shard, QuorumCertificate, ValidatorSet, Vote, VoteKind,
+    MAX_COMMIT_CERT_SIGNERS,
 };
 use stellereum::consensus_net::{ConsensusMsg, MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
@@ -473,6 +474,7 @@ fn qc_fixture(n: u64) -> (ValidatorSet, QuorumCertificate) {
         sigs.push((v.voter, v.signature));
     }
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 10,
         round: 0,
         kind: VoteKind::Precommit,
@@ -575,6 +577,7 @@ fn qc_verify_huge_signer_lists_false_quickly() {
         sigs.push((sk.verifying_key().to_bytes(), sig.to_vec()));
     }
     let qc_cap = QuorumCertificate {
+        shard_id: 0,
         height: 10,
         round: 0,
         kind: VoteKind::Precommit,
@@ -599,6 +602,7 @@ fn qc_verify_huge_signer_lists_false_quickly() {
     let (set4, qc4) = qc_fixture(4);
     let single = qc4.signatures[0].clone();
     let qc_dup = QuorumCertificate {
+        shard_id: 0,
         signatures: vec![single; MAX_COMMIT_CERT_SIGNERS],
         ..qc4.clone()
     };
@@ -776,26 +780,26 @@ fn qc_verify_accepts_true_quorum_and_survives_single_bad_sig() {
 
 #[test]
 fn vote_sign_bytes_is_deterministic_and_field_injective() {
-    let prefix = b"STELLEREUM_BFT_VOTE_V2";
+    let prefix = b"STELLEREUM_BFT_VOTE_V3";
     let hash = Some([3u8; 32]);
 
-    // Fixed layout: domain tag + chain_id(BE8) + height(BE8) + round(BE4)
-    // + kind(1) + flag(1) [+ hash(32) when Some].
+    // Fixed layout: domain tag + chain_id(BE8) + shard_id(BE4)
+    // + height(BE8) + round(BE4) + kind(1) + flag(1) [+ hash(32) when Some].
     let with_hash = vote_sign_bytes(1, 2, VoteKind::Prevote, &hash);
     assert_eq!(
         &with_hash[..prefix.len()],
         prefix,
         "missing domain separator"
     );
-    assert_eq!(with_hash.len(), prefix.len() + 8 + 8 + 4 + 1 + 1 + 32);
-    assert_eq!(with_hash[prefix.len() + 20], 0, "Prevote must encode as 0");
-    assert_eq!(with_hash[prefix.len() + 21], 1, "Some(hash) flag");
-    assert_eq!(&with_hash[prefix.len() + 22..], &[3u8; 32][..]);
+    assert_eq!(with_hash.len(), prefix.len() + 8 + 4 + 8 + 4 + 1 + 1 + 32);
+    assert_eq!(with_hash[prefix.len() + 24], 0, "Prevote must encode as 0");
+    assert_eq!(with_hash[prefix.len() + 25], 1, "Some(hash) flag");
+    assert_eq!(&with_hash[prefix.len() + 26..], &[3u8; 32][..]);
 
     let no_hash = vote_sign_bytes(1, 2, VoteKind::Precommit, &None);
-    assert_eq!(no_hash.len(), prefix.len() + 8 + 8 + 4 + 1 + 1);
-    assert_eq!(no_hash[prefix.len() + 20], 1, "Precommit must encode as 1");
-    assert_eq!(no_hash[prefix.len() + 21], 0, "None flag");
+    assert_eq!(no_hash.len(), prefix.len() + 8 + 4 + 8 + 4 + 1 + 1);
+    assert_eq!(no_hash[prefix.len() + 24], 1, "Precommit must encode as 1");
+    assert_eq!(no_hash[prefix.len() + 25], 0, "None flag");
 
     // The chain id is part of the preimage: the same vote on another chain
     // signs different bytes (cross-chain replay protection).
@@ -818,17 +822,25 @@ fn vote_sign_bytes_is_deterministic_and_field_injective() {
         for r in 0..4u32 {
             for k in [VoteKind::Prevote, VoteKind::Precommit] {
                 for bh in [None, Some([0u8; 32]), Some([1u8; 32]), Some([0xFFu8; 32])] {
-                    let b = vote_sign_bytes(h, r, k, &bh);
-                    assert!(
-                        seen.insert(b.clone()),
-                        "preimage collision for h={h} r={r} k={k:?} bh={bh:?}"
-                    );
-                    checked += 1;
+                    // Finding A: the shard is part of the signed preimage, so
+                    // the same fields on two shards may never collide either.
+                    for shard in [0u32, 1u32] {
+                        let b = if shard == 0 {
+                            vote_sign_bytes(h, r, k, &bh)
+                        } else {
+                            vote_sign_bytes_for_shard(shard, h, r, k, &bh)
+                        };
+                        assert!(
+                            seen.insert(b.clone()),
+                            "preimage collision for shard={shard} h={h} r={r} k={k:?} bh={bh:?}"
+                        );
+                        checked += 1;
+                    }
                 }
             }
         }
     }
-    assert_eq!(checked, 128);
+    assert_eq!(checked, 256);
     assert_eq!(seen.len(), checked);
 }
 

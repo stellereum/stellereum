@@ -30,6 +30,12 @@ mod bin_tests;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    // Protocol identity MUST be installed before any node handshake: it is
+    // what every peer compares against (fork id mismatch = consensus refused,
+    // loudly). Startup visibility is part of the contract.
+    stellereum::protocol::install_chain_identity()
+        .map_err(|e| anyhow::anyhow!("protocol identity: {e}"))?;
+    tracing::info!("{}", stellereum::protocol::startup_line());
     let cli = cli::args::Cli::parse();
     cli::handlers::handle_command(cli.command).await
 }

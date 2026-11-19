@@ -75,6 +75,22 @@ pub mod kind {
     pub const AUTH: u8 = 3;
     pub const REQ: u8 = 4;
     pub const RESP: u8 = 5;
+    /// Post-handshake protocol-negotiation control frame.
+    ///
+    /// This is a CONTROL kind, not a new frame header: the v2 frame layout
+    /// (version byte, header offsets, signature trailer) is byte-identical for
+    /// every pre-existing kind, and peers that never send/receive `HELLO`
+    /// keep the exact v2 wire behaviour. Frames are length-delimited by their
+    /// own header, so a receiver that does not know `HELLO` simply ignores it
+    /// (the `Node::handle` default arm) and the next frame parses normally.
+    pub const HELLO: u8 = 6;
+}
+
+/// True for the control kinds this build understands. An UNKNOWN kind is
+/// deliberately NOT an error (forward compatibility): `Node::handle` ignores
+/// it and the stream stays usable.
+pub const fn is_control_kind(k: u8) -> bool {
+    k == kind::HELLO
 }
 
 pub fn now_ms() -> i64 {
@@ -158,6 +174,443 @@ pub fn negotiate_frame_version(peer_min: u32, peer_max: u32) -> Option<u32> {
     let lo = peer_min.max(FRAME_VERSION_MIN);
     let hi = peer_max.min(FRAME_VERSION_MAX);
     (lo <= hi).then_some(hi)
+}
+
+// ---------------------------------------------------------------------------
+// PROTOCOL VERSION / FORK ID / CAPABILITY NEGOTIATION (control plane).
+//
+// This block is deliberately transport-generic: `infnode` owns the wire
+// mechanics of the control message and the pure negotiation state machine,
+// while the CHAIN identity (its `PROTOCOL_VERSION`, `FORK_ID` and advertised
+// capability set) is installed by the embedding binary through
+// [`install_local_identity`]. `stellereum::protocol` is that installer for the
+// chain; a standalone infnode uses [`DEFAULT_IDENTITY`].
+//
+// The control message is exchanged once per connection AFTER a successful
+// PQ+AUTH handshake. It is NOT carried in the frame header, and it never
+// changes the v2 frame encoding: a peer that never negotiates sends and
+// receives exactly the same bytes as before.
+// ---------------------------------------------------------------------------
+
+/// Semver-ish protocol version: 16-bit major + 16-bit minor, packed into the
+/// low/high halves of a `u32` so the wire form is one fixed 4-byte field.
+///
+/// Compatibility rule (see [`negotiate`]): the major must match; a minor
+/// difference of one is accepted with the capability INTERSECTION and one
+/// advisory log line; a difference of two or more is refused for consensus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProtocolVersion(pub u32);
+
+impl ProtocolVersion {
+    /// Build from `major.minor`.
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self(((major as u32) << 16) | minor as u32)
+    }
+
+    pub const fn major(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    pub const fn minor(self) -> u16 {
+        (self.0 & 0xffff) as u16
+    }
+
+    pub const fn to_wire(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
+    pub const fn from_wire(b: [u8; 4]) -> Self {
+        Self(u32::from_le_bytes(b))
+    }
+
+    /// Absolute minor distance within the same major (`u16::MAX` when the
+    /// majors differ, which every caller treats as incompatible).
+    pub const fn minor_distance(self, other: Self) -> u16 {
+        if self.major() != other.major() {
+            return u16::MAX;
+        }
+        self.minor().abs_diff(other.minor())
+    }
+}
+
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major(), self.minor())
+    }
+}
+
+/// Capability bitflags advertised in [`Hello`].
+///
+/// Unknown bits are preserved on the wire (forward compatibility) but never
+/// enter an AGREED set: [`Self::intersection`] only keeps bits both sides
+/// understand, so a future capability cannot be silently assumed active.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Capabilities(pub u64);
+
+impl Capabilities {
+    /// Nothing: the safe value for a peer refused for consensus.
+    pub const NONE: Self = Self(0);
+    /// Compact proposal gossip (`CompactProposal` / `BodyPull` / `Body`).
+    /// A peer that does not advertise this MUST receive the full `Proposal`.
+    pub const COMPACT_GOSSIP_BIT: u64 = 1 << 0;
+    /// Direct validator mesh delivery (warm links) instead of the overlay
+    /// broadcast. Advisory: the overlay fallback always remains.
+    pub const MESH_DIRECT_BIT: u64 = 1 << 1;
+    pub const COMPACT_GOSSIP: Self = Self(Self::COMPACT_GOSSIP_BIT);
+    pub const MESH_DIRECT: Self = Self(Self::MESH_DIRECT_BIT);
+    /// Every capability this build implements.
+    pub const ALL: Self = Self(Self::COMPACT_GOSSIP_BIT | Self::MESH_DIRECT_BIT);
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// Stable `FORK_ID` of the standalone infnode overlay, used only until the
+/// embedding chain installs its own identity (see [`install_local_identity`]).
+///
+/// Derived from the transport ruleset constants, never from a binary hash:
+/// the frame version, the PQ transcript version/suite and the frame caps.
+/// Changing any of them changes this value; a rebuild does not.
+pub const INFNODE_FORK_ID: u32 = fork_id_from_parts(&[
+    FRAME_VERSION as u32,
+    PQ_TRANSCRIPT_VERSION as u32,
+    PQ_SUITE_MLKEM768_HYBRID as u32,
+    MAX_AUTH_FRAME as u32,
+    MAX_FRAME as u32,
+]);
+
+/// Standalone default identity (overridden by the chain at startup).
+pub const DEFAULT_IDENTITY: ProtocolIdentity = ProtocolIdentity {
+    protocol_version: ProtocolVersion::new(1, 0),
+    fork_id: INFNODE_FORK_ID,
+    capabilities: Capabilities::ALL,
+};
+
+/// Domain separation for the constant-only FNV fold used by [`INFNODE_FORK_ID`].
+const FORK_ID_DOMAIN: &[u8] = b"infnode-fork-v1";
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+const FNV_PRIME: u32 = 0x0100_0193;
+
+/// FNV-1a 32 over `bytes`, seeded with `seed`. `const` so the fork id is a
+/// compile-time constant derived only from the listed inputs.
+pub const fn fnv1a32(seed: u32, bytes: &[u8]) -> u32 {
+    let mut h = seed;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    h
+}
+
+/// Deterministic fork-id fold over the domain and a list of ruleset values.
+pub const fn fork_id_from_parts(parts: &[u32]) -> u32 {
+    let mut h = fnv1a32(FNV_OFFSET, FORK_ID_DOMAIN);
+    let mut i = 0;
+    while i < parts.len() {
+        let b = parts[i].to_le_bytes();
+        h = fnv1a32(h, &b);
+        i += 1;
+    }
+    h
+}
+
+/// The local protocol identity advertised in [`Hello`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtocolIdentity {
+    pub protocol_version: ProtocolVersion,
+    pub fork_id: u32,
+    pub capabilities: Capabilities,
+}
+
+impl ProtocolIdentity {
+    pub const fn hello(self) -> Hello {
+        Hello {
+            protocol_version: self.protocol_version,
+            fork_id: self.fork_id,
+            capabilities: self.capabilities,
+        }
+    }
+}
+
+static LOCAL_IDENTITY: std::sync::OnceLock<ProtocolIdentity> = std::sync::OnceLock::new();
+
+/// Install the local identity ONCE per process. Returns an error if a
+/// DIFFERENT identity was already installed (the chain must not silently run
+/// with a stale fork id); re-installing the exact same identity is a no-op.
+pub fn install_local_identity(identity: ProtocolIdentity) -> Result<(), String> {
+    match LOCAL_IDENTITY.set(identity) {
+        Ok(()) => Ok(()),
+        Err(rejected) if rejected == identity => Ok(()),
+        Err(rejected) => Err(format!(
+            "protocol identity already installed as v{} fork 0x{:08x}; refusing to replace it with v{} fork 0x{:08x}",
+            rejected.protocol_version,
+            rejected.fork_id,
+            identity.protocol_version,
+            identity.fork_id,
+        )),
+    }
+}
+
+/// The identity this process advertises (default until the chain installs).
+pub fn local_identity() -> ProtocolIdentity {
+    *LOCAL_IDENTITY.get_or_init(|| DEFAULT_IDENTITY)
+}
+
+/// Fixed magic of a [`Hello`] control payload (`IHL1`).
+pub const HELLO_MAGIC: [u8; 4] = *b"IHL1";
+/// Fixed prefix length of a Hello payload. Trailing bytes are ignored so a
+/// future version can append fields without breaking this decoder.
+pub const HELLO_WIRE_LEN: usize = 4 + 4 + 4 + 8;
+
+/// `Hello { protocol_version, fork_id, capabilities }`.
+///
+/// It travels as the payload of a [`kind::HELLO`] control frame after the
+/// PQ+AUTH handshake (so it is signed and identity-bound like every frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hello {
+    pub protocol_version: ProtocolVersion,
+    pub fork_id: u32,
+    pub capabilities: Capabilities,
+}
+
+impl Hello {
+    pub const fn new(
+        protocol_version: ProtocolVersion,
+        fork_id: u32,
+        capabilities: Capabilities,
+    ) -> Self {
+        Self {
+            protocol_version,
+            fork_id,
+            capabilities,
+        }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HELLO_WIRE_LEN);
+        out.extend_from_slice(&HELLO_MAGIC);
+        out.extend_from_slice(&self.protocol_version.to_wire());
+        out.extend_from_slice(&self.fork_id.to_le_bytes());
+        out.extend_from_slice(&self.capabilities.bits().to_le_bytes());
+        out
+    }
+
+    /// Decode a control payload. `None` for a bad magic or a short payload;
+    /// trailing bytes are ignored (forward-compatible extension space).
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < HELLO_WIRE_LEN || b[..4] != HELLO_MAGIC {
+            return None;
+        }
+        let version = ProtocolVersion::from_wire([b[4], b[5], b[6], b[7]]);
+        let fork_id = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+        let caps = u64::from_le_bytes([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
+        Some(Self {
+            protocol_version: version,
+            fork_id,
+            capabilities: Capabilities::from_bits(caps),
+        })
+    }
+}
+
+/// Why a peer was refused CONSENSUS participation. Every variant is loud and
+/// specific; none of them drops the connection (DHT/storage services remain
+/// available to a non-consensus peer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NegotiationRefusal {
+    /// The consensus rulesets differ. This is a hard fork boundary: accepting
+    /// the peer would let two incompatible rule sets vote on one chain.
+    ForkMismatch { local: u32, peer: u32 },
+    /// Incomparable major versions (semver-ish integers).
+    MajorMismatch {
+        local: ProtocolVersion,
+        peer: ProtocolVersion,
+    },
+    /// Peer is more than one minor version behind.
+    VersionTooOld {
+        local: ProtocolVersion,
+        peer: ProtocolVersion,
+    },
+    /// Peer is more than one minor version ahead.
+    VersionTooNew {
+        local: ProtocolVersion,
+        peer: ProtocolVersion,
+    },
+}
+
+impl std::fmt::Display for NegotiationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForkMismatch { local, peer } => write!(
+                f,
+                "CONSENSUS REFUSED: fork_id mismatch (local 0x{local:08x}, peer 0x{peer:08x}) — \
+                 peers with different consensus rules must never vote together; \
+                 non-consensus services (DHT/blobs) remain available"
+            ),
+            Self::MajorMismatch { local, peer } => write!(
+                f,
+                "CONSENSUS REFUSED: incompatible protocol major (local v{local}, peer v{peer})"
+            ),
+            Self::VersionTooOld { local, peer } => write!(
+                f,
+                "CONSENSUS REFUSED: peer protocol v{peer} is more than one minor behind local v{local}"
+            ),
+            Self::VersionTooNew { local, peer } => write!(
+                f,
+                "CONSENSUS REFUSED: peer protocol v{peer} is more than one minor ahead of local v{local}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NegotiationRefusal {}
+
+/// Result of a successful negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Agreement {
+    /// Version of the agreed common protocol (the lower of the two on N-1).
+    pub protocol_version: ProtocolVersion,
+    /// Intersection of the advertised capability sets.
+    pub capabilities: Capabilities,
+    /// True when the peers differ by exactly one minor version (accepted, but
+    /// a coarse upgrade is in progress and a full-capability peer would see
+    /// the intersection instead).
+    pub advisory: bool,
+}
+
+/// Pure negotiation state machine (no I/O, no globals): the whole rule set.
+///
+/// * different `fork_id` -> [`NegotiationRefusal::ForkMismatch`];
+/// * same major and same minor -> full intersection, `advisory == false`;
+/// * same major, one minor apart -> intersection, `advisory == true`;
+/// * same major, two or more minors apart -> `VersionTooOld`/`VersionTooNew`;
+/// * different major -> `MajorMismatch`.
+pub fn negotiate(local: ProtocolIdentity, peer: Hello) -> Result<Agreement, NegotiationRefusal> {
+    if local.fork_id != peer.fork_id {
+        return Err(NegotiationRefusal::ForkMismatch {
+            local: local.fork_id,
+            peer: peer.fork_id,
+        });
+    }
+    let lv = local.protocol_version;
+    let pv = peer.protocol_version;
+    if lv.major() != pv.major() {
+        return Err(NegotiationRefusal::MajorMismatch {
+            local: lv,
+            peer: pv,
+        });
+    }
+    let distance = lv.minor_distance(pv);
+    match distance {
+        0 => Ok(Agreement {
+            protocol_version: lv,
+            capabilities: local.capabilities.intersection(peer.capabilities),
+            advisory: false,
+        }),
+        1 => Ok(Agreement {
+            protocol_version: if pv < lv { pv } else { lv },
+            capabilities: local.capabilities.intersection(peer.capabilities),
+            advisory: true,
+        }),
+        _ => {
+            if pv < lv {
+                Err(NegotiationRefusal::VersionTooOld {
+                    local: lv,
+                    peer: pv,
+                })
+            } else {
+                Err(NegotiationRefusal::VersionTooNew {
+                    local: lv,
+                    peer: pv,
+                })
+            }
+        }
+    }
+}
+
+/// Per-peer negotiated state, stored by the transport after a Hello.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerProtocolState {
+    pub hello: Hello,
+    pub agreement: Option<Agreement>,
+    pub refusal: Option<NegotiationRefusal>,
+}
+
+impl PeerProtocolState {
+    /// Consensus traffic may be exchanged only with an accepted peer.
+    pub const fn consensus_eligible(&self) -> bool {
+        self.agreement.is_some()
+    }
+
+    /// Agreed capabilities (`NONE` for a refused peer).
+    pub const fn capabilities(&self) -> Capabilities {
+        match self.agreement {
+            Some(a) => a.capabilities,
+            None => Capabilities::NONE,
+        }
+    }
+
+    /// A refused peer may still serve non-consensus services (DHT/blobs).
+    pub const fn may_serve_non_consensus(&self) -> bool {
+        true
+    }
+}
+
+/// Classify a peer's Hello against the local identity.
+pub fn classify_peer(local: ProtocolIdentity, hello: Hello) -> PeerProtocolState {
+    match negotiate(local, hello) {
+        Ok(agreement) => PeerProtocolState {
+            hello,
+            agreement: Some(agreement),
+            refusal: None,
+        },
+        Err(refusal) => PeerProtocolState {
+            hello,
+            agreement: None,
+            refusal: Some(refusal),
+        },
+    }
+}
+
+/// One decoded control-plane message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlMessage {
+    Hello(Hello),
+}
+
+/// Decode a control frame payload by kind.
+///
+/// An UNKNOWN kind or an undecodable known payload returns `None`, which every
+/// caller MUST treat as "ignore this frame and keep the stream" — never as a
+/// protocol error, disconnect or desync. Frames are self-delimiting, so
+/// ignoring one cannot shift the next one.
+pub fn decode_control(kind: u8, payload: &[u8]) -> Option<ControlMessage> {
+    match kind {
+        self::kind::HELLO => Hello::decode(payload).map(ControlMessage::Hello),
+        _ => None,
+    }
 }
 
 /// Operator-facing diagnosis for a frame whose version byte is not ours:

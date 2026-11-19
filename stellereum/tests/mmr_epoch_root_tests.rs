@@ -128,41 +128,51 @@ fn ok_body(v: &Value) -> &Value {
     v
 }
 
+/// Ruleset v2 MMR epoch length (heights per epoch).
+const E: u64 = stellereum::mmr::MMR_EPOCH_BLOCKS;
+
 /// A complete epoch is served with the recomputed root, and the light
 /// client verifies the answer plus an inclusion proof — anchored on the
 /// quorum-signed boundary commitment.
 #[tokio::test]
 async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let st = test_state(200);
-    // Epoch 0: heights 0..=127 (this binary's range — no other test here
+    let st = test_state(2 * E);
+    // Epoch 0: heights 0..=E-1 (this binary's range — no other test here
     // records these heights).
-    let leaves = record_epoch(&st, &ks, &fks, 0..=127).await;
+    let leaves = record_epoch(&st, &ks, &fks, 0..=(E - 1)).await;
     let (expected_root, expected_peaks) = stellereum::mmr::mmr_root_for_leaves(&leaves);
-    assert_eq!(expected_peaks.len(), 1, "128 leaves form a single mountain");
+    assert_eq!(
+        expected_peaks.len(),
+        leaves.len().count_ones() as usize,
+        "peaks = popcount(leaf count)"
+    );
 
     // Before the boundary block exists there is no signed commitment yet.
     let before = st.call("stell_getEpochRoot", json!({ "epoch": 0 })).await;
     let before = ok_body(&before);
     assert_eq!(before["epoch"], 0);
     assert_eq!(before["start_height"], 0);
-    assert_eq!(before["end_height"], 127);
+    assert_eq!(before["end_height"], E - 1);
     assert_eq!(before["mmr_root"], json!(hex::encode(expected_root)));
-    assert_eq!(before["peaks"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        before["peaks"].as_array().unwrap().len(),
+        expected_peaks.len()
+    );
     assert_eq!(before["complete"], true);
-    assert_eq!(before["leaves"], 128);
+    assert_eq!(before["leaves"], E);
     assert!(before["committed_root"].is_null(), "no boundary header yet");
 
     // The first block of epoch 1 commits the epoch-0 root (the quorum-signed
     // half of the Tier-2 promise).
     let mut boundary = Block {
         shard_id: MASTERCHAIN_SHARD,
-        height: 128,
-        prev_hash: leaves[127],
+        height: E,
+        prev_hash: leaves[(E - 1) as usize],
         state_root: [0x77u8; 32],
         transactions: vec![],
         cross_shard_out: vec![],
-        timestamp: 1_700_000_128,
+        timestamp: 1_700_000_000 + E,
         proposer: ks[0].verifying_key().to_bytes(),
         validator_signatures: vec![],
         shard_headers: vec![],
@@ -174,13 +184,13 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
         epoch_key_commitment: [0u8; 32],
     };
     let boundary_hash = boundary.compute_hash();
-    boundary.precommit_qc = Some(cert(&ks, &fks, 128, boundary_hash, &leaves[127]));
+    boundary.precommit_qc = Some(cert(&ks, &fks, E, boundary_hash, &leaves[(E - 1) as usize]));
     st.record_finalized_header(&boundary).await;
 
     let served = st.call("stell_getEpochRoot", json!({ "epoch": 0 })).await;
     let served = ok_body(&served);
     assert_eq!(served["committed_root"], json!(hex::encode(expected_root)));
-    assert_eq!(served["committed_in_height"], 128);
+    assert_eq!(served["committed_in_height"], E);
 
     // The light-client half, reusing the RPC answer: the answer is
     // self-consistent, and a proof for a finalized leaf verifies under it.
@@ -204,17 +214,17 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
 #[tokio::test]
 async fn stell_get_epoch_root_selectors_and_honest_misses() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let st = test_state(900);
+    let st = test_state(8 * E);
     // Epoch 7 (this binary's range): two headers only.
-    record_epoch(&st, &ks, &fks, 896..=897).await;
+    record_epoch(&st, &ks, &fks, 7 * E..=7 * E + 1).await;
 
     let by_height_raw = st
-        .call("stell_getEpochRoot", json!({ "height": 897 }))
+        .call("stell_getEpochRoot", json!({ "height": 7 * E + 1 }))
         .await;
     let by_height = ok_body(&by_height_raw);
     assert_eq!(by_height["epoch"], 7);
-    assert_eq!(by_height["start_height"], 896);
-    assert_eq!(by_height["end_height"], 1023);
+    assert_eq!(by_height["start_height"], 7 * E);
+    assert_eq!(by_height["end_height"], 8 * E - 1);
     assert_eq!(by_height["complete"], false);
     assert_eq!(by_height["leaves"], 2);
 
@@ -240,9 +250,9 @@ async fn stell_get_epoch_root_selectors_and_honest_misses() {
 #[tokio::test]
 async fn stell_get_epoch_root_marks_partial_epochs_and_proofs_refuse() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let st = test_state(642);
-    // Epoch 5 (this binary's range): three of 128 heights.
-    let leaves = record_epoch(&st, &ks, &fks, 640..=642).await;
+    let st = test_state(5 * E + 2);
+    // Epoch 5 (this binary's range): three of E heights.
+    let leaves = record_epoch(&st, &ks, &fks, 5 * E..=5 * E + 2).await;
 
     let served_raw = st.call("stell_getEpochRoot", json!({ "epoch": 5 })).await;
     let served = ok_body(&served_raw);

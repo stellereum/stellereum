@@ -166,7 +166,7 @@ fn run_pq_direct(committee: &EpochCommittee, members: &[Member]) -> Vec<EpochKey
 #[test]
 fn kem_registry_consts_mirror_pq_registry_delay_philosophy() {
     // Same exit-window delay: rotation observable well before enforcement.
-    assert_eq!(MEV_KEM_ROTATION_DELAY_HEIGHTS, 7_200);
+    assert_eq!(MEV_KEM_ROTATION_DELAY_HEIGHTS, 30_000);
     assert_eq!(
         MEV_KEM_ROTATION_DELAY_HEIGHTS, PQ_ROTATION_DELAY_HEIGHTS,
         "MEV KEM and PQ delays must move together (same rotation philosophy)"

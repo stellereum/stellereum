@@ -2729,3 +2729,197 @@ async fn cnvrf_v3_active_rejects_inadmissible_commit_payload() {
         "a stale-epoch commit carrier must be refused"
     );
 }
+
+/// LIVE FINALIZE PARITY (CN-VRF v3 epoch hooks): the node loop finalizes
+/// through the SEQUENCED lane (`try_finalize_submit` -> `try_poll_apply` ->
+/// `install_apply_outcome`), not `try_finalize`. The epoch hooks are documented
+/// to run on "every finalized-block advance", and both other advance paths
+/// (`try_finalize`, `apply_and_advance`) call them. If `install_apply_outcome`
+/// skips them, the production path never snapshots the H_freeze inputs, never
+/// submits the epoch VDF and never refreshes the epoch mirrors — so at
+/// CN-VRF v3 activation the boundary block has no beacon and the fail-closed
+/// committee schedule carries no proposer (the chain cannot advance).
+#[tokio::test]
+async fn sequenced_finalize_runs_cnvrf_v3_epoch_hooks() {
+    let key = SigningKey::from_bytes(&[0x7Au8; 32]);
+    let me = key.verifying_key().to_bytes();
+    let validators = ValidatorSet::from_list(vec![(me, 1)]);
+    let mut rt = ValidatorRuntime::new(key, validators, Arc::new(InMemoryStateEngine::new()), 1);
+    rt.set_cnvrf_v3_activation_height_for_tests(0);
+    rt.set_cnvrf_v3_vdf_steps(64);
+
+    // H_freeze for epoch 1 is `EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS` =
+    // 7200 - 360 = 6840. `install_apply_outcome` is exactly what the live loop
+    // calls once the worker reports this height applied.
+    let height = crate::cn_vrf::EPOCH_LEN - crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS;
+    let block = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height,
+        prev_hash: [0x11u8; 32],
+        timestamp: 1_760_000_000,
+        proposer: me,
+        ..Default::default()
+    };
+    let bh = block.compute_hash();
+    let outcome = crate::state_engine::BlockTransitionOutcome::default();
+    rt.install_apply_outcome(height, bh, &block, &outcome).await;
+
+    assert!(
+        rt.cnvrf_freeze_inputs.contains_key(&1),
+        "the live/sequenced finalize path must snapshot epoch 1's H_freeze inputs \
+         (install_apply_outcome skipped prepare_cnvrf_v3_epoch_hooks)"
+    );
+    assert!(
+        matches!(&rt.pending_vdf_rx, Some((epoch, _)) if *epoch == 1),
+        "the live/sequenced finalize path must dispatch the epoch-1 VDF at H_freeze"
+    );
+}
+
+/// CRITICAL (sealed + plain union caps): the proposer budgets the sealed
+/// prefix and the plain selection INDEPENDENTLY and then concatenates them.
+/// The validator enforces `MAX_BLOCK_TXS` / `MAX_BLOCK_GAS` / the wire and
+/// proof caps on the committed body, so an over-cap union is a block our own
+/// validators refuse — a liveness outage whenever the sealed (MEV) path has
+/// traffic. `final_block_body` is the one place `propose` assembles the body,
+/// so these pin the union rule directly.
+fn raw_gas_tx(nonce: u64, gas: u64, sig_len: usize) -> Transaction {
+    Transaction {
+        from: [nonce as u8; 32],
+        to: [0xAB; 32],
+        amount: 0,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: vec![0u8; sig_len],
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    }
+}
+
+fn body_gas(txs: &[Transaction]) -> u64 {
+    txs.iter().fold(0u64, |a, t| a.saturating_add(t.gas_limit))
+}
+
+#[test]
+fn final_body_truncates_the_sealed_plus_plain_union_to_the_gas_cap() {
+    // Each half fits the cap on its own (250M+1 < 500M); the union is 500M+2.
+    let sealed = vec![raw_gas_tx(0, MAX_BLOCK_GAS / 2 + 1, 0)];
+    let plain = vec![raw_gas_tx(1, MAX_BLOCK_GAS / 2 + 1, 0)];
+    assert!(
+        body_gas(&sealed) + body_gas(&plain) > MAX_BLOCK_GAS,
+        "fixture must force the union over the gas cap"
+    );
+    let body = ValidatorRuntime::final_block_body(sealed, plain);
+    assert!(
+        body_gas(&body) <= MAX_BLOCK_GAS,
+        "the block body must respect the validator's gas cap (got {})",
+        body_gas(&body)
+    );
+    // Deterministic: the sealed (preferred) prefix survives, the plain tail is
+    // shed. Anything else would make the block depend on a race.
+    assert_eq!(body.len(), 1);
+    assert_eq!(body[0].nonce, 0, "the sealed prefix must be kept first");
+}
+
+#[test]
+fn final_body_truncates_the_sealed_plus_plain_union_to_the_tx_cap() {
+    let sealed: Vec<Transaction> = (0..5_000).map(|n| raw_gas_tx(n, 1, 0)).collect();
+    let plain: Vec<Transaction> = (5_000..11_000).map(|n| raw_gas_tx(n, 1, 0)).collect();
+    assert!(sealed.len() + plain.len() > MAX_BLOCK_TXS);
+    let body = ValidatorRuntime::final_block_body(sealed, plain);
+    assert_eq!(body.len(), MAX_BLOCK_TXS);
+    // Sealed first, then plain, both in order: a deterministic prefix.
+    for (i, t) in body.iter().enumerate() {
+        assert_eq!(t.nonce, i as u64, "union prefix must stay in order");
+    }
+}
+
+#[test]
+fn final_body_truncates_the_union_to_the_wire_cap() {
+    // 13 MiB each: one fits (13MiB+256 < 24MiB), both do not (26MiB+512).
+    let sealed = vec![raw_gas_tx(0, 1_000, 13 * 1024 * 1024)];
+    let plain = vec![raw_gas_tx(1, 1_000, 13 * 1024 * 1024)];
+    let body = ValidatorRuntime::final_block_body(sealed, plain);
+    assert_eq!(
+        body.len(),
+        1,
+        "the union must be truncated to the same wire cap validators enforce"
+    );
+}
+
+/// The validator side of the same rule: an over-cap body is refused, so the
+/// proposer and the validator can never disagree about the cap set.
+#[tokio::test]
+async fn validator_refuses_a_body_over_the_union_caps() {
+    let key = SigningKey::generate(&mut OsRng);
+    let me = key.verifying_key().to_bytes();
+    let fk = FalconKeypair::generate_from_seed(0x5A);
+    let validators = ValidatorSet::from_list(vec![(me, 1)]);
+    let rt = ValidatorRuntime::new(key.clone(), validators, funded_state(me).await, 1)
+        .with_falcon_key(fk.clone());
+    let root = rt.state.get_state_root().await;
+    let txs = vec![
+        raw_gas_tx(0, MAX_BLOCK_GAS / 2 + 1, 0),
+        raw_gas_tx(1, MAX_BLOCK_GAS / 2 + 1, 0),
+    ];
+    let mut block = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 1,
+        prev_hash: [0u8; 32],
+        state_root: root,
+        // A valid order commitment, so the gas cap is what fires (the order
+        // check runs first and is part of the signed hash).
+        order_merkle_root: crate::mev::compute_order_merkle_root(&txs),
+        transactions: txs,
+        timestamp: 1_700_000_000,
+        proposer: me,
+        ..Default::default()
+    };
+    // Give the proposer a valid signature so the gas check is what fires.
+    block.sign_block_with_falcon(&key, &fk);
+    let err = rt
+        .validate_proposal_unaligned(&block, root)
+        .expect_err("an over-gas union must be refused")
+        .to_string();
+    assert!(
+        err.contains("gas"),
+        "the refusal must name the gas cap, got: {err}"
+    );
+}
+
+/// The validator must enforce the wire cap the packer applies, not just the
+/// tx-count/gas caps: a Byzantine proposer can hand-build a body no honest
+/// packer would produce.
+#[tokio::test]
+async fn validator_refuses_a_body_over_the_wire_cap() {
+    let key = SigningKey::generate(&mut OsRng);
+    let me = key.verifying_key().to_bytes();
+    let fk = FalconKeypair::generate_from_seed(0x5B);
+    let validators = ValidatorSet::from_list(vec![(me, 1)]);
+    let rt = ValidatorRuntime::new(key.clone(), validators, funded_state(me).await, 1)
+        .with_falcon_key(fk.clone());
+    let root = rt.state.get_state_root().await;
+    let over = crate::mempool::Mempool::MAX_BLOCK_WIRE_BYTES + 1;
+    let txs = vec![raw_gas_tx(0, 1_000, over)];
+    let mut block = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 1,
+        prev_hash: [0u8; 32],
+        state_root: root,
+        order_merkle_root: crate::mev::compute_order_merkle_root(&txs),
+        transactions: txs,
+        timestamp: 1_700_000_000,
+        proposer: me,
+        ..Default::default()
+    };
+    block.sign_block_with_falcon(&key, &fk);
+    let err = rt
+        .validate_proposal_unaligned(&block, root)
+        .expect_err("an over-wire body must be refused")
+        .to_string();
+    assert!(
+        err.contains("wire"),
+        "the refusal must name the wire cap, got: {err}"
+    );
+}

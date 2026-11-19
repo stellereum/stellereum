@@ -1495,6 +1495,24 @@ impl Mempool {
         self.txs.len()
     }
 
+    /// Age in seconds of the OLDEST transaction currently pending.
+    ///
+    /// Pure read of the admission stamps maintained in `insert`/`evict`: no
+    /// transaction body is inspected and no state lock is taken, so `/health`
+    /// can age the pool without a content scan. The scan is O(n) over
+    /// `inserted_at`, whose length is bounded by `max_size` (the hard pool
+    /// cap enforced on every admission), so it is O(configured pool cap) and
+    /// never O(unbounded history) — no extra maintained minimum is needed.
+    /// Returns `None` only for an empty pool. A stamp newer than `now_secs`
+    /// (a test clock going backwards) saturates the age at `0`, never wraps.
+    pub fn oldest_pending_age_secs(&self, now_secs: u64) -> Option<u64> {
+        self.inserted_at
+            .values()
+            .copied()
+            .min()
+            .map(|inserted| now_secs.saturating_sub(inserted))
+    }
+
     /// Persist pending transactions to disk (mempool survival across restarts).
     /// A restart with an empty mempool is a silent fund-loss: users' and faucet's
     /// valid transactions vanish, nonces gap, and load tests abort. Best-effort:
@@ -3281,6 +3299,41 @@ mod tests {
         let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
         t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
         t
+    }
+
+    /// `/health` age accessor: empty -> None, fresh -> 0, old -> the oldest
+    /// stamp wins, and a backwards clock saturates instead of wrapping.
+    #[test]
+    fn oldest_pending_age_is_a_pure_read_of_the_admission_stamps() {
+        let mut mp = Mempool::new(10, 10);
+        assert_eq!(
+            mp.oldest_pending_age_secs(1_000),
+            None,
+            "an empty pool has no pending age"
+        );
+
+        mp.inserted_at.insert([1u8; 32], 900);
+        assert_eq!(mp.oldest_pending_age_secs(1_000), Some(100));
+
+        // A younger transaction must not hide the oldest one.
+        mp.inserted_at.insert([2u8; 32], 1_050);
+        assert_eq!(
+            mp.oldest_pending_age_secs(1_000),
+            Some(100),
+            "the oldest admission stamp must win"
+        );
+
+        // A fresh transaction (stamp == now) ages to zero, not to "missing".
+        mp.inserted_at.clear();
+        mp.inserted_at.insert([2u8; 32], 1_050);
+        assert_eq!(mp.oldest_pending_age_secs(1_050), Some(0));
+
+        // Old transaction, then a clock that went backwards: saturate at 0.
+        assert_eq!(mp.oldest_pending_age_secs(4_600), Some(3_550));
+        assert_eq!(mp.oldest_pending_age_secs(0), Some(0));
+
+        mp.inserted_at.clear();
+        assert_eq!(mp.oldest_pending_age_secs(1_000), None);
     }
 
     #[test]

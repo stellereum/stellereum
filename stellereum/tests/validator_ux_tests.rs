@@ -4,7 +4,7 @@
 //!
 //! Design rules under test (all consts in `stellereum::staking`, no env):
 //!  - jail is automatic on a downtime slash (`note_missed_heights`); release
-//!    is `jailed_at + JAIL_RELEASE_DELAY_HEIGHTS` (1,000 heights);
+//!    is `jailed_at + JAIL_RELEASE_DELAY_HEIGHTS` (4,000 heights = 16 min @ 240 ms);
 //!  - `unjail` needs release reached AND self-bond back at MIN+buffer
 //!    (`required_bond_floor_nano`, 1,100 STELL) — fail-closed otherwise;
 //!  - `redelegate` moves voting power immediately but arms a
@@ -56,13 +56,14 @@ fn unjail_happy_path_after_window_with_buffer_intact() {
     l.bond(vid(2), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
     assert_eq!(l.elected_count(), 2);
 
-    // Offline for a full streak ending at height 10: slashed AND jailed.
-    let burned = jail_by_downtime(&mut l, vid(1), 10);
+    // Offline for a full streak ending at the threshold height: slashed AND jailed.
+    let t = DOWNTIME_MISS_THRESHOLD as u64;
+    let burned = jail_by_downtime(&mut l, vid(1), t);
     assert!(burned > 0, "the streak must cost something");
     assert!(l.is_jailed(&vid(1)), "downtime slash must jail");
     let rec = l.jail_record(&vid(1)).expect("jail record");
-    assert_eq!(rec.jailed_at_height, 10);
-    assert_eq!(rec.release_height, 10 + JAIL_RELEASE_DELAY_HEIGHTS);
+    assert_eq!(rec.jailed_at_height, t);
+    assert_eq!(rec.release_height, t + JAIL_RELEASE_DELAY_HEIGHTS);
 
     // Out of the set while jailed (power intact, votes gone).
     assert!(!l.to_validator_set().validators.contains_key(&vid(1)));
@@ -99,7 +100,8 @@ fn unjail_refusals_unknown_bare_min_then_topup() {
     // Bond exactly at the floor: one downtime slash pushes self-bond under
     // MIN+buffer and jails.
     l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
-    let burned = jail_by_downtime(&mut l, vid(1), 10);
+    let t = DOWNTIME_MISS_THRESHOLD as u64;
+    let burned = jail_by_downtime(&mut l, vid(1), t);
     assert!(burned > 0);
     assert!(l.is_jailed(&vid(1)));
     let left = l.validators[&vid(1)].self_bond;
@@ -128,7 +130,7 @@ fn jail_blocks_entry_but_never_holds_funds_hostage() {
     let mut l = StakingLedger::new();
     l.bond(vid(1), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
     l.delegate(del(1), vid(1), stell(1000)).unwrap();
-    jail_by_downtime(&mut l, vid(1), 10);
+    jail_by_downtime(&mut l, vid(1), DOWNTIME_MISS_THRESHOLD as u64);
     assert!(l.is_jailed(&vid(1)));
 
     // Entry refused: new delegations and rewards cannot park on a jailed key.
@@ -143,7 +145,7 @@ fn jail_blocks_entry_but_never_holds_funds_hostage() {
     // Redelegate TO a jailed validator refused; redelegate AWAY (flee)
     // allowed. Jail vid(2) as well so the TO-jailed case is covered.
     l.bond(vid(2), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
-    jail_by_downtime(&mut l, vid(2), 10);
+    jail_by_downtime(&mut l, vid(2), DOWNTIME_MISS_THRESHOLD as u64);
     assert_eq!(
         l.redelegate(del(1), vid(1), vid(2), stell(100), 0),
         Err(StakingError::Jailed)
@@ -394,7 +396,7 @@ fn min_edge_refusals_and_rotate_carries_jail() {
     l.redelegate(del(9), vid(3), vid(1), stell(500), 0).unwrap();
     let lock_before = l.redelegation_locked_until(&vid(1), &del(9));
     assert!(lock_before > 0);
-    jail_by_downtime(&mut l, vid(1), 10);
+    jail_by_downtime(&mut l, vid(1), DOWNTIME_MISS_THRESHOLD as u64);
     assert!(l.is_jailed(&vid(1)));
     l.announce_commission(vid(1), 1_200, 50).unwrap();
     l.rotate_key(vid(1), vid(2)).unwrap();

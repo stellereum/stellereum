@@ -30,6 +30,13 @@ pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 /// only ever ADD fresh entries, so this strictly shrinks the table.
 pub const ROUTING_STALE_AFTER_MS: i64 = 24 * 3600 * 1000;
 
+/// Minimum age of the least-recently-seen bucket entry before a NEWcomer may
+/// displace it. A novel identity can otherwise mint enough valid keys to fill
+/// a bucket and evict every honest entry (eclipse by churn). Recently seen
+/// entries are kept; only idle ones are replaced, and `prune_stale` still
+/// handles the 24 h horizon.
+pub const ROUTING_EVICT_GRACE_MS: i64 = 10 * 60 * 1000;
+
 /// Узел в таблице маршрутизации (FULL-PQ: `id` is the PQ id via
 /// `proto::pq_id_from_pub`; `pq_hex` is the pinned Falcon-512 key that MUST
 /// derive `id`. There is no classical identity field any more).
@@ -95,6 +102,25 @@ fn leading_common_bits(a: &[u8; NODEID_LEN], b: &[u8; NODEID_LEN]) -> usize {
     common
 }
 
+/// Peers a `dht.lookup` handler may forward to.
+///
+/// A recursive lookup used to fan out to EVERY connected peer, so one inbound
+/// request could become `deg^ttl` outbound requests (amplification). Kademlia
+/// forwards to at most [`ALPHA`] closest candidates; this pure selector pins
+/// that bound without touching the wire.
+pub fn lookup_fanout(
+    peers: impl IntoIterator<Item = [u8; NODEID_LEN]>,
+    target: &[u8; NODEID_LEN],
+    from: &[u8; NODEID_LEN],
+    fanout: usize,
+) -> Vec<[u8; NODEID_LEN]> {
+    let mut candidates: Vec<[u8; NODEID_LEN]> = peers.into_iter().filter(|p| p != from).collect();
+    candidates.sort_by_key(|a| xor_distance(a, target));
+    candidates.dedup();
+    candidates.truncate(fanout);
+    candidates
+}
+
 /// Kademlia routing table: 160 бакетов по XOR-расстоянию от нашего ID.
 pub struct RoutingTable {
     own: [u8; NODEID_LEN],
@@ -124,7 +150,9 @@ impl RoutingTable {
         common.min(159)
     }
 
-    /// Вставка/обновление узла: самый свежий — в начало бакета; полный бакет — evict старого.
+    /// Insert/update: newest at the front; a full bucket replaces only its
+    /// least-recently-seen entry, and only once that entry is past
+    /// [`ROUTING_EVICT_GRACE_MS`] (anti-eclipse; see the body).
     pub fn insert(&mut self, node: NodeInfo) {
         let idx = self.bucket_of(&node.id);
         let bucket = &mut self.buckets[idx];
@@ -134,8 +162,23 @@ impl RoutingTable {
             return;
         }
         if bucket.len() >= self.k {
-            // полный бакет: вытесняем самого старого (LRU)
-            bucket.pop_back();
+            // Full bucket: replace the LEAST-RECENTLY-SEEN entry, and only
+            // when it has been idle past the grace window. A novel id is
+            // dropped while every existing entry is still recent, so key
+            // churn cannot eclipse honest routing entries.
+            let oldest = bucket
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, n)| n.last_seen)
+                .map(|(i, n)| (i, n.last_seen));
+            match oldest {
+                Some((idx, last_seen))
+                    if node.last_seen.saturating_sub(last_seen) >= ROUTING_EVICT_GRACE_MS =>
+                {
+                    bucket.remove(idx);
+                }
+                _ => return,
+            }
         }
         bucket.push_front(node);
     }

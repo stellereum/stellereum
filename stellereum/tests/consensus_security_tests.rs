@@ -319,6 +319,7 @@ fn qc_rejects_duplicate_signers() {
         (v.voter, v.signature.clone()),
     ];
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

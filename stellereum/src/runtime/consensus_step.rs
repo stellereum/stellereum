@@ -233,6 +233,19 @@ impl ValidatorRuntime {
         if qc.kind != crate::consensus::VoteKind::Precommit {
             return Err("proposal: downtime evidence is not a precommit quorum".to_string());
         }
+        // SHARD BINDING (Finding A): a certificate aggregates one shard's
+        // votes and its signatures are bound to that shard's V3 preimage. A
+        // parent certificate from a SIBLING shard (possible for a nil QC,
+        // whose target hash is absent) must not be embedded here: it would
+        // attribute downtime from another shard's participation. The target
+        // block's own shard is the only acceptable scope, and it is also this
+        // runtime's shard.
+        if qc.shard_id != block.shard_id || qc.shard_id != self.shard_id {
+            return Err(format!(
+                "proposal: downtime evidence is for shard {} but this block/shard is {}/{}",
+                qc.shard_id, block.shard_id, self.shard_id
+            ));
+        }
         // STAB verify-once: the QC power is a pure function of (block bytes,
         // validator history at parent_h). Round retries re-validate the same
         // block; the second+ visits hit O(1) instead of re-running
@@ -341,6 +354,30 @@ impl ValidatorRuntime {
         Ok(())
     }
 
+    /// Wire-size and proof-unit caps, the two the proposer's packer enforces
+    /// (`Mempool::select_for_block_multi` / `truncate_to_block_caps`) that the
+    /// tx-count and gas checks do NOT cover.
+    ///
+    /// PURE function of the body, so every entry point that admits a block
+    /// (proposal, adopt) derives the same verdict on every node. A Byzantine
+    /// proposer that packs over them would otherwise force validators to carry
+    /// bytes/proof work no honest packer can reproduce.
+    pub(super) fn check_block_wire_and_proof_caps(block: &Block) -> Result<(), String> {
+        let mut wire = 0usize;
+        let mut proofs = 0usize;
+        for t in &block.transactions {
+            wire = wire.saturating_add(crate::mempool::Mempool::estimate_tx_wire_bytes(t));
+            proofs = proofs.saturating_add(crate::mempool::Mempool::count_tx_proof_units(t));
+        }
+        if wire > crate::mempool::Mempool::MAX_BLOCK_WIRE_BYTES {
+            return Err("proposal: block wire size exceeded".to_string());
+        }
+        if proofs > crate::mempool::Mempool::MAX_BLOCK_PROOF_UNITS {
+            return Err("proposal: block proof-unit cap exceeded".to_string());
+        }
+        Ok(())
+    }
+
     /// Round-INDEPENDENT proposal checks: everything `validate_proposal` verifies
     /// except which round's proposer slot the block claims. Used by `on_proposal`
     /// to prove a block is genuine (signed by its declared proposer, building on
@@ -375,6 +412,17 @@ impl ValidatorRuntime {
         // source root and must not be a replay of a message already
         // credited on this chain.
         if self.shard_registry.is_sharded() {
+            // TOTAL cross-shard record cap (legacy transfers + 2PC control
+            // records). Checked once, before any per-record work, so a
+            // Byzantine proposer cannot make validators carry an unbounded
+            // `cross_shard_out` body. The proposer uses the same constant.
+            if !Self::cross_shard_record_cap_ok(block) {
+                return Err(format!(
+                    "proposal: cross-shard record cap exceeded ({} > {})",
+                    block.cross_shard_out.len(),
+                    crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+                ));
+            }
             for msg in &block.cross_shard_out {
                 if msg.is_outbound_for(self.shard_id) {
                     if msg.is_xpc() {
@@ -595,6 +643,14 @@ impl ValidatorRuntime {
         if total_gas > MAX_BLOCK_GAS {
             return Err("proposal: block gas limit exceeded".to_string());
         }
+        // SAME CAP SET THE PACKER ENFORCES (`Mempool::select_for_block_multi`
+        // / `truncate_to_block_caps`): a proposer must not hand validators a
+        // body no honest packer can reproduce. The tx-count and gas caps above
+        // already reject the sealed+plain union overflow; these two close the
+        // remaining halves so the proposer and the validator agree on EVERY
+        // cap (wire bytes bound the decode/amortized bandwidth, proof units
+        // bound verification work).
+        Self::check_block_wire_and_proof_caps(block)?;
         // Batched Ed25519 verification: much faster than one-by-one for a full block.
         // STAB verify-once: cache per signature-committing key; the timed attribution re-run
         // below becomes an O(1) HashMap hit with a byte-identical verdict.
@@ -993,7 +1049,7 @@ impl ValidatorRuntime {
     /// `on_prevote`/`on_precommit` — still teaches us the peer's round here,
     /// so a 1200-round desync collapses instead of being dropped both ways.
     pub fn observe_peer_vote(&mut self, vote: &Vote) -> bool {
-        if vote.height != self.hc.height {
+        if vote.height != self.hc.height || vote.shard_id != self.shard_id {
             return false;
         }
         if !vote.verify() {
@@ -1247,9 +1303,28 @@ impl ValidatorRuntime {
         target: Option<BlockHash>,
         round: Round,
     ) -> Option<Vote> {
-        let msg = crate::consensus::vote_sign_bytes(self.hc.height, round, kind, &target);
+        // SHARD BINDING (Finding A): the vote preimage commits to the shard
+        // this runtime serves, so the same validator key running several
+        // shards signs distinct statements per shard. Without it an observer
+        // could package the honest shard-0/shard-1 pair as equivocation
+        // evidence and slash an honest validator.
+        let msg = crate::consensus::vote_sign_bytes_for_shard(
+            self.shard_id,
+            self.hc.height,
+            round,
+            kind,
+            &target,
+        );
         let sig = self.sign_bytes(&msg)?;
-        let mut vote = Vote::signed_with(self.id, self.hc.height, round, kind, target, sig);
+        let mut vote = Vote::signed_with_in_shard(
+            self.id,
+            self.shard_id,
+            self.hc.height,
+            round,
+            kind,
+            target,
+            sig,
+        );
 
         let fk_ref = self.falcon_signing_key();
         if let Some(fk) = fk_ref {
@@ -1272,6 +1347,18 @@ impl ValidatorRuntime {
     }
 
     pub fn on_prevote(&mut self, v: Vote) -> Result<(), String> {
+        // SHARD SCOPE (Finding A). This runtime is one shard's consensus
+        // instance; a vote signed for another shard is a different statement
+        // (V3 preimage) and must not be admitted. The signature verifies
+        // under its OWN shard, so without this check a foreign-shard vote
+        // could enter the set (e.g. via a shared gossip path) and poison the
+        // certificate's shard.
+        if v.shard_id != self.shard_id {
+            return Err(format!(
+                "prevote from shard {} (this node serves shard {})",
+                v.shard_id, self.shard_id
+            ));
+        }
         let res = self.hc.add_prevote(v.clone());
         // EVERY verified same-height vote feeds the peer-round counter, not
         // only the rejected ones. The counter is where the network is: the
@@ -1375,6 +1462,13 @@ impl ValidatorRuntime {
     }
 
     pub fn on_precommit(&mut self, v: Vote) -> Result<(), String> {
+        // SHARD SCOPE — same rule as `on_prevote`.
+        if v.shard_id != self.shard_id {
+            return Err(format!(
+                "precommit from shard {} (this node serves shard {})",
+                v.shard_id, self.shard_id
+            ));
+        }
         let res = self.hc.add_precommit(v.clone());
         // V-P34 (R1 verification gap): the round chase MUST be gated on
         // verification here, exactly as on the prevote path.
@@ -2256,6 +2350,18 @@ impl ValidatorRuntime {
             .fold(0u64, |acc, t| acc.saturating_add(t.gas_limit));
         if total_gas > MAX_BLOCK_GAS {
             return Err("committed block exceeds the gas limit".to_string());
+        }
+        // Same wire/proof caps the proposal path (and the packer) enforce.
+        Self::check_block_wire_and_proof_caps(&block)?;
+        // Same TOTAL cross-shard record cap the proposal path enforces: a
+        // quorum-signed block must not be able to smuggle an unbounded
+        // `cross_shard_out` through the adopt path.
+        if !Self::cross_shard_record_cap_ok(&block) {
+            return Err(format!(
+                "committed block exceeds the cross-shard record cap ({} > {})",
+                block.cross_shard_out.len(),
+                crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+            ));
         }
         // Single proposer signature before the quorum loop: one Ed25519 verify
         // filters forged bodies before paying per-signer QC cost.

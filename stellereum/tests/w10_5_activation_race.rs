@@ -124,6 +124,7 @@ fn precommit_qc(
         *parent,
     );
     QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind: VoteKind::Precommit,

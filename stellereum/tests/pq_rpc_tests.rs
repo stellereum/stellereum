@@ -99,7 +99,7 @@ async fn pq_rpc_happy_path_matches_direct_registry_reads() {
     // Status constants are pinned.
     let status = st.call("stell_getPqRegistryStatus", json!({})).await;
     assert_eq!(status["delay_heights"], json!(PQ_ROTATION_DELAY_HEIGHTS));
-    assert_eq!(status["delay_heights"], json!(7_200u64));
+    assert_eq!(status["delay_heights"], json!(30_000u64));
     assert_eq!(status["history_limit"], json!(PQ_KEY_HISTORY_LIMIT));
     assert!(status["count"].as_u64().unwrap_or(0) >= 1);
 }

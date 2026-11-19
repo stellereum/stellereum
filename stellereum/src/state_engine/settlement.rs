@@ -1282,14 +1282,37 @@ impl InMemoryStateEngine {
             (trial, receipt)
         };
 
-        // 2. Debit (burn) the buyer's wUSDT via the token CEI path + trie sync.
+        // 2a. RESERVE the native issuance and validate the credit BEFORE the
+        //     wUSDT burn. The old order burned first and then tried to mint
+        //     native STELL; at the global supply cap (or on a native-balance
+        //     overflow) the buy failed AFTER the burn and its compensating
+        //     wUSDT mint was a swallowed `let _ =`, so a buyer could lose the
+        //     burned wUSDT while only the native error was reported. Now a
+        //     refusal here happens while the buyer still holds the wUSDT.
+        if receipt.stell_minted > 0 {
+            let current = self
+                .get_account(&buyer)
+                .await
+                .map(|a| a.balance)
+                .unwrap_or(0);
+            if current.checked_add(receipt.stell_minted).is_none() {
+                return Err("PMM buy: native balance would overflow u64".to_string());
+            }
+            self.reserve_mint(receipt.stell_minted).await?;
+        }
+
+        // 2b. Debit (burn) the buyer's wUSDT via the token CEI path + trie sync.
         {
             let mut tokens = self.tokens_write().await;
             let bal = tokens.balance_of(&usdt_id, &buyer);
             if bal < usdt_micro {
+                // Nothing has moved yet beyond the reservation: give it back.
+                if receipt.stell_minted > 0 {
+                    self.release_mint_nano(receipt.stell_minted);
+                }
                 return Err("Insufficient wUSDT balance for PMM buy".to_string());
             }
-            tokens
+            if let Err(e) = tokens
                 .execute(
                     &usdt_id,
                     buyer,
@@ -1298,7 +1321,13 @@ impl InMemoryStateEngine {
                         amount: usdt_micro,
                     },
                 )
-                .map_err(|e| format!("wUSDT debit failed: {e}"))?;
+                .map_err(|e| format!("wUSDT debit failed: {e}"))
+            {
+                if receipt.stell_minted > 0 {
+                    self.release_mint_nano(receipt.stell_minted);
+                }
+                return Err(e);
+            }
             let new_bal = tokens.balance_of(&usdt_id, &buyer);
             let mut trie = self.state_trie.write().await;
             let key = token_balance_key(&usdt_id, &buyer);
@@ -1309,20 +1338,39 @@ impl InMemoryStateEngine {
             }
         }
 
-        // 3. Mint native STELL to the buyer. If the credit fails (overflow),
-        //    refund the burned wUSDT (as the minter) so the buy is all-or-nothing.
-        if let Err(e) = self.credit_native(&buyer, receipt.stell_minted).await {
-            let treasury = *self.pmm_treasury.read().await;
-            let mut tokens = self.tokens_write().await;
-            let _ = tokens.execute(
-                &usdt_id,
-                treasury,
-                crate::token::TokenOp::Mint {
-                    to: buyer,
-                    amount: usdt_micro,
-                },
-            );
-            return Err(e);
+        // 3. Credit the ALREADY-RESERVED native STELL. The pre-checks above
+        //    make this unreachable in a consistent ledger; if it still fails,
+        //    refund the burned wUSDT and surface a refund failure LOUDLY —
+        //    never a silent `let _ =` on a value path.
+        if receipt.stell_minted > 0 {
+            if let Err(e) = self
+                .credit_reserved_native(&buyer, receipt.stell_minted)
+                .await
+            {
+                let treasury = *self.pmm_treasury.read().await;
+                let mut tokens = self.tokens_write().await;
+                match tokens.execute(
+                    &usdt_id,
+                    treasury,
+                    crate::token::TokenOp::Mint {
+                        to: buyer,
+                        amount: usdt_micro,
+                    },
+                ) {
+                    Ok(_) => {}
+                    Err(refund_err) => {
+                        tracing::error!(
+                            "PMM buy: native credit failed ({e}) AND the wUSDT refund failed ({refund_err}) for {}: {} nano-wUSDT remain burned",
+                            hex::encode(&buyer[..8]),
+                            usdt_micro
+                        );
+                        return Err(format!(
+                            "PMM buy failed: native credit refused ({e}) and wUSDT refund failed ({refund_err})"
+                        ));
+                    }
+                }
+                return Err(e);
+            }
         }
 
         // 4. Commit the advanced curve only after every value movement succeeded.

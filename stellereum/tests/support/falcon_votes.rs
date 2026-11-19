@@ -121,6 +121,8 @@ pub fn fvote_deterministic(
             block_hash: bh,
             voter,
             signature,
+            // This fixture signs the masterchain preimage (`vote_sign_bytes`).
+            shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
         };
     }
     // Cache miss: real FIPS 206 signing (fresh OS randomness), self-checked

@@ -97,6 +97,66 @@ pub enum SdkError {
     /// and can be retried again later.
     #[error("retry exhausted after {attempts} attempts: {last}")]
     RetryExhausted { attempts: u32, last: String },
+
+    /// The builder's chain id is not the configured node identity's chain id.
+    ///
+    /// Refused BEFORE signing: a transaction bound to a foreign chain is
+    /// cryptographically valid but is rejected by this node's admission
+    /// (`Transaction chain_id mismatch`), so sending it only wastes a round
+    /// trip.
+    #[error("chain id mismatch: builder would bind {got}, configured node identity is {expected}")]
+    ChainIdMismatch { expected: u64, got: u64 },
+
+    /// The configured node reports a different consensus ruleset than this
+    /// SDK build speaks.
+    #[error(
+        "fork id mismatch: configured node reports 0x{got:08x}, this SDK build speaks 0x{expected:08x}"
+    )]
+    ForkIdMismatch { expected: u32, got: u32 },
+
+    /// The configured node speaks a different protocol major/minor than this
+    /// SDK build.
+    #[error(
+        "protocol version mismatch: configured node speaks {got}, this SDK build speaks {expected}"
+    )]
+    ProtocolVersionMismatch { expected: String, got: String },
+
+    /// An EVM binding claim arrived without the required secp256k1 proof of
+    /// possession (`r(32) || s(32) || recovery_id(1)`).
+    #[error(
+        "EVM binding requires a {expected}-byte secp256k1 proof of possession (r || s || recovery_id), got {got} bytes"
+    )]
+    MissingEvmProof { expected: usize, got: usize },
+
+    /// The EVM proof of possession recovers a different EVM address than the
+    /// one being bound.
+    #[error("EVM proof of possession recovers {recovered}, not the bound address {expected}")]
+    EvmProofMismatch { expected: String, recovered: String },
+
+    /// The EVM proof of possession is malformed or does not recover a sender.
+    #[error("invalid EVM proof of possession: {0}")]
+    InvalidEvmProof(String),
+
+    /// The EVM intent could not be decoded (RLP / signature / unsupported
+    /// shape). `reason` is the stable classifier.
+    #[error("invalid EVM intent ({reason}): {detail}")]
+    InvalidEvmIntent { reason: String, detail: String },
+
+    /// The carrier transaction's nonce does not equal the EVM intent's nonce.
+    #[error("carrier nonce mismatch: EVM intent says {evm}, transaction says {tx}")]
+    CarrierNonceMismatch { evm: u64, tx: u64 },
+
+    /// The carrier transaction's amount does not equal the EVM intent's value.
+    #[error(
+        "carrier value mismatch: EVM intent is worth {evm} nano-STELL, transaction moves {tx}"
+    )]
+    CarrierValueMismatch { evm: u64, tx: u64 },
+
+    /// The EVM intent's chain id is not the configured node identity's.
+    #[error(
+        "EVM intent chain id mismatch: intent says {got}, configured node identity is {expected}"
+    )]
+    EvmChainIdMismatch { expected: u64, got: u64 },
 }
 
 impl SdkError {

@@ -841,13 +841,13 @@ fn the_epoch_key_rotates() {
     let (_c17, m17, _m) = run_dkg(17, &members);
     assert_ne!(m16[0].public_key, m17[0].public_key);
     assert_ne!(m16[0].commitment(), m17[0].commitment());
-    assert_eq!(stellereum::mev_epoch::EPOCH_BLOCKS, 128);
+    assert_eq!(stellereum::mev_epoch::EPOCH_BLOCKS, 500);
     // The epoch of a height is a pure function of the height.
     assert_eq!(stellereum::mev_epoch::epoch_of_height(0), 0);
-    assert_eq!(stellereum::mev_epoch::epoch_of_height(127), 0);
-    assert_eq!(stellereum::mev_epoch::epoch_of_height(128), 1);
-    assert_eq!(stellereum::mev_epoch::epoch_of_height(255), 1);
-    assert_eq!(stellereum::mev_epoch::epoch_of_height(256), 2);
+    assert_eq!(stellereum::mev_epoch::epoch_of_height(499), 0);
+    assert_eq!(stellereum::mev_epoch::epoch_of_height(500), 1);
+    assert_eq!(stellereum::mev_epoch::epoch_of_height(999), 1);
+    assert_eq!(stellereum::mev_epoch::epoch_of_height(1000), 2);
 }
 
 // ===========================================================================

@@ -384,17 +384,58 @@ impl InMemoryStateEngine {
         value: u64,
     ) -> ContractCallOutcome {
         if value > 0 {
-            if let Some(c) = caller {
-                if let Err(e) = self.debit_native(&c, value).await {
+            // A value transfer needs a debited caller. The old body silently
+            // ignored `value` when `caller` was None and swallowed a failed
+            // credit; both are value-path bugs (no caller -> nothing may be
+            // promised, a failed credit -> the debit must be undone).
+            let Some(c) = caller else {
+                return ContractCallOutcome {
+                    status: "failed".to_string(),
+                    return_value: None,
+                    gas_used: 0,
+                    events: Vec::new(),
+                    error: Some("value transfer requires a caller (none was supplied)".to_string()),
+                };
+            };
+            if let Err(e) = self.debit_native(&c, value).await {
+                return ContractCallOutcome {
+                    status: "failed".to_string(),
+                    return_value: None,
+                    gas_used: 0,
+                    events: Vec::new(),
+                    error: Some(format!("insufficient funds to transfer value: {e}")),
+                };
+            }
+            // The debit already happened: this is a TRANSFER, never a mint
+            // (the capped `credit_native` would consume supply headroom and
+            // could drop the value at the cap).
+            if let Err(e) = self.credit_native_transfer(address, value).await {
+                // Undo the debit fail-closed. A refund failure here is
+                // impossible in a consistent ledger (the account was just
+                // debited), but never swallow it.
+                if let Err(refund_err) = self.credit_native_transfer(&c, value).await {
+                    tracing::error!(
+                        "contract value transfer: credit to {} failed ({e}) AND the refund to {} failed ({refund_err}); value is not conserved",
+                        hex::encode(&address[..8]),
+                        hex::encode(&c[..8])
+                    );
                     return ContractCallOutcome {
                         status: "failed".to_string(),
                         return_value: None,
                         gas_used: 0,
                         events: Vec::new(),
-                        error: Some(format!("insufficient funds to transfer value: {e}")),
+                        error: Some(format!(
+                            "value credit failed ({e}) and refund failed ({refund_err})"
+                        )),
                     };
                 }
-                let _ = self.credit_native(address, value).await;
+                return ContractCallOutcome {
+                    status: "failed".to_string(),
+                    return_value: None,
+                    gas_used: 0,
+                    events: Vec::new(),
+                    error: Some(format!("value credit failed: {e}")),
+                };
             }
         }
         self.call_contract_structured(address, method, arg, fuel)
@@ -700,5 +741,51 @@ impl InMemoryStateEngine {
     ) -> Option<MerkleProof> {
         let key = token_balance_key(token_id, account);
         self.state_trie.read().await.generate_merkle_proof(&key)
+    }
+}
+
+#[cfg(test)]
+mod value_helper_tests {
+    use super::*;
+    use crate::state_engine::AccountState;
+    use crate::tokenomics::TOTAL_SUPPLY_CAP;
+
+    /// REGRESSION (LOGIC_BUG_SWEEP §3.3 / §5.2): `call_contract_structured_with_value`
+    /// moves EXISTING value from the caller. It used the capped mint primitive
+    /// and swallowed its error, so at the global supply cap the caller was
+    /// debited while the contract was never credited — value destroyed by a
+    /// silent `let _ =`. A transfer must be uncapped and a failed credit must
+    /// be undone or reported.
+    #[tokio::test]
+    async fn contract_value_credit_is_a_transfer_and_never_dropped_at_the_mint_cap() {
+        let engine = InMemoryStateEngine::new();
+        let caller = [0x11u8; 32];
+        let contract = [0x22u8; 32];
+        let sink = [0x99u8; 32];
+        engine
+            .update_account(AccountState::new(caller, 1_000))
+            .await;
+        // Fill the global counter exactly: the 1,000 nano caller balance is the
+        // pre-mined baseline folded into this first reservation.
+        engine
+            .mint_native(&sink, TOTAL_SUPPLY_CAP - 1_000)
+            .await
+            .expect("fill the mint counter");
+        assert_eq!(engine.total_minted_nano(), TOTAL_SUPPLY_CAP);
+
+        let out = engine
+            .call_contract_structured_with_value(Some(caller), &contract, "missing", 0, 10_000, 100)
+            .await;
+        assert_eq!(out.status, "failed", "the contract does not exist");
+        assert_eq!(
+            engine.get_account(&caller).await.map(|a| a.balance),
+            Some(900),
+            "the caller paid the value exactly once"
+        );
+        assert_eq!(
+            engine.get_account(&contract).await.map(|a| a.balance),
+            Some(100),
+            "the value is a TRANSFER and must land at the contract even at the mint cap"
+        );
     }
 }

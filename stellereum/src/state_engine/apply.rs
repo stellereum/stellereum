@@ -1671,15 +1671,19 @@ impl InMemoryStateEngine {
     ///    (`VmExecutionResult::Success { gas_used }`) — never the declared
     ///    limit, which is a budget, not a consumption;
     ///  * `intrinsic(tx)` is [`Self::TX_INTRINSIC_GAS`] for an EMPTY-payload
-    ///    transaction and 0 otherwise. No VM runs for an empty payload, so the
-    ///    envelope is its WHOLE cost and 0 would make a plain transfer free.
-    ///    A payload's opcode gas already prices the envelope and the execution
-    ///    it performs (the cheapest `Transfer` is priced AT the intrinsic), so
-    ///    adding it there would double-price every contract call, make every
-    ///    RPC estimate under-charge by it, and re-introduce the over-charge
-    ///    for the cheap staking ops (`SysCallStake` costs 2 000 gas, and the
-    ///    single-tx path correctly charged those 2 000, not the 10 000
-    ///    declared — see `bonding_moves_real_funds_and_grants_validator_power`);
+    ///    transaction and for a payload that measured ZERO gas (only
+    ///    zero-priced opcodes such as `Halt`), and 0 otherwise. No VM runs for
+    ///    an empty payload, so the envelope is its WHOLE cost and 0 would make
+    ///    a plain transfer free; the same is true of a successful payload
+    ///    that consumed nothing (otherwise `[Halt]` was a zero-fee,
+    ///    nonce-advancing spam transaction). A payload's opcode gas already
+    ///    prices the envelope and the execution it performs (the cheapest
+    ///    meaningful syscall is priced well above 0), so adding the intrinsic
+    ///    to a NON-zero measurement would double-price every contract call,
+    ///    make every RPC estimate under-charge by it, and re-introduce the
+    ///    over-charge for the cheap staking ops (`SysCallStake` costs 2 000
+    ///    gas, and the single-tx path correctly charged those 2 000, not the
+    ///    10 000 declared — see `bonding_moves_real_funds_and_grants_validator_power`);
     ///  * `tx.gas_limit` is a CAP, never the price: everything above what the
     ///    transaction used is refunded.
     ///
@@ -1687,7 +1691,17 @@ impl InMemoryStateEngine {
     /// transaction that declares less than the floor is never executed below
     /// it.
     pub(super) fn billed_gas(tx: &crate::sharding::Transaction, gas_used: u64) -> u64 {
-        let intrinsic = if tx.payload.is_empty() {
+        // A successful payload whose measured consumption is ZERO (a payload
+        // that is only `OpCode::Halt`, whose gas price is 0) must still pay
+        // the intrinsic envelope: signature verification and the nonce/trie
+        // bookkeeping are real work, and charging 0 made such a transaction
+        // completely free — a self-authenticated spam vector that bypassed
+        // the admission floor (the floor only constrains the DECLARED limit,
+        // which FEE-01 refunds in full when nothing was used). This is the
+        // same intrinsic the failure arm always charges, so a successful
+        // zero-gas transaction can never be cheaper than the same
+        // transaction failing.
+        let intrinsic = if tx.payload.is_empty() || gas_used == 0 {
             Self::TX_INTRINSIC_GAS
         } else {
             0
@@ -2896,11 +2910,37 @@ impl InMemoryStateEngine {
             }
             s
         };
+        // ROTATION ALIASES (SLASH-01): a key rotation applied by THIS block
+        // removes the OLD id from `validators` before the downtime step below.
+        // The evidence for H-1 names the OLD id, so without the alias the
+        // ledger lookup misses and the miss is forgiven — rotating every
+        // height evades downtime slashing. Derived from the block's own
+        // applied rotation opcodes (pure block bytes + `status`), so every
+        // node resolves the same alias. Empty on the common block.
+        let rotation_aliases: HashMap<[u8; 32], [u8; 32]> = {
+            let mut aliases = HashMap::new();
+            for (i, tx) in block.transactions.iter().enumerate() {
+                if !status.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                for op in &tx.payload {
+                    if let crate::svm::OpCode::SysCallRotateValidatorKey {
+                        old_validator,
+                        new_validator,
+                    } = op
+                    {
+                        aliases.insert(*old_validator, *new_validator);
+                    }
+                }
+            }
+            aliases
+        };
         let slashed = self
-            .apply_downtime_slash_with_set(
+            .apply_downtime_slash_with_set_alias(
                 evidence_height,
                 block.last_qc.as_ref(),
                 &attribution_set,
+                &rotation_aliases,
             )
             .await;
 
@@ -3977,6 +4017,38 @@ impl InMemoryStateEngine {
         qc: Option<&crate::consensus::QuorumCertificate>,
         val_set: &crate::consensus::ValidatorSet,
     ) -> u64 {
+        self.apply_downtime_slash_with_set_inner(height, qc, val_set, None)
+            .await
+    }
+
+    /// [`Self::apply_downtime_slash_with_set`] plus the OLD -> NEW rotation
+    /// aliases derived from the block being applied.
+    ///
+    /// ROTATION ESCAPE (SLASH-01): a validator that rotates its key in block
+    /// H is removed from `validators` BEFORE the downtime step attributes
+    /// H-1's evidence (the evidence was formed under the OLD id). Without the
+    /// alias the ledger lookup misses and the deficit is silently forgiven, so
+    /// rotating every height evades downtime slashing entirely. The alias map
+    /// is a pure function of the applied rotation opcodes (block bytes +
+    /// status), so every node attributes the same miss to the same record.
+    pub async fn apply_downtime_slash_with_set_alias(
+        &self,
+        height: u64,
+        qc: Option<&crate::consensus::QuorumCertificate>,
+        val_set: &crate::consensus::ValidatorSet,
+        rotation_aliases: &HashMap<[u8; 32], [u8; 32]>,
+    ) -> u64 {
+        self.apply_downtime_slash_with_set_inner(height, qc, val_set, Some(rotation_aliases))
+            .await
+    }
+
+    async fn apply_downtime_slash_with_set_inner(
+        &self,
+        height: u64,
+        qc: Option<&crate::consensus::QuorumCertificate>,
+        val_set: &crate::consensus::ValidatorSet,
+        rotation_aliases: Option<&HashMap<[u8; 32], [u8; 32]>>,
+    ) -> u64 {
         let Some(cert) = qc else {
             return 0;
         };
@@ -4034,8 +4106,19 @@ impl InMemoryStateEngine {
         let (burned, rewards_cut) = {
             let mut ledger = self.staking_write().await;
             let rewards_before = ledger.rewards_pool;
-            let burned =
-                ledger.note_missed_heights(height, &|v: &[u8; 32]| signers.contains(v), &eligible);
+            let burned = match rotation_aliases {
+                Some(aliases) => ledger.note_missed_heights_with_alias(
+                    height,
+                    &|v: &[u8; 32]| signers.contains(v),
+                    &eligible,
+                    aliases,
+                ),
+                None => ledger.note_missed_heights(
+                    height,
+                    &|v: &[u8; 32]| signers.contains(v),
+                    &eligible,
+                ),
+            };
             (burned, rewards_before.saturating_sub(ledger.rewards_pool))
         };
         if burned > 0 {
@@ -4535,6 +4618,23 @@ impl InMemoryStateEngine {
         use crate::governance::UpgradeExecOutcome;
         if !self.gov_ops_active_at(block.height) {
             return UpgradeExecOutcome::default();
+        }
+        // GOVERNED MIN-BOND MIRROR (S5 completeness): the consensus-set filter
+        // reads `staking.min_validator_bond`, while a governance action writes
+        // `governance.applied.min_validator_bond` first. The block-path sweep
+        // below mirrors it after an action it EXECUTED, but a value that
+        // arrived by another route (a direct RPC execution on a solo node, a
+        // restored snapshot) would otherwise never reach the ledger: the
+        // filter would keep using the old bond while every reader of
+        // `applied` believed the new one was in force. Mirror committed
+        // governance into the ledger on EVERY block. This is a no-op (no write,
+        // no generation bump, byte-identical root) while the two agree, which
+        // is every block on an honest chain.
+        if let Some(governed) = self.governance_read().await.applied.min_validator_bond {
+            let needs_sync = self.staking_read().await.min_validator_bond != Some(governed);
+            if needs_sync {
+                self.staking_write().await.min_validator_bond = Some(governed);
+            }
         }
         // Read-only pre-check with the guard scoped to its own statement: no
         // due finalization/action means no write lock and no generation bump.

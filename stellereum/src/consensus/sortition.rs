@@ -223,6 +223,17 @@ pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 /// `staking::MAX_ACTIVE_VALIDATORS` (250) so the documented decentralization
 /// window runs on the path that finalizes.
 ///
+/// LIVENESS IS NOT THIS PREDICATE'S JOB (review F1, generalised). The count
+/// catches the UNIFORM-stake crossing at 192, but whether a drawn committee can
+/// carry the network's two-thirds is a POWER question: at N = 191 with uniform
+/// stake the 128-seat committee reaches the network quorum (128) only
+/// unanimously, and a skewed distribution can make a draw infeasible below
+/// 192. The producer therefore falls back to the full-network CEC whenever the
+/// µQC it actually compiled cannot carry quorum
+/// (`produce_decision_certificate_with_schedule`); this constant remains the
+/// fail-closed SAFETY gate for the governance rollout and the provably dead
+/// uniform case, not the liveness rule.
+///
 /// FREEZE-shaped pin: `qc_split_size_threshold_is_the_quorum_crossing` in the
 /// consensus unit tests asserts that `191` is still reachable and `192` is the
 /// first unreachable size for a 128-seat committee, so this literal can never
@@ -441,7 +452,10 @@ fn select_committee_from_seed(
     }
 
     let mut selected = Vec::with_capacity(target_k);
-    let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
+    // An unrepresentable stake total is refused at the quorum boundary, but it
+    // must not PANIC here (debug) or wrap (release): the draw stays
+    // deterministic under saturation and the certificate gate fails closed.
+    let mut total_power: u64 = pool.iter().fold(0u64, |acc, (_, p)| acc.saturating_add(*p));
 
     for step in 0..target_k {
         if total_power == 0 || pool.is_empty() {
@@ -459,7 +473,7 @@ fn select_committee_from_seed(
         let mut acc = 0u64;
         let mut chosen_idx = 0;
         for (idx, (_id, power)) in pool.iter().enumerate() {
-            acc += *power;
+            acc = acc.saturating_add(*power);
             if ticket < acc {
                 chosen_idx = idx;
                 break;
@@ -649,9 +663,10 @@ pub fn beacon_draw_committee(
 /// has a dispatched beacon — so a working activation height exists.
 pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
-/// Canonical CN-VRF v3 epoch length in heights (7,200 blocks), pinned at
-/// compile time to [`crate::cn_vrf::EPOCH_LEN`].
-pub const CNVRF_V3_EPOCH_LEN: u64 = 7_200;
+/// Canonical CN-VRF v3 epoch length in heights (30,000 blocks = 2 h at
+/// 240 ms, ruleset v2), pinned at compile time to
+/// [`crate::cn_vrf::EPOCH_LEN`].
+pub const CNVRF_V3_EPOCH_LEN: u64 = 30_000;
 
 const _: () = assert!(CNVRF_V3_EPOCH_LEN == crate::cn_vrf::EPOCH_LEN);
 
@@ -673,7 +688,7 @@ pub fn cnvrf_v3_active_at(height: Height) -> bool {
     }
 }
 
-/// CN-VRF v3 epoch index for `height` (`height / 7_200`).
+/// CN-VRF v3 epoch index for `height` (`height / CNVRF_V3_EPOCH_LEN`).
 pub fn cnvrf_v3_epoch_of_height(height: Height) -> u64 {
     height / CNVRF_V3_EPOCH_LEN
 }

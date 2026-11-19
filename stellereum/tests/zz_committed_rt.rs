@@ -17,6 +17,7 @@ fn committed_with_qc_roundtrips() {
         })
         .collect();
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 9,
         round: 0,
         kind: VoteKind::Precommit,
@@ -46,6 +47,7 @@ fn committed_with_qc_roundtrips() {
         height: 9,
         block: b,
         certificate: QuorumCertificate {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Precommit,

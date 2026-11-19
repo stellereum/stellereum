@@ -1089,6 +1089,38 @@ impl InMemoryStateEngine {
                 if !msg.verify_xpc_proof(&[XpcPhase::Prepared]) {
                     return false;
                 }
+                // PULL HINT (long retention): a PREPARE-ACK while this source
+                // record is ALREADY COMMITTED proves the target is still
+                // PREPARED — it has not applied our COMMIT (the decision was
+                // lost, or the target was offline/restarting). Refresh the
+                // decision height so the deterministic COMMIT re-emission
+                // window restarts and the obligation is not retired while the
+                // target is still asking. This is idempotent bookkeeping: no
+                // value moves, the phase stays COMMITTED, and the proof is the
+                // target's committed PREPARED leaf. Without it a target that
+                // missed the bounded re-emission window could never be
+                // credited, while the source had already released the escrow.
+                if let Some(rec) = existing.as_ref() {
+                    if rec.phase == XpcPhase::Committed {
+                        if height <= rec.decided_height {
+                            return false;
+                        }
+                        let mut rec = existing.expect("checked above");
+                        rec.decided_height = height;
+                        if !self.write_xpc_record(&rec).await {
+                            tracing::error!(
+                                "xpc commit window refresh refused for {}: record would be inconsistent",
+                                hex::encode(&tx_hash[..8])
+                            );
+                            return false;
+                        }
+                        tracing::info!(
+                            "xpc commit window refreshed for {}: target still PREPARED at height {height}",
+                            hex::encode(&tx_hash[..8])
+                        );
+                        return false;
+                    }
+                }
                 let transition = crate::xshard2pc::source_on_prepare_ack(existing.as_ref());
                 if transition != XpcTransition::Advanced(XpcPhase::Committed) {
                     return false;
@@ -1744,6 +1776,128 @@ mod tests {
             target.get_account(&recipient).await.map(|a| a.balance),
             Some(amount),
             "a duplicate COMMIT must not credit twice"
+        );
+    }
+
+    /// RETENTION/PULL REGRESSION: a PREPARE-ACK that reaches the SOURCE after
+    /// it is already COMMITTED proves the target is still PREPARED (it never
+    /// applied the COMMIT). The source must refresh its decision height so the
+    /// bounded COMMIT re-emission window restarts instead of retiring the
+    /// obligation while the target is still asking. The refresh moves no value
+    /// and never advances the phase.
+    #[tokio::test]
+    async fn xpc_prepare_ack_refreshes_a_committed_source_window() {
+        let kp = FalconKeypair::generate_from_seed(45);
+        let recipient = [0x5Bu8; 32];
+        let amount = 1_000_000u64;
+        let probe = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            vec![0u8; FALCON512_SIG_LEN],
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let sig = kp.sign(&probe.signing_message());
+        let tx = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig,
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let tx_hash = tx.compute_tx_hash();
+        let anchor_block = [0xD2u8; 32];
+
+        // TARGET (shard 1): still PREPARED, so it keeps re-sending its vote.
+        let target = InMemoryStateEngine::new();
+        target.enable_cross_shard();
+        assert!(
+            target
+                .write_xpc_record(&crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 5))
+                .await
+        );
+        let target_root = target.get_state_root().await;
+        let proof = target
+            .get_xpc_proof(&tx_hash)
+            .await
+            .expect("target PREPARED leaf proof");
+
+        // SOURCE (shard 0): already COMMITTED at height 10, with a registry
+        // entry proving the target's PREPARED state at a finalized header.
+        let reg = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+        reg.write()
+            .unwrap()
+            .note_finalized(1, anchor_block, target_root);
+        let source = InMemoryStateEngine::new();
+        source.enable_cross_shard();
+        source.with_finalized_headers(reg);
+        let mut committed = crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 5);
+        committed.phase = XpcPhase::Committed;
+        committed.decided_height = 10;
+        assert!(source.write_xpc_record(&committed).await);
+
+        // The target's periodic vote arrives at height 50 — well inside the
+        // new retention window, but AFTER the old 256-height early schedule's
+        // last emission would have been due to age out.
+        let ack = CrossShardMessage::new_xpc(
+            crate::xshard2pc::XPC_PREPARE_ACK,
+            1,
+            0,
+            tx.clone(),
+            target_root,
+            anchor_block,
+            Some(proof),
+        );
+        let block = Block {
+            shard_id: 0,
+            height: 50,
+            prev_hash: [0u8; 32],
+            state_root: target_root,
+            transactions: vec![],
+            cross_shard_out: vec![ack],
+            timestamp: 1_770_000_050,
+            proposer: [0x11; 32],
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+        };
+        let credited = source.apply_cross_shard_consumptions(&block).await;
+        assert_eq!(credited, 0, "a PREPARE-ACK moves no value");
+
+        let rec = source
+            .xpc_record(&tx_hash)
+            .await
+            .expect("committed source record stays");
+        assert_eq!(rec.phase, XpcPhase::Committed, "the phase never moves back");
+        assert_eq!(
+            rec.decided_height, 50,
+            "the source refreshes the decision height from the target's live vote"
+        );
+        assert_eq!(
+            crate::xshard2pc::source_action(&rec, 51),
+            crate::xshard2pc::SourceAction::Commit,
+            "the refreshed window restarts the prompt COMMIT re-emission"
+        );
+        assert!(
+            !crate::xshard2pc::is_retired(&rec, 50),
+            "the refreshed record is retained"
         );
     }
 }

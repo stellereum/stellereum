@@ -27,8 +27,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::envelope::{EnvelopeMode, PqEnvelope};
 use crate::error::{Result, SdkError};
+use crate::governance::{GovAction, VoteChoice};
 use crate::key::{derive_pq_address, FalconKeypair, DEFAULT_SALT, FALCON512_SIG_LEN};
 use crate::opcode::{encode_payload, payload_gas, Op, GAS_BASIC_TRANSFER};
+use crate::protocol::ProtocolIdentity;
 use crate::session::SessionGrant;
 
 /// Chain id used by this deployment unless the node is configured otherwise
@@ -106,6 +108,63 @@ impl Transaction {
             out.extend_from_slice(&self.payload);
         }
         out
+    }
+
+    /// Decode the node's `bincode(Transaction)` wire form.
+    ///
+    /// The payload is kept as its opaque bincode `Vec<OpCode>` bytes (the SDK
+    /// does not decode every opcode), exactly like the in-memory field. The
+    /// trailing `PRIORITY` envelope is split off the signature blob the same
+    /// way the node does it.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if cur.len() < n {
+                return Err(SdkError::Decode("truncated transaction".into()));
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+        fn array32(cur: &mut &[u8]) -> Result<[u8; 32]> {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(take(cur, 32)?);
+            Ok(out)
+        }
+        fn u64le(cur: &mut &[u8]) -> Result<u64> {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(take(cur, 8)?);
+            Ok(u64::from_le_bytes(b))
+        }
+        fn u32le(cur: &mut &[u8]) -> Result<u32> {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(take(cur, 4)?);
+            Ok(u32::from_le_bytes(b))
+        }
+        let from = array32(&mut cur)?;
+        let to = array32(&mut cur)?;
+        let amount = u64le(&mut cur)?;
+        let gas_limit = u64le(&mut cur)?;
+        let nonce = u64le(&mut cur)?;
+        let source_shard = u32le(&mut cur)?;
+        let target_shard = u32le(&mut cur)?;
+        let sig_len = usize::try_from(u64le(&mut cur)?)
+            .map_err(|_| SdkError::Decode("signature length exceeds usize".into()))?;
+        let blob = take(&mut cur, sig_len)?.to_vec();
+        let (signature, priority_fee_per_gas) = split_priority_envelope(&blob);
+        let payload = cur.to_vec();
+        Ok(Self {
+            from,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            signature,
+            payload,
+            priority_fee_per_gas,
+        })
     }
 
     /// Signature blob with the optional trailing `PRIORITY` suffix.
@@ -260,6 +319,71 @@ fn session_commitment(grant: &SessionGrant) -> Vec<u8> {
     out
 }
 
+/// Split the optional trailing `PRIORITY` envelope off a signature blob,
+/// exactly like `Transaction::split_priority_envelope`.
+fn split_priority_envelope(blob: &[u8]) -> (Vec<u8>, u64) {
+    const ENVELOPE_LEN: usize = PRIORITY_FEE_COMMITMENT_TAG.len() + 8;
+    if blob.len() >= ENVELOPE_LEN {
+        let split = blob.len() - ENVELOPE_LEN;
+        if &blob[split..split + PRIORITY_FEE_COMMITMENT_TAG.len()] == PRIORITY_FEE_COMMITMENT_TAG {
+            let mut bid = [0u8; 8];
+            bid.copy_from_slice(&blob[split + PRIORITY_FEE_COMMITMENT_TAG.len()..]);
+            return (blob[..split].to_vec(), u64::from_be_bytes(bid));
+        }
+    }
+    (blob.to_vec(), 0)
+}
+
+/// Attach a `PQ1` envelope to an UNSIGNED transaction.
+///
+/// Used by the signer sidecar's `sign_prepared` arm: the TypeScript package
+/// builds the unsigned transaction bytes, the Rust process owns the Falcon
+/// key and produces the envelope. Refuses an `SF1` payload here (session
+/// grants need the grant object, not a bare envelope).
+pub fn sign_unsigned(
+    mut tx: Transaction,
+    key: &FalconKeypair,
+    mode: EnvelopeMode,
+    chain_id: Option<u64>,
+) -> Result<SignedTx> {
+    if !tx.signature.is_empty() {
+        return Err(SdkError::InvalidArgument(
+            "sign_unsigned expects an unsigned transaction (empty signature)".into(),
+        ));
+    }
+    if tx.from != key.address() {
+        return Err(SdkError::InvalidArgument(format!(
+            "unsigned transaction from 0x{} is not the signing key's address 0x{}",
+            hex::encode(tx.from),
+            hex::encode(key.address())
+        )));
+    }
+    if let Some(cid) = chain_id {
+        ProtocolIdentity::local().verify_for_chain(cid)?;
+    }
+    let msg = match chain_id {
+        Some(cid) => tx.signing_message_for_chain(cid),
+        None => tx.signing_message(),
+    };
+    let sig = key.sign(&msg)?;
+    let envelope = match mode {
+        EnvelopeMode::Explicit => match chain_id {
+            Some(cid) => PqEnvelope::explicit_with_chain(key.public_key().to_vec(), sig, cid),
+            None => PqEnvelope::explicit(key.public_key().to_vec(), sig),
+        },
+        EnvelopeMode::Implicit => match chain_id {
+            Some(cid) => PqEnvelope::implicit_with_chain(sig, cid),
+            None => PqEnvelope::implicit(sig),
+        },
+    };
+    tx.signature = envelope.encode()?;
+    let signed = SignedTx { tx };
+    signed
+        .verify_with_key(key)
+        .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
+    Ok(signed)
+}
+
 /// Builder for the four wallet shapes in scope.
 ///
 /// All setters are chainable and consume `self`.
@@ -272,6 +396,7 @@ pub struct TxBuilder {
     source_shard: u32,
     target_shard: u32,
     chain_id: Option<u64>,
+    identity: ProtocolIdentity,
     mode: EnvelopeMode,
     gas_limit: Option<u64>,
     base_fee: u64,
@@ -288,11 +413,24 @@ impl TxBuilder {
             source_shard: MASTERCHAIN_SHARD,
             target_shard: MASTERCHAIN_SHARD,
             chain_id: Some(DEFAULT_CHAIN_ID),
+            identity: ProtocolIdentity::local(),
             mode: EnvelopeMode::Explicit,
             gas_limit: None,
             base_fee: FROZEN_MIN_GAS_FLOOR,
             priority_fee_per_gas: 0,
         }
+    }
+
+    /// A payload-only transaction (used by the EVM and governance builders).
+    pub(crate) fn payload_tx(ops: Vec<Op>, amount: u64) -> Self {
+        Self::payload_builder(ops, amount)
+    }
+
+    /// Make the transaction self-addressed (`to == from`), the convention for
+    /// claims and governance ops that move no tokens.
+    pub(crate) fn self_addressed(mut self) -> Self {
+        self.to = None;
+        self
     }
 
     /// Native transfer `{ to, amount }` (empty SVM payload).
@@ -367,9 +505,78 @@ impl TxBuilder {
     }
 
     /// Bind to a chain id (default [`DEFAULT_CHAIN_ID`]).
+    ///
+    /// The id is checked against the configured [`ProtocolIdentity`] when the
+    /// builder signs: a foreign chain id is refused with
+    /// [`SdkError::ChainIdMismatch`] instead of producing bytes the node will
+    /// reject.
     pub fn chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = Some(chain_id);
         self
+    }
+
+    /// Configure the identity of the node this builder targets.
+    ///
+    /// [`ProtocolIdentity::local`] is the default. Pass the node's advertised
+    /// identity (when the RPC exposes it) to make a stale wallet fail loudly:
+    /// a different fork id, protocol version or chain id is refused with a
+    /// specific [`SdkError`] before anything is signed.
+    pub fn identity(mut self, identity: ProtocolIdentity) -> Self {
+        self.identity = identity;
+        if self.chain_id.is_none() {
+            self.chain_id = Some(identity.chain_id);
+        }
+        self
+    }
+
+    /// Block-carried governance proposal.
+    ///
+    /// `proposal_id` MUST be the `next_id` the chain will hold when the
+    /// transaction applies, and `height_observed` MUST be the block height it
+    /// applies at (the node refuses any other height: no cross-height
+    /// replay). The transaction sender (`tx.from`, filled from the signing
+    /// key) is the proposer; `to == from`, `amount == 0`.
+    pub fn gov_propose(
+        proposal_id: u64,
+        title: String,
+        action: GovAction,
+        height_observed: u64,
+    ) -> Result<Self> {
+        if title.len() > crate::governance::MAX_PROPOSAL_TITLE_BYTES {
+            return Err(SdkError::InvalidArgument(format!(
+                "proposal title is {} bytes, max {}",
+                title.len(),
+                crate::governance::MAX_PROPOSAL_TITLE_BYTES
+            )));
+        }
+        action.validate()?;
+        Ok(Self::payload_tx(
+            vec![Op::GovPropose {
+                proposal_id,
+                title,
+                action,
+                height_observed,
+            }],
+            0,
+        )
+        .self_addressed())
+    }
+
+    /// Block-carried governance vote. The sender is the voter.
+    ///
+    /// The voting window, one-vote rule and weight snapshot are enforced by
+    /// the node at apply (a vote for an unknown/closed proposal refuses
+    /// there); the builder only pins the proposal and the height.
+    pub fn gov_vote(proposal_id: u64, choice: VoteChoice, height_observed: u64) -> Self {
+        Self::payload_tx(
+            vec![Op::GovVote {
+                proposal_id,
+                choice,
+                height_observed,
+            }],
+            0,
+        )
+        .self_addressed()
     }
 
     /// Build an UNBOUND envelope (no replay domain). The node currently
@@ -438,6 +645,15 @@ impl TxBuilder {
         })
     }
 
+    /// Refuse a chain/fork that does not match the configured node identity.
+    fn validate_identity(&self) -> Result<()> {
+        self.identity.verify()?;
+        if let Some(cid) = self.chain_id {
+            self.identity.verify_chain_id(cid)?;
+        }
+        Ok(())
+    }
+
     fn unsigned(&self, from: [u8; 32], to: [u8; 32]) -> Transaction {
         Transaction {
             from,
@@ -453,8 +669,17 @@ impl TxBuilder {
         }
     }
 
+    /// The UNSIGNED transaction this builder would sign for `from` (the
+    /// sender's 32-byte address). Exposed for byte-parity vectors and
+    /// alternate signers; `sign` is the normal path.
+    pub fn unsigned_transaction(&self, from: [u8; 32]) -> Transaction {
+        let to = self.to.unwrap_or(from);
+        self.unsigned(from, to)
+    }
+
     /// Sign with a first-party Falcon-512 key (`PQ1` envelope).
     pub fn sign(self, key: &FalconKeypair) -> Result<SignedTx> {
+        self.validate_identity()?;
         let from = key.address();
         let to = self.to.unwrap_or(from);
         let mut tx = self.unsigned(from, to);
@@ -495,6 +720,7 @@ impl TxBuilder {
         session_key: &FalconKeypair,
         grant: &SessionGrant,
     ) -> Result<SignedTx> {
+        self.validate_identity()?;
         if !grant.verify_master() {
             return Err(SdkError::VerificationFailed(
                 "session grant's master signature does not verify".into(),
@@ -806,11 +1032,114 @@ mod tests {
     #[test]
     fn signing_message_binds_chain_id() {
         let key = FalconKeypair::generate().unwrap();
-        let tx = TxBuilder::transfer([7u8; 32], 1).nonce(1).chain_id(1);
-        let a = tx.clone().sign(&key).unwrap();
-        let b = tx.chain_id(2).sign(&key).unwrap();
+        // A non-default chain requires an explicit identity for that chain;
+        // the fork id still has to be this build's ruleset.
+        let identity = crate::protocol::ProtocolIdentity {
+            chain_id: 2,
+            ..crate::protocol::ProtocolIdentity::local()
+        };
+        let a = TxBuilder::transfer([7u8; 32], 1)
+            .nonce(1)
+            .identity(identity)
+            .chain_id(2)
+            .sign(&key)
+            .unwrap();
+        let b = TxBuilder::transfer([7u8; 32], 1)
+            .nonce(1)
+            .identity(identity)
+            .chain_id(2)
+            .priority_fee_per_gas(7)
+            .sign(&key)
+            .unwrap();
         assert_ne!(a.to_hex(), b.to_hex());
-        assert_eq!(a.chain_id(), Some(1));
-        assert_eq!(b.chain_id(), Some(2));
+        assert_eq!(a.chain_id(), Some(2));
+    }
+
+    #[test]
+    fn foreign_chain_is_refused_before_signing() {
+        let key = FalconKeypair::generate().unwrap();
+        let err = TxBuilder::transfer([7u8; 32], 1)
+            .chain_id(1)
+            .sign(&key)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SdkError::ChainIdMismatch {
+                expected: 5757,
+                got: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn foreign_fork_is_refused_before_signing() {
+        let key = FalconKeypair::generate().unwrap();
+        let mut identity = crate::protocol::ProtocolIdentity::local();
+        identity.fork_id ^= 1;
+        let err = TxBuilder::transfer([7u8; 32], 1)
+            .identity(identity)
+            .sign(&key)
+            .unwrap_err();
+        assert!(matches!(err, SdkError::ForkIdMismatch { .. }));
+    }
+
+    #[test]
+    fn gov_propose_and_vote_build_self_addressed_zero_value_txs() {
+        let key = FalconKeypair::generate().unwrap();
+        let propose = TxBuilder::gov_propose(
+            4,
+            "raise the floor".into(),
+            crate::governance::GovAction::SetMinGasLimit(300_000),
+            99,
+        )
+        .unwrap()
+        .nonce(3)
+        .sign(&key)
+        .unwrap();
+        assert_eq!(propose.from(), propose.to());
+        assert_eq!(propose.amount(), 0);
+        propose.verify().unwrap();
+
+        let vote = TxBuilder::gov_vote(4, crate::governance::VoteChoice::Yes, 99)
+            .nonce(4)
+            .sign(&key)
+            .unwrap();
+        assert_eq!(vote.from(), vote.to());
+        assert_eq!(vote.amount(), 0);
+        vote.verify().unwrap();
+    }
+
+    #[test]
+    fn unsigned_transaction_roundtrips_through_decode() {
+        let key = FalconKeypair::generate().unwrap();
+        let signed = TxBuilder::transfer([7u8; 32], 42)
+            .nonce(5)
+            .priority_fee_per_gas(9)
+            .sign(&key)
+            .unwrap();
+        let decoded = Transaction::decode(&signed.to_bytes()).unwrap();
+        assert_eq!(decoded, *signed.transaction());
+        assert_eq!(decoded.encode(), signed.to_bytes());
+
+        let mut unsigned = signed.transaction().clone();
+        unsigned.signature.clear();
+        let resaved = crate::tx::sign_unsigned(
+            unsigned,
+            &key,
+            EnvelopeMode::Explicit,
+            Some(DEFAULT_CHAIN_ID),
+        )
+        .unwrap();
+        resaved.verify().unwrap();
+        assert_eq!(resaved.from(), signed.from());
+        assert_eq!(resaved.to(), signed.to());
+        assert_eq!(resaved.nonce(), signed.nonce());
+        assert_eq!(resaved.gas_limit(), signed.gas_limit());
+        assert_eq!(
+            resaved.priority_fee_per_gas(),
+            signed.priority_fee_per_gas()
+        );
+        let decoded = Transaction::decode(&resaved.to_bytes()).unwrap();
+        assert_eq!(decoded, *resaved.transaction());
     }
 }

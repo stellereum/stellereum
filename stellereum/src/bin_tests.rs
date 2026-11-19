@@ -181,6 +181,7 @@ mod gossip_batch_tests {
             height: h,
             block: block_at(h),
             certificate: stellereum::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: h,
                 round: r,
                 kind: VoteKind::Precommit,
@@ -317,6 +318,7 @@ mod gossip_batch_tests {
             height: h,
             block: block_at(h),
             certificate: stellereum::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: h,
                 round: r,
                 kind: VoteKind::Precommit,
@@ -757,8 +759,17 @@ mod round_timeout_tests {
             deterministic_timeout_for(3500, 1000, 1000),
             3500 + 10_000 + 5_000
         );
-        // Deterministic down-proposer gate: ledger evidence only.
-        assert!(should_use_down_proposer_timeout_deterministic(10));
+        // Deterministic down-proposer gate: ledger evidence only. Derive the
+        // boundary from the live constant so a ruleset change to
+        // `DOWNTIME_MISS_THRESHOLD` can never make this test drift.
+        let threshold = stellereum::staking::DOWNTIME_MISS_THRESHOLD;
+        assert!(should_use_down_proposer_timeout_deterministic(threshold));
+        assert!(!should_use_down_proposer_timeout_deterministic(
+            threshold.saturating_sub(1)
+        ));
+        assert!(should_use_down_proposer_timeout_deterministic(
+            threshold.saturating_add(1)
+        ));
         assert!(!should_use_down_proposer_timeout_deterministic(0));
     }
 }

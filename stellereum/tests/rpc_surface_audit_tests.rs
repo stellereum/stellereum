@@ -588,9 +588,7 @@ async fn unsubscribe_is_bound_to_the_subscription_owner() {
         .expect("subscribe");
     let st = base_state(None, None).await;
 
-    let r = st
-        .call("stell_unsubscribe", json!([foreign.clone()]))
-        .await;
+    let r = st.call("stell_unsubscribe", json!([foreign.clone()])).await;
     assert_eq!(r, json!(false), "foreign id must not be removable");
     assert!(
         hub().get(&foreign).is_some(),

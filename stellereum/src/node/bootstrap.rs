@@ -132,6 +132,44 @@ fn hydrate_finalized_header_registry(
 ///  * it does NOT reset the chain epoch: that was derived from the shard-0
 ///    genesis so both consensus instances share one P2P namespace, with the
 ///    shard id making the topics and blob names disjoint.
+///
+/// The genesis chain spec this process boots with.
+///
+/// The upgrade-execution gate is a CONSENSUS parameter, so the value must be
+/// identical on every node of a chain. It is read once at genesis, installed
+/// into the process-wide chain spec, and folded into the commitment digest:
+/// two nodes configured differently produce different genesis roots and fail
+/// to form a chain instead of silently diverging later.
+///
+/// `STELL_UPGRADE_EXEC_ACTIVATION_HEIGHT` is the operator knob; unset (or
+/// unparsable) keeps the compiled default (`u64::MAX`, inert).
+fn genesis_chain_spec_from_env(v: Option<&str>) -> stellereum::chain_spec::GenesisChainSpec {
+    let height = v
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(stellereum::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT);
+    stellereum::chain_spec::GenesisChainSpec::new(height)
+}
+
+/// Install the genesis chain spec once per process (idempotent for the second
+/// shard of the same process; a disagreement is loud, never silent).
+fn install_genesis_chain_spec_from_env() {
+    let spec = genesis_chain_spec_from_env(
+        std::env::var("STELL_UPGRADE_EXEC_ACTIVATION_HEIGHT")
+            .ok()
+            .as_deref(),
+    );
+    if !stellereum::chain_spec::install_genesis_chain_spec(spec) {
+        let active = stellereum::chain_spec::active_genesis_chain_spec();
+        if active != spec {
+            tracing::error!(
+                "[genesis] chain spec already installed as {:?} but this shard booted with {:?}; the genesis roots will differ and the chain cannot form",
+                active,
+                spec
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_workchain_shard(
     adapter: Arc<P2pNetworkAdapter>,
@@ -145,6 +183,7 @@ pub(crate) async fn start_workchain_shard(
     header_registry: Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
     master_staking: stellereum::sharding::MasterStakingLedger,
 ) -> anyhow::Result<()> {
+    install_genesis_chain_spec_from_env();
     let state_engine = Arc::new(InMemoryStateEngine::new());
     // The dev/faucet account is the ONLY funded account on a workchain.
     // Key file (STELL_FAUCET_KEY_FILE, 0600-checked, zeroized) wins when set;
@@ -529,6 +568,7 @@ pub(crate) async fn run_node(
     parallel_exec: bool,
     pure_pq: bool,
 ) -> anyhow::Result<()> {
+    install_genesis_chain_spec_from_env();
     // FULL-PQ: `--pure-pq` parsed-and-ignored with WARN (compat).
     if pure_pq {
         eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
@@ -1074,10 +1114,21 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             let decision = upgrade_halt::guard_upgrade_halt(
                 &marker_path,
                 || {
-                    store
+                    // Applied state can be AHEAD of the finalized metadata
+                    // (the walk/apply lane advances state before the async
+                    // finalized pointer lands; `consensus_driver.rs:533-543`
+                    // handles the same skew on the live trigger). Comparing
+                    // only `finalized()` would classify a node whose state
+                    // already crossed the halt height as Pending and rejoin
+                    // consensus with the OLD binary. `latest_state_height`
+                    // reads the key only — `latest_state()` would clone the
+                    // whole snapshot blob on every boot.
+                    let finalized = store
                         .finalized()
                         .map(|found| found.map(|(h, _)| h))
-                        .map_err(|e| format!("{e}"))
+                        .map_err(|e| format!("{e}"))?;
+                    let applied = store.latest_state_height().map_err(|e| format!("{e}"))?;
+                    Ok(finalized.max(applied))
                 },
                 &running_version,
                 upgrade_halt::running_exe_sha256,
@@ -1517,6 +1568,36 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     tokio::signal::ctrl_c().await?;
     info!("Stellereum Node shutting down cleanly.");
     Ok(())
+}
+
+#[cfg(test)]
+mod genesis_chain_spec_env_tests {
+    //! The upgrade gate is consensus state: the env value is read ONCE at
+    //! genesis, folded into the commitment digest, and must be identical on
+    //! every node. Unset/garbage keeps the compiled default (inert) instead of
+    //! guessing a height.
+    use super::*;
+
+    #[test]
+    fn unset_or_unparsable_env_keeps_the_compiled_default() {
+        let default = stellereum::chain_spec::GenesisChainSpec::compiled_default();
+        assert_eq!(genesis_chain_spec_from_env(None), default);
+        assert_eq!(genesis_chain_spec_from_env(Some("")), default);
+        assert_eq!(genesis_chain_spec_from_env(Some("not-a-height")), default);
+    }
+
+    #[test]
+    fn an_explicit_height_is_taken_verbatim() {
+        assert_eq!(
+            genesis_chain_spec_from_env(Some(" 4242 ")),
+            stellereum::chain_spec::GenesisChainSpec::new(4242)
+        );
+        // Zero is a legal "active from genesis" value, not a missing one.
+        assert_eq!(
+            genesis_chain_spec_from_env(Some("0")),
+            stellereum::chain_spec::GenesisChainSpec::new(0)
+        );
+    }
 }
 
 #[cfg(test)]

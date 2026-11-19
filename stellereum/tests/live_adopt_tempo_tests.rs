@@ -326,6 +326,7 @@ async fn forked_commit_dies_on_linkage_before_quorum_crypto() {
     // Мусорный QC той же формы (неверные подписи): отличить порядок можно только
     // по тексту отказа — linkage-первый код до verify не доходит.
     let garbage_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use stellereum::consensus_net::mesh_may_substitute;
 use stellereum::network::{
-    MeshFuture, ValidatorMesh, ValidatorMeshMember, ValidatorMeshTransport,
+    MeshDelivery, MeshFuture, ValidatorMesh, ValidatorMeshMember, ValidatorMeshTransport,
     VALIDATOR_MESH_COOLDOWN_MS, VALIDATOR_MESH_EVICT_AFTER,
 };
 
@@ -116,7 +117,11 @@ fn member(seed: u8) -> ValidatorMeshMember {
     let mut id = [0u8; 20];
     id[0] = seed;
     id[19] = seed.wrapping_mul(7);
-    ValidatorMeshMember::new(id, vec![format!("127.0.0.1:{}", 30000 + seed as u32)], format!("v{seed}"))
+    ValidatorMeshMember::new(
+        id,
+        vec![format!("127.0.0.1:{}", 30000 + seed as u32)],
+        format!("v{seed}"),
+    )
 }
 
 fn mesh(transport: Arc<FakeTransport>) -> Arc<ValidatorMesh> {
@@ -137,18 +142,30 @@ async fn mesh_delivers_a_proposal_directly_without_any_dht_call() {
 
     assert_eq!(delivery.direct_ok, 3);
     assert_eq!(delivery.direct_failed, 0);
-    assert!(!delivery.fallback_used, "DHT must not be touched on a healthy mesh");
+    assert!(
+        !delivery.fallback_used,
+        "DHT must not be touched on a healthy mesh"
+    );
     assert!(delivery.delivered());
     assert_eq!(transport.overlay_calls(), 0);
     assert!(
         elapsed < Duration::from_millis(400),
         "mesh must not pay the 1.5 s DHT path (took {elapsed:?})"
     );
-    let called: Vec<_> = transport.direct_calls().into_iter().map(|(id, _)| id).collect();
+    let called: Vec<_> = transport
+        .direct_calls()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     for id in ids {
-        assert!(called.contains(&id), "every mesh member must be addressed directly");
+        assert!(
+            called.contains(&id),
+            "every mesh member must be addressed directly"
+        );
     }
-    assert!(transport.direct_calls()[0].1.contains("stell/consensus/test"));
+    assert!(transport.direct_calls()[0]
+        .1
+        .contains("stell/consensus/test"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -164,10 +181,20 @@ async fn failed_direct_link_falls_back_to_the_overlay() {
     let delivery = mesh.deliver("stell/consensus/test", "beef", 1_000).await;
     assert_eq!(delivery.direct_ok, 1);
     assert_eq!(delivery.direct_failed, 1);
-    assert!(delivery.fallback_used, "a failed copy must go to the fallback");
+    assert!(
+        delivery.fallback_used,
+        "a failed copy must go to the fallback"
+    );
     assert!(delivery.fallback_ok);
-    assert!(delivery.delivered());
-    assert_eq!(transport.overlay_calls(), 1, "one fallback publish per delivery");
+    // The overlay accepted ONE copy, which is not proof that the FAILED
+    // direct target received it. The caller must still run the per-peer
+    // broadcast, so this is deliberately NOT a complete delivery.
+    assert!(!delivery.delivered());
+    assert_eq!(
+        transport.overlay_calls(),
+        1,
+        "one fallback publish per delivery"
+    );
     assert_eq!(mesh.consecutive_failures(&b.id), 1);
     assert_eq!(mesh.consecutive_failures(&a.id), 0);
 }
@@ -183,8 +210,13 @@ async fn stalled_dht_does_not_block_direct_delivery() {
     transport.set_direct(b.id, true);
     mesh.install(vec![a, b], 1_000);
 
-    let delivery = mesh.deliver("stell/consensus/test", "deadbeef", 1_000).await;
-    assert_eq!(delivery.direct_ok, 2, "the DHT being down must not lose direct copies");
+    let delivery = mesh
+        .deliver("stell/consensus/test", "deadbeef", 1_000)
+        .await;
+    assert_eq!(
+        delivery.direct_ok, 2,
+        "the DHT being down must not lose direct copies"
+    );
     assert!(!delivery.fallback_used);
     assert!(delivery.delivered());
     assert_eq!(transport.overlay_calls(), 0);
@@ -208,7 +240,10 @@ async fn three_consecutive_failures_evict_and_cooldown_restores() {
         assert!(d.fallback_used, "each failed copy uses the overlay");
         assert!(d.fallback_ok);
     }
-    assert!(mesh.is_suspected(&a.id), "third failure marks the peer suspected");
+    assert!(
+        mesh.is_suspected(&a.id),
+        "third failure marks the peer suspected"
+    );
     assert_eq!(mesh.evictions_total(), 1);
     assert!(
         mesh.direct_targets(1_000).is_empty(),
@@ -223,7 +258,10 @@ async fn three_consecutive_failures_evict_and_cooldown_restores() {
         before,
         "no direct attempt before the cooldown elapses"
     );
-    assert!(d.fallback_used && d.fallback_ok, "the overlay still carries the copy");
+    assert!(
+        d.fallback_used && d.fallback_ok,
+        "the overlay still carries the copy"
+    );
 
     // Cooldown elapsed: one probe is allowed; success restores the link.
     transport.set_direct(a.id, true);
@@ -233,6 +271,158 @@ async fn three_consecutive_failures_evict_and_cooldown_restores() {
     assert!(!mesh.is_suspected(&a.id));
     assert_eq!(mesh.consecutive_failures(&a.id), 0);
     assert_eq!(mesh.direct_targets(1_101), vec![a.id]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cooldown_expiry_does_not_reintroduce_a_dead_peer_into_the_frame_path() {
+    let transport = Arc::new(FakeTransport::new(0, 0));
+    let mesh = Arc::new(ValidatorMesh::with_policy(
+        Arc::clone(&transport) as Arc<dyn ValidatorMeshTransport>,
+        VALIDATOR_MESH_EVICT_AFTER,
+        100,
+        10,
+    ));
+    let a = member(1);
+    transport.set_direct(a.id, false);
+    mesh.install(vec![a.clone()], 1_000);
+
+    for _ in 0..VALIDATOR_MESH_EVICT_AFTER {
+        mesh.deliver("t", "x", 1_000).await;
+    }
+    assert!(mesh.is_suspected(&a.id));
+
+    // REGRESSION: at the exact cooldown boundary the peer used to re-enter
+    // `direct_targets`, so every consensus frame retried the dead link and
+    // paid the full mesh timeout on the send path. Reconnect belongs to the
+    // off-tick maintenance pass.
+    let before = transport.direct_calls().len();
+    assert!(
+        mesh.direct_targets(1_100).is_empty(),
+        "a suspected peer must stay out of the per-frame direct set after cooldown"
+    );
+    transport.set_direct(a.id, true); // reachable again, but not probed yet
+    let delivery = mesh.deliver("t", "y", 1_100).await;
+    assert_eq!(
+        transport.direct_calls().len(),
+        before,
+        "per-frame delivery must not dial a suspected peer"
+    );
+    assert!(delivery.fallback_used && delivery.fallback_ok);
+    assert!(
+        mesh.is_suspected(&a.id),
+        "a fire-and-forget write is not liveness proof; only the acknowledged probe restores"
+    );
+
+    // The heartbeat owns recovery: one acknowledged probe clears suspicion.
+    let report = mesh.maintain(1_150).await;
+    assert_eq!(report.probed, 1);
+    assert_eq!(report.recovered, 1);
+    assert!(!mesh.is_suspected(&a.id));
+    assert_eq!(mesh.direct_targets(1_150), vec![a.id]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_overlay_success_does_not_mask_a_failed_direct_target() {
+    let transport = Arc::new(FakeTransport::new(0, 0));
+    let mesh = mesh(Arc::clone(&transport));
+    let a = member(1);
+    let b = member(2);
+    let c = member(3);
+    transport.set_direct(a.id, true);
+    transport.set_direct(b.id, false); // the failed copy
+    transport.set_direct(c.id, true);
+    mesh.install(vec![a, b, c], 1_000);
+
+    // FakeTransport's overlay reports `Ok(4)` — a count, not per-peer
+    // coverage. The failed direct target is NOT proven received.
+    let delivery = mesh.deliver("stell/consensus/test", "beef", 1_000).await;
+    assert_eq!(delivery.targets, 3);
+    assert_eq!(delivery.direct_ok, 2);
+    assert_eq!(delivery.direct_failed, 1);
+    assert!(delivery.fallback_used && delivery.fallback_ok);
+    assert!(
+        !delivery.delivered(),
+        "the caller must still broadcast so the failed target receives the frame"
+    );
+}
+
+#[test]
+fn partial_mesh_failure_is_not_covered_by_one_overlay_success() {
+    // 3 targets, 1 direct failure, and the overlay accepted ONE copy. That
+    // count means "some subscriber took it", not "the failed validator got
+    // it", so the frame is NOT complete: the per-peer broadcast must still
+    // run and reach every peer.
+    let delivery = MeshDelivery {
+        targets: 3,
+        direct_ok: 2,
+        direct_failed: 1,
+        fallback_used: true,
+        fallback_ok: true,
+    };
+    assert!(
+        !delivery.delivered(),
+        "one overlay success must never be treated as coverage for a failed direct copy"
+    );
+    let src = include_str!("../src/consensus_net.rs");
+    assert!(
+        src.contains("if delivery.delivered() {"),
+        "the broadcast path must gate on the strict direct-coverage proof"
+    );
+    assert!(
+        !src.contains("|| self.fallback_ok"),
+        "overlay counts must not be folded into `delivered()`"
+    );
+
+    // Empty target set is also not success (its own L3 rule), even if the
+    // overlay accepted a copy: the caller must still broadcast.
+    let empty = MeshDelivery {
+        targets: 0,
+        direct_ok: 0,
+        direct_failed: 0,
+        fallback_used: true,
+        fallback_ok: true,
+    };
+    assert!(!empty.delivered());
+}
+
+#[test]
+fn exempt_committed_frames_never_take_the_mesh_shortcut() {
+    // The mesh withholds suspected peers. `Committed` is deliberately exempt
+    // from that cooldown because it is the catch-up frame a returning
+    // validator needs, so it must use the per-peer path (which attempts
+    // cooldown peers, detached) instead of the mesh-only path.
+    assert!(
+        !mesh_may_substitute(true),
+        "Committed must use the per-peer path"
+    );
+    assert!(
+        mesh_may_substitute(false),
+        "votes/proposals may use the mesh"
+    );
+
+    let src = include_str!("../src/consensus_net.rs");
+    assert!(
+        src.contains("mesh_may_substitute(exempt) &&"),
+        "the mesh shortcut must be gated on the exempt/Committed rule"
+    );
+}
+
+#[test]
+fn resolved_peer_ids_are_cached_for_the_frame_path() {
+    // Both consensus and tx gossip used to walk `cfg.peers` and decode every
+    // PQ hex on EVERY message (the mesh check and the per-peer send each did
+    // their own resolution). At ~4 blocks/s that is pure per-frame overhead.
+    let src = include_str!("../src/consensus_net.rs");
+    assert_eq!(
+        src.matches("peer_ids_cache.get()").count(),
+        2,
+        "both peer_ids() implementations must consult the cache"
+    );
+    assert_eq!(
+        src.matches("if all_resolved {").count(),
+        2,
+        "a partially resolved set must stay uncached (registry may fill in later)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -345,7 +535,10 @@ async fn rotation_adds_removes_and_resets_a_changed_link() {
     assert_eq!(second.removed, 1);
     assert_eq!(second.updated, 1, "endpoint change is an update");
     assert_eq!(second.members, 2);
-    assert!(!mesh.is_member(&a.id), "removed validator is no longer addressed");
+    assert!(
+        !mesh.is_member(&a.id),
+        "removed validator is no longer addressed"
+    );
     assert!(mesh.is_member(&b.id) && mesh.is_member(&c.id));
 
     let before = transport.direct_calls().len();
@@ -355,7 +548,10 @@ async fn rotation_adds_removes_and_resets_a_changed_link() {
         .iter()
         .map(|(id, _)| *id)
         .collect();
-    assert!(!new_calls.contains(&a.id), "rotation must stop traffic to removed peers");
+    assert!(
+        !new_calls.contains(&a.id),
+        "rotation must stop traffic to removed peers"
+    );
     assert!(new_calls.contains(&b.id) && new_calls.contains(&c.id));
 
     // A suspected link whose endpoint changed is retried immediately: the
@@ -368,7 +564,10 @@ async fn rotation_adds_removes_and_resets_a_changed_link() {
     let mut b_rotated = b.clone();
     b_rotated.endpoints = vec!["127.0.0.1:39998".to_string()];
     mesh.install(vec![b_rotated, c], 1_100);
-    assert!(!mesh.is_suspected(&b.id), "new endpoint = fresh link, no suspicion");
+    assert!(
+        !mesh.is_suspected(&b.id),
+        "new endpoint = fresh link, no suspicion"
+    );
 
     // Default policy constants stay pinned for operators.
     assert_eq!(VALIDATOR_MESH_EVICT_AFTER, 3);

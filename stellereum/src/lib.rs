@@ -100,6 +100,7 @@ pub mod parallel_exec;
 pub mod pmm;
 pub mod post_quantum;
 pub mod pq_registry;
+pub mod protocol;
 pub mod qc_aggregate;
 pub mod remote_signer;
 pub mod rpc;

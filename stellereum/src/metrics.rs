@@ -50,6 +50,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Content type for the Prometheus text exposition format.
@@ -1211,6 +1212,233 @@ impl Registry {
 pub fn global() -> Arc<Registry> {
     static GLOBAL: OnceLock<Arc<Registry>> = OnceLock::new();
     GLOBAL.get_or_init(|| Arc::new(Registry::new())).clone()
+}
+
+// ============================================================================
+// Health counters (producer-less in phase 1; `/health` must stay honest)
+// ============================================================================
+//
+// These are deliberately separate from [`Registry`]: they are lock-free
+// atomics written from hot paths and read by `/health`, not exposed on the
+// Prometheus scrape (yet). Every field carries a "seen a writer" flag set by
+// the FIRST `record_*` call. `snapshot*` returns `None` until then, so the
+// health endpoint can say `null` + a reason instead of inventing a zero that
+// an operator would read as "measured, and it is zero".
+//
+// Counts saturate at `u64::MAX` (CAS loop, never `fetch_add` wrapping) and
+// therefore never decrease. The stamps are epoch-milliseconds, not durations:
+// the reader subtracts from its own clock, so no clock is stored twice.
+
+/// Immutable view of [`HealthCounters`], one `Option` per field.
+///
+/// `None` means "no writer has recorded anything yet", never "zero".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub view_changes_total: Option<u64>,
+    pub rejected_proposals_total: Option<u64>,
+    pub bytes_inbound_total: Option<u64>,
+    pub bytes_outbound_total: Option<u64>,
+    pub last_persist_ms: Option<u64>,
+    pub last_snapshot_ms: Option<u64>,
+}
+
+/// Process-wide, lock-free health counters.
+///
+/// Phase 1 defines and exports them only. The production writers live in the
+/// consensus engine / driver / net / storage paths and are wired in phase 2
+/// (see `docs/OBSERVABILITY.md`, "Phase 2 wiring"); until the first write the
+/// snapshot is `None` and `/health` reports `null` + a reason.
+#[derive(Debug)]
+pub struct HealthCounters {
+    view_changes_total: AtomicU64,
+    view_changes_seen: AtomicBool,
+    rejected_proposals_total: AtomicU64,
+    rejected_proposals_seen: AtomicBool,
+    bytes_inbound_total: AtomicU64,
+    bytes_inbound_seen: AtomicBool,
+    bytes_outbound_total: AtomicU64,
+    bytes_outbound_seen: AtomicBool,
+    last_persist_ms: AtomicU64,
+    last_persist_seen: AtomicBool,
+    last_snapshot_ms: AtomicU64,
+    last_snapshot_seen: AtomicBool,
+}
+
+impl Default for HealthCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HealthCounters {
+    pub const fn new() -> Self {
+        Self {
+            view_changes_total: AtomicU64::new(0),
+            view_changes_seen: AtomicBool::new(false),
+            rejected_proposals_total: AtomicU64::new(0),
+            rejected_proposals_seen: AtomicBool::new(false),
+            bytes_inbound_total: AtomicU64::new(0),
+            bytes_inbound_seen: AtomicBool::new(false),
+            bytes_outbound_total: AtomicU64::new(0),
+            bytes_outbound_seen: AtomicBool::new(false),
+            last_persist_ms: AtomicU64::new(0),
+            last_persist_seen: AtomicBool::new(false),
+            last_snapshot_ms: AtomicU64::new(0),
+            last_snapshot_seen: AtomicBool::new(false),
+        }
+    }
+
+    /// Saturating add. `fetch_add` wraps at `u64::MAX`; a counter that can go
+    /// backwards is not a counter, so a CAS loop pins the ceiling instead.
+    fn add_saturating(counter: &AtomicU64, seen: &AtomicBool, n: u64) {
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_add(n);
+            match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        // Release after the add: a reader that sees `seen=true` is guaranteed
+        // to see at least the value from this first write.
+        seen.store(true, Ordering::Release);
+    }
+
+    fn store_stamp(stamp: &AtomicU64, seen: &AtomicBool, epoch_ms: u64) {
+        stamp.store(epoch_ms, Ordering::Relaxed);
+        seen.store(true, Ordering::Release);
+    }
+
+    fn read_stamp(stamp: &AtomicU64, seen: &AtomicBool) -> Option<u64> {
+        seen.load(Ordering::Acquire)
+            .then(|| stamp.load(Ordering::Relaxed))
+    }
+
+    /// One view change (a round abandoned without a block QC).
+    pub fn record_view_change(&self) {
+        Self::add_saturating(&self.view_changes_total, &self.view_changes_seen, 1);
+    }
+
+    /// One proposal refused in the consensus driver's `Err` arm.
+    pub fn record_rejected_proposal(&self) {
+        Self::add_saturating(
+            &self.rejected_proposals_total,
+            &self.rejected_proposals_seen,
+            1,
+        );
+    }
+
+    /// `bytes` of consensus traffic observed on the inbound path.
+    pub fn record_bytes_inbound(&self, bytes: u64) {
+        Self::add_saturating(&self.bytes_inbound_total, &self.bytes_inbound_seen, bytes);
+    }
+
+    /// `bytes` of consensus traffic handed to an outbound send path.
+    pub fn record_bytes_outbound(&self, bytes: u64) {
+        Self::add_saturating(&self.bytes_outbound_total, &self.bytes_outbound_seen, bytes);
+    }
+
+    /// Epoch-ms of the last successful background persist job.
+    pub fn record_last_persist_ms(&self, epoch_ms: u64) {
+        Self::store_stamp(&self.last_persist_ms, &self.last_persist_seen, epoch_ms);
+    }
+
+    /// Epoch-ms of the last successful state/domain snapshot write.
+    pub fn record_last_snapshot_ms(&self, epoch_ms: u64) {
+        Self::store_stamp(&self.last_snapshot_ms, &self.last_snapshot_seen, epoch_ms);
+    }
+
+    pub fn snapshot(&self) -> HealthSnapshot {
+        HealthSnapshot {
+            view_changes_total: self
+                .view_changes_seen
+                .load(Ordering::Acquire)
+                .then(|| self.view_changes_total.load(Ordering::Relaxed)),
+            rejected_proposals_total: self
+                .rejected_proposals_seen
+                .load(Ordering::Acquire)
+                .then(|| self.rejected_proposals_total.load(Ordering::Relaxed)),
+            bytes_inbound_total: self
+                .bytes_inbound_seen
+                .load(Ordering::Acquire)
+                .then(|| self.bytes_inbound_total.load(Ordering::Relaxed)),
+            bytes_outbound_total: self
+                .bytes_outbound_seen
+                .load(Ordering::Acquire)
+                .then(|| self.bytes_outbound_total.load(Ordering::Relaxed)),
+            last_persist_ms: Self::read_stamp(&self.last_persist_ms, &self.last_persist_seen),
+            last_snapshot_ms: Self::read_stamp(&self.last_snapshot_ms, &self.last_snapshot_seen),
+        }
+    }
+}
+
+/// Process-wide health counters (see [`HealthCounters`]).
+pub static HEALTH_COUNTERS: HealthCounters = HealthCounters::new();
+
+/// Record one view change (phase-2 writer: the engine's view-change path).
+pub fn record_view_change() {
+    HEALTH_COUNTERS.record_view_change();
+}
+
+/// Record one rejected proposal (phase-2 writer: the driver's `Err` arm).
+pub fn record_rejected_proposal() {
+    HEALTH_COUNTERS.record_rejected_proposal();
+}
+
+/// Record inbound consensus bytes (phase-2 writer: the receive/admit path).
+pub fn record_bytes_inbound(bytes: u64) {
+    HEALTH_COUNTERS.record_bytes_inbound(bytes);
+}
+
+/// Record outbound consensus bytes (phase-2 writer: the send path).
+pub fn record_bytes_outbound(bytes: u64) {
+    HEALTH_COUNTERS.record_bytes_outbound(bytes);
+}
+
+/// Record a successful background persist (epoch-ms).
+pub fn record_last_persist_ms(epoch_ms: u64) {
+    HEALTH_COUNTERS.record_last_persist_ms(epoch_ms);
+}
+
+/// Record a successful state/domain snapshot write (epoch-ms).
+pub fn record_last_snapshot_ms(epoch_ms: u64) {
+    HEALTH_COUNTERS.record_last_snapshot_ms(epoch_ms);
+}
+
+/// One consistent-enough view of every health counter for `/health`.
+pub fn snapshot_health_counters() -> HealthSnapshot {
+    HEALTH_COUNTERS.snapshot()
+}
+
+/// Cumulative view changes, or `None` until a writer exists.
+pub fn snapshot_view_changes_total() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().view_changes_total
+}
+
+/// Cumulative rejected proposals, or `None` until a writer exists.
+pub fn snapshot_rejected_proposals_total() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().rejected_proposals_total
+}
+
+/// Cumulative inbound consensus bytes, or `None` until a writer exists.
+pub fn snapshot_bytes_inbound_total() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().bytes_inbound_total
+}
+
+/// Cumulative outbound consensus bytes, or `None` until a writer exists.
+pub fn snapshot_bytes_outbound_total() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().bytes_outbound_total
+}
+
+/// Epoch-ms of the last successful persist, or `None` until a writer exists.
+pub fn snapshot_last_persist_ms() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().last_persist_ms
+}
+
+/// Epoch-ms of the last successful snapshot write, or `None` until a writer
+/// exists.
+pub fn snapshot_last_snapshot_ms() -> Option<u64> {
+    HEALTH_COUNTERS.snapshot().last_snapshot_ms
 }
 
 /// Flat view of the scalar metrics, cheap enough to build per request.

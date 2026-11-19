@@ -146,7 +146,7 @@ fn test_beacon_draw_committee_is_deterministic_and_gated_off() {
         vs.add([i + 1; 32], 10);
     }
     let beacon = [0xBBu8; 32];
-    // Height 7 is in epoch 0 (7 / 128 == 0).
+    // Height 7 is in epoch 0 (7 / EPOCH_BLOCKS == 0).
     let a = beacon_draw_committee(&vs, 7, 0, 8, &beacon, 0);
     let b = beacon_draw_committee(&vs, 7, 0, 8, &beacon, 0);
     assert_eq!(a, b, "beacon draw must be strictly deterministic");
@@ -177,11 +177,12 @@ fn test_beacon_draw_committee_refuses_a_wrong_epoch() {
         beacon_draw_committee(&vs, 7, 0, 8, &beacon, 1).is_empty(),
         "a beacon from epoch 1 must not elect any committee at an epoch-0 height"
     );
-    // Height 128 -> epoch 1: the binding moves with the height.
-    assert_eq!(crate::mev_epoch::epoch_of_height(128), 1);
-    assert_eq!(beacon_draw_committee(&vs, 128, 0, 8, &beacon, 1).len(), 8);
+    // Height EPOCH_BLOCKS -> epoch 1: the binding moves with the height.
+    let e = crate::mev_epoch::EPOCH_BLOCKS;
+    assert_eq!(crate::mev_epoch::epoch_of_height(e), 1);
+    assert_eq!(beacon_draw_committee(&vs, e, 0, 8, &beacon, 1).len(), 8);
     assert!(
-        beacon_draw_committee(&vs, 128, 0, 8, &beacon, 0).is_empty(),
+        beacon_draw_committee(&vs, e, 0, 8, &beacon, 0).is_empty(),
         "a beacon from epoch 0 must not elect any committee at an epoch-1 height"
     );
     // The epoch is bound into the seed itself: same beacon bytes, same
@@ -321,14 +322,25 @@ fn test_vote_preimage_commits_to_chain_id_and_fields() {
     assert_ne!(b, c);
 
     // Domain separation: the preimage starts with the vote domain tag.
-    assert!(a.starts_with(b"STELLEREUM_BFT_VOTE_V2"));
-    // ... followed by the chain id.
-    let tag_len = b"STELLEREUM_BFT_VOTE_V2".len();
+    assert!(a.starts_with(b"STELLEREUM_BFT_VOTE_V3"));
+    // ... followed by the chain id, then the shard id (Finding A).
+    let tag_len = b"STELLEREUM_BFT_VOTE_V3".len();
     let chain = crate::consensus::consensus_chain_id().to_be_bytes();
     assert!(
         a[tag_len..tag_len + 8] == chain,
         "the chain id must follow the domain tag"
     );
+    assert_eq!(
+        &a[tag_len + 8..tag_len + 12],
+        &0u32.to_be_bytes(),
+        "the masterchain shorthand binds shard 0"
+    );
+    // Two shards at the same height/round/kind produce different preimages.
+    let s0 =
+        crate::consensus::vote_sign_bytes_for_shard(0, 1, 2, VoteKind::Prevote, &Some([0x11; 32]));
+    let s1 =
+        crate::consensus::vote_sign_bytes_for_shard(1, 1, 2, VoteKind::Prevote, &Some([0x11; 32]));
+    assert_ne!(s0, s1);
 }
 
 #[test]
@@ -393,6 +405,7 @@ fn test_uqc_encoding_decoding_and_verification_16_falcon() {
 
     // Verify QuorumCertificate with µQC sentinel marker
     let qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -408,6 +421,7 @@ fn test_uqc_encoding_decoding_and_verification_16_falcon() {
 
     // Helper attachment / extraction check
     let mut qc2 = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -466,6 +480,7 @@ fn test_rejection_of_tampered_uqc_signatures_or_sub_quorum_bitmasks() {
         sortition_parent: parent,
     };
     let sub_qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -503,6 +518,7 @@ fn test_rejection_of_tampered_uqc_signatures_or_sub_quorum_bitmasks() {
         sortition_parent: parent,
     };
     let tampered_qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -518,6 +534,7 @@ fn test_rejection_of_tampered_uqc_signatures_or_sub_quorum_bitmasks() {
     let mut mismatched_uqc = tampered_uqc;
     mismatched_uqc.height = height + 1; // Wrong height
     let mismatched_qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -654,6 +671,7 @@ fn test_uqc_of_a_subset_committee_must_reach_a_network_majority() {
         }
     };
     let wrap = |uqc: &PqMicroCertificate| QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -811,6 +829,7 @@ fn dual_finality_counterexample_w100_b32() {
             sortition_parent: parent,
         };
         QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind: VoteKind::Precommit,
@@ -953,6 +972,7 @@ fn micro_qc_alone_gate_agrees_with_full_quorum_on_live_shape() {
             sortition_parent: parent,
         };
         QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind: VoteKind::Precommit,
@@ -1158,6 +1178,7 @@ fn qc_split_post_activation_micro_alone_never_finalizes() {
             sortition_parent: parent,
         };
         QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -1187,6 +1208,7 @@ fn qc_split_post_activation_micro_alone_never_finalizes() {
             sortition_parent: [0u8; 32],
         };
         QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -1252,6 +1274,7 @@ fn test_backward_compatibility_classical_ed25519_qc() {
         ed_sigs.push((sk.verifying_key().to_bytes(), sig));
     }
     let ed_qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -1312,6 +1335,7 @@ fn test_backward_compatibility_classical_ed25519_qc() {
         parent,
     );
     let qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -1338,6 +1362,7 @@ fn test_backward_compatibility_classical_ed25519_qc() {
         parent,
     );
     let tampered_qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -1623,6 +1648,7 @@ fn test_signers_set_extraction_falcon_uqc_and_classical() {
         })
         .collect();
     let classical_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1643,6 +1669,7 @@ fn test_signers_set_extraction_falcon_uqc_and_classical() {
         "FULL-PQ: rejected Ed quorum attributes nobody"
     );
     let forged_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1683,6 +1710,7 @@ fn test_signers_set_extraction_falcon_uqc_and_classical() {
         parent,
     );
     let uqc_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1700,6 +1728,7 @@ fn test_signers_set_extraction_falcon_uqc_and_classical() {
     // attribution mirrors verify — the undecodable marker attributes
     // NOBODY.
     let marker_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1872,6 +1901,7 @@ fn qc_verify_batch_parity_falcon_uqc_k4716_and_forged() {
             parent,
         );
         let qc = QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -1940,6 +1970,7 @@ fn qc_verify_batch_parity_falcon_uqc_k4716_and_forged() {
             parent,
         );
         let bad_qc = QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -1960,24 +1991,24 @@ fn qc_verify_batch_parity_falcon_uqc_k4716_and_forged() {
     }
 }
 
-/// CN-VRF v3 (7,200-block epoch, gated OFF): epoch boundaries, determinism,
-/// stake weighting, and wrong-epoch fail-closed refusal.
+/// CN-VRF v3 (ruleset-v2 epoch, gated OFF): epoch boundaries,
+/// determinism, stake weighting, and wrong-epoch fail-closed refusal.
 #[test]
-fn test_cnvrf_v3_beacon_draw_committee_7200_epoch_and_gated_off() {
+fn test_cnvrf_v3_beacon_draw_committee_epoch_boundaries_and_gated_off() {
     assert_eq!(CNVRF_V3_ACTIVATION_HEIGHT, u64::MAX);
     assert!(!cnvrf_v3_active_at(0));
-    assert!(!cnvrf_v3_active_at(7199));
-    assert!(!cnvrf_v3_active_at(7200));
+    assert!(!cnvrf_v3_active_at(CNVRF_V3_EPOCH_LEN - 1));
+    assert!(!cnvrf_v3_active_at(CNVRF_V3_EPOCH_LEN));
     assert!(!cnvrf_v3_active_at(u64::MAX - 1));
     assert!(cnvrf_v3_active_at(u64::MAX));
 
-    assert_eq!(CNVRF_V3_EPOCH_LEN, 7_200);
+    assert_eq!(CNVRF_V3_EPOCH_LEN, 30_000);
     assert_eq!(CNVRF_V3_EPOCH_LEN, crate::cn_vrf::EPOCH_LEN);
     assert_eq!(cnvrf_v3_epoch_of_height(0), 0);
-    assert_eq!(cnvrf_v3_epoch_of_height(7199), 0);
-    assert_eq!(cnvrf_v3_epoch_of_height(7200), 1);
-    assert_eq!(cnvrf_v3_epoch_of_height(14399), 1);
-    assert_eq!(cnvrf_v3_epoch_of_height(14400), 2);
+    assert_eq!(cnvrf_v3_epoch_of_height(CNVRF_V3_EPOCH_LEN - 1), 0);
+    assert_eq!(cnvrf_v3_epoch_of_height(CNVRF_V3_EPOCH_LEN), 1);
+    assert_eq!(cnvrf_v3_epoch_of_height(2 * CNVRF_V3_EPOCH_LEN - 1), 1);
+    assert_eq!(cnvrf_v3_epoch_of_height(2 * CNVRF_V3_EPOCH_LEN), 2);
 
     let mut vs = ValidatorSet::new();
     for i in 0..16u8 {
@@ -1987,35 +2018,36 @@ fn test_cnvrf_v3_beacon_draw_committee_7200_epoch_and_gated_off() {
     }
     let beacon = [0x5Au8; 48];
 
-    // 7,200-block epoch boundary: 7199 -> epoch 0, 7200 -> epoch 1.
-    let c_7199 = cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 0);
-    assert_eq!(c_7199.len(), 8);
+    // Epoch boundary: E-1 -> epoch 0, E -> epoch 1.
+    let e = CNVRF_V3_EPOCH_LEN;
+    let c_last0 = cnvrf_v3_beacon_draw_committee(&vs, e - 1, 0, 8, &beacon, 0);
+    assert_eq!(c_last0.len(), 8);
     assert_eq!(
-        c_7199,
-        cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 0)
+        c_last0,
+        cnvrf_v3_beacon_draw_committee(&vs, e - 1, 0, 8, &beacon, 0)
     );
     assert!(
-        cnvrf_v3_beacon_draw_committee(&vs, 7199, 0, 8, &beacon, 1).is_empty(),
-        "height 7199 (epoch 0) must refuse epoch-1 beacon"
+        cnvrf_v3_beacon_draw_committee(&vs, e - 1, 0, 8, &beacon, 1).is_empty(),
+        "height E-1 (epoch 0) must refuse epoch-1 beacon"
     );
 
-    let c_7200 = cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 8, &beacon, 1);
-    assert_eq!(c_7200.len(), 8);
+    let c_e = cnvrf_v3_beacon_draw_committee(&vs, e, 0, 8, &beacon, 1);
+    assert_eq!(c_e.len(), 8);
     assert!(
-        cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 8, &beacon, 0).is_empty(),
-        "height 7200 (epoch 1) must refuse epoch-0 beacon"
+        cnvrf_v3_beacon_draw_committee(&vs, e, 0, 8, &beacon, 0).is_empty(),
+        "height E (epoch 1) must refuse epoch-0 beacon"
     );
 
     // Changing beacon output or epoch changes seed & committee.
     assert_ne!(
-        cnvrf_v3_beacon_seed(&beacon, 0, 7199, 0),
-        cnvrf_v3_beacon_seed(&beacon, 1, 7199, 0)
+        cnvrf_v3_beacon_seed(&beacon, 0, CNVRF_V3_EPOCH_LEN - 1, 0),
+        cnvrf_v3_beacon_seed(&beacon, 1, CNVRF_V3_EPOCH_LEN - 1, 0)
     );
     let beacon_other = [0xA5u8; 48];
     let mut differs = false;
     for round in 0..32u32 {
-        let a = cnvrf_v3_beacon_draw_committee(&vs, 7200, round, 8, &beacon, 1);
-        let b = cnvrf_v3_beacon_draw_committee(&vs, 7200, round, 8, &beacon_other, 1);
+        let a = cnvrf_v3_beacon_draw_committee(&vs, e, round, 8, &beacon, 1);
+        let b = cnvrf_v3_beacon_draw_committee(&vs, e, round, 8, &beacon_other, 1);
         if a != b {
             differs = true;
             break;
@@ -2046,10 +2078,10 @@ fn test_cnvrf_v3_beacon_draw_committee_7200_epoch_and_gated_off() {
 
     // Edge cases: empty set, zero committee_size, oversize committee_size.
     let empty_vs = ValidatorSet::new();
-    assert!(cnvrf_v3_beacon_draw_committee(&empty_vs, 7200, 0, 8, &beacon, 1).is_empty());
-    assert!(cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 0, &beacon, 1).is_empty());
+    assert!(cnvrf_v3_beacon_draw_committee(&empty_vs, e, 0, 8, &beacon, 1).is_empty());
+    assert!(cnvrf_v3_beacon_draw_committee(&vs, e, 0, 0, &beacon, 1).is_empty());
     assert_eq!(
-        cnvrf_v3_beacon_draw_committee(&vs, 7200, 0, 100, &beacon, 1).len(),
+        cnvrf_v3_beacon_draw_committee(&vs, e, 0, 100, &beacon, 1).len(),
         16
     );
 }
@@ -2080,7 +2112,7 @@ fn test_proposer_for_with_beacon_pre_and_post_activation() {
     };
 
     // Pre-activation: delegates byte-identically to `proposer_for`.
-    for h in [0u64, 7199, 7200] {
+    for h in [0u64, CNVRF_V3_EPOCH_LEN - 1, CNVRF_V3_EPOCH_LEN] {
         for r in 0..5u32 {
             let legacy = vs.proposer_for(h, r);
             assert_eq!(vs.proposer_for_with_beacon(h, r, None), legacy);
@@ -2091,8 +2123,8 @@ fn test_proposer_for_with_beacon_pre_and_post_activation() {
 
     // Domain separation between committee draw seed and proposer seed.
     assert_ne!(
-        cnvrf_v3_beacon_seed(&beacon_e1.output, 1, 7200, 0),
-        cnvrf_v3_proposer_seed(&beacon_e1.output, 1, 7200, 0)
+        cnvrf_v3_beacon_seed(&beacon_e1.output, 1, CNVRF_V3_EPOCH_LEN, 0),
+        cnvrf_v3_proposer_seed(&beacon_e1.output, 1, CNVRF_V3_EPOCH_LEN, 0)
     );
 
     // Active at sentinel height `u64::MAX` directly via `proposer_for_with_beacon`.
@@ -2110,22 +2142,22 @@ fn test_proposer_for_with_beacon_pre_and_post_activation() {
         .proposer_for_with_beacon(u64::MAX, 0, Some(&beacon_max))
         .is_some());
 
-    // Simulated active at reachable epoch-boundary heights 7199 (epoch 0) and 7200 (epoch 1).
+    // Simulated active at reachable epoch-boundary heights E-1 (epoch 0) and E (epoch 1).
     assert_eq!(
-        vs.proposer_for_with_beacon_active(7199, 0, None, true),
+        vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN - 1, 0, None, true),
         None
     );
     assert_eq!(
-        vs.proposer_for_with_beacon_active(7199, 0, Some(&beacon_e1), true),
+        vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN - 1, 0, Some(&beacon_e1), true),
         None
     );
     assert_eq!(
-        vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e0), true),
+        vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, 0, Some(&beacon_e0), true),
         None
     );
 
-    let p1 = vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true);
-    let p2 = vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true);
+    let p1 = vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, 0, Some(&beacon_e1), true);
+    let p2 = vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, 0, Some(&beacon_e1), true);
     assert!(p1.is_some());
     assert_eq!(p1, p2, "proposer_for_with_beacon must be deterministic");
 
@@ -2136,8 +2168,8 @@ fn test_proposer_for_with_beacon_pre_and_post_activation() {
     };
     let mut differs = false;
     for r in 0..32u32 {
-        if vs.proposer_for_with_beacon_active(7200, r, Some(&beacon_e1), true)
-            != vs.proposer_for_with_beacon_active(7200, r, Some(&beacon_e1_alt), true)
+        if vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, r, Some(&beacon_e1), true)
+            != vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, r, Some(&beacon_e1_alt), true)
         {
             differs = true;
             break;
@@ -2170,7 +2202,7 @@ fn test_proposer_for_with_beacon_pre_and_post_activation() {
     // Empty validator set fails closed.
     let empty_vs = ValidatorSet::new();
     assert_eq!(
-        empty_vs.proposer_for_with_beacon_active(7200, 0, Some(&beacon_e1), true),
+        empty_vs.proposer_for_with_beacon_active(CNVRF_V3_EPOCH_LEN, 0, Some(&beacon_e1), true),
         None
     );
 }
@@ -2199,7 +2231,7 @@ fn test_qc_verify_with_beacon_pre_and_post_activation() {
         fks.push((id, fk));
     }
 
-    let height: Height = 7200; // Epoch 1 under 7,200-block CN-VRF v3 epochs
+    let height: Height = CNVRF_V3_EPOCH_LEN; // Epoch 1 under ruleset-v2 CN-VRF v3 epochs
     let round: Round = 0;
     let kind = VoteKind::Precommit;
     let block_hash = Some([0x6Du8; 32]);
@@ -2255,6 +2287,7 @@ fn test_qc_verify_with_beacon_pre_and_post_activation() {
             parent,
         );
         QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -2278,7 +2311,7 @@ fn test_qc_verify_with_beacon_pre_and_post_activation() {
     assert!(vs.qc_meets_quorum_with_beacon(&parent_qc, None));
     assert!(!beacon_qc.verify_with_beacon(&vs, Some(&beacon_e1)));
 
-    // 2. Active CN-VRF v3 mode (simulated at height 7200):
+    // 2. Active CN-VRF v3 mode (simulated at the first epoch-1 height):
     //    `beacon_qc` verifies ONLY with the matching epoch-1 beacon, still binds to parent.
     assert!(beacon_qc.binds_to_parent(&parent));
     assert!(!beacon_qc.binds_to_parent(&[0x11; 32]));

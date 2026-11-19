@@ -470,9 +470,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
 
     let mut burned_total2: u64 = 0;
     // The cooldown (DOWNTIME_PENALTY_COOLDOWN) must have elapsed since the
-    // first penalty (height 10), and the streak must reach the threshold
-    // again.
-    for h in 11..=(10 + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN) {
+    // first penalty (fired at the threshold height), and the streak must
+    // reach the threshold again.
+    let first_penalty_height = stellereum::staking::DOWNTIME_MISS_THRESHOLD as u64;
+    for h in 11..=(first_penalty_height + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN) {
         burned_total2 += l.note_missed_heights(h, &signer, &eligible);
     }
     assert!(
@@ -509,8 +510,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     assert_eq!(l.withdrawable_of(&target), 0);
 
     let mut burned_total3: u64 = 0;
-    for h in (11 + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN)
-        ..=(10 + 2 * stellereum::staking::DOWNTIME_PENALTY_COOLDOWN)
+    let second_penalty_height =
+        first_penalty_height + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN;
+    for h in (second_penalty_height + 1)
+        ..=(second_penalty_height + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN)
     {
         burned_total3 += l.note_missed_heights(h, &signer, &eligible);
     }

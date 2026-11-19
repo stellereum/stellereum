@@ -1524,6 +1524,18 @@ impl ValidatorRuntime {
         msg.verify_anchored(Some(reg))
     }
 
+    /// The TOTAL cross-shard record cap: one bound over the legacy transfers
+    /// and the §9 2PC control records together.
+    ///
+    /// A block's `cross_shard_out` carries BOTH kinds in one field; the 2PC
+    /// re-emission cap ([`crate::xshard2pc::XPC_MAX_REEMITS_PER_HEIGHT`])
+    /// bounds only control records, so a legacy block (or a mixed one) could
+    /// otherwise carry an unbounded number of records. PURE function of the
+    /// body, so the proposer and every validator reach the same verdict.
+    pub fn cross_shard_record_cap_ok(block: &Block) -> bool {
+        block.cross_shard_out.len() <= crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+    }
+
     /// The §9 2PC admission rule for an OUTBOUND 2PC record.
     ///
     /// The outbound 2PC records (the target's vote, the source's decision,
@@ -2940,16 +2952,25 @@ mod cnvrf_v3_activation_unit_tests {
         rt.set_cnvrf_v3_activation_height_for_tests(0);
         rt.set_cnvrf_v3_vdf_steps(64);
 
-        // --- first boundary: epoch 1, `H_freeze` = 6840 -------------------
+        // Boundaries are DERIVED from the ruleset-v2 epoch geometry, not
+        // hardcoded: `H_freeze` is one lookahead before the epoch boundary.
+        let epoch_len = crate::cn_vrf::EPOCH_LEN;
+        let lookahead = crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS;
+        let freeze1 = epoch_len - lookahead;
+        let boundary1 = epoch_len;
+        let freeze2 = 2 * epoch_len - lookahead;
+        let boundary2 = 2 * epoch_len;
+
+        // --- first boundary: epoch 1, `H_freeze` = freeze1 -----------------
         let freeze_hash = [0xA1u8; 32];
-        rt.prepare_cnvrf_v3_epoch_hooks(6840, freeze_hash).await;
+        rt.prepare_cnvrf_v3_epoch_hooks(freeze1, freeze_hash).await;
         assert!(
             rt.cnvrf_freeze_inputs.contains_key(&1),
             "the producer must snapshot epoch 1's freeze inputs at H_freeze"
         );
         let beacon1 = poll_ready_beacon(&mut rt, 1).await;
-        let block_7200 = boundary_block(7200, [0x71u8; 32], beacon1.clone());
-        rt.validate_cnvrf_v3_payload(&block_7200)
+        let block_at_first_boundary = boundary_block(boundary1, [0x71u8; 32], beacon1.clone());
+        rt.validate_cnvrf_v3_payload(&block_at_first_boundary)
             .expect("the FIRST post-activation boundary beacon must verify (F3)");
 
         // The state engine records the beacon; the runtime mirror follows.
@@ -2958,12 +2979,12 @@ mod cnvrf_v3_activation_unit_tests {
         rt.finalized_epoch_beacons.insert(1, out1);
         rt.ready_vdf_beacons.remove(&1);
 
-        // --- second boundary: epoch 2, `H_freeze` = 14040 ------------------
-        let freeze2 = [0xB2u8; 32];
-        rt.prepare_cnvrf_v3_epoch_hooks(14040, freeze2).await;
+        // --- second boundary: epoch 2, `H_freeze` = freeze2 -----------------
+        let freeze2_hash = [0xB2u8; 32];
+        rt.prepare_cnvrf_v3_epoch_hooks(freeze2, freeze2_hash).await;
         let beacon2 = poll_ready_beacon(&mut rt, 2).await;
-        let block_14400 = boundary_block(14400, [0x72u8; 32], beacon2);
-        rt.validate_cnvrf_v3_payload(&block_14400)
+        let block_at_second_boundary = boundary_block(boundary2, [0x72u8; 32], beacon2);
+        rt.validate_cnvrf_v3_payload(&block_at_second_boundary)
             .expect("the beacon chain must continue across the second boundary");
 
         // The second seed really chained the first beacon (not zeros).
@@ -2972,7 +2993,7 @@ mod cnvrf_v3_activation_unit_tests {
             2,
             Some(&out1),
             crate::cn_vrf::epoch_had_vdf(1, 0),
-            &freeze2,
+            &freeze2_hash,
             &rt.cnvrf_freeze_inputs
                 .get(&2)
                 .expect("freeze inputs for epoch 2")

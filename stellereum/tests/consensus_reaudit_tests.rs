@@ -136,11 +136,24 @@ fn an_unknown_sortition_parent_compiles_no_micro_certificate() {
         qc.pq_micro_certificate().is_none(),
         "an unknown parent must compile NO micro-certificate"
     );
-    // FULL-PQ (fail-closed, no compat): with no known parent no PQ envelope
-    // can be compiled, so the envelope-less shape is unconditionally invalid.
     assert!(
-        !qc.verify(&vs),
-        "without a PQ envelope the QC must NOT verify under FULL-PQ"
+        qc.sortition_parent().is_none(),
+        "no micro-certificate means no committee (and no parent binding) at all"
+    );
+    // The full-network CEC is schedule-independent: it elects no committee
+    // from any parent, so it needs none, and it is the fail-closed liveness
+    // fallback the producer uses when no µQC can be compiled. Accepting it
+    // does NOT accept a committee nobody else elected; the W5 property is
+    // that no MICRO-certificate is minted against the zero parent.
+    assert!(
+        qc.verify(&vs),
+        "the full-network CEC must verify: every validator signed the block hash"
+    );
+    assert!(
+        qc.signatures
+            .iter()
+            .any(|(marker, _)| *marker == stellereum::consensus::PQ_QC_MARKER_ID),
+        "the accepting envelope must be the full-network CEC, not a µQC"
     );
 
     // With the parent known, the same votes compile a micro-certificate

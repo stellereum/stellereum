@@ -277,13 +277,26 @@ pub const DOWNTIME_SLASH_BPS: u64 = 10;
 ///
 /// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const DOWNTIME_MISS_THRESHOLD: u32 = 10;
+///
+/// RULESET v2 (2026-11-19): retuned for the ~240 ms tempo under a deliberate
+/// new genesis. 42 heights x 240 ms = **10.08 s**, restoring the original
+/// ~10 s outage tolerance (the v1 value of 10 heights had shrunk to ~2.4 s,
+/// so ordinary WAN jitter could slash and jail an honest validator).
+///
+/// Rounding rule (ruleset v2): every duration is converted to heights with
+/// `ceil(duration_ms / 240)`; the resulting wall-clock is always >= the
+/// intent. Full table: `docs/RULESET_V2.md`.
+pub const DOWNTIME_MISS_THRESHOLD: u32 = 42;
 /// Minimum heights between two downtime slashes for the same validator, so a
 /// long outage costs a bounded amount rather than draining the whole bond.
 ///
+/// RULESET v2: 500 heights x 240 ms = **120 s (2 min)**. Still comfortably
+/// below [`JAIL_RELEASE_DELAY_HEIGHTS`], so an unjail cannot land inside the
+/// same outage window that would immediately re-slash it.
+///
 /// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const DOWNTIME_PENALTY_COOLDOWN: u64 = 100;
+pub const DOWNTIME_PENALTY_COOLDOWN: u64 = 500;
 /// Default validator commission on delegated rewards (10%).
 ///
 /// PRODUCT DECISION — COMMISSION CHANGES ONLY THROUGH THE BOUNDED
@@ -320,17 +333,21 @@ pub const BPS_DENOMINATOR: u64 = 10_000;
 
 /// Jail release delay in heights: a downtime-jailed validator becomes
 /// eligible for [`StakingLedger::unjail`] this many heights after the jailing
-/// penalty fired (1,000 heights ≈ 50 min at 3 s blocks).
+/// penalty fired.
 ///
 /// Deterministic const (never env): jail admission and release are consensus
 /// (every node applying the same blocks must reach the same jailed set), and
-/// the delay deliberately exceeds [`DOWNTIME_PENALTY_COOLDOWN`] (100) so a
+/// the delay deliberately exceeds [`DOWNTIME_PENALTY_COOLDOWN`] (500) so a
 /// validator cannot unjail inside the same outage window that would
 /// immediately re-slash it.
 ///
-/// FREEZE (protocol freeze 2026-11-03): 1,000 heights ≈ 50 min at 3 s blocks.
-/// Change requires spec update + audit note (AGENTS.md §7).
-pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 1_000;
+/// RULESET v2: 4,000 heights x 240 ms = **960 s (16 min)**; the v1 value of
+/// 1,000 heights had shrunk to ~4 min at the live tempo.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7). Full table:
+/// `docs/RULESET_V2.md`.
+pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 4_000;
 
 /// Maximum commission change per [`StakingLedger::announce_commission`], in
 /// basis points (500 = 5 percentage points). A raise from 10% to 100% takes
@@ -343,25 +360,32 @@ pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 1_000;
 pub const COMMISSION_MAX_DELTA_BPS: u64 = 500;
 
 /// Delegator-exit window in heights: an announced commission change takes
-/// effect this many heights after the announcement (7,200 heights ≈ 6 h at
-/// 3 s blocks). During the window the announced rate is queryable
+/// effect this many heights after the announcement. During the window the
+/// announced rate is queryable
 /// ([`StakingLedger::commission_schedule_of`], `stell_getValidatorStatus`)
 /// and `undelegate`/`redelegate` stay fully available, so no delegator is
 /// ever surprised by a raise — the exit window the immutability decision
 /// demanded as the EXACT PRECONDITION for any `SetCommission` path.
 ///
-/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h, never env.
-/// Change requires spec update + audit note (AGENTS.md §7).
-pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 7_200;
+/// RULESET v2: 30,000 heights x 240 ms = **7,200 s (2 h)**; the v1 value of
+/// 7,200 heights had shrunk to ~28.8 min at the live tempo.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7). Full table:
+/// `docs/RULESET_V2.md`.
+pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 30_000;
 
 /// Minimum heights between two EFFECTIVE commission changes for one
-/// validator (7,200 ≈ 6 h). Announcing while the cooldown from the last
-/// effective change has not elapsed is refused fail-closed with
+/// validator. Announcing while the cooldown from the last effective change
+/// has not elapsed is refused fail-closed with
 /// [`StakingError::CommissionNotDue`].
 ///
-/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h, never env.
+/// RULESET v2: 30,000 heights x 240 ms = **7,200 s (2 h)**, matching the
+/// effect delay above.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 7_200;
+pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 30_000;
 
 /// CN-VRF v3 reveal-abort slash fraction in basis points (1% = 100 bps).
 ///
@@ -1117,10 +1141,11 @@ pub fn min_bond_ok(
 /// Re-entry liveness window in heights: a validator that rejoined the set
 /// and still shows no votes after this many heights is a liveness risk.
 ///
-/// Equals [`DOWNTIME_MISS_THRESHOLD`] (10) deliberately: 10 consecutive
-/// heights absent from the quorum certificate is exactly what the downtime
-/// slasher already treats as "deliberately offline", so the watch window and
-/// the slash window agree on what "offline" means.
+/// Equals [`DOWNTIME_MISS_THRESHOLD`] (42, = 10.08 s at 240 ms) deliberately:
+/// that many consecutive heights absent from the quorum certificate is
+/// exactly what the downtime slasher already treats as "deliberately
+/// offline", so the watch window and the slash window agree on what
+/// "offline" means.
 pub const REENTRY_LIVENESS_WINDOW_HEIGHTS: u64 = DOWNTIME_MISS_THRESHOLD as u64;
 
 /// Re-entrants of a set refresh: members of `next` that were absent from
@@ -2860,11 +2885,14 @@ impl StakingLedger {
     /// caller tuples — hunt Finding 12 pins that behavior, DO NOT change
     /// it), this primitive is fail-closed end to end:
     ///
-    ///  1. SHAPE: same height/round/kind with differing targets, and
-    ///     `voter` equal to both votes' voter. Anything else (single vote
-    ///     repeated, cross-kind pair, framing with another key's vote)
-    ///     burns 0 with a loud WARN — never an error, so block application
-    ///     can never fail on hostile evidence.
+    ///  1. SHAPE: same height/round/kind AND same shard with differing
+    ///     targets, and `voter` equal to both votes' voter. The shard check is
+    ///     defence in depth: a key may legitimately sign different targets in
+    ///     different shards at the same height/round, so a cross-shard pair is
+    ///     never equivocation. Anything else (single vote repeated, cross-kind
+    ///     pair, cross-shard pair, framing with another key's vote) burns 0
+    ///     with a loud WARN — never an error, so block application can never
+    ///     fail on hostile evidence.
     ///  2. SIGNATURES: both votes must [`crate::consensus::Vote::verify`].
     ///     Unsigned/forged votes burn 0 with a loud WARN (Finding 12 fixed
     ///     here: unsigned "evidence" no longer burns stake).
@@ -2903,6 +2931,20 @@ impl StakingLedger {
         if a.block_hash == b.block_hash {
             tracing::warn!(
                 "equivocation REFUSED (identical targets — single vote repeated) for {}: refusing to slash",
+                hex::encode(voter),
+            );
+            return Ok(0);
+        }
+        // 1b. SHARD (defence in depth): the wired path already canonicalizes
+        // evidence through the verifier, which binds each vote's signature to
+        // its own shard. This independent predicate is belt-and-braces: the
+        // SAME key may honestly sign DIFFERENT targets in DIFFERENT shards at
+        // the same (height, round, kind), so such a pair must never burn.
+        if a.shard_id != b.shard_id {
+            tracing::warn!(
+                "equivocation REFUSED (cross-shard pair: {} vs {}) for {}: refusing to slash",
+                a.shard_id,
+                b.shard_id,
                 hex::encode(voter),
             );
             return Ok(0);
@@ -3574,25 +3616,36 @@ impl StakingLedger {
         self.slash_including_rewards(validator, DOWNTIME_SLASH_BPS)
     }
 
-    /// Note that `validator` did not contribute to the quorum certificate of
-    /// `height`, and slash once the outage is long enough to be deliberate.
+    /// Resolve an evidence id to the record that now owns its stake after
+    /// zero or more rotations applied by the same block.
     ///
-    /// `signed` is the set of validators whose precommit is in the certificate.
-    /// The evidence is the certificate itself, so every node reaches the same
-    /// verdict from the same block - unlike a local "I didn't hear from them"
-    /// timer, which is unsound (a node behind a partition would slash honest
-    /// peers) and non-deterministic (nodes would disagree).
-    ///
-    /// CUMULATIVE DEFICIT (pentest F8): `missed` is a leaky bucket, not a
-    /// consecutive-miss streak. A signed certificate earns ONE recovery
-    /// credit (`missed -= 1`, floored at 0) and NEVER resets the counter to
-    /// zero. A validator alternating 9 misses and 1 vote therefore accrues
-    /// +8 per 10 heights and reaches [`DOWNTIME_MISS_THRESHOLD`], instead of
-    /// resetting to 0 forever and paying nothing at 10% uptime. The
-    /// threshold and cooldown VALUES are unchanged (frozen); only the
-    /// forgiveness rule is. This mirrors the CN-VRF v3 abort counter
-    /// ([`CnVrfAbortState`]), where one present reveal also never erases the
-    /// accumulated misses.
+    /// Pure and bounded: follows `aliases` only while the current id has no
+    /// record, stops at an existing id or after `aliases.len() + 1` hops (a
+    /// cycle cannot loop), so it is safe against a hand-built alias map.
+    fn resolve_rotation_alias(
+        &self,
+        mut id: ValidatorId,
+        aliases: Option<&HashMap<ValidatorId, ValidatorId>>,
+    ) -> ValidatorId {
+        let Some(aliases) = aliases else {
+            return id;
+        };
+        for _ in 0..=aliases.len() {
+            if self.validators.contains_key(&id) {
+                return id;
+            }
+            match aliases.get(&id) {
+                Some(next) if *next != id => id = *next,
+                _ => return id,
+            }
+        }
+        id
+    }
+
+    /// Note one quorum certificate's contribution (or absence) for every
+    /// eligible validator, and slash once the cumulative deficit reaches
+    /// [`DOWNTIME_MISS_THRESHOLD`] (see the module docs for the leaky-bucket
+    /// rule: one signed certificate earns ONE recovery credit, never a reset).
     ///
     /// Returns the burned amount if a slash fired, else 0.
     #[allow(clippy::nonminimal_bool)]
@@ -3602,6 +3655,46 @@ impl StakingLedger {
         height: u64,
         signer: &dyn Fn(&ValidatorId) -> bool,
         eligible: &[ValidatorId],
+    ) -> u64 {
+        self.note_missed_heights_inner(height, signer, eligible, None)
+    }
+
+    /// [`Self::note_missed_heights`] with a deterministic OLD -> NEW key alias
+    /// map for rotations applied by the SAME block whose `last_qc` is being
+    /// attributed.
+    ///
+    /// SLASH-01 / ROTATION ESCAPE: a validator can apply
+    /// `SysCallRotateValidatorKey` in block H, BEFORE the downtime step
+    /// attributes H-1's evidence. The evidence was formed under the OLD id,
+    /// but the rotation has already removed that record; the plain loop finds
+    /// `None`, skips the validator, and the miss is silently forgiven. A
+    /// validator that rotates every height therefore never accrues a deficit.
+    ///
+    /// The alias map is derived from the block's OWN applied rotation opcodes
+    /// (pure block bytes + `status`), so every node resolves the same OLD id
+    /// to the same record and attributes the same miss. The signer check
+    /// still uses the OLD id — that is the identity in the certificate — while
+    /// the counter, slash and jail land on the record that now owns the stake.
+    /// Resolution follows chains of rotations (A->B->C) and stops at a cycle
+    /// or an id that still exists; it is bounded by the map size.
+    pub fn note_missed_heights_with_alias(
+        &mut self,
+        height: u64,
+        signer: &dyn Fn(&ValidatorId) -> bool,
+        eligible: &[ValidatorId],
+        aliases: &HashMap<ValidatorId, ValidatorId>,
+    ) -> u64 {
+        self.note_missed_heights_inner(height, signer, eligible, Some(aliases))
+    }
+
+    #[allow(clippy::nonminimal_bool)]
+    // GATE: explicit cooldown guards wrap on old certificates; simplify would reintroduce wrap.
+    fn note_missed_heights_inner(
+        &mut self,
+        height: u64,
+        signer: &dyn Fn(&ValidatorId) -> bool,
+        eligible: &[ValidatorId],
+        aliases: Option<&HashMap<ValidatorId, ValidatorId>>,
     ) -> u64 {
         // Decide first, slash second.
         //
@@ -3624,7 +3717,10 @@ impl StakingLedger {
         // needs `&mut self`, hence the two-phase structure.
         let mut penalise: Vec<ValidatorId> = Vec::new();
         for v in eligible {
-            let Some(rec) = self.validators.get_mut(v) else {
+            // Resolve the id whose record currently owns this stake. The
+            // common case (no rotation, or the id still exists) is O(1).
+            let target = self.resolve_rotation_alias(*v, aliases);
+            let Some(rec) = self.validators.get_mut(&target) else {
                 continue;
             };
             if signer(v) {
@@ -3649,7 +3745,7 @@ impl StakingLedger {
             if rec.missed >= DOWNTIME_MISS_THRESHOLD && cooled {
                 rec.last_downtime_penalty = height;
                 rec.missed = 0;
-                penalise.push(*v);
+                penalise.push(target);
             }
         }
 
@@ -3734,7 +3830,9 @@ impl StakingLedger {
     /// Execute the CN-VRF v3 abort slash (`CNVRF_ABORT_SLASH_BPS`) across
     /// `self_bond`, `pending_rewards`, active `unbonding` entries (both
     /// self-bond and delegator unbondings — closing audit F5 so same-block
-    /// `unbond()` cannot evade the penalty), and `delegated` stake, then jail
+    /// `unbond()` cannot evade the penalty), MATURED `withdrawable` stake
+    /// (self and delegators — the SLASH-01 scope, so waiting out the cooldown
+    /// cannot evade it either), and `delegated` stake, then jail
     /// `validator` until `height + `[`JAIL_RELEASE_DELAY_HEIGHTS`].
     ///
     /// Note for callers settling pools: `pending_rewards` reductions decrement
@@ -3773,6 +3871,40 @@ impl StakingLedger {
         }
         self.unbonding.retain(|e| e.amount > 0);
 
+        // SLASH-01 (same base as `slash_scoped`): MATURED-but-unclaimed
+        // stake is still slashable. `process_unbonding` drains mature entries
+        // out of `unbonding` into `withdrawable`, so omitting this map let an
+        // offender unbond, wait out the cooldown, and keep the matured amount
+        // when an abort slash lands (the CN-VRF reveal abort is reported at a
+        // committed height and has no age bound). Cut BOTH the validator's
+        // own matured self-bond and every delegator's matured withdrawal, in
+        // sorted key order so the committed state cannot depend on HashMap
+        // iteration order.
+        let mut cut_withdrawable = 0u64;
+        {
+            let mut keys: Vec<(ValidatorId, [u8; 32])> = self
+                .withdrawable
+                .keys()
+                .filter(|(v, _)| *v == validator)
+                .copied()
+                .collect();
+            keys.sort_unstable();
+            for key in keys {
+                let amount = self.withdrawable.get(&key).copied().unwrap_or(0);
+                let cut = ((amount as u128 * slash_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(amount);
+                if cut > 0 {
+                    let left = amount - cut;
+                    if left == 0 {
+                        self.withdrawable.remove(&key);
+                    } else {
+                        self.withdrawable.insert(key, left);
+                    }
+                    cut_withdrawable = cut_withdrawable.saturating_add(cut);
+                }
+            }
+        }
+
         let mut cut_delegated = 0u64;
         if delegated_now > 0 {
             let keys: Vec<(ValidatorId, [u8; 32])> = self
@@ -3800,6 +3932,7 @@ impl StakingLedger {
         let actually_burned = cut_self
             .saturating_add(cut_pending)
             .saturating_add(cut_unbonding)
+            .saturating_add(cut_withdrawable)
             .saturating_add(cut_delegated);
 
         if let Some(v) = self.validators.get_mut(&validator) {
@@ -3839,7 +3972,7 @@ impl StakingLedger {
             tracing::warn!("{msg}");
         }
         tracing::warn!(
-            "CNVRF-ABORT-JAILED validator {} jailed at height {height} after CN-VRF v3 reveal aborts (burned {actually_burned}: self={cut_self}, pending_rewards={cut_pending}, unbonding={cut_unbonding}, delegated={cut_delegated}): excluded until height {release}",
+            "CNVRF-ABORT-JAILED validator {} jailed at height {height} after CN-VRF v3 reveal aborts (burned {actually_burned}: self={cut_self}, pending_rewards={cut_pending}, unbonding={cut_unbonding}, withdrawable={cut_withdrawable}, delegated={cut_delegated}): excluded until height {release}",
             hex::encode(validator),
         );
 
@@ -4611,6 +4744,40 @@ mod tests {
         assert_eq!(l.validators[&offender].self_bond, before - burned);
         assert_eq!(l.validators[&offender].total_slashed, burned);
         assert_eq!(l.total_burned, burned);
+    }
+
+    #[test]
+    fn verified_equivocation_refuses_cross_shard_pair() {
+        use crate::consensus::EquivocationEvidence;
+        // DEFENCE IN DEPTH: the same key may honestly sign different targets
+        // in DIFFERENT shards at the same (height, round, kind). Both votes
+        // verify individually (each signature binds its own shard), so only
+        // the explicit shard predicate stops a slash.
+        let mut l = StakingLedger::new();
+        let sk = SigningKey::generate(&mut OsRng);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE6);
+        let offender = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            offender,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        let a =
+            Vote::sign_with_falcon_in_shard(&sk, &fk, 0, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let b =
+            Vote::sign_with_falcon_in_shard(&sk, &fk, 1, 7, 0, VoteKind::Prevote, Some([2u8; 32]));
+        assert!(a.verify() && b.verify(), "each shard-bound vote verifies");
+        assert_ne!(a.shard_id, b.shard_id);
+        let ev = EquivocationEvidence::new(offender, a, b);
+        assert_eq!(
+            l.slash_equivocation_verified(&ev).unwrap(),
+            0,
+            "a cross-shard pair is never equivocation"
+        );
+        assert_eq!(l.total_stake(&offender), stell(2000));
+        assert_eq!(l.total_burned, 0);
     }
 
     #[test]
@@ -7077,6 +7244,70 @@ mod tests {
     }
 
     #[test]
+    fn downtime_attribution_follows_a_same_block_rotation_alias() {
+        let mut l = StakingLedger::new();
+        let old = vid(41);
+        let new = vid(42);
+        l.bond(old, stell(2_000), DEFAULT_COMMISSION_BPS).unwrap();
+        // One miss short of the threshold, then the block rotates the key.
+        l.validators.get_mut(&old).unwrap().missed = DOWNTIME_MISS_THRESHOLD - 1;
+        l.validators.get_mut(&old).unwrap().last_downtime_penalty = 0;
+        l.rotate_key(old, new).unwrap();
+        assert!(!l.validators.contains_key(&old));
+        assert_eq!(
+            l.validators[&new].missed,
+            DOWNTIME_MISS_THRESHOLD - 1,
+            "rotation carries the deficit"
+        );
+
+        // WITHOUT the alias the old id is gone: the miss is silently forgiven
+        // (this is the escape the engine-side alias map closes).
+        assert_eq!(
+            l.note_missed_heights(100, &|_| false, &[old]),
+            0,
+            "control: the plain lookup skips a rotated-away id"
+        );
+        assert_eq!(l.validators[&new].missed, DOWNTIME_MISS_THRESHOLD - 1);
+
+        // WITH the alias the miss lands on the record that now owns the stake,
+        // hits the threshold, slashes and jails the NEW id.
+        let mut aliases = HashMap::new();
+        aliases.insert(old, new);
+        let burned = l.note_missed_heights_with_alias(101, &|_| false, &[old], &aliases);
+        assert!(burned > 0, "the aliased miss must slash");
+        assert_eq!(l.validators[&new].missed, 0, "slash resets the deficit");
+        assert!(l.is_jailed(&new), "the jail follows the rotated record");
+        assert!(!l.validators.contains_key(&old));
+    }
+
+    #[test]
+    fn downtime_alias_resolves_a_chain_of_rotations() {
+        let mut l = StakingLedger::new();
+        let a = vid(51);
+        let b = vid(52);
+        let c = vid(53);
+        l.bond(a, stell(2_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.rotate_key(a, b).unwrap();
+        l.rotate_key(b, c).unwrap();
+        // A->B->C in one block: the evidence names A and the record is at C.
+        assert!(!l.validators.contains_key(&a));
+        assert!(!l.validators.contains_key(&b));
+        let mut aliases = HashMap::new();
+        aliases.insert(a, b);
+        aliases.insert(b, c);
+        // Recovery credit for A must land on C (C inherited A's missed=0).
+        l.validators.get_mut(&c).unwrap().missed = 2;
+        assert_eq!(
+            l.note_missed_heights_with_alias(50, &|v| *v == a, &[a], &aliases),
+            0
+        );
+        assert_eq!(
+            l.validators[&c].missed, 1,
+            "one recovery credit for the OLD id reaches the final record"
+        );
+    }
+
+    #[test]
     fn rotate_key_strictly_forbids_governance_locked_validator() {
         let mut l = StakingLedger::new();
         l.bond(vid(1), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
@@ -7342,6 +7573,54 @@ mod tests {
         assert_eq!(burned, stell(20)); // 1% of 2000 STELL
         assert_eq!(l.validators[&new_v].self_bond, stell(1980));
         assert!(l.is_jailed(&new_v));
+    }
+
+    #[test]
+    fn cnvrf_abort_slash_includes_matured_withdrawable_stake() {
+        let mut l = StakingLedger::new();
+        let mut abort_state = CnVrfAbortState::new();
+        let v = vid(73);
+        let d = del(1);
+        let unbond_at = 10u64;
+
+        l.bond(v, stell(2_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.delegate(d, v, stell(1_000)).unwrap();
+        // Wait out the cooldown so BOTH legs leave `unbonding` and mature into
+        // `withdrawable`: the exit that used to escape the abort slash.
+        l.unbond(v, stell(2_000), unbond_at).unwrap();
+        l.undelegate(d, v, stell(1_000), unbond_at).unwrap();
+        l.process_unbonding(unbond_at + UNBONDING_PERIOD_SECS)
+            .unwrap();
+        assert_eq!(l.withdrawable_of(&v), stell(2_000));
+        assert_eq!(l.withdrawable_delegator(&v, &d), stell(1_000));
+        assert!(l.unbonding.is_empty());
+
+        // Two aborts of the three: nothing slashed yet.
+        l.record_cnvrf_reveal_abort(&mut abort_state, &v, 200)
+            .unwrap();
+        l.record_cnvrf_reveal_abort(&mut abort_state, &v, 201)
+            .unwrap();
+        assert_eq!(l.total_burned, 0);
+
+        // Third abort: 1% of the FULL 3,000 STELL base. Omitting withdrawable
+        // made this `Ok(0)` (and the stake withdrawable in full).
+        let burned = l
+            .record_cnvrf_reveal_abort(&mut abort_state, &v, 202)
+            .unwrap();
+        assert_eq!(burned, stell(30));
+        assert_eq!(
+            l.withdrawable_of(&v),
+            stell(1_980),
+            "the validator's matured self-bond is part of the slashable base"
+        );
+        assert_eq!(
+            l.withdrawable_delegator(&v, &d),
+            stell(990),
+            "a delegator's matured withdrawal is part of the slashable base"
+        );
+        assert_eq!(l.total_burned, stell(30));
+        assert_eq!(l.validators[&v].total_slashed, stell(30));
+        assert!(l.is_jailed(&v));
     }
 
     #[test]

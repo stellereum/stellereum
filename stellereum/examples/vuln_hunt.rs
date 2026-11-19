@@ -311,6 +311,7 @@ async fn main() {
                 (id, v.signature.clone()),
                 (id, v.signature.clone()),
             ],
+            shard_id: 0,
         };
         // quorum for 1 validator is 1, so this legitimately passes; test with a bigger set
         let ks: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
@@ -330,6 +331,7 @@ async fn main() {
                 (v1.voter, v1.signature.clone()),
                 (v1.voter, v1.signature.clone()),
             ],
+            shard_id: 0,
         };
         let _ = vs;
         if fake.verify(&vs3) {

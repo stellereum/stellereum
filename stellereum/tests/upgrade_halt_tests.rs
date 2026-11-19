@@ -279,6 +279,75 @@ fn marker_below_finalized_is_pending_not_fired() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The applied state can be AHEAD of the async finalized metadata (the
+/// walk/apply lane advances state first; the finalize pointer lands later).
+/// The boot guard must classify by the higher of the two, or a node that
+/// already crossed the halt height rejoins consensus with the OLD binary.
+///
+/// Failing before the fix: `latest_state_height()` did not exist, and the
+/// production call site read only `finalized()` — which this fixture sets to
+/// `H-1`, yielding `Pending` right here.
+#[test]
+fn guard_uses_applied_state_height_when_state_is_ahead_of_finalized() {
+    let dir = temp_marker_dir("stateahead");
+    let path = dir.join(MARKER_FILE_NAME);
+    let store = stellereum::storage::Storage::open(&dir.join("store")).expect("open store");
+    let halt_height = 1200u64;
+
+    // Metadata says below the halt height, applied state says past it.
+    store
+        .set_finalized(halt_height - 1, &[0x11; 32])
+        .expect("set finalized");
+    store
+        .put_state(halt_height + 5, b"applied-state-ahead")
+        .expect("put state");
+    assert_eq!(
+        store.latest_state_height().expect("read state height"),
+        Some(halt_height + 5),
+        "key-only state height must see the applied snapshot"
+    );
+
+    let marker = sample_marker();
+    write_marker(&path, &marker).expect("write marker");
+
+    // Pre-fix predicate (finalized metadata only): Pending, i.e. the old
+    // binary would be allowed to rejoin and vote past the halt height.
+    let finalized_only = guard_upgrade_halt(&path, || Ok(Some(halt_height - 1)), "0.1.0", || None);
+    assert!(
+        matches!(finalized_only, HaltDecision::Pending { .. }),
+        "the metadata-only comparison is exactly the defect: {finalized_only:?}"
+    );
+
+    // Production predicate: max(finalized, latest_state_height).
+    let decision = guard_upgrade_halt(
+        &path,
+        || {
+            let finalized = store
+                .finalized()
+                .map_err(|e| e.to_string())?
+                .map(|(h, _)| h);
+            let applied = store.latest_state_height().map_err(|e| e.to_string())?;
+            Ok(finalized.max(applied))
+        },
+        "0.1.0",
+        || None,
+    );
+    match decision {
+        HaltDecision::Refuse { message } => {
+            assert!(
+                message.contains("REFUSING TO START CONSENSUS"),
+                "must refuse, loudly: {message}"
+            );
+            assert!(
+                message.contains("finalized head 1205"),
+                "refusal must report the applied-height evidence: {message}"
+            );
+        }
+        other => panic!("state at H+5 with a halt marker at H must refuse, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn no_marker_proceeds_without_reading_the_store() {
     let dir = temp_marker_dir("nomarker");
@@ -464,6 +533,12 @@ fn halt_lane_drains_writes_marker_then_exits() {
     assert!(
         bootstrap.contains("guard_upgrade_halt("),
         "startup must consult the upgrade-halt marker before joining consensus"
+    );
+    assert!(
+        bootstrap.contains("latest_state_height()"),
+        "the boot guard must compare against applied state, not finalized metadata alone \
+         (a node whose state crossed the halt height ahead of its finalized pointer must \
+         still refuse the old binary)"
     );
     assert!(
         proto.contains("if b[0] != FRAME_VERSION {")

@@ -98,6 +98,7 @@ fn cert_of(
         return qc;
     }
     QuorumCertificate {
+        shard_id: 0,
         height: h,
         round: r,
         kind,

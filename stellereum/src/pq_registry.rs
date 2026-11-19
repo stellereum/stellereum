@@ -83,7 +83,7 @@ use crate::post_quantum::{PqScheme, MLDSA44_PUBKEY_LEN};
 // ============================================================================
 
 /// Rotation delay in heights: an announced PQ key takes effect this many
-/// heights after the announcement (7,200 heights ≈ 6 h at 3 s blocks).
+/// heights after the announcement.
 ///
 /// WHY (same exit-window philosophy as
 /// [`crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS`], pinned equal in
@@ -95,10 +95,14 @@ use crate::post_quantum::{PqScheme, MLDSA44_PUBKEY_LEN};
 /// is consensus (every node applying the same blocks must agree on when a
 /// key activates).
 ///
-/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h at 3 s blocks
+/// RULESET v2: 30,000 heights x 240 ms = **7,200 s (2 h)** (the v1 value of
+/// 7,200 heights had shrunk to ~28.8 min at the live tempo). Full table:
+/// `docs/RULESET_V2.md`.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env
 /// (spec docs/specs/02_CRYPTO_AND_PQ_PHASE2.md §6, == CN-VRF EPOCH_LEN).
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const PQ_ROTATION_DELAY_HEIGHTS: u64 = 7_200;
+pub const PQ_ROTATION_DELAY_HEIGHTS: u64 = 30_000;
 
 /// How many superseded keys are retained per validator (bounded history).
 ///

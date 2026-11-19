@@ -1,6 +1,6 @@
 [package]
 name = "stellereum-sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 readme = "README.md"
 description = "Client SDK for Stellereum: Falcon-512 PQ1 transaction construction, signing, RPC client and wallet helpers"
@@ -27,11 +27,13 @@ node-parity = ["dep:stellereum"]
 bincode = "1.3"
 blake3 = "1"
 hex = "0.4"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 pqcrypto-falcon = "0.4.1"
 pqcrypto-traits = "0.3.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sha3 = "0.12"
 thiserror = "1"
 ureq = { version = "2", features = ["json"] }
 zeroize = { version = "1", features = ["derive"] }

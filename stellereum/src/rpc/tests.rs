@@ -3081,6 +3081,7 @@ fn pq_anchor_cert(
         parent,
     );
     QuorumCertificate {
+        shard_id: 0,
         height,
         round: 0,
         kind: VoteKind::Precommit,
@@ -9163,4 +9164,285 @@ async fn sse_enforces_per_ip_subscription_cap() {
     .expect("a different IP must remain unaffected");
     drop(other);
     drop(active_streams);
+}
+
+// ===========================================================================
+// API-defect regressions (2026-11-19): block tag resolution, native
+// transaction lookup, historical-state honesty, restart body reconstruction.
+// ===========================================================================
+
+#[tokio::test]
+async fn stell_get_block_accepts_tags_positional_and_hex_selectors() {
+    let st = test_state().await;
+    st.record_block(41, [0x41; 32], 1, 1_700_000_041).await;
+    st.record_block(42, [0x42; 32], 2, 1_700_000_042).await;
+
+    // Every shape the eth adapter accepts must resolve the SAME committed
+    // height. Before the fix only `{"height": <u64>}` worked; `"latest"` and
+    // all positional/hex forms fell through to the "not available" error.
+    for params in [
+        json!({ "height": "latest" }),
+        json!("latest"),
+        json!(42),
+        json!([42]),
+        json!(["0x2a"]),
+        json!({ "height": "0x2a" }),
+        json!({ "height": 42 }),
+    ] {
+        let r = call(&st, "stell_getBlock", params.clone()).await;
+        assert_eq!(
+            r["height"],
+            json!(42),
+            "stell_getBlock {params} must resolve the head, got {r}"
+        );
+        assert_eq!(r["hash"], json!(hex::encode([0x42u8; 32])));
+        // The sibling read must speak the same selector dialect.
+        let txs = call(&st, "stell_getBlockTransactions", params).await;
+        assert_eq!(
+            txs["height"],
+            json!(42),
+            "stell_getBlockTransactions must resolve the same selector"
+        );
+    }
+
+    // Above-tip tags/heights stay an honest not-available error, never a
+    // fabricated block.
+    for params in [json!({ "height": 43 }), json!("0x2b")] {
+        let r = call(&st, "stell_getBlock", params).await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("above this node's tip"),
+            "{r}"
+        );
+    }
+    // Malformed selector is a params error.
+    let bad = call(&st, "stell_getBlock", json!({ "height": "not-a-tag" })).await;
+    assert!(bad["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("invalid"));
+}
+
+#[tokio::test]
+async fn stell_get_transaction_by_hash_serves_finalized_and_pending_honestly() {
+    let st = test_state().await;
+    let block_hash = [0x5Au8; 32];
+    let tx = receipt_tx(0xD7, 0);
+    let tx_hash = tx.compute_tx_hash();
+    st.record_block(30, block_hash, 1, 1_700_000_030).await;
+    st.record_receipts(30, block_hash, std::slice::from_ref(&tx), &[true], &[7])
+        .await;
+
+    let r = call(
+        &st,
+        "stell_getTransactionByHash",
+        json!([hex::encode(tx_hash)]),
+    )
+    .await;
+    assert_eq!(r["tx_hash"], json!(hex::encode(tx_hash)));
+    assert_eq!(r["status"], json!("success"));
+    assert_eq!(r["height"], json!(30));
+    assert_eq!(r["from"], json!(hex::encode(tx.from)));
+    assert_eq!(r["to"], json!(hex::encode(tx.to)));
+    assert_eq!(r["amount"], json!(tx.amount.to_string()));
+    assert_eq!(r["body_available"], json!(true));
+
+    // Pending pool body is served as pending, with no finalized height.
+    let pending = receipt_tx(0xD8, 1);
+    let pending_from = pending.from;
+    let pending_hash = pending.compute_tx_hash();
+    st.mempool
+        .write()
+        .await
+        .add(pending)
+        .expect("admit fixture");
+    let p = call(
+        &st,
+        "stell_getTransactionByHash",
+        json!({ "hash": hex::encode(pending_hash) }),
+    )
+    .await;
+    assert_eq!(p["status"], json!("pending"));
+    assert!(p["height"].is_null(), "{p}");
+    assert_eq!(p["from"], json!(hex::encode(pending_from)));
+
+    // Unknown hashes (object/bare/array shapes) are honestly unknown.
+    for params in [
+        json!({ "hash": hex::encode([0xEEu8; 32]) }),
+        json!(hex::encode([0xEEu8; 32])),
+        json!([hex::encode([0xEEu8; 32])]),
+    ] {
+        let u = call(&st, "stell_getTransactionByHash", params).await;
+        assert_eq!(u["status"], json!("unknown"));
+    }
+    let missing = call(&st, "stell_getTransactionByHash", json!([])).await;
+    assert!(missing["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("missing tx hash"));
+}
+
+#[tokio::test]
+async fn historical_state_tags_are_refused_not_relabelled_as_current() {
+    let st = test_state().await; // head = 42
+    let addr = hex::encode([0x11u8; 32]);
+    let cases: Vec<(&str, Value)> = vec![
+        ("eth_getBalance", json!([addr.clone(), "0x1"])),
+        ("eth_getTransactionCount", json!([addr.clone(), "0x1"])),
+        ("eth_getCode", json!([addr.clone(), "0x1"])),
+        ("eth_getStorageAt", json!([addr.clone(), "0x0", "0x1"])),
+        ("eth_call", json!([{ "data": "0x" }, "0x1"])),
+    ];
+    for (method, params) in cases {
+        let r = call(&st, method, params.clone()).await;
+        let msg = r["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("historical state") && msg.contains("not available"),
+            "{method} {params} must refuse historical state, got {r}"
+        );
+    }
+    // The same methods still answer for the current head.
+    let bal = call(&st, "eth_getBalance", json!([addr, "latest"])).await;
+    assert_eq!(bal, json!("0x0"));
+    let code = call(&st, "eth_getCode", json!([addr, "latest"])).await;
+    assert_eq!(code, json!("0x"));
+}
+
+#[tokio::test]
+async fn restart_hydrated_tx_lookup_never_fabricates_a_zero_sender() {
+    // Receipts restored from the durable store carry no raw transaction body.
+    // The lookup must reconstruct it from the persisted block, and when that
+    // body is not available it must answer `null`/`body_available: false` —
+    // never a synthetic 0x000… sender with value 0 (audit F-11).
+    let st = test_state().await;
+    let tx_hash = [0xB7u8; 32];
+    st.receipts.write().await.insert(TxReceipt {
+        tx_hash,
+        height: 9,
+        block_hash: [0xC7u8; 32],
+        index: 0,
+        success: true,
+        gas_limit: 21_000,
+        fee_charged: 1,
+        raw_tx: None,
+        return_value: None,
+        gas_used: None,
+        events: Vec::new(),
+        contract_address: None,
+    });
+    let evm = call(
+        &st,
+        "eth_getTransactionByHash",
+        json!([hex::encode(tx_hash)]),
+    )
+    .await;
+    assert!(
+        evm.is_null(),
+        "a body this node cannot reconstruct must not be synthesised: {evm}"
+    );
+    let native = call(
+        &st,
+        "stell_getTransactionByHash",
+        json!([hex::encode(tx_hash)]),
+    )
+    .await;
+    assert_eq!(native["status"], json!("success"));
+    assert_eq!(native["body_available"], json!(false));
+    assert!(native["from"].is_null(), "{native}");
+    assert!(native["amount"].is_null(), "{native}");
+    // The receipt itself still reports the committed status/height.
+    let receipt = call(
+        &st,
+        "eth_getTransactionReceipt",
+        json!([hex::encode(tx_hash)]),
+    )
+    .await;
+    assert_eq!(receipt["status"], json!("0x1"));
+    assert_eq!(receipt["blockNumber"], json!("0x9"));
+}
+
+#[tokio::test]
+async fn eth_tx_lookup_rebuilds_restart_hydrated_body_from_archive_store() {
+    let dir = std::env::temp_dir().join(format!(
+        "stell_rpc_body_arch_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let store = std::sync::Arc::new(crate::storage::Storage::open(&dir).unwrap());
+    let sk = SigningKey::generate(&mut OsRng);
+    let tx = receipt_tx(0xCE, 0);
+    let transactions = vec![tx.clone()];
+    let order_merkle_root = crate::mev::compute_order_merkle_root(&transactions);
+    let mut b = crate::sharding::Block {
+        shard_id: crate::sharding::MASTERCHAIN_SHARD,
+        height: 44,
+        prev_hash: [0u8; 32],
+        state_root: [0u8; 32],
+        transactions,
+        cross_shard_out: vec![],
+        timestamp: 1_700_000_044,
+        proposer: sk.verifying_key().to_bytes(),
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
+    };
+    b.sign_block(&sk);
+    let bh = b.compute_hash();
+    store.put_block(&b).unwrap();
+    store
+        .put_receipts_for_block(44, &bh, &b.transactions, &[true], &[1])
+        .unwrap();
+
+    let base = test_state().await;
+    let st = Arc::new(RpcState {
+        engine: base.engine.clone(),
+        mempool: base.mempool.clone(),
+        height: base.height.clone(),
+        node_id: base.node_id.clone(),
+        chain_id: base.chain_id,
+        staking: base.staking.clone(),
+        governance: base.governance.clone(),
+        recent_blocks: base.recent_blocks.clone(),
+        receipts: base.receipts.clone(),
+        auth_token: base.auth_token.clone(),
+        tx_broadcast: base.tx_broadcast.clone(),
+        faucet: base.faucet.clone(),
+        faucet_token: base.faucet_token.clone(),
+        msg_signing_seed: base.msg_signing_seed,
+        archive_store: Some(store.clone()),
+        shard_registry: ShardRegistry::single(),
+    });
+    hydrate_rpc_from_store(&st, store.as_ref()).await;
+
+    let tx_hash = hex::encode(tx.compute_tx_hash());
+    let view = call(&st, "eth_getTransactionByHash", json!([tx_hash])).await;
+    assert_eq!(
+        view["from"],
+        json!(crate::evm_adapter::stell_address_to_evm(&tx.from)),
+        "restart view must recover the real sender from the archive body: {view}"
+    );
+    assert_eq!(
+        view["to"],
+        json!(crate::evm_adapter::stell_address_to_evm(&tx.to))
+    );
+    assert_eq!(view["blockNumber"], json!("0x2c"));
+    let receipt = call(
+        &st,
+        "eth_getTransactionReceipt",
+        json!([hex::encode(tx.compute_tx_hash())]),
+    )
+    .await;
+    assert_eq!(
+        receipt["from"],
+        json!(crate::evm_adapter::stell_address_to_evm(&tx.from)),
+        "receipt must not fall back to the zero address when the body is archived: {receipt}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

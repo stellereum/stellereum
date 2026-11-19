@@ -141,6 +141,7 @@ fn f02_forged_single_validator_committee_size_rejected() {
     let vs = vset1(&ks);
     let bh = Some([0xAA; 32]);
     let mut qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -399,6 +400,7 @@ fn qc_power_parity_single_heavy_neither_assembles_nor_verifies() {
         sortition_parent: [0x6Bu8; 32],
     };
     let mut qc = stellereum::consensus::QuorumCertificate {
+        shard_id: 0,
         height: HH,
         round: RR,
         kind: VoteKind::Precommit,

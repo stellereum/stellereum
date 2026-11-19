@@ -293,6 +293,11 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
             kind,
             block_hash: cert_hash,
             signatures,
+            shard_id: cert_json
+                .get("shard_id")
+                .and_then(|x| x.as_u64())
+                .map(|v| v as crate::sharding::ShardId)
+                .unwrap_or(crate::sharding::MASTERCHAIN_SHARD),
         },
     })
 }

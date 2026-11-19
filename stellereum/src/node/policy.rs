@@ -63,7 +63,15 @@ pub(crate) const PEER_HINT_TTL_MS: u64 = 60_000;
 /// silent node (one-way push loss, DHT-only follower, restored high round)
 /// would otherwise skip `try_catch_up` forever and never reach the blind-QC
 /// `tip+1` rescue. One cheap head/QC probe per this window is the backstop.
-pub(crate) const AT_TIP_PROBE_INTERVAL_MS: u64 = 600_000;
+///
+/// At the current ~240 ms block tempo this window is the node's DETECTION
+/// LATENCY, so it must stay inside ONE snapshot generation: the rescue path
+/// (`try_snapshot_sync`) can then use the state a peer published during this
+/// window instead of crawling through several generations of pruned history.
+/// 600 s (the old value, chosen at ~1 s blocks) is 2 500 blocks now; 120 s is
+/// 500 blocks — still cheap (one head + one QC sidecar read), and well above
+/// the 30 s backstop so it never becomes the primary poll.
+pub(crate) const AT_TIP_PROBE_INTERVAL_MS: u64 = 120_000;
 
 /// How far above our FINALIZED tip a peer-named height may be before it is
 /// treated as "not this chain" for cheap pre-checks.
@@ -100,14 +108,22 @@ pub(crate) const COMPACT_INDEX_BUILDS_PER_TICK: u32 = 2;
 /// attacker can never pin memory.
 pub(crate) const LOOPBACK_QUEUE_CAP: usize = 64;
 
-/// Default wall-time budget for one catch-up pass (`STELL_CATCHUP_BUDGET_MS`).
+/// Default FLOOR for one catch-up pass (`STELL_CATCHUP_BUDGET_MS`).
 ///
 /// Deliberately small: this loop IS the consensus clock, so a DHT/body walk
 /// that overruns it must be abandoned, not waited out. The live stall had this
 /// raised to 15 000 ms against a dead peer and every tick paid it in full;
 /// with event-driven catch-up the attempt is rare, but it must still never
 /// hold a tick hostage.
-pub(crate) const CATCHUP_BUDGET_DEFAULT_MS: u64 = 250;
+///
+/// This is only what an AT-TIP node (no gap evidence) may spend on the cheap
+/// blind probe. A node known to be behind uses
+/// [`catchup_pass_budget_ms`], which scales the budget with the gap — a flat
+/// 250 ms admits about one WAN round trip, i.e. one body, which cannot outrun
+/// a ~240 ms/block chain (and could not even complete a head read + one body
+/// fetch on a 400 ms-RTT link, the same 1-block-behind never-heals class the
+/// 5 s `net_budget` floor was added for).
+pub(crate) const CATCHUP_BUDGET_DEFAULT_MS: u64 = 2_000;
 
 /// Minimum spacing between two REACTIVE catch-up attempts.
 ///
@@ -187,6 +203,26 @@ pub fn catchup_action(
 /// backstop may probe. Pure.
 pub fn node_is_at_tip(our_tip: u64, peer_named_height: u64, peer_hint_height: Option<u64>) -> bool {
     peer_named_height <= our_tip && peer_hint_height.unwrap_or(0) <= our_tip
+}
+
+/// Whether the reactive latch must be re-armed after a catch-up pass that
+/// ADVANCED us.
+///
+/// `try_catch_up` can stop SHORT of the peer's head: a snapshot restore lands
+/// on the newest usable boundary and leaves the remaining gap to the body
+/// walk. The evidence that scheduled the pass (a verified head hint, or the
+/// at-tip evidence a vote/proposal named) is still ahead when the pass
+/// returns, but the success path `continue`s the tick loop and therefore
+/// skips the end-of-tick persistent-evidence re-arm. Without this predicate
+/// the node drops to the 30 s backstop for a walk it could finish on the next
+/// reactive tick — the difference between closing a gap in a second and
+/// crawling toward a moving head. Pure; node-local pacing only.
+pub fn catchup_still_behind(
+    our_tip: u64,
+    peer_hint: Option<(u64, [u8; 32])>,
+    peer_named_height: u64,
+) -> bool {
+    peer_hint.is_some_and(|(ph, _)| ph > our_tip) || peer_named_height > our_tip
 }
 
 /// Height a message NAMES that is above `our_height`, if any.
@@ -612,6 +648,35 @@ pub(crate) fn catchup_budget() -> std::time::Duration {
             .filter(|v| *v > 0)
             .unwrap_or(CATCHUP_BUDGET_DEFAULT_MS),
     )
+}
+
+/// Gap-aware wall-time budget for ONE catch-up pass.
+///
+/// `base_ms` is the configured floor ([`catchup_budget`],
+/// [`CATCHUP_BUDGET_DEFAULT_MS`]). That value is enough for the cheap at-tip
+/// blind probe and a 1-block self-heal, where holding the tick longer only
+/// delays the next round. It is NOT enough for a node known to be behind: a
+/// body fetch costs a WAN round trip, and at the current ~240 ms block tempo a
+/// behind node must fetch more than one body per pass just to keep up, let
+/// alone close the gap. The old flat 250 ms admitted roughly one body per pass
+/// while the chain produced four per second — the node retried every
+/// `REACTIVE_CATCHUP_MIN_GAP_MS` forever and never converged; snapshot-sync
+/// (tens of MB) could never fit at all.
+///
+/// So the budget scales with the gap the same way the historical `net_budget`
+/// documented: 30 s for a walkable gap (1..=100) and 180 s once only
+/// snapshot-sync can bridge it (>100). While behind, the node validates
+/// nothing the network needs, so a longer tick costs nothing and is the only
+/// way to converge. Pure; node-local liveness policy, never consensus.
+pub fn catchup_pass_budget_ms(base_ms: u64, gap: u64) -> u64 {
+    const NEAR_GAP_BUDGET_MS: u64 = 30_000;
+    const FAR_GAP_BUDGET_MS: u64 = 180_000;
+    let gap_budget = match gap {
+        0 => base_ms,
+        1..=100 => NEAR_GAP_BUDGET_MS,
+        _ => FAR_GAP_BUDGET_MS,
+    };
+    base_ms.max(gap_budget)
 }
 
 pub(crate) fn now_secs() -> u64 {

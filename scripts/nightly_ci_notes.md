@@ -1,3 +1,9 @@
+> **HISTORICAL (2026-11-19).** This note predates the `.github/` directory and
+> is kept for reference only. The authoritative nightly is
+> [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml), documented
+> in [`docs/CI.md`](../docs/CI.md). Nothing in this file is wired into CI; the
+> statements below about "no `.github/workflows`" describe the past, not HEAD.
+
 # Nightly CI notes (no .github/workflows in tree)
 
 ## Why no `nightly.yml`

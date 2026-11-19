@@ -61,9 +61,7 @@ async fn receipt_and_status_accept_object_bare_and_array_hashes() {
         ("array", json!([hash_hex])),
     ];
     for (name, params) in shapes {
-        let r = st
-            .call("stell_getTransactionReceipt", params.clone())
-            .await;
+        let r = st.call("stell_getTransactionReceipt", params.clone()).await;
         assert!(
             r.get("error").is_none(),
             "{name} shape must be accepted: {r}"
@@ -78,7 +76,9 @@ async fn receipt_and_status_accept_object_bare_and_array_hashes() {
     }
 
     // A genuinely malformed positional shape is still a parameter error.
-    let bad = st.call("stell_getTransactionReceipt", json!(["not-a-hash"])).await;
+    let bad = st
+        .call("stell_getTransactionReceipt", json!(["not-a-hash"]))
+        .await;
     assert!(bad.get("error").is_some(), "malformed hash must be refused");
     let missing = st.call("stell_getTransactionReceipt", json!([])).await;
     assert!(missing.get("error").is_some());

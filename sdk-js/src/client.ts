@@ -9,7 +9,28 @@
 
 import { isDuplicateMessage, isRetryableError, RpcError, SignerError } from "./errors.ts";
 import { StellereumProvider, type StellereumProviderOptions } from "./provider.ts";
-import type { FalconSigner, SignResponse, TxIntent } from "./signer.ts";
+import type { FalconSigner, SignRequest, SignResponse, TxIntent } from "./signer.ts";
+import {
+  BuilderError,
+  buildEvmBinding,
+  buildEvmCarrier,
+  buildGovPropose,
+  buildGovVote,
+  evmBindingDigest,
+  evmCarrierDigest,
+  type EvmBindingOptions,
+  type EvmCarrierOptions,
+  type EvmCarrierPlan,
+  type GovProposeOptions,
+  type GovVoteOptions,
+} from "./builders.ts";
+import {
+  ProtocolError,
+  assertIdentityForChain,
+  localIdentity,
+  type ProtocolIdentity,
+} from "./protocol.ts";
+import type { UnsignedTransaction } from "./wire.ts";
 
 /** A signed transaction as returned by the Rust signer. */
 export interface SignedTransaction {
@@ -85,6 +106,11 @@ export interface StellereumClientOptions extends StellereumProviderOptions {
   signer: FalconSigner;
   /** Sender address for nonce lookup when the signer does not expose one. */
   address?: string;
+  /**
+   * The node's protocol identity. Defaults to this build's local identity.
+   * The new-shape builders refuse a different chain/fork before signing.
+   */
+  identity?: ProtocolIdentity;
 }
 
 const DEFAULT_FEE_FLOOR = 280_000;
@@ -98,15 +124,37 @@ function asNumber(value: string | number): number {
   return typeof value === "number" ? value : Number(value);
 }
 
+function toSignedTransaction(resp: SignResponse): SignedTransaction {
+  return {
+    rawTransaction: resp.tx_hex,
+    hash: resp.tx_hash,
+    from: resp.from,
+    fromStl57: resp.from_stl57,
+    to: resp.to,
+    nonce: resp.nonce,
+    chainId: resp.chain_id,
+    gasLimit: resp.gas_limit,
+    activation: resp.activation,
+    envelope: resp.envelope,
+  };
+}
+
 export class StellereumClient {
   readonly provider: StellereumProvider;
   readonly signer: FalconSigner;
   private readonly configuredAddress?: string;
+  private readonly configuredIdentity: ProtocolIdentity;
 
   constructor(options: StellereumClientOptions) {
     this.provider = new StellereumProvider(options);
     this.signer = options.signer;
     this.configuredAddress = options.address ?? options.signer.address;
+    this.configuredIdentity = options.identity ?? localIdentity();
+  }
+
+  /** The configured protocol identity (local unless `options.identity` was set). */
+  identity(): ProtocolIdentity {
+    return this.configuredIdentity;
   }
 
   /** The configured sender address, if the signer or options supplied one. */
@@ -220,18 +268,7 @@ export class StellereumClient {
     };
 
     const resp = await this.signer.sign({ tx });
-    return {
-      rawTransaction: resp.tx_hex,
-      hash: resp.tx_hash,
-      from: resp.from,
-      fromStl57: resp.from_stl57,
-      to: resp.to,
-      nonce: resp.nonce,
-      chainId: resp.chain_id,
-      gasLimit: resp.gas_limit,
-      activation: resp.activation,
-      envelope: resp.envelope,
-    };
+    return toSignedTransaction(resp);
   }
 
   /** Convenience: native transfer. */
@@ -265,6 +302,135 @@ export class StellereumClient {
     options: BuildAndSignOptions = {},
   ): Promise<SignedTransaction> {
     return this.buildAndSign({ kind: "unjail", validator, top_up: topUp }, options);
+  }
+
+  // ------------------------------------------------------------------
+  // EVM binding / carrier and governance (protocol v1 shapes)
+  // ------------------------------------------------------------------
+
+  /**
+   * Attach the PQ1 envelope to an UNSIGNED transaction built by this package.
+   *
+   * The Rust signer owns the Falcon key and refuses an unsigned transaction
+   * whose `from` is not its address.
+   */
+  async signPrepared(unsigned: UnsignedTransaction): Promise<SignedTransaction> {
+    const resp = await this.signer.sign({
+      tx: {
+        kind: "prepared",
+        tx_hex: unsigned.txHex,
+        chain_id: unsigned.chainId,
+        priority_fee_per_gas: unsigned.priorityFeePerGas,
+      },
+    });
+    return toSignedTransaction(resp);
+  }
+
+  private async guardedChainId(options: { chainId?: number }): Promise<number> {
+    const identity = this.configuredIdentity;
+    const nodeChain = await this.chainId();
+    const chain = options.chainId ?? identity.chainId;
+    assertIdentityForChain(identity, chain);
+    if (nodeChain !== chain) {
+      throw new ProtocolError(
+        "chain_id_mismatch",
+        `chain id mismatch: node reports ${nodeChain}, configured identity is ${chain}`,
+      );
+    }
+    return chain;
+  }
+
+  private async innerSignature(
+    explicit: string | undefined,
+    digestHex: string,
+    field: string,
+  ): Promise<string> {
+    if (explicit) return explicit;
+    if (this.signer.signDigest) return this.signer.signDigest(digestHex);
+    throw new BuilderError(
+      "missing_inner_signature",
+      `${field} is required: this signer does not expose signDigest`,
+    );
+  }
+
+  /**
+   * Register the EVM address bound to the signing PQ account.
+   *
+   * `bindingSignature` is the Falcon signature over
+   * `evmBindingDigest(chainId, evmAddress, from)`. Supply it, or let the
+   * signer's `signDigest` hook produce it.
+   */
+  async evmBinding(
+    options: Omit<EvmBindingOptions, "from" | "nonce" | "chainId" | "bindingSignature"> & {
+      bindingSignature?: string;
+      nonce?: number;
+      chainId?: number;
+    },
+  ): Promise<SignedTransaction> {
+    const from = this.address();
+    const chainId = await this.guardedChainId(options);
+    const nonce = options.nonce ?? (await this.nonce(from));
+    const digest = evmBindingDigest(chainId, options.evmAddress, from);
+    const bindingSignature = await this.innerSignature(
+      options.bindingSignature,
+      digest,
+      "bindingSignature",
+    );
+    const unsigned = buildEvmBinding({
+      ...options,
+      from,
+      chainId,
+      nonce,
+      bindingSignature,
+    });
+    return this.signPrepared(unsigned);
+  }
+
+  /**
+   * Settle an EVM value-transfer intent under the signing PQ account.
+   *
+   * `intentSignature` is the Falcon signature over `keccak256(evmTx)`.
+   * Nonce and amount are taken from the EVM intent; pass `nonce`/`amountNano`
+   * to pin them (a mismatch throws `BuilderError`).
+   */
+  async evmCarrier(
+    options: Omit<EvmCarrierOptions, "from" | "chainId" | "intentSignature"> & {
+      intentSignature?: string;
+      chainId?: number;
+    },
+  ): Promise<{ signed: SignedTransaction; plan: EvmCarrierPlan }> {
+    const from = this.address();
+    const chainId = await this.guardedChainId(options);
+    const intentSignature = await this.innerSignature(
+      options.intentSignature,
+      evmCarrierDigest(options.evmTx),
+      "intentSignature",
+    );
+    const plan = buildEvmCarrier({ ...options, from, chainId, intentSignature });
+    const signed = await this.signPrepared(plan);
+    return { signed, plan };
+  }
+
+  /** Build, sign and return a block-carried governance proposal. */
+  async govPropose(
+    options: Omit<GovProposeOptions, "from" | "nonce" | "chainId"> & { nonce?: number; chainId?: number },
+  ): Promise<SignedTransaction> {
+    const from = this.address();
+    const chainId = await this.guardedChainId(options);
+    const nonce = options.nonce ?? (await this.nonce(from));
+    const unsigned = buildGovPropose({ ...options, from, chainId, nonce });
+    return this.signPrepared(unsigned);
+  }
+
+  /** Build, sign and return a block-carried governance vote. */
+  async govVote(
+    options: Omit<GovVoteOptions, "from" | "nonce" | "chainId"> & { nonce?: number; chainId?: number },
+  ): Promise<SignedTransaction> {
+    const from = this.address();
+    const chainId = await this.guardedChainId(options);
+    const nonce = options.nonce ?? (await this.nonce(from));
+    const unsigned = buildGovVote({ ...options, from, chainId, nonce });
+    return this.signPrepared(unsigned);
   }
 
   // ------------------------------------------------------------------

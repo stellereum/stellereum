@@ -2,12 +2,13 @@
 //! promise, shipped.
 //!
 //! The V5 master spec (`docs/handoff/STELLEREUM_PQ_BFT_V5_MASTER_SPEC.txt`
-//! §3.2) promises that "every 128 blocks (an epoch) the full validator set
-//! signs a Merkle Mountain Range (MMR) epoch root". Until this module, no
+//! §3.2) promises that "every epoch the full validator set signs a Merkle
+//! Mountain Range (MMR) epoch root". Until this module, no
 //! MMR existed anywhere in the codebase: Tier-2 finality ran purely on
 //! precommit-QC checkpoints (`precommit_qc`, `stell_getFinalizedCheckpoint`).
 //! This module closes that gap: a minimal, deterministic MMR over finalized
-//! block hashes, committed every 128 blocks into the masterchain block
+//! block hashes, committed every `MMR_EPOCH_BLOCKS` (500 under ruleset v2)
+//! into the masterchain block
 //! (`Block::mmr_epoch_root`), served over RPC (`stell_getEpochRoot`) and
 //! verifiable by light clients (`crate::light_client`).
 //!
@@ -16,7 +17,7 @@
 //! * PROVES: that a block hash at height H belongs to the finalized chain of
 //!   epoch E — inclusion of a finalized leaf under the epoch root the quorum
 //!   signed. A bridge or a cross-chain transfer can therefore anchor on ONE
-//!   32-byte epoch root instead of 128 individual checkpoints.
+//!   32-byte epoch root instead of every individual checkpoint.
 //! * DOES NOT prove finality by itself: the root is only as trustworthy as
 //!   the quorum signatures over the block hash that carries it. A root from
 //!   an unverified block is trust-in-the-serving-node (the same caveat as
@@ -77,15 +78,18 @@ use sha2::{Digest, Sha256};
 /// per MEV epoch, committed by the first masterchain block of the NEXT
 /// epoch (see [`commits_epoch_root`]).
 ///
-/// FREEZE (protocol freeze 2026-11-03): 128 blocks per epoch, == MEV
-/// EPOCH_BLOCKS (compile-asserted below). Change requires spec update +
-/// audit note (AGENTS.md §7).
-pub const MMR_EPOCH_BLOCKS: u64 = 128;
+/// RULESET v2: 500 blocks x 240 ms = **120 s (2 min)**, == MEV
+/// `EPOCH_BLOCKS` (compile-asserted below). Full table:
+/// `docs/RULESET_V2.md`.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
+pub const MMR_EPOCH_BLOCKS: u64 = 500;
 
 // The MMR epoch and the MEV epoch must stay the same epoch: the RPC answer,
 // the light-client helper and the block commitment all index epochs by
-// `height / 128`, and two different divisors would name two different
-// epochs "epoch E".
+// `height / EPOCH_BLOCKS`, and two different divisors would name two
+// different epochs "epoch E".
 const _: () = assert!(MMR_EPOCH_BLOCKS == crate::mev_epoch::EPOCH_BLOCKS);
 
 /// Domain separator of a leaf hash: `H(LEAF || block_hash)`.
@@ -175,9 +179,9 @@ pub fn epoch_end(epoch: u64) -> u64 {
 
 /// Which epoch's root the block at `height` commits to, if any.
 ///
-/// The FIRST masterchain block of epoch E (height E*128, height > 0)
-/// commits the MMR root of epoch E-1 — the previous epoch, whose 128
-/// finalized hashes already exist. Committing the *previous* epoch is what
+/// The FIRST masterchain block of epoch E (height E*MMR_EPOCH_BLOCKS, height > 0)
+/// commits the MMR root of epoch E-1 — the previous epoch, whose finalized
+/// hashes already exist. Committing the *previous* epoch is what
 /// keeps the commitment non-circular: a block never commits to a root that
 /// includes its own hash. Every other height commits to nothing (zero).
 pub fn commits_epoch_root(height: u64) -> Option<u64> {
@@ -847,8 +851,8 @@ mod tests {
         assert!(p.verify(&m.root()));
     }
 
-    /// The required sweep: append 1..=129 leaves (across the 128 epoch
-    /// boundary) and prove/verify EVERY leaf at EVERY size.
+    /// The required sweep: append 1..=129 leaves (across a power-of-two
+    /// mountain boundary) and prove/verify EVERY leaf at EVERY size.
     #[test]
     fn mmr_append_1_to_129_and_prove_every_leaf() {
         let mut m = Mmr::new();
@@ -971,21 +975,22 @@ mod tests {
 
     #[test]
     fn mmr_epoch_helpers_name_previous_epoch_at_first_height() {
+        let e = MMR_EPOCH_BLOCKS;
         assert_eq!(epoch_of_height(0), 0);
-        assert_eq!(epoch_of_height(127), 0);
-        assert_eq!(epoch_of_height(128), 1);
+        assert_eq!(epoch_of_height(e - 1), 0);
+        assert_eq!(epoch_of_height(e), 1);
         assert_eq!(epoch_start(0), 0);
-        assert_eq!(epoch_end(0), 127);
-        assert_eq!(epoch_start(1), 128);
-        assert_eq!(epoch_end(1), 255);
+        assert_eq!(epoch_end(0), e - 1);
+        assert_eq!(epoch_start(1), e);
+        assert_eq!(epoch_end(1), 2 * e - 1);
         // Only the first height of an epoch commits, and it commits the
         // PREVIOUS epoch (non-circular).
         assert_eq!(commits_epoch_root(0), None);
         assert_eq!(commits_epoch_root(1), None);
-        assert_eq!(commits_epoch_root(127), None);
-        assert_eq!(commits_epoch_root(128), Some(0));
-        assert_eq!(commits_epoch_root(129), None);
-        assert_eq!(commits_epoch_root(256), Some(1));
+        assert_eq!(commits_epoch_root(e - 1), None);
+        assert_eq!(commits_epoch_root(e), Some(0));
+        assert_eq!(commits_epoch_root(e + 1), None);
+        assert_eq!(commits_epoch_root(2 * e), Some(1));
     }
 
     /// FIXES.md §2.11: the compact multiproof proves any single-mountain

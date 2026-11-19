@@ -741,6 +741,13 @@ pub(crate) async fn try_catch_up(
 /// Walk bodies from our tip to the peer's head, applying the full finalized
 /// transition per block (see the parity comment inside). Returns the peer
 /// height on success, None (loudly logged) on any failure.
+///
+/// This entry point is **multi-hop**: a gap larger than one honest walk window
+/// is closed in bounded hops (see [`walk_chain_multi_hop`]) instead of being
+/// refused. Each hop still runs the unchanged [`walk_chain_once`] verification
+/// (hash linkage, per-height QC/proposer, parent-root continuity), so the
+/// recovery path never accepts an unverified chain; only the AMOUNT fetched
+/// per pass changes, and that is node-local sync policy.
 pub(crate) async fn walk_chain(
     adapter: &Arc<P2pNetworkAdapter>,
     rt: &mut ValidatorRuntime,
@@ -750,6 +757,191 @@ pub(crate) async fn walk_chain(
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
 ) -> Option<u64> {
+    walk_chain_multi_hop(
+        adapter,
+        rt,
+        shard,
+        peer_height,
+        peer_hash,
+        persist,
+        rpc,
+        crate::node::policy::max_walk_gap(),
+    )
+    .await
+}
+
+/// Per-pass hop ceiling for recovery mode. `hop_cap * RECOVERY_MAX_HOPS` is
+/// the hard bound on work one catch-up pass can spend walking bodies, so a
+/// peer advertising millions of blocks cannot turn recovery into an unbounded
+/// WAN walk. The caller's timeout is the wall-clock bound; this is the work
+/// bound. A pass that hits it returns the height it DID reach, so the next
+/// tick continues from there.
+const RECOVERY_MAX_HOPS: u32 = 64;
+
+/// Close a body gap that is longer than one walk window, WITHOUT waiting for a
+/// newer snapshot.
+///
+/// Why this exists (`docs/UPGRADE_AND_RECOVERY.md` §0.4): after a snapshot
+/// restore at boundary `B` the node resumes with finalized head `B`, but the
+/// next snapshot may be up to `snap_int + CATCHUP_GRID` heights away. On a
+/// LIVE chain that is a bounded wait; on a HALTED chain (finality stopped) no
+/// newer snapshot is ever produced, so a single-walk cap strands the node
+/// permanently. Recovery therefore walks in hops:
+///
+/// * each hop targets `our_tip + hop_cap` and resolves that height's hash from
+///   the published header index (falling back to the QC sidecar, which carries
+///   the decided hash even when the index blob is missing);
+/// * [`walk_chain_once`] fetches at most `hop_cap` bodies and applies the full
+///   verified transition, so memory/CPU per hop is the same as the old walk;
+/// * the final hop targets the advertised head, and `walked_head_anchor` still
+///   refuses a peer whose served chain does not end at that exact hash/height;
+/// * at most [`RECOVERY_MAX_HOPS`] hops run per pass; hitting the bound returns
+///   the reached height (progress, not failure) and the next pass continues.
+///
+/// Determinism: hop sizing is a local sync policy, never consensus input. Two
+/// nodes may take different numbers of hops and still apply the identical
+/// blocks in the identical order, ending on the identical state root.
+#[allow(clippy::too_many_arguments)] // GATE: mirrors `walk_chain`'s production signature; grouping into a struct would churn every caller.
+pub(crate) async fn walk_chain_multi_hop(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: stellereum::consensus::Height,
+    peer_hash: stellereum::consensus::BlockHash,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    hop_cap: u64,
+) -> Option<u64> {
+    // A zero cap would make every hop target our own tip; treat it as one
+    // block rather than looping forever.
+    let hop_cap = hop_cap.max(1);
+    let start_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    if peer_height.saturating_sub(start_height) <= hop_cap {
+        return walk_chain_once(
+            adapter,
+            rt,
+            shard,
+            peer_height,
+            peer_hash,
+            persist,
+            rpc,
+            hop_cap,
+        )
+        .await;
+    }
+
+    let entry = format!(
+        "[sync][recovery] body gap {} > one walk window {hop_cap}; entering bounded multi-hop \
+         recovery (peer={peer_height} ours={start_height}, max {RECOVERY_MAX_HOPS} hops/pass) \
+         — no newer snapshot is required to converge",
+        peer_height.saturating_sub(start_height)
+    );
+    eprintln!("{entry}");
+    tracing::info!("{entry}");
+
+    let mut hops = 0u32;
+    loop {
+        let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        if our_height >= peer_height {
+            return Some(our_height);
+        }
+        let (target_height, target_hash) = if peer_height - our_height <= hop_cap {
+            // Final hop: the advertised head, verified exactly as before.
+            (peer_height, peer_hash)
+        } else {
+            let target = our_height.saturating_add(hop_cap);
+            let Some(hash) = fetch_hop_head(adapter, shard, target).await else {
+                eprintln!(
+                    "[sync][recovery] no published head for hop height {target} \
+                     (ours={our_height}, peer={peer_height}); cannot continue this pass"
+                );
+                return None;
+            };
+            (target, hash)
+        };
+
+        let before = our_height;
+        if walk_chain_once(
+            adapter,
+            rt,
+            shard,
+            target_height,
+            target_hash,
+            persist,
+            rpc,
+            hop_cap,
+        )
+        .await
+        .is_none()
+        {
+            eprintln!(
+                "[sync][recovery] hop to {target_height} failed at {before} \
+                 (peer={peer_height}); recovered nothing this pass"
+            );
+            return None;
+        }
+        let after = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        if after <= before {
+            eprintln!(
+                "[sync][recovery] hop to {target_height} made no progress \
+                 (before={before}, after={after}); refusing to loop"
+            );
+            return None;
+        }
+        hops += 1;
+        eprintln!(
+            "[sync][recovery] hop {hops} reached {after}/{peer_height} \
+             ({} heights left, hop cap {hop_cap})",
+            peer_height.saturating_sub(after)
+        );
+        if after >= peer_height {
+            return Some(after);
+        }
+        if hops >= RECOVERY_MAX_HOPS {
+            eprintln!(
+                "[sync][recovery] per-pass hop budget {RECOVERY_MAX_HOPS} exhausted at \
+                 {after}/{peer_height}; returning progress and continuing next pass"
+            );
+            return Some(after);
+        }
+    }
+}
+
+/// Resolve the decided hash at `height` for an intermediate hop.
+///
+/// Preferred source is the header index (`finalize` publishes it every block).
+/// The QC sidecar is the fallback: it binds height -> block hash and does not
+/// depend on the separately-published index blob. Every caller still verifies
+/// the fetched chain to this hash inside [`walk_chain_once`], so an untrusted
+/// or stale answer can only make the hop fail, never re-anchor us.
+async fn fetch_hop_head(
+    adapter: &Arc<P2pNetworkAdapter>,
+    shard: u32,
+    height: u64,
+) -> Option<stellereum::consensus::BlockHash> {
+    if let Some(hash) = adapter.fetch_head_hash(shard, height).await {
+        return Some(hash);
+    }
+    match adapter.fetch_block_qc(shard, height).await {
+        Some(qc) if qc.height == height => qc.block_hash,
+        _ => None,
+    }
+}
+
+/// One verified walk window: fetch at most `walk_cap` bodies back to our
+/// finalized tip, validate every height, apply the full transition, and
+/// re-anchor consensus on the walked tail.
+#[allow(clippy::too_many_arguments)] // GATE: same verified walk, split only to bound one hop's fetch/apply window.
+async fn walk_chain_once(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: stellereum::consensus::Height,
+    peer_hash: stellereum::consensus::BlockHash,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    walk_cap: u64,
+) -> Option<u64> {
     // F3(c): anchor the walk on OUR finalized head and demand the NEXT height,
     // never the walked chain's own first height (passing `blocks[0].height` made
     // the height check a tautology). At genesis the chain roots at the zero
@@ -758,26 +950,14 @@ pub(crate) async fn walk_chain(
         Some((h, hash)) => (*hash, h.saturating_add(1)),
         None => ([0u8; 32], 1u64),
     };
-    // Deep gaps (> 256 blocks) cannot be closed by a sequential backward walk of
-    // thousands of bodies over WAN: each fetch takes ~100-300ms, timing out the net
-    // budget without ever connecting to our anchor. Gaps > 256 MUST be closed via
-    // snapshot-sync; fail fast here so the tick does not stall.
-    //
-    // SYNC TRAP N6 (R3 CODE-TAILS sweep, 256-block walk cap stranding): the
-    // cap itself is load-bearing (unbounded WAN walks are a DoS vector — do
-    // NOT raise it). The stranding happens only when snapshot-sync ALSO fails
-    // (N3 tail-anchor refusal, N4 stale set, N5 publication gap): then the
-    // walk refuses (> 256) and the snapshot refuses, and the node retries
-    // forever without converging. Fix = unblock N3–N5, not this bound. If
-    // this eprintln fires every round for hours while the peer tip advances,
-    // the node is snapshot-stranded, not walk-limited: check N3/N4/N5 first.
-    // The cap tracks the snapshot cadence (`policy::max_walk_gap`): a node that
-    // restored at boundary B must be able to walk to the next snapshot even
-    // when finality has stopped and no newer snapshot will ever appear.
-    let walk_cap = crate::node::policy::max_walk_gap();
+    // One hop stays inside `walk_cap` bodies. A bounded window is load-bearing
+    // (an unbounded WAN walk is a DoS vector); multi-hop recovery above is the
+    // way a larger gap is closed when no newer snapshot exists. A single hop
+    // larger than the cap is refused here so callers cannot bypass the bound.
+    let walk_cap = walk_cap.max(1);
     if peer_height.saturating_sub(expected_first_height) > walk_cap {
         tracing::debug!(
-            "[sync] gap (peer={peer_height} ours={}) > {walk_cap} blocks; body walk skipped in favor of snapshot-sync",
+            "[sync] gap (peer={peer_height} ours={}) > {walk_cap} blocks; body walk skipped for this hop",
             expected_first_height.saturating_sub(1)
         );
         return None;
@@ -786,8 +966,9 @@ pub(crate) async fn walk_chain(
     let mut blocks = match stellereum::sync::collect_missing_blocks(
         peer_hash,
         our_last,
-        // `max_walk_gap()` is clamped to 256..=4096 (`node/policy.rs`), so the
-        // u64 -> usize conversion is lossless on every supported target.
+        // `walk_cap` is bounded by `policy::max_walk_gap()` (clamped
+        // 256..=4096) in production, so the u64 -> usize conversion is
+        // lossless on every supported target.
         walk_cap as usize,
         move |h| {
             let a = fetch_adapter.clone();
@@ -1237,4 +1418,304 @@ pub(crate) async fn retro_publish_pass(
     // and a cursor left behind it would stall the window on the same dead block
     // forever. The count and reason are logged above, never swallowed.
     *published_upto = to;
+}
+
+#[cfg(test)]
+mod recovery_walk_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::path::PathBuf;
+    use stellereum::consensus::{register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet};
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+    use stellereum::state_engine::InMemoryStateEngine;
+
+    fn vset(ks: &[SigningKey]) -> ValidatorSet {
+        ValidatorSet::from_list(
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        )
+    }
+
+    fn fks_for(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+        ks.iter()
+            .enumerate()
+            .map(|(i, _)| FalconKeypair::generate_from_seed(i as u8))
+            .collect()
+    }
+
+    fn attach_quorum(
+        b: &mut Block,
+        ks: &[SigningKey],
+        fks: &[FalconKeypair],
+        vs: &ValidatorSet,
+        height: u64,
+        bh: [u8; 32],
+        parent: [u8; 32],
+    ) {
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+        }
+        let mut set = VoteSet::new();
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let v = Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(bh));
+            set.add(v, vs, height, 0, VoteKind::Precommit)
+                .expect("genuine vote admits");
+        }
+        b.precommit_qc = set.certificate_with_parent(Some(bh), vs, Some(&parent));
+    }
+
+    /// Build a contiguous chain by running the SAME full transition the walk
+    /// applies (`apply_and_advance`), so every block's committed parent root
+    /// is exactly the root a node holding the prefix will have.
+    async fn build_chain(
+        ks: &[SigningKey],
+        fks: &[FalconKeypair],
+        n: u64,
+    ) -> (Vec<Block>, [u8; 32]) {
+        let vs = vset(ks);
+        let engine = Arc::new(InMemoryStateEngine::new());
+        let mut builder = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine, 1);
+        let mut blocks = Vec::with_capacity(n as usize);
+        let mut prev = [0u8; 32];
+        for h in 1..=n {
+            let root = builder.state.get_state_root().await;
+            let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
+            let proposer_idx = ks
+                .iter()
+                .position(|k| k.verifying_key().to_bytes() == proposer_id)
+                .expect("proposer is a member");
+            let mut b = Block {
+                shard_id: MASTERCHAIN_SHARD,
+                height: h,
+                prev_hash: prev,
+                state_root: root,
+                transactions: vec![],
+                cross_shard_out: vec![],
+                timestamp: 1_000 + h,
+                proposer: proposer_id,
+                validator_signatures: vec![],
+                shard_headers: vec![],
+                precommit_qc: None,
+                last_qc: None,
+                mmr_epoch_root: [0u8; 32],
+                cnvrf_v3: None,
+                order_merkle_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+            };
+            b.sign_block_with_falcon(&ks[proposer_idx], &fks[proposer_idx]);
+            let bh = b.compute_hash();
+            attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);
+            builder.apply_and_advance(bh, &b).await;
+            prev = bh;
+            blocks.push(b);
+        }
+        let tip_root = builder.state.get_state_root().await;
+        (blocks, tip_root)
+    }
+
+    async fn test_adapter(tag: &str) -> (P2pNetworkAdapter, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "stell-recovery-walk-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let cfg = infnode::config::NodeConfig {
+            name: "test".to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: vec![],
+            allow_unknown: false,
+            unknown_allow: vec![],
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: vec![],
+            validators: vec![],
+            domain: None,
+            web_listen: None,
+            wallet: None,
+            web_static: None,
+        };
+        let node = infnode::node::Node::new(
+            cfg,
+            infnode::keyring::NodeKeys::generate(),
+            infnode::keyring::PqKeys::generate(),
+            dir.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("test node");
+        let adapter = P2pNetworkAdapter::new(node);
+        adapter.set_epoch(stellereum::network::EpochTag::from_genesis(&[0x77u8; 32]));
+        (adapter, dir)
+    }
+
+    fn test_rpc_state() -> Arc<stellereum::rpc::RpcState> {
+        Arc::new(stellereum::rpc::RpcState {
+            engine: Arc::new(InMemoryStateEngine::new()),
+            mempool: Arc::new(tokio::sync::RwLock::new(
+                stellereum::mempool::Mempool::default(),
+            )),
+            height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            node_id: "recovery-walk-test".to_string(),
+            chain_id: stellereum::zkml::DEFAULT_CHAIN_ID,
+            staking: Arc::new(tokio::sync::RwLock::new(
+                stellereum::staking::StakingLedger::new(),
+            )),
+            governance: Arc::new(tokio::sync::RwLock::new(
+                stellereum::governance::Governance::new(),
+            )),
+            recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
+            receipts: Arc::new(tokio::sync::RwLock::new(
+                stellereum::rpc::ReceiptIndex::default(),
+            )),
+            auth_token: None,
+            tx_broadcast: None,
+            faucet: None,
+            faucet_token: None,
+            msg_signing_seed: None,
+            archive_store: None,
+            shard_registry: stellereum::sharding::ShardRegistry::single(),
+        })
+    }
+
+    /// A node restored at `B` with NO snapshot at or above `B` must still
+    /// reach the head by walking bodies. `gap` deliberately exceeds one walk
+    /// window (400 > the documented 256 cap; 1100 > the cadence-derived
+    /// 1064), the next snapshot is never published, and the resulting state
+    /// root must equal the never-fell-behind builder's.
+    async fn run_recovery_case(seed: u8, gap: u64, hop_cap: u64, use_production_wrapper: bool) {
+        const B: u64 = 64;
+        let n = B + gap;
+        let ks = vec![SigningKey::from_bytes(&[seed; 32])];
+        let fks = fks_for(&ks);
+        let vs = vset(&ks);
+        let (blocks, tip_root) = build_chain(&ks, &fks, n).await;
+
+        let (adapter, dir) = test_adapter(&format!("{seed}-{gap}")).await;
+        let adapter = Arc::new(adapter);
+
+        // Bodies above our restored boundary (the walk never needs the prefix)
+        // and only the headers the hops will ask for. No state snapshot exists.
+        let tail: Vec<&Block> = blocks.iter().filter(|b| b.height > B).collect();
+        let report = adapter.retro_publish_blocks(tail, blocks.len()).await;
+        assert_eq!(
+            report.failed, 0,
+            "all recovery bodies must publish: {:?}",
+            report.first_error
+        );
+        let mut hop_height = B;
+        while n - hop_height > hop_cap {
+            hop_height += hop_cap;
+            adapter
+                .persist_block_header(MASTERCHAIN_SHARD, &blocks[(hop_height - 1) as usize])
+                .await;
+        }
+
+        // The lagging node replays only its prefix through the same full
+        // transition, then has to close `gap` by the walk alone.
+        let lagging_engine = Arc::new(InMemoryStateEngine::new());
+        let mut lagging = ValidatorRuntime::new(ks[0].clone(), vs, lagging_engine, 1);
+        for b in blocks.iter().take(B as usize) {
+            let bh = b.compute_hash();
+            lagging.apply_and_advance(bh, b).await;
+        }
+        assert_eq!(
+            lagging.finalized.last().map(|(h, _)| *h),
+            Some(B),
+            "fixture must restore at exactly height B"
+        );
+
+        let head_hash = blocks.last().expect("non-empty chain").compute_hash();
+        let rpc = test_rpc_state();
+
+        // Pre-fix proof, on the SAME fixture: one window refuses this gap and
+        // applies nothing. That refusal used to be the only body path, so the
+        // node retried forever when no newer snapshot existed. Multi-hop below
+        // must then close it.
+        if gap > hop_cap {
+            let single = walk_chain_once(
+                &adapter,
+                &mut lagging,
+                MASTERCHAIN_SHARD,
+                n,
+                head_hash,
+                None,
+                &rpc,
+                hop_cap,
+            )
+            .await;
+            assert_eq!(
+                single, None,
+                "a single {hop_cap}-block window must refuse the {gap}-block gap \
+                 (this is the pre-fix deadlock)"
+            );
+            assert_eq!(
+                lagging.finalized.last().map(|(h, _)| *h),
+                Some(B),
+                "the refused single window must not move the node"
+            );
+        }
+
+        let got = if use_production_wrapper {
+            walk_chain(
+                &adapter,
+                &mut lagging,
+                MASTERCHAIN_SHARD,
+                n,
+                head_hash,
+                None,
+                &rpc,
+            )
+            .await
+        } else {
+            walk_chain_multi_hop(
+                &adapter,
+                &mut lagging,
+                MASTERCHAIN_SHARD,
+                n,
+                head_hash,
+                None,
+                &rpc,
+                hop_cap,
+            )
+            .await
+        };
+        assert_eq!(
+            got,
+            Some(n),
+            "gap {gap} (hop cap {hop_cap}) must walk to the head without a snapshot"
+        );
+        assert_eq!(
+            lagging.state.get_state_root().await,
+            tip_root,
+            "the recovered node's state root must equal the node that never fell behind \
+             (gap {gap}, hop cap {hop_cap})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_walk_closes_400_and_1100_without_a_new_snapshot() {
+        // Production entry point, cadence-derived cap: 400 fits one hop on
+        // current policy, 1100 does NOT (1064 default) and must enter
+        // multi-hop recovery. On the pre-fix code the 1100 case returns None
+        // at the cap check instead of reaching the head.
+        run_recovery_case(0x41, 400, crate::node::policy::max_walk_gap(), true).await;
+        run_recovery_case(0x42, 1100, crate::node::policy::max_walk_gap(), true).await;
+        // Explicit 256-block per-hop window (the historical honest bound):
+        // 400 must now take MULTIPLE verified hops, not one long walk.
+        run_recovery_case(0x43, 400, 256, false).await;
+    }
 }

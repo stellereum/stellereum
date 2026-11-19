@@ -76,6 +76,7 @@ fn make_classical_qc() -> (ValidatorSet, QuorumCertificate) {
         signatures.push((sk.verifying_key().to_bytes(), sig));
     }
     let qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,
@@ -140,6 +141,7 @@ fn make_pq_uqc() -> (ValidatorSet, QuorumCertificate) {
 
     let payload = encode_pq_micro_envelope(&uqc);
     let qc = QuorumCertificate {
+        shard_id: 0,
         height,
         round,
         kind,

@@ -149,6 +149,7 @@ async fn test_sec03_downtime_slash_with_falcon_uqc() {
     // accusing the honest one. This is the V-P34 R2 hole pinned shut:
     // the old decode-only attribution forgave on this exact shape.
     let garbage_qc = QuorumCertificate {
+        shard_id: 0,
         height: 21,
         round: 0,
         kind: VoteKind::Precommit,

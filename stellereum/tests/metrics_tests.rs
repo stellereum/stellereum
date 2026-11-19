@@ -1553,3 +1553,85 @@ fn data_dir_stats_scans_bytes_and_snapshot_names() {
     assert_eq!(snaps, 2, "two snapshot-like names");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ============================================================================
+// (l) producer-less `/health` counters: honest until written, then saturating
+// ============================================================================
+
+/// Phase 1 defines the health counters but not their production writers. The
+/// contract is: `None` before the first write (so `/health` reports null +
+/// reason, never a fabricated zero), monotonic afterwards, and saturating at
+/// `u64::MAX` instead of wrapping to zero.
+#[test]
+fn health_counters_are_honest_monotonic_and_saturating() {
+    use stellereum::metrics::{HealthCounters, HealthSnapshot};
+
+    let c = HealthCounters::new();
+    assert_eq!(
+        c.snapshot(),
+        HealthSnapshot::default(),
+        "a counter with no writer must read as None, not zero"
+    );
+
+    c.record_view_change();
+    c.record_view_change();
+    c.record_rejected_proposal();
+    c.record_bytes_inbound(1_500);
+    c.record_bytes_outbound(900);
+    c.record_last_persist_ms(1_700_000_000_000);
+    c.record_last_snapshot_ms(1_700_000_000_500);
+
+    let first = c.snapshot();
+    assert_eq!(first.view_changes_total, Some(2));
+    assert_eq!(first.rejected_proposals_total, Some(1));
+    assert_eq!(first.bytes_inbound_total, Some(1_500));
+    assert_eq!(first.bytes_outbound_total, Some(900));
+    assert_eq!(first.last_persist_ms, Some(1_700_000_000_000));
+    assert_eq!(first.last_snapshot_ms, Some(1_700_000_000_500));
+
+    // More writes only grow; stamps take the latest value (a timestamp is not
+    // a counter, but it must still move forward on every successful write).
+    c.record_bytes_inbound(500);
+    c.record_last_persist_ms(1_700_000_000_123);
+    let second = c.snapshot();
+    assert_eq!(second.bytes_inbound_total, Some(2_000));
+    assert_eq!(second.last_persist_ms, Some(1_700_000_000_123));
+    assert!(second.view_changes_total >= first.view_changes_total);
+
+    // Saturation: a counter near the ceiling pins at u64::MAX, never wraps.
+    c.record_bytes_outbound(u64::MAX);
+    c.record_bytes_outbound(1);
+    assert_eq!(c.snapshot().bytes_outbound_total, Some(u64::MAX));
+    c.record_rejected_proposal();
+    assert_eq!(c.snapshot().rejected_proposals_total, Some(2));
+}
+
+/// The process-global free functions are the exact surface the phase-2
+/// writers and `/health` will use; they must agree with the global instance.
+#[test]
+fn global_health_counter_accessors_reflect_recorded_events() {
+    use stellereum::metrics;
+
+    // This integration test binary owns its process, so these counters start
+    // unwritten. (Other tests in this file only touch `Registry`.)
+    assert_eq!(metrics::snapshot_view_changes_total(), None);
+    assert_eq!(metrics::snapshot_bytes_inbound_total(), None);
+
+    metrics::record_view_change();
+    metrics::record_bytes_inbound(42);
+    metrics::record_bytes_outbound(7);
+    metrics::record_rejected_proposal();
+    metrics::record_last_persist_ms(1_000);
+    metrics::record_last_snapshot_ms(2_000);
+
+    assert_eq!(metrics::snapshot_view_changes_total(), Some(1));
+    assert_eq!(metrics::snapshot_bytes_inbound_total(), Some(42));
+    assert_eq!(metrics::snapshot_bytes_outbound_total(), Some(7));
+    assert_eq!(metrics::snapshot_rejected_proposals_total(), Some(1));
+    assert_eq!(metrics::snapshot_last_persist_ms(), Some(1_000));
+    assert_eq!(metrics::snapshot_last_snapshot_ms(), Some(2_000));
+    assert_eq!(
+        metrics::snapshot_health_counters().view_changes_total,
+        Some(1)
+    );
+}

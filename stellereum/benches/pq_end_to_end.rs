@@ -265,6 +265,7 @@ fn bench_qc_row(n: usize) {
         kind,
         block_hash,
         signatures: csigs,
+        shard_id: 0,
     };
     assert!(
         !cqc.verify_unified(&cvs),

@@ -172,6 +172,7 @@ fn votes(n: usize) -> Vec<stellereum::consensus_net::ConsensusMsg> {
                 block_hash: Some([7u8; 32]),
                 voter: [i as u8; 32],
                 signature: vec![0xAB; 64],
+                shard_id: 0,
             },
             locked: None,
         })

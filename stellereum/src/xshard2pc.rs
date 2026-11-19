@@ -87,9 +87,10 @@
 //!   [`XPC_REPREPARE_RETRY_LIMIT`] PREPARE retries per transfer per
 //!   [`XPC_PREPARE_TIMEOUT_HEIGHTS`] window;
 //! * [`target_action_at`] publishes at most one PREPARE-ACK / ABORT-ACK per
-//!   transfer per [`XPC_ACK_REEMIT_INTERVAL`] window, never after the record
-//!   is COMMITTED, and never again after the single ABORT-ACK that carries the
-//!   abort authorisation;
+//!   transfer per [`XPC_ACK_REEMIT_INTERVAL`] window (slow cadence after the
+//!   early recovery burst), never after the record is COMMITTED, and keeps the
+//!   ABORT-ACK recoverable (the source's consumer is idempotent) until the
+//!   record retires;
 //! * [`bounded_reemit_plan`] truncates the WHOLE per-height re-emission set to
 //!   [`XPC_MAX_REEMITS_PER_HEIGHT`], with a deterministic height rotation so a
 //!   busy shard cannot starve the tail.
@@ -559,6 +560,16 @@ pub fn should_reprepare(record: &XpcRecord, height: u64) -> bool {
     slot != 0 && slot <= XPC_REPREPARE_RETRY_LIMIT
 }
 
+/// The cadence of ABORT-REQUEST re-publication after the prepare timeout.
+///
+/// The request is not a value movement; its only purpose is to solicit the
+/// target's idempotent ABORT-ACK. Re-sending it every height let N stuck
+/// transfers consume the entire per-block control budget forever, starving
+/// every new PREPARE and ACK. One request per ACK window is enough: the target
+/// re-emits its ACK on the same cadence, so a lost request is recovered by the
+/// next window.
+pub const XPC_ABORT_REQUEST_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
+
 /// What the SOURCE shard must do for one of its 2PC records at `height`.
 ///
 /// A COMMITTED record is terminal: the source owes at most a BOUNDED burst of
@@ -571,14 +582,18 @@ pub fn should_reprepare(record: &XpcRecord, height: u64) -> bool {
 pub fn source_action(record: &XpcRecord, height: u64) -> SourceAction {
     match record.phase {
         XpcPhase::Prepared => {
-            if height
-                >= record
-                    .prepared_height
-                    .saturating_add(XPC_PREPARE_TIMEOUT_HEIGHTS)
-            {
-                SourceAction::AbortRequest
-            } else {
+            let Some(elapsed) = height.checked_sub(record.prepared_height) else {
+                return SourceAction::Idle;
+            };
+            if elapsed < XPC_PREPARE_TIMEOUT_HEIGHTS {
                 SourceAction::Reprepare
+            } else {
+                let since_timeout = elapsed - XPC_PREPARE_TIMEOUT_HEIGHTS;
+                if since_timeout.is_multiple_of(XPC_ABORT_REQUEST_INTERVAL) {
+                    SourceAction::AbortRequest
+                } else {
+                    SourceAction::Idle
+                }
             }
         }
         XpcPhase::Committed => {
@@ -588,7 +603,26 @@ pub fn source_action(record: &XpcRecord, height: u64) -> SourceAction {
             if elapsed == 0 || elapsed >= XPC_TERMINAL_RETENTION_HEIGHTS {
                 return SourceAction::Idle;
             }
-            if elapsed == 1 || elapsed % XPC_COMMIT_REEMIT_INTERVAL == 0 {
+            // Early recovery burst: the decision height +1, then one per
+            // interval for the first few windows. After that the slow
+            // heartbeat keeps a late COMMIT obtainable without re-publishing
+            // every 64 heights for a full retention day. A live target's
+            // PREPARE-ACK refreshes `decided_height`, which restarts this
+            // schedule, so prompt recovery is never dependent on the slow
+            // heartbeat.
+            let early_window = XPC_COMMIT_REEMIT_INTERVAL.saturating_mul(4);
+            let due = if elapsed <= early_window {
+                elapsed == 1 || elapsed.is_multiple_of(XPC_COMMIT_REEMIT_INTERVAL)
+            } else if elapsed == XPC_TERMINAL_RETENTION_HEIGHTS.saturating_sub(1) {
+                // FINAL COPY: the last slow heartbeat can fall up to a full
+                // interval before retirement. Publish once more immediately
+                // before the record is pruned so a target that came online in
+                // that gap still gets a decision while the record exists.
+                true
+            } else {
+                elapsed.is_multiple_of(XPC_COMMIT_REEMIT_INTERVAL_SLOW)
+            };
+            if due {
                 SourceAction::Commit
             } else {
                 SourceAction::Idle
@@ -645,12 +679,24 @@ pub const XPC_ACK_REEMIT_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
 ///  * the target's mailbox prune already drops terminal copies
 ///    (`completed_cross_shard`), so retiring the record loses no information.
 ///
+/// RETENTION VS RECOVERY (critical): the first value (`256`) was sized for a
+/// 3 s cadence and left only ~46 s of recovery at a ~240 ms block rate. A
+/// target that restarts or catches up for longer than that could never obtain
+/// the source's COMMIT: the source had already released the escrow and the
+/// record was retired, so the recipient was permanently uncredited. One day
+/// at the live 240 ms tempo (`24*3600*1000 / 240 = 360_000`) gives a real sync
+/// / restart window. [`source_action`] additionally restarts this window every
+/// time the still-PREPARED target re-sends a PREPARE-ACK (a pull hint), so a
+/// target that is alive but has not applied COMMIT keeps the obligation alive
+/// indefinitely; only a target silent for the WHOLE window loses it. At the
+/// 50 ms minimum tempo this is ~5 h; see the block-interval note below.
+///
 /// The retirement height is `decided_height + XPC_TERMINAL_RETENTION_HEIGHTS`
 /// on every node: a pure function of the committed record and the applied
 /// block height, never a local clock. A decision that is older than this when
 /// a node restores an old snapshot is retired on that node's next applied
 /// block, so all nodes converge to the same bounded record set.
-pub const XPC_TERMINAL_RETENTION_HEIGHTS: u64 = 256;
+pub const XPC_TERMINAL_RETENTION_HEIGHTS: u64 = 360_000;
 
 /// The cadence of a terminal COMMIT re-publication, in heights.
 ///
@@ -659,6 +705,18 @@ pub const XPC_TERMINAL_RETENTION_HEIGHTS: u64 = 256;
 /// the source's per-block footprint bounded without making a single lost
 /// COMMIT unrecoverable.
 pub const XPC_COMMIT_REEMIT_INTERVAL: u64 = XPC_PREPARE_TIMEOUT_HEIGHTS;
+
+/// Slow COMMIT heartbeat after the early recovery burst.
+///
+/// The first [`XPC_TERMINAL_RETENTION_HEIGHTS`] / 64 heights would otherwise
+/// re-publish one COMMIT every 64 heights for a whole day per stuck transfer.
+/// A live target re-sends PREPARE-ACK every 64 heights while it is still
+/// PREPARED, and that ack REFRESHES the source's decision height (see the
+/// engine's `PrepareAck` arm), which immediately restarts the early cadence —
+/// so prompt recovery does not depend on the slow heartbeat. A silent target
+/// only needs the occasional COMMIT; one per 4 096 heights (~16 min at 240 ms)
+/// is enough to make a late copy available without flooding every block.
+pub const XPC_COMMIT_REEMIT_INTERVAL_SLOW: u64 = 4_096;
 
 /// Control-record budget reserved for INBOUND re-emissions from the peer
 /// shard (its PREPARE-ACK / ABORT-ACK / COMMIT records).
@@ -718,7 +776,10 @@ pub fn is_retired(record: &XpcRecord, height: u64) -> bool {
     match record.phase {
         XpcPhase::Prepared => false,
         XpcPhase::Committed | XpcPhase::Aborted => {
-            height >= record.decided_height.saturating_add(XPC_TERMINAL_RETENTION_HEIGHTS)
+            height
+                >= record
+                    .decided_height
+                    .saturating_add(XPC_TERMINAL_RETENTION_HEIGHTS)
         }
     }
 }
@@ -732,6 +793,39 @@ pub fn is_retired(record: &XpcRecord, height: u64) -> bool {
 /// two honest proposers derive the same block content.
 pub const XPC_MAX_REEMITS_PER_HEIGHT: usize = 16;
 
+/// The hard cap on the TOTAL number of records in a block's
+/// `cross_shard_out`, across BOTH kinds of record the field carries:
+///
+///  * the legacy one-way transfers (and their acks/bounces), and
+///  * every §9 2PC control record (PREPARE / PREPARE-ACK / COMMIT /
+///    ABORT-REQUEST / ABORT-ACK).
+///
+/// [`XPC_MAX_REEMITS_PER_HEIGHT`] bounds only the 2PC re-emission plan; a
+/// pre-2PC (legacy) block had no equivalent bound at all, so a Byzantine
+/// proposer could pack an unbounded number of outbound transfer records (one
+/// per transaction it packs) and an unbounded mailbox pull. Both the proposer
+/// and every validator enforce THIS constant, so the proposer never builds a
+/// block its own validator set refuses, and the excess is carried to later
+/// heights.
+///
+/// The cap is a pure constant (not a node-local policy): two honest proposers
+/// derive the same per-height decision, and a validator re-checks the exact
+/// same bound on the wire.
+pub const XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK: usize = XPC_MAX_REEMITS_PER_HEIGHT;
+
+/// How many OUTBOUND transfer/PREPARE records may ride one block, given that
+/// `control_plan_len` 2PC control records are already due from committed
+/// state.
+///
+/// Bounded by the TOTAL cap, with [`XPC_INBOUND_CONTROL_RESERVE`] slots held
+/// back for records pulled from the inbound mailbox. Used for the legacy
+/// (pre-activation) flow as well as the 2PC opening PREPAREs, so both kinds
+/// obey one deterministic budget.
+pub fn outbound_record_budget(control_plan_len: usize) -> usize {
+    let remaining = XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK.saturating_sub(control_plan_len);
+    remaining.saturating_sub(XPC_INBOUND_CONTROL_RESERVE.min(remaining))
+}
+
 /// True when the target must (re-)publish an ACK for this record at
 /// `height`.
 ///
@@ -740,10 +834,12 @@ pub const XPC_MAX_REEMITS_PER_HEIGHT: usize = 16;
 /// * `Prepared` — one ACK one height after the prepare, then at most one per
 ///   [`XPC_ACK_REEMIT_INTERVAL`] window while the source has not decided;
 /// * `Committed` — NEVER (the transfer is decided; the target owes nothing);
-/// * `Aborted` — exactly ONCE, one height after the abort decision. That
-///   record IS the source's authorisation to refund; a copy is a duplicate
-///   that the source's idempotent `source_on_abort_ack` refuses, so it is
-///   never re-emitted afterwards.
+/// * `Aborted` — one ACK one height after the abort decision, then at most one
+///   per [`XPC_ACK_REEMIT_INTERVAL`] window until the record retires. The
+///   source's `source_on_abort_ack` is idempotent (`Noop` once Aborted), so a
+///   duplicate is harmless — and it is the ONLY way a lost authorisation can
+///   be recovered. A one-shot emission made one dropped packet delay the
+///   refund by a whole retention window.
 pub fn should_reemit_ack(record: &XpcRecord, height: u64) -> bool {
     match record.phase {
         XpcPhase::Prepared => {
@@ -753,16 +849,33 @@ pub fn should_reemit_ack(record: &XpcRecord, height: u64) -> bool {
             elapsed != 0 && elapsed % XPC_ACK_REEMIT_INTERVAL == 1
         }
         XpcPhase::Committed => false,
-        XpcPhase::Aborted => height == record.decided_height.saturating_add(1),
+        XpcPhase::Aborted => {
+            let Some(elapsed) = height.checked_sub(record.decided_height) else {
+                return false;
+            };
+            if elapsed == 0 || elapsed >= XPC_TERMINAL_RETENTION_HEIGHTS {
+                return false;
+            }
+            let early_window = XPC_COMMIT_REEMIT_INTERVAL.saturating_mul(4);
+            if elapsed <= early_window {
+                elapsed == 1 || elapsed.is_multiple_of(XPC_ACK_REEMIT_INTERVAL)
+            } else if elapsed == XPC_TERMINAL_RETENTION_HEIGHTS.saturating_sub(1) {
+                // Final authorisation copy before the record is pruned; the
+                // source's refund is still claimable if it was offline.
+                true
+            } else {
+                elapsed.is_multiple_of(XPC_COMMIT_REEMIT_INTERVAL_SLOW)
+            }
+        }
     }
 }
 
 /// What the TARGET shard must emit for one of its 2PC records at `height`.
 ///
 /// The BOUNDED view of [`target_action`]: an ACK is emitted at most once per
-/// [`XPC_ACK_REEMIT_INTERVAL`] window, never after COMMIT, and never again
-/// after the single abort authorisation. Unknown phase bytes fail closed to
-/// [`TargetAction::Idle`].
+/// [`XPC_ACK_REEMIT_INTERVAL`] window, never after COMMIT, and a bounded
+/// number of times after ABORT (the source's consumer is idempotent).
+/// Unknown phase bytes fail closed to [`TargetAction::Idle`].
 pub fn target_action_at(record: &XpcRecord, height: u64) -> TargetAction {
     if !should_reemit_ack(record, height) {
         return TargetAction::Idle;
@@ -905,6 +1018,32 @@ mod tests {
             source_action(&r, 10 + XPC_PREPARE_TIMEOUT_HEIGHTS),
             SourceAction::AbortRequest
         );
+        // The request is BOUNDED to one per ACK window: a stuck transfer must
+        // not consume a control-record slot every block forever (that starved
+        // every new PREPARE/ACK once 16 transfers were stuck).
+        assert_eq!(
+            source_action(&r, 10 + XPC_PREPARE_TIMEOUT_HEIGHTS + 1),
+            SourceAction::Idle
+        );
+        assert_eq!(
+            source_action(
+                &r,
+                10 + XPC_PREPARE_TIMEOUT_HEIGHTS + XPC_ABORT_REQUEST_INTERVAL
+            ),
+            SourceAction::AbortRequest
+        );
+        let requests: Vec<u64> = (10..10 + 4 * XPC_ABORT_REQUEST_INTERVAL)
+            .filter(|height| source_action(&r, *height) == SourceAction::AbortRequest)
+            .collect();
+        assert_eq!(
+            requests,
+            vec![
+                10 + XPC_PREPARE_TIMEOUT_HEIGHTS,
+                10 + XPC_PREPARE_TIMEOUT_HEIGHTS + XPC_ABORT_REQUEST_INTERVAL,
+                10 + XPC_PREPARE_TIMEOUT_HEIGHTS + 2 * XPC_ABORT_REQUEST_INTERVAL
+            ],
+            "one abort request per window: {requests:?}"
+        );
     }
 
     #[test]
@@ -957,19 +1096,35 @@ mod tests {
             assert_eq!(target_action_at(&committed, height), TargetAction::Idle);
         }
 
-        // ABORTED: exactly one authorisation, then never again.
+        // ABORTED: one authorisation one height after the decision, then at
+        // most one per ACK window while the record is retained — a lost
+        // ABORT-ACK must be recoverable (the source's consumer is idempotent).
         let mut aborted = rec(XpcPhase::Aborted);
         aborted.decided_height = 20;
         assert!(aborted.is_consistent());
         assert_eq!(target_action_at(&aborted, 20), TargetAction::Idle);
         assert_eq!(target_action_at(&aborted, 21), TargetAction::AbortAck);
-        for height in [22, 23, 84, 10_000] {
+        assert_eq!(
+            target_action_at(&aborted, 20 + XPC_ACK_REEMIT_INTERVAL),
+            TargetAction::AbortAck,
+            "a later window re-sends the authorisation"
+        );
+        for height in [22, 23, 20 + XPC_ACK_REEMIT_INTERVAL - 1] {
             assert_eq!(
                 target_action_at(&aborted, height),
                 TargetAction::Idle,
-                "the abort authorisation is emitted once at {height}"
+                "at most one abort authorisation per window: {height}"
             );
         }
+        // Bounded: nothing after the retention window.
+        assert_eq!(
+            target_action_at(&aborted, 20 + XPC_TERMINAL_RETENTION_HEIGHTS),
+            TargetAction::Idle
+        );
+        let acks: Vec<u64> = (20..20 + 4 * XPC_ACK_REEMIT_INTERVAL)
+            .filter(|height| target_action_at(&aborted, *height) == TargetAction::AbortAck)
+            .collect();
+        assert_eq!(acks.len(), 4, "one AbortAck per window: {acks:?}");
     }
 
     #[test]
@@ -1001,7 +1156,7 @@ mod tests {
 
         // The height rotation serves a DIFFERENT subset on the next retry
         // window, so the cap cannot starve the tail.
-        let next = bounded_reemit_plan(&records, 0, 11 + XPC_PREPARE_TIMEOUT_HEIGHTS);
+        let next = bounded_reemit_plan(&records, 0, 10 + XPC_PREPARE_TIMEOUT_HEIGHTS);
         assert_eq!(next.len(), XPC_MAX_REEMITS_PER_HEIGHT);
         assert_ne!(plan, next, "the plan rotates with the height");
 
@@ -1009,7 +1164,8 @@ mod tests {
         let windows = total.div_ceil(XPC_MAX_REEMITS_PER_HEIGHT);
         let mut served = std::collections::HashSet::new();
         for window in 0..windows {
-            let height = 11 + window as u64 * XPC_PREPARE_TIMEOUT_HEIGHTS;
+            let height =
+                10 + XPC_PREPARE_TIMEOUT_HEIGHTS + window as u64 * XPC_ABORT_REQUEST_INTERVAL;
             for reemit in bounded_reemit_plan(&records, 0, height) {
                 served.insert(reemit.tx_hash);
             }
@@ -1568,9 +1724,26 @@ mod retention_tests {
             source_action(&rec, 10 + XPC_COMMIT_REEMIT_INTERVAL),
             SourceAction::Commit
         );
+        // After the early burst, a slow heartbeat keeps a late COMMIT
+        // obtainable (a live target's PREPARE-ACK refreshes the window; a
+        // silent one still gets a copy each slow interval).
+        assert_eq!(
+            source_action(&rec, 10 + 4 * XPC_COMMIT_REEMIT_INTERVAL + 1),
+            SourceAction::Idle
+        );
+        assert_eq!(
+            source_action(&rec, 10 + XPC_COMMIT_REEMIT_INTERVAL_SLOW),
+            SourceAction::Commit
+        );
         // Bounded: after the retention window the source owes nothing.
+        // The height just before retirement is the FINAL copy, so a target
+        // that came online late still gets a decision.
         assert_eq!(
             source_action(&rec, 10 + XPC_TERMINAL_RETENTION_HEIGHTS - 1),
+            SourceAction::Commit
+        );
+        assert_eq!(
+            source_action(&rec, 10 + XPC_TERMINAL_RETENTION_HEIGHTS - 2),
             SourceAction::Idle
         );
         assert_eq!(
@@ -1578,6 +1751,12 @@ mod retention_tests {
             SourceAction::Idle
         );
         assert_eq!(source_action(&rec, u64::MAX), SourceAction::Idle);
+        // The window is sized for a real sync/restart at the live tempo, not
+        // the old 256-height (~46 s at 240 ms) one.
+        assert!(
+            std::hint::black_box(XPC_TERMINAL_RETENTION_HEIGHTS) >= 360_000,
+            "retention must cover a day at 240 ms: {XPC_TERMINAL_RETENTION_HEIGHTS}"
+        );
     }
 
     #[test]
@@ -1593,10 +1772,7 @@ mod retention_tests {
             &committed,
             20 + XPC_TERMINAL_RETENTION_HEIGHTS - 1
         ));
-        assert!(is_retired(
-            &committed,
-            20 + XPC_TERMINAL_RETENTION_HEIGHTS
-        ));
+        assert!(is_retired(&committed, 20 + XPC_TERMINAL_RETENTION_HEIGHTS));
         assert!(is_retired(&committed, u64::MAX));
     }
 
@@ -1608,8 +1784,7 @@ mod retention_tests {
                 plan_len + opening <= XPC_MAX_REEMITS_PER_HEIGHT,
                 "plan={plan_len} opening={opening}"
             );
-            let reserved =
-                XPC_INBOUND_CONTROL_RESERVE.min(XPC_MAX_REEMITS_PER_HEIGHT - plan_len);
+            let reserved = XPC_INBOUND_CONTROL_RESERVE.min(XPC_MAX_REEMITS_PER_HEIGHT - plan_len);
             assert_eq!(
                 plan_len + opening + reserved,
                 XPC_MAX_REEMITS_PER_HEIGHT,
@@ -1619,6 +1794,34 @@ mod retention_tests {
         assert_eq!(
             opening_prepare_budget(0),
             XPC_MAX_REEMITS_PER_HEIGHT - XPC_INBOUND_CONTROL_RESERVE
+        );
+    }
+
+    #[test]
+    fn the_total_cap_bounds_the_legacy_and_2pc_outbound_budgets_alike() {
+        // One total cap, not one per kind. Both the 2PC opening budget and the
+        // legacy outbound budget must leave room for the plan and the inbound
+        // reserve; neither may exceed the total the validator enforces.
+        assert_eq!(
+            XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK,
+            XPC_MAX_REEMITS_PER_HEIGHT
+        );
+        for plan_len in 0..=XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK {
+            let outbound = outbound_record_budget(plan_len);
+            let reserved =
+                XPC_INBOUND_CONTROL_RESERVE.min(XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK - plan_len);
+            assert_eq!(
+                plan_len + outbound + reserved,
+                XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK,
+                "plan={plan_len} outbound={outbound} reserve={reserved}"
+            );
+        }
+        // The legacy flow has no plan (`plan_len = 0`) and gets the SAME
+        // budget the 2PC openings would get with an empty plan.
+        assert_eq!(
+            outbound_record_budget(0),
+            opening_prepare_budget(0),
+            "legacy and 2PC openings share one total budget"
         );
     }
 }

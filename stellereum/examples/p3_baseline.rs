@@ -127,6 +127,7 @@ async fn main() {
             kind: VoteKind::Precommit,
             block_hash: Some(bh),
             signatures: sigs,
+            shard_id: 0,
         };
         let vs = ValidatorSet::from_list(
             ks.iter()

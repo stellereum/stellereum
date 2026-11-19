@@ -4022,13 +4022,16 @@ mod tests {
         )
     }
 
-    /// THE HAPPY PATH: a valid proposal evidence is ACCEPTED by the carrier
-    /// (stack 1) and moves NOTHING — no coins, no ledger state. The slash
-    /// itself fires at the block step, which re-verifies from block bytes;
-    /// pinning the carrier's purity here is what keeps exec/scan skew
-    /// harmless.
+    /// FINDING B FALLBACK: while the proposal-equivocation slash is behind the
+    /// false-slash sentinel (`u64::MAX`), even a perfectly signed same-shard
+    /// pair cannot pass the carrier — blocks carry no SIGNED round, so the
+    /// pair may be an honest cross-round re-proposal and slashing it would
+    /// burn an honest proposer. The carrier must REVERT and move nothing.
+    ///
+    /// (Before the sentinel this carrier accepted the same fixture and the
+    /// block step then slashed it — the false-slash bug this finding removes.)
     #[test]
-    fn proposal_equivocation_report_carries_valid_evidence_without_slashing() {
+    fn proposal_equivocation_report_is_refused_while_the_sentinel_is_active() {
         const NANO: u64 = 1_000_000_000;
         let sk = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
         let proposer = sk.verifying_key().to_bytes();
@@ -4049,16 +4052,21 @@ mod tests {
         let ops = vec![OpCode::SysCallReportProposalEquivocation {
             evidence: Box::new(evidence),
         }];
+        assert_eq!(
+            crate::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
+            u64::MAX
+        );
         match Svm::execute(&ops, 10_000_000, &mut ctx) {
-            VmExecutionResult::Success { burns, .. } => {
-                assert!(burns.is_empty(), "the carrier moves no coins");
-            }
-            other => panic!("expected Success, got {other:?}"),
+            VmExecutionResult::Reverted(reason) => assert!(
+                reason.contains("proposal equivocation evidence rejected"),
+                "the sentinel refusal must name the reason: {reason}"
+            ),
+            other => panic!("expected the sentinel to refuse the report, got {other:?}"),
         }
 
         assert_eq!(
             ledger.validators[&proposer].self_bond, before,
-            "the carrier must not slash — the block step does that"
+            "the carrier must not slash"
         );
         assert_eq!(ledger.total_burned, 0);
         assert!(

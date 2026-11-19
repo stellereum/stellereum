@@ -1547,7 +1547,10 @@ mod tests {
         let delays: Vec<u64> = (0..RECEIPT_SAMPLE_ATTEMPTS)
             .map(receipt_retry_delay_ms)
             .collect();
-        assert!(delays[0] >= 50, "first retry must wait a little: {delays:?}");
+        assert!(
+            delays[0] >= 50,
+            "first retry must wait a little: {delays:?}"
+        );
         for w in delays.windows(2) {
             assert!(w[1] >= w[0], "backoff must be non-decreasing: {delays:?}");
         }
@@ -1556,7 +1559,10 @@ mod tests {
             "per-attempt backoff must stay bounded: {delays:?}"
         );
         let total: u64 = delays.iter().sum();
-        assert!(total < 6_000, "total sample retry wait stays short: {total}");
+        assert!(
+            total < 6_000,
+            "total sample retry wait stays short: {total}"
+        );
         assert_eq!(receipt_retry_delay_ms(0), 100);
         assert_eq!(receipt_retry_delay_ms(99), 1_600);
     }

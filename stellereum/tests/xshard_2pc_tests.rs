@@ -1376,8 +1376,7 @@ async fn more_than_the_control_cap_of_outbound_transfers_finalizes_in_order() {
     let recipient_addrs: Vec<[u8; 32]> = (0..20u8)
         .map(|i| key(120 + i).verifying_key().to_bytes())
         .collect();
-    let senders: Vec<(FalconKeypair, [u8; 32])> =
-        (0..20u8).map(|i| pq_sender(160 + i)).collect();
+    let senders: Vec<(FalconKeypair, [u8; 32])> = (0..20u8).map(|i| pq_sender(160 + i)).collect();
     let initial = 5_000_000_000u64;
     let amount = 1_000_000u64;
     let fee = 280_000u64;
@@ -1519,20 +1518,57 @@ async fn a_terminal_2pc_record_is_retired_and_stops_re_publishing() {
         "precondition: the source committed the transfer"
     );
 
-    // Run past the retention window on BOTH shards, then a few extra heights.
-    for i in 0..(XPC_TERMINAL_RETENTION_HEIGHTS + 8) {
+    // Run PAST the old 256-height window on BOTH shards. The retention fix
+    // keeps the obligation alive for a real sync/restart window, so neither
+    // side may retire it here (the pre-fix code retired the source record at
+    // `decided + 256`, permanently stranding the target's credit).
+    for i in 0..300 {
         cluster.run_height(SHARD0, TS + 1000 + i * 2).await;
         cluster.run_height(SHARD1, TS + 1001 + i * 2).await;
     }
+    assert!(
+        xpc_record(&cluster, SHARD0, &tx_hash).await.is_some(),
+        "the terminal source record must survive the old 256-height window \
+         (a slow target can still need the COMMIT)"
+    );
+    assert!(
+        xpc_record(&cluster, SHARD1, &tx_hash).await.is_some(),
+        "the target's decided record is retained too"
+    );
 
+    // The deterministic retirement rule is a pure function of the record and
+    // the applied height; exercise it directly at the real boundary instead
+    // of running hundreds of thousands of blocks in a unit test. Each side's
+    // decision height differs (the target decides when it applies COMMIT), so
+    // each boundary is derived from that side's own record.
+    let source_retire = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("source record")
+        .decided_height
+        + XPC_TERMINAL_RETENTION_HEIGHTS;
+    let target_retire = xpc_record(&cluster, SHARD1, &tx_hash)
+        .await
+        .expect("target record")
+        .decided_height
+        + XPC_TERMINAL_RETENTION_HEIGHTS;
+    cluster.shard(SHARD0).nodes[0]
+        .state
+        .prune_terminal_xpc_records(source_retire)
+        .await;
+    cluster.shard(SHARD1).nodes[0]
+        .state
+        .prune_terminal_xpc_records(target_retire)
+        .await;
     assert!(
         xpc_record(&cluster, SHARD0, &tx_hash).await.is_none(),
-        "the terminal source record must be retired after the retention window"
+        "the terminal source record must be retired at its deterministic boundary"
     );
     assert!(
         xpc_record(&cluster, SHARD1, &tx_hash).await.is_none(),
-        "the terminal target record must be retired after the retention window"
+        "the terminal target record must be retired at its deterministic boundary"
     );
+    // One more applied height must not re-publish the retired record.
+    cluster.run_height(SHARD0, TS + 5000).await;
     let last = cluster.shard(SHARD0).nodes[0]
         .blocks
         .values()
@@ -1616,5 +1652,384 @@ async fn a_never_admissible_mailbox_record_is_quarantined() {
             .await
             .is_empty(),
         "a never-admissible record must be quarantined after {XPC_MAILBOX_QUARANTINE_HEIGHTS} heights"
+    );
+}
+
+// ===========================================================================
+// 13. TOTAL cross-shard record cap (legacy + 2PC), proposer and validator.
+// ===========================================================================
+
+/// A pool of 30 LEGACY outbound transfers (2PC not activated) must never be
+/// packed as one unbounded `cross_shard_out`. Before the total cap the
+/// proposer put all 30 records in one block: nothing validated the count (the
+/// 2PC cap only counted control records), so a Byzantine proposer could put
+/// an arbitrary number of outbound records in a block. The proposer now obeys
+/// the SAME total cap the validator enforces, and the excess is carried on
+/// later heights in the deterministic selection order.
+#[tokio::test]
+async fn thirty_legacy_outbound_transfers_are_total_capped_and_all_land() {
+    use std::collections::{HashMap, HashSet};
+    use stellereum::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK;
+
+    let v1 = key(240);
+    let v2 = key(241);
+    let senders: Vec<(FalconKeypair, [u8; 32])> = (0..30u8).map(|i| pq_sender(210 + i)).collect();
+    let recipients: Vec<[u8; 32]> = (0..30u8)
+        .map(|i| key(100 + i).verifying_key().to_bytes())
+        .collect();
+    let initial = 5_000_000_000u64;
+    let amount = 1_000_000u64;
+    let fee = 280_000u64;
+
+    let s0a = Arc::new(InMemoryStateEngine::new());
+    let s0b = Arc::new(InMemoryStateEngine::new());
+    for e in [&s0a, &s0b] {
+        for (_, addr) in &senders {
+            e.update_account(AccountState::new(*addr, initial)).await;
+        }
+    }
+    let s1 = Arc::new(InMemoryStateEngine::new());
+    // DELIBERATELY no `with_xpc_activation`: this is the pre-2PC legacy flow.
+    let mut cluster = ShardedCluster::new(
+        sharded(),
+        vec![
+            (SHARD0, vec![(v1.clone(), s0a), (v2.clone(), s0b)]),
+            (SHARD1, vec![(v1.clone(), s1)]),
+        ],
+        CrossShardTransport::local(),
+    );
+
+    let mut tx_hashes: Vec<[u8; 32]> = Vec::with_capacity(senders.len());
+    for (i, (sender, _)) in senders.iter().enumerate() {
+        let tx = sign_pq_tx(sender, recipients[i], amount, fee, 0, SHARD0, SHARD1);
+        tx_hashes.push(tx.compute_tx_hash());
+        cluster.broadcast_tx(tx).await;
+    }
+
+    let mut records_at: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut txs_at: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut first_block_records = 0usize;
+
+    // Every run_height drives a real 2-validator shard: an over-cap proposal
+    // panics ("proposal rejected"), so a finalizing height is a VALID block.
+    for i in 0..8u64 {
+        let bh = cluster.run_height(SHARD0, TS + i).await;
+        let block = cluster.shard(SHARD0).nodes[0]
+            .blocks
+            .get(&bh)
+            .cloned()
+            .expect("source block retained");
+        assert!(
+            block.cross_shard_out.len() <= XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK,
+            "height {} packed {} records, total cap is {}",
+            block.height,
+            block.cross_shard_out.len(),
+            XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+        );
+        if block.height == 1 {
+            first_block_records = block.cross_shard_out.len();
+        }
+        for msg in &block.cross_shard_out {
+            if msg.is_transfer() && msg.is_outbound_for(SHARD0) {
+                records_at
+                    .entry(msg.tx.compute_tx_hash())
+                    .or_insert(block.height);
+            }
+        }
+        for tx in &block.transactions {
+            txs_at.entry(tx.compute_tx_hash()).or_insert(block.height);
+        }
+    }
+
+    assert!(
+        first_block_records < tx_hashes.len(),
+        "precondition: the total cap must DEFER some of the {} transfers \
+         (first block carried {first_block_records})",
+        tx_hashes.len()
+    );
+
+    // All 30 land: each transaction is included exactly once and each carries
+    // its outbound transfer record on the same height.
+    let distinct_records: HashSet<[u8; 32]> = records_at.keys().copied().collect();
+    assert_eq!(
+        distinct_records.len(),
+        tx_hashes.len(),
+        "every outbound transfer must eventually be published"
+    );
+    for tx_hash in &tx_hashes {
+        let rec_h = records_at
+            .get(tx_hash)
+            .unwrap_or_else(|| panic!("no outbound record for {}", hex::encode(&tx_hash[..8])));
+        let tx_h = txs_at
+            .get(tx_hash)
+            .unwrap_or_else(|| panic!("transaction never landed: {}", hex::encode(&tx_hash[..8])));
+        assert_eq!(rec_h, tx_h, "record and transaction must land together");
+    }
+}
+
+/// The validator enforces the SAME total cap: a block whose `cross_shard_out`
+/// exceeds it (here: duplicate legacy records on top of a valid body) must be
+/// refused before any per-kind check. Before the fix the validator loop only
+/// counted 2PC control records, so a legacy-only block's record count was
+/// never checked.
+#[tokio::test]
+async fn validator_refuses_a_block_over_the_total_cross_shard_record_cap() {
+    use stellereum::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK;
+
+    let v1 = key(242);
+    let v2 = key(243);
+    let (sender, sender_addr) = pq_sender(240);
+    let recipient = key(244).verifying_key().to_bytes();
+    let initial = 5_000_000_000u64;
+
+    let s0a = Arc::new(InMemoryStateEngine::new());
+    let s0b = Arc::new(InMemoryStateEngine::new());
+    for e in [&s0a, &s0b] {
+        e.update_account(AccountState::new(sender_addr, initial))
+            .await;
+    }
+    let s1 = Arc::new(InMemoryStateEngine::new());
+    let mut cluster = ShardedCluster::new(
+        sharded(),
+        vec![
+            (SHARD0, vec![(v1.clone(), s0a), (v2.clone(), s0b)]),
+            (SHARD1, vec![(v1.clone(), s1)]),
+        ],
+        CrossShardTransport::local(),
+    );
+    let tx = sign_pq_tx(&sender, recipient, 1_000_000, 280_000, 0, SHARD0, SHARD1);
+    cluster.broadcast_tx(tx).await;
+
+    let proposer_idx = cluster
+        .shard(SHARD0)
+        .nodes
+        .iter()
+        .position(|n| n.is_proposer())
+        .expect("a proposer for height 1");
+    let block = cluster.shard_mut(SHARD0).nodes[proposer_idx]
+        .propose(TS)
+        .await
+        .expect("proposer builds a valid block");
+    let base = block.cross_shard_out.clone();
+    assert!(!base.is_empty(), "precondition: one outbound record");
+
+    // Byzantine body: keep the valid records and repeat them over the cap.
+    let mut oversized = block;
+    while oversized.cross_shard_out.len() <= XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK {
+        oversized.cross_shard_out.extend(base.iter().cloned());
+    }
+    oversized.validator_signatures.clear();
+
+    let receiver_idx = 1 - proposer_idx;
+    let receiver = &cluster.shard(SHARD0).nodes[receiver_idx];
+    let root = receiver.state_root().await;
+    let err = receiver
+        .validate_proposal(&oversized, root)
+        .expect_err("an over-cap cross-shard block must be refused");
+    assert!(
+        err.contains("cross-shard record") && err.contains("cap"),
+        "the refusal must name the total cap, got: {err}"
+    );
+}
+
+// ===========================================================================
+// 14. Task 2: a CONSUMED mailbox record must also be pruned.
+// ===========================================================================
+
+/// The `consumed_cross_shard` branch removed the node-local tracker entry but
+/// never added the id to `prune_ids`, so on the non-draining node-local KV
+/// transport the record was re-fetched by every propose forever. Re-feed the
+/// exact bounce that this shard already consumed and prove it disappears from
+/// the transport mailbox on the next propose.
+#[tokio::test]
+async fn a_consumed_mailbox_record_is_pruned_from_the_transport() {
+    use stellereum::sharding::CROSS_SHARD_TIMEOUT_HEIGHTS;
+
+    let validator = key(245);
+    let (sender, sender_addr) = pq_sender(245);
+    let recipient_addr = key(246).verifying_key().to_bytes();
+
+    let s0 = Arc::new(InMemoryStateEngine::new());
+    s0.update_account(AccountState::new(sender_addr, 5_000_000_000))
+        .await;
+    let s1 = Arc::new(InMemoryStateEngine::new());
+    let mut cluster = ShardedCluster::new(
+        sharded(),
+        vec![
+            (SHARD0, vec![(validator.clone(), s0)]),
+            (SHARD1, vec![(validator.clone(), s1)]),
+        ],
+        CrossShardTransport::local(),
+    );
+
+    let tx = sign_pq_tx(
+        &sender,
+        recipient_addr,
+        1_000_000,
+        280_000,
+        0,
+        SHARD0,
+        SHARD1,
+    );
+    let tx_hash = tx.compute_tx_hash();
+    cluster.broadcast_tx(tx).await;
+
+    // Height 1 produces the legacy outbound; the target NEVER runs, so the
+    // source's height-timeout bounce is the only inbound record.
+    cluster.run_height(SHARD0, TS).await;
+    for h in 2..(1 + CROSS_SHARD_TIMEOUT_HEIGHTS) {
+        cluster.run_height(SHARD0, TS + h).await;
+    }
+    let bh = cluster
+        .run_height(SHARD0, TS + 1 + CROSS_SHARD_TIMEOUT_HEIGHTS)
+        .await;
+    let block = cluster.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&bh)
+        .cloned()
+        .expect("timeout block retained");
+    let bounce = block
+        .cross_shard_out
+        .iter()
+        .find(|m| m.is_bounce() && m.tx.compute_tx_hash() == tx_hash)
+        .cloned()
+        .expect("the timeout bounce must commit");
+    assert!(cluster.shard(SHARD0).nodes[0].is_transfer_completed(&tx_hash));
+
+    // Re-feed the consumed bounce into the source mailbox.
+    cluster
+        .transport
+        .broadcast_cross_shard(&bounce)
+        .await
+        .expect("mailbox publish");
+    assert!(
+        cluster
+            .transport
+            .fetch_cross_shard_inbound(SHARD0)
+            .await
+            .iter()
+            .any(|m| m.msg_id == bounce.msg_id),
+        "precondition: the consumed record is in the mailbox"
+    );
+
+    // The next proposal takes the consumed-key branch and must PRUNE it.
+    cluster.run_height(SHARD0, TS + 500).await;
+    assert!(
+        !cluster
+            .transport
+            .fetch_cross_shard_inbound(SHARD0)
+            .await
+            .iter()
+            .any(|m| m.msg_id == bounce.msg_id),
+        "a consumed mailbox record must be pruned, not re-fetched forever"
+    );
+}
+
+// ===========================================================================
+// 15. Task 3: the live prune path must deliver the PREPARE-ACK pull hint.
+// ===========================================================================
+
+/// A source that already COMMITTED prunes an inbound 2PC record whose hash is
+/// in its `completed_cross_shard` mirror. But a target that is still PREPARED
+/// keeps re-sending PREPARE-ACK: that record is the PULL HINT the engine's
+/// PREPARE-ACK arm uses to refresh the source's COMMIT window. If the live
+/// propose path prunes it before apply, the refresh exists only in unit tests.
+///
+/// This walks the live path: complete the handshake, DROP the source's COMMIT
+/// from the target mailbox (the lost-decision case), let the still-PREPARED
+/// target re-emit its ACK at its ACK cadence, and prove the source's record
+/// `decided_height` advances when the next source block consumes that ACK.
+#[tokio::test]
+async fn a_still_prepared_targets_ack_refreshes_the_source_on_the_live_prune_path() {
+    use stellereum::xshard2pc::XPC_ACK_REEMIT_INTERVAL;
+
+    let validator = key(247);
+    let (sender, sender_addr) = pq_sender(247);
+    let recipient_addr = key(248).verifying_key().to_bytes();
+    let amount = 1_000_000_000u64;
+    let fee = 280_000u64;
+
+    let mut cluster = xpc_cluster(&validator, &[(sender_addr, 5_000_000_000)], &[]).await;
+    let tx = sign_pq_tx(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
+    let tx_hash = tx.compute_tx_hash();
+    cluster.broadcast_tx(tx).await;
+
+    // Source h1: PREPARE. Target h1: PREPARED. Target h2: PREPARE-ACK.
+    cluster.run_height(SHARD0, TS).await;
+    cluster.run_height(SHARD1, TS + 1).await;
+    cluster.run_height(SHARD1, TS + 2).await;
+
+    // Source h2: consumes the ACK and COMMITS. Source h3: publishes COMMIT.
+    cluster.run_height(SHARD0, TS + 3).await;
+    let source_commit_height = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("source record")
+        .decided_height;
+    cluster.run_height(SHARD0, TS + 4).await;
+    let committed = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("source record");
+    assert_eq!(committed.phase, XpcPhase::Committed);
+
+    // "Lose" the COMMIT: drop it from the target's mailbox before the target
+    // ever applies it, so the target stays PREPARED.
+    let target_mailbox = cluster.transport.fetch_cross_shard_inbound(SHARD1).await;
+    let commit_ids: Vec<[u8; 32]> = target_mailbox
+        .iter()
+        .filter(|m| m.is_commit() && m.tx.compute_tx_hash() == tx_hash)
+        .map(|m| m.msg_id)
+        .collect();
+    assert!(!commit_ids.is_empty(), "precondition: COMMIT was published");
+    cluster.transport.prune_consumed(SHARD1, &commit_ids).await;
+
+    // Drive the target to its NEXT ACK window without ever delivering COMMIT.
+    let prepared_height = xpc_record(&cluster, SHARD1, &tx_hash)
+        .await
+        .expect("target record")
+        .prepared_height;
+    let ack_height = prepared_height + XPC_ACK_REEMIT_INTERVAL + 1;
+    while cluster.shard(SHARD1).height() <= ack_height {
+        let h = cluster.shard(SHARD1).height();
+        cluster.run_height(SHARD1, TS + 100 + h).await;
+    }
+    assert_eq!(
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .expect("target record")
+            .phase,
+        XpcPhase::Prepared,
+        "the target never saw COMMIT and must still be PREPARED"
+    );
+
+    let source_mailbox = cluster.transport.fetch_cross_shard_inbound(SHARD0).await;
+    let hint = source_mailbox
+        .iter()
+        .find(|m| m.is_prepare_ack() && m.tx.compute_tx_hash() == tx_hash)
+        .cloned()
+        .expect("the still-PREPARED target must re-emit PREPARE-ACK");
+
+    // Live prune path: the source is COMPLETED (mirror has the hash), yet the
+    // ACK must be admitted so the engine can refresh the window.
+    let source_height = cluster.shard(SHARD0).height();
+    cluster.run_height(SHARD0, TS + 200 + source_height).await;
+    let refreshed = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("source record");
+    assert_eq!(refreshed.phase, XpcPhase::Committed);
+    assert_eq!(
+        refreshed.decided_height,
+        source_height,
+        "the live PREPARE-ACK must refresh the source decision window \
+         (was {source_commit_height}, hint msg {})",
+        hex::encode(&hint.msg_id[..8])
+    );
+    assert!(
+        !cluster
+            .transport
+            .fetch_cross_shard_inbound(SHARD0)
+            .await
+            .iter()
+            .any(|m| m.msg_id == hint.msg_id),
+        "the applied refresh hint must be pruned from the source mailbox"
     );
 }

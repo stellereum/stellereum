@@ -67,6 +67,38 @@ const signer = new HttpFalconSigner({
 });
 ```
 
+## Protocol guard and the new unsigned builders
+
+Every new-shape builder refuses a chain id / fork id that is not the
+configured node identity (`ProtocolError`, codes `chain_id_mismatch`,
+`fork_id_mismatch`, `protocol_version_mismatch`). The current identity is
+protocol 1.0, consensus ruleset v3, fork id `0xb13baff4`, chain 5757.
+
+```ts
+import { buildEvmCarrier, buildGovPropose } from "@stellereum/sdk";
+
+const unsigned = buildGovPropose({
+  from, nonce: 6, gasLimit: 500_000,
+  proposalId: 4, title: "raise the floor",
+  action: { type: "set_min_gas_limit", value: 300_000 },
+  heightObserved: 99,
+});
+const signed = await client.signPrepared(unsigned);
+```
+
+`buildEvmBinding` requires the 65-byte secp256k1 proof of possession and a
+Falcon binding signature; `buildEvmCarrier` requires a Falcon signature over
+`keccak256(evmTx)` and takes the transaction nonce/value from the EVM intent
+(passing `nonce`/`amountNano` pins them and a mismatch is refused). The inner
+Falcon signatures come from the Rust sidecar (`signer.signDigest`, backed by
+`stellereum-sdk-cli sign-digest`); without that hook, pass them explicitly.
+
+Limits: JS never signs Falcon, never recovers the EVM sender and never
+verifies the EVM signature (the node does, over the same bytes); address
+derivation needs BLAKE3, so pass `from`/`pqPublicKey`. The carrier is a value
+transfer only: no contract calls or calldata. EVM binding is
+first-committed-wins.
+
 ## What is not supported
 
 - No native Falcon signing in JS (see above).
@@ -74,8 +106,9 @@ const signer = new HttpFalconSigner({
 - `eth_sendRawTransaction` is refused **locally** with 4200. The node also
   refuses the EVM write path (`stellereum/src/rpc/eth.rs:898-916`); the honest
   replacement is `stell_sendRawTransaction` with a PQ envelope.
-- `eth_subscribe` is not available; the node refuses it too.
 - No EVM contract execution, no JSON-RPC batching, no wallet UI.
+- No node RPC for the protocol identity yet; `client.identity()` is the
+  configured/local identity.
 - The signer is trusted with the key. Keep the CLI/helper on localhost.
 
 ## Commands

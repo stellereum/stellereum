@@ -243,53 +243,81 @@ async fn test_two_shard_parallel_stress_and_tps_benchmark() {
         blk1_s1.cross_shard_out.len()
     );
 
+    // XPC-19: ONE total cap bounds every cross-shard record in a block (outbound
+    // transfers, inbound pulls, 2PC control), so the backlog is spread over
+    // heights instead of packed into one unbounded block. The property this
+    // benchmark must keep is "no record lost, no block over the cap", not the
+    // old exact count.
+    const XCAP: usize = stellereum::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK;
+    for (name, blk) in [("shard0", &blk1_s0), ("shard1", &blk1_s1)] {
+        assert!(
+            blk.cross_shard_out.len() <= XCAP,
+            "{name} block 1 exceeded the cross-shard record cap: {} > {XCAP}",
+            blk.cross_shard_out.len()
+        );
+        assert!(
+            !blk.cross_shard_out.is_empty(),
+            "{name} must start packing cross-shard records"
+        );
+    }
+    let mut s0_out = blk1_s0
+        .cross_shard_out
+        .iter()
+        .filter(|m| !m.is_inbound_for(SHARD0))
+        .count();
+    let mut s1_out = blk1_s1
+        .cross_shard_out
+        .iter()
+        .filter(|m| !m.is_inbound_for(SHARD1))
+        .count();
+
+    // Drain the backlog: bounded heights, every block cap-checked, every
+    // outbound record accounted for exactly once.
+    let mut consumed_inbound = false;
+    for i in 0..32u64 {
+        let a = cluster.run_height(SHARD0, 1002 + i).await;
+        let b = cluster.run_height(SHARD1, 2002 + i).await;
+        for (shard, h) in [(SHARD0, a), (SHARD1, b)] {
+            let blk = cluster.shard(shard).nodes[0]
+                .blocks
+                .get(&h)
+                .cloned()
+                .unwrap();
+            assert!(
+                blk.cross_shard_out.len() <= XCAP,
+                "shard {shard} block {} exceeded the cross-shard record cap: {} > {XCAP}",
+                hex::encode(&h[..6]),
+                blk.cross_shard_out.len()
+            );
+            if blk.cross_shard_out.iter().any(|m| m.is_inbound_for(shard)) {
+                consumed_inbound = true;
+            }
+            let fresh = blk
+                .cross_shard_out
+                .iter()
+                .filter(|m| !m.is_inbound_for(shard))
+                .count();
+            if shard == SHARD0 {
+                s0_out += fresh;
+            } else {
+                s1_out += fresh;
+            }
+        }
+        if s0_out >= 50 && s1_out >= 50 {
+            break;
+        }
+    }
     assert_eq!(
-        blk1_s0.cross_shard_out.len(),
-        50,
-        "Shard 0 must package 50 outbound transfers to Shard 1"
+        s0_out, 50,
+        "every one of the 50 Shard 0 -> 1 transfers must land, spread over heights"
     );
     assert_eq!(
-        blk1_s1.cross_shard_out.len(),
-        100,
-        "Shard 1 packages 50 outbound transfers + 50 inbound Acks for Shard 0"
+        s1_out, 50,
+        "every one of the 50 Shard 1 -> 0 transfers must land, spread over heights"
     );
-
-    // Height 2: Both shards consume inbound cross-shard records. Under
-    // XSHARD-01 the legacy inbound CREDIT is refused (a one-step legacy
-    // message cannot prove the source-side debit), so the record is committed
-    // to the block but no value is credited here; throughput is the property
-    // this benchmark measures.
-    let h2_s0 = cluster.run_height(SHARD0, 1002).await;
-    let h2_s1 = cluster.run_height(SHARD1, 1003).await;
-
-    let blk2_s0 = cluster.shard(SHARD0).nodes[0]
-        .blocks
-        .get(&h2_s0)
-        .cloned()
-        .unwrap();
-    let blk2_s1 = cluster.shard(SHARD1).nodes[0]
-        .blocks
-        .get(&h2_s1)
-        .cloned()
-        .unwrap();
-
-    eprintln!(
-        "blk2_s0 txs count: {}, cross_shard_out: {}",
-        blk2_s0.transactions.len(),
-        blk2_s0.cross_shard_out.len()
-    );
-    eprintln!(
-        "blk2_s1 txs count: {}, cross_shard_out: {}",
-        blk2_s1.transactions.len(),
-        blk2_s1.cross_shard_out.len()
-    );
-
     assert!(
-        blk2_s0
-            .cross_shard_out
-            .iter()
-            .any(|m| m.is_inbound_for(SHARD0)),
-        "Shard 0 must consume inbound records from Shard 1"
+        consumed_inbound,
+        "both shards must consume inbound cross-shard records during the drain"
     );
 
     let mining_elapsed = t_mining_start.elapsed();

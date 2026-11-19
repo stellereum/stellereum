@@ -51,7 +51,28 @@ export type TxIntent =
       value?: number;
     } & TxCommon)
   | ({ kind: "stake"; validator: string; amount: number } & TxCommon)
-  | ({ kind: "unjail"; validator: string; top_up?: number | null } & TxCommon);
+  | ({ kind: "unjail"; validator: string; top_up?: number | null } & TxCommon)
+  | ({ kind: "evm_binding"; evm_address: string; evm_proof: string } & TxCommon)
+  | ({
+      kind: "evm_carrier";
+      evm_tx: string;
+      to_pq: string;
+      amount_nano?: number;
+    } & TxCommon)
+  | ({
+      kind: "gov_propose";
+      proposal_id: number;
+      title: string;
+      action: Record<string, unknown>;
+      height_observed: number;
+    } & TxCommon)
+  | ({
+      kind: "gov_vote";
+      proposal_id: number;
+      choice: "yes" | "no" | "abstain";
+      height_observed: number;
+    } & TxCommon)
+  | ({ kind: "prepared"; tx_hex: string } & TxCommon);
 
 export interface SignRequest {
   tx: TxIntent;
@@ -114,6 +135,26 @@ function parseSignerResponse(raw: string): SignResponse {
 export interface FalconSigner {
   readonly address?: string;
   sign(request: SignRequest): Promise<SignResponse>;
+  /**
+   * Sign a raw 32-byte digest with the Falcon key (hex in, hex out).
+   *
+   * Needed by the EVM binding and carrier shapes: their payload embeds a
+   * Falcon signature, so the caller must sign `bindingMessage(...)` or
+   * `keccak256(evmTx)` BEFORE the envelope preimage exists. Optional because
+   * a third-party signer may not expose it; the client then requires the
+   * signature to be supplied explicitly.
+   */
+  signDigest?(digestHex: string): Promise<string>;
+}
+
+export interface SignDigestRequest {
+  /** 32-byte digest, hex (0x optional). */
+  digest: string;
+}
+
+export interface SignDigestResponse {
+  ok: true;
+  signature: string;
 }
 
 export interface SubprocessSignerOptions {
@@ -140,12 +181,14 @@ export class SubprocessFalconSigner implements FalconSigner {
   readonly address?: string;
   private readonly command: string;
   private readonly args: string[];
+  private readonly keyPath?: string;
   private readonly cwd?: string;
   private readonly env?: Record<string, string>;
   private readonly timeoutMs: number;
 
   constructor(options: SubprocessSignerOptions = {}) {
     this.command = options.command ?? "stellereum-sdk-cli";
+    this.keyPath = options.keyPath;
     if (options.args) {
       this.args = [...options.args];
     } else {
@@ -160,9 +203,10 @@ export class SubprocessFalconSigner implements FalconSigner {
     this.address = options.address;
   }
 
-  sign(request: SignRequest): Promise<SignResponse> {
+  /** Run one CLI invocation, returning the last JSON line on stdout. */
+  private run(args: string[], stdin: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.command, this.args, {
+      const child = spawn(this.command, args, {
         cwd: this.cwd,
         env: { ...process.env, ...(this.env ?? {}) },
         stdio: ["pipe", "pipe", "pipe"],
@@ -203,16 +247,37 @@ export class SubprocessFalconSigner implements FalconSigner {
           );
           return;
         }
-        try {
-          resolve(parseSignerResponse(line));
-        } catch (error) {
-          reject(error);
-        }
+        resolve(line);
       });
       child.stdin.setDefaultEncoding("utf8");
-      child.stdin.write(JSON.stringify(request));
+      child.stdin.write(stdin);
       child.stdin.end();
     });
+  }
+
+  async sign(request: SignRequest): Promise<SignResponse> {
+    return parseSignerResponse(await this.run(this.args, JSON.stringify(request)));
+  }
+
+  async signDigest(digestHex: string): Promise<string> {
+    if (!this.keyPath) {
+      throw new SignerError(
+        "unsupported",
+        "signDigest needs keyPath (a custom args array cannot be rewritten safely)",
+      );
+    }
+    const line = await this.run(
+      ["sign-digest", "--key", this.keyPath],
+      JSON.stringify({ digest: digestHex }),
+    );
+    const parsed = JSON.parse(line) as { ok?: boolean; signature?: string; error?: { code?: string; message?: string } };
+    if (parsed.ok !== true || typeof parsed.signature !== "string") {
+      throw new SignerError(
+        parsed.error?.code ?? "unknown",
+        parsed.error?.message ?? "signer refused the digest",
+      );
+    }
+    return parsed.signature;
   }
 }
 
@@ -241,6 +306,26 @@ export class HttpFalconSigner implements FalconSigner {
   }
 
   async sign(request: SignRequest): Promise<SignResponse> {
+    return parseSignerResponse(await this.post("/sign", JSON.stringify(request)));
+  }
+
+  async signDigest(digestHex: string): Promise<string> {
+    const text = await this.post("/sign-digest", JSON.stringify({ digest: digestHex }));
+    const parsed = JSON.parse(text) as {
+      ok?: boolean;
+      signature?: string;
+      error?: { code?: string; message?: string };
+    };
+    if (parsed.ok !== true || typeof parsed.signature !== "string") {
+      throw new SignerError(
+        parsed.error?.code ?? "unknown",
+        parsed.error?.message ?? "signer refused the digest",
+      );
+    }
+    return parsed.signature;
+  }
+
+  private async post(path: string, body: string): Promise<string> {
     const controller =
       typeof AbortController === "undefined" ? undefined : new AbortController();
     const timer =
@@ -249,10 +334,10 @@ export class HttpFalconSigner implements FalconSigner {
     try {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (this.token) headers.authorization = `Bearer ${this.token}`;
-      response = await this.fetchImpl(`${this.url}/sign`, {
+      response = await this.fetchImpl(`${this.url}${path}`, {
         method: "POST",
         headers,
-        body: JSON.stringify(request),
+        body,
         signal: controller?.signal,
       });
     } catch (error) {
@@ -265,13 +350,19 @@ export class HttpFalconSigner implements FalconSigner {
       if (timer !== undefined) clearTimeout(timer);
     }
     const text = await response.text();
-    try {
-      return parseSignerResponse(text);
-    } catch (error) {
-      if (!response.ok && error instanceof SignerError) {
-        throw new SignerError(error.code, `${error.message} (HTTP ${response.status})`, false);
+    if (!response.ok) {
+      let parsed: { error?: { code?: string; message?: string } } = {};
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // fall through to a generic error below
       }
-      throw error;
+      throw new SignerError(
+        parsed.error?.code ?? "http_error",
+        `${parsed.error?.message ?? text} (HTTP ${response.status})`,
+        false,
+      );
     }
+    return text;
   }
 }

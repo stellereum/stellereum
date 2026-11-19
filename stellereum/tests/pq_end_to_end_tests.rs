@@ -490,6 +490,7 @@ fn pq_qc_sizes_vs_classical() {
             "uQC envelope must match the pinned formula"
         );
         let pq_qc = QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,
@@ -513,6 +514,7 @@ fn pq_qc_sizes_vs_classical() {
             csigs.push((id, sig));
         }
         let cqc = QuorumCertificate {
+            shard_id: 0,
             height,
             round,
             kind,

@@ -51,7 +51,7 @@
 //! The signer signs **the caller's bytes, verbatim**. It never prepends,
 //! appends, hashes, re-encodes or otherwise transforms the message.
 //!
-//! The consensus domain tags — e.g. `STELLEREUM_BFT_VOTE_V2` in
+//! The consensus domain tags — e.g. `STELLEREUM_BFT_VOTE_V3` in
 //! `consensus::vote_sign_bytes` — are applied by the *caller* before the bytes
 //! reach a signer. This is deliberate. If a signer added a tag of its own, two
 //! tag schemes would meet on the same key: the signatures simply would not
@@ -309,7 +309,7 @@ impl std::error::Error for SignerError {
 ///
 /// `sign` signs the bytes it is given and nothing else. It must not add, remove
 /// or transform a domain tag: the consensus tags (e.g.
-/// `STELLEREUM_BFT_VOTE_V2` in `consensus::vote_sign_bytes`) are applied by the
+/// `STELLEREUM_BFT_VOTE_V3` in `consensus::vote_sign_bytes`) are applied by the
 /// caller, so that exactly one component owns the tag scheme. A signer that
 /// tagged on top would make the two schemes confusable on the same key.
 ///

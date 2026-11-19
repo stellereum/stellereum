@@ -455,6 +455,7 @@ async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
             return qc;
         }
         stellereum::consensus::QuorumCertificate {
+            shard_id: 0,
             height: 1,
             round: 0,
             kind: VoteKind::Precommit,

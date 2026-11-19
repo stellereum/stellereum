@@ -329,6 +329,7 @@ async fn catch_up_refuses_a_chain_with_no_real_quorum() {
         let bh = b.compute_hash();
         let v = Vote::sign(&liar, b.height, 0, VoteKind::Precommit, Some(bh));
         b.precommit_qc = Some(QuorumCertificate {
+            shard_id: 0,
             height: b.height,
             round: 0,
             kind: VoteKind::Precommit,
@@ -465,6 +466,7 @@ mod event_driven_catchup {
             height,
             block,
             certificate: QuorumCertificate {
+                shard_id: 0,
                 height,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -641,6 +643,157 @@ mod event_driven_catchup {
         assert!(
             reactive < backstop,
             "reactive must be far faster than the backstop"
+        );
+    }
+}
+
+// ============================================================================
+// Pacing at the current block tempo (2026-11-19): the catch-up PASS BUDGET.
+// ============================================================================
+//
+// The chain now produces a block roughly every 240 ms. A node that is behind
+// retries on the reactive floor (500 ms), so a pass that admits only ~one WAN
+// body fetch per attempt can fetch at most ~2 blocks/s while the chain grows at
+// ~4 blocks/s: the gap never closes, and snapshot-sync (tens of MB) can never
+// fit at all. The budget therefore scales with the known gap; the configured
+// value is only the at-tip floor.
+mod catchup_pass_budget_is_tempo_aware {
+    // The REAL policy file, already included by path above.
+    use super::catchup_policy::{catchup_pass_budget_ms, CATCHUP_BUDGET_DEFAULT_MS};
+    use stellereum::sync::LIVE_ADOPT_GAP_THRESHOLD;
+
+    /// Current live chain tempo (block interval) and the reactive retry floor.
+    const BLOCK_TEMPO_MS: u64 = 240;
+    const REACTIVE_RETRY_MS: u64 = 500;
+    /// A WAN round trip a body fetch has to pay (measured: 100-400 ms).
+    const WAN_RTT_MS: u64 = 400;
+
+    #[test]
+    fn at_tip_keeps_the_small_floor() {
+        // No gap evidence: the blind probe must not hold a healthy tick.
+        assert_eq!(
+            catchup_pass_budget_ms(CATCHUP_BUDGET_DEFAULT_MS, 0),
+            CATCHUP_BUDGET_DEFAULT_MS,
+        );
+        // ...but even the floor must fit a head read plus one body fetch over
+        // a WAN link, or the smallest possible catch-up (one block behind)
+        // times out forever. 250 ms could not do this.
+        // (`black_box`: a value pin must not be optimized into a tautology.)
+        let floor = std::hint::black_box(CATCHUP_BUDGET_DEFAULT_MS);
+        assert!(
+            floor >= 2 * WAN_RTT_MS + BLOCK_TEMPO_MS,
+            "the catch-up floor must fit two WAN round trips + one block \
+             (got {floor}ms)"
+        );
+        // And it must stay well under the backstop interval: the floor is a
+        // per-attempt cap, not a reason to idle.
+        assert!(floor < 30_000);
+    }
+
+    #[test]
+    fn a_behind_pass_outruns_the_chain() {
+        // Smallest burst a node outside the live-adopt window must clear in
+        // one pass. At 240 ms/block this is ~4 s of chain; the flat 250 ms
+        // budget covered about one body.
+        let burst = LIVE_ADOPT_GAP_THRESHOLD + 1;
+        let needed_ms = burst * BLOCK_TEMPO_MS;
+        let budget = catchup_pass_budget_ms(CATCHUP_BUDGET_DEFAULT_MS, burst);
+        assert!(
+            budget >= needed_ms,
+            "one pass must clear a {burst}-block burst at {BLOCK_TEMPO_MS}ms/block \
+             (needs {needed_ms}ms, got {budget}ms)"
+        );
+        // And it must clear it in well under one retry interval's worth of
+        // blocks, or the node still loses ground: per retry period the chain
+        // grows REACTIVE_RETRY_MS / BLOCK_TEMPO_MS blocks.
+        let grown_per_retry = REACTIVE_RETRY_MS.div_ceil(BLOCK_TEMPO_MS);
+        let budget_blocks = budget / BLOCK_TEMPO_MS;
+        assert!(
+            budget_blocks > grown_per_retry,
+            "a pass must fetch more blocks ({budget_blocks}) than the chain grows \
+             between retries ({grown_per_retry})"
+        );
+    }
+
+    #[test]
+    fn snapshot_territory_gets_the_long_budget() {
+        // >100 behind: only a snapshot can bridge it, and it needs minutes.
+        assert!(catchup_pass_budget_ms(CATCHUP_BUDGET_DEFAULT_MS, 101) >= 180_000);
+        // A walkable gap gets the medium budget.
+        assert!(catchup_pass_budget_ms(CATCHUP_BUDGET_DEFAULT_MS, 100) >= 30_000);
+        // Monotone in the gap: more evidence never shortens the pass.
+        let mut prev = 0;
+        for gap in [0u64, 1, 16, 100, 101, 1_000, 10_000] {
+            let b = catchup_pass_budget_ms(CATCHUP_BUDGET_DEFAULT_MS, gap);
+            assert!(b >= prev, "budget must not shrink as the gap grows");
+            prev = b;
+        }
+    }
+}
+
+// ============================================================================
+// A SUCCESSFUL pass that stopped short must stay reactive (2026-11-19).
+// ============================================================================
+//
+// `try_catch_up` can advance us to a snapshot boundary (or part of the walk)
+// and still return `Some`: the verified evidence that scheduled the pass is
+// then STILL ahead. That path `continue`s the tick loop, so the end-of-tick
+// persistent-evidence re-arm does not run. Without an explicit re-arm here the
+// node drops to the 30 s backstop for a walk it could finish on the next
+// reactive tick — at a 240 ms block tempo the head moves 125 blocks in that
+// window, so the "short remainder" is never closed.
+mod successful_pass_rearms_the_latch {
+    use super::catchup_policy::catchup_still_behind;
+
+    #[test]
+    fn partial_snapshot_advance_keeps_the_next_walk_reactive() {
+        // Snapshot-sync landed on boundary 1200; the verified head hint is
+        // 1500. The remaining 300 heights are the body walk's job.
+        assert!(catchup_still_behind(1200, Some((1500, [7u8; 32])), 1200));
+        // Vote/proposal evidence (no hint) is equally persistent.
+        assert!(catchup_still_behind(1200, None, 1210));
+    }
+
+    #[test]
+    fn reaching_the_named_head_does_not_spin() {
+        assert!(!catchup_still_behind(1500, Some((1500, [7u8; 32])), 1500));
+        assert!(!catchup_still_behind(1500, None, 1500));
+        // A hint BELOW our tip is stale evidence, never a re-arm.
+        assert!(!catchup_still_behind(1500, Some((1499, [7u8; 32])), 1400));
+    }
+}
+
+// ============================================================================
+// The at-tip blind probe is the DETECTION latency for a silent behind node.
+// ============================================================================
+//
+// "At tip" is inferred from the absence of ahead evidence, so a node that
+// stopped RECEIVING pushes (one-way loss, DHT-only follower) is invisible to
+// the reactive path. The blind probe is its only rescue, which makes the probe
+// window a wall-clock latency: at the current ~240 ms block tempo the old
+// 600 s value is 2 500 blocks, several snapshot generations of lag.
+mod blind_probe_tracks_the_block_tempo {
+    use super::catchup_policy::{
+        snapshot_interval, AT_TIP_PROBE_INTERVAL_MS, CATCHUP_INTERVAL_DEFAULT_MS,
+    };
+
+    const BLOCK_TEMPO_MS: u64 = 240;
+
+    #[test]
+    fn a_silent_behind_node_is_discovered_within_one_snapshot_generation() {
+        // One snapshot generation (the configured cadence; default 1000).
+        let generation_blocks = snapshot_interval();
+        let blocks = AT_TIP_PROBE_INTERVAL_MS / BLOCK_TEMPO_MS;
+        assert!(
+            blocks <= generation_blocks,
+            "the at-tip blind probe must fire within one snapshot generation \
+             ({blocks} blocks at {BLOCK_TEMPO_MS}ms > {generation_blocks})"
+        );
+        // It stays a last resort: never more frequent than the known-behind
+        // backstop, so an idle node does not poll the DHT.
+        assert!(
+            std::hint::black_box(AT_TIP_PROBE_INTERVAL_MS)
+                >= std::hint::black_box(CATCHUP_INTERVAL_DEFAULT_MS)
         );
     }
 }

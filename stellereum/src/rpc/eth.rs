@@ -73,6 +73,67 @@ use super::*;
 use axum::Json;
 use serde_json::{json, Value};
 
+/// Refuse a HISTORICAL state tag honestly.
+///
+/// This node keeps no historical EVM state window (no archive trie, no
+/// per-height account snapshots): the live engine is the only state it has.
+/// Answering a numeric/`earliest` tag from the CURRENT state would silently
+/// label today's balance/code/storage as another height's — exactly the
+/// fabricated-default failure this surface must not have. `latest`,
+/// `pending`, `safe` and `finalized` all mean this node's finalized head
+/// (single-block BFT finality), and a numeric tag equal to the head is the
+/// same committed state. Everything else is `-32004`.
+fn require_current_state_tag(
+    tag: Option<&crate::evm_adapter::BlockTag>,
+    head: u64,
+) -> Result<(), crate::evm_adapter::JsonRpcError> {
+    use crate::evm_adapter::BlockTag;
+    match tag {
+        None => Ok(()),
+        Some(BlockTag::Latest)
+        | Some(BlockTag::Pending)
+        | Some(BlockTag::Safe)
+        | Some(BlockTag::Finalized) => Ok(()),
+        Some(BlockTag::Number(n)) if *n == head => Ok(()),
+        Some(BlockTag::Earliest) if head == 0 => Ok(()),
+        Some(BlockTag::Number(n)) => Err(crate::evm_adapter::JsonRpcError::new(
+            -32004,
+            format!(
+                "historical state at block {n} is not available on this node: it serves only \
+                 its current finalized head ({head}). Use \"latest\" or a historical-root \
+                 proof instead of relabeling current state."
+            ),
+        )),
+        Some(BlockTag::Earliest) => Err(crate::evm_adapter::JsonRpcError::new(
+            -32004,
+            format!(
+                "historical state at block 0 is not available on this node: it serves only \
+                 its current finalized head ({head}). Use \"latest\" or a historical-root \
+                 proof instead of relabeling current state."
+            ),
+        )),
+    }
+}
+
+/// The block selector of an `eth_call` shape, if one was supplied.
+fn eth_call_block_tag(
+    params: &Value,
+) -> Result<Option<crate::evm_adapter::BlockTag>, crate::evm_adapter::JsonRpcError> {
+    use crate::evm_adapter::BlockTag;
+    let raw = match params {
+        Value::Array(arr) => arr.get(1),
+        Value::Object(obj) => obj
+            .get("blockTag")
+            .or_else(|| obj.get("block_tag"))
+            .or_else(|| obj.get("block")),
+        _ => None,
+    };
+    match raw {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => BlockTag::parse(v).map(Some),
+    }
+}
+
 impl RpcState {
     /// Returns the current finalized block height in hex quantity.
     pub fn eth_block_number(&self) -> String {
@@ -165,6 +226,33 @@ impl RpcState {
         self.eth_get_block_by_hash(hash, full_tx).await
     }
 
+    /// Reconstruct the native transaction body behind a receipt.
+    ///
+    /// Live receipts carry `raw_tx`; receipts hydrated after a restart do not
+    /// (`StoredReceipt` keeps no raw bytes). In that case the committed block
+    /// body in the archive store is authoritative. `None` means this node
+    /// genuinely cannot reconstruct it (body pruned / no store attached);
+    /// callers must then answer with fewer fields, never with zeroed ones.
+    fn receipt_body_tx(&self, r: &crate::rpc::TxReceipt) -> Option<crate::sharding::Transaction> {
+        if let Some(ref raw_hex) = r.raw_tx {
+            let stripped = raw_hex
+                .strip_prefix("0x")
+                .or_else(|| raw_hex.strip_prefix("0X"))
+                .unwrap_or(raw_hex);
+            if let Ok(bytes) = hex::decode(stripped) {
+                if let Ok(tx) = bincode::deserialize::<crate::sharding::Transaction>(&bytes) {
+                    return Some(tx);
+                }
+            }
+        }
+        let store = self.archive_store.as_ref()?;
+        let block = store.get_block(&r.block_hash).ok().flatten()?;
+        block
+            .transactions
+            .into_iter()
+            .find(|tx| tx.compute_tx_hash() == r.tx_hash)
+    }
+
     /// Translates a transaction receipt by transaction hash to standard `EvmReceipt`.
     ///
     /// Accepts BOTH stell hashes and EVM intent hashes (`keccak(EVM raw)`):
@@ -199,11 +287,21 @@ impl RpcState {
                 .fold(0u64, |acc, br| acc.saturating_add(br.fee_charged));
             receipt.cumulative_gas_used = crate::evm_adapter::format_u64_hex(cumulative);
             if receipt.from == "0x0000000000000000000000000000000000000000" {
-                drop(idx);
-                let mp = self.mempool.read().await;
-                if let Some(tx) = mp.get(&lookup_bytes) {
+                // Restart-hydrated receipts have no raw bytes: recover the
+                // committed body from the archive store before falling back to
+                // the (unfinalized) mempool copy. A pruned body stays unknown;
+                // the zero address is the honest "not reconstructed" marker
+                // this view already documented, never a real sender.
+                if let Some(tx) = self.receipt_body_tx(r) {
                     receipt.from = crate::evm_adapter::stell_address_to_evm(&tx.from);
                     receipt.to = Some(crate::evm_adapter::stell_address_to_evm(&tx.to));
+                } else {
+                    drop(idx);
+                    let mp = self.mempool.read().await;
+                    if let Some(tx) = mp.get(&lookup_bytes) {
+                        receipt.from = crate::evm_adapter::stell_address_to_evm(&tx.from);
+                        receipt.to = Some(crate::evm_adapter::stell_address_to_evm(&tx.to));
+                    }
                 }
             }
             Ok(Some(receipt))
@@ -247,24 +345,40 @@ impl RpcState {
         let idx = self.receipts.read().await;
         // Mined view first (settled EVM intents included): pending must not
         // shadow a finalized transaction.
+        let mined_meta = idx
+            .get(&lookup_bytes)
+            .map(|r| (r.block_hash, r.height, r.index));
         if let Some(r) = idx.get(&lookup_bytes) {
-            if is_settled_evm {
-                if let Some(evm_tx) =
-                    crate::evm_adapter::settled_tx_for_evm(&norm, r, self.chain_id)
-                {
-                    return Ok(Some(evm_tx));
+            // Never synthesise a zero-valued transaction for a receipt whose
+            // body this node does not hold (audit F-11). A live receipt carries
+            // `raw_tx`; a restart-hydrated one is reconstructed from the
+            // committed block body. If neither exists, the honest answer is
+            // `null` — the receipt/status methods still report finality.
+            if let Some(tx) = self.receipt_body_tx(r) {
+                let mut evm_tx = crate::evm_adapter::stell_tx_to_evm_with_chain(
+                    &tx,
+                    Some(r.block_hash),
+                    Some(r.height),
+                    Some(r.index),
+                    self.chain_id,
+                );
+                if is_settled_evm {
+                    evm_tx.hash = norm.clone();
                 }
-            } else if let Some(evm_tx) =
-                crate::evm_adapter::stell_receipt_to_evm_tx_with_chain(r, self.chain_id)
-            {
                 return Ok(Some(evm_tx));
             }
         }
         drop(idx);
         let mp = self.mempool.read().await;
         if let Some(tx) = mp.get(&lookup_bytes) {
+            // A pool copy of a FINALIZED transaction (not swept yet) must still
+            // report its committed block, not `null` as if it were pending.
+            let (bh, bn, ti) = match mined_meta {
+                Some((bh, h, i)) => (Some(bh), Some(h), Some(i)),
+                None => (None, None, None),
+            };
             let mut evm_tx =
-                crate::evm_adapter::stell_tx_to_evm_with_chain(tx, None, None, None, self.chain_id);
+                crate::evm_adapter::stell_tx_to_evm_with_chain(tx, bh, bn, ti, self.chain_id);
             if is_settled_evm {
                 evm_tx.hash = norm.clone();
             }
@@ -781,14 +895,38 @@ pub(super) async fn dispatch_eth(
              (no per-block base fee / gas-used history). Price with eth_gasPrice \
              and eth_maxPriorityFeePerGas; the admission floor is stell_baseFee",
         ),
-        "eth_getCode" => match crate::evm_adapter::eth_get_code_rpc(st, params).await {
-            Ok(code) => ok(id, json!(code)),
-            Err(e) => err(id, e.code, e.message),
-        },
-        "eth_getBalance" => match crate::evm_adapter::eth_get_balance(&st.engine, params).await {
-            Ok(bal) => ok(id, json!(bal)),
-            Err(e) => err(id, e.code, e.message),
-        },
+        "eth_getCode" => {
+            let tag = match crate::evm_adapter::parse_address_and_tag_params(params) {
+                Ok((_, tag)) => tag,
+                Err(e) => return Some(err(id, e.code, e.message)),
+            };
+            if let Err(e) = require_current_state_tag(
+                tag.as_ref(),
+                st.height.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                return Some(err(id, e.code, e.message));
+            }
+            match crate::evm_adapter::eth_get_code_rpc(st, params).await {
+                Ok(code) => ok(id, json!(code)),
+                Err(e) => err(id, e.code, e.message),
+            }
+        }
+        "eth_getBalance" => {
+            let tag = match crate::evm_adapter::parse_address_and_tag_params(params) {
+                Ok((_, tag)) => tag,
+                Err(e) => return Some(err(id, e.code, e.message)),
+            };
+            if let Err(e) = require_current_state_tag(
+                tag.as_ref(),
+                st.height.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                return Some(err(id, e.code, e.message));
+            }
+            match crate::evm_adapter::eth_get_balance(&st.engine, params).await {
+                Ok(bal) => ok(id, json!(bal)),
+                Err(e) => err(id, e.code, e.message),
+            }
+        }
         "eth_getTransactionCount" => {
             // On-chain nonce for the resolved account (a 20-byte EVM address
             // resolves to its BOUND PQ account), plus — for the `pending` tag,
@@ -799,6 +937,12 @@ pub(super) async fn dispatch_eth(
             let (account, want_pending) =
                 match crate::evm_adapter::parse_address_and_tag_params(params) {
                     Ok((addr, tag)) => {
+                        if let Err(e) = require_current_state_tag(
+                            tag.as_ref(),
+                            st.height.load(std::sync::atomic::Ordering::Relaxed),
+                        ) {
+                            return Some(err(id, e.code, e.message));
+                        }
                         let want_pending = tag
                             .map(|t| matches!(t, crate::evm_adapter::BlockTag::Pending))
                             .unwrap_or(false);
@@ -913,10 +1057,22 @@ pub(super) async fn dispatch_eth(
                 Err(e) => err(id, e.code, e.message),
             }
         }
-        "eth_call" => match crate::evm_adapter::eth_call_with_engine(&st.engine, params).await {
-            Ok(v) => ok(id, v),
-            Err(e) => err(id, e.code, e.message),
-        },
+        "eth_call" => {
+            let tag = match eth_call_block_tag(params) {
+                Ok(t) => t,
+                Err(e) => return Some(err(id, e.code, e.message)),
+            };
+            if let Err(e) = require_current_state_tag(
+                tag.as_ref(),
+                st.height.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                return Some(err(id, e.code, e.message));
+            }
+            match crate::evm_adapter::eth_call_with_engine(&st.engine, params).await {
+                Ok(v) => ok(id, v),
+                Err(e) => err(id, e.code, e.message),
+            }
+        }
         "eth_newBlockFilter" => ok(id, json!(crate::evm_adapter::eth_new_block_filter())),
         "eth_newPendingTransactionFilter" => ok(
             id,
@@ -942,10 +1098,22 @@ pub(super) async fn dispatch_eth(
             Ok(v) => ok(id, v),
             Err(e) => err(id, e.code, e.message),
         },
-        "eth_getStorageAt" => match st.eth_get_storage_at(params).await {
-            Ok(v) => ok(id, json!(v)),
-            Err(e) => err(id, e.code, e.message),
-        },
+        "eth_getStorageAt" => {
+            let tag = match crate::evm_adapter::parse_get_storage_at_params(params) {
+                Ok((_, _, tag)) => tag,
+                Err(e) => return Some(err(id, e.code, e.message)),
+            };
+            if let Err(e) = require_current_state_tag(
+                Some(&tag),
+                st.height.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                return Some(err(id, e.code, e.message));
+            }
+            match st.eth_get_storage_at(params).await {
+                Ok(v) => ok(id, json!(v)),
+                Err(e) => err(id, e.code, e.message),
+            }
+        }
         "eth_sendRawTransaction" => {
             // FULL-PQ EVM WRITE PATH. What this method can and cannot do:
             //

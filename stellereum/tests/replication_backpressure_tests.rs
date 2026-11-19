@@ -349,6 +349,7 @@ fn only_committed_bypasses_the_bulk_limiter() {
         height: 9,
         block: sample_block(),
         certificate: QuorumCertificate {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Precommit,

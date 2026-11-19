@@ -74,7 +74,7 @@ use crate::consensus::ValidatorId;
 // ============================================================================
 
 /// Rotation delay in heights: an announced MEV KEM key takes effect this many
-/// heights after the announcement (7,200 heights ≈ 6 h at 3 s blocks).
+/// heights after the announcement.
 ///
 /// WHY (same exit-window philosophy as
 /// [`crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS`], pinned equal in
@@ -85,9 +85,12 @@ use crate::consensus::ValidatorId;
 /// admission is consensus (every node applying the same blocks must agree on
 /// when a key activates).
 ///
-/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h at 3 s blocks.
+/// RULESET v2: 30,000 heights x 240 ms = **7,200 s (2 h)**. Full table:
+/// `docs/RULESET_V2.md`.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
 /// Change requires spec update + audit note (AGENTS.md §7).
-pub const MEV_KEM_ROTATION_DELAY_HEIGHTS: u64 = 7_200;
+pub const MEV_KEM_ROTATION_DELAY_HEIGHTS: u64 = 30_000;
 
 /// How many superseded KEM keys are retained per validator (bounded history).
 ///

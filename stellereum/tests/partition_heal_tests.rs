@@ -968,6 +968,7 @@ mod heal_is_reactive {
             height,
             block,
             certificate: QuorumCertificate {
+                shard_id: 0,
                 height,
                 round: 0,
                 kind: VoteKind::Precommit,

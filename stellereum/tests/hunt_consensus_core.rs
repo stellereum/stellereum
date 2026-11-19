@@ -808,6 +808,7 @@ fn hunt8_negative_power_attribution_checks() {
         ),
     ];
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

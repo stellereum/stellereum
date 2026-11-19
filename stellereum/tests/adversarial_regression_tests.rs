@@ -179,6 +179,7 @@ fn precommit_qc(
     // Below quorum no envelope can be compiled; the envelope-less shape is
     // unconditionally invalid under FULL-PQ (fail-closed, as asserted).
     QuorumCertificate {
+        shard_id: 0,
         height,
         round: 0,
         kind: VoteKind::Precommit,
@@ -731,6 +732,7 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
         let mut b = mkblock_falcon(&atk[0], &atk_fk0, 8 + i, prev, root);
         let bh = b.compute_hash();
         b.precommit_qc = Some(QuorumCertificate {
+            shard_id: 0,
             height: 8 + i,
             round: 0,
             kind: VoteKind::Precommit,

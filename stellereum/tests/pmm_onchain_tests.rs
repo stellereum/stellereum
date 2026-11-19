@@ -347,3 +347,60 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
         usdt_micro
     );
 }
+
+/// REGRESSION (LOGIC_BUG_SWEEP §5.2 / §13): a buy whose native mint cannot be
+/// funded must refuse BEFORE burning the buyer's wUSDT.
+///
+/// The old order burned wUSDT first, then called `credit_native`; at the
+/// global supply cap that failed, and the compensating wUSDT mint was a
+/// swallowed `let _ =`. With mint authority renounced, the refund cannot
+/// succeed, so the buyer silently lost the burned wUSDT. The new order
+/// reserves/validates the native leg first, so a refusal leaves the wUSDT
+/// balance (and the token supply) untouched.
+#[tokio::test]
+async fn pmm_buy_refuses_before_burning_when_the_native_mint_is_capped() {
+    let (engine, buyer, usdt_id, usdt_minter) = setup().await;
+    // Irreversibly remove mint authority: a post-burn compensating mint would
+    // fail, which is exactly the silent-loss branch.
+    engine
+        .token_execute(&usdt_id, usdt_minter, TokenOp::RenounceMinter)
+        .await
+        .unwrap();
+    // Fill the global mint counter to one nano below the cap.
+    let sink = [0x5Au8; 32];
+    engine
+        .mint_native(&sink, stellereum::tokenomics::TOTAL_SUPPLY_CAP - 1)
+        .await
+        .expect("precondition: fill the mint counter");
+
+    let before_bal = engine.token_balance(&usdt_id, &buyer).await;
+    let before_supply = engine
+        .tokens_read()
+        .await
+        .get(&usdt_id)
+        .map(|t| t.metadata.total_supply)
+        .unwrap();
+    let err = engine
+        .pmm_buy(buyer, 250_000)
+        .await
+        .expect_err("the native issuance cannot fit under the global cap");
+    assert!(
+        err.contains("global supply cap"),
+        "the refusal must be the supply-cap reservation, got: {err}"
+    );
+    assert_eq!(
+        engine.token_balance(&usdt_id, &buyer).await,
+        before_bal,
+        "wUSDT must not be burned when the native leg is refused"
+    );
+    assert_eq!(
+        engine
+            .tokens_read()
+            .await
+            .get(&usdt_id)
+            .map(|t| t.metadata.total_supply)
+            .unwrap(),
+        before_supply,
+        "token supply must be untouched"
+    );
+}

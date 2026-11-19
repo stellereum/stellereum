@@ -98,6 +98,7 @@ fn qc_from(
     }
     set.certificate_with_parent(Some(hash), vs, Some(&parent))
         .unwrap_or(QuorumCertificate {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Precommit,

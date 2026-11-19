@@ -21,6 +21,7 @@ use crate::consensus::{
     ValidatorSet, Vote, VoteKind, PQ_UQC_MARKER_ID,
 };
 use crate::network::P2pNetworkAdapter;
+use crate::protocol::{self, Capabilities};
 use crate::sharding::{Block, ShardRegistry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -161,8 +162,12 @@ pub const VOTE_SEND_DEDUP_TTL_MS: u64 = 200;
 /// lagging peer learns the outcome from).
 pub const SUPERSEDED_ROUND_LAG: u32 = 2;
 
-/// Wire identity of one cast vote: (height, round, kind, voter).
-pub type VoteWireKey = (u64, u32, u8, [u8; 32]);
+/// Wire identity of one cast vote: (shard, height, round, kind, voter).
+///
+/// The shard is part of the identity: one process can run the same validator
+/// key on several shards, and the send-time dedup / supersede filters must not
+/// collapse a shard-0 vote and a shard-1 vote cast at the same height/round.
+pub type VoteWireKey = (u32, u64, u32, u8, [u8; 32]);
 
 fn vote_kind_tag(kind: VoteKind) -> u8 {
     match kind {
@@ -176,6 +181,7 @@ fn vote_kind_tag(kind: VoteKind) -> u8 {
 pub fn vote_wire_key(msg: &ConsensusMsg) -> Option<VoteWireKey> {
     match msg {
         ConsensusMsg::Vote { vote, .. } => Some((
+            vote.shard_id,
             vote.height,
             vote.round,
             vote_kind_tag(vote.kind),
@@ -355,6 +361,18 @@ pub fn committed_bypasses_skip(msg: &ConsensusMsg) -> bool {
 #[cfg(test)]
 fn batch_bypasses_skip(msgs: &[ConsensusMsg]) -> bool {
     batch_bypasses_skip_refs(msgs.iter())
+}
+
+/// Whether the direct mesh may substitute for the per-peer broadcast.
+///
+/// Exempt payloads (`Committed`, see [`committed_bypasses_skip`]) must NOT
+/// use the mesh shortcut: the mesh withholds suspected peers from its direct
+/// target set, while the catch-up path deliberately still attempts them
+/// (detached, never joined). A `Committed` is exactly the frame a returning /
+/// lagging validator needs, so it always takes the per-peer path that
+/// addresses cooldown peers too.
+pub fn mesh_may_substitute(exempt_skip: bool) -> bool {
+    !exempt_skip
 }
 
 fn batch_bypasses_skip_refs<'a>(msgs: impl Iterator<Item = &'a ConsensusMsg>) -> bool {
@@ -712,6 +730,13 @@ pub struct ConsensusNetwork {
     /// Peer evictions imposed by the target policy (see
     /// [`PEER_EVICT_TARGET_MAX`]). Monotonic test/monitoring counter.
     peer_evicted_total: AtomicU64,
+    /// Resolved static peer ids, cached once every peer resolves. The config
+    /// is immutable after construction, so re-decoding every peer's PQ hex on
+    /// every frame (the mesh check AND the per-peer send resolve independently)
+    /// was pure per-block overhead at ~4 blocks/s. A config with an
+    /// unresolved name (asymmetric registry) is NOT cached, so a later
+    /// resolution is still picked up.
+    peer_ids_cache: std::sync::OnceLock<Vec<[u8; 20]>>,
 }
 
 /// Consecutive-failure counter for one peer (see `peer_health`).
@@ -1155,6 +1180,7 @@ impl ConsensusNetwork {
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
             inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
             peer_evicted_total: AtomicU64::new(0),
+            peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1185,6 +1211,7 @@ impl ConsensusNetwork {
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
             inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
             peer_evicted_total: AtomicU64::new(0),
+            peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1206,6 +1233,44 @@ impl ConsensusNetwork {
             },
             Err(_) => false,
         }
+    }
+
+    /// Capabilities negotiated with one peer.
+    ///
+    /// A peer that has not sent `Hello` yet is a legacy v2 peer and keeps the
+    /// pre-negotiation default ([`protocol::unnegotiated_capabilities`]), so
+    /// existing deployments see byte-identical traffic.
+    fn peer_caps(&self, pid: &[u8; 20]) -> Capabilities {
+        self.adapter
+            .node
+            .peer_capabilities(pid)
+            .unwrap_or_else(protocol::unnegotiated_capabilities)
+    }
+
+    /// True when consensus traffic may be addressed to this peer. A fork or
+    /// two-minor refusal was already logged loudly at Hello time; this gate is
+    /// what actually keeps the peer out of the consensus plane while leaving
+    /// DHT/storage services untouched.
+    fn peer_consensus_admitted(&self, pid: &[u8; 20]) -> bool {
+        self.adapter.node.peer_consensus_admitted(pid)
+    }
+
+    /// Partition configured peers for a chunk that may contain a compact
+    /// proposal: `(compact_ok, full_only)`. Refused peers are in NEITHER set.
+    fn proposal_capability_partition(&self) -> (Vec<[u8; 20]>, Vec<[u8; 20]>) {
+        let mut compact_ok = Vec::new();
+        let mut full_only = Vec::new();
+        for pid in self.peer_ids() {
+            if !self.peer_consensus_admitted(&pid) {
+                continue;
+            }
+            if protocol::peer_receives_compact(self.peer_caps(&pid)) {
+                compact_ok.push(pid);
+            } else {
+                full_only.push(pid);
+            }
+        }
+        (compact_ok, full_only)
     }
 
     /// Record one send/probe outcome for the backoff ledger. Returns the
@@ -1316,15 +1381,28 @@ impl ConsensusNetwork {
     /// make `broadcast` silently send nothing — stalling consensus with no error
     /// anywhere. A node id is always resolvable.
     fn peer_ids(&self) -> Vec<[u8; 20]> {
-        let mut out = Vec::new();
+        if let Some(ids) = self.peer_ids_cache.get() {
+            return ids.clone();
+        }
+        let mut out = Vec::with_capacity(self.adapter.node.cfg.peers.len());
+        let mut all_resolved = true;
         for p in &self.adapter.node.cfg.peers {
             let pid = p
                 .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
-                Err(e) => tracing::warn!("[consensus] cannot resolve peer {}: {e}", p.name),
+                Err(e) => {
+                    all_resolved = false;
+                    tracing::warn!("[consensus] cannot resolve peer {}: {e}", p.name);
+                }
             }
+        }
+        // The static config never changes after construction, so a fully
+        // resolved set can be reused for every frame. A partial set is NOT
+        // cached: the name registry may fill in later.
+        if all_resolved {
+            let _ = self.peer_ids_cache.set(out.clone());
         }
         out
     }
@@ -1576,6 +1654,15 @@ impl ConsensusNetwork {
             return;
         }
         let msgs = &live;
+        let exempt = batch_bypasses_skip_refs(msgs.iter().map(|m| &**m));
+        let fof = batch_is_fire_and_forget_refs(msgs.iter().map(|m| &**m));
+        // CAPABILITY-AWARE DUAL-EMIT: a compact proposal may only be addressed
+        // to peers that negotiated COMPACT_GOSSIP. Peers that did not get the
+        // full `Proposal` form instead (the cached body), in the same flush.
+        // Peers refused for consensus (fork/version) get neither.
+        if self.broadcast_capability_split(msgs, exempt, fof).await {
+            return;
+        }
         // Stage (a): bincode encode + hex + JSON framing. Timed separately so a
         // live measurement can tell a CPU-bound encode from a slow transport.
         let t_encode = std::time::Instant::now();
@@ -1614,21 +1701,41 @@ impl ConsensusNetwork {
         // fails. If even one direct copy failed (or coverage is partial) the
         // normal per-peer broadcast below still runs, so a lost link can never
         // lose the message; receiver-side dedup makes the duplicate harmless.
+        //
+        // EXEMPT payloads (`Committed`) never take the shortcut: the mesh
+        // withholds suspected peers, while the per-peer path still attempts
+        // them (detached) because that is the catch-up frame a lagging
+        // validator needs (see [`mesh_may_substitute`]).
         let mesh_peers = self.peer_ids();
-        if self.adapter.validator_mesh().covers(&mesh_peers) {
+        // MESH_DIRECT capability: the direct mesh may substitute for the
+        // overlay only when EVERY addressed peer advertised it. A peer without
+        // it still receives the overlay broadcast (advisory capability).
+        let mesh_capable = mesh_peers.iter().all(|pid| {
+            self.peer_consensus_admitted(pid) && protocol::mesh_may_use_direct(self.peer_caps(pid))
+        });
+        if mesh_capable
+            && mesh_may_substitute(exempt)
+            && self.adapter.validator_mesh().covers(&mesh_peers)
+        {
             let delivery = self
                 .adapter
                 .deliver_consensus_mesh(&self.topic, &data)
                 .await;
-            // COMPLETE means every ATTEMPTED direct copy succeeded. `direct_targets`
-            // already excludes peers the scoring marks dead (`routing_allowed`
-            // false and no reconnect due), so comparing against the raw config
-            // peer count made a healthy mesh look "incomplete" forever whenever
-            // one configured peer was down: every consensus frame was sent
-            // twice (direct + broadcast) and the warning fired every minute.
-            // A peer excluded as dead is covered by the DHT catch-up path, not
-            // by re-broadcasting at it on every frame.
-            if delivery.targets > 0 && delivery.direct_ok == delivery.targets {
+            // COMPLETE means every ATTEMPTED direct copy succeeded.
+            // `direct_targets` already excludes peers the scoring marks dead
+            // (suspected, even after their cooldown elapsed), so comparing
+            // against the raw config peer count made a healthy mesh look
+            // "incomplete" forever whenever one configured peer was down:
+            // every consensus frame was sent twice (direct + broadcast) and
+            // the warning fired every minute.
+            //
+            // PARTIAL failure is NOT complete, even if the mesh's overlay
+            // fallback accepted a copy: `fallback_ok` is just "some subscriber
+            // accepted", not proof that every failed direct target received
+            // it. A failed direct copy must still be addressed by the
+            // per-peer broadcast below. `MeshDelivery::delivered()` therefore
+            // requires every attempted direct copy to succeed.
+            if delivery.delivered() {
                 return;
             }
             // Mesh coverage is a property of the PEER SET, not of one message:
@@ -1654,14 +1761,130 @@ impl ConsensusNetwork {
                 );
             }
         }
-        let exempt = batch_bypasses_skip_refs(msgs.iter().map(|m| &**m));
         // Fire-and-forget for votes/proposals: the peer's ACK carries no
         // information the sender needs, but it costs a full round trip
         // (300-1200 ms on WAN) and the ordered sender is FIFO, so an awaited
         // ACK also delays the NEXT chunk. A chunk carrying a `Committed`
-        // keeps the acknowledged form (the catch-up proof).
-        let fof = batch_is_fire_and_forget_refs(msgs.iter().map(|m| &**m));
+        // keeps the acknowledged form (the catch-up proof). `fof`/`exempt`
+        // were computed before the capability split above.
         self.send_payload_with_skip(payload, exempt, fof).await;
+    }
+
+    /// Dual-emit a chunk that contains a compact proposal.
+    ///
+    /// Returns `true` when the chunk was fully dispatched here (the caller
+    /// must not send the original payload to everybody), `false` when no
+    /// capability split is needed (no compact proposal, or every peer can
+    /// decode it).
+    async fn broadcast_capability_split(
+        &self,
+        msgs: &[std::borrow::Cow<'_, ConsensusMsg>],
+        exempt: bool,
+        fire_and_forget: bool,
+    ) -> bool {
+        if !msgs
+            .iter()
+            .any(|m| matches!(&**m, ConsensusMsg::CompactProposal { .. }))
+        {
+            return false;
+        }
+        let (compact_ok, full_only) = self.proposal_capability_partition();
+        if full_only.is_empty() {
+            return false;
+        }
+        // Build the full form for every compact member. A missing cached body
+        // must NEVER turn into a compact frame for a non-capable peer: we then
+        // address the capable peers only and say so loudly (the others still
+        // catch up through `Committed`/DHT, never through an undecodable
+        // frame).
+        let mut full_msgs: Vec<ConsensusMsg> = Vec::with_capacity(msgs.len());
+        for m in msgs {
+            match &**m {
+                ConsensusMsg::CompactProposal { .. } => match full_proposal_for_compact(m) {
+                    Some(full) => full_msgs.push(full),
+                    None => {
+                        tracing::error!(
+                            "[consensus] compact chunk has no cached full body; refusing to send \
+                             a compact frame to {} non-COMPACT_GOSSIP peer(s) (they catch up via \
+                             Committed/DHT instead)",
+                            full_only.len()
+                        );
+                        if !compact_ok.is_empty() {
+                            self.encode_and_send_batch(msgs, compact_ok, exempt, fire_and_forget)
+                                .await;
+                        }
+                        return true;
+                    }
+                },
+                other => full_msgs.push(other.clone()),
+            }
+        }
+        if !compact_ok.is_empty() {
+            self.encode_and_send_batch(msgs, compact_ok, exempt, fire_and_forget)
+                .await;
+        }
+        // The full chunk carries the cached `Proposal` plus any votes that
+        // travelled with it; receiving both representations is harmless
+        // (receiver dedup keeps the first proposal per height/round).
+        self.encode_and_send_owned(&full_msgs, full_only, exempt, fire_and_forget)
+            .await;
+        true
+    }
+
+    /// Encode and send an already-materialized chunk to an explicit peer set.
+    async fn encode_and_send_owned(
+        &self,
+        msgs: &[ConsensusMsg],
+        peers: Vec<[u8; 20]>,
+        exempt: bool,
+        fire_and_forget: bool,
+    ) {
+        if msgs.is_empty() {
+            return;
+        }
+        let owned: Vec<std::borrow::Cow<'_, ConsensusMsg>> =
+            msgs.iter().map(std::borrow::Cow::Borrowed).collect();
+        self.encode_and_send_batch(&owned, peers, exempt, fire_and_forget)
+            .await;
+    }
+
+    /// Encode a borrowed chunk exactly like [`Self::broadcast_batch`] does and
+    /// send it only to `peers`.
+    async fn encode_and_send_batch(
+        &self,
+        msgs: &[std::borrow::Cow<'_, ConsensusMsg>],
+        peers: Vec<[u8; 20]>,
+        exempt: bool,
+        fire_and_forget: bool,
+    ) {
+        if peers.is_empty() || msgs.is_empty() {
+            return;
+        }
+        let t_encode = std::time::Instant::now();
+        let frame = match encode_broadcast_payload(&self.topic, msgs) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "[consensus] capability-split encode failed ({}): chunk dropped for {} peer(s)",
+                    e.message(),
+                    peers.len()
+                );
+                return;
+            }
+        };
+        log_stage(
+            &ENCODE_STAGE_GATE,
+            "encode",
+            &format!(
+                "items={} bytes={} split_peers={}",
+                msgs.len(),
+                frame.encoded_len,
+                peers.len()
+            ),
+            t_encode.elapsed(),
+        );
+        self.send_payload_to(peers, frame.payload, exempt, fire_and_forget)
+            .await;
     }
 
     /// Single-encode fallback for a chunk that failed batch encoding (see
@@ -1898,9 +2121,56 @@ impl ConsensusNetwork {
         fire_and_forget: bool,
     ) {
         let peers = self.peer_ids();
+        self.send_payload_to(peers, payload, exempt_skip, fire_and_forget)
+            .await;
+    }
+
+    /// Per-peer delivery for an explicit peer set (the capability split sends
+    /// different encodings to different peers in the same flush).
+    async fn send_payload_to(
+        &self,
+        peers: Vec<[u8; 20]>,
+        payload: Vec<u8>,
+        exempt_skip: bool,
+        fire_and_forget: bool,
+    ) {
         if peers.is_empty() {
             tracing::warn!("[consensus] no resolvable peers to broadcast to");
             return;
+        }
+        // CONSENSUS-REFUSED PEERS (fork mismatch / two-minor gap): never
+        // receive consensus traffic. The refusal was logged once at Hello
+        // time; this is the enforcement point. DHT/blob services are a
+        // separate frame class and stay available.
+        let mut refused = 0u32;
+        let peers: Vec<[u8; 20]> = peers
+            .into_iter()
+            .filter(|pid| {
+                if self.peer_consensus_admitted(pid) {
+                    true
+                } else {
+                    refused += 1;
+                    false
+                }
+            })
+            .collect();
+        if peers.is_empty() {
+            if refused > 0 {
+                tracing::warn!(
+                    "[consensus] all {} peer(s) are refused for consensus (fork/version); \
+                     nothing sent",
+                    refused
+                );
+            } else {
+                tracing::warn!("[consensus] no resolvable peers to broadcast to");
+            }
+            return;
+        }
+        if refused > 0 {
+            tracing::debug!(
+                "[consensus] skipped {} peer(s) refused for consensus participation",
+                refused
+            );
         }
         // Joined set = live peers only. Cooldown peers on an EXEMPT payload
         // are still attempted (catch-up must reach a returning node) but as
@@ -2260,6 +2530,17 @@ pub fn encode_compact_qc_gossip(qc: &QuorumCertificate) -> Result<Vec<u8>, Strin
 /// lives at `compact_gossip_bytes_for` / `parse_compact_qc_incoming`).
 /// `None` on any malformed frame; non-PQ schemes refuse (FULL-PQ).
 pub fn decode_compact_qc_gossip(bytes: &[u8]) -> Option<QuorumCertificate> {
+    decode_compact_qc_gossip_in_shard(bytes, crate::sharding::MASTERCHAIN_SHARD)
+}
+
+/// [`decode_compact_qc_gossip`] for a known shard. The compact frame is
+/// shard-scoped by its topic, so the caller supplies the shard the frame
+/// arrived on; the rebuilt certificate's signatures are verified against that
+/// shard's vote preimage.
+pub fn decode_compact_qc_gossip_in_shard(
+    bytes: &[u8],
+    shard_id: crate::sharding::ShardId,
+) -> Option<QuorumCertificate> {
     if bytes.len() < compact_prop::COMPACT_QC_MAGIC.len()
         || &bytes[..compact_prop::COMPACT_QC_MAGIC.len()] != compact_prop::COMPACT_QC_MAGIC
     {
@@ -2291,6 +2572,7 @@ pub fn decode_compact_qc_gossip(bytes: &[u8]) -> Option<QuorumCertificate> {
         kind,
         block_hash: compact.block_hash,
         signatures: vec![(PQ_UQC_MARKER_ID, envelope)],
+        shard_id,
     })
 }
 
@@ -2465,7 +2747,10 @@ impl CompactIndexCache {
         let salt = compact_prop::salt_for_header(header);
         self.entries
             .iter()
-            .find(|(s, _, at)| *s == salt && now.duration_since(*at).as_millis() as u64 <= COMPACT_INDEX_CACHE_TTL_MS)
+            .find(|(s, _, at)| {
+                *s == salt
+                    && now.duration_since(*at).as_millis() as u64 <= COMPACT_INDEX_CACHE_TTL_MS
+            })
             .map(|(_, index, _)| index)
     }
 
@@ -2487,11 +2772,8 @@ impl CompactIndexCache {
             self.entries.remove(0);
         }
         self.builds += 1;
-        self.entries.push((
-            salt,
-            compact_prop::ShortIdIndex::from_txs(salt, txs),
-            now,
-        ));
+        self.entries
+            .push((salt, compact_prop::ShortIdIndex::from_txs(salt, txs), now));
         &self.entries.last().expect("just pushed").1
     }
 }
@@ -2504,10 +2786,92 @@ impl CompactIndexCache {
 /// still reaches lagging peers through the existing DHT/sync catch-up path:
 /// this selector only chooses the GOSSIP representation.
 pub fn proposal_gossip_msg(block: &Block, round: u32) -> ConsensusMsg {
+    // Keep the FULL body reachable for peers that did not negotiate
+    // COMPACT_GOSSIP: the compact announcement does not carry the txs, so the
+    // sender needs the block to dual-emit a full `Proposal` to those peers at
+    // broadcast time. Bounded (4 heights/rounds); a miss degrades to "do not
+    // send compact to a peer that cannot decode it" (never the reverse).
+    remember_proposal_body(block, round);
     compact_proposal_from_block(block, round).unwrap_or_else(|| ConsensusMsg::Proposal {
         height: block.height,
         round,
         block: block.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Dual-emit support: the full body behind the most recent compact proposals.
+//
+// A compact proposal is header + short ids + inline full slots. To honour the
+// capability contract ("a peer without COMPACT_GOSSIP never receives a compact
+// frame") the sender must be able to address THOSE peers with the full
+// `Proposal`, which needs the block body. `proposal_gossip_msg` caches it here
+// (one short-lived entry per emitted proposal), so the broadcast layer can
+// build the full form without changing the compact wire format or the node's
+// proposal call sites.
+// ---------------------------------------------------------------------------
+
+/// Number of recently emitted proposal bodies retained for dual-emit.
+pub const PROPOSAL_BODY_CACHE_MAX: usize = 4;
+
+#[derive(Default)]
+struct ProposalBodyCache {
+    entries: VecDeque<(u64, u32, [u8; 32], Block)>,
+}
+
+impl ProposalBodyCache {
+    fn insert(&mut self, block: &Block, round: u32) {
+        let hash = block.compute_hash();
+        self.entries
+            .retain(|(h, r, b, _)| !(*h == block.height && *r == round && *b == hash));
+        self.entries
+            .push_back((block.height, round, hash, block.clone()));
+        while self.entries.len() > PROPOSAL_BODY_CACHE_MAX {
+            self.entries.pop_front();
+        }
+    }
+
+    fn get(&self, height: u64, round: u32, hash: &[u8; 32]) -> Option<Block> {
+        self.entries
+            .iter()
+            .find(|(h, r, b, _)| *h == height && *r == round && b == hash)
+            .map(|(_, _, _, block)| block.clone())
+    }
+}
+
+static PROPOSAL_BODIES: OnceLock<Mutex<ProposalBodyCache>> = OnceLock::new();
+
+fn proposal_body_cache() -> &'static Mutex<ProposalBodyCache> {
+    PROPOSAL_BODIES.get_or_init(|| Mutex::new(ProposalBodyCache::default()))
+}
+
+/// Cache the full body of an emitted proposal for capability-aware dual-emit.
+pub fn remember_proposal_body(block: &Block, round: u32) {
+    match proposal_body_cache().lock() {
+        Ok(mut c) => c.insert(block, round),
+        Err(e) => e.into_inner().insert(block, round),
+    }
+}
+
+/// Retrieve the full `Proposal` equivalent of a compact announcement.
+///
+/// `None` when the body is no longer cached (or the message is not a compact
+/// proposal). Callers MUST treat `None` as "cannot address a non-capable peer
+/// with this chunk" and MUST NOT fall back to sending the compact form.
+pub fn full_proposal_for_compact(msg: &ConsensusMsg) -> Option<ConsensusMsg> {
+    let ConsensusMsg::CompactProposal { proposal } = msg else {
+        return None;
+    };
+    let block = match proposal_body_cache().lock() {
+        Ok(c) => c.get(proposal.height, proposal.round, &proposal.block_hash),
+        Err(e) => e
+            .into_inner()
+            .get(proposal.height, proposal.round, &proposal.block_hash),
+    }?;
+    Some(ConsensusMsg::Proposal {
+        height: block.height,
+        round: proposal.round,
+        block,
     })
 }
 
@@ -2921,7 +3285,12 @@ impl CompactBodyServer {
 
     /// Consume one served-once + rate-limit slot for `(requester, pull)`.
     /// `None` means "do not answer" (replay, rate limit, or structurally bad).
-    fn admit_request(&mut self, requester: &str, pull: &compact_prop::BodyPull, now_ms: u64) -> bool {
+    fn admit_request(
+        &mut self,
+        requester: &str,
+        pull: &compact_prop::BodyPull,
+        now_ms: u64,
+    ) -> bool {
         let mut ids = pull.ids.clone();
         ids.sort_unstable();
         let key = ServedKey {
@@ -3216,6 +3585,10 @@ pub struct TxGossip {
     /// deterministically via `dandelion_reseed` in tests/sim). Mutex-only,
     /// never held across await; the OFF path never touches it.
     dandelion_rng: Mutex<dandelion::NodeRng>,
+    /// Same resolved-static-peer cache as [`ConsensusNetwork::peer_ids`]:
+    /// tx broadcast runs per transaction, and re-decoding every PQ hex each
+    /// time is pure overhead on a hot path.
+    peer_ids_cache: std::sync::OnceLock<Vec<[u8; 20]>>,
 }
 
 impl TxGossip {
@@ -3229,6 +3602,7 @@ impl TxGossip {
             send_limit: Mutex::new(SendRateLimiter::with_defaults()),
             dandelion: Mutex::new(dandelion::DandelionRelay::with_defaults()),
             dandelion_rng: Mutex::new(dandelion::NodeRng::new(rand::random::<u64>())),
+            peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -3237,15 +3611,25 @@ impl TxGossip {
     /// silently sent nothing, starving the peer's mempool (and its blocks)
     /// with no error anywhere (audit 2026-10-06).
     fn peer_ids(&self) -> Vec<[u8; 20]> {
-        let mut out = Vec::new();
+        if let Some(ids) = self.peer_ids_cache.get() {
+            return ids.clone();
+        }
+        let mut out = Vec::with_capacity(self.adapter.node.cfg.peers.len());
+        let mut all_resolved = true;
         for p in &self.adapter.node.cfg.peers {
             let pid = p
                 .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
-                Err(e) => tracing::warn!("[txgossip] cannot resolve peer {}: {e}", p.name),
+                Err(e) => {
+                    all_resolved = false;
+                    tracing::warn!("[txgossip] cannot resolve peer {}: {e}", p.name);
+                }
             }
+        }
+        if all_resolved {
+            let _ = self.peer_ids_cache.set(out.clone());
         }
         out
     }
@@ -4328,6 +4712,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -4380,6 +4765,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -4652,6 +5038,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -4803,6 +5190,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -4904,6 +5292,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -5379,6 +5768,7 @@ mod tests {
     fn tagged_vote(height: u64) -> ConsensusMsg {
         ConsensusMsg::Vote {
             vote: Vote {
+                shard_id: 0,
                 height,
                 round: 0,
                 kind: VoteKind::Prevote,
@@ -5477,6 +5867,7 @@ mod tests {
             height: 9,
             block: sample_block(),
             certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
                 height: 9,
                 round: 0,
                 kind: VoteKind::Precommit,
@@ -5624,6 +6015,7 @@ mod tests {
         );
         let env = crate::consensus::encode_pq_micro_envelope(&cert);
         crate::consensus::QuorumCertificate {
+            shard_id: 0,
             height: 900,
             round: 3,
             kind: VoteKind::Precommit,
@@ -5653,6 +6045,7 @@ mod tests {
         );
         // A QC with no µQC envelope refuses: the caller keeps the full path.
         let bare = crate::consensus::QuorumCertificate {
+            shard_id: 0,
             height: 1,
             round: 0,
             kind: VoteKind::Precommit,
@@ -5846,13 +6239,14 @@ mod tests {
         //   + 4 committee + 4 bitmask_len + 8 bitmask + 4 sig_count
         //   + 64*(4 len + 666 sig) = 42961;
         // full = 8 height + 4 round + 4 kind + 1 hash_flag + 32 hash
-        //   + 8 vec_len + 32 marker + 8 env_len + envelope = 97 + 42961;
+        //   + 8 vec_len + 32 marker + 8 env_len + envelope
+        //   + 4 shard_id (the V3 vote binding) = 101 + 42961;
         // compact (compact_prop.rs:compact_qc_bytes) = 8 magic + 8 height
         //   + 4 round + 1 kind + 1 hash_flag + 32 hash + 1 scheme + 4
         //   committee + 32 parent + 4 bitmask_len + 8 bitmask + 4 sig_count
         //   + 64*(4 len + 666 sig) = 107 + 64*(4+666).
-        assert_eq!(full, 97 + 42961);
-        assert_eq!(full, 43058);
+        assert_eq!(full, 101 + 42961);
+        assert_eq!(full, 43062);
         assert_eq!(compact, 107 + 64 * (4 + 666));
         assert_eq!(compact, 42987);
         assert_eq!(
@@ -5863,9 +6257,9 @@ mod tests {
             compact < full,
             "compact {compact} must beat full {full} on identical sig material"
         );
-        // 71 B saved on the live shape = 97 (outer QC framing) - 26
-        // (compact cert framing 107 vs envelope 81).
-        assert_eq!(full - compact, 71);
+        // 75 B saved on the live shape = 101 (outer QC framing incl. the
+        // shard binding) - 26 (compact cert framing 107 vs envelope 81).
+        assert_eq!(full - compact, 75);
     }
 }
 

@@ -14,8 +14,8 @@ disaster today?* This document answers that for the live 4-validator topology in
 
 ## 0. TL;DR
 
-1. **On-chain governance works; only binary execution is still gated.** The
-   block-carried gate is `GOV_OPS_ACTIVATION_HEIGHT = 0`
+1. **On-chain governance works; binary execution is armed by the chain spec.**
+   The block-carried gate is `GOV_OPS_ACTIVATION_HEIGHT = 0`
    (`stellereum/src/governance.rs:151`): signed `SysCallGovPropose` /
    `SysCallGovVote` transactions apply on every node, and the deterministic sweep
    finalizes due proposals and executes every matured `GovAction` in ascending id
@@ -23,25 +23,30 @@ disaster today?* This document answers that for the live 4-validator topology in
    `stellereum/src/state_engine/apply.rs`). The direct RPC form remains solo-only
    and still refuses on `validator_set.len() > 1`
    (`stellereum/src/governance.rs:1082+`), so multi-node governance uses the
-   block form. **The remaining blocker is `SoftwareUpgrade`/`CancelUpgrade`
-   execution:** those actions additionally require
-   `UPGRADE_EXEC_ACTIVATION_HEIGHT` (`stellereum/src/governance.rs:80`), still
-   `u64::MAX`, so a passed upgrade proposal stays `Passed` and never installs
-   `AppliedParams::upgrade_plan`. The halt-on-upgrade code in
-   `stellereum/src/node/consensus_driver.rs:3112-3200` is therefore reachable
-   only after that second gate is ratified.
-2. **Every real gate is a compile-time constant inside a binary**, so "flipping a height"
-   is always a coordinated binary swap. One exception is worse: the only *env*-driven
-   consensus gate, `STELL_CHAIN_BIND_ACTIVATION_HEIGHT`, is read inside the apply path
-   (`stellereum/src/state_engine/parallel.rs:804`,
+   block form. **`SoftwareUpgrade` plan installation additionally requires the
+   upgrade-execution gate:** its EFFECTIVE height is the genesis chain-spec
+   value (`chain_spec::GenesisChainSpec::upgrade_exec_activation_height`), with
+   the compiled `UPGRADE_EXEC_ACTIVATION_HEIGHT` (`u64::MAX`) as the default
+   for chains that do not set it. A chain that leaves the default keeps the old
+   inert behaviour; a chain that sets `H` at genesis installs a passed plan at
+   the first applied block at/after `H`, making the halt-on-upgrade code in
+   `stellereum/src/node/consensus_driver.rs:3112-3200` reachable.
+   `CancelUpgrade` is a safety valve and is not gated: it clears a plan before
+   or after `H`.
+2. **Most gates are compile-time constants inside a binary**, so "flipping a height" is
+   normally a coordinated binary swap. The upgrade-execution gate is now the exception:
+   its effective value is fixed in the genesis chain spec (compiled `u64::MAX` default),
+   so a chain can arm on-chain upgrades without a special binary. One remaining hazard is
+   the *env*-driven consensus gate `STELL_CHAIN_BIND_ACTIVATION_HEIGHT`, read inside the
+   apply path (`stellereum/src/state_engine/parallel.rs:804`,
    `stellereum/src/node/consensus_driver.rs:1555`) — a per-node env edit is a fork window,
    not a config change.
-3. **Mixed versions fail closed, never silently fork** — with three caveats: `FRAME_VERSION`
+3. **Mixed versions fail closed, never silently fork** — with two caveats: `FRAME_VERSION`
    is exact-match `2` with no negotiation (`infnode/crates/infnode/src/proto.rs:137,266`),
-   the consensus `ValidatorId` is still the Ed25519 key while vote validity is Falcon-only
-   (`stellereum/src/consensus/types.rs:1095-1107,1181-1183`), and the executed
-   `upgrade_plan` is **not** in the commitment digest (`stellereum/src/commitment.rs:726-757`
-   has no `upgrade_plan` arm), so the trigger is local, uncommitted state.
+   and the consensus `ValidatorId` is still the Ed25519 key while vote validity is
+   Falcon-only (`stellereum/src/consensus/types.rs:1095-1107,1181-1183`). The executed
+   `upgrade_plan` IS in the commitment digest (`commitment.rs` hashes presence/name/height/
+   sha256), so a local-only plan can no longer hide behind an identical root.
 4. **The recovery mechanism has a hard, provable deadlock.** A caught-up node restores a
    snapshot at height `B` and then refuses any body walk longer than **256** blocks
    (`stellereum/src/node/sync.rs:698`), while consecutive snapshots can be up to
@@ -75,7 +80,8 @@ stellereum/src/mev_epoch.rs:1703:pub const MEV_RESHARE_ACTIVATION_HEIGHT: u64 = 
 stellereum/src/consensus/sortition.rs:179:pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/consensus/sortition.rs:539:pub const BEACON_DRAW_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/consensus/sortition.rs:650:pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
-stellereum/src/governance.rs:80:pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;
+stellereum/src/governance.rs:80:pub const UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = u64::MAX;  // compiled default only
+stellereum/src/chain_spec.rs: GenesisChainSpec { upgrade_exec_activation_height: u64 }  // effective (genesis)
 stellereum/src/tokenomics.rs:55:pub const EMISSIONCapEXACT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/oracle.rs:205:pub const SPRT_TIER3_ACTIVATION_HEIGHT: u64 = u64::MAX;
 stellereum/src/chain_binding.rs:48:pub const CHAIN_BINDING_ACTIVATION_HEIGHT: u64 = CHAIN_BINDING_NEVER;
@@ -98,16 +104,17 @@ Thirteen constants (one env-adjacent `CHAIN_BINDING_NEVER` is the explicit never
 | 8 | `MEV_RESHARE_ACTIVATION_HEIGHT` | `u64::MAX` | `mev_epoch.rs:1703` | `is_reshare_active` (`:1714-1717`), `runtime/mev_sync.rs:357` | **Binary swap.** Not registered in `chain_spec` |
 | 9 | `GOV_OPS_ACTIVATION_HEIGHT` | `0` | `governance.rs:151` | `gov_ops_active_at`; `apply_gov_ops` + deterministic `apply_governance_transition` (`state_engine/apply.rs`) | **Active from genesis.** Block-carried propose/vote and finalize/execute run on every node. Still not registered in `chain_spec` |
 | 10 | `SPRT_TIER3_ACTIVATION_HEIGHT` | `u64::MAX` | `oracle.rs:205` | `sprt_tier3_active_at` (`:223-227`) | **Binary swap.** Not in `chain_spec` |
-| 11 | `UPGRADE_EXEC_ACTIVATION_HEIGHT` | `u64::MAX` | `governance.rs:80` | `upgrade_exec_active_at`, `due_governance_ids` | **Binary swap.** Separate gate: `SoftwareUpgrade`/`CancelUpgrade` execute only when this is open; not in `chain_spec` |
+| 11 | `UPGRADE_EXEC_ACTIVATION_HEIGHT` | compiled default `u64::MAX`; effective value from the genesis chain spec | `governance.rs:80` (default); `chain_spec.rs` (`GenesisChainSpec::upgrade_exec_activation_height`) | `upgrade_exec_active_at` reads the chain spec; `due_governance_ids`, direct RPC, legacy `execute`, oracle variant all funnel through it | **Genesis chain-spec value.** `SoftwareUpgrade` installs at/after `H`; a chain that does not set `H` keeps the old inert `u64::MAX` behaviour. `CancelUpgrade` is ungated (safety valve) |
 | 12 | `CHAIN_BINDING_ACTIVATION_HEIGHT` | `CHAIN_BINDING_NEVER` | `chain_binding.rs:48` | `check_admission*` | **Binary swap.** Retire the env form (§4 item 11) |
 | 13 | `ZKML_CONTEXT_BINDING_ACTIVATION_HEIGHT` | `u64::MAX` | `zkml_attestation.rs:144` | context-bound attestation transcript | **Binary swap.** Opt-in seam, not in `chain_spec` |
 
-The consolidated registry `chain_spec::current_activation_schedule()` lists only seven of
-these (`stellereum/src/chain_spec.rs:130-180`): QC split, beacon draw, CN-VRF v3, compact
-gossip, emission, PQ transport, XPC. **Missing from the registry: `MEV_RESHARE`,
-`GOV_OPS`, `SPRT_TIER3`, `UPGRADE_EXEC`, `CHAIN_BINDING`, `ZKML_CONTEXT_BINDING`** — an
-operator inspecting "the schedule" cannot see the gate that still blocks
-`SoftwareUpgrade` execution, even though governance itself is active.
+The consolidated registry `chain_spec::current_activation_schedule()` now lists eight of
+these (`stellereum/src/chain_spec.rs`): QC split, beacon draw, CN-VRF v3, compact gossip,
+emission, PQ transport, XPC, and `UPGRADE_EXEC_ACTIVATION_HEIGHT` (sourced from the
+genesis chain spec, with the compiled `u64::MAX` default). **Still missing from the
+registry: `MEV_RESHARE`, `GOV_OPS`, `SPRT_TIER3`, `CHAIN_BINDING`,
+`ZKML_CONTEXT_BINDING`** — an operator inspecting "the schedule" can now see the
+upgrade-execution gate, but the other five remain invisible.
 
 #### Runtime (environment) switches that also change consensus
 
@@ -155,8 +162,10 @@ operator inspecting "the schedule" cannot see the gate that still blocks
    (`state_engine/apply.rs`) finalizes every `Open` proposal whose voting window closed
    and executes every `Passed`, matured `GovAction` in ascending id order, with the tally
    re-derived from committed state. It takes no write lock on an ordinary block. All 13
-   `GovAction` types go through this sweep; `SoftwareUpgrade`/`CancelUpgrade` are filtered
-   out unless `upgrade_exec_active_at(height)` is also true.
+   `GovAction` types go through this sweep; `SoftwareUpgrade` is filtered out unless
+   `upgrade_exec_active_at(height)` (the genesis chain-spec gate) is also true.
+   `CancelUpgrade` is deliberately always eligible: it is a safety valve that can only
+   clear a plan, so it works before and after the gate opens.
 3. **The plan is committed.** `commitment.rs` hashes `applied.upgrade_plan` (presence,
    name, height, sha256), so a local-only plan can no longer hide behind an identical
    root.
@@ -166,11 +175,29 @@ operator inspecting "the schedule" cannot see the gate that still blocks
    refuses on `validator_set.len() > 1`; the escape hatch
    `STELL_GOV_ALLOW_MULTINODE_WRITES=1` is still documented as fork-prone.
 
-**Remaining blocker:** `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX`
-(`governance.rs:80`). A passed `SoftwareUpgrade`/`CancelUpgrade` is finalized but never
-matures into `upgrade_plan`, so the binary halt/exec path stays unreachable. This gate is
+**Gate source (no special binary):** the effective upgrade-execution height is
+`chain_spec::GenesisChainSpec::upgrade_exec_activation_height`, installed once per process
+by `chain_spec::install_genesis_chain_spec` **before the first block** (tests use the
+thread-scoped override). The compiled `UPGRADE_EXEC_ACTIVATION_HEIGHT = u64::MAX`
+(`governance.rs:80`) is only the default for a chain whose genesis spec does not set a
+value, so existing chains and tests keep the old inert behaviour. The gate remains
 deliberately separate from `GOV_OPS_ACTIVATION_HEIGHT`: a binary rollout is a heavier,
 separately ratified decision than a parameter change.
+
+A `SoftwareUpgrade { height }` is additionally refused at apply when `height <=` the
+current block height (no retroactive plan), and the legacy height-less `execute` refuses
+a plan because it cannot prove the halt height is still in the future. `CancelUpgrade`
+is not gated and clears the committed plan deterministically before or after `H`.
+
+**Determinism:** a non-default chain-spec value is folded into the state commitment
+(`commitment.rs::governance_digest`, domain `GENESIS_CHAIN_SPEC_V1`; the compiled
+`u64::MAX` default writes ZERO bytes so existing genesis KATs are unchanged). Two nodes
+with different values therefore derive different state roots and the genesis guard
+refuses them. The remaining wiring is the install call itself: `node/bootstrap.rs` must
+call `chain_spec::install_genesis_chain_spec(...)` **before** the first
+`get_state_root()` at `stellereum/src/node/bootstrap.rs:206` (the persisted fingerprint is
+compared at `:246-270`). That file is owned by the UP-3 agent; until that call exists, an
+operator cannot set a non-default value in production (the compiled default applies).
 
 #### 1.2.3 The halt is a predicate, not a one-shot event
 
@@ -516,9 +543,9 @@ single most important change is **making the on-chain path work** — today the 
   drop it (loud on the new side only). This is the observability half: operators can see
   "peer 3 is on protocol 4" instead of guessing from stalls.
 - Compute `schedule_hash = blake3(chain_spec::summary_lines())`. This single value covers
-  every gate, including the six the registry currently omits
-  (`MEV_RESHARE`, `GOV_OPS`, `UPGRADE_EXEC`, `SPRT_TIER3`, `CHAIN_BINDING`,
-  `ZKML_CONTEXT_BINDING`).
+  every gate, including the five the registry currently omits (`MEV_RESHARE`, `GOV_OPS`,
+  `SPRT_TIER3`, `CHAIN_BINDING`, `ZKML_CONTEXT_BINDING`); `UPGRADE_EXEC` is now in the
+  registry and its value is the genesis chain-spec value.
 
 #### C2. Announced upgrade height (reuse `GovAction::SoftwareUpgrade`)
 
@@ -536,8 +563,9 @@ single most important change is **making the on-chain path work** — today the 
   needed because the arm is self-conditional (`None` contributes nothing).
 - ~~**Make execution deterministic**~~ **DONE:** `apply_governance_transition` finalizes and
   executes every due action in ascending id order with `now = block.timestamp` and
-  `cur_height = block.height`. The only remaining piece is the separate
-  `UPGRADE_EXEC_ACTIVATION_HEIGHT` gate for `SoftwareUpgrade`/`CancelUpgrade`.
+  `cur_height = block.height`. The separate `UPGRADE_EXEC_ACTIVATION_HEIGHT` gate now
+  comes from the genesis chain spec (compiled `u64::MAX` default); `CancelUpgrade` is
+  intentionally ungated.
 - ~~**Make propose/vote block-carried**~~ **DONE:** `GOV_OPS_ACTIVATION_HEIGHT = 0`, and
   the RPC `tx` form admits signed `SysCallGovPropose`/`SysCallGovVote` payloads on every
   node.
@@ -626,12 +654,12 @@ single most important change is **making the on-chain path work** — today the 
 
 #### C8. Registry completeness
 
-- Add `MEV_RESHARE`, `GOV_OPS`, `UPGRADE_EXEC`, `SPRT_TIER3`, `CHAIN_BINDING` and
-  `ZKML_CONTEXT_BINDING` to `chain_spec::current_activation_schedule`
-  (`chain_spec.rs:130-180`) and expose it (plus `schedule_hash`) over `stell_chainSpec` /
-  `/api/version`. Today the only way to read the schedule is a Rust library call; operators
-  cannot ask a running binary which rules it will apply, and in particular cannot see the
-  `UPGRADE_EXEC` gate that still blocks binary execution.
+- `UPGRADE_EXEC_ACTIVATION_HEIGHT` is now in `chain_spec::current_activation_schedule`
+  and sourced from the genesis chain spec. Still to add: `MEV_RESHARE`, `GOV_OPS`,
+  `SPRT_TIER3`, `CHAIN_BINDING` and `ZKML_CONTEXT_BINDING`, plus exposing the schedule
+  (and `schedule_hash`) over `stell_chainSpec` / `/api/version`. Today the only way to
+  read the schedule is a Rust library call; operators cannot ask a running binary which
+  rules it will apply.
 
 ### 2.3 Operator timeline under the proposal
 
@@ -856,10 +884,10 @@ or wire.
 | 3 | `build.rs` + `exe_sha256` in `/api/version` and metrics | `stellereum/build.rs` (new); `metrics.rs:1270-1360`; `explorer.rs:2091-2104` | L | Binary pinning is impossible today (`"unknown"`) |
 | 4 | ~~Commit `applied.upgrade_plan`~~ **LANDED** | `commitment.rs:784` | **H** | Plan is now part of the state root |
 | 5 | ~~Deterministic `execute_due` sweep for matured proposals~~ **LANDED** (all non-upgrade actions) | `state_engine/apply.rs` (`apply_governance_transition`); `governance.rs::execute_due_governance_at_height` | **H** | Every block executes due actions; `SoftwareUpgrade`/`CancelUpgrade` still need gate #6 |
-| 6 | ~~Activate `GOV_OPS_ACTIVATION_HEIGHT`~~ **LANDED at 0**; ratify `UPGRADE_EXEC_ACTIVATION_HEIGHT` to enable binary execution | `governance.rs:80,151`; `state_engine/apply.rs` | **H** | Multi-node governance works; upgrade execution does not until the second gate opens |
+| 6 | ~~Activate `GOV_OPS_ACTIVATION_HEIGHT`~~ **LANDED at 0**; `UPGRADE_EXEC_ACTIVATION_HEIGHT` now comes from the genesis chain spec (compiled default `u64::MAX`) | `governance.rs:80,151`; `chain_spec.rs`; `state_engine/apply.rs` | **H** | Multi-node governance works; a chain that does not set the chain-spec height keeps installs inert |
 | 7 | `plan.height` future-window validation + post-sync `>=` halt predicate | `governance.rs:333-345`; `node/consensus_driver.rs:2885-2897` | M | Event-based halt is missed by offline/restarted nodes |
 | 8 | Await persist drain + write an upgrade checkpoint marker before exit 42 | `node/consensus_driver.rs:2892-2975`; `storage.rs:3609-3643` | M | Best-effort flush loses the pre-upgrade checkpoint |
-| 9 | Add `MEV_RESHARE`/`GOV_OPS`/`UPGRADE_EXEC`/`SPRT_TIER3`/`CHAIN_BINDING`/`ZKML_CONTEXT_BINDING` to `chain_spec`; expose `stell_chainSpec` + `schedule_hash` | `chain_spec.rs:130-180`; `rpc/*` | L | Operators cannot inspect the binary's rules; the schedule still hides the gate that blocks `SoftwareUpgrade` execution |
+| 9 | ~~Add `UPGRADE_EXEC` to `chain_spec`~~ **LANDED**; still add `MEV_RESHARE`/`GOV_OPS`/`SPRT_TIER3`/`CHAIN_BINDING`/`ZKML_CONTEXT_BINDING`; expose `stell_chainSpec` + `schedule_hash` | `chain_spec.rs`; `rpc/*` | L | Operators cannot inspect all the binary's rules over RPC |
 | 10 | Raise/derive the body-walk cap relative to snapshot cadence (or document `STELL_SNAPSHOT_INTERVAL ≤ 156`) | `node/sync.rs:685-700`; `snapshot_cadence.rs:79-82` | M | The 256 vs 1100 deadlock (§1.6) |
 | 11 | Retire `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` env; move to `chain_spec` | `chain_binding.rs:33-78`; `state_engine/parallel.rs:804`; `node/consensus_driver.rs:1555` | **H** | Only remaining env-driven consensus gate; a rolling edit forks |
 | 12 | Fix `docs/OPERATIONS.md` §12 fallback claim | `docs/OPERATIONS.md:1568-1578` | L | Doc says a hash mismatch stops the fallback; code tries the next candidate (`consensus_driver.rs:2930-2965`) |

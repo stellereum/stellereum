@@ -93,6 +93,7 @@ fn cert(
         return qc;
     }
     QuorumCertificate {
+        shard_id: 0,
         height,
         round: 0,
         kind,
@@ -431,6 +432,7 @@ fn a_prevote_quorum_is_not_finality_and_is_refused() {
     // A nil certificate is a quorum of "no value" and finalises nothing.
     let nil = Checkpoint {
         cert: QuorumCertificate {
+            shard_id: 0,
             height: h.height,
             round: 0,
             kind: VoteKind::Precommit,
@@ -666,6 +668,7 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
                 Some(h.block_hash),
             );
             QuorumCertificate {
+                shard_id: 0,
                 height: h.height,
                 round: 0,
                 kind: VoteKind::Precommit,

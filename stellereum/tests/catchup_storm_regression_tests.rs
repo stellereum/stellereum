@@ -233,15 +233,26 @@ async fn bounded_backfill_on_weak_link_converges_without_storm() {
 mod catchup_policy;
 
 mod tip_probe_budget {
-    use super::catchup_policy::{catchup_action, CatchupAction, CATCHUP_INTERVAL_DEFAULT_MS};
+    use super::catchup_policy::{
+        catchup_action, CatchupAction, AT_TIP_PROBE_INTERVAL_MS, CATCHUP_INTERVAL_DEFAULT_MS,
+    };
+
+    const TICK_MS: u64 = 50;
+    const WINDOW_MS: u64 = 10 * 60_000;
+
+    /// At-tip blind probes in a ten-minute window, derived from the shipped
+    /// constant (the window is the node's detection latency, so it is the
+    /// constant each of these tests must be measured against).
+    fn expected_blind_probes() -> u64 {
+        WINDOW_MS / AT_TIP_PROBE_INTERVAL_MS
+    }
 
     /// Simulate 10 minutes of 50 ms ticks exactly the way the driver consumes
     /// `catchup_action`: run/blind-probe -> probe + reset, skip-at-tip -> keep
     /// counting (no probe, but the elapsed clock must still reach the low-
     /// frequency blind-probe window), wait -> keep counting.
     fn probes_over_ten_minutes(at_tip: bool, commit_at_tick: Option<usize>) -> (u64, usize) {
-        const TICK_MS: u64 = 50;
-        const TICKS: usize = 12_001; // 10 minutes + one tick, so the blind probe is due
+        const TICKS: usize = (WINDOW_MS / TICK_MS) as usize + 1; // + one tick, so the window is due
         let mut since = 0u64;
         let mut probes = 0u64;
         let mut first_probe_tick = None;
@@ -265,27 +276,44 @@ mod tip_probe_budget {
     }
 
     #[test]
-    fn a_node_at_the_tip_does_one_blind_probe_per_backstop_window() {
+    fn a_node_at_the_tip_does_one_blind_probe_per_blind_probe_window() {
         let (probes, first_tick) = probes_over_ten_minutes(true, None);
-        assert_eq!(
-            probes, 1,
-            "an in-sync node must not poll every backstop, but silence cannot disable catch-up forever"
+        // Exactly one probe per window. The window boundary lands on a tick
+        // whose reset consumed the preceding tick, so the LAST window inside
+        // the simulated span can be one tick short: allow that single-boundary
+        // difference, never a different cadence.
+        let expected = expected_blind_probes();
+        assert!(
+            probes == expected || probes + 1 == expected,
+            "an in-sync node must poll once per blind-probe window \
+             ({probes} probes, expected ~{expected}), not every backstop"
         );
-        assert_eq!(
-            first_tick, 12_000,
-            "the blind probe fires at AT_TIP_PROBE_INTERVAL_MS, not on the 30 s timer"
+        // The probe fires when the BLIND-PROBE window elapses (never on the
+        // 30 s backstop), and not before it.
+        assert!(
+            first_tick as u64 * TICK_MS <= AT_TIP_PROBE_INTERVAL_MS
+                && first_tick as u64 * TICK_MS + TICK_MS >= AT_TIP_PROBE_INTERVAL_MS,
+            "the blind probe must fire at AT_TIP_PROBE_INTERVAL_MS, not on the 30 s timer"
+        );
+        assert!(
+            probes < (WINDOW_MS / TICK_MS),
+            "an in-sync node must never poll per tick: {probes}"
         );
     }
 
     #[test]
     fn a_single_pushed_commit_probes_once_and_far_before_the_backstop() {
-        // At the tip, nothing polls; the pushed commit at tick 7_000 (350 s)
-        // is the FIRST and ONLY trigger, and it fires on that tick.
-        let (probes, first_tick) = probes_over_ten_minutes(true, Some(7_000));
-        assert_eq!(probes, 1, "exactly one reactive probe for one commit");
+        // At the tip, nothing polls; the pushed commit at tick 100 (5 s, inside
+        // the first blind-probe window) is the FIRST trigger, and it fires on
+        // that tick.
+        let (probes, first_tick) = probes_over_ten_minutes(true, Some(100));
         assert_eq!(
-            first_tick, 7_000,
+            first_tick, 100,
             "the attempt starts on the committing tick, never on the timer"
+        );
+        assert!(
+            probes <= 1 + expected_blind_probes(),
+            "one reactive probe plus the blind windows, never per tick: {probes}"
         );
 
         // Contrast: a node already known to be behind DOES use the 30 s

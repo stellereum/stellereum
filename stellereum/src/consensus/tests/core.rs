@@ -410,6 +410,7 @@ fn micro_and_epoch_certs_are_height_indexed_across_rotation() {
             parent,
         );
         QuorumCertificate {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Precommit,
@@ -446,6 +447,7 @@ fn micro_and_epoch_certs_are_height_indexed_across_rotation() {
             parent,
         );
         QuorumCertificate {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Precommit,
@@ -558,6 +560,118 @@ fn block_evidence_verifies_genuine_double_sign() {
     );
     let ev = EquivocationEvidence::new(ids(&ks)[0], a, b);
     assert!(verify_equivocation_evidence(&ev, &member));
+}
+
+#[test]
+fn cross_shard_vote_pair_is_never_equivocation_evidence() {
+    // FINDING A (false-slash primitive). One validator key may run shards 0
+    // and 1 at the same time. At the same (height, round, kind) each shard
+    // has its own target, so the honest node signs two DIFFERENT statements.
+    // That pair must never be slashable — and it is not, because the shard is
+    // inside the V3 signed preimage and the verifier requires one shard.
+    //
+    // (Fails on the pre-fix code: the two votes had no shard in their signed
+    // bytes and the verifier only compared height/round/kind/targets, so it
+    // returned `true` and slashed the honest validator.)
+    let ks = keys(3);
+    let fks = falcon_for_keys(&ks, 0x33);
+    let vs = vset_with_falcon(&ks, &fks);
+    let member = |v: &ValidatorId| vs.validators.contains_key(v);
+    let voter = ids(&ks)[0];
+    let a = Vote::sign_with_falcon_in_shard(
+        &ks[0],
+        &fks[0],
+        0,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(block_hash(1)),
+    );
+    let b = Vote::sign_with_falcon_in_shard(
+        &ks[0],
+        &fks[0],
+        1,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(block_hash(2)),
+    );
+    assert_eq!(a.voter, b.voter);
+    assert_eq!((a.height, a.round, a.kind), (b.height, b.round, b.kind));
+    assert_ne!(a.block_hash, b.block_hash);
+    assert!(
+        a.verify() && b.verify(),
+        "each vote is genuine in its shard"
+    );
+    let ev = EquivocationEvidence::new(voter, a.clone(), b.clone());
+    assert!(
+        !verify_equivocation_evidence(&ev, &member),
+        "cross-shard votes at the same height/round are honest work"
+    );
+    assert!(canonicalize_equivocation_evidence(vec![ev], &member).is_empty());
+
+    // Relabelling cannot rescue the forged offense: the signature commits to
+    // the shard, so a shard-0 vote presented as shard 1 fails verification.
+    let mut relabelled = a.clone();
+    relabelled.shard_id = 1;
+    assert!(!relabelled.verify());
+    let relabelled_ev = EquivocationEvidence::new(voter, relabelled, b.clone());
+    assert!(!verify_equivocation_evidence(&relabelled_ev, &member));
+
+    // SAME-SHARD, different targets at the same (h, r, kind) is still a
+    // genuine double-sign and MUST remain slashable.
+    let c = Vote::sign_with_falcon_in_shard(
+        &ks[0],
+        &fks[0],
+        1,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(block_hash(3)),
+    );
+    let same_shard = EquivocationEvidence::new(voter, b, c);
+    assert!(verify_equivocation_evidence(&same_shard, &member));
+}
+
+#[test]
+fn vote_shard_is_part_of_the_signed_preimage() {
+    // Domain separation: the same fields in two shards produce two different
+    // signatures, and the V3 domain is used (V2 must not be accepted).
+    let ks = keys(1);
+    let fks = falcon_for_keys(&ks, 0x34);
+    let _vs = vset_with_falcon(&ks, &fks);
+    let s0 = vote_sign_bytes_for_shard(0, 9, 2, VoteKind::Precommit, &Some(block_hash(4)));
+    let s1 = vote_sign_bytes_for_shard(1, 9, 2, VoteKind::Precommit, &Some(block_hash(4)));
+    assert_ne!(s0, s1, "the shard must move the signed preimage");
+    assert!(s0.starts_with(VOTE_SIGN_DOMAIN));
+    assert_eq!(VOTE_SIGN_DOMAIN, b"STELLEREUM_BFT_VOTE_V3");
+    // The masterchain shorthand is byte-identical to shard 0.
+    assert_eq!(
+        vote_sign_bytes(9, 2, VoteKind::Precommit, &Some(block_hash(4))),
+        s0
+    );
+    let v0 = Vote::sign_with_falcon_in_shard(
+        &ks[0],
+        &fks[0],
+        0,
+        9,
+        2,
+        VoteKind::Precommit,
+        Some(block_hash(4)),
+    );
+    let v1 = Vote::sign_with_falcon_in_shard(
+        &ks[0],
+        &fks[0],
+        1,
+        9,
+        2,
+        VoteKind::Precommit,
+        Some(block_hash(4)),
+    );
+    assert_eq!(v0.shard_id, 0);
+    assert_eq!(v1.shard_id, 1);
+    assert!(v0.verify() && v1.verify());
+    assert_ne!(v0.signature, v1.signature);
 }
 
 #[test]
@@ -738,7 +852,13 @@ fn block_evidence_canonicalize_sorts_and_dedupes() {
         ),
     );
     let out = canonicalize_equivocation_evidence(
-        vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
+        vec![
+            e2.clone(),
+            garbage,
+            e1dup.clone(),
+            e1swapped.clone(),
+            e1.clone(),
+        ],
         &member,
     );
     assert_eq!(
@@ -776,6 +896,18 @@ fn signed_block_with_falcon(
     height: Height,
     timestamp: u64,
 ) -> crate::sharding::Block {
+    signed_block_with_falcon_shard(key, fk, 0, height, timestamp)
+}
+
+/// [`signed_block_with_falcon`] for an explicit shard (`compute_hash` binds
+/// the shard id, so the signature covers it).
+fn signed_block_with_falcon_shard(
+    key: &SigningKey,
+    fk: &FalconKeypair,
+    shard_id: crate::sharding::ShardId,
+    height: Height,
+    timestamp: u64,
+) -> crate::sharding::Block {
     let proposer = key.verifying_key().to_bytes();
     register_validator_pq_key(
         proposer,
@@ -783,6 +915,7 @@ fn signed_block_with_falcon(
         fk.public_key.clone(),
     );
     let mut b = crate::sharding::Block {
+        shard_id,
         height,
         proposer,
         timestamp,
@@ -797,9 +930,17 @@ fn signed_block_with_falcon(
 }
 
 #[test]
-fn proposal_evidence_verifies_genuine_double_propose() {
-    // Falconize: genuine double-propose carries PQ signatures and
-    // verifies; the Ed-only refusal is pinned separately below.
+fn proposal_evidence_is_disabled_by_the_false_slash_sentinel() {
+    // FINDING B (false-slash primitive). Two validly-signed, same-height,
+    // DIFFERENT bodies used to be treated as a double-propose. That pair is
+    // exactly what an honest proposer produces across rounds after a view
+    // change (A in round r, B in r+1), and the wire block carries no SIGNED
+    // round to tell the cases apart. The compiled sentinel therefore makes
+    // the wired path refuse EVERY proposal evidence: no slash is strictly
+    // better than slashing an honest proposer.
+    //
+    // (This test previously asserted the verifier ACCEPTED the pair — the
+    // vulnerable behavior Finding B removes. It fails on the pre-fix code.)
     let ks = keys(3);
     let fk0 = FalconKeypair::generate_from_seed(0xD0);
     let vs = vset(&ks);
@@ -815,8 +956,98 @@ fn proposal_evidence_verifies_genuine_double_propose() {
         verify_proposer_signature(&a) && verify_proposer_signature(&b),
         "PQ-signed proposals must verify under the registered key"
     );
-    let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a, b);
-    assert!(verify_proposal_equivocation_evidence(&ev, &member));
+    assert_eq!(PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT, u64::MAX);
+    let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a.clone(), b.clone());
+    assert!(
+        !verify_proposal_equivocation_evidence(&ev, &member),
+        "the false-slash sentinel must refuse every proposal evidence"
+    );
+    assert!(
+        canonicalize_proposal_equivocation_evidence(vec![ev], &member).is_empty(),
+        "nothing may survive shaping into a block-carried slash"
+    );
+    // The SAME-ROUND rule is ready behind the sentinel: the pair is an
+    // offense once the (future, signed) round is equal...
+    assert!(proposal_equivocation_offense_rule(
+        a.shard_id,
+        b.shard_id,
+        a.height,
+        b.height,
+        7,
+        7,
+        &a.compute_hash(),
+        &b.compute_hash(),
+    ));
+    // ... and an honest CROSS-ROUND pair at the same height is NOT one.
+    assert!(!proposal_equivocation_offense_rule(
+        a.shard_id,
+        b.shard_id,
+        a.height,
+        b.height,
+        7,
+        8,
+        &a.compute_hash(),
+        &b.compute_hash(),
+    ));
+    // Different shards / heights / identical bodies are never offenses.
+    assert!(!proposal_equivocation_offense_rule(
+        0,
+        1,
+        a.height,
+        b.height,
+        7,
+        7,
+        &a.compute_hash(),
+        &b.compute_hash(),
+    ));
+    assert!(!proposal_equivocation_offense_rule(
+        a.shard_id,
+        b.shard_id,
+        a.height,
+        b.height,
+        7,
+        7,
+        &a.compute_hash(),
+        &a.compute_hash(),
+    ));
+}
+
+#[test]
+fn proposal_evidence_refuses_cross_shard_blocks() {
+    // Every workchain reads the masterchain validator set, so the same
+    // proposer is scheduled at the same height in several shards. Proposing
+    // one block per shard is honest work; it must never be slashable as a
+    // double-propose. The two blocks are fully signed and genuinely distinct
+    // (the shard id is inside the hash), so only the shard check refuses them.
+    let ks = keys(3);
+    let fk0 = FalconKeypair::generate_from_seed(0xD2);
+    let vs = vset(&ks);
+    let member = |v: &ValidatorId| vs.validators.contains_key(v);
+    let a = signed_block_with_falcon_shard(&ks[0], &fk0, 0, 5, 1_000);
+    let b = signed_block_with_falcon_shard(&ks[0], &fk0, 1, 5, 1_000);
+    assert_ne!(a.compute_hash(), b.compute_hash());
+    assert!(verify_proposer_signature(&a) && verify_proposer_signature(&b));
+    let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a.clone(), b.clone());
+    assert!(
+        !verify_proposal_equivocation_evidence(&ev, &member),
+        "blocks from different shards are not a double-propose"
+    );
+    // The same-shard, same-round rule still treats a distinct-body pair as
+    // an offense — but the wired verifier stays behind the false-slash
+    // sentinel, so it refuses it for now (Finding B fallback).
+    let a2 = signed_block_with_falcon_shard(&ks[0], &fk0, 0, 5, 2_000);
+    assert!(proposal_equivocation_offense_rule(
+        a.shard_id,
+        a2.shard_id,
+        a.height,
+        a2.height,
+        3,
+        3,
+        &a.compute_hash(),
+        &a2.compute_hash(),
+    ));
+    let same = ProposalEquivocationEvidence::new(ids(&ks)[0], a, a2);
+    assert!(!verify_proposal_equivocation_evidence(&same, &member));
 }
 
 #[test]
@@ -937,18 +1168,38 @@ fn proposal_evidence_canonicalize_sorts_and_dedupes() {
     let same = signed_block_with_falcon(&ks[0], &fk0, 9, 7);
     let garbage = ProposalEquivocationEvidence::new(proposer, same.clone(), same);
     let out = canonicalize_proposal_equivocation_evidence(
-        vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
+        vec![
+            e2.clone(),
+            garbage,
+            e1dup.clone(),
+            e1swapped.clone(),
+            e1.clone(),
+        ],
         &member,
     );
+    // FINDING B fallback: the wired path is behind the false-slash sentinel,
+    // so nothing survives shaping into a slash. What is still exercised here
+    // is that the candidates are REJECTED deterministically (no ordering or
+    // dedup dependence), and the offense keys stay canonical.
+    assert!(
+        out.is_empty(),
+        "the sentinel must refuse every proposal evidence"
+    );
+    assert_eq!(e1.offense_key(), e1dup.offense_key());
+    assert_eq!(e1.offense_key(), e1swapped.offense_key());
     assert_eq!(
-        out.len(),
-        2,
-        "two distinct offenses survive, dupes collapse"
+        e1.offense_key(),
+        ProposalEquivocationEvidence::new(
+            proposer,
+            signed_block_with_falcon(&ks[0], &fk0, 9, 2),
+            signed_block_with_falcon(&ks[0], &fk0, 9, 1),
+        )
+        .offense_key(),
+        "vote/block order must not move the offense key"
     );
     let mut keys_sorted = [e1.offense_key(), e2.offense_key()];
     keys_sorted.sort();
-    assert_eq!(out[0].offense_key(), keys_sorted[0]);
-    assert_eq!(out[1].offense_key(), keys_sorted[1]);
+    assert!(keys_sorted[0] <= keys_sorted[1]);
 }
 
 #[test]
@@ -1070,6 +1321,7 @@ fn qc_verification_rejects_insufficient_signatures() {
             parent,
         );
         QuorumCertificate {
+            shard_id: 0,
             height: 1,
             round: 0,
             kind: VoteKind::Precommit,
@@ -1094,6 +1346,7 @@ fn qc_verification_rejects_duplicate_signers() {
         (v.voter, v.signature.clone()),
     ];
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1147,6 +1400,7 @@ fn qc_verification_enforces_the_signer_cap() {
     // A genuine 3-of-4 quorum under the cap.
     let mut sigs: Vec<(ValidatorId, Vec<u8>)> = vec![marker.clone()];
     let base = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1168,6 +1422,7 @@ fn qc_verification_enforces_the_signer_cap() {
         sigs.push((junk, vec![0u8; 64]));
     }
     let at_cap = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1184,6 +1439,7 @@ fn qc_verification_enforces_the_signer_cap() {
     // is examined -- even though its signers include a real quorum.
     sigs.push(([0xFFu8; 32], vec![0u8; 64]));
     let over = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,
@@ -1223,6 +1479,13 @@ fn driver_finalizes_and_advances() {
     driver.advance();
     assert!(driver.is_final(1, bh));
     assert_eq!(driver.current.as_ref().unwrap().height, 2);
+    // The block just decided is the next height's sortition parent. A driver
+    // that dropped it would elect a committee from the zero/genesis parent
+    // (or, above height 1, from an UNKNOWN parent: no µQC at all).
+    let next = driver.current.as_ref().unwrap();
+    assert!(next.parent_hash_known(), "the decided parent is known");
+    assert_eq!(next.parent_hash, bh);
+    assert_eq!(next.sortition_parent(), Some(&bh));
 }
 
 #[test]
@@ -1456,4 +1719,402 @@ fn vote_wrong_scope_rejected() {
         Some(block_hash(1)),
     );
     assert!(set.add(v, &vs, 1, 0, VoteKind::Prevote).is_err());
+}
+
+// ============================================================================
+// Regression tests: hunt wave (round safety, quorum scan, committee schedule)
+// ============================================================================
+
+/// A NIL precommit quorum in a NEWER round must not shadow the older round's
+/// block precommit quorum. Both quorums are legitimate: validators that saw
+/// the polka precommit the block at round r, while validators that timed out
+/// precommit nil at r+1. `try_precommit_quorum` used to stop at the FIRST
+/// round carrying any precommit quorum (nil included) and return `None`,
+/// parking the height even though the block was fully certified.
+#[test]
+fn nil_precommit_quorum_does_not_shadow_the_block_precommit_quorum() {
+    let keys = keys(4);
+    let fks = falcon_for_keys(&keys, 0x51);
+    let vs = vset_with_falcon(&keys, &fks);
+    let mut hc = HeightConsensus::new(1, vs);
+    let a = block_hash(7);
+
+    // Round 0: three prevotes AND three precommits for A (a real decision).
+    for (i, k) in keys.iter().enumerate().take(3) {
+        hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(a)))
+            .unwrap();
+        hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(a)))
+            .unwrap();
+    }
+    // Round 1: three prevotes AND three precommits for nil (the network
+    // timed out after the decision quorum formed).
+    for (i, k) in keys.iter().enumerate().take(3) {
+        hc.add_prevote(fvote(k, &fks[i], 1, 1, VoteKind::Prevote, None))
+            .unwrap();
+        hc.add_precommit(fvote(k, &fks[i], 1, 1, VoteKind::Precommit, None))
+            .unwrap();
+    }
+    // The local counter is in the newer round, so the scan sees nil first.
+    hc.round = 1;
+    assert_eq!(
+        hc.try_precommit_quorum(),
+        Some(a),
+        "the certified block must decide; a newer nil quorum is not evidence against it"
+    );
+}
+
+/// A proposal accepted for round r is dead the moment we enter round r+1.
+/// (`next_round` clears it, so the engine's normal path cannot prevote a
+/// stale body; this pins the clear as the reason, not an accident.)
+#[test]
+fn decide_prevote_refuses_a_stale_proposal_from_a_previous_round() {
+    let keys = keys(4);
+    let vs = vset(&keys);
+    let mut hc = HeightConsensus::new(1, vs);
+    let proposer = hc.proposer().unwrap();
+    let stale = block_hash(0x42);
+    hc.receive_proposal(proposer, stale).unwrap();
+    assert_eq!(hc.decide_prevote(), Some(stale));
+    hc.next_round();
+    assert!(
+        !hc.has_live_proposal(),
+        "the proposal belongs to the round we left"
+    );
+    assert_eq!(
+        hc.decide_prevote(),
+        None,
+        "a stale proposal must prevote nil in the new round, never the old body"
+    );
+}
+
+/// A newer precommit quorum whose PREVOTE quorum this node does not hold must
+/// not hide an OLDER round that is fully proven locally. The scan used to stop
+/// at the first non-nil precommit quorum, fail the "prevotes agree" check and
+/// return `None` without ever examining the older, decidable round.
+#[test]
+fn an_unproven_newer_precommit_quorum_does_not_hide_a_decidable_older_round() {
+    let keys = keys(4);
+    let fks = falcon_for_keys(&keys, 0x53);
+    let vs = vset_with_falcon(&keys, &fks);
+    let mut hc = HeightConsensus::new(1, vs);
+    let a = block_hash(0x0A);
+    let b = block_hash(0x0B);
+
+    // Round 0: a complete, locally proven decision for A.
+    for (i, k) in keys.iter().enumerate().take(3) {
+        hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(a)))
+            .unwrap();
+        hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(a)))
+            .unwrap();
+    }
+    // Round 1: the precommits for B arrived but the prevotes did not (the WAN
+    // delivery shape: a bodyless observer sees the tail of a later round).
+    for (i, k) in keys.iter().enumerate().take(3) {
+        hc.add_precommit(fvote(k, &fks[i], 1, 1, VoteKind::Precommit, Some(b)))
+            .unwrap();
+    }
+    hc.round = 1;
+
+    assert_eq!(
+        hc.try_precommit_quorum(),
+        Some(a),
+        "the scan must fall through an unproven newer round to the fully proven older one"
+    );
+}
+
+/// The retained-round cap must be enforceable even when the OLDEST retained
+/// round is the observed polka. The prune loop used to `break` on that round,
+/// which left every later round in place: a height that lived through the cap
+/// then grew without bound (one attacker-sized vote bucket per round).
+#[test]
+fn retained_round_cap_holds_when_the_polka_round_is_the_oldest() {
+    let keys = keys(4);
+    let fks = falcon_for_keys(&keys, 0x52);
+    let vs = vset_with_falcon(&keys, &fks);
+    let mut hc = HeightConsensus::new(1, vs);
+    let bh = block_hash(3);
+    for (i, k) in keys.iter().enumerate().take(3) {
+        hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
+            .unwrap();
+    }
+    assert_eq!(hc.observed_polka, Some((0, bh)));
+
+    // Fill past the cap with rounds that carry votes (the attacker shape).
+    let extra = MAX_RETAINED_VOTE_ROUNDS as u32 + 8;
+    for r in 1..=extra {
+        hc.prevotes.insert(r, VoteSet::new());
+    }
+    let retained = |hc: &HeightConsensus| {
+        let mut rounds: std::collections::HashSet<Round> = hc.prevotes.keys().copied().collect();
+        rounds.extend(hc.precommits.keys().copied());
+        rounds.len()
+    };
+    assert!(retained(&hc) > MAX_RETAINED_VOTE_ROUNDS);
+    hc.next_round();
+    assert!(
+        retained(&hc) <= MAX_RETAINED_VOTE_ROUNDS,
+        "retained rounds {} exceed the cap {} because the polka round is oldest",
+        retained(&hc),
+        MAX_RETAINED_VOTE_ROUNDS
+    );
+    assert!(
+        hc.prevote_set(0).is_some(),
+        "the polka's own round must survive the prune"
+    );
+}
+
+/// Proposer-miss accounting must use the height's REAL schedule. Under the
+/// CN-VRF v3 beacon schedule the parent-hash draw names a different proposer,
+/// so the old `proposer_for(height, round)` charged the wrong validator.
+#[test]
+fn proposer_miss_accounting_uses_the_height_schedule() {
+    let keys = keys(4);
+    let vs = vset(&keys);
+    let mut hc = HeightConsensus::new(1, vs.clone());
+    let parent = vs.proposer_for(1, 0).unwrap();
+
+    // Find a beacon that elects a proposer different from the parent draw.
+    let (beacon, expected) = (0u8..=255)
+        .find_map(|b| {
+            let beacon = EpochBeacon {
+                epoch: 0,
+                output: [b; 48],
+            };
+            let p = vs.proposer_for_with_schedule(1, 0, CommitteeSchedule::Beacon(Some(beacon)))?;
+            (p != parent).then_some((beacon, p))
+        })
+        .expect("some beacon must elect a different proposer");
+
+    hc.set_committee_schedule(CommitteeSchedule::Beacon(Some(beacon)));
+    hc.next_round();
+    assert_eq!(
+        hc.proposer_missed_streak(&expected),
+        1,
+        "the missing slot belongs to the beacon-scheduled proposer"
+    );
+    assert_eq!(
+        hc.proposer_missed_streak(&parent),
+        0,
+        "the parent-hash proposer did not own this slot"
+    );
+}
+
+/// A signature-refused vote must leave NO trace: an empty vote-set bucket for
+/// its round is otherwise materialized before the signature check, counts
+/// toward the retention cap and can evict rounds that carry real votes.
+#[test]
+fn a_refused_signature_does_not_materialize_a_round_bucket() {
+    let keys = keys(4);
+    let fks = falcon_for_keys(&keys, 0x54);
+    let vs = vset_with_falcon(&keys, &fks);
+    let mut hc = HeightConsensus::new(1, vs);
+
+    let mut bad = fvote(
+        &keys[0],
+        &fks[0],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(block_hash(1)),
+    );
+    let last = bad.signature.len() - 1;
+    bad.signature[last] ^= 0xFF;
+    assert!(hc.add_prevote(bad.clone()).is_err());
+    assert!(
+        hc.prevote_set(0).is_none(),
+        "a refused prevote must not create an empty prevote set"
+    );
+
+    let mut bad_precommit = fvote(
+        &keys[0],
+        &fks[0],
+        1,
+        0,
+        VoteKind::Precommit,
+        Some(block_hash(1)),
+    );
+    let last = bad_precommit.signature.len() - 1;
+    bad_precommit.signature[last] ^= 0xFF;
+    assert!(hc.add_precommit(bad_precommit).is_err());
+    assert!(
+        hc.precommit_set(0).is_none(),
+        "a refused precommit must not create an empty precommit set"
+    );
+
+    // A non-member with a perfectly valid Falcon signature is another
+    // attacker: admission must refuse it BEFORE materializing the bucket.
+    let outsider = SigningKey::generate(&mut rand::rngs::OsRng);
+    let outsider_fk = FalconKeypair::generate_from_seed(0xE1);
+    register_validator_pq_key(
+        outsider.verifying_key().to_bytes(),
+        crate::post_quantum::PqScheme::Falcon512,
+        outsider_fk.public_key.clone(),
+    );
+    let outsider_vote = fvote(
+        &outsider,
+        &outsider_fk,
+        1,
+        7,
+        VoteKind::Prevote,
+        Some(block_hash(2)),
+    );
+    assert!(hc.add_prevote(outsider_vote).is_err());
+    assert!(
+        hc.prevote_set(7).is_none(),
+        "a non-member vote must not create a round bucket"
+    );
+}
+
+/// Corroboration for the deadlock breaker is not "two validator ids": under
+/// the BFT assumption fewer than one third of the POWER is Byzantine, so a
+/// round is only network evidence when the peers reporting it carry MORE than
+/// one third of the power. Two colluding validators in a 7-member set are
+/// below that floor and used to be able to steer the forward-only breaker.
+#[test]
+fn deadlock_breaker_corroboration_is_power_weighted() {
+    let keys = keys(7);
+    let vs = vset(&keys);
+    let mut hc = HeightConsensus::new(1, vs);
+    hc.round = 100;
+
+    // Two of seven = 2/7 of the power: a sub-one-third coalition.
+    hc.note_peer_round(ids(&keys)[0], u32::MAX);
+    hc.note_peer_round(ids(&keys)[1], u32::MAX);
+    assert_eq!(
+        hc.deadlock_breaker_target(400, 300),
+        None,
+        "two of seven validators are below the one-third power floor"
+    );
+    assert!(
+        hc.deadlock_local_reset_due(400, 300),
+        "with no honest corroboration the deaf-node fallback must own the breaker"
+    );
+
+    // A third distinct validator crosses one third of the power.
+    hc.note_peer_round(ids(&keys)[2], u32::MAX);
+    assert!(
+        hc.deadlock_breaker_target(400, 300).is_some(),
+        "more than one third of the power is corroborated network position"
+    );
+}
+
+/// Committee sortition must not PANIC on an unrepresentable stake total. The
+/// quorum boundary refuses such a set fail-closed (`power_total_representable`),
+/// but the selection path used a raw `u64` sum and panicked in debug (wrapped
+/// in release) before any quorum check could run.
+#[test]
+fn committee_sortition_saturates_an_unrepresentable_stake_total() {
+    let half = u64::MAX / 2 + 1;
+    let a = [0xA1u8; 32];
+    let b = [0xB2u8; 32];
+    let vs = ValidatorSet::from_list(vec![(a, half), (b, half)]);
+    assert!(!vs.power_total_representable());
+    let committee = derive_sortition_committee(&vs, 1, 0, 1, &[0x11u8; 32]);
+    assert_eq!(
+        committee.len(),
+        1,
+        "a deterministic draw must still elect one seat without overflowing"
+    );
+}
+/// stake the network quorum is 128 and the 128-seat committee can reach 128
+/// only if EVERY member signs. A perfectly valid 128-validator precommit
+/// quorum that contains 63 non-committee members and 65 committee members
+/// cannot compile a µQC (65 < 128) — but the height is decided, so the
+/// producer must fall back to the full-network CEC instead of emitting a
+/// certificate no peer can verify. `qc_split_required`'s raw count says
+/// "µQC" here because N < 192.
+#[test]
+fn decision_certificate_falls_back_to_cec_when_the_drawn_committee_cannot_carry_quorum() {
+    const N: usize = 191;
+    let ks = keys(N);
+    let fks: Vec<FalconKeypair> = (0..N)
+        .map(|i| FalconKeypair::generate_from_seed((i as u8).wrapping_add(1)))
+        .collect();
+    let vs = vset(&ks);
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    let idsv = ids(&ks);
+    let parent = [0x5Au8; 32];
+    let committee = derive_sortition_committee(&vs, 1, 0, micro_committee_size(N), &parent);
+    assert_eq!(committee.len(), 128);
+
+    let target = block_hash(0x77);
+    // A legal 128-power quorum: all 63 non-committee validators plus 65
+    // committee members (one committee seat is effectively offline).
+    let mut chosen: Vec<usize> = (0..N).filter(|&i| !committee.contains(&idsv[i])).collect();
+    assert_eq!(chosen.len(), N - 128);
+    chosen.extend((0..N).filter(|&i| committee.contains(&idsv[i])).take(65));
+    assert_eq!(chosen.len(), 128);
+
+    let mut votes = VoteSet::new();
+    for &i in &chosen {
+        let v = fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(target));
+        votes.add(v, &vs, 1, 0, VoteKind::Prevote).unwrap();
+    }
+    assert!(
+        votes.quorum_reached(Some(target), &vs),
+        "128 of 191 is the network quorum"
+    );
+    assert!(
+        !qc_split_required(1, N),
+        "the raw count keeps the µQC path on"
+    );
+
+    let qc = produce_decision_certificate(&votes, Some(target), &vs, Some(&parent))
+        .expect("a network quorum must produce a decision certificate");
+    assert!(
+        qc.verify(&vs),
+        "the decision certificate must verify: the drawn committee carries 65 of the 128 \
+         required power, so the full-network CEC is the only certificate that can certify this quorum"
+    );
+}
+
+/// The same defect exists well below the count boundary: at N = 129 uniform
+/// stake the committee is 128 seats but the network quorum is only 87, so a
+/// legal quorum of the one non-committee validator plus 86 committee members
+/// carries 86 of the 87 required committee power. The count predicate says
+/// "µQC" (N < 192); the power predicate says the committee cannot certify it.
+#[test]
+fn cec_fallback_also_covers_a_minimal_quorum_at_129_validators() {
+    const N: usize = 129;
+    let ks = keys(N);
+    let fks: Vec<FalconKeypair> = (0..N)
+        .map(|i| FalconKeypair::generate_from_seed((i as u8).wrapping_add(0x40)))
+        .collect();
+    let vs = vset(&ks);
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    let idsv = ids(&ks);
+    let parent = [0x6Bu8; 32];
+    let committee = derive_sortition_committee(&vs, 1, 0, micro_committee_size(N), &parent);
+    assert_eq!(committee.len(), 128);
+
+    let target = block_hash(0x78);
+    let mut chosen: Vec<usize> = (0..N).filter(|&i| !committee.contains(&idsv[i])).collect();
+    assert_eq!(chosen.len(), N - 128);
+    chosen.extend((0..N).filter(|&i| committee.contains(&idsv[i])).take(86));
+    assert_eq!(chosen.len(), 87, "the N=129 network quorum");
+
+    let mut votes = VoteSet::new();
+    for &i in &chosen {
+        let v = fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(target));
+        votes.add(v, &vs, 1, 0, VoteKind::Prevote).unwrap();
+    }
+    assert!(votes.quorum_reached(Some(target), &vs));
+    let qc = produce_decision_certificate(&votes, Some(target), &vs, Some(&parent))
+        .expect("a network quorum must produce a decision certificate");
+    assert!(
+        qc.verify(&vs),
+        "86 of the 87 committee power required here: the CEC must be used"
+    );
 }

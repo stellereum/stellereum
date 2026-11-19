@@ -429,6 +429,13 @@ impl Checkpoint {
                 kind,
                 block_hash: cert_block,
                 signatures,
+                // Shard binding of the signatures (V3 vote preimage). A
+                // server that predates the field serves masterchain only.
+                shard_id: cert_value
+                    .get("shard_id")
+                    .and_then(|x| x.as_u64())
+                    .map(|v| v as crate::sharding::ShardId)
+                    .unwrap_or(crate::sharding::MASTERCHAIN_SHARD),
             },
         })
     }
@@ -850,15 +857,15 @@ pub fn verify_epoch_key_against_block(
 pub struct EpochRootAnswer {
     /// The epoch this root covers.
     pub epoch: u64,
-    /// First height of the epoch (`epoch * 128`).
+    /// First height of the epoch (`epoch * MMR_EPOCH_BLOCKS`).
     pub start_height: u64,
-    /// Last height of the epoch (`start + 127`).
+    /// Last height of the epoch (`start + MMR_EPOCH_BLOCKS - 1`).
     pub end_height: u64,
     /// The MMR root over the epoch's finalized block hashes.
     pub mmr_root: BlockHash,
     /// The mountain peaks, left-to-right (hex in the wire JSON).
     pub peaks: Vec<BlockHash>,
-    /// True when the answer covers the WHOLE epoch (all 128 heights
+    /// True when the answer covers the WHOLE epoch (all MMR_EPOCH_BLOCKS heights
     /// finalized on the serving node). A partial (in-progress) epoch still
     /// has a root, but it is not THE epoch root — proofs against it are
     /// refused until the epoch completes.
@@ -2913,7 +2920,8 @@ mod tests {
 
     /// A complete epoch-0 answer over deterministic leaves, with one proof.
     fn epoch_answer_fixture() -> (EpochRootAnswer, crate::mmr::MmrProof, [u8; 32]) {
-        let leaves: Vec<[u8; 32]> = (0..crate::mmr::MMR_EPOCH_BLOCKS)
+        let e = crate::mmr::MMR_EPOCH_BLOCKS;
+        let leaves: Vec<[u8; 32]> = (0..e)
             .map(|i| {
                 let mut b = [0u8; 32];
                 b[..8].copy_from_slice(&i.to_be_bytes());
@@ -2925,11 +2933,11 @@ mod tests {
         let answer = EpochRootAnswer {
             epoch: 0,
             start_height: 0,
-            end_height: 127,
+            end_height: e - 1,
             mmr_root: root,
             peaks,
             complete: true,
-            leaves: 128,
+            leaves: e,
         };
         let proof = m.prove(41).expect("leaf 41 proves");
         (answer, proof, root)

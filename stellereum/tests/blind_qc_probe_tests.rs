@@ -163,6 +163,7 @@ async fn blind_qc_probe_refuses_forged_qc() {
         })
         .collect();
     block.precommit_qc = Some(QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

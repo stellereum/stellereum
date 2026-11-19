@@ -891,7 +891,9 @@ async fn a_prevote_quorum_without_a_precommit_quorum_is_diagnosable() {
 /// cargo test --test consensus_liveness_harness -- --ignored --nocapture
 /// ```
 #[tokio::test]
-#[ignore]
+#[ignore = "manual diagnostic report (30 s of virtual time, prints per-node \
+stats), not a pass/fail gate; run explicitly with --ignored --nocapture. \
+Tracked in docs/CI.md § Known limits."]
 async fn slow_variant_thirty_virtual_seconds_prints_a_report() {
     let profiles = vec![
         NodeProfile::default(),

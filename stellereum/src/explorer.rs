@@ -18,6 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -255,6 +256,598 @@ pub struct ReadinessReport {
     pub min_peers: usize,
 }
 
+// ============================================================================
+// Operational health surface (`GET /health`, `GET /status`)
+// ============================================================================
+//
+// One payload, one verdict. Every value is either observed or `null` with a
+// reason; a threshold or a missing producer never becomes a fabricated zero.
+// The verdict is computed by [`evaluate_verdict`] from the SAME measured values
+// the payload reports, so a dashboard cannot disagree with the exposed reasons.
+
+/// Rolling window for the block-rate sample.
+pub const HEALTH_BLOCK_RATE_WINDOW_SECS: u64 = 60;
+/// How long one `/health` sample is reused. Short on purpose: health is a
+/// liveness signal, and a longer TTL would hide a stall.
+pub const DEFAULT_HEALTH_CACHE_TTL_MS: u64 = 1_000;
+/// Disk-size samples are the expensive part; cache them separately and longer.
+pub const HEALTH_DATA_DIR_CACHE_TTL_MS: u64 = 30_000;
+
+/// Thresholds for the health verdict. All are operator-tunable via `STELL_HEALTH_*`
+/// (see [`HealthOptions::from_env`]); defaults are documented in `docs/OBSERVABILITY.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HealthThresholds {
+    /// Wall-clock age of the last finalization above which the node is `degraded`.
+    pub max_finalization_lag_secs: u64,
+    /// Same age above which the node is `critical`.
+    pub critical_finalization_lag_secs: u64,
+    /// Network-tip-vs-local-finalized gap above which the node is `degraded`.
+    pub max_finalization_lag_blocks: u64,
+    /// Connected peers required for `ok` (`0` = solo/dev node).
+    pub min_peers: u64,
+    /// Oldest pending mempool transaction above which the node is `degraded`.
+    pub max_mempool_oldest_age_secs: u64,
+    /// Last successful persist above which the node is `degraded`.
+    pub max_persist_age_secs: u64,
+    /// Snapshot block age above which the node is `degraded`.
+    pub max_snapshot_age_secs: u64,
+}
+
+impl Default for HealthThresholds {
+    fn default() -> Self {
+        Self {
+            max_finalization_lag_secs: 5,
+            critical_finalization_lag_secs: 60,
+            max_finalization_lag_blocks: 5,
+            min_peers: 1,
+            max_mempool_oldest_age_secs: 300,
+            max_persist_age_secs: 120,
+            max_snapshot_age_secs: 3_600,
+        }
+    }
+}
+
+/// Runtime knobs for the health surface (thresholds, cache TTL, disk scan).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthOptions {
+    pub thresholds: HealthThresholds,
+    pub cache_ttl_ms: u64,
+    /// `None` disables the data-dir size scan (tests / deployments that do not
+    /// want `/health` to touch the filesystem).
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for HealthOptions {
+    fn default() -> Self {
+        Self {
+            thresholds: HealthThresholds::default(),
+            cache_ttl_ms: DEFAULT_HEALTH_CACHE_TTL_MS,
+            data_dir: Some(data_dir_path()),
+        }
+    }
+}
+
+impl HealthOptions {
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    /// Read every knob from the environment. Unknown/garbage values fall back
+    /// to the documented default; a zero cache TTL is clamped to 1 ms so a
+    /// misconfiguration cannot turn `/health` into an unbounded scan per hit.
+    pub fn from_env() -> Self {
+        let d = HealthThresholds::default();
+        let min_peers = std::env::var("STELL_HEALTH_MIN_PEERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or_else(|| {
+                std::env::var(READY_MIN_PEERS_ENV)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .map(|v| v as u64)
+            })
+            .unwrap_or(d.min_peers);
+        Self {
+            thresholds: HealthThresholds {
+                max_finalization_lag_secs: Self::env_u64(
+                    "STELL_HEALTH_MAX_FINALIZATION_LAG_SECS",
+                    d.max_finalization_lag_secs,
+                ),
+                critical_finalization_lag_secs: Self::env_u64(
+                    "STELL_HEALTH_CRITICAL_FINALIZATION_LAG_SECS",
+                    d.critical_finalization_lag_secs,
+                ),
+                max_finalization_lag_blocks: Self::env_u64(
+                    "STELL_HEALTH_MAX_FINALIZATION_LAG_BLOCKS",
+                    d.max_finalization_lag_blocks,
+                ),
+                min_peers,
+                max_mempool_oldest_age_secs: Self::env_u64(
+                    "STELL_HEALTH_MAX_MEMPOOL_AGE_SECS",
+                    d.max_mempool_oldest_age_secs,
+                ),
+                max_persist_age_secs: Self::env_u64(
+                    "STELL_HEALTH_MAX_PERSIST_AGE_SECS",
+                    d.max_persist_age_secs,
+                ),
+                max_snapshot_age_secs: Self::env_u64(
+                    "STELL_HEALTH_MAX_SNAPSHOT_AGE_SECS",
+                    d.max_snapshot_age_secs,
+                ),
+            },
+            cache_ttl_ms: Self::env_u64("STELL_HEALTH_CACHE_MS", DEFAULT_HEALTH_CACHE_TTL_MS)
+                .max(1),
+            data_dir: Some(data_dir_path()),
+        }
+    }
+}
+
+/// A measured value with its unit, or an explicit `null` + reason.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Measured<T> {
+    pub value: Option<T>,
+    pub unit: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+}
+
+impl<T> Measured<T> {
+    pub fn observed(value: T, unit: &'static str) -> Self {
+        Self {
+            value: Some(value),
+            unit,
+            reason: None,
+            source: None,
+        }
+    }
+
+    pub fn missing(unit: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            unit,
+            reason: Some(reason.into()),
+            source: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: &'static str) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    pub fn as_ref(&self) -> Option<&T> {
+        self.value.as_ref()
+    }
+}
+
+/// Rolling block-rate sample. `samples` and `window_seconds` are part of the
+/// answer because a rate without its window is not a measurement.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BlockRate {
+    pub value: Option<f64>,
+    pub unit: &'static str,
+    pub window_seconds: u64,
+    pub samples: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct IdentityHealth {
+    pub chain_id: u64,
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub fork_id: u32,
+    pub node_id: String,
+    pub shards: Measured<Vec<u64>>,
+    pub software: SoftwareHealth,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SoftwareHealth {
+    pub version: &'static str,
+    pub git_hash: String,
+    pub dirty: String,
+    /// Human-readable one-liner for headers/log lines.
+    pub string: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FinalizationLag {
+    pub blocks: Measured<u64>,
+    pub seconds: Measured<u64>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ChainHealth {
+    pub height: Measured<u64>,
+    pub finalized_height: Measured<u64>,
+    /// Highest VERIFIED peer-reported height (this node's view), when fresh.
+    pub network_tip_height: Measured<u64>,
+    pub finalization_lag: FinalizationLag,
+    pub blocks_per_second: BlockRate,
+    pub last_finalize_age: Measured<u64>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CatchUpHealth {
+    pub mode: Measured<String>,
+    pub last_catch_up_age: Measured<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConsensusHealth {
+    pub round: Measured<u64>,
+    pub last_finalized_round: Measured<u64>,
+    pub view_changes_last_5m: Measured<u64>,
+    pub rejected_proposals_total: Measured<u64>,
+    /// Real cumulative counters that DO have producers. Kept next to the
+    /// unavailable ones so the payload never hides what it can prove.
+    pub forks_total: Measured<u64>,
+    pub divergences_total: Measured<u64>,
+    pub catch_up: CatchUpHealth,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MeshHealth {
+    pub members: Measured<u64>,
+    pub direct_targets: Measured<u64>,
+    pub last_delivery: Measured<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct P2pBytesHealth {
+    pub inbound_total: Measured<u64>,
+    pub outbound_total: Measured<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct P2pHealth {
+    pub peer_count: Measured<u64>,
+    pub peer_states: Measured<Vec<serde_json::Value>>,
+    pub mesh: MeshHealth,
+    pub bytes: P2pBytesHealth,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MempoolHealth {
+    pub size: Measured<u64>,
+    pub oldest_pending_age: Measured<u64>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SnapshotHealth {
+    pub height: Measured<u64>,
+    pub lag_blocks: Measured<u64>,
+    /// Age of the snapshot's height by its stored block timestamp. This is the
+    /// age of the CONTENT, not the wall-clock write time (which storage does not
+    /// export yet).
+    pub age_secs: Measured<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StorageHealth {
+    pub data_dir_bytes: Measured<u64>,
+    pub snapshot_files: Measured<u64>,
+    pub last_persist_age: Measured<u64>,
+    pub snapshot: SnapshotHealth,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    Ok,
+    Degraded,
+    Critical,
+}
+
+/// The verdict plus every reason that produced it. `reasons` is empty only for
+/// `ok`; `unknown` names diagnostics that were unavailable but did NOT change
+/// the verdict (they are not required for the measured checks).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HealthVerdict {
+    pub status: HealthStatus,
+    pub reasons: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+/// The values the verdict is allowed to depend on. Built strictly from the
+/// payload fields; no clocks, env lookups or hidden state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HealthFacts {
+    pub height: Option<u64>,
+    pub finalization_lag_blocks: Option<u64>,
+    pub finalization_lag_secs: Option<u64>,
+    pub last_finalize_age_secs: Option<u64>,
+    pub peer_count: Option<u64>,
+    pub mempool_size: Option<u64>,
+    pub mempool_oldest_age_secs: Option<u64>,
+    pub last_persist_age_secs: Option<u64>,
+    pub snapshot_age_secs: Option<u64>,
+    pub consensus_round: Option<u64>,
+    pub view_changes_last_5m: Option<u64>,
+    pub rejected_proposals_total: Option<u64>,
+    pub catch_up_mode: Option<String>,
+}
+
+fn push_unique(v: &mut Vec<String>, s: String) {
+    if !v.contains(&s) {
+        v.push(s);
+    }
+}
+
+/// Pure verdict function: same facts + same thresholds = same answer, always.
+///
+/// Rules (documented in `docs/OBSERVABILITY.md`):
+///  * `critical`: finalization lag seconds > `critical_finalization_lag_secs`,
+///    or zero peers observed while `min_peers > 0`.
+///  * `degraded`: height 0 / no finalization, finalization lag > max (seconds
+///    or blocks), fewer peers than the minimum, oldest mempool tx too old, last
+///    persist too old, snapshot too old, or a required value unavailable.
+///  * `ok`: none of the above. Missing diagnostics are listed in `unknown`.
+pub fn evaluate_verdict(facts: &HealthFacts, th: &HealthThresholds) -> HealthVerdict {
+    let mut critical: Vec<String> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+
+    match facts.height {
+        None => push_unique(&mut degraded, "height unavailable".to_string()),
+        Some(0) => push_unique(
+            &mut degraded,
+            "height 0: no finalized block yet".to_string(),
+        ),
+        Some(_) => {}
+    }
+
+    if let Some(lag) = facts.finalization_lag_secs {
+        if lag > th.critical_finalization_lag_secs {
+            push_unique(
+                &mut critical,
+                format!(
+                    "finalization lag {lag} s > {} s",
+                    th.critical_finalization_lag_secs
+                ),
+            );
+        } else if lag > th.max_finalization_lag_secs {
+            push_unique(
+                &mut degraded,
+                format!(
+                    "finalization lag {lag} s > {} s",
+                    th.max_finalization_lag_secs
+                ),
+            );
+        }
+    } else if let Some(age) = facts.last_finalize_age_secs {
+        if age > th.critical_finalization_lag_secs {
+            push_unique(
+                &mut critical,
+                format!(
+                    "last finalize age {age} s > {} s",
+                    th.critical_finalization_lag_secs
+                ),
+            );
+        } else if age > th.max_finalization_lag_secs {
+            push_unique(
+                &mut degraded,
+                format!(
+                    "last finalize age {age} s > {} s",
+                    th.max_finalization_lag_secs
+                ),
+            );
+        }
+    } else {
+        push_unique(&mut degraded, "no finalized block observed".to_string());
+    }
+
+    if let Some(lag) = facts.finalization_lag_blocks {
+        if lag > th.max_finalization_lag_blocks {
+            push_unique(
+                &mut degraded,
+                format!(
+                    "finalization lag {lag} blocks > {} blocks",
+                    th.max_finalization_lag_blocks
+                ),
+            );
+        }
+    } else {
+        push_unique(
+            &mut unknown,
+            "finalization block lag unavailable (no fresh peer tip)".to_string(),
+        );
+    }
+
+    match facts.peer_count {
+        None => push_unique(&mut degraded, "peer count unavailable".to_string()),
+        Some(n) if n < th.min_peers => {
+            if n == 0 {
+                push_unique(
+                    &mut critical,
+                    format!("0 peers observed (minimum {})", th.min_peers),
+                );
+            } else {
+                push_unique(
+                    &mut degraded,
+                    format!("{n} peers < minimum {}", th.min_peers),
+                );
+            }
+        }
+        Some(_) => {}
+    }
+
+    if facts.mempool_size.is_none() {
+        push_unique(&mut degraded, "mempool size unavailable".to_string());
+    }
+
+    if let Some(age) = facts.mempool_oldest_age_secs {
+        if age > th.max_mempool_oldest_age_secs {
+            push_unique(
+                &mut degraded,
+                format!(
+                    "oldest mempool tx {age} s > {} s",
+                    th.max_mempool_oldest_age_secs
+                ),
+            );
+        }
+    } else {
+        push_unique(
+            &mut unknown,
+            "mempool oldest-pending age unavailable".to_string(),
+        );
+    }
+
+    if let Some(age) = facts.last_persist_age_secs {
+        if age > th.max_persist_age_secs {
+            push_unique(
+                &mut degraded,
+                format!("last persist age {age} s > {} s", th.max_persist_age_secs),
+            );
+        }
+    } else {
+        push_unique(&mut unknown, "last persist age unavailable".to_string());
+    }
+
+    if let Some(age) = facts.snapshot_age_secs {
+        if age > th.max_snapshot_age_secs {
+            push_unique(
+                &mut degraded,
+                format!("snapshot age {age} s > {} s", th.max_snapshot_age_secs),
+            );
+        }
+    } else {
+        push_unique(&mut unknown, "snapshot age unavailable".to_string());
+    }
+
+    if facts.consensus_round.is_none() {
+        push_unique(&mut unknown, "consensus round unavailable".to_string());
+    }
+    if facts.view_changes_last_5m.is_none() {
+        push_unique(
+            &mut unknown,
+            "view changes over 5 min unavailable (no timestamped counter)".to_string(),
+        );
+    }
+    if facts.rejected_proposals_total.is_none() {
+        push_unique(
+            &mut unknown,
+            "rejected proposals unavailable (no counter)".to_string(),
+        );
+    }
+    if facts.catch_up_mode.is_none() {
+        push_unique(&mut unknown, "catch-up mode unavailable".to_string());
+    }
+
+    if !critical.is_empty() {
+        HealthVerdict {
+            status: HealthStatus::Critical,
+            reasons: critical,
+            unknown,
+        }
+    } else if !degraded.is_empty() {
+        HealthVerdict {
+            status: HealthStatus::Degraded,
+            reasons: degraded,
+            unknown,
+        }
+    } else {
+        HealthVerdict {
+            status: HealthStatus::Ok,
+            reasons: Vec::new(),
+            unknown,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HealthCacheInfo {
+    pub ttl_ms: u64,
+    pub hit: bool,
+    pub age_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HealthPayload {
+    pub schema: &'static str,
+    /// Wall-clock time this sample was collected.
+    pub sampled_at_ms: u64,
+    /// Wall-clock time this response is being served (>= sampled_at_ms).
+    pub served_at_ms: u64,
+    pub cache: HealthCacheInfo,
+    pub identity: IdentityHealth,
+    pub chain: ChainHealth,
+    pub consensus: ConsensusHealth,
+    pub p2p: P2pHealth,
+    pub mempool: MempoolHealth,
+    pub storage: StorageHealth,
+    pub verdict: HealthVerdict,
+}
+
+/// TTL cache for one health sample. A stale entry is NEVER served past its TTL;
+/// callers recompute and overwrite it.
+#[derive(Debug, Default)]
+pub struct HealthCache {
+    inner: Mutex<Option<(u64, HealthPayload)>>,
+}
+
+impl HealthCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(u64, HealthPayload)>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `Some` only while `now_ms - stored_at < ttl_ms` (strict: the entry is
+    /// stale AT the TTL boundary, which the cache test pins).
+    pub fn lookup(&self, now_ms: u64, ttl_ms: u64) -> Option<HealthPayload> {
+        let ttl = ttl_ms.max(1);
+        match self.lock().as_ref() {
+            Some((at, payload)) if now_ms.saturating_sub(*at) < ttl => Some(payload.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn store(&self, now_ms: u64, payload: HealthPayload) {
+        *self.lock() = Some((now_ms, payload));
+    }
+
+    pub fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    pub fn stored_at_ms(&self) -> Option<u64> {
+        self.lock().as_ref().map(|(at, _)| *at)
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn measured_u64(value: Option<u64>, unit: &'static str, reason: &str) -> Measured<u64> {
+    match value {
+        Some(v) => Measured::observed(v, unit),
+        None => Measured::missing(unit, reason),
+    }
+}
+
 pub struct GatewayState {
     pub rpc: Arc<RpcState>,
     pub limiter: Arc<RateLimiter>,
@@ -275,6 +868,16 @@ pub struct GatewayState {
     /// (`POST /api/faucet-public/:address`). Loaded from `STELL_TURNSTILE_*`
     /// env; `Disabled` when unset (legacy IP-throttle-only behaviour).
     pub captcha: Arc<crate::turnstile::CaptchaGate>,
+    /// Health thresholds, cache TTL and optional disk-scan target.
+    pub health_options: HealthOptions,
+    /// One-sample TTL cache for `/health` / `/status`.
+    pub health_cache: HealthCache,
+    /// Separate, longer-lived cache for the data-dir scan: the one part of the
+    /// payload expensive enough to matter.
+    health_data_dir_cache: Mutex<Option<(u64, (u64, u64))>>,
+    /// Serializes cold data-dir scans so N simultaneous cache misses cannot
+    /// start N filesystem walks.
+    health_data_dir_scan_gate: tokio::sync::Mutex<()>,
 }
 
 impl GatewayState {
@@ -295,6 +898,10 @@ impl GatewayState {
             // process when the keys are absent, so a forgotten config on a
             // public node is visible at startup.
             captcha: Arc::new(crate::turnstile::CaptchaGate::from_env()),
+            health_options: HealthOptions::from_env(),
+            health_cache: HealthCache::new(),
+            health_data_dir_cache: Mutex::new(None),
+            health_data_dir_scan_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -313,7 +920,23 @@ impl GatewayState {
             metrics: crate::metrics::global(),
             readiness: Arc::new(ReadinessState::new(config)),
             captcha,
+            health_options: HealthOptions::from_env(),
+            health_cache: HealthCache::new(),
+            health_data_dir_cache: Mutex::new(None),
+            health_data_dir_scan_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Override health thresholds/cache/disk for tests or explicit deployments.
+    /// Returns `self` so it composes with the existing constructors.
+    pub fn with_health_options(mut self, options: HealthOptions) -> Self {
+        self.health_options = options;
+        self.health_cache.clear();
+        *self
+            .health_data_dir_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self
     }
 
     /// Set the current connected-peer count for `/readyz` (call from the
@@ -1943,11 +2566,545 @@ async fn api_block_detail(
     .into_response()
 }
 
-async fn health_check() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::OK,
-        Json(json!({ "status": "ok", "service": "stellereum-gateway" })),
-    )
+/// Data-dir scan with its own TTL. Returns `(bytes, snapshot_files)`, each
+/// either observed or `null` with a reason. The scan is capped by
+/// [`DATA_DIR_SCAN_FILE_CAP`] and runs off the async worker thread.
+async fn data_dir_health(st: &GatewayState, now_ms: u64) -> (Measured<u64>, Measured<u64>) {
+    let Some(dir) = st.health_options.data_dir.clone() else {
+        return (
+            Measured::missing("bytes", "data-dir scan disabled"),
+            Measured::missing("files", "data-dir scan disabled"),
+        );
+    };
+    {
+        let cache = st
+            .health_data_dir_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, (bytes, snaps))) = *cache {
+            if now_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
+                return (
+                    Measured::observed(bytes, "bytes"),
+                    Measured::observed(snaps, "files"),
+                );
+            }
+        }
+    }
+    // One cold scan at a time; the first waiter fills the cache and the rest
+    // re-check it instead of walking the directory again.
+    let _scan_gate = st.health_data_dir_scan_gate.lock().await;
+    {
+        let cache = st
+            .health_data_dir_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, (bytes, snaps))) = *cache {
+            if now_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
+                return (
+                    Measured::observed(bytes, "bytes"),
+                    Measured::observed(snaps, "files"),
+                );
+            }
+        }
+    }
+    if !dir.is_dir() {
+        return (
+            Measured::missing("bytes", "configured data directory does not exist"),
+            Measured::missing("files", "configured data directory does not exist"),
+        );
+    }
+    let scan_dir = dir.clone();
+    match tokio::task::spawn_blocking(move || data_dir_stats(&scan_dir)).await {
+        Ok((bytes, snaps)) => {
+            *st.health_data_dir_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((now_ms, (bytes, snaps)));
+            (
+                Measured::observed(bytes, "bytes"),
+                Measured::observed(snaps, "files"),
+            )
+        }
+        Err(_) => (
+            Measured::missing("bytes", "data-dir scan task failed"),
+            Measured::missing("files", "data-dir scan task failed"),
+        ),
+    }
+}
+
+/// Collect one health sample at `now_ms`. All values are read from this
+/// process's existing observability handles; nothing is invented and no chain
+/// walk is performed. The only potentially expensive step (data-dir metadata)
+/// has its own longer cache in [`GatewayState`].
+pub async fn collect_health(st: &GatewayState, now_ms: u64) -> HealthPayload {
+    let now_secs = now_ms / 1000;
+    let height = st.rpc.height.load(std::sync::atomic::Ordering::Relaxed);
+    // One lock for both pool readings: size and the oldest admission stamp.
+    // The age read is a pure timestamp scan, never a transaction-content walk.
+    let (mempool_size, mempool_oldest_age) = {
+        let pool = st.rpc.mempool.read().await;
+        (pool.len(), pool.oldest_pending_age_secs(now_secs))
+    };
+
+    // Recent finalized blocks; timestamps here are the FINALIZE wall-clock
+    // (`RpcState::record_block` stores `now_secs()`), which is what health ages
+    // need. Bounded by MAX_RECENT_BLOCKS.
+    let recent: Vec<(u64, u64)> = {
+        let rb = st.rpc.recent_blocks.read().await;
+        rb.iter().map(|b| (b.height, b.timestamp)).collect()
+    };
+
+    // Latest quorum-certified header: gives us the last finalized round.
+    let latest_header = {
+        let store = crate::rpc::finalized_headers();
+        let hs = store.read().await;
+        hs.front().map(|h| (h.height, h.cert.round))
+    };
+
+    let last_finalize_age = recent
+        .iter()
+        .map(|(_, ts)| *ts)
+        .filter(|ts| *ts > 0)
+        .max()
+        .map(|ts| now_secs.saturating_sub(ts));
+    let network_tip = crate::rpc::fresh_peer_height();
+    let finalization_lag_blocks = network_tip.map(|tip| tip.saturating_sub(height));
+
+    let blocks_per_second = {
+        let window = HEALTH_BLOCK_RATE_WINDOW_SECS;
+        let mut times: Vec<u64> = recent
+            .iter()
+            .map(|(_, ts)| *ts)
+            .filter(|ts| *ts > 0 && now_secs.saturating_sub(*ts) <= window)
+            .collect();
+        times.sort_unstable();
+        let samples = times.len();
+        if samples >= 2 {
+            let span = times[samples - 1].saturating_sub(times[0]);
+            if span > 0 {
+                BlockRate {
+                    value: Some((samples - 1) as f64 / span as f64),
+                    unit: "blocks/second",
+                    window_seconds: window,
+                    samples,
+                    reason: None,
+                }
+            } else {
+                BlockRate {
+                    value: None,
+                    unit: "blocks/second",
+                    window_seconds: window,
+                    samples,
+                    reason: Some("all sampled finalizations share a timestamp".to_string()),
+                }
+            }
+        } else {
+            BlockRate {
+                value: None,
+                unit: "blocks/second",
+                window_seconds: window,
+                samples,
+                reason: Some(format!(
+                    "need at least two finalizations in the last {window} s"
+                )),
+            }
+        }
+    };
+
+    // Snapshot metadata comes from the durable store when it is attached.
+    let (snap_height, snap_ts, snap_reason) = match &st.rpc.archive_store {
+        None => (
+            None,
+            None,
+            Some("archive_store not attached (no durable storage on this node)".to_string()),
+        ),
+        Some(store) => {
+            let store = store.clone();
+            match tokio::task::spawn_blocking(move || match store.latest_state_height() {
+                Ok(Some(h)) => {
+                    let ts = store
+                        .header_at(h)
+                        .ok()
+                        .flatten()
+                        .map(|record| record.timestamp);
+                    (Some(h), ts, None)
+                }
+                Ok(None) => (None, None, Some("no state snapshot stored".to_string())),
+                Err(e) => (
+                    None,
+                    None,
+                    Some(format!("snapshot height read failed: {e}")),
+                ),
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => (None, None, Some("snapshot read task failed".to_string())),
+            }
+        }
+    };
+    let snapshot_height = measured_u64(
+        snap_height,
+        "blocks",
+        snap_reason.as_deref().unwrap_or("no state snapshot stored"),
+    );
+    let snapshot_lag = match (snap_height, height) {
+        (Some(snap), h) if h >= snap => Some(h - snap),
+        _ => None,
+    };
+    let snapshot_age = match (snap_height, snap_ts) {
+        (Some(_), Some(ts)) if ts > 0 => Some(now_secs.saturating_sub(ts)),
+        _ => None,
+    };
+    let snapshot_block_reason = if snap_height.is_none() {
+        snap_reason
+            .as_deref()
+            .unwrap_or("no state snapshot stored")
+            .to_string()
+    } else {
+        "snapshot block header not retained; storage does not expose snapshot write time"
+            .to_string()
+    };
+
+    let (data_dir_bytes, snapshot_files) = data_dir_health(st, now_ms).await;
+    let metrics = st.metrics.snapshot();
+    // Producer-less phase-1 counters: `None` until a phase-2 writer records
+    // the first event. Never substitute 0 — an operator cannot distinguish
+    // "measured zero" from "nobody writes this" otherwise.
+    let health_counters = crate::metrics::snapshot_health_counters();
+    let last_persist_age = health_counters
+        .last_persist_ms
+        .map(|ms| now_ms.saturating_sub(ms) / 1000);
+    // Prefer the writer's stamp when it exists (true write age); the stored
+    // block timestamp remains the fallback for nodes without that writer.
+    let snapshot_age = health_counters
+        .last_snapshot_ms
+        .map(|ms| now_ms.saturating_sub(ms) / 1000)
+        .or(snapshot_age);
+    let shards: Vec<u64> = st.rpc.shard_registry.ids().map(u64::from).collect();
+    let software = SoftwareHealth {
+        version: crate::metrics::BUILD_VERSION,
+        git_hash: crate::metrics::build_hash_resolved(),
+        dirty: crate::metrics::build_dirty_resolved(),
+        string: format!(
+            "stellereum/{} ({}{})",
+            crate::metrics::BUILD_VERSION,
+            crate::metrics::build_hash_resolved(),
+            match crate::metrics::build_dirty_resolved().as_str() {
+                "true" => ", dirty",
+                _ => "",
+            }
+        ),
+    };
+
+    let mut payload = HealthPayload {
+        schema: "stellereum.health.v1",
+        sampled_at_ms: now_ms,
+        served_at_ms: now_ms,
+        cache: HealthCacheInfo {
+            ttl_ms: st.health_options.cache_ttl_ms,
+            hit: false,
+            age_ms: 0,
+        },
+        identity: IdentityHealth {
+            chain_id: st.rpc.chain_id,
+            protocol_major: crate::protocol::PROTOCOL_MAJOR,
+            protocol_minor: crate::protocol::PROTOCOL_MINOR,
+            fork_id: crate::protocol::FORK_ID,
+            node_id: st.rpc.node_id.clone(),
+            shards: Measured::observed(shards, "shard ids"),
+            software,
+            timestamp_ms: now_ms,
+        },
+        chain: ChainHealth {
+            height: Measured::observed(height, "blocks"),
+            finalized_height: measured_u64(
+                (height > 0).then_some(height),
+                "blocks",
+                "no finalized block yet (height 0)",
+            ),
+            network_tip_height: measured_u64(
+                network_tip,
+                "blocks",
+                "no fresh verified peer tip",
+            ),
+            finalization_lag: FinalizationLag {
+                blocks: measured_u64(
+                    finalization_lag_blocks,
+                    "blocks",
+                    "no fresh verified peer tip to compare against",
+                ),
+                seconds: measured_u64(
+                    last_finalize_age,
+                    "seconds",
+                    "no finalized block observed",
+                ),
+                timestamp_ms: now_ms,
+            },
+            blocks_per_second,
+            last_finalize_age: measured_u64(
+                last_finalize_age,
+                "seconds",
+                "no finalized block observed",
+            ),
+            timestamp_ms: now_ms,
+        },
+        consensus: ConsensusHealth {
+            // The registry seeds round at 0 and has no producer today. A
+            // positive value is real; 0 is not reported as "the round" because
+            // it cannot be distinguished from the unset default.
+            round: if metrics.round > 0.0 {
+                Measured::observed(metrics.round as u64, "round")
+            } else {
+                Measured::missing(
+                    "round",
+                    "no consensus round observed (Registry::set_round has no producer)",
+                )
+            },
+            last_finalized_round: measured_u64(
+                latest_header.map(|(_, round)| u64::from(round)),
+                "round",
+                "no finalized header retained",
+            ),
+            view_changes_last_5m: Measured::missing(
+                "view changes",
+                "cumulative counter exists but no 5-minute window is wired yet; see docs/OBSERVABILITY.md (Phase 2 wiring)",
+            ),
+            rejected_proposals_total: measured_u64(
+                health_counters.rejected_proposals_total,
+                "proposals",
+                "no rejected proposal has been recorded yet (no producer has written the counter)",
+            ),
+            forks_total: Measured::observed(metrics.forks as u64, "events"),
+            divergences_total: Measured::observed(metrics.divergences as u64, "events"),
+            catch_up: CatchUpHealth {
+                mode: Measured::missing(
+                    "mode",
+                    "catch-up mode lives in driver-local state; export policy::CatchupAction at src/node/consensus_driver.rs:1596",
+                ),
+                last_catch_up_age: Measured::missing(
+                    "seconds",
+                    "no last-catch-up timestamp; record it where catchup_action is applied",
+                ),
+            },
+            timestamp_ms: now_ms,
+        },
+        p2p: P2pHealth {
+            peer_count: Measured::observed(crate::rpc::observed_peer_count(), "peers")
+                .with_source("rpc::LIVE_PEER_COUNT (0 = none observed)"),
+            peer_states: Measured::missing(
+                "peers",
+                "per-peer live/suspected/cooldown state is driver-local; export the peer_health map (src/consensus_net.rs:707) or ValidatorMesh snapshot (src/network.rs:729)",
+            ),
+            mesh: MeshHealth {
+                members: Measured::missing(
+                    "members",
+                    "ValidatorMesh state is not process-global; export members()/direct_targets() as a snapshot",
+                ),
+                direct_targets: Measured::missing(
+                    "targets",
+                    "ValidatorMesh state is not process-global; export direct_targets() as a snapshot",
+                ),
+                last_delivery: Measured::missing(
+                    "outcome",
+                    "last MeshDelivery is not recorded globally; store the latest result at src/consensus_net.rs:1722",
+                ),
+            },
+            bytes: P2pBytesHealth {
+                inbound_total: measured_u64(
+                    health_counters.bytes_inbound_total,
+                    "bytes",
+                    "no inbound consensus bytes recorded yet (no producer has written the counter)",
+                ),
+                outbound_total: measured_u64(
+                    health_counters.bytes_outbound_total,
+                    "bytes",
+                    "no outbound consensus bytes recorded yet (no producer has written the counter)",
+                ),
+            },
+            timestamp_ms: now_ms,
+        },
+        mempool: MempoolHealth {
+            size: Measured::observed(mempool_size as u64, "transactions"),
+            oldest_pending_age: measured_u64(
+                mempool_oldest_age,
+                "seconds",
+                "mempool is empty (no pending transaction to age)",
+            ),
+            timestamp_ms: now_ms,
+        },
+        storage: StorageHealth {
+            data_dir_bytes,
+            snapshot_files,
+            last_persist_age: measured_u64(
+                last_persist_age,
+                "seconds",
+                "no successful persist recorded yet (no producer has written the counter)",
+            ),
+            snapshot: SnapshotHealth {
+                height: snapshot_height,
+                lag_blocks: measured_u64(
+                    snapshot_lag,
+                    "blocks",
+                    "snapshot height unavailable",
+                ),
+                age_secs: measured_u64(snapshot_age, "seconds", &snapshot_block_reason),
+            },
+            timestamp_ms: now_ms,
+        },
+        verdict: HealthVerdict {
+            status: HealthStatus::Ok,
+            reasons: Vec::new(),
+            unknown: Vec::new(),
+        },
+    };
+
+    // Verdict is a PURE function of the values the payload reports. Build the
+    // fact set from the payload itself so the two can never disagree.
+    let facts = HealthFacts {
+        height: payload.chain.height.as_ref().copied(),
+        finalization_lag_blocks: payload.chain.finalization_lag.blocks.as_ref().copied(),
+        finalization_lag_secs: payload.chain.finalization_lag.seconds.as_ref().copied(),
+        last_finalize_age_secs: payload.chain.last_finalize_age.as_ref().copied(),
+        peer_count: payload.p2p.peer_count.as_ref().copied(),
+        mempool_size: payload.mempool.size.as_ref().copied(),
+        mempool_oldest_age_secs: payload.mempool.oldest_pending_age.as_ref().copied(),
+        last_persist_age_secs: payload.storage.last_persist_age.as_ref().copied(),
+        snapshot_age_secs: payload.storage.snapshot.age_secs.as_ref().copied(),
+        consensus_round: payload.consensus.round.as_ref().copied(),
+        view_changes_last_5m: payload.consensus.view_changes_last_5m.as_ref().copied(),
+        rejected_proposals_total: payload.consensus.rejected_proposals_total.as_ref().copied(),
+        catch_up_mode: payload.consensus.catch_up.mode.value.clone(),
+    };
+    payload.verdict = evaluate_verdict(&facts, &st.health_options.thresholds);
+    payload
+}
+
+/// Serve one sample, honoring the short TTL cache.
+async fn health_current(st: &GatewayState) -> HealthPayload {
+    let now = now_ms();
+    let ttl = st.health_options.cache_ttl_ms;
+    if let Some(mut payload) = st.health_cache.lookup(now, ttl) {
+        payload.served_at_ms = now;
+        payload.cache.hit = true;
+        payload.cache.age_ms = now.saturating_sub(payload.sampled_at_ms);
+        return payload;
+    }
+    let mut payload = collect_health(st, now).await;
+    payload.served_at_ms = now;
+    payload.cache.hit = false;
+    payload.cache.age_ms = 0;
+    st.health_cache.store(now, payload.clone());
+    payload
+}
+
+/// `GET /health` — the operator-facing health payload. Always HTTP 200: the
+/// verdict (not the status code) says whether the node is healthy, so a
+/// dashboard can distinguish "endpoint unreachable" from "node unhealthy".
+async fn health(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Json<HealthPayload>) {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    (headers, Json(health_current(&st).await))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+async fn status_page(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<String>) {
+    let p = health_current(&st).await;
+    let status = match p.verdict.status {
+        HealthStatus::Ok => "ok",
+        HealthStatus::Degraded => "degraded",
+        HealthStatus::Critical => "critical",
+    };
+    let reasons = if p.verdict.reasons.is_empty() {
+        "<li>none</li>".to_string()
+    } else {
+        p.verdict
+            .reasons
+            .iter()
+            .map(|r| format!("<li>{}</li>", html_escape(r)))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let fmt_u64 = |m: &Measured<u64>| match m.value {
+        Some(v) => format!("{v} {}", m.unit),
+        None => format!(
+            "n/a ({})",
+            html_escape(m.reason.as_deref().unwrap_or("unavailable"))
+        ),
+    };
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>stellereum status</title>\
+         <style>body{{font:14px/1.4 system-ui,sans-serif;margin:2rem;max-width:60rem}}\
+         .ok{{color:#087f23}}.degraded{{color:#9a6700}}.critical{{color:#b42318}}\
+         table{{border-collapse:collapse}}td,th{{padding:.25rem .6rem;text-align:left;border-bottom:1px solid #ddd}}\
+         code{{background:#f4f4f4;padding:0 .2rem}}</style></head><body>\
+         <h1>stellereum status: <span class=\"{status}\">{status}</span></h1>\
+         <p>sampled <code>{sampled}</code> ms &middot; served <code>{served}</code> ms &middot; cache {cache}</p>\
+         <h2>reasons</h2><ul>{reasons}</ul>\
+         <h2>node</h2><table>\
+         <tr><th>chain id</th><td>{chain_id}</td></tr>\
+         <tr><th>node id</th><td><code>{node_id}</code></td></tr>\
+         <tr><th>software</th><td>{software}</td></tr>\
+         <tr><th>height</th><td>{height}</td></tr>\
+         <tr><th>finalized height</th><td>{finalized}</td></tr>\
+         <tr><th>finalization lag</th><td>{lag_s} / {lag_b}</td></tr>\
+         <tr><th>blocks/s</th><td>{rate}</td></tr>\
+         <tr><th>last finalize age</th><td>{last_fin}</td></tr>\
+         <tr><th>peers</th><td>{peers}</td></tr>\
+         <tr><th>mempool</th><td>{mempool}</td></tr>\
+         <tr><th>data dir</th><td>{disk}</td></tr>\
+         </table>\
+         <p><a href=\"/health\">/health</a> &middot; <a href=\"/metrics\">/metrics</a></p>\
+         </body></html>",
+        sampled = p.sampled_at_ms,
+        served = p.served_at_ms,
+        cache = if p.cache.hit {
+            format!("hit ({} ms old)", p.cache.age_ms)
+        } else {
+            "miss".to_string()
+        },
+        chain_id = p.identity.chain_id,
+        node_id = html_escape(&p.identity.node_id),
+        software = html_escape(&p.identity.software.string),
+        height = fmt_u64(&p.chain.height),
+        finalized = fmt_u64(&p.chain.finalized_height),
+        lag_s = fmt_u64(&p.chain.finalization_lag.seconds),
+        lag_b = fmt_u64(&p.chain.finalization_lag.blocks),
+        last_fin = fmt_u64(&p.chain.last_finalize_age),
+        rate = match p.chain.blocks_per_second.value {
+            Some(v) => format!(
+                "{v:.3} blocks/s over {} s ({} samples)",
+                p.chain.blocks_per_second.window_seconds,
+                p.chain.blocks_per_second.samples
+            ),
+            None => format!(
+                "n/a ({})",
+                html_escape(
+                    p.chain
+                        .blocks_per_second
+                        .reason
+                        .as_deref()
+                        .unwrap_or("unavailable")
+                )
+            ),
+        },
+        peers = fmt_u64(&p.p2p.peer_count),
+        mempool = fmt_u64(&p.mempool.size),
+        disk = fmt_u64(&p.storage.data_dir_bytes),
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    (headers, Html(body))
 }
 
 /// Liveness probe: the process is up and answering HTTP. Deliberately cheap —
@@ -2232,7 +3389,8 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         ));
     Router::new()
         .route("/", get(index))
-        .route("/health", get(health_check))
+        .route("/health", get(health))
+        .route("/status", get(status_page))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(prometheus_metrics))

@@ -298,6 +298,7 @@ fn headcount_majority_without_power_is_refused() {
     // Hand-built QC with the same three signatures verifies against nothing:
     // both gates must refuse together.
     let hand_qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Prevote,
@@ -707,6 +708,7 @@ fn sub_quorum_qc_fails_both_gates_together() {
     let ks = keys(4);
     let vs = uniform_set(&ks, 1);
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Prevote,
@@ -773,6 +775,7 @@ fn garbage_envelope_markers_contribute_zero_power() {
 
     // A QC with ONLY garbage markers verifies against nothing.
     let only_garbage = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Prevote,

@@ -111,6 +111,7 @@ fn build_uqc(f: &Fixture, signer_ids: &[[u8; 32]]) -> PqMicroCertificate {
 
 fn wrap_uqc(f: &Fixture, uqc: &PqMicroCertificate) -> QuorumCertificate {
     QuorumCertificate {
+        shard_id: 0,
         height: f.height,
         round: f.round,
         kind: f.kind,
@@ -200,6 +201,7 @@ fn empty_committee_and_zero_weight_fail_closed() {
         sortition_parent: [0x5Au8; 32],
     };
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: f.height,
         round: f.round,
         kind: f.kind,
@@ -225,6 +227,7 @@ fn empty_committee_and_zero_weight_fail_closed() {
         sortition_parent: [0x5Au8; 32],
     };
     let qc2 = QuorumCertificate {
+        shard_id: 0,
         height: f.height,
         round: f.round,
         kind: f.kind,
@@ -261,6 +264,7 @@ fn cec_power_path_still_verifies() {
         sortition_parent: [0x5Au8; 32],
     };
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: f.height,
         round: f.round,
         kind: f.kind,

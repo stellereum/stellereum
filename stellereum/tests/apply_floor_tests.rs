@@ -546,6 +546,46 @@ async fn block_charges_the_measured_gas_of_a_payload() {
     );
 }
 
+/// GOLDEN FEE-01 CASE (zero-gas success): a payload that measured ZERO gas is
+/// NOT a free transaction.
+///
+/// `OpCode::Halt` is priced at `GAS_HALT = 0` and succeeds immediately, so the
+/// executor reports `gas_used = 0`. Before the fix the intrinsic was added
+/// only for an EMPTY payload, so `[Halt]` paid nothing at all: a
+/// self-authenticated, nonce-advancing transaction that cost the sender 0 and
+/// bypassed the admission floor (the floor only constrains the DECLARED limit,
+/// which is refunded when nothing is used). It must pay the intrinsic envelope
+/// exactly like a failing transaction does.
+#[tokio::test]
+async fn a_zero_gas_successful_payload_pays_the_intrinsic_envelope() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Implicit Falcon-512 envelope: no PQ activation surcharge, so the fee is
+    // the base charge alone and a zero base is observable.
+    let tx = txp(&alice, [0xB0; 32], 0, 1_000_000, 0, vec![OpCode::Halt]);
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0), "Halt itself succeeds");
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "a zero-gas success must pay the intrinsic envelope, never 0"
+    );
+    assert_eq!(fees_collected, GAS_BASIC_TRANSFER);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - GAS_BASIC_TRANSFER,
+        "the sender cannot get the envelope back as a refund"
+    );
+    assert_eq!(sender.nonce, 1);
+}
+
 /// GOLDEN FEE-01 CASE (failure): an attributable failure is priced at the
 /// intrinsic envelope, floored by consensus — never at the declared limit.
 ///

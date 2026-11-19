@@ -1,21 +1,146 @@
-//! Read-only consolidated view of compile-time chain activation gates and
-//! protocol defaults across `stellereum` and `infnode`.
+//! Consolidated view of chain activation gates and protocol defaults across
+//! `stellereum` and `infnode`, plus the genesis chain-spec values that are not
+//! compiled into a per-subsystem constant.
 //!
-//! This module does NOT own or override any activation constants; it inspects
-//! the canonical constants defined in their respective subsystems so operators,
-//! diagnostics, and tests have a single source of truth with zero duplicated
-//! literals.
+//! Most gates are inspected from the canonical constants defined in their
+//! respective subsystems, so operators, diagnostics, and tests have a single
+//! source of truth with zero duplicated literals. The upgrade-execution gate is
+//! the exception: its EFFECTIVE value is [`GenesisChainSpec`], installed once
+//! at genesis, with the compiled
+//! [`crate::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT`] as the default for
+//! chains that do not set it.
 
 use crate::consensus::{
     BEACON_DRAW_ACTIVATION_HEIGHT, CNVRF_V3_ACTIVATION_HEIGHT, QC_SPLIT_ACTIVATION_HEIGHT,
     QC_SPLIT_BY_SIZE_THRESHOLD,
 };
 use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
+use crate::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
 use crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT;
 use crate::xshard2pc::XPC_ACTIVATION_HEIGHT;
 use crate::zkml::DEFAULT_CHAIN_ID;
+
+/// The compiled default for the upgrade-execution gate.
+///
+/// This is the value a chain gets when its genesis chain spec does not name
+/// one. It is re-exported from [`crate::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT`]
+/// so there is exactly one compiled sentinel: `u64::MAX` (inert at every
+/// reachable height) on chains that never opted in.
+pub const DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = UPGRADE_EXEC_ACTIVATION_HEIGHT;
+
+/// The parts of a chain's identity that are fixed when genesis is built.
+///
+/// Today the only field is the upgrade-execution activation height. It is
+/// deliberately a *genesis* value, not an env knob: two nodes that disagree
+/// about `upgrade_exec_activation_height` would disagree about whether a
+/// passed `SoftwareUpgrade` installs its plan at a given height, which is a
+/// consensus fork. [`install_genesis_chain_spec`] therefore allows exactly
+/// one install per process, before any block is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenesisChainSpec {
+    /// Height at/above which `SoftwareUpgrade` plan installation is enabled.
+    /// `CancelUpgrade` is a safety valve and stays available below it.
+    /// `u64::MAX` is the compiled default (off).
+    pub upgrade_exec_activation_height: u64,
+}
+
+impl GenesisChainSpec {
+    /// Build a chain spec with an explicit upgrade-execution gate.
+    pub const fn new(upgrade_exec_activation_height: u64) -> Self {
+        Self {
+            upgrade_exec_activation_height,
+        }
+    }
+
+    /// The chain spec used when a chain does not set a value: the compiled
+    /// [`DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT`] (`u64::MAX`, inert).
+    pub const fn compiled_default() -> Self {
+        Self::new(DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT)
+    }
+
+    /// True once the gate is open at `height` (`>=` activation semantics).
+    pub const fn upgrade_exec_active_at(&self, height: u64) -> bool {
+        height >= self.upgrade_exec_activation_height
+    }
+}
+
+impl Default for GenesisChainSpec {
+    fn default() -> Self {
+        Self::compiled_default()
+    }
+}
+
+/// The process-wide genesis chain spec. Installed at most once, before the
+/// first block is applied; otherwise every read falls back to
+/// [`GenesisChainSpec::compiled_default`].
+static INSTALLED_GENESIS_CHAIN_SPEC: std::sync::OnceLock<GenesisChainSpec> =
+    std::sync::OnceLock::new();
+
+/// Fix the genesis chain spec for this process.
+///
+/// Returns `true` when this call installed the spec and `false` when one was
+/// already installed (the first install wins; a second, different value is
+/// never silently accepted). Call this BEFORE applying any block, with the
+/// value covered by the chain's genesis identity. This module cannot enforce
+/// that by itself: see the genesis-fingerprint guard and the note in
+/// `docs/UPGRADE_AND_RECOVERY.md` §1.2.2.
+pub fn install_genesis_chain_spec(spec: GenesisChainSpec) -> bool {
+    INSTALLED_GENESIS_CHAIN_SPEC.set(spec).is_ok()
+}
+
+/// The genesis chain spec in force for this process/thread.
+///
+/// Precedence: the thread-scoped test/debug override (if any), then the
+/// once-installed genesis spec, then the compiled default.
+pub fn active_genesis_chain_spec() -> GenesisChainSpec {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(spec) = GENESIS_CHAIN_SPEC_OVERRIDE.with(|c| c.get()) {
+        return spec;
+    }
+    INSTALLED_GENESIS_CHAIN_SPEC
+        .get()
+        .copied()
+        .unwrap_or_else(GenesisChainSpec::compiled_default)
+}
+
+// TEST-ONLY, thread-scoped override of the whole genesis chain spec (the
+// `QC_SPLIT_ACTIVATION_HEIGHT` pattern used throughout the tree). Release
+// builds have no override, so a process that never installs one behaves
+// byte-identically to the compiled default.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static GENESIS_CHAIN_SPEC_OVERRIDE: std::cell::Cell<Option<GenesisChainSpec>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY genesis chain spec for the
+/// CALLING THREAD. Available in test/debug builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn set_genesis_chain_spec_override(spec: Option<GenesisChainSpec>) {
+    GENESIS_CHAIN_SPEC_OVERRIDE.with(|c| c.set(spec));
+}
+
+/// Set (or clear with `None`) the TEST-ONLY genesis chain spec's
+/// upgrade-execution gate for the CALLING THREAD. Kept as the narrow form of
+/// [`set_genesis_chain_spec_override`] for existing upgrade tests.
+#[cfg(any(test, debug_assertions))]
+pub fn set_upgrade_exec_activation_override(activation: Option<u64>) {
+    set_genesis_chain_spec_override(activation.map(GenesisChainSpec::new));
+}
+
+/// The upgrade-execution activation height in force: the genesis chain
+/// spec's value. This is the ONE source of truth read by
+/// [`crate::governance::upgrade_exec_active_at`] and every execution path.
+pub fn upgrade_exec_activation_height() -> u64 {
+    active_genesis_chain_spec().upgrade_exec_activation_height
+}
+
+/// True once the upgrade-execution gate is open at `height`.
+pub fn upgrade_exec_active_at(height: u64) -> bool {
+    active_genesis_chain_spec().upgrade_exec_active_at(height)
+}
 
 /// Activation status derived from a height-gated `u64` constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +300,12 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 XPC_ACTIVATION_HEIGHT,
                 "Cross-shard two-phase commit (active from genesis: new transfers use prepare/vote/commit)",
             ),
+            ActivationGate::new(
+                "UPGRADE_EXEC_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                upgrade_exec_activation_height(),
+                "On-chain SoftwareUpgrade plan installation (genesis chain-spec value; compiled default is u64::MAX)",
+            ),
         ],
     }
 }
@@ -216,6 +347,42 @@ mod tests {
                 assert_eq!(schedule.is_active(gate.name, u64::MAX), Some(false));
             }
         }
+    }
+
+    /// The operator-visible gate comes from the genesis chain spec, not from a
+    /// second hard-coded sentinel: setting a chain spec moves the registered
+    /// gate and `upgrade_exec_active_at` together.
+    #[test]
+    fn upgrade_exec_gate_is_registered_from_the_genesis_chain_spec() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_genesis_chain_spec_override(None);
+            }
+        }
+        let _reset = Reset;
+        assert_eq!(
+            upgrade_exec_activation_height(),
+            DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT
+        );
+        set_genesis_chain_spec_override(Some(GenesisChainSpec::new(4_242)));
+        let schedule = current_activation_schedule();
+        let below = schedule.is_active("UPGRADE_EXEC_ACTIVATION_HEIGHT", 4_241);
+        let at = schedule.is_active("UPGRADE_EXEC_ACTIVATION_HEIGHT", 4_242);
+        let active_below = upgrade_exec_active_at(4_241);
+        let active_at = upgrade_exec_active_at(4_242);
+
+        assert_eq!(below, Some(false));
+        assert_eq!(at, Some(true));
+        assert!(!active_below);
+        assert!(active_at);
+        let gate = schedule
+            .gates
+            .iter()
+            .find(|g| g.name == "UPGRADE_EXEC_ACTIVATION_HEIGHT")
+            .expect("the upgrade gate must be registered");
+        assert_eq!(gate.module, "stellereum::chain_spec");
+        assert_eq!(gate.activation_height, 4_242);
     }
 
     #[test]
@@ -267,6 +434,10 @@ mod tests {
                 PQ_TRANSPORT_H_ACTIVATION_HEIGHT,
             ),
             ("XPC_ACTIVATION_HEIGHT", XPC_ACTIVATION_HEIGHT),
+            (
+                "UPGRADE_EXEC_ACTIVATION_HEIGHT",
+                DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT,
+            ),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());

@@ -33,6 +33,76 @@ fn tx_hash_param(params: &Value) -> Option<[u8; 32]> {
         .and_then(|s| parse_hash(s).ok())
 }
 
+/// Parse the block selector of `stell_getBlock` using the SAME rule set as
+/// the `eth_*` adapter: `{"height": <n|tag>}`, a bare number/tag, or a
+/// positional array (`[<n|tag>]`). Tags are resolved against the node's tip.
+fn stell_block_tag_param(params: &Value) -> Result<crate::evm_adapter::BlockTag, String> {
+    use crate::evm_adapter::BlockTag;
+    let selector = match params {
+        Value::Array(arr) => arr.first().ok_or_else(|| "missing height".to_string())?,
+        Value::Object(obj) => obj
+            .get("height")
+            .or_else(|| obj.get("blockNumber"))
+            .or_else(|| obj.get("number"))
+            .ok_or_else(|| "missing height".to_string())?,
+        Value::String(_) | Value::Number(_) => params,
+        _ => return Err("missing height".to_string()),
+    };
+    BlockTag::parse(selector).map_err(|e| e.message)
+}
+
+/// Project an `EvmBlock` from the shared adapter into the compact
+/// `stell_getBlock` summary shape (the same shape the recent window and the
+/// archive store serve). Used only as a fallback so every read path answers
+/// from the same committed source.
+fn evm_block_to_stell_summary(
+    b: &crate::evm_adapter::EvmBlock,
+) -> Option<crate::rpc::BlockSummary> {
+    let height = crate::evm_adapter::parse_hex_u64(b.number.as_deref()?).ok()?;
+    let hash = b
+        .hash
+        .as_deref()
+        .map(|h| h.strip_prefix("0x").unwrap_or(h).to_string())?;
+    let timestamp = crate::evm_adapter::parse_hex_u64(&b.timestamp).ok()?;
+    let tx_count = match &b.transactions {
+        crate::evm_adapter::BlockTransactions::Hashes(v) => v.len(),
+        crate::evm_adapter::BlockTransactions::Full(v) => v.len(),
+    };
+    Some(crate::rpc::BlockSummary {
+        height,
+        hash,
+        tx_count,
+        timestamp,
+    })
+}
+
+/// The native transaction body behind a receipt, if this node still holds it.
+///
+/// Receipts filed live carry the bincode bytes; receipts hydrated after a
+/// restart do not (`StoredReceipt` has no raw_tx). In that case the committed
+/// block body in the archive store is the authoritative source. `None` means
+/// this node cannot reconstruct the body — callers must say so instead of
+/// synthesising zero-valued fields.
+async fn receipt_body_tx(st: &RpcState, r: &TxReceipt) -> Option<Transaction> {
+    if let Some(ref raw_hex) = r.raw_tx {
+        let stripped = raw_hex
+            .strip_prefix("0x")
+            .or_else(|| raw_hex.strip_prefix("0X"))
+            .unwrap_or(raw_hex);
+        if let Ok(bytes) = hex::decode(stripped) {
+            if let Ok(tx) = bincode::deserialize::<Transaction>(&bytes) {
+                return Some(tx);
+            }
+        }
+    }
+    let store = st.archive_store.as_ref()?;
+    let block = store.get_block(&r.block_hash).ok().flatten()?;
+    block
+        .transactions
+        .into_iter()
+        .find(|tx| tx.compute_tx_hash() == r.tx_hash)
+}
+
 /// Parse a 32-byte hex address (with or without 0x).
 #[allow(dead_code)]
 pub fn parse_addr(s: &str) -> Result<[u8; 32], String> {
@@ -932,6 +1002,7 @@ pub(super) async fn handle_get_historical_root(
                     "round": record.cert.round,
                     "kind": format!("{:?}", record.cert.kind),
                     "block_hash": record.cert.block_hash.map(hex::encode),
+                    "shard_id": record.cert.shard_id,
                     "signatures": record.cert.signatures.iter().map(|(v, s)| json!({
                         "validator": hex::encode(v),
                         "signature": hex::encode(s),
@@ -1211,68 +1282,87 @@ pub(super) async fn dispatch_reads(
         "stell_getBlock" => {
             // Serve order: local committed window (fed by finalize AND adopt via
             // `record_adopted_block`, so any node serves adopted heights) ->
-            // honest "not available yet". Never fabricated: a height outside the
-            // window is a miss, not a zero-tx fabrication.
+            // durable header store -> the same shared adapter `eth_getBlockBy*`
+            // reads -> honest "not available yet". Never fabricated: a height
+            // outside every source is a miss, not a zero-tx fabrication.
+            //
+            // The selector accepts everything the `eth_*` path accepts:
+            // `{"height": 42}`, `{"height": "latest"}`, `"latest"`, `42`,
+            // `["0x2a"]`, ... Tags resolve against this node's finalized tip.
             //
             // Finalized-read cache: the summary for a finalized height is
             // immutable (any republish evicts via `record_block`), so a fresh
             // `Ok` is cached keyed by (method, height, params-hash). Errors
             // bypass: an unknown height can still arrive via replication.
-            let want = params["height"].as_u64();
-            if let Some(h) = want {
-                let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-                if h <= tip {
-                    if let Some(hit) = finalized_read_cache_get("stell_getBlock", h, params, tip) {
-                        return ok(id, hit);
-                    }
-                }
+            let tag = match stell_block_tag_param(params) {
+                Ok(t) => t,
+                Err(e) if e == "missing height" => return err(id, -32602, e),
+                Err(e) => return err(id, -32602, e),
+            };
+            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let want = tag.resolve(tip);
+            if let Some(hit) = finalized_read_cache_get("stell_getBlock", want, params, tip) {
+                return ok(id, hit);
             }
             let rb = st.recent_blocks.read().await;
-            let found = rb.iter().find(|b| Some(b.height) == want);
-            match found {
-                Some(b) => {
+            let found = rb.iter().find(|b| b.height == want);
+            if let Some(b) = found {
+                let v = json!({
+                    "height": b.height,
+                    "hash": b.hash,
+                    "txs": b.tx_count,
+                    "timestamp": b.timestamp,
+                });
+                drop(rb);
+                finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
+                return ok(id, v);
+            }
+            drop(rb);
+            if let Some(rec) = st
+                .archive_store
+                .as_ref()
+                .and_then(|s| s.header_at(want).ok().flatten())
+            {
+                let v = json!({
+                    "height": rec.height,
+                    "hash": hex::encode(rec.block_hash),
+                    "txs": rec.tx_count,
+                    "timestamp": rec.timestamp,
+                });
+                finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
+                return ok(id, v);
+            }
+            // Same source the `eth_*` adapter serves: the shared adapter maps.
+            let numeric_tag = format!("0x{want:x}");
+            if let Ok(Some(b)) = st.eth_get_block_by_number(&numeric_tag, false).await {
+                if let Some(mut summary) = evm_block_to_stell_summary(&b) {
+                    // An adapter block summary can carry an empty hashes list;
+                    // the receipt index is the authoritative tx count for a
+                    // height this node committed.
+                    if summary.tx_count == 0 {
+                        summary.tx_count = st.receipts.read().await.for_height(want).len();
+                    }
                     let v = json!({
-                        "height": b.height,
-                        "hash": b.hash,
-                        "txs": b.tx_count,
-                        "timestamp": b.timestamp,
+                        "height": summary.height,
+                        "hash": summary.hash,
+                        "txs": summary.tx_count,
+                        "timestamp": summary.timestamp,
                     });
-                    if let Some(h) = want {
-                        let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-                        finalized_read_cache_put("stell_getBlock", h, params, tip, v.clone());
-                    }
-                    ok(id, v)
-                }
-                None => {
-                    drop(rb);
-                    if let Some(h) = want {
-                        if let Some(rec) = st
-                            .archive_store
-                            .as_ref()
-                            .and_then(|s| s.header_at(h).ok().flatten())
-                        {
-                            let v = json!({
-                                "height": rec.height,
-                                "hash": hex::encode(rec.block_hash),
-                                "txs": rec.tx_count,
-                                "timestamp": rec.timestamp,
-                            });
-                            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-                            if h <= tip {
-                                finalized_read_cache_put(
-                                    "stell_getBlock",
-                                    h,
-                                    params,
-                                    tip,
-                                    v.clone(),
-                                );
-                            }
-                            return ok(id, v);
-                        }
-                    }
-                    err(id, -32004, "block not available yet (not in recent window; replication runs behind finalization)")
+                    finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
+                    return ok(id, v);
                 }
             }
+            if want > tip {
+                return err(
+                    id,
+                    -32004,
+                    format!(
+                        "block not available yet: height {want} is above this node's tip \
+                         ({tip}); replication runs behind finalization"
+                    ),
+                );
+            }
+            err(id, -32004, "block not available yet (not in recent window; replication runs behind finalization)")
         }
         // Block transactions, served from the SAME receipt index as
         // `stell_getTransactionReceipt` (filed by the single real application on
@@ -1281,10 +1371,15 @@ pub(super) async fn dispatch_reads(
         // fabricated (an empty list is only returned when the block is KNOWN
         // with zero transactions, not when it is unknown).
         "stell_getBlockTransactions" => {
-            let want = match params["height"].as_u64().or_else(|| params.as_u64()) {
-                Some(h) => h,
-                None => return err(id, -32602, "missing height"),
+            // Same selector shapes as `stell_getBlock` (number, hex, tag,
+            // positional): a client should not need two different height
+            // dialects for two reads of the same block.
+            let tag = match stell_block_tag_param(params) {
+                Ok(t) => t,
+                Err(e) => return err(id, -32602, e),
             };
+            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let want = tag.resolve(tip);
             // Known height = in the recent window (committed locally or adopted).
             let known_mem = st
                 .recent_blocks
@@ -1951,6 +2046,93 @@ pub(super) async fn dispatch_reads(
                     )
                 }
             }
+        }
+        // Transaction lookup by hash (native namespace).
+        //
+        // Without this a wallet had to use `eth_getTransactionByHash`, whose
+        // shape is EVM-only. Serve the native view from the SAME sources the
+        // receipt/status reads use: finalized receipt index (live filings carry
+        // the body; restart-hydrated receipts resolve it from the committed
+        // block body), then the mempool, else an honest `unknown`.
+        //
+        // Never fabricates: if the receipt exists but this node holds neither
+        // the raw bytes nor the block body (e.g. the body was pruned), the
+        // identity fields are `null` and `body_available: false` says why.
+        // EVM intent hashes are accepted too and resolve through the same
+        // bidirectional settlement map as `eth_getTransactionReceipt`.
+        "stell_getTransactionByHash" => {
+            let h = match tx_hash_param(params) {
+                Some(h) => h,
+                None => return err(id, -32602, "missing tx hash"),
+            };
+            let queried = format!("0x{}", hex::encode(h));
+            let lookup = crate::evm_adapter::evm_to_stell_hash(&queried).unwrap_or(h);
+            let head = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let receipt = st.receipts.read().await.get(&lookup).cloned();
+            if let Some(r) = receipt {
+                let body = receipt_body_tx(st, &r).await;
+                let confirmations = head.saturating_sub(r.height).saturating_add(1);
+                let mut obj = json!({
+                    "tx_hash": hex::encode(r.tx_hash),
+                    "status": if r.success { "success" } else { "failed" },
+                    "height": r.height,
+                    "block_hash": hex::encode(r.block_hash),
+                    "index": r.index,
+                    "confirmations": confirmations,
+                    "gas_limit": r.gas_limit.to_string(),
+                    "fee_charged": r.fee_charged.to_string(),
+                    "body_available": body.is_some(),
+                });
+                if queried != format!("0x{}", hex::encode(r.tx_hash)) {
+                    obj["evm_hash"] = json!(queried);
+                }
+                if let Some(ref raw) = r.raw_tx {
+                    obj["raw_tx"] = json!(raw);
+                }
+                match body {
+                    Some(tx) => {
+                        obj["from"] = json!(hex::encode(tx.from));
+                        obj["to"] = json!(hex::encode(tx.to));
+                        obj["amount"] = json!(tx.amount.to_string());
+                        obj["nonce"] = json!(tx.nonce);
+                        obj["source_shard"] = json!(tx.source_shard);
+                        obj["target_shard"] = json!(tx.target_shard);
+                        obj["payload_ops"] = json!(tx.payload.len());
+                    }
+                    None => {
+                        obj["from"] = Value::Null;
+                        obj["to"] = Value::Null;
+                        obj["amount"] = Value::Null;
+                        obj["nonce"] = Value::Null;
+                    }
+                }
+                return ok(id, obj);
+            }
+            let pending_tx = st.mempool.read().await.get(&lookup).cloned();
+            if let Some(tx) = pending_tx {
+                return ok(
+                    id,
+                    json!({
+                        "tx_hash": hex::encode(lookup),
+                        "status": "pending",
+                        "height": Value::Null,
+                        "block_hash": Value::Null,
+                        "index": Value::Null,
+                        "confirmations": 0,
+                        "from": hex::encode(tx.from),
+                        "to": hex::encode(tx.to),
+                        "amount": tx.amount.to_string(),
+                        "nonce": tx.nonce,
+                        "gas_limit": tx.gas_limit.to_string(),
+                        "fee_charged": Value::Null,
+                        "source_shard": tx.source_shard,
+                        "target_shard": tx.target_shard,
+                        "payload_ops": tx.payload.len(),
+                        "body_available": true,
+                    }),
+                );
+            }
+            ok(id, json!({ "status": "unknown" }))
         }
         "stell_getEvents" => {
             let p = if params.is_array() {

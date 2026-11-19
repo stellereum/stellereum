@@ -156,10 +156,18 @@ async fn explorer_serves_index_and_apis() {
     assert!(status.contains("200"), "spv status: {status}");
     assert!(body.contains("12345"), "spv must return balance: {body}");
 
-    // Health check endpoint
-    let (status, body) = http_get(addr, "/health").await;
+    // Liveness probe stays the cheap unconditional "process is up" answer.
+    let (status, body) = http_get(addr, "/healthz").await;
     assert!(status.contains("200"));
     assert!(body.contains("\"status\":\"ok\""));
+
+    // Operator health payload: shaped JSON, always 200, verdict included.
+    let (status, body) = http_get(addr, "/health").await;
+    assert!(status.contains("200"));
+    let health: serde_json::Value = serde_json::from_str(&body).expect("health is JSON");
+    assert_eq!(health["schema"], "stellereum.health.v1");
+    assert_eq!(health["identity"]["chain_id"], 5757);
+    assert!(health["verdict"]["status"].is_string(), "{body}");
 
     // Prometheus metrics endpoint
     let (status, body) = http_get(addr, "/metrics").await;

@@ -1390,29 +1390,30 @@ mod tests {
     /// nothing (`None` — the proposer carries zero instead of a guess).
     #[test]
     fn epoch_mmr_root_covers_a_fully_finalized_epoch() {
+        let e = crate::mmr::MMR_EPOCH_BLOCKS;
         let mut cm = ChainManager::new(block(0, [0u8; 32], 0));
-        // Epoch 0 is heights 0..=127. Finalize 1..=127 sequentially.
+        // Epoch 0 is heights 0..=e-1. Finalize 1..=e-1 sequentially.
         let mut prev = cm.best_head();
-        for h in 1u64..=127 {
+        for h in 1u64..=e - 1 {
             let hash = cm.insert(block(h, prev, (h % 251) as u8));
             cm.finalize(hash).unwrap();
             prev = hash;
         }
         let (root, peaks) = cm.epoch_mmr_root(0).expect("epoch 0 is fully finalized");
         // Independent recomputation from the finalized hashes.
-        let leaves: Vec<BlockHash> = (0u64..=127)
+        let leaves: Vec<BlockHash> = (0u64..=e - 1)
             .map(|h| cm.finalized_at_height(h).unwrap())
             .collect();
         let (expected, expected_peaks) = crate::mmr::mmr_root_for_leaves(&leaves);
         assert_eq!(root, expected);
         assert_eq!(peaks, expected_peaks);
-        assert_eq!(peaks.len(), 1, "128 leaves form a single mountain");
+        assert_eq!(peaks.len(), leaves.len().count_ones() as usize);
         // A finalized leaf proves against the committed root.
         let m = crate::mmr::Mmr::of(&leaves);
         let proof = m.prove(5).expect("height 5 proves");
         assert_eq!(proof.leaf, cm.finalized_at_height(5).unwrap());
         assert!(proof.verify(&root));
-        // Epoch 1 (heights 128..=255) is not finalized: no root.
+        // Epoch 1 (heights e..=2e-1) is not finalized: no root.
         assert!(cm.epoch_mmr_root(1).is_none());
     }
 

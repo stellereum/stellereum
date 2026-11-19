@@ -1230,6 +1230,7 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     stell_getFinalizedCheckpoint, stell_getEpochRoot, stell_bridgeDeposit,
 //     stell_bridgeDispute, stell_tokenBalance, stell_tokenSupply,
 //     stell_tokenResolve, stell_listTokens, stell_getTransactionReceipt,
+//     stell_getTransactionByHash,
 //     stell_getEvents, stell_getTransactionStatus, stell_stakeOf,
 //     stell_getValidatorStatus, stell_zkmlCapabilities, stell_getValidators,
 //     stell_getPqKey, stell_getPqRegistryStatus, stell_proposal,
@@ -1358,6 +1359,7 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_tokenResolve"
         | "stell_listTokens"
         | "stell_getTransactionReceipt"
+        | "stell_getTransactionByHash"
         | "stell_getEvents"
         | "stell_getTransactionStatus"
         | "stell_stakeOf"

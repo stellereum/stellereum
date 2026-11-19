@@ -4,7 +4,8 @@
 //! key lives in ONE process, so it hides nothing from that process) with a
 //! scheme whose secret is SHARED by the validator committee:
 //!
-//! * **Epoch key.** Every epoch (128 blocks) has an *epoch public key* `P_e`
+//! * **Epoch key.** Every epoch (`EPOCH_BLOCKS` = 500 blocks = 2 min under
+//!   ruleset v2) has an *epoch public key* `P_e`
 //!   (a Ristretto255 point) and a matching secret `x_e` that is split with
 //!   Shamir over the epoch committee. The public key is the AGGREGATE of the
 //!   committee members' public key material: every member contributes a
@@ -172,9 +173,14 @@ use sha2::{Digest, Sha256};
 
 /// Blocks per MEV epoch. The epoch key rotates every this many blocks.
 ///
-/// FREEZE (protocol freeze 2026-11-03): 128 blocks per epoch, == MMR
-/// MMR_EPOCH_BLOCKS. Change requires spec update + audit note (AGENTS.md §7).
-pub const EPOCH_BLOCKS: u64 = 128;
+/// RULESET v2: 500 blocks x 240 ms = **120 s (2 min)** (the v1 value of 128
+/// blocks had shrunk to ~30.7 s at the live tempo). Full table:
+/// `docs/RULESET_V2.md`.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env, ==
+/// MMR `MMR_EPOCH_BLOCKS`. Change requires spec update + audit note
+/// (AGENTS.md §7).
+pub const EPOCH_BLOCKS: u64 = 500;
 
 /// Domain separator of the epoch committee hash.
 pub const COMMITTEE_DOMAIN: &[u8; 22] = b"STELL_MEV_COMMITTEE_V1";
@@ -211,7 +217,11 @@ pub const MAX_MEV_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 /// A commitment is only ever consulted for the height being worked, so the
 /// ones below the lookback are dead evidence. The bound keeps the map
 /// bounded on a node that never restarts.
-pub const ORDER_COMMITMENT_LOOKBACK: u64 = 4;
+///
+/// RULESET v2: 50 heights x 240 ms = **12 s** (the v1 value of 4 heights was
+/// ~12 s at 3 s blocks; at 240 ms it would have shrunk to ~0.96 s). This is
+/// a node-local retention bound, not a consensus rule.
+pub const ORDER_COMMITMENT_LOOKBACK: u64 = 50;
 
 /// The MEV epoch a height belongs to.
 #[inline]

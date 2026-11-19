@@ -107,6 +107,7 @@ fn qc_for(
     // refuses (no power), the same fail-closed verdict as before.
     set.certificate_with_parent(Some(hash), vs, Some(&parent))
         .unwrap_or(QuorumCertificate {
+            shard_id: 0,
             height,
             round: 0,
             kind: VoteKind::Precommit,

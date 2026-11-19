@@ -317,7 +317,8 @@ async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
 #[tokio::test]
 #[ignore = "documents the TEST-ONLY single-set compat entry's F5 limitation \
 (`validate_sync_chain`: one set for every height, zero production callers). \
-Live paths resolve set-at-height. Ignored so it cannot gate CI."]
+Live paths resolve set-at-height. Ignored so it cannot gate CI. \
+Tracked in docs/CI.md § Known limits."]
 async fn f5_open_current_quorum_rewrites_old_heights() {
     let (ks, fks) = falcon_votes::falcon_set(4);
     let current = vset(&ks);

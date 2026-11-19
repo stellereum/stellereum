@@ -194,6 +194,31 @@ impl ValidatorRuntime {
         txs.truncate(keep);
     }
 
+    /// The FINAL block body: the sealed (preferred) prefix followed by the
+    /// plain selection, subject to ONE set of block caps.
+    ///
+    /// Each selector is capped INDEPENDENTLY: the plain selection gets the
+    /// full [`MAX_BLOCK_TXS`]/[`MAX_BLOCK_GAS`] budget, while the sealed loop
+    /// is only bounded by the tx count (it never accumulates gas). Simply
+    /// concatenating them therefore admits a union of up to 2x either cap.
+    /// The validator enforces the caps on the committed body
+    /// (`validate_proposal_unaligned`), so an over-cap union is a block our
+    /// OWN validators refuse — a liveness outage for any sealed-heavy pool.
+    ///
+    /// Truncate the union deterministically with the same rule the packer uses:
+    /// the sealed prefix stays (it is the preferred path), the plain tail
+    /// sheds first, and per-sender nonce contiguity survives because both runs
+    /// are internally selection-ordered and the plain filter was seeded with
+    /// the post-sealed nonce state.
+    pub(super) fn final_block_body(
+        sealed: Vec<Transaction>,
+        plain: Vec<Transaction>,
+    ) -> Vec<Transaction> {
+        let mut txs: Vec<Transaction> = sealed.into_iter().chain(plain).collect();
+        Self::truncate_to_block_caps(&mut txs);
+        txs
+    }
+
     /// Whether a prebuilt selection for `height` is cached.
     pub fn has_prebuild_for(&self, height: Height) -> bool {
         self.prebuilt_selection
@@ -1361,8 +1386,11 @@ impl ValidatorRuntime {
         rej_basefee.set(rej_basefee.get() + fctx.rej_basefee.get());
         rej_sponsor.set(rej_sponsor.get() + fctx.rej_sponsor.get());
         // The sealed transactions come first (the proposer prefers the
-        // private path), the plain ones fill the rest.
-        let txs: Vec<Transaction> = sealed_kept.into_iter().chain(plain_txs).collect();
+        // private path), the plain ones fill the rest — ONE cap set over the
+        // UNION: `sealed_kept` and `plain_txs` were budgeted independently, so
+        // without this the body can exceed the caps every validator enforces
+        // (see `final_block_body`).
+        let txs: Vec<Transaction> = Self::final_block_body(sealed_kept, plain_txs);
         let mempool_len = self.mempool.read().await.len();
         // Empty block with a non-empty mempool is the shape to watch (usually
         // a per-sender nonce gap: filter needs exact nonces, evict keeps
@@ -1490,12 +1518,17 @@ impl ValidatorRuntime {
         } else {
             Vec::new()
         };
-        let opening_budget = if xpc_active {
-            crate::xshard2pc::opening_prepare_budget(xpc_plan.len())
+        let opening_budget = if sharded {
+            // ONE total cap for BOTH kinds: the 2PC plan slots are reserved,
+            // and the remaining budget (minus the inbound reserve) bounds the
+            // opening PREPAREs AND the legacy one-way outbound records the
+            // pre-activation flow still produces. The validator re-checks the
+            // same total, so the proposer never builds an over-cap block.
+            crate::xshard2pc::outbound_record_budget(xpc_plan.len())
         } else {
             usize::MAX
         };
-        let txs = if xpc_active {
+        let txs = if sharded {
             let mut kept: Vec<Transaction> = Vec::with_capacity(txs.len());
             // A dropped outbound transfer also invalidates every LATER
             // transaction from the same sender (their nonce sequence assumed
@@ -1518,11 +1551,12 @@ impl ValidatorRuntime {
             }
             if openings < opening_budget {
                 tracing::debug!(
-                    "propose h={}: opening 2PC budget {}/{} (plan={})",
+                    "propose h={}: opening cross-shard budget {}/{} (plan={}, xpc_active={})",
                     self.hc.height,
                     openings,
                     opening_budget,
-                    xpc_plan.len()
+                    xpc_plan.len(),
+                    xpc_active
                 );
             }
             kept
@@ -1682,6 +1716,13 @@ impl ValidatorRuntime {
                     let key = CrossShardKey::of(&msg);
                     if self.consumed_cross_shard.contains(&key) {
                         self.xpc_mailbox_seen.remove(&msg.msg_id);
+                        // S10/prune: a record this chain already consumed will
+                        // never be admitted again. Without the prune the
+                        // non-draining node-local KV transport re-fetched it
+                        // on EVERY propose (the tracker entry was dropped, so
+                        // it looked brand new and never aged out to
+                        // quarantine).
+                        prune_ids.push(msg.msg_id);
                         continue;
                     }
                     // Belt beyond the runtime mirrors: the PERSISTED engine
@@ -1700,6 +1741,23 @@ impl ValidatorRuntime {
                     // records (it is a decision re-publication, not a value
                     // transfer), so a Byzantine proposer cannot flood a block
                     // with uncapped historical COMMITs either.
+                    let tx_hash = msg.tx.compute_tx_hash();
+                    // PULL HINT: a PREPARE-ACK is the target saying it is
+                    // STILL PREPARED. Our own record being terminal (this
+                    // shard COMMITTED and the mirror marks the tx completed)
+                    // does NOT prove the TARGET is complete: if it missed the
+                    // COMMIT it keeps re-sending this vote. That vote is what
+                    // refreshes the engine's decision height (the `PrepareAck`
+                    // arm in `state_engine/xshard.rs`), restarting the
+                    // deterministic COMMIT window. The old completion prune
+                    // below ran BEFORE any admission, so the refresh existed
+                    // in unit tests but never on the live propose path.
+                    let refresh_hint = msg.is_xpc()
+                        && msg.kind() == crate::sharding::CrossShardKind::PrepareAck
+                        && matches!(
+                            self.xpc_records.get(&tx_hash).map(|r| r.phase),
+                            Some(crate::xshard2pc::XpcPhase::Committed)
+                        );
                     let is_control = matches!(
                         msg.kind(),
                         crate::sharding::CrossShardKind::Prepare
@@ -1710,6 +1768,17 @@ impl ValidatorRuntime {
                     );
                     if is_control && control_used >= crate::xshard2pc::XPC_MAX_REEMITS_PER_HEIGHT {
                         // Leave it in the mailbox: a later height has budget.
+                        continue;
+                    }
+                    // TOTAL record cap: one budget covers the 2PC control
+                    // plan (reserved via `xpc_plan.len()`), the outbound
+                    // transfer records already appended, and every inbound
+                    // record (legacy transfers included). The validator
+                    // enforces the same constant; the excess stays in the
+                    // mailbox for a later height.
+                    if cross_shard_out.len().saturating_add(xpc_plan.len())
+                        >= crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+                    {
                         continue;
                     }
                     // §5 M3 kind-dispatched admission: transfers prove
@@ -1736,10 +1805,7 @@ impl ValidatorRuntime {
                         // node-local mailbox made every propose rescan an
                         // ever-growing set of dead records (they are never
                         // included, so apply never prunes them).
-                        if self
-                            .completed_cross_shard
-                            .contains(&msg.tx.compute_tx_hash())
-                        {
+                        if self.completed_cross_shard.contains(&tx_hash) && !refresh_hint {
                             self.xpc_mailbox_seen.remove(&msg.msg_id);
                             prune_ids.push(msg.msg_id);
                             continue;
@@ -1766,10 +1832,10 @@ impl ValidatorRuntime {
                     }
                     // Stale after completion: the transaction already acked or
                     // bounced (e.g. a late duplicate lingering in the KV).
-                    if self
-                        .completed_cross_shard
-                        .contains(&msg.tx.compute_tx_hash())
-                    {
+                    // A still-PREPARED target's PREPARE-ACK is the exception:
+                    // it must reach apply so the engine can refresh the
+                    // source's COMMIT window.
+                    if self.completed_cross_shard.contains(&tx_hash) && !refresh_hint {
                         continue;
                     }
                     if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
@@ -1857,6 +1923,11 @@ impl ValidatorRuntime {
                     if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
                         continue;
                     }
+                    if cross_shard_out.len()
+                        >= crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+                    {
+                        break;
+                    }
                     cross_shard_out.push(msg);
                 }
                 // §5 M3 timeout bounces: outbounds this chain produced that
@@ -1891,6 +1962,15 @@ impl ValidatorRuntime {
                         .any(|m| m.tx.compute_tx_hash() == tx_hash)
                     {
                         continue;
+                    }
+                    // The total cap covers every record kind, bounces too: a
+                    // bounce does not fit this height stays derived and
+                    // eligible, so the next height carries it (same sorted
+                    // order, no value lost).
+                    if cross_shard_out.len()
+                        >= crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
+                    {
+                        break;
                     }
                     cross_shard_out.push(CrossShardMessage::new_bounce(tx, prev_hash));
                 }

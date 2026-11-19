@@ -36,6 +36,19 @@ use crate::keyring::{NodeKeys, PqKeys};
 use crate::proto::{self, now_ms, ts_ok, Frame, NODEID_LEN};
 use crate::reputation::{RepConfig, RepEntry, REP_MAP_CAP, REP_MAP_HARD_CAP};
 
+/// Human-readable names for the capability bits this build knows. Unknown
+/// bits are simply not named (never an error): forward compatibility.
+fn capability_names(caps: proto::Capabilities) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if caps.contains(proto::Capabilities::COMPACT_GOSSIP) {
+        out.push("COMPACT_GOSSIP");
+    }
+    if caps.contains(proto::Capabilities::MESH_DIRECT) {
+        out.push("MESH_DIRECT");
+    }
+    out
+}
+
 /// Токен-бакет для rate limiting запросов пира.
 #[derive(Clone)]
 pub struct RateBucket {
@@ -309,6 +322,10 @@ pub const PEER_EVICT_FAIL_THRESHOLD: u32 = 3;
 /// allowed. Configurable per node (`INFNODE_PEER_EVICT_COOLDOWN_MS` / the
 /// runtime setter); this is the 60 s default.
 pub const PEER_EVICT_COOLDOWN_MS: u64 = 60_000;
+/// Max suspected peers probed per recovery pass (background `dht_refresh`).
+/// Each probe is a bounded acknowledged round trip; a large dead set drains
+/// over several passes instead of stalling one.
+pub const PEER_RECOVERY_MAX_PER_PASS: usize = 4;
 /// Bound on scored peers (fail-closed: never evict a SUSPECTED entry, choose
 /// the healthiest non-suspect victim instead; if all are suspected, stop
 /// tracking new ones).
@@ -605,6 +622,12 @@ pub struct Node {
     /// across await — `check` is pure CPU). Exact invalidation on rotation /
     /// registry change; see `FalconPeerKeyCache`.
     falcon_peer_key_cache: std::sync::Mutex<FalconPeerKeyCache>,
+    /// Per-peer post-handshake protocol negotiation (`Hello` control frame).
+    /// A peer ABSENT from this map has not negotiated yet and is treated as a
+    /// legacy v2 peer (full capabilities), which keeps the pre-negotiation
+    /// wire behaviour byte-identical. Guard is `std` and never held across an
+    /// await (lookups are copy-out).
+    peer_protocol: std::sync::Mutex<HashMap<[u8; NODEID_LEN], proto::PeerProtocolState>>,
 }
 
 /// R6: гейт на КАЖДЫЙ персистимый файл. Держится только на время
@@ -890,10 +913,24 @@ impl Node {
             auth_bans: Mutex::new(HashMap::new()),
             peer_rep: Mutex::new(HashMap::new()),
             falcon_peer_key_cache: std::sync::Mutex::new(FalconPeerKeyCache::new()),
+            peer_protocol: std::sync::Mutex::new(HashMap::new()),
         });
         node.load_persistent().await;
         node.load_routing().await;
         node.load_kv().await;
+        {
+            // Startup visibility for the negotiated identity (task requirement:
+            // version + fork id in the startup log, not only on failure).
+            let local = proto::local_identity();
+            eprintln!(
+                "[{}] protocol v{} fork 0x{:08x} capabilities 0x{:016x} ({:?})",
+                node.cfg.name,
+                local.protocol_version,
+                local.fork_id,
+                local.capabilities.bits(),
+                capability_names(local.capabilities),
+            );
+        }
         Ok(node)
     }
 
@@ -1395,7 +1432,36 @@ impl Node {
     /// Feed a `dht.update`-style payload through the REAL gossip-merge path
     /// (per-update + total caps). Returns the response bytes.
     pub async fn bp_handle_dht_update(self: &Arc<Self>, v: serde_json::Value) -> Option<Vec<u8>> {
-        self.handle_dht_update(&v).await
+        self.bp_handle_dht_update_from(v, [0xEE; NODEID_LEN]).await
+    }
+
+    /// [`Self::bp_handle_dht_update`] attributed to an authenticated sender
+    /// (`from`), so tests can prove third-party endpoint poisoning is refused
+    /// while a self-advertised endpoint change still merges.
+    pub async fn bp_handle_dht_update_from(
+        self: &Arc<Self>,
+        v: serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
+        self.handle_dht_update(&v, from).await
+    }
+
+    /// Feed a `dht.lookup` through the REAL handler (no network), with an
+    /// explicit requester. Test hook for the "never resolve a dead peer" and
+    /// bounded-fan-out rules.
+    pub async fn bp_handle_dht_lookup(
+        self: &Arc<Self>,
+        node: &str,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
+        let v = json!({ "node": node, "ttl": crate::proto::MAX_DHT_LOOKUP_TTL });
+        self.handle_dht_lookup(&v, from).await
+    }
+
+    /// Run one explicit suspected-peer recovery pass (test hook; the live
+    /// driver calls it from `dht_refresh`).
+    pub async fn bp_recover_suspected_peers(self: &Arc<Self>) -> usize {
+        self.recover_suspected_peers().await
     }
 
     pub fn resolve(&self, sel: &str) -> Result<[u8; NODEID_LEN]> {
@@ -1730,6 +1796,10 @@ impl Node {
             self.drop_conn(pid, Some(conn.stable_id())).await;
             bail!("pq digests full");
         }
+        // Post-handshake protocol negotiation (control plane; never a frame
+        // header change). Fail-open: a lost HELLO leaves both sides on the
+        // legacy v2 capability default, which is the pre-negotiation wire.
+        self.send_hello(&conn, pid).await;
         self.add_route(
             pid,
             addr.to_string(),
@@ -2125,6 +2195,37 @@ impl Node {
             .collect()
     }
 
+    /// Probe peers whose suspicion cooldown elapsed, restoring the ones that
+    /// answer. Suspicion is withheld from routing, so without an EXPLICIT
+    /// probe a dynamic peer that came back but never dials us stays excluded
+    /// forever (lookups no longer return it, so nothing else would contact
+    /// it). Bounded per pass; called from the 60 s `dht_refresh` loop.
+    pub async fn recover_suspected_peers(self: &Arc<Self>) -> usize {
+        let now = now_ms();
+        let due: Vec<[u8; NODEID_LEN]> = self
+            .suspected_peers()
+            .into_iter()
+            .filter(|(_, score)| score.reconnect_due(now))
+            .map(|(id, _)| id)
+            .take(PEER_RECOVERY_MAX_PER_PASS)
+            .collect();
+        let mut recovered = 0usize;
+        for pid in due {
+            // A failed probe re-arms the cooldown inside
+            // `peer_record_failure_at` (network errors only; a service
+            // refusal still proves the peer is alive).
+            if let Ok(Ok(_)) = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.request_to(pid, "core.ping", b"{}".to_vec()),
+            )
+            .await
+            {
+                recovered += 1;
+            }
+        }
+        recovered
+    }
+
     /// Record one consecutive transport failure for `pid`.
     ///
     /// Transport errors, timeouts and handshake failures all land here. At
@@ -2161,7 +2262,12 @@ impl Node {
             let entry = map.entry(pid).or_insert_with(PeerScore::fresh);
             entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
             let mut transitioned = false;
-            if !entry.suspected && entry.consecutive_failures >= PEER_EVICT_FAIL_THRESHOLD {
+            if entry.suspected {
+                // A failed post-cooldown retry re-arms the window. Without
+                // this, `suspect_until_ms` stayed in the past forever and
+                // `reconnect_due` was true on every pass (a hot retry loop).
+                entry.suspect_until_ms = now.saturating_add(cooldown_ms);
+            } else if entry.consecutive_failures >= PEER_EVICT_FAIL_THRESHOLD {
                 entry.suspected = true;
                 entry.suspect_until_ms = now.saturating_add(cooldown_ms);
                 entry.evictions = entry.evictions.saturating_add(1);
@@ -2606,9 +2712,7 @@ impl Node {
                         // mesh is degraded. (Only pubsub.msg: other services
                         // expect a peer response and must keep failing.)
                         if svc == "pubsub.msg" {
-                            if let Ok(v) =
-                                serde_json::from_slice::<serde_json::Value>(&payload)
-                            {
+                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
                                 if let (Some(topic), Some(data)) =
                                     (v["topic"].as_str(), v["data"].as_str())
                                 {
@@ -2951,18 +3055,177 @@ impl Node {
         ))
     }
 
+    // ============ Protocol negotiation (control plane) ============
+
+    /// Snapshot of one peer's negotiated protocol state, or `None` when the
+    /// peer has not sent a `Hello` yet (legacy v2 behaviour).
+    pub fn peer_protocol_state(&self, pid: &[u8; NODEID_LEN]) -> Option<proto::PeerProtocolState> {
+        match self.peer_protocol.lock() {
+            Ok(m) => m.get(pid).copied(),
+            Err(e) => e.into_inner().get(pid).copied(),
+        }
+    }
+
+    /// Agreed capabilities for a peer. `None` means "not negotiated yet"; the
+    /// caller decides the legacy default (consensus treats unknown peers as
+    /// full-capability v2 peers so existing deployments are unchanged).
+    pub fn peer_capabilities(&self, pid: &[u8; NODEID_LEN]) -> Option<proto::Capabilities> {
+        self.peer_protocol_state(pid).map(|s| s.capabilities())
+    }
+
+    /// True when consensus traffic may be sent to this peer.
+    ///
+    /// * no `Hello` yet        -> true (legacy v2 peer, byte-compatible);
+    /// * accepted agreement    -> true;
+    /// * refused (fork/version)-> false, LOUDLY recorded at Hello time.
+    pub fn peer_consensus_admitted(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        self.peer_protocol_state(pid)
+            .map(|s| s.consensus_eligible())
+            .unwrap_or(true)
+    }
+
+    /// Record a peer's `Hello` and classify it against the local identity.
+    ///
+    /// The transition is logged exactly once per distinct peer verdict: a
+    /// fork mismatch or a two-minor gap is an operator-visible error naming
+    /// both ids/versions, never a silent acceptance. The connection is NOT
+    /// dropped — the peer may still use DHT/storage services, it just never
+    /// participates in consensus.
+    pub fn apply_peer_hello(
+        &self,
+        pid: [u8; NODEID_LEN],
+        hello: proto::Hello,
+    ) -> proto::PeerProtocolState {
+        let local = proto::local_identity();
+        let state = proto::classify_peer(local, hello);
+        let previous = match self.peer_protocol.lock() {
+            Ok(mut m) => m.insert(pid, state),
+            Err(e) => e.into_inner().insert(pid, state),
+        };
+        if previous == Some(state) {
+            return state;
+        }
+        match (state.refusal, state.agreement) {
+            (Some(refusal), _) => eprintln!(
+                "[{}] {} with peer {} (peer v{}, fork 0x{:08x}, capabilities 0x{:016x})",
+                self.cfg.name,
+                refusal,
+                hex::encode(pid),
+                hello.protocol_version,
+                hello.fork_id,
+                hello.capabilities.bits(),
+            ),
+            (None, Some(agreement)) if agreement.advisory => eprintln!(
+                "[{}] protocol advisory upgrade window: peer {} is v{} (local v{}); \
+                 accepting with capability intersection 0x{:016x}",
+                self.cfg.name,
+                hex::encode(pid),
+                hello.protocol_version,
+                local.protocol_version,
+                agreement.capabilities.bits(),
+            ),
+            _ => {}
+        }
+        state
+    }
+
+    /// Local protocol/fork/capability view, used by the `core.status` read.
+    pub fn protocol_status(&self) -> serde_json::Value {
+        let local = proto::local_identity();
+        json!({
+            "protocol_version": local.protocol_version.to_string(),
+            "protocol_version_raw": local.protocol_version.0,
+            "fork_id": local.fork_id,
+            "fork_id_hex": format!("0x{:08x}", local.fork_id),
+            "capabilities": local.capabilities.bits(),
+            "capabilities_names": capability_names(local.capabilities),
+        })
+    }
+
+    /// Send the post-handshake `Hello` control frame on `conn`.
+    ///
+    /// Fail-open by design: a HELLO failure must never break a handshake that
+    /// already proved the peer's identity. The peer then simply stays a
+    /// legacy v2 peer (unknown capability state).
+    async fn send_hello(&self, conn: &Connection, pid: [u8; NODEID_LEN]) {
+        let hello = proto::local_identity().hello();
+        if let Err(e) = self
+            .send_control_frame(conn, pid, proto::kind::HELLO, &hello.encode())
+            .await
+        {
+            eprintln!(
+                "[{}] HELLO send to {} failed (peer stays legacy v2): {e}",
+                self.cfg.name,
+                hex::encode(pid),
+            );
+        }
+    }
+
+    /// Write one signed control frame on its own bidirectional stream.
+    async fn send_control_frame(
+        &self,
+        conn: &Connection,
+        pid: [u8; NODEID_LEN],
+        kind: u8,
+        payload: &[u8],
+    ) -> Result<()> {
+        let mut f = Frame {
+            kind,
+            seq: self.next_seq(),
+            ts: now_ms(),
+            src: self.id,
+            dst: pid,
+            svc: 0,
+            payload: payload.to_vec(),
+            nonce: vec![],
+            sig: Vec::new(),
+        };
+        self.sign_frame(&mut f);
+        let (mut send, _recv) = tokio::time::timeout(Duration::from_secs(8), conn.open_bi())
+            .await
+            .map_err(|_| anyhow!("open stream timeout"))??;
+        // Control frames are tiny; a best-effort priority keeps them from
+        // queueing behind a bulk blob transfer on the same connection.
+        let _ = send.set_priority(1000);
+        tokio::time::timeout(Duration::from_secs(8), send.write_all(&f.encode()))
+            .await
+            .map_err(|_| anyhow!("control write timeout"))??;
+        let _ = send.finish();
+        Ok(())
+    }
+
     pub async fn status(&self) -> Result<String> {
         let mut out = json!({
             "node": self.id_hex,
             "name": self.cfg.name,
             "listen": self.cfg.listen,
             "advertise": self.cfg.advertise,
+            "protocol": self.protocol_status(),
         });
         let mut plist = Vec::new();
         for (pid, peer) in self.peers.read().await.iter() {
             let conn = peer.conn.read().await.is_some();
             let rtt = peer.rtt.read().await.map(|d| d.as_secs_f64() * 1000.0);
             let learned = peer.learned.read().await.map(|a| a.to_string());
+            let protocol = match self.peer_protocol_state(pid) {
+                Some(s) => json!({
+                    "negotiated": true,
+                    "protocol_version": s.hello.protocol_version.to_string(),
+                    "fork_id": s.hello.fork_id,
+                    "fork_id_hex": format!("0x{:08x}", s.hello.fork_id),
+                    "capabilities": s.capabilities().bits(),
+                    "capabilities_names": capability_names(s.capabilities()),
+                    "consensus_eligible": s.consensus_eligible(),
+                    "advisory": s.agreement.map(|a| a.advisory).unwrap_or(false),
+                    "refusal": s.refusal.map(|r| r.to_string()),
+                }),
+                None => json!({
+                    "negotiated": false,
+                    "consensus_eligible": true,
+                    "capabilities": proto::Capabilities::ALL.bits(),
+                    "capabilities_names": capability_names(proto::Capabilities::ALL),
+                }),
+            };
             plist.push(json!({
                 "name": peer.cfg.name,
                 "node_id": format!("inf1:{}", hex::encode(pid)),
@@ -2970,6 +3233,7 @@ impl Node {
                 "rtt_ms": rtt,
                 "learned_endpoint": learned,
                 "acl": peer.cfg.allow,
+                "protocol": protocol,
             }));
         }
         out["peers"] = serde_json::Value::Array(plist);
@@ -3132,7 +3396,7 @@ impl Node {
             return self.handle_dht_lookup(&v, from).await;
         }
         if svc == svc_id("dht.update") {
-            return self.handle_dht_update(&v).await;
+            return self.handle_dht_update(&v, from).await;
         }
         if svc == svc_id("dht.find_node") {
             return self.handle_dht_find_node(&v).await;
@@ -3960,6 +4224,17 @@ impl Node {
         let mut target = [0u8; NODEID_LEN];
         target.copy_from_slice(&b);
 
+        // Never answer a lookup with a peer we already know is dead: the
+        // requester would waste a dial and route through a black hole.
+        // Suspected entries stay explicitly dialable, but not discoverable.
+        if !self.routing_target_allowed(&target) {
+            return Some(
+                json!({ "ok": true, "found": false, "node": target_hex })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+
         let known = self.routes.read().await.get(&target).cloned();
         if let Some(route) = known {
             return Some(
@@ -3975,15 +4250,19 @@ impl Node {
                     .into_bytes(),
             );
         }
-        // рекурсивный опрос пиров
-        let peers: Vec<[u8; NODEID_LEN]> = self
-            .peers
-            .read()
-            .await
-            .keys()
-            .copied()
-            .filter(|p| *p != from)
-            .collect();
+        // рекурсивный опрос пиров, BOUNDED: one inbound lookup fans out to at
+        // most ALPHA closest peers (Kademlia), never to every connection.
+        // The old code queried all peers at every TTL level, so one request
+        // could amplify into `degree^ttl` requests across the network.
+        let candidates: Vec<[u8; NODEID_LEN]> = {
+            let peers = self.peers.read().await;
+            peers
+                .keys()
+                .copied()
+                .filter(|p| self.routing_target_allowed(p))
+                .collect()
+        };
+        let peers = crate::dht::lookup_fanout(candidates, &target, &from, crate::dht::ALPHA);
         let payload = json!({ "node": target_hex, "ttl": ttl - 1 })
             .to_string()
             .into_bytes();
@@ -4033,8 +4312,27 @@ impl Node {
     }
 
     /// Обмен маршрутами (route gossip): сливаем маршруты, полученные от пира.
-    async fn handle_dht_update(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
+    async fn handle_dht_update(
+        self: &Arc<Self>,
+        v: &serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
         let mut changed = false;
+        // Pinned addresses of identities we already know as peers (static
+        // config, DNS, or a previously admitted DHT record). A THIRD PARTY
+        // must never rewrite these: gossiping `{victim_id, victim_pq,
+        // attacker_endpoint}` passes the id/key check (both are public), and
+        // merge used to append the attacker endpoint, poisoning route
+        // discovery and the dial sweep. Only the peer itself may advertise a
+        // new endpoint for its own id.
+        let pinned_endpoints: HashMap<[u8; NODEID_LEN], Vec<String>> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .filter(|(_, p)| !p.cfg.endpoints.is_empty())
+                .map(|(id, p)| (*id, p.cfg.endpoints.clone()))
+                .collect()
+        };
         if let Some(routes) = v["routes"].as_object() {
             // Fail-closed: сплетня ограничена по числу записей — без этого
             // один пир раздувал таблицу маршрутов и файл routes.json без меры.
@@ -4071,7 +4369,7 @@ impl Node {
                     if crate::proto::pq_id_from_pub(&pq) != pid {
                         continue;
                     }
-                    let endpoints: Vec<String> = rv["endpoints"]
+                    let mut endpoints: Vec<String> = rv["endpoints"]
                         .as_array()
                         .map(|a| {
                             a.iter()
@@ -4082,15 +4380,30 @@ impl Node {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let self_advertised = from == pid;
+                    let pinned = pinned_endpoints.get(&pid);
+                    if !self_advertised {
+                        if let Some(pinned) = pinned {
+                            // Third-party gossip may confirm an identity, but
+                            // the endpoint set stays the one we pinned.
+                            endpoints = pinned.clone();
+                        }
+                    }
                     let route = Route { endpoints, pq_hex };
                     let entry = mine.entry(pid).or_insert_with(|| route.clone());
-                    for e in &route.endpoints {
-                        if entry.endpoints.len() >= crate::proto::MAX_ENDPOINTS_PER_NODE {
-                            break;
-                        }
-                        if !entry.endpoints.contains(e) {
-                            entry.endpoints.push(e.clone());
-                            changed = true;
+                    // Only a self-advertised route may extend our endpoint
+                    // list; a third party's endpoints are ignored even if the
+                    // entry was first created by that same gossip (it was
+                    // seeded from the pinned set above).
+                    if self_advertised || pinned.is_none() {
+                        for e in &route.endpoints {
+                            if entry.endpoints.len() >= crate::proto::MAX_ENDPOINTS_PER_NODE {
+                                break;
+                            }
+                            if !entry.endpoints.contains(e) {
+                                entry.endpoints.push(e.clone());
+                                changed = true;
+                            }
                         }
                     }
                     if entry.pq_hex.is_empty() && !route.pq_hex.is_empty() {
@@ -4203,6 +4516,9 @@ impl Node {
             }
             let _ = self.request_to(n.id, "core.ping", vec![]).await;
         }
+        // Explicit recovery for suspected peers whose cooldown elapsed: they
+        // are withheld from routing, so nothing else would ever contact them.
+        let _ = self.recover_suspected_peers().await;
         // чистим просроченные KV
         self.kv.write().await.prune();
         // Stale-eviction routing health (`dht::ROUTING_STALE_AFTER_MS`, 24 h —
@@ -6776,16 +7092,8 @@ impl Node {
         owner_secret: Option<&str>,
         ttl_ms: i64,
     ) -> BlobStoreReport {
-        self.store_blob_impl(
-            bucket,
-            name,
-            blob,
-            owner_pub,
-            owner_secret,
-            ttl_ms,
-            true,
-        )
-        .await
+        self.store_blob_impl(bucket, name, blob, owner_pub, owner_secret, ttl_ms, true)
+            .await
     }
 
     /// Shared sealed/unsealed write path.
@@ -6841,7 +7149,9 @@ impl Node {
                 };
                 // Refuse a sealed write that would replace another owner's
                 // sealed manifest. The owner may re-publish their own name.
-                if let Some(prev) = self.get_local_kv(&Self::blob_manifest_key(bucket, name)).await
+                if let Some(prev) = self
+                    .get_local_kv(&Self::blob_manifest_key(bucket, name))
+                    .await
                 {
                     if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&prev) {
                         if prev.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1) {
@@ -6876,7 +7186,9 @@ impl Node {
             }
             None => {
                 // A legacy write must not silently downgrade a sealed name.
-                if let Some(prev) = self.get_local_kv(&Self::blob_manifest_key(bucket, name)).await
+                if let Some(prev) = self
+                    .get_local_kv(&Self::blob_manifest_key(bucket, name))
+                    .await
                 {
                     if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&prev) {
                         if prev.get("seal").and_then(|v| v.as_str()) == Some(BLOB_SEAL_V1) {
@@ -6951,28 +7263,23 @@ impl Node {
             let owner_id = blob_owner_id_from_seed(secret_hex).expect("owner id validated above");
             manifest["owner"] = json!(owner_id);
             manifest["auth"] = json!(BLOB_MANIFEST_AUTH_V1);
-            let mac = blob_manifest_mac(secret_hex, &manifest)
-                .expect("sealed manifest must be MAC-able");
+            let mac =
+                blob_manifest_mac(secret_hex, &manifest).expect("sealed manifest must be MAC-able");
             manifest["mac"] = json!(mac);
             // Public signature: any storage peer can verify authorship and
             // refuse a replacement signed by a different key, without holding
             // the owner seed.
             let signer = blob_manifest_signer(secret_hex).expect("signer derived from seed");
             let pk = signer.pq_pub();
-            let signer_id =
-                blob_manifest_signer_id(&hex::encode(&pk)).expect("signer id from pk");
+            let signer_id = blob_manifest_signer_id(&hex::encode(&pk)).expect("signer id from pk");
             let digest =
                 blob_manifest_sig_digest(&manifest, &pk).expect("sealed manifest must sign");
             manifest["owner_pk"] = json!(hex::encode(&pk));
             manifest["sig"] = json!(hex::encode(signer.sign_digest(&digest)));
             // Pin the signer so a later fetch can detect a downgrade even if
             // the replacement is self-consistent.
-            self.kv_store_local_with_ttl(
-                &sealed_owner_key(bucket, name),
-                &signer_id,
-                ttl_ms,
-            )
-            .await;
+            self.kv_store_local_with_ttl(&sealed_owner_key(bucket, name), &signer_id, ttl_ms)
+                .await;
         } else {
             // Legacy at-rest обфускация (owner_pub == None). Не E2E.
             manifest["key"] = json!(hex::encode(data_key));
@@ -7308,8 +7615,7 @@ impl Node {
                                 )
                                 .await
                             {
-                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp)
-                                {
+                                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                                     if v["ok"].as_bool().unwrap_or(false) {
                                         if let Some(b64) = v["data"].as_str() {
                                             got = base64::Engine::decode(
@@ -8378,6 +8684,10 @@ async fn handle_stream(
         node.sign_frame(&mut a);
         send.write_all(&a.encode()).await?;
         let _ = send.finish();
+        // Post-handshake protocol negotiation (control plane). Sent on its own
+        // stream AFTER the AUTH answer so an older peer's single-frame AUTH
+        // reader never sees a concatenated payload. Fail-open.
+        node.send_hello(&conn, claimed).await;
         report_stages(&f, t_proc.elapsed());
         return Ok(Some(claimed));
     }
@@ -8474,6 +8784,22 @@ async fn handle_stream(
     node.remember_peer_addr(&peer, conn.remote_address()).await;
 
     match f.kind {
+        proto::kind::HELLO => {
+            if f.dst != node.id {
+                bail!("not addressed to me");
+            }
+            // Unknown/malformed control messages are IGNORED, never fatal:
+            // control frames are self-delimiting, so ignoring one cannot
+            // desynchronise the next frame (forward compatibility).
+            if let Some(proto::ControlMessage::Hello(hello)) =
+                proto::decode_control(f.kind, &f.payload)
+            {
+                node.apply_peer_hello(pid, hello);
+                node.rep_record_valid(&pid).await;
+            }
+            report_stages(&f, t_proc.elapsed());
+            Ok(None)
+        }
         proto::kind::PING => {
             // PENTEST F4: PING used to bypass the per-peer rate limiter, so a
             // pinned peer with a budget still had an unlimited CPU path (every
@@ -8761,7 +9087,6 @@ pub struct BlobStoreReport {
     pub replicas: usize,
 }
 
-
 fn blob_owner_id_from_ek(ek: &[u8]) -> String {
     hex::encode(blake3::hash(ek).as_bytes())
 }
@@ -8818,14 +9143,7 @@ fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
 fn blob_manifest_mac_input(m: &serde_json::Value) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"infnode-blob-manifest-v1");
-    for field in [
-        "bucket",
-        "name",
-        "seal",
-        "owner",
-        "nonce",
-        "content_hash",
-    ] {
+    for field in ["bucket", "name", "seal", "owner", "nonce", "content_hash"] {
         push_len_prefixed(&mut out, m[field].as_str()?.as_bytes());
     }
     out.extend_from_slice(&m["size"].as_u64()?.to_be_bytes());
@@ -8949,7 +9267,6 @@ fn blob_manifest_verify_signature(manifest: &serde_json::Value, expected_pk_hex:
     };
     crate::proto::pq_falcon_verify(&pk, &digest, &sig)
 }
-
 
 fn sealed_owner_key(bucket: &str, name: &str) -> String {
     format!("sealed-owner:{bucket}:{name}")
@@ -11617,7 +11934,11 @@ mod sealed_manifest_store_tests {
         // The local pin is not remotely writable (otherwise the guard is moot).
         let pin_key = format!("sealed-owner:{mkey}");
         let r = dht_store(&node, &pin_key, "attacker-owner").await;
-        assert_eq!(r["ok"], json!(false), "pin must be local-authoritative: {r}");
+        assert_eq!(
+            r["ok"],
+            json!(false),
+            "pin must be local-authoritative: {r}"
+        );
 
         // A sealed replacement missing auth is refused outright.
         let mut unauthenticated = serde_json::from_str::<serde_json::Value>(&before).expect("json");

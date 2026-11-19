@@ -419,18 +419,226 @@ keeps `code`, `message`, `data`.
 
 ---
 
-## 8. What is NOT supported (honest table)
+## 8. Protocol identity, EVM binding/carrier and governance (protocol v1, ruleset v3)
+
+### 8.1 Chain/fork guard (both SDKs)
+
+The node identifies a consensus ruleset by `FORK_ID`
+(`stellereum/src/protocol.rs`), a compile-time FNV-1a-32 fold over the chain
+id, the ruleset/domain versions, the consensus wire domains and the
+bound/round/height constants. It refuses consensus participation to a peer
+with a different fork id, and refuses transactions bound to another chain id.
+The SDKs mirror the identity and run the SAME check BEFORE signing.
+
+Rust:
+
+```rust
+use stellereum_sdk::{ProtocolIdentity, SdkError, TxBuilder, FORK_ID};
+
+let identity = ProtocolIdentity::local(); // chain 5757, fork 0xb13baff4
+assert_eq!(identity.fork_id, FORK_ID);
+
+// Refused with SdkError::ChainIdMismatch { expected: 5757, got: 1 }
+let _ = TxBuilder::transfer([0x22; 32], 1).chain_id(1).sign(&key);
+
+// Refused with SdkError::ForkIdMismatch { expected, got }
+let mut stale = identity;
+stale.fork_id ^= 1;
+let _ = TxBuilder::transfer([0x22; 32], 1).identity(stale).sign(&key);
+```
+
+`ProtocolIdentity::from_json(&value)` parses the node's `version_info()` shape
+when an RPC exposes it. Until the RPC does (see the node-side gap below),
+`ProtocolIdentity::local()` is the identity this build speaks.
+
+TypeScript:
+
+```ts
+import {
+  FORK_ID_HEX, assertIdentity, assertChainId, localIdentity,
+} from "@stellereum/sdk";
+
+assertIdentity(localIdentity());            // throws ProtocolError otherwise
+assertChainId(localIdentity(), 5757);       // throws ProtocolError otherwise
+```
+
+`ProtocolError.code` is one of `chain_id_mismatch`, `fork_id_mismatch`,
+`protocol_version_mismatch`, `invalid_identity`.
+
+The current identity is **protocol 1.0, consensus ruleset v3, fork id
+`0xb13baff4`** (chain id 5757). A consensus-rule change moves the id; the Rust
+parity suite compares every folded constant and the derivation result against
+the node, so a stale SDK fails its own tests.
+
+### 8.2 EVM binding (Rust)
+
+An EVM address may not be first-claimed by a PQ key that does not control it.
+The claim carries BOTH signatures:
+
+1. Falcon-512 by the claiming PQ key over
+   `keccak256("STELL_EVM_BIND_V1" || chain_id_be(8) || evm(20) || pq(32))`;
+2. a 65-byte secp256k1 proof of possession `r(32) || s(32) || recovery_id(1)`
+   (EIP-2 low-s) over the same digest, whose recovered address MUST equal the
+   EVM address being bound.
+
+```rust
+use stellereum_sdk::{EvmBindingBuilder, ProtocolIdentity};
+
+let signed = EvmBindingBuilder::new(
+    ProtocolIdentity::local(),
+    evm_address,        // [u8; 20]
+    evm_proof,          // Vec<u8>, exactly 65 bytes
+)?
+.nonce(pq_nonce)
+.gas_limit(700_000)
+.sign(&key)?;
+```
+
+The builder refuses:
+- a missing/malformed proof (`SdkError::MissingEvmProof { expected: 65, got }`);
+- a proof that recovers another address (`EvmProofMismatch`);
+- a claim whose chain id is not the identity (`EvmChainIdMismatch`).
+It sets `to == from` and `amount == 0`; the node additionally refuses a claim
+that moves value or mixes the opcode with other payloads.
+
+**Honest limit:** binding is FIRST-COMMITTED-WINS. The registry is a
+deterministic replay index over committed claims, not a state-root domain.
+A second claim for an already-bound EVM address is refused at admission; the
+SDK cannot "re-bind" or "unbind". Read the current binding with
+`stell_getEvmBinding` / `eth_getBalance` before building.
+
+### 8.3 EVM carrier (Rust)
+
+The carrier is a normal PQ1 transaction whose payload is
+`SysCallEvmCarrier { chain_id, evm_tx, evm_address, pq_pubkey, evm_signature }`.
+The transaction's `from` is the bound PQ account, `to` is the recipient's PQ
+account, and:
+
+- `tx.nonce` MUST equal the EVM intent's nonce;
+- `tx.amount` MUST equal `wei_to_nano(evm.value)` exactly;
+- `evm_signature` is Falcon-512 over `keccak256(evm_tx)`;
+- the EVM intent must be a value transfer: present recipient, empty calldata,
+  value > 0 and at least one nano-STELL.
+
+```rust
+use stellereum_sdk::{EvmCarrierBuilder, ProtocolIdentity};
+
+let signed = EvmCarrierBuilder::new(
+    ProtocolIdentity::local(),
+    raw_evm_tx,   // canonical EIP-155 / EIP-1559 bytes from the EVM wallet
+    recipient_pq, // [u8; 32]
+)?
+// Optional pins: a mismatch is a specific refusal, never a silent retarget.
+.nonce(declared_nonce)          // SdkError::CarrierNonceMismatch
+.amount_nano(declared_amount)   // SdkError::CarrierValueMismatch
+.gas_limit(900_000)
+.sign(&key)?;
+```
+
+The builder decodes the intent itself (strict RLP, present recipient, empty
+data, positive value), recovers the EVM sender, and checks the intent chain id.
+`build_unsigned(&key)` returns the unsigned transaction, and
+`signing_message(&key)` returns the exact preimage, for alternate signers.
+
+**Honest limit:** the carrier is a VALUE TRANSFER only. Contract creation and
+any calldata are refused (`contract-execution`), because this chain has no EVM
+interpreter and no EVM state trie. The EVM secp256k1 signature is advisory for
+routing; the consensus credential is the PQ1 envelope. A committed nullifier
+(`keccak256(evm_tx)`) makes the intent settle exactly once.
+
+### 8.4 Governance (Rust)
+
+`SysCallGovPropose` / `SysCallGovVote` ride normal transactions; the sender is
+the proposer/voter (the opcode never names an identity).
+
+```rust
+use stellereum_sdk::{GovAction, TxBuilder, VoteChoice};
+
+let propose = TxBuilder::gov_propose(
+    4,                                  // MUST equal governance.next_id
+    "raise the floor".into(),
+    GovAction::SetMinGasLimit(300_000),
+    99,                                 // MUST equal the applying block height
+)?
+.nonce(pq_nonce)
+.sign(&key)?;
+
+let vote = TxBuilder::gov_vote(4, VoteChoice::Yes, 99)
+    .nonce(next_nonce)
+    .sign(&key)?;
+```
+
+Both are self-addressed and move no tokens. `GovAction` mirrors every node
+variant and its bincode ordinal; `action.validate()` mirrors the node's
+fail-fast bounds. The node still re-validates at apply. `Wallet` exposes
+`gov_propose` / `gov_vote` / `evm_binding` / `evm_carrier` convenience methods.
+
+### 8.5 TypeScript
+
+The package now has real unsigned builders for the same shapes:
+
+```ts
+const unsigned = buildGovPropose({
+  from, nonce: 6, gasLimit: 500_000,
+  proposalId: 4, title: "raise the floor",
+  action: { type: "set_min_gas_limit", value: 300_000 },
+  heightObserved: 99,
+});
+const signed = await client.signPrepared(unsigned);
+```
+
+`buildEvmBinding`, `buildEvmCarrier`, `buildGovPropose` and `buildGovVote`
+return `UnsignedTransaction` (`txHex`, `payloadHex`, `signingMessageHex`,
+`unsignedTxHash`, fields). The envelope and every PQ signature stay in Rust:
+
+- `client.evmBinding(...)` computes the binding digest and asks the signer's
+  `signDigest` hook for the Falcon statement signature, then `signPrepared`
+  for the envelope;
+- `client.evmCarrier(...)` does the same for `keccak256(evmTx)`, then signs;
+- `client.govPropose(...)` / `client.govVote(...)` only need `signPrepared`.
+
+Signer protocol additions (Rust CLI and localhost helper):
+`{"tx":{"kind":"prepared","tx_hex":"..."}}` (attach an envelope to bytes built
+elsewhere) and `POST /sign-digest` / `stellereum-sdk-cli sign-digest`
+(Falcon-sign a 32-byte digest for the inner EVM statements).
+
+**Honest JS limits:**
+- JavaScript does not sign Falcon here. `signDigest` and `sign` call the Rust
+  sidecar; a third-party signer without `signDigest` must supply
+  `bindingSignature` / `intentSignature` explicitly.
+- JS decodes the EVM intent fields but CANNOT recover the secp256k1 sender and
+  does not verify the EVM signature; the node does, over the same bytes.
+- Deriving a PQ address needs BLAKE3, which JS does not have here; pass
+  `from` and `pqPublicKey` from the signer/node.
+- `client.identity()` is the configured/local identity. There is no node RPC
+  that serves `version_info()` yet (see the node-side gap).
+
+### 8.6 Breaking changes (SDK 0.3)
+
+- The default `ProtocolIdentity` is now the local chain (5757, fork
+  `0xb13baff4`). `TxBuilder::chain_id(x)` with `x != 5757` now fails at `sign`
+  with `ChainIdMismatch` unless a matching identity was configured. A wallet
+  for another deployment must build the SDK with that deployment's fork id (or
+  pass an explicit identity whose fork id this build speaks).
+- `Wallet::with_chain_id` also updates the identity chain id; a fork mismatch
+  is refused at sign.
+- EVM/genesis binding claim structs now require `evm_signature`; an empty
+  proof is no longer accepted anywhere.
+
+---
+
+## 9. What is NOT supported (honest table)
 
 | Not supported | Why / what to do instead |
 | --- | --- |
-| Native Falcon-512 signing in JavaScript | No WASM binding in-tree. Use the Rust CLI subprocess or localhost HTTP helper. |
+| Native Falcon-512 signing in JavaScript | No WASM binding in-tree. Use the Rust CLI subprocess or localhost HTTP helper (`sign` and `sign-digest`). |
 | EVM contract execution | There is no EVM interpreter or EVM state trie. Contract creation and calldata are refused (`evm-contract-execution-unsupported`); `eth_call`/`eth_getCode`/`eth_getProof` are honest reads. |
-| EVM value transfer without a carrier | A bare EIP-155/1559 intent cannot move value (no PQ binding → `full-pq-admission`). Bind the EVM address with `stell_evmBindingSubmit`, then submit a `SysCallEvmCarrier` PQ1 transaction (or `stell_evmCarrierSubmit` / `eth_sendRawTransaction` with the `carrier` object). |
+| EVM value transfer without a carrier | A bare EIP-155/1559 intent cannot move value (no PQ binding → `full-pq-admission`). Bind the EVM address (proof of possession REQUIRED), then submit a `SysCallEvmCarrier` PQ1 transaction with matching nonce/value (or `stell_evmCarrierSubmit`). |
 | EVM account / `eth_sendTransaction` / `eth_sign` | The provider has no secp256k1 account; these throw 4200. |
-| EVM ↔ PQ address binding as consensus state | The binding is a node-local routing/replay index, not a state-root domain; this wave does not wire a bootstrap replay. A restart can under-report balances/refuse a carrier until the binding is re-observed, but execution re-verifies the pure signatures. |
+| EVM ↔ PQ address binding as consensus state | The binding is a deterministic replay index over committed claims (first-committed-wins), not a state-root domain. Execution re-verifies the pure Falcon + secp signatures, so a stale index can only refuse/under-report, never fork value. |
 | `eth_subscribe` / WebSocket subscriptions | The node refuses `eth_subscribe`; `stell_subscribe` exists but the JS package does not implement its framing. |
 | JSON-RPC batching | One request per call. |
-| STS token operations, contract deploy, orderbook/PMM, bridge, governance, price feeds, zkML, actor mailbox, session publish/revoke, claim rewards, key rotation, delegate/unbond | Real opcodes, but outside this client's four wallet shapes. Use the node wallet/CLI or extend the SDK with a parity-tested encoder. |
+| STS token operations, contract deploy, orderbook/PMM, bridge, price feeds, zkML, actor mailbox, session publish/revoke, claim rewards, key rotation, delegate/unbond | Real opcodes, but outside this client's wallet shapes. Use the node wallet/CLI or extend the SDK with a parity-tested encoder. Governance propose/vote and the EVM binding/carrier ARE covered (section 8). |
 | Paymaster / sponsored transactions | Revenue for another actor; the SDK mints first-party PQ1 or SF1 only. |
 | Dynamic fee market / replacement-by-fee | `base_fee` is a static floor; `eth_gasPrice` is a testnet constant (`evm_adapter/adapter.rs:71`). Priority is an explicit signed bid. |
 | Automatic nonce-gap filling / mempool replacement | The SDK reads the nonce and returns the node's gap error; it will not invent transactions. |
@@ -442,7 +650,7 @@ keeps `code`, `message`, `data`.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 ```bash
 # Rust (thin client; no node crate)
@@ -473,11 +681,24 @@ The parity suite covers:
 - SF1 grant bytes decode into `SessionKeyAuthorization` and both its verifier
   and the transaction verifier pass;
 - transaction hashes equal `compute_tx_hash`;
+- protocol identity: `PROTOCOL_MAJOR/MINOR`, every `FORK_ID_RULES` entry, the
+  derived fork id and `FORK_ID` all equal the node's;
+- EVM binding: payload bytes + signing preimage equal
+  `build_binding_transaction`, and the node's own `verify_binding_claim` /
+  `verify_evm_payload_against_tx` accept the SDK's signed claim;
+- EVM carrier: payload bytes + signing preimage equal
+  `build_carrier_transaction`, the node recovers the same sender, and
+  `verify_carrier_intent` / `carrier_intent_digest` agree;
+- governance: propose/vote payload bytes + signing preimages equal
+  `Governance::gov_propose_tx` / `gov_vote_tx`, every `GovAction` serializes
+  identically, and the signed transactions pass `verify_signature`;
+- fixed vectors from the node builder are embedded in `sdk-js/test` so the
+  TypeScript encoders cannot drift silently;
 - retry tests capture every HTTP body and assert identical bytes/nonce.
 
 ---
 
-## 10. Node source map (claims used above)
+## 11. Node source map (claims used above)
 
 | Claim | Node location |
 | --- | --- |
@@ -505,5 +726,10 @@ The parity suite covers:
 | SVM opcodes and gas table | `stellereum/src/svm.rs:38,83,92,94,467,548,994,1124` |
 | Session grant struct / signature / scopes | `stellereum/src/zkml.rs:180,247-263,276,554,584,669,752` |
 | Stl57 address format | `stellereum/src/address.rs:57` |
-| Chain id default 5757 | `stellereum/src/zkml.rs:191` |
+| Chain id default 5757 | `stellereum/src/zkml.rs:203` |
+| Protocol identity / fork id / ruleset v3 | `stellereum/src/protocol.rs` (`PROTOCOL_MAJOR`, `PROTOCOL_MINOR`, `CONSENSUS_RULESET_VERSION`, `FORK_ID_RULES`, `FORK_ID`, `version_info`) |
+| EVM binding + carrier + proof of possession | `stellereum/src/evm_adapter/binding.rs` (`binding_message`, `build_binding_transaction`, `verify_binding_claim`, `verify_carrier_intent`, `build_carrier_transaction`) |
+| Carrier/binding opcode payloads | `stellereum/src/svm.rs` (`EvmCarrierIntent`, `EvmAddressClaim`, `SysCallEvmCarrier`, `SysCallBindEvmAddress`) |
+| Governance opcodes and builders | `stellereum/src/governance.rs` (`GovAction`, `VoteChoice`, `gov_propose_tx`, `gov_vote_tx`); `stellereum/src/svm.rs` (`SysCallGovPropose`, `SysCallGovVote`) |
+| Upgrade plan fields (`name`, `height`, `sha256`) | `stellereum/src/governance.rs` (`GovAction::SoftwareUpgrade`); CLI `upgrade-status` |
 | `eth_chainId` hex formatting | `stellereum/src/evm_adapter/types.rs:38` |

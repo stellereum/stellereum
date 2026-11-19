@@ -179,6 +179,7 @@ impl FinalizedHeaderRecord {
                 "round": self.cert.round,
                 "kind": format!("{:?}", self.cert.kind),
                 "block_hash": self.cert.block_hash.map(hex::encode),
+                "shard_id": self.cert.shard_id,
                 "signatures": self.cert.signatures.iter().map(|(v, s)| json!({
                     "validator": hex::encode(v),
                     "signature": hex::encode(s),

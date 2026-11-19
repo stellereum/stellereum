@@ -584,6 +584,7 @@ fn vote_and_qc_decode_never_panic() {
     let venv = bincode::serialize(&v).unwrap();
     assert!(bincode::deserialize::<Vote>(&venv).is_ok());
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

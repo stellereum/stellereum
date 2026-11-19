@@ -177,3 +177,49 @@ async fn direct_upgrade_execution_is_refused_while_the_gate_is_closed() {
         Some(ProposalStatus::Passed)
     );
 }
+
+/// S5 completeness (direct path / snapshot restore): a governed
+/// `min_validator_bond` that reached `applied` WITHOUT going through the
+/// block-path execution sweep (the solo-node RPC executor, or a restored
+/// snapshot) must still reach the CONSENSUS-SET FILTER on the next applied
+/// block. The filter reads `staking.min_validator_bond`; leaving it stale
+/// means governance "passed" a security parameter that does not apply.
+///
+/// Before the fix the sweep returned early (nothing due) and the ledger kept
+/// `None`, so the under-bonded validator stayed in the set.
+#[tokio::test]
+async fn governed_min_bond_is_mirrored_even_without_a_due_action() {
+    let engine = InMemoryStateEngine::new();
+    engine.enable_gov_ops_for_tests();
+    engine.credit_native(&VALIDATOR, FUNDS).await.expect("fund");
+    engine
+        .staking_write()
+        .await
+        .bond(
+            VALIDATOR,
+            BOND_NANO,
+            stellereum::staking::DEFAULT_COMMISSION_BPS,
+        )
+        .expect("bond");
+    let new_min = BOND_NANO * 2;
+    // The direct RPC executor writes `applied` only (state_engine cannot see
+    // that call); no proposal is due, so the block sweep has no other reason
+    // to touch the ledger.
+    engine.governance_write().await.applied.min_validator_bond = Some(new_min);
+
+    engine.apply_block_transition(&empty_block(1), 0).await;
+
+    let ledger = engine.staking_read().await;
+    assert_eq!(
+        ledger.min_validator_bond,
+        Some(new_min),
+        "committed governance must be mirrored into the consensus-set filter"
+    );
+    assert!(
+        !ledger
+            .to_validator_set()
+            .validators
+            .contains_key(&VALIDATOR),
+        "raising the governed minimum ejects the under-bonded validator"
+    );
+}

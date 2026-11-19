@@ -13,8 +13,8 @@ line references): [`../docs/SDK.md`](../docs/SDK.md).
 ## Why this crate does not depend on the node
 
 A wallet must not link tokio/axum/sled/wasmi and the whole RPC state. This
-crate reimplements only the wire pieces it mints (PQ1 envelope, four opcodes,
-signing preimages) and pins every byte against the node in the optional
+crate reimplements only the wire pieces it mints (PQ1 envelope, the supported
+opcodes, signing preimages, EVM intent decoding and the fork-id mirror) and pins every byte against the node in the optional
 `node-parity` test suite. The node is an **optional** dependency:
 
 ```bash
@@ -56,6 +56,19 @@ fn main() -> Result<(), stellereum_sdk::SdkError> {
 | `TxBuilder::contract_call(contract, method, args, value)` | `SysCallCallContractArgs` |
 | `TxBuilder::stake(validator, amount)` | `SysCallStake` |
 | `TxBuilder::unjail(validator, top_up)` | optional `SysCallStake` + `SysCallUnjail` |
+| `TxBuilder::gov_propose(id, title, action, height)` | `SysCallGovPropose` |
+| `TxBuilder::gov_vote(id, choice, height)` | `SysCallGovVote` |
+| `EvmBindingBuilder::new(identity, evm, proof)?` | `SysCallBindEvmAddress` (requires the 65-byte proof) |
+| `EvmCarrierBuilder::new(identity, raw_evm_tx, to_pq)?` | `SysCallEvmCarrier` (nonce/value from the intent) |
+
+Every builder runs the protocol/fork guard first: `ProtocolIdentity::local()`
+is chain 5757, protocol 1.0, ruleset v3, fork id `0xb13baff4`. A foreign chain
+id is `SdkError::ChainIdMismatch`; a foreign fork id is
+`SdkError::ForkIdMismatch`. Configure the node's identity with
+`.identity(identity)` (or `Wallet::with_identity`).
+
+Honest limits: the carrier is a value transfer only (no EVM contract calls),
+and the EVM binding is first-committed-wins.
 
 > The SDK key file is PQClean Falcon-512 material. The node operator's
 > `FalconKeypair::to_bytes` container is a different (expanded polynomial)
@@ -74,7 +87,7 @@ Chainable: `.nonce(n)`, `.chain_id(id)`, `.base_fee(n)`, `.gas_limit(n)`,
 `.receipt`, `.estimate_fee`, `.send_with_retry`, `.wait_for_receipt`,
 `.send_and_wait`.
 
-`Wallet`: `.transfer`, `.contract_call`, `.stake`, `.unjail`, `.submit`,
+`Wallet`: `.transfer`, `.contract_call`, `.stake`, `.unjail`, `.evm_binding`, `.evm_carrier`, `.gov_propose`, `.gov_vote`, `.submit`,
 `.submit_and_wait`, `.next_nonce`, `.reset_nonce`.
 
 ## Signing helper CLI

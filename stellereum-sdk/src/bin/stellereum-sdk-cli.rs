@@ -41,6 +41,7 @@ fn run() -> Result<(), String> {
         "keygen" => cmd_keygen(&rest),
         "address" => cmd_address(&rest),
         "sign" => cmd_sign(&rest),
+        "sign-digest" => cmd_sign_digest(&rest),
         "serve" => cmd_serve(&rest),
         "version" | "--version" | "-V" => {
             println!("stellereum-sdk-cli {}", stellereum_sdk::VERSION);
@@ -63,6 +64,7 @@ fn usage() {
          stellereum-sdk-cli keygen [--out KEY.json]\n  \
          stellereum-sdk-cli address --key KEY.json\n  \
          stellereum-sdk-cli sign --key KEY.json [--request REQ.json]\n  \
+         stellereum-sdk-cli sign-digest --key KEY.json [--digest 0x..]\n  \
          stellereum-sdk-cli serve --key KEY.json [--listen 127.0.0.1:8787]\n  \
          stellereum-sdk-cli version"
     );
@@ -140,6 +142,39 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
             Err(e.to_string())
         }
     }
+}
+
+fn cmd_sign_digest(args: &[String]) -> Result<(), String> {
+    let path = flag(args, "--key").ok_or("sign-digest: --key is required")?;
+    let key = load_key(&path)?;
+    let digest = match flag(args, "--digest") {
+        Some(d) => d,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("stdin: {e}"))?;
+            let value: serde_json::Value =
+                serde_json::from_str(&buf).map_err(|e| format!("request JSON: {e}"))?;
+            value
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .ok_or("sign-digest: missing 'digest'")?
+                .to_string()
+        }
+    };
+    let clean = digest.trim();
+    let clean = clean.strip_prefix("0x").unwrap_or(clean);
+    let bytes = hex::decode(clean).map_err(|e| format!("digest: bad hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!("digest must be 32 bytes, got {}", bytes.len()));
+    }
+    let signature = key.sign(&bytes).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::json!({ "ok": true, "signature": hex::encode(signature) })
+    );
+    Ok(())
 }
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {

@@ -168,6 +168,7 @@ fn qc_over(
     match set.certificate_with_parent(bh, &vs, Some(&[0u8; 32])) {
         Some(qc) => qc,
         None => QuorumCertificate {
+            shard_id: 0,
             height: h,
             round: r,
             kind,

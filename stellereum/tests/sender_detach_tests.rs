@@ -63,6 +63,7 @@ fn sample_commit() -> ConsensusMsg {
         height: 9,
         block: sample_block(),
         certificate: QuorumCertificate {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Precommit,
@@ -75,6 +76,7 @@ fn sample_commit() -> ConsensusMsg {
 fn sample_vote() -> ConsensusMsg {
     ConsensusMsg::Vote {
         vote: Vote {
+            shard_id: 0,
             height: 9,
             round: 0,
             kind: VoteKind::Prevote,

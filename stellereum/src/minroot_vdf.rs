@@ -34,7 +34,15 @@ pub const MAX_VDF_CHECKPOINTS: usize = 4096;
 /// Fast unit-test step count.
 pub const TEST_VDF_STEPS: u64 = 64;
 
-/// Calibrated default VDF steps per epoch (~21.8s 1-core eval, ~156ms 1-core verify at ~137.6k / ~19.3M steps/s).
+/// Calibrated default VDF steps per epoch.
+///
+/// RULESET v2 MEASUREMENT (2026-11-19, release build, one core, AMD Ryzen 5
+/// 3600): 3,000,000 steps = **20.455 s** (146,662 steps/s); 300,000 steps =
+/// 2.023 s (linear). The epoch length is 30,000 heights = 2 h at 240 ms, so
+/// the evaluation is ~0.28% of the epoch. The commit lookahead
+/// [`crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS`] (682 heights = 163.68 s) is
+/// derived from this measurement with a 4x weak-host allowance and 2x
+/// scheduling headroom. See `docs/RULESET_V2.md` §VDF.
 pub const DEFAULT_VDF_STEPS_PER_EPOCH: u64 = 3_000_000;
 
 /// 256-bit safe prime `p = 2^256 - 36113` in little-endian `[u64; 4]` limbs.

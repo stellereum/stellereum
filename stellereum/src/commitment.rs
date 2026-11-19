@@ -787,6 +787,26 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
         put_u64(h, b"gov_applied_upgrade_height", plan.height);
         put_addr(h, b"gov_applied_upgrade_sha256", &plan.sha256);
     }
+
+    // GENESIS CHAIN SPEC (UP-2): the upgrade-execution gate is consensus
+    // state, not a local preference. If the chain sets it, the value MUST
+    // enter the commitment so two nodes with different values cannot share a
+    // genesis (or any later) state root and silently disagree about when a
+    // passed `SoftwareUpgrade` installs its plan.
+    //
+    // CONDITIONAL: the compiled default (`u64::MAX`) writes ZERO bytes, so
+    // every existing chain, every genesis KAT and every snapshot root is
+    // byte-identical to before and `COMMITMENT_VERSION` stays put. A chain
+    // that opts into a reachable height visibly moves its root.
+    let chain_spec = crate::chain_spec::active_genesis_chain_spec();
+    if chain_spec != crate::chain_spec::GenesisChainSpec::compiled_default() {
+        put_bytes(h, b"chain_spec_domain", b"GENESIS_CHAIN_SPEC_V1");
+        put_u64(
+            h,
+            b"chain_spec_upgrade_exec_activation_height",
+            chain_spec.upgrade_exec_activation_height,
+        );
+    }
 }
 
 /// Explicit discriminants, so the committed value cannot drift if the enum is

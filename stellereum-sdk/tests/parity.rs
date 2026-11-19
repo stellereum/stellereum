@@ -306,3 +306,438 @@ fn priority_bid_is_signed_and_hashed_like_node() {
     assert!(tx.verify_signature());
     assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
 }
+
+// ============================================================================
+// Protocol identity, EVM binding/carrier and governance parity (protocol v1)
+// ============================================================================
+
+use stellereum::evm_adapter::{
+    binding_message as node_binding_message, build_binding_transaction, build_carrier_transaction,
+    carrier_intent_digest, carrier_signing_message, decode_raw_transaction,
+    eip1559_tx_signing_hash, evm_transfer_facts, verify_binding_claim, verify_carrier_intent,
+    verify_evm_payload_against_tx, Eip1559Transaction,
+};
+use stellereum_sdk::evm::{EvmBindingBuilder, EvmCarrierBuilder};
+use stellereum_sdk::governance::{GovAction, VoteChoice};
+use stellereum_sdk::protocol::{ProtocolIdentity, FORK_ID, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+
+fn secp_key() -> k256::ecdsa::SigningKey {
+    // Hardhat account #0. Public test vector, never holds value.
+    let bytes =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    k256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+}
+
+fn evm_address(sk: &k256::ecdsa::SigningKey) -> [u8; 20] {
+    let point = sk.verifying_key().to_encoded_point(false);
+    let hash = stellereum::evm_adapter::keccak256(&point.as_bytes()[1..]);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&hash[12..]);
+    out
+}
+
+/// A real EIP-1559 value transfer for chain 5757, signed with Hardhat #0.
+fn eip1559_raw(nonce: u64, value_wei: u128, to: [u8; 20]) -> Vec<u8> {
+    let sk = secp_key();
+    let chain_id = 5757;
+    let gas_limit = 21_000;
+    let hash = eip1559_tx_signing_hash(
+        chain_id,
+        nonce,
+        1,
+        1,
+        gas_limit,
+        Some(&to),
+        value_wei,
+        &[],
+        &[],
+    );
+    let (sig, recid) = sk.sign_prehash_recoverable(&hash).unwrap();
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig.to_bytes()[..32]);
+    s.copy_from_slice(&sig.to_bytes()[32..]);
+    Eip1559Transaction {
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas: 1,
+        max_fee_per_gas: 1,
+        gas_limit,
+        to: Some(to),
+        value: value_wei,
+        data: Vec::new(),
+        access_list: Vec::new(),
+        y_parity: recid.to_byte(),
+        v: recid.to_byte() as u64,
+        r,
+        s,
+    }
+    .encode()
+}
+
+fn binding_proof(pq: &[u8; 32], evm: &[u8; 20]) -> Vec<u8> {
+    let sk = secp_key();
+    let digest = node_binding_message(5757, evm, pq);
+    let (sig, recid) = sk.sign_prehash_recoverable(&digest).unwrap();
+    let mut proof = Vec::with_capacity(65);
+    proof.extend_from_slice(&sig.to_bytes()[..32]);
+    proof.extend_from_slice(&sig.to_bytes()[32..]);
+    proof.push(recid.to_byte());
+    proof
+}
+
+#[test]
+fn protocol_identity_matches_the_node() {
+    assert_eq!(PROTOCOL_MAJOR, stellereum::protocol::PROTOCOL_MAJOR);
+    assert_eq!(PROTOCOL_MINOR, stellereum::protocol::PROTOCOL_MINOR);
+    assert_eq!(FORK_ID, stellereum::protocol::FORK_ID);
+    assert_eq!(
+        stellereum_sdk::protocol::FORK_ID_RULES,
+        stellereum::protocol::FORK_ID_RULES,
+        "the SDK's fork-id rule list must mirror the node's"
+    );
+    assert_eq!(
+        stellereum_sdk::protocol::derive_fork_id(
+            stellereum_sdk::DEFAULT_CHAIN_ID,
+            stellereum_sdk::protocol::CONSENSUS_RULESET_VERSION,
+            stellereum_sdk::protocol::FORK_ID_RULES,
+        ),
+        stellereum::protocol::derive_fork_id(
+            stellereum::zkml::DEFAULT_CHAIN_ID,
+            stellereum::protocol::CONSENSUS_RULESET_VERSION,
+            stellereum::protocol::FORK_ID_RULES,
+        ),
+        "the SDK's derivation must equal the node's derive_fork_id"
+    );
+    let local = ProtocolIdentity::local();
+    assert_eq!(local.fork_id, stellereum::protocol::FORK_ID);
+    assert_eq!(local.chain_id, stellereum::zkml::DEFAULT_CHAIN_ID);
+    assert_eq!(
+        local.fork_id_hex(),
+        format!("0x{:08x}", stellereum::protocol::FORK_ID)
+    );
+}
+
+#[test]
+fn evm_intent_decode_matches_node_transfer_facts() {
+    let to = [0x44u8; 20];
+    let raw = eip1559_raw(11, 5_000_000_000, to);
+    let ours = stellereum_sdk::evm::decode_evm_intent(&raw).unwrap();
+    let theirs = evm_transfer_facts(&raw).unwrap();
+    assert_eq!(ours.from, theirs.from);
+    assert_eq!(ours.to, theirs.to);
+    assert_eq!(ours.value_wei, theirs.value_wei);
+    assert_eq!(ours.value_nano, theirs.value_nano);
+    assert_eq!(ours.nonce, theirs.nonce);
+    assert_eq!(ours.gas_limit, theirs.gas_limit);
+    assert_eq!(ours.from, evm_address(&secp_key()));
+    assert_eq!(
+        ours.chain_id,
+        decode_raw_transaction(&raw).unwrap().chain_id().unwrap()
+    );
+}
+
+#[test]
+fn evm_binding_unsigned_payload_and_preimage_match_node_builder() {
+    let key = FalconKeypair::generate().unwrap();
+    let evm = evm_address(&secp_key());
+    let proof = binding_proof(&key.address(), &evm);
+    let binding_sig = key
+        .sign(&node_binding_message(5757, &evm, &key.address()))
+        .unwrap();
+    let gas = 700_000;
+
+    let ours = EvmBindingBuilder::new(ProtocolIdentity::local(), evm, proof.clone())
+        .unwrap()
+        .nonce(9)
+        .gas_limit(gas)
+        .binding_signature(binding_sig.clone())
+        .build_unsigned(&key)
+        .unwrap();
+
+    // The node's builder takes the ENVELOPE signature as an argument, so
+    // sign the SDK's preimage and let the node verify exactly those bytes.
+    let envelope_sig = key.sign(&ours.signing_message_for_chain(5757)).unwrap();
+    let theirs = build_binding_transaction(
+        key.public_key(),
+        evm,
+        &binding_sig,
+        &proof,
+        9,
+        gas,
+        &envelope_sig,
+    )
+    .unwrap();
+    assert!(theirs.verify_signature());
+
+    assert_eq!(
+        ours.payload,
+        bincode::serialize(&theirs.payload).unwrap(),
+        "binding payload bytes differ"
+    );
+    assert_eq!(ours.from, theirs.from);
+    assert_eq!(ours.to, theirs.to);
+    assert_eq!(ours.amount, theirs.amount);
+    assert_eq!(ours.nonce, theirs.nonce);
+    assert_eq!(ours.gas_limit, theirs.gas_limit);
+    assert_eq!(
+        ours.signing_message_for_chain(5757),
+        theirs.signing_message_for_chain(5757),
+        "binding signing preimage differs"
+    );
+
+    // The node's own pure verifier accepts what the SDK built.
+    let signed = EvmBindingBuilder::new(ProtocolIdentity::local(), evm, proof.clone())
+        .unwrap()
+        .nonce(9)
+        .gas_limit(gas)
+        .sign(&key)
+        .unwrap();
+    let node_tx = node_tx(&signed);
+    assert!(node_tx.verify_signature());
+    verify_binding_claim(
+        match &node_tx.payload[0] {
+            NodeOpCode::SysCallBindEvmAddress(claim) => claim,
+            other => panic!("expected SysCallBindEvmAddress, got {other:?}"),
+        },
+        &key.address(),
+    )
+    .unwrap();
+    verify_evm_payload_against_tx(&node_tx).unwrap();
+}
+
+#[test]
+fn evm_carrier_unsigned_payload_and_preimage_match_node_builder() {
+    let key = FalconKeypair::generate().unwrap();
+    let raw = eip1559_raw(7, 3_000_000_000, [0x55u8; 20]);
+    let to_pq = [0x77u8; 32];
+    let gas = 900_000;
+    let intent_sig = key
+        .sign(&stellereum_sdk::evm::evm_intent_digest(&raw))
+        .unwrap();
+
+    let ours = EvmCarrierBuilder::new(ProtocolIdentity::local(), raw.clone(), to_pq)
+        .unwrap()
+        .gas_limit(gas)
+        .intent_signature(intent_sig.clone())
+        .build_unsigned(&key)
+        .unwrap();
+
+    let envelope_sig = key.sign(&ours.signing_message_for_chain(5757)).unwrap();
+    let theirs = build_carrier_transaction(
+        &raw,
+        key.public_key(),
+        &intent_sig,
+        to_pq,
+        gas,
+        &envelope_sig,
+    )
+    .unwrap();
+    assert!(theirs.verify_signature());
+
+    assert_eq!(
+        ours.payload,
+        bincode::serialize(&theirs.payload).unwrap(),
+        "carrier payload bytes differ"
+    );
+    assert_eq!(ours.from, theirs.from);
+    assert_eq!(ours.to, theirs.to);
+    assert_eq!(ours.amount, theirs.amount);
+    assert_eq!(ours.nonce, theirs.nonce);
+    assert_eq!(ours.gas_limit, theirs.gas_limit);
+    assert_eq!(
+        ours.signing_message_for_chain(5757),
+        theirs.signing_message_for_chain(5757),
+        "carrier signing preimage differs"
+    );
+    assert_eq!(
+        carrier_signing_message(&theirs),
+        ours.signing_message_for_chain(5757)
+    );
+
+    let signed = EvmCarrierBuilder::new(ProtocolIdentity::local(), raw.clone(), to_pq)
+        .unwrap()
+        .gas_limit(gas)
+        .sign(&key)
+        .unwrap();
+    let node_tx = node_tx(&signed);
+    assert!(node_tx.verify_signature());
+    verify_carrier_intent(
+        match &node_tx.payload[0] {
+            NodeOpCode::SysCallEvmCarrier(carrier) => carrier,
+            other => panic!("expected SysCallEvmCarrier, got {other:?}"),
+        },
+        &key.address(),
+    )
+    .unwrap();
+    verify_evm_payload_against_tx(&node_tx).unwrap();
+    assert_eq!(
+        carrier_intent_digest(&node_tx).unwrap(),
+        stellereum_sdk::evm::evm_intent_digest(&raw)
+    );
+}
+
+#[test]
+fn gov_propose_unsigned_bytes_and_preimage_match_node_builder() {
+    let key = FalconKeypair::generate().unwrap();
+    let action = GovAction::SetMinGasLimit(300_000);
+    let node_action = stellereum::governance::GovAction::SetMinGasLimit(300_000);
+
+    let ours = TxBuilder::gov_propose(4, "raise the floor".into(), action.clone(), 99)
+        .unwrap()
+        .nonce(6)
+        .gas_limit(500_000)
+        .unsigned_transaction(key.address());
+    let theirs = stellereum::governance::Governance::gov_propose_tx(
+        key.address(),
+        6,
+        500_000,
+        0,
+        0,
+        4,
+        "raise the floor".into(),
+        node_action,
+        99,
+    )
+    .unwrap();
+
+    assert_eq!(
+        ours.payload,
+        bincode::serialize(&theirs.payload).unwrap(),
+        "gov propose payload bytes differ"
+    );
+    assert_eq!(ours.from, theirs.from);
+    assert_eq!(ours.to, theirs.to);
+    assert_eq!(ours.amount, 0);
+    assert_eq!(ours.nonce, theirs.nonce);
+    assert_eq!(
+        ours.signing_message_for_chain(5757),
+        theirs.signing_message_for_chain(5757),
+        "gov propose signing preimage differs"
+    );
+
+    // Signed by the SDK, accepted by the node's verifier and opcode decoder.
+    let signed = TxBuilder::gov_propose(4, "raise the floor".into(), action, 99)
+        .unwrap()
+        .nonce(6)
+        .gas_limit(500_000)
+        .sign(&key)
+        .unwrap();
+    let node_tx = node_tx(&signed);
+    assert!(node_tx.verify_signature());
+    match &node_tx.payload[0] {
+        NodeOpCode::SysCallGovPropose {
+            proposal_id,
+            title,
+            action,
+            height_observed,
+        } => {
+            assert_eq!(*proposal_id, 4);
+            assert_eq!(title, "raise the floor");
+            assert_eq!(
+                **action,
+                stellereum::governance::GovAction::SetMinGasLimit(300_000)
+            );
+            assert_eq!(*height_observed, 99);
+        }
+        other => panic!("expected SysCallGovPropose, got {other:?}"),
+    }
+}
+
+#[test]
+fn gov_vote_unsigned_bytes_and_preimage_match_node_builder() {
+    let key = FalconKeypair::generate().unwrap();
+    let ours = TxBuilder::gov_vote(8, VoteChoice::Abstain, 123)
+        .nonce(2)
+        .gas_limit(400_000)
+        .unsigned_transaction(key.address());
+    let theirs = stellereum::governance::Governance::gov_vote_tx(
+        key.address(),
+        2,
+        400_000,
+        0,
+        0,
+        8,
+        stellereum::governance::VoteChoice::Abstain,
+        123,
+    );
+
+    assert_eq!(
+        ours.payload,
+        bincode::serialize(&theirs.payload).unwrap(),
+        "gov vote payload bytes differ"
+    );
+    assert_eq!(
+        ours.signing_message_for_chain(5757),
+        theirs.signing_message_for_chain(5757)
+    );
+
+    let signed = TxBuilder::gov_vote(8, VoteChoice::Abstain, 123)
+        .nonce(2)
+        .gas_limit(400_000)
+        .sign(&key)
+        .unwrap();
+    let node_tx = node_tx(&signed);
+    assert!(node_tx.verify_signature());
+    match &node_tx.payload[0] {
+        NodeOpCode::SysCallGovVote {
+            proposal_id,
+            choice,
+            height_observed,
+        } => {
+            assert_eq!(*proposal_id, 8);
+            assert_eq!(*choice, stellereum::governance::VoteChoice::Abstain);
+            assert_eq!(*height_observed, 123);
+        }
+        other => panic!("expected SysCallGovVote, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_supported_gov_action_serializes_identically() {
+    let ours = vec![
+        GovAction::SetMinValidatorBond(1_500_000_000_000),
+        GovAction::SetEquivocationSlashBps(500),
+        GovAction::SetDefaultCommissionBps(1_000),
+        GovAction::SetBlockReward(2_000_000_000),
+        GovAction::SetPmmRedemptionBufferBps(250),
+        GovAction::SetGovernanceQuorumBps(5_000),
+        GovAction::Signal("signal text".into()),
+        GovAction::RegisterOraclePublisher([3u8; 32]),
+        GovAction::UnregisterOraclePublisher([4u8; 32]),
+        GovAction::ResetOracleBreaker,
+        GovAction::SetMinGasLimit(300_000),
+        GovAction::SoftwareUpgrade {
+            name: "v6".into(),
+            height: 1_000,
+            sha256: [9u8; 32],
+        },
+        GovAction::CancelUpgrade,
+    ];
+    let theirs = vec![
+        stellereum::governance::GovAction::SetMinValidatorBond(1_500_000_000_000),
+        stellereum::governance::GovAction::SetEquivocationSlashBps(500),
+        stellereum::governance::GovAction::SetDefaultCommissionBps(1_000),
+        stellereum::governance::GovAction::SetBlockReward(2_000_000_000),
+        stellereum::governance::GovAction::SetPmmRedemptionBufferBps(250),
+        stellereum::governance::GovAction::SetGovernanceQuorumBps(5_000),
+        stellereum::governance::GovAction::Signal("signal text".into()),
+        stellereum::governance::GovAction::RegisterOraclePublisher([3u8; 32]),
+        stellereum::governance::GovAction::UnregisterOraclePublisher([4u8; 32]),
+        stellereum::governance::GovAction::ResetOracleBreaker,
+        stellereum::governance::GovAction::SetMinGasLimit(300_000),
+        stellereum::governance::GovAction::SoftwareUpgrade {
+            name: "v6".into(),
+            height: 1_000,
+            sha256: [9u8; 32],
+        },
+        stellereum::governance::GovAction::CancelUpgrade,
+    ];
+    for (ours, theirs) in ours.iter().zip(theirs.iter()) {
+        assert_eq!(
+            ours.encode(),
+            bincode::serialize(theirs).unwrap(),
+            "GovAction bytes differ for {ours:?}"
+        );
+    }
+}

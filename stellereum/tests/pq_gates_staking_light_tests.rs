@@ -112,6 +112,7 @@ fn light_header(block_hash: [u8; 32], sigs: Vec<([u8; 32], Vec<u8>)>) -> LightHe
         timestamp: 0,
         proposer: [0u8; 32],
         cert: QuorumCertificate {
+            shard_id: 0,
             height: 1,
             round: 0,
             kind: VoteKind::Precommit,

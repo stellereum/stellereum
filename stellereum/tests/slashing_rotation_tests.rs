@@ -15,11 +15,14 @@ use std::sync::Arc;
 use stellereum::consensus::{
     register_validator_pq_key, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet,
 };
-use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
-use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::svm::OpCode;
 
 #[path = "support/falcon_votes.rs"]
 mod falcon_votes;
@@ -997,4 +1000,149 @@ async fn recorded_full_exit_is_still_attributed_on_the_block_path() {
     assert_eq!(l.validators[&v].total_slashed, expected);
     assert_eq!(l.validators[&v].missed, 0, "slash reset the deficit");
     assert!(l.is_jailed(&v), "the exit cannot escape the jail");
+}
+
+// ---------------------------------------------------------------------------
+// ROTATION ESCAPE (SLASH-01): a rotation applied by the SAME block that
+// carries the downtime evidence must not forgive the miss.
+// ---------------------------------------------------------------------------
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+/// A self-signed PQ transaction that rotates `from` -> `to`. The sender is the
+/// OLD validator's PQ address (the opcode requires `ctx.sender == old`).
+fn rotation_tx(
+    kp: &FalconKeypair,
+    old: [u8; 32],
+    new: [u8; 32],
+    nonce: u64,
+    gas: u64,
+) -> Transaction {
+    let payload = vec![OpCode::SysCallRotateValidatorKey {
+        old_validator: old,
+        new_validator: new,
+    }];
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xEEu8; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        sig,
+        [0xEEu8; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
+}
+
+/// A validator one miss short of the downtime threshold rotates its key in the
+/// very block whose `last_qc` omits it. The evidence names the OLD id; the
+/// rotation has already removed that record. Without the engine's alias map
+/// the ledger lookup misses, burns 0 and the validator escapes the slash (and
+/// can repeat this every height). With it, the miss lands on the NEW record,
+/// which inherited the deficit, and the slash + jail follow the rotated stake.
+#[tokio::test]
+async fn rotation_in_the_evidence_block_cannot_forgive_a_downtime_miss() {
+    use stellereum::consensus::VoteSet;
+    use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS};
+
+    let (wsk, wfk) = falcon_votes::falcon_set(1);
+    let witness = wsk[0].verifying_key().to_bytes();
+
+    let silent_kp = FalconKeypair::generate_from_seed(0x61);
+    let fresh_kp = FalconKeypair::generate_from_seed(0x62);
+    let silent = pq_addr(&silent_kp);
+    let fresh = pq_addr(&fresh_kp);
+    assert_ne!(silent, witness);
+    assert_ne!(silent, fresh);
+
+    let e = InMemoryStateEngine::new();
+    let silent_power = floor();
+    let witness_power = 10 * floor();
+    e.staking_write()
+        .await
+        .bond(silent, silent_power, 0)
+        .unwrap();
+    e.staking_write()
+        .await
+        .bond(witness, witness_power, 0)
+        .unwrap();
+    // Back the slash's pool debit and the rotation transaction's fee.
+    e.credit_native(&STAKING_POOL, 11 * floor()).await.unwrap();
+    e.credit_native(&silent, 10_000_000).await.unwrap();
+    {
+        let mut l = e.staking_write().await;
+        let rec = l.validators.get_mut(&silent).unwrap();
+        rec.missed = DOWNTIME_MISS_THRESHOLD - 1;
+        rec.last_downtime_penalty = 0;
+    }
+
+    // The set the height-9 evidence was formed under (the pre-transition set).
+    let at_9 = e.staking_read().await.to_validator_set();
+    assert!(at_9.contains(&silent) && at_9.contains(&witness));
+    let vote = falcon_votes::fvote(&wsk[0], &wfk[0], 9, 0, VoteKind::Precommit, None);
+    assert!(vote.verify());
+    let mut vs = VoteSet::new();
+    vs.add(vote, &at_9, 9, 0, VoteKind::Precommit).unwrap();
+    let qc = vs
+        .certificate_with_parent(None, &at_9, Some(&[0u8; 32]))
+        .expect("witness-alone quorum");
+
+    let root = e.get_state_root().await;
+    let mut blk = mkblock(&wsk[0], 10, [0u8; 32], root);
+    blk.last_qc = Some(qc);
+    blk.transactions = vec![rotation_tx(&silent_kp, silent, fresh, 0, 1_000_000)];
+    blk.order_merkle_root = stellereum::mev::compute_order_merkle_root(&blk.transactions);
+    blk.validator_signatures.clear();
+    blk.sign_block_with_falcon(&wsk[0], &fk_for(&wsk[0]));
+
+    let out = e.apply_block_transition(&blk, 0).await;
+    assert_eq!(
+        out.status,
+        vec![true],
+        "the rotation transaction itself must apply"
+    );
+    let expected = silent_power * DOWNTIME_SLASH_BPS / stellereum::staking::BPS_DENOMINATOR;
+    assert!(
+        out.slashed > 0,
+        "the H-1 miss must not be forgiven by a same-block rotation"
+    );
+    assert_eq!(
+        out.slashed, expected,
+        "the aliased miss burns the pre-slash base"
+    );
+
+    let l = e.staking_read().await;
+    assert!(
+        !l.validators.contains_key(&silent),
+        "the rotation removed the old id (precondition)"
+    );
+    let new_rec = l.validators.get(&fresh).expect("new record exists");
+    assert_eq!(
+        new_rec.missed, 0,
+        "the miss hit the new record and reset it"
+    );
+    assert_eq!(
+        new_rec.total_slashed, expected,
+        "the new record paid the burn"
+    );
+    assert!(l.is_jailed(&fresh), "the jail followed the rotated stake");
 }

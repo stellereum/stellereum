@@ -12,7 +12,7 @@ use crate::key::FalconKeypair;
 use crate::opcode::CallArg;
 use crate::rpc::{Receipt, RetryPolicy, RpcClient, SubmitOutcome};
 use crate::session::SessionGrant;
-use crate::tx::{SignedTx, TxBuilder, DEFAULT_CHAIN_ID};
+use crate::tx::{SignedTx, TxBuilder, DEFAULT_CHAIN_ID, FROZEN_MIN_GAS_FLOOR};
 
 /// A signing key bound to an RPC endpoint and an optional chain id.
 #[derive(Clone, Debug)]
@@ -20,6 +20,7 @@ pub struct Wallet {
     key: FalconKeypair,
     rpc: RpcClient,
     chain_id: u64,
+    identity: crate::protocol::ProtocolIdentity,
     next_nonce: Option<u64>,
 }
 
@@ -30,6 +31,7 @@ impl Wallet {
             key,
             rpc,
             chain_id: DEFAULT_CHAIN_ID,
+            identity: crate::protocol::ProtocolIdentity::local(),
             next_nonce: None,
         }
     }
@@ -42,7 +44,21 @@ impl Wallet {
     /// Override the chain id this wallet binds.
     pub fn with_chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
+        self.identity.chain_id = chain_id;
         self
+    }
+
+    /// Configure the node's advertised protocol identity. A fork/protocol
+    /// mismatch makes every `build`/`sign` fail before signing.
+    pub fn with_identity(mut self, identity: crate::protocol::ProtocolIdentity) -> Self {
+        self.chain_id = identity.chain_id;
+        self.identity = identity;
+        self
+    }
+
+    /// The configured node identity.
+    pub fn identity(&self) -> crate::protocol::ProtocolIdentity {
+        self.identity
     }
 
     /// The signing key.
@@ -94,12 +110,19 @@ impl Wallet {
             .rpc
             .base_fee()
             .unwrap_or(crate::tx::FROZEN_MIN_GAS_FLOOR);
-        Ok(builder.nonce(nonce).chain_id(self.chain_id).base_fee(base))
+        Ok(builder
+            .nonce(nonce)
+            .identity(self.identity)
+            .chain_id(self.chain_id)
+            .base_fee(base))
     }
 
     /// Sign a prepared builder with this wallet's key.
     pub fn sign(&self, builder: TxBuilder) -> Result<SignedTx> {
-        builder.chain_id(self.chain_id).sign(&self.key)
+        builder
+            .identity(self.identity)
+            .chain_id(self.chain_id)
+            .sign(&self.key)
     }
 
     /// Prepare and sign in one call.
@@ -123,7 +146,11 @@ impl Wallet {
             .rpc
             .base_fee()
             .unwrap_or(crate::tx::FROZEN_MIN_GAS_FLOOR);
-        let prepared = builder.nonce(nonce).chain_id(grant.chain_id).base_fee(base);
+        let prepared = builder
+            .nonce(nonce)
+            .identity(self.identity)
+            .chain_id(grant.chain_id)
+            .base_fee(base);
         prepared.sign_with_session(session_key, grant)
     }
 
@@ -152,6 +179,57 @@ impl Wallet {
     /// Unjail a validator, optionally with a top-up in the same payload.
     pub fn unjail(&mut self, validator: [u8; 32], top_up: Option<u64>) -> Result<SignedTx> {
         self.build(TxBuilder::unjail(validator, top_up))
+    }
+
+    /// Register `evm_address` for this wallet's PQ account.
+    ///
+    /// `evm_proof` is the 65-byte secp256k1 proof of possession
+    /// (`r || s || recovery_id`) over the canonical binding digest; a missing
+    /// or non-recovering proof is refused before signing.
+    pub fn evm_binding(&mut self, evm_address: [u8; 20], evm_proof: Vec<u8>) -> Result<SignedTx> {
+        let nonce = self.next_nonce()?;
+        let base = self.rpc.base_fee().unwrap_or(FROZEN_MIN_GAS_FLOOR);
+        let gas = crate::evm::EVM_BINDING_MIN_GAS
+            .max(base)
+            .saturating_add(crate::tx::PQ_ACTIVATION_SURCHARGE_GAS);
+        crate::evm::EvmBindingBuilder::new(self.identity, evm_address, evm_proof)?
+            .nonce(nonce)
+            .gas_limit(gas)
+            .sign(&self.key)
+    }
+
+    /// Settle an EVM value-transfer intent. The carrier nonce and amount are
+    /// taken from the intent; `to_pq` is the recipient's bound PQ account.
+    pub fn evm_carrier(&mut self, raw_evm_tx: Vec<u8>, to_pq: [u8; 32]) -> Result<SignedTx> {
+        let base = self.rpc.base_fee().unwrap_or(FROZEN_MIN_GAS_FLOOR);
+        let gas = crate::evm::EVM_CARRIER_MIN_GAS
+            .max(base)
+            .saturating_add(crate::tx::PQ_ACTIVATION_SURCHARGE_GAS);
+        crate::evm::EvmCarrierBuilder::new(self.identity, raw_evm_tx, to_pq)?
+            .gas_limit(gas)
+            .sign(&self.key)
+    }
+
+    /// Block-carried governance proposal from this wallet's account.
+    pub fn gov_propose(
+        &mut self,
+        proposal_id: u64,
+        title: String,
+        action: crate::governance::GovAction,
+        height_observed: u64,
+    ) -> Result<SignedTx> {
+        let builder = TxBuilder::gov_propose(proposal_id, title, action, height_observed)?;
+        self.build(builder)
+    }
+
+    /// Block-carried governance vote from this wallet's account.
+    pub fn gov_vote(
+        &mut self,
+        proposal_id: u64,
+        choice: crate::governance::VoteChoice,
+        height_observed: u64,
+    ) -> Result<SignedTx> {
+        self.build(TxBuilder::gov_vote(proposal_id, choice, height_observed))
     }
 
     /// Submit a signed transaction with retries. The nonce cache advances

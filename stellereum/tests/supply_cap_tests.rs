@@ -20,10 +20,11 @@
 //! * a snapshot restore rebases the counter to the restored supply, so a
 //!   restarted node cannot mint a second full cap from zero.
 //!
-//! SCOPE NOTE (stated loudly): the counter is NOT yet folded into the
-//! consensus state root — `commitment.rs` is outside this change's scope. The
-//! getter to commit is `InMemoryStateEngine::total_minted_nano`; until that
-//! wiring lands, these tests pin ENGINE behaviour only, not the root.
+//! SCOPE NOTE: the counter is folded into the consensus state root
+//! (`commitment::assemble_cached_digest_with_cnvrf_and_minted`), so a node
+//! that lost or reset it can no longer hide behind an identical root. It is
+//! still PER-ENGINE: see `per_engine_cap_is_not_a_chain_wide_cap_known_gap`
+//! for the workchain gap (a chain-wide cap needs a cross-shard registry).
 
 use ed25519_dalek::SigningKey;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
@@ -404,4 +405,47 @@ async fn minted_supply_moves_the_state_root() {
         a.get_state_root().await != ra,
         "balances still move the root"
     );
+}
+
+/// WORKCHAIN BYPASS — PROOF OF THE KNOWN PER-ENGINE GAP (not a fix).
+///
+/// `total_minted_nano` is a field of ONE `InMemoryStateEngine`. A sharded node
+/// runs one engine per shard/workchain, each with its own counter, so N shards
+/// can each mint a full `TOTAL_SUPPLY_CAP`: the enforced ceiling is
+/// `N * cap + N * pre-mined genesis`, not the chain-wide `cap`. This test
+/// characterises the gap so it cannot regress silently into a claim that the
+/// hard cap is global. Fixing it requires a CHAIN-WIDE supply registry (a
+/// masterchain-owned counter every shard reserves against, i.e. cross-shard
+/// protocol work), not another per-engine check; `node/` wiring is outside
+/// this wave's scope.
+#[tokio::test]
+async fn per_engine_cap_is_not_a_chain_wide_cap_known_gap() {
+    let shard_a = InMemoryStateEngine::new();
+    let shard_b = InMemoryStateEngine::new();
+    shard_a.enable_cross_shard();
+    shard_b.enable_cross_shard();
+
+    // Each engine accepts a FULL cap independently.
+    shard_a
+        .mint_native(&addr(0xA1), TOTAL_SUPPLY_CAP)
+        .await
+        .expect("shard A may mint to its own cap");
+    shard_b
+        .mint_native(&addr(0xB2), TOTAL_SUPPLY_CAP)
+        .await
+        .expect("shard B may mint to its own cap");
+
+    assert_eq!(shard_a.total_minted_nano(), TOTAL_SUPPLY_CAP);
+    assert_eq!(shard_b.total_minted_nano(), TOTAL_SUPPLY_CAP);
+    let chain_total = shard_a.total_minted_nano() as u128 + shard_b.total_minted_nano() as u128;
+    assert_eq!(
+        chain_total,
+        2 * TOTAL_SUPPLY_CAP as u128,
+        "the two engines' minted supplies add up to TWICE the advertised cap: \
+         TOTAL_SUPPLY_CAP currently bounds one engine, not the chain"
+    );
+
+    // Each engine still fails closed one nano past its OWN counter.
+    assert!(shard_a.mint_native(&addr(0xA3), 1).await.is_err());
+    assert!(shard_b.mint_native(&addr(0xB3), 1).await.is_err());
 }

@@ -281,6 +281,7 @@ fn proposer_edge_cases_empty_and_singleton_sets() {
     assert!(derive_sortition_committee(&empty, 1, 0, 4, &parent).is_empty());
     assert!(!proposer_matches_schedule(&empty, 1, &[0x11u8; 32], 0));
     let qc = QuorumCertificate {
+        shard_id: 0,
         height: 1,
         round: 0,
         kind: VoteKind::Precommit,

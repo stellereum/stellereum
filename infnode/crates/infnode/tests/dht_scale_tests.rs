@@ -624,6 +624,91 @@ async fn pubsub_fanout_loopback_dup_rate() {
 // 6) Analytic fanout table vs N=10/15/20 (bounds asserted, caps pinned).
 // ---------------------------------------------------------------------------
 
+#[test]
+fn routing_eviction_does_not_displace_recent_entries() {
+    // Same bucket for every id: all share the high bit with `own`.
+    let own = [0u8; proto::NODEID_LEN];
+    let mut table = dht::RoutingTable::new(own, 2);
+    let now = 10_000_000i64;
+    let mk = |seed: u8, last_seen: i64| {
+        let mut id = [0u8; proto::NODEID_LEN];
+        id[0] = 0x80;
+        id[19] = seed;
+        dht::NodeInfo {
+            id,
+            endpoints: vec!["127.0.0.1:1".to_string()],
+            pq_hex: String::new(),
+            last_seen,
+        }
+    };
+    let honest_a = mk(1, now);
+    let honest_b = mk(2, now - 1_000);
+    table.insert(honest_a.clone());
+    table.insert(honest_b.clone());
+
+    // A fresh attacker key cannot evict a recently-seen honest entry.
+    let attacker = mk(3, now);
+    table.insert(attacker.clone());
+    let ids: Vec<[u8; 20]> = table.all().iter().map(|n| n.id).collect();
+    assert!(ids.contains(&honest_a.id) && ids.contains(&honest_b.id));
+    assert!(
+        !ids.contains(&attacker.id),
+        "novel key must not eclipse fresh entries"
+    );
+
+    // After the grace window the idle entry is replaceable (churn still works).
+    table.insert(mk(4, now + dht::ROUTING_EVICT_GRACE_MS + 1));
+    assert_eq!(table.len(), 2);
+    let ids: Vec<[u8; 20]> = table.all().iter().map(|n| n.id).collect();
+    assert!(
+        !ids.contains(&honest_b.id),
+        "the idle entry (not the recently seen one) is the eviction victim"
+    );
+    assert!(ids.contains(&honest_a.id));
+}
+
+#[test]
+fn dht_lookup_fanout_is_bounded_by_alpha() {
+    let target = [0u8; proto::NODEID_LEN];
+    let from = [0xFFu8; proto::NODEID_LEN];
+    let mut peers = Vec::new();
+    for i in 0..100u8 {
+        let mut id = [0u8; proto::NODEID_LEN];
+        id[0] = i;
+        peers.push(id);
+    }
+    let selected = dht::lookup_fanout(peers.clone(), &target, &from, dht::ALPHA);
+    assert_eq!(
+        selected.len(),
+        dht::ALPHA,
+        "one inbound lookup may fan out to at most ALPHA peers"
+    );
+    assert!(
+        !selected.contains(&from),
+        "never reflect back to the requester"
+    );
+    assert_eq!(selected[0], [0u8; proto::NODEID_LEN], "closest first");
+    for w in selected.windows(2) {
+        assert!(
+            dht::xor_distance(&w[0], &target) <= dht::xor_distance(&w[1], &target),
+            "fanout set is ordered by XOR distance"
+        );
+    }
+    assert!(dht::lookup_fanout(Vec::new(), &target, &from, dht::ALPHA).is_empty());
+
+    // REGRESSION (source guard): the handler used to query EVERY peer at each
+    // TTL level (`peers.keys().copied().filter(|p| *p != from)`).
+    let src = include_str!("../src/node.rs");
+    assert!(
+        src.contains("crate::dht::lookup_fanout"),
+        "dht.lookup must use the bounded selector"
+    );
+    assert!(
+        !src.contains(".keys()\n            .copied()\n            .filter(|p| *p != from)"),
+        "the unbounded all-peer lookup fan-out must stay removed"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pubsub_fanout_bounds_table() {
     // Per-publish relay amplification bound (implementation geometry: flood

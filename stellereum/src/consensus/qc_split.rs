@@ -66,9 +66,9 @@ use super::engine::VoteSet;
 use super::rotation::pq_key_at_height;
 use super::sortition::qc_split_required;
 use super::types::{
-    encode_pq_epoch_envelope, verify_falcon_signature, vote_sign_bytes, BlockHash,
-    CommitteeSchedule, Height, PqMicroCertificate, QuorumCertificate, Round, ValidatorId,
-    ValidatorSet, VoteKind, MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID,
+    encode_pq_epoch_envelope, verify_falcon_signature, vote_sign_bytes_for_shard, BlockHash,
+    CommitteeSchedule, Height, PqMicroCertificate, QuorumCertificate, Round, ShardId, ValidatorId,
+    ValidatorSet, VoteKind, MASTERCHAIN_SHARD, MAX_COMMIT_CERT_SIGNERS, PQ_QC_MARKER_ID,
 };
 use crate::post_quantum::PqScheme;
 
@@ -168,10 +168,28 @@ pub fn produce_decision_certificate_with_schedule_and_pq_keys(
 ) -> Option<QuorumCertificate> {
     let (height, _, _) = votes.scope()?;
     if qc_split_required(height, validators.len()) {
-        produce_full_network_certificate_with_pq_keys(votes, target, validators, pq_keys)
-    } else {
-        votes.certificate_with_schedule(target, validators, parent_hash, schedule)
+        return produce_full_network_certificate_with_pq_keys(votes, target, validators, pq_keys);
     }
+    let qc = votes.certificate_with_schedule(target, validators, parent_hash, schedule)?;
+    // POWER-BASED FALLBACK (review F1, generalised): the µQC is a SAMPLE of
+    // the validator set, and its acceptance rule is the NETWORK's two-thirds
+    // in power (`pq_micro_required_power`). Whether the sample can carry that
+    // threshold is a property of the DRAWN COMMITTEE'S STAKE, not of the
+    // validator COUNT: `qc_split_required`'s size leg only catches the
+    // uniform-stake crossing at N = 192. Below it an ordinary draw can still
+    // be unable to certify a perfectly valid network quorum — at N = 191 with
+    // uniform stake the network needs 128 precommits and the 128-seat
+    // committee can reach 128 only if EVERY committee member signed, so one
+    // offline committee member (or a quorum that happens to exclude one)
+    // leaves the µQC uncompilable while the height is already decided. The
+    // full-network CEC is schedule-independent, carries every signer and is
+    // accepted by the verifier below the split, so it is the safe fallback:
+    // the gate then follows the POWER the committee must actually reach, not
+    // a raw head count.
+    if qc.pq_micro_certificate().is_some() {
+        return Some(qc);
+    }
+    produce_full_network_certificate_with_pq_keys(votes, target, validators, pq_keys).or(Some(qc))
 }
 
 /// Aggregate a [`VoteSet`] into a full-network epoch/CEC certificate.
@@ -228,8 +246,17 @@ pub fn produce_full_network_certificate_with_pq_keys(
         }
     }
 
-    produce_full_network_certificate_from_signers(
-        height, round, kind, target, validators, &signers, pq_keys,
+    // The signers' signatures are bound to the shard the votes were cast in;
+    // verification must reconstruct the same V3 preimage.
+    produce_full_network_certificate_from_signers_in_shard(
+        height,
+        round,
+        kind,
+        target,
+        validators,
+        &signers,
+        pq_keys,
+        votes.shard().unwrap_or(MASTERCHAIN_SHARD),
     )
 }
 
@@ -262,6 +289,34 @@ pub fn produce_full_network_certificate_from_signers(
     signers: &[(ValidatorId, Vec<u8>)],
     pq_keys: Option<&PqKeyMap>,
 ) -> Option<QuorumCertificate> {
+    produce_full_network_certificate_from_signers_in_shard(
+        height,
+        round,
+        kind,
+        block_hash,
+        validators,
+        signers,
+        pq_keys,
+        MASTERCHAIN_SHARD,
+    )
+}
+
+/// [`produce_full_network_certificate_from_signers`] with an explicit shard:
+/// the signatures must have been produced over
+/// `vote_sign_bytes_for_shard(shard_id, height, round, kind, block_hash)`.
+#[allow(clippy::too_many_arguments)]
+// GATE: the certificate fields plus the shard they are bound to; grouping
+// would hide the binding this entry point exists to make explicit.
+pub fn produce_full_network_certificate_from_signers_in_shard(
+    height: Height,
+    round: Round,
+    kind: VoteKind,
+    block_hash: Option<BlockHash>,
+    validators: &ValidatorSet,
+    signers: &[(ValidatorId, Vec<u8>)],
+    pq_keys: Option<&PqKeyMap>,
+    shard_id: ShardId,
+) -> Option<QuorumCertificate> {
     // ANTI-DoS (audit F7 symmetry): the signer list is the only
     // attacker-sized input here. Cap it BEFORE any signature work, and cap
     // the validator set the same way (the CEC bitmask is a full-set bitmask,
@@ -292,7 +347,7 @@ pub fn produce_full_network_certificate_from_signers(
         }
     }
 
-    let msg = vote_sign_bytes(height, round, kind, &block_hash);
+    let msg = vote_sign_bytes_for_shard(shard_id, height, round, kind, &block_hash);
     let mut bitmask = vec![0u8; ids.len().div_ceil(8)];
     let mut compact_sigs: Vec<Vec<u8>> = Vec::with_capacity(by_signer.len());
     // u128 exactly like the verifier's `verify_epoch_cert` accounting, so an
@@ -348,6 +403,7 @@ pub fn produce_full_network_certificate_from_signers(
         kind,
         block_hash,
         signatures: Vec::with_capacity(1),
+        shard_id,
     };
     qc.signatures
         .push((PQ_QC_MARKER_ID, encode_pq_epoch_envelope(&cert)));

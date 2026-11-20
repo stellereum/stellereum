@@ -3,9 +3,10 @@
 Companion to `ops/alert_rules.yaml` (Prometheus rules). Every `stell_*`
 metric below was verified to exist in `stellereum/src/metrics.rs` on
 2026-11-02 (`rg -c '"<name>"' stellereum/src/metrics.rs` returns 1 for each
-name), **except** the four `stell_cluster_*` liveness gauges: those are
-written by `scripts/cluster_liveness_watch.sh` through the node_exporter
-textfile collector (see ClusterLivenessFailed below).
+name), **except** the `stell_cluster_*` liveness gauges and the
+`stell_tick_*` / `stell_clock_*` health gauges: those are written by
+`scripts/cluster_liveness_watch.sh` through the node_exporter textfile
+collector (see ClusterLivenessFailed below).
 
 Scrape surface: explorer/gateway on `STELL_EXPLORER_LISTEN`
 (default `127.0.0.1:8080`; local-cluster uses `127.0.0.1:18080+i`):
@@ -128,12 +129,17 @@ These series do **not** come from the node's `/metrics`. They are produced by
 ```bash
 scripts/cluster_liveness_watch.sh \
   --rpcs "A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
+  --journal "A=ssh root@hostA journalctl -u stell-nodeA" \
+  --journal "B=journalctl --user -u stell-nodeB" \
+  --clock "A=ssh root@hostA 'timedatectl show -p NTPSynchronized --value; date +%s%3N'" \
+  --clock "B=timedatectl show -p NTPSynchronized --value; date +%s%3N" \
   --log /var/log/stell/cluster-liveness.log \
   --textfile /var/lib/node_exporter/textfile_collector/stell_cluster_liveness.prom
 ```
 
 Metrics: `stell_cluster_liveness_ok`, `stell_cluster_height`,
-`stell_cluster_spread`, `stell_cluster_stalled_seconds`.
+`stell_cluster_spread`, `stell_cluster_stalled_seconds`, plus the per-node
+tick/clock series described under TickP99High and ClockSkew.
 
 **Caveats:**
 - A stopped watcher leaves the last value in the textfile; it can look healthy
@@ -160,6 +166,89 @@ Metrics: `stell_cluster_liveness_ok`, `stell_cluster_height`,
    `/health` `.identity.chain_id` / `.identity.fork_id` must match across
    nodes and the expected values. **Do not wipe data unless the genesis/fork
    id changed.**
+
+## TickP99High
+
+**Signal:** `stell_tick_p99_ms > 2000` for 10m, per `node` label.
+
+The watcher parses `[perf] tick h=... took ...` lines from each node's journal
+over a bounded window (`--tick-window`, default 900 s) and exports
+`stell_tick_p50_ms`, `stell_tick_p99_ms`, `stell_tick_over_1s_ratio` and
+`stell_tick_samples`. **The node logs a tick line only when the tick takes
+>=400 ms** (`consensus_driver.rs`), so these are statistics of slow ticks, not
+of every tick. Zero `stell_tick_samples` means the journal command returned
+nothing — check the `--journal` command before believing a 0 p99.
+
+**Why it matters:** apply+flush runs inside the tick. A multi-second tick
+defers proposals (`proposal deferred: apply in flight`) and shows up as
+multi-second block-time gaps. The public site samples block time from block
+timestamps, so a tick spike corrupts that number too.
+
+**Triage:**
+1. Read the raw lines:
+   `journalctl -u stell-nodeA --since=-15min | grep '\[perf\] tick' | tail -20`
+   The line names the cause: `flushes=N` (more outbox batches inside one
+   tick), `catchup_ms`, `retro_ms`, `probe_ms`, `join_ms`.
+2. Check host CPU/IO. A build or test run on the validator is the usual
+   culprit on a 1-vCPU host; confirm with `ps`, load average, and
+   `journalctl` for the compile window.
+3. Correlate with `proposal deferred: apply in flight` and block gaps in the
+   same journal. Slow disk also shows as `stell_persist_queue_dropped_total`
+   (see Downtime-evidence spike).
+4. Do not restart a healthy node for a transient spike. Remove the load, let
+   the 10m window clear, and confirm p99 and the ratio fall.
+
+## TickSlowRatioHigh
+
+**Signal:** `stell_tick_over_1s_ratio > 0.2` for 10m, per `node` label.
+
+This is the breadth signal: more than 20% of *logged* ticks exceed 1000 ms.
+Because only ticks >=400 ms are logged, the ratio describes the slow-tick
+sample, not the full tick stream. A high ratio with a moderate p99 means
+sustained load; a high p99 with a low ratio means rare multi-second outliers
+(apply/retro/join). Use both with `stell_tick_samples`.
+
+**Triage:** same as TickP99High. If the ratio is high while p99 is near 1 s,
+look for a constant CPU/IO consumer (a build, a compaction/sweeper, a noisy
+neighbour); if p99 is several seconds, look for apply or catch-up work inside
+the tick.
+
+## ClockSkew
+
+**Signal:** `stell_clock_sync_ok == 0` for 5m, per `node` label.
+
+`stell_clock_skew_ms{node}` is node epoch-milliseconds minus the watcher's
+midpoint clock for the same command round-trip (positive = node ahead;
+`NaN` when the `--clock` command prints no timestamp). `stell_clock_sync_ok`
+is 0 when `|skew| > 1000 ms`, when `timedatectl` reports
+`NTPSynchronized=no`, or when the clock status is unknown. The default
+`--clock` command measures the watcher's local host, so supply a per-node
+`--clock` (usually over ssh, as in the example above) for remote validators.
+
+**Why it matters:** block timestamps come from each node's clock. A node with
+NTP disabled and a +13.4 s offset produced negative block-timestamp intervals
+and fake 12 s gaps, which the public block-time display then showed as real.
+
+**Triage:**
+1. On the affected host: `timedatectl set-ntp true` (or enable chrony /
+   systemd-timesyncd), then `timedatectl timesync-status`.
+2. Confirm `NTPSynchronized=yes` and an offset well under 1 s. Re-check the
+   textfile: `stell_clock_skew_ms` within ±1000 ms and
+   `stell_clock_sync_ok{node="X"} 1`.
+3. Confirm the chain agrees: sample consecutive block timestamps at the same
+   heights from two nodes and check there are no negative deltas:
+   ```bash
+   for h in 12340 12341 12342 12343 12344; do
+     curl -s -H 'content-type: application/json' \
+       --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stell_getBlock\",\"params\":[{\"height\":$h}]}" \
+       http://127.0.0.1:8545 | jq -r '.result.timestamp'
+   done | awk 'NR>1 && $1 < prev { print "NEGATIVE delta", prev, "->", $1 } { prev=$1 }'
+   ```
+   Repeat against the second node at the same heights. Both nodes must agree
+   and every delta must be non-negative.
+4. Do not step a running validator's clock backwards without a named
+   maintenance window; a forward step is the safe direction if a correction
+   is unavoidable.
 
 ## Downtime-evidence spike
 

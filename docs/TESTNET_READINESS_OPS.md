@@ -396,6 +396,88 @@ Local-cluster-only values (`scripts/local-cluster.md:29-48`,
 
 ---
 
+## 7.1 Performance regressions (tick time and clock skew)
+
+Both problems below corrupt the public "block time", which is sampled from
+block timestamps rather than measured: a slow tick widens the gaps, and an
+unsynchronised clock makes the gaps negative or invents them. Measured
+2026-11-20 on the live cluster: consensus ticks blocked for seconds inside
+apply+flush (p50 752 ms, p90 2.58 s, p99 4.45 s; 27 of 97 ticks over 1 s),
+proposals were deferred with `proposal deferred: apply in flight`, and node A
+had NTP disabled with a +13.4 s offset against B. Both are visible in the
+textfile produced by `scripts/cluster_liveness_watch.sh`; alert rules are in
+`ops/alert_rules.yaml` (`TickP99High`, `TickSlowRatioHigh`, `ClockSkew`) and
+the triage detail is in `ops/alerts.md`.
+
+### Read the tick metrics
+
+The watcher parses `[perf] tick h=... took ...` journal lines per node over a
+bounded window (`--tick-window`, default 900 s) and exports:
+
+| Metric | Meaning | Healthy |
+|---|---|---|
+| `stell_tick_p50_ms{node}` | median logged tick duration | well below block time |
+| `stell_tick_p99_ms{node}` | 99th percentile of the same sample | < 2000 ms |
+| `stell_tick_over_1s_ratio{node}` | fraction of logged ticks > 1000 ms | < 0.2 |
+| `stell_tick_samples{node}` | lines parsed in the window | > 0 |
+
+The node logs a tick line **only when the tick takes >= 400 ms**
+(`stellereum/src/node/consensus_driver.rs`). The percentiles therefore describe
+slow ticks, not all ticks, and the ratio is a fraction of that slow sample.
+Always read `stell_tick_samples` with them: 0 means the `--journal` command
+returned nothing (wrong unit, `--user` scope, ssh failure), not a fast node.
+
+Raw equivalent:
+
+```bash
+journalctl -u stell-nodeA --since=-15min | grep '\[perf\] tick' | tail -20
+# or, from the ops host:
+ssh root@hostA journalctl -u stell-nodeA --since=-15min | grep '\[perf\] tick'
+```
+
+### What a spike means
+
+Apply+flush runs inside the tick. When it blocks, the tick is the clock:
+proposals are deferred (`proposal deferred: apply in flight`), votes/batches
+flush late (`flushes=N` in the line), and block timestamps show multi-second
+gaps. The `[perf] tick` line itself names where the time went — `catchup_ms`,
+`retro_ms`, `probe_ms`, `join_ms`, and `flushes`. Treat a spike as a host/load
+regression first (CPU, disk, compaction, sweeper, a build), not automatically
+as a consensus bug.
+
+**Rule: do not build or test on a validator host.** The reference node is
+1 vCPU and the tick shares it with apply/flush. If a build or test is
+unavoidable on that box, run it under `nice -n 19` and `ionice -c3`, expect
+tick/block-time alerts for the duration, and never leave a compile running
+during a deploy or restart window.
+
+### Clock-skew procedure
+
+`stell_clock_skew_ms{node}` is the node's epoch-milliseconds minus the
+watcher's mid-round-trip clock (positive = node ahead; `NaN` when the `--clock`
+command prints no timestamp). `stell_clock_sync_ok{node}` is 0 when
+`|skew| > 1000 ms`, when `timedatectl` reports `NTPSynchronized=no`, or when
+the clock status is unknown. The default `--clock` command measures the
+watcher's local host, so supply a per-node `--clock` (usually over ssh) when
+watching remote validators.
+
+1. On the affected host enable NTP: `timedatectl set-ntp true` (or enable
+   chrony / systemd-timesyncd, whichever the host uses).
+2. Verify: `timedatectl timesync-status` and
+   `timedatectl show -p NTPSynchronized --value` (expect `yes`, offset well
+   under 1 s).
+3. Re-check the textfile: `stell_clock_skew_ms{node="X"}` within ±1000 ms and
+   `stell_clock_sync_ok{node="X"} 1`.
+4. Confirm no more negative block-interval deltas: fetch consecutive heights
+   from two nodes at the same heights and check every `timestamp[n] >=
+   timestamp[n-1]` (command in `ops/alerts.md#clockskew`). A negative delta or
+   a fake ~12 s gap means one node is still off — fix that node, do not
+   "correct" the block-time display.
+5. Do not step a running validator's clock backwards without a named window;
+   prefer enabling NTP to slew it forward.
+
+---
+
 ## 8. What is MISSING for professional ops — ranked by risk
 
 > Rank = likelihood × blast radius for a 3-node testnet. Note the quorum

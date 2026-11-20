@@ -14,6 +14,11 @@
 #   stell_slow_validation_total, stell_validator_set_fragile,
 #   stell_validator_set_size
 #
+# Exception: stell_cluster_*, stell_tick_* and stell_clock_* in the
+# stellereum-liveness group do NOT come from /metrics. They are written by
+# scripts/cluster_liveness_watch.sh through the node_exporter textfile
+# collector (see the group comment below and ops/alerts.md).
+#
 # Peer-count note: there is NO dedicated peer-count gauge in metrics.rs.
 # PeersLost derives the count from the per-peer label set of
 # stell_peer_latency_seconds (SELF-MEASURED latency series, one per peer id).
@@ -183,9 +188,10 @@ groups:
   - name: stellereum-liveness
     interval: 30s
     rules:
-      # These four series come from the node_exporter TEXTFILE collector, not
-      # from the node's /metrics endpoint. They are written by
-      # scripts/cluster_liveness_watch.sh (reads cluster_liveness.sh output):
+      # These series come from the node_exporter TEXTFILE collector, not from
+      # the node's /metrics endpoint. They are written by
+      # scripts/cluster_liveness_watch.sh, which also parses `[perf] tick`
+      # journal lines and probes each node's clock:
       #
       #   node_exporter --collector.textfile.directory=<dir containing
       #     stell_cluster_liveness.prom>
@@ -195,6 +201,14 @@ groups:
       # watcher leaves the last sample in place; alert on
       # `up{job="node_exporter"} == 0` separately if the watcher host is in
       # scope.
+      #
+      # Tick metrics are computed only over journal lines the node actually
+      # emitted: it logs `[perf] tick` only when a tick takes >=400 ms. So
+      # p50/p99 describe SLOW ticks, and `stell_tick_over_1s_ratio` is the
+      # fraction of logged ticks over 1 s, not of all ticks. Read
+      # `stell_tick_samples` alongside them; 0 samples means the journal
+      # command returned nothing (not a healthy node). See
+      # docs/TESTNET_READINESS_OPS.md §7.1.
       - alert: ClusterLivenessFailed
         expr: stell_cluster_liveness_ok == 0
         for: 2m
@@ -214,3 +228,33 @@ groups:
           summary: "Validator height spread is {{ $value }} blocks on {{ $labels.instance }} (threshold: >1)"
           description: "One or more validators are behind the tip. Do not wipe data; check height/round split and restart only the lagging node per the runbook."
           runbook: "docs/TESTNET_READINESS_OPS.md#9-restart-procedures-one-node--all-nodes"
+
+      - alert: TickP99High
+        expr: stell_tick_p99_ms > 2000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tick p99 is {{ $value }} ms on node {{ $labels.node }} (threshold: 2000 ms)"
+          description: "Consensus ticks are blocking for seconds inside apply+flush, which defers proposals and widens block gaps. Check host CPU/IO, running builds, and stell_tick_samples."
+          runbook: "ops/alerts.md#tickp99high"
+
+      - alert: TickSlowRatioHigh
+        expr: stell_tick_over_1s_ratio > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} of logged ticks exceed 1 s on node {{ $labels.node }} (threshold: 0.2)"
+          description: "More than 20% of logged tick lines are >1000 ms. The node logs only ticks >=400 ms, so this is a fraction of slow ticks, not all ticks."
+          runbook: "ops/alerts.md#tickslowratiohigh"
+
+      - alert: ClockSkew
+        expr: stell_clock_sync_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Clock sync is failing on node {{ $labels.node }} (stell_clock_sync_ok={{ $value }}; check stell_clock_skew_ms)"
+          description: "A node offset beyond 1000 ms (or NTP explicitly disabled/unknown) corrupts block-timestamp sampling, producing negative intervals and fake block-time gaps. Enable NTP and verify with timedatectl timesync-status."
+          runbook: "ops/alerts.md#clockskew"

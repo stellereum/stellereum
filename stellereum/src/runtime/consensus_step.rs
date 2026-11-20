@@ -1340,32 +1340,30 @@ impl ValidatorRuntime {
         // vote that would have synced us arrives after the proposal it should
         // have preceded). Bounded to near rounds: a far claim is answered by
         // the vote path, not by an unsigned envelope.
-        if Some(block.proposer) != self.expected_proposer_now() {
-            // Near-future phase alignment (widened +4 -> +8, see
-            // `PROPOSAL_ALIGN_WINDOW_ROUNDS`): early delivery of a
-            // GENUINE future proposal must align, not reject — the scan is
-            // deliberate, pinned by test. Abuse is bounded elsewhere: the
-            // jump runs through `sync_round_to`, which caps each jump at
-            // ROUND_LOOKBACK and budgets MAX_SYNC_JUMPS_PER_ROUND jumps per
-            // round (audit 2026-10-06; per-round since the wall-clock
-            // budget removal), and
-            // the body is signature-authenticated before this point, so only
-            // the slot owner can pull us to their own slots.
-            let mut target = None;
-            for r in (self.hc.round.saturating_add(1))
-                ..=(self.hc.round.saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS))
+        // PROPOSER SLOT = the round the BODY was signed for, not our current
+        // round. A re-stamped rescue body is valid for its own `block.round`;
+        // an older body is still valid for the round it was signed in. The old
+        // scan picked the EARLIEST future slot this proposer owns, so a
+        // genuine future body could be aligned to a different (earlier) slot
+        // and then refused — audit F5.
+        let body_round = block.round;
+        if self.expected_proposer_at(&self.validators, self.hc.height, body_round)
+            != Some(block.proposer)
+        {
+            return Err("proposal: wrong proposer".to_string());
+        }
+        if body_round > self.hc.round {
+            // Near-future only. Far claims are answered by the verified vote
+            // path (bounded chase), never by an unsigned envelope.
+            if body_round
+                > self
+                    .hc
+                    .round
+                    .saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS)
             {
-                if self.expected_proposer_at(&self.validators, self.hc.height, r)
-                    == Some(block.proposer)
-                {
-                    target = Some(r);
-                    break;
-                }
+                return Err("proposal: wrong proposer".to_string());
             }
-            match target {
-                Some(r) => self.hc.sync_round_to(r),
-                None => return Err("proposal: wrong proposer".to_string()),
-            }
+            self.hc.sync_round_to(body_round);
         }
         // R-TEMPO single validation (was: a SECOND full `validate_proposal`
         // here after `validate_proposal_timed` above — 2x order-commit +

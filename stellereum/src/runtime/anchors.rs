@@ -62,6 +62,7 @@ impl ValidatorRuntime {
             governance: None,
             block_reward: 0,
             last_decision: None,
+            parent_evidence_missing: false,
             shard_id: MASTERCHAIN_SHARD,
             shard_registry: ShardRegistry::single(),
             cross_shard: None,
@@ -2019,6 +2020,129 @@ impl ValidatorRuntime {
             completed,
             xpc,
         }
+    }
+
+    /// DOWNTIME-RESTORE: rebuild the parent-decision stash from the PERSISTED
+    /// finalized tip.
+    ///
+    /// `last_decision` is the only source `propose()` uses for the canonical
+    /// downtime evidence (`last_qc`): the QC that decided the PARENT height.
+    /// It is in-memory, so a plain restart at the tip used to lose it and the
+    /// restarted proposer emitted `last_qc: None`; peers that decided the
+    /// parent reject that omission outright, stalling the height.
+    ///
+    /// This reconstructs the stash from data the node can verify locally:
+    ///
+    /// * `block` must be OUR finalized tip (height AND hash), the parent of
+    ///   the height this runtime is about to propose at;
+    /// * it must be for this runtime's shard;
+    /// * its embedded `precommit_qc` must be a PRECOMMIT certificate for the
+    ///   same height and block hash, bound to the same shard, and must carry
+    ///   a real quorum under the set IN FORCE AT THAT HEIGHT.
+    ///
+    /// No peer claim is involved: everything checked here came out of our own
+    /// persisted store, which is exactly what a restarted node has.
+    ///
+    /// FAIL CLOSED: any missing/unverifiable piece returns `Err` and arms
+    /// [`Self::parent_evidence_missing`], which makes `propose` skip the slot
+    /// instead of emitting a block that omits required downtime evidence. A
+    /// later verified decision (adopt / finalize / sync) clears the gate.
+    pub fn restore_last_decision_from_finalized_block(
+        &mut self,
+        block: &Block,
+    ) -> Result<(), String> {
+        match self.try_restore_last_decision_from_finalized_block(block) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.parent_evidence_missing = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn try_restore_last_decision_from_finalized_block(
+        &mut self,
+        block: &Block,
+    ) -> Result<(), String> {
+        let bh = block.compute_hash();
+        let Some((tip_height, tip_hash)) = self.finalized.last().copied() else {
+            return Err("finalized tip is unknown".to_string());
+        };
+        if block.height != tip_height || bh != tip_hash {
+            return Err(format!(
+                "block {} at height {} is not our finalized tip {} ({})",
+                hex::encode(bh),
+                block.height,
+                tip_height,
+                hex::encode(tip_hash)
+            ));
+        }
+        if block.height.checked_add(1) != Some(self.hc.height) {
+            return Err(format!(
+                "finalized tip height {} is not the parent of consensus height {}",
+                block.height, self.hc.height
+            ));
+        }
+        if block.height == 0 {
+            // Genesis has no decided predecessor: no downtime evidence exists
+            // and none is required for the height-1 proposal.
+            self.parent_evidence_missing = false;
+            return Ok(());
+        }
+        if block.shard_id != self.shard_id {
+            return Err(format!(
+                "finalized tip is for shard {} but this runtime is shard {}",
+                block.shard_id, self.shard_id
+            ));
+        }
+        let Some(qc) = block.precommit_qc.as_ref() else {
+            return Err(format!(
+                "finalized block {} at height {} carries no embedded precommit QC \
+                 (stored before decision proofs existed): the parent downtime \
+                 evidence cannot be reconstructed",
+                hex::encode(bh),
+                block.height
+            ));
+        };
+        if qc.kind != crate::consensus::VoteKind::Precommit {
+            return Err(format!(
+                "embedded decision proof for height {} is not a precommit quorum",
+                block.height
+            ));
+        }
+        if qc.height != block.height {
+            return Err(format!(
+                "embedded decision proof is for height {} but the finalized block is {}",
+                qc.height, block.height
+            ));
+        }
+        if qc.block_hash != Some(bh) {
+            return Err(format!(
+                "embedded decision proof commits to a different block at height {}",
+                block.height
+            ));
+        }
+        if qc.shard_id != block.shard_id || qc.shard_id != self.shard_id {
+            return Err(format!(
+                "embedded decision proof is for shard {} but block/runtime are {}/{}",
+                qc.shard_id, block.shard_id, self.shard_id
+            ));
+        }
+        let set = self.validator_set_for_height(block.height);
+        if !self.verify_qc_for_height(qc, &set) {
+            let signed = self.qc_signed_power_for_height(&set, qc);
+            let required = set.quorum_power();
+            return Err(format!(
+                "embedded decision proof carries only {signed} of {required} required \
+                 power at height {}",
+                block.height
+            ));
+        }
+        let qc = qc.clone();
+        self.blocks.insert(bh, block.clone());
+        self.last_decision = Some((block.height, block.clone(), qc));
+        self.parent_evidence_missing = false;
+        Ok(())
     }
 
     /// Install persisted replay state (startup restore). Extends (never

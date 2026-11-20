@@ -682,6 +682,9 @@ impl ValidatorRuntime {
         // never fires -- lagging peers then never learn outcomes.
         if let Some(qc) = self.hc.precommit_qc.clone() {
             self.last_decision = Some((height, finalized_block.clone(), qc));
+            // The decision proof for this height is now known, so a failed
+            // boot reconstruction (DOWNTIME-RESTORE) no longer blocks proposal.
+            self.parent_evidence_missing = false;
         }
         // W10.5 HARDENING (fail LOUD, never finalize unilaterally): the QC
         // that decided this block must carry quorum power under the set IN

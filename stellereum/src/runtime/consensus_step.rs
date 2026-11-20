@@ -302,19 +302,33 @@ impl ValidatorRuntime {
 
     /// The downtime-evidence QC to embed in a proposal for the current
     /// height: the QC that decided the parent (H-1), known from the last
-    /// decision this node recorded (local finalize AND adopt both stash it).
+    /// decision this node recorded (local finalize, adopt, sync walk and the
+    /// boot restore from the persisted finalized tip all stash it).
+    ///
+    /// The parent HASH is checked too: a stale/divergent decision at the same
+    /// height must never be attached to a different parent (the evidence has
+    /// to name this proposal's exact parent block).
     ///
     /// `None` when this node knows no parent decision yet: the genesis child
-    /// (nothing decided before height 1), or a node restored/healed without
-    /// finalizing since. Validators that DO know the parent decision reject
-    /// the omission; validators that do not accept it and skip attribution
-    /// for that height. Either way the verdict is a pure function of agreed
+    /// (nothing decided before height 1), or a node whose boot could not
+    /// reconstruct the evidence. The latter is fail-closed at `propose`
+    /// (`parent_evidence_missing`), so it skips the slot rather than emitting
+    /// an omission. Validators that DO know the parent decision reject the
+    /// omission; validators that do not accept it and skip attribution for
+    /// that height. Either way the verdict is a pure function of agreed
     /// inputs, so no fork.
-    pub(super) fn decided_parent_qc(&self) -> Option<crate::consensus::QuorumCertificate> {
+    pub(super) fn decided_parent_qc(
+        &self,
+        parent_hash: &BlockHash,
+    ) -> Option<crate::consensus::QuorumCertificate> {
         let h = self.hc.height.checked_sub(1)?;
-        self.last_decision
-            .as_ref()
-            .and_then(|(dh, _, qc)| if *dh == h { Some(qc.clone()) } else { None })
+        self.last_decision.as_ref().and_then(|(dh, b, qc)| {
+            if *dh == h && b.compute_hash() == *parent_hash {
+                Some(qc.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// SHARD SCOPE, shared by every entry point that can apply a block.
@@ -2782,8 +2796,11 @@ impl ValidatorRuntime {
         self.hc.precommit_qc = Some(certificate.clone());
         block.precommit_qc = Some(certificate.clone());
         // W10.5: record the decision exactly like the local-finalize path, so
-        // the NEXT proposal embeds it as canonical downtime evidence.
+        // the NEXT proposal embeds it as canonical downtime evidence. A boot
+        // that could not reconstruct the old tip's evidence (DOWNTIME-RESTORE)
+        // is healed by this verified peer decision.
         self.last_decision = Some((height, block.clone(), certificate));
+        self.parent_evidence_missing = false;
         self.blocks.insert(bh, block.clone());
         self.apply_and_advance(bh, &block).await;
         Ok(bh)

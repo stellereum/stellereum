@@ -1195,6 +1195,9 @@ async fn walk_chain_once(
         rt.blocks.insert(bh, b.clone());
         if let Some(ref qc) = b.precommit_qc {
             rt.last_decision = Some((b.height, b.clone(), qc.clone()));
+            // A verified walked decision restores the parent downtime evidence
+            // a failed boot reconstruction could not (DOWNTIME-RESTORE).
+            rt.parent_evidence_missing = false;
         }
         rt.apply_and_advance(bh, &b).await;
         // Replication for walked heights (same as the adopt path): file this

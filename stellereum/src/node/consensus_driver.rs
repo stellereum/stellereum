@@ -865,6 +865,76 @@ pub(crate) async fn run_consensus_node(
             }
         }
 
+        // DOWNTIME-RESTORE (P0): rebuild the parent-decision stash from the
+        // PERSISTED finalized tip before this node may propose again.
+        //
+        // `last_decision` is in-memory only, so a plain restart at the tip
+        // used to come back with `None`; the next proposal then omitted the
+        // canonical downtime QC for the parent and every peer that decided
+        // that parent rejected the block ("omits the downtime evidence for
+        // decided height..."), stalling the chain while this node held the
+        // slot. The tip body and the precommit QC embedded in it are durable
+        // and locally verifiable, so reconstruct from those - never from a
+        // peer's claim.
+        //
+        // If the stored body predates embedded decision proofs there is
+        // nothing to verify: FAIL CLOSED (arm `parent_evidence_missing`, which
+        // makes `propose` skip the slot) instead of emitting an invalid block.
+        // A later verified adopt/sync/finalize restores the evidence.
+        if let Some((fh, fhash)) = rt.finalized.last().copied() {
+            if fh > 0 {
+                match ap.storage().get_block(&fhash) {
+                    Ok(Some(block)) => {
+                        match rt.restore_last_decision_from_finalized_block(&block) {
+                            Ok(()) => info!(
+                                "[storage] DOWNTIME-RESTORE: rebuilt the parent decision evidence \
+                                 for finalized height {fh} ({}) from the persisted block",
+                                hex::encode(fhash)
+                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[storage] DOWNTIME-RESTORE: cannot rebuild the downtime \
+                                     evidence for finalized height {fh} ({}): {e}; REFUSING to \
+                                     propose until a verified peer decision restores it \
+                                     (fail closed)",
+                                    hex::encode(fhash)
+                                );
+                                tracing::error!(
+                                    height = fh,
+                                    hash = %hex::encode(fhash),
+                                    error = %e,
+                                    "DOWNTIME-RESTORE: parent decision evidence unreconstructible; proposals disabled (fail closed)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        rt.parent_evidence_missing = true;
+                        eprintln!(
+                            "[storage] DOWNTIME-RESTORE: the persisted finalized tip {fh} ({}) \
+                             has no local body; REFUSING to propose until a verified peer \
+                             decision restores the evidence (fail closed)",
+                            hex::encode(fhash)
+                        );
+                        tracing::error!(
+                            height = fh,
+                            hash = %hex::encode(fhash),
+                            "DOWNTIME-RESTORE: finalized tip body missing from the store; proposals disabled (fail closed)"
+                        );
+                    }
+                    Err(e) => {
+                        rt.parent_evidence_missing = true;
+                        eprintln!(
+                            "[storage] DOWNTIME-RESTORE: cannot READ the persisted finalized tip \
+                             {fh} ({}): {e}; REFUSING to propose until a verified peer decision \
+                             restores the evidence (fail closed)",
+                            hex::encode(fhash)
+                        );
+                    }
+                }
+            }
+        }
+
         // Write-ahead vote watermark (Finding C). Read BEFORE the checkpoint
         // restore: the watermark is the authoritative record of the last
         // votes this node SIGNED, and it is the only record that survives a
@@ -3775,7 +3845,7 @@ pub(crate) async fn run_consensus_node(
             // from the stash, never from `hc.precommit_qc` afterwards).
             //
             // IMPORTANT (W10.5): NEVER clear `rt.last_decision` here — `propose()`
-            // (`decided_parent_qc()`) and `check_last_qc_evidence()` depend on
+            // (`decided_parent_qc(&prev_hash)`) and `check_last_qc_evidence()` depend on
             // `last_decision` holding `(height, block, qc)` for height + 1; clearing
             // it caused the next proposer to emit `last_qc: None` and trigger
             // `omits the downtime evidence` view-change stalls.

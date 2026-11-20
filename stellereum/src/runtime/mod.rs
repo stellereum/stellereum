@@ -398,6 +398,12 @@ pub struct ValidatorRuntime {
     /// `hc`. The main loop consumes it for the commit broadcast that lets
     /// lagging peers catch up in place.
     pub last_decision: Option<(Height, Block, crate::consensus::QuorumCertificate)>,
+    /// DOWNTIME-RESTORE fail-closed gate: `true` when boot could not rebuild
+    /// the finalized parent's decision QC from locally verifiable persisted
+    /// data. `propose` refuses to build while set, so the node never emits a
+    /// block that omits required downtime evidence; recording a verified
+    /// decision again (restore / adopt / finalize / sync) clears it.
+    pub parent_evidence_missing: bool,
     /// Which shard this runtime produces and validates blocks for. Defaults to
     /// `MASTERCHAIN_SHARD` so existing single-shard call sites are unchanged.
     pub shard_id: ShardId,

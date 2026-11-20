@@ -939,12 +939,39 @@ impl ValidatorRuntime {
         // peer refuses it, and the node burns the round on a proposal nobody
         // can vote. This is the runtime-level backstop for a restored head
         // that could not be reconciled; the driver also gates it.
-        let finalized_tip = self.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        let (finalized_tip, finalized_hash) = self
+            .finalized
+            .last()
+            .copied()
+            .unwrap_or((0, [0u8; 32]));
         if finalized_tip.checked_add(1) != Some(self.hc.height) {
             tracing::warn!(
                 hc_height = self.hc.height,
                 finalized_tip,
                 "refusing to propose above our own finalized parent (height/head disagrees)"
+            );
+            return None;
+        }
+        // DOWNTIME-RESTORE (fail closed): if boot could not rebuild the
+        // parent's decision QC from the persisted finalized block, this node
+        // cannot attach the canonical downtime evidence. Peers that decided
+        // the parent reject such an omission, so emitting the block would
+        // stall the network while we hold the slot. Skip the slot instead and
+        // wait for a verified peer decision to restore the evidence.
+        if self.parent_evidence_missing {
+            tracing::error!(
+                height = self.hc.height,
+                parent_height = finalized_tip,
+                parent_hash = %hex::encode(finalized_hash),
+                "DOWNTIME-RESTORE: refusing to propose without the parent downtime evidence (fail closed)"
+            );
+            eprintln!(
+                "[consensus] REFUSING to propose at height {}: the downtime evidence for \
+                 decided height {} ({}) could not be reconstructed from persisted data; \
+                 skipping this proposal slot (fail closed)",
+                self.hc.height,
+                finalized_tip,
+                hex::encode(finalized_hash)
             );
             return None;
         }
@@ -2135,10 +2162,11 @@ impl ValidatorRuntime {
             precommit_qc: None,
             // W10.5 CANONICAL DOWNTIME EVIDENCE: the QC that decided the
             // parent height, chosen once here — every applier attributes the
-            // same evidence and converges. `None` only when this node knows
-            // no parent decision yet (genesis child / fresh restore); see
-            // `check_last_qc_evidence` for why validators accept that.
-            last_qc: self.decided_parent_qc(),
+            // same evidence and converges. It must name THIS proposal's
+            // parent (height + hash). `None` only for the genesis child;
+            // a restored node without reconstructible evidence never gets
+            // here (`parent_evidence_missing` fails closed above).
+            last_qc: self.decided_parent_qc(&prev_hash),
             // SHARD-HEAD COMMITMENTS (TON `shard_hashes`): a masterchain block
             // publishes the latest finalized header of every workchain shard,
             // so a cross-shard state root becomes provable from a

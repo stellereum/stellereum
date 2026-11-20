@@ -1233,6 +1233,112 @@ impl ConsensusCluster {
         m.arrivals_by_bucket.clear();
     }
 
+    /// Restart member `index` from its PERSISTED store only.
+    ///
+    /// Unlike [`Self::restart_member`], which replays the harness's in-memory
+    /// finalized list, this walks the canonical chain backwards from the
+    /// store's finalized pointer and replays those bodies through the
+    /// production transition. The tip body is then handed to the runtime's
+    /// boot reconstruction, which rebuilds `last_decision` from the QC
+    /// embedded in the persisted block — exactly the production restore.
+    ///
+    /// A store whose tip carries no QC is a valid input: the runtime refuses
+    /// to reconstruct (fail closed), the restart still succeeds, and the
+    /// caller observes that the node will not propose until a peer decision
+    /// restores the evidence.
+    pub async fn restart_member_from_store(
+        &mut self,
+        index: usize,
+        store: &stellereum::storage::Storage,
+    ) -> Result<(), String> {
+        let (tip, tip_hash) = store
+            .finalized()
+            .map_err(|e| format!("restart: cannot read finalized tip: {e}"))?
+            .ok_or_else(|| "restart: store has no finalized tip".to_string())?;
+        let mut replay: Vec<(Height, BlockHash, Block)> = Vec::new();
+        let mut cur_hash = tip_hash;
+        let mut cur_height = tip;
+        while cur_height > 0 {
+            let block = store
+                .get_block(&cur_hash)
+                .map_err(|e| format!("restart: cannot read body {cur_height}: {e}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "restart: no persisted body for finalized height {cur_height} ({})",
+                        hex::encode(cur_hash)
+                    )
+                })?;
+            if block.height != cur_height {
+                return Err(format!(
+                    "restart: body labelled height {} at slot {cur_height}",
+                    block.height
+                ));
+            }
+            if block.compute_hash() != cur_hash {
+                return Err(format!(
+                    "restart: persisted body at height {cur_height} does not hash to its link"
+                ));
+            }
+            replay.push((cur_height, cur_hash, block.clone()));
+            cur_hash = block.prev_hash;
+            cur_height -= 1;
+        }
+        replay.reverse();
+
+        let key = self.members[index].key.clone();
+        let falcon = self.members[index].falcon.clone();
+        let state = Arc::new(InMemoryStateEngine::new());
+        for (who, balance) in self.genesis_funding.iter() {
+            state
+                .update_account(AccountState::new(*who, *balance))
+                .await;
+        }
+        let mut rt = ValidatorRuntime::new(key, self.validators.clone(), state, 1)
+            .with_falcon_key(falcon)
+            .with_deterministic_sim_signing();
+        for (_, hash, block) in &replay {
+            rt.blocks.insert(*hash, block.clone());
+            rt.apply_and_advance(*hash, block).await;
+        }
+        // The tip body exactly as persisted (which may deliberately omit the
+        // embedded QC in a fail-closed scenario).
+        let tip_block = store
+            .get_block(&tip_hash)
+            .map_err(|e| format!("restart: cannot read tip body: {e}"))?
+            .ok_or_else(|| "restart: persisted tip body disappeared".to_string())?;
+        if let Err(e) = rt.restore_last_decision_from_finalized_block(&tip_block) {
+            eprintln!(
+                "[restart] DOWNTIME-RESTORE: refusing to propose at height {} until a peer \
+                 decision restores the parent evidence: {e}",
+                rt.hc.height
+            );
+        }
+        // Vote watermark floor at the height we resume at (production
+        // `restored_round`: never re-vote a round already signed).
+        let resumed_height = tip + 1;
+        let floor = self.vote_floor[index]
+            .iter()
+            .filter(|((h, _), _)| *h == resumed_height)
+            .map(|(_, r)| *r)
+            .max();
+        if let Some(floor) = floor {
+            rt.hc.round = floor;
+        }
+
+        let m = &mut self.members[index];
+        m.rt = rt;
+        m.round_started_ms = self.now_ms;
+        m.last_prevoted = None;
+        m.last_precommitted = None;
+        m.proposed = None;
+        m.last_prevote = None;
+        m.last_precommit = None;
+        m.byzantine_round = None;
+        m.sim_sightings.clear();
+        m.arrivals_by_bucket.clear();
+        Ok(())
+    }
+
     /// Deliver every retained commit ABOVE `above` to member `index` on the
     /// next tick (the production `Committed` push a returning node reads).
     pub fn deliver_committed_above(&mut self, index: usize, above: Height) {
@@ -1396,7 +1502,7 @@ impl ConsensusCluster {
 
         for i in 0..self.members.len() {
             // 1. PROPOSE (normal path: full propose_delay build cost)
-            self.step_propose(i, stamp).await;
+            let _ = self.step_propose(i, stamp).await;
             // 2. PREVOTE
             self.step_prevote(i, stamp).await;
             // 3. DRAIN the inbox
@@ -1441,7 +1547,7 @@ impl ConsensusCluster {
                 // propose_delay for this one broadcast (same-tick + prebuilt).
                 let saved = self.members[i].profile.propose_delay_ms;
                 self.members[i].profile.propose_delay_ms = 0;
-                self.step_propose(i, stamp).await;
+                let _ = self.step_propose(i, stamp).await;
                 self.members[i].profile.propose_delay_ms = saved;
             }
             // 6. VIEW CHANGE
@@ -1470,20 +1576,20 @@ impl ConsensusCluster {
     // Step 1: propose
     // ------------------------------------------------------------------
 
-    async fn step_propose(&mut self, i: usize, stamp: u64) {
+    async fn step_propose(&mut self, i: usize, stamp: u64) -> Option<Block> {
         if !self.is_active(i) {
-            return;
+            return None;
         }
         let (h, r) = {
             let m = &self.members[i];
             (m.rt.hc.height, m.rt.hc.round)
         };
         if self.members[i].proposed == Some((h, r)) {
-            return;
+            return None;
         }
         let ts = self.timestamp();
         let block = self.members[i].rt.propose(ts).await;
-        let Some(block) = block else { return };
+        let block = block?;
         let proposer = self.members[i].id;
         let round = self.members[i].rt.hc.round;
         self.members[i].proposed = Some((h, round));
@@ -1505,6 +1611,7 @@ impl ConsensusCluster {
         } else {
             None
         };
+        let announced = block.clone();
         self.broadcast(
             i,
             Wire::Proposal {
@@ -1526,6 +1633,16 @@ impl ConsensusCluster {
                 stamp,
             );
         }
+        Some(announced)
+    }
+
+    /// Drive one explicit proposer step for `index` at the current virtual
+    /// time, exactly like the tick's section 1 (including the broadcast and
+    /// the once-per-slot marker). Tests that must inspect the BUILT block
+    /// (e.g. its downtime evidence) use this instead of peeking at a tick.
+    pub async fn propose_once(&mut self, index: usize) -> Option<Block> {
+        let stamp = self.now_ms;
+        self.step_propose(index, stamp).await
     }
 
     // ------------------------------------------------------------------

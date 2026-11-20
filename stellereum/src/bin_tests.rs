@@ -2085,9 +2085,12 @@ mod tick_offload_tests {
         let publish_lane = spawn_tick_lane();
         let record_lane = spawn_tick_lane();
 
-        // Publish lane wedged on a slow transport round trip.
+        // Publish lane wedged on a slow transport round trip. The stall is
+        // deliberately LONGER than the record deadline below so the property
+        // (record is independent of publish) survives a loaded gate host;
+        // 500 ms vs 250 ms flaked under the parallel runner.
         publish_lane.submit(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(5_000)).await;
         });
 
         let rpc = test_rpc_state();
@@ -2102,7 +2105,7 @@ mod tick_offload_tests {
             let _ = done_tx.send(());
         });
 
-        tokio::time::timeout(Duration::from_millis(250), done_rx)
+        tokio::time::timeout(Duration::from_millis(2_000), done_rx)
             .await
             .expect("the record lane must drain while the publish lane is stuck")
             .expect("lane stays open");

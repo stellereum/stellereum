@@ -162,62 +162,10 @@
 .hero-scroll .hero-scroll-arrow { color: var(--telemetry-alt); }
 .hero-scroll:hover .hero-scroll-arrow { color: var(--text); }
 
-/* --- reference object: four isometric electric slabs -------------------- */
-.hero-object {
-  position: relative;
-  display: none;
-  width: 100%;
-  max-width: 460px;
-  justify-self: end;
-  align-self: center;
-  pointer-events: none;
-  user-select: none;
-}
-
-.hero-object-inner {
-  position: relative;
-  animation: object-float 14s var(--ease) infinite;
-}
-
-.hero-object-svg {
-  width: 100%;
-  height: auto;
-  overflow: visible;
-}
-
-.hero-object-tag {
-  position: absolute;
-  top: 5%;
-  right: -2%;
-  padding: 5px 9px;
-  border: 1.5px solid var(--line-strong);
-  background: var(--surface-2);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  transform: rotate(-6deg);
-  box-shadow: 4px 4px 0 var(--shadow);
-}
-
-.hero-object-meta {
-  position: absolute;
-  bottom: 1%;
-  left: 0;
-  color: var(--telemetry-alt);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: .16em;
-  text-transform: uppercase;
-}
-
-@keyframes object-float {
-  0%, 100% { transform: translate3d(0, 0, 0) rotate(-.4deg); }
-  50%      { transform: translate3d(0, -10px, 0) rotate(.4deg); }
-}
+/* --- reference object: live Bayer-dithered 3D knot ----------------------
+   Layout lives in sections.css; the pixel frame, HUD and canvas styling live
+   in pixel.css, and the rendering itself in assets/js/dither.js. The object is
+   in normal grid/flow, so it can never cover the H1, lede or CTA. */
 
 /* Single authoritative live-metrics block now lives in #network; the hero
    keeps only the status chip and the protocol marquee. */

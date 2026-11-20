@@ -26,7 +26,6 @@ body {
     radial-gradient(1100px 620px at 8% -12%, rgba(94, 184, 255, .1), transparent 62%),
     radial-gradient(900px 560px at 96% 2%, rgba(168, 117, 255, .1), transparent 60%),
     linear-gradient(180deg, transparent 0%, rgba(6, 8, 17, .4) 55%, var(--bg) 100%);
-  background-attachment: fixed;
   color: var(--text);
   font-family: var(--font-sans);
   font-size: 16px;
@@ -97,14 +96,13 @@ code, kbd, pre, samp { font-family: var(--font-mono); }
   inset: 0;
   z-index: var(--z-grain);
   pointer-events: none;
-  opacity: .055;
+  opacity: .045;
   background-image: var(--noise);
   background-size: 180px 180px;
-  mix-blend-mode: overlay;
 }
 
 html.is-inverted .grain,
-body.is-inverted .grain { opacity: .035; mix-blend-mode: multiply; }
+body.is-inverted .grain { opacity: .03; }
 
 /* The dark page wash (radial blues + a black floor) would turn muddy grey on
    a light palette; remap it instead of stacking light sections over it. */

@@ -7,17 +7,28 @@
 @media (max-width: 899.98px) {
   .nf-code { font-size: clamp(6rem, 32vw, 12rem); }
 
-  /* Below the two-column breakpoint the object sits in the free lower-right
-     space after the copy. It never enters the H1/lede/CTA boxes. */
+  /* Blurring a moving canvas under the sticky bar is the most expensive
+     compositor job on a low-end phone; use an opaque bar instead. */
+  .site-header {
+    background: rgba(6, 8, 17, .97);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  html.is-inverted .site-header,
+  body.is-inverted .site-header { background: rgba(238, 242, 255, .98); }
+
+  /* Below the two-column breakpoint the live pixel object sits in its own
+     grid row after the copy. Normal flow means it never enters the H1,
+     lede or CTA boxes, and its width is capped against horizontal scroll. */
   .hero-object {
     display: block;
-    width: min(210px, 42vw);
-    margin-top: 6px;
+    width: min(230px, 52vw);
+    margin-top: 12px;
+    margin-left: auto;
     justify-self: end;
     align-self: end;
   }
-  .hero-object-tag { top: 2%; right: 0; font-size: 8px; padding: 4px 6px; }
-  .hero-object-meta { font-size: 8px; }
 
   .invert-pill { order: 2; margin-left: auto; margin-right: 0; }
   .nav-toggle { order: 3; margin-left: 0; }

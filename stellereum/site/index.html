@@ -21,23 +21,24 @@
 <meta name="twitter:description" content="Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
 <meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png">
 
-<link rel="icon" href="favicon.ico?v=13" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=13">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=13">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=13">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=13">
-<link rel="manifest" href="site.webmanifest?v=13">
+<link rel="icon" href="favicon.ico?v=14" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=14">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=14">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=14">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=14">
+<link rel="manifest" href="site.webmanifest?v=14">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap">
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=13">
-<link rel="stylesheet" href="assets/css/base.css?v=13">
-<link rel="stylesheet" href="assets/css/layout.css?v=13">
-<link rel="stylesheet" href="assets/css/components.css?v=13">
-<link rel="stylesheet" href="assets/css/sections.css?v=13">
-<link rel="stylesheet" href="assets/css/responsive.css?v=13">
+<link rel="stylesheet" href="assets/css/tokens.css?v=14">
+<link rel="stylesheet" href="assets/css/base.css?v=14">
+<link rel="stylesheet" href="assets/css/layout.css?v=14">
+<link rel="stylesheet" href="assets/css/components.css?v=14">
+<link rel="stylesheet" href="assets/css/sections.css?v=14">
+<link rel="stylesheet" href="assets/css/responsive.css?v=14">
+<link rel="stylesheet" href="assets/css/pixel.css?v=14">
 
 <script>
 document.documentElement.classList.add('js');
@@ -62,11 +63,15 @@ window.setTimeout(function () {
   [data-copy-from],
   [data-copy-active] { display: none !important; }
   .code-body[hidden] { display: block !important; }
+  /* Canvas controls and the drag cue are JS-only. */
+  .hero-mode,
+  .hero-drag-hint { display: none !important; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=13"></script>
-<script defer src="assets/js/motion.js?v=13"></script>
-<script defer src="assets/js/metrics.js?v=13"></script>
+<script defer src="assets/js/app.js?v=14"></script>
+<script defer src="assets/js/motion.js?v=14"></script>
+<script defer src="assets/js/metrics.js?v=14"></script>
+<script defer src="assets/js/dither.js?v=14"></script>
 </head>
 <body>
 
@@ -79,7 +84,7 @@ window.setTimeout(function () {
 <header class="site-header" id="site-header">
   <div class="header-inner shell">
     <a class="brand" href="#top" aria-label="Stellereum — home">
-      <img class="brand-mark" src="assets/img/stell-mark.png?v=13" alt="" width="32" height="32">
+      <img class="brand-mark" src="assets/img/stell-mark.png?v=14" alt="" width="32" height="32">
       <span class="brand-word">Stellereum</span>
       <span class="brand-tag" aria-hidden="true">PQ–L1</span>
     </a>
@@ -186,83 +191,24 @@ window.setTimeout(function () {
         </a>
       </div>
 
-      <!-- Decorative reference object: an isometric stack of Bayer-dithered
-           electric slabs. Static SVG, no filters, never overlaps the copy. -->
-      <div class="hero-object" aria-hidden="true">
-        <div class="hero-object-inner">
-          <svg class="hero-object-svg" viewBox="0 0 560 640" role="presentation" focusable="false">
-            <defs>
-              <linearGradient id="slab-top" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#5eb8ff"/>
-                <stop offset=".52" stop-color="#7c8dff"/>
-                <stop offset="1" stop-color="#a875ff"/>
-              </linearGradient>
-              <linearGradient id="slab-left" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0" stop-color="#273b86"/>
-                <stop offset="1" stop-color="#0b0f1d"/>
-              </linearGradient>
-              <linearGradient id="slab-right" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0" stop-color="#1b2c68"/>
-                <stop offset="1" stop-color="#080b16"/>
-              </linearGradient>
-              <pattern id="bayer-dots" width="12" height="12" patternUnits="userSpaceOnUse">
-                <circle cx="2" cy="2" r="1.05" fill="#060811" opacity=".55"/>
-                <circle cx="8" cy="2" r=".45" fill="#060811" opacity=".4"/>
-                <circle cx="2" cy="8" r=".7" fill="#060811" opacity=".45"/>
-                <circle cx="8" cy="8" r=".35" fill="#060811" opacity=".35"/>
-              </pattern>
-              <pattern id="slab-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)">
-                <line x1="0" y1="0" x2="0" y2="8" stroke="#7c8dff" stroke-opacity=".22" stroke-width="1"/>
-              </pattern>
-            </defs>
-
-            <circle cx="278" cy="330" r="252" fill="none" stroke="#7c8dff" stroke-opacity=".14"/>
-            <circle cx="278" cy="330" r="196" fill="none" stroke="#7c8dff" stroke-opacity=".1"/>
-            <path d="M196 300v264M280 270v294M364 300v264" stroke="#7c8dff" stroke-opacity=".3" stroke-dasharray="2 7"/>
-
-            <!-- top plate (back) -->
-            <g transform="translate(280 330) scale(.82) translate(-280 -330)">
-              <path d="M60 330 280 220 500 330 280 440Z" fill="url(#slab-top)"/>
-              <path d="M60 330 280 440V472L60 362Z" fill="url(#slab-left)"/>
-              <path d="M500 330 280 440V472L500 362Z" fill="url(#slab-right)"/>
-              <path d="M60 330 280 220 500 330 280 440Z" fill="url(#slab-hatch)"/>
-              <path d="M60 330 280 220 500 330 280 440Z" fill="none" stroke="#eef2ff" stroke-opacity=".7"/>
-            </g>
-
-            <g transform="translate(280 390) scale(.88) translate(-280 -390)">
-              <path d="M60 390 280 280 500 390 280 500Z" fill="url(#slab-top)"/>
-              <path d="M60 390 280 500V532L60 422Z" fill="url(#slab-left)"/>
-              <path d="M500 390 280 500V532L500 422Z" fill="url(#slab-right)"/>
-              <path d="M60 390 280 280 500 390 280 500Z" fill="url(#bayer-dots)"/>
-              <path d="M60 390 280 280 500 390 280 500Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
-            </g>
-
-            <g transform="translate(280 450) scale(.94) translate(-280 -450)">
-              <path d="M60 450 280 340 500 450 280 560Z" fill="url(#slab-top)"/>
-              <path d="M60 450 280 560V592L60 482Z" fill="url(#slab-left)"/>
-              <path d="M500 450 280 560V592L500 482Z" fill="url(#slab-right)"/>
-              <path d="M60 450 280 340 500 450 280 560Z" fill="url(#bayer-dots)"/>
-              <path d="M60 450 280 340 500 450 280 560Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
-              <path d="M60 450 280 560 500 450" fill="none" stroke="#a9b8d8" stroke-opacity=".3"/>
-            </g>
-
-            <!-- base plate (front) -->
-            <g>
-              <path d="M60 510 280 400 500 510 280 620Z" fill="url(#slab-top)"/>
-              <path d="M60 510 280 620V652L60 542Z" fill="url(#slab-left)"/>
-              <path d="M500 510 280 620V652L500 542Z" fill="url(#slab-right)"/>
-              <path d="M60 510 280 400 500 510 280 620Z" fill="url(#bayer-dots)"/>
-              <path d="M60 510 280 400 500 510 280 620Z" fill="none" stroke="#a9b8d8" stroke-opacity=".55"/>
-              <path d="M60 510 280 620 500 510" fill="none" stroke="#a9b8d8" stroke-opacity=".3"/>
-            </g>
-
-            <path d="M60 664h440" stroke="#7c8dff" stroke-opacity=".5"/>
-            <path d="M60 658v12M500 658v12M280 658v12" stroke="#7c8dff" stroke-opacity=".7"/>
-            <path d="M280 250v300" stroke="#9d8cff" stroke-opacity=".35" stroke-dasharray="2 7"/>
-            <path d="M280 286h28M280 386h28M280 486h28" stroke="#9d8cff" stroke-opacity=".7"/>
-          </svg>
-          <span class="hero-object-tag">BAYER 4×4</span>
-          <span class="hero-object-meta">SLAB / 04 · 5757</span>
+      <!-- Live reference object: a parametric PQ lattice knot (p=2, q=3)
+           rasterised at reduced resolution, Bayer 4x4 dithered into the
+           electric LUT, drag-to-rotate. Decorative: the canvas is hidden from
+           assistive tech, the mode switch is a real 44px button. -->
+      <div class="hero-object" id="hero-object">
+        <div class="hero-object-frame canvas-stage" id="hero-stage">
+          <canvas id="hero-canvas" class="dither-canvas hero-canvas" aria-hidden="true"></canvas>
+          <div class="hero-fallback" aria-hidden="true">
+            <span>PQ Lattice</span>
+            <span>BAYER 4×4</span>
+          </div>
+          <span class="hero-hud-chip" id="hero-fps" aria-hidden="true">FPS // BAYER 4×4</span>
+          <span class="hero-frame-index" aria-hidden="true">07 / 07</span>
+          <span class="hero-drag-hint" aria-hidden="true">Drag // Rotate</span>
+        </div>
+        <div class="hero-object-caption">
+          <span class="hero-object-meta">PQ Lattice Knot · P=2 Q=3</span>
+          <button class="hero-mode" type="button" id="hero-mode" aria-pressed="false" aria-label="Switch hero object to ribbon mode">Mode // Refract</button>
         </div>
       </div>
     </div>
@@ -308,7 +254,7 @@ window.setTimeout(function () {
         </p>
       </header>
 
-      <div class="sec-rule" aria-hidden="true"></div>
+      <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
       <div class="metric-sheet">
         <article class="metric metric--lead" data-metric="height" data-reveal>
@@ -369,6 +315,12 @@ window.setTimeout(function () {
         </span>
         <span class="badge">polling every 15s · rpc.stellereum.org</span>
       </div>
+
+      <!-- Ordered-dither ribbon: 1-D Bayer gradient in the electric LUT. -->
+      <div class="dither-ribbon canvas-stage" id="ribbon-wrap" aria-hidden="true">
+        <canvas id="ribbon-canvas" class="dither-canvas"></canvas>
+        <span class="dither-ribbon-label">Bayer 4×4 · Ordered</span>
+      </div>
     </div>
   </section>
 
@@ -386,7 +338,7 @@ window.setTimeout(function () {
         </p>
       </header>
 
-      <div class="sec-rule" aria-hidden="true"></div>
+      <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
       <!-- Hairline schematic, not a grid of equal cells. -->
       <div class="shard-schematic" aria-hidden="true">
@@ -411,9 +363,24 @@ window.setTimeout(function () {
         </div>
       </div>
 
+      <!-- Live interference strip: Bayer-thresholded sine field. -->
+      <div class="interference-panel" data-reveal>
+        <div class="interference-meta">
+          <span>02 / Lattice interference</span>
+          <span>Live field · Bayer 4×4</span>
+        </div>
+        <div class="canvas-stage interference-stage" id="interference-wrap" aria-hidden="true">
+          <canvas id="interference-canvas" class="dither-canvas"></canvas>
+        </div>
+      </div>
+
       <div class="features-grid">
         <article class="feature invert-card" data-reveal>
           <div class="feature-top"><span class="feature-num">01 / SIGNATURE</span><span class="sticker">FALCON-512</span></div>
+          <div class="card-media canvas-stage" data-card-canvas="0" aria-hidden="true">
+            <canvas id="card-canvas-0" class="dither-canvas"></canvas>
+            <span class="card-media-label">Dither / 01</span>
+          </div>
           <h3>Post-quantum votes</h3>
           <p>Every validator vote verifies under Falcon-512. Ed25519 is refused at intake; there is no second, classical lane.</p>
           <div class="card-meta"><span class="kv"><b>Falcon-512</b> · vote signatures</span></div>
@@ -421,6 +388,10 @@ window.setTimeout(function () {
 
         <article class="feature invert-card" data-reveal data-delay="1">
           <div class="feature-top"><span class="feature-num">02 / CONSENSUS</span><span class="sticker">1-BLOCK</span></div>
+          <div class="card-media canvas-stage" data-card-canvas="1" aria-hidden="true">
+            <canvas id="card-canvas-1" class="dither-canvas"></canvas>
+            <span class="card-media-label">Dither / 02</span>
+          </div>
           <h3>BFT finality</h3>
           <p>Propose, prevote, precommit, commit. Quorum is floor(2·power/3)+1. One finalized block is final and does not roll back.</p>
           <div class="card-meta"><span class="kv">quorum <b>floor(2·power/3)+1</b></span></div>
@@ -428,6 +399,10 @@ window.setTimeout(function () {
 
         <article class="feature invert-card" data-reveal data-delay="2">
           <div class="feature-top"><span class="feature-num">03 / SHARDS</span><span class="sticker">0–1</span></div>
+          <div class="card-media canvas-stage" data-card-canvas="2" aria-hidden="true">
+            <canvas id="card-canvas-2" class="dither-canvas"></canvas>
+            <span class="card-media-label">Dither / 03</span>
+          </div>
           <h3>Two shards, fixed</h3>
           <p>The supported topology is masterchain 0 plus workchain 1. Cross-shard transfers use two-phase commit and credit only a proven commit.</p>
           <div class="card-meta"><span class="kv"><b>{0,1}</b> · 2PC from genesis</span></div>
@@ -435,6 +410,10 @@ window.setTimeout(function () {
 
         <article class="feature invert-card" data-reveal data-delay="1">
           <div class="feature-top"><span class="feature-num">04 / CONTRACTS</span><span class="sticker">13 HOST FNS</span></div>
+          <div class="card-media canvas-stage" data-card-canvas="3" aria-hidden="true">
+            <canvas id="card-canvas-3" class="dither-canvas"></canvas>
+            <span class="card-media-label">Dither / 04</span>
+          </div>
           <h3>WASM contracts</h3>
           <p>Contracts run on wasmi as (i64)→i64 functions. There are 13 host imports, fuel is charged before each effect, and upgrade means redeploy.</p>
           <div class="card-meta"><span class="kv">wasmi · <b>13</b> host imports · 5M read fuel</span></div>
@@ -442,6 +421,9 @@ window.setTimeout(function () {
 
         <article class="feature invert-card" data-reveal data-delay="2">
           <div class="feature-top"><span class="feature-num">05 / EVM</span><span class="sticker">READ-ONLY</span></div>
+          <div class="card-media card-media--static" aria-hidden="true">
+            <span class="card-media-label">Dither / 05</span>
+          </div>
           <h3>EVM adapter, no contracts</h3>
           <p>The adapter serves eth_* reads and bound value transfers that carry a Falcon signature. Calldata and contract deployment are refused: there is no EVM interpreter.</p>
           <div class="card-meta"><span class="kv">reads + bound transfers · <b>no Solidity</b></span></div>
@@ -449,6 +431,9 @@ window.setTimeout(function () {
 
         <article class="feature invert-card" data-reveal data-delay="3">
           <div class="feature-top"><span class="feature-num">06 / zkML</span><span class="sticker">RE-EXECUTION</span></div>
+          <div class="card-media card-media--static" aria-hidden="true">
+            <span class="card-media-label">Dither / 06</span>
+          </div>
           <h3>zkML is not a ZK proof</h3>
           <p>A zkML check re-runs the full forward pass and compares the output. The attestation path also rebuilds a BLAKE3 Merkle tree over the neuron leaves.</p>
           <div class="card-meta"><span class="kv">full re-execution · <b>Merkle trace</b></span></div>
@@ -578,7 +563,7 @@ window.setTimeout(function () {
         </p>
       </header>
 
-      <div class="sec-rule" aria-hidden="true"></div>
+      <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
       <div class="build-grid">
         <div class="build-copy">
@@ -686,7 +671,7 @@ curl -s -X POST \
         </p>
       </header>
 
-      <div class="sec-rule" aria-hidden="true"></div>
+      <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
       <div class="eco-grid">
         <article class="eco-card invert-card" data-reveal>
@@ -739,7 +724,7 @@ curl -s -X POST \
         </p>
       </header>
 
-      <div class="sec-rule" aria-hidden="true"></div>
+      <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
       <ol class="timeline">
         <li class="timeline-item timeline-item--done" data-reveal>
@@ -816,7 +801,7 @@ curl -s -X POST \
     <div class="footer-top">
       <div class="footer-brand">
         <a class="brand" href="#top" aria-label="Stellereum — back to top">
-          <img class="brand-mark" src="assets/img/stell-mark.png?v=13" alt="" width="34" height="34">
+          <img class="brand-mark" src="assets/img/stell-mark.png?v=14" alt="" width="34" height="34">
           <span class="brand-word">Stellereum</span>
         </a>
         <p class="footer-note">
@@ -861,7 +846,7 @@ curl -s -X POST \
       <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
       <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
       <div><dt>Supply cap</dt><dd>1B STELL</dd></div>
-      <div><dt>Site build</dt><dd>static-v13 · 2026.11.20</dd></div>
+      <div><dt>Site build</dt><dd>static-v14 · 2026.11.20</dd></div>
     </dl>
 
     <div class="footer-bottom">

@@ -1,0 +1,482 @@
+/* ==========================================================================
+   STELLEREUM — pixel / ordered-dither layer
+   Bayer 4x4 textures, hard 1px frames, blocky offset shadows, dithered
+   dividers, pixel card media, the hero canvas frame and the two live strips.
+   Body copy is never pixelated; only art, rules and ornaments are.
+   ========================================================================== */
+
+:root {
+  /* 50% Bayer 4x4 tile: eight 2px blocks, ordered exactly like the matrix
+     used by dither.js (0,2,8,10 / 4,6,12,14 / 3,1,9,11 / 15,13,7,5). */
+  --bayer-pattern: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' shape-rendering='crispEdges'%3E%3Cpath fill='%23fff' d='M0 0h2v2H0zM4 0h2v2H4zM2 2h2v2H2zM6 2h2v2H6zM0 4h2v2H0zM4 4h2v2H4zM6 4h2v2H6zM2 6h2v2H2z'/%3E%3C/svg%3E");
+  --pixel-shadow: 6px 6px 0 var(--line-soft);
+}
+
+/* --- ordered-dither rules ------------------------------------------------ */
+.dither-rule {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 10px;
+  border: 0;
+  background: none;
+  animation: none;
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 54%, rgba(0, 0, 0, .35) 82%, transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0%, #000 54%, rgba(0, 0, 0, .35) 82%, transparent 100%);
+}
+
+.dither-rule::before {
+  content: "";
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  animation: electric-shimmer 14s steps(14, end) infinite;
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
+}
+
+.dither-rule--standalone {
+  max-width: 420px;
+  margin-top: 24px;
+}
+
+/* A short, blocky checker under every section header. */
+.sec-head::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 0;
+  width: min(210px, 46%);
+  height: 5px;
+  background-image: repeating-conic-gradient(from 0deg at 50% 50%, var(--blue) 0 25%, var(--violet) 0 50%);
+  background-size: 4px 4px;
+  opacity: .62;
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, rgba(0, 0, 0, .5) 68%, transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0%, rgba(0, 0, 0, .5) 68%, transparent 100%);
+}
+
+/* Dot-dash pixel hairline from the marker to the shell edge. */
+.sec-marker::after,
+.manifesto-head::after {
+  height: 4px;
+  background-image: repeating-linear-gradient(90deg, var(--line-strong) 0 4px, transparent 4px 8px);
+  background-size: 8px 4px;
+  opacity: .75;
+}
+
+/* --- pixel chips, tags and hard borders --------------------------------- */
+.tag,
+.badge {
+  border-radius: 0;
+  box-shadow: 2px 2px 0 var(--line-soft);
+}
+
+.tag b { color: var(--telemetry); }
+
+.sticker {
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--line-strong);
+}
+
+.icon-btn,
+.code-panel,
+.net-strip,
+.metric-sheet,
+.metrics-foot,
+.footer-colophon {
+  border-radius: 0;
+}
+
+.metric-sheet { box-shadow: var(--pixel-shadow); }
+.metrics-foot { box-shadow: 3px 3px 0 var(--line-soft); }
+
+/* Dithered wash for tinted sections: 1px dots on a 16px grid, no blur. */
+.section--tint {
+  background-image: radial-gradient(var(--line-soft) .8px, transparent .9px);
+  background-size: 16px 16px;
+}
+
+/* --- shared live canvas stage ------------------------------------------- */
+.canvas-stage {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  background-color: var(--bg);
+  isolation: isolate;
+}
+
+/* JS-off / pre-first-frame fallback: the same ordered dither, in CSS. */
+.canvas-stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-image: var(--grad-soft);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  opacity: .9;
+  pointer-events: none;
+}
+
+.dither-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  -ms-interpolation-mode: nearest-neighbor;
+}
+
+/* --- hero object: pixelated 3D knot in the right-hand column ------------- */
+.hero-object {
+  position: relative;
+  display: none;
+  width: 100%;
+  max-width: 480px;
+  min-width: 0;
+  justify-self: end;
+  align-self: center;
+  user-select: none;
+}
+
+.hero-object-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  box-shadow: 10px 10px 0 rgba(94, 184, 255, .28), 10px 10px 0 1px rgba(6, 8, 17, .55);
+  cursor: grab;
+  touch-action: none;
+}
+
+.hero-object-frame::after {
+  content: "";
+  position: absolute;
+  inset: 7px;
+  z-index: 3;
+  border: 1px solid rgba(124, 141, 255, .22);
+  pointer-events: none;
+}
+
+.hero-object-frame.is-dragging { cursor: grabbing; }
+
+html.is-inverted .hero-object-frame,
+body.is-inverted .hero-object-frame {
+  box-shadow: 10px 10px 0 rgba(79, 70, 229, .3), 10px 10px 0 1px rgba(238, 242, 255, .6);
+}
+
+.hero-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.hero-fallback span:first-child {
+  color: var(--telemetry);
+  font-family: var(--font-display);
+  font-size: clamp(14px, 2.4vw, 22px);
+  letter-spacing: -.02em;
+}
+
+html.dither-ready .hero-fallback { display: none; }
+
+.hero-hud-chip,
+.hero-drag-hint,
+.hero-frame-index {
+  position: absolute;
+  z-index: 4;
+  padding: 3px 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.hero-hud-chip {
+  top: 12px;
+  left: 12px;
+  color: var(--telemetry);
+  box-shadow: 2px 2px 0 rgba(168, 117, 255, .35);
+}
+
+.hero-frame-index {
+  top: 12px;
+  right: 12px;
+  color: var(--telemetry-alt);
+}
+
+.hero-drag-hint {
+  bottom: 12px;
+  left: 12px;
+  border-color: var(--line);
+  color: var(--text-3);
+}
+
+.hero-object-frame.is-static .hero-drag-hint { display: none; }
+
+.hero-object-caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.hero-object-meta {
+  color: var(--telemetry-alt);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.hero-mode {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  line-height: 1;
+  text-transform: uppercase;
+  box-shadow: 3px 3px 0 var(--line-strong);
+  cursor: pointer;
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+
+.hero-mode:hover,
+.hero-mode:focus-visible {
+  background-image: var(--grad);
+  color: var(--on-accent);
+  box-shadow: 5px 5px 0 var(--shadow-alt);
+}
+
+.hero-mode:active {
+  box-shadow: 1px 1px 0 var(--line-strong);
+  transform: translate(2px, 2px);
+}
+
+/* --- dither ribbon (under the live telemetry section) -------------------- */
+.dither-ribbon {
+  position: relative;
+  height: 28px;
+  margin-top: 18px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  box-shadow: 4px 4px 0 var(--line-soft);
+}
+
+.dither-ribbon .dither-canvas { z-index: 1; }
+
+.dither-ribbon-label {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  z-index: 2;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--telemetry);
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+/* --- interference strip (protocol section) ------------------------------- */
+.interference-panel {
+  margin: 0 0 clamp(26px, 3.6vw, 44px);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  box-shadow: 6px 6px 0 var(--line-soft);
+}
+
+.interference-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+
+.interference-meta span:first-child { color: var(--telemetry); }
+.interference-meta span:last-child { color: var(--telemetry-alt); }
+
+.interference-stage { height: 64px; }
+
+/* --- pixel card media ---------------------------------------------------- */
+.card-media {
+  position: relative;
+  height: 104px;
+  margin-bottom: 18px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+}
+
+.card-media::after {
+  content: "";
+  position: absolute;
+  inset: 5px;
+  z-index: 2;
+  border: 1px solid rgba(124, 141, 255, .18);
+  pointer-events: none;
+}
+
+.card-media .dither-canvas { z-index: 1; }
+
+.card-media-label {
+  position: absolute;
+  left: 7px;
+  bottom: 7px;
+  z-index: 3;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--telemetry);
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.card-media--static::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background-image:
+    radial-gradient(120% 120% at 18% 8%, rgba(94, 184, 255, .55), transparent 58%),
+    radial-gradient(110% 110% at 92% 96%, rgba(168, 117, 255, .5), transparent 62%);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+}
+
+/* The chip in a hovered card must stay readable over the gradient. */
+.invert-card:hover .card-media { border-color: var(--on-accent-line); }
+.invert-card:hover .card-media-label {
+  background: var(--on-accent);
+  border-color: var(--on-accent-line);
+  color: var(--ink);
+}
+
+/* --- blocky reveals ------------------------------------------------------ */
+html.js [data-reveal] {
+  transition:
+    opacity .5s steps(6, end),
+    translate .5s steps(6, end);
+}
+
+/* --- responsive ---------------------------------------------------------- */
+@media (max-width: 899.98px) {
+  .hero-object {
+    display: block;
+    width: min(230px, 52vw);
+    margin-top: 12px;
+    margin-left: auto;
+    justify-self: end;
+    align-self: end;
+  }
+
+  .hero-object-caption { margin-top: 8px; }
+  .hero-object-meta { font-size: 8px; }
+  .hero-mode { font-size: 8px; padding: 7px 9px; }
+  .hero-hud-chip { top: 8px; left: 8px; font-size: 7px; }
+  .hero-frame-index { top: 8px; right: 8px; font-size: 7px; }
+  .hero-drag-hint { bottom: 8px; left: 8px; font-size: 7px; }
+  .hero-object-frame::after { inset: 5px; }
+  .interference-stage { height: 52px; }
+  .card-media { height: 92px; }
+}
+
+@media (max-width: 419.98px) {
+  .hero-object { width: min(200px, 54vw); }
+  .hero-drag-hint { display: none; }
+  .dither-ribbon { height: 24px; }
+  .dither-ribbon-label { font-size: 7px; }
+  .card-media { height: 84px; }
+  .sec-head::before { width: 62%; }
+}
+
+@media (min-width: 900px) {
+  .hero-object { display: block; }
+}
+
+/* --- coarse pointers ----------------------------------------------------- */
+@media (hover: none), (pointer: coarse) {
+  .hero-mode:hover {
+    background-image: none;
+    background-color: var(--surface);
+    color: var(--text);
+    box-shadow: 3px 3px 0 var(--line-strong);
+  }
+
+  .hero-object-frame { touch-action: pan-y; }
+}
+
+/* --- reduced motion: the dither art is a still frame --------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .dither-rule::before { animation: none; }
+  .hero-object-frame { cursor: default; }
+  .hero-mode { transition: none; }
+}

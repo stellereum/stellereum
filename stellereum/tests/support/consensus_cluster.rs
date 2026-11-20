@@ -409,6 +409,13 @@ pub struct NodeReport {
     pub finalized_height: Height,
     /// Every height/hash the node finalized, in order.
     pub finalized: Vec<(Height, BlockHash)>,
+    /// Every height/VALUE the node finalized, in order (ruleset v6).
+    ///
+    /// The signed hash commits the round, so two honest re-stamps of one
+    /// value are two hashes with the SAME `value_id`. Safety is one decided
+    /// VALUE per height; comparing raw hashes would flag a re-stamp as a
+    /// fork. Kept alongside `finalized` so tests can check either identity.
+    pub finalized_values: Vec<(Height, [u8; 32])>,
     /// The round each finalized height was DECIDED in (the precommit
     /// quorum's round). The liveness metric: how many rounds a height cost.
     pub decide_rounds: Vec<Round>,
@@ -1948,6 +1955,15 @@ impl ConsensusCluster {
                     vote_wasted += c;
                 }
             }
+            // Round-free value identity of each decided height (ruleset v6):
+            // the body is retained with the finality QC, so this is the value
+            // the node actually committed to.
+            let finalized_values: Vec<(Height, [u8; 32])> = m
+                .rt
+                .finalized
+                .iter()
+                .filter_map(|(h, hash)| m.rt.blocks.get(hash).map(|b| (*h, b.value_id())))
+                .collect();
             nodes.push(NodeReport {
                 index: m.index,
                 id: hex::encode(&m.id[..4]),
@@ -1955,6 +1971,7 @@ impl ConsensusCluster {
                 round: hc.round,
                 finalized_height,
                 finalized: m.rt.finalized.clone(),
+                finalized_values,
                 decide_rounds: m.decide_rounds.clone(),
                 height_start_round: m.height_start_round,
                 prevotes_cast: m.stats.prevotes_cast,

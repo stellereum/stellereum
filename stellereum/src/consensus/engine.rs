@@ -844,6 +844,15 @@ impl VoteSet {
         None
     }
 
+    /// The vote this set admitted from `voter`, if any.
+    ///
+    /// Used by the adopt path to ask "did WE already sign this statement?" —
+    /// a node may follow its own earlier precommit even after it has since
+    /// locked a different value at a higher round (ruleset v6 liveness).
+    pub fn vote_by(&self, voter: &ValidatorId) -> Option<&Vote> {
+        self.votes.get(voter)
+    }
+
     pub fn len(&self) -> usize {
         self.votes.len()
     }
@@ -1751,6 +1760,30 @@ impl HeightConsensus {
 
     pub fn precommit_set(&self, round: Round) -> Option<&VoteSet> {
         self.precommits.get(&round)
+    }
+
+    /// True when a round STRICTLY AFTER `round` already holds both quorums for
+    /// a block (precommit and matching prevote). Such a height is decidable
+    /// locally in a NEWER round, so an older commit must not be preferred over
+    /// it: adopting the older one would let two honest nodes that saw the two
+    /// quorums in different order finalize different blocks.
+    pub fn has_decidable_precommit_quorum_after(&self, round: Round) -> bool {
+        for (&r, set) in &self.precommits {
+            if r <= round {
+                continue;
+            }
+            let Some(Some(target)) = set.quorum_target(&self.validators) else {
+                continue;
+            };
+            let prevoted = self
+                .prevotes
+                .get(&r)
+                .and_then(|s| s.quorum_target(&self.validators));
+            if prevoted.flatten() == Some(target) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return the count of collected votes carrying Falcon signatures in a given round and kind.

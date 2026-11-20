@@ -1008,6 +1008,19 @@ pub(crate) async fn run_consensus_node(
         .as_ref()
         .and_then(|wm| wm.floor_round(rt.hc.height))
         .map(|r| (rt.hc.height, r));
+    // PRECOMMIT has its OWN floor (Finding C stores the two kinds
+    // independently). A late polka may be precommitted at ITS round even when
+    // this node has already prevoted (nil) in a later round: that precommit is
+    // a different statement — a different (height, round, kind) — so it cannot
+    // equivocate any signed prevote. Reusing the union floor here refused
+    // exactly the late-polka rescue (the node at round 11 could never
+    // precommit the polka of round 0, so the height parked). The precommit
+    // floor still refuses re-entering a round this node already precommitted
+    // in, which is the double-sign the write-ahead watermark exists to stop.
+    let mut precommit_floor: Option<(u64, u32)> = restored_watermark
+        .as_ref()
+        .and_then(|wm| wm.precommit_at(rt.hc.height))
+        .map(|e| (e.height, e.round));
     // Throttle for the finalize-blocker diagnostic below: one line per round.
     let mut last_blockers_log: Option<(u64, u32)> = None;
     // Throttle for the propose-gate diagnostic: one line per round.
@@ -3478,13 +3491,17 @@ pub(crate) async fn run_consensus_node(
             if let Some(v) = rt.make_precommit() {
                 // FLOOR: a precommit is stamped with the POLKA's round, which
                 // may be older than the local round — and after a crash the
-                // node must not re-enter a round it already voted in. Refuse
-                // anything at/below the restored watermark round.
+                // node must not re-enter a round it already PRECOMMITTED in.
+                // Compare the PRECOMMIT floor, not the prevote/union floor:
+                // a late polka's round can be below a nil prevote this node
+                // already signed, and precommitting it is a different
+                // (height, round, kind) statement. See `precommit_floor`.
                 if last_precommitted != Some((height, v.round))
-                    && !round_at_or_below_vote_floor(vote_floor, height, v.round)
+                    && !round_at_or_below_vote_floor(precommit_floor, height, v.round)
                 {
                     persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
                     advance_vote_floor(&mut vote_floor, v.height, v.round);
+                    advance_vote_floor(&mut precommit_floor, v.height, v.round);
                     let _ = rt.on_precommit(v.clone());
                     // P3-H4: guards are set at ENQUEUE time (same reason as prevotes).
                     enqueue_outbox(
@@ -5011,5 +5028,33 @@ mod vote_watermark_tests {
         assert_eq!(wm3.floor_round(5), Some(12));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A LATE POLKA'S PRECOMMIT IS NOT BLOCKED BY THE PREVOTE FLOOR.
+    ///
+    /// The live shape: a validator raced to round 11 and signed nil prevotes
+    /// there, then the quorum-completing prevotes of round 0 arrive. The
+    /// polka is precommitted at r0 (its own round). The union `floor_round`
+    /// is 11 and would refuse that precommit, parking the height even though
+    /// the precommit is a different (height, round, kind) statement and the
+    /// node signed no precommit below it. The PRECOMMIT floor is still
+    /// enforced: a round this node already precommitted in is refused.
+    #[test]
+    fn late_polka_precommit_ignores_the_prevote_floor() {
+        // Prevoted nil at r11, never precommitted at this height.
+        let prevote_floor = Some((7, 11));
+        let precommit_floor: Option<(u64, u32)> = None;
+        assert!(round_at_or_below_vote_floor(prevote_floor, 7, 0));
+        assert!(
+            !round_at_or_below_vote_floor(precommit_floor, 7, 0),
+            "the r0 precommit of a late polka must not be refused by the r11 prevote floor"
+        );
+        // ...but a precommit at a round already precommitted is still refused.
+        let precommit_floor = Some((7, 11));
+        assert!(round_at_or_below_vote_floor(precommit_floor, 7, 0));
+        assert!(round_at_or_below_vote_floor(precommit_floor, 7, 11));
+        assert!(!round_at_or_below_vote_floor(precommit_floor, 7, 12));
+        // A different height is governed by its own floor.
+        assert!(!round_at_or_below_vote_floor(precommit_floor, 8, 0));
     }
 }

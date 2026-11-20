@@ -2620,18 +2620,66 @@ impl ValidatorRuntime {
         // polkas in one round need more than 1/3 Byzantine power - so it is
         // refused. A certificate for the SAME block is always fine: that is
         // our own lock being confirmed.
+        //
+        // ROUND-FREE VALUE IDENTITY BEFORE THE LOCK CHECK (ruleset v6): the
+        // incoming commit body may be the OTHER signed round of a value this
+        // node locked on (the QC carries the round-0 hash, our lock names a
+        // later re-stamp). This node need not have held that exact signed body
+        // before — the commit is the first place it sees it — so register the
+        // identity FIRST. Otherwise `same_value` sees an unknown hash, refuses
+        // the commit as conflicting, and the node never adopts the height it
+        // already locked (the late-polka liveness shape). Registration is
+        // exact: `value_id` is the round-free hash of THIS body, so a genuinely
+        // different value still fails the comparison below.
+        self.hc.note_value_id(bh, block.value_id());
         if let Some((locked_block, locked_round)) = self.hc.locked {
+            // OUR OWN EARLIER PRECOMMIT OUTRANKS A LATER LOCK (ruleset v6
+            // liveness). A commit certificate for a round BEFORE our lock can
+            // only be adopted when it is our value — unless WE already
+            // precommitted exactly this block in that round. Then the
+            // certificate merely confirms our own signed statement; the later
+            // lock was taken after a higher polka for another value and says
+            // nothing about the round that was already committed. Refusing
+            // here parked the height on the very nodes whose precommits made
+            // the certificate (the late-polka shape: a node unlocks on a
+            // higher polka while a valid earlier commit is still in flight).
+            // The same-round case stays refused below, a NEWER locally
+            // decidable precommit quorum wins (never prefer an older commit
+            // over a newer decision this node can already make), and a lock
+            // whose value identity matches still adopts without this escape.
+            // A hash-only lock (we saw the polka's votes but never its body)
+            // has no registered value identity, so `same_value` cannot equate
+            // it with the commit body. Rebuild the commit value at the lock's
+            // signed round: if its hash is exactly the locked hash, the lock
+            // names THIS value at another round. Hash equality proves it; a
+            // genuinely different value cannot collide.
+            let lock_matches_restamp = self.hc.value_id_of(&locked_block).is_none() && {
+                let mut candidate = block.clone();
+                candidate.round = locked_round;
+                candidate.compute_hash() == locked_block
+            };
+            let own_precommit = certificate.round < locked_round
+                && !self
+                    .hc
+                    .has_decidable_precommit_quorum_after(certificate.round)
+                && self
+                    .hc
+                    .precommit_set(certificate.round)
+                    .and_then(|s| s.vote_by(&self.id))
+                    .is_some_and(|v| {
+                        v.kind == VoteKind::Precommit && v.block_hash == Some(bh)
+                    });
             // LOCK COMPARISON (ruleset v6, site 7): a re-stamped round of the
             // locked value does not contradict the lock; a different value
             // still does.
-            if certificate.round <= locked_round && !self.hc.same_value(locked_block, bh) {
+            if certificate.round <= locked_round
+                && !self.hc.same_value(locked_block, bh)
+                && !lock_matches_restamp
+                && !own_precommit
+            {
                 return Err("refusing to adopt a block that contradicts our lock".to_string());
             }
         }
-        // ROUND-FREE VALUE IDENTITY (ruleset v6): this adopted body is now a
-        // known value at this height, so later lock comparisons can equate a
-        // re-stamp of it with its original signed hash.
-        self.hc.note_value_id(bh, block.value_id());
         // PREVOTE-QUORUM CONSISTENCY (parity with `try_precommit_quorum`):
         // the local path refuses to decide a block unless a prevote quorum for
         // the SAME block exists in the same round. The adopt path receives only

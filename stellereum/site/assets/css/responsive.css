@@ -20,11 +20,10 @@
 
   /* The hero stage is full-bleed at every width. The object is cropped by
      the canvas camera; only copy density changes on small screens. */
-  .hero-topbar,
-  .hero-bottombar { padding-block: 9px; }
+  .hero-topbar { padding-block: 9px; }
   .hero-inner { padding-block: 10px; }
   .hero-title { font-size: clamp(1.65rem, min(8.5vw, 12vh), 5.4rem); }
-  .hero-lede-panel { padding: 12px; }
+  .hero-lede-panel { padding: 14px; }
   .hero-sub { font-size: 13.5px; }
 
   .invert-pill { order: 2; margin-left: auto; margin-right: 0; }
@@ -232,25 +231,28 @@
 /* --- short phones: keep the hero copy and actions above the fold -------- */
 @media (max-width: 899.98px) and (max-height: 760px) {
   .hero-topbar { padding-block: 7px; }
-  .hero-bottombar { padding-block: 6px; }
-  .hero-inner { padding-block: 6px; }
-  .hero-kicker { margin-bottom: 8px; padding-block: 4px; }
+  .hero-inner { padding-block: 6px 12px; }
+  .hero-kicker { margin-bottom: 10px; padding-block: 4px; }
   .hero-sub { font-size: 12px; line-height: 1.5; }
-  .hero-lede-panel { margin-top: 8px; padding: 10px; }
-  .hero-actions { margin-top: 8px; gap: 8px; }
+  .hero-lede-panel { margin-top: 12px; padding: 12px; }
+  .hero-actions { margin-top: 12px; gap: 8px; }
   .hero-actions .btn { min-height: 44px; padding: 10px 14px; font-size: 10px; }
-  .hero-controls { margin-top: 6px; padding-top: 6px; }
-  .hero-scroll { display: none; }
-  .hero-object-meta { display: none; }
+  .hero-modes { margin-top: 12px; }
   .hero-title { font-size: clamp(1.65rem, min(8.5vw, 12vh), 4.8rem); }
 }
 
-@media (max-width: 899.98px) and (max-height: 620px) {
-  /* Short phone: the chain ID already appears in the top HUD and the lede.
-     Drop the duplicate kicker before shrinking the display type further. */
-  .hero-kicker { display: none; }
-  .hero-topbar { padding-block: 6px; }
-  .hero-bottombar { padding-block: 5px; }
+/* --- very small phones: keep the two-chip HUD on one line ---------------- */
+@media (max-width: 360px) {
+  .hero-topbar { flex-wrap: nowrap; gap: 6px; }
+  .hero-status { min-width: 0; max-width: 44vw; flex: 0 1 44vw; }
+  .hero-status [data-status-text] {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hero-status .status-dot { flex: 0 0 auto; }
+  .hud-chip { flex: 0 0 auto; font-size: 8px; padding: 4px 5px; }
 }
 
 /* --- coarse pointers: no hover lift, no custom cursor -------------------- */

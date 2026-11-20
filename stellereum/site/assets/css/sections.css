@@ -9,7 +9,7 @@
 .hero {
   position: relative;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr;
   min-height: calc(100vh - var(--header-h) - 1px);
   min-height: calc(100svh - var(--header-h) - 1px);
   overflow: clip;
@@ -30,46 +30,12 @@
 
 .hero-stage.is-dragging { cursor: grabbing; }
 
-/* Very low-opacity scanline field: it reads as a display, not a filter. */
-.hero-stage::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  background-image: repeating-linear-gradient(180deg, rgba(6, 8, 17, .22) 0 1px, transparent 1px 4px);
-  opacity: .26;
-  pointer-events: none;
-  mix-blend-mode: multiply;
-}
-
-html.is-inverted .hero-stage::after,
-body.is-inverted .hero-stage::after {
-  background-image: repeating-linear-gradient(180deg, rgba(238, 242, 255, .3) 0 1px, transparent 1px 4px);
-  mix-blend-mode: screen;
-}
-
 .hero-canvas {
   position: absolute;
   inset: 0;
   z-index: 0;
   width: 100%;
   height: 100%;
-}
-
-/* Technical overlay: dot grid + two hairline axes, kept under the scrim. */
-.hero-stage-grid {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-  background-image:
-    radial-gradient(var(--dot) .7px, transparent .8px),
-    linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
-  background-size: 26px 26px, 160px 100%, 100% 160px;
-  opacity: .42;
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, .75), transparent 82%);
-  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, .75), transparent 82%);
 }
 
 /* The deliberate readability layer: opaque ink on the copy side, clear on
@@ -82,8 +48,7 @@ body.is-inverted .hero-stage::after {
   background-image: var(--stage-scrim);
 }
 
-.hero-topbar,
-.hero-bottombar {
+.hero-topbar {
   position: relative;
   z-index: 6;
   display: flex;
@@ -91,30 +56,13 @@ body.is-inverted .hero-stage::after {
   align-items: center;
   justify-content: space-between;
   gap: 8px 16px;
-  border-color: var(--line-soft);
-}
-
-.hero-topbar {
-  padding-block: 10px;
+  padding-block: 12px;
   border-bottom: 1px solid var(--line-soft);
-}
-
-.hero-bottombar {
-  padding-block: 8px 10px;
-  border-top: 1px solid var(--line-soft);
 }
 
 .hero-status {
   background: var(--stage-ink-strong);
   border-color: var(--line-strong);
-}
-
-.hero-hud-group {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
 }
 
 .hud-chip {
@@ -134,16 +82,6 @@ body.is-inverted .hero-stage::after {
   white-space: nowrap;
 }
 
-.hud-chip b { color: var(--telemetry); font-weight: 700; }
-
-.hud-chip--scene {
-  border-color: var(--line-strong);
-  color: var(--telemetry);
-  box-shadow: 2px 2px 0 rgba(168, 117, 255, .3);
-}
-
-.hud-chip--res { color: var(--telemetry-alt); }
-
 .hero-inner {
   position: relative;
   z-index: 4;
@@ -151,7 +89,7 @@ body.is-inverted .hero-stage::after {
   flex-direction: column;
   justify-content: center;
   min-height: 0;
-  padding-block: clamp(10px, 1.6vh, 24px);
+  padding-block: clamp(18px, 3.2vh, 46px);
 }
 
 .hero-copy { width: 100%; min-width: 0; }
@@ -163,7 +101,7 @@ body.is-inverted .hero-stage::after {
   gap: 9px;
   width: fit-content;
   max-width: 100%;
-  margin-bottom: clamp(10px, 1.6vh, 18px);
+  margin-bottom: clamp(14px, 2.2vh, 24px);
   padding: 6px 9px;
   border: 1px solid var(--line);
   background: var(--stage-ink);
@@ -189,7 +127,7 @@ body.is-inverted .hero-stage::after {
 .hero-line {
   display: table;
   max-width: 100%;
-  margin-bottom: clamp(3px, .45vh, 7px);
+  margin-bottom: clamp(5px, .8vh, 11px);
   border: 1px solid var(--line-strong);
   background: var(--stage-ink-strong);
   box-shadow: 5px 5px 0 rgba(94, 184, 255, .26);
@@ -211,7 +149,6 @@ body.is-inverted .hero-stage::after {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: electric-shimmer 9s ease infinite;
 }
 
 .hero-line--stroke {
@@ -243,8 +180,8 @@ body.is-inverted .hero-stage::after {
 
 .hero-lede-panel {
   width: min(560px, 100%);
-  margin-top: clamp(12px, 1.8vh, 24px);
-  padding: clamp(12px, 1.3vw, 18px);
+  margin-top: clamp(18px, 2.8vh, 34px);
+  padding: clamp(16px, 1.5vw, 22px);
   border: 1px solid var(--line);
   background: var(--stage-ink);
   box-shadow: 5px 5px 0 rgba(124, 141, 255, .2);
@@ -264,38 +201,15 @@ body.is-inverted .hero-stage::after {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin-top: clamp(12px, 1.8vh, 18px);
+  margin-top: clamp(16px, 2.2vh, 22px);
 }
 
-.hero-controls {
+.hero-modes {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px 14px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line-soft);
+  gap: 6px;
+  margin-top: clamp(14px, 2vh, 20px);
 }
-
-.hero-scroll {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 44px;
-  color: var(--text-2);
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: .16em;
-  text-transform: uppercase;
-}
-
-.hero-scroll:hover { color: var(--text); }
-.hero-scroll .hero-scroll-arrow { color: var(--telemetry-alt); }
-.hero-scroll:hover .hero-scroll-arrow { color: var(--text); }
-
-.hero-modes { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .hero-mode {
   display: inline-flex;
@@ -336,48 +250,6 @@ body.is-inverted .hero-stage::after {
   box-shadow: 1px 1px 0 var(--line-strong);
   transform: translate(2px, 2px);
 }
-
-.hero-object-meta {
-  margin-top: 8px;
-  color: var(--telemetry-alt);
-  font-family: var(--font-mono);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: .13em;
-  line-height: 1.4;
-  text-transform: uppercase;
-}
-
-.hero-drag-hint {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.hero-drag-bar {
-  display: block;
-  width: clamp(64px, 9vw, 128px);
-  height: 6px;
-  border: 1px solid var(--line-strong);
-  background: var(--bg);
-  overflow: hidden;
-}
-
-.hero-drag-bar span {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background-image: var(--grad);
-  background-size: 200% 200%;
-  animation: electric-shimmer 6s ease infinite;
-}
-
-.hero-stage.is-static .hero-drag-hint { display: none; }
-
-/* --- reference object: live Bayer-dithered 3D knot ----------------------
-   Layout lives in sections.css; the pixel frame, HUD and canvas styling live
-   in pixel.css, and the rendering itself in assets/js/dither.js. The object is
-   in normal grid/flow, so it can never cover the H1, lede or CTA. */
 
 /* Single authoritative live-metrics block now lives in #network; the hero
    keeps only the status chip and the protocol marquee. */
@@ -730,26 +602,10 @@ body.is-inverted .hero-stage::after {
 .kinetic-band {
   position: relative;
   overflow: hidden;
-  padding-block: clamp(10px, 1.6vw, 18px) clamp(6px, 1vw, 12px);
+  padding-block: clamp(18px, 2.6vw, 34px);
   border-block: 1px solid var(--line-strong);
   background: var(--bg-1);
 }
-
-.kinetic-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 4px;
-  color: var(--text-3);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: .16em;
-  text-transform: uppercase;
-}
-
-.kinetic-meta b { color: var(--telemetry); font-weight: 700; }
 
 .kinetic-viewport {
   overflow: hidden;
@@ -775,11 +631,6 @@ body.is-inverted .hero-stage::after {
   will-change: transform;
 }
 
-.kinetic-row + .kinetic-row { margin-top: clamp(4px, .9vw, 12px); }
-
-.kinetic-row--stroke { color: var(--text-2); }
-.kinetic-row--solid { font-size: clamp(24px, 5.2vw, 72px); letter-spacing: -.035em; }
-
 .kinetic-row .k-fill {
   background-image: var(--grad);
   -webkit-background-clip: text;
@@ -798,23 +649,6 @@ body.is-inverted .hero-stage::after {
 
 .kinetic-row .k-dot { color: var(--telemetry-alt); }
 
-.kinetic-row .k-box {
-  display: inline-block;
-  padding: .02em .14em .08em;
-  border: 1px solid var(--line-strong);
-  background: var(--surface);
-  color: var(--text);
-  box-shadow: 4px 4px 0 var(--line-strong);
-}
-
-.kinetic-row .k-box--alt {
-  background-image: var(--grad);
-  background-size: 200% 200%;
-  animation: electric-shimmer 8s ease infinite;
-  color: var(--ink);
-  box-shadow: 4px 4px 0 var(--shadow-alt);
-}
-
 /* =========================== PERFORMANCE ================================ */
 .perf-band {
   position: relative;
@@ -823,7 +657,6 @@ body.is-inverted .hero-stage::after {
   border: 1px solid var(--line-strong);
   background-image: var(--grad);
   background-size: 220% 220%;
-  animation: electric-shimmer 11s ease infinite;
   color: var(--on-accent);
   box-shadow: 10px 10px 0 var(--shadow-alt);
 }
@@ -859,13 +692,6 @@ body.is-inverted .hero-stage::after {
   font-weight: 700;
   letter-spacing: .14em;
   text-transform: uppercase;
-}
-
-.perf-top .sticker {
-  background: rgba(6, 8, 17, .9);
-  color: #eaf1ff;
-  border-color: rgba(6, 8, 17, .9);
-  box-shadow: none;
 }
 
 .perf-grid {
@@ -1171,7 +997,6 @@ body.is-inverted .timeline-item--done .timeline-step { color: #0a6b56; }
   border: 1px solid var(--line-strong);
   background-image: var(--grad);
   background-size: 220% 220%;
-  animation: electric-shimmer 12s ease infinite;
   color: var(--on-accent);
   box-shadow: 12px 12px 0 var(--shadow-alt);
 }

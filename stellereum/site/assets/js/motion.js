@@ -172,7 +172,6 @@
   function initKinetic() {
     var rows = Array.prototype.slice.call(doc.querySelectorAll('[data-kinetic]'));
     if (!rows.length || reduce.matches) return;
-    var readout = doc.querySelector('[data-warp-readout]');
     var ticking = false;
 
     function update() {
@@ -190,8 +189,6 @@
         row.style.setProperty('--kx', (p * 78 * dir).toFixed(1) + 'px');
         row.style.setProperty('--ks', (p * -5.5 * dir).toFixed(2) + 'deg');
       });
-
-      if (readout) readout.textContent = Math.round(Math.abs(p) * 100) + '%';
     }
 
     function onScroll() {
@@ -257,7 +254,7 @@
     }, { passive: true });
 
     doc.addEventListener('pointerover', function (e) {
-      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-stage, .card-media, .sticker') : null;
+      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-stage, .card-media') : null;
       cursor.classList.toggle('is-expanded', !!target);
     });
 

@@ -15,18 +15,18 @@
 <meta property="og:url" content="https://stellereum.org/">
 <meta property="og:title" content="Stellereum — Post-Quantum Layer 1">
 <meta property="og:description" content="Falcon-512 validator votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only; no external audit.">
-<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=16">
+<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=17">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Stellereum — Post-Quantum Layer 1">
 <meta name="twitter:description" content="Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
-<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=16">
+<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=17">
 
-<link rel="icon" href="favicon.ico?v=16" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=16">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=16">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=16">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=16">
-<link rel="manifest" href="site.webmanifest?v=16">
+<link rel="icon" href="favicon.ico?v=17" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=17">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=17">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=17">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=17">
+<link rel="manifest" href="site.webmanifest?v=17">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -36,13 +36,13 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=16">
-<link rel="stylesheet" href="assets/css/base.css?v=16">
-<link rel="stylesheet" href="assets/css/layout.css?v=16">
-<link rel="stylesheet" href="assets/css/components.css?v=16">
-<link rel="stylesheet" href="assets/css/sections.css?v=16">
-<link rel="stylesheet" href="assets/css/responsive.css?v=16">
-<link rel="stylesheet" href="assets/css/pixel.css?v=16">
+<link rel="stylesheet" href="assets/css/tokens.css?v=17">
+<link rel="stylesheet" href="assets/css/base.css?v=17">
+<link rel="stylesheet" href="assets/css/layout.css?v=17">
+<link rel="stylesheet" href="assets/css/components.css?v=17">
+<link rel="stylesheet" href="assets/css/sections.css?v=17">
+<link rel="stylesheet" href="assets/css/responsive.css?v=17">
+<link rel="stylesheet" href="assets/css/pixel.css?v=17">
 
 <script>
 document.documentElement.classList.add('js');
@@ -67,15 +67,14 @@ window.setTimeout(function () {
   [data-copy-from],
   [data-copy-active] { display: none !important; }
   .code-body[hidden] { display: block !important; }
-  /* Canvas controls and the drag cue are JS-only. */
-  .hero-mode,
-  .hero-drag-hint { display: none !important; }
+  /* Canvas controls are JS-only. */
+  .hero-mode { display: none !important; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=16"></script>
-<script defer src="assets/js/motion.js?v=16"></script>
-<script defer src="assets/js/metrics.js?v=16"></script>
-<script defer src="assets/js/dither.js?v=16"></script>
+<script defer src="assets/js/app.js?v=17"></script>
+<script defer src="assets/js/motion.js?v=17"></script>
+<script defer src="assets/js/metrics.js?v=17"></script>
+<script defer src="assets/js/dither.js?v=17"></script>
 </head>
 <body>
 
@@ -88,7 +87,7 @@ window.setTimeout(function () {
 <header class="site-header" id="site-header">
   <div class="header-inner shell">
     <a class="brand" href="#top" aria-label="Stellereum — home">
-      <img class="brand-mark" src="assets/img/stell-mark.png?v=16" alt="" width="32" height="32">
+      <img class="brand-mark" src="assets/img/stell-mark.png?v=17" alt="" width="32" height="32">
       <span class="brand-word">Stellereum</span>
       <span class="brand-tag" aria-hidden="true">PQ–L1</span>
     </a>
@@ -135,17 +134,6 @@ window.setTimeout(function () {
 
 <div class="nav-backdrop" data-nav-backdrop></div>
 
-<!-- Fixed Swiss section index: the reference's numbered section system. -->
-<nav class="section-index" aria-label="Page index">
-  <a href="#network" data-index-link="network" aria-label="01 Network"><span>01</span></a>
-  <a href="#features" data-index-link="features" aria-label="02 Protocol"><span>02</span></a>
-  <a href="#performance" data-index-link="performance" aria-label="03 Limits"><span>03</span></a>
-  <a href="#build" data-index-link="build" aria-label="04 Build"><span>04</span></a>
-  <a href="#ecosystem" data-index-link="ecosystem" aria-label="05 Ecosystem"><span>05</span></a>
-  <a href="#roadmap" data-index-link="roadmap" aria-label="06 Roadmap"><span>06</span></a>
-  <a href="#transmit" data-index-link="transmit" aria-label="07 Transmit"><span>07</span></a>
-</nav>
-
 <noscript>
   <nav class="nojs-nav" aria-label="Section links">
     <div class="shell">
@@ -163,19 +151,10 @@ window.setTimeout(function () {
   <!-- Full-bleed 100svh stage: the Bayer-dithered lattice is the backdrop,
        the display type sits on ink panels over it. -->
   <section class="hero" id="top" aria-labelledby="hero-title">
-    <span class="hud-corner hud-corner--tl" aria-hidden="true"></span>
-    <span class="hud-corner hud-corner--tr" aria-hidden="true"></span>
-    <span class="hud-corner hud-corner--bl" aria-hidden="true"></span>
-    <span class="hud-corner hud-corner--br" aria-hidden="true"></span>
-
     <div class="hero-stage" id="hero-stage" aria-hidden="true">
       <canvas id="hero-canvas" class="dither-canvas hero-canvas"></canvas>
-      <div class="hero-stage-grid"></div>
       <div class="hero-stage-scrim"></div>
-      <div class="hero-fallback">
-        <span>PQ Lattice</span>
-        <span>BAYER 4×4</span>
-      </div>
+      <div class="hero-fallback">PQ Lattice / Bayer 4×4</div>
     </div>
 
     <div class="hero-topbar shell">
@@ -183,17 +162,12 @@ window.setTimeout(function () {
         <span class="status-dot" aria-hidden="true"></span>
         <span data-status-text>Connecting · rpc.stellereum.org</span>
       </span>
-      <span class="hero-hud-group" aria-hidden="true">
-        <span class="hud-chip hud-chip--scene">07 / 07 — PQ LATTICE STAGE</span>
-        <span class="hud-chip" id="hero-fps">FPS // BAYER 4×4</span>
-        <span class="hud-chip hud-chip--tc" id="hero-timecode">TC 00:00:00</span>
-        <span class="hud-chip hud-chip--res" id="hero-res">RENDER —</span>
-      </span>
+      <span class="hud-chip" id="hero-fps">FPS // BAYER 4×4</span>
     </div>
 
     <div class="hero-inner shell">
       <div class="hero-copy">
-        <p class="hero-kicker"><span class="rule-dot" aria-hidden="true"></span>TESTNET · CHAIN ID 5757 · STELL</p>
+        <p class="hero-kicker"><span class="rule-dot" aria-hidden="true"></span>TESTNET · CHAIN 5757</p>
 
         <h1 class="hero-title" id="hero-title">
           <span class="hero-line hero-line--grad"><span class="hero-word grad-text">Stellereum</span></span>
@@ -213,32 +187,12 @@ window.setTimeout(function () {
             <a class="btn btn--outline" href="https://explorer.stellereum.org">Open explorer <span class="arrow" aria-hidden="true">↗</span></a>
           </div>
 
-          <div class="hero-controls">
-            <a class="hero-scroll" href="#network">
-              <span class="rule-dot" aria-hidden="true"></span>
-              Scroll / live telemetry
-              <span class="hero-scroll-arrow" aria-hidden="true">↓</span>
-            </a>
-            <div class="hero-modes" role="group" aria-label="Hero object mode">
-              <button class="hero-mode is-active" type="button" id="hero-mode" data-hero-mode="refract" aria-pressed="true" aria-label="Show the lattice knot">01 // Refract</button>
-              <button class="hero-mode" type="button" id="hero-mode-ribbon" data-hero-mode="ribbon" aria-pressed="false" aria-label="Show the dithered ribbon">02 // Ribbon</button>
-            </div>
+          <div class="hero-modes" role="group" aria-label="Hero object mode">
+            <button class="hero-mode is-active" type="button" id="hero-mode" data-hero-mode="refract" aria-pressed="true" aria-label="Show the lattice knot">Refract</button>
+            <button class="hero-mode" type="button" id="hero-mode-ribbon" data-hero-mode="ribbon" aria-pressed="false" aria-label="Show the dithered ribbon">Ribbon</button>
           </div>
-
-          <p class="hero-object-meta" id="hero-mode-label">PQ Lattice Knot · P=2 Q=3 · drag to rotate</p>
         </div>
       </div>
-    </div>
-
-    <div class="hero-bottombar shell">
-      <span class="hero-hud-group" aria-hidden="true">
-        <span class="hud-chip">SCROLL <b id="hero-scroll">000%</b></span>
-        <span class="hud-chip hud-chip--mode">MODE <b id="hero-mode-cap">REFRACT</b></span>
-      </span>
-      <span class="hero-drag-hint" aria-hidden="true">
-        <span class="hud-chip">DRAG // ROTATE</span>
-        <span class="hero-drag-bar"><span></span></span>
-      </span>
     </div>
   </section>
 
@@ -380,11 +334,6 @@ window.setTimeout(function () {
 
       <div class="sec-rule dither-rule" aria-hidden="true"></div>
 
-      <!-- Second in-shell Bayer ribbon: the reference's signal ladder. -->
-      <div class="lattice-ribbon canvas-stage" id="lattice-wrap" aria-hidden="true">
-        <canvas id="lattice-canvas" class="dither-canvas"></canvas>
-      </div>
-
       <!-- Hairline schematic, not a grid of equal cells. -->
       <div class="shard-schematic" aria-hidden="true">
         <div class="schematic-index">
@@ -421,7 +370,7 @@ window.setTimeout(function () {
 
       <div class="features-grid">
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">01 / SIGNATURE</span><span class="sticker">FALCON-512</span></div>
+          <div class="feature-top"><span class="feature-num">01 / SIGNATURE</span></div>
           <div class="card-media canvas-stage" data-card-canvas="0" aria-hidden="true">
             <canvas id="card-canvas-0" class="dither-canvas"></canvas>
             <span class="card-media-label">Dither / 01</span>
@@ -432,7 +381,7 @@ window.setTimeout(function () {
         </article>
 
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">02 / CONSENSUS</span><span class="sticker">1-BLOCK</span></div>
+          <div class="feature-top"><span class="feature-num">02 / CONSENSUS</span></div>
           <div class="card-media canvas-stage" data-card-canvas="1" aria-hidden="true">
             <canvas id="card-canvas-1" class="dither-canvas"></canvas>
             <span class="card-media-label">Dither / 02</span>
@@ -443,7 +392,7 @@ window.setTimeout(function () {
         </article>
 
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">03 / SHARDS</span><span class="sticker">0–1</span></div>
+          <div class="feature-top"><span class="feature-num">03 / SHARDS</span></div>
           <div class="card-media canvas-stage" data-card-canvas="2" aria-hidden="true">
             <canvas id="card-canvas-2" class="dither-canvas"></canvas>
             <span class="card-media-label">Dither / 03</span>
@@ -454,7 +403,7 @@ window.setTimeout(function () {
         </article>
 
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">04 / CONTRACTS</span><span class="sticker">13 HOST FNS</span></div>
+          <div class="feature-top"><span class="feature-num">04 / CONTRACTS</span></div>
           <div class="card-media canvas-stage" data-card-canvas="3" aria-hidden="true">
             <canvas id="card-canvas-3" class="dither-canvas"></canvas>
             <span class="card-media-label">Dither / 04</span>
@@ -465,7 +414,7 @@ window.setTimeout(function () {
         </article>
 
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">05 / EVM</span><span class="sticker">READ-ONLY</span></div>
+          <div class="feature-top"><span class="feature-num">05 / EVM</span></div>
           <div class="card-media card-media--static" aria-hidden="true">
             <span class="card-media-label">Dither / 05</span>
           </div>
@@ -475,7 +424,7 @@ window.setTimeout(function () {
         </article>
 
         <article class="feature invert-card">
-          <div class="feature-top"><span class="feature-num">06 / zkML</span><span class="sticker">RE-EXECUTION</span></div>
+          <div class="feature-top"><span class="feature-num">06 / zkML</span></div>
           <div class="card-media card-media--static" aria-hidden="true">
             <span class="card-media-label">Dither / 06</span>
           </div>
@@ -529,7 +478,6 @@ window.setTimeout(function () {
       <div class="perf-band" data-reveal>
         <div class="perf-top">
           <span>PROTOCOL CONSTANTS · RULESET V5</span>
-          <span class="sticker">NOT LIVE TELEMETRY</span>
         </div>
 
         <div class="perf-grid">
@@ -583,21 +531,11 @@ window.setTimeout(function () {
     </div>
   </section>
 
-  <!-- ================================================== KINETIC TYPE ROWS -->
+  <!-- ================================================== KINETIC TYPE ROW -->
   <div class="kinetic-band" aria-hidden="true">
-    <div class="shell kinetic-meta">
-      <span>Scroll / deform · axis warp</span>
-      <span><b data-warp-readout>0%</b> skew</span>
-    </div>
     <div class="kinetic-viewport">
-      <p class="kinetic-row kinetic-row--grad" data-kinetic data-dir="1">
+      <p class="kinetic-row" data-kinetic data-dir="1">
         <span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> · </span><span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> ·</span>
-      </p>
-      <p class="kinetic-row kinetic-row--stroke" data-kinetic data-dir="-1">
-        <span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Two Shards<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> · </span><span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Two Shards<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> ·</span>
-      </p>
-      <p class="kinetic-row kinetic-row--solid" data-kinetic data-dir="1">
-        <span class="k-box">Light bent through math</span><span class="k-dot"> · </span><span class="k-box k-box--alt">Form follows finality</span><span class="k-dot"> · </span><span class="k-box">Light bent through math</span><span class="k-dot"> · </span><span class="k-box k-box--alt">Form follows finality</span>
       </p>
     </div>
   </div>
@@ -730,7 +668,7 @@ curl -s -X POST \
         <article class="eco-card invert-card" data-reveal>
           <div class="eco-top">
             <span class="eco-index">05 / 01</span>
-            <span class="eco-chips"><span class="badge badge--active"><span class="dot" aria-hidden="true"></span>Live</span><span class="sticker">High risk</span></span>
+            <span class="eco-chips"><span class="badge badge--active"><span class="dot" aria-hidden="true"></span>Live</span></span>
           </div>
           <span class="eco-numeral" aria-hidden="true">01</span>
           <h3>Governed bridge</h3>
@@ -741,7 +679,7 @@ curl -s -X POST \
         <article class="eco-card invert-card" data-reveal data-delay="1">
           <div class="eco-top">
             <span class="eco-index">05 / 02</span>
-            <span class="eco-chips"><span class="badge badge--soon">Research</span><span class="sticker">Prototype</span></span>
+            <span class="eco-chips"><span class="badge badge--soon">Research</span></span>
           </div>
           <span class="eco-numeral" aria-hidden="true">02</span>
           <h3>Stealth addresses</h3>
@@ -752,7 +690,7 @@ curl -s -X POST \
         <article class="eco-card invert-card" data-reveal data-delay="2">
           <div class="eco-top">
             <span class="eco-index">05 / 03</span>
-            <span class="eco-chips"><span class="badge badge--todo">Partial</span><span class="sticker">No execution</span></span>
+            <span class="eco-chips"><span class="badge badge--todo">Partial</span></span>
           </div>
           <span class="eco-numeral" aria-hidden="true">03</span>
           <h3>Rollups / L2</h3>
@@ -854,7 +792,7 @@ curl -s -X POST \
     <div class="footer-top">
       <div class="footer-brand">
         <a class="brand" href="#top" aria-label="Stellereum — back to top">
-          <img class="brand-mark" src="assets/img/stell-mark.png?v=16" alt="" width="34" height="34">
+          <img class="brand-mark" src="assets/img/stell-mark.png?v=17" alt="" width="34" height="34">
           <span class="brand-word">Stellereum</span>
         </a>
         <p class="footer-note">
@@ -899,7 +837,7 @@ curl -s -X POST \
       <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
       <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
       <div><dt>Supply cap</dt><dd>1B STELL</dd></div>
-      <div><dt>Site build</dt><dd>static-v16 · 2026.11.20</dd></div>
+      <div><dt>Site build</dt><dd>static-v17 · 2026.11.20</dd></div>
     </dl>
 
     <div class="footer-bottom">

@@ -134,16 +134,10 @@
   var items = [];
   var rafId = null;
   var lastNow = 0;
-  var bootTime = 0;
   var fpsCount = 0;
   var fpsMark = 0;
   var fpsEl = null;
-  var heroResEl = null;
-  var heroScrollEl = null;
-  var heroTimecodeEl = null;
-  var heroModeCap = null;
   var heroModeBtns = [];
-  var heroModeLabel = null;
   var heroFrame = null;
   var heroItem = null;
   var staticRaf = null;
@@ -169,24 +163,6 @@
       fpsEl.textContent = fps + ' FPS // BAYER 4\u00d74';
       fpsCount = 0;
       fpsMark = now;
-
-      if (!bootTime) bootTime = now;
-      if (heroTimecodeEl) {
-        var secs = Math.floor((now - bootTime) / 1000);
-        var hh = Math.floor(secs / 3600);
-        var mm = Math.floor((secs % 3600) / 60);
-        var ss = secs % 60;
-        heroTimecodeEl.textContent = 'TC ' + (hh < 10 ? '0' : '') + hh + ':' +
-          (mm < 10 ? '0' : '') + mm + ':' + (ss < 10 ? '0' : '') + ss;
-      }
-      if (heroResEl && heroItem && heroItem.buf) {
-        heroResEl.textContent = 'RENDER ' + heroItem.buf.w + '\u00d7' + heroItem.buf.h;
-      }
-      if (heroScrollEl) {
-        var docH = doc.documentElement.scrollHeight - win.innerHeight;
-        var p = docH > 0 ? Math.min(1, Math.max(0, (win.scrollY || win.pageYOffset || 0) / docH)) : 0;
-        heroScrollEl.textContent = (p < 0.1 ? '00' : '') + Math.round(p * 100) + '%';
-      }
     }
   }
 
@@ -231,7 +207,6 @@
       if (it.visible && it.buf && it.buf.ready) it.render(0.6, 0);
     }
     if (fpsEl) fpsEl.textContent = 'STATIC // BAYER 4\u00d74';
-    if (heroFrame) heroFrame.classList.add('is-static');
   }
 
   function scheduleStatic() {
@@ -862,7 +837,6 @@
   var ribbonItem = null;
   var interfItem = null;
   var slabItem = null;
-  var latticeItem = null;
   var cardItems = [];
 
   function writeElectricPixel(data, idx, lit, gradT, bcol, lut) {
@@ -957,30 +931,6 @@
         var v = (beam * 0.5 + 0.5) * 0.52 + (beam2 * 0.5 + 0.5) * 0.34 + grid + 0.06;
         var g = nx * 0.78 + ny * 0.22 + Math.sin(time * 0.4) * 0.1;
         writeElectricPixel(data, idx, v > bayerRow[x & 3], g, bcol, lut);
-        idx += 4;
-      }
-    }
-    buf.present();
-  }
-
-  /* 16-step ladder in the protocol section: hard quantised, no gradients. */
-  function renderLattice(time) {
-    var buf = latticeItem && latticeItem.buf;
-    if (!buf || !buf.ready) return;
-    var w = buf.w, h = buf.h;
-    var data = buf.imgData.data;
-    var bcol = pal.bg, lut = pal.lut;
-    var invW = 1 / Math.max(1, w - 1);
-    var idx = 0;
-
-    for (var y = 0; y < h; y++) {
-      var bayerRow = BAYER_4X4[y & 3];
-      for (var x = 0; x < w; x++) {
-        var nx = x * invW;
-        var step = Math.floor(nx * 16 + Math.sin(time * 0.8) * 0.4) / 15;
-        var scan = ((x + (time * 18 | 0)) % 24) === 0 ? 0.35 : 0;
-        var v = step * 0.92 + scan;
-        writeElectricPixel(data, idx, v > bayerRow[x & 3], nx * 0.9 + (y / h) * 0.1, bcol, lut);
         idx += 4;
       }
     }
@@ -1195,12 +1145,6 @@
         btn.setAttribute('aria-pressed', on ? 'true' : 'false');
         btn.classList.toggle('is-active', on);
       });
-      if (heroModeCap) heroModeCap.textContent = ribbon ? 'RIBBON' : 'REFRACT';
-      if (heroModeLabel) {
-        heroModeLabel.textContent = ribbon
-          ? 'PQ Lattice Ribbon \u00b7 P=2 Q=3 \u00b7 drag to rotate'
-          : 'PQ Lattice Knot \u00b7 P=2 Q=3 \u00b7 drag to rotate';
-      }
       if (reduceQuery.matches) renderStatic();
       else ensureLoop();
     }
@@ -1239,11 +1183,6 @@
 
     heroFrame = frameEl;
     fpsEl = doc.getElementById('hero-fps');
-    heroResEl = doc.getElementById('hero-res');
-    heroScrollEl = doc.getElementById('hero-scroll');
-    heroTimecodeEl = doc.getElementById('hero-timecode');
-    heroModeCap = doc.getElementById('hero-mode-cap');
-    heroModeLabel = doc.getElementById('hero-mode-label');
     heroModeBtns = Array.prototype.slice.call(doc.querySelectorAll('[data-hero-mode]'));
 
     var buf = createDitherCanvas(canvas, frameEl, 3, function (w, h) {
@@ -1338,27 +1277,6 @@
     watch(slabItem, wrap);
   }
 
-  function setupLattice() {
-    var canvas = doc.getElementById('lattice-canvas');
-    var wrap = doc.getElementById('lattice-wrap');
-    if (!canvas || !wrap) return;
-
-    var buf = createDitherCanvas(canvas, wrap, 2, function () {
-      buf.lastPaint = -1e9;
-      scheduleStatic();
-    });
-    if (!buf) return;
-    latticeItem = {
-      buf: buf,
-      visible: false,
-      /* Static signal ladder: part of the protocol section's print language. */
-      minInterval: 1e9,
-      render: function (t) { renderLattice(t); }
-    };
-    items.push(latticeItem);
-    watch(latticeItem, wrap);
-  }
-
   function setupCards() {
     for (var i = 0; i < 4; i++) {
       var canvas = doc.getElementById('card-canvas-' + i);
@@ -1401,7 +1319,6 @@
       }
       renderStatic();
     } else {
-      if (heroFrame) heroFrame.classList.remove('is-static');
       if (fpsEl) fpsEl.textContent = 'FPS // BAYER 4\u00d74';
       ensureLoop();
     }
@@ -1414,7 +1331,6 @@
     setupRibbon();
     setupInterference();
     setupSlab();
-    setupLattice();
     setupCards();
 
     doc.addEventListener('visibilitychange', function () {

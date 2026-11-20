@@ -42,7 +42,6 @@
 .btn--electric {
   background-image: var(--grad);
   background-size: 220% 220%;
-  animation: electric-shimmer 8s ease infinite;
   color: var(--on-accent);
 }
 
@@ -80,7 +79,7 @@
 
 .btn .arrow { font-size: 14px; line-height: 1; }
 
-/* --- labels, tags, stickers --------------------------------------------- */
+/* --- labels, tags --------------------------------------------- */
 .tag {
   display: inline-flex;
   align-items: center;
@@ -99,27 +98,6 @@
 }
 
 .tag b { color: var(--telemetry); font-weight: 700; }
-
-.sticker {
-  display: inline-block;
-  padding: 5px 9px;
-  border: 1.5px solid var(--line-strong);
-  background: var(--surface-2);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  transform: rotate(-3deg);
-  box-shadow: 3px 3px 0 var(--shadow);
-}
-
-.sticker--accent {
-  background-image: var(--grad);
-  color: var(--on-accent);
-  border-color: var(--line-strong);
-}
 
 .badge {
   display: inline-flex;
@@ -245,8 +223,7 @@ body.is-inverted .status-chip.is-offline { color: #b3123b; }
   color: var(--on-accent);
 }
 
-.invert-card:hover .tag,
-.invert-card:hover .sticker {
+.invert-card:hover .tag {
   border-color: var(--on-accent-line);
   background: var(--on-accent-soft);
   color: var(--on-accent);
@@ -600,17 +577,6 @@ html.js [data-reveal][data-delay="4"] { transition-delay: 270ms; }
 html.js [data-reveal][data-delay="5"] { transition-delay: 340ms; }
 
 /* --- misc ---------------------------------------------------------------- */
-.hud-corner {
-  position: absolute;
-  width: 14px;
-  height: 14px;
-  pointer-events: none;
-}
-
-.hud-corner--tl { top: 14px; left: 14px; border-top: 2px solid var(--blue); border-left: 2px solid var(--blue); }
-.hud-corner--tr { top: 14px; right: 14px; border-top: 2px solid var(--violet); border-right: 2px solid var(--violet); }
-.hud-corner--bl { bottom: 14px; left: 14px; border-bottom: 2px solid var(--blue); border-left: 2px solid var(--blue); }
-.hud-corner--br { bottom: 14px; right: 14px; border-bottom: 2px solid var(--violet); border-right: 2px solid var(--violet); }
 
 .rule-dot {
   display: inline-block;

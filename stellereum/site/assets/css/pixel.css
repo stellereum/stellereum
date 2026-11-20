@@ -32,7 +32,6 @@
   height: 100%;
   background-image: var(--grad);
   background-size: 200% 200%;
-  animation: electric-shimmer 14s steps(14, end) infinite;
   -webkit-mask-image: var(--bayer-pattern);
   mask-image: var(--bayer-pattern);
   -webkit-mask-size: 4px 4px;
@@ -82,11 +81,6 @@
 }
 
 .tag b { color: var(--telemetry); }
-
-.sticker {
-  border-radius: 0;
-  box-shadow: 3px 3px 0 var(--line-strong);
-}
 
 .icon-btn,
 .code-panel,
@@ -174,36 +168,23 @@ html.dither-ready .hero-stage::before { display: none; }
   inset: 0;
   z-index: 3;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
   color: var(--text-2);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: .18em;
   text-transform: uppercase;
   pointer-events: none;
 }
 
-.hero-fallback span:first-child {
-  color: var(--telemetry);
-  font-family: var(--font-display);
-  font-size: clamp(16px, 3vw, 32px);
-  letter-spacing: -.02em;
-}
-
 html.dither-ready .hero-fallback { display: none; }
 
-/* Pixel HUD chip set: hard corners, 1px frame, 3px offset block shadow. */
+/* Pixel HUD chip: hard corner, 1px frame, 2px offset block shadow. */
 .hud-chip {
   box-shadow: 2px 2px 0 rgba(94, 184, 255, .24);
 }
-
-.hud-chip b { font-variant-numeric: tabular-nums; }
-
-.hud-chip--scene { box-shadow: 3px 3px 0 rgba(168, 117, 255, .38); }
 
 .hero-status { box-shadow: 3px 3px 0 rgba(94, 184, 255, .22); }
 
@@ -225,7 +206,6 @@ html.dither-ready .hero-fallback { display: none; }
   mask-repeat: repeat;
   opacity: .78;
   pointer-events: none;
-  animation: electric-shimmer 12s steps(12, end) infinite;
 }
 
 /* Every numbered section is separated by a Bayer seam, not a flat rule. */
@@ -334,24 +314,6 @@ html.dither-ready .hero-fallback { display: none; }
 .card-media .dither-canvas,
 .card-media--static::before { image-rendering: pixelated; }
 
-/* Pixel sticker set: clipped corner, 1px hard frame, 2px block shadow. */
-.sticker {
-  position: relative;
-  border-radius: 0;
-  box-shadow: 3px 3px 0 var(--line-strong);
-  background: var(--surface-2);
-}
-
-.sticker::before {
-  content: "";
-  display: inline-block;
-  width: 5px;
-  height: 5px;
-  margin-right: 5px;
-  background: currentColor;
-  vertical-align: 0;
-}
-
 /* --- blocky reveal and stepped marquee ---------------------------------- */
 /* Kept as a fallback for elements outside [data-reveal]; motion.js adds
    .is-visible. The stepped timing is the reference's hard "bit" feel. */
@@ -401,50 +363,8 @@ html.js [data-reveal].is-visible {
 html.is-inverted .cursor,
 body.is-inverted .cursor { background: var(--indigo); }
 
-/* --- stepped scroll-cue and status bit ---------------------------------- */
+/* --- status bit --------------------------------------------------------- */
 .rule-dot { border-radius: 0; }
-
-.hero-scroll-arrow {
-  display: inline-block;
-  animation: bit-step 1.6s steps(3, end) infinite;
-}
-
-@keyframes bit-step {
-  0%, 33%   { transform: translateY(0); }
-  34%, 66%  { transform: translateY(3px); }
-  67%, 100% { transform: translateY(0); }
-}
-
-/* --- a second ordered-dither ribbon in the protocol section ------------- */
-.lattice-ribbon {
-  position: relative;
-  height: 18px;
-  margin: 0 0 clamp(20px, 3vw, 34px);
-  overflow: hidden;
-  border: 1px solid var(--line-strong);
-  background: var(--bg);
-  box-shadow: 4px 4px 0 var(--line-soft);
-}
-
-.lattice-ribbon .dither-canvas { z-index: 1; }
-
-.lattice-ribbon::after {
-  content: "BAYER 4×4 / SIGNAL LADDER";
-  position: absolute;
-  right: 5px;
-  top: 50%;
-  z-index: 2;
-  padding: 1px 5px;
-  border: 1px solid var(--line);
-  background: var(--stage-ink-strong);
-  color: var(--telemetry);
-  font-family: var(--font-mono);
-  font-size: 7px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  transform: translateY(-50%);
-  pointer-events: none;
-}
 
 /* --- dither ribbon (under the live telemetry section) -------------------- */
 .dither-ribbon {
@@ -592,25 +512,19 @@ html.js [data-reveal] {
   }
 
   .hero-lede-panel { background: var(--stage-ink-strong); }
-  .hero-inner { justify-content: flex-end; padding-bottom: 4px; }
+  .hero-inner { justify-content: flex-end; padding-bottom: clamp(16px, 4vh, 36px); }
+  .hero-status { font-size: 8px; padding: 4px 6px; gap: 7px; }
   .hud-chip { font-size: 8px; padding: 4px 6px; }
-  .hud-chip--tc,
-  .hud-chip--res { display: none; }
-  .hero-object-meta { font-size: 8px; }
-  .hero-mode { font-size: 8px; padding: 7px 9px; }
-  .hero-drag-hint { display: none; }
   .interference-stage { height: 52px; }
   .card-media { height: 92px; }
   .dither-slab { height: clamp(78px, 18vw, 116px); }
 }
 
 @media (max-width: 419.98px) {
-  .hud-chip--scene { max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
   .dither-ribbon { height: 24px; }
   .dither-ribbon-label { font-size: 7px; }
   .card-media { height: 84px; }
   .sec-head::before { width: 62%; }
-  .section-index { display: none; }
 }
 
 /* --- coarse pointers ----------------------------------------------------- */
@@ -633,20 +547,8 @@ html.js [data-reveal] {
 }
 
 /* --- restraint pass ------------------------------------------------------
-   Motion is reserved for the stage, the marquee, the scroll-deformed rows
-   and state changes. Dividers, header bars, HUD bars, static stamp boxes
-   and the limits band hold still: the pixel language is in the treatment,
-   not in constant movement. */
-.site-header::after,
-.dither-rule::before,
-.sec-rule,
-.hero-drag-bar span,
-.kinetic-row .k-box--alt,
-.btn--electric,
-.perf-band,
-.cta-panel,
-.hero-line--grad .hero-word,
-.dither-slab::after { animation: none; }
+   Motion is reserved for the stage, the marquee, the scroll-deformed row
+   and state changes. The pixel language here is treatment, not movement. */
 
 /* Keep the protocols / stack cards typographic and still. */
 #features .invert-card { transition: box-shadow var(--t-base) var(--ease); }
@@ -659,8 +561,7 @@ html.js [data-reveal] {
 #features .invert-card:hover .kv,
 #features .invert-card:hover .kv b,
 #features .invert-card:hover .tag { color: inherit; }
-#features .invert-card:hover .tag,
-#features .invert-card:hover .sticker { background: var(--surface); border-color: var(--line); color: inherit; box-shadow: none; }
+#features .invert-card:hover .tag { background: var(--surface); border-color: var(--line); color: inherit; box-shadow: none; }
 #features .card-media-label { background: var(--bg); border-color: var(--line); color: var(--telemetry); }
 #features .card-media .dither-canvas { filter: saturate(1.04); }
 
@@ -668,8 +569,6 @@ html.js [data-reveal] {
 @media (prefers-reduced-motion: reduce) {
   .dither-rule::before,
   .site-header::after,
-  .hero-drag-bar span,
-  .hero-scroll-arrow,
   .btn::after { animation: none; }
   .hero-stage { cursor: default; }
   .hero-mode { transition: none; }

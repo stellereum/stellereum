@@ -559,8 +559,12 @@ mod gossip_batch_tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                round: 0,
-        };        block.sign_block_with_falcon(&ks[1], &fks[1]);
+            // The runtime advanced to `r` so ks[1] owns the slot; the block
+            // must be signed for THAT round or the proposer check is a coin
+            // flip (it was 50/50 before: block round 0 vs runtime round r).
+            round: r,
+        };
+        block.sign_block_with_falcon(&ks[1], &fks[1]);
         let peer_vote =
             Vote::sign_with_falcon(&ks[1], &fks[1], rt.hc.height, r, VoteKind::Prevote, None);
         let batch = ConsensusMsg::Batch(vec![

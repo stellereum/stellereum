@@ -30,6 +30,13 @@ pub(crate) enum Commands {
         /// kept for operator-config compat, ignored with WARN).
         #[arg(long)]
         pure_pq: bool,
+        /// Do not start consensus until a supermajority of the committed
+        /// validator set at this height is verified to be on this fork id and
+        /// protocol version AND reachable. On timeout the node stays up as an
+        /// OBSERVER (RPC/sync serve; no propose/vote). Env fallback:
+        /// STELL_WAIT_SUPERMAJORITY.
+        #[arg(long)]
+        wait_for_supermajority: Option<u64>,
     },
     /// Bootstrap a FRESH observer from zero: preflight gate, then the live
     /// sync engine (snapshot-sync incl. ledger + all domains, body walk, live).

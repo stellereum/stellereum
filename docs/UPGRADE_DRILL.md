@@ -391,3 +391,70 @@ Recorded 2026-11-19:
 | Run dir | `/tmp/opencode/upgrade-drill-20261119-102547-2016350` |
 
 The 1-node fallback was also run: **PASS**, RTO **10.707 s**, heights 21 → 84.
+
+---
+
+## 9. Supervisor drill (`scripts/upgrade_supervisor_drill.sh`)
+
+This is the executable counterpart to `UPGRADE_AND_RECOVERY.md` §7. It proves
+the `stellereum-upgrader` workflow end-to-end on a throwaway local cluster:
+
+```
+halt (graceful stop + durable marker)
+  -> supervisor dry-run (verifies, changes nothing)
+  -> refusals: digest mismatch, symlink, world-writable staged file (all non-zero)
+  -> supervisor --apply (atomic rename of the verified bytes)
+  -> configured restart command
+  -> supermajority restart gate (solo committed set)
+  -> marker cleared, chain resumes above the halt height
+```
+
+### Commands
+
+```bash
+cd /path/to/stellereum-project
+CARGO_BUILD_JOBS=2 cargo build -p stellereum -p stellereum-upgrader
+./scripts/upgrade_supervisor_drill.sh --plan-name drill-v2
+```
+
+Options:
+
+| Flag | Meaning |
+|---|---|
+| `--supervisor PATH` | `stellereum-upgrader` binary (default: target/debug, then release, then `$PATH`). |
+| `--binary PATH` | Node binary under test (default: target/debug, then release, then `$PATH`). |
+| `--new-binary PATH` | Staged target. Default: a byte copy of `--binary`; the marker still names a new target version, which the restart exports as `STELL_UPGRADE_VERSION`. |
+| `--plan-name NAME` | Plan/target label written into the marker (default `drill-v2`). |
+| `--purge-on-pass` | Delete the run directory after PASS (logs are kept by default). |
+
+### What it enforces
+
+* All paths are under `/tmp/opencode/supervisor-drill-*`; ports are loopback
+  and allocated dynamically; no live endpoint is addressed.
+* The marker has the real `stell-upgrade-halt v1` header and the real
+  `height`/`halted_at_height`/`plan_name`/`plan_sha256`/`target_version` fields.
+* Dry-run must leave the live binary byte-identical.
+* Each refusal must exit non-zero **and** leave the live binary untouched.
+* Apply must leave the live binary's SHA-256 equal to the staged digest.
+* The restarted node must clear the marker, log
+  `cleared the upgrade-halt marker`, run `[upgrade-gate]`, and finalize above
+  the halt height.
+* The progress journal must contain `step=install`, `step=restart` and
+  `step=done`.
+
+The last stdout line is machine-readable:
+
+```
+SUP_DRILL_RESULT=PASS halt=<h> resumed=<h> plan=<name> sha256=<digest> log_dir=<dir>
+```
+
+Any failure prints `[sup-drill] FAIL`/`FATAL`, leaves the artifacts for
+diagnosis, and exits non-zero.
+
+### Relationship to §1–§8
+
+`scripts/upgrade_drill.sh` (manual/on-chain modes) still covers the full
+multi-node stop/swap/restart and the governance-triggered exit-42 path when
+its gate is open. The supervisor drill is narrower and faster: it proves the
+supervisor's refusals, atomic rename, restart contract and the supermajority
+observer fallback. Run both before a production rollout.

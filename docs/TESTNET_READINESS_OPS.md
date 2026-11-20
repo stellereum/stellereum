@@ -452,3 +452,152 @@ inode warn/hard 70/85 conf vs 80/90 docs) — pick testnet values and pin them
 in the checked-in conf; no RTO/RPO statement; no firewall/TLS inventory
 beyond loopback defaults + `allow-unknown`/`unknown-allow` notes; no chaos
 expectation for N=3 beyond local-cluster's honest "kill stalls finality".
+
+---
+
+## 9. Restart procedures (one node / all nodes)
+
+> These are procedures, not an executed drill. Unit names and scopes come from
+> `scripts/cluster-nodes.conf`: A/C/D are `system` units, B is a
+> `systemctl --user` unit. Adjust `STELL_NODES` for the 3-node set. Nothing
+> in this section authorises a restart without the human order required by
+> AGENTS.md §6.
+
+### 9.0 Rules that apply to every restart
+
+1. **Read-only check first and last.** `scripts/cluster_liveness.sh` is the
+   entry and exit gate for every restart:
+   ```bash
+   STELL_RPCS="A=http://127.0.0.1:8545,B=http://127.0.0.1:8546"
+   scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+   ```
+   Capture heights, spread, verdict and the `LIVENESS_RESULT=` line. The
+   later blocks use `$STELL_RPCS`; `export` it if they run in a new shell.
+2. **Quorum math first.** N=4 survives one validator down; N=3 needs **3/3**
+   and any single restart stalls finality. For N=3 the restart needs an
+   explicit window and comms, not just an operator at a keyboard.
+3. **Observed failure modes.** The live cluster has shown both:
+   - **height split** — `cluster_liveness.sh` reports `spread > 1`; one
+     validator is behind and may or may not be catching up. A lagging node
+     alone is *not* a reason to wipe.
+   - **round split** — heights can be close while `/health` shows
+     `consensus.round` / `last_finalized_round` far apart, rounds advancing
+     independently and no QC forming. This is the failure documented in
+     `docs/LIVENESS_ROUND_SYNC_AUDIT.md`; a single restart may or may not
+     re-converge, and a coordinated restart may be required.
+4. **Do not wipe data unless the genesis/fork id changed.** Before any
+   destructive step compare identity across nodes:
+   ```bash
+   for u in 8545 8546 8547 8548; do
+     curl -s "http://127.0.0.1:$u/health" \
+       | jq -c '{chain_id:.identity.chain_id,fork_id:.identity.fork_id,
+                 height:.chain.height.value,round:.consensus.round.value}'
+   done
+   ```
+   If `chain_id`/`fork_id` agree across nodes and with
+   `EXPECT_STELL_CHAIN_ID=5757`, a wipe destroys recoverable state and is not
+   justified. If they differ, stop and escalate (genesis discipline: §3;
+   `docs/FRESH_GENESIS_RUNBOOK.md`). Never delete single store files as a
+   "fix".
+5. **Stop/start, never `kill -9`.** A mid-write kill risks the sled store and
+   the consensus checkpoint. `Restart=always` is already trying; a manual
+   systemd restart is the supported path.
+
+### 9.1 Restart one node
+
+Example for node B (local `--user` unit); for A/C/D use
+`systemctl restart stell-node<X>.service` on the host from
+`scripts/cluster-nodes.conf`:
+
+```bash
+# 1. Pre-check (read-only) and save the output to the incident log.
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+
+# 2. Stop one node by its unit; wait for the unit to become inactive.
+systemctl --user stop stell-nodeB.service
+systemctl --user is-active stell-nodeB.service       # expect: inactive/failed
+
+# 3. Start the same unit. Do not edit/delete env, keys or data.
+systemctl --user start stell-nodeB.service
+journalctl --user -u stell-nodeB.service -f           # watch for FINALIZED/catch-up
+
+# 4. Post-check after it is reachable again (give catch-up time).
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+```
+
+Acceptance: verdict `OK`, `spread <= 1`, block hashes agree at the common
+height, and every reachable height advances for at least two minutes. A
+briefly larger spread while the restarted node catches up is expected; a
+spread that is *growing*, a regressed height, or `DIVERGED` is not.
+
+If the node does not catch up: collect `journalctl`, `df -i`, disk and
+`scripts/doctor.sh` output; verify chain/fork identity (9.0.4) and the env
+file; check for a stale lock with `scripts/stell-sync.sh lockclear <node>`
+(plan mode first — it stops the node). Do not wipe, and do not restore a
+backup over live data unless a human has confirmed the genesis/fork change.
+
+**Round split case:** if heights look fine but `/health` rounds stay far
+apart and finality is not advancing, restart the node whose round is
+furthest from the others *only after* recording every node's
+`round`/`last_finalized_round`. Re-check after it rejoins. If the split
+persists, stop and escalate; this is not fixed by deleting data.
+
+### 9.2 Restart all nodes
+
+Only with an explicit human order that names the window. Expect finality to
+stop during the last restart on N=3, and for the duration of a simultaneous
+restart on N=4.
+
+There are two supported shapes:
+
+**A. Controlled sequence (preferred for recovery).** Start the reference node
+first, then one node at a time, checking quorum between steps:
+
+```bash
+# Freeze load generators / writers first; record the pre-restart liveness line.
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90 | tee pre-restart.log
+
+# Topology is read-only; use its host/scope values instead of hard-coding.
+. scripts/cluster-nodes.conf
+
+# Node A (reference, system unit on its host)
+ssh $NODE_A_SSH_OPTS "$NODE_A_SSH" 'systemctl restart stell-nodeA.service'
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+
+# Node B, then C, then D: one at a time, same stop/start pair.
+systemctl --user restart stell-nodeB.service
+ssh $NODE_C_SSH_OPTS "$NODE_C_SSH" 'systemctl restart stell-nodeC.service'
+ssh $NODE_D_SSH_OPTS "$NODE_D_SSH" 'systemctl restart stell-nodeD.service'
+
+# Final gate: OK, spread <= 1, hashes agree, heights advance for 2 minutes.
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90 | tee post-restart.log
+```
+
+With N=4, stop/start each node while the other three keep quorum; do not run
+the three remote restarts in parallel unless the order explicitly allows a
+full-cluster outage.
+
+**B. Parallel restart via the shipped tool.** `scripts/stell-sync.sh restart`
+restarts every node's service concurrently. It is the fastest path and the
+largest blast radius; use it only when the order says a whole-cluster outage
+is acceptable:
+
+```bash
+scripts/stell-sync.sh restart
+```
+
+After either shape: confirm all four heights advance, `cluster_liveness.sh`
+returns `OK`, `/health` verdicts are healthy/ready, and no node logs
+`rejected proposal` / fork / divergence lines. If a node fails to start,
+leave its data in place, capture the journal and escalate — **do not wipe**.
+
+### 9.3 What a restart does not fix
+
+- **Genesis/fork-id mismatch:** a restart loops the same mismatch. Compare
+  identity and escalate; only a coordinated genesis change justifies new
+  data directories.
+- **Corrupt or full disk / inodes:** fix the host (space, inodes) before
+  restarting; repeated restarts can deepen the problem.
+- **Round split caused by software divergence:** if all nodes restart and
+  the round split returns immediately, preserve logs and escalate to the
+  binary/ruleset owner; do not "fix" quorum or wipe state.

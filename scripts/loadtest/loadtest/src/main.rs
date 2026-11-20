@@ -320,6 +320,25 @@ struct PreflightSender {
     balance: u64,
 }
 
+/// Machine-readable roster used by `--print-all-senders`:
+/// one bare address per line, followed by `SENDERS_TOTAL=<n>`.
+fn sender_address_lines(pre: &[PreflightSender]) -> Vec<String> {
+    let mut out = Vec::with_capacity(pre.len() + 1);
+    out.extend(pre.iter().map(|p| p.address.clone()));
+    out.push(format!("SENDERS_TOTAL={}", pre.len()));
+    out
+}
+
+/// Human summary: nonce and balance per sender.
+fn print_sender_summary(pre: &[PreflightSender]) {
+    for p in pre {
+        println!(
+            "sender[{:>3}] {} nonce={} balance={}",
+            p.index, p.address, p.init_nonce, p.balance
+        );
+    }
+}
+
 fn live_run(cfg: &Config) -> Result<i32, String> {
     // ---- safety gate (before any network I/O) ----
     let (audit, warnings) = safety::gate_live(&cfg.urls, cfg.allow_remote, cfg.operator_order)?;
@@ -520,6 +539,25 @@ fn live_run(cfg: &Config) -> Result<i32, String> {
         );
     }
 
+    if cfg.print_all_senders {
+        // The roster is deliberately printed BEFORE the funding gate and exits
+        // 0 even when senders are unfunded: funding 256 addresses requires the
+        // full list, not the first 50 plus "... N more".
+        println!();
+        for line in sender_address_lines(&pre) {
+            println!("{line}");
+        }
+        println!();
+        print_sender_summary(&pre);
+        println!(
+            "\nprint-all-senders: no transaction sent. {} senders listed; {} below the per-tx minimum {}.",
+            pre.len(),
+            unfunded.len(),
+            needed
+        );
+        return Ok(0);
+    }
+
     if !unfunded.is_empty() {
         println!();
         println!(
@@ -535,6 +573,10 @@ fn live_run(cfg: &Config) -> Result<i32, String> {
         }
         if unfunded.len() > 50 {
             println!("  ... {} more", unfunded.len() - 50);
+            println!(
+                "  rerun with --print-all-senders to print every address (one per line, \
+                 plus SENDERS_TOTAL=<n>)"
+            );
         }
         println!(
             "Fund these deterministic addresses from a testnet faucet/treasury, then rerun. \
@@ -545,12 +587,7 @@ fn live_run(cfg: &Config) -> Result<i32, String> {
 
     if cfg.print_senders || cfg.preflight_only {
         println!();
-        for p in &pre {
-            println!(
-                "sender[{:>3}] {} nonce={} balance={}",
-                p.index, p.address, p.init_nonce, p.balance
-            );
-        }
+        print_sender_summary(&pre);
         println!(
             "\npreflight only: no transaction sent. {} senders ready.",
             pre.len()
@@ -1581,5 +1618,25 @@ stell_block_interval_seconds_count 100
         assert!((mean - 1.235).abs() < 1e-9);
         assert_eq!(count, 100);
         assert!(parse_metrics_block_interval("stell_block_interval_seconds_count 0").is_none());
+    }
+
+    #[test]
+    fn print_all_senders_lists_every_address_and_a_total() {
+        let pre: Vec<PreflightSender> = (0..256u64)
+            .map(|i| PreflightSender {
+                index: i,
+                address: format!("0x{:064x}", i + 1),
+                init_nonce: i,
+                balance: 0,
+            })
+            .collect();
+        let lines = sender_address_lines(&pre);
+        assert_eq!(lines.len(), 257, "256 addresses + one total line");
+        assert_eq!(lines[255], format!("0x{:064x}", 256));
+        assert_eq!(lines[256], "SENDERS_TOTAL=256");
+        for addr in &lines[..256] {
+            assert!(addr.starts_with("0x") && addr.len() == 66, "{addr}");
+            assert!(!addr.contains(' '));
+        }
     }
 }

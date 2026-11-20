@@ -22,6 +22,7 @@ The Wave-2 procedure, funding math and stop conditions live in
 | `--allow-live` + non-loopback URL | refuses unless `--allow-remote` |
 | `--allow-live` + one of `212.113.103.105`, `213.21.246.5`, `138.124.102.200`, `178.155.74.242`, `77.110.96.68`, `rpc.stellereum.org` | refuses unless `--operator-order` |
 | `--preflight-only` / `--print-senders` | reads chain id, base fee and sender balances; sends **no** transaction |
+| `--print-all-senders` | same reads, then prints every address one per line plus `SENDERS_TOTAL=<n>`; exits 0 even when unfunded |
 
 The gate is pure: hostnames are compared literally and never resolved, so DNS
 cannot change the verdict. `--operator-order` is an explicit acknowledgement of
@@ -111,11 +112,41 @@ Exit code 0 means all local checks passed.
 
 This reads `stell_chainId`, `eth_chainId`, `stell_baseFee`,
 `stell_blockNumber`, `stell_getValidators`, and `stell_getBalance` for every
-sender. It prints every deterministic address, its on-chain nonce and balance,
-and refuses to start a live wave when any sender is below one transaction's
-cost (`amount + gas_limit + activation surcharge`).
+sender. When the set is funded it prints every deterministic address, its
+on-chain nonce and balance, and it refuses to start a live wave when any
+sender is below one transaction's cost (`amount + gas_limit + activation
+surcharge`).
 
 Fund the printed addresses from a testnet faucet/treasury, then rerun.
+
+### Funding a large sender set (one address per line)
+
+`--preflight-only` still exits 3 (funding failure) as soon as any sender is
+short, and its refusal block only shows the first 50 addresses. To obtain the
+complete 256-address set for funding, use the roster mode:
+
+```bash
+./scripts/loadtest/loadtest/target/release/stell-loadtest \
+  --allow-live --print-all-senders --url http://127.0.0.1:8545 --senders 256 \
+  | tee /tmp/opencode/senders-256.txt
+```
+
+Output shape:
+
+```
+0x<64 hex chars>
+0x<64 hex chars>
+...
+SENDERS_TOTAL=256
+
+sender[  0] 0x... nonce=0 balance=...
+...
+```
+
+The address lines are machine-readable (`grep '^0x'`, then `wc -l` must equal
+the `SENDERS_TOTAL=` value). The human summary follows after the total line.
+`--print-all-senders` sends no transaction and returns 0 even when every
+sender is unfunded; it always prints the whole set.
 
 ---
 

@@ -566,6 +566,77 @@ pub(crate) fn build_validator_set(
     (vs, is_validator)
 }
 
+/// Resolve the effective supermajority wait height (CLI wins over env).
+///
+/// An explicitly set but unparsable environment value is an ERROR: a typo must
+/// never silently disable a restart-safety gate.
+fn wait_for_supermajority_height(cli: Option<u64>) -> anyhow::Result<Option<u64>> {
+    if cli.is_some() {
+        return Ok(cli);
+    }
+    upgrade_halt::parse_wait_supermajority_height(
+        std::env::var(upgrade_halt::WAIT_SUPERMAJORITY_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Build one protocol report per COMMITTED validator.
+///
+/// The validator id -> peer mapping is the configured `consensus-pub` binding
+/// (Ed25519 consensus id), never a peer's self-declared identity. A validator
+/// with no pinned peer entry cannot be proven reachable and is reported
+/// missing. The local validator reports its own compile-time identity.
+fn supermajority_peer_reports(
+    adapter: &P2pNetworkAdapter,
+    committed: &ValidatorSet,
+    self_ed: [u8; 32],
+    expected_fork_id: u32,
+    expected_protocol: (u16, u16),
+) -> Vec<upgrade_halt::GatePeerReport> {
+    let mut out = Vec::with_capacity(committed.len());
+    for (validator, power) in &committed.validators {
+        if *validator == self_ed {
+            out.push(upgrade_halt::GatePeerReport {
+                validator: *validator,
+                power: *power,
+                present: true,
+                fork_id: Some(expected_fork_id),
+                protocol_version: Some(expected_protocol),
+            });
+            continue;
+        }
+        let peer_pid = adapter
+            .node
+            .cfg
+            .peers
+            .iter()
+            .find(|p| p.consensus_bytes().ok().flatten() == Some(*validator))
+            .and_then(|p| p.primary_id().ok());
+        match peer_pid.and_then(|pid| adapter.node.peer_protocol_state(&pid)) {
+            Some(state) => out.push(upgrade_halt::GatePeerReport {
+                validator: *validator,
+                power: *power,
+                present: true,
+                fork_id: Some(state.hello.fork_id),
+                protocol_version: Some((
+                    state.hello.protocol_version.major(),
+                    state.hello.protocol_version.minor(),
+                )),
+            }),
+            None => out.push(upgrade_halt::GatePeerReport {
+                validator: *validator,
+                power: *power,
+                present: false,
+                fork_id: None,
+                protocol_version: None,
+            }),
+        }
+    }
+    out
+}
+
 #[allow(clippy::type_complexity)]
 // GATE: faucet saver closure type is fixed by persistence hook; alias would churn CLI bootstrap without benefit.
 #[allow(clippy::cmp_owned)]
@@ -575,8 +646,11 @@ pub(crate) async fn run_node(
     shard: u32,
     parallel_exec: bool,
     pure_pq: bool,
+    wait_for_supermajority: Option<u64>,
 ) -> anyhow::Result<()> {
     install_genesis_chain_spec_from_env();
+    // Safety gate input is resolved ONCE, before any consensus state exists.
+    let supermajority_height = wait_for_supermajority_height(wait_for_supermajority)?;
     // FULL-PQ: `--pure-pq` parsed-and-ignored with WARN (compat).
     if pure_pq {
         eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
@@ -837,7 +911,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             "inf1:{}",
             hex::encode(&blake3::hash(&self_ed).as_bytes()[..20])
         );
-        let (vset, is_validator) = build_validator_set(
+        let (vset, mut is_validator) = build_validator_set(
             &adapter.node.cfg,
             self_ed,
             &self_consensus_id,
@@ -1427,6 +1501,143 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         }
 
         stellereum::rpc::hydrate_rpc_from_store(&rpc_state, &persistence.storage()).await;
+
+        // SUPERMAJORITY RESTART GATE (`docs/UPGRADE_AND_RECOVERY.md` §7).
+        // A coordinated restart is only safe when a supermajority of the
+        // COMMITTED set is on this fork/protocol and reachable. This runs
+        // before `run_consensus_node` is spawned, so a node that cannot prove
+        // it either delays consensus (bounded) or stays an observer; it can
+        // never sneak a vote out while its fleet is split. The RPC/sync
+        // surfaces below still serve in observer mode.
+        if let Some(gate_height) = supermajority_height {
+            let committed =
+                match upgrade_halt::committed_validator_set_at(&persistence.storage(), gate_height)
+                {
+                    Ok(Some(set)) => {
+                        info!(
+                            "[upgrade-gate] using the committed validator set at height {} \
+                             ({} validator(s), total power {})",
+                            gate_height,
+                            set.len(),
+                            set.total_power()
+                        );
+                        set
+                    }
+                    Ok(None) => {
+                        // The committed ledger at that height names no bonded
+                        // validators: the runtime keeps the config-defined set
+                        // in force. That set is a pure function of the
+                        // config/genesis, not of peer claims.
+                        tracing::warn!(
+                            "[upgrade-gate] the committed staking ledger at height {} is EMPTY; \
+                             using the deterministic config-defined validator set (the runtime \
+                             does the same while no bond exists)",
+                            gate_height
+                        );
+                        vset.clone()
+                    }
+                    Err(e) => {
+                        // Fail closed: an unreadable or absent committed set
+                        // cannot prove who may vote. Stay an observer and name
+                        // the reason.
+                        tracing::error!(
+                            "[upgrade-gate] REFUSING consensus at height {}: {e}; staying up as \
+                             an OBSERVER",
+                            gate_height
+                        );
+                        eprintln!("[upgrade-gate] REFUSING consensus at height {gate_height}: {e}");
+                        is_validator = false;
+                        vset.clone()
+                    }
+                };
+            let self_in_committed = committed.contains(&self_ed);
+            if !self_in_committed && is_validator {
+                tracing::warn!(
+                    "[upgrade-gate] this validator is NOT in the committed set at height {}; \
+                     staying an OBSERVER (config membership cannot override the committed set)",
+                    gate_height
+                );
+                is_validator = false;
+            }
+            if is_validator && !committed.is_empty() {
+                let timeout = match upgrade_halt::parse_wait_supermajority_timeout(
+                    std::env::var(upgrade_halt::WAIT_SUPERMAJORITY_TIMEOUT_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[upgrade-gate] {e}");
+                        anyhow::bail!("{e}");
+                    }
+                };
+                let expected_fork = stellereum::protocol::FORK_ID;
+                let expected_protocol = (
+                    stellereum::protocol::PROTOCOL_VERSION.major(),
+                    stellereum::protocol::PROTOCOL_VERSION.minor(),
+                );
+                let total_power = committed.total_power();
+                let required_power = committed.quorum_power();
+                info!(
+                    "[upgrade-gate] waiting up to {:?} for {} of {} committed power on \
+                     fork_id=0x{:08x} protocol {}.{} (height {})",
+                    timeout,
+                    required_power,
+                    total_power,
+                    expected_fork,
+                    expected_protocol.0,
+                    expected_protocol.1,
+                    gate_height
+                );
+                let evaluation = upgrade_halt::wait_for_supermajority(
+                    expected_fork,
+                    expected_protocol,
+                    total_power,
+                    required_power,
+                    timeout,
+                    Duration::from_secs(2),
+                    || {
+                        supermajority_peer_reports(
+                            &adapter,
+                            &committed,
+                            self_ed,
+                            expected_fork,
+                            expected_protocol,
+                        )
+                    },
+                )
+                .await;
+                if evaluation.eligible {
+                    info!(
+                        "[upgrade-gate] supermajority verified; joining consensus ({})",
+                        evaluation.summary()
+                    );
+                } else {
+                    tracing::error!(
+                        "[upgrade-gate] OBSERVER MODE: {} — the node will serve RPC/sync but \
+                         will not propose or vote until restarted with a supermajority on this \
+                         build",
+                        evaluation.summary()
+                    );
+                    eprintln!(
+                        "[upgrade-gate] OBSERVER MODE ({}); fix the named validators and restart",
+                        evaluation.summary()
+                    );
+                    is_validator = false;
+                }
+            } else if !is_validator {
+                info!(
+                    "[upgrade-gate] node is not a validator; supermajority gate does not \
+                     change observer mode"
+                );
+            } else {
+                eprintln!(
+                    "[upgrade-gate] committed validator set at height {gate_height} is EMPTY; \
+                     refusing consensus (OBSERVER mode)"
+                );
+                is_validator = false;
+            }
+        }
 
         let c_rpc = rpc_state.clone();
         let c_remote_signer = remote_signer.clone();

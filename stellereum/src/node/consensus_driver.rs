@@ -120,6 +120,57 @@ fn restored_round(persisted_round: u32, vote_watermark_floor: Option<u32>) -> u3
     vote_watermark_floor.map_or(capped, |floor| capped.max(floor))
 }
 
+/// The finalized tip a restart MUST use for a loaded engine state.
+///
+/// `snapshot_state_height` is the height whose POST-state the engine holds.
+/// The stored `finalized` pointer is normally at or above it. It can be
+/// BEHIND it: the finalize pointer is an asynchronously-queued job that may be
+/// dropped under queue pressure (loudly, but dropped), while the state
+/// snapshot of a later height did land — and the snapshot loader only installs
+/// state at `S` when block `S + 1` anchors its root, so that state is already
+/// final.
+///
+/// Running with `hc.height = S + 1` while `finalized` still says `F < S` is
+/// the HEIGHT-SPLIT defect: `propose` builds at `S + 1` with `prev_hash` = the
+/// hash of block `F`, a gap no peer accepts, and the catch-up walk anchors at
+/// `F + 1`, whose block commits to the root the engine has already left
+/// behind — so every walk is refused on parent-root continuity and the node
+/// can never rejoin (only a wipe did).
+///
+/// Returns the tip the node must use. `resolve_parent_hash(S)` must return the
+/// hash of the finalized block at `S`; `None` means the local store cannot
+/// prove it, and the caller must fail closed rather than propose above an
+/// unfinalized parent.
+fn reconciled_finalized_tip(
+    snapshot_state_height: u64,
+    stored_finalized: Option<(u64, [u8; 32])>,
+    resolve_parent_hash: impl Fn(u64) -> Option<[u8; 32]>,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    let stored_tip = stored_finalized.map(|(h, _)| h).unwrap_or(0);
+    if snapshot_state_height <= stored_tip {
+        return Ok(stored_finalized);
+    }
+    match resolve_parent_hash(snapshot_state_height) {
+        Some(hash) => Ok(Some((snapshot_state_height, hash))),
+        None => Err(format!(
+            "engine state is at height {snapshot_state_height} but the stored finalized tip is \
+             {stored_tip} and no local header/body proves the hash of block {snapshot_state_height}; \
+             refusing to run (and propose) above an unfinalized parent"
+        )),
+    }
+}
+
+/// True when this node may build a proposal at `hc_height`.
+///
+/// A block's `prev_hash` is always our finalized tip, so proposing is only
+/// meaningful at exactly `finalized_tip + 1` (height 1 at genesis). Any other
+/// combination builds a block that skips heights or reuses a decided parent;
+/// peers refuse it as a stale/wrong height, and the node burns rounds on a
+/// proposal nobody can vote. This is the propose-side half of HEIGHT-SPLIT.
+fn proposal_parent_is_finalized(finalized_tip: u64, hc_height: u64) -> bool {
+    finalized_tip.checked_add(1) == Some(hc_height)
+}
+
 /// Raise the in-memory floor after a vote was cast this process.
 fn advance_vote_floor(floor: &mut Option<(u64, u32)>, height: u64, round: u32) {
     match floor {
@@ -651,6 +702,63 @@ pub(crate) async fn run_consensus_node(
             }
             Ok(None) => {}
             Err(e) => eprintln!("[storage] could not read the finalized head: {e}"),
+        }
+
+        // HEIGHT-SPLIT RECONCILIATION (restart): never run with `hc.height`
+        // above our own finalized tip + 1. The stored finalize pointer is an
+        // async job that can be dropped under queue pressure while a later
+        // state snapshot landed; the loader already proved that state (block
+        // S + 1 anchors its root), so the state height IS final even when the
+        // pointer was not updated. Repair the pointer from the hash-linked
+        // local header instead of proposing at S + 1 with F's parent (a gap
+        // no peer accepts, and a catch-up walk anchored at F that our engine
+        // is already past). The trusted parent is the one the verified anchor
+        // at S + 1 names; the header at S is the fallback. No proof -> fail
+        // closed, because a block above an unfinalized parent forks.
+        {
+            let stored = ap.storage().finalized().ok().flatten();
+            let resolved = reconciled_finalized_tip(restored_state_height, stored, |s| {
+                if let Ok(Some(hdr)) = ap.storage().header_at(s.saturating_add(1)) {
+                    if hdr.height == s.saturating_add(1) {
+                        return Some(hdr.prev_hash);
+                    }
+                }
+                if let Ok(Some(hdr)) = ap.storage().header_at(s) {
+                    if hdr.height == s {
+                        return Some(hdr.block_hash);
+                    }
+                }
+                None
+            });
+            match resolved {
+                Ok(Some((tip, hash)))
+                    if tip > rt.finalized.last().map(|(h, _)| *h).unwrap_or(0) =>
+                {
+                    info!(
+                        "[storage] engine state at {restored_state_height} is ahead of the stored \
+                         finalized tip {}; repaired the tip to {tip} from the verified local header \
+                         (a stale finalize pointer must never make the node propose above its own \
+                         finalized parent)",
+                        rt.finalized.last().map(|(h, _)| *h).unwrap_or(0)
+                    );
+                    rt.finalized.push((tip, hash));
+                    if rt.hc.height != tip.saturating_add(1) {
+                        rt.hc = stellereum::consensus::HeightConsensus::new(
+                            tip.saturating_add(1),
+                            rt.validators.clone(),
+                        );
+                    }
+                    rt.hc.set_parent_hash(hash);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[storage] REFUSING to join consensus on an unprovable head: {e} \
+                         (wipe the data directory or restore a verified backup)"
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
 
         // If we resumed from a tip but had no snapshot for it, take one now.
@@ -2152,7 +2260,7 @@ pub(crate) async fn run_consensus_node(
         if last_gate_diag != Some((height, round)) {
             last_gate_diag = Some((height, round));
             tracing::warn!(
-                "[consensus] propose-gate h={} r={} can_vote={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} scheduled={}",
+                "[consensus] propose-gate h={} r={} can_vote={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} parent_ready={} scheduled={}",
                 height,
                 round,
                 can_vote,
@@ -2160,6 +2268,10 @@ pub(crate) async fn run_consensus_node(
                 rt.is_proposer(),
                 rt.hc.has_live_proposal(),
                 last_block_at.elapsed() >= min_block_time,
+                proposal_parent_is_finalized(
+                    rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
+                    rt.hc.height
+                ),
                 rt.hc
                     .proposer()
                     .map(|p| hex::encode(&p[..6]))
@@ -2176,10 +2288,22 @@ pub(crate) async fn run_consensus_node(
         // changed under the prebuild) is handled inside `propose` by
         // per-tx revalidation + top-up, so the worst case is one bounded
         // O(block) revalidation before a fresh-equivalent build.
-        if can_vote && !rt.has_pending_apply() {
+        // PARENT-BOUND PROPOSAL GATE (HEIGHT-SPLIT, propose half): a block's
+        // `prev_hash` is always our finalized tip, so the only height we may
+        // build at is `tip + 1` (height 1 at genesis). Proposing at any other
+        // height emits a block that either skips heights or reuses a decided
+        // parent — peers refuse it as a stale/wrong height and ours burns the
+        // round. This is also the backstop for a restored head that could not
+        // be reconciled: fail closed (no proposal) rather than fork.
+        let parent_is_finalized = proposal_parent_is_finalized(
+            rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
+            rt.hc.height,
+        );
+        if can_vote && !rt.has_pending_apply() && parent_is_finalized {
             rt.prebuild_next_proposal(now_secs()).await;
         }
         if can_vote
+            && parent_is_finalized
             && !rt.has_pending_apply()
             && rt.is_proposer()
             && !rt.hc.has_live_proposal()
@@ -4333,6 +4457,10 @@ pub(crate) async fn run_consensus_node(
             // Timeouts never move safety (lock rules untouched); earlier
             // proposals only improve liveness.
             if can_vote
+                && proposal_parent_is_finalized(
+                    rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
+                    rt.hc.height,
+                )
                 && !rt.has_pending_apply()
                 && rt.is_proposer()
                 && !rt.hc.has_live_proposal()
@@ -5056,5 +5184,70 @@ mod vote_watermark_tests {
         assert!(!round_at_or_below_vote_floor(precommit_floor, 7, 12));
         // A different height is governed by its own floor.
         assert!(!round_at_or_below_vote_floor(precommit_floor, 8, 0));
+    }
+}
+
+#[cfg(test)]
+mod restart_height_tests {
+    use super::*;
+
+    /// The stored finalize pointer normally wins; the engine state can only be
+    /// older (slower) than it, and that gap is healed elsewhere.
+    #[test]
+    fn a_snapshot_at_or_below_the_finalized_tip_keeps_the_stored_tip() {
+        let stored = Some((40u64, [7u8; 32]));
+        for state in [0u64, 39, 40] {
+            assert_eq!(
+                reconciled_finalized_tip(state, stored, |_| panic!("must not resolve")),
+                Ok(stored),
+                "state {state} must not override a finalized tip at 40"
+            );
+        }
+        assert_eq!(
+            reconciled_finalized_tip(0, None, |_| panic!("must not resolve")),
+            Ok(None)
+        );
+    }
+
+    /// HEIGHT-SPLIT: when the state snapshot is AHEAD of the stored pointer,
+    /// the state height is final (the loader verified its root against block
+    /// S+1) and must become the tip — never leave `hc.height = S+1` paired
+    /// with a parent F we did not finalize.
+    #[test]
+    fn an_engine_ahead_of_the_pointer_repairs_the_tip_from_the_local_header() {
+        let hash = [0x5Au8; 32];
+        let got = reconciled_finalized_tip(55, Some((50, [0x11; 32])), |s| {
+            assert_eq!(s, 55);
+            Some(hash)
+        });
+        assert_eq!(got, Ok(Some((55, hash))));
+        // No pointer at all + a restored state: same repair.
+        let got = reconciled_finalized_tip(9, None, |_| Some([0x99; 32]));
+        assert_eq!(got, Ok(Some((9, [0x99; 32]))));
+    }
+
+    /// No local proof of the state height's block hash -> fail closed. Running
+    /// with the stale parent would propose above an unfinalized parent and the
+    /// catch-up walk would anchor behind the engine, wedging both paths.
+    #[test]
+    fn an_unprovable_ahead_state_is_refused() {
+        let got = reconciled_finalized_tip(55, Some((50, [0x11; 32])), |_| None);
+        assert!(got.is_err(), "an unprovable head must never be used");
+    }
+
+    /// Proposing is only meaningful at exactly `finalized_tip + 1`; every
+    /// other relationship builds a block peers refuse (a height gap or a
+    /// reused parent).
+    #[test]
+    fn proposals_only_at_the_next_finalized_parent() {
+        assert!(proposal_parent_is_finalized(0, 1), "genesis child");
+        assert!(proposal_parent_is_finalized(5, 6));
+        assert!(
+            !proposal_parent_is_finalized(5, 5),
+            "parent already decided"
+        );
+        assert!(!proposal_parent_is_finalized(5, 7), "skips a height");
+        assert!(!proposal_parent_is_finalized(5, 4));
+        assert!(!proposal_parent_is_finalized(u64::MAX, u64::MAX));
     }
 }

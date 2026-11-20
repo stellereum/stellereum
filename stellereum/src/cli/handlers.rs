@@ -82,8 +82,16 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             shard,
             parallel_exec,
             pure_pq,
+            wait_for_supermajority,
         } => {
-            crate::node::bootstrap::run_node(config, shard, parallel_exec, pure_pq).await?;
+            crate::node::bootstrap::run_node(
+                config,
+                shard,
+                parallel_exec,
+                pure_pq,
+                wait_for_supermajority,
+            )
+            .await?;
         }
         Commands::Sim { blocks } => {
             println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -1735,6 +1743,20 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
         }
         Commands::UpgradeStatus { marker } => {
             use crate::node::bootstrap::upgrade_halt as halt;
+            let gate_env = std::env::var(halt::WAIT_SUPERMAJORITY_ENV).ok();
+            match halt::parse_wait_supermajority_height(gate_env.as_deref()) {
+                Ok(Some(h)) => println!(
+                    "supermajority restart gate: ENABLED at height {h} ({}=...); a node waits for \
+                     strictly more than 2/3 of the committed power on this fork/protocol and \
+                     falls back to OBSERVER on timeout",
+                    halt::WAIT_SUPERMAJORITY_ENV
+                ),
+                Ok(None) => println!(
+                    "supermajority restart gate: disabled ({}=unset)",
+                    halt::WAIT_SUPERMAJORITY_ENV
+                ),
+                Err(e) => println!("supermajority restart gate: INVALID CONFIG — {e}"),
+            }
             let path = marker.unwrap_or_else(halt::marker_path);
             match halt::read_marker(&path) {
                 Ok(None) => {

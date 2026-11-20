@@ -23,6 +23,7 @@ use infnode::proto::{
 };
 
 #[path = "../src/node/upgrade_halt.rs"]
+#[allow(dead_code)]
 mod upgrade_halt;
 
 use upgrade_halt::{

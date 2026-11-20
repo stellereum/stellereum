@@ -179,3 +179,38 @@ groups:
         annotations:
           summary: "Fewer than 3 observed peers on {{ $labels.instance }} (stale series linger; see runbook)"
           runbook: "ops/alerts.md#peerslost"
+
+  - name: stellereum-liveness
+    interval: 30s
+    rules:
+      # These four series come from the node_exporter TEXTFILE collector, not
+      # from the node's /metrics endpoint. They are written by
+      # scripts/cluster_liveness_watch.sh (reads cluster_liveness.sh output):
+      #
+      #   node_exporter --collector.textfile.directory=<dir containing
+      #     stell_cluster_liveness.prom>
+      #
+      # The `instance` label is the node_exporter target that runs the
+      # watcher, so run one watcher per cluster and keep it scraped. A dead
+      # watcher leaves the last sample in place; alert on
+      # `up{job="node_exporter"} == 0` separately if the watcher host is in
+      # scope.
+      - alert: ClusterLivenessFailed
+        expr: stell_cluster_liveness_ok == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cluster_liveness.sh reports STALLED/DIVERGED on {{ $labels.instance }}"
+          description: "stell_cluster_liveness_ok has been {{ $value }} for 2m. Run scripts/cluster_liveness.sh with --journal for the per-node reason."
+          runbook: "docs/TESTNET_READINESS_OPS.md#9-restart-procedures-one-node--all-nodes"
+
+      - alert: ClusterHeightSpread
+        expr: stell_cluster_spread > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator height spread is {{ $value }} blocks on {{ $labels.instance }} (threshold: >1)"
+          description: "One or more validators are behind the tip. Do not wipe data; check height/round split and restart only the lagging node per the runbook."
+          runbook: "docs/TESTNET_READINESS_OPS.md#9-restart-procedures-one-node--all-nodes"

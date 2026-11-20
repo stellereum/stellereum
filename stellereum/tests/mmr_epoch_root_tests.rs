@@ -9,6 +9,10 @@
 //!
 //! This binary touches the process-wide finalized-header store, so every
 //! test uses its OWN epoch range — tests in one binary share a process.
+//!
+//! The serial guard is deliberately held across await points: these tests
+//! mutate process-wide registries, so overlapping them would be a test bug.
+#![allow(clippy::await_holding_lock)]
 
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};

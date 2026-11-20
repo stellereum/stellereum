@@ -1,0 +1,15 @@
+[workspace]
+# The operator-side supervisor is the only member of this small workspace.
+# The node tree keeps its own standalone manifest and profile settings; the
+# excludes make that explicit so `cargo` invoked inside `stellereum/` never
+# adopts this workspace by accident.
+members = ["stellereum-upgrader"]
+exclude = [
+    "stellereum",
+    "infnode",
+    "stellereum-contracts",
+    "stellereum-indexer",
+    "stellereum-sdk",
+    "stell-wallet",
+]
+resolver = "2"

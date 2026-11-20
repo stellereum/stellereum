@@ -860,6 +860,21 @@ pub struct ConsensusCluster {
     /// old harness behaviour). Scenarios opt in via
     /// [`Self::with_straggler_policy`].
     straggler: StragglerPolicy,
+    /// Every FINALIZED height's commit as broadcast by its decider, in height
+    /// order (first writer wins). Mirrors the production `Committed` push and
+    /// lets a restart scenario deliver the commits finalized while the node
+    /// was out — production learns those from its peers' DHT head/body push
+    /// and the retained commit rebroadcast, which the harness does not model.
+    committed_log: Vec<(Height, Block, QuorumCertificate)>,
+    /// Opt-in (restart scenarios): retain the commit log so a returning node
+    /// can be handed the heights finalized while it was out. Off by default so
+    /// every pre-existing scenario keeps its exact memory profile.
+    retain_commits: bool,
+    /// The genesis account funding every node started from (dev + recipient,
+    /// plus seeded senders). A restart rebuilds the engine by replaying the
+    /// finalized chain from this same genesis, so the restored state root is
+    /// the one the never-restarted peers hold.
+    genesis_funding: HashMap<[u8; 32], u64>,
 }
 
 impl ConsensusCluster {
@@ -1007,6 +1022,9 @@ impl ConsensusCluster {
             fast_forward: true,
             vote_pipeline: true,
             straggler: StragglerPolicy::default(),
+            committed_log: Vec::new(),
+            retain_commits: false,
+            genesis_funding: HashMap::new(),
         }
     }
 
@@ -1127,10 +1145,140 @@ impl ConsensusCluster {
         }
     }
 
+    /// Restart member `index` from its PERSISTED finalized tip `upto` (the
+    /// member's current tip when `None`), clearing the in-memory tip above it.
+    ///
+    /// This is the harness model of a process restart: the engine is rebuilt
+    /// from the SAME genesis funding and the finalized bodies up to `upto`
+    /// are replayed through the production transition (`apply_and_advance`),
+    /// then the vote watermark at the resumed height (`upto + 1`) raises the
+    /// round exactly as `restored_round` does in the driver. The node's
+    /// validator keys, voting power and the cluster-wide double-vote history
+    /// are preserved; the per-round harness bookkeeping (last votes, proposed
+    /// slot) is cleared, as on a real restart.
+    ///
+    /// The trust anchor is the persisted FINALIZED LIST, not whatever the
+    /// node had in memory: replaying `1..=upto` is the same proof obligation
+    /// a restarted node has before it may vote again.
+    pub async fn restart_member(&mut self, index: usize, upto: Option<Height>) {
+        let tip = upto.unwrap_or_else(|| {
+            self.members[index]
+                .rt
+                .finalized
+                .last()
+                .map(|(h, _)| *h)
+                .unwrap_or(0)
+        });
+        let key = self.members[index].key.clone();
+        let falcon = self.members[index].falcon.clone();
+        let mut replay: Vec<(Height, BlockHash, Block)> = Vec::new();
+        for (h, hash) in self.members[index].rt.finalized.iter() {
+            if *h > tip {
+                break;
+            }
+            let block = self.members[index]
+                .rt
+                .blocks
+                .get(hash)
+                .cloned()
+                .unwrap_or_else(|| panic!("restart: no retained body for finalized height {h}"));
+            replay.push((*h, *hash, block));
+        }
+
+        // Rebuild the engine from the same genesis funding, then replay the
+        // finalized chain through the production transition.
+        let state = Arc::new(InMemoryStateEngine::new());
+        for (who, balance) in self.genesis_funding.iter() {
+            state
+                .update_account(AccountState::new(*who, *balance))
+                .await;
+        }
+        let mut rt = ValidatorRuntime::new(key, self.validators.clone(), state, 1)
+            .with_falcon_key(falcon)
+            .with_deterministic_sim_signing();
+        for (_, hash, block) in &replay {
+            // Retain the body exactly like the production restore/heal path
+            // does: an adopted/walked next height resolves its PARENT here for
+            // the timestamp + decision-evidence checks.
+            rt.blocks.insert(*hash, block.clone());
+            rt.apply_and_advance(*hash, block).await;
+        }
+        if let Some((_, _, tip_block)) = replay.last() {
+            if let Some(qc) = tip_block.precommit_qc.clone() {
+                rt.last_decision = Some((tip_block.height, tip_block.clone(), qc));
+            }
+        }
+        // Vote watermark floor at the height we resume at (production
+        // `restored_round`: never re-vote a round already signed).
+        let resumed_height = tip + 1;
+        let floor = self.vote_floor[index]
+            .iter()
+            .filter(|((h, _), _)| *h == resumed_height)
+            .map(|(_, r)| *r)
+            .max();
+        if let Some(floor) = floor {
+            rt.hc.round = floor;
+        }
+
+        let m = &mut self.members[index];
+        m.rt = rt;
+        m.round_started_ms = self.now_ms;
+        m.last_prevoted = None;
+        m.last_precommitted = None;
+        m.proposed = None;
+        m.last_prevote = None;
+        m.last_precommit = None;
+        m.byzantine_round = None;
+        m.sim_sightings.clear();
+        m.arrivals_by_bucket.clear();
+    }
+
+    /// Deliver every retained commit ABOVE `above` to member `index` on the
+    /// next tick (the production `Committed` push a returning node reads).
+    pub fn deliver_committed_above(&mut self, index: usize, above: Height) {
+        let due = self.now_ms + self.tick_ms;
+        for (height, block, certificate) in self.committed_log.iter() {
+            if *height <= above {
+                continue;
+            }
+            self.seq += 1;
+            self.wire.push(Pending {
+                deliver_at: due,
+                seq: self.seq,
+                to: index,
+                wire: Wire::Committed {
+                    height: *height,
+                    block: block.clone(),
+                    certificate: certificate.clone(),
+                },
+            });
+        }
+    }
+
+    /// Opt this scenario into retaining the commit log (restart catch-up).
+    pub fn retain_commits(&mut self) {
+        self.retain_commits = true;
+    }
+
+    /// The highest commit the cluster retained (the height a returning node
+    /// must reach before it can vote usefully again).
+    pub fn retained_height(&self) -> Height {
+        self.committed_log.last().map(|(h, _, _)| *h).unwrap_or(0)
+    }
+
+    /// The retained commits, in height order: `(height, block, certificate)`.
+    pub fn retained_commits(&self) -> &[(Height, Block, QuorumCertificate)] {
+        &self.committed_log
+    }
+
     /// Seed every node's mempool with the same transaction, so the blocks
     /// carry real content and the state root EVOLVES height by height (a
     /// state-root comparison over an always-empty state proves nothing).
     pub async fn seed_transactions(&mut self, count: u64) {
+        self.genesis_funding
+            .insert(self.dev_address, self.genesis_balance);
+        self.genesis_funding
+            .insert(self.recipient, self.genesis_balance);
         for m in self.members.iter_mut() {
             // The dev account is funded identically on every node, so every
             // node starts from the same state root.
@@ -1164,6 +1312,13 @@ impl ConsensusCluster {
     /// Deterministic: sender keys derive from the cluster seed, funding is
     /// identical on every node.
     pub async fn seed_transactions_multi(&mut self, n_senders: u64, txs_per_sender: u64) {
+        self.genesis_funding
+            .insert(self.recipient, self.genesis_balance);
+        for s in 0..n_senders {
+            let sk = key_at(0xBEEF_0000, s);
+            self.genesis_funding
+                .insert(sk.verifying_key().to_bytes(), self.genesis_balance);
+        }
         for m in self.members.iter_mut() {
             m.rt.state
                 .update_account(AccountState::new(self.recipient, self.genesis_balance))
@@ -1643,7 +1798,15 @@ impl ConsensusCluster {
                     // A peer already committed this height: adopt it (the
                     // certificate is verified against OUR validator set).
                     let rt = &mut self.members[i].rt;
-                    let _ = rt.adopt_committed(height, block, certificate).await;
+                    let res = rt.adopt_committed(height, block, certificate).await;
+                    if let Err(e) = &res {
+                        if std::env::var("CLUSTER_DEBUG").as_deref() == Ok("1") {
+                            eprintln!(
+                                "[dbg] node{i} refused commit h={height} (ours h={} r={}): {e}",
+                                self.members[i].rt.hc.height, self.members[i].rt.hc.round
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1748,6 +1911,13 @@ impl ConsensusCluster {
         // the outcome and adopts the block (this is the catch-up path the
         // production loop uses).
         let stamp = self.now_ms;
+        // Retain the FIRST commit per height so a restart scenario can deliver
+        // the heights finalized while a node was out (the harness does not
+        // model the DHT head/body push that production uses to resend them).
+        if self.retain_commits && !self.committed_log.iter().any(|(lh, _, _)| *lh == h) {
+            self.committed_log.push((h, block.clone(), cert.clone()));
+            self.committed_log.sort_by_key(|(lh, _, _)| *lh);
+        }
         self.broadcast(
             i,
             Wire::Committed {
@@ -1990,12 +2160,11 @@ impl ConsensusCluster {
             // Round-free value identity of each decided height (ruleset v6):
             // the body is retained with the finality QC, so this is the value
             // the node actually committed to.
-            let finalized_values: Vec<(Height, [u8; 32])> = m
-                .rt
-                .finalized
-                .iter()
-                .filter_map(|(h, hash)| m.rt.blocks.get(hash).map(|b| (*h, b.value_id())))
-                .collect();
+            let finalized_values: Vec<(Height, [u8; 32])> =
+                m.rt.finalized
+                    .iter()
+                    .filter_map(|(h, hash)| m.rt.blocks.get(hash).map(|b| (*h, b.value_id())))
+                    .collect();
             nodes.push(NodeReport {
                 index: m.index,
                 id: hex::encode(&m.id[..4]),

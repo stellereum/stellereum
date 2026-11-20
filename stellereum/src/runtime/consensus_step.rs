@@ -2460,31 +2460,40 @@ impl ValidatorRuntime {
         // validator set below, so the round of the decision carries no
         // authority of its own: a height has ONE decision, and this is it.
         //
-        // FUTURE rounds are normally refused (forward sync owns them, not
-        // adoption) — with ONE exception: a certificate from a round that is
-        // STRICTLY LATER than our own lock is the proof that the network moved
-        // on without us. That is exactly the case a locked node must follow
-        // (adopting it is the SEC-01 fix); refusing it as "forward" left the
-        // node partitioned from the canonical chain forever. The exception is
-        // bounded by the same lookback, so a certificate from an absurdly far
-        // future round is still refused, and it still has to pass the
-        // validator-quorum verification below.
-        let lock_supersedes = self
-            .hc
-            .locked
-            .map(|(_, locked_round)| certificate.round > locked_round)
-            .unwrap_or(false);
+        // ROUND DIRECTION IS NOT A SAFETY GATE ON THE ADOPT PATH.
+        //
+        // A certificate here is a VERIFIED PRECOMMIT QUORUM for THIS height and
+        // THIS block, and the block is bound to our exact next height and to
+        // our finalized parent. That is a DECISION, not a live vote: a height
+        // decides once, and adopting it cannot double-finalize (we are at
+        // tip+1, the height has not been decided locally) and cannot
+        // double-sign (the height advances immediately, so we never vote it).
+        // The lock/value check below is the real conflict gate, and the vote
+        // watermark remains the hard floor.
+        //
+        // A FORWARD certificate (its round above our restored round) is the
+        // normal catch-up shape after a restart: the node comes back at round
+        // 0 (or its watermark floor) while the network decided its next height
+        // several rounds in — there are no votes at OUR height to chase,
+        // because every peer has already moved on. Refusing it as "forward"
+        // left the node depending on a body walk that can fail (pruned/missing
+        // bodies) and it never recovered; only a data wipe did. See
+        // OPEN_DEFECTS HEIGHT-SPLIT.
+        //
+        // The remaining bound is ONE-DIRECTIONAL: a certificate from a round
+        // absurdly far BELOW our own is stale evidence and is still refused.
+        // There is no forward cap to keep: an absurdly high round still has to
+        // carry a genuine quorum under the set in force at this height (the
+        // verification below), and the proposer slot is attributed under the
+        // certificate's own round.
         if certificate.round != self.hc.round {
             let behind = self.hc.round.saturating_sub(certificate.round);
-            let lookback = crate::consensus::ROUND_LOOKBACK as u64;
-            let forward = certificate.round.saturating_sub(self.hc.round);
-            let forward_ok = lock_supersedes && forward as u64 <= lookback;
-            if (certificate.round > self.hc.round && !forward_ok)
-                || behind as u64 > crate::consensus::MAX_SCAN_SPAN as u64
-            {
+            if behind as u64 > crate::consensus::MAX_SCAN_SPAN as u64 {
                 return Err(format!(
-                    "certificate is for round {} not {} (lookback {lookback})",
-                    certificate.round, self.hc.round
+                    "certificate is for round {} not {} (scan span {})",
+                    certificate.round,
+                    self.hc.round,
+                    crate::consensus::MAX_SCAN_SPAN
                 ));
             }
         }

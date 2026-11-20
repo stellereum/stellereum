@@ -46,6 +46,7 @@ pub struct Config {
     pub backlog_stop_secs: u64,
     pub json_out: Option<String>,
     pub print_senders: bool,
+    pub print_all_senders: bool,
     pub preflight_only: bool,
     pub quiet: bool,
     pub dry_run_count: usize,
@@ -94,6 +95,7 @@ impl Default for Config {
             backlog_stop_secs: 10,
             json_out: None,
             print_senders: false,
+            print_all_senders: false,
             preflight_only: false,
             quiet: false,
             dry_run_count: 8,
@@ -217,6 +219,9 @@ pub fn parse(args: Vec<String>) -> Result<Config, String> {
             "--dry-run" => cfg.force_dry_run = parse_bool_flag(key, inline.as_deref())?,
             "--funds-check" => cfg.funds_check = parse_bool_flag(key, inline.as_deref())?,
             "--print-senders" => cfg.print_senders = parse_bool_flag(key, inline.as_deref())?,
+            "--print-all-senders" => {
+                cfg.print_all_senders = parse_bool_flag(key, inline.as_deref())?
+            }
             "--preflight-only" => cfg.preflight_only = parse_bool_flag(key, inline.as_deref())?,
             "--quiet" => cfg.quiet = parse_bool_flag(key, inline.as_deref())?,
             other => return Err(format!("unknown option {other:?} (see --help)")),
@@ -287,9 +292,10 @@ fn validate(cfg: &Config) -> Result<(), String> {
     if cfg.operator_order && !cfg.allow_live {
         return Err("--operator-order is only meaningful with --allow-live".to_string());
     }
-    if (cfg.print_senders || cfg.preflight_only) && !cfg.allow_live {
+    if (cfg.print_senders || cfg.print_all_senders || cfg.preflight_only) && !cfg.allow_live {
         return Err(
-            "--print-senders/--preflight-only read the node; pass --allow-live".to_string(),
+            "--print-senders/--print-all-senders/--preflight-only read the node; pass --allow-live"
+                .to_string(),
         );
     }
     if let Some(ref p) = cfg.json_out {
@@ -354,7 +360,10 @@ MODE
   --allow-remote            Permit a non-loopback endpoint
   --operator-order           Acknowledge an operator order for a blocked live host
   --preflight-only          Read chain id/base fee/sender balances, send nothing, exit
-  --print-senders           Print every deterministic sender address and balance
+  --print-senders           Print every deterministic sender with nonce and balance
+  --print-all-senders       Print every sender address one per line plus SENDERS_TOTAL=<n>
+                            (read-only; exits 0 even when senders are unfunded, so a
+                            full 256-sender set can be funded from the output)
 
 LOAD
   --url <URL>               Submit endpoint; repeatable, senders are load-balanced (default 127.0.0.1:8545)
@@ -454,5 +463,16 @@ mod tests {
         assert!(p(&["--recipient", "self"]).is_ok());
         assert!(p(&["--recipient", "0xdeadbeef"]).is_err());
         assert!(p(&["--recipient", &format!("0x{}", "11".repeat(32))]).is_ok());
+    }
+
+    #[test]
+    fn print_all_senders_is_read_only_and_needs_live() {
+        assert!(p(&["--print-all-senders"]).is_err());
+        let c = p(&["--allow-live", "--print-all-senders"]).unwrap();
+        assert!(c.print_all_senders);
+        assert!(!c.print_senders);
+        assert!(!c.preflight_only);
+        // It stands alone: no --preflight-only is required.
+        assert!(p(&["--allow-live", "--print-all-senders=false"]).is_ok());
     }
 }

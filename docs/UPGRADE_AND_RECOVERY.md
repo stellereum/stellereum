@@ -968,3 +968,116 @@ publishing 411 bytes as 26774a50fe7bdd07_snap_0_750
    linearly with it.
 6. **Whether the third candidate path (`/usr/local/bin/stellereum.new`) is used in
    production.** It is code (`governance.rs:734-736`) but no unit or script stages it.
+
+---
+
+## 7. Safe upgrade timeline (halt → verify → supervisor → gate → resume)
+
+This is the operator-facing contract for the machinery added for coordinated
+restarts. Every phase is fail-closed: if a check cannot be proven, the node
+serves RPC/sync as an OBSERVER instead of voting with a split fleet.
+
+### 7.1 The exact timeline
+
+1. **Halt.** At/after the committed plan's halt height the finalize lane drains
+   persistence, snapshots state and domains, writes the durable
+   `upgrade-halt.marker`, and exits **42** (`node/consensus_driver.rs`). The
+   marker names the plan: `plan_name`, `height`, `plan_sha256`,
+   `target_version`.
+2. **Verify the marker.** Read it *before* touching the binary:
+   ```bash
+   stellereum upgrade-status --marker ./data/upgrade-halt.marker
+   ```
+   It prints the marker, the running version/exe digest and the exact refusal
+   the startup guard would emit. It never clears the marker.
+3. **Supervisor.** Run the `stellereum-upgrader` (dry-run is the default):
+   ```bash
+   # Dry run: read plan, wait for marker, verify staged digest; change nothing.
+   stellereum-upgrader --marker ./data/upgrade-halt.marker \
+       --staged /srv/stellereum/data/upgrades/v0.2.0/stellereum
+
+   # Apply: atomically rename the verified bytes over the live binary and
+   # run the configured service restart.
+   stellereum-upgrader --marker ./data/upgrade-halt.marker \
+       --staged /srv/stellereum/data/upgrades/v0.2.0/stellereum \
+       --live /usr/local/bin/stellereum \
+       --restart-cmd 'systemctl --user restart stellereum' \
+       --apply
+   ```
+   The plan may instead come from committed state over RPC:
+   `--rpc http://127.0.0.1:8545` reads
+   `stell_governanceParams` → `result.applied.upgrade_plan`. If both the marker
+   and the RPC plan are present, their `(name,height,sha256)` must agree.
+   The supervisor refuses a digest mismatch, a symlinked staged/live path or
+   parent, and a world-writable staged file. `--apply` as root is refused
+   unless `--allow-root` is passed; the tool does **not** require root when
+   the live path and restart command are user-scoped. Progress is appended to
+   `--progress` (default `./data/upgrade-supervisor.progress`).
+4. **Wait for supermajority.** Start every upgraded node with either:
+   ```bash
+   STELL_WAIT_SUPERMAJORITY=<halt-height> stellereum run --config node.yaml
+   # or
+   stellereum run --config node.yaml --wait-for-supermajority <halt-height>
+   ```
+   Before consensus is spawned the node resolves the **committed validator set
+   at that height** (the domain snapshot written by the halt; if the staking
+   ledger is empty it uses the deterministic config-defined set, exactly as the
+   runtime does). An absent or unreadable snapshot at the requested height is
+   **fail-closed to observer** — the node never guesses a set from another
+   height or from peer claims. It then requires strictly more than 2/3 of that
+   committed power to be:
+   * present/reachable (a negotiated peer protocol record), and
+   * on the same `fork_id` **and** the same `protocol_version` as this build.
+   A peer on another fork/version contributes **no** power; it can never vote.
+   The wait is bounded (`STELL_WAIT_SUPERMAJORITY_TIMEOUT_SECS`, default
+   120 s) and logs the matching/mismatched/missing power split on every
+   attempt. On timeout the node **stays up as an OBSERVER**: RPC, explorer and
+   sync serve, but it does not propose or vote. Fix the named validators and
+   restart to promote it. Treat this as a one-shot restart guard: after the
+   fleet is up, unset the flag (or point it at a height whose committed domain
+   snapshot is still retained) so a much later restart does not fail closed on
+   a pruned historical snapshot.
+5. **Resume.** Once the gate is eligible, the upgraded binary satisfies the
+   marker (digest or `STELL_UPGRADE_VERSION`), the startup guard clears the
+   marker, consensus starts, and the chain finalizes above the halt height.
+   The two-node side of a three-validator fleet does **not** finalize below
+   the strict >2/3 quorum; the third upgraded node is required.
+
+Current build values for the gate: `PROTOCOL_VERSION = 1.0`, ruleset 6,
+`FORK_ID = 0x0f584a46`. A node whose peers advertise a different fork id or
+protocol version is counted as mismatched and the node stays an observer.
+
+### 7.2 Rollback boundary
+
+There is **no rollback after finality**. Once a block above the halt height is
+finalized under the new rules, restoring the pre-upgrade data directory or
+reinstalling the old binary cannot rewind it: the old binary cannot validate
+the new chain and any attempt to run it is a coordinated new-genesis decision,
+not a rollback.
+
+The last safe rollback point is **before the first post-upgrade block is
+finalized**:
+
+* while the marker is unsatisfied and no upgraded node has finalized, you may
+  restore the pre-upgrade binary/data directory (keeping the marker removed
+  only after out-of-band verification that the old rules are still safe);
+* after the first new finalized block, the only recovery is a coordinated
+  restart of the whole fleet on the same new build (or a new genesis).
+
+Never delete the halt marker to "get a node running": the startup guard exists
+so an old binary cannot silently rejoin after finality. Use
+`stellereum upgrade-status` first.
+
+### 7.3 Drill command
+
+```bash
+CARGO_BUILD_JOBS=2 cargo build -p stellereum -p stellereum-upgrader
+./scripts/upgrade_supervisor_drill.sh --plan-name drill-v2
+```
+
+The drill runs on a throwaway solo loopback cluster under `/tmp/opencode`,
+synthesizes the exact halt marker after a graceful stop, proves the supervisor
+refuses a digest mismatch / symlink / world-writable staged file, performs the
+real atomic swap + restart, exercises the supermajority gate, verifies the
+marker is cleared and the chain resumes above the halt height, and exits
+non-zero on any failure. See `docs/UPGRADE_DRILL.md` §9.

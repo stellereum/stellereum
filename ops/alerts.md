@@ -1,8 +1,11 @@
 # Stellereum alert runbook
 
-Companion to `ops/alert_rules.yaml` (Prometheus rules). Every metric below
-was verified to exist in `stellereum/src/metrics.rs` on 2026-11-02
-(`rg -c '"<name>"' stellereum/src/metrics.rs` returns 1 for each name).
+Companion to `ops/alert_rules.yaml` (Prometheus rules). Every `stell_*`
+metric below was verified to exist in `stellereum/src/metrics.rs` on
+2026-11-02 (`rg -c '"<name>"' stellereum/src/metrics.rs` returns 1 for each
+name), **except** the four `stell_cluster_*` liveness gauges: those are
+written by `scripts/cluster_liveness_watch.sh` through the node_exporter
+textfile collector (see ClusterLivenessFailed below).
 
 Scrape surface: explorer/gateway on `STELL_EXPLORER_LISTEN`
 (default `127.0.0.1:8080`; local-cluster uses `127.0.0.1:18080+i`):
@@ -111,6 +114,52 @@ Derived from the per-peer label set of the SELF-MEASURED latency series
 
 **Triage:** compare against P2P dial logs and `stell_peer_round_lag{peer}`
 (lag exploding on survivors = network, not membership).
+
+## ClusterLivenessFailed / ClusterHeightSpread
+
+**Signal:** `stell_cluster_liveness_ok == 0` for 2m, or
+`stell_cluster_spread > 1` for 2m.
+
+These series do **not** come from the node's `/metrics`. They are produced by
+`scripts/cluster_liveness_watch.sh`, which runs the read-only
+`scripts/cluster_liveness.sh` every 60 s and atomically rewrites
+`stell_cluster_liveness.prom` for the node_exporter **textfile collector**:
+
+```bash
+scripts/cluster_liveness_watch.sh \
+  --rpcs "A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
+  --log /var/log/stell/cluster-liveness.log \
+  --textfile /var/lib/node_exporter/textfile_collector/stell_cluster_liveness.prom
+```
+
+Metrics: `stell_cluster_liveness_ok`, `stell_cluster_height`,
+`stell_cluster_spread`, `stell_cluster_stalled_seconds`.
+
+**Caveats:**
+- A stopped watcher leaves the last value in the textfile; it can look healthy
+  forever. Alert on node_exporter `up` separately (see `ops/status_page.md`).
+- `spread` is max−min height, so it catches a lagging node; it does not catch a
+  same-height fork on its own. `cluster_liveness.sh` also compares block hashes
+  at the highest common height and reports `DIVERGED`.
+- A 2m `for:` on `liveness_ok` means transient single-poll stalls are filtered;
+  the script's own window is 60 s by default.
+
+**Triage:**
+1. Run the same command without the wrapper:
+   `scripts/cluster_liveness.sh --rpcs "..." --journal "<per-node journal cmd>"`.
+   Keep `--window 90`.
+2. Height split (spread > 1): note which node is behind and by how much.
+   Check whether it is advancing (compare `height` deltas, not one sample).
+   Do not wipe. Restart only the lagging node when it is not catching up;
+   see `docs/TESTNET_READINESS_OPS.md` §9.
+3. Round split (equal/near heights, `/health` shows rounds far apart and no
+   finality): capture `round` / `last_finalized_round` from every node before
+   touching anything. This is the failure mode documented in
+   `docs/LIVENESS_ROUND_SYNC_AUDIT.md`; a coordinated restart may be needed.
+4. Confirm the genesis/fork identity before any destructive action:
+   `/health` `.identity.chain_id` / `.identity.fork_id` must match across
+   nodes and the expected values. **Do not wipe data unless the genesis/fork
+   id changed.**
 
 ## Downtime-evidence spike
 

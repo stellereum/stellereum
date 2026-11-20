@@ -39,17 +39,40 @@
 //! height at which this node actually halted (equal to `height` normally,
 //! greater when the node missed the event and halted late).
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use stellereum::consensus::ValidatorSet;
 use stellereum::storage::{wait_for_persist_drain_with, ShutdownDrainConfig, ShutdownDrainOutcome};
 
 /// Exact first line of every marker file. A future format MUST bump the
 /// version here, so an old binary refuses a newer marker loudly instead of
 /// misreading it.
 pub const MARKER_HEADER: &str = "stell-upgrade-halt v1";
+
+/// Height at which the node must prove a supermajority of the committed
+/// validator set is on this fork/protocol before it may propose or vote.
+///
+/// Unset means the pre-existing startup path (verify the halt marker, then
+/// join consensus) is unchanged. Set to a height; the value is parsed
+/// fail-closed by [`parse_wait_supermajority_height`].
+pub const WAIT_SUPERMAJORITY_ENV: &str = "STELL_WAIT_SUPERMAJORITY";
+
+/// Bounded wait budget for the supermajority gate, in seconds.
+///
+/// Default [`DEFAULT_WAIT_SUPERMAJORITY_TIMEOUT_SECS`]. On timeout the node
+/// deliberately stays up as an OBSERVER (RPC/sync still serve) instead of
+/// proposing or voting with an unproven fleet.
+pub const WAIT_SUPERMAJORITY_TIMEOUT_ENV: &str = "STELL_WAIT_SUPERMAJORITY_TIMEOUT_SECS";
+
+/// Default supermajority-gate wait budget (120 s). Long enough for a rolling
+/// restart's last validator to reconnect, short enough that an operator sees
+/// the observer verdict in one screen of logs.
+pub const DEFAULT_WAIT_SUPERMAJORITY_TIMEOUT_SECS: u64 = 120;
 
 /// Default marker location, relative to the node's working directory (the
 /// same `./data` the store lives in, `node/policy.rs::store_path_for_shard`).
@@ -501,6 +524,277 @@ fn clear_failed_message(path: &Path, marker: &UpgradeHaltMarker, err: &std::io::
          ({err}). Fix the permissions on the data directory (or delete the marker) and restart; \
          the guard cannot tell a cleared marker from one it merely meant to clear."
     )
+}
+
+// ===========================================================================
+// SUPERMAJORITY RESTART GATE
+//
+// A coordinated binary restart is only safe when a supermajority of the
+// COMMITTED validator set is running the same consensus rules and is actually
+// reachable. The halt marker proves WHAT to install; this gate proves WHO is
+// ready before the process is allowed to propose or vote. It is deliberately
+// pure over a list of per-validator reports so the fork/version/presence
+// matrix is testable without a network or a store.
+// ===========================================================================
+
+/// One validator's protocol report at gate time.
+///
+/// `power` MUST come from the committed set, never from the peer's claim.
+/// `present` is "we have a live negotiated protocol record for this peer";
+/// `fork_id`/`protocol_version` are that record's advertised values. A missing
+/// peer or an unnegotiated one is reported `present: false`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatePeerReport {
+    pub validator: [u8; 32],
+    pub power: u64,
+    pub present: bool,
+    pub fork_id: Option<u32>,
+    pub protocol_version: Option<(u16, u16)>,
+}
+
+/// Deterministic verdict of the supermajority gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupermajorityEvaluation {
+    pub total_power: u64,
+    pub required_power: u64,
+    pub matching_power: u64,
+    pub matching: Vec<[u8; 32]>,
+    pub mismatched: Vec<[u8; 32]>,
+    pub missing: Vec<[u8; 32]>,
+    pub eligible: bool,
+}
+
+impl SupermajorityEvaluation {
+    /// Operator-facing one-liner used in the loud progress/refusal logs.
+    pub fn summary(&self) -> String {
+        fn short(ids: &[[u8; 32]]) -> String {
+            if ids.is_empty() {
+                return "-".to_string();
+            }
+            ids.iter()
+                .map(|id| hex::encode(&id[..4]))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        format!(
+            "matching_power={}/{} required={} matching=[{}] mismatched=[{}] missing=[{}]",
+            self.matching_power,
+            self.total_power,
+            self.required_power,
+            short(&self.matching),
+            short(&self.mismatched),
+            short(&self.missing),
+        )
+    }
+}
+
+/// Parse `STELL_WAIT_SUPERMAJORITY`. Empty/unset means "gate disabled".
+///
+/// Garbage is an ERROR, not a silent disable: a typo must never turn a safety
+/// gate off. Zero is legal (the caller may want the gate at genesis).
+pub fn parse_wait_supermajority_height(raw: Option<&str>) -> Result<Option<u64>, String> {
+    match raw {
+        None => Ok(None),
+        Some(v) if v.trim().is_empty() => Ok(None),
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|e| format!("{WAIT_SUPERMAJORITY_ENV} must be a block height: {e}")),
+    }
+}
+
+/// Parse the bounded wait budget. Empty/unset uses the default; a
+/// non-numeric or oversized value is refused so the gate cannot be silently
+/// disabled by an arithmetic mistake.
+pub fn parse_wait_supermajority_timeout(raw: Option<&str>) -> Result<Duration, String> {
+    let Some(v) = raw else {
+        return Ok(Duration::from_secs(DEFAULT_WAIT_SUPERMAJORITY_TIMEOUT_SECS));
+    };
+    if v.trim().is_empty() {
+        return Ok(Duration::from_secs(DEFAULT_WAIT_SUPERMAJORITY_TIMEOUT_SECS));
+    }
+    let secs = v
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| format!("{WAIT_SUPERMAJORITY_TIMEOUT_ENV} must be seconds: {e}"))?;
+    // A day is already far beyond any sane rolling restart and keeps the
+    // deadline arithmetic far away from overflow.
+    if secs > 86_400 {
+        return Err(format!(
+            "{WAIT_SUPERMAJORITY_TIMEOUT_ENV}={secs} is above the one-day cap; refusing"
+        ));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn report_matches(
+    report: &GatePeerReport,
+    expected_fork_id: u32,
+    expected_protocol: (u16, u16),
+) -> bool {
+    report.present
+        && report.fork_id == Some(expected_fork_id)
+        && report.protocol_version == Some(expected_protocol)
+}
+
+/// Pure gate core.
+///
+/// * Each validator id counts at most once (a duplicate report can never
+///   inflate the total).
+/// * A present peer on another fork id OR another protocol version is
+///   MISMATCHED and contributes nothing. This is the fail-closed rule: a node
+///   with different rules is never allowed to lend quorum weight.
+/// * A missing/unnegotiated peer contributes nothing.
+/// * `eligible` requires STRICTLY more than 2/3 of the committed power, i.e.
+///   the same `quorum_power()` the consensus engine uses.
+pub fn evaluate_supermajority_gate(
+    expected_fork_id: u32,
+    expected_protocol: (u16, u16),
+    total_power: u64,
+    required_power: u64,
+    reports: &[GatePeerReport],
+) -> SupermajorityEvaluation {
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut matching = Vec::new();
+    let mut mismatched = Vec::new();
+    let mut missing = Vec::new();
+    let mut matching_power = 0u64;
+
+    for report in reports {
+        if !seen.insert(report.validator) {
+            continue;
+        }
+        if report_matches(report, expected_fork_id, expected_protocol) {
+            matching_power = matching_power.saturating_add(report.power);
+            matching.push(report.validator);
+        } else if report.present {
+            mismatched.push(report.validator);
+        } else {
+            missing.push(report.validator);
+        }
+    }
+
+    let eligible = total_power > 0
+        && required_power != u64::MAX
+        && matching_power >= required_power
+        && matching_power <= total_power;
+
+    SupermajorityEvaluation {
+        total_power,
+        required_power,
+        matching_power,
+        matching,
+        mismatched,
+        missing,
+        eligible,
+    }
+}
+
+/// Bounded, loud wait for the supermajority gate.
+///
+/// Polls `probe` until the verdict is eligible or `budget` elapses. Every
+/// attempt logs the exact power split (matching/mismatched/missing) so a stall
+/// names the operators who still need to upgrade. The final evaluation is
+/// returned either way; the caller decides to stay an observer when it is not
+/// eligible. `poll` is clamped to at least 10 ms.
+pub async fn wait_for_supermajority<F>(
+    expected_fork_id: u32,
+    expected_protocol: (u16, u16),
+    total_power: u64,
+    required_power: u64,
+    budget: Duration,
+    poll: Duration,
+    mut probe: F,
+) -> SupermajorityEvaluation
+where
+    F: FnMut() -> Vec<GatePeerReport>,
+{
+    let poll = poll.max(Duration::from_millis(10));
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut attempt = 0u64;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let reports = probe();
+        let evaluation = evaluate_supermajority_gate(
+            expected_fork_id,
+            expected_protocol,
+            total_power,
+            required_power,
+            &reports,
+        );
+        if evaluation.eligible {
+            eprintln!(
+                "[upgrade-gate] attempt {attempt}: supermajority verified (fork_id=0x{expected_fork_id:08x}, protocol={}.{}, {}); allowing consensus",
+                expected_protocol.0,
+                expected_protocol.1,
+                evaluation.summary()
+            );
+            return evaluation;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            eprintln!(
+                "[upgrade-gate] TIMEOUT after {attempt} attempt(s): supermajority NOT verified \
+                 (fork_id=0x{expected_fork_id:08x}, protocol={}.{}, {}); staying up as an OBSERVER \
+                 (RPC/sync serve, no propose/vote). Fix the named validators and restart when a \
+                 supermajority is on this build.",
+                expected_protocol.0,
+                expected_protocol.1,
+                evaluation.summary()
+            );
+            return evaluation;
+        }
+        eprintln!(
+            "[upgrade-gate] attempt {attempt}: waiting for supermajority ({}, {}); retrying",
+            evaluation.summary(),
+            fmt_remaining(deadline.saturating_duration_since(now))
+        );
+        let sleep_for = poll.min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+fn fmt_remaining(d: Duration) -> String {
+    format!("{:.1}s remaining", d.as_secs_f64())
+}
+
+/// The validator set committed at `height`, when the domain snapshot at that
+/// exact height names one.
+///
+/// The halt lane snapshots state AND domains at the halt height before it
+/// exits, so a coordinated restart normally finds an exact height here. A
+/// chain that has never had a bond keeps the config-defined set in force; the
+/// empty ledger is therefore reported as `Ok(None)` and the caller may fall
+/// back to that deterministic config set (never to "whatever peers claim").
+///
+/// There is deliberately NO "nearest snapshot" fallback: a set from another
+/// height can omit or include a rotation that happened at the gate height, so
+/// an exact committed set is required. A missing snapshot at the requested
+/// height is an `Err` (fail closed to observer), exactly like a decode error.
+pub fn committed_validator_set_at(
+    store: &stellereum::storage::Storage,
+    height: u64,
+) -> Result<Option<ValidatorSet>, String> {
+    let bytes = store
+        .domain_at(height)
+        .map_err(|e| format!("read committed domain snapshot at height {height}: {e}"))?;
+    let Some(bytes) = bytes else {
+        return Err(format!(
+            "no committed domain snapshot at height {height}; cannot prove the validator set \
+             in force there (halt the node at that height so it snapshots first, or choose the \
+             plan's halt height)"
+        ));
+    };
+    let set = stellereum::storage::snapshot_validator_set_strict(height, &bytes)
+        .map_err(|e| format!("committed validator set at height {height} is unreadable: {e}"))?;
+    if set.is_empty() {
+        // No bond ever landed: the runtime keeps the config-defined set in
+        // force. Report that explicitly rather than pretending the empty
+        // ledger is a quorum.
+        return Ok(None);
+    }
+    Ok(Some(set))
 }
 
 /// Drain the persistence queue before the upgrade exit, bounded by `cfg`.

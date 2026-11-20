@@ -25,6 +25,7 @@ The full runbook is in [`../stellereum/docs/OPERATIONS.md`](../stellereum/docs/O
 | `node-prune-cron.sh` | The orphan-chunk + snapshot retention sweeper. **Run it on every node.** | **yes** |
 | `cluster-watchdog.sh` | Watches the cluster, alerts, auto-heals the safe cases. | **yes** |
 | `cluster_liveness.sh` | Read-only height / finality / divergence check with per-node `/health`, round, peers, and rejected-proposal diagnostics. Exit 1 = STALLED, 2 = DIVERGED. | no |
+| `cluster_liveness_watch.sh` | Wrapper: runs `cluster_liveness.sh` every 60 s, appends `LIVENESS_RESULT=` to a log, and atomically writes a Prometheus textfile (`stell_cluster_liveness_ok`, `stell_cluster_height`, `stell_cluster_spread`, `stell_cluster_stalled_seconds`) for node_exporter. | **log + textfile only** |
 | `fresh_genesis.sh` | Coordinated new-chain boot: stop all, replace binary, wipe `./data`, set `STELL_NEW_CHAIN=1`, start, wait height > 0, remove the flag. Dry-run by default; `--yes` required. | **yes** (gated) |
 | `tools/stelops/` | The ops tool that reads the store (consensus checkpoint, genesis root) and clears the lock. | **yes** (the lock only) |
 | `cluster-nodes.conf` | The cluster topology and the values every node must agree on. | no |
@@ -40,6 +41,12 @@ to run concurrently on several nodes.
 # Is the cluster advancing, and do the nodes agree? (read-only, no restarts)
 STELL_RPCS="A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
   scripts/cluster_liveness.sh --expected-block-time 2 --window 30
+
+# Same probe every 60 s, with a textfile for node_exporter's collector
+STELL_RPCS="A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
+  scripts/cluster_liveness_watch.sh \
+    --log /var/log/stell/cluster-liveness.log \
+    --textfile /var/lib/node_exporter/textfile_collector/stell_cluster_liveness.prom
 
 # Rehearse a coordinated new chain; nothing is changed without --yes.
 scripts/fresh_genesis.sh --nodes "A=ssh:root@host:/root/nodeA,B=local:/path/nodeB" \

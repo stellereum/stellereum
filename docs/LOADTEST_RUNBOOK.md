@@ -1,8 +1,9 @@
 # LOADTEST_RUNBOOK — Wave-2 procedure
 
 Status: operator runbook for the standalone harness in
-`scripts/loadtest/`. It describes a **planned** three-wave measurement. No
-number in this file is a result; record only pasted command output.
+`scripts/loadtest/`. It describes a **planned** three-wave measurement plus the
+**measured 2026-11-20 baseline** in §0. Nothing else here is a result; record
+only pasted command output.
 
 Read `scripts/loadtest/README.md` first. The short version:
 
@@ -15,6 +16,74 @@ Read `scripts/loadtest/README.md` first. The short version:
 AGENTS.md §6 applies to every step: the live cluster is read-mostly, and a
 transaction wave is allowed only on an explicit human order that names the
 rate, window, endpoints and stop conditions.
+
+---
+
+## 0. Measured baseline — 2026-11-20
+
+These are **measurements**, not targets or promises. One run per rate, 50
+deterministic senders, against the live cluster; the harness reported zero
+429s in all three runs.
+
+| Target tx/s | Achieved accepted tx/s | 429s | Block time p50 | Block time p99 |
+|---:|---:|---:|---:|---:|
+| 60 | 57.6 | 0 | 0.202 s | 0.802 s |
+| 200 | 90.1 | 0 | 0.401 s | 1.552 s |
+| 500 | 107.4 | 0 | 0.401 s | 1.406 s |
+
+`Achieved accepted tx/s`, p50 and p99 are copied from the harness report for
+the sending window. The block-time percentiles are the harness's observed
+`stell_blockNumber` arrival intervals, not node-stamped block intervals.
+
+### Commands
+
+One invocation per rate; only `--rate` and the output paths changed:
+
+```bash
+cd /home/imm/stellereum-project
+BIN=scripts/loadtest/loadtest/target/release/stell-loadtest
+COMMON=(--allow-live --allow-remote --operator-order \
+        --url https://rpc.stellereum.org \
+        --watch-url https://rpc.stellereum.org \
+        --senders 50 --duration 60)
+
+"$BIN" "${COMMON[@]}" --rate 60 \
+  --json-out /tmp/opencode/baseline-60.json | tee baseline-60.log
+"$BIN" "${COMMON[@]}" --rate 200 \
+  --json-out /tmp/opencode/baseline-200.json | tee baseline-200.log
+"$BIN" "${COMMON[@]}" --rate 500 \
+  --json-out /tmp/opencode/baseline-500.json | tee baseline-500.log
+```
+
+The wave log header (`endpoints:`, `watch:`, `target:`) is the authority on
+the exact endpoints and window; keep the three logs and JSON files with the
+numbers above.
+
+### What these numbers mean — and do not mean
+
+1. **The ceiling was sender-bound, not node-bound.** 50 senders sustain about
+   `2.1 tx/s × 50 ≈ 105 tx/s`; the 200 and 500 runs produced 90.1 and 107.4
+   accepted tx/s (≈1.8–2.1 tx/s per sender), so the sender set was the binding
+   constraint, not demonstrated node capacity. **107.4 tx/s is not a 500 tx/s
+   result.**
+2. **Zero 429s does not prove headroom.** At 50 senders the offered load never
+   reached the per-IP RPC limiter, so the limiter was not exercised. Do not
+   cite this baseline as evidence that a 500 tx/s wave will be accepted.
+3. **Validators A and D are 1-vCPU hosts.** Their CPU is part of what the
+   block-time p50/p99 shows; this is a resource-constrained testnet baseline,
+   not a capacity benchmark for larger hardware.
+4. **The correct RPC limiter env names are `STELL_STANDALONE_RATE_LIMIT`
+   (default 300/s per IP; legacy alias `STELL_RPC_RATE_LIMIT_PER_SEC`) and
+   `STELL_RATE_LIMIT_PER_SEC` for the gateway/explorer on :8080 (default
+   30/s).** `STELL_RATE_LIMIT_PER_SEC` alone does not raise the JSON-RPC
+   limiter.
+5. These were three single 60 s runs, not a soak and not an acceptance gate.
+   Mempool peak, included tx/s, CPU and per-node heights from those runs were
+   not preserved here; treat those fields as **UNVERIFIED** for the baseline.
+   Re-run with §5's recording checklist before making a capacity claim.
+
+To measure the node rather than the sender set, raise `--senders` (see §3.3)
+and keep the per-sender in-flight limit at 4.
 
 ---
 
@@ -44,20 +113,31 @@ rate, window, endpoints and stop conditions.
      --json-out /tmp/opencode/rehearsal.json
    ```
    Rehearse until the report is `PASS` with `backlog after drain: 0`.
-5. **Sender funding is confirmed.** Read-only preflight prints every address:
+5. **Sender funding is confirmed.** Print the complete roster, one address per
+   line, and capture the machine-readable total:
    ```bash
-   "$BIN" --allow-live --preflight-only \
-     --url http://127.0.0.1:8546 --senders 256
+   "$BIN" --allow-live --print-all-senders \
+     --url http://127.0.0.1:8546 --senders 256 \
+     | tee /tmp/opencode/senders-256.txt
    ```
-   Fund those addresses from a testnet faucet/treasury **before** the wave.
-   The harness refuses to start when any sender is below one transaction's
-   cost. Do not send funding transactions from the harness.
-6. **Rate limit is known.** The node's standalone RPC budget is
-   `STELL_STANDALONE_RATE_LIMIT` (default **300/s per IP**). A 500 tx/s wave
-   from one IP needs the target node configured at least `target + reads`
-   (recommend `2000`). Changing it on the live cluster requires a restart and
-   therefore a separate human order. If it is not raised, the 500 wave will
-   report 429s and is **not** a valid throughput measurement.
+   Verify `grep -c '^0x' /tmp/opencode/senders-256.txt` equals the
+   `SENDERS_TOTAL=` line. Fund those addresses from a testnet
+   faucet/treasury **before** the wave. `--print-all-senders` is read-only,
+   sends no transaction, and prints the full set even when every sender is
+   unfunded (exit 0). A live wave still refuses to start when any sender is
+   below one transaction's cost. `--preflight-only` remains the balance gate
+   (exit 3) and its refusal block only shows the first 50 unfunded senders —
+   use `--print-all-senders` when the set is larger than that.
+6. **Rate limit is known.** The node's standalone JSON-RPC budget is
+   `STELL_STANDALONE_RATE_LIMIT` (default **300/s per IP**; the legacy alias
+   `STELL_RPC_RATE_LIMIT_PER_SEC` is honoured when the new name is unset).
+   The gateway/explorer on `:8080` has a separate, much smaller
+   `STELL_RATE_LIMIT_PER_SEC` (default 30/s) — changing that does **not**
+   raise the JSON-RPC limit. A 500 tx/s wave from one IP needs the target
+   node's standalone limiter configured at least `target + reads` (recommend
+   `2000`). Changing it on the live cluster requires a restart and therefore
+   a separate human order. If it is not raised, the 500 wave will report 429s
+   and is **not** a valid throughput measurement.
 7. **Baseline snapshot** (read-only):
    - heights A/B/C/D,
    - mempool size,
@@ -145,6 +225,11 @@ per-IP budget is usually the binding limit, not the sender count.
 | 60 tx/s | 64 | ~0.94 tx/s |
 | 200 tx/s | 128 | ~1.6 tx/s |
 | 500 tx/s | 256 | ~2.0 tx/s |
+
+Measured caveat (2026-11-20): at 50 senders the achieved rate topped out at
+107.4 accepted tx/s (~2.1 tx/s per sender), so the 200/500 rows above are a
+sender-count plan, not evidence of node capacity. Increase senders until the
+per-sender rate stops being the limiter, then measure again.
 
 Do not raise `--inflight-per-sender` above 4; the node rejects the resulting
 gap.

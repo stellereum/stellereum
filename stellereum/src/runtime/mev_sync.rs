@@ -932,6 +932,22 @@ impl ValidatorRuntime {
         if self.apply_in_flight.is_some() {
             return None;
         }
+        // PARENT-BOUND PROPOSAL (HEIGHT-SPLIT): a block's `prev_hash` is always
+        // our finalized tip, so the ONLY height we may build at is
+        // `finalized_tip + 1` (height 1 at genesis). Any other relationship
+        // emits a block that skips heights or reuses a decided parent — every
+        // peer refuses it, and the node burns the round on a proposal nobody
+        // can vote. This is the runtime-level backstop for a restored head
+        // that could not be reconciled; the driver also gates it.
+        let finalized_tip = self.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        if finalized_tip.checked_add(1) != Some(self.hc.height) {
+            tracing::warn!(
+                hc_height = self.hc.height,
+                finalized_tip,
+                "refusing to propose above our own finalized parent (height/head disagrees)"
+            );
+            return None;
+        }
         // Liveness: a locked proposer re-proposes its locked value. Building a
         // fresh block while locked is voted nil by every node locked on the old
         // value (including ourselves) while unlocked nodes vote the fresh one

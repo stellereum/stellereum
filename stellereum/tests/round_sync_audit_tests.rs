@@ -76,11 +76,12 @@ fn per_round_cap() -> u32 {
 // A. Worst-case jump bounds: lookback x jumps x budget + corroboration.
 // ===========================================================================
 
-/// A single LONE verified far vote buys exactly one lookback step, not the
-/// cliff. (runtime.rs: the first step is always taken; continuing needs a
-/// second distinct supporter.)
+/// A single verified far vote at N=3 meets the BFT bound `f+1 = 1`, so it
+/// opens the chase — but the per-round jump budget (64) still stops it far
+/// short of the peer's claim. A lone Byzantine reporter cannot move us past
+/// the budgets.
 #[tokio::test]
-async fn lone_vote_moves_at_most_one_lookback_step() {
+async fn lone_vote_chases_within_the_per_round_budget() {
     let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     let far = falcon_votes::fvote(
@@ -94,19 +95,22 @@ async fn lone_vote_moves_at_most_one_lookback_step() {
     rt.on_prevote(far).unwrap();
     assert_eq!(
         rt.hc.round,
-        r + ROUND_LOOKBACK,
-        "one lone verified vote must buy exactly one +8 nudge"
+        r + per_round_cap(),
+        "one verified reporter on a 3-member set is f+1=1, and the jump stays inside the budget"
+    );
+    assert!(
+        rt.hc.round < r + 100,
+        "the budget must stop the chase short of the claim"
     );
     assert_eq!(
         rt.hc.supporting_peers_count(r + 100),
         1,
-        "a single reporter must not count as corroboration on a 3-member set"
+        "one reporter is the f+1 quorum at N=3"
     );
 }
 
-/// Two DISTINCT validators vouching for the same far round open the full
-/// chase — and the chase still stops at the per-round jump budget (64), not
-/// at the peer's round.
+/// The chase still stops at the per-round jump budget (64), not at the
+/// peer's round, even when both peers vouch for it.
 #[tokio::test]
 async fn corroborated_chase_capped_by_per_round_budget() {
     let (mut rt, ks, fks) = three_node().await;
@@ -121,7 +125,11 @@ async fn corroborated_chase_capped_by_per_round_budget() {
         None,
     ))
     .unwrap();
-    assert_eq!(rt.hc.round, r + ROUND_LOOKBACK);
+    assert_eq!(
+        rt.hc.round,
+        r + per_round_cap(),
+        "f+1=1 on a 3-member set already opens the full chase"
+    );
     rt.on_prevote(falcon_votes::fvote(
         &ks[2],
         &fks[2],
@@ -134,7 +142,7 @@ async fn corroborated_chase_capped_by_per_round_budget() {
     assert_eq!(
         rt.hc.round,
         r + per_round_cap(),
-        "corroborated chase must converge within the per-round jump budget (64)"
+        "the second supporter cannot exceed the per-round jump budget"
     );
     assert!(
         rt.hc.round < target,
@@ -192,11 +200,11 @@ async fn spent_budget_blocks_fresh_votes_until_view_change() {
 }
 
 /// Even an ABSURD vote (past `MAX_ROUND_AHEAD`, rejected from every vote
-/// set) still teaches the peer's round — bounded to one lookback step.
-/// Rejection from quorum logic must not mean rejection from sync, and sync
-/// from a rejected vote must not mean an unbounded jump.
+/// set) still teaches the peer's round — bounded to the per-round jump
+/// budget. Rejection from quorum logic must not mean rejection from sync,
+/// and sync from a rejected vote must not mean an unbounded jump.
 #[tokio::test]
-async fn absurd_rejected_vote_still_bounded_to_one_step() {
+async fn absurd_rejected_vote_still_bounded_to_the_budget() {
     let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     let absurd = falcon_votes::fvote(&ks[1], &fks[1], h, r + 5_000, VoteKind::Prevote, None);
@@ -211,8 +219,8 @@ async fn absurd_rejected_vote_still_bounded_to_one_step() {
     );
     assert_eq!(
         rt.hc.round,
-        r + ROUND_LOOKBACK,
-        "a rejected-but-verified absurd vote syncs at most one +8 step"
+        r + per_round_cap(),
+        "a rejected-but-verified absurd vote syncs at most the per-round budget"
     );
 }
 
@@ -328,12 +336,16 @@ async fn replay_of_same_round_moves_exactly_once() {
     let (h, r) = (rt.hc.height, rt.hc.round);
     let v = falcon_votes::fvote(&ks[1], &fks[1], h, r + 50, VoteKind::Prevote, None);
     rt.on_prevote(v.clone()).unwrap();
-    assert_eq!(rt.hc.round, r + ROUND_LOOKBACK);
+    assert_eq!(
+        rt.hc.round,
+        r + 50,
+        "a single reporter at N=3 meets f+1 and lands exactly on its round"
+    );
     // Same vote again: verifies, counted, but the round must not move twice.
     rt.on_prevote(v).unwrap();
     assert_eq!(
         rt.hc.round,
-        r + ROUND_LOOKBACK,
+        r + 50,
         "a replayed vote must never move the round a second time"
     );
     assert!(
@@ -342,11 +354,12 @@ async fn replay_of_same_round_moves_exactly_once() {
     );
 }
 
-/// Our own vote record must never corroborate an ahead jump: with only our
-/// (low) self-report plus one liar's far report, the count for the far round
-/// is 1 and the chase stays a single nudge.
+/// Our own low self-report does not add a second supporter: with only our
+/// self-report plus one liar's far report the count for the far round is 1.
+/// That one verified reporter is already `f+1` at N=3, so it buys the
+/// budgeted chase — never more than the budgets.
 #[tokio::test]
-async fn self_report_never_corroborates_an_ahead_jump() {
+async fn self_report_does_not_add_a_second_supporter() {
     let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     // Record our own current round (production feeds own votes through
@@ -363,8 +376,8 @@ async fn self_report_never_corroborates_an_ahead_jump() {
     );
     assert_eq!(
         rt.hc.round,
-        r + ROUND_LOOKBACK,
-        "uncorroborated far claim stays one nudge even with a self-report present"
+        r + per_round_cap(),
+        "the lone far claim stays inside the per-round budget even with a self-report present"
     );
 }
 

@@ -895,36 +895,30 @@ async fn a_vote_for_a_future_round_advances_us() {
         .with_falcon_key(fks[0].clone());
 
     assert_eq!(rt.hc.round, 0);
-    // CORROBORATION GATE (P3-R1 round-DoS fix, see
-    // `ValidatorRuntime::note_peer_vote_round` in src/runtime.rs): the FIRST
-    // step is always taken — a genuinely-behind node must follow even a
-    // single peer — but CONTINUING past one step needs the round corroborated
-    // by a second DISTINCT validator (same rule as the deadlock breaker,
-    // which already refuses single-reporter jumps). Without this, one
-    // Byzantine vote far ahead drags an honest node off the network's cliff
-    // one budget at a time. So a lone reporter buys exactly one
-    // ROUND_LOOKBACK (+8) nudge, not the full jump: 8 votes from the SAME
-    // validator for round 25 move us 0 -> 8 and then stall (dedup + gate).
-    // Without the future-round rule we would never leave round 0.
+    // CORROBORATION GATE (audit F3): the BFT bound is f + 1, not a constant
+    // two. At N=3 one verified reporter is the network's position (the two
+    // nodes BEHIND cannot gather a second supporter for the leader they need
+    // to follow). A truly lone Byzantine reporter still cannot move us past
+    // the budgets: each chase is capped by `sync_round_to` and the cumulative
+    // per-height budget. Without the future-round rule we would never leave
+    // round 0.
     for _ in 0..8 {
         let v = falcon_votes::fvote(&ks[1], &fks[1], 1, 25, VoteKind::Prevote, None);
         let _ = rt.on_prevote(v);
     }
     assert_eq!(
-        rt.hc.round,
-        stellereum::consensus::ROUND_LOOKBACK,
-        "a lone reporter buys one ROUND_LOOKBACK nudge, not the full jump (P3-R1 corroboration gate)"
+        rt.hc.round, 25,
+        "one verified reporter meets f+1 at N=3 and pulls us to the network round"
     );
-    // A second DISTINCT validator vouching for the same far round is new
-    // evidence (not a replay), so it re-opens the chase and we converge the
-    // rest of the way to the network's round.
+    // A second DISTINCT validator vouching for the same far round changes
+    // nothing: we are already there.
     for _ in 0..8 {
         let v = falcon_votes::fvote(&ks[2], &fks[2], 1, 25, VoteKind::Prevote, None);
         let _ = rt.on_prevote(v);
     }
     assert_eq!(
         rt.hc.round, 25,
-        "a corroborated round must pull us all the way to round 25"
+        "the round stays at the target after corroboration"
     );
 }
 

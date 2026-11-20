@@ -1,6 +1,10 @@
 # Liveness audit: round synchronisation and vote coherence
 
-Status: audit note (read-only; no source or test was modified for this report).
+Status: audit note (read-only report) **plus implementation record**. The §4 R-C / F3
+corroboration fix and the restart/chase convergence it enables are IMPLEMENTED in this
+tree (HEAD after `85dcf6846`); see §8. The §5 send-prune item S2 is a separate change and
+is **not** part of this round-sync patch. No source or test was modified for the original
+report.
 Tree audited: `93978950a` (ruleset v5, signed `round` in block identity) **plus** the
 uncommitted working-tree delta in `stellereum/src/node/consensus_driver.rs`,
 `stellereum/src/runtime/consensus_step.rs` and `stellereum/tests/chase_livelock_tests.rs`.
@@ -523,7 +527,7 @@ never needs to fetch a hash it cannot reconstruct. **No fork risk for the value;
 rule-change activation is still required** because a node that does not compare `value_id`
 would nil the re-stamped body (liveness, not safety, and the live cluster is stopped).
 
-### Rule set R-C — "f+1 corroboration" (mandatory companion, one line)
+### Rule set R-C — "f+1 corroboration" (mandatory companion, one line) — **IMPLEMENTED**
 
 Replace the constant `2` in `consensus_step.rs:1023` (and the dead twin in
 `engine.rs:2469-2473`) with the BFT bound:
@@ -759,13 +763,39 @@ is the one the codebase already says makes this class converge
 
 ---
 
+## 8. Implementation record — F3 / R-C (restart round convergence)
+
+Implemented in this tree:
+
+* `consensus::round_corroboration_threshold(n) = max(1, (n - 1) / 3 + 1)` is the single
+  source of the BFT corroboration bound. N=3 -> 1, N=4..6 -> 2, N=7..9 -> 3.
+* `HeightConsensus::observe_peer_round` and
+  `ValidatorRuntime::note_peer_vote_round_for` both use it instead of the constant `2`.
+  The per-call cap (`ROUND_LOOKBACK`), per-round jump budget
+  (`MAX_SYNC_JUMPS_PER_ROUND`) and cumulative per-height budget
+  (`MAX_PEER_ROUND_ADVANCE_PER_HEIGHT`) are unchanged.
+* The chase/hold interaction is unchanged because there is no "skip the jump while holding
+  a live proposal" rule (F6): a verified peer vote always chases. A same-value vote keeps
+  the proposal live at the target round; a vote for another value wipes the unlocked
+  proposal (accept-wipe protection), and the node then accepts and votes the target
+  round's proposal normally.
+* No separate startup timer was needed: the restart shape (restored round ~130 vs peers at
+  ~5) converges through the same verified-vote chase, within the existing budgets.
+* Tests: `tests/round_restart_convergence_tests.rs` — the held-node/round-40 case, the
+  restored-130-vs-5 case, the single-Byzantine budget negative, and the live-proposal
+  chase. They fail on the pre-fix constant (`+8` then stuck) and pass with `f+1`.
+
+The §5 send-prune item S2 is independent of this fix and is not changed here.
+
+---
+
 ## Appendix A — defect register
 
 | ID | Sev | File:line | One-line |
 |---|---|---|---|
 | W1/F1 | BLOCKER | `runtime/consensus_step.rs:1359-1361` | vote round = local round |
 | W2/F2 | BLOCKER | `node/consensus_driver.rs:2248-2255` | rescue envelope = body's old signed round |
-| W3/F3 | BLOCKER | `runtime/consensus_step.rs:1023-1027, 1071` | `count >= 2` unsatisfiable at N=3, one ahead |
+| W3/F3 | BLOCKER | `runtime/consensus_step.rs:1023-1027, 1071` | `count >= 2` unsatisfiable at N=3, one ahead — **FIXED** (`f+1`, §8) |
 | W4/F4 | HIGH | `consensus_net.rs:197-204`, `node/policy.rs:1058-1062` | send prune drops late votes/precommits |
 | W5/F5 | HIGH | `runtime/consensus_step.rs:1269-1295, 1319-1324` | align to earliest proposer slot, not `block.round` |
 | F6 | HIGH | `consensus_driver.rs:3179-3181` vs `consensus_step.rs:990-1082` | documented skip-while-armed rule does not exist |

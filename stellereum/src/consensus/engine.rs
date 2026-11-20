@@ -44,6 +44,21 @@ pub const MAX_ROUND_ADVANCE_PER_MESSAGE: Round = 1;
 /// proposer's near round in `on_proposal` and is independent of this counter.
 pub const ROUND_LOOKBACK: Round = 8;
 
+/// BFT corroboration threshold for a peer-reported round: `f + 1`, with
+/// `f = floor((n - 1) / 3)` for an equal-power set.
+///
+/// At N=3 one verified peer is enough (the two nodes BEHIND cannot corroborate
+/// the leader they need to follow — requiring two made the gate unsatisfiable
+/// exactly when one node was ahead). N=4..6 needs two, N=7..9 three, and so
+/// on. The value is always at least one, so an empty/one-member set still
+/// accepts its single reporter; the per-call jump budget
+/// ([`MAX_SYNC_JUMPS_PER_ROUND`] × [`ROUND_LOOKBACK`]) and the cumulative
+/// per-height budget ([`MAX_PEER_ROUND_ADVANCE_PER_HEIGHT`]) bound the total
+/// movement a single Byzantine reporter can cause.
+pub fn round_corroboration_threshold(validator_count: usize) -> usize {
+    (validator_count.saturating_sub(1) / 3) + 1
+}
+
 // ============================================================================
 // Block-carried equivocation evidence (deterministic slashing input)
 // ============================================================================
@@ -2592,14 +2607,16 @@ impl HeightConsensus {
         if round <= self.round {
             return false;
         }
-        // Audit F3: a SINGLE far-future vote never moves us (trickle-drag:
-        // one dribbled vote per timeout would ratchet +8/timeout and silence
-        // us). Corroboration re-opens the chase: TWO DISTINCT validators at
-        // the same far round is the network's real position, not one peer's
-        // claim (a lone Byzantine cannot fake corroboration within <1/3).
+        // Audit F3: corroboration is the BFT bound `f + 1`, not a constant
+        // two. At N=3 one verified peer is the network's position (the two
+        // nodes behind can never gather a second supporter for the leader
+        // they need to follow); at N=4..6 two are needed, and so on. A lone
+        // reporter still cannot move us without bound: the jump below is
+        // capped per call/per round and by the cumulative per-height budget.
         // Near chase (<= LOOKBACK) is unchanged (1-round-offset deadlock fix).
         if round > self.round.saturating_add(ROUND_LOOKBACK)
-            && self.supporting_peers_count(round) < 2
+            && self.supporting_peers_count(round)
+                < round_corroboration_threshold(self.validators.len())
         {
             return false;
         }

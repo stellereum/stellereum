@@ -1062,20 +1062,24 @@ impl ValidatorRuntime {
         // proposal live (restored after the sync below). Any other vote keeps
         // the conservative corroboration path.
         //
-        // CORROBORATION WINDOW: in a 3-node cluster only ONE node can be at
-        // the head. Requiring two peers at the EXACT target made the gate
-        // unsatisfiable exactly when it mattered (live: r505 / r507 / r515,
-        // `supporting_peers_count(515)` was 1). Two distinct peers whose
-        // reported rounds are within one ROUND_LOOKBACK BELOW the target
-        // certify that the network has moved to the target region, so the
-        // loop may finish the jump. The window is deliberately one cap step:
-        // a lone far reporter still buys only the first step, and two peers
-        // at a stale round cannot re-open a replay of a much newer claim
-        // (pinned by `spent_budget_blocks_fresh_votes_until_view_change`).
+        // CORROBORATION WINDOW: the BFT bound is `f + 1`, derived from the
+        // validator set (N=3 -> 1, N=4..6 -> 2, N=7..9 -> 3, ...). Requiring
+        // a constant two was unsatisfiable exactly when it mattered: in a
+        // 3-node cluster only ONE node can be at the head (live: r505 / r507
+        // / r515, `supporting_peers_count(515)` was 1). A peer whose reported
+        // round is within one ROUND_LOOKBACK BELOW the target certifies that
+        // the network has moved to the target region, so the loop may finish
+        // the jump. A lone far reporter still buys only the first step when
+        // the set needs more than one supporter; two peers at a stale round
+        // cannot re-open a replay of a much newer claim (pinned by
+        // `spent_budget_blocks_fresh_votes_until_view_change`). The cumulative
+        // per-height jump budget bounds whatever a single Byzantine reporter
+        // can buy.
         let held_proposal = self.hc.proposal;
         let same_value = vote_target.is_some()
             && held_proposal.map(|(_, h)| h) == vote_target;
-        let min_supporters = if self.validators.len() >= 3 { 2 } else { 1 };
+        let min_supporters =
+            crate::consensus::round_corroboration_threshold(self.validators.len());
         let corroboration_floor =
             vote_round.saturating_sub(crate::consensus::ROUND_LOOKBACK);
         let corroborated = same_value

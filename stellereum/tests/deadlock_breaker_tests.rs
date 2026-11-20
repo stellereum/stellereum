@@ -54,18 +54,16 @@ fn stale_vote_feeds_round_counter_without_voting() {
     // ...but the verified round still lands in the counter (no voting).
     assert!(far.verify());
     let moved = hc.observe_peer_round(far.voter, far.round);
-    // F3 corroboration (72bcfd8 2026-10-30): a SINGLE far-future vote is one
-    // peer's claim, not the network's position -- it feeds the counter but no
-    // longer moves the round (trickle-drag: one dribbled vote per timeout
-    // would ratchet +8/timeout and silence us).
+    // F3 corroboration (audit: BFT bound f+1): on a 2-member set f+1 = 1,
+    // so one verified reporter is enough to chase -- within the per-call cap.
     assert!(
-        !moved,
-        "single uncorroborated far vote must feed the counter but not move us"
+        moved,
+        "one verified peer is f+1 on a 2-member set and may chase"
     );
-    assert_eq!(hc.round, 318, "no chase on an uncorroborated far round");
+    assert_eq!(hc.round, 318 + 8, "the chase stays capped at one +8 step per call");
     assert_eq!(hc.max_peer_round(), Some(1550));
-    // A SECOND distinct validator vouching for the same far round is the
-    // network's real position: corroboration re-opens the bounded chase.
+    // A SECOND distinct validator vouching for the same far round is more
+    // evidence but still buys only another bounded step.
     let corroborator = falcon_votes::fvote(
         &ks[1],
         &fks[1],
@@ -76,9 +74,9 @@ fn stale_vote_feeds_round_counter_without_voting() {
     );
     assert!(corroborator.verify());
     let moved2 = hc.observe_peer_round(id(&ks[1]), corroborator.round);
-    assert!(moved2, "corroborated far round must chase");
-    // Bounded chase: +8 per message, NOT a jump to 1550.
-    assert_eq!(hc.round, 318 + 8, "stale sync stays capped at +8");
+    assert!(moved2, "the next corroborated chase step is bounded, not refused");
+    // Bounded chase: +8 per call, NOT a jump to 1550.
+    assert_eq!(hc.round, 318 + 16, "stale sync stays capped at +8 per call");
     // The far vote formed no quorum.
     assert_eq!(hc.try_prevote_quorum(), None);
 }

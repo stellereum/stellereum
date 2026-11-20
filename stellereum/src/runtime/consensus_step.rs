@@ -1434,7 +1434,16 @@ impl ValidatorRuntime {
         // of the SAME value. The signed hash stays the vote/QC identity.
         self.hc.note_value_id(bh, block.value_id());
         let expected = self.expected_proposer_now();
-        self.hc.receive_proposal_for(proposer, bh, expected)?;
+        // RESTART-LIVELOCK: key the one-value-per-round rule on the BODY's
+        // signed round (`block.round`), not on our local acceptance round. A
+        // delayed/re-served body signed at an older round may be admitted
+        // here, but the scheduled proposer's genuine body for THIS round (a
+        // re-stamp at `block.round == hc.round`) must be able to supersede it;
+        // otherwise it is refused as "already recorded for this round" and
+        // this node can only vote the older signed round (at/below its
+        // watermark after a restart), so the height never reaches quorum.
+        self.hc
+            .receive_proposal_for_at(proposer, bh, expected, block.round)?;
         // Fork-choice: the proposal is recorded as a CANDIDATE before it is
         // finalized, so a competing branch is KNOWN. When it loses (another
         // block is finalized at this height) the blocks that lost can be

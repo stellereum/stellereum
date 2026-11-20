@@ -88,3 +88,60 @@ fn adopting_a_round_never_moves_a_node_backwards() {
         "the round only ever moves forward"
     );
 }
+
+// ============================================================================
+// RESTART-LIVELOCK: the one-value-per-round rule is keyed on the proposal's
+// SIGNED round, not on the local acceptance round.
+// ============================================================================
+
+#[test]
+fn a_newer_signed_round_supersedes_a_stale_body_in_the_same_local_round() {
+    let ks = keys(3);
+    let vs = ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
+    let mut hc = HeightConsensus::new(1, vs);
+    hc.round = 26;
+    let proposer = hc.proposer().expect("the schedule names a proposer");
+    let stale = [0xA1u8; 32]; // signed at round 25 by a pre-restart process
+    let current = [0xB2u8; 32]; // the scheduled body for round 26 (re-stamped)
+
+    // The delayed past-round body is still admissible as a VALUE (lock
+    // rescue / one-round lag) ...
+    hc.receive_proposal_for_at(proposer, stale, Some(proposer), 25)
+        .expect("a delayed past-round body is admissible");
+    assert_eq!(hc.proposal, Some((proposer, stale)));
+    assert_eq!(hc.proposal_round, Some(26), "accepted in the local round");
+    assert_eq!(hc.proposal_signed_round, Some(25), "signed identity kept");
+    assert!(hc.has_live_proposal());
+
+    // ... but it must not own round 26: the body the proposer signed FOR 26
+    // supersedes it. This is the live failure ("proposal already recorded for
+    // this round" followed by a nil/silent vote at the stale round).
+    hc.receive_proposal_for_at(proposer, current, Some(proposer), 26)
+        .expect("the current round's body must supersede the stale one");
+    assert_eq!(hc.proposal, Some((proposer, current)));
+    assert_eq!(hc.proposal_round, Some(26));
+    assert_eq!(hc.proposal_signed_round, Some(26));
+
+    // Equivocation is unchanged: a second DISTINCT body for the SAME signed
+    // round is still refused, and the first seating survives.
+    let equivocation = [0xC3u8; 32];
+    let err = hc
+        .receive_proposal_for_at(proposer, equivocation, Some(proposer), 26)
+        .expect_err("same signed round + different hash is equivocation");
+    assert!(err.contains("already recorded"), "got: {err}");
+    assert_eq!(hc.proposal, Some((proposer, current)));
+
+    // A stale signed round can never displace a newer one.
+    assert!(hc
+        .receive_proposal_for_at(proposer, stale, Some(proposer), 25)
+        .is_err());
+    assert_eq!(hc.proposal, Some((proposer, current)));
+
+    // Re-receipt of the identical body stays idempotent-Ok.
+    hc.receive_proposal_for_at(proposer, current, Some(proposer), 26)
+        .expect("identical rebroadcast is idempotent");
+}

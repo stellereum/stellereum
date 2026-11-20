@@ -1239,12 +1239,29 @@ pub struct HeightConsensus {
     pub committee_schedule: CommitteeSchedule,
     /// (proposer, block_hash) proposed this round
     pub proposal: Option<(ValidatorId, BlockHash)>,
-    /// The round `proposal` was accepted in. A vote must name the CURRENT
-    /// round's value: voting a stale-held body with a fresh round number can
-    /// never meet a quorum (the peer holds something else) and poisons the
-    /// round -- observed live as nodes voting different bodies at the same
-    /// round for hundreds of rounds. `has_live_proposal` gates voting on it.
+    /// The LOCAL round `proposal` was accepted in. A vote must name the
+    /// CURRENT round's value: voting a stale-held body with a fresh round
+    /// number can never meet a quorum (the peer holds something else) and
+    /// poisons the round -- observed live as nodes voting different bodies at
+    /// the same round for hundreds of rounds. `has_live_proposal` gates voting
+    /// on it.
     pub proposal_round: Option<Round>,
+    /// The round the held proposal's BODY was signed for (`block.round`).
+    ///
+    /// This is the proposal's identity for the one-value-per-round rule. It is
+    /// NOT always `proposal_round`: a delayed/re-served body signed at an
+    /// earlier round is legitimately accepted at the current round (the
+    /// lock-rescue / one-round-lag path), and the RESTART-LIVELOCK defect is
+    /// exactly what happens when that older body then occupies the current
+    /// round's slot — the proposer's re-stamped body for the current round is
+    /// refused as "already recorded for this round", and the node can only
+    /// vote the older signed round (usually at/below its watermark), so it
+    /// nils or falls silent and no round ever reaches quorum.
+    ///
+    /// Two bodies with DIFFERENT signed rounds are never proposal
+    /// equivocation; a strictly newer signed round SUPERSEDES the held one.
+    /// The same signed round with a different hash is still refused.
+    pub proposal_signed_round: Option<Round>,
     /// locked value: (block_hash, round at which we locked)
     ///
     /// The hash is the SIGNED identity of the body we locked (it commits the
@@ -1516,6 +1533,7 @@ impl HeightConsensus {
             committee_schedule: CommitteeSchedule::ParentHash,
             proposal: None,
             proposal_round: None,
+            proposal_signed_round: None,
             locked: None,
             value_ids: HashMap::new(),
             prevotes: HashMap::new(),
@@ -1613,24 +1631,67 @@ impl HeightConsensus {
         block_hash: BlockHash,
         expected: Option<ValidatorId>,
     ) -> Result<(), String> {
+        // Callers that do not carry the body's signed round (unit tests,
+        // direct state-machine users) mean "this body is for the current
+        // round", which is the pre-existing semantics.
+        self.receive_proposal_for_at(proposer, block_hash, expected, self.round)
+    }
+
+    /// [`Self::receive_proposal_for`] with the BODY's signed round.
+    ///
+    /// RESTART-LIVELOCK (P0): the one-value-per-round rule must be keyed on
+    /// the proposal's own signed round, not on the local acceptance round.
+    ///
+    /// A delayed or re-served body signed at an earlier round is still
+    /// admissible at the current round (lock rescue / one-round lag), but it
+    /// must NOT own the current round's slot: otherwise the scheduled
+    /// proposer's genuine body for the current round — which, under ruleset v6,
+    /// is re-stamped and re-signed at that round — is refused as
+    /// `"proposal already recorded for this round"`. The node then holds only
+    /// the older signed body, votes that older round (at/below its fsynced
+    /// watermark after a restart), and the height never reaches quorum. Live:
+    /// `RX proposal ... r26` immediately followed by that rejection, while the
+    /// proposer proposed a fresh body every round.
+    ///
+    /// A strictly NEWER signed round supersedes the held body: different
+    /// signed rounds are different proposals by construction (the round is
+    /// inside the signed block identity), so this is not equivocation. The
+    /// SAME signed round with a different hash is still refused, and a STALE
+    /// signed round can never displace a newer one.
+    pub fn receive_proposal_for_at(
+        &mut self,
+        proposer: ValidatorId,
+        block_hash: BlockHash,
+        expected: Option<ValidatorId>,
+        signed_round: Round,
+    ) -> Result<(), String> {
         if self.step != Step::Propose {
             return Err("not in propose step".to_string());
         }
         if Some(proposer) != expected {
             return Err("wrong proposer".to_string());
         }
-        // Audit F1: one value per round. A second DISTINCT proposal in the
-        // same round (equivocating proposer) must not overwrite the first —
+        // Audit F1: one value per round. A second DISTINCT body for the SAME
+        // signed round (equivocating proposer) must not overwrite the first —
         // mid-round flips split prevotes. Re-receipt of the IDENTICAL body
         // (rebroadcast) stays Ok (idempotent).
-        if let Some((p, h)) = &self.proposal {
-            if *p == proposer && *h == block_hash && self.proposal_round == Some(self.round) {
+        if let Some((p, h)) = self.proposal {
+            if p == proposer && h == block_hash {
                 return Ok(());
             }
-            return Err("proposal already recorded for this round".to_string());
+            let held_signed = self.proposal_signed_round.unwrap_or(self.round);
+            if signed_round <= held_signed {
+                // Same signed round (equivocation) or a stale body: never
+                // allowed to displace what we already hold.
+                return Err("proposal already recorded for this round".to_string());
+            }
+            // NEWER signed round: the proposer re-stamped/re-proposed for a
+            // later round. That supersedes the held (older) body and re-arms
+            // the CURRENT round, exactly like a first receipt.
         }
         self.proposal = Some((proposer, block_hash));
         self.proposal_round = Some(self.round);
+        self.proposal_signed_round = Some(signed_round);
         Ok(())
     }
 
@@ -2355,6 +2416,7 @@ impl HeightConsensus {
             } else {
                 self.proposal = None;
                 self.proposal_round = None;
+                self.proposal_signed_round = None;
             }
             self.sync_jumps_used += 1;
             self.prune_old_rounds();
@@ -2476,6 +2538,7 @@ impl HeightConsensus {
         self.step = Step::Propose;
         self.proposal = None;
         self.proposal_round = None;
+        self.proposal_signed_round = None;
         self.prune_old_rounds();
     }
 
@@ -2588,6 +2651,7 @@ impl HeightConsensus {
             self.step = Step::Propose;
             self.proposal = None;
             self.proposal_round = None;
+            self.proposal_signed_round = None;
             self.prune_old_rounds();
         }
     }
@@ -2772,6 +2836,7 @@ impl HeightConsensus {
         self.step = Step::Propose;
         self.proposal = None;
         self.proposal_round = None;
+        self.proposal_signed_round = None;
         self.prune_old_rounds();
         true
     }
@@ -2895,6 +2960,7 @@ impl HeightConsensus {
         self.step = Step::Propose;
         self.proposal = None;
         self.proposal_round = None;
+        self.proposal_signed_round = None;
         // RE-PHASE: widen the scan / retention window so the quorum the
         // network formed in ITS round becomes visible (and committable) to a
         // node whose round counter wandered off.

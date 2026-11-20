@@ -2280,12 +2280,13 @@ pub(crate) async fn run_consensus_node(
         // newcomer that never proposes leaves every third round empty.
         // 2. prevote once we have a proposal.
         //
-        // The vote round is the PROPOSAL's SIGNED round, not the local round:
-        // a lock-rescue/demanded re-proposal keeps the round it was signed
-        // under, so every node holding it must stamp the SAME round (ruleset
-        // v4/v5 identity). The fsynced watermark is checked against THAT
-        // round — a node that already voted in a later round stays silent
-        // rather than voting below its floor.
+        // The vote round is the PROPOSAL's SIGNED round. Under ruleset v6 a
+        // lock-rescue/demanded re-proposal is RE-STAMPED at the proposer's
+        // current round (`restamp_for_round`), so the signed round IS the
+        // round the network is voting the value in — not the old round it was
+        // first signed under. The fsynced watermark is still checked against
+        // the vote's own round: a node that already voted in a later round
+        // stays silent rather than voting below its floor.
         let prevote_round = rt.prevote_round();
         if can_vote
             && rt.hc.has_live_proposal()
@@ -3163,9 +3164,12 @@ pub(crate) async fn run_consensus_node(
                                 stellereum::rpc::note_peer_height(vh);
                             }
                             // A nil prevote carrying the sender's locked hash is a
-                            // rescue request: it is stuck on one of OUR bodies.
-                            // Record the demand; our next proposer slot re-proposes
-                            // that body verbatim (see `ValidatorRuntime::propose`).
+                            // rescue request: it is stuck on one of OUR values.
+                            // `note_lock_hint` resolves the (possibly older)
+                            // signed hash to the round-free value id and records
+                            // the demand; our next proposer slot re-stamps that
+                            // value at the current round (see
+                            // `ValidatorRuntime::propose`).
                             rt.note_lock_hint(vh, vk, vbh, locked);
                             // Adopt a peer's round when it is ahead, so the two stay in the
                             // same PHASE.
@@ -4682,10 +4686,21 @@ pub(crate) async fn run_consensus_node(
             {
                 let height_before = rt.hc.height;
                 let from_round = rt.hc.round;
+                // HOLD-SET LOOKUP BY VALUE (ruleset v6, site 8): the lock may
+                // name a signed hash we have since re-stamped away from. The
+                // body is present when ANY held body has the lock's
+                // round-free value id, not only when the exact hash is in
+                // the store — otherwise a re-proposal would look "bodyless"
+                // and the re-phase would drop a lock it still holds.
                 let locked_body_present = rt
                     .hc
                     .locked
-                    .map(|(h, _)| rt.blocks.contains_key(&h))
+                    .map(|(h, _)| {
+                        rt.blocks.contains_key(&h)
+                            || rt.hc.value_id_of(&h).is_some_and(|vid| {
+                                rt.blocks.values().any(|b| b.value_id() == vid)
+                            })
+                    })
                     .unwrap_or(true);
                 if rt.hc.apply_deadlock_local_reset(locked_body_present) {
                     rt.last_breaker_at = Some(std::time::Instant::now());

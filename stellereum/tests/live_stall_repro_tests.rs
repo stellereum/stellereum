@@ -430,3 +430,191 @@ async fn same_body_converges_to_one_round_and_finalises() {
         );
     }
 }
+
+// ===========================================================================
+// 3. THE RULESET-V6 SHAPE (R-B): the proposer RE-STAMPS the locked body at
+//    its current round. The exact live failure this fixes is the watermark:
+//    a validator that already NIL-voted at r+2 has a vote floor of r+2, so a
+//    body still signed at r can never be voted again (the vote would be at
+//    or below the floor). The re-stamped body is signed at r+3, so the value
+//    vote is at r+3 — strictly above the floor — and the height finalises.
+// ===========================================================================
+#[tokio::test]
+async fn restamped_locked_body_is_voted_above_a_nil_watermark_and_finalises() {
+    let (mut nodes, vset) = three_nodes().await;
+
+    // Base round r authored by A, and A also owns q = r+3. B/C's slots at
+    // r+1 and r+2 belong to OTHER validators, so the phase-alignment scan
+    // finds A at q (this is the on_proposal alignment path, unchanged).
+    let (r, proposer, q) = (0u32..4096)
+        .find_map(|r| {
+            let p = vset.proposer_for(HEIGHT, r)?;
+            if vset.proposer_for(HEIGHT, r + 1) == Some(p)
+                || vset.proposer_for(HEIGHT, r + 2) == Some(p)
+                || vset.proposer_for(HEIGHT, r + 3) != Some(p)
+            {
+                return None;
+            }
+            Some((r, p, r + 3))
+        })
+        .expect("a base round with A at r and r+3 but not r+1/r+2 must exist");
+
+    let proposer_idx = nodes
+        .iter()
+        .position(|n| n.id == proposer)
+        .expect("the schedule must name a member");
+    let others: Vec<usize> = (0..N).filter(|i| *i != proposer_idx).collect();
+    let (b_idx, c_idx) = (others[0], others[1]);
+
+    for n in nodes.iter_mut() {
+        n.rt.hc.round = r;
+    }
+
+    // A authors the original body at r; B and C accept it (they hold it, but
+    // no quorum ever forms at r in the live shape).
+    let old = nodes[proposer_idx]
+        .rt
+        .propose(1)
+        .await
+        .expect("the scheduled proposer must build at r");
+    assert_eq!(old.round, r);
+    let old_hash = old.compute_hash();
+    for i in [b_idx, c_idx] {
+        nodes[i]
+            .rt
+            .on_proposal(proposer, old.clone(), r)
+            .await
+            .expect("the genuine body must be accepted at r");
+    }
+
+    // The live watermark shape: C times out to r+2 and NIL-prevotes there.
+    // That fsynced floor is what refused every later value vote before R-B.
+    for _ in 0..2 {
+        nodes[c_idx].rt.next_round();
+    }
+    assert_eq!(nodes[c_idx].rt.hc.round, r + 2);
+    let nil = nodes[c_idx]
+        .rt
+        .make_prevote()
+        .expect("an unarmed proposer-step node must nil-vote");
+    assert_eq!(nil.round, r + 2, "the nil is stamped at the local round");
+    assert_eq!(nil.block_hash, None);
+    let floor = nil.round;
+
+    // B is one round behind; A is at q, still the scheduled proposer, and
+    // locked on the original body.
+    nodes[b_idx].rt.next_round();
+    assert_eq!(nodes[b_idx].rt.hc.round, r + 1);
+    for _ in 0..3 {
+        nodes[proposer_idx].rt.next_round();
+    }
+    assert_eq!(nodes[proposer_idx].rt.hc.round, q);
+    nodes[proposer_idx].rt.hc.locked = Some((old_hash, r));
+    assert!(
+        nodes[proposer_idx].rt.blocks.contains_key(&old_hash),
+        "the locked body must be available for the rescue"
+    );
+
+    // THE FIX: the rescue serves the SAME VALUE re-stamped at q, not the old
+    // signed round. (Before R-B this returned `old` verbatim: round r.)
+    let restamped = nodes[proposer_idx]
+        .rt
+        .propose(1)
+        .await
+        .expect("the locked proposer must rescue its value");
+    assert_eq!(
+        restamped.round, q,
+        "the rescue MUST be signed at the proposer's current round"
+    );
+    assert_eq!(
+        restamped.value_id(),
+        old.value_id(),
+        "the rescue must keep the round-free value identity"
+    );
+    assert_ne!(
+        restamped.compute_hash(),
+        old_hash,
+        "re-serving the old signed hash is the stall this fixes"
+    );
+    let restamped_hash = restamped.compute_hash();
+    assert!(
+        !nodes[b_idx].rt.blocks.contains_key(&restamped_hash),
+        "B has not seen the re-stamped body yet"
+    );
+
+    // Deliver the re-stamped body. C is at r+2 with a nil floor there; B is
+    // at r+1. Both phase-align to A at q and accept.
+    for i in [b_idx, c_idx] {
+        nodes[i]
+            .rt
+            .on_proposal(proposer, restamped.clone(), q)
+            .await
+            .unwrap_or_else(|e| panic!("node {i} must accept the re-stamp: {e}"));
+        assert_eq!(nodes[i].rt.hc.round, q, "aligned to the proposing round");
+    }
+
+    // Every node prevotes the re-stamped body at q. C's vote is STRICTLY
+    // above the nil floor it had already signed — the watermark no longer
+    // blocks, which is exactly what the old rule could not do.
+    let mut prevotes = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let v = n.rt.make_prevote().unwrap_or_else(|| {
+            panic!("node {i} at round {} produced no value prevote", n.rt.hc.round)
+        });
+        assert_eq!(v.round, q, "node {i} must prevote at the re-stamped round");
+        assert_eq!(
+            v.block_hash,
+            Some(restamped_hash),
+            "node {i} must prevote the re-stamped body"
+        );
+        if i == c_idx {
+            assert!(
+                v.round > floor,
+                "the value vote must be strictly above the nil watermark"
+            );
+        }
+        prevotes.push(v);
+    }
+
+    // Full round trip at q: polka -> precommits at q -> precommit QC.
+    for n in nodes.iter_mut() {
+        for v in &prevotes {
+            n.rt.on_prevote(v.clone())
+                .unwrap_or_else(|e| panic!("prevote rejected: {e}"));
+        }
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        assert!(
+            n.rt.hc
+                .prevote_set(q)
+                .and_then(|s| s.quorum_target(&vset))
+                == Some(Some(restamped_hash)),
+            "node {i} must hold the polka for the re-stamped body at q"
+        );
+    }
+    let precommits: Vec<Vote> = nodes
+        .iter_mut()
+        .enumerate()
+        .map(|(i, n)| {
+            n.rt.make_precommit()
+                .unwrap_or_else(|| panic!("node {i} must precommit at q"))
+        })
+        .collect();
+    for v in &precommits {
+        assert_eq!(v.round, q, "precommits follow the polka round");
+        assert_eq!(v.block_hash, Some(restamped_hash));
+    }
+    for n in nodes.iter_mut() {
+        for v in &precommits {
+            n.rt.on_precommit(v.clone())
+                .unwrap_or_else(|e| panic!("precommit rejected: {e}"));
+        }
+    }
+    for (i, n) in nodes.iter_mut().enumerate() {
+        assert_eq!(
+            n.rt.try_finalize().await,
+            Some(restamped_hash),
+            "node {i} must finalise the re-stamped locked value"
+        );
+    }
+}

@@ -88,7 +88,17 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(PROTOCOL_MAJO
 /// `minted_total_nano`, so the block-hash domain set moved
 /// ([`DOMAIN_SET_VERSION`] = 3). Hard fork / new genesis; fork id
 /// `0x9d59096b`. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
-pub const CONSENSUS_RULESET_VERSION: u32 = 5;
+///
+/// RULESET v6 (2026-11-20): LOCK COMPARISONS ARE BY ROUND-FREE VALUE IDENTITY.
+/// A locked/demanded body is RE-STAMPED at the proposer's current round and
+/// re-signed on rescue, so the prevote names the current round instead of an
+/// older signed round that the fsynced vote watermark may already refuse.
+/// `HeightConsensus` compares locks with `Block::value_id` (the block hash
+/// with `round := 0`) via `same_value`, while votes/QCs/signatures keep the
+/// real signed hash. No wire field, domain string or constant value changed;
+/// the ruleset version itself is the activation marker. Fork id
+/// `0x0f584a46`. See `docs/RULESET_V6.md`.
+pub const CONSENSUS_RULESET_VERSION: u32 = 6;
 
 /// Version of the set of domain-separation strings folded into [`FORK_ID`].
 /// Bump when a domain string is added/renamed without changing a hashed

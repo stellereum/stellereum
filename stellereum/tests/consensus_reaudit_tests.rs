@@ -202,7 +202,7 @@ async fn the_lock_hint_rescue_never_serves_another_authors_body() {
     let mut foreign = mine.clone();
     foreign.proposer = id(&ks[1]);
     let fh = foreign.compute_hash();
-    rt.blocks.insert(fh, foreign);
+    rt.blocks.insert(fh, foreign.clone());
 
     // The hint for the foreign body must be IGNORED: serving it would
     // re-propose somebody else's block under OUR proposer slot, which every
@@ -211,20 +211,21 @@ async fn the_lock_hint_rescue_never_serves_another_authors_body() {
     // block the network can never accept.
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(fh));
 
-    // Our own body is kept and served verbatim.
+    // Our own VALUE is kept and served (re-stamped at our current round,
+    // ruleset v6 — the signed hash may differ, the value identity may not).
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(mh));
     while rt.hc.proposer().unwrap() != id(&ks[0]) {
         rt.hc.next_round();
     }
     let served = rt.propose(1).await.expect("must propose");
     assert_eq!(
-        served.compute_hash(),
-        mh,
-        "the rescue must serve OUR demanded body verbatim — never another author's"
+        served.value_id(),
+        mine.value_id(),
+        "the rescue must serve OUR demanded VALUE — never another author's"
     );
     assert_ne!(
-        served.compute_hash(),
-        fh,
+        served.value_id(),
+        foreign.value_id(),
         "the rescue must never re-propose another author's body"
     );
 }

@@ -641,9 +641,13 @@ mod gossip_batch_tests {
         }
         let served = rt.propose(1).await.expect("must serve the demand");
         assert_eq!(
-            served.compute_hash(),
-            mh,
-            "batched nil hint must be recorded"
+            served.value_id(),
+            mine.value_id(),
+            "batched nil hint must be recorded (demand is keyed by VALUE)"
+        );
+        assert_eq!(
+            served.round, rt.hc.round,
+            "the rescue is re-stamped at the proposer's current round"
         );
     }
 

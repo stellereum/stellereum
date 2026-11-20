@@ -5,7 +5,7 @@ use super::{
     DropReason, ValidatorRuntime, DKG_REPUBLISH_INTERVAL, MAX_BLOCK_GAS, MAX_BLOCK_TXS,
     SEAL_PARTIAL_POLL_MS,
 };
-use crate::consensus::{Height, Step};
+use crate::consensus::{Height, Round, Step};
 use crate::mempool::Mempool;
 use crate::sharding::{Block, CrossShardKey, CrossShardMessage, Transaction};
 use std::collections::{HashMap, HashSet};
@@ -878,6 +878,44 @@ impl ValidatorRuntime {
         }
     }
 
+    /// Re-stamp a rescued (locked/demanded) body at `round` and re-sign it
+    /// (ruleset v6, R-B).
+    ///
+    /// The block hash commits the signed BFT round, so serving a locked body
+    /// "verbatim" re-serves an OLD round forever. Acceptors then prevote the
+    /// body's old signed round; once the fsynced vote watermark has moved
+    /// above it (a nil vote in a later round is enough), the driver refuses
+    /// that vote and no value vote is ever cast — the live permanent stall.
+    ///
+    /// The VALUE identity is round-free ([`Block::value_id`]), so the body's
+    /// author rebuilds the identical value at the round it is proposing for
+    /// (all fields except `round`, plus fresh signatures) and serves THAT.
+    /// Locked peers recognise it through `HeightConsensus::same_value`, and
+    /// every voter stamps the current round, strictly above the watermark.
+    ///
+    /// A body authored by ANOTHER validator is returned unmodified: only its
+    /// author can produce a valid proposer signature, and rewriting
+    /// `proposer` would change the value identity (hence the lock) itself.
+    /// The demanded rescue only ever stores our own bodies; for a foreign
+    /// locked body the normal phase-alignment path still applies.
+    fn restamp_for_round(&self, body: &Block, round: Round) -> Option<Block> {
+        if body.proposer != self.id || body.round == round {
+            return Some(body.clone());
+        }
+        let mut out = body.clone();
+        out.round = round;
+        out.validator_signatures.clear();
+        // One hash for the proposer signature and the store key below.
+        let digest = out.compute_hash();
+        let sig = self.sign_bytes(&digest)?;
+        out.validator_signatures.push((self.id, sig));
+        if let Some(fk) = self.falcon_signing_key() {
+            let falcon_sig = fk.sign(&digest);
+            out.validator_signatures.push((fk.validator_id(), falcon_sig));
+        }
+        Some(out)
+    }
+
     pub async fn propose(&mut self, timestamp: u64) -> Option<Block> {
         if self.parallel_exec {
             self.state.set_parallel_exec(true);
@@ -919,21 +957,30 @@ impl ValidatorRuntime {
             }
         }
         if let Some((locked_hash, _)) = self.hc.locked {
-            // PENTEST P1 (liveness): a lock may name a body ANOTHER validator
-            // authored (we locked on their proposal). Re-proposing it under our
-            // slot is refused by every peer (`block.proposer` no longer matches
-            // the schedule), wasting the whole round. Only OUR OWN body may be
-            // re-proposed; otherwise fall through to fresh selection, which
-            // still votes for the locked value through the lock rule.
-            // LOCK RESCUE (protocol-critical, NOT a bug): the locked value is
-            // re-proposed VERBATIM even when another validator authored it.
-            // Peers locked on that value vote it, and validation accepts it
-            // through `proposer_matches_schedule` against the QC round, so a
-            // body authored earlier in the height is legal in a later round.
-            // Substituting our own body would abandon a value the network is
-            // locked on — `sim_nil_grace_tests` shows the failure directly
-            // (nodes vote NIL instead of VALUE and the height churns).
-            if let Some(body) = self.blocks.get(&locked_hash).cloned() {
+            // LOCK RESCUE (protocol-critical): re-propose the locked VALUE.
+            //
+            // The lookup is by VALUE as well as by signed hash (ruleset v6):
+            // a lock may name a hash we re-stamped away from, so if the exact
+            // body is gone we serve any body at this height with the same
+            // round-free `value_id`. Substituting a DIFFERENT value would
+            // abandon what the network is locked on — `sim_nil_grace_tests`
+            // shows the failure directly (nodes vote NIL instead of VALUE and
+            // the height churns).
+            //
+            // The body is then RE-STAMPED at our current round and re-signed
+            // (`restamp_for_round`). Serving the original signed round is the
+            // permanent-stall bug: acceptors prevote that stale round and the
+            // fsynced watermark refuses it. A body another validator authored
+            // is served unmodified (only its author can sign it; rewriting
+            // `proposer` would change the value itself).
+            let locked_body = self.blocks.get(&locked_hash).cloned().or_else(|| {
+                let vid = self.hc.value_id_of(&locked_hash)?;
+                self.blocks
+                    .values()
+                    .find(|b| b.height == self.hc.height && b.value_id() == vid)
+                    .cloned()
+            });
+            if let Some(body) = locked_body {
                 // Info when bypassing a non-empty pool (audit: blocks
                 // troubles): locked re-proposals skip fresh selection, so an
                 // empty locked body with a full mempool looks identical to an
@@ -955,38 +1002,59 @@ impl ValidatorRuntime {
                         body.transactions.len(),
                     );
                 }
+                let served = self.restamp_for_round(&body, self.hc.round)?;
+                let served_hash = served.compute_hash();
+                // Register BOTH signed hashes against the same round-free
+                // value: the lock rule then treats the re-stamp as the locked
+                // value. Keep the ORIGINAL body available in `blocks` (body
+                // serving and lock-hint resolution may still name it).
+                self.hc.note_value_id(locked_hash, body.value_id());
+                self.hc.note_value_id(served_hash, served.value_id());
+                if served_hash != locked_hash {
+                    self.blocks.insert(served_hash, served.clone());
+                }
                 // Self-record like the fresh path: without this the section-1
                 // gate (`!has_live_proposal`) refires every tick and
                 // rebroadcasts the identical hash all round (refire spam).
                 let expected = self.expected_proposer_now();
                 self.hc
-                    .receive_proposal_for(self.id, locked_hash, expected)
+                    .receive_proposal_for(self.id, served_hash, expected)
                     .ok()?;
-                return Some(body);
+                return Some(served);
             }
         }
-        // Rescue: a peer is locked on one of OUR bodies (learned via nil-vote
-        // lock hints). Re-propose it verbatim at our own slot: receivers
-        // validate it normally, the locked peer votes it (it matches its
-        // lock), unlocked peers vote it, QC forms, finalize. One shot per
-        // hint batch -- a still-stuck peer re-hints and we serve again.
+        // Rescue: a peer is locked on one of OUR VALUES (learned via nil-vote
+        // lock hints). The demand is keyed by the round-free `value_id`
+        // (ruleset v6), so a hint naming an older signed round still resolves
+        // after any number of re-stamps. Re-propose the value at our own
+        // current round: receivers validate it normally, the locked peer
+        // votes it (same value, lock comparison accepts the re-stamp),
+        // unlocked peers vote it, QC forms, finalize. One shot per hint batch
+        // -- a still-stuck peer re-hints and we serve again.
         if self.demanded_height != self.hc.height {
             self.demanded.clear();
             self.demanded_height = self.hc.height;
         }
-        if let Some(h) = self.demanded.iter().copied().min() {
+        if let Some(value_id) = self.demanded.iter().copied().min() {
             let demanded_body = self
                 .blocks
-                .get(&h)
-                .filter(|b| b.height == self.hc.height && b.proposer == self.id)
+                .values()
+                .filter(|b| {
+                    b.height == self.hc.height
+                        && b.proposer == self.id
+                        && b.value_id() == value_id
+                })
+                // Any signed copy is the same value; prefer the newest round
+                // for deterministic selection independent of map order.
+                .max_by_key(|b| b.round)
                 .cloned();
             match demanded_body {
                 None => {
-                    // Unknown or stale body (never seen, or a previous
+                    // Unknown or stale value (never seen, or a previous
                     // height): drop it and fall through to fresh selection
                     // below; a still-stuck peer re-hints on its next nil
                     // prevote.
-                    self.demanded.remove(&h);
+                    self.demanded.remove(&value_id);
                 }
                 Some(body) => {
                     let root = self.state.get_state_root().await;
@@ -1010,14 +1078,27 @@ impl ValidatorRuntime {
                                 body.transactions.len(),
                             );
                         }
-                        // Self-record like the fresh path (see the locked path).
-                        let bh = body.compute_hash();
-                        self.blocks.insert(bh, body.clone());
+                        // Re-stamp the demanded value at the round we are
+                        // proposing for and re-sign it (ruleset v6). Serving
+                        // the original signed round would be refused by the
+                        // fsynced watermark exactly when it matters.
+                        let Some(served) = self.restamp_for_round(&body, self.hc.round) else {
+                            // No signer right now: keep the demand so the
+                            // next tick retries; never serve an unsigned body.
+                            return None;
+                        };
+                        let bh = served.compute_hash();
+                        // Register both signed identities against the value,
+                        // and keep the ORIGINAL body for body serving.
+                        self.hc.note_value_id(bh, served.value_id());
+                        self.hc
+                            .note_value_id(body.compute_hash(), body.value_id());
+                        self.blocks.insert(bh, served.clone());
                         let expected = self.expected_proposer_now();
                         self.hc.receive_proposal_for(self.id, bh, expected).ok()?;
                         // Served: consume one-shot (a still-stuck peer re-hints).
-                        self.demanded.remove(&h);
-                        return Some(body);
+                        self.demanded.remove(&value_id);
+                        return Some(served);
                     }
                     // Re-validation failed (transient state/backlog read):
                     // KEEP the demand so the next tick retries instead of
@@ -2238,6 +2319,10 @@ impl ValidatorRuntime {
             );
         }
         self.blocks.insert(bh, block.clone());
+        // Round-free identity (ruleset v6): every lock comparison on this
+        // body (now or after a later re-stamp of the same value) resolves
+        // through it.
+        self.hc.note_value_id(bh, block.value_id());
         let expected = self.expected_proposer_now();
         self.hc.receive_proposal_for(self.id, bh, expected).ok()?;
         Some(block)

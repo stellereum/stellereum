@@ -1222,7 +1222,26 @@ pub struct HeightConsensus {
     /// round for hundreds of rounds. `has_live_proposal` gates voting on it.
     pub proposal_round: Option<Round>,
     /// locked value: (block_hash, round at which we locked)
+    ///
+    /// The hash is the SIGNED identity of the body we locked (it commits the
+    /// round the proposer signed it for). Lock COMPARISONS do not compare it
+    /// directly: they go through [`Self::same_value`], which accepts a
+    /// re-stamped body (a later round, same value) via [`Self::value_ids`]
+    /// (ruleset v6).
     pub locked: Option<(BlockHash, Round)>,
+    /// Round-free value identity per block hash known at THIS height (ruleset
+    /// v6).
+    ///
+    /// A lock is on a VALUE, not on the bits of one signed proposal. When a
+    /// proposer re-stamps its locked body at the current round, the body hash
+    /// changes (the round is part of the signed preimage) but
+    /// [`crate::sharding::Block::value_id`] does not. The runtime registers
+    /// every block it accepts here; [`Self::same_value`] then treats the two
+    /// hashes as the SAME value for the lock rules. Keys stay hash-based so
+    /// the signed hash remains the map key everywhere else (votes, QCs,
+    /// finality), and an unknown hash falls back to plain equality
+    /// (conservative: absence of identity is never identity).
+    value_ids: HashMap<BlockHash, [u8; 32]>,
     /// votes keyed by (round, kind)
     pub(super) prevotes: HashMap<Round, VoteSet>,
     pub(super) precommits: HashMap<Round, VoteSet>,
@@ -1474,6 +1493,7 @@ impl HeightConsensus {
             proposal: None,
             proposal_round: None,
             locked: None,
+            value_ids: HashMap::new(),
             prevotes: HashMap::new(),
             precommits: HashMap::new(),
             decided: None,
@@ -1599,13 +1619,50 @@ impl HeightConsensus {
         self.proposal.is_some() && self.proposal_round == Some(self.round)
     }
 
+    /// Register the ROUND-FREE value identity of `block_hash` (ruleset v6).
+    ///
+    /// The runtime calls this for every body it admits (and for every body it
+    /// re-stamps), so the lock rules can tell "a later signed round of the
+    /// locked value" from "a different value" — something the signed hash
+    /// alone cannot express. Idempotent and cheap.
+    pub fn note_value_id(&mut self, block_hash: BlockHash, value_id: [u8; 32]) {
+        self.value_ids.insert(block_hash, value_id);
+    }
+
+    /// The registered round-free identity of `block_hash`, if known.
+    pub fn value_id_of(&self, block_hash: &BlockHash) -> Option<[u8; 32]> {
+        self.value_ids.get(block_hash).copied()
+    }
+
+    /// True when two block hashes name the SAME value (ruleset v6).
+    ///
+    /// Equal hashes are always the same value. Different hashes are the same
+    /// value only when BOTH identities are known and their
+    /// [`crate::sharding::Block::value_id`] agrees — i.e. they differ solely
+    /// in the signed round. An unknown hash is never assumed equal
+    /// (conservative: the lock keeps its full strength when identity is not
+    /// known).
+    pub fn same_value(&self, a: BlockHash, b: BlockHash) -> bool {
+        if a == b {
+            return true;
+        }
+        match (self.value_id_of(&a), self.value_id_of(&b)) {
+            (Some(va), Some(vb)) => va == vb,
+            _ => false,
+        }
+    }
+
     /// Compute our prevote for the current round, applying the lock rule.
     /// Returns the target to prevote (None = nil).
+    ///
+    /// LOCK COMPARISON (ruleset v6, site 1): a re-stamped body (same value,
+    /// later signed round) is the locked value, so it is voted; a different
+    /// value still nils. See [`Self::same_value`].
     pub fn decide_prevote(&self) -> Option<BlockHash> {
         match (&self.proposal, &self.locked) {
             // If locked on a value, only prevote that value (if it matches proposal)
             (Some((_, proposed)), Some((locked, _))) => {
-                if proposed == locked {
+                if self.same_value(*proposed, *locked) {
                     Some(*proposed)
                 } else {
                     None // locked on a different value -> prevote nil
@@ -1838,7 +1895,9 @@ impl HeightConsensus {
                 ));
             }
             if let Some((locked_block, locked_round)) = self.locked {
-                if locked_round <= r && locked_block != block {
+                // LOCK COMPARISON (ruleset v6, site 5): the diagnostic uses
+                // the same value identity as the decide path it explains.
+                if locked_round <= r && !self.same_value(locked_block, block) {
                     return Some(format!(
                         "h={} r={r}: lock ({}, r{locked_round}) refuses {}",
                         self.height,
@@ -1936,7 +1995,10 @@ impl HeightConsensus {
         if let (Some((locked_block, locked_round)), Some((polka_round, other_block))) =
             (self.locked, polka)
         {
-            if polka_round > locked_round && other_block != locked_block {
+            // LOCK COMPARISON (ruleset v6, site 2): a higher polka for a
+            // DIFFERENT value unlocks; a higher polka for a re-stamped round
+            // of the SAME value confirms the lock and must not release it.
+            if polka_round > locked_round && !self.same_value(other_block, locked_block) {
                 self.locked = None;
             }
         }
@@ -2118,8 +2180,11 @@ impl HeightConsensus {
             // its lock through the higher-round polka path (handled by the
             // precommit producer via `try_prevote_quorum_at`). Refuse the
             // whole scan, exactly as before.
+            // LOCK COMPARISON (ruleset v6, site 3): a decision for a
+            // re-stamped round of the locked value is still OUR value; only a
+            // genuinely different value is refused.
             if let Some((locked_block, _)) = self.locked {
-                if locked_block != block {
+                if !self.same_value(locked_block, block) {
                     return None;
                 }
             }
@@ -2222,9 +2287,12 @@ impl HeightConsensus {
             // locked on. An UNLOCKED accepted proposal is still wiped (the
             // accept-wipe livelock protection: voting a stale value that no
             // one else is locked on can only waste the round).
+            // LOCK COMPARISON (ruleset v6, site 4): keep the proposal live
+            // when it is the locked VALUE, including a body re-stamped for
+            // this round (its signed hash differs from the lock's hash).
             let keep_locked_proposal = matches!(
                 (self.proposal, self.locked),
-                (Some((_, proposed)), Some((locked, _))) if proposed == locked
+                (Some((_, proposed)), Some((locked, _))) if self.same_value(proposed, locked)
             );
             self.peer_round_advance_used = self
                 .peer_round_advance_used

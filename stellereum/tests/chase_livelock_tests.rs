@@ -327,20 +327,32 @@ async fn locked_proposer_reproposes_locked_value() {
         .await
         .expect("locked proposer must still propose");
     assert_eq!(
-        again.compute_hash(),
-        xh,
-        "locked proposer must re-propose the locked body byte-for-byte"
+        again.round, rt.hc.round,
+        "the locked value is re-stamped at the proposer's CURRENT round"
     );
+    assert_eq!(
+        again.value_id(),
+        x.value_id(),
+        "the re-stamp must keep the locked VALUE identity"
+    );
+    let again_hash = again.compute_hash();
 
-    // And a node locked on X votes X when X is re-proposed (the escape: the
-    // unlocked peer votes X too, QC forms, finalize).
+    // And a node locked on X votes X's re-stamped body when it is re-proposed
+    // (the escape: the unlocked peer votes the same value too, QC forms,
+    // finalize). The lock rule compares value ids, so the new signed hash is
+    // accepted as the locked value.
     rt.hc.proposal = None;
     let er = rt.hc.round;
     rt.on_proposal(id(&us), again, er)
         .await
         .expect("own re-proposal must be accepted");
     let v = rt.make_prevote().expect("must vote");
-    assert_eq!(v.block_hash, Some(xh), "locked node votes its locked value");
+    assert_eq!(
+        v.block_hash,
+        Some(again_hash),
+        "locked node votes the re-stamped body of its locked value"
+    );
+    assert_eq!(v.round, er, "and stamps it with the current round");
 }
 
 #[tokio::test]
@@ -528,7 +540,7 @@ async fn lock_hint_rescue_converges() {
     let xh = x.compute_hash();
     let era = a.hc.round;
     let ea = a.hc.round;
-    a.on_proposal(bid, x, ea)
+    a.on_proposal(bid, x.clone(), ea)
         .await
         .expect("A accepts B's block");
     assert!(a.hc.round >= era, "A aligns forward to the proposal");
@@ -580,9 +592,20 @@ async fn lock_hint_rescue_converges() {
         b.hc.next_round();
     }
     let rescue = b.propose(1).await.expect("B must serve the demand");
-    assert_eq!(rescue.compute_hash(), xh, "re-proposal is byte-identical");
+    assert_eq!(
+        rescue.value_id(),
+        x.value_id(),
+        "the rescue must serve the same VALUE A is locked on"
+    );
+    assert_eq!(
+        rescue.round, b.hc.round,
+        "the rescue is re-stamped at B's current round (ruleset v6)"
+    );
+    let rescue_hash = rescue.compute_hash();
 
-    // A votes its locked value when it is re-proposed: QC can now form.
+    // A votes its locked value's re-stamp when it is re-proposed: QC can now
+    // form. The lock comparison is by round-free value id, so the new signed
+    // hash is the locked value.
     while a.hc.round < b.hc.round {
         a.hc.next_round();
     }
@@ -593,8 +616,8 @@ async fn lock_hint_rescue_converges() {
     let v = a.make_prevote().expect("A votes");
     assert_eq!(
         v.block_hash,
-        Some(xh),
-        "locked A votes the re-proposed lock"
+        Some(rescue_hash),
+        "locked A votes the re-stamped body of its lock"
     );
 }
 
@@ -631,9 +654,13 @@ async fn lock_hint_ignores_foreign_and_missing_bodies() {
     }
     let served = rt.propose(1).await.expect("must propose");
     assert_eq!(
-        served.compute_hash(),
-        mh,
-        "serves our demanded body verbatim"
+        served.value_id(),
+        mine.value_id(),
+        "serves our demanded VALUE (re-stamped at the current round)"
+    );
+    assert_eq!(
+        served.round, rt.hc.round,
+        "the rescue must be re-stamped at the proposer's current round"
     );
 }
 
@@ -826,9 +853,13 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
     }
     let served = rt.propose(1).await.expect("must serve the demand");
     assert_eq!(
-        served.compute_hash(),
-        ours_h,
-        "batched nil hint must be recorded"
+        served.value_id(),
+        ours.value_id(),
+        "batched nil hint must be recorded (demand keyed by VALUE)"
+    );
+    assert_eq!(
+        served.round, rt.hc.round,
+        "the rescue is re-stamped at the proposer's current round"
     );
 }
 

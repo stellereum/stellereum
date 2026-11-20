@@ -119,16 +119,25 @@ async fn locked_reproposal_records_live_proposal_and_broadcasts_once() {
         "precondition: view change clears the round-0 proposal"
     );
 
-    // Round 1: locked re-proposal serves the identical body...
+    // Round 1: locked re-proposal serves the SAME VALUE re-stamped at the
+    // proposer's current round (ruleset v6). The signed hash changes (the
+    // round is in the preimage); the round-free value id does not.
     let b1 = rt
         .propose(1_000)
         .await
         .expect("locked re-proposal must succeed");
-    assert_eq!(
+    assert_eq!(b1.round, rt.hc.round, "the rescue is re-stamped to THIS round");
+    assert_ne!(
         b1.compute_hash(),
         h,
-        "locked re-proposal must serve the identical locked body"
+        "a round-1 re-stamp must not re-serve a round-0 signed hash"
     );
+    assert_eq!(
+        b1.value_id(),
+        b0.value_id(),
+        "the rescue must serve the SAME value the lock names"
+    );
+    let b1h = b1.compute_hash();
     // ...AND must close the gate (this is the assertion that fails pre-fix:
     // the locked path returned Some without receive_proposal, so the gate
     // stayed open and every 100ms tick rebroadcast the identical hash).
@@ -140,7 +149,7 @@ async fn locked_reproposal_records_live_proposal_and_broadcasts_once() {
 
     // Repeat call same round: identical or None, never a novel block.
     if let Some(b) = rt.propose(1_000).await {
-        assert_eq!(b.compute_hash(), h)
+        assert_eq!(b.compute_hash(), b1h)
     }
 
     // Full gate simulation: 7 ticks (one round at 100ms/tick with pacing
@@ -170,15 +179,23 @@ async fn demanded_reproposal_records_live_proposal_and_broadcasts_once() {
     assert_eq!(rt.hc.round, 1);
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(h));
 
-    // Round 1: demanded path serves our body verbatim...
+    // Round 1: the demanded path serves OUR VALUE re-stamped at the current
+    // round (ruleset v6). The demand is keyed by the round-free value id, so
+    // resolving the old signed hash still finds it.
     let b1 = rt
         .propose(1_000)
         .await
         .expect("demanded re-proposal must succeed");
+    assert_eq!(b1.round, rt.hc.round, "the demand is re-stamped to THIS round");
     assert_eq!(
+        b1.value_id(),
+        b0.value_id(),
+        "demanded re-proposal must serve the identical VALUE"
+    );
+    assert_ne!(
         b1.compute_hash(),
         h,
-        "demanded re-proposal must serve the identical demanded body"
+        "the old signed round must not be served again"
     );
     // ...AND must close the gate (fails pre-fix for the same reason).
     assert!(
@@ -215,9 +232,11 @@ async fn locked_round_broadcasts_exactly_once_not_once_per_tick() {
         1,
         "one round must produce exactly 1 broadcast, got {} (all identical: {})",
         broadcasts.len(),
-        broadcasts.iter().all(|b| *b == h),
+        broadcasts.iter().all(|b| *b == broadcasts[0]),
     );
-    assert_eq!(broadcasts[0], h);
+    // The one broadcast is the round-1 re-stamp of the locked value, not a
+    // repeat of the round-0 signed hash.
+    assert_ne!(broadcasts[0], h, "a re-stamp must not re-send the old hash");
 }
 
 // ============================================================================

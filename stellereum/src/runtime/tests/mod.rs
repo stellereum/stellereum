@@ -408,31 +408,44 @@ async fn demanded_demand_survives_transient_revalidation_failure() {
     // Reopen the propose gate (the fresh path self-recorded a proposal).
     rt.hc.proposal = None;
     // The peer is stuck on our body and says so with a nil prevote hint.
+    // The demand is keyed by the round-free VALUE id (ruleset v6).
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(h));
-    assert!(rt.demanded.contains(&h), "hint must record the demand");
-    // Corrupt the stored copy so the serve-time re-validation fails.
+    assert!(
+        rt.demanded.contains(&body.value_id()),
+        "hint must record the demand"
+    );
+    // Corrupt the stored copy so the serve-time re-validation fails. Drop the
+    // proposer signatures rather than mutating a hashed field: the demand is
+    // keyed by the round-free VALUE id (ruleset v6), and a field inside that
+    // identity would name a different value (so the demand would correctly be
+    // treated as unwanted). Signatures are excluded from the value identity,
+    // so this is the transient, same-value failure the retry logic handles.
     rt.blocks
         .get_mut(&h)
         .expect("body must be stored")
-        .state_root = [9u8; 32];
+        .validator_signatures
+        .clear();
     rt.hc.proposal = None;
     let _ = rt.propose(1_000).await;
     assert!(
-        rt.demanded.contains(&h),
+        rt.demanded.contains(&body.value_id()),
         "transient re-validation failure must not consume the demand"
     );
     // Repair the stored copy: the still-queued demand serves exactly once.
-    let root = rt.state.get_state_root().await;
     rt.blocks
         .get_mut(&h)
         .expect("body must be stored")
-        .state_root = root;
+        .validator_signatures = body.validator_signatures.clone();
     rt.hc.proposal = None;
     let served = rt.propose(1_000).await.expect("repaired demand must serve");
     assert_eq!(
-        served.compute_hash(),
-        h,
-        "must re-propose the demanded body verbatim"
+        served.value_id(),
+        body.value_id(),
+        "must re-propose the demanded VALUE"
+    );
+    assert_eq!(
+        served.round, rt.hc.round,
+        "and re-stamp it at the proposer's current round"
     );
     assert!(
         rt.demanded.is_empty(),
@@ -463,6 +476,7 @@ async fn lock_hint_envelope_is_untrusted_and_mitigated() {
     // One genuine own body at this height.
     let body = rt.propose(1_000).await.expect("sole proposer must propose");
     let ours = body.compute_hash();
+    let ours_value = body.value_id();
     rt.hc.proposal = None;
     let h = rt.hc.height;
 
@@ -485,19 +499,19 @@ async fn lock_hint_envelope_is_untrusted_and_mitigated() {
     // height's demands — the scope reset only runs for the live height).
     rt.note_lock_hint(h, VoteKind::Prevote, None, Some(ours));
     assert!(
-        rt.demanded.contains(&ours),
-        "genuine hint must record the demand"
+        rt.demanded.contains(&ours_value),
+        "genuine hint must record the demand (keyed by value id)"
     );
     rt.note_lock_hint(h + 1, VoteKind::Prevote, None, Some(ours));
     assert!(
-        rt.demanded.contains(&ours),
+        rt.demanded.contains(&ours_value),
         "wrong-height hints must neither record nor wipe live demands"
     );
     rt.demanded.clear();
 
     // The genuine shape records.
     rt.note_lock_hint(h, VoteKind::Prevote, None, Some(ours));
-    assert!(rt.demanded.contains(&ours));
+    assert!(rt.demanded.contains(&ours_value));
     rt.demanded.clear();
 
     // The set is bounded: 9 distinct own bodies, 8 slots. Build them by

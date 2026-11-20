@@ -30,7 +30,7 @@ export class ProtocolError extends Error {
 
 export const PROTOCOL_MAJOR = 1;
 export const PROTOCOL_MINOR = 0;
-export const CONSENSUS_RULESET_VERSION = 5;
+export const CONSENSUS_RULESET_VERSION = 6;
 export const DOMAIN_SET_VERSION = 3;
 export const DEFAULT_CHAIN_ID = 5757;
 export const CAP_COMPACT_GOSSIP = 1n << 0n;
@@ -117,7 +117,7 @@ export function deriveForkId(
   return h >>> 0;
 }
 
-/** The fork id this package was built for (ruleset v4). */
+/** The fork id this package was built for (ruleset v6). */
 export const FORK_ID = deriveForkId(
   BigInt(DEFAULT_CHAIN_ID),
   CONSENSUS_RULESET_VERSION,

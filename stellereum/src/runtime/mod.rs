@@ -328,11 +328,13 @@ pub struct ValidatorRuntime {
     /// plain path is unaffected.
     pub tx_gossip: Option<Arc<crate::consensus_net::TxGossip>>,
     pub blocks: HashMap<BlockHash, Block>,
-    /// Bodies our locked peers are stuck on (learned from nil-vote lock hints).
+    /// VALUES our locked peers are stuck on (learned from nil-vote lock
+    /// hints), keyed by the round-free [`crate::sharding::Block::value_id`]
+    /// (ruleset v6) so a re-stamped body resolves to the same demand.
     /// Scoped to `demanded_height` (a finalize moves on, old demands die with
     /// it); capped so hint spam cannot grow memory. Served one-shot per hint
     /// batch: re-proposing re-validates, and a still-stuck peer re-hints.
-    demanded: HashSet<BlockHash>,
+    demanded: HashSet<[u8; 32]>,
     demanded_height: Height,
     /// Best-known peer head `(height, hash)` from structurally-valid proposals:
     /// a proposal at height H proves its author finalized H-1 (hash = prev_hash),

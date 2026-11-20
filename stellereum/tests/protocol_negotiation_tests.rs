@@ -303,17 +303,21 @@ fn fork_id_is_stable_for_equal_inputs_and_changes_with_the_ruleset() {
     }
 }
 
-/// Ruleset v5 pin: the SDKs ship `FORK_ID = 0x9d59096b` (protocol 1.0,
-/// `CONSENSUS_RULESET_VERSION = 5`) from the same 23-entry rules list. The
+/// Ruleset v6 pin: the SDKs ship `FORK_ID = 0x0f584a46` (protocol 1.0,
+/// `CONSENSUS_RULESET_VERSION = 6`) from the same 23-entry rules list. The
 /// node MUST produce exactly that value or every SDK builder refuses to sign.
+///
+/// v6 is a LOGIC change (locks compare the round-free `Block::value_id` and
+/// rescued bodies are re-stamped), so the rules list is unchanged and only the
+/// ruleset version moves the fold. See `docs/RULESET_V6.md`.
 #[test]
-fn fork_id_v5_is_pinned_and_matches_the_sdk_guard() {
+fn fork_id_v6_is_pinned_and_matches_the_sdk_guard() {
     /// The value pinned by `stellereum-sdk/src/protocol.rs` and
-    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0x9d59096b"`).
-    const SDK_FORK_ID: u32 = 0x9d59_096b;
+    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0x0f584a46"`).
+    const SDK_FORK_ID: u32 = 0x0f58_4a46;
 
     assert_eq!(FORK_ID, SDK_FORK_ID);
-    assert_eq!(CONSENSUS_RULESET_VERSION, 5);
+    assert_eq!(CONSENSUS_RULESET_VERSION, 6);
     assert_eq!(FORK_ID_RULES.len(), 23, "SDKs fold 23 rules");
 
     // Exact order matters: the fold is sequential. This is the SDK list,

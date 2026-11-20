@@ -928,6 +928,35 @@ impl Block {
     /// replayed on mainnet. The domain tag was bumped `V2 -> V3` because the
     /// preimage layout changed.
     pub fn compute_hash(&self) -> [u8; 32] {
+        self.compute_hash_committing_round(self.round)
+    }
+
+    /// The ROUND-FREE identity of the VALUE this block carries (ruleset v6).
+    ///
+    /// This is the canonical block hash with the signed [`Block::round`]
+    /// forced to `0`. Because `compute_hash_committing_round` zero-skips the
+    /// round section, a round-0 preimage is exactly the legacy/canonical body
+    /// identity, so this is stable across every re-stamp of the same value.
+    ///
+    /// USE IT ONLY WHERE THE QUESTION IS "THE SAME VALUE?", never "the same
+    /// signed statement?":
+    ///
+    /// * lock / unlock / decide comparisons (`HeightConsensus`);
+    /// * the demanded-body (lock-hint rescue) lookup;
+    /// * dedup-by-value.
+    ///
+    /// The wire identity is still [`Self::compute_hash`]: the proposer
+    /// signature, every vote and every QC cover the REAL round, so two
+    /// re-stamps of one value are two distinct signed objects (and proposal
+    /// equivocation still requires the SAME signed round). Voting, signing
+    /// and certificate verification must keep using the signed hash.
+    pub fn value_id(&self) -> [u8; 32] {
+        self.compute_hash_committing_round(0)
+    }
+
+    /// [`Self::compute_hash`] for an explicit round tag, without mutating the
+    /// block. `round == 0` is the round-free value identity.
+    fn compute_hash_committing_round(&self, round: u32) -> [u8; 32] {
         let mut hasher = Sha256::new();
         // Domain separator: version the block-commitment scheme.
         hasher.update(b"STELLEREUM_BLOCK_V3");
@@ -943,9 +972,9 @@ impl Block {
         // section is zero-skipped: round 0 is the canonical default and the
         // only value a pre-v4 body can mean, so every legacy block keeps its
         // pre-existing hash, signatures and QCs byte-for-byte.
-        if self.round != 0 {
+        if round != 0 {
             hasher.update(ROUND_COMMITMENT_TAG);
-            hasher.update(self.round.to_be_bytes());
+            hasher.update(round.to_be_bytes());
         }
         hasher.update(self.prev_hash);
         hasher.update(self.state_root);

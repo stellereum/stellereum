@@ -37,7 +37,7 @@ pub const PROTOCOL_MINOR: u16 = 0;
 
 /// Version of the consensus rule logic not captured by a hashed constant
 /// (`stellereum/src/protocol.rs:CONSENSUS_RULESET_VERSION`).
-pub const CONSENSUS_RULESET_VERSION: u32 = 5;
+pub const CONSENSUS_RULESET_VERSION: u32 = 6;
 
 /// Version of the folded domain-separation string set
 /// (`stellereum/src/protocol.rs:DOMAIN_SET_VERSION`).
@@ -118,7 +118,7 @@ pub const fn derive_fork_id(chain_id: u64, ruleset_version: u32, rules: &[u64]) 
 }
 
 /// The consensus ruleset identifier this SDK build speaks
-/// (`stellereum/src/protocol.rs:FORK_ID`, ruleset v5).
+/// (`stellereum/src/protocol.rs:FORK_ID`, ruleset v6).
 pub const FORK_ID: u32 = derive_fork_id(DEFAULT_CHAIN_ID, CONSENSUS_RULESET_VERSION, FORK_ID_RULES);
 
 /// Capability bit of `COMPACT_GOSSIP` (`infnode::proto::Capabilities`).
@@ -297,8 +297,8 @@ mod tests {
         let id = ProtocolIdentity::local();
         id.verify().unwrap();
         id.verify_for_chain(DEFAULT_CHAIN_ID).unwrap();
-        assert_eq!(id.fork_id_hex(), "0x9d59096b");
-        assert!(id.startup_line().contains("fork_id 0x9d59096b"));
+        assert_eq!(id.fork_id_hex(), "0x0f584a46");
+        assert!(id.startup_line().contains("fork_id 0x0f584a46"));
     }
 
     #[test]

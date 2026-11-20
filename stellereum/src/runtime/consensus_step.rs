@@ -960,18 +960,25 @@ impl ValidatorRuntime {
         // mismatch") — the rescue would fail, the stuck peer would stay
         // stuck, and our own proposer round would be spent on a block the
         // network can never accept.
-        let ours = self
+        //
+        // DEMANDED LOOKUP BY VALUE (ruleset v6): the hint carries the SIGNED
+        // hash the peer is locked on. Resolve it to the body we hold and key
+        // the demand by that body's ROUND-FREE `value_id`, so the demand
+        // survives the re-stamp we are about to serve and cannot be lost
+        // merely because the peer's lock names an older signed round.
+        let Some(value_id) = self
             .blocks
             .get(&h)
-            .is_some_and(|b| b.height == self.hc.height && b.proposer == self.id);
-        if !ours {
+            .filter(|b| b.height == self.hc.height && b.proposer == self.id)
+            .map(|b| b.value_id())
+        else {
             return;
-        }
+        };
         const MAX_DEMANDED: usize = 8;
-        if self.demanded.len() >= MAX_DEMANDED && !self.demanded.contains(&h) {
+        if self.demanded.len() >= MAX_DEMANDED && !self.demanded.contains(&value_id) {
             return;
         }
-        self.demanded.insert(h);
+        self.demanded.insert(value_id);
     }
 
     /// Record a peer's SIGNED round. Returns true when we moved.
@@ -1406,6 +1413,10 @@ impl ValidatorRuntime {
             return Err("proposal: proposer field mismatch".to_string());
         }
         let bh = block.compute_hash();
+        // ROUND-FREE VALUE IDENTITY (ruleset v6): register the value behind
+        // this signed hash so the lock rules can recognise a re-stamped body
+        // of the SAME value. The signed hash stays the vote/QC identity.
+        self.hc.note_value_id(bh, block.value_id());
         let expected = self.expected_proposer_now();
         self.hc.receive_proposal_for(proposer, bh, expected)?;
         // Fork-choice: the proposal is recorded as a CANDIDATE before it is
@@ -1615,7 +1626,10 @@ impl ValidatorRuntime {
         // below our lock round for another block is stale evidence and must
         // not be voted.
         if let Some((locked_block, locked_round)) = self.hc.locked {
-            if locked_block != target && qc_round <= locked_round {
+            // LOCK COMPARISON (ruleset v6, site 6): the target is OUR value
+            // when it is a re-stamped round of the locked value as well as
+            // when the signed hash is identical.
+            if !self.hc.same_value(locked_block, target) && qc_round <= locked_round {
                 return None;
             }
         }
@@ -2607,10 +2621,17 @@ impl ValidatorRuntime {
         // refused. A certificate for the SAME block is always fine: that is
         // our own lock being confirmed.
         if let Some((locked_block, locked_round)) = self.hc.locked {
-            if certificate.round <= locked_round && locked_block != bh {
+            // LOCK COMPARISON (ruleset v6, site 7): a re-stamped round of the
+            // locked value does not contradict the lock; a different value
+            // still does.
+            if certificate.round <= locked_round && !self.hc.same_value(locked_block, bh) {
                 return Err("refusing to adopt a block that contradicts our lock".to_string());
             }
         }
+        // ROUND-FREE VALUE IDENTITY (ruleset v6): this adopted body is now a
+        // known value at this height, so later lock comparisons can equate a
+        // re-stamp of it with its original signed hash.
+        self.hc.note_value_id(bh, block.value_id());
         // PREVOTE-QUORUM CONSISTENCY (parity with `try_precommit_quorum`):
         // the local path refuses to decide a block unless a prevote quorum for
         // the SAME block exists in the same round. The adopt path receives only

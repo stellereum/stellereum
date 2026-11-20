@@ -46,8 +46,8 @@
   <rect x="780" y="296" width="160" height="6" fill="#a875ff"/>
   <rect x="948" y="296" width="80" height="6" fill="#5eb8ff"/>
 
-  <text x="72" y="360" fill="#a9b8d8" font-family="Liberation Mono, monospace" font-size="22" letter-spacing="1">FALCON-512 VOTES · TWO SHARDS {0,1} · WASM</text>
-  <text x="72" y="396" fill="#a9b8d8" font-family="Liberation Mono, monospace" font-size="22" letter-spacing="1">RULESET V5 · FORK 0x9d59096b · TESTNET ONLY</text>
+  <text x="72" y="360" fill="#a9b8d8" font-family="Liberation Mono, monospace" font-size="22" letter-spacing="1">FALCON-512 VOTES · SHARD 0 LIVE · WASM</text>
+  <text x="72" y="396" fill="#a9b8d8" font-family="Liberation Mono, monospace" font-size="22" letter-spacing="1">RULESET V6 · FORK 0x0f584a46 · TESTNET ONLY</text>
 
   <g fill="#7aa2ff">
     <rect x="72" y="470" width="8" height="8"/><rect x="88" y="470" width="8" height="8"/>

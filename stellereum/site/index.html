@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stellereum — Pure Post-Quantum Layer 1 · Testnet</title>
-<meta name="description" content="Stellereum is a pure post-quantum Layer 1 written in Rust. Falcon-512 validator votes, two shards {0,1}, chain ID 5757, ruleset v6. Testnet only; no external audit.">
+<meta name="description" content="Stellereum is a pure post-quantum Layer 1 written in Rust. Falcon-512 validator votes, shards {0,1} with shard 0 live, chain ID 5757, ruleset v6. Testnet only; no external audit.">
 <meta name="theme-color" content="#060811">
 <meta name="color-scheme" content="dark">
 <link rel="canonical" href="https://stellereum.org/">
@@ -14,19 +14,19 @@
 <meta property="og:locale" content="en_US">
 <meta property="og:url" content="https://stellereum.org/">
 <meta property="og:title" content="Stellereum — Pure Post-Quantum Layer 1">
-<meta property="og:description" content="Pure post-quantum: Falcon-512 validator votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only; no external audit.">
-<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=20">
+<meta property="og:description" content="Pure post-quantum: Falcon-512 validator votes, shard 0 live ({0,1} supported), WASM (wasmi) runtime, chain ID 5757. Testnet only; no external audit.">
+<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=21">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Stellereum — Pure Post-Quantum Layer 1">
-<meta name="twitter:description" content="Pure post-quantum: Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
-<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=20">
+<meta name="twitter:description" content="Pure post-quantum: Falcon-512 votes, shard 0 live ({0,1} supported), WASM (wasmi) runtime, chain ID 5757. Testnet only.">
+<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=21">
 
-<link rel="icon" href="favicon.ico?v=20" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=20">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=20">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=20">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=20">
-<link rel="manifest" href="site.webmanifest?v=20">
+<link rel="icon" href="favicon.ico?v=21" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=21">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=21">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=21">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=21">
+<link rel="manifest" href="site.webmanifest?v=21">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -34,10 +34,10 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=20">
-<link rel="stylesheet" href="assets/css/base.css?v=20">
-<link rel="stylesheet" href="assets/css/components.css?v=20">
-<link rel="stylesheet" href="assets/css/reference.css?v=20">
+<link rel="stylesheet" href="assets/css/tokens.css?v=21">
+<link rel="stylesheet" href="assets/css/base.css?v=21">
+<link rel="stylesheet" href="assets/css/components.css?v=21">
+<link rel="stylesheet" href="assets/css/reference.css?v=21">
 
 <script>
 document.documentElement.classList.add('js');
@@ -51,10 +51,10 @@ window.setTimeout(function () {
   .stage-drag { display: none; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=20"></script>
-<script defer src="assets/js/motion.js?v=20"></script>
-<script defer src="assets/js/metrics.js?v=20"></script>
-<script defer src="assets/js/dither.js?v=20"></script>
+<script defer src="assets/js/app.js?v=21"></script>
+<script defer src="assets/js/motion.js?v=21"></script>
+<script defer src="assets/js/metrics.js?v=21"></script>
+<script defer src="assets/js/dither.js?v=21"></script>
 </head>
 <body>
 
@@ -102,7 +102,7 @@ window.setTimeout(function () {
         <button class="stage-mode" type="button" id="hero-mode-ribbon" data-hero-mode="ribbon" aria-pressed="false" aria-label="Show the dithered ribbon">02 // Ribbon</button>
         <a class="scene-pill" href="#type-engine">Protocol ↓</a>
       </div>
-      <p class="stage-caption">Post-quantum L1 · chain 5757 · two shards {0,1}</p>
+      <p class="stage-caption">Post-quantum L1 · chain 5757 · shard 0 live · {0,1} supported</p>
     </div>
     <div class="stage-telemetry">
       <div class="stage-chip-group">
@@ -220,7 +220,7 @@ window.setTimeout(function () {
           <span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> · </span><span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> ·</span>
         </p>
         <p class="kinetic-row" data-kinetic data-dir="-1">
-          <span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Two shards<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> · </span><span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Two shards<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> ·</span>
+          <span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Shard 0 live<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> · </span><span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Shard 0 live<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> ·</span>
         </p>
         <p class="kinetic-row kinetic-row--fill" data-kinetic data-dir="1">
           Light through math · 2PC finality · chain 5757 · Light through math · 2PC finality · chain 5757 ·
@@ -283,7 +283,7 @@ window.setTimeout(function () {
             <canvas class="dither-canvas" id="card-canvas-2"></canvas>
             <div class="work-overlay">
               <div class="work-top"><span class="work-chip">03 / Shards</span><span class="work-chip work-chip--accent">{0,1}</span></div>
-              <div class="work-name"><h3>Two shards, fixed</h3><p>Masterchain 0 + workchain 1</p></div>
+              <div class="work-name"><h3>Shard 0 live</h3><p>Fixed pair {0,1} · shard 1 parked</p></div>
             </div>
           </div>
           <div class="work-foot"><span>2PC from genesis · no live split</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>
@@ -294,7 +294,7 @@ window.setTimeout(function () {
             <canvas class="dither-canvas" id="card-canvas-3"></canvas>
             <div class="work-overlay">
               <div class="work-top"><span class="work-chip">04 / Contracts</span><span class="work-chip work-chip--accent">13 host fns</span></div>
-              <div class="work-name"><h3>WASM contracts</h3><p>wasmi · fuel before effect</p></div>
+              <div class="work-name"><h3>WASM runtime</h3><p>wasmi · fuel before effect</p></div>
             </div>
           </div>
           <div class="work-foot"><span>wasmi · upgrade means redeploy</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>

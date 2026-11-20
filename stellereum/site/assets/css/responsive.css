@@ -18,17 +18,14 @@
   html.is-inverted .site-header,
   body.is-inverted .site-header { background: rgba(238, 242, 255, .98); }
 
-  /* Below the two-column breakpoint the live pixel object sits in its own
-     grid row after the copy. Normal flow means it never enters the H1,
-     lede or CTA boxes, and its width is capped against horizontal scroll. */
-  .hero-object {
-    display: block;
-    width: min(230px, 52vw);
-    margin-top: 12px;
-    margin-left: auto;
-    justify-self: end;
-    align-self: end;
-  }
+  /* The hero stage is full-bleed at every width. The object is cropped by
+     the canvas camera; only copy density changes on small screens. */
+  .hero-topbar,
+  .hero-bottombar { padding-block: 9px; }
+  .hero-inner { padding-block: 10px; }
+  .hero-title { font-size: clamp(1.65rem, min(8.5vw, 12vh), 5.4rem); }
+  .hero-lede-panel { padding: 12px; }
+  .hero-sub { font-size: 13.5px; }
 
   .invert-pill { order: 2; margin-left: auto; margin-right: 0; }
   .nav-toggle { order: 3; margin-left: 0; }
@@ -45,8 +42,8 @@
   .brand-mark { width: 24px; height: 24px; }
   .brand-word { font-size: 11.5px; }
 
-  .hero-title { font-size: clamp(1.75rem, 9vw, 6.6rem); }
-  .hero-sub { font-size: 14px; }
+  .hero-title { font-size: clamp(1.65rem, min(8.5vw, 12vh), 5rem); }
+  .hero-sub { font-size: 12.5px; }
 
   .perf-grid { grid-template-columns: minmax(0, 1fr); }
   .perf-value { font-size: 34px; }
@@ -76,8 +73,6 @@
   .brand-tag { display: inline-block; }
 
   .nav-panel { width: min(390px, 82vw); }
-
-  .hero-hud { font-size: 10px; }
 
   .metric--row {
     grid-template-columns: minmax(0, 1.15fr) auto auto;
@@ -165,14 +160,9 @@
 
   .nav-cta:hover { transform: none; box-shadow: none; }
 
-  /* hero: copy owns the left column; the slab object owns the right one. */
-  .hero-inner {
-    grid-template-columns: minmax(0, 1fr) minmax(260px, 34%);
-    gap: clamp(32px, 4vw, 64px);
-  }
-
-  .hero-object { display: block; }
-  .hero-title { font-size: clamp(2.4rem, 5.7vw, 5.75rem); }
+  /* hero: full-bleed stage; copy is one column over it. */
+  .hero-inner { padding-block: clamp(16px, 3vh, 40px); }
+  .hero-title { font-size: clamp(2.6rem, min(7.8vw, 12.2vh), 9.5rem); }
 
   .metric-sheet { grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); }
   .metric--lead { border-right: 1px solid var(--line-strong); border-bottom: 0; }
@@ -240,13 +230,27 @@
 }
 
 /* --- short phones: keep the hero copy and actions above the fold -------- */
-@media (max-width: 899.98px) and (max-height: 820px) {
-  .hero-hud { padding-block: 9px; }
-  .hero-inner { padding-block: 8px; }
-  .hero-kicker { margin-bottom: 10px; }
-  .hero-sub { margin-top: 12px; }
-  .hero-actions { margin-top: 14px; }
-  .hero-title { font-size: clamp(1.75rem, 9vw, 6.6rem); }
+@media (max-width: 899.98px) and (max-height: 760px) {
+  .hero-topbar { padding-block: 7px; }
+  .hero-bottombar { padding-block: 6px; }
+  .hero-inner { padding-block: 6px; }
+  .hero-kicker { margin-bottom: 8px; padding-block: 4px; }
+  .hero-sub { font-size: 12px; line-height: 1.5; }
+  .hero-lede-panel { margin-top: 8px; padding: 10px; }
+  .hero-actions { margin-top: 8px; gap: 8px; }
+  .hero-actions .btn { min-height: 44px; padding: 10px 14px; font-size: 10px; }
+  .hero-controls { margin-top: 6px; padding-top: 6px; }
+  .hero-scroll { display: none; }
+  .hero-object-meta { display: none; }
+  .hero-title { font-size: clamp(1.65rem, min(8.5vw, 12vh), 4.8rem); }
+}
+
+@media (max-width: 899.98px) and (max-height: 620px) {
+  /* Short phone: the chain ID already appears in the top HUD and the lede.
+     Drop the duplicate kicker before shrinking the display type further. */
+  .hero-kicker { display: none; }
+  .hero-topbar { padding-block: 6px; }
+  .hero-bottombar { padding-block: 5px; }
 }
 
 /* --- coarse pointers: no hover lift, no custom cursor -------------------- */

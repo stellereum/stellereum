@@ -147,7 +147,7 @@
 
   /* ---------------------------------------------------------- hero parallax */
   function initParallax() {
-    var mark = doc.querySelector('.hero-object');
+    var mark = doc.querySelector('.hero-copy');
     if (!mark || reduce.matches) return;
     var ticking = false;
 
@@ -155,7 +155,7 @@
       ticking = false;
       var y = win.scrollY || win.pageYOffset || 0;
       if (y > win.innerHeight * 1.4) return;
-      mark.style.translate = '0 ' + (-y * 0.06).toFixed(1) + 'px';
+      mark.style.translate = '0 ' + (y * 0.035).toFixed(1) + 'px';
     }
 
     function onScroll() {
@@ -167,21 +167,31 @@
   }
 
   /* ------------------------------------------------- kinetic type shear */
+  /* Every data-kinetic row deforms against the band's scroll progress. The
+     rows are decorative (aria-hidden) and become still under reduced motion. */
   function initKinetic() {
-    var row = doc.querySelector('[data-kinetic]');
-    if (!row || reduce.matches) return;
+    var rows = Array.prototype.slice.call(doc.querySelectorAll('[data-kinetic]'));
+    if (!rows.length || reduce.matches) return;
+    var readout = doc.querySelector('[data-warp-readout]');
     var ticking = false;
 
     function update() {
       ticking = false;
-      var r = row.getBoundingClientRect();
       var vh = win.innerHeight;
-      if (r.bottom < -120 || r.top > vh + 120) return;
+      var band = rows[0].closest('.kinetic-band') || rows[0];
+      var r = band.getBoundingClientRect();
+      if (r.bottom < -160 || r.top > vh + 160) return;
 
-      var p = (vh * 0.5 - (r.top + r.height * 0.5)) / (vh * 0.5 + r.height * 0.5);
+      var p = (vh * 0.5 - (r.top + r.height * 0.5)) / (vh * 0.55 + r.height * 0.5);
       p = Math.max(-1, Math.min(1, p));
-      row.style.setProperty('--kx', (p * 90).toFixed(1) + 'px');
-      row.style.setProperty('--ks', (p * -6).toFixed(2) + 'deg');
+
+      rows.forEach(function (row) {
+        var dir = parseFloat(row.getAttribute('data-dir') || '1');
+        row.style.setProperty('--kx', (p * 78 * dir).toFixed(1) + 'px');
+        row.style.setProperty('--ks', (p * -5.5 * dir).toFixed(2) + 'deg');
+      });
+
+      if (readout) readout.textContent = Math.round(Math.abs(p) * 100) + '%';
     }
 
     function onScroll() {
@@ -196,7 +206,7 @@
   /* ---------------------------------------------------------- magnetic */
   function initMagnetic() {
     if (reduce.matches || !precise.matches) return;
-    var els = doc.querySelectorAll('.btn');
+    var els = doc.querySelectorAll('.btn, .hero-mode, [data-magnetic]');
     if (!els.length) return;
 
     Array.prototype.forEach.call(els, function (el) {
@@ -247,7 +257,7 @@
     }, { passive: true });
 
     doc.addEventListener('pointerover', function (e) {
-      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-object-frame') : null;
+      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-stage, .card-media, .sticker') : null;
       cursor.classList.toggle('is-expanded', !!target);
     });
 

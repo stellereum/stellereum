@@ -134,10 +134,15 @@
   var items = [];
   var rafId = null;
   var lastNow = 0;
+  var bootTime = 0;
   var fpsCount = 0;
   var fpsMark = 0;
   var fpsEl = null;
-  var heroModeBtn = null;
+  var heroResEl = null;
+  var heroScrollEl = null;
+  var heroTimecodeEl = null;
+  var heroModeCap = null;
+  var heroModeBtns = [];
   var heroModeLabel = null;
   var heroFrame = null;
   var heroItem = null;
@@ -146,7 +151,10 @@
   function anyVisible() {
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      if (it.visible && it.buf && it.buf.ready) return true;
+      /* Static modules (interval >= 1e8) keep the loop alive only until their
+         one pending frame is painted. Then the page idles. */
+      if (it.visible && it.buf && it.buf.ready &&
+          (it.minInterval < 100000000 || it.buf.lastPaint < 0)) return true;
     }
     return false;
   }
@@ -161,6 +169,24 @@
       fpsEl.textContent = fps + ' FPS // BAYER 4\u00d74';
       fpsCount = 0;
       fpsMark = now;
+
+      if (!bootTime) bootTime = now;
+      if (heroTimecodeEl) {
+        var secs = Math.floor((now - bootTime) / 1000);
+        var hh = Math.floor(secs / 3600);
+        var mm = Math.floor((secs % 3600) / 60);
+        var ss = secs % 60;
+        heroTimecodeEl.textContent = 'TC ' + (hh < 10 ? '0' : '') + hh + ':' +
+          (mm < 10 ? '0' : '') + mm + ':' + (ss < 10 ? '0' : '') + ss;
+      }
+      if (heroResEl && heroItem && heroItem.buf) {
+        heroResEl.textContent = 'RENDER ' + heroItem.buf.w + '\u00d7' + heroItem.buf.h;
+      }
+      if (heroScrollEl) {
+        var docH = doc.documentElement.scrollHeight - win.innerHeight;
+        var p = docH > 0 ? Math.min(1, Math.max(0, (win.scrollY || win.pageYOffset || 0) / docH)) : 0;
+        heroScrollEl.textContent = (p < 0.1 ? '00' : '') + Math.round(p * 100) + '%';
+      }
     }
   }
 
@@ -364,6 +390,7 @@
     tiles: [],
     rowOff: new Int32Array(3),
     rowAt: null,
+    filled: false,
     lum: new Uint8Array(16),
     step: 16,
     dot: 8,
@@ -373,7 +400,11 @@
   };
 
   function buildHeroBackground(w, h) {
-    var fontSize = Math.max(9, Math.round(Math.min(w * 0.06, h * 0.09)));
+    var fontSize = Math.max(9, Math.round(
+      w > h
+        ? Math.min(w * 0.082, h * 0.16)
+        : Math.min(w * 0.11, h * 0.055)
+    ));
     var font = '900 ' + fontSize + 'px "Unbounded", "Inter", sans-serif';
     var defs = [
       { text: 'STELLEREUM \u2022 ', y: 0.26, speed: -24 },
@@ -412,6 +443,7 @@
     }
 
     bg.tiles = tiles;
+    bg.filled = false;
 
     /* One lookup per scanline instead of a three-tile loop per pixel. */
     var rowAt = new Int8Array(h);
@@ -483,12 +515,14 @@
   }
 
   function updateRowOffsets(time) {
+    var changed = false;
     for (var i = 0; i < bg.tiles.length; i++) {
       var t = bg.tiles[i];
       var o = Math.floor(time * t.speed) % t.w;
       if (o < 0) o += t.w;
-      bg.rowOff[i] = o;
+      if (bg.rowOff[i] !== o) { bg.rowOff[i] = o; changed = true; }
     }
+    return changed;
   }
 
   function rasterizeTriangle(
@@ -543,6 +577,7 @@
       nzBuf = new Float32Array(size);
       maskBuf = new Uint8Array(size);
       bg.lum = new Uint8Array(size);
+      bg.filled = false;
     }
     return true;
   }
@@ -561,6 +596,12 @@
     var scrollTilt = 0;
     var sy = win.scrollY || win.pageYOffset || 0;
     if (sy > 0) scrollTilt = Math.min(1, sy / Math.max(1, win.innerHeight)) * 0.28;
+
+    /* Scroll parallax: the stage object sinks and recedes slightly while the
+       copy travels, so the 100vh panel reads as depth, not a flat video. */
+    var scrollDrop = sy > 0 ? Math.min(1, sy / Math.max(1, win.innerHeight)) : 0;
+    halfH -= scrollDrop * h * 0.05;
+    fov *= 1 - scrollDrop * 0.07;
 
     var wantX = engine.targetRotX + engine.parallaxY * 0.26 + scrollTilt;
     var wantY = engine.targetRotY + engine.parallaxX * 0.34;
@@ -585,12 +626,22 @@
 
     var halfW = w * 0.5;
     var halfH = h * 0.5;
-    var fov = Math.min(w, h) * 0.84;
-    var camZ = w < h ? 5.6 : 4.6;
+    var wide = w > h * 1.08;
+    /* Full-bleed composition: on landscape screens the knot is pushed to
+       the clear right side and scaled to ~85% of the viewport height. On
+       portrait it is cropped edge-to-edge behind the display type. */
+    var fov = wide ? Math.min(w, h) * 1.08 : h * 0.58;
+    var camZ = wide ? 4.0 : 4.2;
+    halfW = wide ? w * 0.71 : w * 0.5;
+    halfH = wide ? h * 0.5 : h * 0.34;
 
     if (engine.mode === 'refract') {
-      updateRowOffsets(timeSec);
-      fillHeroBackground(w, h);
+      /* Static background rows are reused until their sub-pixel scroll
+         actually changes. Cuts the per-frame work roughly in half. */
+      if (updateRowOffsets(timeSec) || !bg.filled) {
+        fillHeroBackground(w, h);
+        bg.filled = true;
+      }
 
       var verts = KNOT.verts;
       var norms = KNOT.normals;
@@ -810,6 +861,8 @@
   /* ------------------------------------------------------ SECONDARY MODULES */
   var ribbonItem = null;
   var interfItem = null;
+  var slabItem = null;
+  var latticeItem = null;
   var cardItems = [];
 
   function writeElectricPixel(data, idx, lit, gradT, bcol, lut) {
@@ -875,6 +928,59 @@
         var v = (w1 * 0.55 + w2 * 0.45) * 0.5 + 0.5;
         var g = nx * 0.8 + ny * 0.2 + Math.sin(time * 0.7) * 0.12;
         writeElectricPixel(data, idx, v > bayerRow[x & 3], g, bcol, lut);
+        idx += 4;
+      }
+    }
+    buf.present();
+  }
+
+  /* Full-width slab under the hero: crossed beams, a walking moire field
+     and a 16px pixel lattice, all thresholded with the same Bayer matrix. */
+  function renderSlab(time) {
+    var buf = slabItem && slabItem.buf;
+    if (!buf || !buf.ready) return;
+    var w = buf.w, h = buf.h;
+    var data = buf.imgData.data;
+    var bcol = pal.bg, lut = pal.lut;
+    var invW = 1 / Math.max(1, w - 1);
+    var invH = 1 / Math.max(1, h - 1);
+    var idx = 0;
+
+    for (var y = 0; y < h; y++) {
+      var ny = y * invH;
+      var bayerRow = BAYER_4X4[y & 3];
+      for (var x = 0; x < w; x++) {
+        var nx = x * invW;
+        var beam = Math.sin((nx * 1.6 + ny * 0.9) * 18 - time * 1.25);
+        var beam2 = Math.sin((nx * 2.1 - ny * 1.4) * 13 + time * 0.9);
+        var grid = ((x >> 3) + (y >> 3)) & 1 ? 0.16 : 0;
+        var v = (beam * 0.5 + 0.5) * 0.52 + (beam2 * 0.5 + 0.5) * 0.34 + grid + 0.06;
+        var g = nx * 0.78 + ny * 0.22 + Math.sin(time * 0.4) * 0.1;
+        writeElectricPixel(data, idx, v > bayerRow[x & 3], g, bcol, lut);
+        idx += 4;
+      }
+    }
+    buf.present();
+  }
+
+  /* 16-step ladder in the protocol section: hard quantised, no gradients. */
+  function renderLattice(time) {
+    var buf = latticeItem && latticeItem.buf;
+    if (!buf || !buf.ready) return;
+    var w = buf.w, h = buf.h;
+    var data = buf.imgData.data;
+    var bcol = pal.bg, lut = pal.lut;
+    var invW = 1 / Math.max(1, w - 1);
+    var idx = 0;
+
+    for (var y = 0; y < h; y++) {
+      var bayerRow = BAYER_4X4[y & 3];
+      for (var x = 0; x < w; x++) {
+        var nx = x * invW;
+        var step = Math.floor(nx * 16 + Math.sin(time * 0.8) * 0.4) / 15;
+        var scan = ((x + (time * 18 | 0)) % 24) === 0 ? 0.35 : 0;
+        var v = step * 0.92 + scan;
+        writeElectricPixel(data, idx, v > bayerRow[x & 3], nx * 0.9 + (y / h) * 0.1, bcol, lut);
         idx += 4;
       }
     }
@@ -1081,24 +1187,29 @@
       win.addEventListener('touchend', up);
     }
 
-    if (heroModeBtn) {
-      heroModeBtn.addEventListener('click', function () {
-        engine.mode = engine.mode === 'refract' ? 'ribbon' : 'refract';
-        var ribbon = engine.mode === 'ribbon';
-        heroModeBtn.textContent = ribbon ? 'MODE // RIBBON' : 'MODE // REFRACT';
-        heroModeBtn.setAttribute('aria-pressed', ribbon ? 'true' : 'false');
-        heroModeBtn.setAttribute('aria-label', ribbon
-          ? 'Switch hero object to refract mode'
-          : 'Switch hero object to ribbon mode');
-        if (heroModeLabel) {
-          heroModeLabel.textContent = ribbon
-            ? 'PQ Lattice Ribbon \u00b7 P=2 Q=3'
-            : 'PQ Lattice Knot \u00b7 P=2 Q=3';
-        }
-        if (reduceQuery.matches) renderStatic();
-        else ensureLoop();
+    function setHeroMode(mode) {
+      var ribbon = mode === 'ribbon';
+      engine.mode = ribbon ? 'ribbon' : 'refract';
+      heroModeBtns.forEach(function (btn) {
+        var on = btn.getAttribute('data-hero-mode') === engine.mode;
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btn.classList.toggle('is-active', on);
       });
+      if (heroModeCap) heroModeCap.textContent = ribbon ? 'RIBBON' : 'REFRACT';
+      if (heroModeLabel) {
+        heroModeLabel.textContent = ribbon
+          ? 'PQ Lattice Ribbon \u00b7 P=2 Q=3 \u00b7 drag to rotate'
+          : 'PQ Lattice Knot \u00b7 P=2 Q=3 \u00b7 drag to rotate';
+      }
+      if (reduceQuery.matches) renderStatic();
+      else ensureLoop();
     }
+
+    heroModeBtns.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        setHeroMode(btn.getAttribute('data-hero-mode'));
+      });
+    });
   }
 
   /* --------------------------------------------------------------- WATCHERS */
@@ -1120,22 +1231,6 @@
     io.observe(el);
   }
 
-  function attachHover(item, wrap) {
-    wrap.addEventListener('mouseenter', function () { item.meta.hover = true; });
-    wrap.addEventListener('mouseleave', function () {
-      item.meta.hover = false;
-      item.meta.mx = 0.5;
-      item.meta.my = 0.5;
-    });
-    wrap.addEventListener('mousemove', function (e) {
-      var r = wrap.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) {
-        item.meta.mx = (e.clientX - r.left) / r.width;
-        item.meta.my = (e.clientY - r.top) / r.height;
-      }
-    });
-  }
-
   /* ------------------------------------------------------------------- BOOT */
   function setupHero() {
     var canvas = doc.getElementById('hero-canvas');
@@ -1144,8 +1239,12 @@
 
     heroFrame = frameEl;
     fpsEl = doc.getElementById('hero-fps');
-    heroModeBtn = doc.getElementById('hero-mode');
+    heroResEl = doc.getElementById('hero-res');
+    heroScrollEl = doc.getElementById('hero-scroll');
+    heroTimecodeEl = doc.getElementById('hero-timecode');
+    heroModeCap = doc.getElementById('hero-mode-cap');
     heroModeLabel = doc.getElementById('hero-mode-label');
+    heroModeBtns = Array.prototype.slice.call(doc.querySelectorAll('[data-hero-mode]'));
 
     var buf = createDitherCanvas(canvas, frameEl, 3, function (w, h) {
       heroReady(buf);
@@ -1154,7 +1253,15 @@
       scheduleStatic();
     });
     if (!buf) return;
-    buf.scaleFor = function (cssW) { return cssW < 260 ? 2 : 3; };
+    /* Keep the hero pixel grid coarse (the technique) while capping the
+       buffer on 4K panels. One scale for the whole stage. */
+    buf.scaleFor = function (cssW, cssH) {
+      var area = cssW * cssH;
+      if (cssW < 420) return 2;
+      if (area > 1000000) return 4;
+      if (area > 460000) return 3;
+      return 2;
+    };
 
     heroItem = {
       buf: buf,
@@ -1201,12 +1308,55 @@
     if (!buf) return;
     interfItem = {
       buf: buf,
+      /* One still frame: the protocol/stack section is typographic, not a
+         dashboard. The large slab and the stage carry the live motion. */
       visible: false,
-      minInterval: 50,
+      minInterval: 1e9,
       render: function (t) { renderInterference(t); }
     };
     items.push(interfItem);
     watch(interfItem, wrap);
+  }
+
+  function setupSlab() {
+    var canvas = doc.getElementById('slab-canvas');
+    var wrap = doc.getElementById('slab-wrap');
+    if (!canvas || !wrap) return;
+
+    var buf = createDitherCanvas(canvas, wrap, 3, function () {
+      buf.lastPaint = -1e9;
+      scheduleStatic();
+    });
+    if (!buf) return;
+    slabItem = {
+      buf: buf,
+      visible: false,
+      minInterval: 55,
+      render: function (t) { renderSlab(t); }
+    };
+    items.push(slabItem);
+    watch(slabItem, wrap);
+  }
+
+  function setupLattice() {
+    var canvas = doc.getElementById('lattice-canvas');
+    var wrap = doc.getElementById('lattice-wrap');
+    if (!canvas || !wrap) return;
+
+    var buf = createDitherCanvas(canvas, wrap, 2, function () {
+      buf.lastPaint = -1e9;
+      scheduleStatic();
+    });
+    if (!buf) return;
+    latticeItem = {
+      buf: buf,
+      visible: false,
+      /* Static signal ladder: part of the protocol section's print language. */
+      minInterval: 1e9,
+      render: function (t) { renderLattice(t); }
+    };
+    items.push(latticeItem);
+    watch(latticeItem, wrap);
   }
 
   function setupCards() {
@@ -1218,7 +1368,10 @@
       var item = {
         buf: null,
         visible: false,
-        minInterval: 55,
+        /* The protocol/stack cards are deliberately still: one frame on
+           resize or palette change, never a loop. Motion belongs to the
+           stage and the two signal strips, not to six equal cards. */
+        minInterval: 1e9,
         meta: { hover: false, mx: 0.5, my: 0.5 },
         index: i,
         render: null
@@ -1236,7 +1389,6 @@
 
       cardItems[i] = item;
       items.push(item);
-      attachHover(item, wrap);
       watch(item, wrap);
     }
   }
@@ -1261,6 +1413,8 @@
     setupHero();
     setupRibbon();
     setupInterference();
+    setupSlab();
+    setupLattice();
     setupCards();
 
     doc.addEventListener('visibilitychange', function () {
@@ -1298,6 +1452,8 @@
   /* Small read-only probe for the verification pass (no animation work). */
   win.StellDither = {
     mode: function () { return engine.mode; },
+    running: function () { return rafId !== null; },
+    heroVisible: function () { return engine.visible; },
     stats: function () {
       var out = [];
       for (var i = 0; i < items.length; i++) {
@@ -1310,6 +1466,7 @@
           h: it.buf.h,
           scale: it.buf.scaleFor ? it.buf.scaleFor(it.buf.cssW, it.buf.cssH) : it.buf.pixelScale,
           visible: it.visible,
+          painted: it.buf.lastPaint > 0,
           always: !!it.always,
           interval: it.minInterval
         });

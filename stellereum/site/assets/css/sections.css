@@ -4,6 +4,8 @@
    ========================================================================== */
 
 /* ============================== HERO ==================================== */
+/* A full-bleed 100svh stage. The canvas is the background; every piece of
+   copy sits on an ink panel so the dither can never eat the H1 or the lede. */
 .hero {
   position: relative;
   display: grid;
@@ -11,127 +13,248 @@
   min-height: calc(100vh - var(--header-h) - 1px);
   min-height: calc(100svh - var(--header-h) - 1px);
   overflow: clip;
+  background: var(--bg);
   border-bottom: 1px solid var(--line-strong);
   isolation: isolate;
 }
 
-/* Swiss dot field + two soft spectrum pools behind the copy. No filter. */
-.hero::before {
+.hero-stage {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: var(--bg);
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+.hero-stage.is-dragging { cursor: grabbing; }
+
+/* Very low-opacity scanline field: it reads as a display, not a filter. */
+.hero-stage::after {
   content: "";
   position: absolute;
   inset: 0;
-  z-index: -2;
+  z-index: 3;
+  background-image: repeating-linear-gradient(180deg, rgba(6, 8, 17, .22) 0 1px, transparent 1px 4px);
+  opacity: .26;
+  pointer-events: none;
+  mix-blend-mode: multiply;
+}
+
+html.is-inverted .hero-stage::after,
+body.is-inverted .hero-stage::after {
+  background-image: repeating-linear-gradient(180deg, rgba(238, 242, 255, .3) 0 1px, transparent 1px 4px);
+  mix-blend-mode: screen;
+}
+
+.hero-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Technical overlay: dot grid + two hairline axes, kept under the scrim. */
+.hero-stage-grid {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
   pointer-events: none;
   background-image:
     radial-gradient(var(--dot) .7px, transparent .8px),
-    radial-gradient(58% 62% at 8% 22%, rgba(94, 184, 255, .14), transparent 70%),
-    radial-gradient(52% 58% at 88% 64%, rgba(168, 117, 255, .13), transparent 70%);
-  background-size: 26px 26px, 100% 100%, 100% 100%;
-  mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .7) 62%, transparent 100%);
-  -webkit-mask-image: linear-gradient(180deg, #000 0%, rgba(0, 0, 0, .7) 62%, transparent 100%);
+    linear-gradient(to right, var(--line-soft) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--line-soft) 1px, transparent 1px);
+  background-size: 26px 26px, 160px 100%, 100% 160px;
+  opacity: .42;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, .75), transparent 82%);
+  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, .75), transparent 82%);
 }
 
-.hero-hud {
-  position: relative;
+/* The deliberate readability layer: opaque ink on the copy side, clear on
+   the object side. It never covers the whole canvas. */
+.hero-stage-scrim {
+  position: absolute;
+  inset: 0;
   z-index: 2;
+  pointer-events: none;
+  background-image: var(--stage-scrim);
+}
+
+.hero-topbar,
+.hero-bottombar {
+  position: relative;
+  z-index: 6;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 10px 16px;
-  padding-top: 16px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--line-soft);
-  color: var(--text-2);
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: .14em;
-  text-transform: uppercase;
+  gap: 8px 16px;
+  border-color: var(--line-soft);
 }
 
-.hero-hud-right {
+.hero-topbar {
+  padding-block: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.hero-bottombar {
+  padding-block: 8px 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.hero-status {
+  background: var(--stage-ink-strong);
+  border-color: var(--line-strong);
+}
+
+.hero-hud-group {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 14px;
+  gap: 6px;
+  min-width: 0;
 }
 
-.hero-hud b { color: var(--text); font-weight: 700; }
+.hud-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--stage-ink-strong);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.hud-chip b { color: var(--telemetry); font-weight: 700; }
+
+.hud-chip--scene {
+  border-color: var(--line-strong);
+  color: var(--telemetry);
+  box-shadow: 2px 2px 0 rgba(168, 117, 255, .3);
+}
+
+.hud-chip--res { color: var(--telemetry-alt); }
 
 .hero-inner {
   position: relative;
-  z-index: 2;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: clamp(28px, 4vw, 56px);
-  align-items: center;
-  padding-block: clamp(28px, 5vh, 56px);
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 0;
+  padding-block: clamp(10px, 1.6vh, 24px);
 }
 
-.hero-copy { min-width: 0; }
+.hero-copy { width: 100%; min-width: 0; }
 
 .hero-kicker {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 9px;
-  margin-bottom: clamp(16px, 2.2vw, 24px);
+  width: fit-content;
+  max-width: 100%;
+  margin-bottom: clamp(10px, 1.6vh, 18px);
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  background: var(--stage-ink);
   color: var(--telemetry);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 700;
-  letter-spacing: .2em;
+  letter-spacing: .18em;
   text-transform: uppercase;
 }
 
-/* Fluid scale is checked against the narrowest cell: the longest line
-   "POST-QUANTUM" is ~9.9em wide at 800 weight with this tracking. The cap
-   is the widest value that still fits inside the copy column at 1920. */
+/* Display type: the reference's oversized, boxed Swiss strokes. Each line
+   gets its own hard ink panel, so the canvas stays visible between lines. */
 .hero-title {
   margin: 0;
   max-width: 100%;
-  font-size: clamp(1.75rem, 9vw, 6.6rem);
-  line-height: 1.14;
-  letter-spacing: -.05em;
+  font-size: clamp(2.2rem, min(7.8vw, 12.2vh), 9.5rem);
+  line-height: .94;
+  letter-spacing: -.055em;
   text-transform: uppercase;
 }
 
 .hero-line {
-  display: block;
-  width: fit-content;
+  display: table;
   max-width: 100%;
+  margin-bottom: clamp(3px, .45vh, 7px);
+  border: 1px solid var(--line-strong);
+  background: var(--stage-ink-strong);
+  box-shadow: 5px 5px 0 rgba(94, 184, 255, .26);
   white-space: nowrap;
-  animation: hero-in .95s var(--ease) both;
+  animation: hero-in .9s var(--ease) both;
 }
 
-.hero-line:nth-child(2) { animation-delay: .12s; }
-.hero-line:nth-child(3) { animation-delay: .24s; }
+.hero-line:nth-child(2) { animation-delay: .1s; }
+.hero-line:nth-child(3) { animation-delay: .2s; }
 
-.hero-line--stroke {
-  color: transparent;
-  -webkit-text-stroke: clamp(1px, .13vw, 2px) var(--indigo);
+.hero-word {
+  display: block;
+  padding: .015em .12em .055em;
 }
 
-@supports not ((-webkit-text-stroke: 1px #000) or (text-stroke: 1px #000)) {
-  .hero-line--stroke { color: var(--text); }
-}
-
-.hero-line--last {
+.hero-line--grad .hero-word {
   background-image: var(--grad-text);
   background-size: 180% 180%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: hero-in .95s var(--ease) both, electric-shimmer 9s ease infinite;
+  animation: electric-shimmer 9s ease infinite;
+}
+
+.hero-line--stroke {
+  border-color: var(--indigo);
+  box-shadow: 5px 5px 0 rgba(168, 117, 255, .28);
+}
+
+.hero-word--stroke {
+  color: transparent;
+  -webkit-text-stroke: clamp(1px, .13vw, 2px) var(--indigo);
+}
+
+@supports not ((-webkit-text-stroke: 1px #000) or (text-stroke: 1px #000)) {
+  .hero-word--stroke { color: var(--text); }
+}
+
+.hero-line--fill {
+  border-color: var(--line-strong);
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  box-shadow: 5px 5px 0 var(--line-strong);
+  animation: hero-in .9s var(--ease) both, electric-shimmer 8s ease infinite;
+}
+
+.hero-line--fill .hero-word {
+  color: var(--ink);
+  text-shadow: 2px 2px 0 rgba(6, 8, 17, .26);
+}
+
+.hero-lede-panel {
+  width: min(560px, 100%);
+  margin-top: clamp(12px, 1.8vh, 24px);
+  padding: clamp(12px, 1.3vw, 18px);
+  border: 1px solid var(--line);
+  background: var(--stage-ink);
+  box-shadow: 5px 5px 0 rgba(124, 141, 255, .2);
 }
 
 .hero-sub {
-  max-width: 54ch;
-  margin-top: clamp(20px, 2.8vw, 30px);
+  max-width: 52ch;
   color: var(--text-2);
-  font-size: clamp(14.5px, 1.45vw, 17.5px);
-  line-height: 1.7;
+  font-size: clamp(13px, 1.12vw, 15.5px);
+  line-height: 1.62;
 }
 
 .hero-sub b { color: var(--text); font-weight: 600; white-space: nowrap; }
@@ -140,8 +263,19 @@
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-top: clamp(22px, 3vw, 34px);
+  gap: 10px;
+  margin-top: clamp(12px, 1.8vh, 18px);
+}
+
+.hero-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .hero-scroll {
@@ -149,8 +283,7 @@
   align-items: center;
   gap: 10px;
   min-height: 44px;
-  margin-top: clamp(8px, 1.4vw, 14px);
-  color: var(--text-3);
+  color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 9.5px;
   font-weight: 700;
@@ -161,6 +294,85 @@
 .hero-scroll:hover { color: var(--text); }
 .hero-scroll .hero-scroll-arrow { color: var(--telemetry-alt); }
 .hero-scroll:hover .hero-scroll-arrow { color: var(--text); }
+
+.hero-modes { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.hero-mode {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  line-height: 1;
+  text-transform: uppercase;
+  box-shadow: 3px 3px 0 var(--line-strong);
+  cursor: pointer;
+  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+
+.hero-mode:hover,
+.hero-mode:focus-visible {
+  background-image: var(--grad);
+  color: var(--on-accent);
+  box-shadow: 5px 5px 0 var(--shadow-alt);
+}
+
+.hero-mode[aria-pressed="true"] {
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  color: var(--ink);
+  box-shadow: 3px 3px 0 var(--shadow-alt);
+}
+
+.hero-mode:active {
+  box-shadow: 1px 1px 0 var(--line-strong);
+  transform: translate(2px, 2px);
+}
+
+.hero-object-meta {
+  margin-top: 8px;
+  color: var(--telemetry-alt);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.hero-drag-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hero-drag-bar {
+  display: block;
+  width: clamp(64px, 9vw, 128px);
+  height: 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.hero-drag-bar span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  animation: electric-shimmer 6s ease infinite;
+}
+
+.hero-stage.is-static .hero-drag-hint { display: none; }
 
 /* --- reference object: live Bayer-dithered 3D knot ----------------------
    Layout lives in sections.css; the pixel frame, HUD and canvas styling live
@@ -551,10 +763,10 @@
   display: block;
   width: max-content;
   margin: 0;
-  padding-block: 4px;
+  padding-block: 2px;
   transform: translate3d(calc(-50% + var(--kx, 0px)), 0, 0) skewX(var(--ks, 0deg));
   font-family: var(--font-display);
-  font-size: clamp(44px, 10.4vw, 150px);
+  font-size: clamp(38px, 9.4vw, 138px);
   font-weight: 900;
   line-height: .9;
   letter-spacing: -.05em;
@@ -562,6 +774,11 @@
   white-space: nowrap;
   will-change: transform;
 }
+
+.kinetic-row + .kinetic-row { margin-top: clamp(4px, .9vw, 12px); }
+
+.kinetic-row--stroke { color: var(--text-2); }
+.kinetic-row--solid { font-size: clamp(24px, 5.2vw, 72px); letter-spacing: -.035em; }
 
 .kinetic-row .k-fill {
   background-image: var(--grad);
@@ -580,6 +797,23 @@
 }
 
 .kinetic-row .k-dot { color: var(--telemetry-alt); }
+
+.kinetic-row .k-box {
+  display: inline-block;
+  padding: .02em .14em .08em;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 4px 4px 0 var(--line-strong);
+}
+
+.kinetic-row .k-box--alt {
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  animation: electric-shimmer 8s ease infinite;
+  color: var(--ink);
+  box-shadow: 4px 4px 0 var(--shadow-alt);
+}
 
 /* =========================== PERFORMANCE ================================ */
 .perf-band {

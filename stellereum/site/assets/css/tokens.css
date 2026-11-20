@@ -38,6 +38,11 @@
   --line: rgba(124, 141, 255, .28);
   --line-soft: rgba(124, 141, 255, .17);
   --line-strong: #7c8dff;
+  /* Opaque-enough ink for copy laid over the live dither stage. The hero
+     canvas is always busy; body copy never sits on raw pixels. */
+  --stage-ink: rgba(6, 8, 17, .9);
+  --stage-ink-strong: rgba(6, 8, 17, .96);
+  --stage-scrim: linear-gradient(90deg, rgba(6, 8, 17, .95) 0%, rgba(6, 8, 17, .82) 36%, rgba(6, 8, 17, .3) 64%, rgba(6, 8, 17, .04) 100%);
   --field: rgba(94, 184, 255, .055);
   --shadow: #5eb8ff;
   --shadow-alt: #a875ff;
@@ -124,6 +129,9 @@ body.is-inverted {
   --line: rgba(79, 70, 229, .34);
   --line-soft: rgba(79, 70, 229, .2);
   --line-strong: #4f46e5;
+  --stage-ink: rgba(238, 242, 255, .9);
+  --stage-ink-strong: rgba(238, 242, 255, .97);
+  --stage-scrim: linear-gradient(90deg, rgba(238, 242, 255, .95) 0%, rgba(238, 242, 255, .82) 36%, rgba(238, 242, 255, .3) 64%, rgba(238, 242, 255, .04) 100%);
   --field: rgba(29, 78, 216, .05);
   --shadow: #4f46e5;
   --shadow-alt: #7c3aed;

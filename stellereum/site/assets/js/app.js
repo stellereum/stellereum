@@ -133,13 +133,19 @@
 
   /* ---------------------------------------------------------- active nav */
   var navLinks = Array.prototype.slice.call(doc.querySelectorAll('.nav-link[href^="#"]'));
-  var watched = ['network', 'features', 'performance', 'build', 'ecosystem', 'roadmap']
+  var indexLinks = Array.prototype.slice.call(doc.querySelectorAll('[data-index-link]'));
+  var watched = ['network', 'features', 'performance', 'build', 'ecosystem', 'roadmap', 'transmit']
     .map(function (id) { return doc.getElementById(id); })
     .filter(Boolean);
 
   function setActiveNav(id) {
     navLinks.forEach(function (link) {
       var match = link.getAttribute('href') === '#' + id;
+      if (match) link.setAttribute('aria-current', 'true');
+      else link.removeAttribute('aria-current');
+    });
+    indexLinks.forEach(function (link) {
+      var match = link.getAttribute('data-index-link') === id;
       if (match) link.setAttribute('aria-current', 'true');
       else link.removeAttribute('aria-current');
     });

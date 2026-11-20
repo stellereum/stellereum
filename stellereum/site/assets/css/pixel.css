@@ -144,50 +144,35 @@
   backface-visibility: hidden;
 }
 
-/* --- hero object: pixelated 3D knot in the right-hand column ------------- */
-.hero-object {
-  position: relative;
-  display: none;
-  width: 100%;
-  max-width: 480px;
-  min-width: 0;
-  justify-self: end;
-  align-self: center;
-  user-select: none;
-}
-
-.hero-object-frame {
-  position: relative;
-  width: 100%;
-  aspect-ratio: 1 / 1;
-  overflow: hidden;
-  border: 1px solid var(--line-strong);
+/* --- hero stage: full-bleed pixelated 3D lattice ------------------------ */
+/* The canvas is the whole hero background. The ink panels and scrim that
+   keep copy legible live in sections.css; this file owns the pixel skin. */
+.hero-stage {
+  border: 0;
   background: var(--bg);
-  box-shadow: 10px 10px 0 rgba(94, 184, 255, .28), 10px 10px 0 1px rgba(6, 8, 17, .55);
-  cursor: grab;
-  touch-action: none;
 }
 
-.hero-object-frame::after {
+/* CSS Bayer field under the canvas: first paint and JS-off share one look. */
+.hero-stage::before {
   content: "";
   position: absolute;
-  inset: 7px;
-  z-index: 3;
-  border: 1px solid rgba(124, 141, 255, .22);
+  inset: 0;
+  z-index: 0;
+  background-image: var(--grad-soft);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 6px 6px;
+  mask-size: 6px 6px;
+  opacity: .9;
   pointer-events: none;
 }
 
-.hero-object-frame.is-dragging { cursor: grabbing; }
-
-html.is-inverted .hero-object-frame,
-body.is-inverted .hero-object-frame {
-  box-shadow: 10px 10px 0 rgba(79, 70, 229, .3), 10px 10px 0 1px rgba(238, 242, 255, .6);
-}
+html.dither-ready .hero-stage::before { display: none; }
 
 .hero-fallback {
   position: absolute;
   inset: 0;
-  z-index: 2;
+  z-index: 3;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -205,102 +190,260 @@ body.is-inverted .hero-object-frame {
 .hero-fallback span:first-child {
   color: var(--telemetry);
   font-family: var(--font-display);
-  font-size: clamp(14px, 2.4vw, 22px);
+  font-size: clamp(16px, 3vw, 32px);
   letter-spacing: -.02em;
 }
 
 html.dither-ready .hero-fallback { display: none; }
 
-.hero-hud-chip,
-.hero-drag-hint,
-.hero-frame-index {
+/* Pixel HUD chip set: hard corners, 1px frame, 3px offset block shadow. */
+.hud-chip {
+  box-shadow: 2px 2px 0 rgba(94, 184, 255, .24);
+}
+
+.hud-chip b { font-variant-numeric: tabular-nums; }
+
+.hud-chip--scene { box-shadow: 3px 3px 0 rgba(168, 117, 255, .38); }
+
+.hero-status { box-shadow: 3px 3px 0 rgba(94, 184, 255, .22); }
+
+/* --- Bayer texture: dithered rule, header bar, section seams ------------- */
+/* The header carries a live-looking 4px ordered-dither bar instead of a
+   plain hairline. Pure CSS so it paints on the first frame. */
+.site-header::after {
+  content: "";
   position: absolute;
-  z-index: 4;
-  padding: 3px 6px;
-  border: 1px solid var(--line-strong);
-  background: var(--bg);
-  font-family: var(--font-mono);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  line-height: 1.2;
-  text-transform: uppercase;
+  inset: auto 0 0 0;
+  height: 4px;
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
+  opacity: .78;
   pointer-events: none;
-  white-space: nowrap;
+  animation: electric-shimmer 12s steps(12, end) infinite;
 }
 
-.hero-hud-chip {
-  top: 12px;
-  left: 12px;
-  color: var(--telemetry);
-  box-shadow: 2px 2px 0 rgba(168, 117, 255, .35);
+/* Every numbered section is separated by a Bayer seam, not a flat rule. */
+.section::after {
+  content: "";
+  position: absolute;
+  inset: -1px 0 auto 0;
+  height: 4px;
+  background-image: var(--grad);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
+  opacity: .38;
+  pointer-events: none;
+  z-index: 2;
 }
 
-.hero-frame-index {
-  top: 12px;
-  right: 12px;
-  color: var(--telemetry-alt);
+.section--flat::after { display: none; }
+
+/* Full-width dither slab under the hero marquee. One more live canvas at
+   the reference's scale, and a visual hinge into the telemetry section. */
+.dither-slab {
+  position: relative;
+  height: clamp(84px, 12vw, 168px);
+  overflow: hidden;
+  border-block: 1px solid var(--line-strong);
+  background: var(--bg);
 }
 
-.hero-drag-hint {
-  bottom: 12px;
-  left: 12px;
-  border-color: var(--line);
-  color: var(--text-3);
+.dither-slab::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background-image: linear-gradient(180deg, rgba(6, 8, 17, .46), transparent 48%, rgba(6, 8, 17, .38));
 }
 
-.hero-object-frame.is-static .hero-drag-hint { display: none; }
+.dither-slab .dither-canvas { z-index: 1; }
 
-.hero-object-caption {
+.dither-slab-meta {
+  position: absolute;
+  inset: 10px 12px auto 12px;
+  z-index: 3;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.hero-object-meta {
-  color: var(--telemetry-alt);
+  gap: 6px 14px;
+  pointer-events: none;
   font-family: var(--font-mono);
   font-size: 8.5px;
   font-weight: 700;
-  letter-spacing: .13em;
-  line-height: 1.4;
+  letter-spacing: .15em;
   text-transform: uppercase;
 }
 
-.hero-mode {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 44px;
-  padding: 8px 11px;
-  border: 1px solid var(--line-strong);
-  border-radius: 0;
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: .12em;
-  line-height: 1;
-  text-transform: uppercase;
-  box-shadow: 3px 3px 0 var(--line-strong);
-  cursor: pointer;
-  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+.dither-slab-meta span {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  background: var(--stage-ink-strong);
+  color: var(--telemetry);
 }
 
-.hero-mode:hover,
-.hero-mode:focus-visible {
+.dither-slab-meta span:last-child { color: var(--telemetry-alt); }
+
+/* --- pixel hover / invert states ---------------------------------------- */
+.btn { position: relative; overflow: hidden; }
+
+.btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-image: linear-gradient(0deg, #fff, #fff);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-base) steps(4, end);
+}
+
+.btn:hover::after,
+.btn:focus-visible::after { opacity: .16; }
+.btn--electric::after { mix-blend-mode: overlay; }
+
+/* Invert cards get a Bayer stipple in the accent state, plus a blocky
+   media zoom. Copy stays crisp: only the media canvas scales. */
+.invert-card::after {
   background-image: var(--grad);
-  color: var(--on-accent);
-  box-shadow: 5px 5px 0 var(--shadow-alt);
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
 }
 
-.hero-mode:active {
-  box-shadow: 1px 1px 0 var(--line-strong);
-  transform: translate(2px, 2px);
+.invert-card:hover::after { opacity: .22; }
+
+.invert-card:hover .card-media { border-color: var(--on-accent-line); }
+
+.card-media .dither-canvas,
+.card-media--static::before { image-rendering: pixelated; }
+
+/* Pixel sticker set: clipped corner, 1px hard frame, 2px block shadow. */
+.sticker {
+  position: relative;
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--line-strong);
+  background: var(--surface-2);
+}
+
+.sticker::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  background: currentColor;
+  vertical-align: 0;
+}
+
+/* --- blocky reveal and stepped marquee ---------------------------------- */
+/* Kept as a fallback for elements outside [data-reveal]; motion.js adds
+   .is-visible. The stepped timing is the reference's hard "bit" feel. */
+html.js [data-reveal].is-visible {
+  transition:
+    opacity .52s steps(6, end),
+    translate .52s steps(6, end);
+}
+
+.marquee-track {
+  animation-timing-function: steps(120, end);
+}
+
+.kinetic-row {
+  transition: transform .18s linear;
+}
+
+/* --- pixel cursor (pointer devices only) -------------------------------- */
+.cursor {
+  width: 10px;
+  height: 10px;
+  border: 0;
+  border-radius: 0;
+  background: var(--blue);
+  box-shadow:
+    0 0 0 1px var(--ink),
+    4px 0 0 -2px var(--violet),
+    -4px 0 0 -2px var(--violet),
+    0 4px 0 -2px var(--violet),
+    0 -4px 0 -2px var(--violet);
+  transition:
+    width var(--t-base) steps(4, end),
+    height var(--t-base) steps(4, end),
+    background-color var(--t-fast) steps(2, end);
+}
+
+.cursor.is-expanded {
+  width: 34px;
+  height: 34px;
+  border: 2px solid var(--violet);
+  background: transparent;
+  box-shadow:
+    0 0 0 1px var(--ink),
+    4px 4px 0 var(--blue);
+}
+
+html.is-inverted .cursor,
+body.is-inverted .cursor { background: var(--indigo); }
+
+/* --- stepped scroll-cue and status bit ---------------------------------- */
+.rule-dot { border-radius: 0; }
+
+.hero-scroll-arrow {
+  display: inline-block;
+  animation: bit-step 1.6s steps(3, end) infinite;
+}
+
+@keyframes bit-step {
+  0%, 33%   { transform: translateY(0); }
+  34%, 66%  { transform: translateY(3px); }
+  67%, 100% { transform: translateY(0); }
+}
+
+/* --- a second ordered-dither ribbon in the protocol section ------------- */
+.lattice-ribbon {
+  position: relative;
+  height: 18px;
+  margin: 0 0 clamp(20px, 3vw, 34px);
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  box-shadow: 4px 4px 0 var(--line-soft);
+}
+
+.lattice-ribbon .dither-canvas { z-index: 1; }
+
+.lattice-ribbon::after {
+  content: "BAYER 4×4 / SIGNAL LADDER";
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  z-index: 2;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  background: var(--stage-ink-strong);
+  color: var(--telemetry);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  transform: translateY(-50%);
+  pointer-events: none;
 }
 
 /* --- dither ribbon (under the live telemetry section) -------------------- */
@@ -435,37 +578,39 @@ html.js [data-reveal] {
 
 /* --- responsive ---------------------------------------------------------- */
 @media (max-width: 899.98px) {
-  .hero-object {
-    display: block;
-    width: min(230px, 52vw);
-    margin-top: 12px;
-    margin-left: auto;
-    justify-self: end;
-    align-self: end;
+  /* The stage stays; the object is cropped by the canvas camera, not hidden.
+     Copy gets a stronger vertical scrim and a near-opaque ink panel. */
+  .hero-stage-scrim {
+    background-image:
+      linear-gradient(180deg, rgba(6, 8, 17, .2) 0%, rgba(6, 8, 17, .5) 34%, rgba(6, 8, 17, .9) 58%, rgba(6, 8, 17, .97) 100%);
   }
 
-  .hero-object-caption { margin-top: 8px; }
+  html.is-inverted .hero-stage-scrim,
+  body.is-inverted .hero-stage-scrim {
+    background-image:
+      linear-gradient(180deg, rgba(238, 242, 255, .25) 0%, rgba(238, 242, 255, .55) 34%, rgba(238, 242, 255, .92) 58%, rgba(238, 242, 255, .98) 100%);
+  }
+
+  .hero-lede-panel { background: var(--stage-ink-strong); }
+  .hero-inner { justify-content: flex-end; padding-bottom: 4px; }
+  .hud-chip { font-size: 8px; padding: 4px 6px; }
+  .hud-chip--tc,
+  .hud-chip--res { display: none; }
   .hero-object-meta { font-size: 8px; }
   .hero-mode { font-size: 8px; padding: 7px 9px; }
-  .hero-hud-chip { top: 8px; left: 8px; font-size: 7px; }
-  .hero-frame-index { top: 8px; right: 8px; font-size: 7px; }
-  .hero-drag-hint { bottom: 8px; left: 8px; font-size: 7px; }
-  .hero-object-frame::after { inset: 5px; }
+  .hero-drag-hint { display: none; }
   .interference-stage { height: 52px; }
   .card-media { height: 92px; }
+  .dither-slab { height: clamp(78px, 18vw, 116px); }
 }
 
 @media (max-width: 419.98px) {
-  .hero-object { width: min(200px, 54vw); }
-  .hero-drag-hint { display: none; }
+  .hud-chip--scene { max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
   .dither-ribbon { height: 24px; }
   .dither-ribbon-label { font-size: 7px; }
   .card-media { height: 84px; }
   .sec-head::before { width: 62%; }
-}
-
-@media (min-width: 900px) {
-  .hero-object { display: block; }
+  .section-index { display: none; }
 }
 
 /* --- coarse pointers ----------------------------------------------------- */
@@ -477,12 +622,56 @@ html.js [data-reveal] {
     box-shadow: 3px 3px 0 var(--line-strong);
   }
 
-  .hero-object-frame { touch-action: pan-y; }
+  .hero-mode[aria-pressed="true"],
+  .hero-mode[aria-pressed="true"]:hover {
+    background-image: var(--grad);
+    color: var(--ink);
+  }
+
+  .hero-stage { cursor: default; }
+  .btn::after { display: none; }
 }
 
-/* --- reduced motion: the dither art is a still frame --------------------- */
+/* --- restraint pass ------------------------------------------------------
+   Motion is reserved for the stage, the marquee, the scroll-deformed rows
+   and state changes. Dividers, header bars, HUD bars, static stamp boxes
+   and the limits band hold still: the pixel language is in the treatment,
+   not in constant movement. */
+.site-header::after,
+.dither-rule::before,
+.sec-rule,
+.hero-drag-bar span,
+.kinetic-row .k-box--alt,
+.btn--electric,
+.perf-band,
+.cta-panel,
+.hero-line--grad .hero-word,
+.dither-slab::after { animation: none; }
+
+/* Keep the protocols / stack cards typographic and still. */
+#features .invert-card { transition: box-shadow var(--t-base) var(--ease); }
+#features .invert-card::after { display: none; }
+#features .invert-card:hover { background-image: none; background-color: var(--surface-2); transform: none; box-shadow: 7px 7px 0 var(--line-strong); }
+#features .invert-card:hover h3,
+#features .invert-card:hover p,
+#features .invert-card:hover .card-meta,
+#features .invert-card:hover .feature-num,
+#features .invert-card:hover .kv,
+#features .invert-card:hover .kv b,
+#features .invert-card:hover .tag { color: inherit; }
+#features .invert-card:hover .tag,
+#features .invert-card:hover .sticker { background: var(--surface); border-color: var(--line); color: inherit; box-shadow: none; }
+#features .card-media-label { background: var(--bg); border-color: var(--line); color: var(--telemetry); }
+#features .card-media .dither-canvas { filter: saturate(1.04); }
+
+/* --- reduced motion: effects hold their static frame, they are not removed */
 @media (prefers-reduced-motion: reduce) {
-  .dither-rule::before { animation: none; }
-  .hero-object-frame { cursor: default; }
+  .dither-rule::before,
+  .site-header::after,
+  .hero-drag-bar span,
+  .hero-scroll-arrow,
+  .btn::after { animation: none; }
+  .hero-stage { cursor: default; }
   .hero-mode { transition: none; }
+  .marquee-track { animation: none; }
 }

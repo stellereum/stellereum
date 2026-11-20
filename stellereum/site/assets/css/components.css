@@ -561,6 +561,13 @@ body.is-inverted .status-chip.is-offline { color: #b3123b; }
 
 html.has-cursor .cursor { display: block; }
 
+/* Hide the native arrow only after motion.js has confirmed a fine pointer. */
+html.has-cursor,
+html.has-cursor body,
+html.has-cursor a,
+html.has-cursor button,
+html.has-cursor .hero-stage { cursor: none; }
+
 .cursor.is-expanded {
   width: 44px;
   height: 44px;

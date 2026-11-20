@@ -18,6 +18,19 @@ use stellereum::light_client::{verify_mmr_inclusion, EpochRootAnswer};
 use stellereum::rpc::RpcState;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
+/// These tests share a process-wide finalized-header store and the Falcon key
+/// registry that vote verification consults. Serialise them inside this binary
+/// so a parallel runner cannot interleave two key sets and surface a spurious
+/// "bad vote signature".
+static MMR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    MMR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+
 #[path = "support/falcon_votes.rs"]
 mod falcon_votes;
 
@@ -136,6 +149,7 @@ const E: u64 = stellereum::mmr::MMR_EPOCH_BLOCKS;
 /// quorum-signed boundary commitment.
 #[tokio::test]
 async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
+    let _serial = serial();
     let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(2 * E);
     // Epoch 0: heights 0..=E-1 (this binary's range — no other test here
@@ -213,6 +227,7 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
 /// epoch, and an epoch this node knows nothing about is an honest miss.
 #[tokio::test]
 async fn stell_get_epoch_root_selectors_and_honest_misses() {
+    let _serial = serial();
     let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(8 * E);
     // Epoch 7 (this binary's range): two headers only.
@@ -249,6 +264,7 @@ async fn stell_get_epoch_root_selectors_and_honest_misses() {
 /// light client refuses proofs against it.
 #[tokio::test]
 async fn stell_get_epoch_root_marks_partial_epochs_and_proofs_refuse() {
+    let _serial = serial();
     let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(5 * E + 2);
     // Epoch 5 (this binary's range): three of E heights.

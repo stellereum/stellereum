@@ -834,6 +834,11 @@ pub struct ConsensusCluster {
     base_round: Round,
     /// Every vote every node CAST, for the double-vote invariant.
     cast_votes: Vec<Vec<CastVote>>,
+    /// Production's fsync vote watermark, modelled: the highest round already
+    /// voted per (height, kind). A vote at or below it is refused by the driver
+    /// before signing, so the simulator must refuse it too or it manufactures
+    /// double votes that the real node can never emit.
+    vote_floor: Vec<HashMap<(Height, u8), Round>>,
     /// The equivocation pairs the cluster observed.
     equivocations: Vec<(ValidatorId, Vote, Vote)>,
     /// The transaction template the cluster seeds every mempool with.
@@ -993,6 +998,7 @@ impl ConsensusCluster {
             seq: 0,
             base_round,
             cast_votes: (0..n_validators).map(|_| Vec::new()).collect(),
+            vote_floor: (0..n_validators).map(|_| HashMap::new()).collect(),
             equivocations: Vec::new(),
             dev_key,
             dev_address,
@@ -1428,6 +1434,9 @@ impl ConsensusCluster {
         let Some(vote) = self.members[i].rt.make_prevote() else {
             return;
         };
+        if !self.floor_allows(i, &vote) {
+            return;
+        }
         let locked = lock_hint(&self.members[i].rt, &vote);
         let _ = self.members[i].rt.on_prevote(vote.clone());
         self.members[i].stats.prevotes_cast += 1;
@@ -1543,6 +1552,9 @@ impl ConsensusCluster {
                             && self.members[i].rt.hc.has_live_proposal()
                         {
                             if let Some(vote) = self.members[i].rt.make_prevote() {
+                                if !self.floor_allows(i, &vote) {
+                                    return;
+                                }
                                 let locked = lock_hint(&self.members[i].rt, &vote);
                                 let _ = self.members[i].rt.on_prevote(vote.clone());
                                 self.members[i].stats.prevotes_cast += 1;
@@ -1672,6 +1684,9 @@ impl ConsensusCluster {
         // The precommit is stamped with the POLKA's round, which may differ
         // from the node's local round. The dedup key is (height, vote.round).
         if self.members[i].last_precommitted == Some((h, vote.round)) {
+            return;
+        }
+        if !self.floor_allows(i, &vote) {
             return;
         }
         let _ = self.members[i].rt.on_precommit(vote.clone());
@@ -1891,6 +1906,23 @@ impl ConsensusCluster {
                 wire: wire.clone(),
             });
         }
+    }
+
+    /// Production's vote watermark: refuse a vote at/below the last round
+    /// voted for this (height, kind). Returns true when the vote may be cast.
+    fn floor_allows(&mut self, i: usize, vote: &Vote) -> bool {
+        let tag = match vote.kind {
+            VoteKind::Prevote => 0u8,
+            VoteKind::Precommit => 1u8,
+        };
+        let key = (vote.height, tag);
+        if let Some(floor) = self.vote_floor[i].get(&key).copied() {
+            if vote.round <= floor {
+                return false;
+            }
+        }
+        self.vote_floor[i].insert(key, vote.round);
+        true
     }
 
     /// Record a cast vote for the double-vote invariant.

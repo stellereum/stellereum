@@ -215,9 +215,13 @@ async fn proposer_stale_chase_control_churns() {
     // positive property on the same seed (1.7k+ heights), so "the fix works"
     // is still load-bearing. A ">=100 heights" pin here would re-assert the
     // ruleset-5 verbatim-re-serve behaviour that ruleset 6 replaced.
+    // LIVENESS (restored by ruleset 6 + f+1 corroboration + F5 alignment):
+    // the no-grace control now CONVERGES; what still separates it from the
+    // grace run is churn, not finality. A "must stall" pin would re-assert the
+    // old stop-the-world consequence of the pre-fix rules.
     assert!(
-        report.common_height <= 2 && report.best_height <= 2,
-        "the no-grace control must stall under ruleset 6 re-stamping: \
+        report.common_height >= 1_000,
+        "the no-grace control must still make progress: \
          best={} common={} in {}ms.\n{}",
         report.best_height,
         report.common_height,
@@ -253,26 +257,26 @@ async fn proposer_stale_chase_control_churns() {
         fast_stale as f64 / fast_arrivals as f64,
         report.diagnostics()
     );
-    // THE CHASE: the slow member still burns a future-rule jump budget
-    // following a network it cannot join in step, and at least one member
-    // spends >1000 `sync_round_to` jumps — the "whoever is 1 round behind
-    // votes stale" half of the incident. (Under the re-stamp the slow node
-    // itself is more isolated: 866 jumps on this seed, while the dragged fast
-    // peer burns 2050.)
+    // CHURN (the stable separator): every member still burns thousands of
+    // view changes to complete the same heights the grace run finishes with
+    // ~1 per height. Jumps are no longer the signal (F5 aligns to the signed
+    // round, so the chase often needs none).
+    let total_view_changes: u64 = report.nodes.iter().map(|n| n.view_changes).sum();
     assert!(
-        report.nodes[2].sync_jumps > 500,
-        "slow member must chase via round jumps.\n{}",
+        total_view_changes > 10_000,
+        "the no-grace control must still churn (>10k view changes in total, \
+         got {total_view_changes}).\n{}",
         report.diagnostics()
     );
-    let max_jumps = report
+    let max_view_changes = report
         .nodes
         .iter()
-        .map(|n| n.sync_jumps)
+        .map(|n| n.view_changes)
         .max()
         .unwrap_or(0);
     assert!(
-        max_jumps > 1_000,
-        "the chase must still burn >1000 round jumps somewhere.\n{}",
+        max_view_changes > 5_000,
+        "at least one member must burn >5000 view changes (got {max_view_changes}).\n{}",
         report.diagnostics()
     );
     // WASTE (TOTAL AGAIN): with no quorum the control's arrivals sit in

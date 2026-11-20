@@ -19,40 +19,6 @@
   onScrollHeader();
   win.addEventListener('scroll', onScrollHeader, { passive: true });
 
-  /* ------------------------------------------------------- palette invert */
-  var invertBtns = doc.querySelectorAll('[data-invert-toggle]');
-  var themeMeta = doc.querySelector('meta[name="theme-color"]');
-
-  function applyInvert(on, persist) {
-    doc.documentElement.classList.toggle('is-inverted', on);
-    doc.body.classList.toggle('is-inverted', on);
-
-    Array.prototype.forEach.call(invertBtns, function (btn) {
-      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-      btn.setAttribute('aria-label', on ? 'Switch to dark palette' : 'Switch to light palette');
-    });
-
-    if (themeMeta) themeMeta.setAttribute('content', on ? '#eef2ff' : '#060811');
-
-    if (persist) {
-      try { win.localStorage.setItem('stell-invert', on ? '1' : '0'); } catch (e) {}
-    }
-  }
-
-  function isInverted() {
-    return doc.body.classList.contains('is-inverted');
-  }
-
-  applyInvert(doc.documentElement.classList.contains('is-inverted'), false);
-
-  Array.prototype.forEach.call(invertBtns, function (btn) {
-    btn.addEventListener('click', function () { applyInvert(!isInverted(), true); });
-  });
-
-  win.addEventListener('storage', function (e) {
-    if (e.key === 'stell-invert') applyInvert(e.newValue === '1', false);
-  });
-
   /* --------------------------------------------------------- nav drawer */
   var toggle = doc.querySelector('.nav-toggle');
   var close = doc.querySelector('.nav-close');
@@ -271,5 +237,5 @@
     });
   }, 3200);
 
-  win.StellereumApp = { copyText: copyText, setNav: setNav, applyInvert: applyInvert };
+  win.StellereumApp = { copyText: copyText, setNav: setNav };
 })();

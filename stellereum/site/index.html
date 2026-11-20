@@ -15,18 +15,18 @@
 <meta property="og:url" content="https://stellereum.org/">
 <meta property="og:title" content="Stellereum — Pure Post-Quantum Layer 1">
 <meta property="og:description" content="Pure post-quantum: Falcon-512 validator votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only; no external audit.">
-<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=19">
+<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=20">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Stellereum — Pure Post-Quantum Layer 1">
 <meta name="twitter:description" content="Pure post-quantum: Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
-<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=19">
+<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=20">
 
-<link rel="icon" href="favicon.ico?v=19" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=19">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=19">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=19">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=19">
-<link rel="manifest" href="site.webmanifest?v=19">
+<link rel="icon" href="favicon.ico?v=20" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=20">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=20">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=20">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=20">
+<link rel="manifest" href="site.webmanifest?v=20">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -34,36 +34,27 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=19">
-<link rel="stylesheet" href="assets/css/base.css?v=19">
-<link rel="stylesheet" href="assets/css/components.css?v=19">
-<link rel="stylesheet" href="assets/css/reference.css?v=19">
+<link rel="stylesheet" href="assets/css/tokens.css?v=20">
+<link rel="stylesheet" href="assets/css/base.css?v=20">
+<link rel="stylesheet" href="assets/css/components.css?v=20">
+<link rel="stylesheet" href="assets/css/reference.css?v=20">
 
 <script>
 document.documentElement.classList.add('js');
-try {
-  if (window.localStorage.getItem('stell-invert') === '1') {
-    document.documentElement.classList.add('is-inverted');
-    var theme = document.querySelector('meta[name="theme-color"]');
-    if (theme) theme.setAttribute('content', '#eef2ff');
-  }
-} catch (e) { /* storage blocked: stay dark */ }
 window.setTimeout(function () {
   if (!window.StellMotion) document.documentElement.classList.remove('js');
 }, 3000);
 </script>
 <noscript>
 <style>
-  [data-invert-toggle],
   .stage-mode,
-  .stage-drag,
-  .stage-chip--fps { display: none; }
+  .stage-drag { display: none; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=19"></script>
-<script defer src="assets/js/motion.js?v=19"></script>
-<script defer src="assets/js/metrics.js?v=19"></script>
-<script defer src="assets/js/dither.js?v=19"></script>
+<script defer src="assets/js/app.js?v=20"></script>
+<script defer src="assets/js/motion.js?v=20"></script>
+<script defer src="assets/js/metrics.js?v=20"></script>
+<script defer src="assets/js/dither.js?v=20"></script>
 </head>
 <body>
 
@@ -93,10 +84,6 @@ window.setTimeout(function () {
         <span>STELLEREUM L1</span><span class="dim">•</span>
         <span id="live-timecode">00:00:00:00</span>
       </span>
-      <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
-        <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
-        <span>INVERT</span>
-      </button>
     </div>
   </div>
 
@@ -120,7 +107,6 @@ window.setTimeout(function () {
     <div class="stage-telemetry">
       <div class="stage-chip-group">
         <span class="stage-chip">BAYER 4×4 MATRIX [16 LEVELS] · ELECTRIC LUT</span>
-        <span class="stage-chip stage-chip--fps" id="hero-fps">FPS // BAYER 4×4</span>
       </div>
       <div class="stage-drag" aria-hidden="true">
         <span>DRAG 3D OBJECT</span>
@@ -145,10 +131,6 @@ window.setTimeout(function () {
     <a href="#shader-lab">04. Build</a>
   </nav>
   <div class="header-actions">
-    <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
-      <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
-      <span>INVERT</span>
-    </button>
     <a class="header-cta" href="https://testnet.stellereum.org">Enter testnet ↗</a>
   </div>
 </header>

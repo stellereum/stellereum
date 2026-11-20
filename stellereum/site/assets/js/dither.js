@@ -137,7 +137,6 @@
   var bootTime = 0;
   var fpsCount = 0;
   var fpsMark = 0;
-  var fpsEl = null;
   var heroTimecodeEl = null;
   var heroModeBtns = [];
   var heroFrame = null;
@@ -156,13 +155,12 @@
   }
 
   function updateFps(now) {
-    if (!fpsEl || !engine.visible) return;
+    if (!engine.visible) return;
     fpsCount++;
     if (!fpsMark) fpsMark = now;
     if (now - fpsMark >= 600) {
       var fps = Math.round(fpsCount * 1000 / (now - fpsMark));
       if (fps > 60) fps = 60;
-      fpsEl.textContent = fps + ' FPS // BAYER 4\u00d74';
       fpsCount = 0;
       fpsMark = now;
 
@@ -218,7 +216,6 @@
       var it = items[i];
       if (it.visible && it.buf && it.buf.ready) it.render(0.6, 0);
     }
-    if (fpsEl) fpsEl.textContent = 'STATIC // BAYER 4\u00d74';
   }
 
   function scheduleStatic() {
@@ -1160,7 +1157,6 @@
     if (!canvas || !frameEl) return;
 
     heroFrame = frameEl;
-    fpsEl = doc.getElementById('hero-fps');
     heroTimecodeEl = doc.getElementById('live-timecode');
     heroModeBtns = Array.prototype.slice.call(doc.querySelectorAll('[data-hero-mode]'));
 
@@ -1265,7 +1261,6 @@
       }
       renderStatic();
     } else {
-      if (fpsEl) fpsEl.textContent = 'FPS // BAYER 4\u00d74';
       ensureLoop();
     }
   }

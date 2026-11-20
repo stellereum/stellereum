@@ -166,9 +166,7 @@ html.dither-ready .stage-fallback { display: none; }
   line-height: 1.2;
 }
 
-.stage-chip--wide { color: var(--text-2); }
-.stage-chip--fps { background-image: var(--grad); color: var(--ink); border-color: var(--line-strong); font-weight: 700; }
-.stage-chip .dim { color: var(--telemetry-alt); }
+.stage-chip--wide { color: var(--text-2); }.stage-chip .dim { color: var(--telemetry-alt); }
 .stage-chip.accent-text { color: transparent; }
 
 .bit-dot {
@@ -422,13 +420,7 @@ html.dither-ready .stage-fallback { display: none; }
   display: flex;
   align-items: stretch;
   flex: 0 0 auto;
-}
-
-.header-actions .invert-pill {
-  margin: auto 16px;
-}
-
-.header-cta {
+}.header-cta {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -450,53 +442,6 @@ html.dither-ready .stage-fallback { display: none; }
 }
 
 .header-cta:hover { color: var(--ink); filter: brightness(1.06); }
-
-/* the reference invert pill */
-.invert-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 44px;
-  padding: 6px 12px 6px 7px;
-  border: 1.5px solid var(--line-strong);
-  border-radius: var(--r-pill);
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
-}
-
-.invert-pill:hover,
-.invert-pill:focus-visible {
-  background-image: var(--grad);
-  color: var(--ink);
-}
-
-.invert-track {
-  display: flex;
-  align-items: center;
-  width: 26px;
-  height: 14px;
-  flex: 0 0 auto;
-  padding: 2px;
-  border: 1.5px solid currentColor;
-  border-radius: var(--r-pill);
-}
-
-.invert-thumb {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: currentColor;
-  transition: transform var(--t-base) var(--ease);
-}
-
-html.is-inverted .invert-thumb,
-body.is-inverted .invert-thumb { transform: translateX(11px); }
 
 /* ============================= SECTIONS ================================= */
 .section {
@@ -1356,8 +1301,6 @@ html.js [data-reveal].is-visible {
   .header-nav { display: none; }
   .header-brand { flex: 1 1 auto; border-right: 0; padding: 14px; gap: 8px; font-size: 13px; }
   .brand-tag { display: none; }
-  .header-actions .invert-pill { margin: auto 4px; padding: 6px 9px; min-width: 44px; }
-  .header-actions .invert-pill > span:last-child { display: none; }
   .header-cta { padding-inline: 8px; font-size: 10px; }
   .stage-hud { font-size: 10px; letter-spacing: .12em; }
   .stage-hud--top { padding-top: 18px; }

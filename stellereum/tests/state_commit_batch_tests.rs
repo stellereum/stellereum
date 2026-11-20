@@ -340,7 +340,22 @@ async fn state_root_survives_snapshot_and_storage_roundtrip() {
         drop(st);
     }
     {
-        let st = Storage::open(&dir).unwrap();
+        // sled releases its exclusive flock asynchronously after the handle is
+        // dropped; under a parallel gate the reopen can observe WouldBlock for
+        // a few tens of milliseconds. Retry (bounded) instead of flaking.
+        let st = {
+            let mut opened = None;
+            for _ in 0..40 {
+                match Storage::open(&dir) {
+                    Ok(s) => {
+                        opened = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                }
+            }
+            opened.expect("reopen the store after the previous handle is released")
+        };
         let (_, bytes) = st.latest_state().unwrap().expect("snapshot survives");
         assert_eq!(bytes, snap);
         let eng3 = InMemoryStateEngine::new();

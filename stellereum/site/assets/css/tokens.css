@@ -1,28 +1,28 @@
 /* ==========================================================================
-   STELLEREUM — design tokens
-   Swiss-brutalist grid / electric blue–indigo–violet / Bayer 4×4.
-   Only custom properties live here. Breakpoints: 420 / 680 / 900 / 1200 / 1500.
+   STELLEREUM — tokens ported from the reference
+   Electric blue–indigo–violet / Bayer 4×4 / Swiss spacing.
+   Values taken from kinetika_05_electric_bayer_swiss_brutalism.html.
    ========================================================================== */
 
 :root {
   color-scheme: dark;
 
-  /* --- electric surfaces ------------------------------------------------- */
+  /* --- surfaces ---------------------------------------------------------- */
   --bg: #060811;
-  --bg-1: #080b16;
+  --bg-1: #060811;
   --surface: #0b0f1d;
   --surface-2: #101731;
   --surface-3: #151d3b;
   --ink: #060811;
-  --on-accent: #060811;            /* text on the electric gradient          */
+  --on-accent: #060811;
   --on-accent-2: rgba(6, 8, 17, .82);
   --on-accent-line: rgba(6, 8, 17, .32);
   --on-accent-soft: rgba(6, 8, 17, .1);
 
   /* --- type colour ------------------------------------------------------- */
-  --text: #d8e6ff;          /* body / headings on --bg                       */
-  --text-2: #a9b8d8;        /* secondary, 7.4:1 on --bg                      */
-  --text-3: #7b89ad;        /* meta, large / decorative only                 */
+  --text: #d8e6ff;
+  --text-2: #a9b8d8;
+  --text-3: #7b89ad;
   --telemetry: #7aa2ff;
   --telemetry-alt: #9d8cff;
 
@@ -34,19 +34,17 @@
   --grad-soft: linear-gradient(115deg, rgba(94, 184, 255, .19), rgba(124, 141, 255, .12) 52%, rgba(168, 117, 255, .19));
   --grad-text: linear-gradient(110deg, #8fd2ff 0%, #9aa4ff 48%, #c49aff 100%);
 
-  /* --- rules & elevation ------------------------------------------------- */
-  --line: rgba(124, 141, 255, .28);
-  --line-soft: rgba(124, 141, 255, .17);
+  /* --- rules & elevation (reference: 1 / 2 px, 6 / 9 / 10 px offsets) ---- */
+  --line: rgba(124, 141, 255, .35);
+  --line-soft: rgba(124, 141, 255, .18);
   --line-strong: #7c8dff;
-  /* Opaque-enough ink for copy laid over the live dither stage. The hero
-     canvas is always busy; body copy never sits on raw pixels. */
-  --stage-ink: rgba(6, 8, 17, .9);
-  --stage-ink-strong: rgba(6, 8, 17, .96);
-  --stage-scrim: linear-gradient(90deg, rgba(6, 8, 17, .95) 0%, rgba(6, 8, 17, .82) 36%, rgba(6, 8, 17, .3) 64%, rgba(6, 8, 17, .04) 100%);
   --field: rgba(94, 184, 255, .055);
   --shadow: #5eb8ff;
   --shadow-alt: #a875ff;
   --dot: rgba(124, 141, 255, .42);
+  --shadow-1: 6px;
+  --shadow-2: 9px;
+  --shadow-3: 10px;
 
   /* --- typography -------------------------------------------------------- */
   --font-display: "Unbounded", "Arial Black", "Helvetica Neue", Arial, sans-serif;
@@ -54,13 +52,14 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --font-serif: "Cormorant Garamond", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
 
-  /* --- geometry ---------------------------------------------------------- */
-  --r: 2px;
-  --r-pill: 999px;
-  --gutter: 18px;
-  --max: 1560px;
-  --header-h: 62px;
-  --section-y: clamp(58px, 8.5vw, 124px);
+  /* --- geometry (reference: px-5 / sm:px-10, max-w 1600, py-16 / sm:py-24) */
+  --r: 4px;
+  --r-sm: 2px;
+  --r-pill: 9999px;
+  --gutter: 20px;
+  --max: 1600px;
+  --header-h: 56px;
+  --section-y: 64px;
   --hair: 1px;
 
   /* --- spacing scale ----------------------------------------------------- */
@@ -77,20 +76,27 @@
   --sp-11: 64px;
   --sp-12: 72px;
   --sp-13: 88px;
-  --sp-14: 104px;
+  --sp-14: 96px;
 
-  /* --- motion ------------------------------------------------------------ */
-  --t-fast: 140ms;
-  --t-base: 260ms;
-  --t-slow: 680ms;
+  /* --- motion (reference: one Swiss easing) ----------------------------- */
+  --t-fast: 180ms;
+  --t-base: 240ms;
+  --t-slow: 650ms;
   --ease: cubic-bezier(.16, 1, .3, 1);
   --ease-sharp: cubic-bezier(.2, .8, .2, 1);
 
+  /* --- type scale -------------------------------------------------------- */
+  /* Reference hero is 10.5vw for 6-letter words. "Stellereum" is 10 letters,
+     so the hero cap is the fitted value; section/kinetic scales are the
+     reference values. */
+  --fs-hero: clamp(2.6rem, 8.6vw, 8.8rem);
+  --fs-display: clamp(2.5rem, 8.5vw, 7.2rem);
+  --fs-kinetic: clamp(2.4rem, 7.2vw, 6.8rem);
+  --fs-body: clamp(1.125rem, 1.6vw, 1.5rem);
+  --fs-mono: 11px;
+
   /* --- layers ------------------------------------------------------------ */
-  --z-progress: 80;
-  --z-header: 60;
-  --z-backdrop: 55;
-  --z-drawer: 70;
+  --z-header: 50;
   --z-cursor: 90;
   --z-grain: 95;
 
@@ -98,23 +104,20 @@
   --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.78' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.58'/%3E%3C/svg%3E");
 }
 
-/* Light inversion is a reference effect worth keeping: same components,
-   remapped tokens. It is opt-in through the header pill. The class is set on
-   <html> by the inline boot script (before first paint) and on <body> by
-   app.js, so both selectors share one token map. */
+/* Light inversion is the reference's synchronized palette. */
 html.is-inverted,
 body.is-inverted {
   color-scheme: light;
   --bg: #eef2ff;
-  --bg-1: #e6ebff;
-  --surface: #e9eeff;
+  --bg-1: #eef2ff;
+  --surface: #e2e8ff;
   --surface-2: #dde5ff;
   --surface-3: #cfd9ff;
   --ink: #060811;
-  --on-accent: #f4f7ff;
-  --on-accent-2: rgba(244, 247, 255, .92);
-  --on-accent-line: rgba(244, 247, 255, .38);
-  --on-accent-soft: rgba(244, 247, 255, .16);
+  --on-accent: #eef2ff;
+  --on-accent-2: rgba(238, 242, 255, .92);
+  --on-accent-line: rgba(238, 242, 255, .38);
+  --on-accent-soft: rgba(238, 242, 255, .16);
   --text: #060811;
   --text-2: #26325a;
   --text-3: #4a5780;
@@ -126,12 +129,9 @@ body.is-inverted {
   --grad: linear-gradient(115deg, #1d4ed8 0%, #4f46e5 52%, #7c3aed 100%);
   --grad-soft: linear-gradient(115deg, rgba(29, 78, 216, .14), rgba(79, 70, 229, .09) 52%, rgba(124, 58, 237, .14));
   --grad-text: linear-gradient(110deg, #1d4ed8 0%, #4f46e5 48%, #7c3aed 100%);
-  --line: rgba(79, 70, 229, .34);
+  --line: rgba(79, 70, 229, .35);
   --line-soft: rgba(79, 70, 229, .2);
   --line-strong: #4f46e5;
-  --stage-ink: rgba(238, 242, 255, .9);
-  --stage-ink-strong: rgba(238, 242, 255, .97);
-  --stage-scrim: linear-gradient(90deg, rgba(238, 242, 255, .95) 0%, rgba(238, 242, 255, .82) 36%, rgba(238, 242, 255, .3) 64%, rgba(238, 242, 255, .04) 100%);
   --field: rgba(29, 78, 216, .05);
   --shadow: #4f46e5;
   --shadow-alt: #7c3aed;

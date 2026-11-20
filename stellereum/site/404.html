@@ -8,107 +8,62 @@
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="#060811">
 <meta name="color-scheme" content="dark">
-<link rel="icon" href="favicon.ico?v=17" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=17">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=17">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=17">
-<link rel="manifest" href="site.webmanifest?v=17">
+<link rel="icon" href="favicon.ico?v=18" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=18">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=18">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=18">
+<link rel="manifest" href="site.webmanifest?v=18">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<!-- Non-blocking: a blocked/slow fonts.googleapis.com must never hold the
-         first paint (white screen until timeout). Text renders with the local
-         fallback stack and swaps when the sheet arrives. -->
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
-    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=17">
-<link rel="stylesheet" href="assets/css/base.css?v=17">
-<link rel="stylesheet" href="assets/css/layout.css?v=17">
-<link rel="stylesheet" href="assets/css/components.css?v=17">
-<link rel="stylesheet" href="assets/css/sections.css?v=17">
-<link rel="stylesheet" href="assets/css/responsive.css?v=17">
-<link rel="stylesheet" href="assets/css/pixel.css?v=17">
-
-<script>
-document.documentElement.classList.add('js');
-try {
-  if (window.localStorage.getItem('stell-invert') === '1') {
-    document.documentElement.classList.add('is-inverted');
-    var theme = document.querySelector('meta[name="theme-color"]');
-    if (theme) theme.setAttribute('content', '#eef2ff');
-  }
-} catch (e) {}
-window.setTimeout(function () {
-  if (!window.StellMotion) document.documentElement.classList.remove('js');
-}, 3000);
-</script>
-<noscript><style>[data-invert-toggle] { display: none; }</style></noscript>
-<script defer src="assets/js/app.js?v=17"></script>
-<script defer src="assets/js/motion.js?v=17"></script>
+<link rel="stylesheet" href="assets/css/tokens.css?v=18">
+<link rel="stylesheet" href="assets/css/base.css?v=18">
+<link rel="stylesheet" href="assets/css/components.css?v=18">
+<link rel="stylesheet" href="assets/css/reference.css?v=18">
+<script>document.documentElement.classList.add('js');</script>
+<script defer src="assets/js/app.js?v=18"></script>
+<script defer src="assets/js/motion.js?v=18"></script>
 </head>
 <body>
-
 <a class="skip-link" href="#main">Skip to content</a>
-<div class="grain" aria-hidden="true"></div>
 <div class="cursor" id="custom-cursor" aria-hidden="true"></div>
-<div class="scroll-progress" aria-hidden="true"><span data-scroll-progress></span></div>
 
 <header class="site-header">
-  <div class="header-inner shell">
-    <a class="brand" href="/" aria-label="Stellereum — home">
-      <img class="brand-mark" src="assets/img/stell-mark.png?v=17" alt="" width="32" height="32">
-      <span class="brand-word">Stellereum</span>
-      <span class="brand-tag" aria-hidden="true">PQ–L1</span>
-    </a>
-    <a class="btn btn--electric btn--sm header-home" href="/">Back home <span class="arrow" aria-hidden="true">↗</span></a>
-    <button class="invert-pill" type="button" data-invert-toggle aria-pressed="false" aria-label="Switch to light palette" title="Invert palette">
-      <span class="invert-track" aria-hidden="true"><span class="invert-thumb"></span></span>
-      <span class="invert-label" aria-hidden="true">Invert</span>
-    </button>
+  <a class="header-brand" href="/"><span>Stellereum</span><span class="brand-tag">PQ–L1</span></a>
+  <div class="header-actions">
+    <a class="header-cta" href="/">Back home ↗</a>
   </div>
 </header>
 
 <main id="main">
-  <section class="notfound shell" aria-labelledby="nf-title">
-    <div class="nf-code" aria-hidden="true">404</div>
-
-    <div class="nf-copy">
-      <p class="hero-kicker"><span class="rule-dot" aria-hidden="true"></span>ERROR / PAGE NOT FOUND</p>
-      <span class="badge badge--active"><span class="dot" aria-hidden="true"></span>CHAIN 5757 · NO SUCH PAGE</span>
-      <h1 id="nf-title">This page does not exist</h1>
-      <p>The requested file is not part of this site. Return to the homepage, open the explorer, or read the docs.</p>
-      <div class="nf-actions">
-        <a class="btn btn--electric" href="/">Back home <span class="arrow" aria-hidden="true">↗</span></a>
-        <a class="btn btn--outline" href="https://explorer.stellereum.org">Open explorer <span class="arrow" aria-hidden="true">↗</span></a>
-        <a class="btn btn--outline" href="https://testnet.stellereum.org">Testnet <span class="arrow" aria-hidden="true">↗</span></a>
+  <section class="section section--dot notfound" aria-labelledby="nf-title">
+    <div class="shell">
+      <div class="display-block"><h2>404</h2></div>
+      <h1 class="nf-title" id="nf-title">This page does not exist</h1>
+      <p class="nf-copy">The requested file is not part of this site. Return to the homepage, open the explorer, or read the docs.</p>
+      <div class="lab-actions">
+        <a class="btn btn--electric" href="/">Back home ↗</a>
+        <a class="btn btn--outline" href="https://explorer.stellereum.org">Open explorer ↗</a>
+        <a class="btn btn--outline" href="https://testnet.stellereum.org">Testnet ↗</a>
       </div>
-      <p class="mono break-anywhere nf-meta">
-        RULESET V5 · FORK 0x9d59096b · PROTOCOL 1.0 · TESTNET ONLY
-      </p>
-      <div class="dither-rule dither-rule--standalone" aria-hidden="true"></div>
+      <dl class="footer-colophon">
+        <div><dt>Protocol</dt><dd>1.0</dd></div>
+        <div><dt>Consensus ruleset</dt><dd>v6</dd></div>
+        <div><dt>Fork ID</dt><dd>0x0f584a46</dd></div>
+        <div><dt>Chain ID</dt><dd>5757</dd></div>
+        <div><dt>Site build</dt><dd>static-v18 · 2026.11.20</dd></div>
+      </dl>
     </div>
   </section>
 </main>
 
 <footer class="site-footer">
   <div class="shell">
-    <dl class="footer-colophon footer-colophon--flush">
-      <div><dt>Protocol</dt><dd>1.0</dd></div>
-      <div><dt>Consensus ruleset</dt><dd>v5</dd></div>
-      <div><dt>Fork ID</dt><dd>0x9d59096b</dd></div>
-      <div><dt>Supply cap</dt><dd>1B STELL</dd></div>
-      <div><dt>Site build</dt><dd>static-v17 · 2026.11.20</dd></div>
-    </dl>
-    <div class="footer-bottom">
-      <span class="footer-genesis">
-        <span>GENESIS ROOT</span>
-        <b title="Pinned genesis root for ruleset v5 (src/runtime/mod.rs:307)">61336779…</b>
-      </span>
-      <span>© <span data-year>2026</span> STELLEREUM · TESTNET ONLY · NO EXTERNAL AUDIT</span>
-    </div>
+    <div class="footer-bottom"><div>© 2026 Stellereum // Post-quantum Layer 1</div></div>
   </div>
 </footer>
-
 </body>
 </html>

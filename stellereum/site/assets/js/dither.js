@@ -134,9 +134,11 @@
   var items = [];
   var rafId = null;
   var lastNow = 0;
+  var bootTime = 0;
   var fpsCount = 0;
   var fpsMark = 0;
   var fpsEl = null;
+  var heroTimecodeEl = null;
   var heroModeBtns = [];
   var heroFrame = null;
   var heroItem = null;
@@ -159,10 +161,20 @@
     if (!fpsMark) fpsMark = now;
     if (now - fpsMark >= 600) {
       var fps = Math.round(fpsCount * 1000 / (now - fpsMark));
-      if (fps > 144) fps = 144;
+      if (fps > 60) fps = 60;
       fpsEl.textContent = fps + ' FPS // BAYER 4\u00d74';
       fpsCount = 0;
       fpsMark = now;
+
+      if (!bootTime) bootTime = now;
+      if (heroTimecodeEl) {
+        var elapsed = Math.max(0, now - bootTime);
+        var hrs = String(Math.floor(elapsed / 3600000)).padStart(2, '0');
+        var mins = String(Math.floor((elapsed % 3600000) / 60000)).padStart(2, '0');
+        var secs = String(Math.floor((elapsed % 60000) / 1000)).padStart(2, '0');
+        var frames = String(Math.floor(((elapsed % 1000) / 1000) * 60)).padStart(2, '0');
+        heroTimecodeEl.textContent = hrs + ':' + mins + ':' + secs + ':' + frames;
+      }
     }
   }
 
@@ -375,16 +387,12 @@
   };
 
   function buildHeroBackground(w, h) {
-    var fontSize = Math.max(9, Math.round(
-      w > h
-        ? Math.min(w * 0.082, h * 0.16)
-        : Math.min(w * 0.11, h * 0.055)
-    ));
+    var fontSize = Math.max(14, Math.round(Math.min(w * 0.11, h * 0.21)));
     var font = '900 ' + fontSize + 'px "Unbounded", "Inter", sans-serif';
     var defs = [
-      { text: 'STELLEREUM \u2022 ', y: 0.26, speed: -24 },
-      { text: 'PQ \u2022 5757 \u2022 ', y: 0.50, speed: 19 },
-      { text: 'BAYER 4\u00d74 \u2022 ', y: 0.74, speed: -17 }
+      { text: 'STELLEREUM \u2022 ', y: 0.26, speed: -28 },
+      { text: 'FALCON-512 \u2022 ', y: 0.50, speed: 24 },
+      { text: 'BAYER 4\u00d74 \u2022 ', y: 0.74, speed: -22 }
     ];
     var scratch = doc.createElement('canvas');
     var sctx = scratch.getContext('2d');
@@ -568,18 +576,8 @@
       engine.targetRotY += dt * 0.30 * engine.speed;
     }
 
-    var scrollTilt = 0;
-    var sy = win.scrollY || win.pageYOffset || 0;
-    if (sy > 0) scrollTilt = Math.min(1, sy / Math.max(1, win.innerHeight)) * 0.28;
-
-    /* Scroll parallax: the stage object sinks and recedes slightly while the
-       copy travels, so the 100vh panel reads as depth, not a flat video. */
-    var scrollDrop = sy > 0 ? Math.min(1, sy / Math.max(1, win.innerHeight)) : 0;
-    halfH -= scrollDrop * h * 0.05;
-    fov *= 1 - scrollDrop * 0.07;
-
-    var wantX = engine.targetRotX + engine.parallaxY * 0.26 + scrollTilt;
-    var wantY = engine.targetRotY + engine.parallaxX * 0.34;
+    var wantX = engine.targetRotX + engine.parallaxY * 0.28;
+    var wantY = engine.targetRotY + engine.parallaxX * 0.36;
     engine.curRotX += (wantX - engine.curRotX) * 0.08;
     engine.curRotY += (wantY - engine.curRotY) * 0.08;
 
@@ -601,14 +599,8 @@
 
     var halfW = w * 0.5;
     var halfH = h * 0.5;
-    var wide = w > h * 1.08;
-    /* Full-bleed composition: on landscape screens the knot is pushed to
-       the clear right side and scaled to ~85% of the viewport height. On
-       portrait it is cropped edge-to-edge behind the display type. */
-    var fov = wide ? Math.min(w, h) * 1.08 : h * 0.58;
-    var camZ = wide ? 4.0 : 4.2;
-    halfW = wide ? w * 0.71 : w * 0.5;
-    halfH = wide ? h * 0.5 : h * 0.34;
+    var fov = Math.min(w, h) * 0.88;
+    var camZ = w < h ? 5.6 : 4.25;
 
     if (engine.mode === 'refract') {
       /* Static background rows are reused until their sub-pixel scroll
@@ -836,7 +828,6 @@
   /* ------------------------------------------------------ SECONDARY MODULES */
   var ribbonItem = null;
   var interfItem = null;
-  var slabItem = null;
   var cardItems = [];
 
   function writeElectricPixel(data, idx, lit, gradT, bcol, lut) {
@@ -901,35 +892,6 @@
         var w2 = Math.cos(nx * (freq * 0.55) - shift * 0.7 + ny * 9);
         var v = (w1 * 0.55 + w2 * 0.45) * 0.5 + 0.5;
         var g = nx * 0.8 + ny * 0.2 + Math.sin(time * 0.7) * 0.12;
-        writeElectricPixel(data, idx, v > bayerRow[x & 3], g, bcol, lut);
-        idx += 4;
-      }
-    }
-    buf.present();
-  }
-
-  /* Full-width slab under the hero: crossed beams, a walking moire field
-     and a 16px pixel lattice, all thresholded with the same Bayer matrix. */
-  function renderSlab(time) {
-    var buf = slabItem && slabItem.buf;
-    if (!buf || !buf.ready) return;
-    var w = buf.w, h = buf.h;
-    var data = buf.imgData.data;
-    var bcol = pal.bg, lut = pal.lut;
-    var invW = 1 / Math.max(1, w - 1);
-    var invH = 1 / Math.max(1, h - 1);
-    var idx = 0;
-
-    for (var y = 0; y < h; y++) {
-      var ny = y * invH;
-      var bayerRow = BAYER_4X4[y & 3];
-      for (var x = 0; x < w; x++) {
-        var nx = x * invW;
-        var beam = Math.sin((nx * 1.6 + ny * 0.9) * 18 - time * 1.25);
-        var beam2 = Math.sin((nx * 2.1 - ny * 1.4) * 13 + time * 0.9);
-        var grid = ((x >> 3) + (y >> 3)) & 1 ? 0.16 : 0;
-        var v = (beam * 0.5 + 0.5) * 0.52 + (beam2 * 0.5 + 0.5) * 0.34 + grid + 0.06;
-        var g = nx * 0.78 + ny * 0.22 + Math.sin(time * 0.4) * 0.1;
         writeElectricPixel(data, idx, v > bayerRow[x & 3], g, bcol, lut);
         idx += 4;
       }
@@ -1176,6 +1138,22 @@
   }
 
   /* ------------------------------------------------------------------- BOOT */
+  function attachHover(item, wrap) {
+    wrap.addEventListener('mouseenter', function () { item.meta.hover = true; });
+    wrap.addEventListener('mouseleave', function () {
+      item.meta.hover = false;
+      item.meta.mx = 0.5;
+      item.meta.my = 0.5;
+    });
+    wrap.addEventListener('mousemove', function (e) {
+      var r = wrap.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        item.meta.mx = (e.clientX - r.left) / r.width;
+        item.meta.my = (e.clientY - r.top) / r.height;
+      }
+    });
+  }
+
   function setupHero() {
     var canvas = doc.getElementById('hero-canvas');
     var frameEl = doc.getElementById('hero-stage');
@@ -1183,6 +1161,7 @@
 
     heroFrame = frameEl;
     fpsEl = doc.getElementById('hero-fps');
+    heroTimecodeEl = doc.getElementById('live-timecode');
     heroModeBtns = Array.prototype.slice.call(doc.querySelectorAll('[data-hero-mode]'));
 
     var buf = createDitherCanvas(canvas, frameEl, 3, function (w, h) {
@@ -1192,15 +1171,6 @@
       scheduleStatic();
     });
     if (!buf) return;
-    /* Keep the hero pixel grid coarse (the technique) while capping the
-       buffer on 4K panels. One scale for the whole stage. */
-    buf.scaleFor = function (cssW, cssH) {
-      var area = cssW * cssH;
-      if (cssW < 420) return 2;
-      if (area > 1000000) return 4;
-      if (area > 460000) return 3;
-      return 2;
-    };
 
     heroItem = {
       buf: buf,
@@ -1247,34 +1217,12 @@
     if (!buf) return;
     interfItem = {
       buf: buf,
-      /* One still frame: the protocol/stack section is typographic, not a
-         dashboard. The large slab and the stage carry the live motion. */
       visible: false,
-      minInterval: 1e9,
+      minInterval: 50,
       render: function (t) { renderInterference(t); }
     };
     items.push(interfItem);
     watch(interfItem, wrap);
-  }
-
-  function setupSlab() {
-    var canvas = doc.getElementById('slab-canvas');
-    var wrap = doc.getElementById('slab-wrap');
-    if (!canvas || !wrap) return;
-
-    var buf = createDitherCanvas(canvas, wrap, 3, function () {
-      buf.lastPaint = -1e9;
-      scheduleStatic();
-    });
-    if (!buf) return;
-    slabItem = {
-      buf: buf,
-      visible: false,
-      minInterval: 55,
-      render: function (t) { renderSlab(t); }
-    };
-    items.push(slabItem);
-    watch(slabItem, wrap);
   }
 
   function setupCards() {
@@ -1286,10 +1234,7 @@
       var item = {
         buf: null,
         visible: false,
-        /* The protocol/stack cards are deliberately still: one frame on
-           resize or palette change, never a loop. Motion belongs to the
-           stage and the two signal strips, not to six equal cards. */
-        minInterval: 1e9,
+        minInterval: 55,
         meta: { hover: false, mx: 0.5, my: 0.5 },
         index: i,
         render: null
@@ -1307,6 +1252,7 @@
 
       cardItems[i] = item;
       items.push(item);
+      attachHover(item, wrap);
       watch(item, wrap);
     }
   }
@@ -1330,7 +1276,6 @@
     setupHero();
     setupRibbon();
     setupInterference();
-    setupSlab();
     setupCards();
 
     doc.addEventListener('visibilitychange', function () {

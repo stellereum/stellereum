@@ -203,7 +203,7 @@
   /* ---------------------------------------------------------- magnetic */
   function initMagnetic() {
     if (reduce.matches || !precise.matches) return;
-    var els = doc.querySelectorAll('.btn, .hero-mode, [data-magnetic]');
+    var els = doc.querySelectorAll('.btn, .stage-mode, .scene-pill, .header-cta, [data-magnetic]');
     if (!els.length) return;
 
     Array.prototype.forEach.call(els, function (el) {
@@ -254,7 +254,7 @@
     }, { passive: true });
 
     doc.addEventListener('pointerover', function (e) {
-      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-stage, .card-media') : null;
+      var target = e.target.closest ? e.target.closest('a, button, .work-card, .stage-canvas, .invert-pill') : null;
       cursor.classList.toggle('is-expanded', !!target);
     });
 

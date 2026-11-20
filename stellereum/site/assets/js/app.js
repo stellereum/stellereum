@@ -132,8 +132,8 @@
   });
 
   /* ---------------------------------------------------------- active nav */
-  var navLinks = Array.prototype.slice.call(doc.querySelectorAll('.nav-link[href^="#"]'));
-  var watched = ['network', 'features', 'performance', 'build', 'ecosystem', 'roadmap', 'transmit']
+  var navLinks = Array.prototype.slice.call(doc.querySelectorAll('.header-nav a[href^="#"]'));
+  var watched = ['type-engine', 'deformation-lab', 'selected-works', 'shader-lab']
     .map(function (id) { return doc.getElementById(id); })
     .filter(Boolean);
 

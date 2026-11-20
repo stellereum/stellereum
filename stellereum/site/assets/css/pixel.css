@@ -46,7 +46,7 @@
   margin-top: 24px;
 }
 
-/* A short, blocky checker under every section header. */
+/* A short ordered-dither bar under every section header. */
 .sec-head::before {
   content: "";
   position: absolute;
@@ -54,11 +54,15 @@
   left: 0;
   width: min(210px, 46%);
   height: 5px;
-  background-image: repeating-conic-gradient(from 0deg at 50% 50%, var(--blue) 0 25%, var(--violet) 0 50%);
-  background-size: 4px 4px;
-  opacity: .62;
-  -webkit-mask-image: linear-gradient(90deg, #000 0%, rgba(0, 0, 0, .5) 68%, transparent 100%);
-  mask-image: linear-gradient(90deg, #000 0%, rgba(0, 0, 0, .5) 68%, transparent 100%);
+  background-image: var(--grad);
+  background-size: 200% 200%;
+  opacity: .72;
+  -webkit-mask-image: var(--bayer-pattern);
+  mask-image: var(--bayer-pattern);
+  -webkit-mask-size: 4px 4px;
+  mask-size: 4px 4px;
+  -webkit-mask-repeat: repeat;
+  mask-repeat: repeat;
 }
 
 /* Dot-dash pixel hairline from the marker to the shell edge. */
@@ -136,6 +140,8 @@
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   -ms-interpolation-mode: nearest-neighbor;
+  transform: translateZ(0);
+  backface-visibility: hidden;
 }
 
 /* --- hero object: pixelated 3D knot in the right-hand column ------------- */

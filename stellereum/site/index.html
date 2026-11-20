@@ -21,24 +21,28 @@
 <meta name="twitter:description" content="Falcon-512 votes, two shards {0,1}, WASM contracts, chain ID 5757. Testnet only.">
 <meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png">
 
-<link rel="icon" href="favicon.ico?v=14" sizes="48x48">
-<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=14">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=14">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=14">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=14">
-<link rel="manifest" href="site.webmanifest?v=14">
+<link rel="icon" href="favicon.ico?v=15" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=15">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=15">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=15">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=15">
+<link rel="manifest" href="site.webmanifest?v=15">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap">
+<!-- Non-blocking: a blocked/slow fonts.googleapis.com must never hold the
+         first paint (white screen until timeout). Text renders with the local
+         fallback stack and swaps when the sheet arrives. -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
 
-<link rel="stylesheet" href="assets/css/tokens.css?v=14">
-<link rel="stylesheet" href="assets/css/base.css?v=14">
-<link rel="stylesheet" href="assets/css/layout.css?v=14">
-<link rel="stylesheet" href="assets/css/components.css?v=14">
-<link rel="stylesheet" href="assets/css/sections.css?v=14">
-<link rel="stylesheet" href="assets/css/responsive.css?v=14">
-<link rel="stylesheet" href="assets/css/pixel.css?v=14">
+<link rel="stylesheet" href="assets/css/tokens.css?v=15">
+<link rel="stylesheet" href="assets/css/base.css?v=15">
+<link rel="stylesheet" href="assets/css/layout.css?v=15">
+<link rel="stylesheet" href="assets/css/components.css?v=15">
+<link rel="stylesheet" href="assets/css/sections.css?v=15">
+<link rel="stylesheet" href="assets/css/responsive.css?v=15">
+<link rel="stylesheet" href="assets/css/pixel.css?v=15">
 
 <script>
 document.documentElement.classList.add('js');
@@ -68,10 +72,10 @@ window.setTimeout(function () {
   .hero-drag-hint { display: none !important; }
 </style>
 </noscript>
-<script defer src="assets/js/app.js?v=14"></script>
-<script defer src="assets/js/motion.js?v=14"></script>
-<script defer src="assets/js/metrics.js?v=14"></script>
-<script defer src="assets/js/dither.js?v=14"></script>
+<script defer src="assets/js/app.js?v=15"></script>
+<script defer src="assets/js/motion.js?v=15"></script>
+<script defer src="assets/js/metrics.js?v=15"></script>
+<script defer src="assets/js/dither.js?v=15"></script>
 </head>
 <body>
 
@@ -84,7 +88,7 @@ window.setTimeout(function () {
 <header class="site-header" id="site-header">
   <div class="header-inner shell">
     <a class="brand" href="#top" aria-label="Stellereum — home">
-      <img class="brand-mark" src="assets/img/stell-mark.png?v=14" alt="" width="32" height="32">
+      <img class="brand-mark" src="assets/img/stell-mark.png?v=15" alt="" width="32" height="32">
       <span class="brand-word">Stellereum</span>
       <span class="brand-tag" aria-hidden="true">PQ–L1</span>
     </a>
@@ -195,8 +199,8 @@ window.setTimeout(function () {
            rasterised at reduced resolution, Bayer 4x4 dithered into the
            electric LUT, drag-to-rotate. Decorative: the canvas is hidden from
            assistive tech, the mode switch is a real 44px button. -->
-      <div class="hero-object" id="hero-object">
-        <div class="hero-object-frame canvas-stage" id="hero-stage">
+      <div class="hero-object" id="hero-object" role="group" aria-label="Hero dither object">
+        <div class="hero-object-frame canvas-stage" id="hero-stage" aria-hidden="true">
           <canvas id="hero-canvas" class="dither-canvas hero-canvas" aria-hidden="true"></canvas>
           <div class="hero-fallback" aria-hidden="true">
             <span>PQ Lattice</span>
@@ -207,7 +211,7 @@ window.setTimeout(function () {
           <span class="hero-drag-hint" aria-hidden="true">Drag // Rotate</span>
         </div>
         <div class="hero-object-caption">
-          <span class="hero-object-meta">PQ Lattice Knot · P=2 Q=3</span>
+          <span class="hero-object-meta" id="hero-mode-label">PQ Lattice Knot · P=2 Q=3</span>
           <button class="hero-mode" type="button" id="hero-mode" aria-pressed="false" aria-label="Switch hero object to ribbon mode">Mode // Refract</button>
         </div>
       </div>
@@ -801,7 +805,7 @@ curl -s -X POST \
     <div class="footer-top">
       <div class="footer-brand">
         <a class="brand" href="#top" aria-label="Stellereum — back to top">
-          <img class="brand-mark" src="assets/img/stell-mark.png?v=14" alt="" width="34" height="34">
+          <img class="brand-mark" src="assets/img/stell-mark.png?v=15" alt="" width="34" height="34">
           <span class="brand-word">Stellereum</span>
         </a>
         <p class="footer-note">

@@ -138,6 +138,7 @@
   var fpsMark = 0;
   var fpsEl = null;
   var heroModeBtn = null;
+  var heroModeLabel = null;
   var heroFrame = null;
   var heroItem = null;
   var staticRaf = null;
@@ -749,6 +750,8 @@
 
           var ndotv = Math.max(0, Math.min(1, Math.abs(mz)));
           var fres = 1 - ndotv;
+          /* Reference uses pow(fres, 2.2); x^2.25 via two sqrts is visually
+             identical at this buffer size and keeps the hot path cheap. */
           var fresnel = fres * fres * Math.sqrt(Math.sqrt(fres));
           var l1 = Math.max(0, mx * 0.48 + my * 0.62 + mz * 0.62);
           var l2 = Math.max(0, -mx * 0.55 - my * 0.32 + mz * 0.77);
@@ -1087,6 +1090,11 @@
         heroModeBtn.setAttribute('aria-label', ribbon
           ? 'Switch hero object to refract mode'
           : 'Switch hero object to ribbon mode');
+        if (heroModeLabel) {
+          heroModeLabel.textContent = ribbon
+            ? 'PQ Lattice Ribbon \u00b7 P=2 Q=3'
+            : 'PQ Lattice Knot \u00b7 P=2 Q=3';
+        }
         if (reduceQuery.matches) renderStatic();
         else ensureLoop();
       });
@@ -1137,6 +1145,7 @@
     heroFrame = frameEl;
     fpsEl = doc.getElementById('hero-fps');
     heroModeBtn = doc.getElementById('hero-mode');
+    heroModeLabel = doc.getElementById('hero-mode-label');
 
     var buf = createDitherCanvas(canvas, frameEl, 3, function (w, h) {
       heroReady(buf);

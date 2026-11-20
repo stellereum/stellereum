@@ -247,7 +247,7 @@
     }, { passive: true });
 
     doc.addEventListener('pointerover', function (e) {
-      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-object-tag') : null;
+      var target = e.target.closest ? e.target.closest('a, button, .invert-card, .hero-object-frame') : null;
       cursor.classList.toggle('is-expanded', !!target);
     });
 

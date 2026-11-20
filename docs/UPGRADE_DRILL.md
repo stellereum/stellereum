@@ -296,7 +296,7 @@ as evidence for anything in this list.
    it requires an operator-supplied `--submit-cmd` because this tree has no CLI
    that builds and PQ-signs a `SysCallGovPropose` transaction.
 2. **Governance timing is not shortened.** `GOVERNANCE_VOTING_PERIOD_SECS` is
-   3 days and `GOV_TIMELOCK_HEIGHTS` is 7,200. A real gate-open run needs a
+   3 days and `GOV_TIMELOCK_HEIGHTS` is 90,000. A real gate-open run needs a
    harness/debug path that can drive a proposal through those windows; the
    drill does not edit the constants (that would be a different binary and a
    fork risk) and does not use the fork-prone multi-node direct-RPC form.

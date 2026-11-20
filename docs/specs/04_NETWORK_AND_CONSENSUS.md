@@ -1,10 +1,11 @@
 # 04 — Network & Consensus (HDAE canonical, 2026-10-29)
 
-> **Ruleset status:** this page is updated for **ruleset v5** (`CONSENSUS_RULESET_VERSION = 5`,
-> `DOMAIN_SET_VERSION = 3`, `FORK_ID = 0x9d59096b`, 23 fork-id rules). The v5 change is the
-> chain-wide supply cap; v2–v4 are the height re-scale, shard-bound vote preimage, and signed
-> block round + timestamp bound. See `docs/RULESET_V2.md`..`docs/RULESET_V5.md` and
-> `docs/SUPPLY_CAP.md`. Values below that predate v5 are marked where they are historical.
+> **Ruleset status:** this page is updated for **ruleset v6** (`CONSENSUS_RULESET_VERSION = 6`,
+> `DOMAIN_SET_VERSION = 3`, `FORK_ID = 0x0f584a46`, 23 fork-id rules). v6 changes lock
+> comparison to round-free `Block::value_id` and re-stamps a rescued body at the current
+> round; the v5 chain-wide supply cap is unchanged. See `docs/RULESET_V6.md`, and the
+> historical v2–v5 pages (`docs/RULESET_V2.md`..`docs/RULESET_V5.md`) plus
+> `docs/SUPPLY_CAP.md`. Values below that predate v6 are marked where they are historical.
 
 Source of truth: `stellereum/src/consensus/` (`engine.rs`, `types.rs`,
 `sortition.rs`), `runtime/consensus_step.rs`, `node/consensus_driver.rs`,
@@ -53,8 +54,10 @@ STELLEREUM_BLOCK_V3 ‖ chain_id(8,BE) ‖ shard_id(4,BE) ‖ height(8,BE)
   earlier signed round is the lock-rescue/late-frame path; a FUTURE round is
   refused) and require `block.round <= certificate.round` on adopt. Round 0
   hashes exactly as a pre-v4 body; there is no second encoding.
-  **Not a liveness fix:** the live round-divergence defect (same body voted at
-  different rounds) is still open — see `docs/LIVENESS_ROUND_SYNC_AUDIT.md`.
+  **The live round-divergence defect is CLOSED by ruleset v6:** locks compare
+  round-free `Block::value_id` and a rescue re-stamps the body at the current
+  round, so the vote round is current and above the fsynced watermark. See
+  `docs/RULESET_V6.md`; the earlier analysis is `docs/LIVENESS_ROUND_SYNC_AUDIT.md`.
 - **Chain-wide supply (v5):** each `ShardHeaderCommitment` carries cumulative
   `minted_total_nano` (genesis included), domain-separated by `SHMINT01` and
   zero-skipped inside `commitment_bytes`. The masterchain block hash covers the
@@ -110,7 +113,8 @@ honest proposer clamps into the same window (`MAX_TIMESTAMP_JUMP_SECS = 3_600`).
   with a 500 ms reactive floor. The periodic timer is a backstop only:
   `STELL_CATCHUP_INTERVAL_MS` defaults to **30 s**, and a node at the tip
   skips the DHT probe entirely. One pass is bounded by
-  `STELL_CATCHUP_BUDGET_MS` (default **250 ms**). Snapshot fetch + `stelops`
+  `STELL_CATCHUP_BUDGET_MS` (default **2 000 ms**; a node with gap evidence
+  scales the budget with the gap). Snapshot fetch + `stelops`
   checkpoint verify (gap-0 rule), lockclear on anchor-trap, and hourly prune
   timers are unchanged.
 - Validator mesh: `ValidatorMesh` (network.rs) is installed from the pinned
@@ -120,21 +124,25 @@ honest proposer clamps into the same window (`MAX_TIMESTAMP_JUMP_SECS = 3_600`).
   (`VALIDATOR_MESH_EVICT_AFTER`, `VALIDATOR_MESH_COOLDOWN_MS`). The infnode
   transport applies the same suspicion policy under
   `INFNODE_PEER_EVICT_COOLDOWN_MS` (default `60_000`). **Current wire path:**
-  consensus delivery still uses the pubsub/DHT broadcast path — the mesh's
-  `deliver_consensus_mesh` is not yet called by the consensus sender. The DHT
-  is discovery + blob storage only; it never decides consensus validity.
+  `consensus_net.rs::broadcast_batch` calls `deliver_consensus_mesh` when the
+  mesh covers every addressed peer and all peers advertise `MESH_DIRECT`;
+  otherwise the per-peer pubsub broadcast is used. The mesh falls back to one
+  overlay publish on a failed direct copy, and `Committed` frames stay
+  exempt. The DHT is discovery + blob storage only; it never decides
+  consensus validity.
 - Compact gossip is active from genesis (`COMPACT_GOSSIP_ACTIVATION_HEIGHT =
   0`): the proposal path ships header + 6-byte short ids, bounded
   `BodyPull`/`Body` (64 ids, 3 attempts, 32 MiB frame), and a full body only
   for misses/sealed txs. See `docs/COMPACT_PROPAGATION.md`.
-- P2P: QUIC + pubsub topic `stellereum/consensus/v1/<chain-id>/shard/1`;
+- P2P: QUIC + epoch-scoped pubsub topic
+  `stellereum/consensus/v1/<epoch>` (multi-shard adds `/shard/<id>`);
   stream caps shed slow peers (receiver-side drops are expected under load).
 
 ## Economics safety
 
 - Chain-wide native supply cap: `TOTAL_SUPPLY_CAP = 1e9 STELL` (nano units),
   partitioned across the committed shard set and enforced again by the
-  masterchain over committed shard heads (ruleset v5). **Not** one cap per
+  masterchain over committed shard heads (introduced by ruleset v5). **Not** one cap per
   engine — see `docs/SUPPLY_CAP.md`.
 - Staking floors enforced (999/1470/1999/2000 tiers seen live); F1 reward
   accumulator; vote-equivocation slash path exists (5%).

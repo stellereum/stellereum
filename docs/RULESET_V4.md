@@ -1,9 +1,9 @@
 # Consensus ruleset v4 — signed block round, deterministic timestamp bound, fork id `0x611600c9` (new genesis)
 
-> **SUPERSEDED by ruleset v5** (`docs/RULESET_V5.md`, `FORK_ID = 0x9d59096b`).
+> **SUPERSEDED by ruleset v6** (`docs/RULESET_V6.md`, `FORK_ID = 0x0f584a46`).
 > The v4 signed-round, timestamp-bound and proposal-slashing rules are still
-> current; the v4 fork id and its 21-rule pin are historical. V5 appends the
-> chain-wide supply rules (22–23).
+> current; the v4 fork id and its 21-rule pin are historical. V5 appended the
+> chain-wide supply rules (22–23) and v6 changed lock identity.
 
 **Status:** deliberate consensus change (ruleset v4). **Activation:** new
 genesis; there is no in-place activation height. Ruleset v3 and ruleset v4

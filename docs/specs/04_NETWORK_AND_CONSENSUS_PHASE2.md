@@ -8,12 +8,13 @@ Every `file:line` below was re-grepped on that tree; a claim that could not be
 re-verified is marked STALE with the module directory to read instead.
 
 > **Ruleset snapshot — historical for consensus values.** This page was verified
-> on the 2026-11-18 tree under ruleset **v2**. Rulesets v3–v5 superseded it:
+> on the 2026-11-18 tree under ruleset **v2**. Rulesets v3–v6 superseded it:
 > the vote preimage gained the shard id (`STELLEREUM_BFT_VOTE_V3`), the block
-> gained a SIGNED `round`, the timestamp bound was added, and the supply cap
-> became chain-wide. §4 (vote preimage), the CN-VRF height numbers, and any
-> block-hash/identity claim below are historical; current values live in
-> `docs/RULESET_V3.md`..`docs/RULESET_V5.md` and `stellereum/src/protocol.rs`.
+> gained a SIGNED `round`, the timestamp bound was added, the supply cap
+> became chain-wide, and v6 made lock identity round-free. §4 (vote preimage),
+> the CN-VRF height numbers, and any block-hash/identity claim below are
+> historical; current values live in `docs/RULESET_V3.md`..`docs/RULESET_V6.md`
+> and `stellereum/src/protocol.rs`.
 
 Sources: `stellereum/src/consensus/`, `consensus_net.rs`, `network.rs`,
 `sync.rs`, `mempool.rs`, `staking.rs`, `cn_vrf.rs`, `minroot_vdf.rs`,
@@ -124,7 +125,7 @@ Sources: `stellereum/src/consensus/`, `consensus_net.rs`, `network.rs`,
   our tip schedules the next attempt; the reactive floor is 500 ms, the
   `STELL_CATCHUP_INTERVAL_MS` backstop defaults to 30 s, and a node at tip
   skips the probe. A pass is bounded by `STELL_CATCHUP_BUDGET_MS` (default
-  250 ms).
+  2 000 ms; gap-scaled when behind).
 - Gap-0 / checkpoint invariants: no `GAP_0` const exists in the tree; the
   gap-adjacent consts are `RETRO_SKIP_BEHIND_GAP = 100` (`sync.rs:1856`) and
   `LIVE_ADOPT_GAP_THRESHOLD = 16` (`:1976`). Resync depends on the

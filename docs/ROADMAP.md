@@ -1,7 +1,7 @@
 # ROADMAP — what needs doing (HDAE canonical, curated, 2026-10-29)
 
 Maintained by the lead only. Mark `[x]` with gate-output hash/date, never on intent.
-Machine state: `STATUS.md`. Features: `FEATURES.md` (39 E2E rows). Why: `docs/specs/`.
+Machine state: `STATUS.md`. Features: `FEATURES.md` (113 E2E rows). Why: `docs/specs/`.
 
 ## Remote topology (all private, `immtes/`)
 
@@ -37,7 +37,7 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
   (default-off, byte-identical pre-activation); BLS PoP strict parse
   (default-off); audit package refreshed (repro green except 2 fixed
   estimate-contract tests).
-- [ ] Full feature-matrix re-run (39 rows + new suites)
+- [ ] Full feature-matrix re-run (113 rows + new suites)
 - [x] Polish wave 1 (details in git history): RPC drift, crypto/state pins
 - [x] Session bloat archived (29 files), specs 00-04 + isolation plan written
 - [x] Gate scripts + justfile + agents infra + AGENTS.md constitution
@@ -65,7 +65,7 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 - [ ] Workchain: execute PARK (S4 runbook) or fund + serve shard-1 RPC (currently wedged/empty).
 - [ ] Live demos (code exists, never run live): split, 2PC finalize, DKG sealed round-trip.
 - [ ] Legacy replay-protection rollout (envelopes).
-- [ ] VRF live path; BLS proof-of-possession (structural gaps, both pinned).
+- [ ] VRF live path (parent-hash sortition is canonical; CN-VRF v3 is gate-off). BLS was deleted with the FULL-PQ wipe — drop the old PoP item.
 
 ## P2 — hygiene
 

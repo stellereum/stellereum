@@ -6,7 +6,7 @@ but the shipped construction is **CN-VRF v3** and it is implemented
 `CNVRF_V3_ACTIVATION_HEIGHT = u64::MAX` (off). Read this page for the
 construction, not for current wiring or constants; current wiring is
 `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md` §5 and current constants are
-`docs/RULESET_V5.md` / `stellereum/src/protocol.rs`.
+`docs/RULESET_V6.md` / `stellereum/src/protocol.rs`.
 
 Lead-dictated construction: two-phase per-validator verifiable randomness.
 COMMIT in epoch N−1, OPEN+PROVE in epoch N. Pseudocode and byte layouts only;
@@ -15,8 +15,8 @@ no implementation code.
 > **HISTORICAL CONSTANTS — superseded for numbers, not for the argument.**
 > This spec was written against the 3 s-era ruleset **v1**. The height windows
 > below were rescaled by ruleset **v2** (`docs/RULESET_V2.md` §1), inherited by
-> rulesets **v3/v4**, and are unchanged under the current ruleset **v5**
-> (`docs/RULESET_V5.md`):
+> rulesets **v3/v4**, and are unchanged under the current ruleset **v6**
+> (`docs/RULESET_V6.md`; introduced by v5):
 > `cn_vrf::EPOCH_LEN` 7,200 → **30,000**;
 > `V3_SEGMENT_LEN` 450 → **1,875** (`16 × 1,875 = 30,000`);
 > `V3_COMMIT_LOOKAHEAD_BLOCKS` 360 → **682**;
@@ -27,7 +27,7 @@ no implementation code.
 > `MEV_EPOCH_BLOCKS` / `MMR_EPOCH_BLOCKS` 128 → **500**.
 > Byte layouts, domain tags and the two-phase commit/open security argument are
 > unchanged. Where the text below says 7,200 (or the derived 450/360), read the
-> v1 value it was written with; the current values live in `docs/RULESET_V5.md`.
+> v1 value it was written with; the current values live in `docs/RULESET_V6.md`.
 
 Prior context: `docs/PQ_VRF_FRONTIER_V2.md` (LaV ~10.3 KB rejected as
 brute-force, SPHINCS+ ~8 KB rejected as brute-force, DeuringVRF ~256 B

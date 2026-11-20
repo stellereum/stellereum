@@ -4,16 +4,24 @@ Measurement + analysis ONLY. No live nodes touched, nothing restarted,
 no src/tests/benches changes (a temporary probe test was used for two
 runs, then **deleted** — see §1; final diff of this task = this file).
 
-Companion: `docs/TEMPO_PROFILE.md` (wall-clock/tempo verdict — code is
+Companion: `stellereum/docs/program/TEMPO_PROFILE.md` (wall-clock/tempo verdict — code is
 ≤~1% of live 60–300s/block). This doc goes one level deeper on **CPU**:
 which per-height stage and which functions own the milliseconds.
+
+> **Snapshot note (2026-11-20):** the numbers below were measured on the
+> 2026-11-02 tree, before the module split and the FULL-PQ wipe. The values
+> are the recorded measurements; `file:line` references such as
+> `runtime.rs:5147` / `state_engine.rs:4470` now live under `runtime/` and
+> `state_engine/` and should be re-grepped before use. The "live
+> 60–300s/block" context predates the ruleset-v6 liveness fix; do not quote it
+> as the current tempo without a fresh measurement.
 
 ## 1. Setup
 
 - Repo: `/home/imm/stellereum-project`, crate `stellereum/`.
 - `[[bench]]` check: **no `[[bench]]` sections** in
   `stellereum/Cargo.toml` — benches are `#[test]` fns inside
-  `stellereum/benches/{packing,tempo_probe,privacy_batch,svm_hot_path,
+  `stellereum/benches/{packing,tempo_probe,svm_hot_path,
   zkml_attestation}.rs`, run via `cargo test --release --bench <name>`.
 - New code: **none retained**. A temporary
   `stellereum/tests/perf_profile_probe.rs` (correctness asserts only, no

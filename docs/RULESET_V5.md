@@ -1,5 +1,9 @@
 # RULESET V5 — chain-wide supply cap
 
+> **SUPERSEDED by ruleset v6** (`docs/RULESET_V6.md`, `FORK_ID = 0x0f584a46`).
+> The v5 supply rules are unchanged and still current; only the lock/rescue
+> rules and the fork id moved. Do not use the v5 fork id as the current one.
+
 Ruleset 5 is a hard fork. Old and new binaries must not form a chain together:
 the fork id differs and the shard header commitment carries a new field.
 

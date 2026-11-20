@@ -9,13 +9,14 @@ constant is `u64::MAX` (`stellereum/src/consensus/sortition.rs:507`).
 > a snapshot at `HEAD = 6e6384940` under ruleset **v1**. Ruleset **v2**
 > (`docs/RULESET_V2.md` §1) rescaled every height-derived constant, ruleset
 > **v3** (`docs/RULESET_V3.md` §2) made votes shard-bound, rulesets **v4/v5**
-> added the signed block round and the chain-wide supply cap. The current
-> ruleset is **v5** (`FORK_ID = 0x9d59096b`). The CN-VRF gate itself is still
+> added the signed block round and the chain-wide supply cap, and **v6**
+> changed lock identity. The current ruleset is **v6**
+> (`FORK_ID = 0x0f584a46`). The CN-VRF gate itself is still
 > `u64::MAX` at this tree (`stellereum/src/consensus/sortition.rs:664`); only
 > the line numbers and height values moved. **Do not copy the numbers from this
 > page.**
 >
-> | constant | this snapshot (v1) | current (ruleset v5) |
+> | constant | this snapshot (v1) | current (v5 supply rules, unchanged in v6) |
 > |---|---:|---:|
 > | `cn_vrf::EPOCH_LEN` / `CNVRF_V3_EPOCH_LEN` | 7,200 | **30,000** |
 > | `V3_SEGMENT_LEN` | 450 | **1,875** |
@@ -43,9 +44,9 @@ were landing while this was written). Re-run the commands in §7 before acting.
 
 | component | evidence |
 |---|---|
-| 48-byte, 16-segment reverse BLAKE3 hash chain over a 7,200-block epoch | `cn_vrf.rs:1013-1021` (`V3_LINK_LEN=48`, `V3_SEGMENTS=16`, `V3_SEGMENT_LEN=450`; compile-time `16*450 == 7200` at `:1021`) |
+| 48-byte, 16-segment reverse BLAKE3 hash chain over a 30,000-block epoch | `cn_vrf.rs:1013-1032` (`V3_LINK_LEN=48`, `V3_SEGMENTS=16`, `V3_SEGMENT_LEN=1,875`; compile-time `16*1875 == 30,000` at `:1034`) |
 | commit carrier = 16 anchors + Falcon-512 signature | `cn_vrf.rs:1025` (`COMMIT_CARRIER_V3_LEN = 32 + 8 + 16*48 + 666 = 1474` bytes), `:1397-1417` (commit), `:1422-1443` (verify) |
-| reveal verified in ≤ 450 BLAKE3 steps | `cn_vrf.rs:1463-1497` |
+| reveal verified in ≤ 1,875 BLAKE3 steps | `cn_vrf.rs:1463-1497` |
 | MinRoot VDF epoch beacon | `minroot_vdf.rs:37-38`, `:312-347` (`eval`), `:354-404` (`verify`) |
 | on-chain state transition | `state_engine/apply.rs:2609-2618` (gate), `:2635-2859` (`apply_cnvrf_v3`) |
 | runtime wiring (payload, epoch hooks, custody) | `runtime/anchors.rs:565-607`, `:659-752`, `:363-454` |
@@ -99,11 +100,11 @@ pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
   visible in `stell_getActivationSchedule`; that test compares the schedule entry against the
   same module constant, so it stays green automatically.
 
-**Choose `H` as an exact multiple of 7,200.** Reason, from the code:
+**Choose `H` as an exact multiple of 30,000.** Reason, from the code:
 
 * `active_epoch_beacon` returns a deterministic bootstrap beacon for an epoch whose `H_freeze`
-  (`epoch*7200 - 360`) happened **before** activation (`anchors.rs:200-213`). With `H = E*7200`,
-  epoch `E`'s `H_freeze = H - 360 < H`, so epoch `E` is bootstrapped deterministically on every
+  (`epoch*30_000 - 682`) happened **before** activation (`anchors.rs:200-213`). With `H = E*30_000`,
+  epoch `E`'s `H_freeze = H - 682 < H`, so epoch `E` is bootstrapped deterministically on every
   node and needs no VDF.
 * Any other `H` can make the *first* active epoch's `H_freeze` fall at/after activation. That
   epoch then has neither a finalized beacon nor a VDF-ready one, `active_epoch_beacon` returns
@@ -129,7 +130,7 @@ pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
   `:1599`), and the epoch seed binds `chain_id` (`cn_vrf.rs:1707-1724`), which is folded into the
   state commitment domain (`apply.rs:2843-2845`). Any such change moves the state root.
 * **The activation epoch is a warm-up epoch.** A commitment for epoch `N` must be made before
-  `N*7200 - 360`, i.e. during epoch `N-1` (`cn_vrf.rs:1569-1594`). At activation there is no epoch
+  `N*30_000 - 682`, i.e. during epoch `N-1` (`cn_vrf.rs:1569-1594`). At activation there is no epoch
   `E-1` under the gate, so epoch `E` has no commitments: every `apply_slot_reveal` returns
   `AbsentNoCommit` (`cn_vrf.rs:1624-1629`), nothing is slashed, and the rolling mix stays zero. The
   first epoch that can carry reveals is `E+1`. The module records this as O9 /
@@ -164,7 +165,7 @@ There is no environment knob and the node driver never calls `set_cnvrf_v3_vdf_s
 (`anchors.rs:141-150` is a public setter, not wired in `node/`).
 
 * **UNVERIFIED — must be measured**: on the actual 1-vCPU hosts, does 3,000,000 steps finish
-  well inside the 360-block window? Measure it with §7's bench command on each host class, then
+  well inside the 682-block window? Measure it with §7's bench command on each host class, then
   multiply `steps / steps_per_sec` by the measured block time.
 * If it does not fit, changing the step count is a **network-wide code change**, because proposal
   validation requires the carried proof's steps to equal the local constant
@@ -237,7 +238,7 @@ surface.
 | beacon for the wrong chain id / freeze input | seed recomputed and compared (`anchors.rs:933-948`, `apply.rs:2795-2806`) | beacon not recorded; warning |
 | beacon with non-agreed step count | `anchors.rs:921-926` | proposal rejected |
 | wrong-epoch or stale commit | `cn_vrf.rs:1581-1587` (`StaleOrCurrent` / `TooFarAhead`); proposal mirror `anchors.rs:852-854` | commit ignored/rejected; first valid one wins |
-| commit past the freeze cutoff (`epoch*7200 - 360`) | `cn_vrf.rs:1588-1594`; proposal mirror `anchors.rs:855-861` | commit rejected |
+| commit past the freeze cutoff (`epoch*30_000 - 682`) | `cn_vrf.rs:1588-1594`; proposal mirror `anchors.rs:855-861` | commit rejected |
 | duplicate commit | `cn_vrf.rs:1598-1601` (`IgnoredDuplicate`, first-committed-wins) | no state change |
 | invalid commit signature | `cn_vrf.rs:1427-1442` (length, all-zero sig, Falcon verify) | commit rejected |
 | reveal that does not walk the chain | `cn_vrf.rs:1489-1495` → `InvalidReveal` (`:1654`); proposal rejects (`anchors.rs:890-894`) | block rejected before apply |
@@ -271,7 +272,7 @@ block and what it commits to in state:
 Therefore:
 
 1. **Pre-stage the rollback snapshot.** Take a full node snapshot (state + keys + CN-VRF custody
-   dir) at `H - K` for a comfortable `K` (at least one epoch, 7,200 blocks, so the snapshot's
+   dir) at `H - K` for a comfortable `K` (at least one epoch, 30,000 blocks, so the snapshot's
    commitments and secrets are consistent). Keep the pre-activation binary alongside it.
 2. **Abort criteria** (any one): a boundary block cannot be produced or verified; consecutive
    "epoch disabled" lines on more than a threshold of validators; `epoch_vdf` rejection at every
@@ -293,19 +294,19 @@ Therefore:
 
 ## 6. Operator runbook (ordered)
 
-1. Pick `H = E * 7200` strictly greater than the current height plus one full epoch of lead time.
+1. Pick `H = E * 30_000` strictly greater than the current height plus one full epoch of lead time.
 2. Measure VDF throughput on each host class (§7) and confirm 3,000,000 steps fit in the
-   360-block window with margin. Record the numbers in the change ticket.
+   682-block window with margin. Record the numbers in the change ticket.
 3. Create the custody directory on every validator, owned by the node user, mode `0700`; confirm
    the passphrase is present in the unit's environment file. Set `STELL_CNVRF_V3_DIR` if the
    default `data/cnvrf_v3` is not on the node's persistent volume.
 4. Back up keys + custody dir + passphrase to the off-host location, and run a restore drill.
 5. Flip `CNVRF_V3_ACTIVATION_HEIGHT` to `H`, rebuild, and deploy **all** validator and full-node
-   binaries before `H - 7200` so the commit window has a full epoch.
+   binaries before `H - 30_000` so the commit window has a full epoch.
 6. Between deployment and `H`, watch for "disabling local reveal/propose" lines on any validator.
 7. At `H`: confirm epoch `E` uses the deterministic bootstrap beacon and expect **no reveals** in
-   it (warm-up epoch, see §3.1). Then confirm the first `H_freeze` at `H + 6840` dispatches VDF
-   work and the beacon becomes ready before `H + 7200`; reveals and abort-slash accounting start in
+   it (warm-up epoch, see §3.1). Then confirm the first `H_freeze` at `H + 29_318` dispatches VDF
+   work and the beacon becomes ready before `H + 30_000`; reveals and abort-slash accounting start in
    epoch `E+1`.
 8. After the first boundary: confirm the rolling mix changes each epoch, and that an abort slash
    fires only for a validator that is genuinely down (not one that merely lost its secret and was

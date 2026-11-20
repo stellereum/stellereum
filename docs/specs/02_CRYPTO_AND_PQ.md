@@ -1,15 +1,22 @@
 # 02 — Crypto & Post-Quantum (HDAE canonical, 2026-10-29)
 
-Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
+Source of truth in code: `stellereum/src/post_quantum.rs`,
 `wallet_signing.rs`, `stellereum/Cargo.toml`.
+
+> **Updated for the FULL-PQ wipe (2026-11-20).** The former `bls.rs`
+> (BLS12-381 aggregate certificates) was deleted with the classical excision;
+> validator votes are Falcon-512-only (`Vote::verify_uncached`) and Ed25519
+> survives **only as the 32-byte validator identity/voter id**, never as a
+> vote or transaction signature. See `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md`
+> for the current module-level map.
 
 ## Algorithm set
 
 | Use | Algorithm | Notes |
 |---|---|---|
-| Validator/consensus signatures | Ed25519 (`ed25519-dalek` v2, batch verify) | QC path uses batch verification |
+| Validator/consensus signatures | Falcon-512 (FIPS 206) | Falcon-only: `Vote::verify` refuses a vote without a verifying Falcon half. Ed25519 is the voter id, not a signature |
 | Post-quantum signatures | Falcon (FIPS 206, via `pqcrypto-falcon`, PQClean C archive) | All 4 live validators hold full PQ key sets |
-| Aggregate certificates | BLS12-381 (`bls12_381` v0.9, minimal-pubkey-size: 48-B keys, 96-B sigs) | **No proof-of-possession** — structural gap, tracked |
+| Aggregate certificates | Falcon µQC signatures (no BLS) | BLS12-381 and its pairing dependency were deleted; there is no aggregate/pairing path |
 | Key exchange (mail/overlay) | X25519 + ChaCha20Poly1305 | infnode/infmail |
 | Hashing | BLAKE3 (primary), SHA-2/3 where protocol pins | Address checksum = BLAKE3 |
 | KDF (wallet) | Argon2id + XChaCha20Poly1305 | POSIx 0600/0700 enforced |
@@ -17,9 +24,8 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 
 ## Key/signature sizes (pinned)
 
-- Ed25519: 32-B pubkey, 64-B signature.
+- Ed25519 identity key: 32-B pubkey (voter id only).
 - Falcon-512: 897-B pubkey, 666-B signature (FIPS 206 parameter set in use).
-- BLS12-381: 48-B pubkey, 96-B signature.
 - Legacy `G=0` keys load without address change (migration invariant).
 
 ## Signing standards
@@ -45,7 +51,8 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 - ML-DSA-44 (`0x03`): fail-closed DISABLED — `from_id(3)` errs, verify
   returns false, registry refuses (pinned by `mldsa_*` tests).
 - Phase-1 tracks live in `stellereum/docs/PLAN-VRF.md` (VRF: math bound, NOT wired into
-  sortition) and `stellereum/docs/PLAN-POP.md` (BLS PoP: format exists, gate unchanged).
+  sortition); `stellereum/docs/PLAN-POP.md` is retained only as design history —
+  its BLS module was deleted, so there is no PoP path to gate.
 
 ## Invariants (executable: `cargo test -p stellereum --lib post_quantum`)
 

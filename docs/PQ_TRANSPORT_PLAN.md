@@ -1,8 +1,9 @@
 # PQ Transport Plan — infnode flag-day migration (classical → PQ)
 
-Status: DESIGN ONLY. Prototype: `infnode/crates/infnode/src/pq_transport.rs`
-(UNWIRED — not referenced by `lib.rs`/`node.rs`; production behavior unchanged).
-No new dependencies added. ML-KEM is UNAVAILABLE offline (see §2).
+Status: DESIGN ONLY (partly superseded). Prototype: `infnode/crates/infnode/src/pq_transport.rs`
+(still UNWIRED — not referenced by `lib.rs`/`node.rs`; production behaviour unchanged).
+`ml-kem 0.3` is now a declared dependency (`infnode/crates/infnode/Cargo.toml:34`), but the
+module is not in the `lib.rs` mod list, so no node path calls it.
 
 Audit anchor: current primitives are `ed25519-dalek 2.2.0`, `x25519-dalek 2.0.1`,
 `blake3 1.8.6`, `rustls 0.23.45` on `ring 0.17.14`, `quinn 0.11.11`,
@@ -25,7 +26,7 @@ first-class phase, not an afterthought (§5).
 
 | Option | PQ? | Available offline | Rank | Disposition |
 |---|---|---|---|---|
-| ML-KEM-768 (FIPS 203) | yes | NO — absent from `Cargo.lock` (304 crates, zero hits for `ml-kem`/`kyber`/`dilithium`/`pqcrypto`/`oqs`); `cargo metadata --offline` fails; `~/.cargo` cache holds only stale non-graph `pqcrypto-falcon*`/`falcon-rust*` | 1 | FIRST CHOICE, blocked on lead vendoring |
+| ML-KEM-768 (FIPS 203) | yes | YES now — `ml-kem 0.3` is declared in `infnode/crates/infnode/Cargo.toml:34`; the `pq_transport` module is still not declared in `lib.rs`, so it remains unwired | 1 | FIRST CHOICE, module wiring still pending |
 | Falcon-auth + ephemeral-X25519 (signed-ephemeral interim) | auth only | yes | 2 | HONEST INTERIM — ship PQ peer auth first, KEX stays classical, flag says so (`PqPlanX25519Backend::PQPLAN_CLASSICAL = true`) |
 | X25519 X3DH status quo (`node.rs:6970-7021`, `proto.rs:127-152`) | no | yes | 3 | pre-flag-day only |
 | X25519 + symmetric-PSK bootstrap | no | — | REJECTED | no PSK-distribution story for TOFU strangers; fragility for zero PQ gain |

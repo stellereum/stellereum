@@ -1,5 +1,12 @@
 # CLASSICAL CRYPTOGRAPHY INVENTORY — Stellereum FULL-PQ Repo
 
+> **SNAPSHOT WARNING.** Counts and rows below are from the pre-wipe tree and
+> are **not** current: `bls12_381` is no longer a dependency, the contract
+> `ed25519_verify` host is deleted (replaced by `falcon512_verify`), and the
+> FULL-PQ wipe removed the Ed25519 vote/tx legs. Treat this as history; the
+> current status is `docs/CLASSICAL_EXCISION_STATUS.md` and
+> `docs/specs/02_CRYPTO_AND_PQ_PHASE2.md`.
+
 Scope: every use of quantum-breakable (Shor-breakable) cryptography: ECDH/ECDSA/EdDSA
 (ed25519, secp256k1, X25519, P-256), pairings (BLS12-381), RSA/DSA/classical-DH,
 class groups. NOT classical (excluded except this note): SHA-2/SHA-3/SHAKE/BLAKE3

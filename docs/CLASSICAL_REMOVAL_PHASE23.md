@@ -1,5 +1,10 @@
 # CLASSICAL REMOVAL — PHASE 2 + PHASE 3 FLAG-DAY DESIGN (binding)
 
+> **HISTORICAL DESIGN (2026-11-04 era).** The removal landed: the contract
+> `ed25519_verify` host is deleted (replaced by `falcon512_verify`) and the
+> BLS/Ed25519 legs are gone. Read this as the plan that was executed, not as a
+> description of the current tree.
+
 Scope: the 25 pure-PQ holes in `docs/CLASSICAL_INVENTORY.md` (read first).
 Phase 1 (test-only/dead-code/BLS) is out of scope here.
 Rule: NEVER modify existing files for this design; this doc is NEW-FILE-ONLY.

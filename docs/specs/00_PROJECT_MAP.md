@@ -3,11 +3,11 @@
 The whole repo on one page. Details in `01-04_*.md`. Status in `STATUS.md`.
 Work in `../ROADMAP.md`.
 
-## Trees (only `stellereum/` is canonical — `stellereum_head/`, `w8/` are stale copies, never touch)
+## Trees (only `stellereum/` is canonical — the stale copies `stellereum_head/` and `w8/` were removed 2026-10-29)
 
 ```
 stellereum-project/
-├── stellereum/               # CANONICAL NODE (60 src files, crate `stellereum`)
+├── stellereum/               # CANONICAL NODE (146 .rs files, crate `stellereum`)
 │   └── src/                  # consensus, runtime, main loop, sharding, state_engine,
 │                             # cpat2 trie, staking, contract/VM, rpc, mempool, PQ
 ├── infnode/    # crates/infnode (QUIC+DHT) + crates/infmail (webmail)

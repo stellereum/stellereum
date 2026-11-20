@@ -10,7 +10,8 @@ where they are the authority.
 ## What Stellereum is
 
 Stellereum (STELL) is a post-quantum, sharded, non-EVM Layer-1 blockchain
-written in Rust: Ed25519 + Falcon-512 hybrid signatures, BFT consensus with
+written in Rust: Falcon-512 signatures (Ed25519 survives only as the 32-byte
+validator identity/voter id), BFT consensus with
 a stake-weighted sortition fast path (µQC), TON-style workchain sharding
 with a two-phase cross-shard commit, a WASM contract engine, and a native
 orderbook. **Stage: public testnet. The code has passed internal review
@@ -26,7 +27,7 @@ Canonical in-tree sources this site is built from:
 | `stellereum/docs/SHARDING.md` | routing rule, split/merge, 2PC |
 | `stellereum/docs/OPERATIONS.md` | running a node, incidents §§7,14,15 |
 | `stellereum/docs/VALIDATOR_ONBOARDING.md` | bond → propose → claim → leave |
-| `stellereum/docs/audits/KNOWN_ISSUES.md` | 36 known issues (KI-01…KI-36) |
+| `stellereum/docs/audits/KNOWN_ISSUES.md` | 40 known issues (KI-01…KI-41) |
 | `stellereum/docs/audits/THREAT_MODEL.md` | STRIDE model, attacker classes |
 | `/SECURITY.md` (repo root) | reporting policy (placeholders) |
 

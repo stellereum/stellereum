@@ -1,7 +1,7 @@
 # 60-minute developer loop
 
-Goal: install → wallet → faucet drip → transfer → deploy → call →
-query → events, against a local node. Every command below names the
+Goal: install → wallet → faucet drip → transfer → deploy preview →
+call preview → query → events, against a local node. Every command below names the
 binary/flag it was read from (`stellereum --help`, `wallet send --help`,
 `docs/RPC.md`). Live-network outputs are marked TODO — verify with the
 command given.
@@ -119,17 +119,21 @@ rpc stell_getTransactionStatus '{"hash":"<64-hex>"}'
 
 Write WAT using only the 13 `host.*` imports ([03-contracts](03-contracts.md));
 minimal example is `contracts/sts20_token.wat` (imports `host.sload`,
-`host.sstore`, `host.emit`). Deploy over RPC:
+`host.sstore`, `host.emit`). `stell_deployContract` is a **preview** (address
+prediction + validation); a real deploy is a signed
+`SysCallDeployContract` tx submitted through `stell_sendRawTransaction`:
 
 ```sh
 rpc stell_deployContract '{"from":"<hex>","code":"<hex-of-wasm>","abi":{…}}'
-# optional wrapper: {"tx":"<hex of bincode(Transaction)>"} with a
-# SysCallDeployContract payload (src/rpc.rs stell_deployContract)
+# preview only: deploys nothing, predicts contract_address(from, nonce)
+rpc stell_sendRawTransaction '{"tx":"<hex of signed bincode(Transaction)>"}'
+# the SDK has no deploy builder yet: build the SysCallDeployContract Op and
+# sign locally, or extend the SDK with a parity-tested encoder
 ```
 
 - TODO (live output + minimal WAT→wasm toolchain): `wat2wasm` binary name
   and exact success JSON unverified. Verify: `which wat2wasm; rpc
-  stell_deployContract …`.
+  stell_sendRawTransaction …`.
 - **If `-32602 missing 'code'`:** the field name is `code`, hex-encoded.
 - **If `contract imports something the host does not provide`:** you
   imported outside the 13 host functions. **If `contract code exceeds the
@@ -142,12 +146,16 @@ rpc stell_callContract '{"contract":"<hex>","method":"transfer","args":[1,2,500]
 rpc stell_runGetMethod '{"contract":"<hex>","method":"balance_of","args":[2]}'
 rpc stell_getEvents '{"tx_hash":"<64-hex>"}'
 # → [{"contract":"…","contract_stl57":"…","topic":…,"value":…}]
+# events exist only for a tx a block applied; a call PREVIEW emits none
 rpc stell_getTransactionReceipt '{"hash":"<64-hex>"}'
+# after you submit a signed tx (not after a preview)
 # → {"status":"success","height":…,"fee_charged":"…","return_value":…,"events":[…]}
 ```
 
-`stell_callContract` writes state (auth-token gated when configured);
-`stell_runGetMethod` is the read-only path (5M fuel cap). Events are also
+`stell_callContract` is a **preview** (auth-token gated): it runs on a clone
+and drops the tx, so no state changes. `stell_runGetMethod` is the read-only
+path (5M fuel cap). To write, sign the same payload locally and submit via
+`stell_sendRawTransaction`. Events are also
 queryable per contract: `stell_getEvents '{"contract":"<hex>"}'`.
 
 - TODO (live outputs): capture real call/query/events JSON. Verify: commands above.

@@ -65,7 +65,7 @@ is an **admission floor**, not a separate execution debit.
 
 ## Shards and the routing rule
 
-One rule, one implementation (`sharding::route_shard`, `src/sharding.rs`;
+One rule, one implementation (`sharding::route_shard`, `src/sharding/`;
 published as `ROUTING_RULE`, id `workchain-prefix-v1`):
 
 - Shard **0 is the masterchain**, addressed **explicitly** TON-style:
@@ -102,7 +102,7 @@ load ≤ 50. Chain id default **5757** (`zkml::DEFAULT_CHAIN_ID`;
    open submission by design; admission checks signature, base fee,
    `amount+gas_limit` solvency, duplicates, per-sender quota (1024) and
    pool cap (50 000). Blocks hold ≤ 10 000 txs and ≤ 500 000 000 gas
-   (`src/runtime.rs:28,52`).
+   (`src/runtime/mod.rs:215,239`).
 4. **Receipt:** `stell_getTransactionReceipt` → `success|failed` (+height,
    `fee_charged`, `return_value`, `gas_used`, `events`) or
    `pending|unknown` (this node's mempool only). Verdicts are recorded at

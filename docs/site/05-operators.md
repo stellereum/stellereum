@@ -2,8 +2,8 @@
 
 Lifecycle: `install → configure → keygen → join → snapshot-sync →
 monitor → alert → prune → upgrade → rollback → disaster-recover`.
-Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-network.sh`,
-`scripts/add-peer.sh`; health tooling: `scripts/stell-sync.sh`,
+Authority: `docs/OPERATIONS.md`; join scripts: `stellereum/scripts/join-network.sh`,
+`stellereum/scripts/add-peer.sh`; health tooling: `scripts/stell-sync.sh`,
 `scripts/doctor.sh`, `scripts/cluster-watchdog.sh`,
 `scripts/node-prune-cron.sh`, `scripts/tools/stelops/`.
 
@@ -46,14 +46,14 @@ Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-network.sh`,
    (`stage_verified_upgrade_binary`); live `execve` only with
    `STELL_AUTO_UPGRADE=1`, else exit 42 for the supervisor
    (`OPERATIONS.md` §12).
-10. **Rollback:** restore from `scripts/backup/` tarballs (whole `./data`,
+10. **Rollback:** restore from `stellereum/scripts/backup/` tarballs (whole `./data`,
     never single files); a genesis-era mismatch refuses loudly — that
     refusal is the safety net.
 11. **Disaster-recover:** coordinated whole-`./data` wipe on **all** nodes
     at once for a new genesis; single-node wipes re-fork. Last resort.
 
 - TODO (snapshot cadence): `OPERATIONS.md` §1 says snapshots every 100
-  heights; `src/main.rs:157` says `STELL_SNAPSHOT_INTERVAL` default 1000.
+  heights; `src/main.rs` says `STELL_SNAPSHOT_INTERVAL` default 1000.
   Verify: `rg -n "SNAPSHOT_INTERVAL|every 100" src/main.rs docs/OPERATIONS.md`.
 
 ## Tool map
@@ -67,7 +67,7 @@ Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-network.sh`,
 | `stell-sync.sh topic <node>` | expected vs subscribed pubsub topic | suspected isolation |
 | `node-prune-cron.sh` (+ systemd timer) | orphan-chunk + snapshot sweeper (grace 6 h, cap 200 k/run, refuses on stale `kv.json`) | timer on **every** node |
 | `cluster-watchdog.sh` | interval watcher; restarts dead units, prunes inodes; reports (never heals) topic/lock/tip stalls | always running |
-| `tools/stelops/` | reads store checkpoint + genesis root, clears lock (`checkpoint`, `genesis-root`, `clear-lock`) | node stopped (sled locks) |
+| `scripts/tools/stelops/` | reads store checkpoint + genesis root, clears lock (`checkpoint`, `genesis-root`, `clear-lock`) | node stopped (sled locks) |
 | `stall_watchdog.sh` | per-host: restarts via `stell-node.sh` after 180 s of flat heights | single-host deployments |
 | `health_check.sh` | read-only probe (heights, mempool, disk, refusing-patterns) | cron/alert probe |
 

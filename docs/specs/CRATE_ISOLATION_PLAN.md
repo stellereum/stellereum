@@ -2,7 +2,7 @@
 
 ## Current graph (from `cargo metadata --no-deps`)
 
-- `stellereum` (single package, 60 src files) → path-dep `infnode`.
+- `stellereum` (single package, 146 `.rs` files) → path-dep `infnode`.
 - `infnode`: `infnode` + `infmail` (infmail → infnode).
 - `stellereum-contracts`: sdk + e2e + 4 contract crates.
 - Standalone: indexer, sdk, wallet (lib+bin), stelops.

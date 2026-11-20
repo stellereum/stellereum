@@ -789,6 +789,56 @@ The §5 send-prune item S2 is independent of this fix and is not changed here.
 
 ---
 
+## 9. Implementation record — RESTART-LIVELOCK (proposal-slot poisoning)
+
+Live evidence: after the restart at `#17396` every node had finalized
+`#17395` with the same state root, the proposer schedule agreed
+(`r24/r25/r26` -> the same validator), that validator proposed every round,
+and the followers still did not vote the proposal:
+
+```text
+RX proposal from 5762c3311356 #17396 r26
+rejected proposal from 5762c3311356 at #17396 r26: proposal already recorded for this round
+RX Prevote from 5762c3311356 #17396 r26 target 425ac266
+RX Prevote from df3d10f3549f #17396 r26 target nil
+```
+
+Root cause: the one-value-per-round rule was keyed on the LOCAL acceptance
+round (`proposal_round == hc.round`) plus the exact hash
+(`engine.rs::receive_proposal_for`). `on_proposal` deliberately admits a body
+whose SIGNED round is older than the local round (lock rescue / one-round
+lag), so a delayed pre-restart frame signed at `k < r` recorded itself as
+"the proposal for round r". Under ruleset v6 the scheduled proposer's genuine
+body for round r is a re-stamp at `block.round == r`; it was then refused as
+`"proposal already recorded for this round"`. The node held only the older
+signed body, so its value prevote was stamped at `k` -- on/below its fsynced
+watermark after the restart -- and was suppressed: it stayed silent or nil'd.
+The periodic retransmit then re-broadcast that stale body with the CURRENT
+round's envelope, so the poisoning spread and repeated (the live
+`proposal ... r25` frames arriving during `r26`).
+
+Fix: the proposal slot's identity is the BODY's signed round
+(`HeightConsensus::proposal_signed_round`); `receive_proposal_for_at` (the
+admission call from `on_proposal`, which passes `block.round`) applies:
+
+* identical body -> idempotent `Ok`;
+* strictly NEWER signed round -> supersedes the held body (different signed
+  rounds are different proposals by construction; the round is inside the
+  signed identity) and re-arms the current round;
+* SAME signed round, different hash -> still `"proposal already recorded"`
+  (equivocation unchanged);
+* STALE signed round -> never displaces a newer body.
+
+`receive_proposal_for` keeps the old semantics (signed round = local round)
+for direct state-machine callers. The vote still names the body's signed
+round, the watermark still gates the cast, and no round moves backwards.
+Tests: `tests/restart_livelock_tests.rs` (one restart, all three restarts,
+stale-proposal negative; all three fail on HEAD with
+`proposal already recorded for this round`) and
+`consensus/tests/round_parity_tests.rs::a_newer_signed_round_supersedes_a_stale_body_in_the_same_local_round`.
+
+---
+
 ## Appendix A — defect register
 
 | ID | Sev | File:line | One-line |

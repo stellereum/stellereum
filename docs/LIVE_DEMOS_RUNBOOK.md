@@ -35,7 +35,7 @@ derived from them, not guessed.
   `STELL_BROADCAST_JOIN_MS=2000`, `STELL_CATCHUP_BUDGET_MS=8000`.
 - Catch-up is event-driven: the 30 s `STELL_CATCHUP_INTERVAL_MS` backstop is
   skipped at tip; reactive evidence runs after a 500 ms floor. The 8000 ms
-  budget above is a WAN tuning override of the 250 ms code default.
+  budget above is a WAN tuning override of the 2,000 ms code default.
 - Read-only recon rule: never touch `multinode/`, live configs,
   `/root/*`. `down`/`reset` only affect `run/cluster/`.
 

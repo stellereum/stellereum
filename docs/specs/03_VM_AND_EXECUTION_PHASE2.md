@@ -8,8 +8,9 @@ sections that cannot be re-verified are marked `STALE — see <module dir>`.
 
 > **Ruleset snapshot — historical for consensus values.** Verified under
 > ruleset **v2**. Height windows quoted here (e.g. commission delay 7 200) were
-> rescaled by v2 (now 30 000) and ruleset v5 is current
-> (`FORK_ID = 0x9d59096b`); see `docs/RULESET_V2.md` and `docs/RULESET_V5.md`.
+> rescaled by v2 (now 30 000) and ruleset v6 is current
+> (`FORK_ID = 0x0f584a46`); see `docs/RULESET_V2.md`, `docs/RULESET_V5.md` and
+> `docs/RULESET_V6.md`.
 
 Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter/`,
 `state_engine/`, `runtime/`, `sharding/`, `mempool.rs`, `native_api.rs`,
@@ -24,11 +25,11 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter/`,
 - Contract caps: 2 MiB code (`MAX_CONTRACT_CODE_SIZE`, `contract.rs:45`),
   8 call args (`MAX_CONTRACT_CALL_ARGS`, `:50`), 50M fuel
   (`MAX_CONTRACT_FUEL`, `:53`); 13 `linker.func_wrap("host", …)`
-  registrations (`contract.rs:1193-1410`): `sload` `:1193`, `sstore` `:1201`,
-  `emit` `:1220`, `caller` `:1241`, `value` `:1251`, `block_time` `:1259`,
-  `block_hash` `:1267`, `calldata` `:1277`, `sha256` `:1296`, `blake3`
-  `:1321`, `ed25519_verify` `:1346`, `return_data` `:1388`,
-  `send_message` `:1410`.
+  registrations (`contract.rs:1193-1410`): `sload` `:1195`, `sstore` `:1203`,
+  `emit` `:1222`, `caller` `:1243`, `value` `:1253`, `block_time` `:1261`,
+  `block_hash` `:1269`, `calldata` `:1279`, `sha256` `:1298`, `blake3`
+  `:1323`, `falcon512_verify` `:1348` (the former `ed25519_verify` host is
+  deleted), `return_data` `:1390`, `send_message` `:1412`.
 - EVM adapter: `CHAIN_ID 5757` (`evm_adapter/types.rs:19`), hex `0x167d`;
   serves dynamic `effective_chain_id` (`:25` → `zkml.rs:205`).
   Gas-model/EIP-1559: NO base-fee engine behind the adapter — static defaults

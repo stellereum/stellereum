@@ -1,8 +1,8 @@
 # Consensus ruleset v2 — 240 ms height calibration (new genesis)
 
-> **SUPERSEDED by ruleset v5** (`docs/RULESET_V5.md`, `FORK_ID = 0x9d59096b`).
+> **SUPERSEDED by ruleset v6** (`docs/RULESET_V6.md`, `FORK_ID = 0x0f584a46`).
 > This page is the historical v2 rationale and its fork-id pin (`0x3b768f7a`).
-> All v2 rule values remain folded in v5; do not use v2 as the current ruleset.
+> All v2 rule values remain folded in v6; do not use v2 as the current ruleset.
 
 **Status:** deliberate consensus change (ruleset v2). **Activation:** new
 genesis; there is no in-place activation height. Old (ruleset v1) and new

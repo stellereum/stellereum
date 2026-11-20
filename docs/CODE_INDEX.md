@@ -1,10 +1,16 @@
 # CODE INDEX — every Rust file, generated; do not hand-edit
 # Regen: `python3` block in session 2026-11-04 (see tool history). Paths relative to workspace root.
 
+> **STALE SNAPSHOT (2026-11-04).** The 2026-11-18 module split and the FULL-PQ
+> wipe changed this tree: `consensus.rs`, `runtime.rs`, `state_engine.rs`,
+> `rpc.rs`, `sharding.rs`, `evm_adapter.rs`, `bls.rs` and `crypto_privacy.rs`
+> are now directories or are deleted. Do not trust a path in this file without
+> re-grepping; the current module map is `docs/specs/00_PROJECT_MAP_PHASE2.md`.
+
 ## stellereum/src — L1 node core (consensus, execution, crypto, storage, RPC)
 
 - `stellereum/src/address.rs` (366 ln) — Stellereum Branded Address Format (`Stl57...`)
-- `stellereum/src/bls.rs` (914 ln) — Real pair-based BLS12-381 aggregate signatures, and the soft-fork spec (P1-c).
+- `stellereum/src/bls.rs` — **DELETED** (FULL-PQ wipe; no `bls12_381` dependency, no BLS QC path). Any older `bls.rs` pointer is stale.
 - `stellereum/src/bootstrap.rs` (444 ln) — Fresh-observer bootstrap: from an empty data directory to the live tip
 - `stellereum/src/bridge.rs` (2732 ln) — Native Teleport Bridges (TON, Arbitrum, Ethereum, Solana)
 - `stellereum/src/bridge_adapters.rs` (1133 ln) — §8 chain adapters: LIVE deposit-proof verification framework.
@@ -504,14 +510,15 @@
 
 - `stellereum-sdk/src/lib.rs` (672 ln) — Minimal canonical transaction-builder SDK for Stellereum (kills B2:
 
-## Ruleset v5 / consensus reference (docs; hand-maintained)
+## Ruleset v6 / consensus reference (docs; hand-maintained)
 
 - `docs/RULESET_V2.md` — 240 ms height re-scale (historical, superseded).
 - `docs/RULESET_V3.md` — shard-bound vote preimage `STELLEREUM_BFT_VOTE_V3` (historical fork id).
 - `docs/RULESET_V4.md` — signed block `round`, deterministic timestamp bound, proposal-equivocation ON.
-- `docs/RULESET_V5.md` — current ruleset: `FORK_ID 0x9d59096b`, 23 rules, chain-wide supply cap.
+- `docs/RULESET_V5.md` — chain-wide supply cap, fork `0x9d59096b` (historical, superseded by v6).
+- `docs/RULESET_V6.md` — current ruleset: round-free `value_id` locks + re-stamped rescue, `FORK_ID 0x0f584a46`, 23 rules.
 - `docs/SUPPLY_CAP.md` — `SupplyPartition` + `minted_total_nano` + masterchain aggregate model.
-- `docs/LIVENESS_ROUND_SYNC_AUDIT.md` — live round-divergence liveness defect (IN PROGRESS; not fixed).
+- `docs/LIVENESS_ROUND_SYNC_AUDIT.md` — live round-divergence analysis (defect FIXED by ruleset v6).
 - `stellereum/docs/OBSERVABILITY.md` — metrics/logs/alert surfaces.
 - `docs/CI.md` — continuous-integration gate and job layout.
 

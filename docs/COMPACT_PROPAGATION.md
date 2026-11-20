@@ -148,7 +148,7 @@ closed, so the frame is forward-compatible.
 | 428 | 75694 | 2934 (−96.1%) | 6700 (−91.1%) |
 | 1000 | 176366 | 6366 (−96.4%) | 15166 (−91.4%) |
 
-QC hybrid (BLS-off): +ceil(C/8)+1 B overhead now (C=100: +14 B). Votes
+QC hybrid (BLS-off; a design-era projection — BLS is now deleted): +ceil(C/8)+1 B overhead now (C=100: +14 B). Votes
 untouched (158 B live path).
 
 ## 5. Risks

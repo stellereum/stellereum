@@ -35,9 +35,11 @@ rewritten**; this table is the delta, so the original analysis stays
 reproducible.
 
 > **Status is pinned at `9832e97a9` (ruleset v3).** The current tree is ruleset
-> **v5**: `CONSENSUS_RULESET_VERSION = 5`, `DOMAIN_SET_VERSION = 3`,
-> `FORK_ID = 0x9d59096b`, and a pre-v5 peer is refused. The §2 row below still
-> reads v3 values as history; see `docs/RULESET_V5.md`.
+> **v6**: `CONSENSUS_RULESET_VERSION = 6`, `DOMAIN_SET_VERSION = 3`,
+> `FORK_ID = 0x0f584a46`, and a pre-v6 peer is refused. The §2 row below still
+> reads v3 values as history; see `docs/RULESET_V6.md`. Current
+> `GOV_TIMELOCK_HEIGHTS` is **90,000**, not the 7,200 quoted in §6.2, and
+> `GENESIS_VALIDATOR_BALANCE` is **1M STELL**, not the 100M quoted there.
 
 | Original gap | Status at `9832e97a9` | Evidence |
 |---|---|---|

@@ -1,7 +1,10 @@
-# MEV PQ Migration Plan — epoch DKG + X25519
+# MEV PQ Migration Plan — epoch DKG + ML-KEM transport
 
-Status: DESIGN ONLY. No wiring, no activation. Prototype lives unwired in
-`stellereum/src/mev_pq_plan.rs` (9 KATs, `std`-only mechanics model, never called by production).
+Status: **HISTORICAL DESIGN RECORD — the recommended option was implemented.**
+`mev_epoch.rs` now uses Falcon-512-authenticated ML-KEM-768 share packages
+(FIPS 203); the classical X25519 package leg is deleted, so this page is the
+rationale, not the current wiring. See `stellereum/src/mev_epoch.rs` and
+`docs/specs/02_CRYPTO_AND_PQ_PHASE2.md`.
 
 ## 1. What the DKG produces and who consumes it (one line)
 

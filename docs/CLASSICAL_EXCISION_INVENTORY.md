@@ -1,6 +1,12 @@
 # CLASSICAL EXCISION INVENTORY — FULL-PQ, no migrations, no compat
 Date (UTC): 2026-11-04. Scope: `stellereum/` + `infnode/`. Method: `rg -n` only; every row has file:line or a pasted `rg -c` count. No code edits made.
 
+> **Snapshot (2026-11-04), pre-FULL-PQ-wipe.** Several rows describe paths that
+> no longer exist (`bls.rs`, the contract `ed25519_verify` host, Ed25519
+> vote/tx verification). Current tree: `bls.rs` deleted, `ed25519_verify`
+> replaced by `falcon512_verify`, votes Falcon-only. Use
+> `docs/CLASSICAL_EXCISION_STATUS.md` for the current status.
+
 Lead directive: wipe nodes, history restarts fresh. No wire-v1 readers, no legacy fallbacks, no dual-stack defaults. Pure PQ or nothing.
 
 ## 0. Reproduce counts (run from repo root `/home/imm/stellereum-project`)

@@ -3,15 +3,16 @@
 One line per term; protocol terms first, resilience/ops terms after.
 
 - **µQC (micro-certificate):** fast finality path — a small stake-weighted
-  sample signs a block instead of the full Ed25519 set (`PROTOCOL.md` §6).
+  sample signs a block instead of the full validator set (`PROTOCOL.md` §6).
 - **sortition:** parent-hash-seeded (`STELL_SORTITION_V5`) stake-weighted
   committee draw, size `min(N, 128)` (`MICRO_COMMITTEE_MAX_SIZE`).
 - **network-anchored quorum:** µQC needs `max(2/3 of committee, strict
   majority of whole-network stake)` (`PROTOCOL.md` §6.3).
 - **Stl57:** branded Base58 address (`Stl57…` + 4-byte BLAKE3 checksum),
   same 32-byte key as hex (`src/address.rs`).
-- **Falcon (-512 / FN-DSA):** post-quantum validator signature paired
-  with Ed25519; pre-FIPS keys migrate via `keys rotate-falcon`.
+- **Falcon (-512 / FN-DSA):** post-quantum validator vote/QC signature.
+  Ed25519 survives only as the validator identity/voter id; pre-FIPS keys
+  migrate via `keys rotate-falcon`.
 - **2PC:** cross-shard two-phase commit (prepare / vote / commit,
   two-sided abort) replacing unilateral ack/bounce (`SHARDING.md` §6).
 - **epoch seal:** threshold (Shamir) MEV scheme — DKG epoch key, sealed
@@ -25,15 +26,15 @@ One line per term; protocol terms first, resilience/ops terms after.
   committed shards by `SupplyPartition`; the masterchain refuses an aggregate
   above the cap (`docs/SUPPLY_CAP.md`).
 - **lock_hint:** the lock a node advertises alongside its vote so peers
-  reason about its locked value (`src/main.rs:1028`).
+  reason about its locked value (`src/node/policy.rs:886`).
 - **polka:** 2/3+ prevotes for one block at a round — a network fact that
-  compels precommits and unlocks stale locks (`src/consensus.rs:2853+`).
+  compels precommits and unlocks stale locks (`src/consensus/`, engine vote-set path).
 - **F1 (lazy) accumulator:** reward-per-token delegator payout state
   (`reward_per_token`, pools, checkpoints) in the state root.
 - **F-01 failure fee:** attributable failures pay and advance nonce;
   uncoverable ones move nothing (`PROTOCOL.md` §4c).
 - **D2 penalty:** per-sender admission-floor surcharge after apply
-  failures, mirrored in consensus (`src/state_engine.rs:481`).
+  failures, mirrored in consensus (`src/mempool.rs:643`).
 - **epoch / activation boundary:** height-gated rule switches (2PC
   `XPC_ACTIVATION_HEIGHT`, compiled and `0` from genesis; the old
   `STELL_XPC_ACTIVATION_HEIGHT` env is ignored); every node of a shard must

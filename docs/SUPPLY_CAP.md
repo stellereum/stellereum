@@ -1,6 +1,7 @@
 # Chain-wide `TOTAL_SUPPLY_CAP`
 
-Status: ruleset v5 (design + implementation). Supersedes the per-engine note in
+Status: ruleset v5 (design + implementation); the v5 supply rules are
+unchanged and still current under ruleset v6. Supersedes the per-engine note in
 `src/node/bootstrap.rs` and the `SUPPLY-01` known gap.
 
 ## 1. The invariant
@@ -197,8 +198,9 @@ crate::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION   // value 1
 crate::tokenomics::TOTAL_SUPPLY_CAP                 // value 1_000_000_000_000_000_000
 ```
 
-and `CONSENSUS_RULESET_VERSION` is **5** (`DOMAIN_SET_VERSION` 3, `FORK_ID`
-`0x9d59096b`, 23 rules). The rule logic — a new consensus refusal and a new
+and `CONSENSUS_RULESET_VERSION` is **6** (`DOMAIN_SET_VERSION` 3, `FORK_ID`
+`0x0f584a46`, 23 rules; the two supply rules and their values are unchanged
+from v5). The rule logic — a new consensus refusal and a new
 signed shard-head field — is more than a constant change. A mixed v4/v5 fleet
 refuses consensus at the handshake instead of accepting a masterchain block
 whose supply accounting it cannot interpret.

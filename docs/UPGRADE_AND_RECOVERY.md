@@ -67,6 +67,9 @@ disaster today?* This document answers that for the live 4-validator topology in
    a masterchain aggregate refusal) and moves `FORK_ID` to `0x9d59096b`. A mixed v4/v5
    fleet is refused at the handshake; pre-v5 state must not be assumed valid under the
    new cap. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
+   **Ruleset v6 (2026-11-20) is another new-genesis fork** (`FORK_ID = 0x0f584a46`):
+   it changes lock identity and rescue to round-free `Block::value_id`, with no wire
+   field or constant change. See `docs/RULESET_V6.md`; the current build values are in §7.1.
 
 ---
 
@@ -144,9 +147,9 @@ upgrade-execution gate, but the other five remain invisible.
   (`:1812-1830`); `CancelUpgrade` clears it (`:1831-1833`).
 - Timing is deterministic: proposals open for `GOVERNANCE_VOTING_PERIOD_SECS` (3 days,
   `:36`), need `PROPOSAL_MIN_STAKE_NANO` (10 000 STELL, `:38`), and a passed action is
-  timelocked for `GOV_TIMELOCK_HEIGHTS = 7_200` (`:60`). Note the comment "≈ 6 h at 3 s
+  timelocked for `GOV_TIMELOCK_HEIGHTS = 90_000` (`:71`). Note the comment "≈ 6 h at 3 s
   blocks" (`:48-50`) does not match the live 50 ms block floor
-  (`node/policy.rs:356`, `node/consensus_driver.rs:893-901`): 7 200 heights is ≈ 6 minutes
+  (`node/policy.rs:356`, `node/consensus_driver.rs:893-901`): 90 000 heights is ≈ 75 minutes
   at 50 ms.
 - The trigger is on the finalize lane: `if plan.height <= height` →
   `request_flush`, `snapshot_state`, `snapshot_domains`, then optional `execve` and
@@ -571,7 +574,7 @@ single most important change is **making the on-chain path work** — today the 
 - **Fix validation:** reject a plan unless its `height` is at least `MIN_UPGRADE_DELAY`
   heights beyond the execution height. Express the delay as a **wall-clock lead time
   converted at the live cadence** (e.g. 2 days ≈ 3.46 M heights at 50 ms) rather than reusing
-  `GOV_TIMELOCK_HEIGHTS`, which is only ~6 minutes at the live floor. A past height still
+  `GOV_TIMELOCK_HEIGHTS`, which is only ~75 minutes at the live floor. A past height still
   halts deterministically on the first block that sees it (`plan.height <= height`,
   `node/consensus_driver.rs:3129`).
 - ~~**Commit the executed plan**~~ **DONE:** `commitment.rs:784` hashes
@@ -684,7 +687,7 @@ single most important change is **making the on-chain path work** — today the 
 | T−7 d | Build; `sha256sum` the binary; stage it at `data/upgrades/<name>/stellereum` on every node; confirm `/api/version.exe_sha256` and `schedule_hash` are identical on all four | `governance.rs:726-736`; C3 |
 | T−7 d | Open `software_upgrade` with `height = H_future`, `sha256 = <digest>` (block-carried) | C2 |
 | T−7 d … T−4 d | 3-day vote; quorum 6 666 bps (`governance.rs:30`) | existing |
-| T−2 d | Passed → 7 200-height timelock. At the live 50 ms floor that is ~6 min, so the **plan's own `height`** (not the timelock) is the real lead time; set it days out | `governance.rs:48-60` |
+| T−2 d | Passed → 90 000-height timelock. At the live 50 ms floor that is ≈75 min, so the **plan's own `height`** (not the timelock) is the real lead time; set it days out | `governance.rs:71` |
 | T−1 h | Pre-upgrade backup (data + keys), rehearse restore on a throwaway node | `stellereum/scripts/backup/backup.sh`; `ops/upgrade_rehearsal.md:44-60` |
 | H−1 | Verify every node's `exe_sha256` still equals the *old* build and the staged candidate equals the plan digest | C3 |
 | H | All nodes checkpoint (C5) and exit 42 after drain | C4 |

@@ -23,23 +23,33 @@ topics 1/2/3 = Transfer/Mint/Burn):
     (call $sload (i64.const 0))))
 ```
 
-Compile with `wat2wasm`, hex-encode the wasm, deploy:
+Compile with `wat2wasm`, hex-encode the wasm, and get a deploy **preview**
+(address prediction + code validation) with:
 
 ```sh
 rpc stell_deployContract '{"from":"<hex>","code":"<hex>","abi":{…}}'
 ```
 
+`stell_deployContract` is a **preview**: it validates the code and predicts
+`contract_address(tx.from, tx.nonce)`, but it deploys nothing and never enters
+the mempool (`src/rpc/contracts.rs`). A contract exists only after a block
+applies a signed `SysCallDeployContract` transaction submitted via
+`stell_sendRawTransaction` (the SDK has no deploy builder today; you must
+build the `Op` payload and sign it locally).
+
 - TODO: pin the exact `wat2wasm` version and a live deploy receipt.
-  Verify: `which wat2wasm; rpc stell_deployContract …` then
+  Verify: `which wat2wasm; rpc stell_sendRawTransaction …` then
   `rpc stell_getTransactionReceipt …`.
 
 ## Calls, queries, events
 
-- **Call (writes):** `stell_callContract
+- **Call preview (not a write):** `stell_callContract
   {"contract":"<hex>","method":"<name>","args":[…],"value":…}` —
   `contract`/`address`, `args`/`arg` aliases; missing `args` = legacy
-  single `0`. Auth-token gated when configured; executes inline and
-  admits a tx (`src/rpc.rs`).
+  single `0`. Auth-token gated. It executes on a **clone** of the registry,
+  returns the result, and DROPS the tx: it never enters the mempool and never
+  changes live state (`src/rpc/contracts.rs`). To persist a call, sign the
+  same payload locally and submit it via `stell_sendRawTransaction`.
 - **Query (reads):** `stell_runGetMethod {"contract":…,"method":…,
   "args":…}` — same rule as fees/topology for shard reporting
   (`shard`, `local_shard`, `shard_is_local`); never fabricates another
@@ -51,14 +61,14 @@ rpc stell_deployContract '{"from":"<hex>","code":"<hex>","abi":{…}}'
   `.wat` (`source`/`source_hex`/`source_hash`) and compares;
   `stell_registerContractSource` records it (signed action);
   `stell_getContractSource`, `stell_getContractAbi`,
-  `stell_getContractReceipt` read back (`src/rpc.rs`).
+  `stell_getContractReceipt` read back (`src/rpc/`).
 - **Upgrade = redeploy.** No in-place upgrade opcode exists; ship a new
   contract (new address), migrate state explicitly, pause the old one
   (`ContractError::Paused` exists for that path).
 
 ## ABI manifest
 
-Optional `abi` param on deploy (`parse_abi_manifest_param`, `src/rpc.rs`);
+Optional `abi` param on deploy (`parse_abi_manifest_param`, `src/rpc/`);
 typed in `src/contract_abi.rs` (`ContractAbi{methods,events}`). Full example:
 
 ```json
@@ -79,7 +89,7 @@ A call whose args do not match the manifest fails with
 
 ## Host functions (all 13) and fuel
 
-From `host_linker` (`src/contract.rs:1152+`) and `FUEL_*` consts (`:99–132`):
+From `host_linker` (`src/contract.rs:1193+`) and `FUEL_*` consts (`:100–132`):
 
 | Import | Signature | Fuel |
 | --- | --- | --- |
@@ -93,7 +103,7 @@ From `host_linker` (`src/contract.rs:1152+`) and `FUEL_*` consts (`:99–132`):
 | `host.calldata` | `(dest_ptr)→len` | 20 + 1/byte |
 | `host.sha256` | `(src,len,dst)` | 30 + 1/byte + 32 |
 | `host.blake3` | `(src,len,dst)` | 20 + 1/byte + 32 |
-| `host.ed25519_verify` | `(pk,msg,mlen,sig)→0/1` | 500 + 32 + mlen + 64 |
+| `host.falcon512_verify` | `(msg,mlen,pk,pklen,sig,siglen)→0/1` | 2000 + mlen + pklen + siglen |
 | `host.return_data` | `(ptr,len)` | 10 + 1/byte |
 | `host.send_message` | `(rcpt_ptr,32,val,payload_ptr,len,bounce)→id/neg` | 100 |
 

@@ -10,10 +10,10 @@ deleted. Sections that cannot be re-verified on the current tree are marked
 `STALE — see <module dir>` rather than left as false pointers.
 
 > **Ruleset snapshot — historical for consensus values.** Verified under
-> ruleset **v2**. Rulesets v3–v5 changed the vote preimage, block identity
-> (signed `round`), timestamp bound and chain-wide supply accounting; the
-> staking/CN-VRF height windows below were also rescaled by v2. Current values:
-> `docs/RULESET_V5.md`, `stellereum/src/protocol.rs`.
+> ruleset **v2**. Rulesets v3–v6 changed the vote preimage, block identity
+> (signed `round`), timestamp bound, chain-wide supply accounting, and lock
+> identity (v6). Current values:
+> `docs/RULESET_V6.md` (`FORK_ID = 0x0f584a46`), `stellereum/src/protocol.rs`.
 
 Paths relative to repo root unless noted.
 

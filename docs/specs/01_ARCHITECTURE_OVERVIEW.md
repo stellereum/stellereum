@@ -1,9 +1,11 @@
 # 01 — Architecture Overview (HDAE canonical, 2026-10-29)
 
-> **Current consensus ruleset: v5** (`FORK_ID = 0x9d59096b`, 23 rules).
-> Consensus-rule changes since this page was written: v2 height re-scale,
-> v3 shard-bound vote preimage, v4 signed block round + timestamp bound,
-> v5 chain-wide supply cap. See `docs/RULESET_V5.md` and `docs/SUPPLY_CAP.md`.
+> **Current consensus ruleset: v6** (`FORK_ID = 0x0f584a46`, 23 rules).
+> v6 compares locks by round-free `Block::value_id` and re-stamps a rescued
+> body at the proposer's current round; it is the activation marker for the
+> live-stall fix (`docs/RULESET_V6.md`). Rulesets v2–v5 were the height
+> re-scale, shard-bound vote preimage, signed block round + timestamp bound,
+> and chain-wide supply cap (historical pages `docs/RULESET_V2.md`..`V5.md`).
 
 Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 (full list in `.archive/README.md`). Canonical audit: root
@@ -24,9 +26,11 @@ Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 
 ## Canonical vs copies
 
-- `stellereum/` is the ONLY canonical node tree (60 src files). The diverged
-  stale copies `stellereum_head/` (48 files) and `w8/` (55 files) were REMOVED
-  2026-10-29 (recoverable from git history if archaeology is ever needed).
+- `stellereum/` is the ONLY canonical node tree (146 `.rs` files: 67
+  top-level modules plus the `consensus/`, `runtime/`, `state_engine/`,
+  `rpc/`, `sharding/` and `evm_adapter/` directories). The diverged stale
+  copies `stellereum_head/` and `w8/` were REMOVED 2026-10-29 (recoverable
+  from git history if archaeology is ever needed).
   See `CRATE_ISOLATION_PLAN.md`.
 - Live topology: A `212.113.103.105`, B local `:8546`, C `77.110.96.68:2222`,
   D `138.124.102.200`. N=4, quorum 2f+1, set 4/4 non-fragile.
@@ -36,14 +40,14 @@ Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 | Domain | Files | Frozen surface |
 |---|---|---|
 | Primitives/addressing | `address.rs`, `cell.rs`, `chain_binding.rs` | `Stl57` format (Base58 + BLAKE3 checksum), chain-id binding |
-| Consensus/BFT | `consensus/`, `runtime/`, `node/`, `consensus_net.rs` | V5 sortition (parent-hash), µQC `min(N, 128)` seats, tick floor 50 ms, base timeout 3 000 ms (ruleset v5) |
+| Consensus/BFT | `consensus/`, `runtime/`, `node/`, `consensus_net.rs` | parent-hash sortition (V5 draw), µQC `min(N, 128)` seats, tick floor 50 ms, base timeout 3 000 ms (current ruleset v6) |
 | Execution/VM | `contract.rs`, `contract_abi.rs`, `contract_source.rs`, `state_engine.rs`, `evm_adapter.rs` | wasmi, 13 host fns, canonical `.wat` source form |
 | Storage/state | `cpat2.rs` (trie), `storage.rs`, `chain.rs`, `mmr.rs` | exclusion proofs, MMR epoch roots (epoch 500) |
 | Economics | `staking.rs`, `token.rs`, `tokenomics.rs`, `clob*.rs`, `amm*.rs`, `perps*.rs`, `mev*.rs` | chain-wide `TOTAL_SUPPLY_CAP` (`SupplyPartition` + committed aggregate), F1 reward accumulator, failure-fee on apply-fail |
-| Privacy | `crypto_privacy.rs`, `wallet_signing.rs` | shielded transfer/unshield, `STELL-MSGSIG-V1` |
+| Privacy | `silentpay.rs`, `wallet_signing.rs` | silent-payment prototype (`silentpay.rs`, UNWIRED); no confidential/shielded ledger — the Ristretto path was deleted; `STELL-MSGSIG-V1` wallet signing |
 | Cross-shard/bridge | `xshard2pc.rs`, `bridge.rs`, `bridge_adapters.rs` | 2PC armed by compiled `XPC_ACTIVATION_HEIGHT = 0` (active from genesis), truth-gate bridge |
-| Crypto | `post_quantum.rs`, `bls.rs`, `vrf.rs` | Falcon FIPS-206, BLS12-381 (no PoP — structural), VRF planned |
-| Interfaces | `rpc.rs`, `native_api.rs`, `light_client.rs`, `simulator.rs`, `mempool.rs` | 22 native APIs, mempool priority+shard-pin+nonce-window |
+| Crypto | `post_quantum.rs`, `vrf.rs`, `cn_vrf.rs` | Falcon-512 vote/QC signatures (FIPS 206); no BLS/pairing path (deleted); parent-hash sortition, CN-VRF v3 implemented with its activation gate off |
+| Interfaces | `rpc/`, `native_api.rs`, `light_client.rs`, `simulator.rs`, `mempool.rs` | 32-method native API catalog, mempool priority+shard-pin+nonce-window |
 
 ## Frozen core contracts (change = audit + spec update)
 

@@ -9,9 +9,9 @@ marked `STALE — see <path>`.
 
 > **Ruleset snapshot — historical for constants.** Verified under ruleset
 > **v2**; the CN-VRF height windows shown here (7 200 / 450 / 360) are the v1
-> values, not current. Ruleset v5 is current (`FORK_ID = 0x9d59096b`); current
+> values, not current. Ruleset v6 is current (`FORK_ID = 0x0f584a46`); current
 > values are `EPOCH_LEN = 30_000`, `V3_SEGMENT_LEN = 1_875`,
-> `V3_COMMIT_LOOKAHEAD_BLOCKS = 682` (`docs/RULESET_V5.md`).
+> `V3_COMMIT_LOOKAHEAD_BLOCKS = 682` (`docs/RULESET_V6.md`; unchanged since v5).
 
 Sources: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `vrf.rs`,
 `cn_vrf.rs`, `minroot_vdf.rs`, `staking.rs`, `wallet_signing.rs`,
@@ -74,20 +74,20 @@ Sources: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `vrf.rs`,
 ## 5. CN-VRF (v1 + v3 + MinRoot PQ-VDF) — WIRED
 
 - Spec: `docs/PQ_CN_VRF_SPEC.md:1`.
-- v1 sandbox primitives: `EPOCH_LEN 7200` (`cn_vrf.rs:65`); DSTs
+- v1 sandbox primitives: `EPOCH_LEN 30_000` (`cn_vrf.rs:69`); DSTs
   `STELL_CNVRF_COMMIT_V1` / `COMMIT_SIG_V1` / `OPEN_V1` / `BETA_V1`;
   `cnvrf_commit` (`:381`), `cnvrf_verify` (`:491`), commit state
   (`:655,:687`); nonce custody 0600.
 - CN-VRF v3 (`cn_vrf.rs:1009+`): 16-segment 48-byte `BLAKE3-XOF-48` reverse
   hash-chain (`V3_LINK_LEN 48` `:1013`, `V3_SEGMENTS 16` `:1015`,
-  `V3_SEGMENT_LEN 450` `:1017`; `16 × 450 = EPOCH_LEN`);
-  `V3_COMMIT_LOOKAHEAD_BLOCKS 360` (`:1019`); `CommitCarrierV3`
+  `V3_SEGMENT_LEN 1_875` `:1021`; `16 × 1_875 = EPOCH_LEN`);
+  `V3_COMMIT_LOOKAHEAD_BLOCKS 682` (`:1032`); `CommitCarrierV3`
   (`COMMIT_CARRIER_V3_LEN` `:1025`); bounded reveal verify
   `cnvrf_v3_verify_reveal` (`:1466`); `CnVrfV3State` (`:1519`);
   deterministic `epoch_raw_seed` fallback (`:1707`).
 - Activation & abort accounting: `CNVRF_V3_ACTIVATION_HEIGHT`
   (`consensus/sortition.rs:552`, default `u64::MAX` = dormant),
-  `CNVRF_V3_EPOCH_LEN 7200` (`:556`), sortition entry points
+  `CNVRF_V3_EPOCH_LEN 30_000` (`:669`), sortition entry points
   (`:601,:619`); dedicated non-vote-resettable abort slashing in `staking.rs`
   (`CNVRF_ABORT_SLASH_BPS`, `CNVRF_ABORT_THRESHOLD`,
   `CNVRF_ABORT_RECOVERY_STREAK`, `CnVrfAbortState` + `slash_cnvrf_abort`).
@@ -101,7 +101,7 @@ Sources: `stellereum/src/post_quantum.rs`, `pq_registry.rs`, `vrf.rs`,
 
 ## 6. PQ registry + rotation
 
-- `PQ_ROTATION_DELAY_HEIGHTS 7200` (`pq_registry.rs:101`);
+- `PQ_ROTATION_DELAY_HEIGHTS 30_000` (`pq_registry.rs:105`);
   `PQ_KEY_HISTORY_LIMIT 2` (`:110`); `PQ_MAX_KEY_BYTES = MLDSA44_PUBKEY_LEN`
   (`:122`); announce DST `STELL_PQ_ROTATE_V1` (`:126`).
 - The old "`PQ_MAX_KEY_BYTES = HYBRID_PUBKEY_LEN 929`" claim is STALE: the

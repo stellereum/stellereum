@@ -1,7 +1,7 @@
 # 03 — VM & Execution (HDAE canonical, 2026-10-29)
 
 Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
-`contract_source.rs`, `state_engine.rs`, `evm_adapter.rs`, `simulator.rs`.
+`contract_source.rs`, `state_engine/`, `evm_adapter/`, `simulator.rs`.
 
 ## Execution model
 
@@ -25,7 +25,8 @@ Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
 - Account Object = on-chain program-passport (owner/guardian/renter/sessions,
   ceiling only ratchets down, tombstone, guardian delay 72h). Siloed Vault is
   by-convention, not consensus-enforced.
-- Native APIs: 22 pinned (`stell_nativeApi` surface). Faucet, estimateFee,
+- Native APIs: 32 pinned methods (`stell_nativeApi` catalog,
+  `src/native_api.rs::METHODS`). Faucet, estimateFee,
   archive proofs, epoch keys, contract source registry included.
 
 ## Mempool rules (consensus-critical, do not relax)
@@ -47,5 +48,5 @@ Source of truth: `stellereum/src/contract.rs`, `contract_abi.rs`,
 - Chain-wide native supply: every mint path reserves against
   `TOTAL_SUPPLY_CAP` through `SupplyPartition`; the masterchain also aggregates
   committed `ShardHeaderCommitment::minted_total_nano` and refuses an
-  over-cap head (ruleset v5, `docs/SUPPLY_CAP.md`).
+  over-cap head (introduced by ruleset v5, `docs/SUPPLY_CAP.md`).
 - Archive proofs + historical roots via `stell_getArchiveProof`.

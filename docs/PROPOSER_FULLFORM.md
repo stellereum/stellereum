@@ -524,7 +524,7 @@ measured negligible or safety-load-bearing).
    (deterministic on all nodes); changing math mid-epoch forks the
    schedule (`proposer_for` `:1476` diverges) — add members (C2), don't
    redefine power.
-6. **Signature domains (Ed25519 / Falcon / BLS envelopes, chain-id binding).**
+6. **Signature domains (Falcon-512 vote/QC envelopes, chain-id binding; Ed25519 is identity only).**
    `VOTE_FALCON_MAGIC/PART_LEN` (`stellereum/src/consensus.rs:329-331`),
    `verify_falcon_signature` (`:374`), `attach_vote_falcon` (`:448`),
    proposer Falcon path (`:393-445`), `consensus_chain_id` frozen

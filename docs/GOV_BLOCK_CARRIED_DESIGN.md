@@ -168,7 +168,7 @@ Executed` (deterministic execute sweep). Transitions: `propose` tx
 `lock_governance`) → `Open`; `vote` tx (`now < voting_end`, one vote, weight
 from snapshot, `lock_governance(weight)`) → tallies; `finalize_due_at_height`
 (`now ≥ voting_end`; `turnout ≥ electorate*Q/10000 && yes>no && yes+no>0` →
-`Passed` + `timelocks[id]=finalize_height+7200`, else `Rejected`; BOTH
+`Passed` + `timelocks[id]=finalize_height+90_000`, else `Rejected`; BOTH
 release proposer+voter locks exactly once) → terminal-pending;
 `execute_due_governance_at_height` (`status==Passed && height ≥ maturity`, or
 unscheduled-legacy `None`→immediate one-time migration; applies action
@@ -192,7 +192,7 @@ D2 penalty escalation on failing gov spam; nonce-gap enforcement.
 - Determinism: same block applied via finalize path AND reorg path
 (`apply_block_transition` both callers) → identical roots; intra-block
 bond→vote→finalize ordering test asserting tally invariance (G1 snapshot).
-- Multi-node harness: proposal→vote→finalize→7200-height wait→execute on a
+- Multi-node harness: proposal→vote→finalize→90_000-height wait→execute on a
 3-node testnet incl. one node down mid-vote + resync; all roots equal;
 equivocation-5b step unaffected (gov txs present in same blocks).
 - Gate: `cargo clippy --all-targets -- -D warnings` + full `cargo test`
@@ -202,7 +202,7 @@ equivocation-5b step unaffected (gov txs present in same blocks).
 
 - `SysCallGovPropose { proposal_id, title, action, height_observed }` — sender-is-proposer, snapshot+lock at apply; id and height pinned.
 - `SysCallGovVote { proposal_id, choice, height_observed }` — snapshot-weighted, one-vote, lock backing stake; height pinned.
-- Deterministic finalize sweep — block timestamp/height, schedules `+7200`, releases locks once, ascending id.
+- Deterministic finalize sweep — block timestamp/height, schedules `+90_000`, releases locks once, ascending id.
 - Deterministic execute sweep — maturity-gated, oracle-atomic, exactly-once, ascending id; all 13 actions, with `SoftwareUpgrade`/`CancelUpgrade` gated by `UPGRADE_EXEC_ACTIVATION_HEIGHT`.
 - SPAM RULE: 10k stake gate (locked, not slashed) + base-fee gas + D2 escalation; no slash-on-rejected. (The proposed per-proposer 4-open cap is not implemented in this wave.)
 - MIGRATION: `GOV_OPS_ACTIVATION_HEIGHT = 0` from genesis; RPC direct form

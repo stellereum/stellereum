@@ -22,13 +22,13 @@ Quorum is `floor(2·power/3)+1`: 1→1, 2→2, 3→3, 4→3, 5→4 — so 2- and
 
 ## Commission immutability
 
-Commission is set **once at bond time** from governance
-(`ctx.default_commission_bps`, default `DEFAULT_COMMISSION_BPS` =
-**1000 bps = 10 %**, `src/staking.rs:327`); the ledger has **no setter**,
-the opcode carries no commission field, and the wallet `stake` command
-offers no `--commission-bps` — deliberately unimplemented
-(`docs/RPC.md` §5). A later `SetDefaultCommissionBps` vote prices **new**
-bonds only. Pick your validator accordingly: the rate is forever.
+Commission is set **once at bond time** — either the governance default
+(`ctx.default_commission_bps`, `DEFAULT_COMMISSION_BPS` = **1000 bps = 10 %**,
+`src/staking.rs`) or an explicit `--commission-bps N` on a **new** bond
+(`SysCallStakeWithCommission`, `src/svm.rs`). There is no later setter: the
+ledger has no commission-change opcode wired, and the rate is forever.
+A later `SetDefaultCommissionBps` vote prices **new** bonds only. Pick your
+validator accordingly.
 
 ## Rewards (F1 lazy — how and when claimed)
 
@@ -64,8 +64,9 @@ Misses derive from the finalized block's embedded parent QC, so every
 node counts identically; signing again resets the counter; the cooldown
 skips the first offence (chains < 500 blocks). Burns debit the staking
 pool for real. Genesis math: 1000 STELL bond loses 1 STELL per downtime
-hit, 50 per equivocation. At the ~240 ms ruleset-v2 tempo, 42 misses
-≈ 10.1 s — a GC pause can cost you (`OPERATIONS.md` §5). A halted 2-validator
+hit, 50 per equivocation. At the current 50 ms floor, 42 misses
+≈ 2.1 s; at live 2–3 s/block it is ≈ 84–126 s — a GC pause can cost you
+(`OPERATIONS.md` §5). A halted 2-validator
 net slashes nobody (no blocks, no evidence). `missed` has no RPC — watch
 `stell_stakeOf` for a `total` below your bond.
 
@@ -99,7 +100,7 @@ Spinning disk stalls the persist queue and reads as consensus lag.
 ```sh
 stellereum keys init --keys-dir ./keys
 stellereum keys peer-stanza --keys-dir ./keys --name node-e
-scripts/join-network.sh --faucet-key <64-HEX> --advertise <IP:9410> \
+stellereum/scripts/join-network.sh --faucet-key <64-HEX> --advertise <IP:9410> \
   --peers-file <admin-set.yaml>     # new nodes start STELL_OBSERVER=1
 stellereum node-bootstrap --config node.yaml --shard 1
 rpc stell_faucet '{"address":"-1:<YOUR-HEX>"}'   # masterchain form

@@ -2031,18 +2031,32 @@ impl FalconKeypair {
 
         // Per-signature randomizer: the caller's seed mixed with fresh OS
         // entropy. 40 bytes become the Falcon nonce, 48 bytes seed the
-        // sampler's ChaCha20 stream.
-        let mut os_entropy = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut *os_entropy);
-        let mut hasher = blake3::Hasher::new_derive_key("FALCON512_SIGN_V5");
-        hasher.update(seed);
-        hasher.update(&*os_entropy);
-        hasher.update(message);
-        let mut xof = hasher.finalize_xof();
-        let mut randomizer = Zeroizing::new([0u8; 88]);
-        xof.fill(&mut *randomizer);
-        zeroize::Zeroize::zeroize(&mut os_entropy);
-        self.sign_with_randomizer(message, &randomizer)
+        // sampler's ChaCha20 stream. Standard FIPS 206 rejection sampling
+        // retries if a Gaussian draw compresses past the 625-byte frame
+        // (`comp_encode == None`, ~1e-4 per attempt).
+        const MAX_COMPRESSION_RETRIES: u32 = 16;
+        for _attempt in 0..MAX_COMPRESSION_RETRIES {
+            let mut os_entropy = Zeroizing::new([0u8; 32]);
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut *os_entropy);
+            let mut hasher = blake3::Hasher::new_derive_key("FALCON512_SIGN_V5");
+            hasher.update(seed);
+            hasher.update(&*os_entropy);
+            hasher.update(message);
+            let mut xof = hasher.finalize_xof();
+            let mut randomizer = Zeroizing::new([0u8; 88]);
+            xof.fill(&mut *randomizer);
+            zeroize::Zeroize::zeroize(&mut os_entropy);
+            match self.sign_with_randomizer(message, &randomizer) {
+                FalconSignAttempt::Signed(sig) => return sig,
+                FalconSignAttempt::CompressionOverflow => continue,
+                FalconSignAttempt::Refused => return Vec::new(),
+            }
+        }
+        tracing::warn!(
+            "Falcon-512 signing REFUSED: compressed signature exceeded frame across \
+             {MAX_COMPRESSION_RETRIES} FIPS 206 rejection-sampling attempts"
+        );
+        Vec::new()
     }
 
     /// Deterministic Falcon-512 signing strictly for reproducible simulation
@@ -2051,16 +2065,27 @@ impl FalconKeypair {
         if !falcon_ntru_partner_matches(&self.capital_f, &self.capital_g, &self.h) {
             return Vec::new();
         }
-        let mut hasher = blake3::Hasher::new_derive_key("FALCON512_SIM_SIGN_V1");
-        hasher.update(seed);
-        hasher.update(message);
-        let mut xof = hasher.finalize_xof();
-        let mut randomizer = Zeroizing::new([0u8; 88]);
-        xof.fill(&mut *randomizer);
-        self.sign_with_randomizer(message, &randomizer)
+        const MAX_COMPRESSION_RETRIES: u32 = 16;
+        for attempt in 0..MAX_COMPRESSION_RETRIES {
+            let mut hasher = blake3::Hasher::new_derive_key("FALCON512_SIM_SIGN_V1");
+            hasher.update(seed);
+            hasher.update(message);
+            if attempt > 0 {
+                hasher.update(&attempt.to_le_bytes());
+            }
+            let mut xof = hasher.finalize_xof();
+            let mut randomizer = Zeroizing::new([0u8; 88]);
+            xof.fill(&mut *randomizer);
+            match self.sign_with_randomizer(message, &randomizer) {
+                FalconSignAttempt::Signed(sig) => return sig,
+                FalconSignAttempt::CompressionOverflow => continue,
+                FalconSignAttempt::Refused => return Vec::new(),
+            }
+        }
+        Vec::new()
     }
 
-    fn sign_with_randomizer(&self, message: &[u8], randomizer: &[u8; 88]) -> Vec<u8> {
+    fn sign_with_randomizer(&self, message: &[u8], randomizer: &[u8; 88]) -> FalconSignAttempt {
         let mut nonce = [0u8; 40];
         nonce.copy_from_slice(&randomizer[..40]);
         if nonce.iter().all(|&b| b == 0) {
@@ -2083,7 +2108,7 @@ impl FalconKeypair {
                 "Falcon-512 signing REFUSED: private key coefficients are out of the \
                  FIPS 206 range; no compliant signature can be produced"
             );
-            return Vec::new();
+            return FalconSignAttempt::Refused;
         };
 
         // Chain-canonical signature framing (pentest P4 F-PQ-1): 0x29 header,
@@ -2095,11 +2120,10 @@ impl FalconKeypair {
         sig[0] = 0x29;
         sig[1..41].copy_from_slice(&nonce);
         if comp_encode(&mut sig[41..], &s2).is_none() {
-            tracing::warn!(
-                "Falcon-512 signing REFUSED: compressed signature does not fit the \
-                 FIPS 206 frame"
+            tracing::debug!(
+                "Falcon-512 signing retry: compressed signature exceeded 625-byte frame"
             );
-            return Vec::new();
+            return FalconSignAttempt::CompressionOverflow;
         }
 
         // Self-check: never hand out a signature this module cannot verify.
@@ -2108,11 +2132,17 @@ impl FalconKeypair {
                 "Falcon-512 signing REFUSED: the produced signature failed the local \
                  FIPS 206 verification self-check"
             );
-            return Vec::new();
+            return FalconSignAttempt::Refused;
         }
 
-        sig
+        FalconSignAttempt::Signed(sig)
     }
+}
+
+enum FalconSignAttempt {
+    Signed(Vec<u8>),
+    CompressionOverflow,
+    Refused,
 }
 
 const FALCON_PUBKEY_CACHE_CAP: usize = 4096;
@@ -3548,5 +3578,28 @@ mod tests {
         let mut actual = s2_modq;
         poly_mul_precomputed_ntt_in_place(&mut actual, &h_ntt);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_falcon_sign_retries_compression_overflow_and_never_returns_empty() {
+        // Construct a synthetic over-wide vector that fails `comp_encode` to
+        // prove `CompressionOverflow` is handled separately from `Refused`, and
+        // verify 512 real signatures from a valid key always succeed and verify.
+        let mut wide = [4095i16; 512];
+        let mut buf = [0u8; FALCON512_SIG_LEN - 41];
+        assert!(comp_encode(&mut buf, &wide).is_none());
+        wide[0] = -4095;
+        assert!(comp_encode(&mut buf, &wide).is_none());
+
+        let kp = FalconKeypair::generate_from_seed(0x6E);
+        for i in 0..512u32 {
+            let msg = i.to_le_bytes();
+            let sig = kp.sign(&msg);
+            assert_eq!(sig.len(), FALCON512_SIG_LEN);
+            assert!(verify_falcon512(kp.pubkey(), &msg, &sig));
+            let det = kp.sign_deterministic_for_sim(&msg, &[0x55u8; 32]);
+            assert_eq!(det.len(), FALCON512_SIG_LEN);
+            assert!(verify_falcon512(kp.pubkey(), &msg, &det));
+        }
     }
 }

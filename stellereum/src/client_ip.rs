@@ -98,17 +98,22 @@ impl XffMode {
     /// Parse from a raw env/config string (case-insensitive, trimmed).
     /// Unknown / empty values fall back to [`XffMode::Rightmost`] (fail-safe).
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "leftmost" | "left" | "first" => XffMode::Leftmost,
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("leftmost")
+            || s.eq_ignore_ascii_case("left")
+            || s.eq_ignore_ascii_case("first")
+        {
+            XffMode::Leftmost
+        } else {
             // "rightmost" | "right" | "last" | "" | anything-else
-            _ => XffMode::Rightmost,
+            XffMode::Rightmost
         }
     }
 
     /// Effective mode from `STELL_XFF_MODE` (default [`XffMode::Rightmost`]).
     pub fn from_env() -> Self {
-        std::env::var(XFF_MODE_ENV)
-            .map(|v| Self::parse(&v))
+        std::env::var_os(XFF_MODE_ENV)
+            .and_then(|v| v.to_str().map(Self::parse))
             .unwrap_or(XffMode::Rightmost)
     }
 }
@@ -266,14 +271,17 @@ pub fn default_trusted_nets() -> Vec<TrustedNet> {
 /// - var present but blank → trust NOTHING (operator explicitly disabled);
 /// - otherwise comma-separated CIDRs / plain IPs; invalid entries are skipped.
 pub fn trusted_nets_from_env() -> Vec<TrustedNet> {
-    match std::env::var(TRUSTED_PROXY_CIDRS_ENV) {
-        Err(_) => default_trusted_nets(),
-        Ok(raw) => {
-            if raw.trim().is_empty() {
-                return Vec::new();
+    match std::env::var_os(TRUSTED_PROXY_CIDRS_ENV) {
+        None => default_trusted_nets(),
+        Some(raw) => match raw.to_str() {
+            None => default_trusted_nets(),
+            Some(s) => {
+                if s.trim().is_empty() {
+                    return Vec::new();
+                }
+                s.split(',').filter_map(parse_trusted_token).collect()
             }
-            raw.split(',').filter_map(parse_trusted_token).collect()
-        }
+        },
     }
 }
 
@@ -314,8 +322,11 @@ fn parse_ip_token_raw(tok: &str) -> Option<IpAddr> {
     if t.is_empty() {
         return None;
     }
-    let lower = t.to_ascii_lowercase();
-    if lower == "unknown" || lower == "_hidden" || lower == "_secluded" || lower == "hidden" {
+    if t.eq_ignore_ascii_case("unknown")
+        || t.eq_ignore_ascii_case("_hidden")
+        || t.eq_ignore_ascii_case("_secluded")
+        || t.eq_ignore_ascii_case("hidden")
+    {
         return None;
     }
     // Direct parse first (covers bare v4 + v6).
@@ -487,20 +498,176 @@ impl PartialEq<IpAddr> for ClientIp {
 
 /// Parse an explicit boolean env flag (`1/true/yes/on`, case-insensitive).
 fn env_flag(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    let Some(s) = raw.to_str() else {
+        return false;
+    };
+    let t = s.trim();
+    t == "1"
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("yes")
+        || t.eq_ignore_ascii_case("on")
 }
 
 /// Whether the deployment opted in to forwarding a LOOPBACK client address
 /// (`STELL_TRUST_LOOPBACK_FORWARDED`, default off).
 pub fn trust_loopback_forwarded_from_env() -> bool {
     env_flag(TRUST_LOOPBACK_FORWARDED_ENV)
+}
+
+/// Parsed client-IP resolution policy (trusted proxies, XFF mode, loopback opt-in).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientIpConfig {
+    pub trusted: Vec<TrustedNet>,
+    pub mode: XffMode,
+    pub trust_loopback_forwarded: bool,
+}
+
+impl ClientIpConfig {
+    /// Load configuration from environment variables (`STELL_TRUSTED_PROXY_CIDRS`,
+    /// `STELL_XFF_MODE`, `STELL_TRUST_LOOPBACK_FORWARDED`).
+    pub fn from_env() -> Self {
+        Self {
+            trusted: trusted_nets_from_env(),
+            mode: XffMode::from_env(),
+            trust_loopback_forwarded: trust_loopback_forwarded_from_env(),
+        }
+    }
+
+    /// Resolve a client IP using this pre-parsed configuration.
+    pub fn resolve(&self, headers: &HeaderMap, peer: IpAddr) -> ClientIp {
+        resolve_with_config(headers, peer, self)
+    }
+}
+
+fn select_xff_from_headers(
+    headers: &HeaderMap,
+    mode: XffMode,
+    trusted: &[TrustedNet],
+) -> Option<IpAddr> {
+    match mode {
+        XffMode::Leftmost => {
+            for v in headers.get_all("x-forwarded-for") {
+                let Ok(s) = v.to_str() else { continue };
+                for tok in s.split(',') {
+                    if let Some(ip) = parse_ip_token(tok) {
+                        return Some(ip);
+                    }
+                }
+            }
+            None
+        }
+        XffMode::Rightmost => {
+            let mut all = headers.get_all("x-forwarded-for").into_iter();
+            match (all.next(), all.next()) {
+                (None, _) => None,
+                (Some(v), None) => {
+                    let Ok(s) = v.to_str() else { return None };
+                    let mut leftmost_trusted: Option<IpAddr> = None;
+                    for tok in s.rsplit(',') {
+                        if let Some(ip) = parse_ip_token(tok) {
+                            if !is_trusted_in(&ip, trusted) {
+                                return Some(ip);
+                            }
+                            leftmost_trusted = Some(ip);
+                        }
+                    }
+                    leftmost_trusted
+                }
+                (Some(v1), Some(v2)) => {
+                    let mut first_valid: Option<IpAddr> = None;
+                    let mut last_untrusted: Option<IpAddr> = None;
+                    for v in [v1, v2].into_iter().chain(all) {
+                        let Ok(s) = v.to_str() else { continue };
+                        for tok in s.split(',') {
+                            if let Some(ip) = parse_ip_token(tok) {
+                                if first_valid.is_none() {
+                                    first_valid = Some(ip);
+                                }
+                                if !is_trusted_in(&ip, trusted) {
+                                    last_untrusted = Some(ip);
+                                }
+                            }
+                        }
+                    }
+                    last_untrusted.or(first_valid)
+                }
+            }
+        }
+    }
+}
+
+fn parse_forwarded_elem(elem: &str) -> Option<IpAddr> {
+    for pair in elem.split(';') {
+        let pair = pair.trim();
+        let Some((k, val)) = pair.split_once('=') else {
+            continue;
+        };
+        if !k.trim().eq_ignore_ascii_case("for") {
+            continue;
+        }
+        return parse_ip_token(val.trim());
+    }
+    None
+}
+
+fn select_forwarded_from_headers(
+    headers: &HeaderMap,
+    mode: XffMode,
+    trusted: &[TrustedNet],
+) -> Option<IpAddr> {
+    match mode {
+        XffMode::Leftmost => {
+            for v in headers.get_all("forwarded") {
+                let Ok(s) = v.to_str() else { continue };
+                for elem in s.split(',') {
+                    if let Some(ip) = parse_forwarded_elem(elem) {
+                        return Some(ip);
+                    }
+                }
+            }
+            None
+        }
+        XffMode::Rightmost => {
+            let mut all = headers.get_all("forwarded").into_iter();
+            match (all.next(), all.next()) {
+                (None, _) => None,
+                (Some(v), None) => {
+                    let Ok(s) = v.to_str() else { return None };
+                    let mut leftmost_trusted: Option<IpAddr> = None;
+                    for elem in s.rsplit(',') {
+                        if let Some(ip) = parse_forwarded_elem(elem) {
+                            if !is_trusted_in(&ip, trusted) {
+                                return Some(ip);
+                            }
+                            leftmost_trusted = Some(ip);
+                        }
+                    }
+                    leftmost_trusted
+                }
+                (Some(v1), Some(v2)) => {
+                    let mut first_valid: Option<IpAddr> = None;
+                    let mut last_untrusted: Option<IpAddr> = None;
+                    for v in [v1, v2].into_iter().chain(all) {
+                        let Ok(s) = v.to_str() else { continue };
+                        for elem in s.split(',') {
+                            if let Some(ip) = parse_forwarded_elem(elem) {
+                                if first_valid.is_none() {
+                                    first_valid = Some(ip);
+                                }
+                                if !is_trusted_in(&ip, trusted) {
+                                    last_untrusted = Some(ip);
+                                }
+                            }
+                        }
+                    }
+                    last_untrusted.or(first_valid)
+                }
+            }
+        }
+    }
 }
 
 /// Resolve with explicit config and an explicit loopback-forwarding policy
@@ -525,8 +692,8 @@ pub fn resolve_detailed(
     if !is_trusted_in(&peer, trusted) {
         return ClientIp::from_peer(peer);
     }
-    let claimed = select_from_chain(&xff_chain_from_headers(headers), mode, trusted)
-        .or_else(|| select_from_chain(&forwarded_chain_from_headers(headers), mode, trusted))
+    let claimed = select_xff_from_headers(headers, mode, trusted)
+        .or_else(|| select_forwarded_from_headers(headers, mode, trusted))
         .or_else(|| {
             ["cf-connecting-ip", "true-client-ip", "x-real-ip"]
                 .iter()
@@ -535,19 +702,26 @@ pub fn resolve_detailed(
         .map(canonical_ip);
     match claimed {
         None => ClientIp::from_peer(peer),
-        Some(ip)
-            if ip.is_loopback() && !(trust_loopback_forwarded && is_trusted_in(&peer, trusted)) =>
-        {
-            ClientIp {
-                addr: peer,
-                source: ClientIpSource::ForwardedLoopbackRejected,
-            }
-        }
+        Some(ip) if ip.is_loopback() && !trust_loopback_forwarded => ClientIp {
+            addr: peer,
+            source: ClientIpSource::ForwardedLoopbackRejected,
+        },
         Some(ip) => ClientIp {
             addr: ip,
             source: ClientIpSource::Forwarded,
         },
     }
+}
+
+/// Resolve with a pre-parsed [`ClientIpConfig`].
+pub fn resolve_with_config(headers: &HeaderMap, peer: IpAddr, cfg: &ClientIpConfig) -> ClientIp {
+    resolve_detailed(
+        headers,
+        peer,
+        &cfg.trusted,
+        cfg.mode,
+        cfg.trust_loopback_forwarded,
+    )
 }
 
 /// Resolve with explicit config using the SECURE default policy: a forwarded
@@ -567,14 +741,26 @@ pub fn resolve_with(
     )
 }
 
+#[cfg(not(any(test, debug_assertions)))]
+fn cached_config() -> &'static ClientIpConfig {
+    static CONFIG: std::sync::OnceLock<ClientIpConfig> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(ClientIpConfig::from_env)
+}
+
 /// Resolve the real client IP: proxy headers only when the TCP `peer` is a
 /// trusted proxy per `STELL_TRUSTED_PROXY_CIDRS`; otherwise the peer itself.
 /// `X-Forwarded-For` chain discipline comes from `STELL_XFF_MODE`; loopback
 /// forwarded addresses also require `STELL_TRUST_LOOPBACK_FORWARDED`.
 pub fn resolve_client_ip(headers: &HeaderMap, peer: IpAddr) -> ClientIp {
-    let trusted = trusted_nets_from_env();
-    let mode = XffMode::from_env();
-    resolve_with(headers, peer, &trusted, mode)
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        resolve_with_config(headers, peer, cached_config())
+    }
+    #[cfg(any(test, debug_assertions))]
+    {
+        let cfg = ClientIpConfig::from_env();
+        resolve_with_config(headers, peer, &cfg)
+    }
 }
 
 /// Convenience: resolve from an optional `ConnectInfo` peer.

@@ -104,6 +104,210 @@ pub struct Notification {
     pub result: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NormalizedTopicKey {
+    Int(i64),
+    Text(String),
+}
+
+#[inline]
+fn topic_key_normalized(s: &str) -> NormalizedTopicKey {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<i64>() {
+        return NormalizedTopicKey::Int(n);
+    }
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if let Ok(n) = i64::from_str_radix(h, 16) {
+            return NormalizedTopicKey::Int(n);
+        }
+    }
+    NormalizedTopicKey::Text(t.to_lowercase())
+}
+
+#[derive(Clone, Debug)]
+struct NormalizedEventsFilter {
+    contract: Option<String>,
+    wildcard: bool,
+    topics: Vec<NormalizedTopicKey>,
+}
+
+impl NormalizedEventsFilter {
+    fn from_topic(contract: Option<&str>, topics: &[String]) -> Self {
+        let mut wildcard = topics.is_empty();
+        let mut norm_topics = Vec::new();
+        if !wildcard {
+            for w in topics {
+                let wt = w.trim();
+                if wt == "*" || wt == "#" {
+                    wildcard = true;
+                    norm_topics.clear();
+                    break;
+                }
+                let k = topic_key_normalized(wt);
+                if !norm_topics.contains(&k) {
+                    norm_topics.push(k);
+                }
+            }
+        }
+        Self {
+            contract: contract.map(|c| c.to_string()),
+            wildcard,
+            topics: norm_topics,
+        }
+    }
+
+    #[inline]
+    fn matches(&self, ev_contract: Option<&str>, ev_keys: &[NormalizedTopicKey]) -> bool {
+        if let Some(want) = &self.contract {
+            match ev_contract {
+                Some(have) if have.eq_ignore_ascii_case(want) => {}
+                _ => return false,
+            }
+        }
+        if self.wildcard {
+            return true;
+        }
+        if ev_keys.is_empty() {
+            return false;
+        }
+        self.topics.iter().any(|w| ev_keys.contains(w))
+    }
+}
+
+fn with_normalized_event_topics<R>(
+    topics: &[String],
+    f: impl FnOnce(&[NormalizedTopicKey]) -> R,
+) -> R {
+    if topics.is_empty() {
+        f(&[])
+    } else if topics.len() == 1 {
+        let one = [topic_key_normalized(&topics[0])];
+        f(&one)
+    } else {
+        let many: Vec<NormalizedTopicKey> =
+            topics.iter().map(|t| topic_key_normalized(t)).collect();
+        f(&many)
+    }
+}
+
+#[derive(Default)]
+struct SubscriptionIndex {
+    client_counts: HashMap<String, usize>,
+    new_heads: HashSet<String>,
+    new_txs: HashSet<String>,
+    invalidations: HashSet<String>,
+    events: HashMap<String, NormalizedEventsFilter>,
+    total_len: usize,
+}
+
+impl SubscriptionIndex {
+    fn insert_entry(&mut self, id: &str, topic: &SubscriptionTopic, client: Option<&str>) {
+        if let Some(c) = client {
+            if let Some(cnt) = self.client_counts.get_mut(c) {
+                *cnt += 1;
+            } else {
+                self.client_counts.insert(c.to_string(), 1);
+            }
+        }
+        match topic {
+            SubscriptionTopic::NewHeads => {
+                self.new_heads.insert(id.to_string());
+            }
+            SubscriptionTopic::NewTxs => {
+                self.new_txs.insert(id.to_string());
+            }
+            SubscriptionTopic::Invalidations => {
+                self.invalidations.insert(id.to_string());
+            }
+            SubscriptionTopic::Events { contract, topics } => {
+                self.events.insert(
+                    id.to_string(),
+                    NormalizedEventsFilter::from_topic(contract.as_deref(), topics),
+                );
+            }
+        }
+        self.total_len += 1;
+    }
+
+    fn remove_entry(&mut self, id: &str, sub: &Subscription) {
+        if let Some(c) = sub.client.as_deref() {
+            if let Some(cnt) = self.client_counts.get_mut(c) {
+                if *cnt <= 1 {
+                    self.client_counts.remove(c);
+                } else {
+                    *cnt -= 1;
+                }
+            }
+        }
+        match &sub.topic {
+            SubscriptionTopic::NewHeads => {
+                self.new_heads.remove(id);
+            }
+            SubscriptionTopic::NewTxs => {
+                self.new_txs.remove(id);
+            }
+            SubscriptionTopic::Invalidations => {
+                self.invalidations.remove(id);
+            }
+            SubscriptionTopic::Events { .. } => {
+                self.events.remove(id);
+            }
+        }
+        self.total_len = self.total_len.saturating_sub(1);
+    }
+
+    fn rebuild_from(&mut self, reg: &HashMap<String, Subscription>) {
+        self.client_counts.clear();
+        self.new_heads.clear();
+        self.new_txs.clear();
+        self.invalidations.clear();
+        self.events.clear();
+        self.total_len = 0;
+        for (id, s) in reg {
+            self.insert_entry(id, &s.topic, s.client.as_deref());
+        }
+    }
+
+    fn count_matching(&self, event: &SubscriptionTopic) -> usize {
+        match event {
+            SubscriptionTopic::NewHeads => self.new_heads.len(),
+            SubscriptionTopic::NewTxs => self.new_txs.len(),
+            SubscriptionTopic::Invalidations => self.invalidations.len(),
+            SubscriptionTopic::Events { contract, topics } => {
+                if self.events.is_empty() {
+                    return 0;
+                }
+                with_normalized_event_topics(topics, |ev_keys| {
+                    self.events
+                        .values()
+                        .filter(|f| f.matches(contract.as_deref(), ev_keys))
+                        .count()
+                })
+            }
+        }
+    }
+
+    fn collect_matching(&self, event: &SubscriptionTopic) -> Vec<String> {
+        match event {
+            SubscriptionTopic::NewHeads => self.new_heads.iter().cloned().collect(),
+            SubscriptionTopic::NewTxs => self.new_txs.iter().cloned().collect(),
+            SubscriptionTopic::Invalidations => self.invalidations.iter().cloned().collect(),
+            SubscriptionTopic::Events { contract, topics } => {
+                if self.events.is_empty() {
+                    return Vec::new();
+                }
+                with_normalized_event_topics(topics, |ev_keys| {
+                    self.events
+                        .iter()
+                        .filter(|(_, f)| f.matches(contract.as_deref(), ev_keys))
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                })
+            }
+        }
+    }
+}
+
 /// Per-process subscription registry + notification fan-out.
 ///
 /// The registry (`Arc<RwLock<HashMap<String, Subscription>>>`) is the source
@@ -117,6 +321,9 @@ pub struct Notification {
 pub struct SubscriptionHub {
     /// Live subscriptions of this process, keyed by subscription id.
     pub registry: Arc<std::sync::RwLock<HashMap<String, Subscription>>>,
+    /// Pre-normalized event filters, per-topic buckets, and per-client counts
+    /// (lock ordering: always acquire `registry` before `index`).
+    index: std::sync::RwLock<SubscriptionIndex>,
     /// Fan-out channel to the transports.
     tx: broadcast::Sender<Notification>,
     /// Rolling window of the block invalidation signals this node published
@@ -147,6 +354,7 @@ impl SubscriptionHub {
         let (tx, _rx) = broadcast::channel(STREAM_BROADCAST_CAPACITY);
         SubscriptionHub {
             registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            index: std::sync::RwLock::new(SubscriptionIndex::default()),
             tx,
             invalidations: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
@@ -204,20 +412,27 @@ impl SubscriptionHub {
     ) -> Result<String, String> {
         let now = unix_now_secs();
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
+        if idx.total_len != reg.len() {
+            idx.rebuild_from(&reg);
+        }
         // Sweep detached leftovers (a client that subscribed over plain HTTP
         // and never came back). Attached subscriptions live with their
         // transport.
-        reg.retain(|_, s| s.attached || now.saturating_sub(s.created_at) < SUBSCRIPTION_TTL_SECS);
+        reg.retain(|id, s| {
+            let keep = s.attached || now.saturating_sub(s.created_at) < SUBSCRIPTION_TTL_SECS;
+            if !keep {
+                idx.remove_entry(id, s);
+            }
+            keep
+        });
         if reg.len() >= MAX_SUBSCRIPTIONS {
             return Err(format!(
                 "subscription limit reached ({MAX_SUBSCRIPTIONS} live subscriptions)"
             ));
         }
         if let Some(client) = client {
-            let held = reg
-                .values()
-                .filter(|s| s.client.as_deref() == Some(client))
-                .count();
+            let held = idx.client_counts.get(client).copied().unwrap_or(0);
             if held >= MAX_SUBSCRIPTIONS_PER_CLIENT {
                 return Err(format!(
                     "per-client subscription limit reached ({MAX_SUBSCRIPTIONS_PER_CLIENT} live subscriptions for this client)"
@@ -230,6 +445,7 @@ impl SubscriptionHub {
                 break candidate;
             }
         };
+        idx.insert_entry(&id, &topic, client);
         reg.insert(
             id.clone(),
             Subscription {
@@ -250,7 +466,17 @@ impl SubscriptionHub {
     /// down another client's stream.
     pub fn unsubscribe(&self, id: &str) -> bool {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
-        reg.remove(id).is_some()
+        if let Some(s) = reg.remove(id) {
+            let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
+            if idx.total_len != reg.len() + 1 {
+                idx.rebuild_from(&reg);
+            } else {
+                idx.remove_entry(id, &s);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove a subscription only when `client` owns it.
@@ -262,7 +488,19 @@ impl SubscriptionHub {
     pub fn unsubscribe_for(&self, id: &str, client: Option<&str>) -> bool {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         match reg.get(id) {
-            Some(s) if s.client.as_deref() == client => reg.remove(id).is_some(),
+            Some(s) if s.client.as_deref() == client => {
+                if let Some(removed) = reg.remove(id) {
+                    let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
+                    if idx.total_len != reg.len() + 1 {
+                        idx.rebuild_from(&reg);
+                    } else {
+                        idx.remove_entry(id, &removed);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -351,18 +589,44 @@ impl SubscriptionHub {
     pub fn publish(&self, event: &SubscriptionTopic, result: Value) -> usize {
         let targets: Vec<String> = {
             let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
-            reg.values()
-                .filter(|s| topic_matches(&s.topic, event))
-                .map(|s| s.id.clone())
-                .collect()
+            if reg.is_empty() {
+                return 0;
+            }
+            let has_receivers = self.tx.receiver_count() > 0;
+            let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
+            if idx.total_len != reg.len() {
+                drop(idx);
+                let mut idx_w = self.index.write().unwrap_or_else(|e| e.into_inner());
+                if idx_w.total_len != reg.len() {
+                    idx_w.rebuild_from(&reg);
+                }
+                if !has_receivers {
+                    return idx_w.count_matching(event);
+                }
+                idx_w.collect_matching(event)
+            } else {
+                if !has_receivers {
+                    return idx.count_matching(event);
+                }
+                idx.collect_matching(event)
+            }
         };
         let addressed = targets.len();
-        for id in targets {
+        if addressed == 0 {
+            return 0;
+        }
+        let mut result = Some(result);
+        for (i, id) in targets.into_iter().enumerate() {
+            let val = if i + 1 == addressed {
+                result.take().unwrap()
+            } else {
+                result.as_ref().unwrap().clone()
+            };
             // `send` fails only when nobody listens; the registry entry
             // survives, so a client may attach a transport later.
             let _ = self.tx.send(Notification {
                 subscription: id,
-                result: result.clone(),
+                result: val,
             });
         }
         addressed
@@ -443,18 +707,43 @@ pub(super) fn random_subscription_id() -> String {
     hex::encode(b)
 }
 
-/// Normalize a topic id so `1`, `"1"` and `"0x1"` compare equal.
-pub(super) fn topic_key(s: &str) -> String {
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum TopicKeyRef<'a> {
+    Int(i64),
+    Text(&'a str),
+}
+
+#[cfg(test)]
+impl PartialEq for TopicKeyRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Text(a), Self::Text(b)) => {
+                if a.is_ascii() && b.is_ascii() {
+                    a.eq_ignore_ascii_case(b)
+                } else {
+                    a.to_lowercase() == b.to_lowercase()
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn topic_key_ref(s: &str) -> TopicKeyRef<'_> {
     let t = s.trim();
     if let Ok(n) = t.parse::<i64>() {
-        return n.to_string();
+        return TopicKeyRef::Int(n);
     }
     if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         if let Ok(n) = i64::from_str_radix(h, 16) {
-            return n.to_string();
+            return TopicKeyRef::Int(n);
         }
     }
-    t.to_lowercase()
+    TopicKeyRef::Text(t)
 }
 
 /// Does a subscriber's filter match an event?
@@ -463,6 +752,7 @@ pub(super) fn topic_key(s: &str) -> String {
 /// * An `events` filter matches when the contract matches (a filter without a
 ///   contract matches every contract) AND the topic sets intersect (an empty
 ///   filter matches every topic; `*` / `#` are wildcards).
+#[cfg(test)]
 pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopic) -> bool {
     match (filter, event) {
         (SubscriptionTopic::NewHeads, SubscriptionTopic::NewHeads) => true,
@@ -489,7 +779,11 @@ pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopi
             }
             want_topics.iter().any(|w| {
                 let w = w.trim();
-                w == "*" || w == "#" || ev_topics.iter().any(|h| topic_key(h) == topic_key(w))
+                if w == "*" || w == "#" {
+                    return true;
+                }
+                let wk = topic_key_ref(w);
+                ev_topics.iter().any(|h| topic_key_ref(h) == wk)
             })
         }
         _ => false,
@@ -509,7 +803,11 @@ pub fn publish_new_head(
     tx_count: usize,
     timestamp: u64,
 ) -> usize {
-    hub().publish(
+    let h = hub();
+    if h.is_empty() {
+        return 0;
+    }
+    h.publish(
         &SubscriptionTopic::NewHeads,
         json!({
             "height": height,
@@ -534,7 +832,11 @@ pub fn publish_new_tx(
     amount: u64,
     status: &str,
 ) -> usize {
-    hub().publish(
+    let h = hub();
+    if h.is_empty() {
+        return 0;
+    }
+    h.publish(
         &SubscriptionTopic::NewTxs,
         json!({
             "hash": hex::encode(hash),
@@ -556,10 +858,14 @@ pub fn publish_contract_event(
     block_height: u64,
     tx_hash: [u8; 32],
 ) -> usize {
+    let h = hub();
+    if h.is_empty() {
+        return 0;
+    }
     let contract = hex::encode(event.contract);
     let topics = vec![event.topic.to_string()];
     let data = hex::encode((event.value as u64).to_be_bytes());
-    hub().publish(
+    h.publish(
         &SubscriptionTopic::Events {
             contract: Some(contract.clone()),
             topics: topics.clone(),
@@ -1406,14 +1712,17 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
 pub(super) async fn ws_handler(
     headers: axum::http::HeaderMap,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    cached_client: Option<axum::Extension<crate::client_ip::ClientIp>>,
     ws: axum::extract::ws::WebSocketUpgrade,
     axum::extract::State(st): axum::extract::State<Arc<RpcState>>,
 ) -> axum::response::Response {
     let header_token = extract_header_token(&headers).map(|s| s.to_string());
     // Keep the FULL ClientIp (address + provenance): the sign gate must see
     // that a forwarded loopback claim is not a local client.
-    let client = peer.map(|axum::extract::ConnectInfo(addr)| {
-        crate::client_ip::resolve_client_ip(&headers, addr.ip())
+    let client = cached_client.map(|axum::Extension(c)| c).or_else(|| {
+        peer.map(|axum::extract::ConnectInfo(addr)| {
+            crate::client_ip::resolve_client_ip(&headers, addr.ip())
+        })
     });
     ws.on_upgrade(move |socket| handle_ws(socket, st, header_token, client))
 }
@@ -1706,6 +2015,7 @@ pub(super) async fn ws_handle_text(
 pub(super) async fn rpc_handler(
     axum::extract::State(st): axum::extract::State<Arc<RpcState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    cached_client: Option<axum::Extension<crate::client_ip::ClientIp>>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
@@ -1722,11 +2032,13 @@ pub(super) async fn rpc_handler(
         Ok(v) => v,
         Err(e) => return err(Value::Null, -32700, format!("parse error: {e}")).into_response(),
     };
-    // Real client IP for per-IP faucet throttling: proxy headers only when
-    // the TCP peer is a trusted proxy (STELL_TRUSTED_PROXY_CIDRS,
-    // loopback-only by default — see crate::client_ip); otherwise the peer.
-    // Without this every client behind nginx/Cloudflare shared one bucket.
-    let client = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()));
+    // Real client IP for per-IP faucet throttling: reuse the middleware's
+    // pre-resolved ClientIp when present; otherwise resolve from headers/peer
+    // (direct router mount without middleware).
+    let client = Some(match cached_client {
+        Some(axum::Extension(c)) => c,
+        None => crate::client_ip::resolve_client_ip(&headers, addr.ip()),
+    });
     if let Some(arr) = first.as_array() {
         let raw_len = body.len();
         match handle_rpc_batch_call_client(&st, arr, raw_len, header_token, client).await {
@@ -1824,15 +2136,16 @@ pub(super) fn standalone_limit_per_sec() -> u32 {
 
 pub(super) async fn standalone_rate_limit(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let limiter = STANDALONE_LIMITER
         .get_or_init(|| crate::explorer::RateLimiter::new(standalone_limit_per_sec()));
     // Real client IP behind a trusted proxy (see crate::client_ip); without
     // this every client behind nginx/Cloudflare shared the 300/s bucket.
-    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip()).addr;
-    if limiter.check(client) {
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    if limiter.check(client.addr) {
+        req.extensions_mut().insert(client);
         next.run(req).await
     } else {
         (

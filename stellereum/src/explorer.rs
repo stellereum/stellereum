@@ -38,17 +38,38 @@ pub fn default_rate_limit_per_sec() -> u32 {
         .unwrap_or(DEFAULT_RATE_LIMIT_PER_SEC)
 }
 
-/// Per-IP fixed-window rate limiter (no external dependency).
+const RATE_LIMITER_SHARDS: usize = 16;
+const RATE_LIMITER_MAX_ENTRIES_PER_SHARD: usize = 100_000 / RATE_LIMITER_SHARDS;
+
+#[inline]
+fn rate_limiter_shard_index(ip: IpAddr) -> usize {
+    let mut x: u64 = match ip {
+        IpAddr::V4(v4) => u32::from(v4) as u64,
+        IpAddr::V6(v6) => {
+            let n = u128::from(v6);
+            (n as u64) ^ ((n >> 64) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        }
+    };
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x as usize) & (RATE_LIMITER_SHARDS - 1)
+}
+
+/// Per-IP fixed-window rate limiter (no external dependency), sharded across
+/// 16 buckets by canonical IP to minimize lock contention.
 pub struct RateLimiter {
     per_sec: u32,
-    inner: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    shards: [Mutex<HashMap<IpAddr, (u64, u32)>>; RATE_LIMITER_SHARDS],
 }
 
 impl RateLimiter {
     pub fn new(per_sec: u32) -> Self {
         Self {
             per_sec: per_sec.max(1),
-            inner: Mutex::new(HashMap::new()),
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }
     }
 
@@ -64,10 +85,12 @@ impl RateLimiter {
     /// Deterministic core (audit follow-up: the old test flaked on second
     /// boundaries under load — time is injected here so tests pin behavior).
     pub fn check_at(&self, ip: IpAddr, now: u64) -> bool {
-        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let ip = crate::client_ip::canonical_ip(ip);
+        let idx = rate_limiter_shard_index(ip);
+        let mut m = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
         // Bound memory: with many distinct source IPs the map could grow without
-        // limit. Periodically drop stale windows (O(n) but rare).
-        if m.len() > 100_000 {
+        // limit. Periodically drop stale windows (O(n) per shard, rare).
+        if m.len() > RATE_LIMITER_MAX_ENTRIES_PER_SHARD {
             m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
         }
         let entry = m.entry(ip).or_insert((now, 0));
@@ -80,8 +103,10 @@ impl RateLimiter {
 
     /// Drop stale windows (call periodically to bound memory).
     pub fn prune(&self, now: u64) {
-        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
+        for shard in &self.shards {
+            let mut m = shard.lock().unwrap_or_else(|e| e.into_inner());
+            m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
+        }
     }
 }
 
@@ -977,13 +1002,14 @@ async fn rate_limit(
 async fn nested_rpc_rate_limit(
     State(st): State<Arc<GatewayState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip()).addr;
-    if !st.rpc_limiter.check(client) {
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    if !st.rpc_limiter.check(client.addr) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
+    req.extensions_mut().insert(client);
     next.run(req).await
 }
 

@@ -550,11 +550,24 @@ expectation for N=3 beyond local-cluster's honest "kill stalls finality".
 1. **Read-only check first and last.** `scripts/cluster_liveness.sh` is the
    entry and exit gate for every restart:
    ```bash
+   # Replace with one RPC endpoint per expected node, and set N accordingly.
    STELL_RPCS="A=http://127.0.0.1:8545,B=http://127.0.0.1:8546"
-   scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+   N=2
+   scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90
    ```
    Capture heights, spread, verdict and the `LIVENESS_RESULT=` line. The
-   later blocks use `$STELL_RPCS`; `export` it if they run in a new shell.
+   later blocks use `$STELL_RPCS` and `$N`; set them again in a new shell.
+   `--min-reachable N` requires N valid RPC heights in the final poll; N must
+   be positive and no greater than the configured endpoint count. Below N is
+   `STALLED` (exit 1), unless a detected divergence takes precedence. Without
+   it the effective minimum is 1, so `OK` can hide down endpoints. The watcher
+   forwards the same option and exports `stell_cluster_liveness_ok=0` on a
+   failed probe; see `ops/alerts.md`. RPC reachability does not establish P2P
+   connectivity, validator membership, voting power, or quorum; verify those
+   independently. The probe checks the reachable tip, not every node's progress.
+   Hash mismatch is detected only among returned hashes at a positive common
+   height with at least two reachable endpoints; missing hashes do not fail
+   `OK` and must be checked separately.
 2. **Quorum math first.** N=4 survives one validator down; N=3 needs **3/3**
    and any single restart stalls finality. For N=3 the restart needs an
    explicit window and comms, not just an operator at a keyboard.
@@ -593,7 +606,7 @@ Example for node B (local `--user` unit); for A/C/D use
 
 ```bash
 # 1. Pre-check (read-only) and save the output to the incident log.
-scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90
 
 # 2. Stop one node by its unit; wait for the unit to become inactive.
 systemctl --user stop stell-nodeB.service
@@ -604,11 +617,13 @@ systemctl --user start stell-nodeB.service
 journalctl --user -u stell-nodeB.service -f           # watch for FINALIZED/catch-up
 
 # 4. Post-check after it is reachable again (give catch-up time).
-scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90
 ```
 
 Acceptance: verdict `OK`, `spread <= 1`, block hashes agree at the common
-height, and every reachable height advances for at least two minutes. A
+height from every expected node, and every expected height advances for at
+least two minutes. Verify the hashes and per-node progress independently:
+`OK` alone and a 90-second window do not establish these conditions. A
 briefly larger spread while the restarted node catches up is expected; a
 spread that is *growing*, a regressed height, or `DIVERGED` is not.
 
@@ -637,14 +652,14 @@ first, then one node at a time, checking quorum between steps:
 
 ```bash
 # Freeze load generators / writers first; record the pre-restart liveness line.
-scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90 | tee pre-restart.log
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90 | tee pre-restart.log
 
 # Topology is read-only; use its host/scope values instead of hard-coding.
 . scripts/cluster-nodes.conf
 
 # Node A (reference, system unit on its host)
 ssh $NODE_A_SSH_OPTS "$NODE_A_SSH" 'systemctl restart stell-nodeA.service'
-scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90
 
 # Node B, then C, then D: one at a time, same stop/start pair.
 systemctl --user restart stell-nodeB.service
@@ -652,10 +667,12 @@ ssh $NODE_C_SSH_OPTS "$NODE_C_SSH" 'systemctl restart stell-nodeC.service'
 ssh $NODE_D_SSH_OPTS "$NODE_D_SSH" 'systemctl restart stell-nodeD.service'
 
 # Final gate: OK, spread <= 1, hashes agree, heights advance for 2 minutes.
-scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --window 90 | tee post-restart.log
+scripts/cluster_liveness.sh --rpcs "$STELL_RPCS" --min-reachable "$N" --window 90 | tee post-restart.log
 ```
 
-With N=4, stop/start each node while the other three keep quorum; do not run
+Independently verify all hashes and per-node advancement over two minutes;
+the 90-second `OK` probe alone is insufficient. With N=4 validators, stop/start
+each node only after independently checking the other three retain quorum; do not run
 the three remote restarts in parallel unless the order explicitly allows a
 full-cluster outage.
 

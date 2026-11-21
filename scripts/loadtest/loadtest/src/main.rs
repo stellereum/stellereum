@@ -1220,11 +1220,7 @@ fn drain(
     }
 }
 
-/// Receipt sampling is deliberately patient: drain only means the on-chain
-/// nonce caught up, while the receipt index is filed by the application on
-/// finalize/adopt and can lag by a block. One immediate query used to report
-/// `unknown` for receipts that appeared a moment later; sample with a short
-/// bounded backoff instead (total wait is further capped by the deadline).
+// Retry non-terminal observations and errors, but bound the entire sample.
 const RECEIPT_SAMPLE_ATTEMPTS: u32 = 6;
 const RECEIPT_SAMPLE_BASE_MS: u64 = 100;
 
@@ -1241,11 +1237,28 @@ fn sample_receipts(
     read_gate: &RateGate,
     stats: &Stats,
 ) -> ReceiptSample {
+    sample_receipts_until(
+        cfg,
+        clients,
+        outcomes,
+        read_gate,
+        stats,
+        Instant::now() + Duration::from_secs(10),
+    )
+}
+
+fn sample_receipts_until(
+    cfg: &Config,
+    clients: &[RpcClient],
+    outcomes: &[SenderOutcome],
+    read_gate: &RateGate,
+    stats: &Stats,
+    deadline: Instant,
+) -> ReceiptSample {
     let mut sample = ReceiptSample::default();
     if cfg.receipt_sample == 0 {
         return sample;
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
     let stop = AtomicBool::new(false);
     let mut n = 0usize;
     for o in outcomes {
@@ -1266,12 +1279,23 @@ fn sample_receipts(
             if !read_gate.acquire(Some(deadline), &stop) {
                 break;
             }
-            match client.call("stell_getTransactionStatus", json!({ "hash": hash })) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match client.call_with_timeout(
+                "stell_getTransactionStatus",
+                json!({ "hash": hash }),
+                remaining,
+            ) {
                 Ok(v) => {
-                    let s = v.as_str().unwrap_or("unknown").to_string();
-                    if s != "unknown" {
-                        status = s;
+                    let s = v.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                    if s == "success" || s == "failed" {
+                        status = s.to_string();
                         break;
+                    }
+                    if s == "pending" {
+                        status = s.to_string();
                     }
                 }
                 Err(e) => {
@@ -1282,7 +1306,10 @@ fn sample_receipts(
                 }
             }
             if attempt + 1 < RECEIPT_SAMPLE_ATTEMPTS {
-                std::thread::sleep(Duration::from_millis(receipt_retry_delay_ms(attempt)));
+                std::thread::sleep(
+                    Duration::from_millis(receipt_retry_delay_ms(attempt))
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
         match status.as_str() {
@@ -1290,14 +1317,20 @@ fn sample_receipts(
             "failed" => sample.failed += 1,
             _ => sample.unknown += 1,
         }
-        let height = if sample.details.len() < 3 && status != "unknown" {
+        let height = if sample.details.len() < 3 && (status == "success" || status == "failed") {
             let mut height = None;
             for attempt in 0..3u32 {
-                if let Ok(v) = client.call_retry(
+                if Instant::now() >= deadline || !read_gate.acquire(Some(deadline), &stop) {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if let Ok(v) = client.call_with_timeout(
                     "stell_getTransactionReceipt",
                     json!({ "hash": hash }),
-                    1,
-                    100,
+                    remaining,
                 ) {
                     height = v.get("height").and_then(parse_u64_any);
                     if height.is_some() {
@@ -1305,7 +1338,10 @@ fn sample_receipts(
                     }
                 }
                 if attempt < 2 {
-                    std::thread::sleep(Duration::from_millis(receipt_retry_delay_ms(attempt)));
+                    std::thread::sleep(
+                        Duration::from_millis(receipt_retry_delay_ms(attempt))
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
             }
             height
@@ -1548,6 +1584,186 @@ fn merge_latest(client: &RpcClient, at_ns: u64, stats: &Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A loopback-only scripted JSON-RPC peer; no node or external network.
+    fn fake_sample(
+        replies: Vec<(Duration, Value)>,
+        budget: Duration,
+    ) -> (ReceiptSample, u64, Vec<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let server_done = Arc::clone(&done);
+        let server_methods = Arc::clone(&methods);
+        let server = std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            while !server_done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("fake RPC accept: {e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((_, value)) = line
+                        .split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                server_methods
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap().to_owned());
+                let (delay, response) = replies
+                    .next()
+                    .unwrap_or((Duration::ZERO, json!({"result":{"status":"unknown"}})));
+                std::thread::sleep(delay);
+                let body = response.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        let cfg = Config {
+            receipt_sample: 1,
+            ..Config::default()
+        };
+        let outcome = SenderOutcome {
+            index: 0,
+            address: String::new(),
+            init_nonce: 0,
+            next_nonce: 1,
+            onchain_nonce_after: 1,
+            accepted: 1,
+            failed: 0,
+            retries: 0,
+            last_hash: Some("abc".to_string()),
+            stop_reason: None,
+        };
+        let stats = Stats::new(0, 0, 0);
+        let sample = sample_receipts_until(
+            &cfg,
+            &[RpcClient::new(&format!("http://{address}"), 2_000)],
+            &[outcome],
+            &RateGate::new(10_000.0, 10.0),
+            &stats,
+            Instant::now() + budget,
+        );
+        done.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let calls = methods.lock().unwrap().clone();
+        (sample, stats.read_errors.load(Ordering::Relaxed), calls)
+    }
+
+    fn reply(result: Value) -> (Duration, Value) {
+        (
+            Duration::ZERO,
+            json!({"jsonrpc":"2.0","id":1,"result":result}),
+        )
+    }
+
+    #[test]
+    fn receipt_sample_retries_unknown_then_reads_object_status_and_height() {
+        let (sample, errors, calls) = fake_sample(
+            vec![
+                reply(json!({"status":"unknown"})),
+                reply(json!({"status":"success","height":42})),
+                reply(json!({"status":"success","height":42})),
+            ],
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            (
+                sample.queried,
+                sample.success,
+                sample.failed,
+                sample.unknown
+            ),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(sample.details[0].2, Some(42));
+        assert_eq!(errors, 0);
+        assert_eq!(
+            calls,
+            [
+                "stell_getTransactionStatus",
+                "stell_getTransactionStatus",
+                "stell_getTransactionReceipt"
+            ]
+        );
+    }
+
+    #[test]
+    fn receipt_sample_unknown_and_invalid_shapes_never_become_success() {
+        for response in [
+            json!({"status":"unknown"}),
+            json!({"status":"pending"}),
+            json!("success"),
+            json!({"status":true}),
+        ] {
+            let (sample, _, calls) = fake_sample(vec![reply(response)], Duration::from_millis(140));
+            assert_eq!((sample.success, sample.failed, sample.unknown), (0, 0, 1));
+            assert!(calls
+                .iter()
+                .all(|method| method == "stell_getTransactionStatus"));
+        }
+    }
+
+    #[test]
+    fn receipt_sample_errors_and_timeout_remain_unknown() {
+        let error = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}});
+        let (sample, errors, _) =
+            fake_sample(vec![(Duration::ZERO, error)], Duration::from_millis(140));
+        assert_eq!((sample.success, sample.failed, sample.unknown), (0, 0, 1));
+        assert!(errors >= 1);
+        let (sample, errors, _) = fake_sample(
+            vec![(
+                Duration::from_millis(200),
+                json!({"result":{"status":"success"}}),
+            )],
+            Duration::from_millis(40),
+        );
+        assert_eq!((sample.success, sample.failed, sample.unknown), (0, 0, 1));
+        assert!(errors >= 1);
+    }
+
+    #[test]
+    fn receipt_sample_failure_is_not_success() {
+        let (sample, _, _) = fake_sample(
+            vec![
+                reply(json!({"status":"failed","height":7})),
+                reply(json!({"status":"failed","height":7})),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!((sample.success, sample.failed, sample.unknown), (0, 1, 0));
+    }
 
     #[test]
     fn gas_limit_respects_a_fixed_operator_override() {

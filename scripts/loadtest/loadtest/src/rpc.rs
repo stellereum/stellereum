@@ -152,6 +152,7 @@ fn truncate(s: &str, max: usize) -> String {
 pub struct RpcClient {
     url: String,
     agent: ureq::Agent,
+    timeout: Duration,
 }
 
 impl RpcClient {
@@ -162,12 +163,22 @@ impl RpcClient {
         Self {
             url: url.to_string(),
             agent,
+            timeout: Duration::from_millis(timeout_ms),
         }
     }
 
     /// One JSON-RPC call. `params` is the exact JSON value the node's handler
     /// expects (`[]` for parameterless methods, an object otherwise).
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call_with_timeout(method, params, self.timeout)
+    }
+
+    pub fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1u64,
@@ -179,6 +190,7 @@ impl RpcClient {
         let response = self
             .agent
             .post(&self.url)
+            .timeout(timeout.min(self.timeout))
             .set("content-type", "application/json")
             .send_string(&body);
 

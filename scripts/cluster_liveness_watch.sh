@@ -124,6 +124,8 @@ OPTIONS
                          For remote nodes supply --clock per node; the default
                          measures the host running the watcher, not the node.
   --clock-timeout SEC    per-node clock command timeout (default $CLOCK_TIMEOUT)
+  --min-reachable N      forward minimum final-poll RPC heights to the probe
+                         (default 1; not a validator or P2P quorum)
   --once                 run one probe, write the files, exit with the verdict
   --quiet                do not echo each LIVENESS_RESULT= line
   --help                 this text
@@ -131,6 +133,9 @@ OPTIONS
   Everything else (--rpcs, --health-rpcs, --window, --timeout,
   --expected-block-time, --stall-factor, --interval, --journal-last, ...) is
   forwarded verbatim to scripts/cluster_liveness.sh.
+
+  OK permits partial reachability by default and does not prove hash agreement:
+  missing hash responses do not fail the probe. Check the log's reachable=N/M.
 
   Note: --interval is the INNER polling interval of cluster_liveness.sh;
   use --watch-interval for the wrapper's cadence. A probe blocks for
@@ -220,6 +225,7 @@ while [[ $# -gt 0 ]]; do
         --tick-lines)     need_value "$@"; TICK_LINES="$2"; shift 2 ;;
         --tick-timeout)   need_value "$@"; TICK_TIMEOUT="$2"; shift 2 ;;
         --clock-timeout)  need_value "$@"; CLOCK_TIMEOUT="$2"; shift 2 ;;
+        --min-reachable)  need_value "$@"; LIVENESS_ARGS+=("$1" "$2"); shift 2 ;;
         --once)           ONCE=1; shift ;;
         --quiet)          QUIET=1; shift ;;
         --help|-h)        usage; exit 0 ;;

@@ -129,6 +129,7 @@ These series do **not** come from the node's `/metrics`. They are produced by
 ```bash
 scripts/cluster_liveness_watch.sh \
   --rpcs "A=http://127.0.0.1:8545,B=http://127.0.0.1:8546" \
+  --min-reachable 2 \
   --journal "A=ssh root@hostA journalctl -u stell-nodeA" \
   --journal "B=journalctl --user -u stell-nodeB" \
   --clock "A=ssh root@hostA 'timedatectl show -p NTPSynchronized --value; date +%s%3N'" \
@@ -142,18 +143,30 @@ Metrics: `stell_cluster_liveness_ok`, `stell_cluster_height`,
 tick/clock series described under TickP99High and ClockSkew.
 
 **Caveats:**
+- `--min-reachable N` is forwarded to the probe: it requires N configured RPC
+  endpoints to return valid heights in the **final poll** (N must be a positive
+  integer no greater than the endpoint count). Below N gives `STALLED` / exit 1,
+  unless observed divergence takes precedence. The default is effectively 1,
+  so `OK` can include down endpoints; inspect `reachable=N/M` in the log.
+  Choose N for the monitoring policy (2 requires both endpoints above).
+  RPC reachability is neither P2P connectivity nor validator voting power or
+  quorum; verify those independently.
+- `OK` means the reachable tip was not classified as stalled, not that every
+  endpoint advanced or was reachable. A short window cannot prove progress.
 - A stopped watcher leaves the last value in the textfile; it can look healthy
   forever. Alert on node_exporter `up` separately (see `ops/status_page.md`).
 - `spread` is max−min height, so it catches a lagging node; it does not catch a
   same-height fork on its own. `cluster_liveness.sh` also compares block hashes
-  at the highest common height and reports `DIVERGED`.
+  at the lowest final-poll height when it is > 0 and at least two endpoints
+  are reachable; differing returned hashes give `DIVERGED`. Failed or missing
+  hash lookups do not fail `OK`, so `OK` does not prove hash agreement.
 - A 2m `for:` on `liveness_ok` means transient single-poll stalls are filtered;
   the script's own window is 60 s by default.
 
 **Triage:**
 1. Run the same command without the wrapper:
-   `scripts/cluster_liveness.sh --rpcs "..." --journal "<per-node journal cmd>"`.
-   Keep `--window 90`.
+   `scripts/cluster_liveness.sh --rpcs "..." --min-reachable N --journal "<per-node journal cmd>"`.
+   Use the same N as the watcher and `--window 90`.
 2. Height split (spread > 1): note which node is behind and by how much.
    Check whether it is advancing (compare `height` deltas, not one sample).
    Do not wipe. Restart only the lagging node when it is not catching up;

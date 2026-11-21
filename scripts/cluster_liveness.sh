@@ -3,8 +3,8 @@
 # cluster_liveness.sh — read-only cluster liveness / divergence detector.
 #
 # Answers the only three questions that matter during an incident:
-#   1. Is every validator's height advancing?
-#   2. Do the validators agree on the height (within one block)?
+#   1. Is the reachable cluster tip advancing?
+#   2. Do reachable endpoints agree on the height (within one block)?
 #   3. If not, WHY: health verdict, round, finalized height, peers, and the
 #      last rejected-proposal reasons from the node journals.
 #
@@ -16,7 +16,7 @@
 # Exit codes:
 #   0  OK
 #   1  STALLED  (no height change for > stall-factor * expected block time,
-#                 or every endpoint unreachable)
+#                 every endpoint unreachable, or configured minimum not met)
 #   2  DIVERGED (heights differ by more than one block, a height regressed, or
 #                 two nodes serve different block hashes at a common height)
 #  64  usage / configuration error
@@ -47,6 +47,7 @@ STALL_FACTOR=3
 RPC_TIMEOUT=5
 JOURNAL_SCAN=2000
 JOURNAL_LAST=10
+MIN_REACHABLE=""
 
 RPCS_SPEC="${STELL_RPCS:-}"
 HEALTH_SPEC="${STELL_HEALTH_RPCS:-}"
@@ -75,6 +76,8 @@ OPTIONS
   --stall-factor N       stall threshold = N * expected block time
                          (default $STALL_FACTOR)
   --timeout SEC          per-RPC HTTP timeout (default $RPC_TIMEOUT)
+  --min-reachable N      require at least N endpoints with valid heights in the
+                         final poll (default: 1; partial reachability allowed)
   --journal CMD          journal command for rejected-proposal reasons
                          ("ssh host journalctl -u stell-nodeA"; repeatable,
                          or may be written as NAME=CMD for one node)
@@ -83,14 +86,17 @@ OPTIONS
   --help                 this text
 
 VERDICTS
-  OK        every reachable node advanced, spread <= 1, hashes agree
+  OK        reachable tip not stalled, spread <= 1, no hash mismatch detected,
+            and the configured minimum of reachable endpoints is met
   STALLED   cluster tip unchanged for > stall-factor * expected block time,
-            or every endpoint is unreachable
+            every endpoint is unreachable, or minimum reachability is not met
   DIVERGED  heights differ by more than 1, a height regressed, or the
             reachable nodes disagree on the block hash at a common height
 
 NOTES
   * This tool is strictly read-only: no writes, no restarts, no lock clears.
+  * Reachability means a valid RPC height in the final poll; it is not a
+    validator count or P2P peer count. Hash lookup failures do not fail OK.
   * /health lives on the gateway HTTP port, not necessarily the JSON-RPC port.
     Supply --health-rpcs (or ;health=... in --rpcs) when they differ.
   * Rejected-proposal log line used: "[consensus] rejected proposal from ...".
@@ -131,6 +137,7 @@ while [[ $# -gt 0 ]]; do
         --expected-block-time) need_value "$@"; EXPECTED_BLOCK_TIME="$2"; shift 2 ;;
         --stall-factor)     need_value "$@"; STALL_FACTOR="$2"; shift 2 ;;
         --timeout)          need_value "$@"; RPC_TIMEOUT="$2"; shift 2 ;;
+        --min-reachable)    need_value "$@"; MIN_REACHABLE="$2"; shift 2 ;;
         --journal-last)     need_value "$@"; JOURNAL_LAST="$2"; shift 2 ;;
         --journal-scan)     need_value "$@"; JOURNAL_SCAN="$2"; shift 2 ;;
         --journal)
@@ -154,6 +161,9 @@ done
 [[ "$RPC_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
 [[ "$JOURNAL_LAST" =~ ^[1-9][0-9]*$ ]] || die "--journal-last must be a positive integer"
 [[ "$JOURNAL_SCAN" =~ ^[1-9][0-9]*$ ]] || die "--journal-scan must be a positive integer"
+if [[ -n "$MIN_REACHABLE" ]]; then
+    [[ "$MIN_REACHABLE" =~ ^[1-9][0-9]*$ ]] || die "--min-reachable must be a positive integer"
+fi
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v jq   >/dev/null 2>&1 || die "jq is required (JSON-RPC / health parsing)"
@@ -221,6 +231,15 @@ parse_endpoints() {
 
 parse_endpoints "$RPCS_SPEC" "$HEALTH_SPEC"
 
+if [[ -n "$MIN_REACHABLE" ]]; then
+    endpoint_count="${#NAMES[@]}"
+    # Compare lengths first so an oversized input cannot overflow shell arithmetic.
+    if (( ${#MIN_REACHABLE} > ${#endpoint_count} )) ||
+       { (( ${#MIN_REACHABLE} == ${#endpoint_count} )) && [[ "$MIN_REACHABLE" > "$endpoint_count" ]]; }; then
+        die "--min-reachable exceeds configured endpoint count ($endpoint_count)"
+    fi
+fi
+
 for jname in "${!JOURNAL_CMD[@]}"; do
     [[ -n "${RPC_URL[$jname]:-}" ]] || die "--journal names an unknown node: $jname"
 done
@@ -254,10 +273,17 @@ rpc_result() { # url method params-json -> compact result JSON or empty
 }
 
 height_of() { # url -> decimal height, non-zero exit if unreachable/bad
-    local url="$1" hex
+    local url="$1" hex digits
     hex="$(rpc_result "$url" stell_blockNumber '[]')" || return 1
     [[ "$hex" =~ ^0x[0-9a-fA-F]+$ ]] || return 1
-    printf '%d' "$((16#${hex#0x}))"
+    digits="${hex#0x}"
+    # Reject values that cannot be represented as a non-negative shell integer.
+    while [[ ${#digits} -gt 1 && "$digits" == 0* ]]; do digits="${digits#0}"; done
+    (( ${#digits} <= 16 )) || return 1
+    if (( ${#digits} == 16 )); then
+        [[ "${digits:0:1}" =~ ^[0-7]$ ]] || return 1
+    fi
+    printf '%d' "$((16#$digits))"
 }
 
 hash_at() { # url height -> block hash or empty
@@ -397,6 +423,9 @@ elif (( BACKWARD )); then
 elif (( HASH_MISMATCH )); then
     VERDICT="DIVERGED"
     REASON="block hash mismatch at common height ${COMMON_HEIGHT}"
+elif [[ -n "$MIN_REACHABLE" ]] && (( REACHABLE < MIN_REACHABLE )); then
+    VERDICT="STALLED"
+    REASON="reachable endpoints ${REACHABLE} below minimum ${MIN_REACHABLE}"
 elif (( STALLED_FOR > STALL_SECS )); then
     VERDICT="STALLED"
     REASON="cluster tip unchanged for ${STALLED_FOR}s > ${STALL_SECS}s"

@@ -171,6 +171,91 @@ pub const CNVRF_V3_COMMITMENT_TAG: &[u8; 8] = b"CNVRFV31";
 /// so it can never be confused with any other preimage field.
 pub const ROUND_COMMITMENT_TAG: &[u8; 8] = b"ROUND001";
 
+/// Domain separator for [`Block::body_commitment`] (two-level header commitment, v4).
+pub const BODY_COMMITMENT_V4_DOMAIN: &[u8] = b"STELLEREUM_BODY_V4\0";
+
+/// Domain separator for [`BlockHeader::compute_hash`] (two-level header commitment, v4).
+pub const HEADER_COMMIT_V4_DOMAIN: &[u8] = b"STELLEREUM_HDR_V4\0";
+
+/// Compiled activation height for the two-level `BlockHeader` + `body_commitment`
+/// scheme (`b"STELLEREUM_HDR_V4\0"` / `b"STELLEREUM_BODY_V4\0"`).
+///
+/// Frozen at `u64::MAX` (`GatedOff`) in release builds until Ruleset v7
+/// activation; no environment variable can override this in release builds.
+/// At heights `< effective_header_commit_activation_height()`,
+/// [`Block::compute_hash`] remains byte-identical to `"STELLEREUM_BLOCK_V3"`.
+pub const HEADER_COMMIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static HEADER_COMMIT_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `HEADER_COMMIT_ACTIVATION_HEIGHT`
+/// override for the calling thread. Absent from release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_header_commit_activation_override(height: Option<u64>) {
+    HEADER_COMMIT_ACTIVATION_OVERRIDE.with(|c| c.set(height));
+}
+
+/// Effective two-level header commitment activation height for the calling thread.
+pub fn effective_header_commit_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = HEADER_COMMIT_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    HEADER_COMMIT_ACTIVATION_HEIGHT
+}
+
+/// True iff the two-level `BlockHeader` commitment scheme is active at `height`.
+///
+/// Strictly returns `false` for every height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`).
+pub fn header_commit_active_at(height: u64) -> bool {
+    let gate = effective_header_commit_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Two-level consensus block header committed by [`BlockHeader::compute_hash`]
+/// once [`header_commit_active_at`] is true (`height >= HEADER_COMMIT_ACTIVATION_HEIGHT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockHeader {
+    pub shard_id: ShardId,
+    pub height: u64,
+    pub round: u32,
+    pub prev_hash: [u8; 32],
+    pub state_root: CellHash,
+    pub body_commitment: [u8; 32],
+    pub mmr_epoch_root: [u8; 32],
+    pub epoch_key_commitment: [u8; 32],
+    pub timestamp: u64,
+    pub proposer: [u8; 32],
+}
+
+impl BlockHeader {
+    /// Compute the v4 header-level block hash (`b"STELLEREUM_HDR_V4\0"`).
+    ///
+    /// Covers `consensus_chain_id()` and all 10 fields of [`BlockHeader`] in
+    /// fixed-width big-endian / 32-byte encoding.
+    pub fn compute_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(HEADER_COMMIT_V4_DOMAIN);
+        hasher.update(crate::consensus::consensus_chain_id().to_be_bytes());
+        hasher.update(self.shard_id.to_be_bytes());
+        hasher.update(self.height.to_be_bytes());
+        hasher.update(self.round.to_be_bytes());
+        hasher.update(self.prev_hash);
+        hasher.update(self.state_root);
+        hasher.update(self.body_commitment);
+        hasher.update(self.mmr_epoch_root);
+        hasher.update(self.epoch_key_commitment);
+        hasher.update(self.timestamp.to_be_bytes());
+        hasher.update(self.proposer);
+        hasher.finalize().into()
+    }
+}
+
 mod bytes48_serde {
     use serde::de::{Error, SeqAccess, Visitor};
     use serde::ser::SerializeTuple;
@@ -918,6 +1003,109 @@ impl Block {
         self
     }
 
+    /// Compute the canonical commitment over all 6 body-only fields of this
+    /// block (`b"STELLEREUM_BODY_V4\0"`).
+    ///
+    /// Covers `transactions`, `order_merkle_root`, `cross_shard_out`,
+    /// `shard_headers`, `last_qc`, and `cnvrf_v3`. Deliberately excludes
+    /// `round`, `validator_signatures`, `precommit_qc`, and any block hash to
+    /// avoid hash cycles and preserve [`Self::value_id`] across round
+    /// re-stamps.
+    pub fn body_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BODY_COMMITMENT_V4_DOMAIN);
+
+        // 1. transactions
+        hasher.update((self.transactions.len() as u32).to_be_bytes());
+        if !self.transactions.is_empty() {
+            let mut tx_batch = Transaction::batch_hasher();
+            for tx in &self.transactions {
+                hasher.update(tx_batch.hash_one(tx));
+            }
+        }
+
+        // 2. order_merkle_root (32 B, unconditionally)
+        hasher.update(self.order_merkle_root);
+
+        // 3. cross_shard_out (msg_id + fixed 32 B message_commitment)
+        hasher.update((self.cross_shard_out.len() as u32).to_be_bytes());
+        for m in &self.cross_shard_out {
+            hasher.update(m.msg_id);
+            hasher.update(m.message_commitment());
+        }
+
+        // 4. shard_headers (length-prefixed commitment_bytes per entry)
+        hasher.update((self.shard_headers.len() as u32).to_be_bytes());
+        for sh in &self.shard_headers {
+            let sh_bytes = sh.commitment_bytes();
+            hasher.update((sh_bytes.len() as u32).to_be_bytes());
+            hasher.update(&sh_bytes);
+        }
+
+        // 5. last_qc (canonical sorted (voter, sig))
+        match &self.last_qc {
+            None => hasher.update([0u8]),
+            Some(qc) => {
+                hasher.update([1u8]);
+                hasher.update(qc.shard_id.to_be_bytes());
+                hasher.update(qc.height.to_be_bytes());
+                hasher.update(qc.round.to_be_bytes());
+                hasher.update([match qc.kind {
+                    crate::consensus::VoteKind::Prevote => 0u8,
+                    crate::consensus::VoteKind::Precommit => 1u8,
+                }]);
+                match &qc.block_hash {
+                    Some(bh) => {
+                        hasher.update([1u8]);
+                        hasher.update(bh);
+                    }
+                    None => hasher.update([0u8]),
+                }
+                let mut sigs: Vec<(&[u8; 32], &[u8])> = qc
+                    .signatures
+                    .iter()
+                    .map(|(voter, sig)| (voter, sig.as_slice()))
+                    .collect();
+                sigs.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+                hasher.update((sigs.len() as u32).to_be_bytes());
+                for (voter, sig) in sigs {
+                    hasher.update(voter);
+                    hasher.update((sig.len() as u32).to_be_bytes());
+                    hasher.update(sig);
+                }
+            }
+        }
+
+        // 6. cnvrf_v3 (length-prefixed canonical_bytes)
+        match &self.cnvrf_v3 {
+            None => hasher.update([0u8]),
+            Some(payload) => {
+                hasher.update([1u8]);
+                let cb = payload.canonical_bytes();
+                hasher.update((cb.len() as u32).to_be_bytes());
+                hasher.update(&cb);
+            }
+        }
+
+        hasher.finalize().into()
+    }
+
+    /// Construct the two-level [`BlockHeader`] for this block.
+    pub fn header(&self) -> BlockHeader {
+        BlockHeader {
+            shard_id: self.shard_id,
+            height: self.height,
+            round: self.round,
+            prev_hash: self.prev_hash,
+            state_root: self.state_root,
+            body_commitment: self.body_commitment(),
+            mmr_epoch_root: self.mmr_epoch_root,
+            epoch_key_commitment: self.epoch_key_commitment,
+            timestamp: self.timestamp,
+            proposer: self.proposer,
+        }
+    }
+
     /// The canonical block hash.
     ///
     /// CHAIN BINDING: the preimage starts with the domain tag, then the CHAIN
@@ -957,6 +1145,13 @@ impl Block {
     /// [`Self::compute_hash`] for an explicit round tag, without mutating the
     /// block. `round == 0` is the round-free value identity.
     fn compute_hash_committing_round(&self, round: u32) -> [u8; 32] {
+        if header_commit_active_at(self.height) {
+            return BlockHeader {
+                round,
+                ..self.header()
+            }
+            .compute_hash();
+        }
         let mut hasher = Sha256::new();
         // Domain separator: version the block-commitment scheme.
         hasher.update(b"STELLEREUM_BLOCK_V3");

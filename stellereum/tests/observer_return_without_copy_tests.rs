@@ -178,9 +178,9 @@ async fn build_live_chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        // FULL-PQ: the proposer slot must carry the proposer's registered
-        // Falcon signature; an Ed-only block is refused by block sync.
+            round: 0,
+        }; // FULL-PQ: the proposer slot must carry the proposer's registered
+           // Falcon signature; an Ed-only block is refused by block sync.
         let proposer_idx = ks
             .iter()
             .position(|k| k.verifying_key().to_bytes() == proposer_id)
@@ -273,6 +273,12 @@ impl<'a> FlakyPeers<'a> {
             state_root: b.state_root,
             proposer: b.proposer,
             qc: b.precommit_qc.clone()?,
+            shard_id: b.shard_id,
+            round: b.round,
+            body_commitment: None,
+            mmr_epoch_root: b.mmr_epoch_root,
+            epoch_key_commitment: b.epoch_key_commitment,
+            timestamp: b.timestamp,
         })
     }
 

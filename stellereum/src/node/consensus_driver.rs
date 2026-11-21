@@ -1007,9 +1007,8 @@ pub(crate) async fn run_consensus_node(
         // auto-init happens ONLY with `STELL_NEW_CHAIN=1` on a pristine store;
         // any legacy/absent/corrupt/mismatched store quarantines fail-closed
         // to non-signing Observer until explicit `stellereum safety-init`.
-        let observer_env = stellereum::bootstrap::is_observer_env(
-            std::env::var("STELL_OBSERVER").ok().as_deref(),
-        );
+        let observer_env =
+            stellereum::bootstrap::is_observer_env(std::env::var("STELL_OBSERVER").ok().as_deref());
         match ap.storage().get_meta("genesis_state_root") {
             Ok(Some(genesis_bytes)) if genesis_bytes.len() == 32 => {
                 let mut genesis_root = [0u8; 32];
@@ -1113,9 +1112,8 @@ pub(crate) async fn run_consensus_node(
             }
         }
     } else {
-        let observer_env = stellereum::bootstrap::is_observer_env(
-            std::env::var("STELL_OBSERVER").ok().as_deref(),
-        );
+        let observer_env =
+            stellereum::bootstrap::is_observer_env(std::env::var("STELL_OBSERVER").ok().as_deref());
         if !is_validator || observer_env {
             rt.safety = stellereum::safety::SafetyAuthority::new_observer();
         } else {
@@ -3358,8 +3356,7 @@ pub(crate) async fn run_consensus_node(
                                             last_flush = std::time::Instant::now();
                                             let voted_round = v.round;
                                             cast_prevote = Some(v);
-                                            last_prevoted =
-                                                Some((rt.hc.height, voted_round));
+                                            last_prevoted = Some((rt.hc.height, voted_round));
                                         }
                                     }
                                 }
@@ -3690,6 +3687,12 @@ pub(crate) async fn run_consensus_node(
                                     // the queue already carries. A not-yet-persisted
                                     // body is an honest serve-miss (fetch covers it),
                                     // never fabricated data.
+                                    let adopted_post_root = rt.state.get_state_root().await;
+                                    if let Some(ap) = &persistence {
+                                        let store = ap.storage();
+                                        let _ = store
+                                            .put_finalized_post_root(height, adopted_post_root);
+                                    }
                                     if rt.applied_statuses.len() == block.transactions.len() {
                                         let r = rpc.clone();
                                         let txs = block.transactions.clone();
@@ -3698,6 +3701,10 @@ pub(crate) async fn run_consensus_node(
                                         let events = rt.applied_events.clone();
                                         let ts = block.timestamp;
                                         let hdr = block.clone();
+                                        let persist_store =
+                                            persistence.as_ref().map(|ap| ap.storage());
+                                        let is_mc =
+                                            block_shard == stellereum::sharding::MASTERCHAIN_SHARD;
                                         record_lane.submit(async move {
                                             // LIGHT CLIENT (audit W8.3): the
                                             // adopted header's quorum certificate
@@ -3708,6 +3715,34 @@ pub(crate) async fn run_consensus_node(
                                                 height, bh, &txs, &statuses, &fees, &events, ts,
                                             )
                                             .await;
+                                            if is_mc {
+                                                if let Some(store) = persist_store {
+                                                    let exec_hardening =
+                                                        stellereum::chain_spec::exec_hardening_v1_active_at(height);
+                                                    for (i, tx) in txs.iter().enumerate() {
+                                                        if !statuses.get(i).copied().unwrap_or(false) {
+                                                            continue;
+                                                        }
+                                                        if let Some((evm, pq)) =
+                                                            stellereum::evm_adapter::verified_binding_from_tx_at(
+                                                                tx,
+                                                                exec_hardening,
+                                                            )
+                                                        {
+                                                            let _ = store.put_evm_binding_if_absent(&evm, &pq);
+                                                        }
+                                                    }
+                                                    if store
+                                                        .evm_bindings_cursor()
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|c| height > c)
+                                                        .unwrap_or(true)
+                                                    {
+                                                        let _ = store.set_evm_bindings_cursor(height);
+                                                    }
+                                                }
+                                            }
                                         });
                                     } else {
                                         eprintln!(
@@ -4032,6 +4067,8 @@ pub(crate) async fn run_consensus_node(
                 let fees = std::mem::take(&mut rt.applied_fees);
                 let events = std::mem::take(&mut rt.applied_events);
                 let r = rpc.clone();
+                let persist_store = persistence.as_ref().map(|ap| ap.storage());
+                let is_mc = block_shard == stellereum::sharding::MASTERCHAIN_SHARD;
                 record_lane.submit(async move {
                     // LIGHT CLIENT (audit W8.3): publish the finalized header
                     // with its quorum certificate, so an external verifier can
@@ -4048,11 +4085,44 @@ pub(crate) async fn run_consensus_node(
                     )
                     .await;
                     r.record_block(height, bh, tx_count, block_ts).await;
+                    if let Some(store) = persist_store {
+                        let _ = store.put_finalized_post_root(height, root);
+                        if is_mc {
+                            let exec_hardening =
+                                stellereum::chain_spec::exec_hardening_v1_active_at(height);
+                            for (i, tx) in block.transactions.iter().enumerate() {
+                                if !statuses.get(i).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                if let Some((evm, pq)) =
+                                    stellereum::evm_adapter::verified_binding_from_tx_at(
+                                        tx,
+                                        exec_hardening,
+                                    )
+                                {
+                                    let _ = store.put_evm_binding_if_absent(&evm, &pq);
+                                }
+                            }
+                            if store
+                                .evm_bindings_cursor()
+                                .ok()
+                                .flatten()
+                                .map(|c| height > c)
+                                .unwrap_or(true)
+                            {
+                                let _ = store.set_evm_bindings_cursor(height);
+                            }
+                        }
+                    }
                 });
             } else {
                 let r = rpc.clone();
+                let persist_store = persistence.as_ref().map(|ap| ap.storage());
                 record_lane.submit(async move {
                     r.record_block(height, bh, 0, block_ts).await;
+                    if let Some(store) = persist_store {
+                        let _ = store.put_finalized_post_root(height, root);
+                    }
                 });
             }
             // Persist asynchronously: never block consensus on disk I/O.
@@ -4456,6 +4526,7 @@ pub(crate) async fn run_consensus_node(
                             bridge,
                             zkml_models,
                             cnvrf_v3,
+                            evm_bindings,
                         } = bundle;
                         // Serialize on the blocking pool. Bytes are identical to
                         // the old inline `create_snapshot`/`bincode::serialize`
@@ -4487,6 +4558,7 @@ pub(crate) async fn run_consensus_node(
                             stellereum::storage::serialize_off_tick(domains).await
                         {
                             ap2.enqueue_cnvrf_v3(height, cnvrf_v3.clone());
+                            ap2.enqueue_evm_bindings_state(height, evm_bindings.clone());
                             ap2.enqueue_domains(
                                 height,
                                 domain_bytes.clone(),
@@ -4514,6 +4586,7 @@ pub(crate) async fn run_consensus_node(
                             // FOREVER (one per 100 heights), because a node
                             // thousands of blocks behind anchors on a recent
                             // one long after every body/header window elapsed.
+                            let pq_keys = ap2.storage().export_pq_keys_blob().unwrap_or_default();
                             let by_kind: Vec<(&'static str, Vec<u8>)> = vec![
                                 ("domains", domain_bytes.clone()),
                                 ("session", session_keys.clone()),
@@ -4521,6 +4594,8 @@ pub(crate) async fn run_consensus_node(
                                 ("zkml", zkml_models.clone()),
                                 ("cross_shard", cross_shard.clone()),
                                 ("cnvrf_v3", cnvrf_v3.clone()),
+                                ("pq_keys", pq_keys),
+                                ("evm_bindings", evm_bindings.clone()),
                             ];
                             debug_assert!(
                                 {
@@ -5063,16 +5138,16 @@ pub(crate) async fn run_consensus_node(
                 // round-free value id, not only when the exact hash is in
                 // the store — otherwise a re-proposal would look "bodyless"
                 // and the re-phase would drop a lock it still holds.
-                let locked_body_present = rt
-                    .hc
-                    .locked
-                    .map(|(h, _)| {
-                        rt.blocks.contains_key(&h)
-                            || rt.hc.value_id_of(&h).is_some_and(|vid| {
-                                rt.blocks.values().any(|b| b.value_id() == vid)
-                            })
-                    })
-                    .unwrap_or(true);
+                let locked_body_present =
+                    rt.hc
+                        .locked
+                        .map(|(h, _)| {
+                            rt.blocks.contains_key(&h)
+                                || rt.hc.value_id_of(&h).is_some_and(|vid| {
+                                    rt.blocks.values().any(|b| b.value_id() == vid)
+                                })
+                        })
+                        .unwrap_or(true);
                 if rt.hc.apply_deadlock_local_reset(locked_body_present) {
                     rt.last_breaker_at = Some(std::time::Instant::now());
                     debug_assert_eq!(

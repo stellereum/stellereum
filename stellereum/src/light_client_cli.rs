@@ -229,6 +229,44 @@ pub struct ServedHeader {
     pub prev_hash: [u8; 32],
     pub state_root: [u8; 32],
     pub cert: QuorumCertificate,
+    pub shard_id: u32,
+    pub round: u32,
+    pub body_commitment: Option<[u8; 32]>,
+    pub mmr_epoch_root: [u8; 32],
+    pub epoch_key_commitment: [u8; 32],
+    pub timestamp: u64,
+    pub proposer: [u8; 32],
+}
+
+fn parse_opt_hex32(v: Option<&Value>, field: &str) -> anyhow::Result<Option<[u8; 32]>> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => parse_hex32(s)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("the header {field} is invalid: {e}")),
+        Some(_) => anyhow::bail!("the header {field} must be a 32-byte hex string"),
+    }
+}
+
+fn parse_opt_u32(v: Option<&Value>, field: &str) -> anyhow::Result<u32> {
+    match v {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .ok_or_else(|| anyhow::anyhow!("the header {field} is not a valid u32")),
+        Some(_) => anyhow::bail!("the header {field} must be an unsigned 32-bit integer"),
+    }
+}
+
+fn parse_opt_u64(v: Option<&Value>, field: &str) -> anyhow::Result<u64> {
+    match v {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("the header {field} is not an unsigned 64-bit integer")),
+        Some(_) => anyhow::bail!("the header {field} must be an unsigned 64-bit integer"),
+    }
 }
 
 /// Parse the node's `stell_getFinalizedHeader` answer.
@@ -252,6 +290,16 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow::anyhow!("the header has no state root"))?,
     )?;
+    let shard_id = parse_opt_u32(v.get("shard_id"), "shard_id")?;
+    let round = parse_opt_u32(v.get("round"), "round")?;
+    let body_commitment = parse_opt_hex32(v.get("body_commitment"), "body_commitment")?;
+    let mmr_epoch_root =
+        parse_opt_hex32(v.get("mmr_epoch_root"), "mmr_epoch_root")?.unwrap_or([0u8; 32]);
+    let epoch_key_commitment =
+        parse_opt_hex32(v.get("epoch_key_commitment"), "epoch_key_commitment")?
+            .unwrap_or([0u8; 32]);
+    let timestamp = parse_opt_u64(v.get("timestamp"), "timestamp")?;
+    let proposer = parse_opt_hex32(v.get("proposer"), "proposer")?.unwrap_or([0u8; 32]);
     let cert_json = v
         .get("cert")
         .ok_or_else(|| anyhow::anyhow!("the header carries no quorum certificate"))?;
@@ -259,7 +307,7 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
         .get("height")
         .and_then(|x| x.as_u64())
         .ok_or_else(|| anyhow::anyhow!("the certificate has no height"))?;
-    let round = cert_json.get("round").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let cert_round = cert_json.get("round").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let kind = match cert_json.get("kind").and_then(|x| x.as_str()) {
         Some("Precommit") => VoteKind::Precommit,
         Some("Prevote") => VoteKind::Prevote,
@@ -294,7 +342,7 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
         state_root,
         cert: QuorumCertificate {
             height: cert_height,
-            round,
+            round: cert_round,
             kind,
             block_hash: cert_hash,
             signatures,
@@ -304,6 +352,13 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
                 .map(|v| v as crate::sharding::ShardId)
                 .unwrap_or(crate::sharding::MASTERCHAIN_SHARD),
         },
+        shard_id,
+        round,
+        body_commitment,
+        mmr_epoch_root,
+        epoch_key_commitment,
+        timestamp,
+        proposer,
     })
 }
 
@@ -378,6 +433,30 @@ pub fn check_anchoring_header(
                 header.height
             );
         }
+    }
+    if crate::sharding::header_commit_active_at(header.height) {
+        if header.cert.shard_id != header.shard_id {
+            anyhow::bail!(
+                "header at height {} has certificate shard_id {} != header shard_id {}",
+                header.height,
+                header.cert.shard_id,
+                header.shard_id
+            );
+        }
+        crate::light_client::verify_header_hash_binding(
+            header.shard_id,
+            header.height,
+            header.round,
+            header.prev_hash,
+            header.state_root,
+            header.body_commitment,
+            header.mmr_epoch_root,
+            header.epoch_key_commitment,
+            header.timestamp,
+            header.proposer,
+            header.block_hash,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     Ok(())
 }
@@ -490,23 +569,32 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
     if header.cert.height != header.height
         || header.cert.block_hash != Some(header.block_hash)
         || header.cert.kind != VoteKind::Precommit
+        || (crate::sharding::header_commit_active_at(header.height)
+            && header.cert.shard_id != header.shard_id)
     {
         anyhow::bail!(
             "the header at height {} does not carry a precommit certificate bound to its own \
-             height and hash — it is not a finality proof",
+             height, shard and hash — it is not a finality proof",
             header.height
         );
     }
 
     // 4. The quorum certificate, checked against the OUT-OF-BAND set. This is
     //    the step that makes the root more than the server's word.
-    let checkpoint = Checkpoint::new(
-        header.height,
-        header.block_hash,
-        header.prev_hash,
-        header.state_root,
-        header.cert,
-    );
+    let checkpoint = Checkpoint {
+        height: header.height,
+        block_hash: header.block_hash,
+        parent_hash: header.prev_hash,
+        state_root: header.state_root,
+        cert: header.cert,
+        shard_id: header.shard_id,
+        round: header.round,
+        body_commitment: header.body_commitment,
+        mmr_epoch_root: header.mmr_epoch_root,
+        epoch_key_commitment: header.epoch_key_commitment,
+        timestamp: header.timestamp,
+        proposer: header.proposer,
+    };
     let client = LightClient::new(validators.clone(), checkpoint).map_err(|e| {
         anyhow::anyhow!(
             "the anchoring header was REFUSED by the light client: {e}. The node's chain is \

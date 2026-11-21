@@ -791,6 +791,56 @@ impl RpcState {
     }
 }
 
+/// Resolve `evm -> pq` using canonical `Domain::EvmBindings` first (via
+/// `st.engine.evm_binding_pq`), falling back to the persistent `"evm_bindings"`
+/// sled index when `archive_store` is attached.
+async fn resolve_evm_binding_pq(st: &RpcState, evm: &[u8; 20]) -> Option<[u8; 32]> {
+    if let Some(pq) = st.engine.evm_binding_pq(evm).await {
+        return Some(pq);
+    }
+    st.archive_store
+        .as_ref()
+        .and_then(|store| store.evm_binding_by_evm(evm).ok().flatten())
+}
+
+/// Resolve `pq -> evm` using canonical `Domain::EvmBindings` first (via
+/// `st.engine.evm_binding_for_pq`), falling back to the persistent `"evm_bindings"`
+/// sled index when `archive_store` is attached.
+async fn resolve_evm_binding_for_pq(st: &RpcState, pq: &[u8; 32]) -> Option<[u8; 20]> {
+    if let Some(evm) = st.engine.evm_binding_for_pq(pq).await {
+        return Some(evm);
+    }
+    st.archive_store
+        .as_ref()
+        .and_then(|store| store.evm_binding_by_pq(pq).ok().flatten())
+}
+
+/// Resolve a 20-byte EVM or 32-byte Stellereum address to the owning PQ account,
+/// consulting canonical `st.engine.evm_binding_pq` first and `archive_store` on miss.
+async fn resolve_evm_account_rpc(
+    st: &RpcState,
+    addr: &str,
+) -> Result<[u8; 32], crate::evm_adapter::JsonRpcError> {
+    let trimmed = addr.trim();
+    let bare = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if bare.len() == 40 {
+        let evm = crate::evm_adapter::evm_address_from_hex(bare).map_err(|e| {
+            crate::evm_adapter::JsonRpcError::invalid_params(format!(
+                "invalid address '{addr}': {e}"
+            ))
+        })?;
+        if let Some(pq) = resolve_evm_binding_pq(st, &evm).await {
+            return Ok(pq);
+        }
+    }
+    crate::evm_adapter::parse_evm_or_stell_address(addr).map_err(|e| {
+        crate::evm_adapter::JsonRpcError::invalid_params(format!("invalid address '{addr}': {e}"))
+    })
+}
+
 pub(super) async fn dispatch_eth(
     st: &RpcState,
     id: Value,
@@ -848,9 +898,7 @@ pub(super) async fn dispatch_eth(
         // never executed).
         "eth_estimateGas" => {
             let sender = match estimate_sender(params) {
-                Ok(Some(raw)) => match crate::evm_adapter::resolve_evm_account(&st.engine, &raw)
-                    .await
-                {
+                Ok(Some(raw)) => match resolve_evm_account_rpc(st, &raw).await {
                     Ok(a) => Some(a),
                     Err(e) => return Some(err(id, -32602, format!("invalid from address: {e}"))),
                 },
@@ -912,8 +960,8 @@ pub(super) async fn dispatch_eth(
             }
         }
         "eth_getBalance" => {
-            let tag = match crate::evm_adapter::parse_address_and_tag_params(params) {
-                Ok((_, tag)) => tag,
+            let (addr_str, tag) = match crate::evm_adapter::parse_address_and_tag_params(params) {
+                Ok(v) => v,
                 Err(e) => return Some(err(id, e.code, e.message)),
             };
             if let Err(e) = require_current_state_tag(
@@ -922,10 +970,13 @@ pub(super) async fn dispatch_eth(
             ) {
                 return Some(err(id, e.code, e.message));
             }
-            match crate::evm_adapter::eth_get_balance(&st.engine, params).await {
-                Ok(bal) => ok(id, json!(bal)),
-                Err(e) => err(id, e.code, e.message),
-            }
+            let stell_addr = match resolve_evm_account_rpc(st, &addr_str).await {
+                Ok(a) => a,
+                Err(e) => return Some(err(id, e.code, e.message)),
+            };
+            let acc = st.engine.get_account(&stell_addr).await;
+            let balance_nano = acc.map(|a| a.balance).unwrap_or(0);
+            ok(id, json!(crate::evm_adapter::nano_to_wei_hex(balance_nano)))
         }
         "eth_getTransactionCount" => {
             // On-chain nonce for the resolved account (a 20-byte EVM address
@@ -946,31 +997,32 @@ pub(super) async fn dispatch_eth(
                         let want_pending = tag
                             .map(|t| matches!(t, crate::evm_adapter::BlockTag::Pending))
                             .unwrap_or(false);
-                        match crate::evm_adapter::resolve_evm_account(&st.engine, &addr).await {
+                        match resolve_evm_account_rpc(st, &addr).await {
                             Ok(a) => (a, want_pending),
                             Err(e) => return Some(rpc_error(id, e)),
                         }
                     }
                     Err(e) => return Some(rpc_error(id, e)),
                 };
-            match crate::evm_adapter::eth_get_transaction_count(&st.engine, params).await {
-                Ok(cnt) => {
-                    if !want_pending {
-                        return Some(ok(id, json!(cnt)));
-                    }
-                    let onchain = crate::evm_adapter::parse_hex_u64(&cnt).unwrap_or(0);
-                    let pooled = st
-                        .mempool
-                        .read()
-                        .await
-                        .next_pending_nonce(&account)
-                        .unwrap_or(0);
-                    ok(
-                        id,
-                        json!(crate::evm_adapter::format_u64_hex(onchain.max(pooled))),
-                    )
-                }
-                Err(e) => err(id, e.code, e.message),
+            let onchain = st
+                .engine
+                .get_account(&account)
+                .await
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            if !want_pending {
+                ok(id, json!(crate::evm_adapter::format_u64_hex(onchain)))
+            } else {
+                let pooled = st
+                    .mempool
+                    .read()
+                    .await
+                    .next_pending_nonce(&account)
+                    .unwrap_or(0);
+                ok(
+                    id,
+                    json!(crate::evm_adapter::format_u64_hex(onchain.max(pooled))),
+                )
             }
         }
         "eth_blockNumber" => ok(id, json!(st.eth_block_number())),
@@ -1153,7 +1205,7 @@ pub(super) async fn dispatch_eth(
             let evm_hash = view.hash.clone();
             let evm_from_hex = crate::evm_adapter::evm_address_to_hex(&evm_from);
             // 1. No binding => the historical, unchanged refusal.
-            let Some(bound_pq) = st.engine.evm_binding_pq(&evm_from).await else {
+            let Some(bound_pq) = resolve_evm_binding_pq(st, &evm_from).await else {
                 return Some(rpc_error(
                     id,
                     crate::evm_adapter::evm_send_refusal(Some(&evm_hash)),
@@ -1172,7 +1224,7 @@ pub(super) async fn dispatch_eth(
             // 3. The recipient must be routable: a bare EVM address has no PQ
             //    key, so crediting it would burn the funds.
             let recipient_evm = crate::evm_adapter::evm_address_to_hex(&facts.to);
-            let Some(to_pq) = st.engine.evm_binding_pq(&facts.to).await else {
+            let Some(to_pq) = resolve_evm_binding_pq(st, &facts.to).await else {
                 return Some(rpc_error(
                     id,
                     crate::evm_adapter::recipient_unbound(&recipient_evm, Some(&evm_hash)),
@@ -1355,7 +1407,7 @@ pub(super) async fn dispatch_eth(
                     Ok(a) => a,
                     Err(e) => return Some(err(id, -32602, e)),
                 };
-                let pq = st.engine.evm_binding_pq(&evm).await;
+                let pq = resolve_evm_binding_pq(st, &evm).await;
                 json!({
                     "evmAddress": format!("0x{}", hex::encode(evm)),
                     "pqAddress": pq.map(|p| format!("0x{}", hex::encode(p))),
@@ -1369,7 +1421,7 @@ pub(super) async fn dispatch_eth(
                 if let Err(e) = hex::decode_to_slice(bare, &mut pq) {
                     return Some(err(id, -32602, format!("invalid PQ address: {e}")));
                 }
-                let evm = crate::evm_adapter::lookup_bound_evm(&pq);
+                let evm = resolve_evm_binding_for_pq(st, &pq).await;
                 json!({
                     "evmAddress": evm.map(|e| format!("0x{}", hex::encode(e))),
                     "pqAddress": format!("0x{}", hex::encode(pq)),
@@ -1455,7 +1507,7 @@ pub(super) async fn dispatch_eth(
                 &crate::post_quantum::DEFAULT_SALT,
             );
             // A conflict is refused before any signature work: first claim wins.
-            if let Some(existing) = st.engine.evm_binding_pq(&evm_address).await {
+            if let Some(existing) = resolve_evm_binding_pq(st, &evm_address).await {
                 if existing != pq_from {
                     return Some(rpc_error(
                         id,
@@ -1583,14 +1635,14 @@ pub(super) async fn dispatch_eth(
                     ))
                 }
             };
-            let Some(bound_pq) = st.engine.evm_binding_pq(&evm_from).await else {
+            let Some(bound_pq) = resolve_evm_binding_pq(st, &evm_from).await else {
                 return Some(rpc_error(
                     id,
                     crate::evm_adapter::evm_send_refusal(Some(&view.hash)),
                 ));
             };
             let recipient_evm = crate::evm_adapter::evm_address_to_hex(&facts.to);
-            let Some(to_pq) = st.engine.evm_binding_pq(&facts.to).await else {
+            let Some(to_pq) = resolve_evm_binding_pq(st, &facts.to).await else {
                 return Some(rpc_error(
                     id,
                     crate::evm_adapter::recipient_unbound(&recipient_evm, Some(&view.hash)),

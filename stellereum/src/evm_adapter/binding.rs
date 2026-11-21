@@ -525,6 +525,74 @@ pub fn is_evm_binding_tx(tx: &Transaction) -> bool {
     matches!(classify_evm_payload(tx), Some(EvmPayload::Binding(_)))
 }
 
+/// Purely verify and extract `(evm_address, pq_address)` from a transaction's
+/// `SysCallBindEvmAddress` or `SysCallEvmCarrier` payload without consulting
+/// [`evm_binding_index`] (`OnceLock`) or any local database.
+///
+/// Returns `None` for non-EVM payloads, `Mixed` payloads, or invalid claims /
+/// carrier proofs.
+pub fn verified_binding_from_tx(tx: &Transaction) -> Option<([u8; 20], [u8; 32])> {
+    match classify_evm_payload(tx)? {
+        EvmPayload::Binding(claim) => {
+            verify_binding_claim(claim, &tx.from).ok()?;
+            Some((claim.evm_address, tx.from))
+        }
+        EvmPayload::Carrier(carrier) => {
+            let facts = verify_carrier_intent(carrier, &tx.from).ok()?;
+            Some((facts.from, tx.from))
+        }
+        EvmPayload::Mixed => None,
+    }
+}
+
+/// Height-hardened variant of [`verified_binding_from_tx`]: when `stop_at_halt`
+/// is `true` (`exec_hardening_v1_active_at(height)`), payload scanning stops at
+/// the first [`OpCode::Halt`].
+pub fn verified_binding_from_tx_at(
+    tx: &Transaction,
+    stop_at_halt: bool,
+) -> Option<([u8; 20], [u8; 32])> {
+    if !stop_at_halt {
+        return verified_binding_from_tx(tx);
+    }
+    let mut found: Option<EvmPayload<'_>> = None;
+    let mut others = false;
+    for op in &tx.payload {
+        if matches!(op, OpCode::Halt) {
+            break;
+        }
+        match op {
+            OpCode::SysCallEvmCarrier(c) => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(EvmPayload::Carrier(c));
+            }
+            OpCode::SysCallBindEvmAddress(c) => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(EvmPayload::Binding(c));
+            }
+            _ => others = true,
+        }
+    }
+    if others {
+        return None;
+    }
+    match found? {
+        EvmPayload::Binding(claim) => {
+            verify_binding_claim(claim, &tx.from).ok()?;
+            Some((claim.evm_address, tx.from))
+        }
+        EvmPayload::Carrier(carrier) => {
+            let facts = verify_carrier_intent(carrier, &tx.from).ok()?;
+            Some((facts.from, tx.from))
+        }
+        EvmPayload::Mixed => None,
+    }
+}
+
 /// Build the carrier transaction a bound PQ key authorises for `raw`.
 ///
 /// Deterministic: the same inputs always produce the same transaction bytes

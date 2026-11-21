@@ -422,6 +422,11 @@ fn light_client_verifies_under_the_beacon_schedule() {
             .expect("beacon schedule names a proposer"),
         cert: qc.clone(),
         signatures: Vec::new(),
+        shard_id: 0,
+        round: 0,
+        body_commitment: None,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
     };
 
     // The header's finality gate is beacon-aware: the same certificate is
@@ -478,6 +483,11 @@ fn light_client_verifies_under_the_beacon_schedule() {
             .expect("beacon schedule names a proposer"),
         cert: next_qc,
         signatures: Vec::new(),
+        shard_id: 0,
+        round: 0,
+        body_commitment: None,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
     };
     light
         .apply_header(next_header)

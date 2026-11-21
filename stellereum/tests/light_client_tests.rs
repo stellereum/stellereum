@@ -245,6 +245,11 @@ impl Fixture {
                 &b.prev_hash,
             ),
             signatures: b.validator_signatures.clone(),
+            shard_id: b.shard_id,
+            round: b.round,
+            body_commitment: None,
+            mmr_epoch_root: b.mmr_epoch_root,
+            epoch_key_commitment: b.epoch_key_commitment,
         }
     }
 
@@ -1202,6 +1207,13 @@ fn a_cli_anchoring_header_at_another_height_is_refused() {
             signatures: vec![],
             shard_id: MASTERCHAIN_SHARD,
         },
+        shard_id: MASTERCHAIN_SHARD,
+        round: 0,
+        body_commitment: None,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
     };
     let err = check_anchoring_header(&header, 4, None)
         .expect_err("a header from another height is not the anchor");
@@ -1430,6 +1442,13 @@ fn an_absent_key_is_reported_as_not_included_and_never_as_a_zero() {
                 f.blocks[0].compute_hash(),
                 &f.blocks[0].prev_hash,
             ),
+            shard_id: f.blocks[0].shard_id,
+            round: f.blocks[0].round,
+            body_commitment: None,
+            mmr_epoch_root: f.blocks[0].mmr_epoch_root,
+            epoch_key_commitment: f.blocks[0].epoch_key_commitment,
+            timestamp: f.blocks[0].timestamp,
+            proposer: f.blocks[0].proposer,
         },
     )
     .unwrap();

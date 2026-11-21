@@ -254,6 +254,28 @@ pub struct Checkpoint {
     pub state_root: CellHash,
     /// Precommit quorum certificate for `block_hash` at `height`.
     pub cert: QuorumCertificate,
+    /// Shard identifier for v4 header reconstruction (`BlockHeader::shard_id`).
+    #[serde(default)]
+    pub shard_id: u32,
+    /// Consensus round committed by the v4 header (`BlockHeader::round`).
+    #[serde(default)]
+    pub round: u32,
+    /// Commitment to the block body (`Block::body_commitment()`), required when
+    /// `crate::sharding::header_commit_active_at(height)` is true.
+    #[serde(default)]
+    pub body_commitment: Option<[u8; 32]>,
+    /// Epoch-MMR root committed by the header (`BlockHeader::mmr_epoch_root`).
+    #[serde(default)]
+    pub mmr_epoch_root: [u8; 32],
+    /// Epoch-key commitment carried by the header (`BlockHeader::epoch_key_commitment`).
+    #[serde(default)]
+    pub epoch_key_commitment: [u8; 32],
+    /// Block timestamp committed by the v4 header (`BlockHeader::timestamp`).
+    #[serde(default)]
+    pub timestamp: u64,
+    /// Block proposer committed by the v4 header (`BlockHeader::proposer`).
+    #[serde(default)]
+    pub proposer: [u8; 32],
 }
 
 /// The GENESIS anchor of a light client: the chain's root.
@@ -289,6 +311,8 @@ pub struct GenesisAnchor {
 ///
 /// Either the chain's GENESIS (trusted by construction) or a finalized block
 /// with the quorum certificate that decided it (trusted by a quorum).
+#[allow(clippy::large_enum_variant)]
+// GATE: Checkpoint holds v4 header commitment fields alongside GenesisAnchor; boxing would break public LightAnchor::Checkpoint(cp) API.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LightAnchor {
     /// The chain's root. No quorum evidence exists (and none is needed).
@@ -311,6 +335,13 @@ impl Checkpoint {
             parent_hash,
             state_root,
             cert,
+            shard_id: 0,
+            round: 0,
+            body_commitment: None,
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 0,
+            proposer: [0u8; 32],
         }
     }
 
@@ -322,6 +353,35 @@ impl Checkpoint {
             parent_hash: header.prev_hash,
             state_root: header.state_root,
             cert: header.cert.clone(),
+            shard_id: header.shard_id,
+            round: header.round,
+            body_commitment: header.body_commitment,
+            mmr_epoch_root: header.mmr_epoch_root,
+            epoch_key_commitment: header.epoch_key_commitment,
+            timestamp: header.timestamp,
+            proposer: header.proposer,
+        }
+    }
+
+    /// Build a v4 checkpoint directly from a [`crate::sharding::BlockHeader`]
+    /// and its finalizing [`QuorumCertificate`].
+    pub fn from_block_header(
+        header: crate::sharding::BlockHeader,
+        cert: QuorumCertificate,
+    ) -> Self {
+        Self {
+            height: header.height,
+            block_hash: header.compute_hash(),
+            parent_hash: header.prev_hash,
+            state_root: header.state_root,
+            cert,
+            shard_id: header.shard_id,
+            round: header.round,
+            body_commitment: Some(header.body_commitment),
+            mmr_epoch_root: header.mmr_epoch_root,
+            epoch_key_commitment: header.epoch_key_commitment,
+            timestamp: header.timestamp,
+            proposer: header.proposer,
         }
     }
 
@@ -376,6 +436,41 @@ impl Checkpoint {
                 .and_then(|x| x.as_str())
                 .ok_or_else(|| "historical root has no parent hash".to_string())?,
         )?;
+        let shard_id = parse_opt_u32(
+            v.get("shard_id").or_else(|| v.get("anchor_shard_id")),
+            "historical root shard_id",
+        )?;
+        let round = parse_opt_u32(
+            v.get("round").or_else(|| v.get("anchor_round")),
+            "historical root round",
+        )?;
+        let body_commitment = parse_opt_hex32(
+            v.get("body_commitment")
+                .or_else(|| v.get("anchor_body_commitment")),
+            "historical root body_commitment",
+        )?;
+        let mmr_epoch_root = parse_opt_hex32(
+            v.get("mmr_epoch_root")
+                .or_else(|| v.get("anchor_mmr_epoch_root")),
+            "historical root mmr_epoch_root",
+        )?
+        .unwrap_or([0u8; 32]);
+        let epoch_key_commitment = parse_opt_hex32(
+            v.get("epoch_key_commitment")
+                .or_else(|| v.get("anchor_epoch_key_commitment")),
+            "historical root epoch_key_commitment",
+        )?
+        .unwrap_or([0u8; 32]);
+        let timestamp = parse_opt_u64(
+            v.get("timestamp").or_else(|| v.get("anchor_timestamp")),
+            "historical root timestamp",
+        )?;
+        let proposer = parse_opt_hex32(
+            v.get("proposer").or_else(|| v.get("anchor_proposer")),
+            "historical root proposer",
+        )?
+        .unwrap_or([0u8; 32]);
+
         let cert_value = v
             .get("cert")
             .ok_or_else(|| "historical root carries no quorum certificate".to_string())?;
@@ -420,7 +515,7 @@ impl Checkpoint {
                 signatures.push((validator, signature));
             }
         }
-        Ok(Self {
+        let cp = Self {
             height: anchor_height,
             block_hash: anchor_hash,
             parent_hash,
@@ -439,12 +534,42 @@ impl Checkpoint {
                     .map(|v| v as crate::sharding::ShardId)
                     .unwrap_or(crate::sharding::MASTERCHAIN_SHARD),
             },
-        })
+            shard_id,
+            round,
+            body_commitment,
+            mmr_epoch_root,
+            epoch_key_commitment,
+            timestamp,
+            proposer,
+        };
+        if crate::sharding::header_commit_active_at(cp.height) && cp.cert.shard_id != cp.shard_id {
+            return Err(format!(
+                "historical root certificate shard_id {} does not match header shard_id {}",
+                cp.cert.shard_id, cp.shard_id
+            ));
+        }
+        verify_header_hash_binding(
+            cp.shard_id,
+            cp.height,
+            cp.round,
+            cp.parent_hash,
+            cp.state_root,
+            cp.body_commitment,
+            cp.mmr_epoch_root,
+            cp.epoch_key_commitment,
+            cp.timestamp,
+            cp.proposer,
+            cp.block_hash,
+        )?;
+        Ok(cp)
     }
 
     /// Verify the finality claim, and nothing else.
     ///
     /// Refuses, in order:
+    ///  * when v4 header commitment is active at `height`: missing
+    ///    `body_commitment`, shard mismatch, or `BlockHeader::compute_hash()`
+    ///    mismatch against `block_hash`;
     ///  * a certificate that is not a **precommit** quorum (a prevote quorum
     ///    is not proof of finality);
     ///  * a certificate bound to a different height or a different block hash
@@ -454,8 +579,7 @@ impl Checkpoint {
     ///  * too little power from *distinct validator* signers;
     ///  * signatures that do not verify.
     pub fn verify(&self, validators: &ValidatorSet) -> Result<(), String> {
-        verify_finality(&self.cert, self.height, self.block_hash, validators)
-            .map_err(|e| format!("checkpoint at height {} rejected: {e}", self.height))
+        self.verify_with_schedule(validators, CommitteeSchedule::ParentHash)
     }
 
     /// [`Self::verify`] under an explicit [`CommitteeSchedule`] (CN-VRF v3
@@ -465,6 +589,28 @@ impl Checkpoint {
         validators: &ValidatorSet,
         schedule: CommitteeSchedule,
     ) -> Result<(), String> {
+        verify_header_hash_binding(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.parent_hash,
+            self.state_root,
+            self.body_commitment,
+            self.mmr_epoch_root,
+            self.epoch_key_commitment,
+            self.timestamp,
+            self.proposer,
+            self.block_hash,
+        )
+        .map_err(|e| format!("checkpoint at height {} rejected: {e}", self.height))?;
+        if crate::sharding::header_commit_active_at(self.height)
+            && self.cert.shard_id != self.shard_id
+        {
+            return Err(format!(
+                "checkpoint at height {} rejected: certificate shard_id {} does not match header shard_id {}",
+                self.height, self.cert.shard_id, self.shard_id
+            ));
+        }
         verify_finality_with_schedule(
             &self.cert,
             self.height,
@@ -480,6 +626,65 @@ impl Checkpoint {
     pub fn is_self_referential(&self) -> bool {
         self.block_hash == self.parent_hash
     }
+}
+
+/// Fail-closed header-hash binding check for v4 two-level header commitment.
+///
+/// Below `HEADER_COMMIT_ACTIVATION_HEIGHT` (`!header_commit_active_at(height)`),
+/// returns `Ok(())` so legacy v3 checkpoints/headers without `body_commitment`
+/// keep verifying purely via their quorum certificate.
+///
+/// At/after activation (`header_commit_active_at(height)`), requires:
+/// 1. `body_commitment == Some(bc)`;
+/// 2. reconstructed `crate::sharding::BlockHeader` hashes to `claimed_block_hash`.
+#[allow(clippy::too_many_arguments)]
+// GATE: mirrors the exact 10 fields of `crate::sharding::BlockHeader` plus `claimed_block_hash`
+// so every header-only verifier (`Checkpoint`, `LightHeader`, `ServedHeader`, and
+// `from_historical_root_json`) enforces one canonical hash-binding check.
+pub fn verify_header_hash_binding(
+    shard_id: u32,
+    height: u64,
+    round: u32,
+    prev_hash: [u8; 32],
+    state_root: CellHash,
+    body_commitment: Option<[u8; 32]>,
+    mmr_epoch_root: [u8; 32],
+    epoch_key_commitment: [u8; 32],
+    timestamp: u64,
+    proposer: [u8; 32],
+    claimed_block_hash: BlockHash,
+) -> Result<(), String> {
+    if !crate::sharding::header_commit_active_at(height) {
+        return Ok(());
+    }
+    let bc = body_commitment.ok_or_else(|| {
+        format!(
+            "header at height {height} is missing v4 body_commitment \
+             (required when header commitment is active)"
+        )
+    })?;
+    let hdr = crate::sharding::BlockHeader {
+        shard_id,
+        height,
+        round,
+        prev_hash,
+        state_root,
+        body_commitment: bc,
+        mmr_epoch_root,
+        epoch_key_commitment,
+        timestamp,
+        proposer,
+    };
+    let computed = hdr.compute_hash();
+    if computed != claimed_block_hash {
+        return Err(format!(
+            "header at height {height} failed v4 BlockHeader::compute_hash binding: \
+             computed {}, claimed {}",
+            hex::encode(computed),
+            hex::encode(claimed_block_hash),
+        ));
+    }
+    Ok(())
 }
 
 /// THE schedule rule of the light client: parent-hash below the configured
@@ -504,23 +709,7 @@ fn schedule_for(
     CommitteeSchedule::Beacon(beacon)
 }
 
-/// Shared finality gate: a precommit quorum for exactly this (height, hash).
-fn verify_finality(
-    cert: &QuorumCertificate,
-    height: u64,
-    block_hash: BlockHash,
-    validators: &ValidatorSet,
-) -> Result<(), String> {
-    verify_finality_with_schedule(
-        cert,
-        height,
-        block_hash,
-        validators,
-        CommitteeSchedule::ParentHash,
-    )
-}
-
-/// [`verify_finality`] under an explicit [`CommitteeSchedule`].
+/// [`verify_finality_with_schedule`] under an explicit [`CommitteeSchedule`].
 ///
 /// Below CN-VRF v3 activation the schedule is
 /// [`CommitteeSchedule::ParentHash`] and this is byte-identical to the legacy
@@ -638,6 +827,22 @@ pub struct LightHeader {
     /// past both.
     #[serde(default)]
     pub signatures: Vec<(ValidatorId, Vec<u8>)>,
+    /// Shard identifier for v4 header reconstruction (`BlockHeader::shard_id`).
+    #[serde(default)]
+    pub shard_id: u32,
+    /// Consensus round committed by the v4 header (`BlockHeader::round`).
+    #[serde(default)]
+    pub round: u32,
+    /// Commitment to the block body (`Block::body_commitment()`), required when
+    /// `crate::sharding::header_commit_active_at(height)` is true.
+    #[serde(default)]
+    pub body_commitment: Option<[u8; 32]>,
+    /// Epoch-MMR root committed by the header (`BlockHeader::mmr_epoch_root`).
+    #[serde(default)]
+    pub mmr_epoch_root: [u8; 32],
+    /// Epoch-key commitment carried by the header (`BlockHeader::epoch_key_commitment`).
+    #[serde(default)]
+    pub epoch_key_commitment: [u8; 32],
 }
 
 impl LightHeader {
@@ -654,6 +859,28 @@ impl LightHeader {
         validators: &ValidatorSet,
         schedule: CommitteeSchedule,
     ) -> Result<(), String> {
+        verify_header_hash_binding(
+            self.shard_id,
+            self.height,
+            self.round,
+            self.prev_hash,
+            self.state_root,
+            self.body_commitment,
+            self.mmr_epoch_root,
+            self.epoch_key_commitment,
+            self.timestamp,
+            self.proposer,
+            self.block_hash,
+        )
+        .map_err(|e| format!("header at height {} rejected: {e}", self.height))?;
+        if crate::sharding::header_commit_active_at(self.height)
+            && self.cert.shard_id != self.shard_id
+        {
+            return Err(format!(
+                "header at height {} rejected: certificate shard_id {} does not match header shard_id {}",
+                self.height, self.cert.shard_id, self.shard_id
+            ));
+        }
         verify_finality_with_schedule(
             &self.cert,
             self.height,
@@ -768,6 +995,11 @@ impl LightHeader {
     /// `height - 1`.
     pub fn of_block(block: &crate::sharding::Block) -> Option<Self> {
         let cert = block.precommit_qc.clone()?;
+        let body_commitment = if crate::sharding::header_commit_active_at(block.height) {
+            Some(block.body_commitment())
+        } else {
+            None
+        };
         Some(Self {
             height: block.height,
             prev_hash: block.prev_hash,
@@ -777,6 +1009,11 @@ impl LightHeader {
             proposer: block.proposer,
             cert,
             signatures: block.validator_signatures.clone(),
+            shard_id: block.shard_id,
+            round: block.round,
+            body_commitment,
+            mmr_epoch_root: block.mmr_epoch_root,
+            epoch_key_commitment: block.epoch_key_commitment,
         })
     }
 }
@@ -1135,6 +1372,40 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
     }
     let b = hex::decode(s).map_err(|e| format!("bad hex: {e}"))?;
     b.try_into().map_err(|_| "expected 32 bytes".to_string())
+}
+
+/// Parse an optional 32-byte hex string (`None` / `null` -> `Ok(None)`).
+fn parse_opt_hex32(v: Option<&serde_json::Value>, field: &str) -> Result<Option<[u8; 32]>, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => parse_hex32(s)
+            .map(Some)
+            .map_err(|e| format!("bad {field}: {e}")),
+        Some(_) => Err(format!("{field} must be a 32-byte hex string")),
+    }
+}
+
+/// Parse an optional `u32` JSON field (`None` / `null` -> `Ok(0)`).
+fn parse_opt_u32(v: Option<&serde_json::Value>, field: &str) -> Result<u32, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .ok_or_else(|| format!("{field} is not a valid u32")),
+        Some(_) => Err(format!("{field} must be an unsigned 32-bit integer")),
+    }
+}
+
+/// Parse an optional `u64` JSON field (`None` / `null` -> `Ok(0)`).
+fn parse_opt_u64(v: Option<&serde_json::Value>, field: &str) -> Result<u64, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| format!("{field} is not an unsigned 64-bit integer")),
+        Some(_) => Err(format!("{field} must be an unsigned 64-bit integer")),
+    }
 }
 
 /// Parse a `u64` that a JSON server may have written as a number or a string.
@@ -1665,6 +1936,28 @@ impl LightClient {
         header: LightHeader,
     ) -> Result<(), String> {
         self.check_header_shape(&header)?;
+        verify_header_hash_binding(
+            header.shard_id,
+            header.height,
+            header.round,
+            header.prev_hash,
+            header.state_root,
+            header.body_commitment,
+            header.mmr_epoch_root,
+            header.epoch_key_commitment,
+            header.timestamp,
+            header.proposer,
+            header.block_hash,
+        )
+        .map_err(|e| format!("header at height {} rejected: {e}", header.height))?;
+        if crate::sharding::header_commit_active_at(header.height)
+            && header.cert.shard_id != header.shard_id
+        {
+            return Err(format!(
+                "header at height {} rejected: certificate shard_id {} does not match header shard_id {}",
+                header.height, header.cert.shard_id, header.shard_id
+            ));
+        }
         // --- finality (QC quorum) WITHOUT the block-signature quorum -------
         verify_finality_with_schedule(
             &header.cert,

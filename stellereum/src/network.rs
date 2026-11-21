@@ -61,6 +61,36 @@ fn header_name(epoch: &EpochTag, height: u64) -> String {
     format!("{}_h_{height}", epoch.as_str())
 }
 
+/// Content/shard-scoped blob name for [`crate::storage::BlockHeaderRecordV2`].
+pub fn header_v2_name(epoch: &EpochTag, shard_id: u32, height: u64) -> String {
+    format!("{}_h2_{shard_id}_{height}", epoch.as_str())
+}
+
+/// Content-addressed DHT name for a `SnapV4` manifest (`SNAP-DHT-NAME`):
+/// binds `(epoch, shard_id, height, state_root)` so poisoning one state root
+/// at `height` cannot block or alias an honest manifest at the same height.
+pub fn snapv4_manifest_name(
+    epoch: &EpochTag,
+    shard_id: u32,
+    height: u64,
+    state_root: &[u8; 32],
+) -> String {
+    format!(
+        "{}_snapm_{shard_id}_{height}_{}",
+        epoch.as_str(),
+        hex::encode(&state_root[..8])
+    )
+}
+
+/// Content-addressed DHT name for a `SnapV4` unit/chunk (`chunk_hash`).
+pub fn snapv4_unit_name(epoch: &EpochTag, shard_id: u32, chunk_hash: &[u8; 32]) -> String {
+    format!(
+        "{}_snapu_{shard_id}_{}",
+        epoch.as_str(),
+        hex::encode(chunk_hash)
+    )
+}
+
 fn header_index_name(epoch: &EpochTag, shard_id: u32, height: u64) -> String {
     format!("{}_hi_{shard_id}_{height}", epoch.as_str())
 }
@@ -1146,6 +1176,8 @@ pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
     "zkml",
     "cross_shard",
     "cnvrf_v3",
+    "pq_keys",
+    "evm_bindings",
 ];
 
 /// Process-wide bound on concurrent DHT fetches (storm guard 2026-10-13).
@@ -1190,15 +1222,143 @@ fn snapshot_fetch_sem() -> &'static tokio::sync::Semaphore {
 /// 5ms spreads the burst (~0.64s per full pass) without slowing the window.
 pub const RETRO_PUBLISH_PACE_MS: u64 = 5;
 
+/// Hard bound on chunk count in a snapshot manifest (`SNAP-MANIFEST-DOS`).
+pub const MAX_BLOB_CHUNKS: usize = infnode::node::MAX_BLOB_CHUNKS;
+/// Hard bound on single-chunk wire length (`1 MiB`).
+pub const BLOB_CHUNK_BYTES: usize = infnode::node::BLOB_CHUNK_BYTES;
+/// Hard bound on total snapshot blob bytes (`512 MiB`, `MAX_SNAPSHOT_DECODE_BYTES`).
+pub const MAX_BLOB_BYTES: usize = crate::snapshot_v4::MAX_SNAPSHOT_DECODE_BYTES as usize;
+/// Hard bound on raw JSON manifest string size (`4 MiB`).
+pub const MAX_SNAPSHOT_JSON_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
 /// One chunk entry of a snapshot manifest, resolved for resumable fetch.
 ///
-/// `id` addresses the chunk bytes (`fetch_chunk_net`); `hash` is the
-/// integrity commitment from the manifest (a mismatch discards the chunk
-/// as tamper, exactly like `fetch_blob` does). Module-level (not an
-/// associated item) so the resumable helpers below can name it.
-struct SnapshotChunkMeta {
-    id: String,
-    hash: Option<String>,
+/// `id` addresses the chunk bytes (`fetch_chunk_net`); `hash` is the mandatory
+/// 32-byte BLAKE3 integrity commitment from the manifest (`SNAP-MANIFEST-DOS`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotChunkMeta {
+    pub id: String,
+    pub hash: String,
+}
+
+/// Verify that `blake3(bytes) == expected_hash`.
+pub fn verify_bytes_blake3_hash(bytes: &[u8], expected_hash: &[u8; 32]) -> bool {
+    *blake3::hash(bytes).as_bytes() == *expected_hash
+}
+
+/// Parse and strictly validate a snapshot blob JSON manifest BEFORE allocating
+/// chunk tables or issuing chunk fetches (`SNAP-MANIFEST-DOS`).
+///
+/// Enforces:
+/// - `manifest_str.len() <= MAX_SNAPSHOT_JSON_MANIFEST_BYTES`
+/// - `size <= MAX_BLOB_BYTES` (`512 MiB`)
+/// - `chunks.len() <= MAX_BLOB_CHUNKS` (`4096`) and `<= size.div_ceil(1 MiB) + 2`
+/// - non-empty safe `id` and mandatory valid 32-byte hex `hash` on EVERY chunk
+/// - contiguous `off` / bounded `len` when `off`/`len` fields are present
+#[allow(clippy::type_complexity)]
+// GATE: 4-tuple return preserves existing parse_and_validate_snapshot_manifest public signature without churn.
+pub fn parse_and_validate_snapshot_manifest(
+    manifest_str: &str,
+) -> Result<(Vec<SnapshotChunkMeta>, [u8; 32], Vec<u8>, usize), String> {
+    if manifest_str.len() > MAX_SNAPSHOT_JSON_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest string length {} exceeds max {}",
+            manifest_str.len(),
+            MAX_SNAPSHOT_JSON_MANIFEST_BYTES
+        ));
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest_str).map_err(|e| format!("manifest undecodable: {e:?}"))?;
+    let nonce_str = manifest["nonce"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing or empty nonce".to_string())?;
+    let nonce = hex::decode(nonce_str).map_err(|_| "bad nonce hex".to_string())?;
+    let key = hex::decode(manifest["key"].as_str().unwrap_or(""))
+        .map_err(|_| "bad key hex".to_string())?;
+    if key.len() != 32 {
+        return Err(format!("key is {} bytes, want 32", key.len()));
+    }
+    let mut dk = [0u8; 32];
+    dk.copy_from_slice(&key);
+
+    let size_u64 = manifest["size"]
+        .as_u64()
+        .ok_or_else(|| "missing u64 size".to_string())?;
+    if size_u64 > MAX_BLOB_BYTES as u64 {
+        return Err(format!(
+            "declared size {size_u64} exceeds MAX_BLOB_BYTES ({MAX_BLOB_BYTES})"
+        ));
+    }
+    let size = usize::try_from(size_u64).map_err(|_| "size overflows usize".to_string())?;
+
+    let chunks = manifest["chunks"]
+        .as_array()
+        .ok_or_else(|| "missing chunks array".to_string())?;
+    if chunks.len() > MAX_BLOB_CHUNKS {
+        return Err(format!(
+            "chunk count {} exceeds MAX_BLOB_CHUNKS ({MAX_BLOB_CHUNKS})",
+            chunks.len()
+        ));
+    }
+    let max_by_size = size.div_ceil(BLOB_CHUNK_BYTES).saturating_add(2);
+    if (chunks.is_empty() && size > 0) || chunks.len() > max_by_size {
+        return Err(format!(
+            "chunk count {} inconsistent with declared size {size} (max {max_by_size})",
+            chunks.len()
+        ));
+    }
+
+    let mut metas = Vec::with_capacity(chunks.len());
+    let mut expected_off = 0usize;
+    for (idx, c) in chunks.iter().enumerate() {
+        let id = c["id"]
+            .as_str()
+            .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains(".."))
+            .ok_or_else(|| format!("chunk {idx} has missing or unsafe id"))?;
+        let hash_str = c
+            .get("hash")
+            .and_then(|h| h.as_str())
+            .ok_or_else(|| format!("chunk {idx} missing mandatory hash"))?;
+        let hash_bytes =
+            hex::decode(hash_str).map_err(|_| format!("chunk {idx} has invalid hex hash"))?;
+        if hash_bytes.len() != 32 {
+            return Err(format!(
+                "chunk {idx} hash is {} bytes, want 32",
+                hash_bytes.len()
+            ));
+        }
+        if c.get("off").is_some() || c.get("len").is_some() {
+            let off_u64 = c
+                .get("off")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("chunk {idx} has malformed off"))?;
+            let len_u64 = c
+                .get("len")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("chunk {idx} has malformed len"))?;
+            let off = usize::try_from(off_u64).map_err(|_| "chunk off overflow".to_string())?;
+            let len = usize::try_from(len_u64).map_err(|_| "chunk len overflow".to_string())?;
+            if off != expected_off || len == 0 || len > BLOB_CHUNK_BYTES {
+                return Err(format!(
+                    "chunk {idx} non-contiguous or oversized (off={off}, expected={expected_off}, len={len})"
+                ));
+            }
+            expected_off = expected_off
+                .checked_add(len)
+                .ok_or_else(|| "chunk table total length overflow".to_string())?;
+            if expected_off > MAX_BLOB_BYTES + 64 {
+                return Err(format!(
+                    "chunk table total length {expected_off} exceeds MAX_BLOB_BYTES ({MAX_BLOB_BYTES})"
+                ));
+            }
+        }
+        metas.push(SnapshotChunkMeta {
+            id: id.to_string(),
+            hash: hash_str.to_string(),
+        });
+    }
+    Ok((metas, dk, nonce, size))
 }
 
 /// Result of a UNICAST consensus frame: which transport carried it.
@@ -1683,6 +1843,20 @@ impl P2pNetworkAdapter {
                 slots[0].lane,
             )
             .await;
+            // Additive v2 header record carrying full v4 BlockHeader fields.
+            let rec_v2 = crate::storage::BlockHeaderRecordV2::of(block);
+            if let Ok(v2_bytes) = bincode::serialize(&rec_v2) {
+                paced_store_blob_in_lane(
+                    &self.node,
+                    BUCKET_STELLEREUM_HEADERS,
+                    &header_v2_name(&self.epoch(), shard_id, block.height),
+                    &v2_bytes,
+                    ttl,
+                    ReplStoreKind::Companion,
+                    slots[0].lane,
+                )
+                .await;
+            }
             // And the height -> hash pointer, so a caller can ask for "the header at
             // height N" without already knowing the hash.
             let idx = format!("{}:{}", block.height, hex::encode(block.compute_hash()));
@@ -1801,6 +1975,12 @@ impl P2pNetworkAdapter {
             for (bucket, name) in &plan.blobs {
                 self.node.delete_blob_local(bucket, name).await;
             }
+            self.node
+                .delete_blob_local(
+                    BUCKET_STELLEREUM_HEADERS,
+                    &header_v2_name(&epoch, shard_id, h),
+                )
+                .await;
             for k in &plan.kv {
                 self.node.kv_remove_local(k).await;
             }
@@ -1881,17 +2061,87 @@ impl P2pNetworkAdapter {
         None
     }
 
+    /// Fetch a v2 header record by shard, height, and expected hash.
+    ///
+    /// When `header_commit_active_at(height)` is true, fails closed unless
+    /// `rec.header.compute_hash() == expected_hash`.
+    pub async fn fetch_block_header_v2(
+        &self,
+        shard_id: u32,
+        height: u64,
+        expected_hash: [u8; 32],
+    ) -> Option<crate::storage::BlockHeaderRecordV2> {
+        let _permit = fetch_sem().acquire().await.ok()?;
+        let name = header_v2_name(&self.epoch(), shard_id, height);
+        let mut last_err = "missing";
+        for attempt in 1..=3u32 {
+            let blob_res = tokio::time::timeout(
+                std::time::Duration::from_millis(10_000),
+                self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
+            )
+            .await
+            .ok()
+            .flatten();
+            if let Some(bytes) = blob_res {
+                match decode_wire_limited::<crate::storage::BlockHeaderRecordV2>(
+                    &bytes,
+                    MAX_WIRE_SMALL_BYTES,
+                ) {
+                    Ok(rec) => {
+                        if rec.header.shard_id == shard_id
+                            && rec.header.height == height
+                            && rec.block_hash == expected_hash
+                        {
+                            if !crate::sharding::header_commit_active_at(height)
+                                || rec.header.compute_hash() == expected_hash
+                            {
+                                return Some(rec);
+                            }
+                            last_err = "v4 compute_hash mismatch";
+                        } else {
+                            last_err = "shard/hash/height mismatch";
+                        }
+                    }
+                    Err(_) => last_err = "bad bincode",
+                }
+            } else {
+                last_err = "fetch miss/timeout";
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+            }
+        }
+        eprintln!("[sync] fetch_block_header_v2 shard={shard_id} height={height} name={name}: failed ({last_err})");
+        None
+    }
+
     /// Fetch a header by height AND hash, refusing one that does not match the hash.
     ///
     /// The hash argument is what makes this trustworthy: a peer cannot hand us a
     /// header for a different block under this height, because the record's own
-    /// `block_hash` must equal the hash we asked for.
+    /// `block_hash` must equal the hash we asked for. At `header_commit_active_at(height)`,
+    /// requires [`Self::fetch_block_header_v2`] and `rec.header.compute_hash() == expected_hash`.
     pub async fn fetch_block_header(
         &self,
         shard_id: u32,
         height: u64,
         expected_hash: [u8; 32],
     ) -> Option<crate::storage::BlockHeaderRecord> {
+        if crate::sharding::header_commit_active_at(height) {
+            let v2 = self
+                .fetch_block_header_v2(shard_id, height, expected_hash)
+                .await?;
+            return Some(crate::storage::BlockHeaderRecord {
+                height: v2.header.height,
+                prev_hash: v2.header.prev_hash,
+                state_root: v2.header.state_root,
+                proposer: v2.header.proposer,
+                timestamp: v2.header.timestamp,
+                tx_count: v2.tx_count,
+                gas_used: v2.gas_used,
+                block_hash: v2.block_hash,
+            });
+        }
         let _permit = fetch_sem().acquire().await.ok()?;
         let name = header_name(&self.epoch(), height);
         let mut last_err = "missing";
@@ -2179,56 +2429,15 @@ impl P2pNetworkAdapter {
                 return None;
             }
         };
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
-            .map_err(|e| {
+        match parse_and_validate_snapshot_manifest(&manifest_str) {
+            Ok(parsed) => Some(parsed),
+            Err(reason) => {
                 eprintln!(
-                    "[sync] snapshot-fetch manifest undecodable: {bucket}/{name}: {e:?} \
-                 (treating as miss, not trusted)"
+                    "[sync] snapshot-fetch manifest rejected: {bucket}/{name}: {reason} (treating as miss)"
                 );
-            })
-            .ok()?;
-        let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or(""))
-            .map_err(|_| {
-                eprintln!(
-                    "[sync] snapshot-fetch manifest {bucket}/{name}: bad nonce (treating as miss)"
-                );
-            })
-            .ok()?;
-        let key = hex::decode(manifest["key"].as_str().unwrap_or(""))
-            .map_err(|_| {
-                eprintln!(
-                    "[sync] snapshot-fetch manifest {bucket}/{name}: bad key (treating as miss)"
-                );
-            })
-            .ok()?;
-        if key.len() != 32 {
-            eprintln!(
-                "[sync] snapshot-fetch manifest {bucket}/{name}: key is {} bytes, want 32 \
-                 (treating as miss)",
-                key.len()
-            );
-            return None;
-        }
-        let mut dk = [0u8; 32];
-        dk.copy_from_slice(&key);
-        let size = manifest["size"].as_u64().unwrap_or(0) as usize;
-        let mut metas = Vec::new();
-        if let Some(chunks) = manifest["chunks"].as_array() {
-            for c in chunks {
-                metas.push(SnapshotChunkMeta {
-                    id: c["id"].as_str().unwrap_or("").to_string(),
-                    hash: c["hash"].as_str().map(|s| s.to_string()),
-                });
+                None
             }
         }
-        if metas.is_empty() && size > 0 {
-            eprintln!(
-                "[sync] snapshot-fetch manifest {bucket}/{name}: declares {size} bytes \
-                 but lists no chunks (treating as miss)"
-            );
-            return None;
-        }
-        Some((metas, dk, nonce, size))
     }
 
     /// Resumable large-blob fetch: manifest + per-chunk assembly with resume.
@@ -2306,11 +2515,20 @@ impl P2pNetworkAdapter {
                                 std::time::Duration::from_millis(
                                     crate::sync::SNAPSHOT_CHUNK_TIMEOUT_MS,
                                 ),
-                                node.fetch_chunk_net(&bucket, &cid, expected.as_deref()),
+                                node.fetch_chunk_net(&bucket, &cid, Some(expected.as_str())),
                             )
                             .await;
                             match got {
-                                Ok(Some(bytes)) => Some(bytes),
+                                Ok(Some(bytes)) => {
+                                    if bytes.len() > BLOB_CHUNK_BYTES {
+                                        eprintln!(
+                                            "[sync] snapshot-fetch {bucket}/{cid}: chunk {i} length {} exceeds BLOB_CHUNK_BYTES ({BLOB_CHUNK_BYTES}); discarding",
+                                            bytes.len()
+                                        );
+                                        return None;
+                                    }
+                                    Some(bytes)
+                                }
                                 Ok(None) => {
                                     tracing::debug!(
                                         "[sync] snapshot-fetch {bucket}/{cid}: chunk {i} \
@@ -2349,12 +2567,34 @@ impl P2pNetworkAdapter {
                     );
                 }
                 Ok(Ok(chunks)) => {
-                    let mut ct = Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
+                    let total_ct: Option<usize> = chunks
+                        .iter()
+                        .try_fold(0usize, |acc, c| acc.checked_add(c.len()));
+                    let Some(total_ct) = total_ct else {
+                        eprintln!(
+                            "[sync] snapshot-fetch {bucket}/{name}: assembled ciphertext length overflows usize; rejecting"
+                        );
+                        return None;
+                    };
+                    if total_ct > MAX_BLOB_BYTES.saturating_add(64) {
+                        eprintln!(
+                            "[sync] snapshot-fetch {bucket}/{name}: assembled ciphertext {total_ct} bytes exceeds MAX_BLOB_BYTES ({MAX_BLOB_BYTES}); rejecting"
+                        );
+                        return None;
+                    }
+                    let mut ct = Vec::with_capacity(total_ct);
                     for c in &chunks {
                         ct.extend_from_slice(c);
                     }
                     match infnode::node::e2e_decrypt(&dk, &nonce, &ct) {
                         Ok(plain) => {
+                            if plain.len() > MAX_BLOB_BYTES || plain.len() != size {
+                                eprintln!(
+                                    "[sync] snapshot-fetch {bucket}/{name}: decrypted length {} invalid (declared {size}, max {MAX_BLOB_BYTES}); rejecting",
+                                    plain.len()
+                                );
+                                return None;
+                            }
                             eprintln!(
                                 "[sync] snapshot-fetch {bucket}/{name}: assembled {size} bytes \
                                  from {n_chunks} chunks (attempt {blob_attempt})"
@@ -2472,6 +2712,151 @@ impl P2pNetworkAdapter {
         }
         tokio::task::yield_now().await;
         out
+    }
+
+    // ==================== W1 SnapV4 Content-Addressed DHT Transport ====================
+
+    /// Publish a `SnapV4` `SnapshotManifestV1` under its content-addressed
+    /// `snapv4_manifest_name(epoch, shard_id, target_height, target_state_root)`.
+    pub async fn persist_snapv4_manifest(
+        &self,
+        shard_id: u32,
+        manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    ) -> Result<usize, String> {
+        if manifest.shard_id != shard_id {
+            return Err(format!(
+                "persist_snapv4_manifest: shard mismatch ({} != {shard_id})",
+                manifest.shard_id
+            ));
+        }
+        let bytes = crate::snapshot_v4::encode_manifest_strict(manifest)
+            .map_err(|e| format!("encode snapv4 manifest: {e}"))?;
+        let name = snapv4_manifest_name(
+            &self.epoch(),
+            shard_id,
+            manifest.target_height,
+            &manifest.target_state_root,
+        );
+        let stored = paced_store_blob(
+            &self.node,
+            BUCKET_STELLEREUM_STATE,
+            &name,
+            &bytes,
+            dht_forever_ttl_ms(),
+            ReplStoreKind::Bulk,
+        )
+        .await;
+        if stored == 0 {
+            return Err(format!(
+                "snapv4 manifest {name} reached no local chunk and no replica"
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Publish a single `SnapV4` unit/chunk under its BLAKE3 content-addressed
+    /// `snapv4_unit_name(epoch, shard_id, chunk_hash)`.
+    pub async fn persist_snapv4_unit(
+        &self,
+        shard_id: u32,
+        chunk_hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<usize, String> {
+        if bytes.len() > crate::snapshot_v4::MAX_SNAP_CHUNK_BYTES {
+            return Err(format!(
+                "persist_snapv4_unit: chunk len {} exceeds MAX_SNAP_CHUNK_BYTES ({})",
+                bytes.len(),
+                crate::snapshot_v4::MAX_SNAP_CHUNK_BYTES
+            ));
+        }
+        if !verify_bytes_blake3_hash(bytes, chunk_hash) {
+            return Err("persist_snapv4_unit: blake3(bytes) != chunk_hash".to_string());
+        }
+        let name = snapv4_unit_name(&self.epoch(), shard_id, chunk_hash);
+        let stored = paced_store_blob(
+            &self.node,
+            BUCKET_STELLEREUM_STATE,
+            &name,
+            bytes,
+            dht_forever_ttl_ms(),
+            ReplStoreKind::Bulk,
+        )
+        .await;
+        if stored == 0 {
+            return Err(format!(
+                "snapv4 unit {name} reached no local chunk and no replica"
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Fetch a `SnapV4` manifest by `(shard_id, height, state_root)`.
+    /// If `expected_hash` is `Some`, verifies `blake3(bytes) == expected_hash`.
+    /// Always checks `decode_manifest_strict` and `(shard_id, target_height, target_state_root)`.
+    pub async fn fetch_snapv4_manifest(
+        &self,
+        shard_id: u32,
+        height: u64,
+        state_root: &[u8; 32],
+        expected_hash: Option<&[u8; 32]>,
+    ) -> Option<crate::snapshot_v4::SnapshotManifestV1> {
+        let _permit = fetch_sem().acquire().await.ok()?;
+        let name = snapv4_manifest_name(&self.epoch(), shard_id, height, state_root);
+        let bytes = self.node.fetch_blob(BUCKET_STELLEREUM_STATE, &name).await?;
+        if let Some(exp) = expected_hash {
+            if !verify_bytes_blake3_hash(&bytes, exp) {
+                eprintln!(
+                    "[sync] fetch_snapv4_manifest {name}: blake3 mismatch against expected_hash; rejecting"
+                );
+                return None;
+            }
+        }
+        let manifest = match crate::snapshot_v4::decode_manifest_strict(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[sync] fetch_snapv4_manifest {name}: strict decode failed: {e}");
+                return None;
+            }
+        };
+        if manifest.shard_id != shard_id
+            || manifest.target_height != height
+            || manifest.target_state_root != *state_root
+        {
+            eprintln!(
+                "[sync] fetch_snapv4_manifest {name}: target mismatch (shard={}, height={})",
+                manifest.shard_id, manifest.target_height
+            );
+            return None;
+        }
+        Some(manifest)
+    }
+
+    /// Fetch a single `SnapV4` unit/chunk by `expected_hash`, enforcing
+    /// `fetch_sem -> snapshot_fetch_sem`, `MAX_SNAP_CHUNK_BYTES`, and
+    /// `blake3(bytes) == expected_hash`.
+    pub async fn fetch_snapv4_unit(
+        &self,
+        shard_id: u32,
+        expected_hash: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        let _permit = fetch_sem().acquire().await.ok()?;
+        let _snap = snapshot_fetch_sem().acquire().await.ok()?;
+        let name = snapv4_unit_name(&self.epoch(), shard_id, expected_hash);
+        let bytes =
+            Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await?;
+        if bytes.len() > crate::snapshot_v4::MAX_SNAP_CHUNK_BYTES {
+            eprintln!(
+                "[sync] fetch_snapv4_unit {name}: len {} exceeds MAX_SNAP_CHUNK_BYTES; rejecting",
+                bytes.len()
+            );
+            return None;
+        }
+        if !verify_bytes_blake3_hash(&bytes, expected_hash) {
+            eprintln!("[sync] fetch_snapv4_unit {name}: blake3(bytes) != expected_hash; rejecting");
+            return None;
+        }
+        tokio::task::yield_now().await;
+        Some(bytes)
     }
 
     /// Broadcast transaction into mempool over infnode DHT KV

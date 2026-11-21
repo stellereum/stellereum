@@ -120,6 +120,11 @@ fn light_header(block_hash: [u8; 32], sigs: Vec<([u8; 32], Vec<u8>)>) -> LightHe
             signatures: Vec::new(),
         },
         signatures: sigs,
+        shard_id: 0,
+        round: 0,
+        body_commitment: None,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
     }
 }
 

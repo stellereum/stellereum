@@ -220,7 +220,7 @@ where
 /// proposer the deterministic schedule names, and the anchor walk verifies
 /// all three (linkage + QC validity under OUR committed set + proposer
 /// match) via [`verify_finality_for_header`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderLink {
     pub height: u64,
     pub block_hash: [u8; 32],
@@ -228,6 +228,107 @@ pub struct HeaderLink {
     pub state_root: [u8; 32],
     pub proposer: [u8; 32],
     pub qc: crate::consensus::QuorumCertificate,
+    #[serde(default)]
+    pub shard_id: u32,
+    #[serde(default)]
+    pub round: u32,
+    #[serde(default)]
+    pub body_commitment: Option<[u8; 32]>,
+    #[serde(default)]
+    pub mmr_epoch_root: [u8; 32],
+    #[serde(default)]
+    pub epoch_key_commitment: [u8; 32],
+    #[serde(default)]
+    pub timestamp: u64,
+}
+
+/// Optional v4 [`crate::sharding::BlockHeader`] fields for [`verify_finality_for_header_v2_with_schedule`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderV4Fields {
+    pub shard_id: u32,
+    pub round: u32,
+    pub state_root: [u8; 32],
+    pub body_commitment: Option<[u8; 32]>,
+    pub mmr_epoch_root: [u8; 32],
+    pub epoch_key_commitment: [u8; 32],
+    pub timestamp: u64,
+}
+
+impl HeaderLink {
+    /// Construct a [`HeaderLink`] from a [`crate::storage::BlockHeaderRecordV2`] and its QC.
+    pub fn from_v2_record(
+        rec: &crate::storage::BlockHeaderRecordV2,
+        qc: crate::consensus::QuorumCertificate,
+    ) -> Self {
+        let h = &rec.header;
+        Self {
+            height: h.height,
+            block_hash: rec.block_hash,
+            prev_hash: h.prev_hash,
+            state_root: h.state_root,
+            proposer: h.proposer,
+            qc,
+            shard_id: h.shard_id,
+            round: h.round,
+            body_commitment: if crate::sharding::header_commit_active_at(h.height) {
+                Some(h.body_commitment)
+            } else {
+                None
+            },
+            mmr_epoch_root: h.mmr_epoch_root,
+            epoch_key_commitment: h.epoch_key_commitment,
+            timestamp: h.timestamp,
+        }
+    }
+
+    /// Construct a [`HeaderLink`] from a full [`Block`] carrying a precommit QC.
+    pub fn from_block(b: &Block) -> Option<Self> {
+        let qc = b.precommit_qc.clone()?;
+        Some(Self {
+            height: b.height,
+            block_hash: b.compute_hash(),
+            prev_hash: b.prev_hash,
+            state_root: b.state_root,
+            proposer: b.proposer,
+            qc,
+            shard_id: b.shard_id,
+            round: b.round,
+            body_commitment: if crate::sharding::header_commit_active_at(b.height) {
+                Some(b.body_commitment())
+            } else {
+                None
+            },
+            mmr_epoch_root: b.mmr_epoch_root,
+            epoch_key_commitment: b.epoch_key_commitment,
+            timestamp: b.timestamp,
+        })
+    }
+
+    /// Verify finality and v4 header hash binding (when `header_commit_active_at(self.height)`).
+    pub fn verify_with_schedule(
+        &self,
+        validators: &crate::consensus::ValidatorSet,
+        schedule: crate::consensus::CommitteeSchedule,
+    ) -> Result<(), String> {
+        verify_finality_for_header_v2_with_schedule(
+            validators,
+            self.height,
+            &self.block_hash,
+            &self.prev_hash,
+            &self.proposer,
+            &self.qc,
+            schedule,
+            Some(HeaderV4Fields {
+                shard_id: self.shard_id,
+                round: self.round,
+                state_root: self.state_root,
+                body_commitment: self.body_commitment,
+                mmr_epoch_root: self.mmr_epoch_root,
+                epoch_key_commitment: self.epoch_key_commitment,
+                timestamp: self.timestamp,
+            }),
+        )
+    }
 }
 
 /// Upper bound for the proposer-schedule scan in [`proposer_matches_schedule`].
@@ -379,7 +480,65 @@ pub fn verify_finality_for_header_with_schedule(
     qc: &crate::consensus::QuorumCertificate,
     schedule: crate::consensus::CommitteeSchedule,
 ) -> Result<(), String> {
+    verify_finality_for_header_v2_with_schedule(
+        validators,
+        height,
+        block_hash,
+        parent_hash,
+        proposer,
+        qc,
+        schedule,
+        None,
+    )
+}
+
+/// [`verify_finality_for_header_with_schedule`] with optional v4 [`HeaderV4Fields`].
+///
+/// When `crate::sharding::header_commit_active_at(height)` is true, fails closed
+/// unless `v4` is `Some`, `body_commitment` is `Some(bc)`, and
+/// `BlockHeader::compute_hash() == *block_hash`.
+#[allow(clippy::too_many_arguments)]
+// GATE: v4 header finality gate validates all BlockHeader fields alongside QC schedule without allocating an intermediate struct.
+pub fn verify_finality_for_header_v2_with_schedule(
+    validators: &crate::consensus::ValidatorSet,
+    height: u64,
+    block_hash: &[u8; 32],
+    parent_hash: &[u8; 32],
+    proposer: &[u8; 32],
+    qc: &crate::consensus::QuorumCertificate,
+    schedule: crate::consensus::CommitteeSchedule,
+    v4: Option<HeaderV4Fields>,
+) -> Result<(), String> {
     use crate::consensus::VoteKind;
+    if crate::sharding::header_commit_active_at(height) {
+        let Some(fields) = v4 else {
+            return Err(format!(
+                "finality: height {height} requires v4 BlockHeader fields (header commit active)"
+            ));
+        };
+        let Some(bc) = fields.body_commitment else {
+            return Err(format!(
+                "finality: height {height} requires body_commitment == Some(...) under v4 header commitment"
+            ));
+        };
+        let hdr = crate::sharding::BlockHeader {
+            shard_id: fields.shard_id,
+            height,
+            round: fields.round,
+            prev_hash: *parent_hash,
+            state_root: fields.state_root,
+            body_commitment: bc,
+            mmr_epoch_root: fields.mmr_epoch_root,
+            epoch_key_commitment: fields.epoch_key_commitment,
+            timestamp: fields.timestamp,
+            proposer: *proposer,
+        };
+        if hdr.compute_hash() != *block_hash {
+            return Err(format!(
+                "finality: height {height} BlockHeader::compute_hash() mismatch (forged header fields rejected)"
+            ));
+        }
+    }
     if qc.kind != VoteKind::Precommit {
         return Err(format!(
             "finality: height {height}: QC kind is not Precommit"
@@ -581,16 +740,8 @@ where
                  refusing without a set-at-height (F5 fail-closed)"
             )
         })?;
-        verify_finality_for_header_with_schedule(
-            &vs,
-            height,
-            &link.block_hash,
-            &link.prev_hash,
-            &link.proposer,
-            &link.qc,
-            resolve_schedule(height),
-        )
-        .map_err(|e| format!("snapshot anchor: {e}"))?;
+        link.verify_with_schedule(&vs, resolve_schedule(height))
+            .map_err(|e| format!("snapshot anchor: {e}"))?;
         // The block at `next_height - 1` is the boundary: it is the height
         // the snapshot restores to, and its hash is the finalized head the
         // node resumes from.
@@ -854,16 +1005,8 @@ where
                  refusing without a set-at-height (F5 fail-closed)"
             )
         })?;
-        verify_finality_for_header_with_schedule(
-            &vs,
-            height,
-            &link.block_hash,
-            &link.prev_hash,
-            &link.proposer,
-            &link.qc,
-            resolve_schedule(height),
-        )
-        .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
+        link.verify_with_schedule(&vs, resolve_schedule(height))
+            .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
         // The boundary block (the height the snapshot restores to): its hash
         // is QC-verified above, so it is a value the quorum vouched for.
         if height + 1 == next_height {
@@ -1280,6 +1423,7 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
     "cross_shard",
     "cnvrf_v3",
     "pq_keys",
+    "evm_bindings",
 ];
 
 pub async fn fast_sync_state<F, Fut, G, GFut>(
@@ -1721,6 +1865,12 @@ async fn install_bundle(
                     .await
                     .map_err(|e| format!("fast sync: restore pq_keys error: {e}"))?;
             }
+            "evm_bindings" => {
+                engine
+                    .restore_evm_bindings(dbytes)
+                    .await
+                    .map_err(|e| format!("fast sync: restore evm_bindings error: {e}"))?;
+            }
             // Forward-compat: kinds the restore path does not install yet.
             // A non-empty blob here is logged loudly so a silently-dropped
             // domain can never hide: the root check above already passed, so
@@ -1742,6 +1892,300 @@ async fn install_bundle(
         tokio::task::yield_now().await;
     }
     Ok(())
+}
+
+// ==================== W1 SnapV4 Verification & Incremental Sync ====================
+
+/// Pre-fetch validation of a `SnapshotManifestV1` against a consensus-verified
+/// [`crate::snapshot_v4::TrustedSnapshotAnchor`]. Fails closed before any unit
+/// buffer allocation or chunk download.
+pub fn verify_snapv4_manifest_pre_fetch(
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+) -> Result<(), String> {
+    crate::snapshot_v4::validate_manifest_pre_fetch(manifest, anchor)
+        .map_err(|e| format!("snap_v4 pre-fetch manifest rejected: {e}"))
+}
+
+/// [`verify_snapv4_manifest_pre_fetch`] with an explicit PQ key resolver.
+pub fn verify_snapv4_manifest_pre_fetch_with_key_resolver<F>(
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    key_resolver: F,
+) -> Result<(), String>
+where
+    F: Fn(&crate::consensus::ValidatorId, u64) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)>,
+{
+    crate::snapshot_v4::validate_manifest_pre_fetch_with_key_resolver(
+        manifest,
+        anchor,
+        key_resolver,
+    )
+    .map_err(|e| format!("snap_v4 pre-fetch manifest rejected: {e}"))
+}
+
+/// Fetch every non-`UnchangedRef` unit chunk named in `manifest`, verifying
+/// `chunk_hash`, `byte_len`, and `unit_hash` (for `FullUnit`) immediately upon
+/// receipt before buffering.
+pub async fn fetch_verified_snapv4_chunks<F, Fut>(
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    mut fetch_chunk: F,
+) -> Result<std::collections::BTreeMap<(u16, u16), Vec<u8>>, String>
+where
+    F: FnMut(u16, u16, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let mut chunks = std::collections::BTreeMap::new();
+    for desc in &manifest.units {
+        if desc.encoding == crate::snapshot_v4::UNIT_ENC_UNCHANGED {
+            continue;
+        }
+        let bytes = fetch_chunk(desc.unit_tag, desc.sub_index, desc.chunk_hash)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "snap_v4 chunk ({}, {}) missing from peers/DHT",
+                    desc.unit_tag, desc.sub_index
+                )
+            })?;
+        crate::snapshot_v4::verify_unit_chunk(desc, &bytes).map_err(|e| {
+            format!(
+                "snap_v4 chunk ({}, {}) verification failed: {e}",
+                desc.unit_tag, desc.sub_index
+            )
+        })?;
+        chunks.insert((desc.unit_tag, desc.sub_index), bytes);
+        tokio::task::yield_now().await;
+    }
+    Ok(chunks)
+}
+
+async fn check_snapv4_commit_gates(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    state: &crate::snapshot_v4::SnapStateV4,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+) -> Result<crate::consensus::ValidatorSet, String> {
+    if anchor.validator_set.validators.is_empty() {
+        return Err("snap_v4: empty anchor validator set".to_string());
+    }
+    let ledger = state.staking.to_ledger();
+    let derived_set = ledger.to_validator_set();
+    if derived_set.validators.is_empty() {
+        return Err(format!(
+            "snap_v4: snapshot at height {} commits to an EMPTY validator set",
+            anchor.target_height
+        ));
+    }
+    if derived_set.validators != anchor.validator_set.validators {
+        return Err(format!(
+            "snap_v4: snapshot validator set at height {} does not match trusted anchor set",
+            anchor.target_height
+        ));
+    }
+    let replay = state.cross_shard.to_replay();
+    if !target_engine.cross_shard_replay_covers(&replay).await {
+        return Err(format!(
+            "snap_v4: cross_shard replay sets at height {} do not cover target engine state",
+            anchor.target_height
+        ));
+    }
+    Ok(derived_set)
+}
+
+fn commit_snapv4_to_storage(
+    storage: &crate::storage::Storage,
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    chunks: &std::collections::BTreeMap<(u16, u16), Vec<u8>>,
+) -> Result<(), String> {
+    let manifest_bytes = crate::snapshot_v4::encode_manifest_strict(manifest)
+        .map_err(|e| format!("snap_v4 encode manifest: {e}"))?;
+    let mut unit_refs: Vec<([u8; 32], &[u8])> = Vec::new();
+    for desc in &manifest.units {
+        if desc.encoding == crate::snapshot_v4::UNIT_ENC_UNCHANGED {
+            continue;
+        }
+        let raw = chunks
+            .get(&(desc.unit_tag, desc.sub_index))
+            .ok_or_else(|| {
+                format!(
+                    "snap_v4 commit missing verified chunk ({}, {})",
+                    desc.unit_tag, desc.sub_index
+                )
+            })?;
+        unit_refs.push((desc.chunk_hash, raw.as_slice()));
+    }
+    let (is_base, base_height) = match manifest.kind {
+        crate::snapshot_v4::SnapshotKind::Base => (true, None),
+        crate::snapshot_v4::SnapshotKind::Delta { base_height, .. } => (false, Some(base_height)),
+    };
+    let marker = crate::storage::SnapCommitMarker {
+        height: manifest.target_height,
+        state_root: manifest.target_state_root,
+        block_hash: manifest.target_block_hash,
+        is_base,
+        base_height,
+    };
+    // Barrier invariant: `commit_snap_v4` only writes `snap_units`,
+    // `snap_manifests`, `snap_committed`, `finalized_post_root_v1`, and clears
+    // `snap_staging`. `safety_record_v1`, `ConsensusCheckpoint`, and
+    // `VoteWatermark` are never read, modified, or reset.
+    storage
+        .commit_snap_v4(&marker, &manifest_bytes, &unit_refs)
+        .map_err(|e| format!("snap_v4 storage commit failed: {e}"))
+}
+
+/// Verify and install a `Base` `SnapV4` checkpoint into `target_engine` (and
+/// optionally persist atomically to `storage` without touching
+/// `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`).
+pub async fn fast_sync_snapv4_base(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    chunks: &std::collections::BTreeMap<(u16, u16), Vec<u8>>,
+    storage: Option<&crate::storage::Storage>,
+) -> Result<
+    (
+        crate::snapshot_v4::SnapStateV4,
+        crate::consensus::ValidatorSet,
+    ),
+    String,
+> {
+    fast_sync_snapv4_base_with_key_resolver(
+        target_engine,
+        anchor,
+        manifest,
+        chunks,
+        storage,
+        crate::consensus::pq_key_at_height,
+    )
+    .await
+}
+
+pub async fn fast_sync_snapv4_base_with_key_resolver<F>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    chunks: &std::collections::BTreeMap<(u16, u16), Vec<u8>>,
+    storage: Option<&crate::storage::Storage>,
+    key_resolver: F,
+) -> Result<
+    (
+        crate::snapshot_v4::SnapStateV4,
+        crate::consensus::ValidatorSet,
+    ),
+    String,
+>
+where
+    F: Fn(&crate::consensus::ValidatorId, u64) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)>,
+{
+    let state = crate::snapshot_v4::verify_and_apply_base_with_key_resolver(
+        manifest,
+        chunks,
+        anchor,
+        key_resolver,
+    )
+    .await
+    .map_err(|e| format!("snap_v4 base verify failed: {e}"))?;
+    let bound_set = check_snapv4_commit_gates(target_engine, &state, anchor).await?;
+    state
+        .apply_to_engine(target_engine)
+        .await
+        .map_err(|e| format!("snap_v4 apply to target engine failed: {e}"))?;
+    if let Some(st) = storage {
+        commit_snapv4_to_storage(st, manifest, chunks)?;
+    }
+    Ok((state, bound_set))
+}
+
+/// Verify and install a bounded `Delta` chain (`Base -> Δ_1 -> ... -> Δ_k`,
+/// `k <= MAX_DELTA_CHAIN_LEN`) over a verified `base_state`. Fails closed
+/// before mutating `target_engine` or `storage`, and preserves
+/// `safety_record_v1`, `ConsensusCheckpoint`, and `VoteWatermark`.
+pub async fn fast_sync_snapv4_incremental(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    base_state: &crate::snapshot_v4::SnapStateV4,
+    base_height: u64,
+    base_state_root: [u8; 32],
+    chain: &[(
+        &crate::snapshot_v4::EncodedSnapshotV4,
+        &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    )],
+    storage: Option<&crate::storage::Storage>,
+) -> Result<
+    (
+        crate::snapshot_v4::SnapStateV4,
+        crate::consensus::ValidatorSet,
+    ),
+    String,
+> {
+    fast_sync_snapv4_incremental_with_key_resolver(
+        target_engine,
+        base_state,
+        base_height,
+        base_state_root,
+        chain,
+        storage,
+        crate::consensus::pq_key_at_height,
+    )
+    .await
+}
+
+pub async fn fast_sync_snapv4_incremental_with_key_resolver<F>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    base_state: &crate::snapshot_v4::SnapStateV4,
+    base_height: u64,
+    base_state_root: [u8; 32],
+    chain: &[(
+        &crate::snapshot_v4::EncodedSnapshotV4,
+        &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    )],
+    storage: Option<&crate::storage::Storage>,
+    key_resolver: F,
+) -> Result<
+    (
+        crate::snapshot_v4::SnapStateV4,
+        crate::consensus::ValidatorSet,
+    ),
+    String,
+>
+where
+    F: Fn(&crate::consensus::ValidatorId, u64) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)>,
+{
+    if chain.is_empty() {
+        return Err("snap_v4 incremental sync requires a non-empty delta chain".to_string());
+    }
+    let computed_base_root = base_state
+        .compute_state_root()
+        .await
+        .map_err(|e| format!("snap_v4 base root computation failed: {e}"))?;
+    if computed_base_root != base_state_root {
+        return Err(format!(
+            "snap_v4 delta base_state_root mismatch: expected {}, actual {}",
+            hex::encode(base_state_root),
+            hex::encode(computed_base_root)
+        ));
+    }
+    let final_state = crate::snapshot_v4::verify_and_apply_delta_chain_with_key_resolver(
+        base_state,
+        base_height,
+        base_state_root,
+        chain,
+        key_resolver,
+    )
+    .await
+    .map_err(|e| format!("snap_v4 delta chain verify failed: {e}"))?;
+    let (_, last_anchor) = chain[chain.len() - 1];
+    let bound_set = check_snapv4_commit_gates(target_engine, &final_state, last_anchor).await?;
+    final_state
+        .apply_to_engine(target_engine)
+        .await
+        .map_err(|e| format!("snap_v4 apply incremental state failed: {e}"))?;
+    if let Some(st) = storage {
+        for &(encoded, _) in chain {
+            commit_snapv4_to_storage(st, &encoded.manifest, &encoded.chunks)?;
+        }
+    }
+    Ok((final_state, bound_set))
 }
 
 // ==================== Adopter body/receipt replication (mechanics only) ====================
@@ -2395,8 +2839,9 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-                            round: 0,
-            };            b.sign_block(&sk);
+                round: 0,
+            };
+            b.sign_block(&sk);
             // Falconize: Ed-only refuses `verify_proposer_signature` (no
             // classical fallback); mirror the runtime proposal path
             // (`runtime.rs` pushes `(self.id, ed_sig)` + `(falcon_id,
@@ -2494,8 +2939,9 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-                            round: 0,
-            };            b.sign_block(&proposer);
+                round: 0,
+            };
+            b.sign_block(&proposer);
             // Falconize (same envelope as `chain` above): the proposer half
             // under the derived Falcon address, registered for the Ed id.
             {
@@ -2528,6 +2974,16 @@ mod tests {
                 .precommit_qc
                 .clone()
                 .expect("quorum_chain blocks carry QCs"),
+            shard_id: b.shard_id,
+            round: b.round,
+            body_commitment: if crate::sharding::header_commit_active_at(b.height) {
+                Some(b.body_commitment())
+            } else {
+                None
+            },
+            mmr_epoch_root: b.mmr_epoch_root,
+            epoch_key_commitment: b.epoch_key_commitment,
+            timestamp: b.timestamp,
         }
     }
 
@@ -2698,8 +3154,9 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-                            round: 0,
-            };            b.sign_block(&keys[proposer_idx]);
+                round: 0,
+            };
+            b.sign_block(&keys[proposer_idx]);
             // Falconize: the derived-address half registered for this Ed id
             // above, mirroring the runtime proposal path.
             {
@@ -3314,6 +3771,12 @@ mod tests {
                 state_root: [0xEE; 32], // arbitrary forged root
                 proposer: [0u8; 32],
                 qc: blocks[5].precommit_qc.clone().unwrap(),
+                shard_id: 0,
+                round: 0,
+                body_commitment: None,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: 5,
             },
         );
         let err = verify_snapshot_anchor(Some((2, head_hash)), [0u8; 32], 5, &vs, 1_000_000, |h| {
@@ -3396,8 +3859,9 @@ mod tests {
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
                 cnvrf_v3: None,
-                            round: 0,
-            };            eb.sign_block(&proposer);
+                round: 0,
+            };
+            eb.sign_block(&proposer);
             let hash = eb.compute_hash();
             eb.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &evil_vs, &evil_all));
             let link = qc_link(&eb);
@@ -3471,6 +3935,12 @@ mod tests {
                 state_root: root,
                 proposer: gpk,
                 qc,
+                shard_id: 0,
+                round: 0,
+                body_commitment: None,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: h,
             }
         };
         let mut links: HashMap<u64, HeaderLink> = HashMap::new();
@@ -3598,8 +4068,9 @@ mod repl_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        b.sign_block(&sk);
+            round: 0,
+        };
+        b.sign_block(&sk);
         b
     }
 

@@ -289,9 +289,9 @@ async fn build_live_chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        // FULL-PQ: sync validation checks the height-indexed Falcon proposer
-        // signature; an Ed-only body is refused ("invalid proposer signature").
+            round: 0,
+        }; // FULL-PQ: sync validation checks the height-indexed Falcon proposer
+           // signature; an Ed-only body is refused ("invalid proposer signature").
         b.sign_block_with_falcon(&proposer, &fks[proposer_idx]);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, fks, h, bh);
@@ -345,6 +345,12 @@ impl<'a> PrunedPeers<'a> {
             state_root: b.state_root,
             proposer: b.proposer,
             qc: b.precommit_qc.clone()?,
+            shard_id: b.shard_id,
+            round: b.round,
+            body_commitment: None,
+            mmr_epoch_root: b.mmr_epoch_root,
+            epoch_key_commitment: b.epoch_key_commitment,
+            timestamp: b.timestamp,
         })
     }
 

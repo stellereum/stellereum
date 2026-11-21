@@ -114,6 +114,11 @@ fn header(
         proposer: signers[0].verifying_key().to_bytes(),
         cert: cert(signers, fks, vs, height, block_hash, &prev_hash),
         signatures: Vec::new(),
+        shard_id: 0,
+        round: 0,
+        body_commitment: None,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
     }
 }
 

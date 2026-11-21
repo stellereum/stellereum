@@ -837,3 +837,133 @@ pub(super) struct LegacyStateSnapshotV2WithCounter {
     pub(super) penalty: HashMap<[u8; 32], u64>,
     pub(super) total_minted_nano: u64,
 }
+
+/// Canonical on-chain EVM ↔ PQ address bijection (`Domain::EvmBindings`).
+///
+/// Enforces a strict 1-to-1 first-writer-wins mapping between 20-byte EVM
+/// addresses and 32-byte PQ accounts. Only `by_evm` is serialized; the
+/// inverse index `by_pq` is skipped during serde and rebuilt fail-closed via
+/// [`Self::rebuild_inverse`] on restore so the two maps can never desync.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmBindingsState {
+    pub by_evm: HashMap<[u8; 20], [u8; 32]>,
+    #[serde(skip)]
+    pub by_pq: HashMap<[u8; 32], [u8; 20]>,
+}
+
+/// Persistence snapshot of [`EvmBindingsState`] (`"evm_bindings_state"` tree
+/// in `storage.rs` and `SnapV4` `DomainUnitId::EvmBindings`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmBindingsSnapshot {
+    pub by_evm: HashMap<[u8; 20], [u8; 32]>,
+}
+
+impl From<&EvmBindingsState> for EvmBindingsSnapshot {
+    fn from(state: &EvmBindingsState) -> Self {
+        Self {
+            by_evm: state.by_evm.clone(),
+        }
+    }
+}
+
+impl EvmBindingsState {
+    /// Create an empty canonical EVM bindings state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when no bindings are recorded.
+    pub fn is_empty(&self) -> bool {
+        self.by_evm.is_empty()
+    }
+
+    /// Number of bound `(evm, pq)` pairs.
+    pub fn len(&self) -> usize {
+        self.by_evm.len()
+    }
+
+    /// Look up the PQ address bound to `evm`.
+    pub fn get_pq(&self, evm: &[u8; 20]) -> Option<[u8; 32]> {
+        self.by_evm.get(evm).copied()
+    }
+
+    /// Look up the EVM address bound to `pq`.
+    pub fn get_evm(&self, pq: &[u8; 32]) -> Option<[u8; 20]> {
+        self.by_pq.get(pq).copied()
+    }
+
+    /// Bind `(evm, pq)` under strict 1-to-1 first-writer-wins semantics:
+    /// - identical `(evm, pq)` already present -> `Ok(false)` (idempotent);
+    /// - conflict on either `evm` or `pq` -> `Err(...)` without overwriting;
+    /// - fresh pair -> inserts into both maps and returns `Ok(true)`.
+    pub fn bind(&mut self, evm: [u8; 20], pq: [u8; 32]) -> Result<bool, String> {
+        if let Some(&existing_pq) = self.by_evm.get(&evm) {
+            if existing_pq == pq {
+                if let Some(&existing_evm) = self.by_pq.get(&pq) {
+                    if existing_evm != evm {
+                        return Err(format!(
+                            "EVM bindings invariant violated: PQ account {} maps to 0x{}, expected 0x{}",
+                            hex::encode(pq),
+                            hex::encode(existing_evm),
+                            hex::encode(evm)
+                        ));
+                    }
+                } else {
+                    self.by_pq.insert(pq, evm);
+                }
+                return Ok(false);
+            }
+            return Err(format!(
+                "EVM address 0x{} is already bound to PQ account {} (refusing to re-bind to {})",
+                hex::encode(evm),
+                hex::encode(existing_pq),
+                hex::encode(pq)
+            ));
+        }
+        if let Some(&existing_evm) = self.by_pq.get(&pq) {
+            return Err(format!(
+                "PQ account {} is already bound to EVM address 0x{} (refusing to bind to 0x{})",
+                hex::encode(pq),
+                hex::encode(existing_evm),
+                hex::encode(evm)
+            ));
+        }
+        self.by_evm.insert(evm, pq);
+        self.by_pq.insert(pq, evm);
+        Ok(true)
+    }
+
+    /// Rebuild `by_pq` from `by_evm`, failing closed if any two distinct EVM
+    /// addresses map to the same PQ account.
+    pub fn rebuild_inverse(&mut self) -> Result<(), String> {
+        let mut inverse = HashMap::with_capacity(self.by_evm.len());
+        for (&evm, &pq) in &self.by_evm {
+            if let Some(prev_evm) = inverse.insert(pq, evm) {
+                return Err(format!(
+                    "duplicate PQ address {} in EVM bindings (bound to both 0x{} and 0x{})",
+                    hex::encode(pq),
+                    hex::encode(prev_evm),
+                    hex::encode(evm)
+                ));
+            }
+        }
+        self.by_pq = inverse;
+        Ok(())
+    }
+
+    /// Export a persistence snapshot.
+    pub fn to_snapshot(&self) -> EvmBindingsSnapshot {
+        EvmBindingsSnapshot::from(self)
+    }
+
+    /// Construct and validate [`EvmBindingsState`] from a snapshot (fail-closed
+    /// on duplicate PQ mappings).
+    pub fn from_snapshot(snap: EvmBindingsSnapshot) -> Result<Self, String> {
+        let mut state = Self {
+            by_evm: snap.by_evm,
+            by_pq: HashMap::new(),
+        };
+        state.rebuild_inverse()?;
+        Ok(state)
+    }
+}

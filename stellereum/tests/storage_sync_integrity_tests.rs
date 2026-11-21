@@ -59,7 +59,8 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32]) -> Block {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(&sk);
+    };
+    b.sign_block(&sk);
     b
 }
 
@@ -146,9 +147,9 @@ fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32],
             cnvrf_v3: None,
-                    round: 0,
-        };        // FULL-PQ: the proposer half must be a Falcon-512 signature
-        // (`verify_proposer_signature` refuses the Ed-only shape).
+            round: 0,
+        }; // FULL-PQ: the proposer half must be a Falcon-512 signature
+           // (`verify_proposer_signature` refuses the Ed-only shape).
         b.sign_block_with_falcon(&keys[proposer_idx], &fks[proposer_idx]);
         let hash = b.compute_hash();
         b.precommit_qc = Some(qc_from(&keys, &fks, &vs, h, hash, prev));
@@ -166,6 +167,12 @@ fn link_of(b: &Block) -> sync::HeaderLink {
         state_root: b.state_root,
         proposer: b.proposer,
         qc: b.precommit_qc.clone().expect("quorum chain carries QCs"),
+        shard_id: b.shard_id,
+        round: b.round,
+        body_commitment: None,
+        mmr_epoch_root: b.mmr_epoch_root,
+        epoch_key_commitment: b.epoch_key_commitment,
+        timestamp: b.timestamp,
     }
 }
 

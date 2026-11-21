@@ -29,8 +29,9 @@ pub use types::{
     compute_contract_address, contract_abi_key, contract_key, contract_source_key,
     hashpool_commitment_key, hashpool_nullifier_key, token_balance_key, token_supply_key,
     ActorMessage, ActorSendBody, BlockTransitionOutcome, ContractCallOutcome, DeployOutcome,
-    EscrowRecord, ExecPostActions, GovOpsOutcome, HashPoolApplyOutcome, HashPoolBlockOps,
-    HashPoolDepositOp, HashPoolOpError, HashPoolSpendOp, StateSnapshotV2,
+    EscrowRecord, EvmBindingsSnapshot, EvmBindingsState, ExecPostActions, GovOpsOutcome,
+    HashPoolApplyOutcome, HashPoolBlockOps, HashPoolDepositOp, HashPoolOpError, HashPoolSpendOp,
+    StateSnapshotV2,
 };
 pub use verify_once::{
     record_verified_signature, verified_signature_covers, verify_once_clear,
@@ -88,6 +89,46 @@ pub const HASH_POOL_ENABLED: bool = false;
 /// [`InMemoryStateEngine::enable_gov_ops_for_tests`] opener is retained for
 /// the existing block-path fixtures.
 pub use crate::governance::GOV_OPS_ACTIVATION_HEIGHT;
+
+/// Compiled default activation height for Ruleset v7 canonical
+/// `Domain::EvmBindings` state commitment and first-writer-wins consensus
+/// transition in `apply()`.
+///
+/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation so historical
+/// blocks, `FORK_ID == 0x0f584a46`, `COMMITMENT_VERSION == 5`, and
+/// `EXPECTED_GENESIS_ROOT` remain byte-identical.
+pub const EVM_BINDINGS_STATE_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static EVM_BINDINGS_STATE_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY `EVM_BINDINGS_STATE` activation
+/// height override for the calling thread.
+#[cfg(any(test, debug_assertions))]
+pub fn set_evm_bindings_state_activation_override(activation: Option<u64>) {
+    EVM_BINDINGS_STATE_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `EVM_BINDINGS_STATE` activation height for the calling thread.
+pub fn effective_evm_bindings_state_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = EVM_BINDINGS_STATE_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    EVM_BINDINGS_STATE_ACTIVATION_HEIGHT
+}
+
+/// True iff canonical `Domain::EvmBindings` state is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`).
+pub fn evm_bindings_state_active_at(height: u64) -> bool {
+    let gate = effective_evm_bindings_state_activation_height();
+    gate != u64::MAX && height >= gate
+}
 
 /// Default scheme tag for an account that has not pinned a public key.
 ///
@@ -523,6 +564,13 @@ pub struct InMemoryStateEngine {
     /// Per-epoch `(freeze_block_hash, rolling_mix_at_freeze)` captured at
     /// `H_freeze = epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`.
     cnvrf_freeze_inputs: Arc<RwLock<std::collections::BTreeMap<u64, ([u8; 32], [u8; 48])>>>,
+    /// Canonical on-chain EVM ↔ PQ address bijection (`Domain::EvmBindings`).
+    ///
+    /// PRIVATE on purpose: reads go through `evm_bindings_read`, mutations
+    /// through `evm_bindings_write` (which bumps `Domain::EvmBindings` and
+    /// `commitment_generation`). CONDITIONAL in the commitment (0 bytes while
+    /// empty, preserving `COMMITMENT_VERSION = 5` and genesis KATs).
+    evm_bindings: Arc<RwLock<EvmBindingsState>>,
     /// Test/debug per-engine activation height override for CN-VRF v3
     /// (initialized to `u64::MAX`, keeping frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
     #[cfg(any(test, debug_assertions))]

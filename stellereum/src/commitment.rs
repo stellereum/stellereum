@@ -135,6 +135,7 @@ pub enum Domain {
     Xpc,
     Zkml,
     CnVrf,
+    EvmBindings,
 }
 
 impl Domain {
@@ -177,6 +178,7 @@ impl Domain {
             Domain::Xpc => "xpc",
             Domain::Zkml => "zkml",
             Domain::CnVrf => "cnvrf",
+            Domain::EvmBindings => "evm_bindings",
         }
     }
 }
@@ -208,6 +210,7 @@ pub struct DomainGenerations {
     pub xpc: std::sync::atomic::AtomicU64,
     pub zkml: std::sync::atomic::AtomicU64,
     pub cnvrf: std::sync::atomic::AtomicU64,
+    pub evm_bindings: std::sync::atomic::AtomicU64,
 }
 
 impl DomainGenerations {
@@ -238,6 +241,9 @@ impl DomainGenerations {
         let v = self.load(Domain::CnVrf);
         dst.counter(Domain::CnVrf)
             .store(v, std::sync::atomic::Ordering::Release);
+        let v = self.load(Domain::EvmBindings);
+        dst.counter(Domain::EvmBindings)
+            .store(v, std::sync::atomic::Ordering::Release);
     }
 
     fn counter(&self, domain: Domain) -> &std::sync::atomic::AtomicU64 {
@@ -256,6 +262,7 @@ impl DomainGenerations {
             Domain::Xpc => &self.xpc,
             Domain::Zkml => &self.zkml,
             Domain::CnVrf => &self.cnvrf,
+            Domain::EvmBindings => &self.evm_bindings,
         }
     }
 
@@ -273,6 +280,7 @@ impl DomainGenerations {
             self.bump(d);
         }
         self.bump(Domain::CnVrf);
+        self.bump(Domain::EvmBindings);
     }
 }
 
@@ -390,6 +398,7 @@ struct DomainSlot {
 pub struct DomainCache {
     slots: [Option<DomainSlot>; 13],
     cnvrf_slot: Option<DomainSlot>,
+    evm_bindings_slot: Option<DomainSlot>,
     /// Per-contract ABI JSON cache (feeds the contracts domain).
     pub abi: AbiJsonCache,
     /// Domain-level hits (reused preimage) since creation / last reset.
@@ -403,6 +412,7 @@ impl DomainCache {
     fn slot_ref(&self, domain: Domain) -> Option<&DomainSlot> {
         match domain {
             Domain::CnVrf => self.cnvrf_slot.as_ref(),
+            Domain::EvmBindings => self.evm_bindings_slot.as_ref(),
             other => self.slots[other.index()].as_ref(),
         }
     }
@@ -411,6 +421,7 @@ impl DomainCache {
     fn slot_mut(&mut self, domain: Domain) -> &mut Option<DomainSlot> {
         match domain {
             Domain::CnVrf => &mut self.cnvrf_slot,
+            Domain::EvmBindings => &mut self.evm_bindings_slot,
             other => &mut self.slots[other.index()],
         }
     }
@@ -447,6 +458,21 @@ impl DomainCache {
     /// 13-domain hit/miss counters.
     pub(crate) fn put_cnvrf_silent(&mut self, generation: u64, bytes: Vec<u8>) {
         self.cnvrf_slot = Some(DomainSlot { generation, bytes });
+    }
+
+    /// Fetch the cached EVM bindings preimage without altering the 13-domain
+    /// benchmark/regression hit/miss counters.
+    pub fn get_evm_bindings_silent(&self, generation: u64) -> Option<Vec<u8>> {
+        match &self.evm_bindings_slot {
+            Some(slot) if slot.generation == generation => Some(slot.bytes.clone()),
+            _ => None,
+        }
+    }
+
+    /// Store the EVM bindings preimage under its generation without altering the
+    /// 13-domain hit/miss counters.
+    pub fn put_evm_bindings_silent(&mut self, generation: u64, bytes: Vec<u8>) {
+        self.evm_bindings_slot = Some(DomainSlot { generation, bytes });
     }
 
     /// Borrow a cached preimage when its generation still matches.
@@ -491,7 +517,9 @@ impl DomainCache {
     /// Number of domains with a stored preimage (diagnostics / fork-isolation
     /// tests: a deep copy must start at zero).
     pub fn slots_filled(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count() + usize::from(self.cnvrf_slot.is_some())
+        self.slots.iter().filter(|s| s.is_some()).count()
+            + usize::from(self.cnvrf_slot.is_some())
+            + usize::from(self.evm_bindings_slot.is_some())
     }
 
     /// Reset counters (tests / diagnostics; entries are kept).
@@ -2031,6 +2059,39 @@ pub fn cnvrf_v3_digest(snap: &crate::state_engine::CnVrfV3EngineSnapshot) -> [u8
     h.finalize().into()
 }
 
+/// Canonical EVM bindings domain commitment writer.
+///
+/// CONDITIONAL DOMAIN: when `s.by_evm.is_empty()`, emits ZERO bytes so
+/// pre-activation genesis roots and `COMMITMENT_VERSION` remain 100% unchanged.
+pub fn write_evm_bindings_domain<S: PreimageSink>(
+    h: &mut S,
+    s: &crate::state_engine::EvmBindingsState,
+) {
+    if s.by_evm.is_empty() {
+        return;
+    }
+    put_bytes(h, b"evm_bindings_domain", b"EVM_BINDINGS_V1");
+    let mut entries: Vec<(&[u8; 20], &[u8; 32])> = s.by_evm.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    put_u64(h, b"evm_bindings_len", entries.len() as u64);
+    for (evm, pq) in entries {
+        put_bytes(h, b"evm_addr", evm);
+        put_addr(h, b"pq_addr", pq);
+    }
+}
+
+/// EVM bindings domain preimage (zero bytes while empty).
+pub fn evm_bindings_preimage(s: &crate::state_engine::EvmBindingsState) -> Vec<u8> {
+    capture(|h| write_evm_bindings_domain(h, s))
+}
+
+/// Standalone digest of the EVM bindings domain.
+pub fn evm_bindings_digest(s: &crate::state_engine::EvmBindingsState) -> [u8; 32] {
+    let mut h = Sha256::new();
+    write_evm_bindings_domain(&mut h, s);
+    h.finalize().into()
+}
+
 /// Assemble the full §2-aware commitment digest from per-domain preimage
 /// bytes (digest order = [`Domain::ALL`]).
 ///
@@ -2057,16 +2118,31 @@ pub fn assemble_cached_digest_with_cnvrf(domains: [&[u8]; 13], cnvrf: &[u8]) -> 
 /// [`assemble_cached_digest_with_cnvrf`] plus the engine's GLOBAL MINTED
 /// SUPPLY counter.
 ///
-/// The counter joins the digest ONLY when non-zero, exactly like the zkML and
-/// CN-VRF domains: a chain that has never minted keeps its pre-field root (the
-/// genesis KAT stays pinned). The first mint moves the root, which is what
-/// makes "two nodes disagree about minted supply" a visible divergence instead
-/// of a silent one — the reason `state_engine` enforces `TOTAL_SUPPLY_CAP`
-/// through this scalar.
+/// Byte-identical to [`assemble_cached_digest_with_cnvrf_minted_and_evm_bindings`]
+/// when `evm_bindings` is empty.
 pub fn assemble_cached_digest_with_cnvrf_and_minted(
     domains: [&[u8]; 13],
     cnvrf: &[u8],
     total_minted_nano: u64,
+) -> [u8; 32] {
+    assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
+        domains,
+        cnvrf,
+        total_minted_nano,
+        &[],
+    )
+}
+
+/// [`assemble_cached_digest_with_cnvrf_and_minted`] plus the conditional
+/// canonical `Domain::EvmBindings` preimage bytes.
+///
+/// Byte-identical to [`assemble_cached_digest_with_cnvrf_and_minted`] when
+/// `evm_bindings` is empty (0 bytes).
+pub fn assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
+    domains: [&[u8]; 13],
+    cnvrf: &[u8],
+    total_minted_nano: u64,
+    evm_bindings: &[u8],
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
@@ -2077,6 +2153,7 @@ pub fn assemble_cached_digest_with_cnvrf_and_minted(
     if total_minted_nano != 0 {
         put_u64(&mut h, b"total_minted_nano", total_minted_nano);
     }
+    h.update(evm_bindings);
     h.finalize().into()
 }
 
@@ -2155,6 +2232,38 @@ pub fn commitment_digest_with_zkml_and_cnvrf(
     zkml_models: &crate::zkml::ZkMlModelRegistry,
     cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
 ) -> [u8; 32] {
+    let empty_bindings = crate::state_engine::EvmBindingsState::default();
+    commitment_digest_with_zkml_cnvrf_and_evm_bindings(s, zkml_models, cnvrf, &empty_bindings)
+}
+
+/// Full live-path commitment digest including the conditional `Domain::EvmBindings`.
+///
+/// Byte-identical to [`commitment_digest_with_zkml_and_cnvrf`] when `evm_bindings`
+/// is empty.
+pub fn commitment_digest_with_zkml_cnvrf_and_evm_bindings(
+    s: &CommitmentSnapshot,
+    zkml_models: &crate::zkml::ZkMlModelRegistry,
+    cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
+    evm_bindings: &crate::state_engine::EvmBindingsState,
+) -> [u8; 32] {
+    commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
+        s,
+        zkml_models,
+        cnvrf,
+        0,
+        evm_bindings,
+    )
+}
+
+/// Full live-path commitment digest including conditional CN-VRF v3,
+/// `total_minted_nano`, and `Domain::EvmBindings` in canonical tail order.
+pub fn commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
+    s: &CommitmentSnapshot,
+    zkml_models: &crate::zkml::ZkMlModelRegistry,
+    cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
+    total_minted_nano: u64,
+    evm_bindings: &crate::state_engine::EvmBindingsState,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     commitment_digest_into(&mut h, s);
     zkml_models_digest_inner(&mut h, zkml_models);
@@ -2165,6 +2274,10 @@ pub fn commitment_digest_with_zkml_and_cnvrf(
         &cnvrf.abort_state,
         &cnvrf.epoch_beacons,
     );
+    if total_minted_nano != 0 {
+        put_u64(&mut h, b"total_minted_nano", total_minted_nano);
+    }
+    write_evm_bindings_domain(&mut h, evm_bindings);
     h.finalize().into()
 }
 
@@ -3473,5 +3586,51 @@ mod tests {
             commitment_digest_with_zkml_and_cnvrf(&s, &zkml, &emptied),
             base_digest
         );
+    }
+
+    #[test]
+    fn empty_evm_bindings_domain_contributes_zero_bytes_and_preserves_genesis() {
+        let s = empty_snapshot();
+        let zkml = crate::zkml::ZkMlModelRegistry::default();
+        let cnvrf = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        let empty = crate::state_engine::EvmBindingsState::default();
+        assert!(evm_bindings_preimage(&empty).is_empty());
+        assert_eq!(
+            commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &empty),
+            EMPTY_SNAPSHOT_DIGEST
+        );
+        assert_eq!(
+            commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &empty),
+            commitment_digest_with_zkml(&s, &zkml)
+        );
+    }
+
+    #[test]
+    fn evm_bindings_domain_is_order_independent_and_commits_entries() {
+        let s = empty_snapshot();
+        let zkml = crate::zkml::ZkMlModelRegistry::default();
+        let cnvrf = crate::state_engine::CnVrfV3EngineSnapshot::default();
+        let mut a = crate::state_engine::EvmBindingsState::default();
+        let mut b = crate::state_engine::EvmBindingsState::default();
+
+        for i in 1..=6u8 {
+            a.bind([i; 20], [i.wrapping_add(0x40); 32]).unwrap();
+        }
+        for i in (1..=6u8).rev() {
+            b.bind([i; 20], [i.wrapping_add(0x40); 32]).unwrap();
+        }
+        assert_eq!(evm_bindings_preimage(&a), evm_bindings_preimage(&b));
+        assert_eq!(evm_bindings_digest(&a), evm_bindings_digest(&b));
+
+        let d_a = commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &a);
+        let d_b = commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &b);
+        assert_eq!(d_a, d_b);
+        assert_ne!(d_a, EMPTY_SNAPSHOT_DIGEST);
+
+        let mut changed = a.clone();
+        changed.by_evm.insert([1u8; 20], [0xFFu8; 32]);
+        let d_changed =
+            commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &changed);
+        assert_ne!(d_changed, d_a);
     }
 }

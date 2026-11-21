@@ -2120,4 +2120,27 @@ impl InMemoryStateEngine {
         }
         replayed
     }
+
+    /// Synchronize canonical `Domain::EvmBindings` entries into the
+    /// process-local `EvmBindingRegistry` index (non-consensus read/routing
+    /// helper for startup hydration and RPC queries).
+    pub async fn sync_canonical_evm_bindings_to_index(&self) -> usize {
+        let entries: Vec<([u8; 20], [u8; 32])> = {
+            let guard = self.evm_bindings_read().await;
+            guard.by_evm.iter().map(|(&evm, &pq)| (evm, pq)).collect()
+        };
+        if entries.is_empty() {
+            return 0;
+        }
+        let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() else {
+            return 0;
+        };
+        let mut synced = 0usize;
+        for (evm, pq) in entries {
+            if matches!(idx.bind(evm, pq), Ok(true)) {
+                synced += 1;
+            }
+        }
+        synced
+    }
 }

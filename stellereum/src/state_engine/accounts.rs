@@ -91,6 +91,7 @@ impl InMemoryStateEngine {
             cnvrf_abort: Arc::new(RwLock::new(crate::staking::CnVrfAbortState::default())),
             epoch_vdf_beacons: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             cnvrf_freeze_inputs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            evm_bindings: Arc::new(RwLock::new(super::EvmBindingsState::default())),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
@@ -123,6 +124,7 @@ impl InMemoryStateEngine {
         let cnvrf_abort = self.cnvrf_abort.read().await.clone();
         let epoch_vdf_beacons = self.epoch_vdf_beacons.read().await.clone();
         let cnvrf_freeze_inputs = self.cnvrf_freeze_inputs.read().await.clone();
+        let evm_bindings = self.evm_bindings.read().await.clone();
 
         let pq_tree = self
             .pq_tree
@@ -228,6 +230,7 @@ impl InMemoryStateEngine {
             cnvrf_abort: Arc::new(RwLock::new(cnvrf_abort)),
             epoch_vdf_beacons: Arc::new(RwLock::new(epoch_vdf_beacons)),
             cnvrf_freeze_inputs: Arc::new(RwLock::new(cnvrf_freeze_inputs)),
+            evm_bindings: Arc::new(RwLock::new(evm_bindings)),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.cnvrf_v3_activation_override
@@ -906,7 +909,29 @@ impl InMemoryStateEngine {
             }
         };
 
-        crate::commitment::assemble_cached_digest_with_cnvrf_and_minted(
+        // Canonical EVM bindings (Domain::EvmBindings).
+        let gen = self.domain_gens.load(Domain::EvmBindings);
+        let evm_bindings_hit = self
+            .domain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_evm_bindings_silent(gen);
+        let evm_bindings = match evm_bindings_hit {
+            Some(b) => b,
+            None => {
+                let state = self.evm_bindings.read().await.clone();
+                let b = crate::commitment::evm_bindings_preimage(&state);
+                if self.domain_gens.load(Domain::EvmBindings) == gen {
+                    self.domain_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put_evm_bindings_silent(gen, b.clone());
+                }
+                b
+            }
+        };
+
+        crate::commitment::assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
             [
                 &tokens,
                 &staking,
@@ -924,6 +949,7 @@ impl InMemoryStateEngine {
             ],
             &cnvrf,
             self.total_minted_nano(),
+            &evm_bindings,
         )
     }
 
@@ -1283,6 +1309,60 @@ impl InMemoryStateEngine {
         self.bump_domain_generation(crate::commitment::Domain::CnVrf);
     }
 
+    /// Read the canonical on-chain EVM ↔ PQ address bindings (`Domain::EvmBindings`).
+    pub async fn evm_bindings_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, super::EvmBindingsState> {
+        self.evm_bindings.read().await
+    }
+
+    /// Write access to the canonical on-chain EVM ↔ PQ address bindings (bumps
+    /// `Domain::EvmBindings` and `commitment_generation`).
+    pub async fn evm_bindings_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, super::EvmBindingsState> {
+        self.dom_guard(crate::commitment::Domain::EvmBindings, &self.evm_bindings)
+            .await
+    }
+
+    /// Capture a persistence snapshot of [`EvmBindingsState`].
+    pub async fn evm_bindings_state_snapshot(&self) -> super::EvmBindingsSnapshot {
+        self.evm_bindings.read().await.to_snapshot()
+    }
+
+    /// Serialize the canonical EVM bindings domain for persistence / SnapV4.
+    /// Returns an empty `Vec` when the domain is empty (0 bytes invariant).
+    pub async fn evm_bindings_snapshot(&self) -> Vec<u8> {
+        let guard = self.evm_bindings.read().await;
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        bincode::serialize(&guard.to_snapshot()).unwrap_or_default()
+    }
+
+    /// Install a persisted [`EvmBindingsSnapshot`] (fail-closed on duplicate PQ mappings)
+    /// and bump `Domain::EvmBindings` + `commitment_generation`.
+    pub async fn restore_evm_bindings_state(
+        &self,
+        snap: super::EvmBindingsSnapshot,
+    ) -> Result<(), String> {
+        let state = super::EvmBindingsState::from_snapshot(snap)?;
+        *self.evm_bindings_write().await = state;
+        Ok(())
+    }
+
+    /// Install serialized EVM bindings bytes (empty bytes install an empty state).
+    pub async fn restore_evm_bindings(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            *self.evm_bindings_write().await = super::EvmBindingsState::default();
+            return Ok(());
+        }
+        let snap: super::EvmBindingsSnapshot =
+            bincode_deserialize_exact(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+                .map_err(|e| format!("restore evm_bindings failed: {e:?}"))?;
+        self.restore_evm_bindings_state(snap).await
+    }
+
     /// Set the test/debug per-engine CN-VRF v3 activation height override.
     ///
     /// Keeps frozen `CNVRF_V3_ACTIVATION_HEIGHT` (`u64::MAX`) untouched.
@@ -1595,10 +1675,13 @@ impl InMemoryStateEngine {
         // digests for the same state.
         let zkml_models = self.zkml_models.read().await.clone();
         let cnvrf_snap = self.cnvrf_v3_snapshot().await;
-        let digest = crate::commitment::commitment_digest_with_zkml_and_cnvrf(
+        let evm_bindings = self.evm_bindings.read().await.clone();
+        let digest = crate::commitment::commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
             &snapshot,
             &zkml_models,
             &cnvrf_snap,
+            self.total_minted_nano(),
+            &evm_bindings,
         );
         self.state_trie
             .write()
@@ -2356,6 +2439,7 @@ impl InMemoryStateEngine {
         // global one: the global moves with it.
         self.bump_domain_generation(crate::commitment::Domain::CrossShard);
         self.bump_domain_generation(crate::commitment::Domain::Xpc);
+        self.bump_domain_generation(crate::commitment::Domain::EvmBindings);
 
         // The cross-shard replay sets are derived from applied blocks and are
         // not part of the accounts snapshot: clear them so a reorg that
@@ -2374,6 +2458,7 @@ impl InMemoryStateEngine {
         self.cross_shard_produced.write().await.clear();
         self.cross_shard_completed.write().await.clear();
         self.cross_shard_xpc.write().await.clear();
+        *self.evm_bindings.write().await = super::EvmBindingsState::default();
 
         // Consistent lock order: accounts -> tokens -> trie
         let mut map = self.accounts.write().await;
@@ -2682,11 +2767,26 @@ impl InMemoryStateEngine {
 impl InMemoryStateEngine {
     /// The PQ account an EVM address is bound to, as this node knows it.
     ///
-    /// Bridge between the RPC read surface and the index: `eth_getBalance` /
-    /// `eth_getTransactionCount` resolve a MetaMask address through here so a
-    /// wallet sees the balance of the account that can actually spend it.
+    /// Reads the canonical on-chain [`Domain::EvmBindings`] state first (truth
+    /// for `height >= EVM_BINDINGS_STATE_ACTIVATION_HEIGHT`), falling back to
+    /// the pre-activation process-local index [`crate::evm_adapter::lookup_bound_pq`].
     pub async fn evm_binding_pq(&self, evm: &[u8; 20]) -> Option<[u8; 32]> {
+        if let Some(pq) = self.evm_bindings.read().await.get_pq(evm) {
+            return Some(pq);
+        }
         crate::evm_adapter::lookup_bound_pq(evm)
+    }
+
+    /// The EVM address a PQ account is bound to, as this node knows it.
+    ///
+    /// Reads the canonical on-chain [`Domain::EvmBindings`] state first,
+    /// falling back to the pre-activation process-local index
+    /// [`crate::evm_adapter::lookup_bound_evm`].
+    pub async fn evm_binding_for_pq(&self, pq: &[u8; 32]) -> Option<[u8; 20]> {
+        if let Some(evm) = self.evm_bindings.read().await.get_evm(pq) {
+            return Some(evm);
+        }
+        crate::evm_adapter::lookup_bound_evm(pq)
     }
 
     /// Replay a block's (or a window's) COMMITTED transactions into the index,
@@ -2746,6 +2846,28 @@ mod tests {
         engine.restore_snapshot(&checkpoint).await.expect("restore");
         assert_eq!(engine.xpc_len().await, 0);
         assert!(engine.get_xpc_proof(&tx_hash).await.is_none());
+        assert_eq!(engine.get_state_root().await, expected_root);
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_clears_evm_bindings_and_updates_domain() {
+        let engine = InMemoryStateEngine::new();
+        let user = [0x41u8; 32];
+        engine
+            .update_account(AccountState::new(user, 1_000_000))
+            .await;
+
+        let checkpoint = engine.create_snapshot().await;
+        let expected_root = engine.get_state_root().await;
+
+        let evm = [0xAAu8; 20];
+        assert!(engine.evm_bindings_write().await.bind(evm, user).unwrap());
+        assert_eq!(engine.evm_binding_pq(&evm).await, Some(user));
+        assert_eq!(engine.evm_binding_for_pq(&user).await, Some(evm));
+        assert_ne!(engine.get_state_root().await, expected_root);
+
+        engine.restore_snapshot(&checkpoint).await.expect("restore");
+        assert!(engine.evm_bindings_read().await.is_empty());
         assert_eq!(engine.get_state_root().await, expected_root);
     }
 }

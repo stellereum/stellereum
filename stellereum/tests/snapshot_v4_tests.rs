@@ -107,8 +107,8 @@ fn constants_and_unit_tag_taxonomy_are_exact() {
     assert_eq!(MAX_DELTA_CHAIN_LEN, 8);
     assert_eq!(DELTA_FULL_THRESHOLD_NUM, 70);
     assert_eq!(DELTA_FULL_THRESHOLD_DEN, 100);
-    assert_eq!(N_DOMAIN_UNITS, 15);
-    assert_eq!(TOTAL_UNIT_TAGS, 271);
+    assert_eq!(N_DOMAIN_UNITS, 16);
+    assert_eq!(TOTAL_UNIT_TAGS, 272);
     const _: () = assert!(MAX_MANIFEST_WIRE_BYTES >= 1024);
     assert!(!SNAP_MANIFEST_SIG_DOMAIN.is_empty());
     assert!(!SNAP_UNIT_HASH_DOMAIN.is_empty());
@@ -132,8 +132,13 @@ fn constants_and_unit_tag_taxonomy_are_exact() {
         assert_eq!(UnitKind::from_tag(dom.tag()), Some(UnitKind::Domain(dom)));
         assert!(!dom.name().is_empty());
     }
-    assert_eq!(DomainUnitId::from_tag(271), None);
-    assert_eq!(UnitKind::from_tag(271), None);
+    assert_eq!(DomainUnitId::from_tag(271), Some(DomainUnitId::EvmBindings));
+    assert_eq!(
+        UnitKind::from_tag(271),
+        Some(UnitKind::Domain(DomainUnitId::EvmBindings))
+    );
+    assert_eq!(DomainUnitId::from_tag(272), None);
+    assert_eq!(UnitKind::from_tag(272), None);
 }
 
 #[tokio::test]

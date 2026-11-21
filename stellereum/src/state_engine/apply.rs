@@ -1681,6 +1681,19 @@ impl InMemoryStateEngine {
         if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
             self.mark_evm_intent_settled(&digest).await;
         }
+        if super::evm_bindings_state_active_at(chain_height) {
+            if let Some((evm, pq)) =
+                crate::evm_adapter::verified_binding_from_tx_at(tx, exec_hardening)
+            {
+                let needs_insert = {
+                    let guard = self.evm_bindings.read().await;
+                    guard.get_pq(&evm).is_none() && guard.get_evm(&pq).is_none()
+                };
+                if needs_insert {
+                    let _ = self.evm_bindings_write().await.bind(evm, pq);
+                }
+            }
+        }
         // H1: a committed single transaction feeds the same routing/settlement
         // indexes as a block apply.
         self.observe_committed_evm_tx(tx);
@@ -2934,12 +2947,27 @@ impl InMemoryStateEngine {
         // written here also protects the block boundary onward; the
         // pre-execution nullifier check covers every later block and every
         // hand-built replay.
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
+        let evm_bindings_active = super::evm_bindings_state_active_at(block.height);
         for (i, tx) in block.transactions.iter().enumerate() {
             if !status.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
                 self.mark_evm_intent_settled(&digest).await;
+            }
+            if evm_bindings_active {
+                if let Some((evm, pq)) =
+                    crate::evm_adapter::verified_binding_from_tx_at(tx, exec_hardening)
+                {
+                    let needs_insert = {
+                        let guard = self.evm_bindings.read().await;
+                        guard.get_pq(&evm).is_none() && guard.get_evm(&pq).is_none()
+                    };
+                    if needs_insert {
+                        let _ = self.evm_bindings_write().await.bind(evm, pq);
+                    }
+                }
             }
             self.observe_committed_evm_tx(tx);
         }
@@ -3129,7 +3157,6 @@ impl InMemoryStateEngine {
         // height evades downtime slashing. Derived from the block's own
         // applied rotation opcodes (pure block bytes + `status`), so every
         // node resolves the same alias. Empty on the common block.
-        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
         let rotation_aliases: HashMap<[u8; 32], [u8; 32]> = {
             let mut aliases = HashMap::new();
             for (i, tx) in block.transactions.iter().enumerate() {

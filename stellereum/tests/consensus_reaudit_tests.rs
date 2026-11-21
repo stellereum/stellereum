@@ -292,6 +292,12 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(boundary, 0).unwrap(),
                 qc: qc_for(&ks, &fks, vs.clone(), boundary, b_hash, &[0x9Au8; 32]),
+                shard_id: 0,
+                round: 0,
+                body_commitment: None,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: 0,
             })
         } else if h == next_height {
             Some(HeaderLink {
@@ -301,6 +307,12 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(next_height, 0).unwrap(),
                 qc: qc_for(&ks, &fks, vs.clone(), next_height, c_hash, &b_hash),
+                shard_id: 0,
+                round: 0,
+                body_commitment: None,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: 0,
             })
         } else if h + 1 == boundary {
             Some(HeaderLink {
@@ -310,6 +322,12 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(h, 0).unwrap(),
                 qc: qc_for(&ks, &fks, vs.clone(), h, [0x9Au8; 32], &[0x8Au8; 32]),
+                shard_id: 0,
+                round: 0,
+                body_commitment: None,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: 0,
             })
         } else {
             None

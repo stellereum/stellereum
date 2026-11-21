@@ -23,6 +23,13 @@
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
 //!   "receipts_by_height": height(8B BE)+index(4B BE)+tx_hash(32B) -> b"" [NEW, additive only]
 //!   "pq_keys"     : b"a:"+address (32B) -> bincode(scheme, pubkey, salt) / b"h:"+pk_hash (32B) -> pubkey
+//!   "headers_v2"  : height(8B BE) -> bincode(BlockHeaderRecordV2) [additive v4 BlockHeader]
+//!   "evm_bindings_state": height(8B BE) -> bincode(EvmBindingsSnapshot) [additive root-committed domain]
+//!   "evm_bindings": b"e:"||evm(20)->pq(32), b"p:"||pq(32)->evm(20), b"meta:cursor"->u64 BE [never pruned]
+//!   "snap_units"  : unit_hash(32B) -> raw SnapV4 unit/chunk bytes
+//!   "snap_manifests": height(8B BE) -> canonical SnapshotManifestV1 bytes
+//!   "snap_committed": height(8B BE) -> bincode(SnapCommitMarker)
+//!   "snap_staging": height(8B BE)||unit_tag(2B BE)||sub_index(2B BE) -> chunk bytes
 //!
 //! The receipts tree is ADDITIVE: no existing tree's key/value format is
 //! changed. Bodies stay content-addressed by hash; receipts are keyed by tx
@@ -549,6 +556,20 @@ pub struct Storage {
     receipts_by_height: sled::Tree,
     /// Post-quantum public keys tree.
     pub pq_keys: sled::Tree,
+    /// Two-level v4 block header records (`BlockHeaderRecordV2`), keyed by height.
+    headers_v2: sled::Tree,
+    /// Canonical `Domain::EvmBindings` snapshot tree, keyed by height.
+    evm_bindings_state: sled::Tree,
+    /// Non-consensus crash-safe EVM ↔ PQ bijection index (never pruned).
+    evm_bindings: sled::Tree,
+    /// W1 SnapV4 content-addressed unit/chunk store (`unit_hash -> bytes`).
+    snap_units: sled::Tree,
+    /// W1 SnapV4 manifests keyed by height (`height_be -> canonical bytes`).
+    snap_manifests: sled::Tree,
+    /// W1 SnapV4 atomic commit markers keyed by height (`height_be -> SnapCommitMarker`).
+    snap_committed: sled::Tree,
+    /// W1 SnapV4 resumable staging chunks (`height || unit_tag || sub_index -> bytes`).
+    snap_staging: sled::Tree,
     safety_failed: Arc<Mutex<bool>>,
 }
 
@@ -586,6 +607,30 @@ impl BlockHeaderRecord {
             state_root: b.state_root,
             proposer: b.proposer,
             timestamp: b.timestamp,
+            tx_count: b.transactions.len() as u32,
+            gas_used,
+            block_hash: b.compute_hash(),
+        }
+    }
+}
+
+/// Additive v4 header record carrying the full [`crate::sharding::BlockHeader`]
+/// (including `shard_id`, `round`, `body_commitment`, `mmr_epoch_root`, and
+/// `epoch_key_commitment`). Kept in its own `"headers_v2"` tree so the frozen
+/// `BlockHeaderRecord` bincode schema remains untouched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockHeaderRecordV2 {
+    pub header: crate::sharding::BlockHeader,
+    pub tx_count: u32,
+    pub gas_used: u64,
+    pub block_hash: BlockHash,
+}
+
+impl BlockHeaderRecordV2 {
+    pub fn of(b: &Block) -> Self {
+        let gas_used: u64 = b.transactions.iter().map(|t| t.gas_limit).sum();
+        Self {
+            header: b.header(),
             tx_count: b.transactions.len() as u32,
             gas_used,
             block_hash: b.compute_hash(),
@@ -792,6 +837,37 @@ pub struct HistoricalRoot {
     pub cert: crate::consensus::QuorumCertificate,
     /// Always true when served: the anchor is a finalized block.
     pub finalized: bool,
+    /// Anchoring block's shard id (v4 header commitment).
+    #[serde(default)]
+    pub anchor_shard_id: u32,
+    /// Anchoring block's round (v4 header commitment).
+    #[serde(default)]
+    pub anchor_round: u32,
+    /// Anchoring block's body commitment (`Some` at `anchor_height >= H`, `None` below `H`).
+    #[serde(default)]
+    pub anchor_body_commitment: Option<[u8; 32]>,
+    /// Anchoring block's MMR epoch root (v4 header commitment).
+    #[serde(default)]
+    pub anchor_mmr_epoch_root: [u8; 32],
+    /// Anchoring block's epoch key commitment (v4 header commitment).
+    #[serde(default)]
+    pub anchor_epoch_key_commitment: [u8; 32],
+    /// Anchoring block's timestamp (v4 header commitment).
+    #[serde(default)]
+    pub anchor_timestamp: u64,
+    /// Anchoring block's proposer (v4 header commitment).
+    #[serde(default)]
+    pub anchor_proposer: [u8; 32],
+}
+
+/// Atomic commit marker for W1 `SnapV4` checkpoints in `"snap_committed"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapCommitMarker {
+    pub height: u64,
+    pub state_root: [u8; 32],
+    pub block_hash: [u8; 32],
+    pub is_base: bool,
+    pub base_height: Option<u64>,
 }
 
 /// Maximum blocks removed by one prune job.
@@ -906,6 +982,13 @@ impl Storage {
         let receipts = db.open_tree("receipts_v1")?;
         let receipts_by_height = db.open_tree("receipts_by_height")?;
         let pq_keys = db.open_tree("pq_keys")?;
+        let headers_v2 = db.open_tree("headers_v2")?;
+        let evm_bindings_state = db.open_tree("evm_bindings_state")?;
+        let evm_bindings = db.open_tree("evm_bindings")?;
+        let snap_units = db.open_tree("snap_units")?;
+        let snap_manifests = db.open_tree("snap_manifests")?;
+        let snap_committed = db.open_tree("snap_committed")?;
+        let snap_staging = db.open_tree("snap_staging")?;
         let this = Self {
             db,
             blocks,
@@ -923,6 +1006,13 @@ impl Storage {
             receipts,
             receipts_by_height,
             pq_keys,
+            headers_v2,
+            evm_bindings_state,
+            evm_bindings,
+            snap_units,
+            snap_manifests,
+            snap_committed,
+            snap_staging,
             safety_failed: Arc::new(Mutex::new(false)),
         };
         let swept = this.sweep_dangling_indexes().unwrap_or(0);
@@ -1064,6 +1154,10 @@ impl Storage {
         // The header record is written for every block regardless of retention
         // mode, so switching a node from archive to pruning never loses the chain.
         self.put_header(&BlockHeaderRecord::of(block))?;
+        self.put_header_v2(&BlockHeaderRecordV2::of(block))?;
+        if block.height > 0 {
+            self.put_finalized_post_root(block.height - 1, block.state_root)?;
+        }
         let mut hk = Vec::with_capacity(40);
         hk.extend_from_slice(&block.height.to_be_bytes());
         hk.extend_from_slice(&hash);
@@ -1192,6 +1286,176 @@ impl Storage {
     pub fn latest_header(&self) -> Result<Option<BlockHeaderRecord>> {
         match self.headers.last()? {
             Some((_, v)) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    // ---------- Headers V2 (`BlockHeader` v4, additive) ----------
+
+    pub fn put_header_v2(&self, rec: &BlockHeaderRecordV2) -> Result<()> {
+        self.headers_v2
+            .insert(rec.header.height.to_be_bytes(), bincode::serialize(rec)?)?;
+        Ok(())
+    }
+
+    pub fn header_v2_at(&self, height: u64) -> Result<Option<BlockHeaderRecordV2>> {
+        if let Some(v) = self.headers_v2.get(height.to_be_bytes())? {
+            let rec: BlockHeaderRecordV2 = bincode::deserialize(&v)?;
+            if rec.header.height != height {
+                return Err(anyhow!(
+                    "header_v2 height mismatch at key {height}: record reports {}",
+                    rec.header.height
+                ));
+            }
+            if crate::sharding::header_commit_active_at(height)
+                && rec.header.compute_hash() != rec.block_hash
+            {
+                return Err(anyhow!(
+                    "header_v2 at height {height} failed compute_hash() == block_hash binding"
+                ));
+            }
+            return Ok(Some(rec));
+        }
+        // Fallback: reconstruct from retained block body if available.
+        let mut candidate_hashes = self.hashes_at_height(height)?;
+        if let Some(legacy) = self.header_at(height)? {
+            if !candidate_hashes.contains(&legacy.block_hash) {
+                candidate_hashes.push(legacy.block_hash);
+            }
+        }
+        for hash in candidate_hashes {
+            if let Some(block) = self.get_block(&hash)? {
+                if block.height == height {
+                    let rec = BlockHeaderRecordV2::of(&block);
+                    if crate::sharding::header_commit_active_at(height)
+                        && rec.header.compute_hash() != rec.block_hash
+                    {
+                        return Err(anyhow!(
+                            "reconstructed header_v2 at height {height} failed compute_hash() binding"
+                        ));
+                    }
+                    return Ok(Some(rec));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The highest v2 header retained, if any.
+    pub fn latest_header_v2(&self) -> Result<Option<BlockHeaderRecordV2>> {
+        if let Some((_, v)) = self.headers_v2.last()? {
+            let rec: BlockHeaderRecordV2 = bincode::deserialize(&v)?;
+            if crate::sharding::header_commit_active_at(rec.header.height)
+                && rec.header.compute_hash() != rec.block_hash
+            {
+                return Err(anyhow!(
+                    "latest header_v2 at height {} failed compute_hash() == block_hash binding",
+                    rec.header.height
+                ));
+            }
+            return Ok(Some(rec));
+        }
+        if let Some(legacy) = self.latest_header()? {
+            return self.header_v2_at(legacy.height);
+        }
+        Ok(None)
+    }
+
+    /// Prune stored header records (both legacy `headers` and `headers_v2`)
+    /// below `keep_from`, always retaining the highest header for bootability.
+    pub fn prune_headers_below(&self, keep_from: u64) -> Result<usize> {
+        let max_v1 = self
+            .headers
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .max();
+        let max_v2 = self
+            .headers_v2
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .max();
+        let max_h = match (max_v1, max_v2) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let mut removed = 0usize;
+        let v1_keys: Vec<sled::IVec> = self
+            .headers
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && Some(h) != max_h
+            })
+            .collect();
+        for k in v1_keys {
+            self.headers.remove(k)?;
+            removed += 1;
+        }
+        let v2_keys: Vec<sled::IVec> = self
+            .headers_v2
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && Some(h) != max_h
+            })
+            .collect();
+        for k in v2_keys {
+            self.headers_v2.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    // ---------- Finalized post-state roots (SNAP-TIP-SKIP) ----------
+
+    fn finalized_post_root_key(height: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(20 + 8);
+        k.extend_from_slice(b"finalized_post_root_v1");
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    /// Record the finalized post-state root for `height` in `"meta"` so
+    /// [`Self::verify_restored_root`] can still verify a snapshot at the tip
+    /// when no successor block at `height + 1` exists yet (`SNAP-TIP-SKIP`).
+    pub fn put_finalized_post_root(&self, height: u64, root: [u8; 32]) -> Result<()> {
+        self.meta
+            .insert(Self::finalized_post_root_key(height), &root[..])?;
+        Ok(())
+    }
+
+    /// Read the recorded finalized post-state root for `height`, if present.
+    pub fn finalized_post_root_at(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        match self.meta.get(Self::finalized_post_root_key(height))? {
+            Some(v) => {
+                if v.len() != 32 {
+                    return Err(anyhow!(
+                        "corrupt finalized_post_root_v1 at height {height}: {} bytes",
+                        v.len()
+                    ));
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&v);
+                Ok(Some(out))
+            }
             None => Ok(None),
         }
     }
@@ -1869,6 +2133,7 @@ impl Storage {
         self.prune_zkml_models_below(keep_from)?;
         self.prune_cross_shard_below(keep_from)?;
         self.prune_cnvrf_v3_below(keep_from)?;
+        self.prune_evm_bindings_state_below(keep_from)?;
         Ok(removed)
     }
 
@@ -2143,6 +2408,539 @@ impl Storage {
         Ok(removed)
     }
 
+    // ---------- Canonical EVM bindings domain snapshots (`Domain::EvmBindings`) ----------
+
+    pub fn put_evm_bindings_state(&self, height: u64, bytes: &[u8]) -> Result<()> {
+        self.evm_bindings_state
+            .insert(height.to_be_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// The canonical `Domain::EvmBindings` snapshot at `height`, when stored.
+    /// `None` (or empty bytes) on older directories means empty `EvmBindingsState`
+    /// (contributes 0 bytes to the commitment digest).
+    pub fn evm_bindings_state_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .evm_bindings_state
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    /// Drop `evm_bindings_state` snapshots older than `keep_from`. Called from
+    /// `prune_domains_below`. Never drops a row at a retained snapshot height:
+    /// see [`Self::aux_retained_heights`].
+    pub fn prune_evm_bindings_state_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
+        let mut removed = 0;
+        let keys: Vec<sled::IVec> = self
+            .evm_bindings_state
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
+            })
+            .collect();
+        for k in keys {
+            self.evm_bindings_state.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    // ---------- Non-consensus crash-safe EVM bindings index (`"evm_bindings"`) ----------
+    //
+    // Key layout:
+    //   b"e:" || evm(20)  -> pq(32)
+    //   b"p:" || pq(32)   -> evm(20)
+    //   b"meta:cursor"    -> u64 BE
+    //
+    // NEVER pruned by `prune_blocks_below` / `prune_receipts_below`!
+
+    const EVM_BINDING_CURSOR_KEY: &'static [u8] = b"meta:cursor";
+
+    fn evm_binding_e_key(evm: &[u8; 20]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(22);
+        k.extend_from_slice(b"e:");
+        k.extend_from_slice(evm);
+        k
+    }
+
+    fn evm_binding_p_key(pq: &[u8; 32]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(34);
+        k.extend_from_slice(b"p:");
+        k.extend_from_slice(pq);
+        k
+    }
+
+    /// Atomically record `(evm, pq)` under strict first-writer-wins semantics:
+    /// - If `(evm, pq)` is already identically mapped -> `Ok(false)` (idempotent).
+    /// - If either `evm` or `pq` is already mapped to a different address -> `Err`
+    ///   without overwriting.
+    /// - Otherwise inserts both `b"e:"` and `b"p:"` in one sled transaction -> `Ok(true)`.
+    pub fn put_evm_binding_if_absent(&self, evm: &[u8; 20], pq: &[u8; 32]) -> Result<bool> {
+        let e_key = Self::evm_binding_e_key(evm);
+        let p_key = Self::evm_binding_p_key(pq);
+        let evm_val = *evm;
+        let pq_val = *pq;
+        let inserted = self
+            .evm_bindings
+            .transaction(
+                |tree| -> sled::transaction::ConflictableTransactionResult<bool, String> {
+                    let existing_e = tree.get(&e_key)?;
+                    let existing_p = tree.get(&p_key)?;
+                    match (existing_e, existing_p) {
+                        (Some(epq), Some(eevm)) => {
+                            if epq.as_ref() == &pq_val[..] && eevm.as_ref() == &evm_val[..] {
+                                Ok(false)
+                            } else {
+                                Err(sled::transaction::ConflictableTransactionError::Abort(
+                                    format!(
+                                        "evm_bindings conflict for evm=0x{} / pq={}",
+                                        hex::encode(evm_val),
+                                        hex::encode(pq_val)
+                                    ),
+                                ))
+                            }
+                        }
+                        (Some(_), None) | (None, Some(_)) => Err(
+                            sled::transaction::ConflictableTransactionError::Abort(format!(
+                                "evm_bindings first-writer-wins conflict for evm=0x{} / pq={}",
+                                hex::encode(evm_val),
+                                hex::encode(pq_val)
+                            )),
+                        ),
+                        (None, None) => {
+                            tree.insert(e_key.as_slice(), &pq_val[..])?;
+                            tree.insert(p_key.as_slice(), &evm_val[..])?;
+                            Ok(true)
+                        }
+                    }
+                },
+            )
+            .map_err(|e| match e {
+                sled::transaction::TransactionError::Abort(msg) => anyhow!(msg),
+                sled::transaction::TransactionError::Storage(err) => {
+                    anyhow!("evm_bindings sled error: {err}")
+                }
+            })?;
+        Ok(inserted)
+    }
+
+    pub fn evm_binding_by_evm(&self, evm: &[u8; 20]) -> Result<Option<[u8; 32]>> {
+        match self.evm_bindings.get(Self::evm_binding_e_key(evm))? {
+            Some(v) => {
+                if v.len() != 32 {
+                    return Err(anyhow!(
+                        "corrupt evm_bindings e: value length {} != 32",
+                        v.len()
+                    ));
+                }
+                let mut pq = [0u8; 32];
+                pq.copy_from_slice(&v);
+                Ok(Some(pq))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn evm_binding_by_pq(&self, pq: &[u8; 32]) -> Result<Option<[u8; 20]>> {
+        match self.evm_bindings.get(Self::evm_binding_p_key(pq))? {
+            Some(v) => {
+                if v.len() != 20 {
+                    return Err(anyhow!(
+                        "corrupt evm_bindings p: value length {} != 20",
+                        v.len()
+                    ));
+                }
+                let mut evm = [0u8; 20];
+                evm.copy_from_slice(&v);
+                Ok(Some(evm))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn evm_bindings_cursor(&self) -> Result<Option<u64>> {
+        match self.evm_bindings.get(Self::EVM_BINDING_CURSOR_KEY)? {
+            Some(v) => {
+                if v.len() != 8 {
+                    return Err(anyhow!(
+                        "corrupt evm_bindings meta:cursor length {} != 8",
+                        v.len()
+                    ));
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&v);
+                Ok(Some(u64::from_be_bytes(arr)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_evm_bindings_cursor(&self, height: u64) -> Result<()> {
+        self.evm_bindings
+            .insert(Self::EVM_BINDING_CURSOR_KEY, &height.to_be_bytes())?;
+        Ok(())
+    }
+
+    pub fn iter_evm_bindings(&self) -> Result<Vec<([u8; 20], [u8; 32])>> {
+        let mut out = Vec::new();
+        for kv in self.evm_bindings.scan_prefix(b"e:") {
+            let (k, v) = kv?;
+            if k.len() != 22 || v.len() != 32 {
+                return Err(anyhow!(
+                    "corrupt evm_bindings entry: key_len={} val_len={}",
+                    k.len(),
+                    v.len()
+                ));
+            }
+            let mut evm = [0u8; 20];
+            evm.copy_from_slice(&k[2..22]);
+            let mut pq = [0u8; 32];
+            pq.copy_from_slice(&v);
+            out.push((evm, pq));
+        }
+        Ok(out)
+    }
+
+    #[doc(hidden)]
+    pub fn evm_bindings_tree_for_test(&self) -> sled::Tree {
+        self.evm_bindings.clone()
+    }
+
+    // ---------- W1 SnapV4 persistent trees (never touch safety_record_v1/meta) ----------
+
+    fn snap_staging_key(height: u64, unit_tag: u16, sub_index: u16) -> [u8; 12] {
+        let mut k = [0u8; 12];
+        k[0..8].copy_from_slice(&height.to_be_bytes());
+        k[8..10].copy_from_slice(&unit_tag.to_be_bytes());
+        k[10..12].copy_from_slice(&sub_index.to_be_bytes());
+        k
+    }
+
+    pub fn put_snap_unit(&self, chunk_hash: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        self.snap_units.insert(&chunk_hash[..], bytes)?;
+        Ok(())
+    }
+
+    pub fn snap_unit(&self, chunk_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        Ok(self.snap_units.get(&chunk_hash[..])?.map(|v| v.to_vec()))
+    }
+
+    pub fn has_snap_unit(&self, chunk_hash: &[u8; 32]) -> Result<bool> {
+        Ok(self.snap_units.contains_key(&chunk_hash[..])?)
+    }
+
+    pub fn put_snap_manifest(&self, height: u64, manifest_bytes: &[u8]) -> Result<()> {
+        self.snap_manifests
+            .insert(height.to_be_bytes(), manifest_bytes)?;
+        Ok(())
+    }
+
+    pub fn snap_manifest(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .snap_manifests
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    pub fn put_snap_staging_chunk(
+        &self,
+        height: u64,
+        unit_tag: u16,
+        sub_index: u16,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = Self::snap_staging_key(height, unit_tag, sub_index);
+        self.snap_staging.insert(key, bytes)?;
+        Ok(())
+    }
+
+    pub fn snap_staging_chunk(
+        &self,
+        height: u64,
+        unit_tag: u16,
+        sub_index: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = Self::snap_staging_key(height, unit_tag, sub_index);
+        Ok(self.snap_staging.get(key)?.map(|v| v.to_vec()))
+    }
+
+    pub fn clear_snap_staging(&self, height: u64) -> Result<usize> {
+        let keys: Vec<sled::IVec> = self
+            .snap_staging
+            .scan_prefix(height.to_be_bytes())
+            .keys()
+            .filter_map(|k| k.ok())
+            .collect();
+        let n = keys.len();
+        for k in keys {
+            self.snap_staging.remove(k)?;
+        }
+        Ok(n)
+    }
+
+    pub fn sweep_all_snap_staging(&self) -> Result<usize> {
+        let n = self.snap_staging.len();
+        self.snap_staging.clear()?;
+        Ok(n)
+    }
+
+    /// Atomically commit a verified `SnapV4` checkpoint (data-before-index):
+    /// 1. Write all content-addressed units into `snap_units`.
+    /// 2. Write the canonical manifest into `snap_manifests`.
+    /// 3. Flush to disk (`db.flush()`).
+    /// 4. Insert the commit marker into `snap_committed` + `finalized_post_root_v1`.
+    /// 5. Clear `snap_staging` for `marker.height`.
+    ///
+    /// Never reads or modifies `safety_record_v1`, `meta["consensus"]`, or
+    /// `meta["vote_watermark"]`.
+    pub fn commit_snap_v4(
+        &self,
+        marker: &SnapCommitMarker,
+        manifest_bytes: &[u8],
+        units: &[([u8; 32], &[u8])],
+    ) -> Result<()> {
+        for (hash, bytes) in units {
+            self.snap_units.insert(&hash[..], *bytes)?;
+        }
+        self.snap_manifests
+            .insert(marker.height.to_be_bytes(), manifest_bytes)?;
+        self.db.flush()?;
+        let marker_bytes = bincode::serialize(marker)?;
+        self.snap_committed
+            .insert(marker.height.to_be_bytes(), marker_bytes)?;
+        self.put_finalized_post_root(marker.height, marker.state_root)?;
+        let _ = self.clear_snap_staging(marker.height);
+        Ok(())
+    }
+
+    pub fn snap_committed_at(&self, height: u64) -> Result<Option<SnapCommitMarker>> {
+        match self.snap_committed.get(height.to_be_bytes())? {
+            Some(v) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn latest_snap_committed(&self) -> Result<Option<SnapCommitMarker>> {
+        match self.snap_committed.last()? {
+            Some((_, v)) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reconstruct a committed `SnapV4` state at `height` (resolving any
+    /// `Base -> Δ_1 -> ... -> Δ_k` chain up to `MAX_DELTA_CHAIN_LEN`).
+    pub async fn load_snap_v4_state(
+        &self,
+        height: u64,
+    ) -> Result<Option<crate::snapshot_v4::SnapStateV4>> {
+        use crate::snapshot_v4::{
+            apply_delta_state, assemble_base_state, decode_manifest_strict, verify_unit_chunk,
+            SnapshotKind, SnapshotManifestV1, MAX_DELTA_CHAIN_LEN, UNIT_ENC_UNCHANGED,
+        };
+        use std::collections::BTreeMap;
+
+        let Some(marker) = self.snap_committed_at(height)? else {
+            return Ok(None);
+        };
+        if marker.height != height {
+            return Err(anyhow!(
+                "snap_committed marker height {} != key {height}",
+                marker.height
+            ));
+        }
+
+        let mut chain: Vec<SnapshotManifestV1> = Vec::new();
+        let mut cur_h = height;
+        let mut expected_root = marker.state_root;
+        loop {
+            let mbytes = self.snap_manifest(cur_h)?.ok_or_else(|| {
+                anyhow!("missing snap_manifests entry for committed height {cur_h}")
+            })?;
+            let manifest = decode_manifest_strict(&mbytes)
+                .map_err(|e| anyhow!("decode snap_manifest at height {cur_h}: {e}"))?;
+            if manifest.target_height != cur_h || manifest.target_state_root != expected_root {
+                return Err(anyhow!(
+                    "snap_manifest mismatch at height {cur_h}: target=({}, {}), expected=({cur_h}, {})",
+                    manifest.target_height,
+                    hex::encode(manifest.target_state_root),
+                    hex::encode(expected_root)
+                ));
+            }
+            match manifest.kind {
+                SnapshotKind::Base => {
+                    chain.push(manifest);
+                    break;
+                }
+                SnapshotKind::Delta {
+                    base_height,
+                    base_state_root,
+                } => {
+                    if base_height >= cur_h {
+                        return Err(anyhow!(
+                            "non-monotonic snap_v4 delta chain: base={base_height} >= target={cur_h}"
+                        ));
+                    }
+                    if chain.len() >= MAX_DELTA_CHAIN_LEN {
+                        return Err(anyhow!(
+                            "snap_v4 delta chain exceeds MAX_DELTA_CHAIN_LEN ({MAX_DELTA_CHAIN_LEN})"
+                        ));
+                    }
+                    chain.push(manifest);
+                    cur_h = base_height;
+                    expected_root = base_state_root;
+                }
+            }
+        }
+        chain.reverse();
+
+        let load_chunks = |m: &SnapshotManifestV1| -> Result<BTreeMap<(u16, u16), Vec<u8>>> {
+            let mut map = BTreeMap::new();
+            for desc in &m.units {
+                if desc.encoding == UNIT_ENC_UNCHANGED {
+                    continue;
+                }
+                let raw = self.snap_unit(&desc.chunk_hash)?.ok_or_else(|| {
+                    anyhow!(
+                        "missing snap_unit {} for ({}, {}) at height {}",
+                        hex::encode(desc.chunk_hash),
+                        desc.unit_tag,
+                        desc.sub_index,
+                        m.target_height
+                    )
+                })?;
+                verify_unit_chunk(desc, &raw)
+                    .map_err(|e| anyhow!("verify snap_unit at {}: {e}", m.target_height))?;
+                map.insert((desc.unit_tag, desc.sub_index), raw);
+            }
+            Ok(map)
+        };
+
+        let base_manifest = &chain[0];
+        let base_chunks = load_chunks(base_manifest)?;
+        let mut state = assemble_base_state(base_manifest, &base_chunks)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "assemble base snap_v4 at {}: {e}",
+                    base_manifest.target_height
+                )
+            })?;
+        let mut prev_h = base_manifest.target_height;
+        let mut prev_root = base_manifest.target_state_root;
+        for delta_manifest in &chain[1..] {
+            let delta_chunks = load_chunks(delta_manifest)?;
+            state = apply_delta_state(&state, prev_h, prev_root, delta_manifest, &delta_chunks)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "apply delta snap_v4 at {}: {e}",
+                        delta_manifest.target_height
+                    )
+                })?;
+            prev_h = delta_manifest.target_height;
+            prev_root = delta_manifest.target_state_root;
+        }
+        Ok(Some(state))
+    }
+
+    /// Prune old `SnapV4` committed checkpoints, manifests, and unreferenced
+    /// content-addressed units below `keep_from`, keeping the newest committed
+    /// checkpoint and any `Base`/intermediate deltas it depends on.
+    ///
+    /// Never touches `safety_record_v1`, `meta["consensus"]`, or `meta["vote_watermark"]`.
+    pub fn prune_deltas_below(&self, keep_from: u64) -> Result<usize> {
+        use crate::snapshot_v4::{decode_manifest_strict, SnapshotKind, UNIT_ENC_UNCHANGED};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut committed_heights = BTreeSet::new();
+        for kv in self.snap_committed.iter().keys() {
+            let k = kv?;
+            if k.len() == 8 {
+                committed_heights.insert(u64::from_be_bytes(k.as_ref().try_into().unwrap()));
+            }
+        }
+        if committed_heights.is_empty() {
+            return Ok(0);
+        }
+        let max_h = committed_heights.iter().copied().max();
+        let mut manifests: BTreeMap<u64, crate::snapshot_v4::SnapshotManifestV1> = BTreeMap::new();
+        for kv in self.snap_manifests.iter() {
+            let (k, v) = kv?;
+            if k.len() == 8 {
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                if let Ok(m) = decode_manifest_strict(&v) {
+                    manifests.insert(h, m);
+                }
+            }
+        }
+
+        let mut retain: BTreeSet<u64> = BTreeSet::new();
+        for &h in &committed_heights {
+            if h >= keep_from || Some(h) == max_h {
+                retain.insert(h);
+            }
+        }
+        // Transitive dependency closure: any retained Delta must retain its Base chain.
+        let mut work: Vec<u64> = retain.iter().copied().collect();
+        while let Some(h) = work.pop() {
+            if let Some(m) = manifests.get(&h) {
+                if let SnapshotKind::Delta { base_height, .. } = m.kind {
+                    if retain.insert(base_height) {
+                        work.push(base_height);
+                    }
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        for &h in &committed_heights {
+            if !retain.contains(&h) {
+                self.snap_committed.remove(h.to_be_bytes())?;
+                removed += 1;
+            }
+        }
+        for &h in manifests.keys() {
+            if !retain.contains(&h) {
+                self.snap_manifests.remove(h.to_be_bytes())?;
+            }
+        }
+        let mut live_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for h in &retain {
+            if let Some(m) = manifests.get(h) {
+                for d in &m.units {
+                    if d.encoding != UNIT_ENC_UNCHANGED {
+                        live_hashes.insert(d.chunk_hash);
+                    }
+                }
+            }
+        }
+        let dead_units: Vec<sled::IVec> = self
+            .snap_units
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 32 {
+                    return true;
+                }
+                let mut h = [0u8; 32];
+                h.copy_from_slice(k);
+                !live_hashes.contains(&h)
+            })
+            .collect();
+        for k in dead_units {
+            self.snap_units.remove(k)?;
+        }
+        Ok(removed)
+    }
+
     // ---------- Durable cross-shard finalized-header registry ----------
 
     /// The single row holding the latest registry snapshot.
@@ -2236,21 +3034,24 @@ impl Storage {
         engine: &InMemoryStateEngine,
         snapshot_height: u64,
     ) -> Result<()> {
-        let Some(expected) = self.expected_restore_root(snapshot_height)? else {
-            // No anchor (no header or body for snapshot_height+1). If we finalized
-            // beyond the snapshot, loading it blind would resume consensus on state
-            // nothing vouches for -- exactly the fork observed live. Refuse instead;
-            // the operator repairs by wiping or by restoring a verified backup.
-            // The only exception is tip state (snapshot == finalized head): there is
-            // nothing newer to disagree with, so there is nothing to prove.
-            let tip = self.finalized()?.map(|(h, _)| h).unwrap_or(snapshot_height);
-            if snapshot_height < tip {
-                return Err(anyhow!(
-                    "no anchor to verify snapshot at height {snapshot_height} (finalized head is {tip}); \
-                     refusing to resume on unprovable state -- wipe the data directory or restore a verified backup"
-                ));
+        let expected = match self.expected_restore_root(snapshot_height)? {
+            Some(root) => root,
+            None => {
+                let tip = self.finalized()?.map(|(h, _)| h).unwrap_or(snapshot_height);
+                if snapshot_height < tip {
+                    return Err(anyhow!(
+                        "no anchor to verify snapshot at height {snapshot_height} (finalized head is {tip}); \
+                         refusing to resume on unprovable state -- wipe the data directory or restore a verified backup"
+                    ));
+                }
+                // SNAP-TIP-SKIP: when at the tip (no successor block yet), check
+                // the durable finalized_post_root_v1 meta entry if present.
+                // Legacy directories and unit tests without it keep Ok(()) compat.
+                match self.finalized_post_root_at(snapshot_height)? {
+                    Some(root) => root,
+                    None => return Ok(()),
+                }
             }
-            return Ok(());
         };
         if let Some(bytes) = self.cnvrf_v3_at(snapshot_height)? {
             if !bytes.is_empty() {
@@ -2504,10 +3305,15 @@ impl Storage {
                 tmp.restore_cnvrf_v3_snapshot(&snap).await;
             }
         }
+        if let Some(bytes) = self.evm_bindings_state_at(height)? {
+            tmp.restore_evm_bindings(&bytes)
+                .await
+                .map_err(|e| anyhow!("restore evm_bindings_state at height {height}: {e}"))?;
+        }
 
         // Anchor the recomputed root: the header at height+1 commits to the
-        // post-`height` state. At the tip (no successor yet) there is nothing
-        // newer to disagree with, mirroring `verify_restored_root`.
+        // post-`height` state. At the tip (no successor yet) check
+        // `finalized_post_root_at(height)` if present, else skip for compat.
         let computed = tmp.get_state_root().await;
         match self.expected_restore_root(height)? {
             Some(expected) if computed != expected => {
@@ -2525,6 +3331,15 @@ impl Storage {
                     return Err(anyhow!(
                         "no anchor to verify snapshot at height {height} (finalized head is {finalized_tip}): refusing to prove from unanchored state"
                     ));
+                }
+                if let Some(expected) = self.finalized_post_root_at(height)? {
+                    if computed != expected {
+                        return Err(anyhow!(
+                            "snapshot at tip height {height} hashes to {} but finalized_post_root_v1 commits to {}: refusing to prove from it",
+                            hex::encode(computed),
+                            hex::encode(expected),
+                        ));
+                    }
                 }
             }
         }
@@ -2634,14 +3449,67 @@ impl Storage {
         })?;
         // The root the anchor commits to. Taken from the header record when
         // present (it is the canonical chain record), else from the body.
-        let (state_root, anchor_prev_hash) = if let Some(rec) = self.header_at(anchor_height)? {
-            (rec.state_root, rec.prev_hash)
+        let (state_root, anchor_prev_hash, legacy_ts, legacy_proposer) = if let Some(rec) =
+            self.header_at(anchor_height)?
+        {
+            (rec.state_root, rec.prev_hash, rec.timestamp, rec.proposer)
         } else if let Some(block) = self.get_block(&anchor_hash)? {
-            (block.state_root, block.prev_hash)
+            (
+                block.state_root,
+                block.prev_hash,
+                block.timestamp,
+                block.proposer,
+            )
         } else {
             return Err(anyhow!(
-                "anchoring block at height {anchor_height} names a body this node no longer holds: refusing"
-            ));
+                    "anchoring block at height {anchor_height} names a body this node no longer holds: refusing"
+                ));
+        };
+        let v2_opt = self.header_v2_at(anchor_height)?;
+        let (
+            anchor_shard_id,
+            anchor_round,
+            anchor_body_commitment,
+            anchor_mmr_epoch_root,
+            anchor_epoch_key_commitment,
+            anchor_timestamp,
+            anchor_proposer,
+        ) = if crate::sharding::header_commit_active_at(anchor_height) {
+            let v2 = v2_opt.ok_or_else(|| {
+                anyhow!(
+                    "missing v2 header record for anchoring height {anchor_height} under v4 header commitment: refusing fail-closed"
+                )
+            })?;
+            if v2.block_hash != anchor_hash
+                || v2.header.compute_hash() != anchor_hash
+                || v2.header.state_root != state_root
+                || v2.header.prev_hash != anchor_prev_hash
+            {
+                return Err(anyhow!(
+                    "anchoring header v2 at height {anchor_height} failed BlockHeader::compute_hash() binding against anchor_hash"
+                ));
+            }
+            (
+                v2.header.shard_id,
+                v2.header.round,
+                Some(v2.header.body_commitment),
+                v2.header.mmr_epoch_root,
+                v2.header.epoch_key_commitment,
+                v2.header.timestamp,
+                v2.header.proposer,
+            )
+        } else if let Some(v2) = v2_opt {
+            (
+                v2.header.shard_id,
+                v2.header.round,
+                None,
+                v2.header.mmr_epoch_root,
+                v2.header.epoch_key_commitment,
+                v2.header.timestamp,
+                v2.header.proposer,
+            )
+        } else {
+            (0, 0, None, [0u8; 32], [0u8; 32], legacy_ts, legacy_proposer)
         };
         Ok(HistoricalRoot {
             height,
@@ -2651,6 +3519,13 @@ impl Storage {
             anchor_prev_hash,
             cert,
             finalized: true,
+            anchor_shard_id,
+            anchor_round,
+            anchor_body_commitment,
+            anchor_mmr_epoch_root,
+            anchor_epoch_key_commitment,
+            anchor_timestamp,
+            anchor_proposer,
         })
     }
 
@@ -3781,11 +4656,34 @@ pub async fn load_full_state_into(
 > {
     engine.attach_pq_tree(storage.pq_keys.clone());
     storage.hydrate_implicit_pq_keys()?;
+    let paired_opt = storage.latest_paired_snapshot()?;
+    let snap_v4_opt = storage.latest_snap_committed()?;
+    if let Some(marker) = snap_v4_opt {
+        if paired_opt
+            .as_ref()
+            .is_none_or(|(ph, _)| marker.height > *ph)
+        {
+            if let Some(snap_v4) = storage.load_snap_v4_state(marker.height).await? {
+                let tmp = InMemoryStateEngine::new();
+                tmp.attach_pq_tree(storage.pq_keys.clone());
+                snap_v4
+                    .apply_to_engine(&tmp)
+                    .await
+                    .map_err(|e| anyhow!("restore snap_v4 throwaway at {}: {e}", marker.height))?;
+                storage.verify_restored_root(&tmp, marker.height).await?;
+                let (staking, gov) = snap_v4
+                    .apply_to_engine(engine)
+                    .await
+                    .map_err(|e| anyhow!("restore snap_v4 live at {}: {e}", marker.height))?;
+                return Ok(Some((marker.height, staking, gov)));
+            }
+        }
+    }
     // Take the newest height at which BOTH a state and a domains snapshot exist.
     // A crash between the two writes (they are separate enqueued jobs) can leave an
     // unpaired tail; loading state@H with domains@D!=H builds a frankestate no anchor
     // can validate. Pairing is the precondition for everything below.
-    let Some((height, state_bytes)) = storage.latest_paired_snapshot()? else {
+    let Some((height, state_bytes)) = paired_opt else {
         // Distinguish "nothing stored" (genuine fresh start) from "snapshots exist
         // but none are paired" (a crash between the two snapshot jobs, or corruption).
         // The latter must NOT silently start fresh: finalized metadata may claim a
@@ -3820,6 +4718,7 @@ pub async fn load_full_state_into(
     // over the same multi-MB bytes.
     let cross_shard_snap: Option<crate::sharding::CrossShardReplaySnapshot>;
     let cnvrf_snap: Option<crate::state_engine::CnVrfV3EngineSnapshot>;
+    let evm_bindings_opt: Option<Vec<u8>>;
 
     // Phase 1 (throwaway): restore + verify without touching live state. The
     // verification is MANDATORY whenever an anchor exists: a snapshot labeled H whose
@@ -3897,6 +4796,12 @@ pub async fn load_full_state_into(
         if let Some(snap) = &cnvrf_snap {
             tmp.restore_cnvrf_v3_snapshot(snap).await;
         }
+        evm_bindings_opt = storage.evm_bindings_state_at(height)?;
+        if let Some(bytes) = &evm_bindings_opt {
+            tmp.restore_evm_bindings(bytes)
+                .await
+                .map_err(|e| anyhow!("restore evm_bindings_state: {e}"))?;
+        }
         storage.verify_restored_root(&tmp, height).await?;
     }
 
@@ -3933,6 +4838,12 @@ pub async fn load_full_state_into(
     }
     if let Some(snap) = &cnvrf_snap {
         engine.restore_cnvrf_v3_snapshot(snap).await;
+    }
+    if let Some(bytes) = &evm_bindings_opt {
+        engine
+            .restore_evm_bindings(bytes)
+            .await
+            .map_err(|e| anyhow!("restore evm_bindings_state: {e}"))?;
     }
     match domains_opt {
         Some(bytes) => {
@@ -3991,6 +4902,10 @@ pub enum PersistJob {
         cross_shard: Vec<u8>,
     },
     CnVrfV3 {
+        height: u64,
+        bytes: Vec<u8>,
+    },
+    EvmBindingsState {
         height: u64,
         bytes: Vec<u8>,
     },
@@ -4070,6 +4985,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
         PersistJob::State { .. } => "State snapshot",
         PersistJob::Domains { .. } => "Domains snapshot",
         PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
+        PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
         PersistJob::XshardHeaders { .. } => "cross-shard header registry",
         PersistJob::Consensus(_) => "Consensus safety checkpoint",
         PersistJob::Finalized { .. } => "Finalized tip pointer",
@@ -4103,6 +5019,7 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
             "receipts for this height are re-derivable by re-application; RPC serves no receipt until then"
         }
         PersistJob::CnVrfV3 { .. }
+        | PersistJob::EvmBindingsState { .. }
         | PersistJob::XshardHeaders { .. }
         | PersistJob::Flush => {
             "recoverable auxiliary state; the next cadence/finalize refreshes it"
@@ -4220,6 +5137,9 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_bridge(height, &bridge))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
+                    PersistJob::EvmBindingsState { height, bytes } => {
+                        st.put_evm_bindings_state(height, &bytes)
+                    }
                     PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
@@ -4480,6 +5400,11 @@ impl AsyncPersistence {
         self.push(PersistJob::CnVrfV3 { height, bytes });
     }
 
+    /// Non-blocking: enqueue a canonical `Domain::EvmBindings` snapshot for `height`.
+    pub fn enqueue_evm_bindings_state(&self, height: u64, bytes: Vec<u8>) {
+        self.push(PersistJob::EvmBindingsState { height, bytes });
+    }
+
     /// Non-blocking: enqueue a complete cross-shard finalized-header registry
     /// snapshot. Latest-state (a later job replaces an earlier one), so the
     /// queue-under-pressure drop of one snapshot is recovered by the next
@@ -4516,6 +5441,7 @@ impl AsyncPersistence {
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
         let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
+        let evm_bindings = engine.evm_bindings_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
         // tests) - and that is CORRECT here, because there is nothing live to
@@ -4551,6 +5477,7 @@ impl AsyncPersistence {
         // skip on error exactly like the old inline `if let Ok(bytes)` did.
         if let Some(bytes) = serialize_off_tick(snap).await {
             self.enqueue_cnvrf_v3(height, cnvrf_v3);
+            self.enqueue_evm_bindings_state(height, evm_bindings);
             self.enqueue_domains(
                 height,
                 bytes,

@@ -163,16 +163,6 @@ pub(crate) async fn try_snapshot_sync(
         if boundary <= our_height || boundary == 0 {
             break;
         }
-        let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
-            miss_snapshot += 1;
-            consecutive_misses = consecutive_misses.saturating_add(1);
-            tokio::time::sleep(std::time::Duration::from_millis(
-                stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
-            ))
-            .await;
-            boundary = boundary.saturating_sub(probe_step);
-            continue;
-        };
 
         // Trusted root: the header at boundary + 1, whose state_root is the state
         // after block `boundary`. Verify its identity and linkage explicitly rather
@@ -210,6 +200,28 @@ pub(crate) async fn try_snapshot_sync(
             boundary = boundary.saturating_sub(probe_step);
             continue;
         }
+
+        // Prefer content-addressed SnapV4 manifest (small pre-fetch metadata);
+        // fall back to legacy monolithic state snapshot if no SnapV4 Base manifest is served.
+        let snapv4_manifest = adapter
+            .fetch_snapv4_manifest(shard, boundary, &next_hdr.state_root, None)
+            .await
+            .filter(|m| matches!(m.kind, stellereum::snapshot_v4::SnapshotKind::Base));
+        let legacy_snapshot = if snapv4_manifest.is_none() {
+            let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
+                miss_snapshot += 1;
+                consecutive_misses = consecutive_misses.saturating_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+                ))
+                .await;
+                boundary = boundary.saturating_sub(probe_step);
+                continue;
+            };
+            Some(snapshot)
+        } else {
+            None
+        };
         consecutive_misses = 0;
 
         // F1: the peer header is only trustworthy if it is part of OUR chain.
@@ -237,6 +249,15 @@ pub(crate) async fn try_snapshot_sync(
                 let a = a.clone();
                 async move {
                     let hash = a.fetch_head_hash(shard, h).await?;
+                    if stellereum::sharding::header_commit_active_at(h) {
+                        let rec_v2 = a.fetch_block_header_v2(shard, h, hash).await?;
+                        let qc = a.fetch_block_qc(shard, h).await?;
+                        return Some(stellereum::sync::HeaderLink::from_v2_record(&rec_v2, qc));
+                    }
+                    if let Some(rec_v2) = a.fetch_block_header_v2(shard, h, hash).await {
+                        let qc = a.fetch_block_qc(shard, h).await?;
+                        return Some(stellereum::sync::HeaderLink::from_v2_record(&rec_v2, qc));
+                    }
                     let rec = a.fetch_block_header(shard, h, hash).await?;
                     let qc = a.fetch_block_qc(shard, h).await?;
                     Some(stellereum::sync::HeaderLink {
@@ -246,6 +267,12 @@ pub(crate) async fn try_snapshot_sync(
                         state_root: rec.state_root,
                         proposer: rec.proposer,
                         qc,
+                        shard_id: shard,
+                        round: 0,
+                        body_commitment: None,
+                        mmr_epoch_root: [0u8; 32],
+                        epoch_key_commitment: [0u8; 32],
+                        timestamp: rec.timestamp,
                     })
                 }
             }
@@ -312,62 +339,11 @@ pub(crate) async fn try_snapshot_sync(
             }
         };
         let trusted_root = anchor.state_root;
-        // The snapshot bytes fetched by the presence probe above ARE the
-        // restore input: re-fetching the same blob here (manifest + every
-        // chunk, tens of MB) doubled the wire cost of every snapshot-sync
-        // attempt for bytes already in hand. Verification is unchanged — the
-        // restore still has to reproduce `trusted_root` and match the anchor
-        // set before live state is touched.
-        let fetch_domain = {
-            let a = adapter.clone();
-            move |kind: &'static str| {
-                let a = a.clone();
-                async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
-            }
-        };
-        // F5 set-at-height trust gate: the snapshot must additionally commit
-        // to the validator set at `boundary`, and to exactly the set that
-        // verified its anchor (resolved at the boundary height). On today's
-        // single-set chains the snapshot commits to the one set in force, so
-        // this is behavior-identical to the non-binding path it replaces.
-        let anchor_set = rt.validator_set_for_height(boundary);
-        if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding_prefetched(
-            &rt.state,
-            trusted_root,
-            snapshot,
-            fetch_domain,
-            boundary,
-            &anchor_set,
-        )
-        .await
-        .map(|_| ())
-        {
-            eprintln!("[sync] snapshot at {boundary} rejected: {e}");
-            consecutive_misses = consecutive_misses.saturating_add(1);
-            tokio::time::sleep(std::time::Duration::from_millis(
-                stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
-            ))
-            .await;
-            boundary = boundary.saturating_sub(probe_step);
-            continue;
-        }
-
-        // The snapshot's root is verified. Record the boundary so the normal
-        // machinery continues from here.
-        //
-        // THE FINALIZED HEAD AND THE SORTITION PARENT COME FROM THE VERIFIED
-        // CHAIN (audit W6.4b), never from the peer-supplied header record: a
-        // peer publishes the header and its QC separately, and only the block
-        // HASH is covered by the quorum certificate — the record's `prev_hash`
-        // field is attacker-controlled. Taking the head (and the sortition
-        // entropy) from it let a peer point this node at a FORK: it would
-        // then refuse every legitimate commit (they do not extend the
-        // poisoned head) and elect a sortition committee nobody else uses.
         let boundary_hash = anchor.boundary_hash;
         if next_hdr.prev_hash != boundary_hash {
             // The peer's successor header does not link to the VERIFIED
             // boundary block: the peer is serving an inconsistent (or forked)
-            // view. Fail closed — never adopt it.
+            // view. Fail closed before touching `rt.state`.
             eprintln!(
                 "[sync] REFUSING snapshot at {boundary}: successor header does not link to the verified boundary block"
             );
@@ -379,6 +355,110 @@ pub(crate) async fn try_snapshot_sync(
             boundary = boundary.saturating_sub(probe_step);
             continue;
         }
+        // F5 set-at-height trust gate: the snapshot must additionally commit
+        // to the validator set at `boundary`, and to exactly the set that
+        // verified its anchor (resolved at the boundary height). On today's
+        // single-set chains the snapshot commits to the one set in force, so
+        // this is behavior-identical to the non-binding path it replaces.
+        let anchor_set = rt.validator_set_for_height(boundary);
+        let mut installed_via_snapv4 = false;
+        if let Some(manifest) = snapv4_manifest {
+            let snap_anchor = stellereum::snapshot_v4::TrustedSnapshotAnchor {
+                chain_id: stellereum::consensus::consensus_chain_id(),
+                shard_id: shard,
+                target_height: boundary,
+                trusted_boundary_hash: boundary_hash,
+                trusted_state_root: trusted_root,
+                validator_set: &anchor_set,
+            };
+            match stellereum::sync::verify_snapv4_manifest_pre_fetch(&manifest, &snap_anchor) {
+                Ok(()) => {
+                    match stellereum::sync::fetch_verified_snapv4_chunks(
+                        &manifest,
+                        |_, _, chunk_hash| {
+                            let a = adapter.clone();
+                            async move { a.fetch_snapv4_unit(shard, &chunk_hash).await }
+                        },
+                    )
+                    .await
+                    {
+                        Ok(chunks) => {
+                            match stellereum::sync::fast_sync_snapv4_base(
+                                &rt.state,
+                                &snap_anchor,
+                                &manifest,
+                                &chunks,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(_) => installed_via_snapv4 = true,
+                                Err(e) => {
+                                    eprintln!("[sync] snap_v4 at {boundary} rejected: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[sync] snap_v4 chunks at {boundary} failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[sync] snap_v4 manifest at {boundary} rejected: {e}");
+                }
+            }
+        }
+        if !installed_via_snapv4 {
+            let snapshot = if let Some(s) = legacy_snapshot {
+                s
+            } else if let Some(s) = adapter.fetch_state_snapshot(shard, boundary).await {
+                s
+            } else {
+                miss_snapshot += 1;
+                consecutive_misses = consecutive_misses.saturating_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+                ))
+                .await;
+                boundary = boundary.saturating_sub(probe_step);
+                continue;
+            };
+            let fetch_domain = {
+                let a = adapter.clone();
+                move |kind: &'static str| {
+                    let a = a.clone();
+                    async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
+                }
+            };
+            if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding_prefetched(
+                &rt.state,
+                trusted_root,
+                snapshot,
+                fetch_domain,
+                boundary,
+                &anchor_set,
+            )
+            .await
+            .map(|_| ())
+            {
+                eprintln!("[sync] snapshot at {boundary} rejected: {e}");
+                consecutive_misses = consecutive_misses.saturating_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+                ))
+                .await;
+                boundary = boundary.saturating_sub(probe_step);
+                continue;
+            }
+        }
+
+        // The snapshot's root is verified. Record the boundary so the normal
+        // machinery continues from here.
+        //
+        // Safety invariant (W1 §2.6): snapshot sync NEVER clears, overwrites, or
+        // resets `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`;
+        // `rt.safety.advance_height` only advances monotonically via CAS and
+        // preserves quarantine on any mismatch.
         rt.finalized.push((boundary, boundary_hash));
         if let Some(b) = rt.blocks.get(&boundary_hash) {
             let _ = b;
@@ -1250,7 +1330,33 @@ async fn walk_chain_once(
         // Persist the verified body (finalize-path parity): the job takes the
         // body by MOVE — same bytes, same job, no extra full copy.
         let applied_height = b.height;
+        let walked_post_root = rt.state.get_state_root().await;
         if let Some(ap) = persist {
+            let store = ap.storage();
+            let _ = store.put_finalized_post_root(applied_height, walked_post_root);
+            if b.shard_id == stellereum::sharding::MASTERCHAIN_SHARD {
+                let exec_hardening =
+                    stellereum::chain_spec::exec_hardening_v1_active_at(applied_height);
+                for (tx_i, tx) in b.transactions.iter().enumerate() {
+                    if !rt.applied_statuses.get(tx_i).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some((evm, pq)) =
+                        stellereum::evm_adapter::verified_binding_from_tx_at(tx, exec_hardening)
+                    {
+                        let _ = store.put_evm_binding_if_absent(&evm, &pq);
+                    }
+                }
+                if store
+                    .evm_bindings_cursor()
+                    .ok()
+                    .flatten()
+                    .map(|c| applied_height > c)
+                    .unwrap_or(true)
+                {
+                    let _ = store.set_evm_bindings_cursor(applied_height);
+                }
+            }
             ap.enqueue_block(b);
         }
         // Fail fast on divergence: the NEXT block in this same validated chain
@@ -1522,8 +1628,9 @@ mod recovery_walk_tests {
                 cnvrf_v3: None,
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-                            round: 0,
-            };            b.sign_block_with_falcon(&ks[proposer_idx], &fks[proposer_idx]);
+                round: 0,
+            };
+            b.sign_block_with_falcon(&ks[proposer_idx], &fks[proposer_idx]);
             let bh = b.compute_hash();
             attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);
             builder.apply_and_advance(bh, &b).await;

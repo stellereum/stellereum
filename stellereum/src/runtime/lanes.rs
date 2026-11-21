@@ -242,6 +242,7 @@ pub struct SnapBundle {
     pub bridge: Vec<u8>,
     pub zkml_models: Vec<u8>,
     pub cnvrf_v3: Vec<u8>,
+    pub evm_bindings: Vec<u8>,
 }
 
 /// Snapshot request/response on the sequenced lane (see `SnapBundle`).
@@ -350,6 +351,7 @@ impl ApplyLane {
                         let zkml_models = state.zkml_models_snapshot().await;
                         let cnvrf_v3 = bincode::serialize(&state.cnvrf_v3_snapshot().await)
                             .unwrap_or_default();
+                        let evm_bindings = state.evm_bindings_snapshot().await;
                         let _ = job.done.send(Some(SnapBundle {
                             height: job.height,
                             accounts,
@@ -358,6 +360,7 @@ impl ApplyLane {
                             bridge,
                             zkml_models,
                             cnvrf_v3,
+                            evm_bindings,
                         }));
                     }
                 }

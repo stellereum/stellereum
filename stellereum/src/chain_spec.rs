@@ -18,6 +18,8 @@ use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
 use crate::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
+use crate::sharding::HEADER_COMMIT_ACTIVATION_HEIGHT;
+use crate::state_engine::EVM_BINDINGS_STATE_ACTIVATION_HEIGHT;
 use crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT;
 use crate::xshard2pc::XPC_ACTIVATION_HEIGHT;
 use crate::zkml::DEFAULT_CHAIN_ID;
@@ -396,6 +398,18 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 wasm_xshard_pmm_hardening_activation_height(),
                 "Ruleset v7 WASM/XShard/PMM/PQ1 hardening: SubCallSnapshot, caller vs origin, outbound post-commit + balance sync, deploy_with_nonce, PMM ZeroMint/ZeroPayout, canonical PQ1",
             ),
+            ActivationGate::new(
+                "HEADER_COMMIT_ACTIVATION_HEIGHT",
+                "stellereum::sharding::block",
+                HEADER_COMMIT_ACTIVATION_HEIGHT,
+                "Ruleset v7 two-level BlockHeader v4 + body_commitment binding state_root and prev_hash into block_hash",
+            ),
+            ActivationGate::new(
+                "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
+                "stellereum::state_engine",
+                EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
+                "Ruleset v7 canonical Domain::EvmBindings state commitment and deterministic first-writer-wins apply",
+            ),
         ],
     }
 }
@@ -536,6 +550,14 @@ mod tests {
                 "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
                 WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
             ),
+            (
+                "HEADER_COMMIT_ACTIVATION_HEIGHT",
+                HEADER_COMMIT_ACTIVATION_HEIGHT,
+            ),
+            (
+                "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
+                EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
+            ),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());
@@ -550,6 +572,19 @@ mod tests {
                 gate.status,
                 ActivationGate::new(gate.name, gate.module, constant_height, gate.note).status
             );
+        }
+
+        for r2_gate in [
+            "HEADER_COMMIT_ACTIVATION_HEIGHT",
+            "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
+        ] {
+            let gate = schedule
+                .gates
+                .iter()
+                .find(|g| g.name == r2_gate)
+                .expect("R2 gate must be registered");
+            assert_eq!(gate.activation_height, u64::MAX);
+            assert_eq!(gate.status, ActivationStatus::GatedOff);
         }
     }
 

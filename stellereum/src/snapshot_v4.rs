@@ -10,8 +10,8 @@
 //! - `Base` mode: 256 deterministic prefix buckets (`addr[0] ∈ 0x00..=0xFF`,
 //!   sorted by `address: [u8; 32]`, sub-chunked at `MAX_ACCOUNTS_PER_CHUNK` /
 //!   `MAX_SNAP_CHUNK_BYTES`, empty buckets encoded as `UnchangedRef` with
-//!   `BLAKE3("STELL_SNAP_BUCKET_EMPTY_V1")` and 0 wire bytes) plus 15 canonical
-//!   `DomainUnitId` units (`Scalars` .. `PqKeys`).
+//!   `BLAKE3("STELL_SNAP_BUCKET_EMPTY_V1")` and 0 wire bytes) plus 16 canonical
+//!   `DomainUnitId` units (`Scalars` .. `EvmBindings`).
 //! - `Delta` mode: `AccountBucketDelta` / `MapDiff` / `ScalarsDelta` /
 //!   `CrossShardDelta` / `UnchangedRef`, with strict `base_state_root` and
 //!   monotonic `base_height < target_height` chain verification, uniqueness and
@@ -47,7 +47,8 @@ use crate::staking::{
     ValidatorStake,
 };
 use crate::state_engine::{
-    AccountState, CnVrfV3EngineSnapshot, EscrowRecord, InMemoryStateEngine, StateSnapshotV2,
+    AccountState, CnVrfV3EngineSnapshot, EscrowRecord, EvmBindingsSnapshot, EvmBindingsState,
+    InMemoryStateEngine, StateSnapshotV2,
 };
 use crate::storage::DomainSnapshot;
 use crate::token::{TokenActor, TokenMetadata, TokenRegistry};
@@ -109,8 +110,8 @@ pub const UNIT_ENC_DELTA: u8 = 1;
 pub const UNIT_ENC_UNCHANGED: u8 = 2;
 
 /// Number of non-account domain units.
-pub const N_DOMAIN_UNITS: usize = 15;
-/// Total canonical unit tags (`256` account buckets + `15` domains).
+pub const N_DOMAIN_UNITS: usize = 16;
+/// Total canonical unit tags (`256` account buckets + `16` domains).
 pub const TOTAL_UNIT_TAGS: usize = N_ACCOUNT_BUCKETS + N_DOMAIN_UNITS;
 
 // ============================================================================
@@ -471,7 +472,7 @@ impl std::error::Error for SnapV4Error {}
 // Unit Tags & Domain Identifiers
 // ============================================================================
 
-/// Non-account domain unit identifiers (`unit_tag` 256..=270).
+/// Non-account domain unit identifiers (`unit_tag` 256..=271).
 ///
 /// NOTE: `safety_record_v1`, `ConsensusCheckpoint`, and `VoteWatermark` are
 /// explicitly absent and never represented here.
@@ -493,6 +494,7 @@ pub enum DomainUnitId {
     CrossShard = 268,
     CnVrfV3 = 269,
     PqKeys = 270,
+    EvmBindings = 271,
 }
 
 impl DomainUnitId {
@@ -512,6 +514,7 @@ impl DomainUnitId {
         Self::CrossShard,
         Self::CnVrfV3,
         Self::PqKeys,
+        Self::EvmBindings,
     ];
 
     pub const fn tag(self) -> u16 {
@@ -535,6 +538,7 @@ impl DomainUnitId {
             268 => Some(Self::CrossShard),
             269 => Some(Self::CnVrfV3),
             270 => Some(Self::PqKeys),
+            271 => Some(Self::EvmBindings),
             _ => None,
         }
     }
@@ -556,6 +560,7 @@ impl DomainUnitId {
             Self::CrossShard => "CrossShard",
             Self::CnVrfV3 => "CnVrfV3",
             Self::PqKeys => "PqKeys",
+            Self::EvmBindings => "EvmBindings",
         }
     }
 }
@@ -1724,6 +1729,25 @@ impl CanonicalPqKeys {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalEvmBindings {
+    pub by_evm: BTreeMap<[u8; 20], [u8; 32]>,
+}
+
+impl CanonicalEvmBindings {
+    pub fn from_state(state: &EvmBindingsState) -> Self {
+        Self {
+            by_evm: state.by_evm.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+
+    pub fn to_snapshot(&self) -> EvmBindingsSnapshot {
+        EvmBindingsSnapshot {
+            by_evm: self.by_evm.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+}
+
 /// Account bucket full-chunk payload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountBucketFull {
@@ -1803,6 +1827,7 @@ pub struct SnapStateV4 {
     pub cross_shard: CanonicalCrossShard,
     pub cnvrf_v3: CnVrfV3EngineSnapshot,
     pub pq_keys: CanonicalPqKeys,
+    pub evm_bindings: CanonicalEvmBindings,
 }
 
 impl Default for SnapStateV4 {
@@ -1824,6 +1849,7 @@ impl Default for SnapStateV4 {
             cross_shard: CanonicalCrossShard::default(),
             cnvrf_v3: CnVrfV3EngineSnapshot::default(),
             pq_keys: CanonicalPqKeys::default(),
+            evm_bindings: CanonicalEvmBindings::default(),
         }
     }
 }
@@ -1892,6 +1918,7 @@ impl SnapStateV4 {
         let bridge = engine.bridge_read().await.clone();
         let zkml_models = engine.zkml_models_read().await.clone();
         let cnvrf_v3 = engine.cnvrf_v3_snapshot().await;
+        let evm_bindings = CanonicalEvmBindings::from_state(&*engine.evm_bindings_read().await);
 
         let engine_consumed = engine.cross_shard_consumed_snapshot().await;
         let produced_pairs = engine.cross_shard_produced_snapshot().await;
@@ -2001,6 +2028,7 @@ impl SnapStateV4 {
             pq_keys: CanonicalPqKeys {
                 entries: pq_entries,
             },
+            evm_bindings,
         })
     }
 
@@ -2074,6 +2102,11 @@ impl SnapStateV4 {
         let pq_bytes = encode_canonical(&pq_pairs)?;
         engine
             .restore_pq_keys(&pq_bytes)
+            .await
+            .map_err(SnapV4Error::EngineRestore)?;
+
+        engine
+            .restore_evm_bindings_state(self.evm_bindings.to_snapshot())
             .await
             .map_err(SnapV4Error::EngineRestore)?;
 
@@ -2330,6 +2363,7 @@ impl SnapStateV4 {
             DomainUnitId::CrossShard => encode_canonical(&self.cross_shard)?,
             DomainUnitId::CnVrfV3 => encode_canonical(&self.cnvrf_v3)?,
             DomainUnitId::PqKeys => encode_canonical(&self.pq_keys)?,
+            DomainUnitId::EvmBindings => encode_canonical(&self.evm_bindings)?,
         };
         if single.len() > MAX_SNAP_CHUNK_BYTES {
             return Err(SnapV4Error::ChunkTooLarge {
@@ -2534,7 +2568,7 @@ fn finalize_manifest(
     Ok(manifest)
 }
 
-/// Build a `Base` `SnapV4` checkpoint (256 prefix buckets + 15 canonical domain units).
+/// Build a `Base` `SnapV4` checkpoint (256 prefix buckets + 16 canonical domain units).
 pub fn build_base_snapshot(
     state: &SnapStateV4,
     params: &SnapshotBuildParams<'_>,
@@ -2686,7 +2720,7 @@ pub fn build_delta_snapshot(
         )?;
     }
 
-    // 15 domain units
+    // 16 domain units
     for domain in DomainUnitId::ALL {
         let base_hash = base.domain_state_hash(domain)?;
         let target_hash = target.domain_state_hash(domain)?;
@@ -2789,6 +2823,23 @@ pub fn build_delta_snapshot(
             DomainUnitId::PqKeys => {
                 let diff =
                     build_map_diff(base_hash, &base.pq_keys.entries, &target.pq_keys.entries)?;
+                let delta_bytes = encode_canonical(&diff)?;
+                push_delta_or_full(
+                    domain.tag(),
+                    target_hash,
+                    delta_bytes,
+                    full_chunks,
+                    &mut units,
+                    &mut chunks,
+                    &mut total_wire_bytes,
+                )?;
+            }
+            DomainUnitId::EvmBindings => {
+                let diff = build_map_diff(
+                    base_hash,
+                    &base.evm_bindings.by_evm,
+                    &target.evm_bindings.by_evm,
+                )?;
                 let delta_bytes = encode_canonical(&diff)?;
                 push_delta_or_full(
                     domain.tag(),
@@ -3215,29 +3266,40 @@ fn group_units_by_tag(manifest: &SnapshotManifestV1) -> [Vec<&SnapshotUnitDesc>;
     grouped
 }
 
-/// Verify and assemble a `Base` `SnapV4` checkpoint, including throwaway
-/// `state_root == anchor.trusted_state_root` verification before returning.
-pub async fn verify_and_apply_base(
+/// Assemble and verify a `Base` `SnapV4` checkpoint from its manifest and chunks
+/// (verifying `magic`, `version`, bounds, `units_merkle_root`, every `chunk_hash`
+/// and `unit_hash`, and `compute_state_root() == manifest.target_state_root`),
+/// without requiring a live `ValidatorSet` (for local disk reload where
+/// `verify_restored_root` checks the chain anchor).
+pub async fn assemble_base_state(
     manifest: &SnapshotManifestV1,
     chunks: &BTreeMap<(u16, u16), Vec<u8>>,
-    anchor: &TrustedSnapshotAnchor<'_>,
 ) -> Result<SnapStateV4, SnapV4Error> {
-    verify_and_apply_base_with_key_resolver(manifest, chunks, anchor, pq_key_at_height).await
-}
-
-pub async fn verify_and_apply_base_with_key_resolver<F>(
-    manifest: &SnapshotManifestV1,
-    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
-    anchor: &TrustedSnapshotAnchor<'_>,
-    key_resolver: F,
-) -> Result<SnapStateV4, SnapV4Error>
-where
-    F: Fn(&ValidatorId, u64) -> Option<(PqScheme, Vec<u8>)>,
-{
-    validate_manifest_pre_fetch_with_key_resolver(manifest, anchor, key_resolver)?;
+    if manifest.magic != SNAP_MANIFEST_MAGIC {
+        return Err(SnapV4Error::InvalidMagic);
+    }
+    if manifest.version != SNAP_MANIFEST_VERSION {
+        return Err(SnapV4Error::UnsupportedVersion(manifest.version));
+    }
     if !matches!(manifest.kind, SnapshotKind::Base) {
         return Err(SnapV4Error::InvalidKind { expected: "Base" });
     }
+    if manifest.units.len() > MAX_SNAP_UNITS {
+        return Err(SnapV4Error::TooManyUnits {
+            count: manifest.units.len(),
+            max: MAX_SNAP_UNITS,
+        });
+    }
+    if compute_units_merkle_root(&manifest.units) != manifest.units_merkle_root {
+        return Err(SnapV4Error::UnitsMerkleRootMismatch);
+    }
+    assemble_base_state_inner(manifest, chunks).await
+}
+
+async fn assemble_base_state_inner(
+    manifest: &SnapshotManifestV1,
+    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
+) -> Result<SnapStateV4, SnapV4Error> {
     check_no_unexpected_chunks(manifest, chunks)?;
     let grouped = group_units_by_tag(manifest);
 
@@ -3306,6 +3368,9 @@ where
                     }
                     DomainUnitId::CnVrfV3 => state.cnvrf_v3 = decode_canonical_exact(raw, limit)?,
                     DomainUnitId::PqKeys => state.pq_keys = decode_canonical_exact(raw, limit)?,
+                    DomainUnitId::EvmBindings => {
+                        state.evm_bindings = decode_canonical_exact(raw, limit)?
+                    }
                     DomainUnitId::Tokens | DomainUnitId::Contracts => unreachable!(),
                 }
             }
@@ -3313,11 +3378,73 @@ where
     }
 
     let computed_root = state.compute_state_root().await?;
-    if computed_root != anchor.trusted_state_root {
+    if computed_root != manifest.target_state_root {
         return Err(SnapV4Error::StateRootMismatch);
     }
 
     Ok(state)
+}
+
+/// Verify and assemble a `Base` `SnapV4` checkpoint, including throwaway
+/// `state_root == anchor.trusted_state_root` verification before returning.
+pub async fn verify_and_apply_base(
+    manifest: &SnapshotManifestV1,
+    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
+    anchor: &TrustedSnapshotAnchor<'_>,
+) -> Result<SnapStateV4, SnapV4Error> {
+    verify_and_apply_base_with_key_resolver(manifest, chunks, anchor, pq_key_at_height).await
+}
+
+pub async fn verify_and_apply_base_with_key_resolver<F>(
+    manifest: &SnapshotManifestV1,
+    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
+    anchor: &TrustedSnapshotAnchor<'_>,
+    key_resolver: F,
+) -> Result<SnapStateV4, SnapV4Error>
+where
+    F: Fn(&ValidatorId, u64) -> Option<(PqScheme, Vec<u8>)>,
+{
+    validate_manifest_pre_fetch_with_key_resolver(manifest, anchor, key_resolver)?;
+    if !matches!(manifest.kind, SnapshotKind::Base) {
+        return Err(SnapV4Error::InvalidKind { expected: "Base" });
+    }
+    assemble_base_state_inner(manifest, chunks).await
+}
+
+/// Verify and apply a single `Delta` checkpoint over `base_state` without
+/// requiring a live `ValidatorSet` (for local disk reload where
+/// `verify_restored_root` checks the chain anchor).
+pub async fn apply_delta_state(
+    base_state: &SnapStateV4,
+    base_height: u64,
+    base_state_root: [u8; 32],
+    manifest: &SnapshotManifestV1,
+    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
+) -> Result<SnapStateV4, SnapV4Error> {
+    if manifest.magic != SNAP_MANIFEST_MAGIC {
+        return Err(SnapV4Error::InvalidMagic);
+    }
+    if manifest.version != SNAP_MANIFEST_VERSION {
+        return Err(SnapV4Error::UnsupportedVersion(manifest.version));
+    }
+    if manifest.units.len() > MAX_SNAP_UNITS {
+        return Err(SnapV4Error::TooManyUnits {
+            count: manifest.units.len(),
+            max: MAX_SNAP_UNITS,
+        });
+    }
+    if compute_units_merkle_root(&manifest.units) != manifest.units_merkle_root {
+        return Err(SnapV4Error::UnitsMerkleRootMismatch);
+    }
+    apply_delta_state_inner(
+        base_state,
+        base_height,
+        base_state_root,
+        manifest,
+        chunks,
+        manifest.target_state_root,
+    )
+    .await
 }
 
 /// Verify and apply a single `Delta` checkpoint over `base_state`, returning the
@@ -3355,6 +3482,25 @@ where
     F: Fn(&ValidatorId, u64) -> Option<(PqScheme, Vec<u8>)>,
 {
     validate_manifest_pre_fetch_with_key_resolver(manifest, anchor, key_resolver)?;
+    apply_delta_state_inner(
+        base_state,
+        base_height,
+        base_state_root,
+        manifest,
+        chunks,
+        anchor.trusted_state_root,
+    )
+    .await
+}
+
+async fn apply_delta_state_inner(
+    base_state: &SnapStateV4,
+    base_height: u64,
+    base_state_root: [u8; 32],
+    manifest: &SnapshotManifestV1,
+    chunks: &BTreeMap<(u16, u16), Vec<u8>>,
+    expected_target_root: [u8; 32],
+) -> Result<SnapStateV4, SnapV4Error> {
     let SnapshotKind::Delta {
         base_height: declared_base_h,
         base_state_root: declared_base_root,
@@ -3477,7 +3623,7 @@ where
         next_state.buckets[b] = decode_bucket_full_chunks(bucket, descs, chunks)?;
     }
 
-    // 15 domain units
+    // 16 domain units
     for domain in DomainUnitId::ALL {
         let descs = &grouped[domain.tag() as usize];
         let base_dom_hash = base_state.domain_state_hash(domain)?;
@@ -3610,6 +3756,23 @@ where
                         diff,
                         base_dom_hash,
                         "PqKeys",
+                    )
+                    .map_err(|e| match e {
+                        SnapV4Error::DeltaBaseUnitHashMismatch { .. } => {
+                            SnapV4Error::DeltaBaseUnitHashMismatch {
+                                unit_tag: domain.tag(),
+                            }
+                        }
+                        other => other,
+                    })?;
+                }
+                DomainUnitId::EvmBindings => {
+                    let diff: MapDiff<[u8; 20], [u8; 32]> = decode_canonical_exact(raw, limit)?;
+                    apply_map_diff(
+                        &mut next_state.evm_bindings.by_evm,
+                        diff,
+                        base_dom_hash,
+                        "EvmBindings",
                     )
                     .map_err(|e| match e {
                         SnapV4Error::DeltaBaseUnitHashMismatch { .. } => {
@@ -3842,6 +4005,9 @@ where
                     DomainUnitId::PqKeys => {
                         next_state.pq_keys = decode_canonical_exact(raw, limit)?
                     }
+                    DomainUnitId::EvmBindings => {
+                        next_state.evm_bindings = decode_canonical_exact(raw, limit)?
+                    }
                     DomainUnitId::Tokens | DomainUnitId::Contracts => unreachable!(),
                 }
             }
@@ -3849,7 +4015,7 @@ where
     }
 
     let computed_root = next_state.compute_state_root().await?;
-    if computed_root != anchor.trusted_state_root {
+    if computed_root != expected_target_root {
         return Err(SnapV4Error::StateRootMismatch);
     }
 

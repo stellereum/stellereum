@@ -2828,6 +2828,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "futures",
  "hex",
  "reqwest",
  "rusqlite",

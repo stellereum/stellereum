@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use stellereum_indexer::db::Database;
 use stellereum_indexer::events::AbiCache;
-use stellereum_indexer::server::{create_router, AppState};
+use stellereum_indexer::server::{create_router, AppState, IndexerStreamHub};
 use stellereum_indexer::syncer::Syncer;
 use tracing::info;
 
@@ -36,13 +36,15 @@ async fn main() -> Result<()> {
     let sync_status = std::sync::Arc::new(tokio::sync::RwLock::new(
         stellereum_indexer::syncer::SyncStatus::default(),
     ));
+    let stream_hub = std::sync::Arc::new(IndexerStreamHub::new());
     let syncer = Syncer::new_with_state(
         db.clone(),
         node_url,
         rpc_url.clone(),
         abis.clone(),
         sync_status.clone(),
-    );
+    )
+    .with_stream_hub(stream_hub.clone());
     tokio::spawn(async move {
         syncer.run().await;
     });
@@ -63,6 +65,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
+        stream_hub,
     };
     let app = create_router(app_state);
 

@@ -2559,6 +2559,17 @@ impl Node {
         svc: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        self.request_to_with_response_limit(pid, svc, payload, None)
+            .await
+    }
+
+    async fn request_to_with_response_limit(
+        self: &Arc<Self>,
+        pid: [u8; NODEID_LEN],
+        svc: &str,
+        payload: Vec<u8>,
+        response_limit: Option<usize>,
+    ) -> Result<Vec<u8>> {
         // R18: РОВНО ОДИН peers.read на весь запрос (дальше peer раздаётся в
         // connect_or_get/pick_conn — раньше каждый из них читал peers заново).
         let peer = self
@@ -2580,7 +2591,16 @@ impl Node {
         // нужно (spawned-доставка в deliver_local).
         let req_timeout_secs: u64 = if svc == "mail.send" { 30 } else { 5 };
         let first = self
-            .request_on(&conn, &pid, &key, &peer, svc, &payload, req_timeout_secs)
+            .request_on_limited(
+                &conn,
+                &pid,
+                &key,
+                &peer,
+                svc,
+                &payload,
+                req_timeout_secs,
+                response_limit,
+            )
             .await;
         let resp_ms = t_resp.elapsed().as_millis();
         if dial_ms >= 200 || resp_ms >= 200 {
@@ -2623,8 +2643,17 @@ impl Node {
                 self.drop_conn(pid, Some(conn.stable_id())).await;
                 let retried = async {
                     let (conn, key) = self.conn_with_session(&peer, pid).await?;
-                    self.request_on(&conn, &pid, &key, &peer, svc, &payload, req_timeout_secs)
-                        .await
+                    self.request_on_limited(
+                        &conn,
+                        &pid,
+                        &key,
+                        &peer,
+                        svc,
+                        &payload,
+                        req_timeout_secs,
+                        response_limit,
+                    )
+                    .await
                 }
                 .await;
                 match retried {
@@ -2827,6 +2856,22 @@ impl Node {
         payload: &[u8],
         timeout_secs: u64,
     ) -> Result<Vec<u8>> {
+        self.request_on_limited(conn, pid, key, peer, svc, payload, timeout_secs, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // GATE: preserve request plumbing while bounding selected responses
+    async fn request_on_limited(
+        &self,
+        conn: &Connection,
+        pid: &[u8; NODEID_LEN],
+        key: &[u8; 32],
+        peer: &PeerLink,
+        svc: &str,
+        payload: &[u8],
+        timeout_secs: u64,
+        response_limit: Option<usize>,
+    ) -> Result<Vec<u8>> {
         // open_bi can block on the peer's stream credit or a half-dead
         // connection; connect_with_auth guards this same call with 8s. Bound it
         // so a stalled open surfaces as a retryable network error instead of
@@ -2900,12 +2945,21 @@ impl Node {
         let write_ms = t_write.elapsed();
         let _ = send.finish();
         let t_wait = std::time::Instant::now();
-        let bytes = timeout(
-            Duration::from_secs(timeout_secs),
-            recv.read_to_end(proto::MAX_FRAME),
-        )
-        .await
-        .map_err(|_| anyhow!("response timeout"))??;
+        let bytes = if let Some(limit) = response_limit {
+            timeout(
+                Duration::from_secs(timeout_secs),
+                read_bounded_response(&mut recv, limit.min(proto::MAX_FRAME)),
+            )
+            .await
+            .map_err(|_| anyhow!("response timeout"))??
+        } else {
+            timeout(
+                Duration::from_secs(timeout_secs),
+                recv.read_to_end(proto::MAX_FRAME),
+            )
+            .await
+            .map_err(|_| anyhow!("response timeout"))??
+        };
         let wait_ms = t_wait.elapsed();
         // Patch B: стадии запроса (open/write/wait) с join-ключом (f.seq, f.ts) —
         // приёмник логирует ТЕ ЖЕ seq/ts в "dispatch", обе ноды сидят на одних
@@ -6355,6 +6409,19 @@ impl Node {
         std::fs::read(&path).ok()
     }
 
+    fn local_chunk_get_bounded(
+        &self,
+        bucket: &str,
+        chunk_id: &str,
+        limit: usize,
+    ) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(chunk_id) {
+            return None;
+        }
+        let file = std::fs::File::open(self.chunks_dir(bucket).join(chunk_id)).ok()?;
+        read_bounded_chunk(file, limit).ok()
+    }
+
     /// Сохранить чанк на RF реплик (k-ближайших к chunk_id по DHT).
     pub async fn store_chunk_replicated(
         self: &Arc<Self>,
@@ -6421,8 +6488,9 @@ impl Node {
     /// Erasure coding: k информационных шардов + (n-k) чётности (Reed-Solomon GF(256)).
     /// Даёт устойчивость к потере ЛЮБЫХ n-k шардов при хранении в n/k раз меньшем объёме,
     /// чем полная репликация RF=n.
-    fn ec_encode(ct: &[u8], k: usize, n: usize) -> Vec<Vec<u8>> {
-        let shard_len = ct.len().div_ceil(k).max(1);
+    fn ec_encode(ct: &[u8], k: usize, n: usize) -> Option<Vec<Vec<u8>>> {
+        let shard_len = mail_ec_shard_len(k, n, ct.len())?;
+        let rs = ReedSolomon::new(k, n.checked_sub(k)?).ok()?;
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(n);
         for i in 0..k {
             let mut s = vec![0u8; shard_len];
@@ -6436,10 +6504,8 @@ impl Node {
         for _ in k..n {
             shards.push(vec![0u8; shard_len]);
         }
-        if let Ok(rs) = ReedSolomon::new(k, n - k) {
-            let _ = rs.encode(&mut shards);
-        }
-        shards
+        rs.encode(&mut shards).ok()?;
+        Some(shards)
     }
 
     /// Восстановление ciphertext из любых k доступных шардов.
@@ -6449,14 +6515,17 @@ impl Node {
         n: usize,
         ct_len: usize,
     ) -> Option<Vec<u8>> {
+        let shard_len = mail_ec_shard_len(k, n, ct_len)?;
+        if slots.len() != n || slots.iter().flatten().any(|shard| shard.len() != shard_len) {
+            return None;
+        }
         let present = slots.iter().filter(|s| s.is_some()).count();
         if present < k {
             return None;
         }
-        let rs = ReedSolomon::new(k, n - k).ok()?;
+        let rs = ReedSolomon::new(k, n.checked_sub(k)?).ok()?;
         rs.reconstruct(slots).ok()?;
-        let shard_len = slots.first()?.as_ref()?.len();
-        let mut out = Vec::with_capacity(shard_len * k);
+        let mut out = Vec::with_capacity(shard_len.checked_mul(k)?);
         for s in slots.iter().take(k) {
             out.extend_from_slice(s.as_ref()?.as_slice());
         }
@@ -6472,12 +6541,31 @@ impl Node {
         cid: &str,
         expected_hash: Option<&str>,
     ) -> Option<Vec<u8>> {
+        self.fetch_chunk_net_with_limit(bucket, cid, expected_hash, None)
+            .await
+    }
+
+    async fn fetch_chunk_net_with_limit(
+        self: &Arc<Self>,
+        bucket: &str,
+        cid: &str,
+        expected_hash: Option<&str>,
+        shard_limit: Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let response_limit = match shard_limit {
+            Some(limit) => Some(mail_ec_response_limit(limit)?),
+            None => None,
+        };
         // ЛОКАЛЬНЫЙ ДИСК — ПЕРВЫМ. Раньше сначала шли два сетевых прохода
         // (до 40 попыток с таймаутами), и только потом локальный резерв:
         // открытие письма, чей чанк лежит у нас, висело/падало по таймауту
         // (наблюдалось: внешнее письмо открывалось без текста, хотя чанк был
         // на диске). Сеть — только если локально нет.
-        if let Some(local) = self.local_chunk_get(bucket, cid) {
+        let local_get = || match shard_limit {
+            Some(limit) => self.local_chunk_get_bounded(bucket, cid, limit),
+            None => self.local_chunk_get(bucket, cid),
+        };
+        if let Some(local) = local_get() {
             // хэш проверяем и для локальных данных (защита от битой записи)
             if let Some(expected) = expected_hash {
                 let actual = hex::encode(blake3::hash(&local).as_bytes());
@@ -6509,8 +6597,13 @@ impl Node {
                     let req = json!({ "bucket": bucket, "chunk_id": cid })
                         .to_string()
                         .into_bytes();
-                    if let Ok(resp) = self.request_to(n.id, "storage.fetch", req).await {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                    if let Ok(resp) = self
+                        .request_to_with_response_limit(n.id, "storage.fetch", req, response_limit)
+                        .await
+                    {
+                        if let Some(limit) = shard_limit {
+                            got = decode_mail_ec_response(&resp, limit);
+                        } else if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                             if v["ok"].as_bool().unwrap_or(false) {
                                 if let Some(b64) = v["data"].as_str() {
                                     got =
@@ -6526,7 +6619,7 @@ impl Node {
             eprintln!(
                 "[node] WARN: chunk {cid} of {bucket} served from LOCAL disk, not from the network"
             );
-            got = self.local_chunk_get(bucket, cid);
+            got = local_get();
         }
         if let Some(expected) = expected_hash {
             if let Some(g) = &got {
@@ -6550,9 +6643,16 @@ impl Node {
         k: usize,
         n: usize,
     ) -> Result<usize, StoreMailError> {
-        if k == 0 || n <= k {
+        if k == 0 || n <= k || n > MAIL_EC_MAX_SHARDS {
             return Err(StoreMailError::InvalidErasureParams { k, n });
         }
+        // XChaCha20-Poly1305 appends a 16-byte tag. Check before encryption
+        // and before allocating the n shards.
+        let ct_len = blob
+            .len()
+            .checked_add(16)
+            .ok_or(StoreMailError::ErasureTooLarge)?;
+        mail_ec_shard_len(k, n, ct_len).ok_or(StoreMailError::ErasureTooLarge)?;
         // детерминированное шифрование + content-адресные id шардов (см. blob_key_nonce):
         // повторный store_mail_ec того же письма пишет в те же пути
         let content_hash = blob_content_hash(blob);
@@ -6567,7 +6667,7 @@ impl Node {
             None => None,
         };
         let ct = e2e_encrypt_det(&data_key, &nonce, blob);
-        let shards = Self::ec_encode(&ct, k, n);
+        let shards = Self::ec_encode(&ct, k, n).ok_or(StoreMailError::ErasureEncodingFailed)?;
         let have_mail_role = self.role_allows("mail");
         let mut chunks: Vec<serde_json::Value> = Vec::with_capacity(n);
         let mut stored = 0usize;
@@ -6859,7 +6959,23 @@ impl Node {
         let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).ok()?;
         // ключ блоба: "key" (открытый, старая модель) либо "key_box" (Proton) —
         // для key_box нужен приватный ML-KEM-768 сид владельца.
-        let dk: [u8; 32] = if let Some(kb) = manifest["key_box"].as_object() {
+        let dk: [u8; 32] = if let Some(kb) = manifest.get("key_box") {
+            let kb = kb.as_object()?;
+            if manifest.get("key").is_some() || kb.contains_key("eph") {
+                return None;
+            }
+            // Bound every field before calling `box_unwrap_key`.
+            let valid_hex = |field: &str, bytes: usize| {
+                kb.get(field).and_then(|v| v.as_str()).is_some_and(|s| {
+                    s.len() == bytes * 2 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            };
+            if !valid_hex("ct", crate::mailbox::KEM_CT_LEN)
+                || !valid_hex("nonce", 24)
+                || !valid_hex("ct2", 48)
+            {
+                return None;
+            }
             let priv_hex = owner_priv?;
             box_unwrap_key(&serde_json::Value::Object(kb.clone()), priv_hex).ok()?
         } else {
@@ -6872,26 +6988,66 @@ impl Node {
             k
         };
         // EC-манифест: собираем любые k из n шардов и восстанавливаем ciphertext
-        if let Some(ec) = manifest.get("ec").and_then(|v| v.as_object()) {
-            let k = ec.get("k").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-            let n = ec.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-            let ct_len = ec.get("ct_len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if let Some(ec) = manifest.get("ec") {
+            let ec = ec.as_object()?;
+            let k = usize::try_from(ec.get("k")?.as_u64()?).ok()?;
+            let n = usize::try_from(ec.get("n")?.as_u64()?).ok()?;
+            let ct_len = usize::try_from(ec.get("ct_len")?.as_u64()?).ok()?;
+            let Some(shard_len) = mail_ec_shard_len(k, n, ct_len) else {
+                eprintln!(
+                    "[node] EC: {name}: unsupported geometry or resource limit \
+                     (k={k}, n={n}, ct_len={ct_len}; require 0 < k < n <= {MAIL_EC_MAX_SHARDS}, \
+                     ct_len <= {MAIL_EC_MAX_CIPHERTEXT}, shard <= {}, \
+                     total shards <= {MAIL_EC_MAX_ENCODED} bytes); legacy mail requires offline migration",
+                    crate::proto::MAX_STORAGE_CHUNK_LEN
+                );
+                return None;
+            };
+            if usize::try_from(ec.get("shard_len")?.as_u64()?).ok()? != shard_len {
+                return None;
+            }
+            let chunks = manifest["chunks"].as_array()?;
+            if chunks.len() < k || chunks.len() > n {
+                return None;
+            }
             let mut slots: Vec<Option<Vec<u8>>> = vec![None; n];
+            let mut seen = vec![false; n];
+            // Validate indices and mandatory non-empty chunk hashes before
+            // fetching anything, including duplicate indices that would otherwise
+            // inflate the available-shard count.
+            for c in chunks {
+                let idx = usize::try_from(c["shard"].as_u64()?).ok()?;
+                if idx >= n || std::mem::replace(&mut seen[idx], true) {
+                    return None;
+                }
+                let expected_hash = c["hash"].as_str()?;
+                if expected_hash.is_empty() {
+                    return None;
+                }
+            }
             let mut have = 0usize;
-            if let Some(chunks) = manifest["chunks"].as_array() {
-                for c in chunks {
-                    let idx = c["shard"].as_u64().unwrap_or(0) as usize;
-                    if idx >= n {
+            for c in chunks {
+                let idx = usize::try_from(c["shard"].as_u64()?).ok()?;
+                let cid = c["id"].as_str().unwrap_or("");
+                let expected_hash = c["hash"].as_str()?;
+                if expected_hash.is_empty() {
+                    return None;
+                }
+                if let Some(data) = self
+                    .fetch_chunk_net_with_limit("mail", cid, Some(expected_hash), Some(shard_len))
+                    .await
+                {
+                    if data.len() != shard_len {
+                        eprintln!(
+                            "[node] EC: {name}: shard {idx} ({cid}) length {} != {shard_len}, skipping",
+                            data.len()
+                        );
                         continue;
                     }
-                    let cid = c["id"].as_str().unwrap_or("");
-                    if let Some(data) = self.fetch_chunk_net("mail", cid, c["hash"].as_str()).await
-                    {
-                        slots[idx] = Some(data);
-                        have += 1;
-                        if have >= k {
-                            break;
-                        }
+                    slots[idx] = Some(data);
+                    have += 1;
+                    if have >= k {
+                        break;
                     }
                 }
             }
@@ -9094,6 +9250,10 @@ pub enum StoreMailError {
     InvalidOwnerKey,
     /// `store_mail_ec` was called with impossible erasure-coding parameters.
     InvalidErasureParams { k: usize, n: usize },
+    /// The ciphertext or encoded shards exceed the local resource limits.
+    ErasureTooLarge,
+    /// Reed-Solomon construction or encoding failed; nothing was published.
+    ErasureEncodingFailed,
 }
 
 impl std::fmt::Display for StoreMailError {
@@ -9106,13 +9266,113 @@ impl std::fmt::Display for StoreMailError {
             ),
             Self::InvalidErasureParams { k, n } => write!(
                 f,
-                "invalid erasure-coding parameters k={k} n={n} (need 0 < k < n)"
+                "invalid erasure-coding parameters k={k} n={n} (need 0 < k < n <= 256)"
             ),
+            Self::ErasureTooLarge => write!(f, "erasure-coded mail exceeds resource limits"),
+            Self::ErasureEncodingFailed => write!(f, "erasure encoding failed"),
         }
     }
 }
 
 impl std::error::Error for StoreMailError {}
+
+// Match the existing non-EC mail read cap and the storage protocol's chunk cap.
+// Bound the full reconstructed shard set independently of ciphertext size.
+const MAIL_EC_MAX_SHARDS: usize = 256;
+const MAIL_EC_MAX_CIPHERTEXT: usize = 32 * 1024 * 1024;
+const MAIL_EC_MAX_ENCODED: usize = 64 * 1024 * 1024;
+
+// An honest storage.fetch reply is compact JSON with an <=80-byte hex ID and
+// base64 data, inside an encrypted frame. This allowance covers the frame
+// header, AEAD tag, MAX_NONCE_LEN, the u16-sized signature, and JSON metadata.
+// It is not a peer-supplied size hint and never increases MAX_FRAME.
+const MAIL_EC_RESPONSE_OVERHEAD: usize = 128 * 1024;
+
+fn mail_ec_response_limit(shard_len: usize) -> Option<usize> {
+    if shard_len > crate::proto::MAX_STORAGE_CHUNK_LEN {
+        return None;
+    }
+    let b64_len = shard_len.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+    b64_len.checked_add(MAIL_EC_RESPONSE_OVERHEAD)
+}
+
+// Read at most limit + 1 bytes, using a fixed-size scratch buffer. The extra
+// byte detects a growing file/stream; neither metadata nor a remote hint is
+// trusted. The returned Vec is never grown past limit.
+fn read_bounded_chunk(mut reader: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(limit);
+    let mut buf = [0u8; 8192];
+    loop {
+        let to_read = (limit - data.len()).min(buf.len() - 1) + 1;
+        let n = reader.read(&mut buf[..to_read])?;
+        if n == 0 {
+            return Ok(data);
+        }
+        if n > limit - data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk too large",
+            ));
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+}
+
+async fn read_bounded_response(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut data = Vec::with_capacity(limit);
+    let mut buf = [0u8; 8192];
+    loop {
+        let to_read = (limit - data.len()).min(buf.len() - 1) + 1;
+        let n = reader.read(&mut buf[..to_read]).await?;
+        if n == 0 {
+            return Ok(data);
+        }
+        if n > limit - data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response too large",
+            ));
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+}
+
+fn decode_mail_ec_response(response: &[u8], shard_len: usize) -> Option<Vec<u8>> {
+    let max_encoded = shard_len.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+    let value: serde_json::Value = serde_json::from_slice(response).ok()?;
+    if !value["ok"].as_bool()? {
+        return None;
+    }
+    let encoded = value["data"].as_str()?;
+    if encoded.len() > max_encoded {
+        return None;
+    }
+    let mut data = vec![0; shard_len];
+    let written = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded, &mut data)
+        .ok()?;
+    if written != shard_len {
+        return None;
+    }
+    Some(data)
+}
+
+fn mail_ec_shard_len(k: usize, n: usize, ct_len: usize) -> Option<usize> {
+    if k == 0 || n <= k || n > MAIL_EC_MAX_SHARDS || ct_len > MAIL_EC_MAX_CIPHERTEXT {
+        return None;
+    }
+    let shard_len = ct_len.div_ceil(k).max(1);
+    if shard_len > crate::proto::MAX_STORAGE_CHUNK_LEN
+        || shard_len.checked_mul(n)? > MAIL_EC_MAX_ENCODED
+    {
+        return None;
+    }
+    Some(shard_len)
+}
 
 /// Hard cap on `chunks[]` in a blob manifest (4 GiB at the 1 MiB chunk size).
 /// The manifest itself is capped at 1 MiB by the DHT value bound, but a tiny
@@ -10565,7 +10825,7 @@ mod ec_tests {
     fn ec_roundtrip_no_loss() {
         let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         for (k, n) in [(3usize, 5usize), (2, 3), (4, 6)] {
-            let shards = Node::ec_encode(&data, k, n);
+            let shards = Node::ec_encode(&data, k, n).expect("encode");
             assert_eq!(shards.len(), n);
             let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
             let back = Node::ec_decode(&mut slots, k, n, data.len()).expect("decode");
@@ -10577,7 +10837,7 @@ mod ec_tests {
     fn ec_survives_n_minus_k_losses() {
         let data: Vec<u8> = (0..4096u32).map(|i| ((i * 7) % 253) as u8).collect();
         let (k, n) = (3usize, 5usize);
-        let shards = Node::ec_encode(&data, k, n);
+        let shards = Node::ec_encode(&data, k, n).expect("encode");
         // теряем ровно n-k шардов (любые)
         let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         slots[0] = None;
@@ -10590,7 +10850,7 @@ mod ec_tests {
     fn ec_rejects_too_few_shards() {
         let data: Vec<u8> = vec![9u8; 300];
         let (k, n) = (3usize, 5usize);
-        let shards = Node::ec_encode(&data, k, n);
+        let shards = Node::ec_encode(&data, k, n).expect("encode");
         let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         slots[0] = None;
         slots[1] = None;
@@ -10602,13 +10862,96 @@ mod ec_tests {
     fn ec_handles_non_multiple_lengths() {
         for len in [1usize, 7, 1000, 1234, 65537] {
             let data: Vec<u8> = (0..len).map(|i| (i % 199) as u8).collect();
-            let shards = Node::ec_encode(&data, 3, 5);
+            let shards = Node::ec_encode(&data, 3, 5).expect("encode");
             let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
             slots[1] = None;
             slots[4] = None;
             let back = Node::ec_decode(&mut slots, 3, 5, len).expect("decode");
             assert_eq!(back.len(), len);
             assert_eq!(back, data, "len={len}");
+        }
+    }
+
+    #[test]
+    fn ec_invalid_geometry_and_resource_bounds_fail_closed() {
+        use super::{mail_ec_shard_len, MAIL_EC_MAX_CIPHERTEXT, MAIL_EC_MAX_ENCODED};
+
+        for (k, n) in [(0, 1), (1, 1), (2, 1), (1, 257), (usize::MAX, usize::MAX)] {
+            assert!(Node::ec_encode(b"x", k, n).is_none(), "{k}/{n}");
+        }
+        assert!(mail_ec_shard_len(1, 256, MAIL_EC_MAX_ENCODED / 256 + 1).is_none());
+        assert!(mail_ec_shard_len(20, 21, MAIL_EC_MAX_CIPHERTEXT + 1).is_none());
+        assert!(mail_ec_shard_len(1, 2, crate::proto::MAX_STORAGE_CHUNK_LEN + 1).is_none());
+        assert!(mail_ec_shard_len(1, 256, 1).is_some());
+        assert!(mail_ec_shard_len(1, 2, usize::MAX).is_none());
+        assert!(Node::ec_decode(&mut [], 2, 1, 0).is_none());
+        assert!(Node::ec_decode(&mut [Some(vec![1]), Some(vec![2])], 1, 2, 2).is_none());
+    }
+
+    #[test]
+    fn ec_gf256_upper_boundary_recovers_lost_data() {
+        let data = b"boundary";
+        let shards = Node::ec_encode(data, 1, 256).expect("encode at GF(256) boundary");
+        let mut slots: Vec<_> = shards.into_iter().map(Some).collect();
+        slots[0] = None;
+        assert_eq!(
+            Node::ec_decode(&mut slots, 1, 256, data.len()).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn ec_limits_cover_exact_upper_boundaries() {
+        use super::{mail_ec_shard_len, MAIL_EC_MAX_CIPHERTEXT};
+        let shard = crate::proto::MAX_STORAGE_CHUNK_LEN;
+        assert_eq!(
+            mail_ec_shard_len(16, 32, MAIL_EC_MAX_CIPHERTEXT),
+            Some(shard)
+        );
+        assert_eq!(mail_ec_shard_len(16, 33, MAIL_EC_MAX_CIPHERTEXT), None);
+    }
+
+    #[test]
+    fn ec_remote_json_base64_is_bounded_and_accepts_padded_legacy_replies() {
+        use super::decode_mail_ec_response;
+        use base64::Engine as _;
+        for len in 1..=8 {
+            let data = vec![42u8; len];
+            let response = serde_json::json!({
+                "ok": true,
+                "chunk_id": "abc",
+                "data": base64::engine::general_purpose::STANDARD.encode(&data)
+            })
+            .to_string();
+            assert_eq!(
+                decode_mail_ec_response(response.as_bytes(), len),
+                Some(data)
+            );
+        }
+        // Same base64 character count but decoded data is one byte too large.
+        let oversized = br#"{"ok":true,"data":"AAA="}"#;
+        assert!(decode_mail_ec_response(oversized, 1).is_none());
+        assert!(decode_mail_ec_response(br#"{"ok":true,"data":"AAAA"}"#, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn ec_remote_frame_reader_rejects_oversized_stream_without_network() {
+        use tokio::io::AsyncWriteExt;
+        let limit = super::mail_ec_response_limit(1).unwrap();
+        for extra in [0, 1] {
+            let (mut sender, mut receiver) = tokio::io::duplex(4096);
+            let send = tokio::spawn(async move {
+                let data = vec![7; limit + extra];
+                let _ = sender.write_all(&data).await;
+            });
+            let result = super::read_bounded_response(&mut receiver, limit).await;
+            if extra == 0 {
+                assert_eq!(result.unwrap().len(), limit);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+            drop(receiver);
+            send.await.unwrap();
         }
     }
 }
@@ -10658,6 +11001,342 @@ mod disk_growth_tests {
         .await
         .expect("node");
         (node, tmp)
+    }
+
+    async fn ec_test_node(tag: &str) -> (Arc<Node>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "infnode-ec-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).expect("new isolated test directory");
+        let mut cfg = test_cfg("EC");
+        // Node::new creates a QUIC endpoint even though these tests do not
+        // connect or send packets. Never bind it to an external interface.
+        cfg.client_listen = Some("127.0.0.1:0".into());
+        let node = Node::new(
+            cfg,
+            NodeKeys::generate(),
+            PqKeys::generate(),
+            dir.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
+        (node, dir)
+    }
+
+    #[tokio::test]
+    async fn ec_invalid_write_does_not_publish_and_invalid_manifests_are_refused() {
+        let (node, dir) = ec_test_node("invalid").await;
+        assert_eq!(
+            node.store_mail_ec("bad-ec", b"mail", None, 1, 257).await,
+            Err(StoreMailError::InvalidErasureParams { k: 1, n: 257 })
+        );
+        assert!(node.get_local_kv("m:bad-ec").await.is_none());
+        let too_large = vec![0; MAIL_EC_MAX_ENCODED / MAIL_EC_MAX_SHARDS];
+        assert_eq!(
+            node.store_mail_ec("large-ec", &too_large, None, 1, 256)
+                .await,
+            Err(StoreMailError::ErasureTooLarge)
+        );
+        assert!(node.get_local_kv("m:large-ec").await.is_none());
+        assert!(!dir.join("chunks").join("mail").exists());
+
+        let base = json!({
+            "nonce": "00".repeat(24), "key": "00".repeat(32),
+            "ec": {"k": 1, "n": 2, "ct_len": 16, "shard_len": 16},
+            "chunks": [{"shard": 0, "id": "unused"}]
+        });
+        let mut cases = Vec::new();
+        let mut m = base.clone();
+        m["ec"]["n"] = json!(u64::MAX);
+        cases.push(m);
+        let mut m = base.clone();
+        m["ec"]["k"] = json!(0);
+        cases.push(m);
+        let mut m = base.clone();
+        m["ec"]["ct_len"] = json!(u64::MAX);
+        cases.push(m);
+        let mut m = base.clone();
+        m["ec"]["shard_len"] = json!(15);
+        cases.push(m);
+        let mut m = base.clone();
+        m["ec"]["k"] = json!(2);
+        m["ec"]["n"] = json!(3);
+        m["ec"]["shard_len"] = json!(8);
+        m["chunks"] = json!([{"shard": 0}, {"shard": 0}]);
+        cases.push(m);
+        let mut m = base;
+        m["ec"] = json!(null);
+        cases.push(m);
+        for (i, manifest) in cases.into_iter().enumerate() {
+            let name = format!("invalid-ec-{i}");
+            node.kv_store_local(&format!("m:{name}"), &manifest.to_string())
+                .await;
+            assert!(node.fetch_mail_inner(&name, None).await.is_none(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ec_bounded_local_read_refuses_oversized_file() {
+        let (node, dir) = ec_test_node("local-limit").await;
+        let chunk_dir = dir.join("chunks").join("mail");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let id = "ab".repeat(32);
+        std::fs::write(chunk_dir.join(&id), [1u8, 2, 3, 4]).unwrap();
+        assert!(node.local_chunk_get_bounded("mail", &id, 3).is_none());
+        assert_eq!(
+            node.local_chunk_get_bounded("mail", &id, 4),
+            Some(vec![1, 2, 3, 4])
+        );
+        assert!(node.local_chunk_get_bounded("mail", "../bad", 4).is_none());
+    }
+
+    #[tokio::test]
+    async fn ec_reads_legacy_writer_fixture_without_network() {
+        let (node, dir) = ec_test_node("legacy").await;
+        let name = "legacy-ec";
+        let plain = b"old EC manifest fixture";
+        let hash = blob_content_hash(plain);
+        let (key, nonce) = blob_key_nonce("mail", name, &hash);
+        let ct = e2e_encrypt_det(&key, &nonce, plain);
+        // Reproduce the old writer's layout independently of ec_encode.
+        let (k, n) = (3, 5);
+        let shard_len = ct.len().div_ceil(k).max(1);
+        let mut shards = vec![vec![0; shard_len]; n];
+        for (i, byte) in ct.iter().enumerate() {
+            shards[i / shard_len][i % shard_len] = *byte;
+        }
+        ReedSolomon::new(k, n - k)
+            .unwrap()
+            .encode(&mut shards)
+            .unwrap();
+        let chunk_dir = dir.join("chunks").join("mail");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunks: Vec<_> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| {
+                let id = ec_chunk_id_for("mail", name, i, &hash);
+                std::fs::write(chunk_dir.join(&id), shard).unwrap();
+                json!({"id": id, "shard": i, "len": shard.len(), "hash": hex::encode(blake3::hash(shard).as_bytes())})
+            })
+            .collect();
+        let manifest = json!({
+            "bucket": "mail", "name": name, "size": plain.len(),
+            "nonce": hex::encode(nonce), "key": hex::encode(key),
+            "ec": {"k": k, "n": n, "ct_len": ct.len(), "shard_len": shard_len},
+            "chunks": chunks
+        });
+        node.kv_store_local(&format!("m:{name}"), &manifest.to_string())
+            .await;
+        assert_eq!(
+            node.fetch_mail_inner(name, None).await.as_deref(),
+            Some(plain.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn ec_corrupt_local_shard_recovers_from_remaining_shards() {
+        let (node, dir) = ec_test_node("corrupt-local").await;
+        let plain = b"EC mail payload with enough bytes for multi-byte shards";
+        let (k, n) = (3, 5);
+        let chunk_dir = dir.join("chunks").join("mail");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+
+        let write_fixture = |name: &str| {
+            let hash = blob_content_hash(plain);
+            let (key, nonce) = blob_key_nonce("mail", name, &hash);
+            let ct = e2e_encrypt_det(&key, &nonce, plain);
+            let shards = Node::ec_encode(&ct, k, n).unwrap();
+            let shard_len = shards[0].len();
+            let chunks: Vec<_> = shards
+                .iter()
+                .enumerate()
+                .map(|(i, shard)| {
+                    let id = ec_chunk_id_for("mail", name, i, &hash);
+                    std::fs::write(chunk_dir.join(&id), shard).unwrap();
+                    json!({
+                        "id": id,
+                        "shard": i,
+                        "len": shard.len(),
+                        "hash": hex::encode(blake3::hash(shard).as_bytes()),
+                    })
+                })
+                .collect();
+            let manifest = json!({
+                "bucket": "mail", "name": name, "size": plain.len(),
+                "nonce": hex::encode(nonce), "key": hex::encode(key),
+                "ec": {"k": k, "n": n, "ct_len": ct.len(), "shard_len": shard_len},
+                "chunks": chunks,
+            });
+            (shards, manifest)
+        };
+
+        // Case 1: 1 locally corrupted shard (hash mismatch) + >= k good shards -> recovers.
+        let name1 = "corrupt-byte-ec";
+        let (shards1, m1) = write_fixture(name1);
+        let id0 = m1["chunks"][0]["id"].as_str().unwrap();
+        let mut bad0 = shards1[0].clone();
+        bad0[0] ^= 0xff;
+        std::fs::write(chunk_dir.join(id0), &bad0).unwrap();
+        node.kv_store_local(&format!("m:{name1}"), &m1.to_string())
+            .await;
+        assert_eq!(
+            node.fetch_mail_inner(name1, None).await.as_deref(),
+            Some(plain.as_slice())
+        );
+
+        // Case 2: 1 wrong-length shard (`data.len() != shard_len`) + >= k good shards -> skips and recovers.
+        let name2 = "corrupt-len-ec";
+        let (shards2, mut m2) = write_fixture(name2);
+        let id0_len = m2["chunks"][0]["id"].as_str().unwrap().to_string();
+        let short0 = &shards2[0][..shards2[0].len() - 1];
+        std::fs::write(chunk_dir.join(&id0_len), short0).unwrap();
+        m2["chunks"][0]["hash"] = json!(hex::encode(blake3::hash(short0).as_bytes()));
+        node.kv_store_local(&format!("m:{name2}"), &m2.to_string())
+            .await;
+        assert_eq!(
+            node.fetch_mail_inner(name2, None).await.as_deref(),
+            Some(plain.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn ec_missing_or_empty_shard_hash_is_refused() {
+        let (node, dir) = ec_test_node("missing-hash").await;
+        let name = "missing-hash-ec";
+        let plain = b"EC manifest must require non-empty shard hash";
+        let hash = blob_content_hash(plain);
+        let (key, nonce) = blob_key_nonce("mail", name, &hash);
+        let ct = e2e_encrypt_det(&key, &nonce, plain);
+        let (k, n) = (2, 3);
+        let shards = Node::ec_encode(&ct, k, n).unwrap();
+        let shard_len = shards[0].len();
+        let chunk_dir = dir.join("chunks").join("mail");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunks: Vec<_> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| {
+                let id = ec_chunk_id_for("mail", name, i, &hash);
+                std::fs::write(chunk_dir.join(&id), shard).unwrap();
+                json!({
+                    "id": id,
+                    "shard": i,
+                    "len": shard.len(),
+                    "hash": hex::encode(blake3::hash(shard).as_bytes()),
+                })
+            })
+            .collect();
+        let base = json!({
+            "bucket": "mail", "name": name, "size": plain.len(),
+            "nonce": hex::encode(nonce), "key": hex::encode(key),
+            "ec": {"k": k, "n": n, "ct_len": ct.len(), "shard_len": shard_len},
+            "chunks": chunks,
+        });
+
+        let mut no_first_hash = base.clone();
+        no_first_hash["chunks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("hash");
+        node.kv_store_local("m:missing-hash-0", &no_first_hash.to_string())
+            .await;
+        assert!(node
+            .fetch_mail_inner("missing-hash-0", None)
+            .await
+            .is_none());
+
+        let mut no_last_hash = base.clone();
+        no_last_hash["chunks"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("hash");
+        node.kv_store_local("m:missing-hash-2", &no_last_hash.to_string())
+            .await;
+        assert!(node
+            .fetch_mail_inner("missing-hash-2", None)
+            .await
+            .is_none());
+
+        let mut empty_hash = base;
+        empty_hash["chunks"][0]["hash"] = json!("");
+        node.kv_store_local("m:empty-hash-0", &empty_hash.to_string())
+            .await;
+        assert!(node.fetch_mail_inner("empty-hash-0", None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ec_invalid_key_box_bounds_are_refused() {
+        let (node, dir) = ec_test_node("keybox-bounds").await;
+        let owner = crate::mailbox::MailKeys::generate();
+        let owner_priv = hex::encode(owner.kem_seed);
+        let name = "keybox-ec";
+        let plain = b"key_box field bounds check";
+        let hash = blob_content_hash(plain);
+        let (key, nonce) = blob_key_nonce("mail", name, &hash);
+        let ct = e2e_encrypt_det(&key, &nonce, plain);
+        let (k, n) = (2, 3);
+        let shards = Node::ec_encode(&ct, k, n).unwrap();
+        let shard_len = shards[0].len();
+        let chunk_dir = dir.join("chunks").join("mail");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunks: Vec<_> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| {
+                let id = ec_chunk_id_for("mail", name, i, &hash);
+                std::fs::write(chunk_dir.join(&id), shard).unwrap();
+                json!({
+                    "id": id,
+                    "shard": i,
+                    "len": shard.len(),
+                    "hash": hex::encode(blake3::hash(shard).as_bytes()),
+                })
+            })
+            .collect();
+        let valid_kb = box_wrap_key(&hex::encode(&owner.kem_ek), &key).unwrap();
+        let valid = json!({
+            "bucket": "mail", "name": name, "size": plain.len(),
+            "nonce": hex::encode(nonce), "key_box": valid_kb,
+            "ec": {"k": k, "n": n, "ct_len": ct.len(), "shard_len": shard_len},
+            "chunks": chunks,
+        });
+        node.kv_store_local("m:kb-ok", &valid.to_string()).await;
+        assert_eq!(
+            node.fetch_mail_inner("kb-ok", Some(&owner_priv))
+                .await
+                .as_deref(),
+            Some(plain.as_slice())
+        );
+
+        let mut bad_ct = valid.clone();
+        bad_ct["key_box"]["ct"] = json!("00".repeat(crate::mailbox::KEM_CT_LEN + 1));
+        let mut bad_nonce = valid.clone();
+        bad_nonce["key_box"]["nonce"] = json!("00".repeat(23));
+        let mut bad_ct2 = valid.clone();
+        bad_ct2["key_box"]["ct2"] = json!("00".repeat(49));
+        let mut legacy_eph = valid.clone();
+        legacy_eph["key_box"]["eph"] = json!("00".repeat(32));
+        let mut ambiguous_key = valid;
+        ambiguous_key["key"] = json!(hex::encode(key));
+
+        for (i, m) in [bad_ct, bad_nonce, bad_ct2, legacy_eph, ambiguous_key]
+            .into_iter()
+            .enumerate()
+        {
+            let mname = format!("kb-bad-{i}");
+            node.kv_store_local(&format!("m:{mname}"), &m.to_string())
+                .await;
+            assert!(
+                node.fetch_mail_inner(&mname, Some(&owner_priv))
+                    .await
+                    .is_none(),
+                "{mname}"
+            );
+        }
     }
 
     /// `register_dns_candidate`: validated, idempotent, never self. The

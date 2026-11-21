@@ -324,6 +324,7 @@ async fn a_runtime_above_its_finalized_parent_builds_no_proposal() {
     assert!(rt.is_proposer(), "solo validator owns every slot");
     // Positive control: the one legal relationship builds a block.
     rt.finalized.push((2, [0x22u8; 32]));
+    rt.safety.advance_height(3, 2, [0x22u8; 32]).unwrap();
     rt.hc = stellereum::consensus::HeightConsensus::new(3, rt.validators.clone());
     rt.hc.set_parent_hash([0x22u8; 32]);
     assert!(

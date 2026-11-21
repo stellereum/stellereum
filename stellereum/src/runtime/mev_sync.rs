@@ -899,6 +899,9 @@ impl ValidatorRuntime {
     /// The demanded rescue only ever stores our own bodies; for a foreign
     /// locked body the normal phase-alignment path still applies.
     fn restamp_for_round(&self, body: &Block, round: Round) -> Option<Block> {
+        if !self.safety.can_sign() {
+            return None;
+        }
         if body.proposer != self.id || body.round == round {
             return Some(body.clone());
         }
@@ -907,16 +910,22 @@ impl ValidatorRuntime {
         out.validator_signatures.clear();
         // One hash for the proposer signature and the store key below.
         let digest = out.compute_hash();
-        let sig = self.sign_bytes(&digest)?;
+        let signer = self.vote_signer();
+        let (sig, falcon_sig) = self
+            .safety
+            .authorize_and_sign_proposal(out.height, round, digest, &signer)
+            .ok()?;
         out.validator_signatures.push((self.id, sig));
-        if let Some(fk) = self.falcon_signing_key() {
-            let falcon_sig = fk.sign(&digest);
-            out.validator_signatures.push((fk.validator_id(), falcon_sig));
+        if let Some((falcon_id, fsig)) = falcon_sig {
+            out.validator_signatures.push((falcon_id, fsig));
         }
         Some(out)
     }
 
     pub async fn propose(&mut self, timestamp: u64) -> Option<Block> {
+        if !self.safety.can_sign() {
+            return None;
+        }
         if self.parallel_exec {
             self.state.set_parallel_exec(true);
         }
@@ -1064,6 +1073,78 @@ impl ValidatorRuntime {
                     .receive_proposal_for(self.id, served_hash, expected)
                     .ok()?;
                 return Some(served);
+            }
+        }
+        // PROPOSER VALUE PREFERENCE (WAN late-polka liveness): while this
+        // height has NO observed polka, prefer re-proposing the value WE
+        // LAST PREVOTED over building a fresh, conflicting one.
+        //
+        // WHY (measured on `masterchain_liveness_tests::
+        // a_late_polka_is_still_precommitted{,_four_validators}`): the
+        // validator with the stalled inbound link never sees the polka that
+        // its own prevote helped form. It times out, becomes proposer, and
+        // offers a FRESH block at a later round; peers locked on the polka
+        // value nil it, the proposer prevotes it itself, and that later
+        // non-nil prevote is exactly what the cross-kind guard then uses to
+        // refuse `precommit(r_polka, B0)` when the late polka finally
+        // arrives. The height then waits for the polka author's next proposer
+        // slot (which can be far away), so a 300 s stand finalizes at most one
+        // height. Re-proposing the last prevoted value instead keeps the
+        // validator's own signed history coherent with the network: it either
+        // votes that value (same round it was signed in, already-voted rounds
+        // are refused by the watermark) or casts NO prevote at all -- never a
+        // conflicting non-nil one. If WE authored the value, `restamp_for_round`
+        // re-stamps it at the current round and the polka re-forms there; if
+        // another validator did, the body is served unmodified and its author
+        // re-stamps it on its own slot, still above our untouched floor.
+        //
+        // SAFETY: proposing is not voting. The body is one this node already
+        // validated and voted for, at this height; voters apply the normal
+        // signature/round/lock/watermark checks. The lock branch above keeps
+        // priority (an adopted lock is never bypassed by a stale prevote).
+        //
+        // BOUNDED WINDOW: the preference lasts only `ROUND_LOOKBACK` rounds.
+        // A foreign value cannot be re-stamped by us (only its author can
+        // sign it), so if its author is gone the network must still be able
+        // to move on: after the window a fresh block is proposed again, which
+        // is exactly the pre-existing behaviour. The window is wide enough to
+        // cover the live late-polka shape (the deaf node's own slots fall
+        // within a few rounds of the prevote).
+        if self.hc.locked.is_none() && self.hc.observed_polka().is_none() {
+            if let Some(last) = self
+                .safety
+                .current_state()
+                .and_then(|s| s.last_non_nil_prevote)
+                .filter(|last| {
+                    self.hc.round.saturating_sub(last.round) <= crate::consensus::ROUND_LOOKBACK
+                })
+            {
+                let body = self.blocks.get(&last.block_hash).cloned().or_else(|| {
+                    let vid = self.hc.value_id_of(&last.block_hash)?;
+                    self.blocks
+                        .values()
+                        .find(|b| b.height == self.hc.height && b.value_id() == vid)
+                        .cloned()
+                });
+                if let Some(body) = body {
+                    if body.height == self.hc.height
+                        && body.proposer == self.id
+                        && body.timestamp > 0
+                    {
+                        let served = self.restamp_for_round(&body, self.hc.round)?;
+                        let served_hash = served.compute_hash();
+                        self.hc.note_value_id(last.block_hash, body.value_id());
+                        self.hc.note_value_id(served_hash, served.value_id());
+                        if served_hash != last.block_hash {
+                            self.blocks.insert(served_hash, served.clone());
+                        }
+                        let expected = self.expected_proposer_now();
+                        self.hc
+                            .receive_proposal_for(self.id, served_hash, expected)
+                            .ok()?;
+                        return Some(served);
+                    }
+                }
             }
         }
         // Rescue: a peer is locked on one of OUR VALUES (learned via nil-vote
@@ -2191,36 +2272,17 @@ impl ValidatorRuntime {
             // admission AND adopt paths.
             round: self.hc.round,
         };
-        // Sign the proposer slot with whichever signer is configured. `sign_block`
-        // signs with an in-process key, so when a remote signer is present the
-        // signature is produced out of process and pushed directly.
-        // One hash for both the proposer signature and the order-commit /
-        // block-store keys below: `compute_hash` intentionally excludes
-        // `validator_signatures` (and `precommit_qc`), so pushing our own
-        // signature cannot move it. Recomputing it would re-hash all 10k
-        // transaction hashes (~25ms at MAX_BLOCK_TXS) for an identical value.
-        let proposal_msg = block.compute_hash();
-        if let Some(sig) = self.sign_bytes(&proposal_msg) {
-            block.validator_signatures.push((self.id, sig));
-        } else {
-            return None; // no signer, no proposal
-        }
-        let fk_ref = self.falcon_signing_key();
-        if let Some(fk) = fk_ref {
-            let falcon_sig = fk.sign(&proposal_msg);
-            let falcon_id = fk.validator_id();
-            block.validator_signatures.push((falcon_id, falcon_sig));
-        }
         // Proposer-side pre-gossip size check (packing/visibility only, no
-        // consensus change): the `select_multi` wire estimate (~24MB) leaves
-        // headroom under `MAX_CONSENSUS_MSG` (32MB), but it is an ESTIMATE, so
-        // a block can still encode oversize and die in `broadcast_singles`
-        // (silently dropped, height stalls with a full mempool). Check the
-        // EXACT `ConsensusMsg::Proposal` encoding here and fall back to a
-        // smaller block — drop fattest txs first — instead of proposing
-        // un-sendable bytes. Trimming only shrinks `transactions` (and the
-        // outbound cross-shard records that name dropped txs); it never
-        // reorders, never touches apply/consensus logic.
+        // consensus change): estimate wire size with deterministic placeholder
+        // signature lengths BEFORE signing once through `SafetyAuthority`, so a
+        // trimmed block never double-signs the same `(height, round)` (`SLASH-B`).
+        block.validator_signatures.push((self.id, vec![0u8; 64]));
+        if let Some(fk) = self.falcon_signing_key() {
+            block.validator_signatures.push((
+                fk.validator_id(),
+                vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            ));
+        }
         {
             let cap = crate::consensus_net::MAX_CONSENSUS_MSG;
             let mut encoded_len = crate::consensus_net::ConsensusMsg::Proposal {
@@ -2306,53 +2368,37 @@ impl ValidatorRuntime {
                     .retain(|m| !dropped_hashes.contains(&m.tx.compute_tx_hash()));
                 // The body changed, so the ORDER COMMITMENT must be recomputed
                 // over the surviving (still ordered) list BEFORE the block is
-                // re-signed below: the root is inside the signed hash, so a
-                // stale root would make the proposal fail its own validators'
-                // order check.
+                // signed below: the root is inside the signed hash.
                 block.order_merkle_root =
                     crate::mev::compute_order_merkle_root(&block.transactions);
-                // The body changed, so the proposer signature must be remade
-                // over the new hash (same rule as the fresh path above).
-                block.validator_signatures.clear();
-                let new_msg = block.compute_hash();
-                if let Some(sig) = self.sign_bytes(&new_msg) {
-                    block.validator_signatures.push((self.id, sig));
-                } else {
-                    return None;
-                }
-                let fk_ref = self.falcon_signing_key();
-                if let Some(fk) = fk_ref {
-                    let falcon_sig = fk.sign(&new_msg);
-                    let falcon_id = fk.validator_id();
-                    block.validator_signatures.push((falcon_id, falcon_sig));
-                }
-                let final_len = crate::consensus_net::ConsensusMsg::Proposal {
-                    height: self.hc.height,
-                    round: self.hc.round,
-                    block: block.clone(),
-                }
-                .encode()
-                .map(|b| b.len())
-                .unwrap_or(usize::MAX);
                 tracing::error!(
-                    "propose h={} r={}: pre-gossip fallback SHRANK block {} -> {} txs ({} bytes now, cap {}); dropped fattest first, survivors kept in order",
+                    "propose h={} r={}: pre-gossip fallback SHRANK block {} -> {} txs ({} bytes est, cap {}); dropped fattest first, survivors kept in order",
                     self.hc.height,
                     self.hc.round,
                     orig_txs,
                     block.transactions.len(),
-                    final_len,
+                    encoded_len,
                     cap,
                 );
             }
+        }
+        block.validator_signatures.clear();
+        let proposal_msg = block.compute_hash();
+        let (sig, falcon_sig) = {
+            let signer = self.vote_signer();
+            self.safety
+                .authorize_and_sign_proposal(self.hc.height, self.hc.round, proposal_msg, &signer)
+                .ok()?
+        };
+        block.validator_signatures.push((self.id, sig));
+        if let Some((falcon_id, fsig)) = falcon_sig {
+            block.validator_signatures.push((falcon_id, fsig));
         }
         // MEV order commitment at build: record (and sign) the exact execution
         // order BEFORE the block is proposed or voted on. `try_finalize`
         // re-verifies this commitment against the block it is about to apply,
         // so this node never executes an order it did not commit to build.
-        // NOTE: recomputed AFTER the pre-gossip fallback above (which may have
-        // shrunk the body and re-signed it); `compute_hash` excludes the
-        // signatures, so this equals `proposal_msg` on the untrimmed path.
-        let bh = block.compute_hash();
+        let bh = proposal_msg;
         {
             let mut pool = self.mempool.write().await;
             pool.mev.commit_block_order(

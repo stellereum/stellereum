@@ -641,38 +641,44 @@ impl Transaction {
 
     /// True if transaction carries an Ed25519 chain_id envelope (CH1).
     pub fn is_chain_id_bound(&self) -> bool {
-        let sig = self.sponsor_inner_sig();
+        Self::chain_id_from_inner(self.sponsor_inner_sig()).is_some()
+    }
+
+    fn chain_id_from_inner(inner_sig: &[u8]) -> Option<u64> {
         let tag_len = CHAIN_SIG_TAG.len();
-        sig.len() == 64 + tag_len + 8 && sig[64..64 + tag_len] == CHAIN_SIG_TAG[..]
+        if inner_sig.len() == 64 + tag_len + 8 && inner_sig[64..64 + tag_len] == CHAIN_SIG_TAG[..] {
+            let offset = 64 + tag_len;
+            let bytes: [u8; 8] = inner_sig[offset..offset + 8].try_into().ok()?;
+            Some(u64::from_be_bytes(bytes))
+        } else {
+            None
+        }
     }
 
     /// Extract chain_id from CH1 envelope if present.
     pub fn chain_id_from_envelope(&self) -> Option<u64> {
-        if !self.is_chain_id_bound() {
-            return None;
-        }
-        let offset = 64 + CHAIN_SIG_TAG.len();
-        let bytes: [u8; 8] = self.sponsor_inner_sig()[offset..offset + 8]
-            .try_into()
-            .ok()?;
-        Some(u64::from_be_bytes(bytes))
+        Self::chain_id_from_inner(self.sponsor_inner_sig())
+    }
+
+    fn is_evm_inner(inner_sig: &[u8]) -> bool {
+        inner_sig.len() > EVM_SIG_TAG.len() && inner_sig[..EVM_SIG_TAG.len()] == EVM_SIG_TAG[..]
     }
 
     /// True when this transaction carries a Phase-2 EVM (secp256k1)
     /// settlement envelope (`b"EV1"` prefix). Never 64 bytes long, so every
     /// pre-EV1 verifier fails it closed at `Signature::from_slice`.
     pub fn is_evm(&self) -> bool {
-        let sig = self.sponsor_inner_sig();
-        sig.len() > EVM_SIG_TAG.len() && sig[..EVM_SIG_TAG.len()] == EVM_SIG_TAG[..]
+        Self::is_evm_inner(self.sponsor_inner_sig())
     }
 
     /// Raw canonical EVM bytes carried by the envelope (`None` for non-EVM
     /// transactions).
     pub fn evm_raw(&self) -> Option<&[u8]> {
-        if !self.is_evm() {
+        let inner = self.sponsor_inner_sig();
+        if !Self::is_evm_inner(inner) {
             return None;
         }
-        Some(&self.sponsor_inner_sig()[EVM_SIG_TAG.len()..])
+        Some(&inner[EVM_SIG_TAG.len()..])
     }
 
     /// Decode the EVM envelope into its separate-enum view
@@ -784,6 +790,20 @@ impl Transaction {
         true
     }
 
+    fn chain_id_from_parsed_inner(inner_sig: &[u8]) -> Option<u64> {
+        if let Some((d, _)) = Self::delegation_from_inner(inner_sig) {
+            Some(d.chain_id)
+        } else if let Some(cid) = Self::chain_id_from_inner(inner_sig) {
+            Some(cid)
+        } else if let Some(env) = Self::pq_envelope_from_inner(inner_sig) {
+            env.chain_id
+        } else if Self::is_evm_inner(inner_sig) {
+            Some(EVM_CHAIN_ID)
+        } else {
+            None
+        }
+    }
+
     /// Returns the chain_id bound to this transaction, if any.
     ///
     /// - For session key transactions: returns `delegation.chain_id`.
@@ -794,20 +814,12 @@ impl Transaction {
     pub fn chain_id(&self) -> Option<u64> {
         // A sponsor grant carries the replay-protection domain for sponsored
         // transactions (the grant is committed into both signatures).
-        if let Some(auth) = self.sponsor_auth() {
+        let (inner_len, sponsor_auth, _) = Self::split_sponsor_envelope(&self.signature);
+        if let Some(auth) = sponsor_auth {
             return Some(auth.chain_id);
         }
-        if let Some(d) = self.delegation() {
-            Some(d.chain_id)
-        } else if let Some(cid) = self.chain_id_from_envelope() {
-            Some(cid)
-        } else if let Some(env) = self.pq_envelope() {
-            env.chain_id
-        } else if self.is_evm() {
-            Some(EVM_CHAIN_ID)
-        } else {
-            None
-        }
+        let inner_sig = &self.signature[..inner_len];
+        Self::chain_id_from_parsed_inner(inner_sig)
     }
 
     pub fn compute_tx_hash(&self) -> [u8; 32] {
@@ -851,32 +863,51 @@ impl Transaction {
             hasher.update(PRIORITY_FEE_COMMITMENT_TAG);
             hasher.update(self.priority_fee_per_gas.to_be_bytes());
         }
+        // Parse the trailing sponsor envelope ONCE and inspect the inner slice
+        // directly (identical to calling `delegation()`, `is_chain_id_bound()`,
+        // `chain_id_from_envelope()`, `sponsor_auth()`, `is_evm()`, `is_pq()`).
+        let (inner_len, sponsor_auth, _) = Self::split_sponsor_envelope(&self.signature);
+        let inner_sig = &self.signature[..inner_len];
         // Conditional commitment: nothing is appended for a legacy signature,
         // so legacy tx hashes (and every block hash built from them) are
         // byte-identical to before session keys existed.
-        if let Some(d) = self.delegation() {
-            hasher.update(Self::delegation_commitment_bytes(&d));
-        }
-        if self.is_chain_id_bound() {
-            hasher.update(CHAIN_ID_COMMITMENT_TAG);
-            if let Some(cid) = self.chain_id_from_envelope() {
-                hasher.update(cid.to_be_bytes());
+        if let Some((d, _)) = Self::delegation_from_inner(inner_sig) {
+            hasher.update(b"SESSION");
+            payload_buf.clear();
+            match bincode::serialize_into(&mut *payload_buf, &d) {
+                Ok(()) => {
+                    hasher.update((payload_buf.len() as u32).to_be_bytes());
+                    hasher.update(&payload_buf[..]);
+                }
+                Err(_) => hasher.update(u32::MAX.to_be_bytes()),
             }
+        }
+        if let Some(cid) = Self::chain_id_from_inner(inner_sig) {
+            hasher.update(CHAIN_ID_COMMITMENT_TAG);
+            hasher.update(cid.to_be_bytes());
         }
         // Conditional commitment: nothing is appended for a legacy
         // transaction, so legacy tx hashes (and every block hash built from
         // them) are byte-identical to before sponsorship existed.
-        if let Some(auth) = self.sponsor_auth() {
-            hasher.update(Self::sponsor_commitment_bytes(&auth));
+        if let Some(ref auth) = sponsor_auth {
+            hasher.update(SPONSOR_COMMITMENT_TAG);
+            payload_buf.clear();
+            match bincode::serialize_into(&mut *payload_buf, auth) {
+                Ok(()) => {
+                    hasher.update((payload_buf.len() as u32).to_be_bytes());
+                    hasher.update(&payload_buf[..]);
+                }
+                Err(_) => hasher.update(u32::MAX.to_be_bytes()),
+            }
         }
         // EVM settlement commits the full envelope (tag + canonical raw), so
         // an EVM transaction can never share a hash with a legacy transaction
         // over identical mapped fields (legacy hashes ignore `signature`).
-        if self.is_evm() {
+        if Self::is_evm_inner(inner_sig) {
             hasher.update(b"EVM_TX");
             hasher.update(&self.signature);
         }
-        if self.is_pq() {
+        if Self::is_pq_inner(inner_sig) {
             hasher.update(b"PQ_ENV");
             hasher.update(&self.signature);
         }
@@ -907,22 +938,29 @@ impl Transaction {
         TxHashBatch::new()
     }
 
+    fn is_pq_inner(inner_sig: &[u8]) -> bool {
+        inner_sig.starts_with(PQ_ENVELOPE_MAGIC)
+    }
+
     /// True if the transaction signature begins with the PQ1 framing marker.
     pub fn is_pq(&self) -> bool {
-        self.sponsor_inner_sig().starts_with(PQ_ENVELOPE_MAGIC)
+        Self::is_pq_inner(self.sponsor_inner_sig())
+    }
+
+    fn pq_envelope_from_inner(inner_sig: &[u8]) -> Option<PqSignatureEnvelope> {
+        if !Self::is_pq_inner(inner_sig) {
+            return None;
+        }
+        let env = PqSignatureEnvelope::decode(inner_sig).ok()?;
+        if env.encoded_len() != inner_sig.len() && env.legacy_encode_len() != inner_sig.len() {
+            return None;
+        }
+        Some(env)
     }
 
     /// Decode the post-quantum signature envelope if present, ensuring exact fit (no trailing bytes).
     pub fn pq_envelope(&self) -> Option<PqSignatureEnvelope> {
-        if !self.is_pq() {
-            return None;
-        }
-        let inner = self.sponsor_inner_sig();
-        let env = PqSignatureEnvelope::decode(inner).ok()?;
-        if env.encoded_len() != inner.len() && env.legacy_encode_len() != inner.len() {
-            return None;
-        }
-        Some(env)
+        Self::pq_envelope_from_inner(self.sponsor_inner_sig())
     }
 
     /// True if this transaction carries a raw public key in a PQ envelope (activation tx).
@@ -1328,26 +1366,28 @@ impl Transaction {
             &self.payload,
             self.priority_fee_per_gas,
         );
+        let (inner_len, sponsor_auth, _) = Self::split_sponsor_envelope(&self.signature);
+        let inner_sig = &self.signature[..inner_len];
         // EVM-settled transactions are never verified against this preimage
         // (their envelope IS the secp256k1-signed raw); return the base
         // message deterministically with no grant/chain commitment appended.
-        if self.is_evm() {
+        if Self::is_evm_inner(inner_sig) {
             return msg;
         }
-        if let Some(d) = self.delegation() {
+        if let Some((d, _)) = Self::delegation_from_inner(inner_sig) {
             Self::append_delegation_commitment(&mut msg, &d);
-        } else if self.sponsor_auth().is_none() {
+        } else if sponsor_auth.is_none() {
             // Sponsored transactions bind their chain through the sponsor
             // commitment below (single commitment, no ambiguity); the
             // chain-id branch stays legacy-only.
-            if let Some(cid) = self.chain_id() {
+            if let Some(cid) = Self::chain_id_from_parsed_inner(inner_sig) {
                 Self::append_chain_id_commitment(&mut msg, cid);
             }
         }
         // The sponsor grant is bound into the USER's signed message (and the
         // tx hash), so it cannot be swapped after signing. Nothing is
         // appended for legacy transactions.
-        if let Some(auth) = self.sponsor_auth() {
+        if let Some(auth) = sponsor_auth {
             Self::append_sponsor_commitment(&mut msg, &auth);
         }
         msg

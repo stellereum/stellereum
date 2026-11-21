@@ -383,6 +383,18 @@ pub(crate) async fn try_snapshot_sync(
         if let Some(b) = rt.blocks.get(&boundary_hash) {
             let _ = b;
         }
+        if let Err(e) = rt
+            .safety
+            .advance_height(boundary + 1, boundary, boundary_hash)
+        {
+            tracing::error!(
+                boundary,
+                error = %e,
+                "[safety] snapshot sync advance_height failed; quarantining"
+            );
+            rt.safety
+                .quarantine(format!("snapshot_sync advance_height({boundary}): {e}"));
+        }
         rt.hc = stellereum::consensus::HeightConsensus::new(boundary + 1, rt.validators.clone());
         // The sortition committee of this height is elected from the PARENT
         // block hash — the finalized head we just restored. Every node must

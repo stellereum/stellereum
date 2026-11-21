@@ -500,12 +500,8 @@ async fn same_value_vote_keeps_the_proposal_live_in_the_peer_round() {
     assert!(rt.note_peer_vote_round_for(rt.hc.height, r + 10, Some(bh)));
     assert_eq!(rt.hc.round, r + 10, "same-value vote must reach its round");
     assert!(rt.hc.has_live_proposal(), "locked proposal must survive the sync");
-    let v = rt.make_prevote().expect("armed node must vote");
-    assert_eq!(
-        v.round, r,
-        "vote carries the BODY's signed round, identical on every holder"
-    );
-    assert_eq!(v.block_hash, Some(bh), "and the same locked body");
+    assert_eq!(rt.hc.decide_prevote(), Some(bh));
+    assert_eq!(rt.prevote_round(), r);
 
     // A DIFFERENT-target vote keeps the conservative one-step bound: the
     // same-value rule must not become a round-DoS.
@@ -523,6 +519,10 @@ async fn same_value_vote_keeps_the_proposal_live_in_the_peer_round() {
     let v = rt.make_prevote().expect("locked node still votes its lock");
     assert_eq!(v.block_hash, Some(bh));
     assert_eq!(v.round, r, "still the body's signed round");
+    assert!(
+        rt.make_prevote().is_none(),
+        "SafetyAuthority refuses re-signing the same prevote round"
+    );
 }
 
 #[tokio::test]

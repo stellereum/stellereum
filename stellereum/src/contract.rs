@@ -35,7 +35,8 @@
 use crate::contract_abi::{AbiError, AbiValue, ContractAbi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{OnceLock, RwLock};
 use wasmi::{
     Config, Engine, Extern, ExternType, Instance, Linker, Memory, Module, Store, StoreLimits,
     StoreLimitsBuilder,
@@ -412,7 +413,7 @@ fn validate_memory_limits(code: &[u8]) -> Result<(), ContractError> {
 /// Registry of all deployed contracts (part of consensus state).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ContractRegistry {
-    pub contracts: HashMap<[u8; 32], Contract>,
+    pub contracts: BTreeMap<[u8; 32], Contract>,
     pub next_nonce: u64,
     #[serde(default)]
     pub last_return_data: Vec<u8>,
@@ -445,7 +446,7 @@ impl ContractRegistry {
         }
         validate_memory_limits(code)?;
         let engine = contract_engine();
-        let module = Module::new(&engine, code).map_err(|_| ContractError::InvalidWasm)?;
+        let module = cached_module(engine, code).map_err(|_| ContractError::InvalidWasm)?;
         for export in module.exports() {
             if let ExternType::Memory(mem_ty) = export.ty() {
                 if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
@@ -472,9 +473,9 @@ impl ContractRegistry {
             return_data: Vec::new(),
             calldata: Vec::new(),
         };
-        let mut store = Store::new(&engine, host);
+        let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
-        let linker = host_linker(&engine);
+        let linker = host_linker(engine);
         // A missing import, or a start function that traps, is a deploy-time error.
         linker
             .instantiate_and_start(&mut store, &module)
@@ -954,7 +955,7 @@ impl ContractRegistry {
         }
 
         let engine = contract_engine();
-        let module = match Module::new(&engine, &contract.code) {
+        let module = match cached_module(engine, &contract.code) {
             Ok(m) => m,
             Err(_) => {
                 return (
@@ -978,7 +979,7 @@ impl ContractRegistry {
             return_data: Vec::new(),
             calldata: calldata.to_vec(),
         };
-        let mut store = Store::new(&engine, host);
+        let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
         if store.set_fuel(fuel).is_err() {
             return (
@@ -987,7 +988,7 @@ impl ContractRegistry {
             );
         }
 
-        let linker = host_linker(&engine);
+        let linker = host_linker(engine);
         let instance = match linker.instantiate_and_start(&mut store, &module) {
             Ok(inst) => inst,
             Err(e) => {
@@ -1082,17 +1083,99 @@ impl ContractRegistry {
     }
 }
 
-/// Build the deterministic wasmi engine used for every contract execution.
-fn contract_engine() -> Engine {
+/// Maximum number of compiled `wasmi::Module` entries kept in the
+/// process-wide bounded FIFO module cache.
+pub const CONTRACT_MODULE_CACHE_CAP: usize = 1024;
+
+struct CompiledModuleCache {
+    map: HashMap<[u8; 32], Module>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl CompiledModuleCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::with_capacity(CONTRACT_MODULE_CACHE_CAP),
+            order: VecDeque::with_capacity(CONTRACT_MODULE_CACHE_CAP),
+        }
+    }
+}
+
+static CONTRACT_ENGINE: OnceLock<Engine> = OnceLock::new();
+static CONTRACT_MODULE_CACHE: OnceLock<RwLock<CompiledModuleCache>> = OnceLock::new();
+
+/// Build a per-call consensus `wasmi::Engine` preserving pre-R1 lazy-translation
+/// fuel accounting (`Frozen Core`: changing compilation mode on `run_contract`
+/// alters execution fuel for cold contracts and therefore requires the R1
+/// activation gate).
+fn consensus_contract_engine() -> Engine {
     let mut config = Config::default();
-    // Bound execution: every instruction consumes fuel; a call cannot loop forever.
     config.consume_fuel(true);
-    // Keep the feature surface tight. Float determinism is enforced by the
-    // `deterministic` crate feature (canonical NaN semantics) enabled in
-    // Cargo.toml, so results match on every CPU/architecture.
     config.wasm_multi_memory(false);
     config.wasm_mutable_global(true);
     Engine::new(&config)
+}
+
+/// Return the shared deterministic `wasmi::Engine` used for contract
+/// validation and read-only getter calls (`stell_runGetMethod`).
+///
+/// Uses `CompilationMode::Eager` so cached `Module` reads burn identical fuel
+/// across cold and hot RPC calls, while keeping isolated `Store`, `Linker`,
+/// and `Instance` per invocation. Consensus `run_contract` adopts this shared
+/// eager cache only behind the R1 activation gate.
+fn contract_engine() -> &'static Engine {
+    CONTRACT_ENGINE.get_or_init(|| {
+        let mut config = Config::default();
+        // Bound execution: every instruction consumes fuel; a call cannot loop forever.
+        config.consume_fuel(true);
+        // Compile eagerly on `Module::new` so lazy-translation fuel never leaks
+        // into the first caller's `Store` (cold vs hot cache must burn identical fuel).
+        config.compilation_mode(wasmi::CompilationMode::Eager);
+        // Keep the feature surface tight. Float determinism is enforced by the
+        // `deterministic` crate feature (canonical NaN semantics) enabled in
+        // Cargo.toml, so results match on every CPU/architecture.
+        config.wasm_multi_memory(false);
+        config.wasm_mutable_global(true);
+        Engine::new(&config)
+    })
+}
+
+fn module_cache() -> &'static RwLock<CompiledModuleCache> {
+    CONTRACT_MODULE_CACHE.get_or_init(|| RwLock::new(CompiledModuleCache::new()))
+}
+
+/// Compile or retrieve a cached `wasmi::Module` keyed by `blake3(code)`.
+///
+/// Only successfully parsed and validated modules enter the cache; invalid WASM
+/// returns `Err` without poisoning the cache. Eviction is deterministic FIFO
+/// once `CONTRACT_MODULE_CACHE_CAP` entries are cached.
+fn cached_module(engine: &Engine, code: &[u8]) -> Result<Module, wasmi::Error> {
+    let key: [u8; 32] = *blake3::hash(code).as_bytes();
+    {
+        let cache = module_cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(module) = cache.map.get(&key) {
+            return Ok(module.clone());
+        }
+    }
+
+    let module = Module::new(engine, code)?;
+    {
+        let mut cache = module_cache().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = cache.map.get(&key) {
+            return Ok(existing.clone());
+        }
+        while cache.map.len() >= CONTRACT_MODULE_CACHE_CAP {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.map.remove(&oldest);
+            } else {
+                cache.map.clear();
+                break;
+            }
+        }
+        cache.map.insert(key, module.clone());
+        cache.order.push_back(key);
+    }
+    Ok(module)
 }
 
 struct HostState {
@@ -1282,15 +1365,16 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             // the contract's memory so a contract can read blob parameters
             // (addresses, bytes, strings) that do not fit the i64 calling
             // convention.
-            let data = caller.data().calldata.clone();
-            let fuel = FUEL_CALLDATA
-                .saturating_add((data.len() as u64).saturating_mul(FUEL_CALLDATA_PER_BYTE));
+            let len = caller.data().calldata.len();
+            let fuel =
+                FUEL_CALLDATA.saturating_add((len as u64).saturating_mul(FUEL_CALLDATA_PER_BYTE));
             HostState::charge(&mut caller, fuel)?;
-            if data.is_empty() {
+            if len == 0 {
                 return Ok(0);
             }
+            let data = caller.data().calldata.clone();
             write_wasm_memory(&mut caller, dest_ptr, &data)?;
-            Ok(data.len() as i64)
+            Ok(len as i64)
         },
     );
     let _ = linker.func_wrap(
@@ -1654,7 +1738,7 @@ fn run_contract(
             args.len()
         )));
     }
-    let engine = contract_engine();
+    let engine = consensus_contract_engine();
     let module = Module::new(&engine, code).map_err(|_| ContractError::InvalidWasm)?;
 
     let host = HostState {

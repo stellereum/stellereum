@@ -227,6 +227,32 @@ fn plan_plain_tx(
         }
         plan.writes
             .push((tx.from, ubal.saturating_sub(tx.amount), unonce + 1));
+        if !cross_shard && auth.sponsor == tx.to {
+            // The sponsor IS the recipient (`sponsored_grant()` only excludes
+            // `sponsor == from`, so a third-party sponsor can name itself as
+            // the payee). The sequential path debits the sponsor's fee FIRST
+            // and credits the amount AFTERWARDS, so the final balance is
+            // `(sbal - fail_fee) + tx.amount`. Emit ONE absolute write for
+            // the sponsor: a separate recipient write would overwrite the fee
+            // debit (last write wins in `commit_plain_plan`) and mint the fee.
+            match (sbal - fail_fee).checked_add(tx.amount) {
+                Some(final_balance) => plan.writes.push((tx.to, final_balance, snonce)),
+                None => {
+                    // The credit would overflow: the failure-fee path
+                    // (sponsor pays, user nonce advances) - same shape as
+                    // the recipient-overflow arm below.
+                    plan.applied = false;
+                    plan.fee = 0;
+                    plan.writes.clear();
+                    if fail_fee > 0 && sbal >= fail_fee {
+                        plan.fee = fail_fee;
+                        plan.writes.push((tx.from, ubal, unonce + 1));
+                        plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+                    }
+                }
+            }
+            return plan;
+        }
         plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
         if !cross_shard {
             match recipient {

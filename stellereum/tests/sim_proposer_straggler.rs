@@ -215,12 +215,15 @@ async fn proposer_stale_chase_control_churns() {
     // positive property on the same seed (1.7k+ heights), so "the fix works"
     // is still load-bearing. A ">=100 heights" pin here would re-assert the
     // ruleset-5 verbatim-re-serve behaviour that ruleset 6 replaced.
-    // LIVENESS (restored by ruleset 6 + f+1 corroboration + F5 alignment):
-    // the no-grace control now CONVERGES; what still separates it from the
-    // grace run is churn, not finality. A "must stall" pin would re-assert the
-    // old stop-the-world consequence of the pre-fix rules.
+    // LIVENESS (restored by ruleset 6 + f+1 corroboration + F5 alignment,
+    // and bounded by `05_LOCK_SAFETY_P0.md` §1.3 CrossKindConflict): pre-P0
+    // unsafe retroactive precommits gave ~1509 heights in 1200s; with
+    // CrossKindConflict enforcing BFT safety against conflicting prior
+    // non-nil prevotes, each confused height takes an extra restamp/lock
+    // cycle (~584 heights in 1200s). What separates control from the grace
+    // run (1700+ heights) is still churn, not finality or a stall.
     assert!(
-        report.common_height >= 1_000,
+        report.common_height >= 500,
         "the no-grace control must still make progress: \
          best={} common={} in {}ms.\n{}",
         report.best_height,

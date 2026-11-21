@@ -361,7 +361,7 @@ pub fn attach_vote_falcon_deterministic(key: &FalconKeypair, msg: &[u8], signatu
     attach_vote_falcon_sig(&falcon_sig, signature);
 }
 
-fn attach_vote_falcon_sig(falcon_sig: &[u8], signature: &mut Vec<u8>) {
+pub fn attach_vote_falcon_sig(falcon_sig: &[u8], signature: &mut Vec<u8>) {
     let mut ed = vec![0u8; 64];
     if signature.len() == 64 {
         ed.copy_from_slice(signature);

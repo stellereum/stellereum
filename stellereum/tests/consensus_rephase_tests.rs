@@ -119,7 +119,7 @@ fn breaker_never_fires_before_the_timeout_or_without_a_peer() {
 
 #[test]
 fn rephase_widens_the_scan_window_and_never_rewinds() {
-    let (ks, _fks) = falcon_votes::falcon_set(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 412;
     hc.locked = Some(([7u8; 32], 400));
@@ -135,10 +135,36 @@ fn rephase_widens_the_scan_window_and_never_rewinds() {
     );
     assert_eq!(hc.scan_lookback, REPHASE_SCAN_WINDOW);
     assert_eq!(
-        hc.locked, None,
-        "a bodyless lock with no QC behind it is dropped"
+        hc.locked,
+        Some(([7u8; 32], 400)),
+        "a bodyless lock survives even when no QC was observed locally"
     );
     assert_eq!(hc.height, H, "the re-phase never moves the height");
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            413,
+            VoteKind::Prevote,
+            Some([7u8; 32]),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            413,
+            VoteKind::Precommit,
+            Some([7u8; 32]),
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        hc.try_precommit_quorum(),
+        Some([7u8; 32]),
+        "the re-phased node can decide a quorum for its locked value"
+    );
 }
 
 #[test]

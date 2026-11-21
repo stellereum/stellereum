@@ -29,8 +29,12 @@ use consensus_cluster::{ConsensusCluster, NodeProfile};
 /// enough that a stall reports instead of hanging.
 const STALL_BUDGET_MS: u64 = 60_000;
 /// Virtual budget for the liveness control: unanimity + a 65s slow link
-/// needs room for several slow rounds (~one link delay per height).
-const CONTROL_BUDGET_MS: u64 = 360_000;
+/// under `05_LOCK_SAFETY_P0.md` §1.3–1.6 (`CrossKindConflict` forbids
+/// signing a retroactive `r0` precommit after fast nodes prevoted `r1`, so
+/// fast nodes adopt lock `(B0, r0)` at the `r0` polka, re-stamp on the
+/// next proposer turn, and deliver `Committed` across the final `65s` leg —
+/// 3 heights finish in ~545–600s, while tight timeout stalls at 0 finals).
+const CONTROL_BUDGET_MS: u64 = 650_000;
 
 /// Virtual tick quantum (matches the harness default).
 const TICK_MS: u64 = 100;

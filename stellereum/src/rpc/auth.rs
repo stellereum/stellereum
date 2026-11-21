@@ -53,16 +53,20 @@ pub(super) fn require_wallet_sign_auth(
     None
 }
 
-// GATE: H-02 — SIGN arms serve loopback peers only (audit: "only on
+// GATE: H-02 — SIGN arms serve DIRECT loopback peers only (audit: "only on
 // loopback"). `None` is the in-process test harness (production transports
-// always resolve an IP); any non-loopback `Some(ip)` is refused.
+// always resolve an address); any other client is refused. The provenance
+// matters: a proxied request whose `X-Forwarded-For` claims loopback is
+// `Forwarded`/`ForwardedLoopbackRejected` and is NEVER local, so handing the
+// bare `IpAddr` here (which lost the source) used to let a remote caller
+// reach the dev signing key through a same-host proxy.
 pub(super) fn require_wallet_sign_loopback(
     id: &Value,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
 ) -> Option<Json<RpcResponse>> {
-    match peer_ip {
+    match client {
         None => None,
-        Some(ip) if ip.is_loopback() => None,
+        Some(client) if client.is_local_client() => None,
         Some(_) => Some(err(
             id.clone(),
             -32001,
@@ -308,12 +312,12 @@ pub(super) fn handle_sign_message(
     id: Value,
     params: &Value,
     header_token: Option<&str>,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
 ) -> Json<RpcResponse> {
     if let Some(denied) = require_wallet_sign_auth(st, &id, params, header_token) {
         return denied;
     }
-    if let Some(denied) = require_wallet_sign_loopback(&id, peer_ip) {
+    if let Some(denied) = require_wallet_sign_loopback(&id, client) {
         return denied;
     }
     let Some(seed) = st.msg_signing_seed else {
@@ -405,12 +409,12 @@ pub(super) fn handle_sign_typed_data(
     id: Value,
     params: &Value,
     header_token: Option<&str>,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
 ) -> Json<RpcResponse> {
     if let Some(denied) = require_wallet_sign_auth(st, &id, params, header_token) {
         return denied;
     }
-    if let Some(denied) = require_wallet_sign_loopback(&id, peer_ip) {
+    if let Some(denied) = require_wallet_sign_loopback(&id, client) {
         return denied;
     }
     let Some(seed) = st.msg_signing_seed else {

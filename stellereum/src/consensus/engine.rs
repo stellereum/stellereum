@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::qc_split::produce_decision_certificate_with_schedule;
 use super::rotation::pq_key_at_height;
@@ -1262,6 +1262,17 @@ pub struct HeightConsensus {
     /// equivocation; a strictly newer signed round SUPERSEDES the held one.
     /// The same signed round with a different hash is still refused.
     pub proposal_signed_round: Option<Round>,
+    /// Bodies this HEIGHT has already admitted as live at (or one round
+    /// before) their own signed round.
+    ///
+    /// A body that was genuinely proposed and accepted in its round may be
+    /// re-served VERBATIM many rounds later (lock rescue / demanded rescue),
+    /// and the receivers must still treat it as a real value then. A body this
+    /// height never admitted at its signed round, however, is only a delayed
+    /// or re-enveloped frame: after a restart the set is empty, so a stale
+    /// retransmit can no longer own the current round's slot and block the
+    /// locked value's re-stamp (RESTART-SPLIT).
+    signed_admitted: HashSet<BlockHash>,
     /// locked value: (block_hash, round at which we locked)
     ///
     /// The hash is the SIGNED identity of the body we locked (it commits the
@@ -1534,6 +1545,7 @@ impl HeightConsensus {
             proposal: None,
             proposal_round: None,
             proposal_signed_round: None,
+            signed_admitted: HashSet::new(),
             locked: None,
             value_ids: HashMap::new(),
             prevotes: HashMap::new(),
@@ -1665,6 +1677,25 @@ impl HeightConsensus {
         expected: Option<ValidatorId>,
         signed_round: Round,
     ) -> Result<(), String> {
+        // Direct state-machine callers do not carry a "already admitted at
+        // its signed round" bit; treat the body as new (the conservative
+        // stale-body rule) unless it is current/one-round-late anyway.
+        self.receive_proposal_for_known_at(proposer, block_hash, expected, signed_round, false)
+    }
+
+    /// [`Self::receive_proposal_for_at`] with the caller's knowledge that this
+    /// exact body was ALREADY admitted at its own signed round in this height
+    /// (`Self::was_signed_admitted`). That exception is what keeps a
+    /// legitimately re-served locked body live; a body first seen under a
+    /// fresh envelope after a restart does not qualify.
+    pub fn receive_proposal_for_known_at(
+        &mut self,
+        proposer: ValidatorId,
+        block_hash: BlockHash,
+        expected: Option<ValidatorId>,
+        signed_round: Round,
+        already_signed_admitted: bool,
+    ) -> Result<(), String> {
         if self.step != Step::Propose {
             return Err("not in propose step".to_string());
         }
@@ -1689,10 +1720,46 @@ impl HeightConsensus {
             // later round. That supersedes the held (older) body and re-arms
             // the CURRENT round, exactly like a first receipt.
         }
+        // STALE-BODY GUARD (RESTART-SPLIT): a body signed MORE than one round
+        // before our current round must never own the current round's slot,
+        // even when it arrives under a fresh (unsigned) envelope.
+        //
+        // The retransmit path used to re-broadcast every held body under the
+        // CURRENT round envelope, so after a coordinated restart a body signed
+        // at round k could be re-advertised at round r and admitted here as
+        // "the proposal for r". That is not a vote we can ever use: the vote
+        // must name the body's signed round k, which is at/below the fsynced
+        // watermark after the restart, so the node falls silent while the real
+        // proposer cannot re-stamp the locked value (the stale body occupies
+        // `has_live_proposal`). The height then burns rounds forever.
+        //
+        // Keep the body as a CANDIDATE (the runtime inserts it into `blocks`
+        // on Ok), so lock hints and value-id lookups can still resolve it, but
+        // do not arm it as the current round's proposal. One-round lag is
+        // deliberately preserved: a node that timed out to r+1 must still vote
+        // a body proposed at r, and a current-round re-stamp is always live.
+        if signed_round.saturating_add(1) < self.round
+            && !already_signed_admitted
+            && !self.signed_admitted.contains(&block_hash)
+        {
+            return Ok(());
+        }
         self.proposal = Some((proposer, block_hash));
         self.proposal_round = Some(self.round);
         self.proposal_signed_round = Some(signed_round);
+        // Remember every body admitted at (or one round before) its signed
+        // round so a genuine later re-serve stays live. `next_round` does not
+        // clear this: the body remains a legitimate value for this height.
+        self.signed_admitted.insert(block_hash);
         Ok(())
+    }
+
+    /// True when THIS height already admitted `block_hash` as live at (or one
+    /// round before) its own signed round. Used by the runtime to distinguish
+    /// a legitimate verbatim re-serve from a stale frame first seen under a
+    /// fresh envelope (RESTART-SPLIT).
+    pub fn was_signed_admitted(&self, block_hash: &BlockHash) -> bool {
+        self.signed_admitted.contains(block_hash)
     }
 
     /// True only when we hold a proposal accepted in the CURRENT round. Voting
@@ -2866,16 +2933,14 @@ impl HeightConsensus {
     /// True when a non-nil precommit quorum is observable right now: either we
     /// banked the deciding QC (`precommit_qc`), or some retained round's
     /// precommit set holds quorum power for a block. Pure readout, no state
-    /// change. This is the reset gate below: a QC means someone may have
-    /// finalized (bodies deliver partially — a bodyless node sees votes, not
-    /// bodies — while progress stamps only on execution, so "QC observed but
-    /// no progress" is exactly the fork window).
+    /// change. A QC means someone may have finalized (bodies deliver
+    /// partially — a bodyless node sees votes, not bodies — while progress
+    /// stamps only on execution).
     ///
     /// Approximation, stated honestly: vote sets older than `ROUND_LOOKBACK`
     /// are pruned, so a QC observed long ago is invisible; and a QC that
     /// formed elsewhere but was never delivered to us is invisible by
-    /// definition. Both leave the old drop in place — local policy cannot see
-    /// what the network never sent it.
+    /// definition. Absence of a locally observed QC cannot justify unlocking.
     pub fn precommit_qc_observed(&self) -> bool {
         if self
             .precommit_qc
@@ -2894,8 +2959,7 @@ impl HeightConsensus {
     ///
     /// Fail-safe: NEVER touches `height`, `validators`, `decided`,
     /// `precommit_qc`, or any vote set contents beyond the standard prune —
-    /// only round/step/proposal state, the (conditionally dropped) lock and
-    /// the scan window.
+    /// only round/step/proposal state and the scan window; the lock is retained.
     ///
     /// NEVER REWIND (BFT safety). Re-entering a round the node already voted
     /// in at this height is a SELF-EQUIVOCATION: two different statements
@@ -2914,45 +2978,22 @@ impl HeightConsensus {
     /// Tendermint rule "a node must still commit a round it has left if the
     /// quorum turns up", with a window wide enough to cover a real desync.
     ///
-    /// LOCK RULE (audit-consensus hardening 2026-10-14): the lock is dropped
-    /// ONLY for a bodyless lock with NO precommit QC observed
-    /// (`precommit_qc_observed()` false). In every other case the lock is
-    /// kept, and it still clears only through the normal lifecycle — QC
-    /// finalize (`try_precommit_quorum`) or a same-height polka for another
-    /// value (`try_prevote_quorum_at`) — both untouched by this function.
-    /// Dropping a QC-backed bodyless lock is the fork primitive: holders that
-    /// received the body finalize A while the reset node drops its A-lock
-    /// and finalizes B.
+    /// LOCK RULE: preserve the lock even when its body and locally observed
+    /// QC are absent. Another validator may have observed a QC. This can
+    /// stall recovery until the body or a higher-round polka arrives.
     ///
-    /// LOUD LIVENESS CAVEAT: keeping the lock CAN re-stall the exact
-    /// A-r1595/B-r412 deaf deadlock this reset was built for, WHENEVER a
-    /// precommit QC was observed but no progress followed (bodyless + QC):
-    /// the node stays locked, `decide_prevote` then emits nil for every
-    /// foreign proposal, and the lock only clears via a higher-round non-nil
-    /// polka (`round > locked_round`) or arrival of the locked body. The
-    /// gate above is the deliberate trade: the observed deaf deadlock had NO
-    /// votes at all (gate passes, lock drops, immediate recovery preserved),
-    /// while any hint that value was certified (QC observed) pays stall
-    /// instead of risking a fork. Safety over liveness, explicitly.
-    ///
-    /// IDEMPOTENT: the re-phase widens the window and clears a stale lock —
-    /// both happen ONCE per height. Re-firing it on every timeout window
+    /// IDEMPOTENT: the re-phase widens the window once per height.
+    /// Re-firing it on every timeout window
     /// would only advance the round by one (which the round timer does
     /// anyway) and change nothing else: a no-op dressed up as progress.
     /// Returns false when there is nothing left to do, so the caller can
     /// skip stamping/logging.
-    pub fn apply_deadlock_local_reset(&mut self, locked_body_present: bool) -> bool {
-        // The ONLY case that drops: bodyless AND no QC backing the lock.
-        let drop_lock = !locked_body_present && !self.precommit_qc_observed();
+    pub fn apply_deadlock_local_reset(&mut self, _locked_body_present: bool) -> bool {
         let needs_work = !self.rephase_applied
             || self.proposal.is_some()
-            || self.proposal_round.is_some()
-            || self.locked.is_some() && drop_lock;
+            || self.proposal_round.is_some();
         if !needs_work {
             return false;
-        }
-        if drop_lock {
-            self.locked = None;
         }
         // BFT Safety: NEVER rewind the round at the same height — re-voting a
         // round is a self-equivocation. Move forward monotonically instead.

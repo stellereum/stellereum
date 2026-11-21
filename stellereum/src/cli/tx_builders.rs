@@ -42,6 +42,65 @@ pub(crate) fn sign_pq_explicit_payload(
     target_shard: u32,
     payload: Vec<stellereum::svm::OpCode>,
 ) -> Transaction {
+    sign_pq_explicit_payload_inner(
+        pq_key,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload,
+        None,
+    )
+}
+
+/// Chain-bound variant of [`sign_pq_explicit_payload`].
+///
+/// The signature covers `Transaction::signing_message_for_chain(chain_id)` and
+/// the PQ1 envelope carries the same `chain_id`, so admission after
+/// `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` accepts it and a replay on another
+/// chain fails the cryptographic check. The unbound function above is kept
+/// byte-identical for scripts that still run against a pre-activation chain.
+#[allow(clippy::too_many_arguments)]
+// GATE: chain-bound PQ payload builder (same shape as the unbound one plus chain_id).
+pub(crate) fn sign_pq_explicit_payload_with_chain(
+    pq_key: &stellereum::post_quantum::FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<stellereum::svm::OpCode>,
+    chain_id: u64,
+) -> Transaction {
+    sign_pq_explicit_payload_inner(
+        pq_key,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        payload,
+        Some(chain_id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: single signing body for the bound and unbound PQ payload builders.
+fn sign_pq_explicit_payload_inner(
+    pq_key: &stellereum::post_quantum::FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    payload: Vec<stellereum::svm::OpCode>,
+    chain_id: Option<u64>,
+) -> Transaction {
     let from = falcon_pq_address(pq_key);
     let mut tx = Transaction {
         from,
@@ -55,15 +114,60 @@ pub(crate) fn sign_pq_explicit_payload(
         payload,
         priority_fee_per_gas: 0,
     };
-    let msg = tx.signing_message();
-    let sig = pq_key.sign(&msg);
-    let env = stellereum::sharding::PqSignatureEnvelope::new_explicit(
-        stellereum::post_quantum::PqScheme::Falcon512,
-        pq_key.public_key.clone(),
-        sig,
-    );
+    let env = match chain_id {
+        Some(cid) => {
+            let msg = tx.signing_message_for_chain(cid);
+            let sig = pq_key.sign(&msg);
+            stellereum::sharding::PqSignatureEnvelope::new_explicit_with_chain(
+                stellereum::post_quantum::PqScheme::Falcon512,
+                pq_key.public_key.clone(),
+                sig,
+                stellereum::post_quantum::DEFAULT_SALT,
+                cid,
+            )
+        }
+        None => {
+            let msg = tx.signing_message();
+            let sig = pq_key.sign(&msg);
+            stellereum::sharding::PqSignatureEnvelope::new_explicit(
+                stellereum::post_quantum::PqScheme::Falcon512,
+                pq_key.public_key.clone(),
+                sig,
+            )
+        }
+    };
     tx.signature = env.encode();
     tx
+}
+
+/// Chain-bound PQ transfer (same shape as `rpc::sign_pq_explicit_transfer`).
+///
+/// The CLI keeps its own copy so `wallet send` / `wallet send-pq` can bind the
+/// signature without touching the faucet's public helper. Empty payload; the
+/// envelope is always explicit (no implicit-key registry state needed).
+#[allow(clippy::too_many_arguments)]
+// GATE: transfer builder mirrors the faucet-shaped transaction plus chain_id.
+pub(crate) fn sign_pq_explicit_transfer_with_chain(
+    pq_key: &stellereum::post_quantum::FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+    chain_id: u64,
+) -> Transaction {
+    sign_pq_explicit_payload_with_chain(
+        pq_key,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        Vec::new(),
+        chain_id,
+    )
 }
 
 /// Build the transaction that places an order on the committed book.
@@ -78,24 +182,50 @@ pub(crate) fn build_place_order_tx(
     amount: u64,
     nonce: u64,
 ) -> Transaction {
+    build_place_order_tx_inner(trader, pair, is_buy, price, amount, nonce, None)
+}
+
+/// Chain-bound variant of [`build_place_order_tx`].
+#[allow(clippy::too_many_arguments)]
+// GATE: order builder (same shape as the unbound one plus chain_id).
+pub(crate) fn build_place_order_tx_with_chain(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    pair: u32,
+    is_buy: bool,
+    price: u64,
+    amount: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_place_order_tx_inner(trader, pair, is_buy, price, amount, nonce, Some(chain_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: single body for the bound and unbound place-order builders.
+fn build_place_order_tx_inner(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    pair: u32,
+    is_buy: bool,
+    price: u64,
+    amount: u64,
+    nonce: u64,
+    chain_id: Option<u64>,
+) -> Transaction {
     let from = falcon_pq_address(trader);
     let gas = cli_tx_gas(stellereum::svm::GAS_ORDER_PLACE)
         .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-    sign_pq_explicit_payload(
-        trader,
-        from,
-        0,
-        gas,
-        nonce,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallPlaceOrder {
-            pair_id: pair,
-            is_buy,
-            price,
-            amount,
-        }],
-    )
+    let payload = vec![stellereum::svm::OpCode::SysCallPlaceOrder {
+        pair_id: pair,
+        is_buy,
+        price,
+        amount,
+    }];
+    match chain_id {
+        Some(cid) => {
+            sign_pq_explicit_payload_with_chain(trader, from, 0, gas, nonce, 1, 1, payload, cid)
+        }
+        None => sign_pq_explicit_payload(trader, from, 0, gas, nonce, 1, 1, payload),
+    }
 }
 
 /// Build the transaction that cancels an order on the committed book.
@@ -108,19 +238,35 @@ pub(crate) fn build_cancel_order_tx(
     order_id: u64,
     nonce: u64,
 ) -> Transaction {
+    build_cancel_order_tx_inner(trader, order_id, nonce, None)
+}
+
+/// Chain-bound variant of [`build_cancel_order_tx`].
+pub(crate) fn build_cancel_order_tx_with_chain(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    order_id: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_cancel_order_tx_inner(trader, order_id, nonce, Some(chain_id))
+}
+
+fn build_cancel_order_tx_inner(
+    trader: &stellereum::post_quantum::FalconKeypair,
+    order_id: u64,
+    nonce: u64,
+    chain_id: Option<u64>,
+) -> Transaction {
     let from = falcon_pq_address(trader);
     let gas = cli_tx_gas(stellereum::svm::GAS_ORDER_CANCEL)
         .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-    sign_pq_explicit_payload(
-        trader,
-        from,
-        0,
-        gas,
-        nonce,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallCancelOrder { order_id }],
-    )
+    let payload = vec![stellereum::svm::OpCode::SysCallCancelOrder { order_id }];
+    match chain_id {
+        Some(cid) => {
+            sign_pq_explicit_payload_with_chain(trader, from, 0, gas, nonce, 1, 1, payload, cid)
+        }
+        None => sign_pq_explicit_payload(trader, from, 0, gas, nonce, 1, 1, payload),
+    }
 }
 
 /// Build the transaction that publishes a master-signed session grant on chain.
@@ -129,26 +275,47 @@ pub(crate) fn build_cancel_order_tx(
 /// and retrievable from the receipt: a delegation becomes a committed record
 /// instead of a printout. Note the pair `(pair, order_id)` of the cancel is
 /// carried by the opcode alone - the book is looked up by id at block time.
+#[cfg(test)]
 pub(crate) fn build_session_grant_tx(
     master: &stellereum::post_quantum::FalconKeypair,
     grant: &SessionKeyAuthorization,
     nonce: u64,
 ) -> Transaction {
+    build_session_grant_tx_inner(master, grant, nonce, None)
+}
+
+/// Chain-bound variant of [`build_session_grant_tx`].
+///
+/// The grant itself already commits to `grant.chain_id`; binding the wrapping
+/// transaction to the same id keeps the published delegation usable after
+/// chain-binding activation.
+pub(crate) fn build_session_grant_tx_with_chain(
+    master: &stellereum::post_quantum::FalconKeypair,
+    grant: &SessionKeyAuthorization,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_session_grant_tx_inner(master, grant, nonce, Some(chain_id))
+}
+
+fn build_session_grant_tx_inner(
+    master: &stellereum::post_quantum::FalconKeypair,
+    grant: &SessionKeyAuthorization,
+    nonce: u64,
+    chain_id: Option<u64>,
+) -> Transaction {
     let from = falcon_pq_address(master);
     let gas = cli_tx_gas(stellereum::svm::GAS_PUBLISH_SESSION_GRANT)
         .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-    sign_pq_explicit_payload(
-        master,
-        from,
-        0,
-        gas,
-        nonce,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallPublishSessionGrant(
-            Box::new(grant.clone()),
-        )],
-    )
+    let payload = vec![stellereum::svm::OpCode::SysCallPublishSessionGrant(
+        Box::new(grant.clone()),
+    )];
+    match chain_id {
+        Some(cid) => {
+            sign_pq_explicit_payload_with_chain(master, from, 0, gas, nonce, 1, 1, payload, cid)
+        }
+        None => sign_pq_explicit_payload(master, from, 0, gas, nonce, 1, 1, payload),
+    }
 }
 
 /// Build the transaction that carries one or more teleport-bridge intents.
@@ -168,6 +335,25 @@ pub(crate) fn build_bridge_intent_tx(
     intents: &[stellereum::bridge::BridgeIntent],
     nonce: u64,
 ) -> Transaction {
+    build_bridge_intent_tx_inner(signer, intents, nonce, None)
+}
+
+/// Chain-bound variant of [`build_bridge_intent_tx`].
+pub(crate) fn build_bridge_intent_tx_with_chain(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    intents: &[stellereum::bridge::BridgeIntent],
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_bridge_intent_tx_inner(signer, intents, nonce, Some(chain_id))
+}
+
+fn build_bridge_intent_tx_inner(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    intents: &[stellereum::bridge::BridgeIntent],
+    nonce: u64,
+    chain_id: Option<u64>,
+) -> Transaction {
     assert!(
         !intents.is_empty(),
         "a bridge transaction always carries at least one intent"
@@ -179,7 +365,12 @@ pub(crate) fn build_bridge_intent_tx(
         .iter()
         .map(|i| stellereum::svm::OpCode::SysCallBridge(Box::new(i.clone())))
         .collect();
-    sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload)
+    match chain_id {
+        Some(cid) => {
+            sign_pq_explicit_payload_with_chain(signer, from, 0, gas, nonce, 1, 1, payload, cid)
+        }
+        None => sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload),
+    }
 }
 
 /// Build the LIVE unjail transaction (pentest F7).
@@ -208,6 +399,27 @@ pub(crate) fn build_unjail_tx(
     top_up: Option<u64>,
     nonce: u64,
 ) -> Transaction {
+    build_unjail_tx_inner(signer, validator, top_up, nonce, None)
+}
+
+/// Chain-bound variant of [`build_unjail_tx`].
+pub(crate) fn build_unjail_tx_with_chain(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_unjail_tx_inner(signer, validator, top_up, nonce, Some(chain_id))
+}
+
+fn build_unjail_tx_inner(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+    chain_id: Option<u64>,
+) -> Transaction {
     let from = falcon_pq_address(signer);
     let mut payload = Vec::new();
     let mut opcode_gas = stellereum::svm::GAS_STAKE_UNBOND;
@@ -222,7 +434,12 @@ pub(crate) fn build_unjail_tx(
     payload.push(stellereum::svm::OpCode::SysCallUnjail { validator });
     let gas =
         cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-    sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload)
+    match chain_id {
+        Some(cid) => {
+            sign_pq_explicit_payload_with_chain(signer, from, 0, gas, nonce, 1, 1, payload, cid)
+        }
+        None => sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload),
+    }
 }
 
 /// Resolve the validator/relayer keys that will attest a deposit claim.
@@ -515,6 +732,71 @@ pub(crate) fn parse_supported_chain(
         "solana" => SupportedChain::Solana,
         other => anyhow::bail!("unknown chain {other:?} (expected ton|arbitrum|ethereum|solana)"),
     })
+}
+
+/// True when a chain-binding activation height is scheduled (the production
+/// constant or, in debug builds, `STELL_CHAIN_BIND_ACTIVATION_HEIGHT`).
+///
+/// The CLI cannot know the node's committed height before it connects, so a
+/// scheduled activation is treated as "binding required": an unresolvable
+/// chain id is an error rather than an unbound signature that the node will
+/// refuse at admission.
+pub(crate) fn chain_binding_scheduled() -> bool {
+    stellereum::chain_binding::ChainBindingActivation::from_chain_spec().height
+        != stellereum::chain_binding::CHAIN_BINDING_NEVER
+}
+
+/// Resolve the chain id a CLI transaction must be bound to.
+///
+/// * `explicit` (`--chain-id`) always wins.
+/// * Otherwise ask the node via `stell_chainId`.
+/// * If the RPC is unavailable / returns an error:
+///   - with chain binding scheduled, FAIL CLOSED (never bind to `0`, never
+///     fall back to an unbound signature the chain will reject);
+///   - with binding not scheduled, return `None` so the pre-activation
+///     unbound transaction shape is preserved byte-for-byte for existing
+///     scripts.
+///
+/// Offline use (`--dry-run` without a reachable node) must therefore pass
+/// `--chain-id` once activation is scheduled.
+pub(crate) fn resolve_chain_id(rpc: &str, explicit: Option<u64>) -> anyhow::Result<Option<u64>> {
+    if let Some(chain_id) = explicit {
+        return Ok(Some(chain_id));
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "stell_chainId", "params": []
+    })
+    .to_string();
+    let scheduled = chain_binding_scheduled();
+    let failure = |detail: String| -> anyhow::Result<Option<u64>> {
+        if scheduled {
+            anyhow::bail!(
+                "cannot resolve chain id from {rpc}: {detail}; chain binding is scheduled, so \
+                 pass --chain-id <id> (an unbound transaction would be refused at admission)"
+            );
+        }
+        eprintln!(
+            "warning: cannot resolve chain id from {rpc}: {detail}; \
+             building an UNBOUND transaction (admitted only while chain binding is inactive)"
+        );
+        Ok(None)
+    };
+
+    let resp: serde_json::Value = match ureq::post(rpc).send_string(&body) {
+        Ok(resp) => match resp.into_json() {
+            Ok(json) => json,
+            Err(e) => return failure(format!("invalid JSON response: {e}")),
+        },
+        Err(e) => return failure(format!("RPC unavailable: {e}")),
+    };
+    if let Some(e) = resp.get("error") {
+        return failure(format!("RPC error: {e}"));
+    }
+    match resp.get("result").and_then(|v| v.as_u64()) {
+        Some(chain_id) => Ok(Some(chain_id)),
+        None => failure("node did not return a chain id".to_string()),
+    }
 }
 
 /// Resolve the sender nonce: an explicit `--nonce`, or the account's current

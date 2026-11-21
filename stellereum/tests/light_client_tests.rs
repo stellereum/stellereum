@@ -17,7 +17,10 @@ use stellereum::consensus::{
     BlockHash, QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
 };
 use stellereum::light_client::{
-    Checkpoint, LightClient, LightError, LightHeader, MAX_MERKLE_PATH_STEPS,
+    Checkpoint, LightClient, LightError, LightHeader, ProofAnswer, MAX_MERKLE_PATH_STEPS,
+};
+use stellereum::light_client_cli::{
+    check_anchoring_header, check_answer_matches_request, ServedHeader,
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
@@ -196,8 +199,9 @@ impl Fixture {
                 cnvrf_v3: None,
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-                        round: 0,
-            };            // 3 of 4 signatures: a genuine power quorum, so these headers also
+                round: 0,
+            };
+            // 3 of 4 signatures: a genuine power quorum, so these headers also
             // satisfy the block-level quorum check.
             for k in keys.iter().take(3) {
                 b.sign_block(k);
@@ -1061,41 +1065,161 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
 }
 
 #[test]
-fn a_header_may_not_roll_the_state_back_to_a_superseded_root() {
-    // h1 commits A, h2 moves to B, h3 claims A again. A quorum could finalize
-    // all three only if the state really did return to A; anything else is a
-    // rollback, and a client that follows it is being walked backwards.
-    let f = Fixture::new(vec![[0u8; 32], [0xAAu8; 32], [0xBBu8; 32], [0xCCu8; 32]]);
+fn a_valid_quorum_certified_chain_may_revisit_an_earlier_state_root() {
+    // A -> B -> A: the state root returns to an earlier value while the height
+    // strictly grows and every `prev_hash` links to the tip. That is a chain of
+    // real transitions, not a rollback: finality (the precommit QC) plus the
+    // parent link are the security here, and refusing a recurring root would
+    // also break `sync::verify_synced_blocks_against_anchor_with_sets`.
+    //
+    // This replaces the former `a_header_may_not_roll_the_state_back_to_a_
+    // superseded_root`, which pinned the erroneous `superseded_root` gate.
+    let a = [0u8; 32];
+    let f = Fixture::new(vec![
+        a,
+        [0xAAu8; 32],
+        [0xBBu8; 32],
+        [0xAAu8; 32], // back to the root committed at height 2
+        [0xAAu8; 32], // an empty block keeps it
+        [0xCCu8; 32],
+    ]);
     let mut lc = LightClient::new(f.validators.clone(), f.checkpoint(0)).unwrap();
-    lc.apply_header(f.header(1)).unwrap(); // root -> 0xAA
-    lc.apply_header(f.header(2)).unwrap(); // root -> 0xBB
-    assert_eq!(lc.state_root(), [0xBBu8; 32]);
-
-    let mut rollback = f.header(3).clone();
-    rollback.state_root = f.blocks[0].state_root; // back to A
-    Fixture::rehash(&mut rollback, &f.keys, &f.fks, &f.validators, hash_of(0xC1));
-    let err = lc
-        .apply_header(rollback)
-        .expect_err("state must not roll back below a finalized height");
-    assert!(err.contains("roll back"), "got: {err}");
+    for i in 1..=4 {
+        lc.apply_header(f.header(i))
+            .unwrap_or_else(|e| panic!("header {i} must be accepted: {e}"));
+    }
+    assert_eq!(lc.tip_height(), 5);
     assert_eq!(
         lc.state_root(),
-        [0xBBu8; 32],
-        "the tip's root must not move"
+        [0xAAu8; 32],
+        "height 4 revisits the root committed at height 2"
     );
-    assert_eq!(lc.header_count(), 2);
+    assert_eq!(lc.header_count(), 4);
 
-    // Carrying the parent's own root forward is NOT a rollback: a block that
-    // changes nothing leaves the state where it was. Refusing that would wedge
-    // the client on a chain of no-op blocks, which is over-tightening.
-    let mut noop = f.header(3).clone();
-    noop.state_root = f.blocks[2].state_root;
-    Fixture::rehash(&mut noop, &f.keys, &f.fks, &f.validators, hash_of(0xC2));
+    // A break in `prev_hash` is still refused, even with a genuine QC: the
+    // accepted chain must be contiguous.
+    let mut broken = f.header(5).clone(); // height 6
+    broken.prev_hash = [0xEEu8; 32];
+    Fixture::rehash(&mut broken, &f.keys, &f.fks, &f.validators, hash_of(0xC3));
+    let err = lc
+        .apply_header(broken)
+        .expect_err("a header whose parent is not the tip is a fork");
+    assert!(err.contains("forks"), "got: {err}");
+    assert_eq!(lc.tip_height(), 5, "a refused header must not move the tip");
+    assert_eq!(lc.state_root(), [0xAAu8; 32]);
+}
+
+// ============================================================================
+// CLI request binding (`light-client --verify/--min-height`)
+// ============================================================================
+
+/// A genuine `stell_getProof`-shaped answer for one key, used to pin the CLI
+/// gates. The proof is real; only the answer's labels are changed per test.
+fn cli_answer(key: &[u8; 32], height: Option<u64>) -> ProofAnswer {
+    let mut trie = stellereum::cpat2::CompressedTrie::new();
+    trie.insert(key, &[0u8; 64]);
+    let proof = trie
+        .generate_proof(key)
+        .expect("key is in the trie, so an inclusion proof exists");
+    ProofAnswer {
+        address: *key,
+        balance: 0,
+        nonce: 0,
+        account_proof: proof.to_nodes(),
+        storage_proofs: vec![],
+        state_root: trie.root_hash(),
+        height,
+    }
+}
+
+#[test]
+fn a_cli_answer_for_another_account_is_refused() {
+    // The node answers a different question with a perfectly valid proof for
+    // some other (say richer) account. Before the address gate the CLI printed
+    // VERIFIED for it; it must now be refused before any proof work.
+    let requested = [0xABu8; 32];
+    let answer = cli_answer(&[0xEEu8; 32], Some(10));
+    let err = check_answer_matches_request(&answer, &requested, None)
+        .expect_err("an answer about another account must be refused");
     assert!(
-        lc.apply_header(noop).is_ok(),
-        "an unchanged state root is not a rollback"
+        err.to_string().contains("does not match requested"),
+        "got: {err}"
     );
-    assert_eq!(lc.header_count(), 3);
+}
+
+#[test]
+fn a_cli_answer_whose_proof_is_for_another_key_is_refused() {
+    // The answer's `address` label says the requested account, but the leaf
+    // proof inside is for another key. Both must agree with `--verify`.
+    let requested = [0xB0u8; 32];
+    let mut answer = cli_answer(&[0xA1u8; 32], Some(10));
+    answer.address = requested;
+    let err = check_answer_matches_request(&answer, &requested, None)
+        .expect_err("a proof for another key must be refused");
+    assert!(err.to_string().contains("proof key"), "got: {err}");
+}
+
+#[test]
+fn a_cli_answer_below_the_pinned_min_height_is_refused() {
+    let requested = [0xA1u8; 32];
+    let stale = cli_answer(&requested, Some(5));
+
+    // Fresh enough: no floor, or a floor at/below the served height.
+    check_answer_matches_request(&stale, &requested, None).expect("no floor");
+    check_answer_matches_request(&stale, &requested, Some(5)).expect("at the floor");
+
+    // A node replaying an old, genuinely certified proof is refused.
+    let err = check_answer_matches_request(&stale, &requested, Some(10))
+        .expect_err("a stale height must be refused");
+    assert!(
+        err.to_string().contains("below --min-height 10"),
+        "got: {err}"
+    );
+
+    // With a floor set, an answer that hides its height is fail-closed, not
+    // treated as fresh.
+    let hidden = cli_answer(&requested, None);
+    let err = check_answer_matches_request(&hidden, &requested, Some(10))
+        .expect_err("a heightless answer cannot satisfy --min-height");
+    assert!(err.to_string().contains("cannot be enforced"), "got: {err}");
+}
+
+#[test]
+fn a_cli_anchoring_header_at_another_height_is_refused() {
+    // The proof is at height 3, so the anchoring header must be height 4. A
+    // genuinely signed header at height 5 with the SAME state root is still
+    // the wrong answer to this question.
+    let header = ServedHeader {
+        height: 5,
+        block_hash: [0x11u8; 32],
+        prev_hash: [0x22u8; 32],
+        state_root: [0x33u8; 32],
+        cert: QuorumCertificate {
+            height: 5,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some([0x11u8; 32]),
+            signatures: vec![],
+            shard_id: MASTERCHAIN_SHARD,
+        },
+    };
+    let err = check_anchoring_header(&header, 4, None)
+        .expect_err("a header from another height is not the anchor");
+    assert!(
+        err.to_string()
+            .contains("height 5 != expected anchoring height 4"),
+        "got: {err}"
+    );
+
+    // `--min-height 5` means the anchoring header (proof height + 1) must be
+    // at least 6.
+    let err = check_anchoring_header(&header, 5, Some(5))
+        .expect_err("an anchoring header below the floor must be refused");
+    assert!(
+        err.to_string().contains("below --min-height 5"),
+        "got: {err}"
+    );
+    check_anchoring_header(&header, 5, Some(4)).expect("height 5 is fresh for a floor of 5");
 }
 
 // ============================================================================

@@ -828,10 +828,20 @@ impl InMemoryStateEngine {
     /// committed escrow. This writer exists so the source-side escrow is a real,
     /// provable, committed record (and so a future two-step legacy producer can
     /// be verified without touching this gate).
-    pub async fn record_legacy_escrow_receipts(
+    fn build_tx_hash_index(txs: &[crate::sharding::Transaction]) -> HashMap<[u8; 32], usize> {
+        let hashes = crate::sharding::Transaction::compute_tx_hashes_batched(txs);
+        let mut map = HashMap::with_capacity(hashes.len());
+        for (idx, hash) in hashes.into_iter().enumerate() {
+            map.entry(hash).or_insert(idx);
+        }
+        map
+    }
+
+    async fn record_legacy_escrow_receipts_with_index(
         &self,
         block: &crate::sharding::Block,
         status: &[bool],
+        tx_index: &mut Option<HashMap<[u8; 32], usize>>,
     ) -> usize {
         if !self.cross_shard_enabled() {
             return 0;
@@ -841,17 +851,16 @@ impl InMemoryStateEngine {
         // critical section keeps the apply cheap and the order irrelevant
         // (each leaf has its own key).
         let mut leaves: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        let mut msg_hasher = crate::sharding::Transaction::batch_hasher();
         for msg in &block.cross_shard_out {
             if !msg.is_transfer() || !msg.is_outbound_for(block.shard_id) {
                 continue;
             }
             let tx = &msg.tx;
-            let tx_hash = tx.compute_tx_hash();
-            let Some(idx) = block
-                .transactions
-                .iter()
-                .position(|t| t.compute_tx_hash() == tx_hash)
-            else {
+            let tx_hash = msg_hasher.hash_one(tx);
+            let index_map =
+                tx_index.get_or_insert_with(|| Self::build_tx_hash_index(&block.transactions));
+            let Some(&idx) = index_map.get(&tx_hash) else {
                 continue;
             };
             if !status.get(idx).copied().unwrap_or(false) {
@@ -871,6 +880,16 @@ impl InMemoryStateEngine {
         }
         drop(trie);
         leaves.len()
+    }
+
+    pub async fn record_legacy_escrow_receipts(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> usize {
+        let mut tx_index = None;
+        self.record_legacy_escrow_receipts_with_index(block, status, &mut tx_index)
+            .await
     }
 
     /// §9 2PC, SOURCE side: record the PREPARED state of every transfer this
@@ -911,14 +930,18 @@ impl InMemoryStateEngine {
         // LEGACY transfer this block committed. It runs after the transactions
         // (this hook is called post-apply) so it can consult `status`: only a
         // transfer whose escrow transaction APPLIED is recorded.
-        let _escrows = self.record_legacy_escrow_receipts(block, status).await;
+        let mut tx_index = None;
+        let _escrows = self
+            .record_legacy_escrow_receipts_with_index(block, status, &mut tx_index)
+            .await;
         let mut created = 0usize;
+        let mut msg_hasher = crate::sharding::Transaction::batch_hasher();
         for msg in &block.cross_shard_out {
             if !msg.is_prepare() || !msg.is_outbound_for(block.shard_id) {
                 continue;
             }
             let tx = &msg.tx;
-            let tx_hash = tx.compute_tx_hash();
+            let tx_hash = msg_hasher.hash_one(tx);
             // §9 COEXISTENCE GUARD: a transfer already produced through the
             // LEGACY outbound path is never re-opened as a 2PC transfer. The
             // two flows must not coexist on one transfer, so a PREPARE for a
@@ -936,11 +959,9 @@ impl InMemoryStateEngine {
             // applied. A PREPARE without its transaction is refused (the
             // proposal path refuses it too), and a transaction that was
             // refused at apply time escrows nothing.
-            let Some(idx) = block
-                .transactions
-                .iter()
-                .position(|t| t.compute_tx_hash() == tx_hash)
-            else {
+            let index_map =
+                tx_index.get_or_insert_with(|| Self::build_tx_hash_index(&block.transactions));
+            let Some(&idx) = index_map.get(&tx_hash) else {
                 continue;
             };
             if !status.get(idx).copied().unwrap_or(false) {
@@ -1068,6 +1089,9 @@ impl InMemoryStateEngine {
             // (the re-published PREPARE - it proves the value is already
             // escrowed at the source, which is the stronger statement).
             CrossShardKind::Prepare => {
+                if self.cross_shard_completed.read().await.contains(&tx_hash) {
+                    return false;
+                }
                 if !msg.verify_inclusion_strict() && !msg.verify_xpc_proof(&[XpcPhase::Prepared]) {
                     return false;
                 }
@@ -1079,8 +1103,7 @@ impl InMemoryStateEngine {
                     return false;
                 }
                 let rec = XpcRecord::prepared(tx.clone(), tx.source_shard, tx.target_shard, height);
-                self.write_xpc_record(&rec).await;
-                true
+                self.write_xpc_record(&rec).await
             }
             // SOURCE side: the target voted YES. The proof is the TARGET's
             // PREPARED leaf, so the vote is a fact of the target's committed
@@ -1118,7 +1141,7 @@ impl InMemoryStateEngine {
                             "xpc commit window refreshed for {}: target still PREPARED at height {height}",
                             hex::encode(&tx_hash[..8])
                         );
-                        return false;
+                        return true;
                     }
                 }
                 let transition = crate::xshard2pc::source_on_prepare_ack(existing.as_ref());
@@ -1192,6 +1215,9 @@ impl InMemoryStateEngine {
             // REFUSES: it has voted YES, and a 2PC participant that voted YES
             // must commit. That refusal is what blocks the double spend.
             CrossShardKind::AbortRequest => {
+                if self.cross_shard_completed.read().await.contains(&tx_hash) {
+                    return false;
+                }
                 if !msg.verify_xpc_proof(&[XpcPhase::Prepared, XpcPhase::Committed]) {
                     return false;
                 }
@@ -1208,8 +1234,7 @@ impl InMemoryStateEngine {
                     prepared_height: height,
                     decided_height: height,
                 };
-                self.write_xpc_record(&rec).await;
-                true
+                self.write_xpc_record(&rec).await
             }
             // SOURCE side: the target authorises the abort. The proof is the
             // TARGET's ABORTED leaf - and the target can only hold that leaf
@@ -1898,6 +1923,89 @@ mod tests {
         assert!(
             !crate::xshard2pc::is_retired(&rec, 50),
             "the refreshed record is retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn xpc_prepare_ack_refresh_returns_true() {
+        let kp = FalconKeypair::generate_from_seed(46);
+        let recipient = [0x5Cu8; 32];
+        let amount = 1_000_000u64;
+        let probe = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            vec![0u8; FALCON512_SIG_LEN],
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let sig = kp.sign(&probe.signing_message());
+        let tx = Transaction::new_pq_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig,
+            recipient,
+            amount,
+            280_000,
+            0,
+            0,
+            1,
+            vec![],
+            &DEFAULT_SALT,
+        );
+        let tx_hash = tx.compute_tx_hash();
+        let anchor_block = [0xD3u8; 32];
+
+        let target = InMemoryStateEngine::new();
+        target.enable_cross_shard();
+        assert!(
+            target
+                .write_xpc_record(&crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 5))
+                .await
+        );
+        let target_root = target.get_state_root().await;
+        let proof = target
+            .get_xpc_proof(&tx_hash)
+            .await
+            .expect("target PREPARED leaf proof");
+
+        let reg = Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
+        reg.write()
+            .unwrap()
+            .note_finalized(1, anchor_block, target_root);
+        let source = InMemoryStateEngine::new();
+        source.enable_cross_shard();
+        source.with_finalized_headers(reg);
+        let mut committed = crate::xshard2pc::XpcRecord::prepared(tx.clone(), 0, 1, 5);
+        committed.phase = XpcPhase::Committed;
+        committed.decided_height = 10;
+        assert!(source.write_xpc_record(&committed).await);
+
+        let ack = CrossShardMessage::new_xpc(
+            crate::xshard2pc::XPC_PREPARE_ACK,
+            1,
+            0,
+            tx,
+            target_root,
+            anchor_block,
+            Some(proof),
+        );
+        assert!(
+            !source.apply_xpc_record(&ack, 10).await,
+            "refresh at same or earlier height is a no-op"
+        );
+        assert!(
+            source.apply_xpc_record(&ack, 50).await,
+            "refreshing decided_height must report true when committed XPC state changed"
+        );
+        assert_eq!(
+            source.xpc_record(&tx_hash).await.map(|r| r.decided_height),
+            Some(50)
         );
     }
 }

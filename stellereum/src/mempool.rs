@@ -581,6 +581,19 @@ pub struct Mempool {
     /// admission for every restored tx).
     #[serde(skip)]
     reserved: HashMap<[u8; 32], u64>,
+    /// sender -> balance claimed by UNVERIFIED activation-buffer entries.
+    ///
+    /// Separate from `reserved` on purpose (audit: activation-buffer DoS): an
+    /// implicit PQ envelope for an account that is not activated yet cannot be
+    /// signature-verified (the key is not in the registry), so its claim must
+    /// never be able to price a REAL, signed activation out of the pool.
+    /// [`Mempool::reserved_for`] still reports the SUM (so the sender's joint
+    /// affordability is honest), but a verified `is_pq_activation` admission
+    /// checks `reserved` only, and the activation drain releases these claims
+    /// and re-verifies every buffered transaction (garbage is dropped there).
+    /// `#[serde(skip)]` like `reserved`: rebuilt by `load_into`.
+    #[serde(skip)]
+    activation_reserved: HashMap<[u8; 32], u64>,
     /// hash -> admission wall-clock seconds (audit: blocks troubles — TTL
     /// eviction for stuck txs; cleaned in `evict` with everything else).
     inserted_at: HashMap<TxHash, u64>,
@@ -730,6 +743,7 @@ impl Mempool {
             per_sender: HashMap::new(),
             sender_nonces: HashMap::new(),
             reserved: HashMap::new(),
+            activation_reserved: HashMap::new(),
             inserted_at: HashMap::new(),
             max_size,
             per_sender_limit,
@@ -805,6 +819,12 @@ impl Mempool {
     /// proposer stops packing at ~24MB estimated wire and leaves headroom.
     /// Estimate, not exact bincode (see `estimate_tx_wire_bytes`).
     pub const MAX_BLOCK_WIRE_BYTES: usize = 24 * 1024 * 1024;
+
+    /// Short TTL for UNVERIFIED activation-buffer entries on the admission
+    /// path (a full buffer drains these before reporting `Full`). They cannot
+    /// be signature-checked, so they must not squat the 2048 global slots for
+    /// the long [`Self::STUCK_TX_TTL_SECS`] a signature-verified pooled tx may.
+    pub const ACTIVATION_BUFFER_TTL_SECS: u64 = 30;
     /// Verified-proof cap per block (audit: blocks troubles): attestation
     /// verifies and zkML re-executions serialize on the single apply worker
     /// while `apply_in_flight` blocks the next propose. Bounds worst-case lane
@@ -996,11 +1016,27 @@ impl Mempool {
             .map(|_| (tx.amount, self.sponsor_fee_cost(tx)))
     }
 
-    /// Funds already claimed by `sender`'s pooled transactions (F-03). A new
-    /// checked admission is refused when `reserved_for(sender) + tx_cost(new)`
-    /// exceeds the sender's balance, so one funding cannot back more slots
-    /// than it can jointly pay for.
+    /// Funds already claimed by `sender`: pooled transactions (F-03) PLUS the
+    /// unverified activation-buffer entries parked for that address. A new
+    /// checked admission of a plain/implicit transaction is refused when
+    /// `reserved_for(sender) + tx_cost(new)` exceeds the sender's balance, so
+    /// one funding cannot back more slots than it can jointly pay for.
+    ///
+    /// A VERIFIED `is_pq_activation` admission deliberately checks
+    /// [`Self::pool_reserved_for`] instead: the buffer leg belongs to entries
+    /// nobody has proven (their key is not registered yet), so it must never
+    /// price the real key holder out of their own activation.
     pub fn reserved_for(&self, sender: &[u8; 32]) -> u64 {
+        // Pooled claims + unverified activation-buffer claims: what the sender
+        // has already committed. Admission of a VERIFIED activation checks the
+        // pool-only leg instead (see `pool_reserved_for`) so an attacker cannot
+        // park garbage implicit envelopes and block the real key holder.
+        self.pool_reserved_for(sender)
+            .saturating_add(self.activation_reserved.get(sender).copied().unwrap_or(0))
+    }
+
+    /// Funds claimed by POOLED (signature-verified) transactions only.
+    fn pool_reserved_for(&self, sender: &[u8; 32]) -> u64 {
         self.reserved.get(sender).copied().unwrap_or(0)
     }
 
@@ -1023,27 +1059,59 @@ impl Mempool {
     fn release_reservation(&mut self, tx: &Transaction) {
         if let Some((user_cost, sponsor_cost)) = Self::sponsored_pure_legs(tx) {
             let sponsor = tx.fee_payer();
-            if let Some(r) = self.reserved.get_mut(&tx.from) {
-                *r = r.saturating_sub(user_cost);
-                if *r == 0 {
-                    self.reserved.remove(&tx.from);
-                }
-            }
-            if let Some(r) = self.reserved.get_mut(&sponsor) {
-                *r = r.saturating_sub(sponsor_cost);
-                if *r == 0 {
-                    self.reserved.remove(&sponsor);
-                }
-            }
+            self.release_claim(&tx.from, user_cost, false);
+            self.release_claim(&sponsor, sponsor_cost, false);
             return;
         }
         let cost = Self::tx_cost(tx);
-        if let Some(r) = self.reserved.get_mut(&tx.from) {
-            *r = r.saturating_sub(cost);
-            if *r == 0 {
-                self.reserved.remove(&tx.from);
-            }
+        self.release_claim(&tx.from, cost, false);
+    }
+
+    /// Release the claim of a transaction that was sitting in the UNVERIFIED
+    /// activation buffer. Its cost was claimed in `activation_reserved`, so
+    /// that bucket shrinks first (the pooled bucket is only a fallback for a
+    /// claim that somehow outlived a re-classification).
+    fn release_activation_reservation(&mut self, tx: &Transaction) {
+        if let Some((user_cost, sponsor_cost)) = Self::sponsored_pure_legs(tx) {
+            let sponsor = tx.fee_payer();
+            self.release_claim(&tx.from, user_cost, true);
+            self.release_claim(&sponsor, sponsor_cost, true);
+            return;
         }
+        let cost = Self::tx_cost(tx);
+        self.release_claim(&tx.from, cost, true);
+    }
+
+    /// Release `cost` from an account's claims. `activation_first` selects
+    /// which bucket shrinks first: buffer removals target the unverified leg,
+    /// pool removals the signature-checked leg. Both legs belong to the same
+    /// account, so the total is exact either way.
+    fn release_claim(&mut self, sender: &[u8; 32], cost: u64, activation_first: bool) {
+        let mut left = cost;
+        if activation_first {
+            left = Self::take_claim_from(&mut self.activation_reserved, sender, left);
+        }
+        left = Self::take_claim_from(&mut self.reserved, sender, left);
+        if left > 0 && !activation_first {
+            // Defensive fallback: a buffer claim still present when a pooled
+            // release runs (claim/release are strictly one-in / one-out).
+            Self::take_claim_from(&mut self.activation_reserved, sender, left);
+        }
+    }
+
+    /// Subtract up to `cost` from `bucket[sender]`, dropping the entry when it
+    /// reaches zero. Returns what was left unclaimed.
+    fn take_claim_from(bucket: &mut HashMap<[u8; 32], u64>, sender: &[u8; 32], cost: u64) -> u64 {
+        let Some(r) = bucket.get_mut(sender) else {
+            return cost;
+        };
+        let take = (*r).min(cost);
+        *r -= take;
+        let empty = *r == 0;
+        if empty {
+            bucket.remove(sender);
+        }
+        cost - take
     }
 
     /// Minimum bid that may displace the cheapest pooled transaction
@@ -1202,10 +1270,16 @@ impl Mempool {
         )?;
         if let Some(ref old) = old_tx {
             // The replaced transaction leaves the buffer: its claim ends here.
-            self.release_reservation(old);
+            self.release_activation_reservation(old);
         }
-        *self.reserved.entry(tx.from).or_insert(0) =
-            self.reserved_for(&tx.from).saturating_add(cost);
+        // UNVERIFIED claim: isolated from the pooled leg so a garbage implicit
+        // envelope can never price the real key holder's activation out.
+        *self.activation_reserved.entry(tx.from).or_insert(0) = self
+            .activation_reserved
+            .get(&tx.from)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(cost);
         Ok(hash)
     }
 
@@ -1221,7 +1295,7 @@ impl Mempool {
         let pending = self.activation_buffer.drain_account(sender);
         // The buffer's claims end with the buffer.
         for tx in &pending {
-            self.release_reservation(tx);
+            self.release_activation_reservation(tx);
         }
         let mut admitted = Vec::new();
         let ctx = AdmissionCtx::wall_now();
@@ -1865,7 +1939,7 @@ impl Mempool {
                             .unwrap_or(false);
                         user_short || sponsor_short
                     }
-                    None => tx.amount.saturating_add(tx.gas_limit) > balance,
+                    None => Self::tx_cost(tx) > balance,
                 };
                 // Waiting behind a gap for too long: the sender controls the
                 // gap, so an aged future nonce is pool pollution, not a
@@ -2228,15 +2302,41 @@ impl Mempool {
                 return Err(MempoolError::InsufficientBalance);
             }
             let floor = self.required_fee_for_tx(&tx);
-            let (hash, old_tx) =
+            let buffered =
                 self.activation_buffer
-                    .buffer_tx_with_timestamp(tx.clone(), floor, ctx.now)?;
+                    .buffer_tx_with_timestamp(tx.clone(), floor, ctx.now);
+            let (hash, old_tx) = match buffered {
+                Ok(v) => v,
+                // A full buffer must not turn into a permanent DoS: unverified
+                // entries expire on a SHORT TTL on the admission path (the
+                // long `STUCK_TX_TTL_SECS` sweep stays for pooled txs), so a
+                // flood of garbage envelopes frees its slots instead of
+                // locking every legitimate unactivated account out.
+                Err(MempoolError::Full) => {
+                    let stale = self
+                        .activation_buffer
+                        .drain_stale(ctx.now, Self::ACTIVATION_BUFFER_TTL_SECS);
+                    for stale_tx in &stale {
+                        self.release_activation_reservation(stale_tx);
+                    }
+                    self.activation_buffer
+                        .buffer_tx_with_timestamp(tx.clone(), floor, ctx.now)?
+                }
+                Err(e) => return Err(e),
+            };
             if let Some(ref old) = old_tx {
                 // The replaced transaction leaves the buffer: its claim ends here.
-                self.release_reservation(old);
+                self.release_activation_reservation(old);
             }
-            *self.reserved.entry(tx.from).or_insert(0) =
-                self.reserved_for(&tx.from).saturating_add(cost);
+            // UNVERIFIED claim: isolated from `reserved` (see `release_claim`
+            // and the `activation_reserved` field docs). A verified activation
+            // checks the pooled leg only, so this parking cannot block it.
+            *self.activation_reserved.entry(tx.from).or_insert(0) = self
+                .activation_reserved
+                .get(&tx.from)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(cost);
             return Ok(hash);
         }
 
@@ -2310,7 +2410,17 @@ impl Mempool {
                 if sender_balance < total {
                     return Err(MempoolError::InsufficientBalance);
                 }
-                if self.reserved_for(&tx.from).saturating_add(total) > sender_balance {
+                // A VERIFIED PQ activation must only compete with claims of
+                // signature-checked pooled transactions: unverified
+                // `activation_reserved` slots (attacker-parked implicit
+                // envelopes, drained and re-verified below) can never price
+                // the legitimate key holder out.
+                let claim = if tx.is_pq_activation() {
+                    self.pool_reserved_for(&tx.from)
+                } else {
+                    self.reserved_for(&tx.from)
+                };
+                if claim.saturating_add(total) > sender_balance {
                     return Err(MempoolError::InsufficientBalance);
                 }
             }
@@ -2384,13 +2494,19 @@ impl Mempool {
         // the penalty map moves between them).
         if let Some((user_cost, sponsor_cost)) = Self::sponsored_pure_legs(&tx) {
             let sponsor = tx.fee_payer();
+            // The POOLED bucket only ever accumulates its own (verified)
+            // claims: `reserved_for` includes unverified activation-buffer
+            // slots, which must not be copied into `reserved` (that would
+            // launder an attacker's claim into the leg a real activation
+            // checks).
             *self.reserved.entry(sender).or_insert(0) =
-                self.reserved_for(&sender).saturating_add(user_cost);
-            *self.reserved.entry(sponsor).or_insert(0) =
-                self.reserved_for(&sponsor).saturating_add(sponsor_cost);
+                self.pool_reserved_for(&sender).saturating_add(user_cost);
+            *self.reserved.entry(sponsor).or_insert(0) = self
+                .pool_reserved_for(&sponsor)
+                .saturating_add(sponsor_cost);
         } else {
             *self.reserved.entry(sender).or_insert(0) = self
-                .reserved_for(&sender)
+                .pool_reserved_for(&sender)
                 .saturating_add(Self::tx_cost(&tx));
         }
         self.inserted_at.insert(hash, ctx.now);
@@ -2412,7 +2528,7 @@ impl Mempool {
             // never came back down (audit W6.6: activation-buffer reservation
             // leak / double count).
             for p_tx in &pending {
-                self.release_reservation(p_tx);
+                self.release_activation_reservation(p_tx);
             }
             let mut dropped = 0usize;
             for p_tx in pending {
@@ -2705,7 +2821,7 @@ impl Mempool {
                             .unwrap_or(false);
                         user_short || sponsor_short
                     }
-                    None => tx.amount.saturating_add(tx.gas_limit) > balance,
+                    None => Self::tx_cost(tx) > balance,
                 };
                 // Gap-stuck: past the executable head with no fill in TTL.
                 // The head itself (nonce == onchain and affordable) is kept:
@@ -2729,7 +2845,7 @@ impl Mempool {
         for tx in &expired_activation {
             // A swept buffered transaction leaves the buffer: its claim ends
             // with it (audit W6.6: the sweep must release the reservation).
-            self.release_reservation(tx);
+            self.release_activation_reservation(tx);
         }
         let pruned_activation = expired_activation.len();
         n.saturating_add(pruned_activation)
@@ -2779,7 +2895,7 @@ impl Mempool {
             if let Some(ref t) = act_tx {
                 // A removed buffered transaction leaves the buffer: its claim
                 // ends with it.
-                self.release_reservation(t);
+                self.release_activation_reservation(t);
             }
             act_tx
         }
@@ -2796,7 +2912,7 @@ impl Mempool {
             if self.txs.contains_key(h) {
                 self.evict(h);
             } else if let Some(tx) = self.activation_buffer.remove_by_hash(h) {
-                self.release_reservation(&tx);
+                self.release_activation_reservation(&tx);
             }
         }
     }
@@ -3052,33 +3168,84 @@ impl Mempool {
     /// exactness does not matter, monotonicity does. (A width-aware estimate
     /// sits stashed — apply only together with a bench-1k recalibration.)
     pub fn estimate_tx_wire_bytes(tx: &Transaction) -> usize {
-        use crate::svm::OpCode;
         let mut n = 256usize; // envelope: sigs, hashes, nonces, shards
                               // Phase-2 EVM settlement carries the canonical raw (up to 128 KiB) in
                               // `signature`: account it honestly so packing still respects the block
                               // gossip cap (the base 256 above only covers ~64-byte signatures).
-        n += tx.signature.len();
+        n = n.saturating_add(tx.signature.len());
         for op in &tx.payload {
-            n += match op {
-                OpCode::SysCallVerifyZkMlReexec { proof, .. } => 500 + proof.wire_len(),
-                OpCode::SysCallVerifyZkMlAttestation { proof, .. } => {
-                    500 + proof.public_inputs.len() * 2 + proof.wire_len()
-                }
-                // A PQ equivocation report carries TWO post-quantum signatures
-                // (up to ~2.4 KB each for ML-DSA-44), so the flat 200-byte
-                // default would under-count it by more than an order of
-                // magnitude and let a producer pack a block past the gossip
-                // cap.
-                OpCode::SysCallReportPqEquivocation { evidence } => 200 + evidence.wire_len(),
-                // A proposal equivocation report carries TWO FULL BLOCKS, so
-                // the flat default would under-count it by up to four orders
-                // of magnitude. Count it honestly for the same reason: the
-                // estimator is what keeps packing under the gossip cap.
-                OpCode::SysCallReportProposalEquivocation { evidence } => 200 + evidence.wire_len(),
-                _ => 200,
-            };
+            n = n.saturating_add(Self::estimate_op_wire_bytes(op, 0));
         }
         n
+    }
+
+    /// Recursion cap for `SysCallActorSend` bodies (which are PROGRAMS and can
+    /// nest). Deeper than this is priced above the block cap: fail-closed.
+    const MAX_ACTOR_DEPTH: usize = 16;
+
+    /// Honest structural wire estimate of one payload opcode.
+    ///
+    /// FAIL-BEFORE (T7b): the old estimator had a flat `_ => 200` catch-all,
+    /// so a `SysCallActorSend` carrying a 512 KiB contract deploy (or nested
+    /// actor sends) was admitted as ~456 bytes and could be packed past
+    /// [`Mempool::MAX_BLOCK_WIRE_BYTES`]. Every variable-size carrier is now
+    /// accounted for, and nesting past [`Self::MAX_ACTOR_DEPTH`] returns
+    /// `MAX_BLOCK_WIRE_BYTES + 1` so admission refuses it.
+    fn estimate_op_wire_bytes(op: &crate::svm::OpCode, depth: usize) -> usize {
+        use crate::svm::OpCode;
+        if depth > Self::MAX_ACTOR_DEPTH {
+            return Self::MAX_BLOCK_WIRE_BYTES.saturating_add(1);
+        }
+        match op {
+            // `body` is a PROGRAM: recurse, never treat it as opaque bytes.
+            OpCode::SysCallActorSend { body, .. } => body.iter().fold(200usize, |acc, child| {
+                acc.saturating_add(Self::estimate_op_wire_bytes(child, depth + 1))
+            }),
+            OpCode::SysCallDeployContract { code } => 128 + code.len(),
+            OpCode::SysCallCallContract { method, .. } => 128 + method.len(),
+            OpCode::SysCallCallContractArgs {
+                method,
+                args,
+                calldata,
+                ..
+            } => 128 + method.len() + args.len() * 8 + calldata.len(),
+            OpCode::SysCallRegisterZkMlModel { model, .. } => {
+                256 + model.param_count().saturating_mul(8)
+            }
+            OpCode::SysCallRegisterZkMlSpec { spec, .. } => {
+                256 + spec.spec_bytes.len() + spec.setup_attestation.len()
+            }
+            OpCode::SysCallVerifyZkMlReexec { proof, .. } => 500 + proof.wire_len(),
+            OpCode::SysCallVerifyZkMlAttestation { proof, .. } => {
+                500 + proof.public_inputs.len() * 2 + proof.wire_len()
+            }
+            OpCode::SysCallVerifyPqSignature {
+                pubkey,
+                message,
+                signature,
+                ..
+            } => 128 + pubkey.len() + message.len() + signature.len(),
+            // Both equivocation reports are large: the PQ one carries two
+            // signatures, the proposal one two full blocks. Count honestly.
+            OpCode::SysCallReportEquivocation { evidence } => 256 + evidence.wire_len(),
+            OpCode::SysCallReportPqEquivocation { evidence } => 256 + evidence.wire_len(),
+            OpCode::SysCallReportProposalEquivocation { evidence } => 256 + evidence.wire_len(),
+            OpCode::SysCallEvmCarrier(c) => {
+                128 + c.evm_tx.len() + c.pq_pubkey.len() + c.evm_signature.len()
+            }
+            OpCode::SysCallBindEvmAddress(c) => {
+                128 + c.pq_pubkey.len() + c.binding_signature.len() + c.evm_signature.len()
+            }
+            OpCode::SysCallGovPropose { title, action, .. } => {
+                256 + title.len() + bincode::serialized_size(action).unwrap_or(0) as usize
+            }
+            OpCode::SysCallBridge(intent) => {
+                256 + bincode::serialized_size(intent).unwrap_or(0) as usize
+            }
+            OpCode::SysCallTokenCreate { name, symbol, .. } => 128 + name.len() + symbol.len(),
+            // Fixed-size opcodes: the conservative envelope constant.
+            _ => 200,
+        }
     }
 
     /// Verified-proof units in a transaction for packing (audit: blocks
@@ -3165,7 +3332,7 @@ impl Mempool {
         // forever.
         for h in confirmed {
             if let Some(tx) = self.activation_buffer.remove_by_hash(h) {
-                self.release_reservation(&tx);
+                self.release_activation_reservation(&tx);
             }
         }
         // The SEALED envelopes of the included transactions leave the pool
@@ -4829,6 +4996,247 @@ mod tests {
         assert_eq!(evicted, 1);
         assert!(!mp.sender_nonces.contains_key(&me));
         assert!(!mp.contains(&h1));
+    }
+
+    /// FAIL-BEFORE (T7a): a garbage `is_pq_implicit` envelope must NOT be able
+    /// to reserve the victim's balance and lock their REAL, signed activation
+    /// out of the pool. Before the split, both claims lived in `reserved`, so
+    /// the owner's activation was refused with `InsufficientBalance`.
+    #[test]
+    fn unverified_activation_buffer_cannot_block_real_pq_activation() {
+        use crate::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+
+        let custom_registry = StatefulImplicitKeyRegistry::new();
+        let mut mp = Mempool::new(100, 50)
+            .with_base_fee(100)
+            .with_implicit_registry(custom_registry.clone());
+
+        let seed = 0x7b;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        assert!(custom_registry.lookup(&from).is_none());
+        const BAL: u64 = 1_000_000;
+
+        // Attacker: implicit envelope for the victim address with a correctly
+        // sized but bogus signature. It cannot be verified yet (the key is not
+        // registered), and its cost claims (almost) the whole balance.
+        let mut fake = Transaction {
+            from,
+            to: [9u8; 32],
+            amount: BAL - 100,
+            gas_limit: 100,
+            nonce: 1,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        fake.signature = PqSignatureEnvelope::new_implicit(
+            PqScheme::Falcon512,
+            vec![0xABu8; crate::post_quantum::FALCON512_SIG_LEN],
+        )
+        .encode();
+        let fake_hash = fake.compute_tx_hash();
+        mp.add_checked(fake, BAL)
+            .expect("the unverifiable envelope parks in the activation buffer");
+        assert!(mp.is_buffered(&fake_hash));
+        assert_eq!(
+            mp.reserved_for(&from),
+            BAL,
+            "the joint claim still reports the buffered slot"
+        );
+        assert_eq!(
+            mp.pool_reserved_for(&from),
+            0,
+            "an unverified claim must not live in the pooled leg"
+        );
+
+        // The real owner activates: the verified explicit envelope must not be
+        // priced out by the parked garbage.
+        let mut activation = Transaction {
+            from,
+            to: [3u8; 32],
+            amount: 10,
+            gas_limit: 100 + PQ_ACTIVATION_SURCHARGE_GAS,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = activation.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        activation.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig).encode();
+        let activation_hash = mp
+            .add_checked(activation, BAL)
+            .expect("a verified activation must not be blocked by unverified buffer claims");
+        assert!(mp.contains(&activation_hash));
+        assert_eq!(
+            mp.activation_buffer.count_for_account(&from),
+            0,
+            "activation drains the buffer"
+        );
+        assert!(
+            !mp.contains(&fake_hash) && !mp.is_buffered(&fake_hash),
+            "the garbage envelope is re-verified on drain and dropped"
+        );
+        assert_eq!(
+            mp.reserved_for(&from),
+            10 + (100 + PQ_ACTIVATION_SURCHARGE_GAS) + PQ_ACTIVATION_SURCHARGE_GAS,
+            "only the real activation keeps a claim after the drain"
+        );
+    }
+
+    /// FAIL-BEFORE (T7b): the flat `_ => 200` default priced a huge
+    /// `SysCallActorSend` (and its nested body) as if it were a bare transfer,
+    /// so it was admitted and could be packed past `MAX_BLOCK_WIRE_BYTES`.
+    #[test]
+    fn estimate_tx_wire_bytes_counts_nested_actor_send_and_large_ops() {
+        let sk = key();
+        let mut big = txa(&sk, [5u8; 32], 10, 1_000, 0);
+        big.payload = vec![crate::svm::OpCode::SysCallActorSend {
+            recipient: [6u8; 32],
+            value: 1,
+            body: vec![crate::svm::OpCode::SysCallDeployContract {
+                code: vec![0u8; 512_000],
+            }],
+            bounce: true,
+            gas_budget: 0,
+        }];
+        let estimate = Mempool::estimate_tx_wire_bytes(&big);
+        assert!(
+            estimate > 512_000,
+            "a 512 KiB nested deploy must not be estimated as a bare transfer (got {estimate})"
+        );
+        assert!(estimate > 200 + 128 + 512_000);
+
+        // A carrier above the 24 MiB block wire cap must be refused.
+        let mut oversize = txa(&sk, [5u8; 32], 10, 1_000, 1);
+        oversize.payload = vec![crate::svm::OpCode::SysCallActorSend {
+            recipient: [6u8; 32],
+            value: 1,
+            body: vec![crate::svm::OpCode::SysCallDeployContract {
+                code: vec![0u8; Mempool::MAX_BLOCK_WIRE_BYTES + 1],
+            }],
+            bounce: true,
+            gas_budget: 0,
+        }];
+        let mut mp = Mempool::new(100, 100);
+        match mp.add_checked(oversize, 10_000_000) {
+            Err(MempoolError::TxTooLarge { wire_bytes, cap }) => {
+                assert_eq!(cap, Mempool::MAX_BLOCK_WIRE_BYTES);
+                assert!(wire_bytes > cap);
+            }
+            other => panic!("oversize actor send must be refused with TxTooLarge, got {other:?}"),
+        }
+
+        // Nesting past the recursion cap fails closed (priced above the cap).
+        let mut deep = crate::svm::OpCode::Nop;
+        for _ in 0..=Mempool::MAX_ACTOR_DEPTH {
+            deep = crate::svm::OpCode::SysCallActorSend {
+                recipient: [6u8; 32],
+                value: 0,
+                body: vec![deep],
+                bounce: true,
+                gas_budget: 0,
+            };
+        }
+        assert!(
+            Mempool::estimate_op_wire_bytes(&deep, 0) > Mempool::MAX_BLOCK_WIRE_BYTES,
+            "excessively nested actor sends must fail closed"
+        );
+
+        // Large variable carriers are counted too, not defaulted to 200.
+        let mut carrier = txa(&sk, [5u8; 32], 10, 1_000, 0);
+        carrier.payload = vec![crate::svm::OpCode::SysCallCallContractArgs {
+            contract: [7u8; 32],
+            method: b"transfer".to_vec(),
+            args: vec![1, 2, 3],
+            calldata: vec![0u8; 100_000],
+        }];
+        assert!(Mempool::estimate_tx_wire_bytes(&carrier) > 100_000);
+    }
+
+    /// FAIL-BEFORE (T7c): eviction/sweep compared `amount + gas_limit` with
+    /// the balance, silently ignoring the activation/carrier surcharge, so a
+    /// transaction whose full cost exceeds the balance was never reclaimed.
+    #[test]
+    fn evict_unexecutable_and_sweep_include_activation_and_carrier_surcharges() {
+        use crate::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+
+        let custom_registry = StatefulImplicitKeyRegistry::new();
+        let mut mp = Mempool::new(100, 50)
+            .with_base_fee(100)
+            .with_implicit_registry(custom_registry);
+        let seed = 0x7c;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+
+        let make_activation = || {
+            let mut tx = Transaction {
+                from,
+                to: [4u8; 32],
+                amount: 10,
+                gas_limit: 100 + PQ_ACTIVATION_SURCHARGE_GAS,
+                nonce: 0,
+                source_shard: 1,
+                target_shard: 1,
+                signature: Vec::new(),
+                payload: Vec::new(),
+                priority_fee_per_gas: 0,
+            };
+            let msg = tx.signing_message();
+            let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+            tx.signature =
+                PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig).encode();
+            tx
+        };
+        let full_cost = 10 + (100 + PQ_ACTIVATION_SURCHARGE_GAS) + PQ_ACTIVATION_SURCHARGE_GAS;
+        // Enough for amount + gas_limit, NOT enough for the separate surcharge.
+        let short_balance = 10 + 100 + PQ_ACTIVATION_SURCHARGE_GAS;
+        assert!(short_balance < full_cost);
+
+        let tx1 = make_activation();
+        let h1 = tx1.compute_tx_hash();
+        mp.add_checked(tx1, full_cost + 1)
+            .expect("admitted while funded");
+        let now = 1_000_000u64;
+        assert_eq!(
+            mp.evict_unexecutable_at(now, |s| if *s == from {
+                Some((0, short_balance))
+            } else {
+                None
+            }),
+            1,
+            "the surcharge makes the tx unaffordable; eviction must count it"
+        );
+        assert!(!mp.contains(&h1));
+        assert_eq!(mp.reserved_for(&from), 0, "the claim must be released");
+
+        let tx2 = make_activation();
+        let h2 = tx2.compute_tx_hash();
+        mp.insert(tx2, full_cost + 1, true, AdmissionCtx::new(now))
+            .expect("re-admitted");
+        assert_eq!(
+            mp.sweep_expired(now + Mempool::STUCK_TX_TTL_SECS + 1, |s| {
+                if *s == from {
+                    Some((0, short_balance))
+                } else {
+                    None
+                }
+            }),
+            1,
+            "the sweep must use the same surcharge-aware cost"
+        );
+        assert!(!mp.contains(&h2));
+        assert_eq!(
+            mp.reserved_for(&from),
+            0,
+            "the sweep must release the claim"
+        );
     }
 }
 

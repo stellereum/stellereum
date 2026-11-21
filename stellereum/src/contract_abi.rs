@@ -231,10 +231,14 @@ impl Serialize for AbiType {
 
 impl<'de> Deserialize<'de> for AbiType {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = serde_json::Value::deserialize(d)?;
-        let name = match raw {
-            serde_json::Value::String(s) => s,
-            other => other.to_string(),
+        let name = if d.is_human_readable() {
+            let raw = serde_json::Value::deserialize(d)?;
+            match raw {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            }
+        } else {
+            String::deserialize(d)?
         };
         AbiType::parse(&name).ok_or_else(|| D::Error::custom(format!("unknown ABI type: {name}")))
     }

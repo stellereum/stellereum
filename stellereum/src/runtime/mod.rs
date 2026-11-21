@@ -654,6 +654,9 @@ pub struct ValidatorRuntime {
     /// Test/debug activation height override (keeps frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
     #[cfg(any(test, debug_assertions))]
     cnvrf_v3_activation_override: Option<u64>,
+    /// Single serialized safety authority owning lock, floors, cross-kind
+    /// prevote/precommit guard, and durable write-ahead persistence.
+    pub safety: crate::safety::SafetyAuthority,
 }
 
 /// Hard cap on queued outbound CN-VRF v3 commitments held in memory.

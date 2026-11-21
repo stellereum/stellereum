@@ -42,58 +42,6 @@ fn encode_full_proposal_loopback(
     Some(serde_json::json!({ "data": hex::encode(bytes), "src": src }).to_string())
 }
 
-/// Signed-preimage kind tag of a vote (0 = prevote, 1 = precommit).
-fn vote_watermark_kind(kind: VoteKind) -> u8 {
-    match kind {
-        VoteKind::Prevote => 0,
-        VoteKind::Precommit => 1,
-    }
-}
-
-/// WRITE-AHEAD the vote watermark BEFORE the vote can reach the wire.
-///
-/// The record carries the exact `(height, round, kind, target, shard)` the node
-/// signed and is fsynced, so a crash right after the broadcast can never lose
-/// it: on restart the node restores the watermark and refuses to vote again at
-/// or below that round (Finding C). Failing to persist is LOUD; consensus is
-/// not blocked, because a wedged disk must not stop the network — but an
-/// operator sees the exact loss window.
-fn persist_vote_watermark_before_broadcast(
-    persistence: Option<&Arc<stellereum::storage::AsyncPersistence>>,
-    vote: &stellereum::consensus::Vote,
-) {
-    let Some(ap) = persistence else {
-        return;
-    };
-    let storage = ap.storage();
-    let mut wm = match storage.vote_watermark() {
-        Ok(Some(wm)) => wm,
-        Ok(None) => stellereum::storage::VoteWatermark::default(),
-        Err(e) => {
-            tracing::error!(
-                "[consensus] could not read the vote watermark ({e}); writing a fresh one \
-                 (the new vote is still recorded)"
-            );
-            stellereum::storage::VoteWatermark::default()
-        }
-    };
-    wm.note(stellereum::storage::VoteWatermarkEntry {
-        height: vote.height,
-        round: vote.round,
-        kind: vote_watermark_kind(vote.kind),
-        target: vote.block_hash,
-        shard_id: vote.shard_id,
-    });
-    if let Err(e) = storage.persist_vote_watermark(&wm) {
-        tracing::error!(
-            "[consensus] FAILED to persist the write-ahead vote watermark for h={} r={} \
-             ({e}): a crash before the next checkpoint could lose this vote",
-            vote.height,
-            vote.round
-        );
-    }
-}
-
 /// True when `round` is at or below the highest round already signed at
 /// `height`. Such a vote is refused — the round was already used (possibly
 /// before a crash), so re-voting there is exactly the double-sign the
@@ -881,16 +829,20 @@ pub(crate) async fn run_consensus_node(
         // nothing to verify: FAIL CLOSED (arm `parent_evidence_missing`, which
         // makes `propose` skip the slot) instead of emitting an invalid block.
         // A later verified adopt/sync/finalize restores the evidence.
+        let mut restored_finalized_qc_verified = false;
         if let Some((fh, fhash)) = rt.finalized.last().copied() {
             if fh > 0 {
                 match ap.storage().get_block(&fhash) {
                     Ok(Some(block)) => {
                         match rt.restore_last_decision_from_finalized_block(&block) {
-                            Ok(()) => info!(
-                                "[storage] DOWNTIME-RESTORE: rebuilt the parent decision evidence \
-                                 for finalized height {fh} ({}) from the persisted block",
-                                hex::encode(fhash)
-                            ),
+                            Ok(()) => {
+                                restored_finalized_qc_verified = true;
+                                info!(
+                                    "[storage] DOWNTIME-RESTORE: rebuilt the parent decision evidence \
+                                     for finalized height {fh} ({}) from the persisted block",
+                                    hex::encode(fhash)
+                                );
+                            }
                             Err(e) => {
                                 eprintln!(
                                     "[storage] DOWNTIME-RESTORE: cannot rebuild the downtime \
@@ -990,10 +942,39 @@ pub(crate) async fn run_consensus_node(
                 }
                 if let Some(h) = cp.locked_hash {
                     rt.hc.locked = Some((h, cp.locked_round));
-                    if let std::collections::hash_map::Entry::Vacant(e) = rt.blocks.entry(h) {
-                        if let Ok(Some(blk)) = ap.storage().get_block(&h) {
-                            e.insert(blk);
+                    let mut restored_body = None;
+                    if !rt.blocks.contains_key(&h) {
+                        restored_body = ap.storage().get_block(&h).ok().flatten();
+                        if restored_body.is_none() {
+                            // The lock BODY is durable state too: without it
+                            // the restored lock can never be compared to a
+                            // re-stamp (`same_value` needs both value ids) and
+                            // the locked node nils every proposal for the rest
+                            // of the height. Old checkpoints may predate
+                            // lock-body persistence, so fetch it before
+                            // giving up.
+                            restored_body = adapter.fetch_block(&h).await;
                         }
+                    }
+                    if let Some(blk) = restored_body {
+                        rt.blocks.insert(h, blk);
+                    }
+                    // Rebuild the round-free value identity of the lock. It
+                    // is not part of the checkpoint, and a re-stamped rescue
+                    // body has a DIFFERENT signed hash for the SAME value, so
+                    // without this a restored node would nil its own lock's
+                    // re-proposal (RESTART-SPLIT).
+                    if let Some(blk) = rt.blocks.get(&h) {
+                        let vid = blk.value_id();
+                        rt.hc.note_value_id(h, vid);
+                    } else {
+                        tracing::warn!(
+                            "[consensus] restored lock for height {} round {} but its body {} is missing; \
+                             the lock cannot be re-proposed until the body is recovered",
+                            cp.height,
+                            cp.locked_round,
+                            hex::encode(&h[..6]),
+                        );
                     }
                     info!(
                         "[consensus] restored lock for height {} round {}",
@@ -1019,6 +1000,128 @@ pub(crate) async fn run_consensus_node(
                 );
                 rt.hc.round = floor;
             }
+        }
+
+        // Durable SafetyAuthority boot reconciliation (`05_LOCK_SAFETY_P0.md` §2.4):
+        // Production driver MUST use `SafetyBackend::Durable`. Clean-genesis
+        // auto-init happens ONLY with `STELL_NEW_CHAIN=1` on a pristine store;
+        // any legacy/absent/corrupt/mismatched store quarantines fail-closed
+        // to non-signing Observer until explicit `stellereum safety-init`.
+        let observer_env = stellereum::bootstrap::is_observer_env(
+            std::env::var("STELL_OBSERVER").ok().as_deref(),
+        );
+        match ap.storage().get_meta("genesis_state_root") {
+            Ok(Some(genesis_bytes)) if genesis_bytes.len() == 32 => {
+                let mut genesis_root = [0u8; 32];
+                genesis_root.copy_from_slice(&genesis_bytes);
+                let identity = stellereum::storage::SafetyRecordIdentity {
+                    validator: self_vote_id,
+                    chain: stellereum::safety::derive_safety_chain_id(
+                        stellereum::consensus::consensus_chain_id(),
+                        &genesis_root,
+                    ),
+                    shard: block_shard,
+                };
+                let boot_ctx = stellereum::safety::SafetyBootContext {
+                    is_validator,
+                    is_observer_env: observer_env,
+                    new_chain_explicit: stellereum::bootstrap::is_new_chain_explicit_env(),
+                    restored_finalized: rt.finalized.last().copied(),
+                    restored_state_height: Some(restored_state_height),
+                    restored_finalized_qc_verified,
+                    legacy_checkpoint: restored_checkpoint.clone(),
+                    legacy_watermark: restored_watermark.clone(),
+                };
+                rt.safety = stellereum::safety::SafetyAuthority::open_from_storage(
+                    ap.storage(),
+                    identity,
+                    boot_ctx,
+                );
+            }
+            Ok(Some(other)) => {
+                rt.safety = stellereum::safety::SafetyAuthority::new_quarantined(format!(
+                    "genesis_state_root has invalid length {} (expected 32)",
+                    other.len()
+                ));
+            }
+            Ok(None) => {
+                if !is_validator || observer_env {
+                    rt.safety = stellereum::safety::SafetyAuthority::new_observer();
+                } else {
+                    rt.safety = stellereum::safety::SafetyAuthority::new_quarantined(
+                        "missing genesis_state_root metadata; cannot derive safety record identity",
+                    );
+                }
+            }
+            Err(e) => {
+                rt.safety = stellereum::safety::SafetyAuthority::new_quarantined(format!(
+                    "failed to read genesis_state_root metadata: {e}"
+                ));
+            }
+        }
+
+        if let Some(srec) = rt.safety.current_state() {
+            if srec.height != rt.hc.height {
+                rt.safety.quarantine(format!(
+                    "safety_record_v1 height {} disagrees with runtime height {}",
+                    srec.height, rt.hc.height
+                ));
+            } else {
+                if let Some(floor) = [srec.highest_prevote_round, srec.highest_precommit_round]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                {
+                    if rt.hc.round < floor {
+                        rt.hc.round = floor;
+                    }
+                }
+                if let Some(lock) = srec.locked {
+                    rt.hc.locked = Some((lock.block_hash, lock.round));
+                    rt.hc.note_value_id(lock.block_hash, lock.value_id);
+                    match ap.storage().get_block(&lock.block_hash) {
+                        Ok(Some(blk))
+                            if blk.height == srec.height
+                                && blk.compute_hash() == lock.block_hash
+                                && blk.value_id() == lock.value_id =>
+                        {
+                            rt.blocks.insert(lock.block_hash, blk);
+                        }
+                        Ok(Some(_)) => {
+                            rt.safety.quarantine(format!(
+                                "corrupt/mismatched durable lock body {} at height {} (staying locked, signing disabled)",
+                                hex::encode(&lock.block_hash[..6]),
+                                srec.height
+                            ));
+                        }
+                        Ok(None) => {
+                            rt.safety.quarantine(format!(
+                                "missing durable lock body {} at height {} (staying locked, signing disabled)",
+                                hex::encode(&lock.block_hash[..6]),
+                                srec.height
+                            ));
+                        }
+                        Err(e) => {
+                            rt.safety.quarantine(format!(
+                                "failed reading durable lock body {} at height {}: {e}",
+                                hex::encode(&lock.block_hash[..6]),
+                                srec.height
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let observer_env = stellereum::bootstrap::is_observer_env(
+            std::env::var("STELL_OBSERVER").ok().as_deref(),
+        );
+        if !is_validator || observer_env {
+            rt.safety = stellereum::safety::SafetyAuthority::new_observer();
+        } else {
+            rt.safety = stellereum::safety::SafetyAuthority::new_quarantined(
+                "durable persistence unavailable for validator",
+            );
         }
     }
 
@@ -1199,6 +1302,18 @@ pub(crate) async fn run_consensus_node(
         .as_ref()
         .and_then(|wm| wm.precommit_at(rt.hc.height))
         .map(|e| (e.height, e.round));
+    // Seed liveness dedup hints from the authoritative SafetyAuthority state.
+    if let Some(srec) = rt.safety.current_state() {
+        if let Some(pr) = srec.highest_prevote_round {
+            advance_vote_floor(&mut vote_floor, srec.height, pr);
+            last_prevoted = Some((srec.height, pr));
+        }
+        if let Some(pcr) = srec.highest_precommit_round {
+            advance_vote_floor(&mut vote_floor, srec.height, pcr);
+            advance_vote_floor(&mut precommit_floor, srec.height, pcr);
+            last_precommitted = Some((srec.height, pcr));
+        }
+    }
     // Throttle for the finalize-blocker diagnostic below: one line per round.
     let mut last_blockers_log: Option<(u64, u32)> = None;
     // Throttle for the propose-gate diagnostic: one line per round.
@@ -1883,10 +1998,15 @@ pub(crate) async fn run_consensus_node(
                             v.block_hash.is_none(),
                             "fresh catchup height has no proposal yet"
                         );
-                        // WRITE-AHEAD before the vote can be enqueued.
-                        persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
                         advance_vote_floor(&mut vote_floor, v.height, v.round);
-                        let _ = rt.on_prevote(v.clone());
+                        if let Err(e) = rt.on_prevote(v.clone()) {
+                            tracing::warn!(
+                                height = v.height,
+                                round = v.round,
+                                error = %e,
+                                "[consensus] own catchup prevote admission failed"
+                            );
+                        }
                         enqueue_outbox(
                             &mut outbox,
                             ConsensusMsg::Vote {
@@ -2501,11 +2621,15 @@ pub(crate) async fn run_consensus_node(
             && !round_at_or_below_vote_floor(vote_floor, height, prevote_round)
         {
             if let Some(v) = rt.make_prevote() {
-                // WRITE-AHEAD: the watermark is durable before the outbox can
-                // flush this vote.
-                persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
                 advance_vote_floor(&mut vote_floor, v.height, v.round);
-                let _ = rt.on_prevote(v.clone());
+                if let Err(e) = rt.on_prevote(v.clone()) {
+                    tracing::warn!(
+                        height = v.height,
+                        round = v.round,
+                        error = %e,
+                        "[consensus] own value prevote admission failed"
+                    );
+                }
                 // P3-H4: guards are set at ENQUEUE time, so the vote is cast
                 // exactly once even though the wire flush happens later.
                 enqueue_outbox(
@@ -2599,9 +2723,15 @@ pub(crate) async fn run_consensus_node(
                     v.block_hash.is_none(),
                     "no live proposal must prevote nil, never a value"
                 );
-                persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
                 advance_vote_floor(&mut vote_floor, v.height, v.round);
-                let _ = rt.on_prevote(v.clone());
+                if let Err(e) = rt.on_prevote(v.clone()) {
+                    tracing::warn!(
+                        height = v.height,
+                        round = v.round,
+                        error = %e,
+                        "[consensus] own timeout nil prevote admission failed"
+                    );
+                }
                 enqueue_outbox(
                     &mut outbox,
                     ConsensusMsg::Vote {
@@ -3202,12 +3332,15 @@ pub(crate) async fn run_consensus_node(
                                         )
                                     {
                                         if let Some(v) = rt.make_prevote() {
-                                            persist_vote_watermark_before_broadcast(
-                                                persistence.as_ref(),
-                                                &v,
-                                            );
                                             advance_vote_floor(&mut vote_floor, v.height, v.round);
-                                            let _ = rt.on_prevote(v.clone());
+                                            if let Err(e) = rt.on_prevote(v.clone()) {
+                                                tracing::warn!(
+                                                    height = v.height,
+                                                    round = v.round,
+                                                    error = %e,
+                                                    "[consensus] own fast-path prevote admission failed"
+                                                );
+                                            }
                                             enqueue_outbox(
                                                 &mut outbox,
                                                 ConsensusMsg::Vote {
@@ -3693,10 +3826,16 @@ pub(crate) async fn run_consensus_node(
                 if last_precommitted != Some((height, v.round))
                     && !round_at_or_below_vote_floor(precommit_floor, height, v.round)
                 {
-                    persist_vote_watermark_before_broadcast(persistence.as_ref(), &v);
                     advance_vote_floor(&mut vote_floor, v.height, v.round);
                     advance_vote_floor(&mut precommit_floor, v.height, v.round);
-                    let _ = rt.on_precommit(v.clone());
+                    if let Err(e) = rt.on_precommit(v.clone()) {
+                        tracing::warn!(
+                            height = v.height,
+                            round = v.round,
+                            error = %e,
+                            "[consensus] own precommit admission failed"
+                        );
+                    }
                     // P3-H4: guards are set at ENQUEUE time (same reason as prevotes).
                     enqueue_outbox(
                         &mut outbox,
@@ -3712,6 +3851,16 @@ pub(crate) async fn run_consensus_node(
                     last_precommitted = Some((height, v.round));
                     // Persist the lock so a restart cannot double-vote this height.
                     if let (Some(ap), Some((lh, lr))) = (&persistence, rt.hc.locked) {
+                        // Persist the locked BODY as well. A lock without its
+                        // body is unusable after a restart: `same_value` needs
+                        // the body's round-free identity to recognise the
+                        // re-stamp, and `propose` needs the body to re-serve
+                        // it. The lock is set before the height is finalized,
+                        // so the normal finalized-block persistence has not
+                        // covered it yet (RESTART-SPLIT).
+                        if let Some(body) = rt.blocks.get(&lh).cloned() {
+                            ap.enqueue_block(body);
+                        }
                         let (fh, fhash) = rt.finalized.last().copied().unwrap_or((0, [0u8; 32]));
                         ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
                             height,
@@ -4780,10 +4929,14 @@ pub(crate) async fn run_consensus_node(
             if rt.hc.has_live_proposal() {
                 if let Some((_, ph)) = rt.hc.proposal {
                     if let Some(b) = rt.blocks.get(&ph).cloned() {
-                        compact_server.remember(&b, rt.hc.round);
+                        // The envelope is a freshness hint for the BODY, so it
+                        // must name the body's OWN signed round. Using the
+                        // current local round re-advertised a stale body as
+                        // "the proposal for r" (RESTART-SPLIT).
+                        compact_server.remember(&b, b.round);
                         requeued |= enqueue_outbox(
                             &mut outbox,
-                            stellereum::consensus_net::proposal_gossip_msg(&b, rt.hc.round),
+                            stellereum::consensus_net::proposal_gossip_msg(&b, b.round),
                         );
                     }
                 }
@@ -4822,10 +4975,13 @@ pub(crate) async fn run_consensus_node(
                 let have_body = target.and_then(|h| rt.blocks.get(&h).cloned());
                 if let Some(body) = have_body {
                     let h = body.compute_hash();
-                    compact_server.remember(&body, rt.hc.round);
+                    // Envelope = the body's signed round, never the local
+                    // round: the other nodes must not adopt a stale body as
+                    // the current round's proposal (RESTART-SPLIT).
+                    compact_server.remember(&body, body.round);
                     enqueue_outbox(
                         &mut outbox,
-                        stellereum::consensus_net::proposal_gossip_msg(&body, rt.hc.round),
+                        stellereum::consensus_net::proposal_gossip_msg(&body, body.round),
                     );
                     flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
                     outbox_flushes += 1;
@@ -4995,14 +5151,15 @@ pub(crate) async fn run_consensus_node(
                 if let Some((_, ph)) = rt.hc.proposal {
                     if let Some(b) = rt.blocks.get(&ph).cloned() {
                         if b.transactions.len() <= 32
-                            && !outbox_has_proposal(&outbox, rt.hc.height, rt.hc.round)
+                            && !outbox_has_proposal(&outbox, b.height, b.round)
                         {
-                            compact_server.remember(&b, rt.hc.round);
-                            outbox.push_back(stellereum::consensus_net::proposal_gossip_msg(
-                                &b,
-                                rt.hc.round,
-                            ));
-                            resent = true;
+                            // Same rule everywhere: re-share under the body's
+                            // signed round, not the local one (RESTART-SPLIT).
+                            compact_server.remember(&b, b.round);
+                            resent |= enqueue_outbox(
+                                &mut outbox,
+                                stellereum::consensus_net::proposal_gossip_msg(&b, b.round),
+                            );
                         }
                     }
                 }
@@ -5319,5 +5476,24 @@ mod restart_height_tests {
         assert!(!proposal_parent_is_finalized(5, 7), "skips a height");
         assert!(!proposal_parent_is_finalized(5, 4));
         assert!(!proposal_parent_is_finalized(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn periodic_retransmit_dedups_against_signed_round_not_local_round() {
+        let b = stellereum::sharding::Block {
+            height: 9,
+            round: 2,
+            ..Default::default()
+        };
+        let mut outbox = std::collections::VecDeque::new();
+        assert!(!outbox_has_proposal(&outbox, b.height, b.round));
+        assert!(enqueue_outbox(
+            &mut outbox,
+            stellereum::consensus_net::proposal_gossip_msg(&b, b.round),
+        ));
+        // Even when local hc.round is 5 > b.round (2), checking (b.height, b.round)
+        // recognizes the already-queued signed-round proposal and avoids duplicate enqueue.
+        assert!(!outbox_has_proposal(&outbox, 9, 5));
+        assert!(outbox_has_proposal(&outbox, b.height, b.round));
     }
 }

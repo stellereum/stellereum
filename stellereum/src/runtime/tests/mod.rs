@@ -580,7 +580,9 @@ async fn r0_proposal_packs_the_full_available_mempool_deterministically() {
         50,
         "r0 must carry the full available mempool, not a partial prefix"
     );
-    // Deterministic rebuild: the same pool yields the same ordered set.
+    // Deterministic rebuild at the next round: the same pool & packing
+    // snapshot yield the exact same ordered transaction set.
+    rt.hc.next_round();
     let second = rt.propose(1_000).await.expect("rebuild must also propose");
     let h1: Vec<[u8; 32]> = first
         .transactions
@@ -1797,7 +1799,27 @@ async fn make_precommit_stamps_the_polka_round_not_the_local_round() {
     let state = funded_state(me).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1);
     let h = rt.hc.height;
-    let target = [0x42u8; 32];
+    let blk = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: h,
+        prev_hash: [0u8; 32],
+        state_root: [0x11u8; 32],
+        transactions: Vec::new(),
+        cross_shard_out: Vec::new(),
+        timestamp: 1_000,
+        proposer: me,
+        validator_signatures: Vec::new(),
+        shard_headers: Vec::new(),
+        precommit_qc: None,
+        last_qc: None,
+        order_merkle_root: crate::mev::compute_order_merkle_root(&[]),
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
+        round: 0,
+    };
+    let target = blk.compute_hash();
+    rt.blocks.insert(target, blk);
 
     // A full prevote quorum for `target` at round 0.
     // FULL-PQ: Falcon votes (classical `Vote::sign` is rejected).
@@ -1828,12 +1850,12 @@ async fn make_precommit_stamps_the_polka_round_not_the_local_round() {
         Some((target, 0)),
         "the lock records the polka round, not the local round"
     );
-    // Recasting for the same polka round is a duplicate, not a new vote:
-    // main.rs dedups on (height, vote.round), and here we simply observe
-    // that the same bytes come back (idempotent for the receiver).
-    let again = rt.make_precommit().expect("idempotent re-cast");
-    assert_eq!(again.round, 0);
-    assert_eq!(again.block_hash, Some(target));
+    // SafetyAuthority enforces highest_precommit_round: a second make_precommit
+    // for the same polka round must never re-sign.
+    assert!(
+        rt.make_precommit().is_none(),
+        "SafetyAuthority refuses re-signing the same precommit round"
+    );
 
     // A polka in a NEWER round supersedes: we now precommit at round 1.
     for (k, fk) in ks.iter().zip(fks.iter()) {

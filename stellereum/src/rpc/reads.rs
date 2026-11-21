@@ -511,50 +511,67 @@ pub(super) async fn simulate_and_estimate_fee(
     gas_budget: u64,
 ) -> Json<RpcResponse> {
     let is_cross_shard = sim_tx.source_shard != sim_tx.target_shard;
-    let sim_engine = st.engine.clone_for_simulation().await;
+    let is_plain_fast_path = sim_tx.payload.is_empty()
+        && !crate::evm_adapter::is_evm_carrier_tx(&sim_tx)
+        && !crate::evm_adapter::is_evm_binding_tx(&sim_tx);
 
-    // Consensus floor and surcharge (e.g. PQ activation or penalties)
-    let (floor_base, surcharge) = sim_engine.consensus_floor_parts(&sim_tx).await;
-    let pool_floor = st.mempool.read().await.base_fee;
-    let base_fee = pool_floor
-        .max(floor_base)
-        .max(crate::svm::GAS_BASIC_TRANSFER);
+    let (surcharge, base_fee, gas_consumed) = if is_plain_fast_path {
+        // Fast path for plain transfers (`payload.is_empty()`, neither EVM
+        // carrier nor binding): `consensus_floor_parts` reads only
+        // `governance.applied.min_gas_limit`, `consensus_penalty[from]` (D2),
+        // and `Mempool::surcharges_for_tx(tx)` (PQ activation / EVM carrier);
+        // `execute_payload` is never called and `gas_consumed` is always
+        // `GAS_BASIC_TRANSFER`. Reading directly from `st.engine` avoids
+        // deep-cloning 20+ subsystems via `clone_for_simulation()` and is
+        // byte-identical to the full simulation path.
+        let (floor_base, surcharge) = st.engine.consensus_floor_parts(&sim_tx).await;
+        let pool_floor = st.mempool.read().await.base_fee;
+        let base_fee = pool_floor
+            .max(floor_base)
+            .max(crate::svm::GAS_BASIC_TRANSFER);
+        (surcharge, base_fee, crate::svm::GAS_BASIC_TRANSFER)
+    } else {
+        let sim_engine = st.engine.clone_for_simulation().await;
 
-    // Provide test/simulation funds for sender in case account is unfunded in simulation
-    {
-        let mut map = sim_engine.accounts.write().await;
-        let entry = map
-            .entry(sim_tx.from)
-            .or_insert_with(|| AccountState::new(sim_tx.from, 0));
-        if entry.balance < 100_000_000_000 {
-            entry.balance = 100_000_000_000;
-        }
-    }
-    // Also if token transfer, ensure sender has tokens in cloned engine
-    for op in &sim_tx.payload {
-        if let crate::svm::OpCode::SysCallTokenTransfer {
-            token_id, amount, ..
-        } = op
+        // Consensus floor and surcharge (e.g. PQ activation or penalties)
+        let (floor_base, surcharge) = sim_engine.consensus_floor_parts(&sim_tx).await;
+        let pool_floor = st.mempool.read().await.base_fee;
+        let base_fee = pool_floor
+            .max(floor_base)
+            .max(crate::svm::GAS_BASIC_TRANSFER);
+
+        // Provide test/simulation funds for sender in case account is unfunded in simulation
         {
-            let mut tokens = sim_engine.tokens_write().await;
-            if let Some(tok) = tokens.tokens.get_mut(token_id) {
-                let cur = tok.balance_of(&sim_tx.from);
-                if cur < *amount {
-                    tok.balances
-                        .insert(sim_tx.from, cur.saturating_add(*amount));
+            let mut map = sim_engine.accounts.write().await;
+            let entry = map
+                .entry(sim_tx.from)
+                .or_insert_with(|| AccountState::new(sim_tx.from, 0));
+            if entry.balance < 100_000_000_000 {
+                entry.balance = 100_000_000_000;
+            }
+        }
+        // Also if token transfer, ensure sender has tokens in cloned engine
+        for op in &sim_tx.payload {
+            if let crate::svm::OpCode::SysCallTokenTransfer {
+                token_id, amount, ..
+            } = op
+            {
+                let mut tokens = sim_engine.tokens_write().await;
+                if let Some(tok) = tokens.tokens.get_mut(token_id) {
+                    let cur = tok.balance_of(&sim_tx.from);
+                    if cur < *amount {
+                        tok.balances
+                            .insert(sim_tx.from, cur.saturating_add(*amount));
+                    }
                 }
             }
         }
-    }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-    let gas_consumed = if sim_tx.payload.is_empty() {
-        crate::svm::GAS_BASIC_TRANSFER
-    } else {
         // BOUNDED FUEL (audit W6.7): the estimate used to raise the
         // simulation's gas limit to `MAX_CONTRACT_FUEL` (50 000 000) — the
         // contract-execution ceiling — so an UNAUTHENTICATED read could burn
@@ -572,7 +589,7 @@ pub(super) async fn simulate_and_estimate_fee(
         // gone: it could only ever evaluate to 5 000 000, so the `.max()` was
         // dead code pretending to be a caller-controllable floor.
         sim_tx.gas_limit = gas_budget;
-        match sim_engine.execute_payload(&sim_tx, now).await {
+        let gas_consumed = match sim_engine.execute_payload(&sim_tx, now).await {
             Ok((crate::svm::VmExecutionResult::Success { gas_used, .. }, _)) => gas_used,
             Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
                 return err(id, -32000, "simulation out of gas");
@@ -583,7 +600,8 @@ pub(super) async fn simulate_and_estimate_fee(
             Err(e) => {
                 return err(id, -32000, format!("simulation failed: {e}"));
             }
-        }
+        };
+        (surcharge, base_fee, gas_consumed)
     };
 
     let effective_gas = gas_consumed.max(base_fee);
@@ -1939,25 +1957,82 @@ pub(super) async fn dispatch_reads(
             // Paginated (audit 2026-10-06): creation is permissionless so the
             // registry is attacker-growable; an unbounded dump is a DoS
             // amplifier. `limit` default 100, hard max 1000.
-            let limit = params["limit"].as_u64().unwrap_or(100).min(1000) as usize;
-            let offset = params["offset"].as_u64().unwrap_or(0) as usize;
-            // Bounded iteration (audit 2026-10-06): creation is permissionless
-            // so the registry is attacker-growable. Walk the registry directly
-            // and stop after offset+limit instead of materializing every id;
-            // skip/take semantics (and `total`) are unchanged.
+            let p = if params.is_array() {
+                params.get(0).unwrap_or(params)
+            } else {
+                params
+            };
+            let limit = p
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100)
+                .min(1000) as usize;
+            let cursor: Option<[u8; 32]> = match p.get("cursor").or_else(|| p.get("last_token_id"))
+            {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_str() {
+                    Some(s) => match parse_hash(s) {
+                        Ok(c) => Some(c),
+                        Err(e) => return err(id, -32602, format!("invalid cursor: {e}")),
+                    },
+                    None => return err(id, -32602, "invalid cursor: expected hex string"),
+                },
+            };
+            let offset = p.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
             let tokens = st.engine.tokens_read().await;
             let total = tokens.token_count();
-            let ids: Vec<String> = tokens
-                .tokens
-                .keys()
-                .skip(offset)
-                .take(limit)
-                .map(hex::encode)
-                .collect();
-            ok(
-                id,
-                json!({ "tokens": ids, "total": total, "offset": offset }),
-            )
+            let mut ids: Vec<String> = Vec::with_capacity(limit);
+            let mut has_more = false;
+
+            if let Some(last_id) = cursor {
+                use std::ops::Bound;
+                for k in tokens
+                    .tokens
+                    .range((Bound::Excluded(last_id), Bound::Unbounded))
+                    .map(|(k, _)| k)
+                {
+                    if ids.len() < limit {
+                        ids.push(hex::encode(k));
+                    } else {
+                        has_more = true;
+                        break;
+                    }
+                }
+                let next_cursor = if has_more { ids.last().cloned() } else { None };
+                ok(
+                    id,
+                    json!({
+                        "tokens": ids,
+                        "total": total,
+                        "next_cursor": next_cursor,
+                        "has_more": has_more,
+                    }),
+                )
+            } else {
+                // Bounded iteration (audit 2026-10-06) over deterministic
+                // BTreeMap order: walk the registry directly and stop after
+                // offset+limit+1 instead of materializing every id.
+                for k in tokens.tokens.keys().skip(offset) {
+                    if ids.len() < limit {
+                        ids.push(hex::encode(k));
+                    } else {
+                        has_more = true;
+                        break;
+                    }
+                }
+                let next_cursor = if has_more { ids.last().cloned() } else { None };
+                ok(
+                    id,
+                    json!({
+                        "tokens": ids,
+                        "total": total,
+                        "offset": offset,
+                        "next_cursor": next_cursor,
+                        "has_more": has_more,
+                    }),
+                )
+            }
         }
 
         // ---- receipts (P0-3) ----

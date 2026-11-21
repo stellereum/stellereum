@@ -64,6 +64,11 @@ pub struct LightClientOptions {
     pub validators: std::path::PathBuf,
     /// How long to wait for the node to finalize the anchoring header.
     pub wait_seconds: u64,
+    /// Reject proofs and headers below this height (`--min-height`).
+    ///
+    /// A node can replay an older, genuinely quorum-certified header; a floor
+    /// keeps the verifier from accepting a rollback to a past height.
+    pub min_height: Option<u64>,
     /// Print the RPC traffic.
     pub verbose: bool,
 }
@@ -302,6 +307,81 @@ pub fn parse_served_header(v: &Value) -> anyhow::Result<ServedHeader> {
     })
 }
 
+/// Bind a served `stell_getProof` answer to the request the caller made.
+///
+/// The server picks which account and which height to answer about; without
+/// this gate it can answer a *different* question with a perfectly valid proof
+/// (a rich account, or a legitimately signed header from an old height) and the
+/// CLI would still print `VERIFIED`. Fail-closed: an answer that names another
+/// account, reports a height below `min_height`, or omits its height while a
+/// floor is pinned is refused before any proof work happens.
+pub fn check_answer_matches_request(
+    answer: &ProofAnswer,
+    expected_address: &[u8; 32],
+    min_height: Option<u64>,
+) -> anyhow::Result<()> {
+    if answer.address != *expected_address {
+        anyhow::bail!(
+            "proof address {} does not match requested --verify {}",
+            hex::encode(answer.address),
+            hex::encode(expected_address)
+        );
+    }
+    // The address in the answer is only a label; the key inside the proof is
+    // what actually gets verified against the trie. Require both to be the
+    // account the caller asked about.
+    let account_proof = crate::cpat2::MerkleProof::from_nodes(&answer.account_proof)
+        .map_err(|e| anyhow::anyhow!("the node's account proof is malformed: {e}"))?;
+    if account_proof.key != *expected_address {
+        anyhow::bail!(
+            "proof key {} does not match requested --verify {}",
+            hex::encode(account_proof.key),
+            hex::encode(expected_address)
+        );
+    }
+    if let Some(min_h) = min_height {
+        let height = answer.height.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the node's proof answer does not report a height; --min-height {min_h} cannot \
+                 be enforced"
+            )
+        })?;
+        if height < min_h {
+            anyhow::bail!("proof height {height} is below --min-height {min_h}");
+        }
+    }
+    Ok(())
+}
+
+/// The anchoring header must be the header at exactly `expected_height`.
+///
+/// A header from another height — even a genuinely certified one with the same
+/// `state_root` — does not anchor this proof, and accepting it would let the
+/// server pair a fresh root with a stale height (or vice versa).
+pub fn check_anchoring_header(
+    header: &ServedHeader,
+    expected_height: u64,
+    min_height: Option<u64>,
+) -> anyhow::Result<()> {
+    if header.height != expected_height {
+        anyhow::bail!(
+            "header height {} != expected anchoring height {expected_height}",
+            header.height
+        );
+    }
+    if let Some(min_h) = min_height {
+        let floor = min_h.saturating_add(1);
+        if header.height < floor {
+            anyhow::bail!(
+                "header height {} is below --min-height {min_h} (anchoring header must be at \
+                 least {floor})",
+                header.height
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Fetch the header at `height`, waiting for the node to produce it.
 ///
 /// The anchoring header is the FIRST header a quorum certified for the root
@@ -323,7 +403,12 @@ fn fetch_anchoring_header(
             verbose,
         ) {
             Ok(v) => match parse_served_header(&v) {
-                Ok(h) => return Ok(h),
+                // The answer must be the header we asked for: a server that
+                // serves some other height is not answering this question.
+                Ok(h) if h.height == height => return Ok(h),
+                Ok(h) => {
+                    last_err = format!("header height {} != expected {height}", h.height);
+                }
                 Err(e) => {
                     last_err = e.to_string();
                 }
@@ -355,6 +440,11 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
         validators.total_power(),
         validators.quorum_power()
     );
+    // The account the caller asked about, decoded BEFORE we talk to the node:
+    // a malformed `--verify` is a usage error, not something to discover after
+    // trusting an answer.
+    let expected_address = crate::address::parse_address(&opts.verify)
+        .map_err(|e| anyhow::anyhow!("--verify {:?} is not a valid address: {e}", opts.verify))?;
 
     // 2. The proof the server is offering.
     let raw = rpc_call(
@@ -365,6 +455,10 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
     )?;
     let answer = ProofAnswer::from_json(&raw)
         .map_err(|e| anyhow::anyhow!("the node's proof answer is unusable: {e}"))?;
+    // The answer must be about the account we asked for, and fresh enough for
+    // the caller's floor. Without this an attacker can clear this check with a
+    // valid proof for some OTHER, richer account.
+    check_answer_matches_request(&answer, &expected_address, opts.min_height)?;
     let height = answer
         .height
         .ok_or_else(|| anyhow::anyhow!("the node did not report a height for the proof"))?;
@@ -376,8 +470,14 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
     );
 
     // 3. The header that COMMITS to that root: the header at height+1 (the
-    //    chain commits to the state BEFORE its own block).
-    let header = fetch_anchoring_header(&opts.from, height + 1, opts.wait_seconds, opts.verbose)?;
+    //    chain commits to the state BEFORE its own block). `checked_add` keeps
+    //    a corrupt height from wrapping to 0 and anchoring on the genesis end.
+    let anchor_height = height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("proof height {height} overflows"))?;
+    let header =
+        fetch_anchoring_header(&opts.from, anchor_height, opts.wait_seconds, opts.verbose)?;
+    check_anchoring_header(&header, anchor_height, opts.min_height)?;
     if header.state_root != answer.state_root {
         anyhow::bail!(
             "the node's header at height {} commits to root {}, but the proof it served is \
@@ -423,6 +523,17 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
     // 5. The proof itself.
     match client.verify_proof_answer(&answer) {
         Ok(proven) => {
+            // Belt and braces: the leaf the proof commits to must be the
+            // account the caller asked about, not merely the one the answer
+            // named. `verify_proof_answer` already binds `proof.key` to
+            // `answer.address`; this closes the chain to `--verify`.
+            if proven.address != expected_address {
+                anyhow::bail!(
+                    "the verified proof is for {}, not the requested --verify {}",
+                    hex::encode(proven.address),
+                    hex::encode(expected_address)
+                );
+            }
             println!("light client: VERIFIED");
             println!("  address:  {}", hex::encode(proven.address));
             println!("  balance:  {} nano-STELL", proven.balance);

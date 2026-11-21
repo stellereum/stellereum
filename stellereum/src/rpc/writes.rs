@@ -172,11 +172,12 @@ pub(super) async fn dispatch_writes(
     method: &str,
     params: &Value,
     header_token: Option<&str>,
-    peer_ip: Option<std::net::IpAddr>,
+    peer_ip: Option<crate::client_ip::ClientIp>,
 ) -> Option<Json<RpcResponse>> {
     if !matches!(
         method,
         "stell_sendSealedTransaction"
+            | "stell_mevStats"
             | "stell_faucet"
             | "stell_submitProposal"
             | "stell_vote"
@@ -202,7 +203,7 @@ async fn dispatch_writes_inner(
     method: &str,
     params: &Value,
     header_token: Option<&str>,
-    peer_ip: Option<std::net::IpAddr>,
+    peer_ip: Option<crate::client_ip::ClientIp>,
 ) -> Json<RpcResponse> {
     match method {
         // Submit a SEALED transaction. The parameter is the hex-encoded
@@ -314,20 +315,11 @@ async fn dispatch_writes_inner(
                     return err(id, -32000, e);
                 }
             };
-            // Per-source throttle, same budget as the explorer path (audit
-            // follow-up: this path skipped it entirely, so the token holder
-            // could rotate addresses without limit here). Unattributed callers
-            // share the fallback bucket — they are throttled, not exempt.
-            {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if !faucet.check_ip_throttle(peer_ip, now_secs).await {
-                    return err(id, -32000, "per-IP faucet budget exhausted for this hour");
-                }
-            }
-            // Reconcile inputs for the atomic mex inside build_transfer: the
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Reconcile inputs for the atomic mex inside request_drip: the
             // on-chain nonce plus our own pending nonces from the shared
             // mempool. Without this, reserved-but-never-executed drips (wiped
             // mempool across a restart) leave a permanent gap that new drips
@@ -348,11 +340,24 @@ async fn dispatch_writes_inner(
                 .filter(|t| t.from == faucet_addr)
                 .map(|t| t.nonce)
                 .collect();
-            let Some((tx, amount)) = faucet
-                .build_transfer(a, params["amount"].as_u64(), Some((onchain, pending)))
+            let chain_id = faucet
+                .chain_id()
+                .unwrap_or_else(crate::consensus::consensus_chain_id);
+            let grant = match faucet
+                .request_drip_for_chain(
+                    FaucetDripRequest::token(
+                        a,
+                        params["amount"].as_u64(),
+                        Some((onchain, pending)),
+                        now_secs,
+                        peer_ip.map(|c| c.addr),
+                    ),
+                    Some(chain_id),
+                )
                 .await
-            else {
-                return err(id, -32000, "faucet limit reached for this address");
+            {
+                Ok(g) => g,
+                Err(e) => return err(id, -32000, e.to_string()),
             };
             let balance = st
                 .engine
@@ -360,25 +365,29 @@ async fn dispatch_writes_inner(
                 .await
                 .map(|acc| acc.balance)
                 .unwrap_or(0);
+            let next_height = st
+                .height
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
             let tx_hash = match st.mempool.write().await.add_checked_ctx(
-                tx.clone(),
+                grant.tx.clone(),
                 balance,
-                AdmissionCtx::wall_now(),
+                AdmissionCtx::wall_now().with_chain_height(next_height),
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    faucet.rollback(&tx, a, amount).await;
+                    let _ = faucet.rollback_grant(&grant).await;
                     return err(id, -32000, format!("faucet transfer rejected: {e}"));
                 }
             };
             st.save_mempool_throttled().await;
             if let Some(bcast) = &st.tx_broadcast {
-                let _ = bcast.send(tx);
+                let _ = bcast.send(grant.tx);
             }
             ok(
                 id,
                 json!({
-                    "credited_nano": amount.to_string(),
+                    "credited_nano": grant.amount.to_string(),
                     "recipient": hex::encode(a),
                     "tx_hash": hex::encode(tx_hash),
                     "shard": drip_shard,

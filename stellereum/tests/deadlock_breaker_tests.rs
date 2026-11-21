@@ -234,8 +234,8 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
 // so with no processed votes both nodes sit deaf forever and the jump breaker
 // (`deadlock_breaker_target` -> max(peer rounds)) never fires. The local
 // reset below fires on the same no-finality timer with zero/default peer
-// rounds: bounded re-entry to round 0 of the SAME height, dropping only a
-// bodyless lock. Local policy only, no wire change.
+// rounds: forward re-phase at the SAME height, retaining even a bodyless lock.
+// Local policy only, no wire change.
 
 #[test]
 fn breaker_fires_with_empty_peer_set() {
@@ -254,15 +254,14 @@ fn breaker_fires_with_empty_peer_set() {
         !hc.deadlock_local_reset_due(299, 300),
         "no fire before timeout"
     );
-    // Gate precondition for the drop below: bodyless AND no precommit QC
-    // observed anywhere (no votes at all here). Had a QC been observed, the
-    // lock would survive (see breaker_local_reset_keeps_bodyless_lock_when_...).
+    // There are no locally observed votes; this says nothing about a QC that
+    // may have formed elsewhere, so it cannot justify dropping the lock.
     assert!(
         !hc.precommit_qc_observed(),
-        "empty vote sets => gate passes"
+        "empty vote sets have no locally observed QC"
     );
-    // Bodyless lock with no QC behind it is dropped, the round ADVANCES (it is
-    // never rewound: re-voting an already-used round is a self-equivocation),
+    // The lock survives, the round ADVANCES (it is never rewound:
+    // re-voting an already-used round is a self-equivocation),
     // and the quorum-scan window is widened so the round the network is
     // actually in becomes committable. Height untouched.
     assert!(hc.apply_deadlock_local_reset(false));
@@ -270,7 +269,7 @@ fn breaker_fires_with_empty_peer_set() {
         hc.round, 413,
         "the re-phase must move FORWARD, never rewind"
     );
-    assert_eq!(hc.locked, None);
+    assert_eq!(hc.locked, Some(([42u8; 32], 400)));
     assert_eq!(hc.height, 92079);
     assert_eq!(hc.decided, None);
     assert_eq!(
@@ -282,6 +281,14 @@ fn breaker_fires_with_empty_peer_set() {
     assert!(!hc.apply_deadlock_local_reset(false));
     assert_eq!(hc.round, 413);
     assert_eq!(hc.height, 92079);
+    let proposer = ks[0].verifying_key().to_bytes();
+    hc.receive_proposal_for_at(proposer, [43u8; 32], Some(proposer), 413)
+        .unwrap();
+    assert_eq!(
+        hc.decide_prevote(),
+        None,
+        "a conflicting proposal after re-phase must still receive nil"
+    );
 }
 
 #[test]

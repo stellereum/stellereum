@@ -403,14 +403,24 @@ async fn runtime4() -> (
 async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
     let (ks, fks, mut rt) = runtime4().await;
     let h = rt.hc.height;
+    let y_blk = stellereum::sharding::Block {
+        height: h,
+        state_root: [0xBBu8; 32],
+        timestamp: 2,
+        proposer: id(&ks[0]),
+        round: 2,
+        ..Default::default()
+    };
+    let y_hash = y_blk.compute_hash();
+    rt.blocks.insert(y_hash, y_blk);
     rt.hc.locked = Some((X, 1));
     rt.hc.round = 1;
 
     // Equal-round Y polka: the network speaks, but not above our lock.
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        rt.on_prevote(prevote(k, fk, h, 1, Some(Y))).unwrap();
+        rt.on_prevote(prevote(k, fk, h, 1, Some(y_hash))).unwrap();
     }
-    assert_eq!(rt.hc.observed_polka(), Some((1, Y)));
+    assert_eq!(rt.hc.observed_polka(), Some((1, y_hash)));
     assert_eq!(
         rt.make_precommit(),
         None,
@@ -422,12 +432,12 @@ async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
     rt.next_round();
     assert_eq!(rt.hc.round, 2);
     for (k, fk) in ks.iter().zip(fks.iter()) {
-        rt.on_prevote(prevote(k, fk, h, 2, Some(Y))).unwrap();
+        rt.on_prevote(prevote(k, fk, h, 2, Some(y_hash))).unwrap();
     }
     let pc = rt.make_precommit().expect("higher polka must be followed");
-    assert_eq!(pc.block_hash, Some(Y));
+    assert_eq!(pc.block_hash, Some(y_hash));
     assert_eq!(pc.round, 2, "stamped with the polka's round");
-    assert_eq!(rt.hc.locked, Some((Y, 2)));
+    assert_eq!(rt.hc.locked, Some((y_hash, 2)));
 }
 
 /// A nil quorum never becomes a precommit while a value lock is held.

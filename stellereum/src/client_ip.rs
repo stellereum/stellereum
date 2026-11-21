@@ -113,6 +113,21 @@ impl XffMode {
     }
 }
 
+/// Canonicalize an address for identity decisions.
+///
+/// A dual-stack listener reports an IPv4 peer as an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`). Left as-is, `Ipv6Addr::is_loopback` is false for
+/// `::ffff:127.0.0.1` (only `::1` matches), and the same client gets two
+/// rate-limit buckets / faucet budgets for `a.b.c.d` and `::ffff:a.b.c.d`.
+/// Every trust, locality and bucket key therefore runs on the canonical form:
+/// `::ffff:a.b.c.d` becomes `a.b.c.d`.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 /// One trusted network: an address family plus a masked network + prefix len.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustedNet {
@@ -122,7 +137,9 @@ pub enum TrustedNet {
 
 impl TrustedNet {
     fn contains(&self, ip: &IpAddr) -> bool {
-        match (*self, *ip) {
+        // Canonicalize first: a mapped v6 peer is matched as the v4 it is, so
+        // `::ffff:127.0.0.1` cannot dodge a `127.0.0.0/8` trust rule.
+        match (*self, canonical_ip(*ip)) {
             (TrustedNet::V4 { net, prefix }, IpAddr::V4(v4)) => {
                 let mask = v4_mask(prefix);
                 (u32::from(v4) & mask) == net
@@ -188,6 +205,20 @@ pub fn parse_trusted_token(tok: &str) -> Option<TrustedNet> {
                 })
             }
             IpAddr::V6(v6) => {
+                // A CIDR in mapped-v6 space (`::ffff:127.0.0.0/104`) is the
+                // v4 network it maps to; incoming peers are canonicalized to
+                // v4, so a v6-form rule would otherwise never match.
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    if prefix < 96 {
+                        return None;
+                    }
+                    let p = prefix - 96;
+                    let mask = v4_mask(p);
+                    return Some(TrustedNet::V4 {
+                        net: u32::from(v4) & mask,
+                        prefix: p,
+                    });
+                }
                 if prefix > 128 {
                     return None;
                 }
@@ -200,14 +231,16 @@ pub fn parse_trusted_token(tok: &str) -> Option<TrustedNet> {
         }
     } else {
         match tok.parse::<IpAddr>() {
-            Ok(IpAddr::V4(v4)) => Some(TrustedNet::V4 {
-                net: u32::from(v4),
-                prefix: 32,
-            }),
-            Ok(IpAddr::V6(v6)) => Some(TrustedNet::V6 {
-                net: u128::from(v6),
-                prefix: 128,
-            }),
+            Ok(ip) => match canonical_ip(ip) {
+                IpAddr::V4(v4) => Some(TrustedNet::V4 {
+                    net: u32::from(v4),
+                    prefix: 32,
+                }),
+                IpAddr::V6(v6) => Some(TrustedNet::V6 {
+                    net: u128::from(v6),
+                    prefix: 128,
+                }),
+            },
             Err(_) => None,
         }
     }
@@ -263,7 +296,13 @@ pub fn is_trusted_peer(ip: &IpAddr) -> bool {
 ///
 /// Accepts bare IPs, `[v6]` / `[v6]:port`, `v4:port`; rejects `unknown`,
 /// obfuscated identifiers (`_hidden`, `_secluded`), empty and garbage.
+/// The result is canonicalized ([`canonical_ip`]), so a header claiming
+/// `::ffff:a.b.c.d` yields the same [`IpAddr`] as `a.b.c.d`.
 pub fn parse_ip_token(tok: &str) -> Option<IpAddr> {
+    parse_ip_token_raw(tok).map(canonical_ip)
+}
+
+fn parse_ip_token_raw(tok: &str) -> Option<IpAddr> {
     let mut t = tok.trim();
     if t.is_empty() {
         return None;
@@ -417,10 +456,11 @@ pub struct ClientIp {
 }
 
 impl ClientIp {
-    /// The address came from the TCP connection itself.
+    /// The address came from the TCP connection itself (canonicalized, so a
+    /// mapped v6 peer is stored as its v4 form).
     pub fn from_peer(addr: IpAddr) -> Self {
         Self {
-            addr,
+            addr: canonical_ip(addr),
             source: ClientIpSource::Peer,
         }
     }
@@ -432,8 +472,10 @@ impl ClientIp {
 
     /// True only for a DIRECT loopback TCP peer: a header-derived loopback
     /// claim is never local (fail-closed for the captcha-exempt faucet path).
+    /// The address is canonicalized, so an IPv4-mapped `::ffff:127.0.0.1`
+    /// peer counts as loopback.
     pub fn is_local_client(&self) -> bool {
-        self.source == ClientIpSource::Peer && self.addr.is_loopback()
+        self.source == ClientIpSource::Peer && canonical_ip(self.addr).is_loopback()
     }
 }
 
@@ -476,6 +518,10 @@ pub fn resolve_detailed(
     mode: XffMode,
     trust_loopback_forwarded: bool,
 ) -> ClientIp {
+    // Canonicalize the peer BEFORE any trust check: a dual-stack listener
+    // reports `::ffff:127.0.0.1`, which must be judged (and bucketed) as
+    // `127.0.0.1`.
+    let peer = canonical_ip(peer);
     if !is_trusted_in(&peer, trusted) {
         return ClientIp::from_peer(peer);
     }
@@ -485,7 +531,8 @@ pub fn resolve_detailed(
             ["cf-connecting-ip", "true-client-ip", "x-real-ip"]
                 .iter()
                 .find_map(|name| single_ip_header(headers, name))
-        });
+        })
+        .map(canonical_ip);
     match claimed {
         None => ClientIp::from_peer(peer),
         Some(ip)
@@ -818,5 +865,69 @@ mod tests {
             false,
         );
         assert!(!r.is_local_client());
+    }
+
+    /// FAIL-BEFORE (T5a): `::ffff:127.0.0.1` must be the SAME client as
+    /// `127.0.0.1`: a loopback claim is rejected without the opt-in, the
+    /// opt-in path returns the canonical v4, and both spellings share one
+    /// limiter bucket (no quota doubling / ban evasion).
+    #[test]
+    fn ipv4_mapped_loopback_rejected_and_buckets_unified() {
+        let trusted = nets("127.0.0.0/8, ::1/128");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let headers = h(&[("x-forwarded-for", "::ffff:127.0.0.1")]);
+
+        // Default policy (STELL_TRUST_LOOPBACK_FORWARDED off).
+        let r = resolve_detailed(&headers, peer, &trusted, XffMode::Rightmost, false);
+        assert_eq!(
+            r.source,
+            ClientIpSource::ForwardedLoopbackRejected,
+            "mapped-v6 loopback claim must be rejected like plain v4"
+        );
+        assert_eq!(r.addr, peer);
+        assert!(!r.is_local_client());
+
+        // Opt-in: accepted, but canonicalized to the v4 form.
+        let r = resolve_detailed(&headers, peer, &trusted, XffMode::Rightmost, true);
+        assert_eq!(r.source, ClientIpSource::Forwarded);
+        assert_eq!(r.addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        // A mapped-v6 PEER is loopback too (dual-stack listener).
+        let mapped_peer: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let r = resolve_detailed(
+            &HeaderMap::new(),
+            mapped_peer,
+            &trusted,
+            XffMode::Rightmost,
+            false,
+        );
+        assert_eq!(r.addr, peer);
+        assert_eq!(r.source, ClientIpSource::Peer);
+        assert!(r.is_local_client());
+
+        // Both spellings resolve to the same canonical IpAddr...
+        assert_eq!(parse_ip_token("::ffff:1.2.3.4"), parse_ip_token("1.2.3.4"));
+        assert_eq!(
+            parse_ip_token("::ffff:1.2.3.4"),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        // ...and therefore share one rate-limit bucket.
+        let limiter = crate::explorer::RateLimiter::new(1);
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        let mapped: IpAddr = "::ffff:1.2.3.4".parse().unwrap();
+        assert!(limiter.check_at(canonical_ip(v4), 100));
+        assert!(
+            !limiter.check_at(canonical_ip(mapped), 100),
+            "mapped-v6 must not open a second bucket for the same client"
+        );
+    }
+
+    /// A trusted-proxy rule written in mapped-v6 space still matches the v4
+    /// peer it denotes.
+    #[test]
+    fn mapped_v6_cidr_matches_v4_peer() {
+        let trusted = nets("::ffff:10.0.0.0/104");
+        assert!(is_trusted_in(&"10.1.2.3".parse().unwrap(), &trusted));
+        assert!(!is_trusted_in(&"11.2.3.4".parse().unwrap(), &trusted));
     }
 }

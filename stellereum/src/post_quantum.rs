@@ -1085,17 +1085,20 @@ fn intt(a: &mut [u16; 512]) {
     }
 }
 
+fn poly_mul_precomputed_ntt_in_place(a: &mut [u16; 512], b_ntt: &[u16; 512]) {
+    ntt(a);
+    for (ai, &bi) in a.iter_mut().zip(b_ntt.iter()) {
+        *ai = barrett_reduce_q(*ai as u32 * bi as u32);
+    }
+    intt(a);
+}
+
 fn poly_mul_ntt(a: &[u16; 512], b: &[u16; 512]) -> [u16; 512] {
     let mut a_ntt = *a;
     let mut b_ntt = *b;
-    ntt(&mut a_ntt);
     ntt(&mut b_ntt);
-    let mut c_ntt = [0u16; 512];
-    for i in 0..512 {
-        c_ntt[i] = barrett_reduce_q(a_ntt[i] as u32 * b_ntt[i] as u32);
-    }
-    intt(&mut c_ntt);
-    c_ntt
+    poly_mul_precomputed_ntt_in_place(&mut a_ntt, &b_ntt);
+    a_ntt
 }
 
 /// Rounds `num / den` to the nearest integer (ties away from zero).
@@ -2117,7 +2120,9 @@ const FALCON_PUBKEY_CACHE_CAP: usize = 4096;
 static FALCON_PUBKEY_CACHE: std::sync::LazyLock<RwLock<HashMap<[u8; 32], [u16; 512]>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
+/// Unpack a canonical Falcon-512 public key and return `h_ntt = ntt(h)` from
+/// the bounded cache (precomputed once on cache miss).
+fn unpack_falcon_pubkey_ntt(pubkey: &[u8]) -> Option<[u16; 512]> {
     if pubkey.len() != FALCON512_PUBKEY_LEN {
         return None;
     }
@@ -2128,17 +2133,18 @@ fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
         return None;
     }
     let key = *blake3::hash(pubkey).as_bytes();
-    if let Some(&h) = FALCON_PUBKEY_CACHE
+    if let Some(&h_ntt) = FALCON_PUBKEY_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
     {
-        return Some(h);
+        return Some(h_ntt);
     }
-    let mut h = [0u16; 512];
-    if !modq_decode(&mut h, &pubkey[1..]) {
+    let mut h_ntt = [0u16; 512];
+    if !modq_decode(&mut h_ntt, &pubkey[1..]) {
         return None;
     }
+    ntt(&mut h_ntt);
     {
         let mut cache = FALCON_PUBKEY_CACHE
             .write()
@@ -2146,9 +2152,9 @@ fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
         if cache.len() >= FALCON_PUBKEY_CACHE_CAP && !cache.contains_key(&key) {
             cache.clear();
         }
-        cache.insert(key, h);
+        cache.insert(key, h_ntt);
     }
-    Some(h)
+    Some(h_ntt)
 }
 
 fn unpack_falcon_sig(sig: &[u8]) -> Option<([u8; 40], [i16; 512])> {
@@ -2188,15 +2194,9 @@ fn unpack_falcon_sig(sig: &[u8]) -> Option<([u8; 40], [i16; 512])> {
     }
 
     let mut s2 = [0i16; 512];
-    let consumed = comp_decode(&mut s2, payload)?;
-
-    let mut pad = 0u8;
-    for &b in &payload[consumed..] {
-        pad |= b;
-    }
-    if std::hint::black_box(pad) != 0 {
-        return None;
-    }
+    // `comp_decode` already validates both the partial-byte bit padding and
+    // that every trailing byte in `&payload[v..]` is zero (see `comp_decode`).
+    comp_decode(&mut s2, payload)?;
 
     Some((nonce, s2))
 }
@@ -2215,7 +2215,7 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
         return false;
     }
 
-    let Some(h) = unpack_falcon_pubkey(pubkey) else {
+    let Some(h_ntt) = unpack_falcon_pubkey_ntt(pubkey) else {
         return false;
     };
 
@@ -2225,12 +2225,12 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 
     let c = hash_to_point(&nonce, message);
 
-    let mut s2_modq = [0u16; 512];
+    let mut s2_h = [0u16; 512];
     for i in 0..512 {
-        s2_modq[i] = ((s2[i] as i32).rem_euclid(FALCON_MODULUS_Q as i32)) as u16;
+        s2_h[i] = ((s2[i] as i32).rem_euclid(FALCON_MODULUS_Q as i32)) as u16;
     }
 
-    let s2_h = poly_mul_ntt(&s2_modq, &h);
+    poly_mul_precomputed_ntt_in_place(&mut s2_h, &h_ntt);
 
     let mut norm_sq = 0i64;
     for i in 0..512 {
@@ -3506,28 +3506,47 @@ mod tests {
     #[test]
     fn test_falcon_pubkey_cache_hit_and_bounded() {
         let kp = FalconKeypair::generate_from_seed(0x6C);
-        let h1 = unpack_falcon_pubkey(kp.pubkey()).expect("valid pubkey must unpack");
-        let h2 = unpack_falcon_pubkey(kp.pubkey()).expect("cached pubkey must unpack");
-        assert_eq!(h1, kp.h);
-        assert_eq!(h2, kp.h);
+        let mut expected_h_ntt = kp.h;
+        ntt(&mut expected_h_ntt);
+        let h1 = unpack_falcon_pubkey_ntt(kp.pubkey()).expect("valid pubkey must unpack");
+        let h2 = unpack_falcon_pubkey_ntt(kp.pubkey()).expect("cached pubkey must unpack");
+        assert_eq!(h1, expected_h_ntt);
+        assert_eq!(h2, expected_h_ntt);
 
         let key = *blake3::hash(kp.pubkey()).as_bytes();
         {
             let cache = FALCON_PUBKEY_CACHE
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            assert_eq!(cache.get(&key), Some(&kp.h));
+            assert_eq!(cache.get(&key), Some(&expected_h_ntt));
             assert!(cache.len() <= FALCON_PUBKEY_CACHE_CAP);
         }
 
         // Invalid pubkey (bad header) must not decode or enter cache.
         let mut bad_pk = kp.pubkey().to_vec();
         bad_pk[0] = 0x19;
-        assert!(unpack_falcon_pubkey(&bad_pk).is_none());
+        assert!(unpack_falcon_pubkey_ntt(&bad_pk).is_none());
         let bad_key = *blake3::hash(&bad_pk).as_bytes();
         assert!(!FALCON_PUBKEY_CACHE
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&bad_key));
+    }
+
+    #[test]
+    fn test_poly_mul_precomputed_ntt_matches_poly_mul_ntt() {
+        let kp = FalconKeypair::generate_from_seed(0x6D);
+        let msg = b"precomputed ntt equivalence";
+        let sig = kp.sign(msg);
+        let (_nonce, s2) = unpack_falcon_sig(&sig).expect("valid signature must unpack");
+        let mut s2_modq = [0u16; 512];
+        for i in 0..512 {
+            s2_modq[i] = ((s2[i] as i32).rem_euclid(FALCON_MODULUS_Q as i32)) as u16;
+        }
+        let expected = poly_mul_ntt(&s2_modq, &kp.h);
+        let h_ntt = unpack_falcon_pubkey_ntt(kp.pubkey()).expect("valid pubkey must unpack");
+        let mut actual = s2_modq;
+        poly_mul_precomputed_ntt_in_place(&mut actual, &h_ntt);
+        assert_eq!(actual, expected);
     }
 }

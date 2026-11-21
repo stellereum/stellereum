@@ -672,6 +672,8 @@ fn bridge_release(r: &mut Report) {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use stellereum::bridge::MultisigRelayer;
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
     println!("\n[9] Bridge multisig release");
 
@@ -688,31 +690,38 @@ fn bridge_release(r: &mut Report) {
 
     // #38: a lone validator still has to actually sign.
     let k = SigningKey::generate(&mut OsRng);
-    let mut one = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
+    let k_id = k.verifying_key().to_bytes();
+    let k_falcon = FalconKeypair::generate();
+    register_validator_pq_key(k_id, PqScheme::Falcon512, k_falcon.public_key.clone());
+    let mut one = MultisigRelayer::new(vec![k_id]);
+    let op = [2u8; 32];
     let msg = b"release 100 STELL";
-    let sig = (
-        k.verifying_key().to_bytes(),
-        ed25519_dalek::Signer::sign(&k, msg).to_bytes().to_vec(),
-    );
+    let preimage = MultisigRelayer::release_signing_message(op, msg);
+    let sig = (k_id, k_falcon.sign(&preimage));
     r.check(
         "#38 lone validator must sign",
-        one.try_release([2u8; 32], msg, &[]).is_err()
-            && one.try_release([2u8; 32], msg, &[sig]).is_ok(),
+        one.try_release(op, msg, &[]).is_err() && one.try_release(op, msg, &[sig]).is_ok(),
         "unsigned refused, signed accepted",
     );
 
     // #39: a signature from outside the relayer set is worthless.
     let outsider = SigningKey::generate(&mut OsRng);
-    let mut one2 = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
+    let outsider_id = outsider.verifying_key().to_bytes();
+    let outsider_falcon = FalconKeypair::generate();
+    register_validator_pq_key(
+        outsider_id,
+        PqScheme::Falcon512,
+        outsider_falcon.public_key.clone(),
+    );
+    let mut one2 = MultisigRelayer::new(vec![k_id]);
+    let op3 = [3u8; 32];
     let osig = (
-        outsider.verifying_key().to_bytes(),
-        ed25519_dalek::Signer::sign(&outsider, msg)
-            .to_bytes()
-            .to_vec(),
+        outsider_id,
+        outsider_falcon.sign(&MultisigRelayer::release_signing_message(op3, msg)),
     );
     r.check(
         "#39 outsider signature rejected",
-        one2.try_release([3u8; 32], msg, &[osig]).is_err(),
+        one2.try_release(op3, msg, &[osig]).is_err(),
         "non-whitelisted signer does not count",
     );
 }

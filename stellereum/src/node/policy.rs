@@ -1051,6 +1051,18 @@ pub(crate) fn flush_outbox(
     height: u64,
     round: u32,
 ) {
+    flush_outbox_with(outbox, height, round, sender.queued(), |chunk| {
+        sender.try_enqueue(chunk)
+    });
+}
+
+fn flush_outbox_with(
+    outbox: &mut std::collections::VecDeque<ConsensusMsg>,
+    height: u64,
+    round: u32,
+    queued_before: usize,
+    mut enqueue: impl FnMut(Vec<ConsensusMsg>) -> Result<(), Vec<ConsensusMsg>>,
+) {
     if outbox.is_empty() {
         return;
     }
@@ -1085,14 +1097,16 @@ pub(crate) fn flush_outbox(
         );
     }
     let items = outbox.len();
-    let queued_before = sender.queued();
     let t_flush = std::time::Instant::now();
     while !outbox.is_empty() {
         let n = outbox.len().min(MAX_BATCH_ITEMS);
         let chunk: Vec<ConsensusMsg> = outbox.drain(..n).collect();
-        if !sender.enqueue(chunk) {
-            // Sender gone (shutdown) or backlog at the cap. Keep the rest for
-            // the next flush; nothing was dropped and nothing was sent twice.
+        if let Err(chunk) = enqueue(chunk) {
+            // Restore the refused chunk ahead of the untouched suffix. No
+            // signing, deduplication, or additional persistent queue is needed.
+            for msg in chunk.into_iter().rev() {
+                outbox.push_front(msg);
+            }
             break;
         }
     }
@@ -1104,6 +1118,116 @@ pub(crate) fn flush_outbox(
         &format!("items={items} queued={queued_before}"),
         t_flush.elapsed(),
     );
+}
+
+#[cfg(test)]
+mod refused_chunk_regression {
+    use super::*;
+    use std::collections::VecDeque;
+    use stellereum::consensus::Vote;
+
+    fn vote(id: u8, round: u32) -> ConsensusMsg {
+        ConsensusMsg::Vote {
+            vote: Vote {
+                shard_id: 0,
+                height: 9,
+                round,
+                kind: VoteKind::Prevote,
+                block_hash: None,
+                voter: [id; 32],
+                signature: vec![id; 64],
+            },
+            locked: None,
+        }
+    }
+
+    fn ids(messages: impl IntoIterator<Item = ConsensusMsg>) -> Vec<u8> {
+        messages
+            .into_iter()
+            .map(|m| match m {
+                ConsensusMsg::Vote { vote, .. } => vote.voter[0],
+                _ => panic!("expected vote"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refused_chunk_restores_order_budget_and_dedup_then_retries() {
+        let count = MAX_BATCH_ITEMS + 3;
+        let mut outbox = VecDeque::new();
+        for id in 0..count {
+            assert!(enqueue_outbox(&mut outbox, vote(id as u8, 4)));
+        }
+        let mut accepted = Vec::new();
+        let mut attempts = 0;
+        flush_outbox_with(&mut outbox, 9, 4, 0, |chunk| {
+            attempts += 1;
+            assert!(chunk.len() <= MAX_BATCH_ITEMS);
+            if attempts == 2 {
+                Err(chunk)
+            } else {
+                accepted.extend(chunk);
+                Ok(())
+            }
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(accepted.len(), MAX_BATCH_ITEMS);
+        assert_eq!(
+            ids(outbox.iter().cloned()),
+            (MAX_BATCH_ITEMS..count).map(|x| x as u8).collect::<Vec<_>>()
+        );
+        assert!(!enqueue_outbox(&mut outbox, vote(MAX_BATCH_ITEMS as u8, 4)));
+        flush_outbox_with(&mut outbox, 9, 4, 1, |chunk| {
+            accepted.extend(chunk);
+            Ok(())
+        });
+        assert!(outbox.is_empty());
+        assert_eq!(
+            ids(accepted),
+            (0..count).map(|x| x as u8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refusal_closed_sender_restores_and_next_flush_prunes_stale() {
+        let mut outbox = VecDeque::from([vote(1, 2), vote(2, 4)]);
+        flush_outbox_with(&mut outbox, 9, 4, 0, Err);
+        assert_eq!(ids(outbox.iter().cloned()), vec![2]);
+        flush_outbox_with(&mut outbox, 9, 6, 0, |_| panic!("stale vote sent"));
+        assert!(outbox.is_empty());
+    }
+
+    #[test]
+    fn flush_outbox_retains_valid_late_polka_precommit_when_local_round_advanced() {
+        let late_precommit = ConsensusMsg::Vote {
+            vote: stellereum::consensus::Vote {
+                shard_id: 0,
+                height: 9,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some([0x42; 32]),
+                voter: [7; 32],
+                signature: vec![7; 64],
+            },
+            locked: None,
+        };
+        let stale_prevote = vote(1, 2);
+        let mut outbox = VecDeque::from([stale_prevote, late_precommit.clone()]);
+        let mut sent = Vec::new();
+        flush_outbox_with(&mut outbox, 9, 11, 0, |chunk| {
+            sent.extend(chunk);
+            Ok(())
+        });
+        assert!(outbox.is_empty());
+        assert_eq!(sent.len(), 1, "only late-polka precommit survives");
+        match &sent[0] {
+            ConsensusMsg::Vote { vote, .. } => {
+                assert_eq!(vote.kind, VoteKind::Precommit);
+                assert_eq!(vote.round, 0);
+            }
+            other => panic!("unexpected msg: {other:?}"),
+        }
+    }
 }
 
 // ==================== §7 Phase 1: non-transport work OFF the tick ====================

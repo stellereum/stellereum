@@ -603,9 +603,9 @@ pub const fn epoch_of_height(height: u64) -> u64 {
     height / EPOCH_LEN
 }
 
-/// First height of epoch N.
+/// First height of epoch N (saturates at `u64::MAX` on overflow).
 pub const fn epoch_start_height(epoch_n: u64) -> u64 {
-    epoch_n * EPOCH_LEN
+    epoch_n.saturating_mul(EPOCH_LEN)
 }
 
 /// First usable epoch after activation (O9): activation waits one full epoch

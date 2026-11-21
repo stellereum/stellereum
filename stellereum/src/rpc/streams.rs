@@ -1410,10 +1410,12 @@ pub(super) async fn ws_handler(
     axum::extract::State(st): axum::extract::State<Arc<RpcState>>,
 ) -> axum::response::Response {
     let header_token = extract_header_token(&headers).map(|s| s.to_string());
-    let peer_ip = peer.map(|axum::extract::ConnectInfo(addr)| {
-        crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr
+    // Keep the FULL ClientIp (address + provenance): the sign gate must see
+    // that a forwarded loopback claim is not a local client.
+    let client = peer.map(|axum::extract::ConnectInfo(addr)| {
+        crate::client_ip::resolve_client_ip(&headers, addr.ip())
     });
-    ws.on_upgrade(move |socket| handle_ws(socket, st, header_token, peer_ip))
+    ws.on_upgrade(move |socket| handle_ws(socket, st, header_token, client))
 }
 
 /// One event of the WebSocket select loop.
@@ -1429,9 +1431,9 @@ pub(super) async fn handle_ws(
     socket: axum::extract::ws::WebSocket,
     st: Arc<RpcState>,
     header_token: Option<String>,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
 ) {
-    handle_ws_with_timeout(socket, st, header_token, peer_ip, ws_idle_timeout()).await
+    handle_ws_with_timeout(socket, st, header_token, client, ws_idle_timeout()).await
 }
 
 /// The WebSocket session with an explicit idle timeout (the const
@@ -1446,7 +1448,7 @@ pub(super) async fn handle_ws_with_timeout(
     mut socket: axum::extract::ws::WebSocket,
     st: Arc<RpcState>,
     header_token: Option<String>,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
     idle_timeout: std::time::Duration,
 ) {
     let _live = WsLiveGuard::new();
@@ -1476,7 +1478,7 @@ pub(super) async fn handle_ws_with_timeout(
                         &mut owned,
                         &mut socket,
                         header_token.as_deref(),
-                        peer_ip,
+                        client,
                     )
                     .await
                     {
@@ -1491,7 +1493,7 @@ pub(super) async fn handle_ws_with_timeout(
                         &mut owned,
                         &mut socket,
                         header_token.as_deref(),
-                        peer_ip,
+                        client,
                     )
                     .await
                     {
@@ -1554,7 +1556,7 @@ pub(super) async fn ws_handle_text(
     owned: &mut HashSet<String>,
     socket: &mut axum::extract::ws::WebSocket,
     header_token: Option<&str>,
-    peer_ip: Option<std::net::IpAddr>,
+    client: Option<crate::client_ip::ClientIp>,
 ) -> bool {
     // SIZE CAP (see `WS_MAX_MESSAGE_BYTES`): mirror the HTTP body limit
     // BEFORE parsing, so a giant frame cannot buy a giant JSON build.
@@ -1622,7 +1624,7 @@ pub(super) async fn ws_handle_text(
     // request sits under. Over budget → a clean error frame on the SAME
     // socket (the socket stays open: answers, never drops, on rate-limit).
     {
-        let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+        let ip = client.map(|c| c.addr).unwrap_or(LOCAL_BUCKET_IP);
         if !ws_general_budget().check(ip) {
             let denied = err(
                 id,
@@ -1641,7 +1643,7 @@ pub(super) async fn ws_handle_text(
     // budget. Over budget → a clean error frame on the SAME socket (the
     // socket stays open: answers, never drops, on rate-limit).
     if is_ws_expensive_method(&method) {
-        let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+        let ip = client.map(|c| c.addr).unwrap_or(LOCAL_BUCKET_IP);
         if !ws_expensive_read_budget().check(ip) {
             let denied = err(
                 id,
@@ -1674,7 +1676,7 @@ pub(super) async fn ws_handle_text(
             .await
             .is_ok();
     }
-    let resp = dispatch(st.as_ref(), id, &method, &params, header_token, peer_ip).await;
+    let resp = dispatch_client(st.as_ref(), id, &method, &params, header_token, client).await;
     // Track the subscriptions this connection owns: they are pushed to it and
     // they die with it.
     if method == "stell_subscribe" {
@@ -1724,10 +1726,10 @@ pub(super) async fn rpc_handler(
     // the TCP peer is a trusted proxy (STELL_TRUSTED_PROXY_CIDRS,
     // loopback-only by default — see crate::client_ip); otherwise the peer.
     // Without this every client behind nginx/Cloudflare shared one bucket.
-    let peer_ip = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr);
+    let client = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()));
     if let Some(arr) = first.as_array() {
         let raw_len = body.len();
-        match handle_rpc_batch_call(&st, arr, raw_len, header_token, peer_ip).await {
+        match handle_rpc_batch_call_client(&st, arr, raw_len, header_token, client).await {
             Ok(responses) => {
                 if responses.is_empty() {
                     // All-notification batch: nothing to answer (JSON-RPC 2.0:
@@ -1745,7 +1747,7 @@ pub(super) async fn rpc_handler(
         Err(e) => return err(Value::Null, -32600, format!("invalid request: {e}")).into_response(),
     };
     let id = req.id.unwrap_or(Value::Null);
-    dispatch(&st, id, &req.method, &req.params, header_token, peer_ip)
+    dispatch_client(&st, id, &req.method, &req.params, header_token, client)
         .await
         .into_response()
 }

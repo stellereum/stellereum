@@ -21,6 +21,7 @@
 //!   "cnvrf_v3"    : height(8B BE) -> bincode(CnVrfV3EngineSnapshot)
 //!   "xshard_headers": b"latest" -> bincode(FinalizedHeaderRegistry snapshot) [durable C1 anchors]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
+//!   "receipts_by_height": height(8B BE)+index(4B BE)+tx_hash(32B) -> b"" [NEW, additive only]
 //!   "pq_keys"     : b"a:"+address (32B) -> bincode(scheme, pubkey, salt) / b"h:"+pk_hash (32B) -> pubkey
 //!
 //! The receipts tree is ADDITIVE: no existing tree's key/value format is
@@ -42,10 +43,442 @@ use crate::sharding::{Block, FinalizedHeaderRegistry, FinalizedHeaderSink};
 use crate::state_engine::InMemoryStateEngine;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use sled::transaction::Transactional;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub type BlockHash = [u8; 32];
+
+/// Identity of the single safety-record owner of a storage directory.
+/// `chain` must be a stable, collision-resistant chain identifier (for example
+/// the genesis hash), not an operator-selected display name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyRecordIdentity {
+    pub validator: [u8; 32],
+    pub chain: [u8; 32],
+    pub shard: u32,
+}
+
+/// Opaque application state: this primitive does not validate consensus rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyRecord {
+    pub identity: SafetyRecordIdentity,
+    pub generation: u64,
+    pub payload: Vec<u8>,
+}
+
+const SAFETY_TREE: &str = "safety_record_v1";
+const SAFETY_KEY: &[u8] = b"record";
+const SAFETY_MAGIC: &[u8; 8] = b"STSAFETY";
+const SAFETY_VERSION: u16 = 1;
+const SAFETY_MAX_PAYLOAD: usize = 1024 * 1024;
+const SAFETY_HEADER: usize = 8 + 2 + 32 + 32 + 4 + 8 + 4;
+const SAFETY_HASH: usize = 32;
+
+impl SafetyRecord {
+    fn encode(&self) -> Result<Vec<u8>> {
+        if self.generation == 0 || self.payload.len() > SAFETY_MAX_PAYLOAD {
+            return Err(anyhow!(
+                "invalid safety record generation or payload length"
+            ));
+        }
+        let mut bytes = Vec::with_capacity(SAFETY_HEADER + self.payload.len() + SAFETY_HASH);
+        bytes.extend_from_slice(SAFETY_MAGIC);
+        bytes.extend_from_slice(&SAFETY_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.identity.validator);
+        bytes.extend_from_slice(&self.identity.chain);
+        bytes.extend_from_slice(&self.identity.shard.to_be_bytes());
+        bytes.extend_from_slice(&self.generation.to_be_bytes());
+        bytes.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.payload);
+        let hash = blake3::hash(&bytes);
+        bytes.extend_from_slice(hash.as_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8], identity: &SafetyRecordIdentity) -> Result<Self> {
+        if bytes.len() < SAFETY_HEADER + SAFETY_HASH
+            || &bytes[..8] != SAFETY_MAGIC
+            || u16::from_be_bytes(bytes[8..10].try_into()?) != SAFETY_VERSION
+        {
+            return Err(anyhow!("invalid or unsupported safety record"));
+        }
+        let payload_len = u32::from_be_bytes(bytes[86..90].try_into()?) as usize;
+        if payload_len > SAFETY_MAX_PAYLOAD
+            || bytes.len() != SAFETY_HEADER + payload_len + SAFETY_HASH
+        {
+            return Err(anyhow!("invalid safety record length"));
+        }
+        let hash_offset = SAFETY_HEADER + payload_len;
+        if blake3::hash(&bytes[..hash_offset]).as_bytes() != &bytes[hash_offset..] {
+            return Err(anyhow!("safety record checksum mismatch"));
+        }
+        let stored_identity = SafetyRecordIdentity {
+            validator: bytes[10..42].try_into()?,
+            chain: bytes[42..74].try_into()?,
+            shard: u32::from_be_bytes(bytes[74..78].try_into()?),
+        };
+        let generation = u64::from_be_bytes(bytes[78..86].try_into()?);
+        if &stored_identity != identity || generation == 0 {
+            return Err(anyhow!("safety record identity or generation mismatch"));
+        }
+        Ok(Self {
+            identity: stored_identity,
+            generation,
+            payload: bytes[SAFETY_HEADER..hash_offset].to_vec(),
+        })
+    }
+}
+
+/// Isolated single-record storage primitive, not connected to consensus or a
+/// signer. Calls through clones of the same `Storage` serialize read, update,
+/// and flush. sled's exclusive database lock is required; raw tree writes or
+/// other access bypassing this API invalidate its guarantees.
+///
+/// A successful update means sled's synchronous flush completed. This relies
+/// on sled, the filesystem and hardware honoring their durability contracts;
+/// provisioning and syncing the database directory and its ancestors is the
+/// operator's responsibility. A failed write/flush is indeterminate: callers
+/// must halt, not sign, and recover explicitly. Read, decode, identity, write,
+/// flush, and tree-open errors quarantine all handles sharing this `Storage`
+/// until it is dropped and explicitly recovered. Reopening alone is not proof
+/// of recovery. Neither a checksum nor a local generation counter detects
+/// deletion, a restored old directory, a cloned directory, or malicious
+/// rewriting. Absence must not be interpreted as permission to initialize a
+/// previously used validator. This is not a migration or anti-rollback scheme.
+/// Decoding bounds the payload before copying it, but sled materializes the
+/// whole stored value in `get` first; this API cannot bound that allocation
+/// when the database has been corrupted or modified outside this API.
+#[derive(Clone)]
+pub struct SafetyRecordStore {
+    db: sled::Db,
+    tree: sled::Tree,
+    identity: SafetyRecordIdentity,
+    failed: Arc<Mutex<bool>>,
+}
+
+impl SafetyRecordStore {
+    /// Read and validate the current record. `None` is ambiguous: it may also
+    /// mean lost or deleted state, not a safe fresh validator.
+    pub fn load(&self) -> Result<Option<SafetyRecord>> {
+        self.load_with_read(|| self.tree.get(SAFETY_KEY))
+    }
+
+    fn load_with_read(
+        &self,
+        read: impl FnOnce() -> sled::Result<Option<sled::IVec>>,
+    ) -> Result<Option<SafetyRecord>> {
+        let mut failed = self
+            .failed
+            .lock()
+            .map_err(|_| anyhow!("safety lock poisoned"))?;
+        if *failed {
+            return Err(anyhow!("safety store requires recovery"));
+        }
+        self.read_current(&mut failed, read)
+    }
+
+    fn read_current(
+        &self,
+        failed: &mut bool,
+        read: impl FnOnce() -> sled::Result<Option<sled::IVec>>,
+    ) -> Result<Option<SafetyRecord>> {
+        let result = read().map_err(anyhow::Error::from).and_then(|current| {
+            current
+                .map(|bytes| SafetyRecord::decode(&bytes, &self.identity))
+                .transpose()
+        });
+        if result.is_err() {
+            *failed = true;
+        }
+        result
+    }
+
+    /// Atomically replace exactly the expected generation and flush before
+    /// returning success. `None` initializes generation 1; subsequent writes
+    /// must supply the observed generation and advance it exactly once.
+    /// Never retry an indeterminate I/O error as though no write occurred.
+    pub fn persist(&self, expected: Option<u64>, payload: Vec<u8>) -> Result<SafetyRecord> {
+        self.persist_with_flush(expected, payload, || self.db.flush().map(|_| ()))
+    }
+
+    fn persist_with_flush(
+        &self,
+        expected: Option<u64>,
+        payload: Vec<u8>,
+        flush: impl FnOnce() -> sled::Result<()>,
+    ) -> Result<SafetyRecord> {
+        self.persist_with_read_and_flush(expected, payload, || self.tree.get(SAFETY_KEY), flush)
+    }
+
+    fn persist_with_read_and_flush(
+        &self,
+        expected: Option<u64>,
+        payload: Vec<u8>,
+        read: impl FnOnce() -> sled::Result<Option<sled::IVec>>,
+        flush: impl FnOnce() -> sled::Result<()>,
+    ) -> Result<SafetyRecord> {
+        let mut failed = self
+            .failed
+            .lock()
+            .map_err(|_| anyhow!("safety lock poisoned"))?;
+        if *failed {
+            return Err(anyhow!("safety store requires recovery"));
+        }
+        let actual = self
+            .read_current(&mut failed, read)?
+            .map(|record| record.generation);
+        if actual != expected {
+            return Err(anyhow!("stale safety record generation"));
+        }
+        let generation = match actual {
+            Some(n) => n
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("safety generation exhausted"))?,
+            None => 1,
+        };
+        let record = SafetyRecord {
+            identity: self.identity.clone(),
+            generation,
+            payload,
+        };
+        let bytes = record.encode()?;
+        if let Err(error) = self.tree.insert(SAFETY_KEY, bytes) {
+            *failed = true;
+            return Err(error.into());
+        }
+        if let Err(error) = flush() {
+            *failed = true;
+            return Err(error.into());
+        }
+        Ok(record)
+    }
+}
+
+#[cfg(test)]
+mod safety_record_unit_tests {
+    use super::*;
+
+    #[test]
+    fn read_errors_quarantine_all_handles_without_false_success() {
+        for fail_load in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "stell-safety-read-{}-{}-{}",
+                std::process::id(),
+                fail_load,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            assert!(!dir.exists());
+            let storage = Storage::open(&dir).unwrap();
+            let identity = SafetyRecordIdentity {
+                validator: [1; 32],
+                chain: [2; 32],
+                shard: 3,
+            };
+            let first = storage.safety_record_store(identity.clone()).unwrap();
+            let second = storage
+                .clone()
+                .safety_record_store(identity.clone())
+                .unwrap();
+            first.persist(None, vec![1]).unwrap();
+            let read = || Err(sled::Error::Unsupported("injected read error".into()));
+            if fail_load {
+                assert!(first.load_with_read(read).is_err());
+            } else {
+                assert!(first
+                    .persist_with_read_and_flush(Some(1), vec![2], read, || {
+                        panic!("flush must not run after a read error")
+                    })
+                    .is_err());
+            }
+            for handle in [&first, &second] {
+                assert!(handle
+                    .load()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires recovery"));
+                assert!(handle
+                    .persist(Some(1), vec![3])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires recovery"));
+            }
+            assert!(storage
+                .safety_record_store(identity)
+                .err()
+                .expect("poisoned storage must refuse new safety handle")
+                .to_string()
+                .contains("requires recovery"));
+            assert_eq!(
+                SafetyRecord::decode(
+                    &first.tree.get(SAFETY_KEY).unwrap().unwrap(),
+                    &first.identity
+                )
+                .unwrap()
+                .payload,
+                vec![1]
+            );
+            drop(first);
+            drop(second);
+            drop(storage);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn decode_failure_remains_quarantined_even_if_bytes_are_repaired() {
+        let dir = std::env::temp_dir().join(format!(
+            "stell-safety-decode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists());
+        let storage = Storage::open(&dir).unwrap();
+        let identity = SafetyRecordIdentity {
+            validator: [1; 32],
+            chain: [2; 32],
+            shard: 3,
+        };
+        let first = storage.safety_record_store(identity.clone()).unwrap();
+        let second = storage.clone().safety_record_store(identity).unwrap();
+        first.persist(None, vec![1]).unwrap();
+        let original = first.tree.get(SAFETY_KEY).unwrap().unwrap();
+        first.tree.insert(SAFETY_KEY, &[0u8][..]).unwrap();
+        assert!(first.persist(Some(1), vec![2]).is_err());
+        first.tree.insert(SAFETY_KEY, original).unwrap();
+        assert!(second
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("requires recovery"));
+        assert!(second
+            .persist(Some(1), vec![2])
+            .unwrap_err()
+            .to_string()
+            .contains("requires recovery"));
+        drop(first);
+        drop(second);
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_flush_result_poison_is_shared_by_all_handles() {
+        let dir = std::env::temp_dir().join(format!(
+            "stell-safety-flush-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists());
+        let storage = Storage::open(&dir).unwrap();
+        let identity = SafetyRecordIdentity {
+            validator: [1; 32],
+            chain: [2; 32],
+            shard: 3,
+        };
+        let first = storage.safety_record_store(identity.clone()).unwrap();
+        let second = storage
+            .clone()
+            .safety_record_store(identity.clone())
+            .unwrap();
+        first.persist(None, vec![1]).unwrap();
+        let error = first.persist_with_flush(Some(1), vec![2], || {
+            let bytes = first.tree.get(SAFETY_KEY).unwrap().unwrap();
+            let record = SafetyRecord::decode(&bytes, &identity).unwrap();
+            assert_eq!(record.generation, 2);
+            assert_eq!(record.payload, vec![2]);
+            Err(sled::Error::Unsupported(
+                "injected unknown flush outcome".into(),
+            ))
+        });
+        assert!(error.is_err());
+        for handle in [first, second] {
+            assert!(handle
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("requires recovery"));
+            assert!(handle
+                .persist(Some(2), vec![3])
+                .unwrap_err()
+                .to_string()
+                .contains("requires recovery"));
+        }
+        assert!(storage
+            .safety_record_store(identity)
+            .err()
+            .expect("poisoned storage must refuse new safety handle")
+            .to_string()
+            .contains("requires recovery"));
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn error_after_successful_flush_is_fail_closed_for_all_handles() {
+        let dir = std::env::temp_dir().join(format!(
+            "stell-safety-post-flush-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists());
+        let storage = Storage::open(&dir).unwrap();
+        let identity = SafetyRecordIdentity {
+            validator: [1; 32],
+            chain: [2; 32],
+            shard: 3,
+        };
+        let first = storage.safety_record_store(identity.clone()).unwrap();
+        let second = storage
+            .clone()
+            .safety_record_store(identity.clone())
+            .unwrap();
+        first.persist(None, vec![1]).unwrap();
+        let result = first.persist_with_flush(Some(1), vec![2], || {
+            let bytes = first.tree.get(SAFETY_KEY).unwrap().unwrap();
+            let record = SafetyRecord::decode(&bytes, &identity).unwrap();
+            assert_eq!(record.generation, 2);
+            assert_eq!(record.payload, vec![2]);
+            first.db.flush()?;
+            Err(sled::Error::Unsupported(
+                "injected error after successful flush".into(),
+            ))
+        });
+        assert!(result.is_err());
+        for handle in [first, second] {
+            assert!(handle
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("requires recovery"));
+            assert!(handle
+                .persist(Some(2), vec![3])
+                .unwrap_err()
+                .to_string()
+                .contains("requires recovery"));
+        }
+        assert!(storage
+            .safety_record_store(identity)
+            .err()
+            .expect("poisoned storage must refuse new safety handle")
+            .to_string()
+            .contains("requires recovery"));
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 /// Durable store for blocks, chain metadata and state snapshots.
 #[derive(Clone)]
@@ -106,8 +539,17 @@ pub struct Storage {
     /// trees are untouched, so pre-existing data directories open unchanged and
     /// simply report no receipts until heights are adopted/replicated.
     receipts: sled::Tree,
+    /// Tip-ordered receipt index: `height(8B BE) || index(4B BE) || tx_hash(32B)`
+    /// -> empty. NEW additive tree. `receipts` is keyed by the (random) tx hash,
+    /// so a lexicographic prefix of it is NOT a height window; restart hydration
+    /// that capped a `receipts` scan therefore lost the newest receipts once the
+    /// store exceeded the cap. This index makes the same cap a genuine
+    /// tip-window (`iter().rev()` is `(height, index)`-descending) with no
+    /// change to `StoredReceipt` or `receipts_v1` bytes.
+    receipts_by_height: sled::Tree,
     /// Post-quantum public keys tree.
     pub pq_keys: sled::Tree,
+    safety_failed: Arc<Mutex<bool>>,
 }
 
 /// FREEZE RULE (audit follow-up, chain-down incident): NEVER add fields to
@@ -359,6 +801,32 @@ pub struct HistoricalRoot {
 /// and the next prune is scheduled from the regular snapshot cadence instead.
 const PRUNE_BATCH: usize = 20_000;
 
+/// Meta key marking the `receipts_by_height` index as COMPLETE for this store.
+///
+/// Absent means the index cannot be trusted (pre-upgrade directory, or a
+/// backfill that was interrupted): readers then fall back to the legacy
+/// `receipts` scan and keep their pre-fix behaviour instead of silently
+/// serving a partial window. `Storage::open` sets it after a full backfill.
+pub const RECEIPTS_BY_HEIGHT_READY_META_KEY: &str = "receipts_by_height_v1";
+
+/// Fixed width of one `receipts_by_height` key:
+/// `height(8B BE) || index(4B BE) || tx_hash(32B)`.
+const RECEIPT_INDEX_KEY_LEN: usize = 44;
+
+/// Rows applied per backfill batch: bounds the write burst on first open of an
+/// existing multi-million-receipt directory.
+const RECEIPT_INDEX_BACKFILL_BATCH: usize = 10_000;
+
+/// Tip-ordered receipt index key. The tx hash is part of the key so a reverse
+/// slice of the tree yields the newest `(height, index)` rows directly.
+fn receipt_index_key(r: &StoredReceipt) -> [u8; RECEIPT_INDEX_KEY_LEN] {
+    let mut key = [0u8; RECEIPT_INDEX_KEY_LEN];
+    key[0..8].copy_from_slice(&r.height.to_be_bytes());
+    key[8..12].copy_from_slice(&r.index.to_be_bytes());
+    key[12..RECEIPT_INDEX_KEY_LEN].copy_from_slice(&r.tx_hash);
+    key
+}
+
 /// Default sled page-cache ceiling in bytes: 1 GiB, exactly the sled 0.34
 /// default — made explicit and tunable rather than inherited silently. The
 /// 1 GiB default is itself an OOM contributor on small (2–4 GB) nodes; lower
@@ -436,6 +904,7 @@ impl Storage {
         let cnvrf_v3 = db.open_tree("cnvrf_v3")?;
         let xshard_headers = db.open_tree("xshard_headers")?;
         let receipts = db.open_tree("receipts_v1")?;
+        let receipts_by_height = db.open_tree("receipts_by_height")?;
         let pq_keys = db.open_tree("pq_keys")?;
         let this = Self {
             db,
@@ -452,7 +921,9 @@ impl Storage {
             cnvrf_v3,
             xshard_headers,
             receipts,
+            receipts_by_height,
             pq_keys,
+            safety_failed: Arc::new(Mutex::new(false)),
         };
         let swept = this.sweep_dangling_indexes().unwrap_or(0);
         if swept > 0 {
@@ -460,7 +931,72 @@ impl Storage {
                 "[storage] open: swept {swept} dangling by_height index entries (crash debris)"
             );
         }
+        // Derived, additive index: a failure here must not brick the store. The
+        // marker stays unset, so `latest_receipts_capped` keeps using the
+        // legacy tx-hash scan (the pre-fix behaviour) until a later open
+        // completes the backfill.
+        if let Err(e) = this.ensure_receipt_height_index() {
+            tracing::warn!("[storage] receipt height index unavailable: {e}");
+            eprintln!("[storage] receipt height index unavailable (using legacy scan): {e}");
+        }
         Ok(this)
+    }
+
+    /// Open the isolated safety record for the expected validator/chain/shard.
+    /// Fails closed immediately if any prior safety read/write/flush error
+    /// poisoned this `Storage` instance.
+    pub fn safety_record_store(&self, identity: SafetyRecordIdentity) -> Result<SafetyRecordStore> {
+        let mut failed = self
+            .safety_failed
+            .lock()
+            .map_err(|_| anyhow!("safety lock poisoned"))?;
+        if *failed {
+            return Err(anyhow!("safety store requires recovery"));
+        }
+        let tree = match self.db.open_tree(SAFETY_TREE) {
+            Ok(tree) => tree,
+            Err(error) => {
+                *failed = true;
+                return Err(error.into());
+            }
+        };
+        Ok(SafetyRecordStore {
+            db: self.db.clone(),
+            tree,
+            identity,
+            failed: self.safety_failed.clone(),
+        })
+    }
+
+    /// True when `headers` or `by_height` contains any entry at `height > 0`.
+    /// Used by the clean-genesis safety-record auto-initialization gate.
+    pub fn has_non_genesis_blocks_or_headers(&self) -> Result<bool> {
+        for kv in self.headers.iter() {
+            let (k, _) = kv?;
+            if k.len() != 8 {
+                return Ok(true);
+            }
+            let h = u64::from_be_bytes(k.as_ref().try_into()?);
+            if h > 0 {
+                return Ok(true);
+            }
+        }
+        for kv in self.by_height.iter() {
+            let (k, _) = kv?;
+            if k.len() < 8 {
+                return Ok(true);
+            }
+            let h = u64::from_be_bytes(k[..8].try_into()?);
+            if h > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[doc(hidden)]
+    pub fn safety_record_tree_for_test(&self) -> sled::Result<sled::Tree> {
+        self.db.open_tree(SAFETY_TREE)
     }
 
     /// Crash-recovery sweep: remove every `by_height` index entry whose block
@@ -570,6 +1106,18 @@ impl Storage {
         Ok(())
     }
 
+    /// Durable `set_meta`: insert + `flush()` (fsync barrier) before returning.
+    ///
+    /// Used for state whose loss would change policy (faucet lifetime caps /
+    /// nonce, faucet init marker). A plain [`Self::set_meta`] only lands in the
+    /// page cache until the next barrier, so a crash could resurrect spent
+    /// credit; callers that need "durable before the next step" use this.
+    pub fn set_meta_durable(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.meta.insert(key.as_bytes(), value)?;
+        self.meta.flush()?;
+        Ok(())
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.meta.get(key.as_bytes())?.map(|v| v.to_vec()))
     }
@@ -676,6 +1224,25 @@ impl Storage {
         self.receipts.clone()
     }
 
+    /// Test-only handle to the raw tip-ordered receipt index.
+    #[doc(hidden)]
+    pub fn receipts_by_height_tree_for_test(&self) -> sled::Tree {
+        self.receipts_by_height.clone()
+    }
+
+    /// Test-only: force the "index complete" marker on/off. `false` simulates a
+    /// pre-upgrade directory so the next `open` exercises the one-time backfill.
+    #[doc(hidden)]
+    pub fn set_receipt_index_ready_for_test(&self, ready: bool) -> Result<()> {
+        if ready {
+            self.meta.insert(RECEIPTS_BY_HEIGHT_READY_META_KEY, b"1")?;
+        } else {
+            self.meta.remove(RECEIPTS_BY_HEIGHT_READY_META_KEY)?;
+        }
+        self.meta.flush()?;
+        Ok(())
+    }
+
     // ---------- Verified body ingest (adopter replication) ----------
     //
     // Bodies/receipts are ALREADY committed by the proposer; replication must
@@ -737,9 +1304,79 @@ impl Storage {
 
     // ---------- Receipts (durable, adopter-persisted) ----------
 
+    /// Complete the additive `receipts_by_height` index and set its durable
+    /// "complete" marker (one-time per store).
+    ///
+    /// Chosen over a permanent fallback to the tx-hash scan: the backfill is a
+    /// single streaming pass over `receipts` (bounded batches, one decoded
+    /// receipt in RAM), idempotent and resumable — a crash before the marker
+    /// write simply redoes it on the next open, and until then readers keep the
+    /// legacy behaviour. Undecodable bodies are logged and skipped: they are
+    /// already unreadable to every consumer, so they cannot be indexed.
+    fn ensure_receipt_height_index(&self) -> Result<()> {
+        if self.meta.get(RECEIPTS_BY_HEIGHT_READY_META_KEY)?.is_some() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let mut scanned = 0usize;
+        let mut indexed = 0usize;
+        let mut pending = 0usize;
+        let mut batch = sled::Batch::default();
+        for kv in self.receipts.iter() {
+            let (_, value) = kv?;
+            scanned += 1;
+            match decode_receipt(&value) {
+                Ok(r) => {
+                    batch.insert(&receipt_index_key(&r)[..], &[] as &[u8]);
+                    indexed += 1;
+                    pending += 1;
+                }
+                Err(e) => tracing::warn!(
+                    "[storage] receipt index backfill: skipping undecodable receipt: {e}"
+                ),
+            }
+            if pending >= RECEIPT_INDEX_BACKFILL_BATCH {
+                self.receipts_by_height
+                    .apply_batch(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            self.receipts_by_height.apply_batch(batch)?;
+        }
+        self.receipts_by_height.flush()?;
+        self.meta.insert(RECEIPTS_BY_HEIGHT_READY_META_KEY, b"1")?;
+        self.meta.flush()?;
+        if scanned > 0 {
+            let msg = format!(
+                "[storage] receipt height index backfilled: {indexed}/{scanned} receipts in {:?}",
+                started.elapsed()
+            );
+            tracing::info!("{msg}");
+            eprintln!("{msg}");
+        }
+        Ok(())
+    }
+
     /// Persist one receipt (idempotent by tx hash).
+    ///
+    /// The body and its tip-ordered index row are written in ONE sled
+    /// transaction: a crash can never leave a body invisible to
+    /// [`Self::latest_receipts_capped`], nor an index row pointing at a body
+    /// that was never filed.
     pub fn put_receipt(&self, r: &StoredReceipt) -> Result<()> {
-        self.receipts.insert(r.tx_hash, bincode::serialize(r)?)?;
+        let body = bincode::serialize(r)?;
+        let tx_hash = r.tx_hash;
+        let index_key = receipt_index_key(r);
+        (&self.receipts, &self.receipts_by_height)
+            .transaction(
+                |(receipts, index)| -> sled::transaction::ConflictableTransactionResult<(), ()> {
+                    receipts.insert(&tx_hash[..], body.clone())?;
+                    index.insert(&index_key[..], &[] as &[u8])?;
+                    Ok(())
+                },
+            )
+            .map_err(|e| anyhow!("receipt transaction failed: {e:?}"))?;
         Ok(())
     }
 
@@ -787,7 +1424,9 @@ impl Storage {
         // across 9 release reps at N=428 — batch machinery exceeds 428 x
         // ~4us pagecache inserts) and reverted. No durability delta either
         // way: neither path flushes; the barrier is `flush()` (every 25
-        // heights, shutdown, upgrade — untouched).
+        // heights, shutdown, upgrade — untouched). Each `put_receipt` also
+        // writes the tip-ordered row, atomically with the body (one two-tree
+        // sled transaction per receipt — still a per-tx cost, no block batch).
         let mut n = 0;
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
@@ -829,25 +1468,32 @@ impl Storage {
         // order (random vs height), so take-first grabbed an arbitrary prefix
         // and could delete 0 forever while stale entries sat beyond it.
         // Scan in bounded chunks to avoid one giant pass on huge trees.
+        // The tip-ordered index row of every removed receipt goes in the same
+        // chunk (per-tree atomic batches), so the index cannot grow forever.
         let mut removed = 0;
         loop {
-            let stale: Vec<sled::IVec> = self
+            let stale: Vec<(sled::IVec, StoredReceipt)> = self
                 .receipts
                 .iter()
                 .filter_map(|kv| kv.ok())
                 .filter_map(|(k, v)| {
                     let r: StoredReceipt = decode_receipt(&v).ok()?;
-                    (r.height < keep_from).then_some(k)
+                    (r.height < keep_from).then_some((k, r))
                 })
                 .take(PRUNE_BATCH)
                 .collect();
             if stale.is_empty() {
                 break;
             }
-            for k in stale {
-                self.receipts.remove(k)?;
-                removed += 1;
+            let mut bodies = sled::Batch::default();
+            let mut index_rows = sled::Batch::default();
+            for (k, r) in &stale {
+                bodies.remove(k);
+                index_rows.remove(&receipt_index_key(r)[..]);
             }
+            self.receipts.apply_batch(bodies)?;
+            self.receipts_by_height.apply_batch(index_rows)?;
+            removed += stale.len();
             if removed >= PRUNE_BATCH * 4 {
                 break; // one pass drains 80k; the rest next cadence
             }
@@ -862,6 +1508,10 @@ impl Storage {
     /// Bounded scan of stored receipts (tip hydration / tests). `limit` caps
     /// memory; iteration order is tx-hash order, so callers needing tip-ward
     /// priority must sort/filter by height themselves.
+    ///
+    /// Kept as the compatibility fallback for stores whose `receipts_by_height`
+    /// index is absent or incomplete; new readers use
+    /// [`Self::latest_receipts_capped`].
     pub fn all_receipts_capped(&self, limit: usize) -> Result<Vec<StoredReceipt>> {
         let mut out = Vec::new();
         for kv in self.receipts.iter().filter_map(|k| k.ok()) {
@@ -869,6 +1519,71 @@ impl Storage {
                 break;
             }
             out.push(decode_receipt(&kv.1)?);
+        }
+        Ok(out)
+    }
+
+    /// The newest `limit` receipts, ordered `(height, index)` DESCENDING.
+    ///
+    /// Reads the additive `receipts_by_height` index in reverse, so the slice
+    /// is a genuine tip window instead of a random tx-hash prefix: `O(limit)`
+    /// reads, independent of how large `receipts` has grown. Dangling index
+    /// rows (body already pruned) are skipped.
+    ///
+    /// Fallback: when the index is not marked complete (pre-upgrade store), its
+    /// meta read fails, or the index is empty while receipts exist, this warns
+    /// and returns [`Self::all_receipts_capped`] — the exact pre-fix behaviour,
+    /// never a silently partial window.
+    pub fn latest_receipts_capped(&self, limit: usize) -> Result<Vec<StoredReceipt>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ready = match self.meta.get(RECEIPTS_BY_HEIGHT_READY_META_KEY) {
+            Ok(ready) => ready.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    "[storage] receipts_by_height marker unreadable ({e}); using legacy receipt scan"
+                );
+                return self.all_receipts_capped(limit);
+            }
+        };
+        if !ready {
+            tracing::warn!(
+                "[storage] receipts_by_height index is not complete; using the legacy tx-hash-ordered receipt scan (newest receipts may be missed)"
+            );
+            return self.all_receipts_capped(limit);
+        }
+        if self.receipts_by_height.is_empty() && !self.receipts.is_empty() {
+            tracing::warn!(
+                "[storage] receipts_by_height index is empty while receipts exist; using the legacy tx-hash-ordered receipt scan"
+            );
+            return self.all_receipts_capped(limit);
+        }
+        let mut out = Vec::new();
+        for kv in self.receipts_by_height.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, _) = kv?;
+            if key.len() != RECEIPT_INDEX_KEY_LEN {
+                tracing::warn!(
+                    "[storage] receipts_by_height: ignoring malformed {}B key",
+                    key.len()
+                );
+                continue;
+            }
+            let mut tx_hash = [0u8; 32];
+            tx_hash.copy_from_slice(&key[12..RECEIPT_INDEX_KEY_LEN]);
+            // Dangling row: the body was pruned between the index write and now.
+            if let Some(value) = self.receipts.get(tx_hash)? {
+                match decode_receipt(&value) {
+                    Ok(receipt) => out.push(receipt),
+                    Err(e) => tracing::warn!(
+                        "[storage] latest_receipts_capped: skipping undecodable receipt {}: {e}",
+                        hex::encode(tx_hash)
+                    ),
+                }
+            }
         }
         Ok(out)
     }
@@ -4189,8 +4904,9 @@ mod tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        b.sign_block(signer);
+            round: 0,
+        };
+        b.sign_block(signer);
         b
     }
 
@@ -5467,8 +6183,9 @@ mod archive_proof_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        b.sign_block(signer);
+            round: 0,
+        };
+        b.sign_block(signer);
         b
     }
 

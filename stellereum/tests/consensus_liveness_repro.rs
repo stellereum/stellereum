@@ -690,6 +690,19 @@ async fn a_thirty_round_skew_still_converges() {
 /// key then suppresses the correct precommit on every later tick, and the
 /// height is never decided. That is the live failure: a full prevote QC, no
 /// precommit QC.
+fn test_polka_block(height: u64, round: u32, proposer: [u8; 32], tag: u8) -> (Block, [u8; 32]) {
+    let blk = Block {
+        height,
+        state_root: [tag; 32],
+        timestamp: 100 + tag as u64,
+        proposer,
+        round,
+        ..Default::default()
+    };
+    let h = blk.compute_hash();
+    (blk, h)
+}
+
 #[tokio::test]
 async fn polka_is_not_masked_by_a_newer_nil_quorum() {
     let (ks, fks) = falcon_votes::falcon_set(3);
@@ -699,8 +712,9 @@ async fn polka_is_not_masked_by_a_newer_nil_quorum() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
         .with_falcon_key(fks[0].clone());
 
-    let block = [0xABu8; 32];
     let polka_round = 0u32;
+    let (blk, block) = test_polka_block(1, polka_round, ks[0].verifying_key().to_bytes(), 0xAB);
+    rt.blocks.insert(block, blk);
 
     // Round 0: A and B prevote the block -> 2500 >= 2334 -> a POLKA.
     for (i, k) in ks.iter().enumerate().take(2) {
@@ -772,7 +786,8 @@ async fn a_nil_precommit_does_not_suppress_the_real_one() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
         .with_falcon_key(fks[0].clone());
 
-    let block = [0xCDu8; 32];
+    let (blk, block) = test_polka_block(1, 0, ks[0].verifying_key().to_bytes(), 0xCD);
+    rt.blocks.insert(block, blk);
     for (i, k) in ks.iter().enumerate().take(2) {
         rt.on_prevote(falcon_votes::fvote(
             k,
@@ -825,7 +840,8 @@ async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
         .with_falcon_key(fks[0].clone());
 
     let network_round = 40u32;
-    let block = [0x5Eu8; 32];
+    let (blk, block) = test_polka_block(1, network_round, ks[0].verifying_key().to_bytes(), 0x5E);
+    rt.blocks.insert(block, blk);
 
     // The network forms the polka in ITS round (40): A and B prevote the
     // block, so 1500 + 1000 = 2500 >= 2334.
@@ -993,8 +1009,10 @@ async fn the_lock_refuses_a_conflicting_precommit() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
         .with_falcon_key(fks[0].clone());
 
-    let a = [0x11u8; 32];
-    let b = [0x22u8; 32];
+    let (blk_a, a) = test_polka_block(1, 10, ks[0].verifying_key().to_bytes(), 0x11);
+    let (blk_b, b) = test_polka_block(1, 10, ks[0].verifying_key().to_bytes(), 0x22);
+    rt.blocks.insert(a, blk_a);
+    rt.blocks.insert(b, blk_b);
 
     // We lock on A at round 10.
     for (i, k) in ks.iter().enumerate().take(2) {
@@ -1015,7 +1033,7 @@ async fn the_lock_refuses_a_conflicting_precommit() {
     assert_eq!(rt.hc.locked, Some((a, 10)));
 
     // Now a polka for a DIFFERENT block at the SAME round must not make us
-    // precommit against our lock.
+    // precommit against our lock (nor re-sign round 10).
     for (i, k) in ks.iter().enumerate().take(2) {
         let _ = rt.on_prevote(falcon_votes::fvote(
             k,
@@ -1026,13 +1044,11 @@ async fn the_lock_refuses_a_conflicting_precommit() {
             Some(b),
         ));
     }
-    // (The vote set keeps the FIRST vote per validator, so the polka for A
-    // is still the one in the set: the lock and the polka agree.)
-    let again = rt
-        .make_precommit()
-        .expect("the same polka must still precommit");
-    assert_eq!(again.block_hash, Some(a));
-    assert_eq!(again.round, 10);
+    assert!(
+        rt.make_precommit().is_none(),
+        "SafetyAuthority refuses conflicting/duplicate precommit at round 10"
+    );
+    assert_eq!(rt.hc.locked, Some((a, 10)));
 }
 
 /// A polka for a DIFFERENT block at a HIGHER round releases the lock
@@ -1046,8 +1062,10 @@ async fn a_higher_round_polka_releases_the_lock() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
         .with_falcon_key(fks[0].clone());
 
-    let a = [0x11u8; 32];
-    let b = [0x22u8; 32];
+    let (blk_a, a) = test_polka_block(1, 10, ks[0].verifying_key().to_bytes(), 0x11);
+    let (blk_b, b) = test_polka_block(1, 12, ks[0].verifying_key().to_bytes(), 0x22);
+    rt.blocks.insert(a, blk_a);
+    rt.blocks.insert(b, blk_b);
 
     for (i, k) in ks.iter().enumerate().take(2) {
         rt.on_prevote(falcon_votes::fvote(
@@ -1098,7 +1116,8 @@ async fn a_nil_quorum_never_unlocks_the_lock() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
         .with_falcon_key(fks[0].clone());
 
-    let a = [0x11u8; 32];
+    let (blk_a, a) = test_polka_block(1, 10, ks[0].verifying_key().to_bytes(), 0x11);
+    rt.blocks.insert(a, blk_a);
     for (i, k) in ks.iter().enumerate().take(2) {
         rt.on_prevote(falcon_votes::fvote(
             k,

@@ -446,8 +446,8 @@ fn far_ahead_votes_rejected_from_voteset() {
 
 #[test]
 fn f3_nil_precommit_quorum_is_not_qc_observed() {
-    // A nil quorum proves nothing certifiable: the gate passes and a bodyless
-    // lock still drops (liveness preserved where no fork is possible).
+    // A nil quorum is not a non-nil certificate, but it also does not prove
+    // that another node never observed a certificate for the locked value.
     let ks = keys(4);
     let fks = falcon_for_keys(0x74);
     let mut hc = HeightConsensus::new(H, vset1(&ks));
@@ -469,7 +469,12 @@ fn f3_nil_precommit_quorum_is_not_qc_observed() {
         "nil quorum must not count as an observed precommit QC"
     );
     assert!(hc.apply_deadlock_local_reset(false));
-    assert_eq!(hc.locked, None);
+    assert_eq!(
+        hc.locked,
+        Some((A_BLK, 400)),
+        "a nil quorum cannot justify dropping a bodyless lock"
+    );
+    assert_eq!(hc.try_precommit_quorum(), None, "nil cannot decide a block");
     // The re-phase NEVER rewinds the round: re-entering a round this node
     // already voted in at this height is a self-equivocation (slashable).
     // It advances instead, and widens the quorum-scan window so the round

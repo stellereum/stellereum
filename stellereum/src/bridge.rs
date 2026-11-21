@@ -1946,7 +1946,21 @@ impl MultisigRelayer {
         distinct_falcon_signers(msg, sigs, &validators).unwrap_or(0)
     }
 
-    /// Authorize a release exactly once. `op_id` is the bridge operation id.
+    /// Signing preimage for this offline model's release authorization.
+    ///
+    /// The fixed domain separates these signatures from other bridge messages;
+    /// the fixed-width operation id and the complete payload are both signed.
+    /// This is not the TON or EVM release-order signing format.
+    pub fn release_signing_message(op_id: [u8; 32], msg: &[u8]) -> Vec<u8> {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V1");
+        preimage.extend_from_slice(&op_id);
+        preimage.extend_from_slice(msg);
+        preimage
+    }
+
+    /// Authorize a release exactly once. Signatures must cover
+    /// [`Self::release_signing_message`], not the raw `msg`.
     pub fn try_release(
         &mut self,
         op_id: [u8; 32],
@@ -1959,7 +1973,7 @@ impl MultisigRelayer {
         if self.validators.is_empty() {
             return Err("Relayer set is empty: refusing to release".to_string());
         }
-        if self.count_signers(msg, sigs) < self.threshold {
+        if self.count_signers(&Self::release_signing_message(op_id, msg), sigs) < self.threshold {
             return Err(format!(
                 "Insufficient multisig signatures: need {}",
                 self.threshold

@@ -214,6 +214,7 @@ async fn the_lock_hint_rescue_never_serves_another_authors_body() {
     // Our own VALUE is kept and served (re-stamped at our current round,
     // ruleset v6 — the signed hash may differ, the value identity may not).
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(mh));
+    rt.hc.next_round();
     while rt.hc.proposer().unwrap() != id(&ks[0]) {
         rt.hc.next_round();
     }

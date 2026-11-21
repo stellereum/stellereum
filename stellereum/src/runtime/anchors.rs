@@ -13,6 +13,44 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+pub(super) struct RuntimeVoteSigner<'a> {
+    pub(super) rt: &'a ValidatorRuntime,
+}
+
+impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
+    fn validator_id(&self) -> ValidatorId {
+        self.rt.id
+    }
+
+    fn sign_ed25519(&self, msg: &[u8]) -> Option<Vec<u8>> {
+        match &self.rt.remote_signer {
+            Some(s) => match s.sign(msg) {
+                Ok(sig) => Some(sig.to_vec()),
+                Err(e) => {
+                    eprintln!("[signer] refusing to vote, remote signer failed: {e}");
+                    None
+                }
+            },
+            None => Some(self.rt.key.sign(msg).to_vec()),
+        }
+    }
+
+    fn sign_falcon(&self, msg: &[u8]) -> Option<(ValidatorId, Vec<u8>)> {
+        let fk = self.rt.falcon_signing_key()?;
+        let sig = if self.rt.deterministic_sim_signing {
+            let mut h = blake3::Hasher::new();
+            h.update(b"STELL_SIM_VOTE_SEED_V1");
+            h.update(&fk.validator_id());
+            h.update(msg);
+            let seed: [u8; 32] = *h.finalize().as_bytes();
+            fk.sign_deterministic_for_sim(msg, &seed)
+        } else {
+            fk.sign(msg)
+        };
+        Some((fk.validator_id(), sig))
+    }
+}
+
 impl ValidatorRuntime {
     pub fn new(
         key: SigningKey,
@@ -110,6 +148,7 @@ impl ValidatorRuntime {
             cnvrf_v3_vdf_steps: crate::minroot_vdf::DEFAULT_VDF_STEPS_PER_EPOCH,
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: None,
+            safety: crate::safety::SafetyAuthority::new_ephemeral(start_height),
             last_progress_at: std::time::Instant::now(),
             last_breaker_at: None,
             // The fork-choice tree starts EMPTY: the node learns its
@@ -3082,23 +3121,16 @@ impl ValidatorRuntime {
         }
     }
 
-    /// Produce a signature over `bytes`, via the remote signer when one is configured.
-    ///
-    /// Returns `None` on any signer failure. Deliberately NOT `unwrap_or`-style
-    /// fallback to `self.key`: a node that believes its key is in an HSM while it
-    /// quietly signs from a plaintext seed in its own heap is the exact failure this
-    /// exists to prevent, so the caller must skip the vote instead.
-    pub(super) fn sign_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        match &self.remote_signer {
-            Some(s) => match s.sign(bytes) {
-                Ok(sig) => Some(sig.to_vec()),
-                Err(e) => {
-                    eprintln!("[signer] refusing to vote, remote signer failed: {e}");
-                    None
-                }
-            },
-            None => Some(self.key.sign(bytes).to_vec()),
-        }
+    /// Replace the default in-memory `SafetyAuthority` (used by `ValidatorRuntime::new`)
+    /// with a durable or specifically configured authority (production `node/` MUST
+    /// wire `SafetyBackend::Durable` via `SafetyAuthority::open_from_storage`).
+    pub fn with_safety_authority(mut self, safety: crate::safety::SafetyAuthority) -> Self {
+        self.safety = safety;
+        self
+    }
+
+    pub(super) fn vote_signer(&self) -> RuntimeVoteSigner<'_> {
+        RuntimeVoteSigner { rt: self }
     }
 
     /// Downtime slash for the certificate this runtime currently holds in `hc`:

@@ -138,7 +138,8 @@ pub fn log_stage(gate: &AtomicU64, site: &str, detail: &str, took: std::time::Du
 /// Maximum number of drained chunks that may wait in the background broadcast
 /// sender before the flush stops draining and applies backpressure (the rest
 /// stay in the consensus outbox and are retried/still deduplicated next tick).
-/// Bounds memory if the transport is wedged without ever dropping a message.
+/// Bounds sender memory if the transport is wedged; enqueue alone does not
+/// guarantee transport delivery or survival of sender task failure.
 pub const MAX_PENDING_CHUNKS: usize = 256;
 
 /// Coalescing window for duplicate vote sends (tail-killer, send side).
@@ -191,13 +192,19 @@ pub fn vote_wire_key(msg: &ConsensusMsg) -> Option<VoteWireKey> {
     }
 }
 
-/// True when `msg` is a vote that is superseded at `(height, round)`: same
-/// height, and its round is at least [`SUPERSEDED_ROUND_LAG`] behind. Never
-/// true for proposals, commits, or batches.
+/// True when `msg` is a prevote that is superseded at `(height, round)`: same
+/// height, and its round is at least [`SUPERSEDED_ROUND_LAG`] behind.
+///
+/// `Precommit`s are deliberately EXEMPT (late-polka liveness/safety,
+/// `05_LOCK_SAFETY_P0.md` §1.6.2): a valid late-polka `Precommit` at `r0`
+/// cast when `hc.round = 11` must reach peers instead of being pruned before
+/// wire send. Never true for proposals, commits, or batches.
 pub fn is_superseded_vote(msg: &ConsensusMsg, height: u64, round: u32) -> bool {
     match msg {
         ConsensusMsg::Vote { vote, .. } => {
-            vote.height == height && vote.round.saturating_add(SUPERSEDED_ROUND_LAG) <= round
+            vote.kind == VoteKind::Prevote
+                && vote.height == height
+                && vote.round.saturating_add(SUPERSEDED_ROUND_LAG) <= round
         }
         _ => false,
     }
@@ -2378,36 +2385,64 @@ impl ConsensusNetwork {
 /// handed to the background sender.
 pub type BroadcastChunk = Vec<ConsensusMsg>;
 
+/// Owns one pending reservation until processing finishes or the channel
+/// discards the entry. This also releases reservations on task cancellation.
+struct PendingChunk {
+    chunk: Option<BroadcastChunk>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingChunk {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Handle to the dedicated ordered broadcast sender. Cheap to clone; all clones
 /// feed the same FIFO queue and therefore the same wire order.
 #[derive(Clone)]
 pub struct ConsensusSender {
-    tx: mpsc::UnboundedSender<BroadcastChunk>,
-    /// Chunks handed to the queue but not yet sent (channel depth). Kept here
-    /// because tokio's `UnboundedSender` exposes no `len()`; used for the
-    /// backpressure cap and the flush sub-timing line.
+    tx: mpsc::UnboundedSender<PendingChunk>,
+    /// Reserved, queued, and in-flight chunks, used for backpressure and
+    /// the flush sub-timing line.
     pending: Arc<AtomicUsize>,
 }
 
 impl ConsensusSender {
-    /// Enqueue one drained chunk. Non-blocking. Returns `false` when the queue
-    /// is at [`MAX_PENDING_CHUNKS`] (or the sender task is gone), in which case
-    /// the caller keeps the chunk in its outbox for a later flush. A chunk is
-    /// never dropped or duplicated by this path: the outbox moved it out
-    /// exactly once, and dedup lives at enqueue time.
+    /// Compatibility wrapper that drops the chunk on refusal. Call
+    /// [`Self::try_enqueue`] to retain ownership on failure.
     pub fn enqueue(&self, chunk: BroadcastChunk) -> bool {
-        if self.pending.load(Ordering::Relaxed) >= MAX_PENDING_CHUNKS {
-            return false;
+        self.try_enqueue(chunk).is_ok()
+    }
+
+    /// Non-blocking enqueue that returns ownership on saturation or closure.
+    pub fn try_enqueue(&self, chunk: BroadcastChunk) -> Result<(), BroadcastChunk> {
+        // Reserve before publishing: the receiver may complete immediately,
+        // and multiple clones may enqueue concurrently.
+        if self
+            .pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n < MAX_PENDING_CHUNKS {
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            })
+            .is_err()
+        {
+            return Err(chunk);
         }
-        if self.tx.send(chunk).is_ok() {
-            self.pending.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
+        let entry = PendingChunk {
+            chunk: Some(chunk),
+            pending: Arc::clone(&self.pending),
+        };
+        match self.tx.send(entry) {
+            Ok(()) => Ok(()),
+            Err(mut err) => Err(err.0.chunk.take().expect("unsent chunk is present")),
         }
     }
 
-    /// Chunks waiting behind the transport (for the flush sub-timing line).
+    /// Reserved, queued, and in-flight chunks (for the flush sub-timing line).
     pub fn queued(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
     }
@@ -2421,15 +2456,16 @@ where
     F: FnMut(BroadcastChunk) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<BroadcastChunk>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<PendingChunk>();
     let pending = Arc::new(AtomicUsize::new(0));
     let task_pending = Arc::clone(&pending);
     tokio::spawn(async move {
-        while let Some(chunk) = rx.recv().await {
+        while let Some(mut entry) = rx.recv().await {
+            let chunk = entry.chunk.take().expect("queued chunk is present");
             let items = chunk.len();
             let t = std::time::Instant::now();
             send(chunk).await;
-            task_pending.fetch_sub(1, Ordering::Relaxed);
+            drop(entry);
             // Same stage name as the old synchronous flush, now measured on the
             // sender task so the transport cost stays visible even though the
             // tick no longer waits for it. `queued` is the backlog behind this
@@ -6099,6 +6135,14 @@ mod tests {
             },
         };
         assert!(!is_superseded_vote(&commit, 9, 99));
+        let late_precommit = ConsensusMsg::Vote {
+            vote: Vote::sign(&sk, 9, 0, VoteKind::Precommit, Some([1u8; 32])),
+            locked: None,
+        };
+        assert!(
+            !is_superseded_vote(&late_precommit, 9, 11),
+            "late-polka precommit at r0 must not be dropped when local round is 11"
+        );
     }
 
     #[test]
@@ -6184,9 +6228,8 @@ mod tests {
     #[tokio::test]
     async fn ordered_sender_saturation_returns_false_without_dropping() {
         // Backpressure contract: once the queue is at MAX_PENDING_CHUNKS further
-        // enqueues are refused (the caller keeps the message in its outbox) and
-        // nothing already accepted is lost. This is what makes an unbounded
-        // consensus outbox safe to drain into the sender.
+        // enqueues are refused and do not consume another slot. The bool
+        // compatibility wrapper drops refused chunks; use try_enqueue to retain them.
         let sender = spawn_ordered_sender(|_chunk: BroadcastChunk| async {
             // Never completes within the test window: models a wedged transport.
             std::future::pending::<()>().await;
@@ -6209,6 +6252,116 @@ mod tests {
             cap,
             "a refused enqueue must not consume a slot"
         );
+    }
+
+    #[test]
+    fn sender_refusal_returns_chunk_and_rolls_back_closed_reservation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sender = ConsensusSender {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+        };
+        drop(rx);
+        let returned = sender.try_enqueue(vec![tagged_vote(73)]).unwrap_err();
+        assert_eq!(tagged_height(&returned[0]), 73);
+        assert_eq!(sender.queued(), 0);
+    }
+
+    #[test]
+    fn sender_refusal_at_usize_max_does_not_overflow() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sender = ConsensusSender {
+            tx,
+            pending: Arc::new(AtomicUsize::new(usize::MAX)),
+        };
+        let returned = sender.try_enqueue(vec![tagged_vote(74)]).unwrap_err();
+        assert_eq!(tagged_height(&returned[0]), 74);
+        assert_eq!(sender.queued(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn sender_task_failure_releases_inflight_and_queued_reservations() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let mut release_rx = Some(release_rx);
+        let sender = spawn_ordered_sender(move |_chunk| {
+            let started = started_tx.take().unwrap();
+            let release = release_rx.take().unwrap();
+            async move {
+                started.send(()).unwrap();
+                release.await.unwrap();
+                panic!("controlled sender failure");
+            }
+        });
+        let clone = sender.clone();
+        assert!(sender.try_enqueue(vec![tagged_vote(1)]).is_ok());
+        started_rx.await.unwrap();
+        assert!(clone.try_enqueue(vec![tagged_vote(2)]).is_ok());
+        assert_eq!(sender.queued(), 2);
+        release_tx.send(()).unwrap();
+        clone.tx.closed().await;
+        assert_eq!(sender.queued(), 0);
+        let returned = clone.try_enqueue(vec![tagged_vote(3)]).unwrap_err();
+        assert_eq!(tagged_height(&returned[0]), 3);
+        assert_eq!(sender.queued(), 0);
+    }
+
+    #[test]
+    fn sender_refusal_concurrent_reservations_do_not_exceed_cap() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sender = ConsensusSender {
+            tx,
+            pending: Arc::new(AtomicUsize::new(MAX_PENDING_CHUNKS - 1)),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut threads = Vec::new();
+        for i in 0..8 {
+            let sender = sender.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                sender.try_enqueue(vec![tagged_vote(i)]).is_ok()
+            }));
+        }
+        barrier.wait();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+        assert_eq!(sender.queued(), MAX_PENDING_CHUNKS);
+        let returned = sender.try_enqueue(vec![tagged_vote(99)]).unwrap_err();
+        assert_eq!(tagged_height(&returned[0]), 99);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_refusal_fast_receiver_never_underflows_pending() {
+        let sender = spawn_ordered_sender(|_chunk| async {});
+        for i in 0..2000 {
+            let mut chunk = vec![tagged_vote(i)];
+            loop {
+                match sender.try_enqueue(chunk) {
+                    Ok(()) => break,
+                    Err(returned) => {
+                        chunk = returned;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            assert!(sender.queued() <= MAX_PENDING_CHUNKS);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sender.queued() != 0 {
+                assert!(sender.queued() <= MAX_PENDING_CHUNKS);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "pending did not drain");
     }
 
     /// Structural µQC QC fixture (signature bytes are patterned filler, NOT

@@ -640,6 +640,7 @@ mod gossip_batch_tests {
                 let _ = rt.on_prevote(v);
             }
         }
+        rt.hc.next_round();
         while rt.hc.proposer().unwrap() != id(&ks[0]) {
             rt.hc.next_round();
         }

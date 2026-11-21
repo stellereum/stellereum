@@ -161,6 +161,7 @@ async fn runtime_with_parent(parent_ts: u64) -> (ValidatorRuntime, [u8; 32], Sig
     let parent_hash = parent.compute_hash();
     rt.blocks.insert(parent_hash, parent.clone());
     rt.finalized = vec![(1, parent_hash)];
+    rt.safety.advance_height(2, 1, parent_hash).unwrap();
     rt.hc.height = 2;
     (rt, parent_hash, k)
 }

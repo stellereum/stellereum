@@ -59,6 +59,20 @@ pub struct ChainBindingActivation {
     pub height: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CHAIN_BIND_THREAD_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only thread-local override for [`ChainBindingActivation::from_chain_spec`],
+/// preventing `set_var(STELL_CHAIN_BIND_ACTIVATION_HEIGHT)` from racing with
+/// parallel tests in the same `--lib` test binary.
+#[cfg(test)]
+pub fn set_chain_binding_override_for_tests(height: Option<u64>) {
+    CHAIN_BIND_THREAD_OVERRIDE.with(|c| c.set(height));
+}
+
 impl ChainBindingActivation {
     /// Refusal never activates (phase 1+2 behaviour).
     pub fn never() -> Self {
@@ -84,6 +98,14 @@ impl ChainBindingActivation {
     /// operator docs still point at something, and it is IGNORED (loudly) when
     /// set.
     pub fn from_chain_spec() -> Self {
+        #[cfg(test)]
+        if let Some(h) = CHAIN_BIND_THREAD_OVERRIDE.with(|c| c.get()) {
+            return if h == CHAIN_BINDING_NEVER {
+                Self::never()
+            } else {
+                Self::at_height(h)
+            };
+        }
         // RELEASE builds are the production rule: the compiled constant, full
         // stop, so two nodes can never disagree because of their environment.
         // DEBUG builds (the whole test suite runs there) may arm a boundary via

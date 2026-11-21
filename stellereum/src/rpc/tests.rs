@@ -508,6 +508,117 @@ async fn sign_refuses_non_loopback_peer() {
     );
 }
 
+/// FAIL-BEFORE (T5b): a same-host proxy (loopback peer) that forwards
+/// `X-Forwarded-For: 127.0.0.1` used to lose the `ClientIpSource` on the way
+/// to `require_wallet_sign_loopback`, so the bare `127.0.0.1` was treated as a
+/// DIRECT loopback client and the remote caller reached the dev signing key.
+/// The provenance now survives HTTP and WS: every header-derived claim is
+/// refused, a direct loopback peer still works.
+#[tokio::test]
+async fn wallet_sign_rejects_forwarded_loopback_and_rejected_claim_via_http_and_ws() {
+    let st = signing_state(Some("secret")).await;
+    let trusted = crate::client_ip::parse_trusted_list("127.0.0.0/8");
+    let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-forwarded-for",
+        "127.0.0.1".parse::<axum::http::HeaderValue>().unwrap(),
+    );
+    let rejected = crate::client_ip::resolve_detailed(
+        &headers,
+        peer,
+        &trusted,
+        crate::client_ip::XffMode::Rightmost,
+        false,
+    );
+    assert_eq!(
+        rejected.source,
+        crate::client_ip::ClientIpSource::ForwardedLoopbackRejected
+    );
+
+    // HTTP single call (what `rpc_handler` -> dispatch_client runs).
+    let out = dispatch_client(
+        &st,
+        json!(1),
+        "stell_signMessage",
+        &json!({"message": "hi", "token": "secret"}),
+        None,
+        Some(rejected),
+    )
+    .await;
+    let e = out
+        .0
+        .error
+        .expect("forwarded loopback claim must be refused");
+    assert_eq!(e.code, -32001);
+
+    // HTTP batch (what `handle_rpc_batch_call_client` runs).
+    let items = vec![json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "stell_signMessage",
+        "params": {"message": "hi", "token": "secret"},
+    })];
+    let out = match handle_rpc_batch_call_client(&st, &items, 100, None, Some(rejected)).await {
+        Ok(out) => out,
+        Err(_) => panic!("batch itself must be valid"),
+    };
+    assert_eq!(out[0].error.as_ref().expect("refused").code, -32001);
+
+    // WS path: the socket dispatches through the same `dispatch_client` with
+    // the resolved `ClientIp`; a `Forwarded` loopback (opt-in deployment) is
+    // still NOT a local client.
+    let forwarded = crate::client_ip::ClientIp {
+        addr: peer,
+        source: crate::client_ip::ClientIpSource::Forwarded,
+    };
+    let out = dispatch_client(
+        &st,
+        json!(1),
+        "stell_signMessage",
+        &json!({"message": "hi", "token": "secret"}),
+        None,
+        Some(forwarded),
+    )
+    .await;
+    assert_eq!(out.0.error.expect("forwarded claim refused").code, -32001);
+
+    // Direct loopback peer: still allowed (unchanged devnet behavior).
+    let direct = crate::client_ip::ClientIp::from_peer(peer);
+    let out = dispatch_client(
+        &st,
+        json!(1),
+        "stell_signMessage",
+        &json!({"message": "hi", "token": "secret"}),
+        None,
+        Some(direct),
+    )
+    .await;
+    assert!(
+        out.0.error.is_none(),
+        "direct loopback sign must still work"
+    );
+}
+
+/// FAIL-BEFORE (T6): `stell_mevStats` was implemented in
+/// `dispatch_writes_inner` but missing from the `matches!` filter of
+/// `dispatch_writes`, so the call fell through to reads and returned
+/// `-32601 method not found`.
+#[tokio::test]
+async fn stell_mev_stats_is_reachable_via_rpc_dispatch() {
+    let st = test_state().await;
+    let r = dispatch(&st, json!(1), "stell_mevStats", &json!({}), None, None).await;
+    assert!(
+        r.0.error.is_none(),
+        "stell_mevStats must not be method-not-found: {}",
+        r.0.error.map(|e| e.message).unwrap_or_default()
+    );
+    let v = r.0.result.expect("stats payload");
+    for key in ["epoch", "sealed", "plain", "sealed_share"] {
+        assert!(v.get(key).is_some(), "missing {key} in {v}");
+    }
+}
+
 #[tokio::test]
 async fn rpc_signature_does_not_verify_on_another_chain() {
     // GATE: H-02 — updated to the gated dev-mode path (token required);
@@ -1412,10 +1523,358 @@ async fn faucet_caps_survive_a_restart() {
         "a capped address must stay capped after a restart"
     );
 
-    // And a corrupt record fails closed to empty (under-serves, never over-mints).
+    // And a corrupt record is NOT a clean faucet (fail-closed): the state is
+    // quarantined and every grant path refuses. Previously this silently
+    // reloaded as empty, re-opening every lifetime cap after a restart.
     let broken = Faucet::new(key_seed, 1, 10, 25);
-    broken.load_bytes(b"not-a-faucet-state").await;
+    let err = broken.load_bytes_strict(b"not-a-faucet-state").await;
+    assert!(err.is_err(), "corrupt blob must be reported, not swallowed");
+    assert!(
+        broken.is_quarantined().await,
+        "corrupt blob must quarantine"
+    );
     assert_eq!(broken.dispensed_to(who).await, 0);
+    assert!(
+        broken.build_transfer(who, None, None).await.is_none(),
+        "a quarantined faucet must refuse drips"
+    );
+    let q = broken
+        .request_drip(FaucetDripRequest::token(
+            who,
+            None,
+            None,
+            1_800_000_000,
+            None,
+        ))
+        .await;
+    assert!(
+        matches!(q, Err(FaucetDripError::Quarantined { .. })),
+        "corrupt state must surface Quarantined, got {q:?}"
+    );
+
+    // An EMPTY blob is corrupt too: it must never be read as "fresh faucet".
+    let empty = Faucet::new(key_seed, 1, 10, 25);
+    assert!(empty.load_bytes_strict(b"").await.is_err());
+    assert!(empty.is_quarantined().await);
+    assert!(empty.build_transfer(who, None, None).await.is_none());
+}
+
+/// In-memory [`FaucetMetaStore`] with injectable read/write failures. Proves
+/// that every startup/storage error quarantines instead of resetting caps.
+#[derive(Default)]
+struct FakeMetaStore {
+    values: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    fail_read_for: Option<String>,
+    fail_write_for: Option<String>,
+}
+
+impl FakeMetaStore {
+    fn with_value(key: &str, value: &[u8]) -> Self {
+        let store = Self::default();
+        store
+            .values
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_vec());
+        store
+    }
+
+    fn fail_read(mut self, key: &str) -> Self {
+        self.fail_read_for = Some(key.to_string());
+        self
+    }
+
+    fn fail_write(mut self, key: &str) -> Self {
+        self.fail_write_for = Some(key.to_string());
+        self
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.values.lock().unwrap().get(key).cloned()
+    }
+}
+
+impl FaucetMetaStore for FakeMetaStore {
+    fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        if self.fail_read_for.as_deref() == Some(key) {
+            return Err("injected storage read error".to_string());
+        }
+        Ok(self.get(key))
+    }
+
+    fn set_meta_durable(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        if self.fail_write_for.as_deref() == Some(key) {
+            return Err("injected write/flush error".to_string());
+        }
+        self.values
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_vec());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn faucet_startup_quarantines_on_storage_read_error() {
+    let store = FakeMetaStore::default().fail_read(FAUCET_STATE_META_KEY);
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25);
+    let who = [0x42u8; 32];
+    let err = faucet
+        .restore_or_quarantine(&store, 0)
+        .await
+        .expect_err("a storage read error must not look like a fresh faucet");
+    assert!(err.contains("failed to read"), "{err}");
+    assert!(faucet.is_quarantined().await);
+    assert_eq!(faucet.dispensed_to(who).await, 0);
+    assert!(faucet.build_transfer(who, None, None).await.is_none());
+    assert!(!faucet.check_ip_throttle(None, 1_800_000_000).await);
+    assert!(matches!(
+        faucet
+            .request_drip(FaucetDripRequest::token(
+                who,
+                None,
+                None,
+                1_800_000_000,
+                None
+            ))
+            .await,
+        Err(FaucetDripError::Quarantined { .. })
+    ));
+}
+
+#[tokio::test]
+async fn faucet_startup_quarantines_corrupt_or_missing_state() {
+    // (a) Decodable failure through the full startup machine (not just
+    // `load_bytes_strict`): corrupt blob -> quarantine, no grant.
+    let corrupt = FakeMetaStore::with_value(FAUCET_STATE_META_KEY, b"garbage");
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25);
+    let err = faucet
+        .restore_or_quarantine(&corrupt, 0)
+        .await
+        .expect_err("corrupt blob must quarantine");
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(faucet.is_quarantined().await);
+    assert!(faucet
+        .build_transfer([0x42u8; 32], None, None)
+        .await
+        .is_none());
+
+    // (b) Marker present, state missing -> the state was LOST, not new.
+    let marker_only = FakeMetaStore::with_value(FAUCET_INITIALIZED_META_KEY, b"1");
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25);
+    let err = faucet
+        .restore_or_quarantine(&marker_only, 0)
+        .await
+        .expect_err("marker without state must quarantine");
+    assert!(err.contains("present but faucet state missing"), "{err}");
+    assert!(faucet.is_quarantined().await);
+
+    // (c) No marker, no state, but the chain shows prior faucet spends.
+    let empty = FakeMetaStore::default();
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25);
+    let err = faucet
+        .restore_or_quarantine(&empty, 7)
+        .await
+        .expect_err("onchain_nonce > 0 with no state must quarantine");
+    assert!(err.contains("onchain_nonce"), "{err}");
+    assert!(faucet.is_quarantined().await);
+    assert!(
+        empty.get(FAUCET_INITIALIZED_META_KEY).is_none(),
+        "a refused startup must not write the init marker"
+    );
+}
+
+#[tokio::test]
+async fn faucet_startup_initializes_clean_faucet_and_flushes_marker() {
+    let store = Arc::new(FakeMetaStore::default());
+    let persist_store = Arc::clone(&store);
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25).with_fallible_persist(Arc::new(
+        move |bytes: &[u8]| persist_store.set_meta_durable(FAUCET_STATE_META_KEY, bytes),
+    ));
+    faucet
+        .restore_or_quarantine(store.as_ref(), 0)
+        .await
+        .expect("genuinely fresh faucet (nonce 0, no marker/state) must init");
+    assert!(!faucet.is_quarantined().await);
+    assert_eq!(
+        store.get(FAUCET_INITIALIZED_META_KEY).as_deref(),
+        Some(b"1" as &[u8]),
+        "clean init must durably write the marker"
+    );
+    assert!(
+        store.get(FAUCET_STATE_META_KEY).is_some(),
+        "clean init must persist the pristine state blob"
+    );
+
+    let who = [0x42u8; 32];
+    let grant = faucet
+        .request_drip(FaucetDripRequest::token(
+            who,
+            None,
+            None,
+            1_800_000_000,
+            None,
+        ))
+        .await
+        .expect("fresh faucet must serve a drip");
+    assert_eq!(grant.amount, 10);
+
+    // Restart over the same durable store: caps must survive, no quarantine.
+    let restarted = Faucet::new([0x11u8; 32], 1, 10, 25);
+    restarted
+        .restore_or_quarantine(store.as_ref(), 0)
+        .await
+        .expect("persisted state must load on restart");
+    assert!(!restarted.is_quarantined().await);
+    assert_eq!(restarted.dispensed_to(who).await, 10);
+}
+
+#[tokio::test]
+async fn faucet_startup_quarantines_when_marker_flush_fails() {
+    let store = FakeMetaStore::default().fail_write(FAUCET_STATE_META_KEY);
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25);
+    let err = faucet
+        .restore_or_quarantine(&store, 0)
+        .await
+        .expect_err("a failed durable init write must quarantine");
+    assert!(err.contains("failed to persist"), "{err}");
+    assert!(faucet.is_quarantined().await);
+    assert!(faucet
+        .build_transfer([0x42u8; 32], None, None)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn faucet_persist_failure_rolls_back_ram_and_refuses_grant() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fail = Arc::new(AtomicBool::new(true));
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 25).with_fallible_persist({
+        let fail = Arc::clone(&fail);
+        Arc::new(move |_bytes: &[u8]| {
+            if fail.load(Ordering::SeqCst) {
+                Err("injected write/flush failure".to_string())
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let who = [0x42u8; 32];
+
+    assert!(
+        faucet.build_transfer(who, None, None).await.is_none(),
+        "a drip whose durable write failed must be refused"
+    );
+    assert_eq!(
+        faucet.dispensed_to(who).await,
+        0,
+        "failed persist must roll back the lifetime credit"
+    );
+
+    fail.store(false, Ordering::SeqCst);
+    let (tx, amount) = faucet
+        .build_transfer(who, None, None)
+        .await
+        .expect("the next drip may proceed once the store heals");
+    assert_eq!(amount, 10);
+    assert_eq!(tx.nonce, 0, "failed persist must rewind the nonce too");
+    assert_eq!(
+        faucet.dispensed_to(who).await,
+        10,
+        "rollback must restore the pre-mutation ledger (not double-charge)"
+    );
+}
+
+#[tokio::test]
+async fn faucet_ip_budget_is_refunded_on_persist_failure_and_grant_rollback() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fail = Arc::new(AtomicBool::new(true));
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 1_000_000_000).with_fallible_persist({
+        let fail = Arc::clone(&fail);
+        Arc::new(move |_bytes: &[u8]| {
+            if fail.load(Ordering::SeqCst) {
+                Err("injected flush failure".to_string())
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+    let t = 1_800_000_000u64;
+
+    assert!(
+        !faucet.check_ip_throttle(Some(ip), t).await,
+        "failed persist must refuse the throttle charge"
+    );
+    fail.store(false, Ordering::SeqCst);
+    let ip_max = faucet_ip_max_per_hour();
+    for _ in 0..ip_max {
+        assert!(
+            faucet.check_ip_throttle(Some(ip), t).await,
+            "the failed charge must have been refunded"
+        );
+    }
+    assert!(
+        !faucet.check_ip_throttle(Some(ip), t).await,
+        "budget must still cap at the configured maximum"
+    );
+
+    // A grant rejected by admission is fully refunded (credit + IP budget).
+    let faucet = Faucet::new([0x11u8; 32], 1, 10, 1_000_000_000);
+    let first = [0x42u8; 32];
+    let grant = faucet
+        .request_drip(FaucetDripRequest::token(first, None, None, t, Some(ip)))
+        .await
+        .expect("first drip");
+    faucet
+        .rollback_grant(&grant)
+        .await
+        .expect("rollback persists");
+    assert_eq!(faucet.dispensed_to(first).await, 0);
+    for i in 0..ip_max {
+        let who = [(i as u8).wrapping_add(1); 32];
+        faucet
+            .request_drip(FaucetDripRequest::token(who, None, None, t, Some(ip)))
+            .await
+            .unwrap_or_else(|e| panic!("refunded IP budget must allow drip {i}: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn faucet_public_distinguishes_lifetime_cap_from_cooldown() {
+    let drip = public_drip_nano();
+    let cooldown = public_drip_cooldown_secs();
+    let faucet = Faucet::new([0x77u8; 32], 0, 10, drip);
+    let who = [0x42u8; 32];
+    let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+    let t = 1_700_000_000u64;
+
+    let grant = faucet
+        .request_drip(FaucetDripRequest::public(who, None, t, Some(ip)))
+        .await
+        .expect("first public drip");
+    assert_eq!(grant.amount, drip);
+    assert!(grant.is_public);
+
+    match faucet
+        .request_drip(FaucetDripRequest::public(who, None, t + 1, Some(ip)))
+        .await
+    {
+        Err(FaucetDripError::Cooldown { retry_after_secs }) => {
+            assert_eq!(retry_after_secs, cooldown - 1)
+        }
+        other => panic!("expected Cooldown, got {other:?}"),
+    }
+
+    // Cooldown has elapsed; the lifetime cap is now the ONLY refusal reason
+    // and must NOT be reported as a 2700s cooldown.
+    match faucet
+        .request_drip(FaucetDripRequest::public(who, None, t + cooldown, Some(ip)))
+        .await
+    {
+        Err(FaucetDripError::LifetimeCapExhausted) => {}
+        other => panic!("expected LifetimeCapExhausted, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1884,7 +2343,8 @@ async fn faucet_masterchain_drip_finalizes_on_shard_0() {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    let outcome = st.engine.apply_block_transition(&block, 0).await;
+    };
+    let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 0");
     assert_eq!(outcome.failed, 0);
     let acc = st
@@ -1939,7 +2399,8 @@ async fn faucet_workchain_drip_finalizes_on_its_shard() {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    let outcome = st.engine.apply_block_transition(&block, 0).await;
+    };
+    let outcome = st.engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1, "the drip must apply on shard 1");
     let acc = st
         .engine
@@ -2051,6 +2512,122 @@ async fn faucet_prefix_matrix_routes_before_nonce_reservation() {
     let ok = call(&st0, "stell_faucet", drip_req(&format!("-1:{addr}"))).await;
     assert_eq!(ok["credited_nano"], "10", "{ok}");
     assert_eq!(ok["shard"], 0);
+}
+
+#[tokio::test]
+async fn faucet_signs_chain_bound_tx_and_survives_chain_binding_activation_at_height_1() {
+    struct ChainBindGuard;
+    impl ChainBindGuard {
+        fn at(height: u64) -> Self {
+            crate::chain_binding::set_chain_binding_override_for_tests(Some(height));
+            Self
+        }
+    }
+    impl Drop for ChainBindGuard {
+        fn drop(&mut self) {
+            crate::chain_binding::set_chain_binding_override_for_tests(None);
+        }
+    }
+
+    let _bind_guard = ChainBindGuard::at(1);
+    let key_seed = [0x11u8; 32];
+    let chain_id = crate::consensus::consensus_chain_id();
+    let faucet = Arc::new(Faucet::new(key_seed, 1, 10, 100).with_chain_id(chain_id));
+    let engine = Arc::new(InMemoryStateEngine::new().with_chain_id(chain_id));
+    engine
+        .update_account(AccountState::new(faucet.account(), 100_000_000))
+        .await;
+    let st = Arc::new(RpcState {
+        engine,
+        mempool: Arc::new(RwLock::new(Mempool::default())),
+        height: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        node_id: "inf1:test".to_string(),
+        chain_id,
+        staking: Arc::new(RwLock::new(crate::staking::StakingLedger::new())),
+        governance: Arc::new(RwLock::new(crate::governance::Governance::new())),
+        recent_blocks: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+        receipts: Arc::new(RwLock::new(ReceiptIndex::default())),
+        auth_token: None,
+        tx_broadcast: None,
+        faucet: Some(Arc::clone(&faucet)),
+        faucet_token: Some(FAUCET_TOKEN.to_string()),
+        msg_signing_seed: None,
+        archive_store: None,
+        shard_registry: ShardRegistry::single(),
+    });
+
+    let who = [0x5Au8; 32];
+
+    // Before D3: an unbound faucet tx at activation_height = 1, height = 1 is
+    // rejected by both mempool admission and state-engine block apply.
+    let kp = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&key_seed);
+    let gas = crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+    let unbound = sign_pq_explicit_transfer(&kp, who, 10, gas, 0, 1, 1);
+    assert_eq!(unbound.chain_id(), None);
+    let pool_err = st
+        .mempool
+        .write()
+        .await
+        .add_checked_ctx(
+            unbound.clone(),
+            100_000_000,
+            crate::mempool::AdmissionCtx::wall_now().with_chain_height(1),
+        )
+        .expect_err("unbound drip must be rejected once STELL_CHAIN_BIND_ACTIVATION_HEIGHT=1");
+    assert!(
+        pool_err
+            .to_string()
+            .contains(crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX),
+        "unexpected mempool refusal: {pool_err}"
+    );
+    let apply_err = st
+        .engine
+        .apply_transaction_at_height(&unbound, 0, 1)
+        .await
+        .expect_err("unbound drip must be rejected at block height 1");
+    assert!(
+        apply_err.contains(crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX),
+        "unexpected apply refusal: {apply_err}"
+    );
+
+    // After D3: `stell_faucet` signs a chain-bound transfer, mempool accepts
+    // it with `.with_chain_height(next_height)`, and `apply_transaction_at_height`
+    // executes it at height 1.
+    let r = call(&st, "stell_faucet", drip_req(&hex::encode(who))).await;
+    assert_eq!(r["credited_nano"], "10", "bound faucet drip must pass: {r}");
+    let txs = st.mempool.read().await.all().to_vec();
+    assert_eq!(txs.len(), 1);
+    let tx = &txs[0];
+    assert_eq!(tx.chain_id(), Some(st.chain_id));
+    assert!(tx.verify_signature_for_chain(st.chain_id, true));
+    assert!(!tx.verify_signature_for_chain(st.chain_id + 1, true));
+
+    st.engine
+        .apply_transaction_at_height(tx, 1_700_000_000, 1)
+        .await
+        .expect("chain-bound faucet tx must apply at height 1");
+    assert_eq!(
+        st.engine.get_account(&who).await.map(|a| a.balance),
+        Some(10)
+    );
+
+    // Direct Faucet helpers (`build_transfer` / `request_drip`) inherit `with_chain_id`.
+    let (direct_tx, _) = faucet
+        .build_transfer([0x5Bu8; 32], None, None)
+        .await
+        .expect("build_transfer");
+    assert_eq!(direct_tx.chain_id(), Some(chain_id));
+    let direct_grant = faucet
+        .request_drip(FaucetDripRequest::token(
+            [0x5Cu8; 32],
+            None,
+            None,
+            1_800_000_000,
+            None,
+        ))
+        .await
+        .expect("request_drip");
+    assert_eq!(direct_grant.tx.chain_id(), Some(chain_id));
 }
 
 #[tokio::test]
@@ -3863,8 +4440,9 @@ async fn archive_fixture() -> (Arc<RpcState>, ArchiveFixture) {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                    round: 0,
-        };        b.sign_block(&signer);
+            round: 0,
+        };
+        b.sign_block(&signer);
         b
     };
     let b_h = mk(height, [0u8; 32], [0xAAu8; 32]);
@@ -4206,7 +4784,8 @@ async fn rpc_hydrates_from_the_durable_receipt_store() {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(&sk);
+    };
+    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store
@@ -4264,7 +4843,8 @@ async fn rpc_accepts_stl57_address_and_archive_store_fallback() {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(&sk);
+    };
+    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store
@@ -7043,8 +7623,9 @@ async fn a_runtime_invalidation_reaches_the_rpc_feed() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        b.sign_block(&key);
+            round: 0,
+        };
+        b.sign_block(&key);
         b
     };
 
@@ -9396,7 +9977,8 @@ async fn eth_tx_lookup_rebuilds_restart_hydrated_body_from_archive_store() {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(&sk);
+    };
+    b.sign_block(&sk);
     let bh = b.compute_hash();
     store.put_block(&b).unwrap();
     store

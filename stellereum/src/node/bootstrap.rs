@@ -35,10 +35,9 @@ use stellereum::orderbook::OrderbookManager;
 use stellereum::sharding::{Block, ShardRegistry};
 use stellereum::state_engine::InMemoryStateEngine;
 
-/// Failed faucet-state durability writes (audit 2.3). Counted so a repeating
-/// failure is visible even if the log is rotated; the consequence (lifetime
-/// caps can reset on restart) is named at the failure site.
-static FAUCET_PERSIST_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Failed faucet-state durability writes are counted inside `rpc::faucet`
+// (`FAUCET_PERSIST_FAILURES`) at the refusal site, where the RAM rollback is
+// also applied. A failed write never yields a granted drip.
 
 /// Read the persisted genesis fingerprint, refusing on an I/O error.
 ///
@@ -1424,80 +1423,67 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     // Lifetime caps and the nonce must survive a restart, or
                     // every previously-capped address can draw its full cap
                     // again (and the nonce sequence restarts at 0). The state
-                    // is a small blob under a meta key; a corrupt record fails
-                    // closed to empty, which can only UNDER-serve, never
-                    // over-mint.
+                    // is a small blob under a meta key; a corrupt record is
+                    // QUARANTINED at startup (fail-closed), never treated as
+                    // a clean faucet. Writes are durable (`set_meta_durable`
+                    // inserts + fsyncs) and report failure: the faucet rolls
+                    // back the in-memory reservation and refuses the drip.
                     let store = persistence.storage();
                     let faucet = stellereum::rpc::Faucet::new(
                         *seed,
                         shard,
                         stellereum::rpc::Faucet::default_drip_nano(),
                         FAUCET_LIFETIME_CAP,
-                    );
+                    )
+                    .with_chain_id(stellereum::zkml::effective_chain_id());
                     // NOTE: the persisted state is loaded asynchronously just
                     // below, once rpc_state exists; the hook is attached here
                     // so no drip can slip through unpersisted.
-                    let saver: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync> =
+                    let saver: std::sync::Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync> = {
+                        let store = store.clone();
                         std::sync::Arc::new(move |bytes: &[u8]| {
-                            // Durability is a HARD requirement for the lifetime
-                            // caps/nonce: an in-memory advance whose durable
-                            // record did not land lets every capped address
-                            // redraw its full cap after a restart (rotating-IP
-                            // drain). We cannot fail the (already reserved)
-                            // drip from this sync hook without changing the RPC
-                            // API, so this is an explicit LOUD best-effort:
-                            // counted and logged with the consequence named.
-                            if let Err(e) =
-                                store.set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes)
-                            {
-                                let n = FAUCET_PERSIST_FAILURES
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    .saturating_add(1);
-                                tracing::error!(
-                                    "[faucet] CRITICAL: failed to persist lifetime caps/nonce \
-                                     ({} failure(s)): {e}. Consequence: this drip's lifetime \
-                                     credit is in memory only; a restart can RESET per-address \
-                                     caps and reopen the faucet budget. Fix the store or stop \
-                                     the faucet.",
-                                    n
-                                );
-                                eprintln!(
-                                    "[faucet] CRITICAL: failed to persist faucet state \
-                                     ({n} failure(s)): {e}; lifetime caps can reset on restart"
-                                );
-                            }
-                        });
-                    Some(Arc::new(faucet.with_persist(saver)))
+                            store
+                                .set_meta_durable(stellereum::rpc::FAUCET_STATE_META_KEY, bytes)
+                                .map_err(|e| {
+                                    format!(
+                                        "durable write of {} failed: {e}",
+                                        stellereum::rpc::FAUCET_STATE_META_KEY
+                                    )
+                                })
+                        })
+                    };
+                    Some(Arc::new(faucet.with_fallible_persist(saver)))
                 }),
         });
-        // Restore lifetime caps / nonce saved by the previous run, if any.
-        // Without this, every capped address redraws its full cap after each
-        // restart. A missing or corrupt record loads as empty (fail closed).
+        // Restore lifetime caps / nonce saved by the previous run, with the
+        // fail-closed startup machine (see `Faucet::restore_or_quarantine`):
+        //   * corrupt/unreadable blob, or empty blob -> QUARANTINE;
+        //   * marker `faucet_initialized_v1` present but state missing ->
+        //     QUARANTINE (the state was LOST, not never-created);
+        //   * no marker + no state + on-chain nonce > 0 -> QUARANTINE (the
+        //     chain proves this faucet already spent, so an empty reset would
+        //     re-open every lifetime cap);
+        //   * no marker + no state + on-chain nonce == 0 -> clean init, both
+        //     writes flushed before returning.
+        // A quarantined faucet refuses every drip; it is never silently reset.
         if let Some(f) = rpc_state.faucet.as_ref() {
-            if let Ok(Some(bytes)) = persistence
-                .storage()
-                .get_meta(stellereum::rpc::FAUCET_STATE_META_KEY)
-            {
-                f.load_bytes(&bytes).await;
-            }
-            // Reconcile the durable nonce with the chain: drips reserved
-            // (nonce advanced + persisted) but never executed -- e.g. the
-            // mempool was wiped by a restart before inclusion -- leave a
-            // permanent gap, because the account's on-chain nonce never
-            // advances to meet the reservation. New drips then wait
-            // forever behind phantom predecessors. Observed live: faucet
-            // nonce 20+, on-chain 0, every drip stuck. The on-chain
-            // nonce is authoritative at startup (the mempool never
-            // survives a restart, so nothing reserved-but-unexecuted can
-            // still be pending); clamp down to it, never up (in-flight
-            // drips built but not yet submitted keep their nonces, and
-            // the faucet is single-writer).
+            let store = persistence.storage();
+            // The on-chain nonce is authoritative at startup (the mempool never
+            // survives a restart, so nothing reserved-but-unexecuted can still
+            // be pending); `restore_or_quarantine` also clamps DOWN to it.
             let onchain = state_engine
                 .get_account(&f.account())
                 .await
                 .map(|a| a.nonce)
                 .unwrap_or(0);
-            f.clamp_nonce_down(onchain).await;
+            if let Err(e) = f.restore_or_quarantine(store.as_ref(), onchain).await {
+                let msg = format!(
+                    "[faucet] QUARANTINED (fail-closed): {e}; all drips are refused \
+                     until the operator repairs or removes the faucet state"
+                );
+                tracing::error!("{msg}");
+                eprintln!("{msg}");
+            }
         }
 
         stellereum::rpc::hydrate_rpc_from_store(&rpc_state, &persistence.storage()).await;

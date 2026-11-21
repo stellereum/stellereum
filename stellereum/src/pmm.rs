@@ -50,6 +50,10 @@ pub enum PmmError {
     Dust,
     /// Arithmetic overflow guard.
     Overflow,
+    /// A buy would mint zero STELL.
+    ZeroMint,
+    /// A sell would pay out zero USDT.
+    ZeroPayout,
 }
 
 impl std::fmt::Display for PmmError {
@@ -59,6 +63,8 @@ impl std::fmt::Display for PmmError {
             PmmError::InsufficientReserve => "USDT reserve insufficient for this redemption",
             PmmError::Dust => "amount too small (rounds to zero)",
             PmmError::Overflow => "arithmetic overflow",
+            PmmError::ZeroMint => "buy would mint zero STELL",
+            PmmError::ZeroPayout => "sell would pay out zero USDT",
         };
         write!(f, "{s}")
     }
@@ -176,9 +182,22 @@ impl PrimaryMarketMaker {
     }
 
     fn price_at(&self, supply_nano: u128) -> u64 {
+        self.price_at_checked(supply_nano).unwrap_or(u64::MAX)
+    }
+
+    fn price_at_checked(&self, supply_nano: u128) -> Result<u64, PmmError> {
+        if self.depth_cap_nano == 0 {
+            return Err(PmmError::Overflow);
+        }
         // P = P0 * (1 + S/S_cap) = P0 * (S_cap + S) / S_cap
-        let num = (self.base_price_micro as u128) * (self.depth_cap_nano + supply_nano);
-        (num / self.depth_cap_nano) as u64
+        let sum = self
+            .depth_cap_nano
+            .checked_add(supply_nano)
+            .ok_or(PmmError::Overflow)?;
+        let num = (self.base_price_micro as u128)
+            .checked_mul(sum)
+            .ok_or(PmmError::Overflow)?;
+        u64::try_from(num / self.depth_cap_nano).map_err(|_| PmmError::Overflow)
     }
 
     /// USDT currently redeemable: `reserve - buffer` (saturating).
@@ -212,14 +231,22 @@ impl PrimaryMarketMaker {
     ///
     /// Integral of P(S) from s to s+d:
     ///   cost = P0 * ( d + ( (s+d)^2 - s^2 ) / (2 * S_cap) )
-    fn buy_cost_micro(&self, s: u128, d: u128) -> u128 {
+    fn buy_cost_micro(&self, s: u128, d: u128) -> Result<u128, PmmError> {
         let p0 = self.base_price_micro as u128;
         let sc = self.depth_cap_nano;
-        let s2 = (s + d) * (s + d);
-        let s1 = s * s;
+        let two_sc = 2u128.checked_mul(sc).ok_or(PmmError::Overflow)?;
+        if two_sc == 0 {
+            return Err(PmmError::Overflow);
+        }
+        let s_plus_d = s.checked_add(d).ok_or(PmmError::Overflow)?;
+        let s2 = s_plus_d.checked_mul(s_plus_d).ok_or(PmmError::Overflow)?;
+        let s1 = s.checked_mul(s).ok_or(PmmError::Overflow)?;
         // (s+d)^2 - s^2 = 2*s*d + d^2
-        let quad = (s2 - s1) / (2 * sc);
-        p0 * (d + quad) / NANO_PER_STELL
+        let diff = s2.checked_sub(s1).ok_or(PmmError::Overflow)?;
+        let quad = diff / two_sc;
+        let total = d.checked_add(quad).ok_or(PmmError::Overflow)?;
+        let prod = p0.checked_mul(total).ok_or(PmmError::Overflow)?;
+        Ok(prod / NANO_PER_STELL)
     }
 
     /// STELL minted for a given USDT amount `u` (micro), starting from supply `s`.
@@ -230,29 +257,48 @@ impl PrimaryMarketMaker {
     ///
     /// We solve in "nano" units: define A = s + S_cap, B = 2*S_cap*k where
     /// k (in nano) = u_micro * NANO_PER_STELL / P0.
-    fn mint_for_usdt(&self, s: u128, u_micro: u128) -> u128 {
+    fn mint_for_usdt(&self, s: u128, u_micro: u128) -> Result<u128, PmmError> {
         let p0 = self.base_price_micro as u128;
+        if p0 == 0 {
+            return Err(PmmError::Overflow);
+        }
         let sc = self.depth_cap_nano;
         // k = value of u in STELL at base price, in nano.
-        let k = u_micro.saturating_mul(NANO_PER_STELL) / p0;
-        let a = s + sc;
-        let disc = a.saturating_mul(a).saturating_add(2 * sc * k);
-        Self::isqrt(disc).saturating_sub(a)
+        let k = u_micro
+            .checked_mul(NANO_PER_STELL)
+            .ok_or(PmmError::Overflow)?
+            / p0;
+        let a = s.checked_add(sc).ok_or(PmmError::Overflow)?;
+        let a_sq = a.checked_mul(a).ok_or(PmmError::Overflow)?;
+        let two_sc_k = 2u128
+            .checked_mul(sc)
+            .and_then(|v| v.checked_mul(k))
+            .ok_or(PmmError::Overflow)?;
+        let disc = a_sq.checked_add(two_sc_k).ok_or(PmmError::Overflow)?;
+        Ok(Self::isqrt(disc).saturating_sub(a))
     }
 
     /// USDT paid (micro) for selling exactly `d_nano` STELL from supply `s`.
     ///
     /// Integral: payout = P0 * ( d + ( s^2 - (s-d)^2 ) / (2*S_cap) )
     ///                    = P0 * ( d + (2*s*d - d^2)/(2*S_cap) )
-    fn sell_payout_micro(&self, s: u128, d: u128) -> u128 {
+    fn sell_payout_micro(&self, s: u128, d: u128) -> Result<u128, PmmError> {
         let p0 = self.base_price_micro as u128;
         let sc = self.depth_cap_nano;
+        let two_sc = 2u128.checked_mul(sc).ok_or(PmmError::Overflow)?;
+        if two_sc == 0 || s < d {
+            return Err(PmmError::Overflow);
+        }
         // s^2 - (s-d)^2 = 2*s*d - d^2
-        let s2 = s * s;
-        let low = (s - d) * (s - d);
-        let quad = (s2 - low) / (2 * sc);
+        let s2 = s.checked_mul(s).ok_or(PmmError::Overflow)?;
+        let s_minus_d = s - d;
+        let low = s_minus_d.checked_mul(s_minus_d).ok_or(PmmError::Overflow)?;
+        let diff = s2.checked_sub(low).ok_or(PmmError::Overflow)?;
+        let quad = diff / two_sc;
         // payout = P0 * (d + quad) / 1e9
-        p0.saturating_mul(d.saturating_add(quad)) / NANO_PER_STELL
+        let total = d.checked_add(quad).ok_or(PmmError::Overflow)?;
+        let prod = p0.checked_mul(total).ok_or(PmmError::Overflow)?;
+        Ok(prod / NANO_PER_STELL)
     }
 
     /// Buy with exactly `usdt_micro` USDT; mints STELL along the curve.
@@ -274,59 +320,144 @@ impl PrimaryMarketMaker {
         usdt_micro: u64,
         buffer_bps: u64,
     ) -> Result<BuyReceipt, PmmError> {
+        self.buy_with_buffer_inner(usdt_micro, buffer_bps, false)
+    }
+
+    /// Hardened [`buy_with_buffer`] variant returning [`PmmError::ZeroMint`]
+    /// when a non-zero input mints zero STELL.
+    pub fn buy_with_buffer_checked(
+        &mut self,
+        usdt_micro: u64,
+        buffer_bps: u64,
+    ) -> Result<BuyReceipt, PmmError> {
+        self.buy_with_buffer_inner(usdt_micro, buffer_bps, true)
+    }
+
+    fn buy_with_buffer_inner(
+        &mut self,
+        usdt_micro: u64,
+        buffer_bps: u64,
+        hardened_zero_error: bool,
+    ) -> Result<BuyReceipt, PmmError> {
         if usdt_micro == 0 {
             return Err(PmmError::ZeroAmount);
         }
         let u = usdt_micro as u128;
         let s = self.minted_nano;
-        let d = self.mint_for_usdt(s, u);
+        let d = self.mint_for_usdt(s, u)?;
         if d == 0 {
-            return Err(PmmError::Dust);
+            return Err(if hardened_zero_error {
+                PmmError::ZeroMint
+            } else {
+                PmmError::Dust
+            });
         }
         // The exact curve cost may be <= u due to floor rounding. The buyer pays
         // the full `u` and any rounding remainder stays in the reserve (no value
         // is lost and the reserve is never under-funded).
-        self.minted_nano = s.checked_add(d).ok_or(PmmError::Overflow)?;
+        let new_minted = s.checked_add(d).ok_or(PmmError::Overflow)?;
+        let stell_minted = u64::try_from(d).map_err(|_| PmmError::Overflow)?;
+        let usdt_paid = u64::try_from(u).map_err(|_| PmmError::Overflow)?;
+        let supply_after = u64::try_from(new_minted).map_err(|_| PmmError::Overflow)?;
+        let new_price_micro_usd = self.price_at_checked(new_minted)?;
         // Add the full USDT in (buyer pays `u`).
-        self.reserve_micro = self.reserve_micro.saturating_add(u);
+        let new_reserve = self
+            .reserve_micro
+            .checked_add(u)
+            .ok_or(PmmError::Overflow)?;
         // Ring-fence a fraction for redemptions.
         let bps = (buffer_bps as u128).min(BPS);
-        let buf = u * bps / BPS;
-        self.redemption_buffer_micro = self.redemption_buffer_micro.saturating_add(buf);
+        let buf = u.checked_mul(bps).ok_or(PmmError::Overflow)? / BPS;
+        let new_buffer = self
+            .redemption_buffer_micro
+            .checked_add(buf)
+            .ok_or(PmmError::Overflow)?;
+
+        self.minted_nano = new_minted;
+        self.reserve_micro = new_reserve;
+        self.redemption_buffer_micro = new_buffer;
         Ok(BuyReceipt {
-            stell_minted: d as u64,
-            usdt_paid: u as u64,
-            new_price_micro_usd: self.price_micro_usd(),
-            supply_after: self.minted_nano as u64,
+            stell_minted,
+            usdt_paid,
+            new_price_micro_usd,
+            supply_after,
         })
     }
 
     /// Buy an exact amount of STELL; charges the curve cost.
     pub fn buy_exact_stell(&mut self, stell_nano: u64) -> Result<BuyReceipt, PmmError> {
+        self.buy_exact_stell_inner(stell_nano, false)
+    }
+
+    /// Hardened [`buy_exact_stell`] variant returning [`PmmError::ZeroMint`]
+    /// when a non-zero input yields zero cost.
+    pub fn buy_exact_stell_checked(&mut self, stell_nano: u64) -> Result<BuyReceipt, PmmError> {
+        self.buy_exact_stell_inner(stell_nano, true)
+    }
+
+    fn buy_exact_stell_inner(
+        &mut self,
+        stell_nano: u64,
+        hardened_zero_error: bool,
+    ) -> Result<BuyReceipt, PmmError> {
         if stell_nano == 0 {
             return Err(PmmError::ZeroAmount);
         }
         let d = stell_nano as u128;
         let s = self.minted_nano;
-        let cost = self.buy_cost_micro(s, d);
+        let cost = self.buy_cost_micro(s, d)?;
         if cost == 0 {
-            return Err(PmmError::Dust);
+            return Err(if hardened_zero_error {
+                PmmError::ZeroMint
+            } else {
+                PmmError::Dust
+            });
         }
-        self.minted_nano = s.checked_add(d).ok_or(PmmError::Overflow)?;
-        self.reserve_micro = self.reserve_micro.saturating_add(cost);
-        let buf = cost * PMM_REDEMPTION_BUFFER_BPS as u128 / BPS;
-        self.redemption_buffer_micro = self.redemption_buffer_micro.saturating_add(buf);
+        let new_minted = s.checked_add(d).ok_or(PmmError::Overflow)?;
+        let usdt_paid = u64::try_from(cost).map_err(|_| PmmError::Overflow)?;
+        let supply_after = u64::try_from(new_minted).map_err(|_| PmmError::Overflow)?;
+        let new_price_micro_usd = self.price_at_checked(new_minted)?;
+        let new_reserve = self
+            .reserve_micro
+            .checked_add(cost)
+            .ok_or(PmmError::Overflow)?;
+        let buf = cost
+            .checked_mul(PMM_REDEMPTION_BUFFER_BPS as u128)
+            .ok_or(PmmError::Overflow)?
+            / BPS;
+        let new_buffer = self
+            .redemption_buffer_micro
+            .checked_add(buf)
+            .ok_or(PmmError::Overflow)?;
+
+        self.minted_nano = new_minted;
+        self.reserve_micro = new_reserve;
+        self.redemption_buffer_micro = new_buffer;
         Ok(BuyReceipt {
             stell_minted: stell_nano,
-            usdt_paid: cost as u64,
-            new_price_micro_usd: self.price_micro_usd(),
-            supply_after: self.minted_nano as u64,
+            usdt_paid,
+            new_price_micro_usd,
+            supply_after,
         })
     }
 
     /// Sell (redeem) exactly `stell_nano`; pays the curve value in USDT, bounded
     /// by the usable reserve.
     pub fn sell_stell(&mut self, stell_nano: u64) -> Result<SellReceipt, PmmError> {
+        self.sell_stell_inner(stell_nano, false)
+    }
+
+    /// Hardened [`sell_stell`] variant returning [`PmmError::ZeroPayout`]
+    /// when a non-zero sell rounds to zero USDT payout.
+    pub fn sell_stell_checked(&mut self, stell_nano: u64) -> Result<SellReceipt, PmmError> {
+        self.sell_stell_inner(stell_nano, true)
+    }
+
+    fn sell_stell_inner(
+        &mut self,
+        stell_nano: u64,
+        hardened_zero_error: bool,
+    ) -> Result<SellReceipt, PmmError> {
         if stell_nano == 0 {
             return Err(PmmError::ZeroAmount);
         }
@@ -336,22 +467,31 @@ impl PrimaryMarketMaker {
             // Cannot redeem more than the PMM ever minted.
             return Err(PmmError::InsufficientReserve);
         }
-        let payout = self.sell_payout_micro(s, d);
+        let payout = self.sell_payout_micro(s, d)?;
         if payout == 0 {
-            return Err(PmmError::Dust);
+            return Err(if hardened_zero_error {
+                PmmError::ZeroPayout
+            } else {
+                PmmError::Dust
+            });
         }
         if payout > self.usable_reserve_micro() {
             return Err(PmmError::InsufficientReserve);
         }
-        self.minted_nano = s - d;
+        let new_minted = s - d;
+        let usdt_paid = u64::try_from(payout).map_err(|_| PmmError::Overflow)?;
+        let supply_after = u64::try_from(new_minted).map_err(|_| PmmError::Overflow)?;
+        let new_price_micro_usd = self.price_at_checked(new_minted)?;
+
+        self.minted_nano = new_minted;
         self.reserve_micro = self.reserve_micro.saturating_sub(payout);
         // Buffer shrinks proportionally but never below zero.
         self.redemption_buffer_micro = self.redemption_buffer_micro.min(self.reserve_micro);
         Ok(SellReceipt {
             stell_burned: stell_nano,
-            usdt_paid: payout as u64,
-            new_price_micro_usd: self.price_micro_usd(),
-            supply_after: self.minted_nano as u64,
+            usdt_paid,
+            new_price_micro_usd,
+            supply_after,
         })
     }
 
@@ -363,15 +503,13 @@ impl PrimaryMarketMaker {
         let mut hi = self.minted_nano;
         let usable = self.usable_reserve_micro();
         while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            let payout = self.sell_payout_micro(self.minted_nano, mid);
-            if payout <= usable {
-                lo = mid;
-            } else {
-                hi = mid - 1;
+            let mid = lo + (hi - lo).div_ceil(2);
+            match self.sell_payout_micro(self.minted_nano, mid) {
+                Ok(payout) if payout <= usable => lo = mid,
+                _ => hi = mid - 1,
             }
         }
-        lo as u64
+        u64::try_from(lo).unwrap_or(u64::MAX)
     }
 
     /// Total value locked in the reserve, in USD (for dashboards).
@@ -456,11 +594,13 @@ mod tests {
         pmm.buy_with_usdt(usdt(100_000)).unwrap();
         // max redeemable must not exceed usable reserve
         let max = pmm.max_redeemable_stell();
-        let payout = pmm.sell_payout_micro(pmm.minted_nano, max as u128);
+        let payout = pmm.sell_payout_micro(pmm.minted_nano, max as u128).unwrap();
         assert!(payout <= pmm.usable_reserve_micro());
         // one unit more exceeds
         if max < pmm.minted_nano as u64 {
-            let over = pmm.sell_payout_micro(pmm.minted_nano, (max as u128) + 1);
+            let over = pmm
+                .sell_payout_micro(pmm.minted_nano, (max as u128) + 1)
+                .unwrap();
             assert!(over > pmm.usable_reserve_micro() || over == payout);
         }
     }
@@ -551,8 +691,8 @@ mod tests {
             (5 * sc, 5 * sc),      // full-sell at headline magnitude
         ];
         for &(s0, d) in cases {
-            let buy = pmm.buy_cost_micro(s0, d);
-            let sell = pmm.sell_payout_micro(s0 + d, d);
+            let buy = pmm.buy_cost_micro(s0, d).unwrap();
+            let sell = pmm.sell_payout_micro(s0 + d, d).unwrap();
             assert!(
                 sell == buy,
                 "Sell(s0+d,d) must equal Buy(s0,d): s0={s0} d={d} buy={buy} sell={sell}"
@@ -590,7 +730,7 @@ mod tests {
                 .checked_mul(sum)
                 .expect("P0*(d+quad) must not overflow u128");
             assert!(prod / 1_000_000_000 < u128::MAX / 2, "headroom sanity");
-            let payout = pmm.sell_payout_micro(s, d);
+            let payout = pmm.sell_payout_micro(s, d).unwrap();
             assert_eq!(
                 payout,
                 prod / 1_000_000_000,
@@ -603,7 +743,7 @@ mod tests {
             }
             // Buy side at the same scale must also stay finite.
             if d > 1_000_000_000 {
-                let buy = pmm.buy_cost_micro(s - d, d);
+                let buy = pmm.buy_cost_micro(s - d, d).unwrap();
                 assert!(buy > 0);
             }
         }
@@ -626,9 +766,9 @@ mod tests {
         ];
         for &(buy_usd, code_pin_usd) in VECTORS {
             let u = buy_usd * 1_000_000; // micro
-            let d = pmm.mint_for_usdt(0, u);
+            let d = pmm.mint_for_usdt(0, u).unwrap();
             assert!(d > 0, "buy ${buy_usd} must mint");
-            let payout = pmm.sell_payout_micro(d, d);
+            let payout = pmm.sell_payout_micro(d, d).unwrap();
             // Post-fix: full redemption refund ≈ deposit (floor rounding only).
             assert!(payout <= u, "payout {payout} must not exceed deposit {u}");
             let loss = u - payout;
@@ -683,7 +823,9 @@ mod tests {
         );
         // 20% buffer is withheld: full redemption must NOT fit.
         assert!(
-            pmm.sell_payout_micro(pmm.minted_nano, pmm.minted_nano) > pmm.usable_reserve_micro(),
+            pmm.sell_payout_micro(pmm.minted_nano, pmm.minted_nano)
+                .unwrap()
+                > pmm.usable_reserve_micro(),
             "withheld buffer must block a full instant drain"
         );
         // f_max spot (≈0.735 at x=1, b=0.2 per report table): integer band
@@ -766,13 +908,15 @@ mod tests {
         let max = pmm.max_redeemable_stell();
         assert!(max > 0 && (max as u128) < pmm.minted_nano);
         let usable_before = pmm.usable_reserve_micro();
-        let payout = pmm.sell_payout_micro(pmm.minted_nano, max as u128);
+        let payout = pmm.sell_payout_micro(pmm.minted_nano, max as u128).unwrap();
         assert!(
             payout <= usable_before,
             "max payout {payout} must fit usable {usable_before}"
         );
         if (max as u128) < pmm.minted_nano {
-            let over = pmm.sell_payout_micro(pmm.minted_nano, (max as u128) + 1);
+            let over = pmm
+                .sell_payout_micro(pmm.minted_nano, (max as u128) + 1)
+                .unwrap();
             assert!(
                 over > usable_before || over == payout,
                 "max+1 payout {over} must exceed usable {usable_before} (or price identically)"

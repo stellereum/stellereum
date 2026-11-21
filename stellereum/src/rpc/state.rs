@@ -381,16 +381,40 @@ pub struct TxReceipt {
 pub struct ReceiptIndex {
     pub order: std::collections::VecDeque<[u8; 32]>,
     pub map: HashMap<[u8; 32], TxReceipt>,
+    pub by_height: std::collections::BTreeMap<u64, Vec<[u8; 32]>>,
 }
 
 impl ReceiptIndex {
+    fn remove_from_height_index(&mut self, height: u64, hash: &[u8; 32]) {
+        if let Some(hashes) = self.by_height.get_mut(&height) {
+            if let Some(pos) = hashes.iter().position(|h| h == hash) {
+                hashes.swap_remove(pos);
+            }
+            if hashes.is_empty() {
+                self.by_height.remove(&height);
+            }
+        }
+    }
+
     pub fn insert(&mut self, r: TxReceipt) {
         let hash = r.tx_hash;
-        if self.map.insert(hash, r).is_none() {
-            self.order.push_back(hash);
-            while self.order.len() > MAX_RECEIPTS {
-                if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
+        let new_height = r.height;
+        match self.map.insert(hash, r) {
+            None => {
+                self.by_height.entry(new_height).or_default().push(hash);
+                self.order.push_back(hash);
+                while self.order.len() > MAX_RECEIPTS {
+                    if let Some(old) = self.order.pop_front() {
+                        if let Some(removed) = self.map.remove(&old) {
+                            self.remove_from_height_index(removed.height, &old);
+                        }
+                    }
+                }
+            }
+            Some(prev) => {
+                if prev.height != new_height {
+                    self.remove_from_height_index(prev.height, &hash);
+                    self.by_height.entry(new_height).or_default().push(hash);
                 }
             }
         }
@@ -405,9 +429,21 @@ impl ReceiptIndex {
     }
 
     pub fn for_height(&self, height: u64) -> Vec<&TxReceipt> {
-        let mut rows: Vec<&TxReceipt> = self.map.values().filter(|r| r.height == height).collect();
+        let Some(hashes) = self.by_height.get(&height) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&TxReceipt> = hashes
+            .iter()
+            .filter_map(|h| self.map.get(h))
+            .collect();
         rows.sort_by_key(|r| r.index);
         rows
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.map.clear();
+        self.by_height.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -723,7 +759,15 @@ impl RpcState {
 /// never more than the in-memory cap. Pure orchestration over the two stores;
 /// the durable side stays the source of truth.
 pub async fn hydrate_rpc_from_store(st: &RpcState, store: &crate::storage::Storage) {
-    let mut all = store.all_receipts_capped(MAX_RECEIPTS).unwrap_or_default();
+    // Tip-ordered: the additive `receipts_by_height` index yields a genuine
+    // newest-first window (`(height, index)` descending). Capping a raw
+    // `receipts` scan (tx-hash order) used to hand back an arbitrary prefix and
+    // silently drop the newest receipts — and with them the EVM bindings below
+    // — once the store passed `MAX_RECEIPTS`. The legacy scan remains the
+    // documented fallback inside `latest_receipts_capped`.
+    let mut all = store
+        .latest_receipts_capped(MAX_RECEIPTS)
+        .unwrap_or_default();
     all.sort_by_key(|r| std::cmp::Reverse((r.height, r.index)));
     all.truncate(MAX_RECEIPTS);
     // Insert oldest-first so the index's VecDeque order ends tip-last like the
@@ -819,7 +863,7 @@ pub struct RpcRequest {
     pub params: Value,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RpcResponse {
     pub jsonrpc: &'static str,
     pub id: Value,
@@ -873,6 +917,29 @@ pub async fn handle_rpc_batch_call(
     header_token: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
 ) -> Result<Vec<RpcResponse>, RpcResponse> {
+    // Legacy entry point: a bare address is a DIRECT peer. Transports that
+    // resolved a proxy header must call `handle_rpc_batch_call_client`, so the
+    // `ClientIpSource` provenance reaches the wallet-sign loopback gate.
+    handle_rpc_batch_call_client(
+        st,
+        items,
+        raw_len,
+        header_token,
+        peer_ip.map(crate::client_ip::ClientIp::from_peer),
+    )
+    .await
+}
+
+/// [`handle_rpc_batch_call`] with the full [`crate::client_ip::ClientIp`]
+/// provenance (see the transport handlers in `rpc::streams`).
+pub async fn handle_rpc_batch_call_client(
+    st: &RpcState,
+    items: &[Value],
+    raw_len: usize,
+    header_token: Option<&str>,
+    client: Option<crate::client_ip::ClientIp>,
+) -> Result<Vec<RpcResponse>, RpcResponse> {
+    let peer_ip = client.map(|c| c.addr);
     if items.is_empty() {
         return Err(batch_refused("empty batch"));
     }
@@ -928,7 +995,7 @@ pub async fn handle_rpc_batch_call(
             continue;
         }
         out.push(
-            dispatch(st, id, &req.method, &req.params, header_token, peer_ip)
+            dispatch_client(st, id, &req.method, &req.params, header_token, client)
                 .await
                 .0,
         );
@@ -936,7 +1003,7 @@ pub async fn handle_rpc_batch_call(
     Ok(out)
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,

@@ -53,6 +53,8 @@ ml-kem = "0.3"
 # WebSocket client for the streaming-subscription tests. Already in the
 # dependency graph through axum's `ws` feature, so this adds no new crate.
 tokio-tungstenite = "0.24"
+# `test-util` adds no external dependencies and lets router timeout tests advance virtual time.
+tokio = { version = "1", features = ["test-util"] }
 
 # Test speed: the suite is crypto-heavy (Ed25519, hashing, Merkle, WASM), and an
 # unoptimized dependency graph made it unusably slow. Dependencies are compiled

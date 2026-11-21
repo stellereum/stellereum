@@ -117,7 +117,17 @@ fn a_configured_remote_signer_is_what_signs_the_vote() {
 
     // Get to a point where a prevote can be produced.
     let mut rt = rt;
-    rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0xAB; 32]));
+    let proposer = key.verifying_key().to_bytes();
+    let blk = stellereum::sharding::Block {
+        height: 1,
+        state_root: [0xAB; 32],
+        proposer,
+        round: 0,
+        ..Default::default()
+    };
+    let bh = blk.compute_hash();
+    rt.blocks.insert(bh, blk);
+    rt.hc.proposal = Some((proposer, bh));
     rt.hc.step = stellereum::consensus::Step::Prevote;
 
     let before = calls.load(Ordering::SeqCst);
@@ -144,7 +154,17 @@ fn a_remote_signer_failure_produces_no_vote_at_all() {
     let (rt, fail, _calls) = remote_setup(key.clone());
     let mut rt = rt;
 
-    rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0xCD; 32]));
+    let proposer = key.verifying_key().to_bytes();
+    let blk = stellereum::sharding::Block {
+        height: 1,
+        state_root: [0xCD; 32],
+        proposer,
+        round: 0,
+        ..Default::default()
+    };
+    let bh = blk.compute_hash();
+    rt.blocks.insert(bh, blk);
+    rt.hc.proposal = Some((proposer, bh));
     rt.hc.step = stellereum::consensus::Step::Prevote;
 
     // Now break the signer.
@@ -193,7 +213,17 @@ async fn the_local_path_is_unchanged_when_no_remote_signer_is_configured() {
     let mut rt = ValidatorRuntime::new(key.clone(), vs, state, 1)
         .with_falcon_key(FalconKeypair::generate_from_seed(0xF2));
 
-    rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0x11; 32]));
+    let proposer = key.verifying_key().to_bytes();
+    let blk = stellereum::sharding::Block {
+        height: 1,
+        state_root: [0x11; 32],
+        proposer,
+        round: 0,
+        ..Default::default()
+    };
+    let bh = blk.compute_hash();
+    rt.blocks.insert(bh, blk);
+    rt.hc.proposal = Some((proposer, bh));
     rt.hc.step = stellereum::consensus::Step::Prevote;
 
     let vote = rt.make_prevote().expect("the local path still signs");
@@ -225,8 +255,18 @@ fn remote_signed_vote_is_indistinguishable_from_a_local_one() {
     let (remote_rt, _f, _c) = remote_setup_with_falcon(key.clone(), 0xF3);
     let mut remote_rt = remote_rt.with_deterministic_sim_signing();
 
+    let proposer = key.verifying_key().to_bytes();
+    let blk = stellereum::sharding::Block {
+        height: 1,
+        state_root: [0x42; 32],
+        proposer,
+        round: 0,
+        ..Default::default()
+    };
+    let bh = blk.compute_hash();
     for rt in [&mut local_rt, &mut remote_rt] {
-        rt.hc.proposal = Some((key.verifying_key().to_bytes(), [0x42; 32]));
+        rt.blocks.insert(bh, blk.clone());
+        rt.hc.proposal = Some((proposer, bh));
         rt.hc.step = stellereum::consensus::Step::Prevote;
     }
 

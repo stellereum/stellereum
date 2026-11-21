@@ -209,7 +209,19 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 );
 
                 // 4. Cross-Shard Atomic Transaction with Merkle Proof
-                let cross_tx = Transaction::sign(&trader_alice, bob_addr, 500, 1000, b, 1, 2);
+                // Bind the demo transaction to this chain id as well: the
+                // simulator never submits it, but the CLI must not keep a
+                // legacy unbound signing path around.
+                let cross_tx = Transaction::sign_with_chain_id(
+                    &trader_alice,
+                    bob_addr,
+                    500,
+                    1000,
+                    b,
+                    1,
+                    2,
+                    stellereum::zkml::DEFAULT_CHAIN_ID,
+                );
                 let state_root = state_engine.get_state_root().await;
                 let cross_msg =
                     CrossShardMessage::new_trusted(1, 2, cross_tx, state_root, [b as u8; 32]);
@@ -460,11 +472,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 target_shard,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 verbose,
             } => {
                 let pq_key = falcon_from_hex_seed(&from_key, "from_key")?;
                 let to_arr = parse_wallet_address(&to)?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
 
                 // Reusing a fixed nonce meant only the first transaction from a
                 // key could ever be accepted; every later one was a replay. Read
@@ -511,17 +525,35 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 // on shard 0 (the namespace/DHT shard is not a chain).
                 let gas = stellereum::svm::GAS_BASIC_TRANSFER
                     + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
-                let tx = stellereum::rpc::sign_pq_explicit_transfer(
-                    &pq_key,
-                    to_arr,
-                    amount,
-                    gas,
-                    nonce,
-                    stellereum::sharding::MASTERCHAIN_SHARD,
-                    target_shard,
-                );
+                let tx = match chain_id {
+                    Some(cid) => sign_pq_explicit_transfer_with_chain(
+                        &pq_key,
+                        to_arr,
+                        amount,
+                        gas,
+                        nonce,
+                        stellereum::sharding::MASTERCHAIN_SHARD,
+                        target_shard,
+                        cid,
+                    ),
+                    None => stellereum::rpc::sign_pq_explicit_transfer(
+                        &pq_key,
+                        to_arr,
+                        amount,
+                        gas,
+                        nonce,
+                        stellereum::sharding::MASTERCHAIN_SHARD,
+                        target_shard,
+                    ),
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                match chain_id {
+                    Some(cid) if !tx.verify_signature_for_chain(cid, true) => anyhow::bail!(
+                        "refusing to submit: built transaction is not bound to chain {cid}"
+                    ),
+                    _ => {}
                 }
                 println!("✅ PQ Transaction Signed (Falcon-512, explicit PQ1 envelope):");
                 println!("  Hash:   {}", hex::encode(tx.compute_tx_hash()));
@@ -530,6 +562,9 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 println!("  Amount: {} nano-STELL", tx.amount);
                 println!("  Nonce:  {nonce}");
                 println!("  Target Shard: {}", tx.target_shard);
+                if let Some(cid) = chain_id {
+                    println!("  Chain Id: {cid} (signature bound)");
+                }
 
                 if dry_run {
                     return Ok(());
@@ -559,6 +594,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 target_shard,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 verbose,
             } => {
@@ -581,6 +617,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     anyhow::bail!("Recipient must be 32 bytes");
                 }
                 let to_arr: [u8; 32] = to_bytes.try_into().unwrap();
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
 
                 let query = |method: &str,
                              params: serde_json::Value|
@@ -622,26 +659,44 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     }
                 };
 
-                // Faucet-identical shape: unbound explicit PQ1 envelope, base
-                // fee + activation surcharge, masterchain source. Fits the
-                // existing verifier (sharding.rs verify path) with no new
-                // acceptance surface.
+                // Faucet-identical shape: explicit PQ1 envelope, base fee +
+                // activation surcharge, masterchain source. When a chain id is
+                // available the envelope is chain-bound; with binding not yet
+                // scheduled an unreachable RPC keeps the legacy unbound shape.
                 let gas = stellereum::svm::GAS_BASIC_TRANSFER
                     + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
-                let tx = stellereum::rpc::sign_pq_explicit_transfer(
-                    &pq_key,
-                    to_arr,
-                    amount,
-                    gas,
-                    nonce,
-                    stellereum::sharding::MASTERCHAIN_SHARD,
-                    target_shard,
-                );
+                let tx = match chain_id {
+                    Some(cid) => sign_pq_explicit_transfer_with_chain(
+                        &pq_key,
+                        to_arr,
+                        amount,
+                        gas,
+                        nonce,
+                        stellereum::sharding::MASTERCHAIN_SHARD,
+                        target_shard,
+                        cid,
+                    ),
+                    None => stellereum::rpc::sign_pq_explicit_transfer(
+                        &pq_key,
+                        to_arr,
+                        amount,
+                        gas,
+                        nonce,
+                        stellereum::sharding::MASTERCHAIN_SHARD,
+                        target_shard,
+                    ),
+                };
                 // Client-side self-check (fail-closed): never submit a tx that
                 // does not verify — an unsigned/unverifiable spend is refused
                 // here, not metered into the mempool.
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                match chain_id {
+                    Some(cid) if !tx.verify_signature_for_chain(cid, true) => anyhow::bail!(
+                        "refusing to submit: built transaction is not bound to chain {cid}"
+                    ),
+                    _ => {}
                 }
                 println!("✅ PQ Transaction Signed (Falcon-512, explicit PQ1 envelope):");
                 println!("  Hash:   {}", hex::encode(tx.compute_tx_hash()));
@@ -650,6 +705,9 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 println!("  Amount: {} nano-STELL", tx.amount);
                 println!("  Nonce:  {nonce}");
                 println!("  Target Shard: {}", tx.target_shard);
+                if let Some(cid) = chain_id {
+                    println!("  Chain Id: {cid} (signature bound)");
+                }
 
                 if dry_run {
                     return Ok(());
@@ -678,11 +736,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 top_up,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 verbose,
                 token,
             } => {
                 let pq_key = falcon_from_hex_seed(&falcon_seed, "falcon_seed")?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let signer_addr = falcon_pq_address(&pq_key);
                 let validator_addr = match validator {
                     Some(v) => parse_wallet_address(&v)?,
@@ -733,7 +793,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     }
                 };
 
-                let tx = build_unjail_tx(&pq_key, validator_addr, top_up, nonce);
+                let tx = match chain_id {
+                    Some(cid) => {
+                        build_unjail_tx_with_chain(&pq_key, validator_addr, top_up, nonce, cid)
+                    }
+                    None => build_unjail_tx(&pq_key, validator_addr, top_up, nonce),
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -811,7 +876,11 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 println!("  Signature:      {}", hex::encode(&auth.master_signature));
 
                 let account_nonce = resolve_nonce(&rpc, &auth.master_address, nonce)?;
-                let tx = build_session_grant_tx(&master_fk, &auth, account_nonce);
+                // The grant is minted for `chain_id`; bind the wrapping
+                // transaction to the same id so the published delegation stays
+                // admissible after chain-binding activation.
+                let tx =
+                    build_session_grant_tx_with_chain(&master_fk, &auth, account_nonce, chain_id);
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -1025,10 +1094,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 amount,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 token,
             } => {
                 let trader_fk = falcon_from_hex_seed(&trader_key, "trader_key")?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let is_buy = match side.to_lowercase().as_str() {
                     "buy" => true,
                     "sell" => false,
@@ -1043,8 +1114,20 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
                 let sender = falcon_pq_address(&trader_fk);
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx =
-                    build_place_order_tx(&trader_fk, pair, is_buy, price, amount, account_nonce);
+                let tx = match chain_id {
+                    Some(cid) => build_place_order_tx_with_chain(
+                        &trader_fk,
+                        pair,
+                        is_buy,
+                        price,
+                        amount,
+                        account_nonce,
+                        cid,
+                    ),
+                    None => {
+                        build_place_order_tx(&trader_fk, pair, is_buy, price, amount, account_nonce)
+                    }
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -1073,13 +1156,20 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 order_id,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 token,
             } => {
                 let trader_fk = falcon_from_hex_seed(&trader_key, "trader_key")?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let sender = falcon_pq_address(&trader_fk);
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx = build_cancel_order_tx(&trader_fk, order_id, account_nonce);
+                let tx = match chain_id {
+                    Some(cid) => {
+                        build_cancel_order_tx_with_chain(&trader_fk, order_id, account_nonce, cid)
+                    }
+                    None => build_cancel_order_tx(&trader_fk, order_id, account_nonce),
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -1110,10 +1200,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     from_key,
                     rpc,
                     nonce,
+                    chain_id,
                     dry_run,
                     token,
                 } => {
                     let publisher_fk = falcon_from_hex_seed(&key, "publisher key")?;
+                    let chain_id = resolve_chain_id(&rpc, chain_id)?;
 
                     // The feed carries the OFF-CHAIN clock: it is timestamped when
                     // the publisher signs it. The chain re-checks it against
@@ -1187,16 +1279,29 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     )];
                     let gas = cli_tx_gas(stellereum::svm::GAS_SUBMIT_PQ_PRICE_FEED)
                         .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-                    let tx = sign_pq_explicit_payload(
-                        &sender_fk,
-                        sender_addr,
-                        0,
-                        gas,
-                        nonce,
-                        1,
-                        1,
-                        payload,
-                    );
+                    let tx = match chain_id {
+                        Some(cid) => sign_pq_explicit_payload_with_chain(
+                            &sender_fk,
+                            sender_addr,
+                            0,
+                            gas,
+                            nonce,
+                            1,
+                            1,
+                            payload,
+                            cid,
+                        ),
+                        None => sign_pq_explicit_payload(
+                            &sender_fk,
+                            sender_addr,
+                            0,
+                            gas,
+                            nonce,
+                            1,
+                            1,
+                            payload,
+                        ),
+                    };
                     if !tx.verify_signature() {
                         anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                     }
@@ -1247,10 +1352,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 attest_keys_dir,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 token,
             } => {
                 let signer_fk = falcon_from_hex_seed(&from_key, "from_key")?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let recipient: [u8; 32] = parse_wallet_address(&recipient)?;
                 let source_chain = parse_supported_chain(&chain)?;
 
@@ -1297,7 +1404,17 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
                 let sender = falcon_pq_address(&signer_fk);
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx = build_bridge_intent_tx(&signer_fk, &[attestation, intent], account_nonce);
+                let tx = match chain_id {
+                    Some(cid) => build_bridge_intent_tx_with_chain(
+                        &signer_fk,
+                        &[attestation, intent],
+                        account_nonce,
+                        cid,
+                    ),
+                    None => {
+                        build_bridge_intent_tx(&signer_fk, &[attestation, intent], account_nonce)
+                    }
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -1329,10 +1446,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 from_key,
                 rpc,
                 nonce,
+                chain_id,
                 dry_run,
                 token,
             } => {
                 let signer_fk = falcon_from_hex_seed(&from_key, "from_key")?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let target_chain = parse_supported_chain(&chain)?;
 
                 let intent = stellereum::bridge::BridgeIntent::Withdraw {
@@ -1342,11 +1461,19 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 };
                 let sender = falcon_pq_address(&signer_fk);
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx = build_bridge_intent_tx(
-                    &signer_fk,
-                    std::slice::from_ref(&intent),
-                    account_nonce,
-                );
+                let tx = match chain_id {
+                    Some(cid) => build_bridge_intent_tx_with_chain(
+                        &signer_fk,
+                        std::slice::from_ref(&intent),
+                        account_nonce,
+                        cid,
+                    ),
+                    None => build_bridge_intent_tx(
+                        &signer_fk,
+                        std::slice::from_ref(&intent),
+                        account_nonce,
+                    ),
+                };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
@@ -1702,6 +1829,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             verify,
             validators,
             wait_seconds,
+            min_height,
             verbose,
         } => {
             let opts = stellereum::light_client_cli::LightClientOptions {
@@ -1709,6 +1837,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 verify,
                 validators,
                 wait_seconds,
+                min_height,
                 verbose,
             };
             stellereum::light_client_cli::run(&opts)?;
@@ -1823,6 +1952,61 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             );
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
+        }
+        Commands::SafetyInit {
+            store_dir,
+            keys_dir,
+            validator_pub,
+            shard,
+            prevote_round_floor,
+            precommit_round_floor,
+            i_fenced_all_signers,
+        } => {
+            if !i_fenced_all_signers {
+                anyhow::bail!(
+                    "refusing safety-init: pass --i-fenced-all-signers ONLY after stopping and \
+                     fencing all legacy validator processes and remote signers for this key"
+                );
+            }
+            let val_pub: [u8; 32] = if let Some(hex_pk) = validator_pub {
+                let raw = hex::decode(hex_pk.trim())
+                    .map_err(|e| anyhow::anyhow!("invalid --validator-pub hex: {e}"))?;
+                raw.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("--validator-pub must decode to exactly 32 bytes")
+                })?
+            } else {
+                let key_path = keys_dir.join("validator.key");
+                let legacy_path = keys_dir.join("identity.key");
+                if !key_path.exists() && !legacy_path.exists() {
+                    anyhow::bail!(
+                        "no validator.key or identity.key found in {}; pass --validator-pub for remote signer",
+                        keys_dir.display()
+                    );
+                }
+                let sk = stellereum::node_keys::load_or_generate_consensus_key(&keys_dir)?;
+                sk.verifying_key().to_bytes()
+            };
+            let storage = stellereum::storage::Storage::open(&store_dir)?;
+            let record = stellereum::safety::operator_safety_init(
+                &storage,
+                val_pub,
+                shard,
+                prevote_round_floor,
+                precommit_round_floor,
+                i_fenced_all_signers,
+            )?;
+            let payload =
+                stellereum::safety::SafetyRecordPayload::decode_canonical(&record.payload)?;
+            println!(
+                "safety_record_v1 initialized: validator={} shard={} generation={} height={} finalized={} prevote_floor={:?} precommit_floor={:?}",
+                hex::encode(val_pub),
+                shard,
+                record.generation,
+                payload.height,
+                payload.finalized_height,
+                payload.highest_prevote_round,
+                payload.highest_precommit_round
+            );
         }
     }
     Ok(())

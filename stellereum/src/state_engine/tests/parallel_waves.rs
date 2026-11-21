@@ -1038,3 +1038,122 @@ async fn fork288000_post_commit_pin_failure_moves_nothing() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FAIL-BEFORE (T1): a sponsored plain transfer whose third-party SPONSOR is
+/// also the RECIPIENT (`auth.sponsor == tx.to`) used to overwrite the fee
+/// debit: the plan pushed `(sponsor, sbal - fail_fee)` and then
+/// `(to, sbal + amount)`, and `commit_plain_plan` applies absolute values, so
+/// the last write won and minted `fail_fee` out of thin air (the proposer was
+/// still credited it). The parallel path now emits ONE final write,
+/// `(sbal - fee) + amount`, exactly like the sequential `apply.rs`.
+#[tokio::test]
+async fn parallel_sponsored_tx_sponsor_equals_recipient_matches_sequential() {
+    use crate::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+    use crate::sharding::{SponsorAuthorization, SPONSOR_SIG_TAG};
+
+    const TS: u64 = 1_700_000_000;
+    const USER_BAL: u64 = 1_000_000;
+    const SPONSOR_BAL: u64 = 1_000_000;
+
+    let user = FalconKeypair::generate_from_seed_bytes(&[0x71u8; 32]);
+    let sponsor = FalconKeypair::generate_from_seed_bytes(&[0x72u8; 32]);
+    let from = derive_pq_address(PqScheme::Falcon512, &user.public_key, &DEFAULT_SALT);
+    // The recipient IS the sponsor's address: the pathological split.
+    let to = derive_pq_address(PqScheme::Falcon512, &sponsor.public_key, &DEFAULT_SALT);
+    // Implicit user envelope (the key is pre-registered): the tx is a PLAIN
+    // transfer, so it takes `plan_plain_tx` (an explicit activation envelope
+    // would route through `commit_native` instead).
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &user.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+
+    let amount = 1_000u64;
+    let gas = crate::svm::GAS_BASIC_TRANSFER;
+
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce: 0,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let mut auth = SponsorAuthorization {
+        sponsor: to,
+        max_fee_per_tx: 100_000_000,
+        valid_until: TS + 1_000_000,
+        allowed_targets: vec![to],
+        chain_id: crate::zkml::effective_chain_id(),
+        sponsor_sig: Vec::new(),
+        sponsor_scheme: Some(PqScheme::Falcon512),
+        sponsor_pubkey: Some(sponsor.public_key.clone()),
+        sponsor_salt: Some(DEFAULT_SALT),
+    };
+    // The sponsor signs FIRST; the user then signs the action bound to the
+    // full grant (including this sponsor signature).
+    auth.sponsor_sig = sponsor.sign(&tx.sponsor_message(&auth));
+    let suffix = {
+        let body = bincode::serialize(&auth).expect("grant serializes");
+        let mut out = Vec::with_capacity(body.len() + 7);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(SPONSOR_SIG_TAG);
+        out
+    };
+    // Provisional inner envelope so `signing_message` sees the grant.
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, vec![0u8; 666]).encode();
+    tx.signature.extend_from_slice(&suffix);
+    let user_msg = tx.signing_message();
+    let user_sig = user.sign(&user_msg);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, user_sig).encode();
+    tx.signature.extend_from_slice(&suffix);
+
+    assert_eq!(tx.sponsored_grant().expect("third-party grant").sponsor, to);
+    assert!(!tx.is_pq_activation(), "fixture must take the plain planner");
+
+    let seq = InMemoryStateEngine::new();
+    let par = InMemoryStateEngine::new().with_parallel_exec(true);
+    seq.update_account(AccountState::new(from, USER_BAL)).await;
+    seq.update_account(AccountState::new(to, SPONSOR_BAL)).await;
+    par.update_account(AccountState::new(from, USER_BAL)).await;
+    par.update_account(AccountState::new(to, SPONSOR_BAL)).await;
+
+    let txs = [tx];
+    let r_seq = seq.apply_block_parallel_fees(&txs, TS).await;
+    let r_par = par.apply_block_parallel_fees(&txs, TS).await;
+    assert_eq!(r_seq.0, 1, "sequential: sponsored transfer applies");
+    assert_eq!(r_par.0, 1, "parallel: sponsored transfer applies");
+    assert_eq!(r_seq.1, 0);
+    assert_eq!(r_par.1, 0);
+    assert_eq!(r_seq.2, r_par.2, "fees_collected must match");
+    let fee = r_seq.4[0];
+    assert!(fee > 0, "the fee leg must be charged");
+
+    let seq_user = seq.get_account(&from).await.expect("user account");
+    let par_user = par.get_account(&from).await.expect("user account");
+    let seq_sponsor = seq.get_account(&to).await.expect("sponsor account");
+    let par_sponsor = par.get_account(&to).await.expect("sponsor account");
+
+    // Exactly the sequential formula: fee debited FIRST, amount credited after.
+    assert_eq!(seq_user.balance, USER_BAL - amount);
+    assert_eq!(seq_sponsor.balance, (SPONSOR_BAL - fee) + amount);
+    assert_eq!(par_user.balance, seq_user.balance);
+    assert_eq!(par_sponsor.balance, seq_sponsor.balance);
+    assert_eq!(par_user.nonce, 1);
+    assert_eq!(par_sponsor.nonce, seq_sponsor.nonce);
+    assert_eq!(
+        seq.get_state_root().await,
+        par.get_state_root().await,
+        "parallel_exec must be bit-identical to the sequential path"
+    );
+    // Value conservation: no `fail_fee` was minted.
+    assert_eq!(
+        par_user.balance + par_sponsor.balance + r_par.2,
+        USER_BAL + SPONSOR_BAL,
+        "the fee must move to fees_collected, not be printed"
+    );
+}

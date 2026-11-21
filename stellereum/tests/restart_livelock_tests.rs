@@ -599,6 +599,25 @@ fn stale_body_window(c: &Cluster, height: u64) -> (Round, ValidatorId) {
     panic!("no two-round proposer window at height {height}");
 }
 
+/// Find `(k, r, p)` with `r >= k + 2` where the SAME validator `p` owns both
+/// rounds. A body signed at `k` and re-advertised at `r` is then genuinely
+/// stale (beyond the one-round lag) while still passing the proposer-slot
+/// check at `r` -- exactly the retransmit shape that poisoned a restarted
+/// follower.
+fn stale_body_gap_window(c: &Cluster, height: u64) -> (Round, Round, ValidatorId) {
+    for k in 0u32..100_000 {
+        let Some(p) = c.proposer(height, k) else {
+            continue;
+        };
+        for gap in 2u32..8 {
+            if c.proposer(height, k + gap) == Some(p) {
+                return (k, k + gap, p);
+            }
+        }
+    }
+    panic!("no stale-body gap window at height {height}");
+}
+
 // ===========================================================================
 // 1. NEGATIVE: a stale proposal for a past round must never block the
 //    current round, and must never make the node vote the past round.
@@ -945,4 +964,281 @@ async fn all_three_restart_with_inflight_stale_proposal_finalises_in_the_first_r
             "node {i} must decide in the FIRST post-restart round"
         );
     }
+}
+
+/// Restart selected nodes from persisted state while KEEPING the lock(s) and
+/// the round-free value identity of each locked body. The production boot path
+/// does the same: a lock names a signed hash, the body is durable state, and
+/// `value_id` is how a re-stamped rescue body is recognised as the same value.
+fn restart_with_persisted_locks(c: &mut Cluster, indices: &[usize], restored_round: Round) {
+    let locks: Vec<_> = indices
+        .iter()
+        .map(|&i| c.nodes[i].rt.hc.locked)
+        .collect();
+    c.restart(indices, restored_round);
+    for (slot, &i) in indices.iter().enumerate() {
+        if let Some((h, lock_round)) = locks[slot] {
+            c.nodes[i].rt.hc.locked = Some((h, lock_round));
+            if let Some(body) = c.nodes[i].rt.blocks.get(&h).cloned() {
+                let vid = body.value_id();
+                c.nodes[i].rt.hc.note_value_id(h, vid);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 4. RESTART-SPLIT: all three restart with a RESTORED LOCK and an empty
+//    proposal cache, while a stale body (signed at k) is still circulating
+//    under the CURRENT round (k + 1) envelope. The stale frame must NOT arm
+//    the scheduled proposer's slot, or it can never re-stamp the locked
+//    value; every node must prevote the SAME current-round body and the
+//    height must decide in the first post-restart round.
+// ===========================================================================
+
+#[tokio::test]
+async fn all_three_restart_with_restored_lock_and_stale_rebroadcast_decide_first_round() {
+    let mut c = cluster_at_restart_height().await;
+    let height = RESTART_HEIGHT;
+    let (k, r, p) = stale_body_gap_window(&c, height);
+    let pi = c.index_of(p);
+
+    for node in c.nodes.iter_mut() {
+        node.rt.hc.round = k;
+        node.round_started_ms = c.now_ms;
+    }
+
+    // Pre-restart: the scheduled proposer signs body X at k; every node
+    // prevotes it and locks it (a full prevote QC exists, only the precommit
+    // quorum is still missing when the process dies).
+    let stale = c.nodes[pi]
+        .rt
+        .propose(Cluster::timestamp(height, k))
+        .await
+        .expect("the scheduled proposer builds X at k");
+    assert_eq!(stale.round, k);
+    let stale_hash = stale.compute_hash();
+    for i in 0..c.nodes.len() {
+        if i != pi {
+            c.nodes[i]
+                .rt
+                .on_proposal(p, stale.clone(), k)
+                .await
+                .expect("followers accept X at k");
+        }
+    }
+    let mut votes = Vec::with_capacity(c.nodes.len());
+    for i in 0..c.nodes.len() {
+        let v = c.nodes[i]
+            .rt
+            .make_prevote()
+            .expect("every node prevotes X at k");
+        assert_eq!(v.round, k);
+        assert_eq!(v.block_hash, Some(stale_hash));
+        c.nodes[i].last_prevoted = Some((height, k));
+        advance_floor(&mut c.nodes[i].prevote_floor, height, k);
+        c.nodes[i].cast_prevote = Some(v.clone());
+        votes.push(v);
+    }
+    for i in 0..c.nodes.len() {
+        for v in &votes {
+            c.nodes[i]
+                .rt
+                .on_prevote(v.clone())
+                .expect("the prevote quorum is admissible");
+        }
+        assert_eq!(
+            c.nodes[i].rt.hc.try_prevote_quorum(),
+            Some(Some(stale_hash)),
+            "precondition: every node observed the polka for X"
+        );
+        assert!(c.nodes[i]
+            .rt
+            .make_precommit()
+            .is_some_and(|pc| pc.round == k));
+        assert_eq!(
+            c.nodes[i].rt.hc.locked.map(|(h, _)| h),
+            Some(stale_hash),
+            "precondition: every node locked X at k"
+        );
+    }
+
+    // Coordinated restart into round r (the fsynced watermark), with the
+    // locks and their value identities restored and the proposal cache empty.
+    let all: Vec<usize> = (0..c.nodes.len()).collect();
+    restart_with_persisted_locks(&mut c, &all, r);
+    for &i in &all {
+        assert_eq!(c.nodes[i].rt.hc.round, r);
+        assert!(!c.nodes[i].rt.hc.has_live_proposal());
+        assert_eq!(
+            c.nodes[i].rt.hc.locked.map(|(h, _)| h),
+            Some(stale_hash),
+            "node {i}: the lock must survive the restart"
+        );
+    }
+
+    // The stale frame is re-advertised under the CURRENT envelope (this is
+    // what the old retransmit path did). It is still a valid body for its own
+    // signed round, but it must not become the proposal for k + 1.
+    for &i in &all {
+        c.nodes[i]
+            .rt
+            .on_proposal(p, stale.clone(), r)
+            .await
+            .expect("a genuine stale body is still admissible as a candidate");
+        assert!(
+            !c.nodes[i].rt.hc.has_live_proposal(),
+            "node {i}: a body signed at k must not own round r's proposal slot"
+        );
+    }
+
+    // The proposer at r is the author of X (by construction), so it CAN
+    // and MUST re-stamp the locked value at the current round.
+    let current = c.nodes[pi]
+        .rt
+        .propose(Cluster::timestamp(height, r))
+        .await
+        .expect("the stale frame must not block the locked value's re-stamp");
+    assert_eq!(current.round, r);
+    assert_ne!(current.compute_hash(), stale_hash);
+    let current_hash = current.compute_hash();
+    for i in 0..c.nodes.len() {
+        if i != pi {
+            c.nodes[i]
+                .rt
+                .on_proposal(p, current.clone(), r)
+                .await
+                .expect("the current-round re-stamp of the locked value is accepted");
+        }
+    }
+
+    // LIVE ASSERTION: same hash, same round, real quorum on every node.
+    c.confirm_first_round_quorum(r, current_hash);
+
+    let consumed = c
+        .run_until(60_000, |c| {
+            c.nodes.iter().all(|n| n.rt.hc.height > height)
+        })
+        .await;
+    assert!(
+        c.nodes.iter().all(|n| n.rt.hc.height > height),
+        "the restored-lock restart must not livelock: height {height} never finalized in \
+         {consumed} ms (rounds {:?})",
+        c.nodes.iter().map(|n| n.rt.hc.round).collect::<Vec<_>>()
+    );
+    for i in 0..c.nodes.len() {
+        assert_eq!(
+            c.nodes[i].restart_finalized_at,
+            Some(r),
+            "node {i}: the height must decide in the first post-restart round"
+        );
+    }
+}
+
+// ===========================================================================
+// 5. NEGATIVE (admission): a stale body re-broadcast at the CURRENT round
+//    must never be the value a fresh (unlocked, empty-cache) node prevotes
+//    when the genuine current-round body exists.
+// ===========================================================================
+
+#[tokio::test]
+async fn stale_rebroadcast_never_arms_a_fresh_node_when_current_body_exists() {
+    let mut c = cluster_at_restart_height().await;
+    let height = RESTART_HEIGHT;
+    let (k, r, p) = stale_body_gap_window(&c, height);
+    let pi = c.index_of(p);
+    let fresh = (0..c.nodes.len()).find(|i| *i != pi).unwrap();
+
+    // The stale body is signed at k by the proposer that also owns k + 1.
+    c.nodes[pi].rt.hc.round = k;
+    c.nodes[pi].round_started_ms = c.now_ms;
+    let stale = c.nodes[pi]
+        .rt
+        .propose(Cluster::timestamp(height, k))
+        .await
+        .expect("the scheduled proposer builds the stale body at k");
+    let stale_hash = stale.compute_hash();
+
+    // The fresh node restarts into r: no lock, no proposal cache, no
+    // watermark. This is the node the old retransmit poisoned.
+    c.restart(&[fresh], r);
+    assert_eq!(c.nodes[fresh].rt.hc.round, r);
+    assert!(c.nodes[fresh].rt.hc.locked.is_none());
+
+    c.nodes[fresh]
+        .rt
+        .on_proposal(p, stale.clone(), r)
+        .await
+        .expect("the stale body is still admissible as a candidate body");
+    assert!(
+        !c.nodes[fresh].rt.hc.has_live_proposal(),
+        "a stale body re-broadcast at r must not own the current round's slot"
+    );
+    assert!(
+        c.value_prevote(fresh).is_none(),
+        "a fresh node must not prevote a stale body that was merely re-enveloped"
+    );
+
+    // The genuine current-round body arrives: it must be accepted and voted.
+    c.nodes[pi].rt.hc.round = r;
+    let current = c.nodes[pi]
+        .rt
+        .propose(Cluster::timestamp(height, r))
+        .await
+        .expect("the scheduled proposer builds the genuine current body");
+    assert_eq!(current.round, r);
+    assert_ne!(current.compute_hash(), stale_hash);
+
+    c.nodes[fresh]
+        .rt
+        .on_proposal(p, current.clone(), r)
+        .await
+        .expect("the current-round body must still be accepted");
+    let v = c.value_prevote(fresh).expect("the fresh node votes the genuine body");
+    assert_eq!(v.round, r);
+    assert_eq!(
+        v.block_hash,
+        Some(current.compute_hash()),
+        "the only value a fresh node may prevote here is the current-round body"
+    );
+}
+
+// ===========================================================================
+// 6. NEGATIVE (lock-rescue regression): a genuinely late but CURRENT-round
+//    (re-stamped) body is still accepted and voted. That is the rescue path
+//    the stale-body guard must not touch.
+// ===========================================================================
+
+#[tokio::test]
+async fn late_current_round_body_is_still_accepted_and_voted() {
+    let mut c = cluster_at_restart_height().await;
+    let height = RESTART_HEIGHT;
+    let (_k, r, p) = stale_body_gap_window(&c, height);
+    let pi = c.index_of(p);
+    let fresh = (0..c.nodes.len()).find(|i| *i != pi).unwrap();
+
+    // Build the CURRENT-round body directly.
+    c.nodes[pi].rt.hc.round = r;
+    c.nodes[pi].round_started_ms = c.now_ms;
+    let current = c.nodes[pi]
+        .rt
+        .propose(Cluster::timestamp(height, r))
+        .await
+        .expect("the scheduled proposer builds at r");
+    assert_eq!(current.round, r);
+    let current_hash = current.compute_hash();
+
+    // The receiver restarts at r with an empty cache; the frame arrives
+    // late, but its signed round is CURRENT, so it is the real proposal.
+    c.restart(&[fresh], r);
+    c.nodes[fresh]
+        .rt
+        .on_proposal(p, current.clone(), r)
+        .await
+        .expect("a late current-round body is a normal proposal, not a stale one");
+    let v = c
+        .value_prevote(fresh)
+        .expect("the current-round body must be voted");
+    assert_eq!(v.round, r);
+    assert_eq!(v.block_hash, Some(current_hash));
 }

@@ -1176,6 +1176,44 @@ async fn faucet_get_hint() -> Response {
         .into_response()
 }
 
+fn faucet_drip_error_response(err: crate::rpc::FaucetDripError) -> Response {
+    match err {
+        crate::rpc::FaucetDripError::LifetimeCapExhausted => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "faucet limit reached for this address",
+        )
+            .into_response(),
+        crate::rpc::FaucetDripError::Cooldown { retry_after_secs } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "public drip cooling down for this address, retry in {retry_after_secs} seconds"
+            ),
+        )
+            .into_response(),
+        crate::rpc::FaucetDripError::IpRateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "per-IP faucet budget exhausted for this hour",
+        )
+            .into_response(),
+        crate::rpc::FaucetDripError::Quarantined { reason } => {
+            tracing::error!("[faucet] quarantined drip refused: {reason}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "faucet is temporarily unavailable (fail-closed quarantine)",
+            )
+                .into_response()
+        }
+        crate::rpc::FaucetDripError::PersistFailed { reason } => {
+            tracing::error!("[faucet] persist failure refused drip: {reason}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "faucet state could not be persisted; drip refused",
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn api_faucet(
     State(st): State<Arc<GatewayState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1239,21 +1277,14 @@ async fn api_faucet(
                 return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
             }
         };
-    // Per-IP drip throttle (shared with the RPC path's token gate).
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if !faucet.check_ip_throttle(Some(client_ip), now_secs).await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "per-IP faucet budget exhausted for this hour",
-        )
-            .into_response();
-    }
-    // Atomic mex-reconcile (same as the JSON-RPC faucet path): without it,
-    // reserved-but-never-executed drips (wiped mempool across a restart)
-    // leave a permanent nonce gap that explorer drips wait behind forever.
+    // Atomic mex-reconcile + single-lock cap/IP-budget reservation:
+    // cap/quarantine refusals do not burn the per-IP hourly budget, and
+    // mempool admission failure rolls the entire grant (nonce, cap, IP
+    // budget) back via `rollback_grant`.
     let faucet_addr = faucet.account();
     let onchain = st
         .rpc
@@ -1272,15 +1303,24 @@ async fn api_faucet(
         .filter(|t| t.from == faucet_addr)
         .map(|t| t.nonce)
         .collect();
-    let Some((tx, amount)) = faucet
-        .build_transfer(a, None, Some((onchain, pending)))
-        .await
-    else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "faucet limit reached for this address",
+    let chain_id = faucet
+        .chain_id()
+        .unwrap_or_else(crate::consensus::consensus_chain_id);
+    let grant = match faucet
+        .request_drip_for_chain(
+            crate::rpc::FaucetDripRequest::token(
+                a,
+                None,
+                Some((onchain, pending)),
+                now_secs,
+                Some(client_ip),
+            ),
+            Some(chain_id),
         )
-            .into_response();
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => return faucet_drip_error_response(e),
     };
     let balance = st
         .rpc
@@ -1289,23 +1329,28 @@ async fn api_faucet(
         .await
         .map(|acc| acc.balance)
         .unwrap_or(0);
+    let next_height = st
+        .rpc
+        .height
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
     let tx_hash = match st.rpc.mempool.write().await.add_checked_ctx(
-        tx.clone(),
+        grant.tx.clone(),
         balance,
-        crate::mempool::AdmissionCtx::wall_now(),
+        crate::mempool::AdmissionCtx::wall_now().with_chain_height(next_height),
     ) {
         Ok(h) => h,
         Err(e) => {
-            faucet.rollback(&tx, a, amount).await;
+            let _ = faucet.rollback_grant(&grant).await;
             return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
         }
     };
     if let Some(bcast) = &st.rpc.tx_broadcast {
-        let _ = bcast.send(tx);
+        let _ = bcast.send(grant.tx);
     }
     Json(json!({
         "status": "pending",
-        "credited_nano": amount.to_string(),
+        "credited_nano": grant.amount.to_string(),
         "recipient": hex::encode(a),
         "tx_hash": hex::encode(tx_hash),
         "shard": drip_shard,
@@ -1484,15 +1529,10 @@ async fn api_faucet_public(
             }
         }
     }
-    // (3) Per-IP drip throttle after captcha verification.
-    if !faucet.check_ip_throttle(Some(client_ip), now_secs).await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "per-IP faucet budget exhausted for this hour",
-        )
-            .into_response();
-    }
-    // (4) Same atomic mex-reconcile as the token faucet path.
+    // (3) Atomic cooldown + lifetime cap + per-IP budget + mex-reconcile
+    // under ONE faucet lock: cooldown/cap/quarantine refusals never burn the
+    // per-IP hourly budget, and mempool admission failure rolls the entire
+    // grant back via `rollback_grant`.
     let faucet_addr = faucet.account();
     let onchain = st
         .rpc
@@ -1511,18 +1551,23 @@ async fn api_faucet_public(
         .filter(|t| t.from == faucet_addr)
         .map(|t| t.nonce)
         .collect();
-    let (tx, amount) = match faucet
-        .build_public_transfer(a, now_secs, Some((onchain, pending)))
+    let chain_id = faucet
+        .chain_id()
+        .unwrap_or_else(crate::consensus::consensus_chain_id);
+    let grant = match faucet
+        .request_drip_for_chain(
+            crate::rpc::FaucetDripRequest::public(
+                a,
+                Some((onchain, pending)),
+                now_secs,
+                Some(client_ip),
+            ),
+            Some(chain_id),
+        )
         .await
     {
-        Ok(v) => v,
-        Err(wait_secs) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("public drip cooling down for this address, retry in {wait_secs} seconds"),
-            )
-                .into_response();
-        }
+        Ok(g) => g,
+        Err(e) => return faucet_drip_error_response(e),
     };
     let balance = st
         .rpc
@@ -1531,23 +1576,28 @@ async fn api_faucet_public(
         .await
         .map(|acc| acc.balance)
         .unwrap_or(0);
+    let next_height = st
+        .rpc
+        .height
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
     let tx_hash = match st.rpc.mempool.write().await.add_checked_ctx(
-        tx.clone(),
+        grant.tx.clone(),
         balance,
-        crate::mempool::AdmissionCtx::wall_now(),
+        crate::mempool::AdmissionCtx::wall_now().with_chain_height(next_height),
     ) {
         Ok(h) => h,
         Err(e) => {
-            faucet.rollback(&tx, a, amount).await;
+            let _ = faucet.rollback_grant(&grant).await;
             return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
         }
     };
     if let Some(bcast) = &st.rpc.tx_broadcast {
-        let _ = bcast.send(tx);
+        let _ = bcast.send(grant.tx);
     }
     Json(json!({
         "status": "pending",
-        "credited_nano": amount.to_string(),
+        "credited_nano": grant.amount.to_string(),
         "recipient": hex::encode(a),
         "tx_hash": hex::encode(tx_hash),
         "shard": drip_shard,
@@ -1593,7 +1643,7 @@ async fn api_spv(
 async fn api_contracts(
     State(st): State<Arc<GatewayState>>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     // Paginated like stell_listTokens (audit 2026-10-06): permissionless
     // deploys grow this list; `limit` default 100, hard max 1000.
     let limit: usize = query
@@ -1605,19 +1655,65 @@ async fn api_contracts(
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // Bounded iteration like stell_listTokens (audit 2026-10-06): walk the
-    // registry directly and stop after offset+limit instead of materializing
-    // every address; skip/take semantics (and `total`) are unchanged.
+    let after = match query
+        .get("after")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => {
+            let Some(cursor) = parse_addr(raw) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid after cursor (expected 32-byte hex contract address)",
+                )
+                    .into_response();
+            };
+            Some(cursor)
+        }
+        None => None,
+    };
     let contracts = st.rpc.engine.contracts_read().await;
     let total = contracts.contracts.len();
-    let addrs: Vec<String> = contracts
-        .contracts
-        .keys()
-        .skip(offset)
-        .take(limit)
-        .map(hex::encode)
-        .collect();
-    Json(json!({ "contracts": addrs, "total": total, "offset": offset }))
+    if let Some(cursor) = after {
+        let mut keys: Vec<[u8; 32]> = contracts
+            .contracts
+            .keys()
+            .copied()
+            .filter(|k| *k > cursor)
+            .collect();
+        keys.sort_unstable();
+        let has_more = keys.len() > limit;
+        let page: Vec<[u8; 32]> = keys.into_iter().take(limit).collect();
+        let next_cursor = if has_more {
+            page.last().map(hex::encode)
+        } else {
+            None
+        };
+        let addrs: Vec<String> = page.iter().map(hex::encode).collect();
+        return Json(json!({
+            "contracts": addrs,
+            "total": total,
+            "offset": 0,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }))
+        .into_response();
+    }
+    // Sort contract IDs deterministically before skip/take so pages are
+    // reproducible across requests/restarts while keeping the default shape
+    // (`contracts`, `total`, `offset`) unchanged.
+    let addrs: Vec<String> = if limit == 0 || offset >= total {
+        Vec::new()
+    } else {
+        let mut keys: Vec<[u8; 32]> = contracts.contracts.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(hex::encode)
+            .collect()
+    };
+    Json(json!({ "contracts": addrs, "total": total, "offset": offset })).into_response()
 }
 
 /// Hard cap for `GET /api/finals?limit=` (fail-closed: oversized clamps,
@@ -3329,14 +3425,13 @@ async fn prometheus_metrics(
                 .saturating_add(tokens as u64),
         );
     }
-    // Disk footprint (best-effort scan, capped; non-blocking spawn_blocking off Tokio worker thread).
+    // Disk footprint: reuse the TTL-cached, single-flight `data_dir_health`
+    // helper shared with `/health` so `/metrics` scrapes do not re-walk up to
+    // `DATA_DIR_SCAN_FILE_CAP` files on every request.
     {
-        let dir = data_dir_path();
-        let (bytes, snaps) = tokio::task::spawn_blocking(move || data_dir_stats(&dir))
-            .await
-            .unwrap_or((0, 0));
-        st.metrics.set_data_dir_bytes(bytes);
-        st.metrics.set_snapshot_count(snaps);
+        let (bytes_m, snaps_m) = data_dir_health(&st, now_ms()).await;
+        st.metrics.set_data_dir_bytes(bytes_m.value.unwrap_or(0));
+        st.metrics.set_snapshot_count(snaps_m.value.unwrap_or(0));
     }
     // Build identity (runtime git fallback inside the resolver, logged once).
     // Persist-queue depth/dropped and per-peer round-lag have no producer yet
@@ -3376,18 +3471,18 @@ async fn cors_middleware(req: Request, next: Next) -> Response {
 
 /// Build the gateway router (explorer UI + JSON API + JSON-RPC under /rpc).
 pub fn router(gateway: Arc<GatewayState>) -> Router {
-    // CORS on the nested router (headers must be set on its responses);
-    // rate limiting via a DEDICATED limiter instance (audit follow-up): the
-    // outer limiter below may or may not cover nested routes depending on
-    // axum layer/nest semantics — either way /rpc gets exactly one counting
-    // layer here, never zero, never double-counted on the shared bucket.
-    let rpc_router = crate::rpc::router(gateway.rpc.clone())
-        .layer(middleware::from_fn(cors_middleware))
-        .layer(middleware::from_fn_with_state(
-            gateway.clone(),
-            nested_rpc_rate_limit,
-        ));
-    Router::new()
+    // Rate limiting on `/rpc` uses a DEDICATED limiter instance (`rpc_limiter`,
+    // separate from the explorer routes' `limiter` below): nesting after
+    // `rate_limit` + `with_state` guarantees `/rpc` never hits `rate_limit`,
+    // while mounting `/rpc` BEFORE the shared CORS + anti-slow-loris
+    // `ServiceBuilder` puts `/rpc`, `/rpc/ws`, and `/rpc/events` under the
+    // same `TimeoutLayer(30s)` and `ConcurrencyLimitLayer(512)` as the rest
+    // of the gateway.
+    let rpc_router = crate::rpc::router(gateway.rpc.clone()).layer(middleware::from_fn_with_state(
+        gateway.clone(),
+        nested_rpc_rate_limit,
+    ));
+    let explorer_routes = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/status", get(status_page))
@@ -3428,9 +3523,14 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         // STELL_SSE_IDLE_TIMEOUT_SECS), so one request cannot hold a gateway
         // concurrency permit forever.
         .route("/events", get(crate::rpc::sse_handler))
-        .layer(middleware::from_fn(cors_middleware))
         .layer(middleware::from_fn_with_state(gateway.clone(), rate_limit))
-        // Same anti-slow-loris layers as the standalone RPC (audit 2026-10-06).
+        .with_state(gateway);
+
+    explorer_routes
+        .nest("/rpc", rpc_router)
+        .layer(middleware::from_fn(cors_middleware))
+        // Same anti-slow-loris layers as the standalone RPC (audit 2026-10-06),
+        // covering both explorer routes and the nested `/rpc` mount.
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(
@@ -3441,10 +3541,6 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
                 ))
                 .layer(tower::limit::ConcurrencyLimitLayer::new(512)),
         )
-        .with_state(gateway)
-        // Nesting after `with_state` so both routers share the `()` state. The
-        // nested router already carries its own CORS/rate-limit layers above.
-        .nest("/rpc", rpc_router)
 }
 
 /// Serve the gateway with per-IP connect info for the rate limiter.

@@ -114,6 +114,11 @@ use writes::*;
 /// `header_token` is a token presented in an HTTP header, if any. Write methods
 /// accept the token either in `params` or in a header, so a caller does not have
 /// to put a credential in the request body.
+///
+/// Legacy entry point: a bare peer address carries NO provenance, so it is
+/// treated as a direct [`crate::client_ip::ClientIp`] peer. Transports that
+/// resolved the address from proxy headers MUST call [`dispatch_client`]
+/// instead, so a forwarded loopback claim cannot pass the wallet-sign gate.
 pub(super) async fn dispatch(
     st: &RpcState,
     id: Value,
@@ -121,6 +126,26 @@ pub(super) async fn dispatch(
     params: &Value,
     header_token: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
+) -> Json<RpcResponse> {
+    dispatch_client(
+        st,
+        id,
+        method,
+        params,
+        header_token,
+        peer_ip.map(crate::client_ip::ClientIp::from_peer),
+    )
+    .await
+}
+
+/// [`dispatch`] with the full [`crate::client_ip::ClientIp`] provenance.
+pub(super) async fn dispatch_client(
+    st: &RpcState,
+    id: Value,
+    method: &str,
+    params: &Value,
+    header_token: Option<&str>,
+    client: Option<crate::client_ip::ClientIp>,
 ) -> Json<RpcResponse> {
     if let Some(resp) = eth::dispatch_eth(st, id.clone(), method, params).await {
         return resp;
@@ -131,9 +156,9 @@ pub(super) async fn dispatch(
         return resp;
     }
     if let Some(resp) =
-        writes::dispatch_writes(st, id.clone(), method, params, header_token, peer_ip).await
+        writes::dispatch_writes(st, id.clone(), method, params, header_token, client).await
     {
         return resp;
     }
-    reads::dispatch_reads(st, id, method, params, header_token, peer_ip).await
+    reads::dispatch_reads(st, id, method, params, header_token, client.map(|c| c.addr)).await
 }

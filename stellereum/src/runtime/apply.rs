@@ -538,6 +538,11 @@ impl ValidatorRuntime {
         // it becomes in-force below, exactly when this node moves to the new
         // height — never mid-flight.
         self.refresh_validator_set_from_staking().await;
+        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+            self.safety
+                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        }
         self.hc = HeightConsensus::new(height + 1, self.validators.clone());
         self.install_due_validator_set();
         self.hc.validators = self.validators.clone();
@@ -771,6 +776,11 @@ impl ValidatorRuntime {
         // it becomes in-force below, exactly when this node moves to the new
         // height — never mid-flight.
         self.refresh_validator_set_from_staking().await;
+        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+            self.safety
+                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        }
         self.hc = HeightConsensus::new(height + 1, self.validators.clone());
         self.install_due_validator_set();
         self.hc.validators = self.validators.clone();
@@ -1166,6 +1176,11 @@ impl ValidatorRuntime {
         self.note_finalized_header(block).await;
         self.note_light_anchor(block);
         self.refresh_validator_set_from_staking().await;
+        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+            self.safety
+                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        }
         self.hc = HeightConsensus::new(height + 1, self.validators.clone());
         // W10.5: activate the set staged for the new height (never mid-flight).
         self.install_due_validator_set();

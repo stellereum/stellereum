@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Micro-gas costs for token operations (nano-STELL)
 ///
@@ -622,14 +622,14 @@ pub fn compute_token_id(creator: &[u8; 32], name: &str, symbol: &str, nonce: u64
 /// Registry managing all fungible tokens on the chain
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TokenRegistry {
-    pub tokens: HashMap<[u8; 32], TokenActor>,
+    pub tokens: BTreeMap<[u8; 32], TokenActor>,
     pub next_nonce: u64,
 }
 
 impl TokenRegistry {
     pub fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
+            tokens: BTreeMap::new(),
             next_nonce: 1,
         }
     }
@@ -638,10 +638,8 @@ impl TokenRegistry {
     /// for wallets: the create-tx receipt carries no token id (receipts hold
     /// no events), and the id commits the registry nonce which no client can
     /// predict — so clients resolve it by the three values they chose.
-    /// Deterministic across nodes (sorted by id, first wins): HashMap order
-    /// is per-process random, which once resolved the same triple to
-    /// different ids on different nodes (audit follow-up). Same triple
-    /// created twice legitimately yields DISTINCT ids — callers with
+    /// Deterministic across nodes (BTreeMap order: smallest id wins). Same
+    /// triple created twice legitimately yields DISTINCT ids — callers with
     /// duplicates must disambiguate by other means (id in hand).
     pub fn find_by_creator_name(
         &self,
@@ -649,18 +647,12 @@ impl TokenRegistry {
         name: &str,
         symbol: &str,
     ) -> Option<[u8; 32]> {
-        let mut hits: Vec<[u8; 32]> = self
-            .tokens
-            .iter()
-            .filter_map(|(id, t)| {
-                (t.metadata.minter == *creator
-                    && t.metadata.name == name
-                    && t.metadata.symbol == symbol)
-                    .then_some(*id)
-            })
-            .collect();
-        hits.sort_unstable();
-        hits.into_iter().next()
+        self.tokens.iter().find_map(|(id, t)| {
+            (t.metadata.minter == *creator
+                && t.metadata.name == name
+                && t.metadata.symbol == symbol)
+                .then_some(*id)
+        })
     }
 
     /// Deploy a new token. Returns its deterministic ID.

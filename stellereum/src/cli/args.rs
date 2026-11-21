@@ -181,6 +181,11 @@ pub(crate) enum Commands {
         /// to the served proof's root.
         #[arg(long, default_value_t = 30)]
         wait_seconds: u64,
+        /// Reject proofs and anchoring headers below this height. Guards
+        /// against a node replaying an older, genuinely signed checkpoint.
+        /// The flag requires a value: `--min-height` on its own is refused.
+        #[arg(long)]
+        min_height: Option<u64>,
         /// Print the RPC traffic.
         #[arg(long, default_value_t = false)]
         verbose: bool,
@@ -258,6 +263,31 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         sub: KeysCommands,
     },
+    /// Initialize durable consensus safety record (generation 1) after
+    /// stopping and fencing all legacy validators and remote signers for this key.
+    SafetyInit {
+        /// Store directory containing the sled DB (default: ./data/store)
+        #[arg(long, default_value = "./data/store")]
+        store_dir: PathBuf,
+        /// Keys directory containing validator.key (default: ./keys)
+        #[arg(long, default_value = "./keys")]
+        keys_dir: PathBuf,
+        /// Optional validator Ed25519 public key (32-byte hex) when key is held by a remote signer
+        #[arg(long)]
+        validator_pub: Option<String>,
+        /// Shard ID to initialize (0 = Masterchain, 1 = Base Workchain)
+        #[arg(long, default_value_t = 0)]
+        shard: u32,
+        /// Conservative initial highest prevote round floor at finalized_height + 1
+        #[arg(long)]
+        prevote_round_floor: Option<u32>,
+        /// Conservative initial highest precommit round floor at finalized_height + 1
+        #[arg(long)]
+        precommit_round_floor: Option<u32>,
+        /// Confirm all legacy validators and remote signers using this key are fenced/stopped
+        #[arg(long, default_value_t = false)]
+        i_fenced_all_signers: bool,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum WalletCommands {
@@ -300,6 +330,12 @@ pub(crate) enum WalletCommands {
         /// Explicit nonce; by default the account's current nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to. Omitted: query
+        /// `stell_chainId`; while chain binding is not scheduled an
+        /// unreachable RPC keeps the legacy unbound signature, once scheduled
+        /// an explicit id is required (fail-closed).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -345,6 +381,12 @@ pub(crate) enum WalletCommands {
         /// Explicit nonce; by default the account's current nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to. Omitted: query
+        /// `stell_chainId`; while chain binding is not scheduled an
+        /// unreachable RPC keeps the legacy unbound signature, once scheduled
+        /// an explicit id is required (fail-closed).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -380,6 +422,9 @@ pub(crate) enum WalletCommands {
         /// Explicit nonce; by default the account's current nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -674,6 +719,9 @@ pub(crate) enum OrderbookCommands {
         /// Explicit sender nonce; by default the account's nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -695,6 +743,9 @@ pub(crate) enum OrderbookCommands {
         /// Explicit sender nonce; by default the account's nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -732,6 +783,9 @@ pub(crate) enum OracleCommands {
         /// Explicit sender nonce; by default the account's nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -796,6 +850,9 @@ pub(crate) enum BridgeCommands {
         /// Explicit sender nonce; by default the account's nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -828,6 +885,9 @@ pub(crate) enum BridgeCommands {
         /// Explicit sender nonce; by default the account's nonce is queried
         #[arg(long)]
         nonce: Option<u64>,
+        /// Chain id to bind the transaction signature to (see `wallet send`).
+        #[arg(long)]
+        chain_id: Option<u64>,
         /// Only print the signed transaction instead of submitting it
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -835,4 +895,49 @@ pub(crate) enum BridgeCommands {
         #[arg(long)]
         token: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod cli_safety_init_tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_safety_init_subcommand() {
+        let cli = Cli::try_parse_from([
+            "stellereum",
+            "safety-init",
+            "--store-dir",
+            "/tmp/store",
+            "--keys-dir",
+            "/tmp/keys",
+            "--shard",
+            "0",
+            "--prevote-round-floor",
+            "12",
+            "--precommit-round-floor",
+            "4",
+            "--i-fenced-all-signers",
+        ])
+        .expect("parse safety-init");
+        match cli.command {
+            Commands::SafetyInit {
+                store_dir,
+                keys_dir,
+                validator_pub,
+                shard,
+                prevote_round_floor,
+                precommit_round_floor,
+                i_fenced_all_signers,
+            } => {
+                assert_eq!(store_dir, PathBuf::from("/tmp/store"));
+                assert_eq!(keys_dir, PathBuf::from("/tmp/keys"));
+                assert_eq!(validator_pub, None);
+                assert_eq!(shard, 0);
+                assert_eq!(prevote_round_floor, Some(12));
+                assert_eq!(precommit_round_floor, Some(4));
+                assert!(i_fenced_all_signers);
+            }
+            _ => panic!("expected SafetyInit command"),
+        }
+    }
 }

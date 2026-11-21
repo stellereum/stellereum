@@ -46,19 +46,19 @@ pub const FINALIZED_READ_CACHE_TTL_SECS: u64 = 60;
 /// it (see the module docs above). Deliberately `stell_*` height-pinned reads
 /// only: no `eth_*` (adapter-side mutable state, `latest`/`pending` tags),
 /// no mempool-dependent reads, no live-state reads.
-pub(super) fn finalized_read_cacheable(method: &str) -> bool {
-    matches!(
-        method,
-        "stell_getBlock"
-            | "stell_getBlockTransactions"
-            | "stell_getFinalizedHeader"
-            | "stell_getEpochRoot"
-    )
+pub(super) fn finalized_read_cache_method(method: &str) -> Option<&'static str> {
+    match method {
+        "stell_getBlock" => Some("stell_getBlock"),
+        "stell_getBlockTransactions" => Some("stell_getBlockTransactions"),
+        "stell_getFinalizedHeader" => Some("stell_getFinalizedHeader"),
+        "stell_getEpochRoot" => Some("stell_getEpochRoot"),
+        _ => None,
+    }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct FinalizedReadKey {
-    method: String,
+    method: &'static str,
     height: u64,
     params_hash: [u8; 32],
 }
@@ -83,12 +83,28 @@ pub(super) fn finalized_read_cache() -> &'static std::sync::Mutex<FinalizedReadC
     FINALIZED_READ_CACHE.get_or_init(|| std::sync::Mutex::new(FinalizedReadCache::default()))
 }
 
+struct Blake3IoWriter<'a>(&'a mut blake3::Hasher);
+
+impl std::io::Write for Blake3IoWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Canonical hash of the request params: two byte-identical requests share a
 /// key; anything else (even an ignored extra field) is a separate key holding
 /// the same bytes — fail-closed towards extra entries, never wrong bytes.
 pub fn finalized_read_cache_params_hash(params: &Value) -> [u8; 32] {
-    let bytes = serde_json::to_vec(params).unwrap_or_default();
-    *blake3::hash(&bytes).as_bytes()
+    let mut hasher = blake3::Hasher::new();
+    if serde_json::to_writer(Blake3IoWriter(&mut hasher), params).is_err() {
+        hasher.reset();
+    }
+    *hasher.finalize().as_bytes()
 }
 
 pub(super) fn finalized_read_cache_fresh(entry: &FinalizedReadEntry, tip: u64) -> bool {
@@ -104,11 +120,9 @@ pub fn finalized_read_cache_get(
     params: &Value,
     tip: u64,
 ) -> Option<Value> {
-    if !finalized_read_cacheable(method) {
-        return None;
-    }
+    let method = finalized_read_cache_method(method)?;
     let key = FinalizedReadKey {
-        method: method.to_string(),
+        method,
         height,
         params_hash: finalized_read_cache_params_hash(params),
     };
@@ -141,11 +155,14 @@ pub fn finalized_read_cache_put(
     tip: u64,
     result: Value,
 ) {
-    if !finalized_read_cacheable(method) || height > tip {
+    if height > tip {
         return;
     }
+    let Some(method) = finalized_read_cache_method(method) else {
+        return;
+    };
     let key = FinalizedReadKey {
-        method: method.to_string(),
+        method,
         height,
         params_hash: finalized_read_cache_params_hash(params),
     };
@@ -166,7 +183,7 @@ pub fn finalized_read_cache_put(
                     Some((_, t)) => e.filled_at < *t,
                 };
                 if replace {
-                    oldest = Some((k.clone(), e.filled_at));
+                    oldest = Some((*k, e.filled_at));
                 }
             }
             if let Some((k, _)) = oldest {

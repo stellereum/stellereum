@@ -120,15 +120,17 @@
 //!    to it, so the binding between "this root" and "this state" is inherited
 //!    from the quorum — full nodes are the ones that check a header's root
 //!    against the state they applied. What is enforced here is narrower: the
-//!    root must travel with a finalized header at a known height, and it must
-//!    not roll back to a root an earlier finalized header already superseded.
+//!    root must travel with a quorum-certified header at a known height, and
+//!    each header must be the immediate successor of the one before it.
 //! 4. **It does not fetch anything.** No gossip, no retry, no peer scoring, no
 //!    eclipse or partition detection. Transport is the caller's problem; this
 //!    module only decides what to believe once a header or a proof is in hand.
 //!    A client that cannot reach an honest full node will simply stop advancing.
-//! 5. **The non-reversion check is only as deep as the retained window.** It
-//!    sees the checkpoint and the retained headers, and forgets older roots as
-//!    they age out. It is a cheap backstop, not a substitute for the quorum.
+//! 5. **It does not forbid a state root from recurring.** A chain may return to
+//!    an earlier root (`A -> B -> A`) by executing real transitions; that is
+//!    not a rollback as long as height grows by one and `prev_hash` links to
+//!    the tip. Non-reversion comes from that strict linkage and the precommit
+//!    quorum, not from remembering old roots.
 //!
 //! # Absence is provable now
 //!
@@ -1634,14 +1636,12 @@ impl LightClient {
     ///  * names a different parent than the tip (a fork);
     ///  * comes with the window already full;
     ///  * lacks a precommit quorum of real validator power at its own height;
-    ///  * carries block signatures that do not add up; or
-    ///  * commits a state root an earlier finalized header already superseded.
+    ///    or carries block signatures that do not add up.
     pub fn apply_header(&mut self, header: LightHeader) -> Result<(), String> {
         self.check_header_shape(&header)?;
         // --- finality --------------------------------------------------------
         let schedule = self.committee_schedule_at(header.height);
         header.verify_with_schedule(&self.validators, schedule)?;
-        self.check_no_rollback(&header)?;
         self.headers.push_back(header);
         Ok(())
     }
@@ -1674,7 +1674,6 @@ impl LightClient {
             self.committee_schedule_at(header.height),
         )
         .map_err(|e| format!("header at height {} rejected: {e}", header.height))?;
-        self.check_no_rollback(&header)?;
         self.headers.push_back(header);
         Ok(())
     }
@@ -1715,40 +1714,6 @@ impl LightClient {
             ));
         }
         Ok(())
-    }
-
-    /// Rollback gate shared by both header-accept paths.
-    fn check_no_rollback(&self, header: &LightHeader) -> Result<(), String> {
-        if let Some(rolled_back_to) = self.superseded_root(header) {
-            return Err(format!(
-                "light client: header at height {} commits state root {}, which an earlier finalized header already superseded; the state would roll back",
-                header.height,
-                hex::encode(rolled_back_to)
-            ));
-        }
-        Ok(())
-    }
-
-    /// The root this header would be rolling the state back to, if any.
-    ///
-    /// A header may legitimately carry its parent's own root: an empty block
-    /// does not move the state, and refusing that would wedge a client on a
-    /// chain of no-op blocks. What it may not do is reach further back than
-    /// that — reintroducing a root some earlier finalized height had already
-    /// moved past is a rollback (or a collision), and BFT finality says it
-    /// cannot happen honestly.
-    fn superseded_root(&self, header: &LightHeader) -> Option<CellHash> {
-        let parent_height = header.height.checked_sub(1)?;
-        if header.state_root == self.state_root() {
-            return None;
-        }
-        if self.anchor_height() < parent_height && header.state_root == self.anchor_state_root() {
-            return Some(self.anchor_state_root());
-        }
-        self.headers
-            .iter()
-            .find(|h| h.height < parent_height && h.state_root == header.state_root)
-            .map(|h| h.state_root)
     }
 
     /// Re-anchor onto a newer checkpoint, after verifying it.
@@ -1863,8 +1828,7 @@ impl LightClient {
     ///   or a full window — same shape gate as [`Self::apply_header`]);
     /// * the rotation header's finality evidence does not verify under the
     ///   CURRENT set (forged rotation, or a header certified by some other
-    ///   set — including the NEW set signing its own adoption);
-    /// * the rotation header would roll state back to a superseded root.
+    ///   set — including the NEW set signing its own adoption).
     ///
     /// After a rotation, headers certified only by the superseded set are
     /// refused: [`Self::apply_header`] verifies against the NEW set, and the
@@ -1898,7 +1862,6 @@ impl LightClient {
             .rotation
             .verify_with_schedule(&self.validators, rotation_schedule)
             .map_err(|e| format!("light client: refusing rotation: {e}"))?;
-        self.check_no_rollback(&proof.rotation)?;
         let effective = proof.rotation.height;
         self.headers.push_back(proof.rotation);
         self.validators = proof.next_set;

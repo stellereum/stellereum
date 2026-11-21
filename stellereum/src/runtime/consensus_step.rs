@@ -1442,8 +1442,20 @@ impl ValidatorRuntime {
         // otherwise it is refused as "already recorded for this round" and
         // this node can only vote the older signed round (at/below its
         // watermark after a restart), so the height never reaches quorum.
-        self.hc
-            .receive_proposal_for_at(proposer, bh, expected, block.round)?;
+        // A body this HEIGHT admitted at its own signed round may be re-served
+        // VERBATIM many rounds later (lock rescue / demanded rescue) and must
+        // stay live. A body first seen under a fresh envelope after a restart
+        // was never admitted here, so it must not own this round's slot
+        // (RESTART-SPLIT). The marker is per-HeightConsensus and is therefore
+        // empty on a restart even when the lock body itself was restored.
+        let already_admitted = self.hc.was_signed_admitted(&bh);
+        self.hc.receive_proposal_for_known_at(
+            proposer,
+            bh,
+            expected,
+            block.round,
+            already_admitted,
+        )?;
         // Fork-choice: the proposal is recorded as a CANDIDATE before it is
         // finalized, so a competing branch is KNOWN. When it loses (another
         // block is finalized at this height) the blocks that lost can be
@@ -1452,56 +1464,6 @@ impl ValidatorRuntime {
         let _ = self.run_fork_choice();
         self.blocks.insert(bh, block);
         Ok(bh)
-    }
-
-    /// Build a vote signed by whichever signer is configured.
-    pub(super) fn make_vote(&self, kind: VoteKind, target: Option<BlockHash>) -> Option<Vote> {
-        self.make_vote_at(kind, target, self.hc.round)
-    }
-
-    /// Build a vote stamped with an explicit round. Precommits use the round
-    /// of the POLKA they follow, not the local round: the decision needs the
-    /// prevote QC and the precommit QC in the SAME bucket, and the two nodes
-    /// are routinely one round apart (60% of sampled time on the live stand).
-    pub(super) fn make_vote_at(
-        &self,
-        kind: VoteKind,
-        target: Option<BlockHash>,
-        round: Round,
-    ) -> Option<Vote> {
-        // SHARD BINDING (Finding A): the vote preimage commits to the shard
-        // this runtime serves, so the same validator key running several
-        // shards signs distinct statements per shard. Without it an observer
-        // could package the honest shard-0/shard-1 pair as equivocation
-        // evidence and slash an honest validator.
-        let msg = crate::consensus::vote_sign_bytes_for_shard(
-            self.shard_id,
-            self.hc.height,
-            round,
-            kind,
-            &target,
-        );
-        let sig = self.sign_bytes(&msg)?;
-        let mut vote = Vote::signed_with_in_shard(
-            self.id,
-            self.shard_id,
-            self.hc.height,
-            round,
-            kind,
-            target,
-            sig,
-        );
-
-        let fk_ref = self.falcon_signing_key();
-        if let Some(fk) = fk_ref {
-            if self.deterministic_sim_signing {
-                crate::consensus::attach_vote_falcon_deterministic(fk, &msg, &mut vote.signature);
-            } else {
-                crate::consensus::attach_vote_falcon(fk, &msg, &mut vote.signature);
-            }
-        }
-
-        Some(vote)
     }
 
     /// The round a prevote for the CURRENT live proposal would carry.
@@ -1533,17 +1495,28 @@ impl ValidatorRuntime {
     }
 
     pub fn make_prevote(&self) -> Option<Vote> {
+        if !self.safety.can_sign() {
+            return None;
+        }
         if self.hc.step != Step::Propose && self.hc.step != Step::Prevote {
             return None;
         }
         let target = self.hc.decide_prevote();
-        // A nil vote has no body, so it keeps the local round (the shared
-        // `make_vote` path). A value vote carries the BODY's signed round,
-        // identical on every node that holds it. See `prevote_round`.
-        match target {
-            None => self.make_vote(VoteKind::Prevote, None),
-            Some(_) => self.make_vote_at(VoteKind::Prevote, target, self.prevote_round()),
-        }
+        let (round, target_with_vid) = match target {
+            None => (self.hc.round, None),
+            Some(bh) => {
+                let vid = self
+                    .blocks
+                    .get(&bh)
+                    .map(|b| b.value_id())
+                    .or_else(|| self.hc.value_id_of(&bh))?;
+                (self.prevote_round(), Some((bh, vid)))
+            }
+        };
+        let signer = self.vote_signer();
+        self.safety
+            .authorize_and_sign_prevote(self.hc.height, round, self.shard_id, target_with_vid, &signer)
+            .ok()
     }
 
     pub fn on_prevote(&mut self, v: Vote) -> Result<(), String> {
@@ -1607,61 +1580,136 @@ impl ValidatorRuntime {
     /// precommit. Finalization of an older round is unaffected: `try_finalize`
     /// inspects the same lookback window and can still commit it.
     pub fn make_precommit(&mut self) -> Option<Vote> {
-        // Cast at the polka's OWN round (Tendermint), not at `hc.round`.
-        // The old rule ("the QC must be in my current round") meant that a
-        // one-round skew -- the normal state of the two-node stand -- made BOTH
-        // nodes refuse to precommit: each saw the QC one round behind, so a
-        // full prevote QC never decided (31 of 180 wasted rounds, measured
-        // live: prevote QC present, no precommit ever cast).
-        //
-        // The scan also runs the polka-UNLOCK rule (a polka for another block
-        // at a higher round releases our lock), so it must run first.
-        // CN-VRF v3: the prevote QC this builds must come from the same
-        // schedule the network used at this height (review F2).
-        self.install_committee_schedule();
-        self.hc.try_prevote_quorum_at();
-        // The precommit follows the newest POLKA -- a quorum of prevotes FOR A
-        // BLOCK. It must NOT follow the newest quorum of any kind: a NIL
-        // quorum (the network timed out in a later round) is not a polka and
-        // used to SHADOW the real polka, so the node emitted a nil precommit
-        // for the newer round instead of precommitting the certified block,
-        // and the dedup key then suppressed the correct precommit forever.
-        // Live 2026-10-21: the masterchain sat at height 285027 with a full
-        // prevote QC formed and NO precommit QC.
-        //
-        // THE POLKA LEDGER (liveness fix, live 2026-10-21). `best_polka` is the
-        // newest polka this node has OBSERVED -- the one whose quorum was
-        // completed by a prevote that arrived -- or the newest one inside the
-        // scan window, whichever is newer. The ledger is what makes a LATE
-        // polka work: the quorum-completing prevote can arrive long after
-        // this node raced ahead of the network, and a scan of the rounds
-        // around the local counter cannot see that round at all. The live
-        // cluster showed it exactly: the prevote QC for one block was in
-        // every validator's vote set and only ONE of them ever cast a
-        // precommit, so the precommit quorum never formed and the height
-        // stayed parked for three days.
-        let (qc_round, target) = self.hc.best_polka()?;
-        let qc = self.hc.prevote_qc.get(&qc_round)?;
-        if qc.block_hash != Some(target) {
+        if !self.safety.can_sign() {
             return None;
         }
-        // SAFETY (lock rule): never precommit a block that contradicts our own
-        // lock. The unlock rule above already released the lock when the
-        // network certified a DIFFERENT block at a HIGHER round; a polka at or
-        // below our lock round for another block is stale evidence and must
-        // not be voted.
+        let prev_hc_locked = self.hc.locked;
+        self.install_committee_schedule();
+        self.hc.try_prevote_quorum_at();
+        let Some((qc_round, target)) = self.hc.best_polka() else {
+            self.hc.locked = self
+                .safety
+                .locked()
+                .map(|l| (l.block_hash, l.round))
+                .or(prev_hc_locked);
+            return None;
+        };
+        let Some(qc) = self.hc.prevote_qc.get(&qc_round).cloned() else {
+            self.hc.locked = self
+                .safety
+                .locked()
+                .map(|l| (l.block_hash, l.round))
+                .or(prev_hc_locked);
+            return None;
+        };
+        if qc.block_hash != Some(target) {
+            self.hc.locked = self
+                .safety
+                .locked()
+                .map(|l| (l.block_hash, l.round))
+                .or(prev_hc_locked);
+            return None;
+        }
+        // Require the full validated block body before locking or signing
+        // (no hash-only locks, `05_LOCK_SAFETY_P0.md` §2.3 Step 1).
+        let Some(polka_block) = self.blocks.get(&target).cloned() else {
+            self.hc.locked = self
+                .safety
+                .locked()
+                .map(|l| (l.block_hash, l.round))
+                .or(prev_hc_locked);
+            return None;
+        };
+        if polka_block.height != self.hc.height || polka_block.compute_hash() != target {
+            self.hc.locked = self
+                .safety
+                .locked()
+                .map(|l| (l.block_hash, l.round))
+                .or(prev_hc_locked);
+            return None;
+        }
+        let value_id = polka_block.value_id();
+        // Enforce any in-memory lock still held on `self.hc.locked` (e.g.
+        // unit tests that seed `hc.locked` directly) in addition to `SafetyAuthority`.
         if let Some((locked_block, locked_round)) = self.hc.locked {
-            // LOCK COMPARISON (ruleset v6, site 6): the target is OUR value
-            // when it is a re-stamped round of the locked value as well as
-            // when the signed hash is identical.
             if !self.hc.same_value(locked_block, target) && qc_round <= locked_round {
                 return None;
             }
         }
-        // Lock at the polka round too: the lock round is what the safety
-        // check in `try_precommit_quorum` compares against.
-        self.hc.locked = Some((target, qc_round));
-        self.make_vote_at(VoteKind::Precommit, Some(target), qc_round)
+
+        let validators = self.validator_set_for_height(self.hc.height);
+        let schedule = self.hc.committee_schedule;
+        let res = {
+            let signer = self.vote_signer();
+            self.safety.authorize_and_sign_precommit(
+                self.hc.height,
+                qc_round,
+                self.shard_id,
+                &polka_block,
+                &qc,
+                &validators,
+                schedule,
+                &signer,
+            )
+        };
+
+        match res {
+            Ok((vote, next_locked)) => {
+                self.hc.note_value_id(target, value_id);
+                if let Some(nl) = next_locked {
+                    if self.hc.locked.is_none_or(|(_, round)| nl.round > round) {
+                        self.hc.locked = Some((nl.block_hash, nl.round));
+                    }
+                }
+                Some(vote)
+            }
+            Err(crate::safety::SafetyRefusal::CrossKindConflict(_)) => {
+                // Liveness recovery without weakening safety (§1.6.1): adopt the
+                // verified polka lock durably so subsequent rounds re-stamp and
+                // prevote the locked value instead of proposing fresh conflicting
+                // blocks, while refusing to sign a precommit at `qc_round`.
+                match self.safety.record_polka_lock_transition(
+                    self.hc.height,
+                    qc_round,
+                    &polka_block,
+                    &qc,
+                    &validators,
+                    schedule,
+                ) {
+                    Ok(Some(nl)) => {
+                        self.hc.note_value_id(target, value_id);
+                        if self.hc.locked.is_none_or(|(_, round)| nl.round > round) {
+                            self.hc.locked = Some((nl.block_hash, nl.round));
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        self.hc.locked = self
+                            .safety
+                            .locked()
+                            .map(|l| (l.block_hash, l.round))
+                            .or(prev_hc_locked);
+                    }
+                }
+                None
+            }
+            Err(crate::safety::SafetyRefusal::SignerFailed) => {
+                // Non-rollback on ambiguous signer failure (§2.3 Step C): sync
+                // `hc.locked` to the durably persisted lock and return `None`.
+                if let Some(nl) = self.safety.locked() {
+                    self.hc.note_value_id(nl.block_hash, nl.value_id);
+                    self.hc.locked = Some((nl.block_hash, nl.round));
+                }
+                None
+            }
+            Err(_) => {
+                self.hc.locked = self
+                    .safety
+                    .locked()
+                    .map(|l| (l.block_hash, l.round))
+                    .or(prev_hc_locked);
+                None
+            }
+        }
     }
 
     pub fn on_precommit(&mut self, v: Vote) -> Result<(), String> {
@@ -1705,7 +1753,7 @@ impl ValidatorRuntime {
     /// key is in the (foreign) set — voting with a foreign set is exactly the
     /// node-C failure (silent wrong quorums instead of an honest observer).
     pub fn effective_can_vote(&self, config_is_validator: bool) -> bool {
-        if self.validator_set_stale {
+        if self.validator_set_stale || !self.safety.can_sign() {
             return false;
         }
         config_is_validator || self.validators.validators.contains_key(&self.id)

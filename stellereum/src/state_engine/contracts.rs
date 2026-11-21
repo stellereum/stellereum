@@ -374,6 +374,9 @@ impl InMemoryStateEngine {
     }
 
     /// Call a contract with structured outcome and optional value transfer.
+    ///
+    /// Preserves legacy (`< H`, `hardened == false`) behavior; hardened (`>= H`)
+    /// callers should invoke [`Self::call_contract_structured_with_value_hardened`].
     pub async fn call_contract_structured_with_value(
         &self,
         caller: Option<[u8; 32]>,
@@ -383,7 +386,33 @@ impl InMemoryStateEngine {
         fuel: u64,
         value: u64,
     ) -> ContractCallOutcome {
-        if value > 0 {
+        self.call_contract_structured_with_value_hardened(
+            caller, address, method, arg, fuel, value, false,
+        )
+        .await
+    }
+
+    /// Call a contract with structured outcome, optional value transfer, and
+    /// explicit `hardened` (`>= H`) rollback semantics.
+    ///
+    /// - When `hardened == false`: preserves pre-gate behavior.
+    /// - When `hardened == true`: if the call fails (including `OutOfFuel`,
+    ///   `Trapped`, `NotFound`, `Paused`, `NoSuchMethod`), any transferred `value`
+    ///   is rolled back from both `Contract.balance` and `accounts[address]`
+    ///   back to `accounts[caller]`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: hardened structured contract call mirrors call_contract_structured_with_value plus hardened toggle.
+    pub async fn call_contract_structured_with_value_hardened(
+        &self,
+        caller: Option<[u8; 32]>,
+        address: &[u8; 32],
+        method: &str,
+        arg: i64,
+        fuel: u64,
+        value: u64,
+        hardened: bool,
+    ) -> ContractCallOutcome {
+        let debited_caller: Option<[u8; 32]> = if value > 0 {
             // A value transfer needs a debited caller. The old body silently
             // ignored `value` when `caller` was None and swallowed a failed
             // credit; both are value-path bugs (no caller -> nothing may be
@@ -437,9 +466,97 @@ impl InMemoryStateEngine {
                     error: Some(format!("value credit failed: {e}")),
                 };
             }
+            Some(c)
+        } else {
+            None
+        };
+
+        if !hardened {
+            return self
+                .call_contract_structured(address, method, arg, fuel)
+                .await;
         }
-        self.call_contract_structured(address, method, arg, fuel)
-            .await
+
+        let prev_contract_balance = self.contracts.read().await.get(address).map(|c| c.balance);
+        self.sync_contract_balance(address).await;
+        let caller_addr = caller.unwrap_or([0u8; 32]);
+        let call_ctx = crate::contract::ContractCallContext {
+            caller: caller_addr,
+            value,
+            block_time: 0,
+            block_hash: [0u8; 32],
+        };
+        let res = {
+            let mut contracts = self.contracts_write().await;
+            contracts.call_with_context_hardened(
+                address,
+                method,
+                arg,
+                fuel,
+                &call_ctx,
+                caller_addr,
+                caller_addr,
+                true,
+            )
+        };
+        match res {
+            Ok(outcome) => {
+                self.sync_account_balance_from_contract(address).await;
+                if !outcome.outbound_messages.is_empty() {
+                    let _ = self
+                        .process_contract_outbound_messages(&outcome.outbound_messages)
+                        .await;
+                }
+                ContractCallOutcome {
+                    status: "success".to_string(),
+                    return_value: Some(outcome.result),
+                    gas_used: outcome.fuel_used,
+                    events: outcome.events,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                if let Some(prev) = prev_contract_balance {
+                    let mut contracts = self.contracts_write().await;
+                    if let Some(c) = contracts.contracts.get_mut(address) {
+                        c.balance = prev;
+                    }
+                }
+                let mut rollback_note: Option<String> = None;
+                if let Some(c) = debited_caller {
+                    if let Err(debit_err) = self.debit_native(address, value).await {
+                        tracing::error!(
+                            "hardened contract value rollback: failed to debit {} from {}: {debit_err}",
+                            value,
+                            hex::encode(&address[..8])
+                        );
+                        rollback_note = Some(format!("value rollback debit failed: {debit_err}"));
+                    } else if let Err(refund_err) = self.credit_native_transfer(&c, value).await {
+                        tracing::error!(
+                            "hardened contract value rollback: debited {} from {} but refund to {} failed: {refund_err}",
+                            value,
+                            hex::encode(&address[..8]),
+                            hex::encode(&c[..8])
+                        );
+                        rollback_note = Some(format!("value rollback refund failed: {refund_err}"));
+                    }
+                }
+                let (gas_used, mut err_msg) = match &e {
+                    crate::contract::ContractError::OutOfFuel => (fuel, e.to_string()),
+                    _ => (0, e.to_string()),
+                };
+                if let Some(note) = rollback_note {
+                    err_msg = format!("{err_msg}; {note}");
+                }
+                ContractCallOutcome {
+                    status: "failed".to_string(),
+                    return_value: None,
+                    gas_used,
+                    events: Vec::new(),
+                    error: Some(err_msg),
+                }
+            }
+        }
     }
 
     /// Process outbound contract messages:

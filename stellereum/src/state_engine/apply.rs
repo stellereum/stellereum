@@ -4,7 +4,7 @@ use super::types::{
     write_contract_trie_entries, ActorSnapshot, BridgeSnapshot, ClobQuoteMode, DeliveryCtx,
     MessageUndo, PayloadDomainSnapshot,
 };
-use super::verify_once::require_pq_tx_envelope;
+use super::verify_once::require_pq_tx_envelope_at_height;
 use super::{
     AccountState, ActorMessage, BlockTransitionOutcome, ExecPostActions, GovOpsOutcome,
     HashPoolApplyOutcome, HashPoolBlockOps, HashPoolOpError, InMemoryStateEngine,
@@ -157,13 +157,37 @@ impl InMemoryStateEngine {
         self.execute_payload_with_preverify(tx, timestamp).await
     }
 
+    /// Height-gated variant of [`Self::execute_payload`].
+    pub async fn execute_payload_at_height(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+    ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        self.execute_payload_with_preverify_at_height(tx, timestamp, chain_height)
+            .await
+    }
+
     /// Capture pre-execution state for exactly the domains this payload's
     /// opcodes can mutate (B1 atomicity). Plain transfers (empty payload)
     /// never call this: they touch no domain. Each clone is gated on the
     /// opcodes present so hot paths pay only for what they use.
+    #[allow(dead_code)] // GATE: kept for pre-hardening direct callers alongside snapshot_payload_domains_at
     pub(super) async fn snapshot_payload_domains(
         &self,
         payload: &[crate::svm::OpCode],
+    ) -> PayloadDomainSnapshot {
+        self.snapshot_payload_domains_at(payload, false).await
+    }
+
+    /// Height-gated variant of [`Self::snapshot_payload_domains`].
+    /// When `exec_hardening` is true, stops scanning at the first `OpCode::Halt`
+    /// and includes `SysCallCallContractArgs` (contracts) and
+    /// `SysCallSubmitPqPriceFeed` (oracle).
+    pub(super) async fn snapshot_payload_domains_at(
+        &self,
+        payload: &[crate::svm::OpCode],
+        exec_hardening: bool,
     ) -> PayloadDomainSnapshot {
         use crate::svm::OpCode::*;
         let mut touches_tokens = false;
@@ -175,6 +199,9 @@ impl InMemoryStateEngine {
         let mut touches_session = false;
         let mut touches_zkml = false;
         for op in payload {
+            if exec_hardening && matches!(op, Halt) {
+                break;
+            }
             match op {
                 SysCallTokenTransfer { .. }
                 | SysCallTokenTransferFrom { .. }
@@ -186,6 +213,7 @@ impl InMemoryStateEngine {
                 SysCallDeployContract { .. } | SysCallCallContract { .. } => {
                     touches_contracts = true
                 }
+                SysCallCallContractArgs { .. } if exec_hardening => touches_contracts = true,
                 SysCallPlaceOrder { .. } | SysCallCancelOrder { .. } => {
                     touches_books = true;
                     // settle_clob_effects does token Transfer/Mint/Burn on the
@@ -218,6 +246,7 @@ impl InMemoryStateEngine {
                 // opcode.
                 | SysCallReportPqEquivocation { .. } => touches_staking = true,
                 SysCallSubmitPriceFeed { .. } => touches_oracle = true,
+                SysCallSubmitPqPriceFeed { .. } if exec_hardening => touches_oracle = true,
                 SysCallPublishSessionGrant { .. } | SysCallRevokeSession { .. } => {
                     touches_session = true
                 }
@@ -422,6 +451,22 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        self.execute_payload_with_preverify_at_height(tx, timestamp, u64::MAX)
+            .await
+    }
+
+    /// Height-gated variant of [`Self::execute_payload_with_preverify`].
+    #[allow(clippy::type_complexity)]
+    // GATE: execution snapshot uses account tuple layout shared with commit path.
+    pub async fn execute_payload_with_preverify_at_height(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+    ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
+        let wasm_pmm_hardening =
+            crate::chain_spec::wasm_xshard_pmm_hardening_active_at(chain_height);
         // Session-key gate at the BLOCK timestamp, checked BEFORE the
         // empty-payload early return below. A plain session transfer has no
         // payload, so without this it would never reach the session hook at
@@ -500,15 +545,59 @@ impl InMemoryStateEngine {
                     pmm_native_snapshot: Vec::new(),
                     pmm_minted_nano: 0,
                     clob_native_snapshot: Vec::new(),
+                    outbound_messages: Vec::new(),
                 },
             ));
         }
 
-        let sender_balance = self
-            .get_account(&tx.from)
-            .await
-            .map(|a| a.balance)
-            .unwrap_or(0);
+        let contract_keys_to_sync: Vec<[u8; 32]> = if wasm_pmm_hardening {
+            let mut has_call = false;
+            for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
+                if matches!(
+                    op,
+                    crate::svm::OpCode::SysCallCallContract { .. }
+                        | crate::svm::OpCode::SysCallCallContractArgs { .. }
+                ) {
+                    has_call = true;
+                    break;
+                }
+            }
+            if has_call {
+                let mut keys: Vec<[u8; 32]> = self
+                    .contracts_read()
+                    .await
+                    .contracts
+                    .keys()
+                    .copied()
+                    .collect();
+                keys.push(crate::contract::contract_address(&tx.from, tx.nonce));
+                keys
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (sender_balance, outbound_budget_from_accounts) = {
+            let accounts_guard = self.accounts.read().await;
+            let sbal = accounts_guard.get(&tx.from).map(|a| a.balance).unwrap_or(0);
+            let budgets = if wasm_pmm_hardening && !contract_keys_to_sync.is_empty() {
+                let mut map = HashMap::with_capacity(contract_keys_to_sync.len());
+                for addr in contract_keys_to_sync {
+                    if let Some(acc) = accounts_guard.get(&addr) {
+                        map.insert(addr, acc.balance);
+                    }
+                }
+                Some(map)
+            } else {
+                None
+            };
+            (sbal, budgets)
+        };
 
         let mut tokens = self.tokens_write().await;
         let mut orderbooks = self.orderbooks_write().await;
@@ -547,16 +636,28 @@ impl InMemoryStateEngine {
         // rolls back"), while a breaker latch tripped by a gate inside that
         // same payload is a sticky alarm and survives its own transaction -
         // see `restore_oracle_after_failure`.
-        let mut oracle_before = if tx.payload.iter().any(|op| {
-            matches!(
-                op,
-                crate::svm::OpCode::SysCallSubmitPriceFeed(_)
-                    | crate::svm::OpCode::SysCallPlaceOrder { .. }
-            )
-        }) {
-            Some(oracle.clone())
-        } else {
-            None
+        let mut oracle_before = {
+            let mut has_oracle_op = false;
+            for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
+                if matches!(
+                    op,
+                    crate::svm::OpCode::SysCallSubmitPriceFeed(_)
+                        | crate::svm::OpCode::SysCallPlaceOrder { .. }
+                ) || (exec_hardening
+                    && matches!(op, crate::svm::OpCode::SysCallSubmitPqPriceFeed(_)))
+                {
+                    has_oracle_op = true;
+                    break;
+                }
+            }
+            if has_oracle_op {
+                Some(oracle.clone())
+            } else {
+                None
+            }
         };
 
         // A payload with order syscalls commits its book changes inside the VM.
@@ -739,12 +840,19 @@ impl InMemoryStateEngine {
         // the raw payload bytes. A payload with no actor send never allocates
         // anything measurable (the sink stays empty).
         let mut actor_send_sink: Vec<crate::svm::ActorSendRequest> = Vec::new();
-        let res = crate::svm::Svm::execute_with_confidential_and_sends(
+        let vm_opts = crate::svm::VmExecOptions {
+            exec_hardening,
+            wasm_pmm_hardening,
+            tx_nonce: tx.nonce,
+            outbound_budget_from_accounts,
+        };
+        let res = crate::svm::Svm::execute_with_confidential_and_sends_at(
             &tx.payload,
             tx.gas_limit,
             &mut ctx,
             &mut actor_send_sink,
             zkml_models_work.as_mut(),
+            &vm_opts,
         );
         // The PMM's native leg: the VM moved wUSDT and advanced the curve in
         // its clone-committed registries, but it cannot mint or burn native
@@ -760,14 +868,18 @@ impl InMemoryStateEngine {
         // Bridge intents are read straight off the payload (the VM only
         // validates them - it has no account map). Settlement below is the
         // native leg: a deposit credit, or a withdrawal debit into escrow.
-        let bridge_intents: Vec<crate::bridge::BridgeIntent> = tx
-            .payload
-            .iter()
-            .filter_map(|op| match op {
-                crate::svm::OpCode::SysCallBridge(intent) => Some((**intent).clone()),
-                _ => None,
-            })
-            .collect();
+        let bridge_intents: Vec<crate::bridge::BridgeIntent> = {
+            let mut intents = Vec::new();
+            for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
+                if let crate::svm::OpCode::SysCallBridge(intent) = op {
+                    intents.push((**intent).clone());
+                }
+            }
+            intents
+        };
 
         // A failed payload restores the pre-payload oracle (no price survives
         // a revert), keeping only a breaker latch the payload managed to trip.
@@ -1007,8 +1119,11 @@ impl InMemoryStateEngine {
                 }
             }
 
-            // Route any outbound contract messages produced by SysCallCallContract
-            if !outbound_messages.is_empty() {
+            // Route any outbound contract messages produced by SysCallCallContract.
+            // Pre-hardening (< H) this runs eagerly here; at >= H (`wasm_pmm_hardening`)
+            // messages are deferred via `ExecPostActions::outbound_messages` and routed
+            // strictly AFTER `commit_native` succeeds so CLOB/commit failures never leak.
+            if !outbound_messages.is_empty() && !wasm_pmm_hardening {
                 self.process_contract_outbound_messages(outbound_messages)
                     .await
                     .map_err(|e| format!("contract outbound message routing failed: {e}"))?;
@@ -1172,6 +1287,18 @@ impl InMemoryStateEngine {
                 // (plus the domain snapshot it took before calling us),
                 // closing the B1 hole where a rejected transaction kept
                 // bridge/actor/PMM-native legs it had already settled.
+                let deferred_outbound = if wasm_pmm_hardening {
+                    if let crate::svm::VmExecutionResult::Success {
+                        outbound_messages, ..
+                    } = &res
+                    {
+                        outbound_messages.clone()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
                 Ok((
                     res,
                     ExecPostActions {
@@ -1180,6 +1307,7 @@ impl InMemoryStateEngine {
                         pmm_native_snapshot,
                         pmm_minted_nano,
                         clob_native_snapshot,
+                        outbound_messages: deferred_outbound,
                     },
                 ))
             }
@@ -1239,8 +1367,8 @@ impl InMemoryStateEngine {
         // 1. Cryptographic signature check (FULL-PQ first: classical
         // envelopes are refused before any crypto, fee, nonce or balance
         // effect — admission-stage, like the chain-id mismatch below).
-        require_pq_tx_envelope(tx)?;
-        if !tx.verify_signature() {
+        require_pq_tx_envelope_at_height(tx, chain_height)?;
+        if !tx.verify_signature_at_height(chain_height) {
             return Err("Transaction signature verification failed (forged signature)".to_string());
         }
         if let Some(cid) = tx.chain_id() {
@@ -1390,16 +1518,22 @@ impl InMemoryStateEngine {
         // snapshot, so a rejected transaction leaves no free bond, no free
         // mint and no half-settled legs behind. Empty payloads touch no
         // domain and skip the snapshot.
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         let domain_snap = if tx.payload.is_empty() {
             None
         } else {
-            Some(self.snapshot_payload_domains(&tx.payload).await)
+            Some(
+                self.snapshot_payload_domains_at(&tx.payload, exec_hardening)
+                    .await,
+            )
         };
         // Settlement undo records (bridge/actor/PMM-native direct map
         // writes), filled on VM success for the commit-failure path below.
         let mut post_actions: Option<ExecPostActions> = None;
         if !tx.payload.is_empty() {
-            let exec = self.execute_payload(tx, timestamp).await;
+            let exec = self
+                .execute_payload_with_preverify_at_height(tx, timestamp, chain_height)
+                .await;
             let (res, actions) = match exec {
                 Ok(v) => v,
                 // Settlement (or deeper) refused AFTER the VM committed its
@@ -1416,6 +1550,7 @@ impl InMemoryStateEngine {
                                 pmm_native_snapshot: Vec::new(),
                                 pmm_minted_nano: 0,
                                 clob_native_snapshot: Vec::new(),
+                                outbound_messages: Vec::new(),
                             },
                         )
                         .await;
@@ -1464,14 +1599,15 @@ impl InMemoryStateEngine {
         // 6. Commit the native movement (amount + fee + payload value) through
         //    the shared commit point, then write ONLY the touched accounts.
         //    B1: a refusal here rolls back EVERYTHING (see rollback_payload).
-        let (touched, _fee) = match self
-            .commit_native(
+        let (mut touched, _fee) = match self
+            .commit_native_at(
                 tx,
                 gas_charged,
                 &vm_transfers,
                 &vm_payouts,
                 &vm_burns,
                 timestamp,
+                chain_height,
             )
             .await
         {
@@ -1486,13 +1622,21 @@ impl InMemoryStateEngine {
                 return Err(e);
             }
         };
+        if let Some(ref actions) = post_actions {
+            if !actions.outbound_messages.is_empty() {
+                let outbound_touched = self
+                    .process_contract_outbound_messages_hardened(&actions.outbound_messages)
+                    .await;
+                touched.extend(outbound_touched);
+            }
+        }
         // Session budget: charged only now that the transaction has actually
         // applied, and with the gas it is BILLED for (`billed_gas`: the VM's
         // measurement for a payload, the intrinsic envelope cost for an
         // empty-payload transfer, both capped at the declared limit). The
         // block path files the same number, so the registry does not care
         // which path applied the transaction.
-        self.session_note_applied(tx, Self::billed_gas(tx, gas_charged))
+        self.session_note_applied(tx, Self::billed_gas_at(tx, gas_charged, exec_hardening))
             .await;
         // Contract deploys commit code hashes here — AFTER the native commit,
         // never speculatively inside execution (B1: the trie has no undo).
@@ -1690,23 +1834,29 @@ impl InMemoryStateEngine {
     /// The consensus floor still applies ON TOP ([`Self::fee_for_gas`]), so a
     /// transaction that declares less than the floor is never executed below
     /// it.
+    #[allow(dead_code)] // GATE: kept for legacy callers alongside billed_gas_at
     pub(super) fn billed_gas(tx: &crate::sharding::Transaction, gas_used: u64) -> u64 {
-        // A successful payload whose measured consumption is ZERO (a payload
-        // that is only `OpCode::Halt`, whose gas price is 0) must still pay
-        // the intrinsic envelope: signature verification and the nonce/trie
-        // bookkeeping are real work, and charging 0 made such a transaction
-        // completely free — a self-authenticated spam vector that bypassed
-        // the admission floor (the floor only constrains the DECLARED limit,
-        // which FEE-01 refunds in full when nothing was used). This is the
-        // same intrinsic the failure arm always charges, so a successful
-        // zero-gas transaction can never be cheaper than the same
-        // transaction failing.
-        let intrinsic = if tx.payload.is_empty() || gas_used == 0 {
-            Self::TX_INTRINSIC_GAS
+        Self::billed_gas_at(tx, gas_used, false)
+    }
+
+    /// Height-gated [`Self::billed_gas`]:
+    /// - `< H` (`exec_hardening == false`): `gas_used + TX_INTRINSIC_GAS` when payload is empty or `gas_used == 0`, else `gas_used`, capped at `tx.gas_limit`.
+    /// - `>= H` (`exec_hardening == true`): `gas_used.max(TX_INTRINSIC_GAS).min(tx.gas_limit)` so `[OpCode::Nop]` pays `280_000` without adding `280_000` on top of payloads with `gas_used > 280_000`.
+    pub(super) fn billed_gas_at(
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        exec_hardening: bool,
+    ) -> u64 {
+        if exec_hardening {
+            gas_used.max(Self::TX_INTRINSIC_GAS).min(tx.gas_limit)
         } else {
-            0
-        };
-        gas_used.saturating_add(intrinsic).min(tx.gas_limit)
+            let intrinsic = if tx.payload.is_empty() || gas_used == 0 {
+                Self::TX_INTRINSIC_GAS
+            } else {
+                0
+            };
+            gas_used.saturating_add(intrinsic).min(tx.gas_limit)
+        }
     }
 
     /// FEE-01: the fee for one transaction.
@@ -1717,13 +1867,25 @@ impl InMemoryStateEngine {
     /// the `commit_native` docs). The floor is fail-closed: it can only
     /// raise the fee, never lower it, and the PQ surcharge is additive, as
     /// before.
+    #[allow(dead_code)] // GATE: kept for legacy callers alongside fee_for_gas_at
     pub(super) fn fee_for_gas(
         tx: &crate::sharding::Transaction,
         gas_used: u64,
         floor_base: u64,
         surcharge: u64,
     ) -> u64 {
-        Self::billed_gas(tx, gas_used)
+        Self::fee_for_gas_at(tx, gas_used, floor_base, surcharge, false)
+    }
+
+    /// Height-gated [`Self::fee_for_gas`].
+    pub(super) fn fee_for_gas_at(
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        floor_base: u64,
+        surcharge: u64,
+        exec_hardening: bool,
+    ) -> u64 {
+        Self::billed_gas_at(tx, gas_used, exec_hardening)
             .max(floor_base)
             .saturating_add(surcharge)
     }
@@ -2044,7 +2206,7 @@ impl InMemoryStateEngine {
     ///
     /// Callers outside the block path must keep using `commit_native`, which
     /// reads the live inputs and delegates here.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     // GATE: batching the fee prefix adds parameters; the shared commit core
     // below is untouched (moved verbatim), so semantics are provable by diff.
     pub(super) async fn commit_native_with_floor(
@@ -2059,6 +2221,38 @@ impl InMemoryStateEngine {
         sender_vesting_floor: Option<u64>,
         vesting_floors: &HashMap<[u8; 32], u64>,
     ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
+        self.commit_native_with_floor_at(
+            tx,
+            gas_used,
+            transfers,
+            payouts,
+            burns,
+            floor_base,
+            surcharge,
+            sender_vesting_floor,
+            vesting_floors,
+            u64::MAX,
+        )
+        .await
+    }
+
+    /// Height-gated variant of [`Self::commit_native_with_floor`].
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    // GATE: adds chain_height for EXEC_HARDENING_V1 / WASM_XSHARD_PMM_HARDENING gates; undo tuple mirrors account layout.
+    pub(super) async fn commit_native_with_floor_at(
+        &self,
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        transfers: &[([u8; 32], u64)],
+        payouts: &[([u8; 32], [u8; 32], u64)],
+        burns: &[([u8; 32], u64)],
+        floor_base: u64,
+        surcharge: u64,
+        sender_vesting_floor: Option<u64>,
+        vesting_floors: &HashMap<[u8; 32], u64>,
+        chain_height: u64,
+    ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         // The VM ran against the sender's balance without knowing about the fee
         // and about the plain `amount` transfer, so the combined debit has to be
         // re-checked here, under the lock, or a payload could spend the fee twice.
@@ -2086,7 +2280,7 @@ impl InMemoryStateEngine {
         // plus the additive PQ surcharge — NEVER the declared limit. Both
         // apply paths pass the executor's measurement, so a transaction
         // that declared more than it used is refunded the difference.
-        let fee = Self::billed_gas(tx, gas_used).max(floor_base);
+        let fee = Self::billed_gas_at(tx, gas_used, exec_hardening).max(floor_base);
         let fee_with_surcharge = fee.saturating_add(surcharge);
         let charge = tx
             .amount
@@ -2214,7 +2408,7 @@ impl InMemoryStateEngine {
 
                 if tx.is_pq_activation() {
                     let env = tx
-                        .pq_envelope()
+                        .pq_envelope_at_height(chain_height)
                         .ok_or_else(|| "Missing PQ activation envelope".to_string())?;
                     if env.is_implicit {
                         return Err("PQ activation envelope must not be implicit".to_string());
@@ -2480,7 +2674,7 @@ impl InMemoryStateEngine {
         drop(map);
 
         if tx.is_pq_activation() {
-            if let Some(env) = tx.pq_envelope() {
+            if let Some(env) = tx.pq_envelope_at_height(chain_height) {
                 if !env.is_implicit {
                     if let Some(ref pk) = env.pubkey {
                         let salt = env.salt;
@@ -2531,6 +2725,7 @@ impl InMemoryStateEngine {
     /// to the batched variant. This is the single-transaction path
     /// (`apply_transaction`) and every non-block caller stays on these live
     /// reads — only the block path passes a block snapshot.
+    #[allow(dead_code)] // GATE: kept for legacy callers alongside commit_native_at
     pub(super) async fn commit_native(
         &self,
         tx: &crate::sharding::Transaction,
@@ -2539,6 +2734,22 @@ impl InMemoryStateEngine {
         payouts: &[([u8; 32], [u8; 32], u64)],
         burns: &[([u8; 32], u64)],
         now: u64,
+    ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
+        self.commit_native_at(tx, gas_used, transfers, payouts, burns, now, u64::MAX)
+            .await
+    }
+
+    /// Height-gated variant of [`Self::commit_native`].
+    #[allow(clippy::too_many_arguments)] // GATE: mirrors commit_native with explicit chain_height
+    pub(super) async fn commit_native_at(
+        &self,
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        transfers: &[([u8; 32], u64)],
+        payouts: &[([u8; 32], [u8; 32], u64)],
+        burns: &[([u8; 32], u64)],
+        now: u64,
+        chain_height: u64,
     ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
         // Live fee-floor inputs: the governed base + this engine's D2
         // penalty mirror + the PQ surcharge predicate.
@@ -2559,7 +2770,7 @@ impl InMemoryStateEngine {
             }
             (sender_floor, floors)
         };
-        self.commit_native_with_floor(
+        self.commit_native_with_floor_at(
             tx,
             gas_used,
             transfers,
@@ -2569,6 +2780,7 @@ impl InMemoryStateEngine {
             surcharge,
             sender_vesting_floor,
             &vesting_floors,
+            chain_height,
         )
         .await
     }
@@ -2917,6 +3129,7 @@ impl InMemoryStateEngine {
         // height evades downtime slashing. Derived from the block's own
         // applied rotation opcodes (pure block bytes + `status`), so every
         // node resolves the same alias. Empty on the common block.
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
         let rotation_aliases: HashMap<[u8; 32], [u8; 32]> = {
             let mut aliases = HashMap::new();
             for (i, tx) in block.transactions.iter().enumerate() {
@@ -2924,6 +3137,9 @@ impl InMemoryStateEngine {
                     continue;
                 }
                 for op in &tx.payload {
+                    if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                        break;
+                    }
                     if let crate::svm::OpCode::SysCallRotateValidatorKey {
                         old_validator,
                         new_validator,
@@ -3023,11 +3239,15 @@ impl InMemoryStateEngine {
 
         // 1. Migrate CN-VRF v3 commitments and abort-slash debt for any applied
         //    `SysCallRotateValidatorKey` transactions in this block.
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
         for (idx, tx) in block.transactions.iter().enumerate() {
             if !status.get(idx).copied().unwrap_or(false) {
                 continue;
             }
             for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
                 if let crate::svm::OpCode::SysCallRotateValidatorKey {
                     old_validator,
                     new_validator,
@@ -3895,12 +4115,16 @@ impl InMemoryStateEngine {
     ) -> usize {
         // Collect first: the common block carries no unjail op and must not
         // take the staking write lock at all.
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
         let mut requests: Vec<([u8; 32], [u8; 32])> = Vec::new();
         for (i, tx) in block.transactions.iter().enumerate() {
             if !status.get(i).copied().unwrap_or(false) {
                 continue;
             }
             for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
                 if let crate::svm::OpCode::SysCallUnjail { validator } = op {
                     requests.push((tx.from, *validator));
                 }
@@ -4187,10 +4411,14 @@ impl InMemoryStateEngine {
     /// loudly (slash-wrongly is worse than slash-rarely). Never fails the
     /// block: hostile evidence costs the reporter gas, never the chain.
     pub async fn apply_equivocation_slash(&self, block: &crate::sharding::Block) -> u64 {
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(block.height);
         let mut items: Vec<crate::consensus::EquivocationEvidence> = Vec::new();
         let mut proposals: Vec<crate::consensus::ProposalEquivocationEvidence> = Vec::new();
         for tx in &block.transactions {
             for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
                 if let crate::svm::OpCode::SysCallReportEquivocation { evidence } = op {
                     items.push((**evidence).clone());
                 }
@@ -4807,5 +5035,25 @@ impl InMemoryStateEngine {
         };
         let mut reg = self.session_keys_write().await;
         reg.note_applied(&d, gas_used);
+    }
+
+    /// Hardened (`>= H`) contract outbound message processor called strictly
+    /// AFTER `commit_native` succeeds. Debits `accounts[msg.sender]` before
+    /// queuing or bouncing and returns `(addr, balance, nonce)` for `state_trie`.
+    pub(super) async fn process_contract_outbound_messages_hardened(
+        &self,
+        messages: &[crate::contract::ContractMessage],
+    ) -> Vec<([u8; 32], u64, u64)> {
+        if messages.is_empty() {
+            return Vec::new();
+        }
+        let my_shard = self.shard_id();
+        let sharded = self.cross_shard_enabled();
+        let topology = self.shard_topology.read().await.clone();
+        let mut map = self.accounts.write().await;
+        let mut xout = self.cross_shard_out.write().await;
+        crate::svm::Svm::route_contract_messages_hardened(
+            messages, &mut map, &mut xout, my_shard, sharded, &topology,
+        )
     }
 }

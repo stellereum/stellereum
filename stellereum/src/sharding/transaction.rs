@@ -947,20 +947,43 @@ impl Transaction {
         Self::is_pq_inner(self.sponsor_inner_sig())
     }
 
-    fn pq_envelope_from_inner(inner_sig: &[u8]) -> Option<PqSignatureEnvelope> {
+    fn pq_envelope_from_inner_with_mode(
+        inner_sig: &[u8],
+        canonical: bool,
+    ) -> Option<PqSignatureEnvelope> {
         if !Self::is_pq_inner(inner_sig) {
             return None;
         }
-        let env = PqSignatureEnvelope::decode(inner_sig).ok()?;
-        if env.encoded_len() != inner_sig.len() && env.legacy_encode_len() != inner_sig.len() {
+        let env = PqSignatureEnvelope::decode_at_height(inner_sig, canonical).ok()?;
+        if canonical {
+            if env.encoded_len() != inner_sig.len() {
+                return None;
+            }
+        } else if env.encoded_len() != inner_sig.len() && env.legacy_encode_len() != inner_sig.len()
+        {
             return None;
         }
         Some(env)
     }
 
+    fn pq_envelope_from_inner(inner_sig: &[u8]) -> Option<PqSignatureEnvelope> {
+        Self::pq_envelope_from_inner_with_mode(inner_sig, false)
+    }
+
     /// Decode the post-quantum signature envelope if present, ensuring exact fit (no trailing bytes).
     pub fn pq_envelope(&self) -> Option<PqSignatureEnvelope> {
         Self::pq_envelope_from_inner(self.sponsor_inner_sig())
+    }
+
+    /// Decode the post-quantum signature envelope strictly in canonical layout (`>= H`).
+    pub fn pq_envelope_canonical(&self) -> Option<PqSignatureEnvelope> {
+        Self::pq_envelope_from_inner_with_mode(self.sponsor_inner_sig(), true)
+    }
+
+    /// Decode the post-quantum signature envelope with height-gated canonical strictness.
+    pub fn pq_envelope_at_height(&self, height: u64) -> Option<PqSignatureEnvelope> {
+        let canonical = crate::chain_spec::wasm_xshard_pmm_hardening_active_at(height);
+        Self::pq_envelope_from_inner_with_mode(self.sponsor_inner_sig(), canonical)
     }
 
     /// True if this transaction carries a raw public key in a PQ envelope (activation tx).
@@ -1177,9 +1200,25 @@ impl Transaction {
         self.verify_signature_with_registry(Self::global_implicit_registry())
     }
 
+    /// Height-gated signature verification (`decode_canonical` when
+    /// `wasm_xshard_pmm_hardening_active_at(height)` is true).
+    pub fn verify_signature_at_height(&self, height: u64) -> bool {
+        self.verify_signature_with_registry_at_height(Self::global_implicit_registry(), height)
+    }
+
     /// Verify signature against a caller-supplied implicit key registry with default salt.
     pub fn verify_signature_with_registry(&self, registry: &StatefulImplicitKeyRegistry) -> bool {
         self.verify_signature_with_registry_and_salt(registry, &DEFAULT_SALT)
+    }
+
+    /// Height-gated signature verification against a caller-supplied implicit key registry.
+    pub fn verify_signature_with_registry_at_height(
+        &self,
+        registry: &StatefulImplicitKeyRegistry,
+        height: u64,
+    ) -> bool {
+        let canonical_pq = crate::chain_spec::wasm_xshard_pmm_hardening_active_at(height);
+        self.verify_signature_with_registry_and_salt_inner(registry, &DEFAULT_SALT, canonical_pq)
     }
 
     /// Verify signature against a caller-supplied implicit key registry and salt.
@@ -1192,14 +1231,28 @@ impl Transaction {
         registry: &StatefulImplicitKeyRegistry,
         salt: &[u8; 16],
     ) -> bool {
+        self.verify_signature_with_registry_and_salt_inner(registry, salt, false)
+    }
+
+    fn verify_signature_with_registry_and_salt_inner(
+        &self,
+        registry: &StatefulImplicitKeyRegistry,
+        salt: &[u8; 16],
+        canonical_pq: bool,
+    ) -> bool {
         let (inner_len, sponsor_auth, sponsor_malformed) =
             Self::split_sponsor_envelope(&self.signature);
         if sponsor_malformed {
             return false;
         }
         let inner_sig = &self.signature[..inner_len];
-        let (inner_ok, is_pq_inner) =
-            self.verify_inner_with_registry(registry, salt, inner_sig, sponsor_auth.as_ref());
+        let (inner_ok, is_pq_inner) = self.verify_inner_with_registry(
+            registry,
+            salt,
+            inner_sig,
+            sponsor_auth.as_ref(),
+            canonical_pq,
+        );
         if !inner_ok {
             return false;
         }
@@ -1230,6 +1283,7 @@ impl Transaction {
         _salt: &[u8; 16],
         inner_sig: &[u8],
         sponsor_auth: Option<&SponsorAuthorization>,
+        canonical_pq: bool,
     ) -> (bool, bool) {
         let build_pq_signing_message = |chain_id: Option<u64>| {
             let mut msg = Self::base_signing_message(
@@ -1291,10 +1345,15 @@ impl Transaction {
             return (false, false);
         }
         if inner_sig.starts_with(PQ_ENVELOPE_MAGIC) {
-            let Ok(env) = PqSignatureEnvelope::decode(inner_sig) else {
+            let Ok(env) = PqSignatureEnvelope::decode_at_height(inner_sig, canonical_pq) else {
                 return (false, false);
             };
-            if env.encoded_len() != inner_sig.len() && env.legacy_encode_len() != inner_sig.len() {
+            let exact_len = if canonical_pq {
+                env.encoded_len() == inner_sig.len()
+            } else {
+                env.encoded_len() == inner_sig.len() || env.legacy_encode_len() == inner_sig.len()
+            };
+            if !exact_len {
                 return (false, false);
             }
             // FULL-PQ: non-PQ schemes always refused (no classical fallback).
@@ -1993,6 +2052,11 @@ impl Transaction {
         txs.iter().all(Transaction::verify_signature)
     }
 
+    /// Height-gated sequential batch signature verification.
+    pub fn verify_signatures_batch_at_height(txs: &[Transaction], height: u64) -> bool {
+        txs.iter().all(|tx| tx.verify_signature_at_height(height))
+    }
+
     /// Parallel batched verification across CPU cores (rayon).
     /// Splits the block into chunks and batch-verifies each chunk in parallel.
     /// Falls back to the sequential batch for tiny inputs. Returns true iff ALL valid.
@@ -2003,6 +2067,17 @@ impl Transaction {
             return Self::verify_signatures_batch(txs);
         }
         txs.par_chunks(CHUNK).all(Self::verify_signatures_batch)
+    }
+
+    /// Height-gated parallel batched verification across CPU cores (rayon).
+    pub fn verify_signatures_batch_parallel_at_height(txs: &[Transaction], height: u64) -> bool {
+        use rayon::prelude::*;
+        const CHUNK: usize = 16;
+        if txs.len() < CHUNK {
+            return Self::verify_signatures_batch_at_height(txs, height);
+        }
+        txs.par_chunks(CHUNK)
+            .all(|chunk| Self::verify_signatures_batch_at_height(chunk, height))
     }
 
     /// Per-transaction validity for a batch of transactions (Ed25519 batch verify

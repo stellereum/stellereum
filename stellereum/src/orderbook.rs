@@ -10,6 +10,10 @@ pub const PAIR_STELL_USDT: u32 = 1;
 pub const PAIR_STELL_TON: u32 = 2;
 pub const PAIR_STELL_GRAM: u32 = 3;
 
+/// Hard cap on maker fills a single order may execute on the hardened (`>= H`)
+/// path so 1,000 tiny resting orders at one price level cannot be scanned for free.
+pub const MAX_MATCH_FILLS_PER_ORDER: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     Buy,
@@ -177,6 +181,12 @@ impl OrderbookActor {
             .find(|o| o.order_id == order_id)
     }
 
+    /// Read-only lookup of a resting order's owner (`trader`) without cloning
+    /// the orderbook.
+    pub fn order_owner(&self, order_id: u64) -> Option<[u8; 32]> {
+        self.find_order(order_id).map(|o| o.trader)
+    }
+
     /// Match or insert an order with specified type (Limit or Market).
     pub fn submit_order_ext(
         &mut self,
@@ -212,6 +222,34 @@ impl OrderbookActor {
         timestamp: u64,
         max_levels: usize,
     ) -> (Order, Vec<TradeExecution>) {
+        self.submit_order_bounded_with_fills(
+            trader,
+            side,
+            order_type,
+            price,
+            amount,
+            timestamp,
+            max_levels,
+            usize::MAX,
+        )
+    }
+
+    /// Like [`Self::submit_order_bounded`], additionally capping the total
+    /// number of maker fills (`max_fills`) across both `OrderSide::Buy` and
+    /// `OrderSide::Sell` so many small resting orders at one price level cannot
+    /// cause unbounded matching work.
+    #[allow(clippy::too_many_arguments)] // GATE: mirrors submit_order_bounded with explicit max_fills cap for >= H
+    pub fn submit_order_bounded_with_fills(
+        &mut self,
+        trader: [u8; 32],
+        side: OrderSide,
+        order_type: OrderType,
+        price: u64,
+        amount: u64,
+        timestamp: u64,
+        max_levels: usize,
+        max_fills: usize,
+    ) -> (Order, Vec<TradeExecution>) {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
         // Every accepted submission mutates the book (a rest, a fill, or
@@ -232,6 +270,7 @@ impl OrderbookActor {
 
         let mut trades = Vec::new();
         let mut levels_crossed = 0usize;
+        let mut fills = 0usize;
 
         match side {
             OrderSide::Buy => {
@@ -245,12 +284,15 @@ impl OrderbookActor {
                     if order.filled >= order.amount {
                         break;
                     }
-                    if levels_crossed >= max_levels {
+                    if levels_crossed >= max_levels || fills >= max_fills {
                         break;
                     }
                     levels_crossed += 1;
 
                     for maker in orders.iter_mut() {
+                        if fills >= max_fills {
+                            break;
+                        }
                         let remaining_order = order.amount - order.filled;
                         let remaining_maker = maker.amount - maker.filled;
                         let fill_amount = remaining_order.min(remaining_maker);
@@ -258,6 +300,7 @@ impl OrderbookActor {
                         if fill_amount > 0 {
                             order.filled += fill_amount;
                             maker.filled += fill_amount;
+                            fills += 1;
 
                             trades.push(TradeExecution {
                                 maker_order_id: maker.order_id,
@@ -318,12 +361,15 @@ impl OrderbookActor {
                     if order.filled >= order.amount {
                         break;
                     }
-                    if levels_crossed >= max_levels {
+                    if levels_crossed >= max_levels || fills >= max_fills {
                         break;
                     }
                     levels_crossed += 1;
 
                     for maker in orders.iter_mut() {
+                        if fills >= max_fills {
+                            break;
+                        }
                         let remaining_order = order.amount - order.filled;
                         let remaining_maker = maker.amount - maker.filled;
                         let fill_amount = remaining_order.min(remaining_maker);
@@ -331,6 +377,7 @@ impl OrderbookActor {
                         if fill_amount > 0 {
                             order.filled += fill_amount;
                             maker.filled += fill_amount;
+                            fills += 1;
 
                             trades.push(TradeExecution {
                                 maker_order_id: maker.order_id,

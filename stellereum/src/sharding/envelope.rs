@@ -360,6 +360,147 @@ impl PqSignatureEnvelope {
             pk_len
         ))
     }
+
+    /// Decodes a `PQ1` signature envelope strictly in canonical layout (`H` and above).
+    ///
+    /// Unlike [`Self::decode`] (kept for pre-hardening heights `< H`), this decoder
+    /// eliminates `tx_hash` malleability by accepting **only** the canonical wire
+    /// encoding produced by [`Self::encode`]:
+    ///
+    /// - Explicit (`flag == 0`):
+    ///   `b"PQ1" || scheme_id (1B) || 0x00 || pk_len (2B LE == scheme.pubkey_size()) || pubkey || salt (16B) || sig_len (2B LE == scheme.signature_size()) || sig_bytes || [chain_id (8B BE)]`
+    /// - Implicit (`flag == 1`):
+    ///   `b"PQ1" || scheme_id (1B) || 0x01 || pk_len (2B LE == 0) || sig_len (2B LE == scheme.signature_size()) || sig_bytes || [chain_id (8B BE)]`
+    ///
+    /// Legacy explicit framings (`salt || key` and salt-free `key || sig`), invalid
+    /// flag bytes, non-zero `pk_len` on implicit envelopes, mismatched key/signature
+    /// lengths, and any trailing bytes are unconditionally rejected.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 7 {
+            return Err("Envelope bytes too short".to_string());
+        }
+        if &bytes[0..3] != PQ_ENVELOPE_MAGIC {
+            return Err("Missing PQ1 magic header".to_string());
+        }
+
+        let scheme = PqScheme::from_id(bytes[3])?;
+        if bytes[4] > 1 {
+            return Err("Envelope flag byte must be 0 (explicit) or 1 (implicit)".to_string());
+        }
+        let is_implicit = bytes[4] == 1;
+        let pk_len = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+
+        if is_implicit {
+            if pk_len != 0 {
+                return Err("Implicit envelope must not carry a public key".to_string());
+            }
+            let mut cursor = 7;
+            if bytes.len() < cursor + 2 {
+                return Err("Truncated signature length in envelope".to_string());
+            }
+            let sig_len = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor += 2;
+            if sig_len != scheme.signature_size() {
+                return Err(format!(
+                    "Envelope signature length mismatch for {}: expected {}, got {}",
+                    scheme.name(),
+                    scheme.signature_size(),
+                    sig_len
+                ));
+            }
+            if bytes.len() < cursor + sig_len {
+                return Err("Truncated signature bytes in envelope".to_string());
+            }
+            if bytes.len() != cursor + sig_len && bytes.len() != cursor + sig_len + 8 {
+                return Err("Canonical envelope has trailing bytes".to_string());
+            }
+            let signature_bytes = bytes[cursor..cursor + sig_len].to_vec();
+            cursor += sig_len;
+            let chain_id = if bytes.len() == cursor + 8 {
+                Some(u64::from_be_bytes(
+                    bytes[cursor..cursor + 8].try_into().unwrap(),
+                ))
+            } else {
+                None
+            };
+            return Ok(Self {
+                scheme,
+                is_implicit: true,
+                pubkey: None,
+                signature_bytes,
+                salt: DEFAULT_SALT,
+                chain_id,
+            });
+        }
+
+        let expected_pk_len = scheme.pubkey_size();
+        if pk_len != expected_pk_len {
+            return Err(format!(
+                "Canonical explicit envelope public key length mismatch for {}: expected {}, got {}",
+                scheme.name(),
+                expected_pk_len,
+                pk_len
+            ));
+        }
+
+        let mut cursor = 7;
+        if bytes.len() < cursor + pk_len + 16 + 2 {
+            return Err("Truncated canonical explicit envelope bytes".to_string());
+        }
+        let pubkey = bytes[cursor..cursor + pk_len].to_vec();
+        cursor += pk_len;
+
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&bytes[cursor..cursor + 16]);
+        cursor += 16;
+
+        let sig_len = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if sig_len != scheme.signature_size() {
+            return Err(format!(
+                "Envelope signature length mismatch for {}: expected {}, got {}",
+                scheme.name(),
+                scheme.signature_size(),
+                sig_len
+            ));
+        }
+        if bytes.len() < cursor + sig_len {
+            return Err("Truncated signature bytes in canonical envelope".to_string());
+        }
+        if bytes.len() != cursor + sig_len && bytes.len() != cursor + sig_len + 8 {
+            return Err("Canonical envelope has trailing bytes".to_string());
+        }
+
+        let signature_bytes = bytes[cursor..cursor + sig_len].to_vec();
+        cursor += sig_len;
+        let chain_id = if bytes.len() == cursor + 8 {
+            Some(u64::from_be_bytes(
+                bytes[cursor..cursor + 8].try_into().unwrap(),
+            ))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            scheme,
+            is_implicit: false,
+            pubkey: Some(pubkey),
+            signature_bytes,
+            salt,
+            chain_id,
+        })
+    }
+
+    /// Decodes a `PQ1` envelope with height-gated canonical strictness:
+    /// - `canonical == false` (pre-hardening heights `< H`): uses [`Self::decode`].
+    /// - `canonical == true` (hardening heights `>= H` and ingress): uses [`Self::decode_canonical`].
+    pub fn decode_at_height(bytes: &[u8], canonical: bool) -> Result<Self, String> {
+        if canonical {
+            Self::decode_canonical(bytes)
+        } else {
+            Self::decode(bytes)
+        }
+    }
 }
 
 /// Tag that separates a legacy signature from a session-key envelope inside

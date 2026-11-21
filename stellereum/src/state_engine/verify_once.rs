@@ -238,22 +238,72 @@ pub(super) fn require_pq_tx_envelope(tx: &crate::sharding::Transaction) -> Resul
     Ok(())
 }
 
+/// Height-gated variant of [`require_pq_tx_envelope`]: when
+/// `wasm_xshard_pmm_hardening_active_at(height)` is true, rejects non-canonical
+/// `PQ1` encodings (`salt || key`, salt-free explicit, trailing bytes).
+pub(super) fn require_pq_tx_envelope_at_height(
+    tx: &crate::sharding::Transaction,
+    height: u64,
+) -> Result<(), String> {
+    if tx.delegation().is_some() {
+        return Ok(());
+    }
+    let Some(env) = tx.pq_envelope_at_height(height) else {
+        return Err(
+            "Pure PQ mode: classical or non-canonical PQ1 transactions rejected at this height"
+                .to_string(),
+        );
+    };
+    if !env.scheme.is_post_quantum() {
+        return Err(
+            "Pure PQ mode: scheme must be post-quantum (Falcon-512; ML-DSA-44 has no verifier)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Resolve per-transaction signature validity for a block: attested
 /// transactions skip crypto; every other transaction is verified exactly as
 /// before (parallel batch over the unattested subset, scalar fallback per
 /// item). Newly verified transactions are attested for future blocks.
 /// The returned vector is true iff that transaction's signature is valid.
+#[allow(dead_code)] // GATE: kept as legacy pre-height wrapper alongside verify_block_tx_signatures_at_height
 pub(super) fn resolve_block_sig_validity(
     txs: &[crate::sharding::Transaction],
     expected_chain: u64,
 ) -> Vec<bool> {
+    resolve_block_sig_validity_inner(txs, expected_chain, None)
+}
+
+/// Height-gated variant of [`resolve_block_sig_validity`]: at/after
+/// `WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT`, non-canonical `PQ1` envelopes
+/// are rejected before consulting `verified_signature_covers`.
+pub(super) fn verify_block_tx_signatures_at_height(
+    txs: &[crate::sharding::Transaction],
+    expected_chain: u64,
+    height: u64,
+) -> Vec<bool> {
+    resolve_block_sig_validity_inner(txs, expected_chain, Some(height))
+}
+
+fn resolve_block_sig_validity_inner(
+    txs: &[crate::sharding::Transaction],
+    expected_chain: u64,
+    height: Option<u64>,
+) -> Vec<bool> {
     let mut out = vec![false; txs.len()];
     let mut need: Vec<usize> = Vec::new();
     for (i, tx) in txs.iter().enumerate() {
-        // FULL-PQ: classical envelopes never reach crypto — fail closed here
+        // FULL-PQ: classical (and at >= H non-canonical PQ1) envelopes never
+        // reach crypto or the verify-once cache — fail closed here
         // (admission-stage: left false, so the block pre-check skips them
         // with no fee, no nonce, exactly like a bad signature).
-        if require_pq_tx_envelope(tx).is_err() {
+        let envelope_ok = match height {
+            Some(h) => require_pq_tx_envelope_at_height(tx, h),
+            None => require_pq_tx_envelope(tx),
+        };
+        if envelope_ok.is_err() {
             continue;
         }
         if verified_signature_covers(tx, expected_chain) {
@@ -270,14 +320,24 @@ pub(super) fn resolve_block_sig_validity(
     // because every item verifies against its own message/key (order and
     // membership in the batch never change a per-item verdict).
     let subset: Vec<crate::sharding::Transaction> = need.iter().map(|&i| txs[i].clone()).collect();
-    if crate::sharding::Transaction::verify_signatures_batch_parallel(&subset) {
+    let batch_ok = match height {
+        Some(h) => {
+            crate::sharding::Transaction::verify_signatures_batch_parallel_at_height(&subset, h)
+        }
+        None => crate::sharding::Transaction::verify_signatures_batch_parallel(&subset),
+    };
+    if batch_ok {
         for &i in &need {
             out[i] = true;
             record_verified_signature(&txs[i], expected_chain);
         }
     } else {
         for &i in &need {
-            if txs[i].verify_signature() {
+            let item_ok = match height {
+                Some(h) => txs[i].verify_signature_at_height(h),
+                None => txs[i].verify_signature(),
+            };
+            if item_ok {
                 out[i] = true;
                 record_verified_signature(&txs[i], expected_chain);
             }

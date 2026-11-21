@@ -5,6 +5,28 @@ use crate::sharding::Transaction;
 use axum::Json;
 use serde_json::{json, Value};
 
+/// Effective nonce for deployment address prediction:
+/// - `< H` (`hardened == false`): global `contracts.next_nonce` (matches `ContractRegistry::deploy_inner`).
+/// - `>= H` (`hardened == true`): sender `tx_nonce` (matches `ContractRegistry::deploy_with_nonce`).
+#[inline]
+pub(super) fn predicted_deploy_nonce(next_nonce: u64, tx_nonce: u64, hardened: bool) -> u64 {
+    crate::contract::predicted_deploy_nonce(next_nonce, tx_nonce, hardened)
+}
+
+/// Predict the deterministic deployment address for `creator` given the
+/// registry's `next_nonce` and the transaction's `tx_nonce`.
+///
+/// R1-D wires `hardened` to `WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT`.
+#[inline]
+pub(super) fn predicted_deploy_address(
+    creator: &[u8; 32],
+    next_nonce: u64,
+    tx_nonce: u64,
+    hardened: bool,
+) -> [u8; 32] {
+    crate::contract::predicted_deploy_address(creator, next_nonce, tx_nonce, hardened)
+}
+
 pub(super) fn parse_contract_call_arg(val: &Value) -> Result<i64, String> {
     if let Some(arr) = val.as_array() {
         if let Some(first) = arr.first() {
@@ -714,8 +736,11 @@ async fn dispatch_contracts_inner(
                 // into the engine + mempool (no verify_signature). A forged
                 // `from` deploys as the victim. Verify like sendRawTransaction.
                 // FULL-PQ: classical envelopes refused at intake, before crypto.
+                let current_height = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                let hardened =
+                    crate::chain_spec::wasm_xshard_pmm_hardening_active_at(current_height);
                 {
-                    let pq_ok = match tx.pq_envelope() {
+                    let pq_ok = match tx.pq_envelope_at_height(current_height) {
                         Some(env) => env.scheme.is_post_quantum(),
                         None => false,
                     };
@@ -727,7 +752,7 @@ async fn dispatch_contracts_inner(
                         );
                     }
                 }
-                if !tx.verify_signature() {
+                if !tx.verify_signature_at_height(current_height) {
                     return err(id, -32000, "invalid transaction signature");
                 }
                 let deploy_code = tx.payload.iter().find_map(|op| {
@@ -752,20 +777,25 @@ async fn dispatch_contracts_inner(
                 // exclusively when a block applies a tx submitted via
                 // `stell_sendRawTransaction` — N-03: this preview is NOT
                 // admitted to the mempool, NOT gossipped; the tx is dropped).
-                if let Err(e) = crate::contract::ContractRegistry::validate_code(&code) {
+                let validate_res = if hardened {
+                    crate::contract::ContractRegistry::validate_code_hardened(
+                        &code,
+                        crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                    )
+                } else {
+                    crate::contract::ContractRegistry::validate_code(&code)
+                };
+                if let Err(e) = validate_res {
                     return err(id, -32000, format!("deploy contract failed: {e}"));
                 }
-                // H-04: the `init_data`/`salt` parameter is retired. It is not
-                // part of the replayable `SysCallDeployContract` payload, so
-                // no block-applied transaction could ever observe it; keeping
-                // it would promise an address determinism the chain cannot
-                // deliver (the old BLAKE3(code_hash || salt) address was a
-                // phantom the block path never recreated — the second half of
-                // the double-deploy). The predicted address below is the
-                // SDK-canonical `contract_address(tx.from, tx.nonce)`: exactly
-                // what block application derives when this tx applies first
-                // for its sender.
-                let predicted = crate::contract::contract_address(&tx.from, tx.nonce);
+                // `"contract_address"` / `"contract_address_stl57"` always report the
+                // SDK-canonical `contract_address(tx.from, tx.nonce)` prediction;
+                // pre-gate (`!hardened`) also includes `"legacy_contract_address"`
+                // and `"legacy_next_nonce"` reflecting `ContractRegistry::deploy_inner`.
+                let next_nonce = st.engine.contracts_read().await.next_nonce;
+                let predicted = predicted_deploy_address(&tx.from, next_nonce, tx.nonce, true);
+                let legacy_predicted =
+                    predicted_deploy_address(&tx.from, next_nonce, tx.nonce, false);
                 if st.engine.get_contract(&predicted).await.is_some() {
                     return err(
                         id,
@@ -781,20 +811,31 @@ async fn dispatch_contracts_inner(
                 // admission, no gossip broadcast, and NO receipt. A deploy
                 // that was never sent must never be reported as MINED (F5):
                 // the receipt index is reserved for block application.
-                return ok(
-                    id,
-                    json!({
-                        "contract_address": hex::encode(predicted),
-                        "contract_address_stl57": predicted_stl57,
-                        "code_hash": hex::encode(code_hash),
-                        "tx_hash": hex::encode(tx_hash),
-                        "predicted": true,
-                        "deployed": false,
-                        "preview_only": true,
-                        "address_derivation": "contract_address(tx.from, tx.nonce)",
-                        "note": "prediction only: the contract exists once a block applies this signed transaction",
-                    }),
-                );
+                let mut resp = json!({
+                    "contract_address": hex::encode(predicted),
+                    "contract_address_stl57": predicted_stl57,
+                    "code_hash": hex::encode(code_hash),
+                    "tx_hash": hex::encode(tx_hash),
+                    "predicted": true,
+                    "deployed": false,
+                    "preview_only": true,
+                    "address_derivation": if hardened {
+                        "contract_address(tx.from, tx.nonce)"
+                    } else {
+                        "contract_address(tx.from, contracts.next_nonce)"
+                    },
+                    "note": "prediction only: the contract exists once a block applies this signed transaction",
+                });
+                if !hardened {
+                    if let Some(obj) = resp.as_object_mut() {
+                        obj.insert(
+                            "legacy_contract_address".to_string(),
+                            json!(hex::encode(legacy_predicted)),
+                        );
+                        obj.insert("legacy_next_nonce".to_string(), json!(next_nonce));
+                    }
+                }
+                return ok(id, resp);
             }
 
             // Direct parameters: validated + previewed, never deployed here.
@@ -812,7 +853,18 @@ async fn dispatch_contracts_inner(
                 Ok(c) => c,
                 Err(e) => return err(id, -32602, format!("invalid code hex: {e}")),
             };
-            if let Err(e) = crate::contract::ContractRegistry::validate_code(&code) {
+            let hardened = crate::chain_spec::wasm_xshard_pmm_hardening_active_at(
+                st.height.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let validate_res = if hardened {
+                crate::contract::ContractRegistry::validate_code_hardened(
+                    &code,
+                    crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                )
+            } else {
+                crate::contract::ContractRegistry::validate_code(&code)
+            };
+            if let Err(e) = validate_res {
                 return err(id, -32000, format!("deploy contract failed: {e}"));
             }
 
@@ -823,15 +875,10 @@ async fn dispatch_contracts_inner(
                 return err(id, -32602, format!("invalid abi parameter: {e}"));
             }
 
-            // F6: the address is `contract_address(sender, nonce)` — a
-            // function of the SIGNER, never of a node-chosen random key. This
-            // form carries no signer (`from` is refused: the node cannot sign
-            // as the caller), so the address is predicted ONLY when the
-            // request names `sender` (plus an optional `nonce`, defaulting to
-            // that account's committed nonce — the position its next tx
-            // occupies). Without a sender the answer is `contract_address:
-            // null`, so two identical requests always return the SAME answer
-            // and the node never hands out an address nobody can deploy at.
+            // F6: `"contract_address"` is derived from `sender` and `tx.nonce`
+            // (SDK-canonical), matching consensus at `>= H`. Before `H`, the
+            // legacy `contracts.next_nonce` derivation is also exposed as
+            // `"legacy_contract_address"` / `"legacy_next_nonce"`.
             let code_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&code).into();
             let sender = match p.get("sender").and_then(|v| v.as_str()) {
                 Some(s) => match parse_rpc_address(s) {
@@ -850,9 +897,10 @@ async fn dispatch_contracts_inner(
                     None => return err(id, -32602, "invalid nonce: must be an unsigned integer"),
                 },
             };
-            let prediction: Option<([u8; 32], u64)> = match sender {
+            let next_nonce = st.engine.contracts_read().await.next_nonce;
+            let prediction: Option<([u8; 32], u64, [u8; 32], u64)> = match sender {
                 Some(sender_addr) => {
-                    let nonce = match requested_nonce {
+                    let tx_nonce = match requested_nonce {
                         Some(n) => n,
                         None => st
                             .engine
@@ -861,7 +909,12 @@ async fn dispatch_contracts_inner(
                             .map(|a| a.nonce)
                             .unwrap_or(0),
                     };
-                    let predicted = crate::contract::contract_address(&sender_addr, nonce);
+                    let effective_nonce = predicted_deploy_nonce(next_nonce, tx_nonce, true);
+                    let predicted =
+                        predicted_deploy_address(&sender_addr, next_nonce, tx_nonce, true);
+                    let legacy_nonce = predicted_deploy_nonce(next_nonce, tx_nonce, false);
+                    let legacy_predicted =
+                        predicted_deploy_address(&sender_addr, next_nonce, tx_nonce, false);
                     // Only block application can create the contract, so an
                     // existing entry here is a real refusal (never a preview
                     // write).
@@ -872,7 +925,7 @@ async fn dispatch_contracts_inner(
                             "deploy contract failed: contract already exists",
                         );
                     }
-                    Some((predicted, nonce))
+                    Some((predicted, effective_nonce, legacy_predicted, legacy_nonce))
                 }
                 None => None,
             };
@@ -881,30 +934,45 @@ async fn dispatch_contracts_inner(
             // validates the code and predicts where a signed
             // `SysCallDeployContract` from `sender` at `nonce` would land.
             let gas_cost = crate::svm::contract_deploy_gas(code.len());
-            let predicted_hex = prediction.map(|(a, _)| hex::encode(a));
-            let predicted_stl57 = prediction.map(|(a, _)| crate::address::encode_stl57_address(&a));
-            let predicted_nonce = prediction.map(|(_, n)| n);
-            ok(
-                id,
-                json!({
-                    "contract_address": predicted_hex,
-                    "contract_address_stl57": predicted_stl57,
-                    "code_hash": hex::encode(code_hash),
-                    "sender": sender.map(hex::encode).unwrap_or_default(),
-                    "nonce": predicted_nonce,
-                    "gas_estimate": gas_cost,
-                    "predicted": prediction.is_some(),
-                    "deployed": false,
-                    "preview_only": true,
-                    "tx_hash": Value::Null,
-                    "address_derivation": "contract_address(tx.from, tx.nonce)",
-                    "note": if prediction.is_some() {
-                        "prediction only: the contract exists once a block applies a signed SysCallDeployContract transaction from `sender` at `nonce`"
-                    } else {
-                        "no sender in this request, so no address can be predicted: pass `sender` (and optional `nonce`), or sign the deploy locally and submit it via the `tx` form"
-                    },
-                }),
-            )
+            let predicted_hex = prediction.map(|(a, ..)| hex::encode(a));
+            let predicted_stl57 =
+                prediction.map(|(a, ..)| crate::address::encode_stl57_address(&a));
+            let predicted_nonce = prediction.map(|(_, n, ..)| n);
+            let mut resp = json!({
+                "contract_address": predicted_hex,
+                "contract_address_stl57": predicted_stl57,
+                "code_hash": hex::encode(code_hash),
+                "sender": sender.map(hex::encode).unwrap_or_default(),
+                "nonce": predicted_nonce,
+                "gas_estimate": gas_cost,
+                "predicted": prediction.is_some(),
+                "deployed": false,
+                "preview_only": true,
+                "tx_hash": Value::Null,
+                "address_derivation": if hardened {
+                    "contract_address(tx.from, tx.nonce)"
+                } else {
+                    "contract_address(tx.from, contracts.next_nonce)"
+                },
+                "note": if prediction.is_some() {
+                    "prediction only: the contract exists once a block applies a signed SysCallDeployContract transaction from `sender` at `nonce`"
+                } else {
+                    "no sender in this request, so no address can be predicted: pass `sender` (and optional `nonce`), or sign the deploy locally and submit it via the `tx` form"
+                },
+            });
+            if !hardened {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert(
+                        "legacy_contract_address".to_string(),
+                        json!(prediction.map(|(_, _, a, _)| hex::encode(a))),
+                    );
+                    obj.insert(
+                        "legacy_next_nonce".to_string(),
+                        json!(prediction.map(|(_, _, _, n)| n).unwrap_or(next_nonce)),
+                    );
+                }
+            }
+            ok(id, resp)
         }
         "stell_callContract" => {
             // N-02/N-03: this arm runs the call on a CLONE of the registry

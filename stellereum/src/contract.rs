@@ -105,6 +105,12 @@ pub const FUEL_SSTORE: u64 = 100;
 pub const FUEL_EMIT: u64 = 50;
 /// Fuel charged per outbound contract message sent.
 pub const FUEL_SEND_MESSAGE: u64 = 100;
+/// Fuel charged per byte of outbound message payload on the hardened (`>= H`) path.
+pub const FUEL_SEND_MESSAGE_PER_BYTE: u64 = 1;
+/// Maximum nested sub-call depth enforced during hardened contract execution.
+pub const MAX_CALL_DEPTH: usize = 8;
+/// Default fuel limit applied to WASM `(start)` sections during hardened code validation.
+pub const VALIDATE_CODE_START_FUEL_LIMIT: u64 = GET_METHOD_SAFETY_FUEL_LIMIT;
 /// Fuel charged for reading caller address into WASM memory.
 pub const FUEL_CALLER: u64 = 10;
 /// Fuel charged for reading call value.
@@ -139,6 +145,142 @@ pub struct ContractCallContext {
     pub value: u64,
     pub block_time: u64,
     pub block_hash: [u8; 32],
+}
+
+/// Extended execution options for hardened (`>= H`) contract calls,
+/// separating immediate `caller` from immutable transaction `origin` (`tx.from`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractCallOptions {
+    pub caller: [u8; 32],
+    pub origin: [u8; 32],
+    pub value: u64,
+    pub block_time: u64,
+    pub block_hash: [u8; 32],
+    pub hardened: bool,
+}
+
+impl ContractCallContext {
+    /// Promote a legacy context into [`ContractCallOptions`] with an explicit
+    /// transaction `origin` (`tx.from`) and `hardened` activation flag.
+    pub fn with_origin(&self, origin: [u8; 32], hardened: bool) -> ContractCallOptions {
+        ContractCallOptions {
+            caller: self.caller,
+            origin,
+            value: self.value,
+            block_time: self.block_time,
+            block_hash: self.block_hash,
+            hardened,
+        }
+    }
+}
+
+impl From<&ContractCallContext> for ContractCallOptions {
+    fn from(ctx: &ContractCallContext) -> Self {
+        Self {
+            caller: ctx.caller,
+            origin: ctx.caller,
+            value: ctx.value,
+            block_time: ctx.block_time,
+            block_hash: ctx.block_hash,
+            hardened: false,
+        }
+    }
+}
+
+/// Per-contract mutable fields captured by [`SubCallSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractStateSnapshot {
+    pub storage: HashMap<i64, i64>,
+    pub balance: u64,
+}
+
+/// Snapshot of contract state and call-frame accumulators taken before a sub-call.
+///
+/// On any sub-call failure (`Trapped`, `OutOfFuel`, `NoSuchMethod`, `Paused`,
+/// `NotFound`, `Overflow`, or depth limit), [`SubCallSnapshot::rollback`]
+/// restores the saved contracts' `storage` and `balance`, truncates `events`
+/// and `outbound_messages` back to their pre-sub-call lengths, and restores
+/// `ContractRegistry::last_return_data`.
+#[derive(Clone, Debug)]
+pub struct SubCallSnapshot {
+    pub contracts: HashMap<[u8; 32], ContractStateSnapshot>,
+    pub events_len: usize,
+    pub outbound_len: usize,
+    pub last_return_data: Vec<u8>,
+}
+
+impl SubCallSnapshot {
+    /// Capture a snapshot for a specific set of affected contract addresses.
+    pub fn capture(
+        registry: &ContractRegistry,
+        addresses: &[[u8; 32]],
+        events_len: usize,
+        outbound_len: usize,
+    ) -> Self {
+        let mut contracts = HashMap::with_capacity(addresses.len());
+        for addr in addresses {
+            if let Some(c) = registry.contracts.get(addr) {
+                contracts.insert(
+                    *addr,
+                    ContractStateSnapshot {
+                        storage: c.storage.clone(),
+                        balance: c.balance,
+                    },
+                );
+            }
+        }
+        Self {
+            contracts,
+            events_len,
+            outbound_len,
+            last_return_data: registry.last_return_data.clone(),
+        }
+    }
+
+    /// Capture a snapshot across all contracts currently in `registry`.
+    pub fn capture_all(
+        registry: &ContractRegistry,
+        events_len: usize,
+        outbound_len: usize,
+    ) -> Self {
+        let contracts = registry
+            .contracts
+            .iter()
+            .map(|(addr, c)| {
+                (
+                    *addr,
+                    ContractStateSnapshot {
+                        storage: c.storage.clone(),
+                        balance: c.balance,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            contracts,
+            events_len,
+            outbound_len,
+            last_return_data: registry.last_return_data.clone(),
+        }
+    }
+
+    /// Restore `registry`, `events`, and `outbound_messages` to the captured snapshot.
+    pub fn rollback(
+        self,
+        registry: &mut ContractRegistry,
+        events: &mut Vec<ContractEvent>,
+        outbound_messages: &mut Vec<ContractMessage>,
+    ) {
+        for (addr, snap) in self.contracts {
+            if let Some(c) = registry.contracts.get_mut(&addr) {
+                c.storage = snap.storage;
+                c.balance = snap.balance;
+            }
+        }
+        events.truncate(self.events_len);
+        outbound_messages.truncate(self.outbound_len);
+        registry.last_return_data = self.last_return_data;
+    }
 }
 
 /// Full execution outcome of a contract call.
@@ -212,6 +354,33 @@ pub fn contract_address(creator: &[u8; 32], nonce: u64) -> [u8; 32] {
     h.update(creator);
     h.update(nonce.to_be_bytes());
     h.finalize().into()
+}
+
+/// Effective nonce used to derive a contract's deploy address:
+/// - `< H` (`hardened == false`): `next_nonce` (global `ContractRegistry::next_nonce`)
+/// - `>= H` (`hardened == true`): `tx_nonce` (sender transaction nonce)
+#[inline]
+pub fn predicted_deploy_nonce(next_nonce: u64, tx_nonce: u64, hardened: bool) -> u64 {
+    if hardened {
+        tx_nonce
+    } else {
+        next_nonce
+    }
+}
+
+/// Predict the deterministic deployment address for `creator` given the
+/// registry's `next_nonce` and the transaction's `tx_nonce`.
+#[inline]
+pub fn predicted_deploy_address(
+    creator: &[u8; 32],
+    next_nonce: u64,
+    tx_nonce: u64,
+    hardened: bool,
+) -> [u8; 32] {
+    contract_address(
+        creator,
+        predicted_deploy_nonce(next_nonce, tx_nonce, hardened),
+    )
 }
 
 /// A deployed contract actor.
@@ -467,6 +636,8 @@ impl ContractRegistry {
             events: Vec::new(),
             outbound_messages: Vec::new(),
             caller: [0u8; 32],
+            origin: [0u8; 32],
+            hardened: false,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -483,6 +654,70 @@ impl ContractRegistry {
                 let msg = format!("{e}");
                 if msg.contains("import") {
                     ContractError::UnresolvableImports
+                } else {
+                    ContractError::InvalidWasm
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Hardened (`>= H`) WASM code validation with a bounded fuel budget for
+    /// any `(start)` section.
+    ///
+    /// Prevents infinite-loop DoS in `(start)` during deployment/RPC validation
+    /// while permitting legitimate `(start)` initializers within `validate_fuel`.
+    pub fn validate_code_hardened(code: &[u8], validate_fuel: u64) -> Result<(), ContractError> {
+        if code.is_empty() {
+            return Err(ContractError::EmptyCode);
+        }
+        if code.len() > MAX_CONTRACT_CODE_SIZE {
+            return Err(ContractError::CodeTooLarge);
+        }
+        validate_memory_limits(code)?;
+        let engine = contract_engine();
+        let module = cached_module(engine, code).map_err(|_| ContractError::InvalidWasm)?;
+        for export in module.exports() {
+            if let ExternType::Memory(mem_ty) = export.ty() {
+                if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
+                    return Err(ContractError::InvalidWasm);
+                }
+                if let Some(max) = mem_ty.maximum() {
+                    if max > MAX_CONTRACT_PAGES as u64 {
+                        return Err(ContractError::InvalidWasm);
+                    }
+                }
+            }
+        }
+        let host = HostState {
+            limits: store_limits(),
+            contract_addr: [0u8; 32],
+            balance: 0,
+            storage: HashMap::new(),
+            events: Vec::new(),
+            outbound_messages: Vec::new(),
+            caller: [0u8; 32],
+            origin: [0u8; 32],
+            hardened: true,
+            value: 0,
+            block_time: 0,
+            block_hash: [0u8; 32],
+            return_data: Vec::new(),
+            calldata: Vec::new(),
+        };
+        let mut store = Store::new(engine, host);
+        store.limiter(|s| &mut s.limits);
+        store
+            .set_fuel(validate_fuel)
+            .map_err(|_| ContractError::OutOfFuel)?;
+        let linker = host_linker(engine);
+        linker
+            .instantiate_and_start(&mut store, &module)
+            .map_err(|e| {
+                let msg = format!("{e}");
+                if msg.contains("import") {
+                    ContractError::UnresolvableImports
+                } else if msg.contains("fuel") {
+                    ContractError::OutOfFuel
                 } else {
                     ContractError::InvalidWasm
                 }
@@ -556,6 +791,83 @@ impl ContractRegistry {
             return Err(ContractError::AlreadyExists);
         }
         self.next_nonce = self.next_nonce.saturating_add(1);
+        let code_hash: [u8; 32] = Sha256::digest(&code).into();
+        self.contracts.insert(
+            address,
+            Contract {
+                address,
+                creator,
+                code_hash,
+                code,
+                storage: HashMap::new(),
+                created_at: now,
+                paused: false,
+                balance,
+                abi,
+                source_hash: None,
+            },
+        );
+        Ok(address)
+    }
+
+    /// Deploy a new contract using an explicit sender `nonce` (hardened `>= H`
+    /// path) instead of the global `self.next_nonce` counter.
+    ///
+    /// Validates `code` via [`Self::validate_code_hardened`] with
+    /// [`VALIDATE_CODE_START_FUEL_LIMIT`], derives `contract_address(&creator, nonce)`,
+    /// and rejects duplicate addresses with [`ContractError::AlreadyExists`].
+    pub fn deploy_with_nonce(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+    ) -> Result<[u8; 32], ContractError> {
+        self.deploy_with_nonce_inner(creator, code, nonce, now, 0, None)
+    }
+
+    /// Deploy a new contract with an explicit sender `nonce` and initial `balance`.
+    pub fn deploy_with_nonce_and_balance(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+        balance: u64,
+    ) -> Result<[u8; 32], ContractError> {
+        self.deploy_with_nonce_inner(creator, code, nonce, now, balance, None)
+    }
+
+    /// Deploy a new contract with an explicit sender `nonce` and typed ABI manifest.
+    pub fn deploy_with_nonce_and_abi(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+        abi: ContractAbi,
+    ) -> Result<[u8; 32], ContractError> {
+        self.deploy_with_nonce_inner(creator, code, nonce, now, 0, Some(abi))
+    }
+
+    fn deploy_with_nonce_inner(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+        balance: u64,
+        abi: Option<ContractAbi>,
+    ) -> Result<[u8; 32], ContractError> {
+        Self::validate_code_hardened(&code, VALIDATE_CODE_START_FUEL_LIMIT)?;
+        if let Some(a) = &abi {
+            a.validate()
+                .map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
+        }
+        let address = contract_address(&creator, nonce);
+        if self.contracts.contains_key(&address) {
+            return Err(ContractError::AlreadyExists);
+        }
         let code_hash: [u8; 32] = Sha256::digest(&code).into();
         self.contracts.insert(
             address,
@@ -766,7 +1078,67 @@ impl ContractRegistry {
         self.call_with_context_args_inner(address, method, args, calldata, fuel, ctx)
     }
 
-    fn call_with_context_args_inner(
+    /// Hardened (`>= H` when `hardened == true`) single-argument call accepting
+    /// separate `origin` (`tx.from`) and immediate `caller`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: R1-D integration signature keeping legacy ContractCallContext unchanged.
+    pub fn call_with_context_hardened(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        arg: i64,
+        fuel: u64,
+        ctx: &ContractCallContext,
+        origin: [u8; 32],
+        caller: [u8; 32],
+        hardened: bool,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_context_args_calldata_hardened(
+            address,
+            method,
+            &[arg],
+            &[],
+            fuel,
+            ctx,
+            origin,
+            caller,
+            hardened,
+        )
+    }
+
+    /// Hardened (`>= H` when `hardened == true`) multi-argument call accepting
+    /// separate `origin` (`tx.from`) and immediate `caller`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: R1-D integration signature keeping legacy ContractCallContext unchanged.
+    pub fn call_with_context_args_hardened(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        fuel: u64,
+        ctx: &ContractCallContext,
+        origin: [u8; 32],
+        caller: [u8; 32],
+        hardened: bool,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_context_args_calldata_hardened(
+            address,
+            method,
+            args,
+            &[],
+            fuel,
+            ctx,
+            origin,
+            caller,
+            hardened,
+        )
+    }
+
+    /// Hardened (`>= H` when `hardened == true`) multi-argument + calldata call
+    /// accepting separate `origin` (`tx.from`) and immediate `caller`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: R1-D integration signature keeping legacy ContractCallContext unchanged.
+    pub fn call_with_context_args_calldata_hardened(
         &mut self,
         address: &[u8; 32],
         method: &str,
@@ -774,6 +1146,30 @@ impl ContractRegistry {
         calldata: &[u8],
         fuel: u64,
         ctx: &ContractCallContext,
+        origin: [u8; 32],
+        caller: [u8; 32],
+        hardened: bool,
+    ) -> Result<ContractOutcome, ContractError> {
+        let opts = ContractCallOptions {
+            caller,
+            origin: if hardened { origin } else { caller },
+            value: ctx.value,
+            block_time: ctx.block_time,
+            block_hash: ctx.block_hash,
+            hardened,
+        };
+        self.call_with_options(address, method, args, calldata, fuel, &opts)
+    }
+
+    /// Execute a contract call using explicit [`ContractCallOptions`].
+    pub fn call_with_options(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
     ) -> Result<ContractOutcome, ContractError> {
         let contract = self
             .contracts
@@ -783,18 +1179,40 @@ impl ContractRegistry {
             return Err(ContractError::Paused);
         }
         let fuel = fuel.min(MAX_CONTRACT_FUEL);
+        let ctx = ContractCallContext {
+            caller: opts.caller,
+            value: opts.value,
+            block_time: opts.block_time,
+            block_hash: opts.block_hash,
+        };
         let (out, used, new_storage, new_balance, events, outbound_messages, return_data) =
-            run_contract(
-                *address,
-                &contract.code,
-                &contract.storage,
-                contract.balance,
-                method,
-                args,
-                calldata,
-                fuel,
-                ctx,
-            )?;
+            if opts.hardened {
+                run_contract_hardened(
+                    *address,
+                    &contract.code,
+                    &contract.storage,
+                    contract.balance,
+                    method,
+                    args,
+                    calldata,
+                    fuel,
+                    &ctx,
+                    opts.origin,
+                    true,
+                )?
+            } else {
+                run_contract(
+                    *address,
+                    &contract.code,
+                    &contract.storage,
+                    contract.balance,
+                    method,
+                    args,
+                    calldata,
+                    fuel,
+                    &ctx,
+                )?
+            };
         contract.storage = new_storage;
         contract.balance = new_balance;
         self.last_return_data = return_data.clone();
@@ -805,6 +1223,60 @@ impl ContractRegistry {
             outbound_messages,
             return_data,
         })
+    }
+
+    /// Execute a sub-call with [`SubCallSnapshot`] isolation.
+    ///
+    /// On success, appends the sub-call's `events` and `outbound_messages` to
+    /// the caller's accumulators and returns the [`ContractOutcome`].
+    /// On any error (including `OutOfFuel` or `call_depth > MAX_CALL_DEPTH`),
+    /// rolls back `storage`, `balance`, `last_return_data`, `events`, and
+    /// `outbound_messages` to the pre-sub-call snapshot while leaving any
+    /// mutations committed before the sub-call intact.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: sub-call isolation requires target, inputs, depth, options, and caller event/outbound accumulators.
+    pub fn execute_subcall_hardened(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        call_depth: usize,
+        events: &mut Vec<ContractEvent>,
+        outbound_messages: &mut Vec<ContractMessage>,
+    ) -> Result<ContractOutcome, ContractError> {
+        let snap =
+            SubCallSnapshot::capture(self, &[*address], events.len(), outbound_messages.len());
+        if call_depth > MAX_CALL_DEPTH {
+            snap.rollback(self, events, outbound_messages);
+            return Err(ContractError::Trapped);
+        }
+        match self.call_with_options(address, method, args, calldata, fuel, opts) {
+            Ok(outcome) => {
+                events.extend(outcome.events.iter().cloned());
+                outbound_messages.extend(outcome.outbound_messages.iter().cloned());
+                Ok(outcome)
+            }
+            Err(err) => {
+                snap.rollback(self, events, outbound_messages);
+                Err(err)
+            }
+        }
+    }
+
+    fn call_with_context_args_inner(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        ctx: &ContractCallContext,
+    ) -> Result<ContractOutcome, ContractError> {
+        let opts = ContractCallOptions::from(ctx);
+        self.call_with_options(address, method, args, calldata, fuel, &opts)
     }
 
     /// Call a method with typed ABI arguments.
@@ -973,6 +1445,8 @@ impl ContractRegistry {
             events: Vec::new(),
             outbound_messages: Vec::new(),
             caller: [0u8; 32],
+            origin: [0u8; 32],
+            hardened: false,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -1186,6 +1660,8 @@ struct HostState {
     events: Vec<ContractEvent>,
     outbound_messages: Vec<ContractMessage>,
     caller: [u8; 32],
+    origin: [u8; 32],
+    hardened: bool,
     value: u64,
     block_time: u64,
     block_hash: [u8; 32],
@@ -1328,6 +1804,20 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             HostState::charge(&mut caller, FUEL_CALLER)?;
             let caller_addr = caller.data().caller;
             write_wasm_memory(&mut caller, dest_ptr, &caller_addr)?;
+            Ok(())
+        },
+    );
+    let _ = linker.func_wrap(
+        "host",
+        "origin",
+        |mut caller: wasmi::Caller<'_, HostState>, dest_ptr: i32| -> Result<(), wasmi::Error> {
+            HostState::charge(&mut caller, FUEL_CALLER)?;
+            let origin_addr = if caller.data().hardened {
+                caller.data().origin
+            } else {
+                caller.data().caller
+            };
+            write_wasm_memory(&mut caller, dest_ptr, &origin_addr)?;
             Ok(())
         },
     );
@@ -1502,16 +1992,31 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
          payload_len: i64,
          bounce_flag: i64|
          -> Result<i64, wasmi::Error> {
-            HostState::charge(&mut caller, FUEL_SEND_MESSAGE)?;
+            if caller.data().hardened {
+                if recipient_len != 32
+                    || recipient_ptr < 0
+                    || payload_ptr < 0
+                    || !(0..=64 * 1024).contains(&payload_len)
+                {
+                    HostState::charge(&mut caller, FUEL_SEND_MESSAGE)?;
+                    return Ok(-1);
+                }
+                let fuel = FUEL_SEND_MESSAGE.saturating_add(
+                    (payload_len as u64).saturating_mul(FUEL_SEND_MESSAGE_PER_BYTE),
+                );
+                HostState::charge(&mut caller, fuel)?;
+            } else {
+                HostState::charge(&mut caller, FUEL_SEND_MESSAGE)?;
 
-            if recipient_len != 32 {
-                return Ok(-1);
-            }
-            if recipient_ptr < 0 || payload_ptr < 0 || payload_len < 0 {
-                return Ok(-1);
-            }
-            if payload_len > 64 * 1024 {
-                return Ok(-1);
+                if recipient_len != 32 {
+                    return Ok(-1);
+                }
+                if recipient_ptr < 0 || payload_ptr < 0 || payload_len < 0 {
+                    return Ok(-1);
+                }
+                if payload_len > 64 * 1024 {
+                    return Ok(-1);
+                }
             }
             if value_nano < 0 {
                 return Ok(-2);
@@ -1732,14 +2237,72 @@ fn run_contract(
     ),
     ContractError,
 > {
+    run_contract_hardened(
+        contract_addr,
+        code,
+        initial_storage,
+        initial_balance,
+        method,
+        args,
+        calldata,
+        fuel,
+        ctx,
+        ctx.caller,
+        false,
+    )
+}
+
+/// Execute an exported method with explicit `origin` (`tx.from`) and
+/// `hardened` activation toggle.
+///
+/// - When `hardened == false` (`< H`): preserves legacy per-call
+///   `consensus_contract_engine()` (`LazyTranslation`), flat `FUEL_SEND_MESSAGE`,
+///   and `host.origin == ctx.caller`.
+/// - When `hardened == true` (`>= H`): uses the shared `Eager` [`contract_engine()`]
+///   + bounded [`cached_module`], per-byte `send_message` fuel, distinct
+///     `host.origin` vs `host.caller`, and `OutOfFuel` classification on `(start)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+// GATE: hardened contract execution mirrors run_contract with explicit origin and activation flag.
+pub fn run_contract_hardened(
+    contract_addr: [u8; 32],
+    code: &[u8],
+    initial_storage: &HashMap<i64, i64>,
+    initial_balance: u64,
+    method: &str,
+    args: &[i64],
+    calldata: &[u8],
+    fuel: u64,
+    ctx: &ContractCallContext,
+    origin: [u8; 32],
+    hardened: bool,
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+    ),
+    ContractError,
+> {
     if args.len() > MAX_CONTRACT_CALL_ARGS {
         return Err(ContractError::AbiMismatch(format!(
             "a call may take at most {MAX_CONTRACT_CALL_ARGS} arguments, got {}",
             args.len()
         )));
     }
-    let engine = consensus_contract_engine();
-    let module = Module::new(&engine, code).map_err(|_| ContractError::InvalidWasm)?;
+    let owned_engine;
+    let (engine, module): (&Engine, Module) = if hardened {
+        let eng = contract_engine();
+        let m = cached_module(eng, code).map_err(|_| ContractError::InvalidWasm)?;
+        (eng, m)
+    } else {
+        owned_engine = consensus_contract_engine();
+        let m = Module::new(&owned_engine, code).map_err(|_| ContractError::InvalidWasm)?;
+        (&owned_engine, m)
+    };
 
     let host = HostState {
         limits: store_limits(),
@@ -1749,20 +2312,28 @@ fn run_contract(
         events: Vec::new(),
         outbound_messages: Vec::new(),
         caller: ctx.caller,
+        origin: if hardened { origin } else { ctx.caller },
+        hardened,
         value: ctx.value,
         block_time: ctx.block_time,
         block_hash: ctx.block_hash,
         return_data: Vec::new(),
         calldata: calldata.to_vec(),
     };
-    let mut store = Store::new(&engine, host);
+    let mut store = Store::new(engine, host);
     store.limiter(|s| &mut s.limits);
     store.set_fuel(fuel).map_err(|_| ContractError::OutOfFuel)?;
 
-    let linker = host_linker(&engine);
+    let linker = host_linker(engine);
     let instance = linker
         .instantiate_and_start(&mut store, &module)
-        .map_err(|_| ContractError::InvalidWasm)?;
+        .map_err(|e| {
+            if hardened && format!("{e}").contains("fuel") {
+                ContractError::OutOfFuel
+            } else {
+                ContractError::InvalidWasm
+            }
+        })?;
     let call_res = match call_export(&mut store, &instance, method, args, false) {
         Some(res) => res,
         None => return Err(ContractError::NoSuchMethod),

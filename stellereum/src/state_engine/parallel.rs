@@ -1,5 +1,5 @@
 use super::types::{write_contract_trie_entries, PayloadDomainSnapshot};
-use super::verify_once::resolve_block_sig_validity;
+use super::verify_once::verify_block_tx_signatures_at_height;
 use super::{AccountState, ExecPostActions, InMemoryStateEngine, PQ_ACTIVATION_SURCHARGE_GAS};
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
@@ -133,6 +133,7 @@ fn plan_plain_tx(
     vesting_locked: Option<u64>,
     cross_shard: bool,
     sponsor: Option<(u64, u64)>,
+    exec_hardening: bool,
 ) -> PlainTxPlan {
     let mut plan = PlainTxPlan::default();
 
@@ -148,7 +149,7 @@ fn plan_plain_tx(
     // in full was the over-charge FEE-01 closes). F-01: the consensus floor
     // still raises the result. Both numbers come from the engine's helpers, so
     // they cannot drift from `commit_native`'s.
-    let fee = InMemoryStateEngine::fee_for_gas(tx, 0, floor_base, 0);
+    let fee = InMemoryStateEngine::fee_for_gas_at(tx, 0, floor_base, 0, exec_hardening);
     // The failure price is `failure_fee_for` (the intrinsic envelope is
     // guaranteed consumption whether or not a payload ran); for a plain
     // transfer the two coincide, and the debug assertion pins that.
@@ -456,6 +457,7 @@ impl InMemoryStateEngine {
         session_valid: Option<&HashMap<usize, bool>>,
         fee_floors: &[(u64, u64)],
         vesting_floors: &HashMap<[u8; 32], u64>,
+        exec_hardening: bool,
         applied: &mut usize,
         failed: &mut usize,
         fees_collected: &mut u64,
@@ -525,6 +527,7 @@ impl InMemoryStateEngine {
                                 burn_for_cross_shard && tx.source_shard != tx.target_shard,
                                 tx.effective_sponsor()
                                     .and_then(|s| snapshot.get(&s).copied().flatten()),
+                                exec_hardening,
                             );
                             (i, plan)
                         })
@@ -566,8 +569,10 @@ impl InMemoryStateEngine {
                             // `billed_gas(tx, gas_used)` and the two paths
                             // must agree on the committed registry spend for
                             // the same block.
-                            session_notes
-                                .push((&txs[*i], InMemoryStateEngine::billed_gas(&txs[*i], 0)));
+                            session_notes.push((
+                                &txs[*i],
+                                InMemoryStateEngine::billed_gas_at(&txs[*i], 0, exec_hardening),
+                            ));
                         }
                     }
                 }
@@ -605,6 +610,7 @@ impl InMemoryStateEngine {
                     vesting_floors.get(&tx.from).copied(),
                     burn_for_cross_shard && tx.source_shard != tx.target_shard,
                     sponsor,
+                    exec_hardening,
                 );
                 commit_plain_plan(
                     &mut map,
@@ -618,7 +624,10 @@ impl InMemoryStateEngine {
                     trie_dirty,
                 );
                 if plan.applied && tx.delegation().is_some() {
-                    session_notes.push((tx, InMemoryStateEngine::billed_gas(tx, 0)));
+                    session_notes.push((
+                        tx,
+                        InMemoryStateEngine::billed_gas_at(tx, 0, exec_hardening),
+                    ));
                 }
             }
         }
@@ -749,7 +758,8 @@ impl InMemoryStateEngine {
         // as before. Fail-closed: any attestation mismatch forces full
         // re-verification. Chain-id/binding/session/nonce/balance checks below
         // still run for EVERY transaction, attested or not.
-        let sig_valid = resolve_block_sig_validity(txs, self.chain_id);
+        let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
+        let sig_valid = verify_block_tx_signatures_at_height(txs, self.chain_id, chain_height);
 
         // 2) Group transaction indices by sender, preserving order.
         let mut order: Vec<[u8; 32]> = Vec::new();
@@ -1103,6 +1113,7 @@ impl InMemoryStateEngine {
                         session_valid.as_ref(),
                         &fee_floors,
                         &vesting_floors,
+                        exec_hardening,
                         &mut applied,
                         &mut failed,
                         &mut fees_collected,
@@ -1219,9 +1230,18 @@ impl InMemoryStateEngine {
                                 // envelope cost at the commit.
                                 (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new())
                             } else {
-                                domain_snap =
-                                    Some(self.snapshot_payload_domains(&tx.payload).await);
-                                match self.execute_payload_with_preverify(tx, timestamp).await {
+                                domain_snap = Some(
+                                    self.snapshot_payload_domains_at(&tx.payload, exec_hardening)
+                                        .await,
+                                );
+                                match self
+                                    .execute_payload_with_preverify_at_height(
+                                        tx,
+                                        timestamp,
+                                        chain_height,
+                                    )
+                                    .await
+                                {
                                     Ok((
                                         crate::svm::VmExecutionResult::Success {
                                             transfers,
@@ -1256,6 +1276,7 @@ impl InMemoryStateEngine {
                                                     pmm_native_snapshot: Vec::new(),
                                                     pmm_minted_nano: 0,
                                                     clob_native_snapshot: Vec::new(),
+                                                    outbound_messages: Vec::new(),
                                                 },
                                             )
                                             .await;
@@ -1267,10 +1288,10 @@ impl InMemoryStateEngine {
                             };
                         // FEE-01: the fee is priced from what execution
                         // MEASURED (`gas_used`), never from the declared
-                        // limit — `commit_native_with_floor` caps it at the
+                        // limit — `commit_native_with_floor_at` caps it at the
                         // limit and refunds the rest.
                         match self
-                            .commit_native_with_floor(
+                            .commit_native_with_floor_at(
                                 tx,
                                 gas_used,
                                 &transfers,
@@ -1280,12 +1301,13 @@ impl InMemoryStateEngine {
                                 fee_floors[i].1,
                                 vesting_floors.get(&tx.from).copied(),
                                 &vesting_floors,
+                                chain_height,
                             )
                             .await
                         {
-                            Ok((touched, fee)) => {
+                            Ok((mut touched, fee)) => {
                                 if tx.is_pq_activation() {
-                                    if let Some(env) = tx.pq_envelope() {
+                                    if let Some(env) = tx.pq_envelope_at_height(chain_height) {
                                         if !env.is_implicit {
                                             if let Some(ref pk) = env.pubkey {
                                                 let salt = crate::post_quantum::DEFAULT_SALT;
@@ -1296,6 +1318,16 @@ impl InMemoryStateEngine {
                                         }
                                     }
                                 }
+                                if let Some(ref actions) = post_actions {
+                                    if !actions.outbound_messages.is_empty() {
+                                        let outbound_touched = self
+                                            .process_contract_outbound_messages_hardened(
+                                                &actions.outbound_messages,
+                                            )
+                                            .await;
+                                        touched.extend(outbound_touched);
+                                    }
+                                }
                                 trie_dirty.extend(touched);
                                 fees_collected = fees_collected.saturating_add(fee);
                                 applied += 1;
@@ -1304,7 +1336,11 @@ impl InMemoryStateEngine {
                                 events[i] = tx_events;
                                 self.session_note_applied(
                                     tx,
-                                    InMemoryStateEngine::billed_gas(tx, gas_used),
+                                    InMemoryStateEngine::billed_gas_at(
+                                        tx,
+                                        gas_used,
+                                        exec_hardening,
+                                    ),
                                 )
                                 .await;
                             }
@@ -1444,8 +1480,14 @@ impl InMemoryStateEngine {
                     // failure after (including the native commit below) restores
                     // everything (see rollback_payload). NOTE: must stay in sync
                     // with the `apply_transaction` copy.
-                    domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
-                    match self.execute_payload_with_preverify(tx, timestamp).await {
+                    domain_snap = Some(
+                        self.snapshot_payload_domains_at(&tx.payload, exec_hardening)
+                            .await,
+                    );
+                    match self
+                        .execute_payload_with_preverify_at_height(tx, timestamp, chain_height)
+                        .await
+                    {
                         Ok((
                             crate::svm::VmExecutionResult::Success {
                                 transfers,
@@ -1485,6 +1527,7 @@ impl InMemoryStateEngine {
                                         pmm_native_snapshot: Vec::new(),
                                         pmm_minted_nano: 0,
                                         clob_native_snapshot: Vec::new(),
+                                        outbound_messages: Vec::new(),
                                     },
                                 )
                                 .await;
@@ -1508,7 +1551,7 @@ impl InMemoryStateEngine {
                 // sum of those fees to the proposer, so unused gas is
                 // refunded and `fee_charged` equals what left the sender.
                 match self
-                    .commit_native_with_floor(
+                    .commit_native_with_floor_at(
                         tx,
                         gas_used,
                         &transfers,
@@ -1518,12 +1561,13 @@ impl InMemoryStateEngine {
                         fee_floors[i].1,
                         vesting_floors.get(&tx.from).copied(),
                         &vesting_floors,
+                        chain_height,
                     )
                     .await
                 {
-                    Ok((touched, fee)) => {
+                    Ok((mut touched, fee)) => {
                         if tx.is_pq_activation() {
-                            if let Some(env) = tx.pq_envelope() {
+                            if let Some(env) = tx.pq_envelope_at_height(chain_height) {
                                 if !env.is_implicit {
                                     if let Some(ref pk) = env.pubkey {
                                         let salt = crate::post_quantum::DEFAULT_SALT;
@@ -1531,6 +1575,16 @@ impl InMemoryStateEngine {
                                             self.pin_pubkey(tx.from, env.scheme, pk, &salt).await;
                                     }
                                 }
+                            }
+                        }
+                        if let Some(ref actions) = post_actions {
+                            if !actions.outbound_messages.is_empty() {
+                                let outbound_touched = self
+                                    .process_contract_outbound_messages_hardened(
+                                        &actions.outbound_messages,
+                                    )
+                                    .await;
+                                touched.extend(outbound_touched);
                             }
                         }
                         // Later transactions may touch the same accounts again; the
@@ -1550,7 +1604,7 @@ impl InMemoryStateEngine {
                         // consensus state: it lands in the committed registry.
                         self.session_note_applied(
                             tx,
-                            InMemoryStateEngine::billed_gas(tx, gas_used),
+                            InMemoryStateEngine::billed_gas_at(tx, gas_used, exec_hardening),
                         )
                         .await;
                     }

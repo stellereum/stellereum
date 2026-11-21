@@ -658,6 +658,10 @@ pub struct ExecPostActions {
     /// consume mint headroom (audit F5).
     pub(super) pmm_minted_nano: u64,
     pub(super) clob_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)>,
+    /// Outbound contract messages emitted by WASM execution on `>= H`, held
+    /// until AFTER `commit_native` succeeds so failed CLOB/native commits
+    /// never leave dangling messages in `inbox` / `cross_shard_out`.
+    pub(super) outbound_messages: Vec<crate::contract::ContractMessage>,
 }
 
 /// The versioned state snapshot: the accounts PLUS the D2 consensus penalty

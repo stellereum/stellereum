@@ -38,6 +38,11 @@ pub const NANO_STELL: u64 = 1;
 pub const GAS_BASIC_TRANSFER: u64 = 280_000;
 const _: () = assert!(GAS_TOKEN_TRANSFER >= GAS_BASIC_TRANSFER);
 pub const GAS_ORDER_CANCEL: u64 = 100; // Ultra cheap cancellation for HFT bots
+/// Hardened base gas for `SysCallCancelOrder` (`>= H`): matches `GAS_ORDER_PLACE`
+/// so valid cancellations pay realistic clone/book-mutation cost instead of 100 gas.
+pub const GAS_ORDER_CANCEL_HARDENED: u64 = 1_200;
+/// Per-scanned-order gas charged by `SysCallCancelOrder` on the hardened (`>= H`) path.
+pub const GAS_PER_CANCEL_SCAN: u64 = 2;
 pub const GAS_ORDER_PLACE: u64 = 1_200;
 pub const GAS_ZKML_VERIFY: u64 = 5_000;
 pub const GAS_PATRICIA_LOOKUP: u64 = 50;
@@ -1450,6 +1455,19 @@ fn ensure_working<T: Clone>(slot: &mut Option<T>, src: Option<&T>) {
     }
 }
 
+/// Height-gated execution options for [`Svm::execute_with_confidential_and_sends_at`].
+///
+/// Kept separate from [`VmContext`] so all existing `VmContext { ... }` struct
+/// literals remain source-compatible, and [`VmExecOptions::default()`] preserves
+/// 100% pre-gate (`< H`) behaviour.
+#[derive(Clone, Debug, Default)]
+pub struct VmExecOptions {
+    pub exec_hardening: bool,
+    pub wasm_pmm_hardening: bool,
+    pub tx_nonce: u64,
+    pub outbound_budget_from_accounts: Option<HashMap<[u8; 32], u64>>,
+}
+
 pub struct Svm;
 
 impl Svm {
@@ -1462,7 +1480,8 @@ impl Svm {
         gas_limit: u64,
         ctx: &mut VmContext,
     ) -> VmExecutionResult {
-        Self::execute_inner(instructions, gas_limit, ctx, None, None)
+        let opts = VmExecOptions::default();
+        Self::execute_inner(instructions, gas_limit, ctx, None, None, &opts)
     }
 
     /// The block-path VM: the actor-send sink AND the §2
@@ -1491,7 +1510,27 @@ impl Svm {
         sends: &mut Vec<ActorSendRequest>,
         zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
     ) -> VmExecutionResult {
-        Self::execute_inner(instructions, gas_limit, ctx, Some(sends), zkml_models)
+        let opts = VmExecOptions::default();
+        Self::execute_inner(
+            instructions,
+            gas_limit,
+            ctx,
+            Some(sends),
+            zkml_models,
+            &opts,
+        )
+    }
+
+    /// Height-gated variant of [`Self::execute_with_confidential_and_sends`].
+    pub fn execute_with_confidential_and_sends_at(
+        instructions: &[OpCode],
+        gas_limit: u64,
+        ctx: &mut VmContext,
+        sends: &mut Vec<ActorSendRequest>,
+        zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
+        opts: &VmExecOptions,
+    ) -> VmExecutionResult {
+        Self::execute_inner(instructions, gas_limit, ctx, Some(sends), zkml_models, opts)
     }
 
     fn execute_inner(
@@ -1500,6 +1539,7 @@ impl Svm {
         ctx: &mut VmContext,
         mut sends: Option<&mut Vec<ActorSendRequest>>,
         mut zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
+        opts: &VmExecOptions,
     ) -> VmExecutionResult {
         // The operand stack starts WITHOUT an allocation: the hot benchmark
         // path (and most real payloads) may never push, and `Vec::new` only
@@ -1676,19 +1716,36 @@ impl Svm {
                         let book = books
                             .entry(*pair_id)
                             .or_insert_with(|| OrderbookActor::new(*pair_id, 1000));
-                        let (placed_order, trade_events) = book.submit_order_bounded(
-                            ctx.sender,
-                            side.clone(),
-                            OrderType::Limit,
-                            *price,
-                            *amount,
-                            ctx.timestamp,
-                            MAX_MATCH_LEVELS,
-                        );
-                        // Charge gas per price level crossed (anti-griefing).
-                        // If the extra gas cannot be paid, revert the whole call.
-                        let level_gas = (trade_events.len() as u64).min(MAX_MATCH_LEVELS as u64)
-                            * GAS_PER_MATCH_LEVEL;
+                        let (placed_order, trade_events) = if opts.exec_hardening {
+                            book.submit_order_bounded_with_fills(
+                                ctx.sender,
+                                side.clone(),
+                                OrderType::Limit,
+                                *price,
+                                *amount,
+                                ctx.timestamp,
+                                MAX_MATCH_LEVELS,
+                                crate::orderbook::MAX_MATCH_FILLS_PER_ORDER,
+                            )
+                        } else {
+                            book.submit_order_bounded(
+                                ctx.sender,
+                                side.clone(),
+                                OrderType::Limit,
+                                *price,
+                                *amount,
+                                ctx.timestamp,
+                                MAX_MATCH_LEVELS,
+                            )
+                        };
+                        // Charge gas per fill/level crossed (anti-griefing).
+                        // Hardened (>= H) charges for EVERY fill without `.min(MAX_MATCH_LEVELS)`.
+                        let level_gas = if opts.exec_hardening {
+                            (trade_events.len() as u64).saturating_mul(GAS_PER_MATCH_LEVEL)
+                        } else {
+                            (trade_events.len() as u64).min(MAX_MATCH_LEVELS as u64)
+                                * GAS_PER_MATCH_LEVEL
+                        };
                         if state.gas_remaining < level_gas {
                             return VmExecutionResult::OutOfGas;
                         }
@@ -1718,68 +1775,127 @@ impl Svm {
                 }
                 OpCode::SysCallCancelOrder { order_id } => {
                     charge!(GAS_ORDER_CANCEL);
-                    // Only the order's own trader may cancel it, and the refund
-                    // goes to that trader, not the caller.
-                    //
-                    // Without the ownership check any third party could cancel any
-                    // resting order for a trivial gas cost while the escrow record
-                    // stayed in place. The victim could then never release it: the
-                    // release path looks the order up in the book, the order is
-                    // already gone, and the release silently does nothing. That
-                    // stranded the full escrowed balance permanently.
-                    //
-                    // The equivalent check in the engine's own cancel path is at
-                    // `state_engine.rs` "Only the order owner may cancel".
-                    let mut cancelled: Option<u32> = None;
-                    ensure_working(&mut working_books, ctx.orderbooks.as_deref());
-                    if let Some(books) = working_books.as_mut() {
-                        for (pair, book) in books.iter_mut() {
-                            // Locate the trader without removing anything: the
-                            // cancel below is the only thing that should mutate.
-                            let owner = book
-                                .bids
-                                .values()
-                                .chain(book.asks.values())
-                                .flatten()
-                                .find(|o| o.order_id == *order_id)
-                                .map(|o| (o.trader, matches!(o.side, OrderSide::Sell)));
-                            match owner {
-                                None => continue,
-                                Some((t, _)) if t != ctx.sender => {
-                                    return VmExecutionResult::Reverted(
-                                        "only the order owner may cancel it".to_string(),
-                                    )
+                    if opts.exec_hardening {
+                        // Read-only owner search BEFORE `ensure_working` so a stranger's
+                        // or missing cancel never pays the full book-map clone.
+                        let mut found: Option<(u32, [u8; 32])> = None;
+                        let mut scanned_orders: u64 = 0;
+                        if let Some(books) = working_books.as_ref().or(ctx.orderbooks.as_deref()) {
+                            for (pair, book) in books.iter() {
+                                for o in book.bids.values().chain(book.asks.values()).flatten() {
+                                    scanned_orders = scanned_orders.saturating_add(1);
+                                    if o.order_id == *order_id {
+                                        found = Some((*pair, o.trader));
+                                        break;
+                                    }
                                 }
-                                Some(_) => {}
-                            }
-                            if let Some(order) = book.cancel_order(*order_id) {
-                                // The real refund is issued by the engine when it
-                                // processes the Cancel event below (native for a
-                                // sell, native-or-wUSDT for a buy - the VM cannot
-                                // see the escrow map to know which). Mirror it in
-                                // the VM-local balance only for the side whose
-                                // asset is unambiguous: a sell refunds base STELL.
-                                // For a buy the quote asset is unknown here, so
-                                // staying un-credited is the conservative choice
-                                // (it can only make a later opcode revert, never
-                                // overdraw).
-                                if matches!(order.side, OrderSide::Sell) {
-                                    let refund = order.amount.saturating_sub(order.filled);
-                                    current_balance = current_balance.saturating_add(refund);
+                                if found.is_some() {
+                                    break;
                                 }
-                                cancelled = Some(*pair);
-                                break;
                             }
                         }
+                        let scan_gas = scanned_orders.saturating_mul(GAS_PER_CANCEL_SCAN);
+                        charge!(scan_gas);
+                        let mut cancelled: Option<u32> = None;
+                        match found {
+                            None => {}
+                            Some((_, owner)) if owner != ctx.sender => {
+                                return VmExecutionResult::Reverted(
+                                    "only the order owner may cancel it".to_string(),
+                                );
+                            }
+                            Some((pair, _)) => {
+                                let extra_base =
+                                    GAS_ORDER_CANCEL_HARDENED.saturating_sub(GAS_ORDER_CANCEL);
+                                charge!(extra_base);
+                                ensure_working(&mut working_books, ctx.orderbooks.as_deref());
+                                if let Some(books) = working_books.as_mut() {
+                                    if let Some(book) = books.get_mut(&pair) {
+                                        if let Some(order) = book.cancel_order(*order_id) {
+                                            if matches!(order.side, OrderSide::Sell) {
+                                                let refund =
+                                                    order.amount.saturating_sub(order.filled);
+                                                current_balance =
+                                                    current_balance.saturating_add(refund);
+                                            }
+                                            cancelled = Some(pair);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(pair) = cancelled {
+                            clob_events.push(ClobEvent::Cancel {
+                                pair_id: pair,
+                                order_id: *order_id,
+                                trader: ctx.sender,
+                            });
+                        }
+                        state.stack.push(if cancelled.is_some() { 1 } else { 0 });
+                    } else {
+                        // Only the order's own trader may cancel it, and the refund
+                        // goes to that trader, not the caller.
+                        //
+                        // Without the ownership check any third party could cancel any
+                        // resting order for a trivial gas cost while the escrow record
+                        // stayed in place. The victim could then never release it: the
+                        // release path looks the order up in the book, the order is
+                        // already gone, and the release silently does nothing. That
+                        // stranded the full escrowed balance permanently.
+                        //
+                        // The equivalent check in the engine's own cancel path is at
+                        // `state_engine.rs` "Only the order owner may cancel".
+                        let mut cancelled: Option<u32> = None;
+                        ensure_working(&mut working_books, ctx.orderbooks.as_deref());
+                        if let Some(books) = working_books.as_mut() {
+                            for (pair, book) in books.iter_mut() {
+                                // Locate the trader without removing anything: the
+                                // cancel below is the only thing that should mutate.
+                                let owner = book
+                                    .bids
+                                    .values()
+                                    .chain(book.asks.values())
+                                    .flatten()
+                                    .find(|o| o.order_id == *order_id)
+                                    .map(|o| (o.trader, matches!(o.side, OrderSide::Sell)));
+                                match owner {
+                                    None => continue,
+                                    Some((t, _)) if t != ctx.sender => {
+                                        return VmExecutionResult::Reverted(
+                                            "only the order owner may cancel it".to_string(),
+                                        )
+                                    }
+                                    Some(_) => {}
+                                }
+                                if let Some(order) = book.cancel_order(*order_id) {
+                                    // The real refund is issued by the engine when it
+                                    // processes the Cancel event below (native for a
+                                    // sell, native-or-wUSDT for a buy - the VM cannot
+                                    // see the escrow map to know which). Mirror it in
+                                    // the VM-local balance only for the side whose
+                                    // asset is unambiguous: a sell refunds base STELL.
+                                    // For a buy the quote asset is unknown here, so
+                                    // staying un-credited is the conservative choice
+                                    // (it can only make a later opcode revert, never
+                                    // overdraw).
+                                    if matches!(order.side, OrderSide::Sell) {
+                                        let refund = order.amount.saturating_sub(order.filled);
+                                        current_balance = current_balance.saturating_add(refund);
+                                    }
+                                    cancelled = Some(*pair);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(pair) = cancelled {
+                            clob_events.push(ClobEvent::Cancel {
+                                pair_id: pair,
+                                order_id: *order_id,
+                                trader: ctx.sender,
+                            });
+                        }
+                        state.stack.push(if cancelled.is_some() { 1 } else { 0 });
                     }
-                    if let Some(pair) = cancelled {
-                        clob_events.push(ClobEvent::Cancel {
-                            pair_id: pair,
-                            order_id: *order_id,
-                            trader: ctx.sender,
-                        });
-                    }
-                    state.stack.push(if cancelled.is_some() { 1 } else { 0 });
                 }
                 OpCode::SysCallVerifyZkMl => {
                     charge!(GAS_ZKML_VERIFY);
@@ -2018,18 +2134,48 @@ impl Svm {
                 }
                 OpCode::SysCallDeployContract { code } => {
                     charge!(contract_deploy_gas(code.len()));
-                    ensure_working(&mut working_contracts, ctx.contracts.as_deref());
-                    let Some(reg) = working_contracts.as_mut() else {
-                        return VmExecutionResult::Reverted(
-                            "Contract registry not available".to_string(),
-                        );
-                    };
-                    match reg.deploy(ctx.sender, code.clone(), ctx.timestamp) {
-                        Ok(_addr) => state.stack.push(1),
-                        Err(e) => {
+                    if opts.wasm_pmm_hardening {
+                        if let Err(e) = crate::contract::ContractRegistry::validate_code_hardened(
+                            code,
+                            crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                        ) {
                             return VmExecutionResult::Reverted(format!(
                                 "contract deploy failed: {e}"
-                            ))
+                            ));
+                        }
+                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                        let Some(reg) = working_contracts.as_mut() else {
+                            return VmExecutionResult::Reverted(
+                                "Contract registry not available".to_string(),
+                            );
+                        };
+                        match reg.deploy_with_nonce(
+                            ctx.sender,
+                            code.clone(),
+                            opts.tx_nonce,
+                            ctx.timestamp,
+                        ) {
+                            Ok(_addr) => state.stack.push(1),
+                            Err(e) => {
+                                return VmExecutionResult::Reverted(format!(
+                                    "contract deploy failed: {e}"
+                                ))
+                            }
+                        }
+                    } else {
+                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                        let Some(reg) = working_contracts.as_mut() else {
+                            return VmExecutionResult::Reverted(
+                                "Contract registry not available".to_string(),
+                            );
+                        };
+                        match reg.deploy(ctx.sender, code.clone(), ctx.timestamp) {
+                            Ok(_addr) => state.stack.push(1),
+                            Err(e) => {
+                                return VmExecutionResult::Reverted(format!(
+                                    "contract deploy failed: {e}"
+                                ))
+                            }
                         }
                     }
                 }
@@ -2048,7 +2194,23 @@ impl Svm {
                         ));
                     }
                     charge!(contract_call_gas(method.len(), 1, 0));
-                    ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                    if working_contracts.is_none() {
+                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                        if opts.wasm_pmm_hardening {
+                            if let (Some(reg), Some(budgets)) = (
+                                working_contracts.as_mut(),
+                                opts.outbound_budget_from_accounts.as_ref(),
+                            ) {
+                                for (addr, acc_bal) in budgets {
+                                    if let Some(c) = reg.contracts.get_mut(addr) {
+                                        if *acc_bal > c.balance {
+                                            c.balance = *acc_bal;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let Some(reg) = working_contracts.as_mut() else {
                         return VmExecutionResult::Reverted(
                             "Contract registry not available".to_string(),
@@ -2070,13 +2232,27 @@ impl Svm {
                         block_time: ctx.timestamp,
                         block_hash: [0u8; 32],
                     };
-                    match reg.call_with_context(
-                        contract,
-                        method,
-                        *arg,
-                        state.gas_remaining,
-                        &call_ctx,
-                    ) {
+                    let call_res = if opts.wasm_pmm_hardening {
+                        reg.call_with_context_hardened(
+                            contract,
+                            method,
+                            *arg,
+                            state.gas_remaining,
+                            &call_ctx,
+                            ctx.sender,
+                            ctx.sender,
+                            true,
+                        )
+                    } else {
+                        reg.call_with_context(
+                            contract,
+                            method,
+                            *arg,
+                            state.gas_remaining,
+                            &call_ctx,
+                        )
+                    };
+                    match call_res {
                         Ok(outcome) => {
                             if state.gas_remaining < outcome.fuel_used {
                                 return VmExecutionResult::OutOfGas;
@@ -2124,7 +2300,23 @@ impl Svm {
                         ));
                     }
                     charge!(contract_call_gas(method.len(), args.len(), calldata.len()));
-                    ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                    if working_contracts.is_none() {
+                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                        if opts.wasm_pmm_hardening {
+                            if let (Some(reg), Some(budgets)) = (
+                                working_contracts.as_mut(),
+                                opts.outbound_budget_from_accounts.as_ref(),
+                            ) {
+                                for (addr, acc_bal) in budgets {
+                                    if let Some(c) = reg.contracts.get_mut(addr) {
+                                        if *acc_bal > c.balance {
+                                            c.balance = *acc_bal;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let Some(reg) = working_contracts.as_mut() else {
                         return VmExecutionResult::Reverted(
                             "Contract registry not available".to_string(),
@@ -2146,14 +2338,29 @@ impl Svm {
                         block_time: ctx.timestamp,
                         block_hash: [0u8; 32],
                     };
-                    match reg.call_with_context_args_calldata(
-                        contract,
-                        method,
-                        args,
-                        calldata,
-                        state.gas_remaining,
-                        &call_ctx,
-                    ) {
+                    let call_res = if opts.wasm_pmm_hardening {
+                        reg.call_with_context_args_calldata_hardened(
+                            contract,
+                            method,
+                            args,
+                            calldata,
+                            state.gas_remaining,
+                            &call_ctx,
+                            ctx.sender,
+                            ctx.sender,
+                            true,
+                        )
+                    } else {
+                        reg.call_with_context_args_calldata(
+                            contract,
+                            method,
+                            args,
+                            calldata,
+                            state.gas_remaining,
+                            &call_ctx,
+                        )
+                    };
+                    match call_res {
                         Ok(outcome) => {
                             if state.gas_remaining < outcome.fuel_used {
                                 return VmExecutionResult::OutOfGas;
@@ -2702,21 +2909,52 @@ impl Svm {
                             "PMM USDT token not initialised".to_string(),
                         );
                     };
+                    if opts.wasm_pmm_hardening {
+                        // Strict CEI: check token registry availability and wUSDT
+                        // balance BEFORE cloning/mutating `working_pmm`.
+                        let usdt_bal = if let Some(reg) = working_tokens.as_ref() {
+                            reg.balance_of(&usdt_id, &ctx.sender)
+                        } else if let Some(reg) = ctx.token_registry.as_deref() {
+                            reg.balance_of(&usdt_id, &ctx.sender)
+                        } else {
+                            return VmExecutionResult::Reverted(
+                                "Token registry not available".to_string(),
+                            );
+                        };
+                        if usdt_bal < *usdt_micro {
+                            return VmExecutionResult::Reverted(
+                                "Insufficient wUSDT balance for PMM buy".to_string(),
+                            );
+                        }
+                    }
                     ensure_working(&mut working_pmm, ctx.pmm.as_ref().map(|p| &*p.state));
                     let Some(working) = working_pmm.as_mut() else {
                         return VmExecutionResult::Reverted(
                             "PMM not available in this VM context".to_string(),
                         );
                     };
-                    let receipt = match working.buy_with_buffer(
-                        *usdt_micro,
-                        ctx.pmm
-                            .as_ref()
-                            .map(|p| p.redemption_buffer_bps)
-                            .unwrap_or(crate::pmm::PMM_REDEMPTION_BUFFER_BPS),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => return VmExecutionResult::Reverted(format!("PMM buy: {e}")),
+                    let buffer_bps = ctx
+                        .pmm
+                        .as_ref()
+                        .map(|p| p.redemption_buffer_bps)
+                        .unwrap_or(crate::pmm::PMM_REDEMPTION_BUFFER_BPS);
+                    let receipt = if opts.wasm_pmm_hardening {
+                        match working.buy_with_buffer_checked(*usdt_micro, buffer_bps) {
+                            Ok(r) => {
+                                if r.stell_minted == 0 {
+                                    return VmExecutionResult::Reverted(
+                                        "PMM buy: zero mint".to_string(),
+                                    );
+                                }
+                                r
+                            }
+                            Err(e) => return VmExecutionResult::Reverted(format!("PMM buy: {e}")),
+                        }
+                    } else {
+                        match working.buy_with_buffer(*usdt_micro, buffer_bps) {
+                            Ok(r) => r,
+                            Err(e) => return VmExecutionResult::Reverted(format!("PMM buy: {e}")),
+                        }
                     };
                     // Burn the buyer's wUSDT. Checked before the curve commit
                     // matters only in the sense that a revert discards both.
@@ -2780,9 +3018,23 @@ impl Svm {
                             "PMM not available in this VM context".to_string(),
                         );
                     };
-                    let receipt = match working.sell_stell(*stell_nano) {
-                        Ok(r) => r,
-                        Err(e) => return VmExecutionResult::Reverted(format!("PMM sell: {e}")),
+                    let receipt = if opts.wasm_pmm_hardening {
+                        match working.sell_stell_checked(*stell_nano) {
+                            Ok(r) => {
+                                if r.usdt_paid == 0 || r.stell_burned == 0 {
+                                    return VmExecutionResult::Reverted(
+                                        "PMM sell: zero payout".to_string(),
+                                    );
+                                }
+                                r
+                            }
+                            Err(e) => return VmExecutionResult::Reverted(format!("PMM sell: {e}")),
+                        }
+                    } else {
+                        match working.sell_stell(*stell_nano) {
+                            Ok(r) => r,
+                            Err(e) => return VmExecutionResult::Reverted(format!("PMM sell: {e}")),
+                        }
                     };
                     // Mint the wUSDT payout. Only the treasury (the token's
                     // minter, fixed at pmm_init_usdt) may mint, so a PMM that
@@ -3475,6 +3727,124 @@ impl Svm {
             }
         }
     }
+
+    /// Hardened (`>= H`) contract outbound message router that enforces 1:1
+    /// balance conservation across `accounts` and `cross_shard_out`:
+    /// - Rejects non-empty raw payloads that do not decode as [`crate::state_engine::ActorSendBody`]
+    ///   (prevents bounce-minting from failed `decode_actor_body`).
+    /// - Checks `accounts[msg.sender].balance >= msg.value` and debits
+    ///   `msg.sender` BEFORE queuing into `recipient.inbox`, `cross_shard_out`,
+    ///   or bouncing.
+    /// - Converts empty `msg.payload` into an empty `ActorSendBody` so pure-value
+    ///   transfers deliver cleanly (or bounce only already-debited value).
+    /// - Returns `(addr, balance, nonce)` of every debited `msg.sender` so the
+    ///   caller can update `state_trie`.
+    pub fn route_contract_messages_hardened(
+        messages: &[crate::contract::ContractMessage],
+        accounts: &mut HashMap<[u8; 32], crate::state_engine::AccountState>,
+        cross_shard_out: &mut Vec<crate::sharding::CrossShardMessage>,
+        local_shard: u32,
+        sharded: bool,
+        topology: &crate::sharding::ShardTopology,
+    ) -> Vec<([u8; 32], u64, u64)> {
+        use bincode::Options;
+        let mut debited_senders = Vec::new();
+        for msg in messages {
+            let body_bytes = if msg.payload.is_empty() {
+                bincode::serialize(&crate::state_engine::ActorSendBody {
+                    program: Vec::new(),
+                    gas_budget: 0,
+                })
+                .unwrap_or_default()
+            } else {
+                let valid_body = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
+                    .with_limit(16 * 1024 * 1024)
+                    .deserialize::<crate::state_engine::ActorSendBody>(&msg.payload)
+                    .is_ok();
+                if !valid_body {
+                    continue;
+                }
+                msg.payload.clone()
+            };
+
+            let Some(sender_acc) = accounts.get_mut(&msg.sender) else {
+                continue;
+            };
+            if sender_acc.balance < msg.value {
+                continue;
+            }
+            if msg.value > 0 {
+                sender_acc.balance -= msg.value;
+                debited_senders.push((msg.sender, sender_acc.balance, sender_acc.nonce));
+            }
+
+            let target_shard = crate::sharding::route_shard(
+                topology,
+                &crate::sharding::ShardAddress::Workchain(msg.recipient),
+            );
+            let is_cross_shard = sharded && (target_shard != local_shard);
+
+            if is_cross_shard {
+                let tx = crate::sharding::Transaction {
+                    from: msg.sender,
+                    to: msg.recipient,
+                    amount: msg.value,
+                    gas_limit: 100_000,
+                    nonce: 0,
+                    source_shard: local_shard,
+                    target_shard,
+                    signature: Vec::new(),
+                    payload: Vec::new(),
+                    priority_fee_per_gas: 0,
+                };
+                let mut cross_msg = crate::sharding::CrossShardMessage::new_trusted(
+                    local_shard,
+                    target_shard,
+                    tx,
+                    [0u8; 32],
+                    [0u8; 32],
+                );
+                cross_msg.msg_id = msg.msg_id;
+                cross_msg.bounce = msg.bounce;
+                cross_msg.bounced = false;
+                cross_shard_out.push(cross_msg);
+            } else {
+                let actor_msg = crate::state_engine::ActorMessage {
+                    msg_id: msg.msg_id,
+                    sender: msg.sender,
+                    recipient: msg.recipient,
+                    value: msg.value,
+                    body: body_bytes,
+                    bounce: msg.bounce,
+                    bounced: false,
+                };
+                if let Some(recipient_acc) = accounts.get_mut(&msg.recipient) {
+                    recipient_acc.inbox.push_back(actor_msg);
+                } else if msg.bounce {
+                    let bounce_msg = crate::state_engine::ActorMessage {
+                        msg_id: msg.msg_id,
+                        sender: msg.recipient,
+                        recipient: msg.sender,
+                        value: msg.value,
+                        body: actor_msg.body,
+                        bounce: false,
+                        bounced: true,
+                    };
+                    if let Some(sender_acc) = accounts.get_mut(&msg.sender) {
+                        sender_acc.inbox.push_back(bounce_msg);
+                    }
+                } else {
+                    let mut recipient_acc =
+                        crate::state_engine::AccountState::new(msg.recipient, 0);
+                    recipient_acc.inbox.push_back(actor_msg);
+                    accounts.insert(msg.recipient, recipient_acc);
+                }
+            }
+        }
+        debited_senders
+    }
 }
 
 #[cfg(test)]
@@ -4049,10 +4419,7 @@ mod tests {
         let ops = vec![OpCode::SysCallReportProposalEquivocation {
             evidence: Box::new(evidence),
         }];
-        assert_eq!(
-            crate::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
-            0
-        );
+        assert_eq!(crate::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT, 0);
         assert!(
             matches!(
                 Svm::execute(&ops, 10_000_000, &mut ctx),

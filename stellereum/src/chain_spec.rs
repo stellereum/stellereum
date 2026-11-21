@@ -30,6 +30,84 @@ use crate::zkml::DEFAULT_CHAIN_ID;
 /// reachable height) on chains that never opted in.
 pub const DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = UPGRADE_EXEC_ACTIVATION_HEIGHT;
 
+/// Compiled default activation height for Ruleset v7 Execution Hardening v1
+/// (`OpCode::Halt` barrier in block scanners, `SysCallCallContractArgs` /
+/// `SysCallSubmitPqPriceFeed` rollback snapshots, `TX_INTRINSIC_GAS` minimum
+/// billing, and CLOB `PlaceOrder`/`CancelOrder` gas & fill bounds).
+///
+/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation so historical
+/// blocks, `FORK_ID == 0x0f584a46`, `COMMITMENT_VERSION == 5`, and
+/// `EXPECTED_GENESIS_ROOT` remain byte-identical.
+pub const EXEC_HARDENING_V1_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Compiled default activation height for Ruleset v7 WASM / XShard / PMM /
+/// Canonical-PQ1 Hardening (`SubCallSnapshot`, `caller()` vs `origin()`,
+/// `outbound_messages` post-commit atomicity + `sync_contract_balance` + bounce
+/// conservation, `deploy_with_nonce(tx.nonce)`, `validate_code`/`send_message`
+/// fuel, `PMM`/`GenesisVault` `ZeroMint`/`ZeroPayout`, `cross_shard_completed`
+/// guard, and strict canonical `PQ1` envelope decoding).
+///
+/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation.
+pub const WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static WASM_XSHARD_PMM_HARDENING_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY `EXEC_HARDENING_V1` activation
+/// height override for the calling thread.
+#[cfg(any(test, debug_assertions))]
+pub fn set_exec_hardening_v1_activation_override(activation: Option<u64>) {
+    EXEC_HARDENING_V1_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Set (or clear with `None`) the TEST-ONLY `WASM_XSHARD_PMM_HARDENING`
+/// activation height override for the calling thread.
+#[cfg(any(test, debug_assertions))]
+pub fn set_wasm_xshard_pmm_hardening_activation_override(activation: Option<u64>) {
+    WASM_XSHARD_PMM_HARDENING_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `EXEC_HARDENING_V1` activation height for the calling thread.
+pub fn exec_hardening_v1_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = EXEC_HARDENING_V1_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    EXEC_HARDENING_V1_ACTIVATION_HEIGHT
+}
+
+/// Effective `WASM_XSHARD_PMM_HARDENING` activation height for the calling thread.
+pub fn wasm_xshard_pmm_hardening_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = WASM_XSHARD_PMM_HARDENING_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT
+}
+
+/// True iff `EXEC_HARDENING_V1` is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`).
+pub fn exec_hardening_v1_active_at(height: u64) -> bool {
+    let gate = exec_hardening_v1_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// True iff `WASM_XSHARD_PMM_HARDENING` is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`).
+pub fn wasm_xshard_pmm_hardening_active_at(height: u64) -> bool {
+    let gate = wasm_xshard_pmm_hardening_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
 /// The parts of a chain's identity that are fixed when genesis is built.
 ///
 /// Today the only field is the upgrade-execution activation height. It is
@@ -306,6 +384,18 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 upgrade_exec_activation_height(),
                 "On-chain SoftwareUpgrade plan installation (genesis chain-spec value; compiled default is u64::MAX)",
             ),
+            ActivationGate::new(
+                "EXEC_HARDENING_V1_ACTIVATION_HEIGHT",
+                "stellereum::state_engine::apply",
+                exec_hardening_v1_activation_height(),
+                "Ruleset v7 execution hardening: Halt barrier in scanners, CallContractArgs/SubmitPqPriceFeed rollback, TX_INTRINSIC_GAS floor, CLOB fill/cancel gas",
+            ),
+            ActivationGate::new(
+                "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                wasm_xshard_pmm_hardening_activation_height(),
+                "Ruleset v7 WASM/XShard/PMM/PQ1 hardening: SubCallSnapshot, caller vs origin, outbound post-commit + balance sync, deploy_with_nonce, PMM ZeroMint/ZeroPayout, canonical PQ1",
+            ),
         ],
     }
 }
@@ -438,6 +528,14 @@ mod tests {
                 "UPGRADE_EXEC_ACTIVATION_HEIGHT",
                 DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT,
             ),
+            (
+                "EXEC_HARDENING_V1_ACTIVATION_HEIGHT",
+                EXEC_HARDENING_V1_ACTIVATION_HEIGHT,
+            ),
+            (
+                "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
+                WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
+            ),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());
@@ -537,5 +635,35 @@ mod tests {
             assert!(line.contains(gate.name));
             assert!(line.contains(gate.module));
         }
+    }
+
+    #[test]
+    fn r1_hardening_gates_default_off_even_at_u64_max_and_respect_overrides() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_exec_hardening_v1_activation_override(None);
+                set_wasm_xshard_pmm_hardening_activation_override(None);
+            }
+        }
+        let _reset = Reset;
+
+        assert_eq!(exec_hardening_v1_activation_height(), u64::MAX);
+        assert_eq!(wasm_xshard_pmm_hardening_activation_height(), u64::MAX);
+        assert!(!exec_hardening_v1_active_at(0));
+        assert!(!exec_hardening_v1_active_at(u64::MAX));
+        assert!(!wasm_xshard_pmm_hardening_active_at(0));
+        assert!(!wasm_xshard_pmm_hardening_active_at(u64::MAX));
+
+        set_exec_hardening_v1_activation_override(Some(10));
+        set_wasm_xshard_pmm_hardening_activation_override(Some(10));
+        assert!(!exec_hardening_v1_active_at(9));
+        assert!(exec_hardening_v1_active_at(10));
+        assert!(exec_hardening_v1_active_at(11));
+        assert!(exec_hardening_v1_active_at(u64::MAX));
+        assert!(!wasm_xshard_pmm_hardening_active_at(9));
+        assert!(wasm_xshard_pmm_hardening_active_at(10));
+        assert!(wasm_xshard_pmm_hardening_active_at(11));
+        assert!(wasm_xshard_pmm_hardening_active_at(u64::MAX));
     }
 }

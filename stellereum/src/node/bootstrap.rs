@@ -1433,6 +1433,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 for ap in &persists {
                     let outcome =
                         stellereum::storage::wait_for_persist_drain(|| ap.pending()).await;
+                    let _ = ap.storage().flush();
                     if outcome.drained {
                         eprintln!("[storage] persistence drained; exiting");
                     } else {

@@ -1688,6 +1688,7 @@ async fn walk_chain_once_with_lanes(
                 }
             }
             ap.enqueue_block(b);
+            ap.enqueue_finalized(applied_height, bh);
         }
         // Fail fast on divergence: the NEXT block in this same validated chain
         // commits to the state our apply must have produced. Without this, a
@@ -1708,6 +1709,9 @@ async fn walk_chain_once_with_lanes(
                 return None;
             }
         }
+    }
+    if let Some(ap) = persist {
+        ap.request_flush();
     }
     // Re-anchor consensus on the WALKED height with FRESH round state (never the
     // advertised height, which `walked_head_anchor` proved equal in any case).

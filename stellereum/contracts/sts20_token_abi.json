@@ -1,0 +1,73 @@
+{
+  "methods": [
+    {
+      "name": "init",
+      "params": [{ "name": "initial_supply", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": true
+    },
+    {
+      "name": "total_supply",
+      "params": [{ "name": "dummy", "type": "i64" }],
+      "returns": "u64",
+      "mutates_state": false
+    },
+    {
+      "name": "balance_of",
+      "params": [{ "name": "account_id", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": false
+    },
+    {
+      "name": "set_tax",
+      "params": [{ "name": "tax_bps", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": true
+    },
+    {
+      "name": "transfer_direct",
+      "params": [
+        { "name": "from_id", "type": "u64" },
+        { "name": "to_id", "type": "u64" },
+        { "name": "amount", "type": "u64" }
+      ],
+      "returns": "u64",
+      "mutates_state": true
+    },
+    {
+      "name": "transfer",
+      "params": [{ "name": "packed", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": true
+    },
+    {
+      "name": "burn",
+      "params": [{ "name": "amount", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": true
+    },
+    {
+      "name": "mint",
+      "params": [{ "name": "amount", "type": "u64" }],
+      "returns": "u64",
+      "mutates_state": true
+    }
+  ],
+  "events": [
+    {
+      "name": "Transfer",
+      "topics": [{ "name": "amount", "type": "u64" }],
+      "data": []
+    },
+    {
+      "name": "Mint",
+      "topics": [{ "name": "amount", "type": "u64" }],
+      "data": []
+    },
+    {
+      "name": "Burn",
+      "topics": [{ "name": "amount", "type": "u64" }],
+      "data": []
+    }
+  ]
+}

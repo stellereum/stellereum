@@ -1,0 +1,729 @@
+//! On-chain contract SOURCE VERIFICATION (audit P2 item 15).
+//!
+//! The explorer serves decoded events and contract pages, but nothing proves
+//! that a deployed WASM blob was compiled from a claimed source. This module
+//! is the practical, Sourcify-style answer for a `.wat`-canonical chain:
+//!
+//! * the canonical source form is the `.wat` TEXT (the repo already ships
+//!   `.wat` contracts under `contracts/`, and deploys compile them with the
+//!   [`wat`] crate — the same pipeline verification re-runs);
+//! * the deterministic build fingerprint is `source_hash = BLAKE3(source_text)`;
+//! * verification recompiles the claimed source with the deploy-time pipeline,
+//!   hashes the rebuilt bytecode and compares it to the on-chain `code_hash`;
+//! * verification is strictly READ-ONLY: it never mutates state. The only
+//!   mutation is the optional `source_hash` registration, which is an
+//!   explicit, creator-signed action
+//!   ([`verify_register_signature`]/`stell_registerContractSource`) AND
+//!   requires the same rebuild ([`verify_registration`]): the signature only
+//!   proves the creator chose the fingerprint, the rebuild proves the
+//!   fingerprint is the deployed code. A hash-only claim is never verified.
+//!
+//! # Trust model (what "verified" actually proves)
+//!
+//! `verified == true` proves exactly this, and nothing more:
+//!
+//! 1. the bytes the node has on-chain for this contract are byte-identical to
+//!    what the CURRENT node build of the [`wat`] compiler produces from the
+//!    submitted source text with the claimed flags;
+//! 2. `source_hash` is the BLAKE3 digest of exactly that source text.
+//!
+//! It does NOT prove: that the source is safe to interact with (a verified
+//! backdoor is still a backdoor); that the source matches any OTHER compiler
+//! version (the claimed `compiler` MUST name this pipeline — anything else is
+//! REFUSED, fail-closed); that the contract behaved honestly in the past; or
+//! that the on-chain bytecode was built with honest flags (flags outside the
+//! allowlist are REFUSED because `wat::parse_str` has no flag surface to
+//! reproduce them with).
+//!
+//! Like Sourcify/NEAR/MultiversX verification, this is a transparency claim,
+//! not a safety certificate.
+
+use serde::{Deserialize, Serialize};
+
+/// Maximum accepted source text (1 MiB — same order as [`crate::contract::MAX_CONTRACT_CODE_SIZE`]).
+pub const MAX_CONTRACT_SOURCE_SIZE: usize = 1024 * 1024;
+
+/// Compilers this node can reproduce. The node compiles with the [`wat`]
+/// crate — the same pipeline used at deploy time — so only claims naming
+/// that pipeline are answerable. Anything else is REFUSED (`verified: false`),
+/// never guessed.
+pub const SUPPORTED_COMPILER_NAMES: &[&str] =
+    &["wat-1.0", "wat2wasm-1.0", "wat", "wat2wasm", "wast-1.0"];
+
+/// Compiler flags this node can reproduce. `wat::parse_str` has no flag
+/// surface (canonical encoding, always), so only the no-op spellings are
+/// accepted; anything else is REFUSED because the node could not have
+/// reproduced that build.
+pub const SUPPORTED_COMPILER_FLAGS: &[&str] = &["", "default", "canonical", "--canonical"];
+
+/// Domain separation for the source-registration signature (see
+/// [`register_message`]).
+pub const REGISTER_SOURCE_DOMAIN: &[u8] = b"STELL_REGISTER_SOURCE";
+
+/// Outcome of [`verify_source_for_code_hash`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerification {
+    pub verified: bool,
+    pub onchain_code_hash: String,
+    pub rebuilt_code_hash: String,
+    pub source_hash: String,
+    pub compiler: String,
+    pub compiler_flags: String,
+    /// Machine-readable refusal reason when `verified == false`
+    /// (`"ok"` when verified).
+    pub reason: String,
+}
+
+impl SourceVerification {
+    fn refused(
+        onchain: &[u8; 32],
+        rebuilt: Option<&[u8; 32]>,
+        source_hash: [u8; 32],
+        compiler: &str,
+        flags: &str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            verified: false,
+            onchain_code_hash: hex::encode(onchain),
+            rebuilt_code_hash: rebuilt.map(hex::encode).unwrap_or_default(),
+            source_hash: hex::encode(source_hash),
+            compiler: compiler.to_string(),
+            compiler_flags: flags.to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// `source_hash = BLAKE3(source_text)` — the deterministic build fingerprint.
+#[inline]
+pub fn source_hash(source_text: &[u8]) -> [u8; 32] {
+    *blake3::hash(source_text).as_bytes()
+}
+
+/// Compile `.wat` source text with the deploy-time pipeline.
+pub fn compile_wat_source(source_text: &str) -> Result<Vec<u8>, String> {
+    wat::parse_str(source_text).map_err(|e| format!("source does not compile with wat: {e}"))
+}
+
+/// BLAKE3 of bytecode (the deterministic-deploy code-hash algorithm).
+#[inline]
+pub fn code_hash_blake3(code: &[u8]) -> [u8; 32] {
+    *blake3::hash(code).as_bytes()
+}
+
+/// SHA-256 of bytecode (the legacy `ContractRegistry::deploy` code-hash algorithm).
+#[inline]
+pub fn code_hash_sha256(code: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(code).into()
+}
+
+/// True when `compiler` names the pipeline this node can reproduce.
+pub fn is_supported_compiler(compiler: &str) -> bool {
+    let norm = compiler.trim().to_ascii_lowercase();
+    SUPPORTED_COMPILER_NAMES.iter().any(|c| *c == norm)
+}
+
+/// True when `flags` name a build this node can reproduce.
+pub fn is_supported_flags(flags: &str) -> bool {
+    let norm = flags.trim().to_ascii_lowercase();
+    SUPPORTED_COMPILER_FLAGS.iter().any(|f| *f == norm)
+}
+
+/// Decode the source-text bytes from the RPC/indexer parameters.
+///
+/// * `source` — the `.wat` text inline;
+/// * `source_hex` — hex (`0x`-prefixed or bare) of the UTF-8 `.wat` text.
+///
+/// Returns the raw source bytes (still to be UTF-8-checked by the caller).
+pub fn decode_source_bytes(
+    source: Option<&str>,
+    source_hex: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if let Some(hex_text) = source_hex {
+        let clean = hex_text
+            .trim()
+            .strip_prefix("0x")
+            .or_else(|| hex_text.trim().strip_prefix("0X"))
+            .unwrap_or(hex_text.trim());
+        if clean.is_empty() || clean.len() % 2 != 0 {
+            return Err("invalid source_hex: expected even-length hex".to_string());
+        }
+        let bytes = hex::decode(clean).map_err(|e| format!("invalid source_hex: {e}"))?;
+        if bytes.is_empty() {
+            return Err("empty source".to_string());
+        }
+        if bytes.len() > MAX_CONTRACT_SOURCE_SIZE {
+            return Err(format!(
+                "source too large: {} bytes (max {MAX_CONTRACT_SOURCE_SIZE})",
+                bytes.len()
+            ));
+        }
+        return Ok(bytes);
+    }
+    match source {
+        Some(text) => {
+            if text.is_empty() {
+                return Err("empty source".to_string());
+            }
+            if text.len() > MAX_CONTRACT_SOURCE_SIZE {
+                return Err(format!(
+                    "source too large: {} bytes (max {MAX_CONTRACT_SOURCE_SIZE})",
+                    text.len()
+                ));
+            }
+            Ok(text.as_bytes().to_vec())
+        }
+        None => Err("missing source: provide 'source' (wat text) or 'source_hex'".to_string()),
+    }
+}
+
+/// Verify claimed `.wat` source against an on-chain code hash.
+///
+/// Pure and read-only: compiles `source_text` with the deploy-time pipeline
+/// and compares the rebuilt bytecode hash against `onchain_code_hash`. Both
+/// historical code-hash algorithms are accepted (BLAKE3 for deterministic
+/// deploys, SHA-256 for legacy `deploy`), because the stored hash — not a
+/// recomputation — is the ground truth.
+pub fn verify_source_for_code_hash(
+    onchain_code_hash: &[u8; 32],
+    source_text: &[u8],
+    compiler: &str,
+    compiler_flags: &str,
+) -> SourceVerification {
+    let shash = source_hash(source_text);
+    if !is_supported_compiler(compiler) {
+        return SourceVerification::refused(
+            onchain_code_hash,
+            None,
+            shash,
+            compiler,
+            compiler_flags,
+            format!(
+                "unsupported compiler '{compiler}': this node reproduces only {SUPPORTED_COMPILER_NAMES:?}"
+            ),
+        );
+    }
+    if !is_supported_flags(compiler_flags) {
+        return SourceVerification::refused(
+            onchain_code_hash,
+            None,
+            shash,
+            compiler,
+            compiler_flags,
+            format!(
+                "unsupported compiler_flags '{compiler_flags}': this node reproduces only {SUPPORTED_COMPILER_FLAGS:?}"
+            ),
+        );
+    }
+    let text = match std::str::from_utf8(source_text) {
+        Ok(t) => t,
+        Err(_) => {
+            return SourceVerification::refused(
+                onchain_code_hash,
+                None,
+                shash,
+                compiler,
+                compiler_flags,
+                "source is not valid UTF-8 wat text",
+            )
+        }
+    };
+    let rebuilt = match compile_wat_source(text) {
+        Ok(b) => b,
+        Err(e) => {
+            return SourceVerification::refused(
+                onchain_code_hash,
+                None,
+                shash,
+                compiler,
+                compiler_flags,
+                e,
+            )
+        }
+    };
+    let rebuilt_blake3 = code_hash_blake3(&rebuilt);
+    let rebuilt_sha256 = code_hash_sha256(&rebuilt);
+    // The stored hash is ground truth; accept either historical algorithm so
+    // contracts from both deploy paths verify.
+    let matched = if rebuilt_blake3 == *onchain_code_hash {
+        Some(rebuilt_blake3)
+    } else if rebuilt_sha256 == *onchain_code_hash {
+        Some(rebuilt_sha256)
+    } else {
+        None
+    };
+    match matched {
+        Some(m) => SourceVerification {
+            verified: true,
+            onchain_code_hash: hex::encode(onchain_code_hash),
+            rebuilt_code_hash: hex::encode(m),
+            source_hash: hex::encode(shash),
+            compiler: compiler.to_string(),
+            compiler_flags: compiler_flags.to_string(),
+            reason: "ok".to_string(),
+        },
+        None => SourceVerification::refused(
+            onchain_code_hash,
+            Some(&rebuilt_blake3),
+            shash,
+            compiler,
+            compiler_flags,
+            "rebuilt bytecode hash does not match the on-chain code hash",
+        ),
+    }
+}
+
+/// Verify a source REGISTRATION claim end to end.
+///
+/// A creator signature over `(contract, source_hash)` proves only that the
+/// creator chose a fingerprint — it does not prove the fingerprint describes
+/// the deployed code. This function adds the missing half:
+///
+/// 1. `claimed_source_hash` MUST be [`source_hash`] of exactly `source_text`
+///    (otherwise the signed claim authorizes a different source than the one
+///    being registered);
+/// 2. `source_text` MUST rebuild to the deployed `onchain_code_hash`
+///    ([`verify_source_for_code_hash`]).
+///
+/// Returns the [`SourceVerification`] on success (`verified == true`). An
+/// `Err` is a claim mismatch — the request itself is inconsistent — while
+/// `Ok(v)` with `v.verified == false` is a failed rebuild, which callers MUST
+/// refuse to register (a hash claim is never verification).
+pub fn verify_registration(
+    onchain_code_hash: &[u8; 32],
+    source_text: &[u8],
+    claimed_source_hash: &[u8; 32],
+    compiler: &str,
+    compiler_flags: &str,
+) -> Result<SourceVerification, String> {
+    let actual = source_hash(source_text);
+    if actual != *claimed_source_hash {
+        return Err(format!(
+            "source_hash does not match the submitted source: claimed {}, rebuilt-from-text {}",
+            hex::encode(claimed_source_hash),
+            hex::encode(actual)
+        ));
+    }
+    Ok(verify_source_for_code_hash(
+        onchain_code_hash,
+        source_text,
+        compiler,
+        compiler_flags,
+    ))
+}
+
+/// The bytes the contract creator signs to register a source hash:
+/// `b"STELL_REGISTER_SOURCE" || contract || source_hash`.
+pub fn register_message(contract: &[u8; 32], source_hash: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(REGISTER_SOURCE_DOMAIN.len() + 64);
+    m.extend_from_slice(REGISTER_SOURCE_DOMAIN);
+    m.extend_from_slice(contract);
+    m.extend_from_slice(source_hash);
+    m
+}
+
+fn strip_hex_prefix(s: &str) -> &str {
+    let trimmed = s.trim();
+    trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed)
+}
+
+fn verify_pq_register_sig(
+    scheme: crate::post_quantum::PqScheme,
+    pk: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), String> {
+    let ok = if scheme == crate::post_quantum::PqScheme::Falcon512 {
+        crate::consensus::verify_falcon_signature(pk, msg, sig)
+    } else {
+        crate::post_quantum::verify_pq_signature(scheme, pk, msg, sig)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("signature does not verify against the contract creator".to_string())
+    }
+}
+
+/// Verify the creator's signature authorising a `source_hash` registration.
+///
+/// Supports post-quantum Falcon-512 / Hybrid signatures (a `PQ1` envelope —
+/// explicit or implicit via the global PQ key registry — raw `pubkey || sig`,
+/// or a raw 666-byte Falcon signature with implicit/explicit key lookup).
+/// The legacy 64-byte Ed25519 branch is REMOVED: such a signature is refused
+/// with an explicit migration error (never accepted, never guessed).
+pub fn verify_register_signature(
+    creator: &[u8; 32],
+    contract: &[u8; 32],
+    source_hash: &[u8; 32],
+    signature_hex: &str,
+) -> Result<(), String> {
+    verify_register_signature_with_pubkey(creator, contract, source_hash, signature_hex, None)
+}
+
+/// Same as [`verify_register_signature`], optionally accepting an explicit
+/// Falcon-512 public key hex string (for callers supplying raw 666-byte
+/// Falcon signatures without wrapping them in a `PQ1` envelope).
+pub fn verify_register_signature_with_pubkey(
+    creator: &[u8; 32],
+    contract: &[u8; 32],
+    source_hash: &[u8; 32],
+    signature_hex: &str,
+    pubkey_hex: Option<&str>,
+) -> Result<(), String> {
+    use crate::post_quantum::{
+        derive_pq_address, PqScheme, DEFAULT_SALT, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+    };
+
+    let bytes = hex::decode(strip_hex_prefix(signature_hex))
+        .map_err(|e| format!("invalid signature hex: {e}"))?;
+    let msg = register_message(contract, source_hash);
+
+    if let Some(pk_hex) = pubkey_hex {
+        let pk = hex::decode(strip_hex_prefix(pk_hex))
+            .map_err(|e| format!("invalid pubkey hex: {e}"))?;
+        if pk.len() != FALCON512_PUBKEY_LEN {
+            return Err(format!(
+                "invalid pubkey length: expected {FALCON512_PUBKEY_LEN}, got {}",
+                pk.len()
+            ));
+        }
+        let derived = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        if derived != *creator {
+            return Err("creator address does not match Falcon-512 public key".to_string());
+        }
+        if bytes.starts_with(b"PQ1") {
+            let env = crate::sharding::PqSignatureEnvelope::decode(&bytes)?;
+            if !env.scheme.is_post_quantum() {
+                return Err("non-PQ scheme refused in PQ1 envelope".to_string());
+            }
+            if let Some(ref epk) = env.pubkey {
+                if epk.as_slice() != pk.as_slice() {
+                    return Err("PQ1 envelope public key mismatches pubkey parameter".to_string());
+                }
+                if derive_pq_address(env.scheme, epk, &env.salt) != *creator {
+                    return Err("creator address does not match PQ1 public key".to_string());
+                }
+            }
+            return verify_pq_register_sig(env.scheme, &pk, &msg, &env.signature_bytes);
+        }
+        if bytes.len() != FALCON512_SIG_LEN {
+            return Err(format!(
+                "invalid Falcon-512 signature: expected {FALCON512_SIG_LEN} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        return verify_pq_register_sig(PqScheme::Falcon512, &pk, &msg, &bytes);
+    }
+
+    if bytes.starts_with(b"PQ1") {
+        let env = crate::sharding::PqSignatureEnvelope::decode(&bytes)?;
+        if !env.scheme.is_post_quantum() {
+            return Err("non-PQ scheme refused in PQ1 envelope".to_string());
+        }
+        if env.signature_bytes.len() != env.scheme.signature_size() {
+            return Err(format!(
+                "invalid PQ signature length for {}: expected {}, got {}",
+                env.scheme.name(),
+                env.scheme.signature_size(),
+                env.signature_bytes.len()
+            ));
+        }
+        if !env.is_implicit {
+            let pk = env
+                .pubkey
+                .as_deref()
+                .ok_or_else(|| "missing public key in explicit PQ1 envelope".to_string())?;
+            if pk.len() != env.scheme.pubkey_size() {
+                return Err(format!(
+                    "invalid PQ public key length for {}: expected {}, got {}",
+                    env.scheme.name(),
+                    env.scheme.pubkey_size(),
+                    pk.len()
+                ));
+            }
+            let derived = derive_pq_address(env.scheme, pk, &env.salt);
+            if derived != *creator {
+                return Err("creator address does not match PQ1 public key".to_string());
+            }
+            return verify_pq_register_sig(env.scheme, pk, &msg, &env.signature_bytes);
+        } else {
+            let (scheme, pk) = crate::sharding::Transaction::global_implicit_registry()
+                .lookup(creator)
+                .ok_or_else(|| {
+                    "implicit PQ1 signature requires a registered creator public key".to_string()
+                })?;
+            if scheme != env.scheme {
+                return Err("implicit PQ1 scheme does not match registered creator key".to_string());
+            }
+            return verify_pq_register_sig(scheme, &pk, &msg, &env.signature_bytes);
+        }
+    }
+
+    if bytes.len() == FALCON512_PUBKEY_LEN + FALCON512_SIG_LEN {
+        let (pk, sig) = bytes.split_at(FALCON512_PUBKEY_LEN);
+        let derived = derive_pq_address(PqScheme::Falcon512, pk, &DEFAULT_SALT);
+        if derived != *creator {
+            return Err("creator address does not match Falcon-512 public key".to_string());
+        }
+        return verify_pq_register_sig(PqScheme::Falcon512, pk, &msg, sig);
+    }
+
+    if bytes.len() == FALCON512_SIG_LEN {
+        let (scheme, pk) = crate::sharding::Transaction::global_implicit_registry()
+            .lookup(creator)
+            .ok_or_else(|| {
+                "raw Falcon-512 signature requires pubkey parameter or registered creator key"
+                    .to_string()
+            })?;
+        if scheme != PqScheme::Falcon512 {
+            return Err("registered creator key is not Falcon-512".to_string());
+        }
+        return verify_pq_register_sig(scheme, &pk, &msg, &bytes);
+    }
+
+    if bytes.len() == 64 {
+        return Err(
+            "legacy 64-byte Ed25519 registration signatures are REMOVED: sign the \
+             registration with Falcon-512 (PQ1 envelope, or pubkey||signature)"
+                .to_string(),
+        );
+    }
+
+    Err("invalid signature: expected PQ1 envelope, Falcon-512 pubkey+signature, or Falcon-512 signature".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contract::ContractRegistry;
+
+    const KNOWN_WAT: &str = r#"(module
+      (import "host" "sload" (func $sload (param i64) (result i64)))
+      (import "host" "sstore" (func $sstore (param i64 i64)))
+      (import "host" "emit" (func $emit (param i64 i64)))
+      (func (export "get") (param i64) (result i64) (call $sload (i64.const 0)))
+      (func (export "set") (param i64) (result i64)
+        (call $sstore (i64.const 0) (local.get 0)) (local.get 0))
+    )"#;
+
+    fn deploy_known() -> (ContractRegistry, [u8; 32]) {
+        let wasm = compile_wat_source(KNOWN_WAT).expect("known wat compiles");
+        let mut reg = ContractRegistry::new();
+        let addr = reg.deploy([7u8; 32], wasm, 1).expect("deploy");
+        (reg, addr)
+    }
+
+    #[test]
+    fn known_wat_source_verifies() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        let v = verify_source_for_code_hash(
+            &c.code_hash,
+            KNOWN_WAT.as_bytes(),
+            "wat2wasm-1.0",
+            "default",
+        );
+        assert!(v.verified, "known source must verify: {}", v.reason);
+        assert_eq!(
+            v.source_hash,
+            hex::encode(source_hash(KNOWN_WAT.as_bytes()))
+        );
+        assert_eq!(v.onchain_code_hash, hex::encode(c.code_hash));
+        assert_eq!(v.reason, "ok");
+    }
+
+    #[test]
+    fn tampered_source_is_refused() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        let tampered = KNOWN_WAT.replace("i64.const 0", "i64.const 1");
+        assert_ne!(tampered, KNOWN_WAT);
+        let v = verify_source_for_code_hash(&c.code_hash, tampered.as_bytes(), "wat2wasm-1.0", "");
+        assert!(!v.verified, "tampered source must NOT verify");
+        assert!(v.reason.contains("does not match"));
+    }
+
+    #[test]
+    fn wrong_compiler_claim_is_refused() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        for compiler in ["solc-0.8.24", "rustc-1.75", "tinygo-0.30", ""] {
+            let v = verify_source_for_code_hash(&c.code_hash, KNOWN_WAT.as_bytes(), compiler, "");
+            assert!(!v.verified, "compiler '{compiler}' must be refused");
+            assert!(v.reason.contains("unsupported compiler"), "{}", v.reason);
+        }
+    }
+
+    #[test]
+    fn unknown_flags_are_refused() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        let v = verify_source_for_code_hash(
+            &c.code_hash,
+            KNOWN_WAT.as_bytes(),
+            "wat2wasm-1.0",
+            "-O3 --fake-flag",
+        );
+        assert!(!v.verified);
+        assert!(
+            v.reason.contains("unsupported compiler_flags"),
+            "{}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn garbage_source_is_refused_not_accepted() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        let v = verify_source_for_code_hash(
+            &c.code_hash,
+            b"(module this is not valid wat ((( ",
+            "wat",
+            "",
+        );
+        assert!(!v.verified);
+        assert!(v.reason.contains("does not compile"), "{}", v.reason);
+    }
+
+    #[test]
+    fn source_hash_is_deterministic_fingerprint() {
+        assert_eq!(source_hash(b"a"), source_hash(b"a"));
+        assert_ne!(source_hash(b"a"), source_hash(b"b"));
+        assert_eq!(source_hash(b"a").len(), 32);
+    }
+
+    #[test]
+    fn registration_requires_the_claimed_hash_to_be_the_submitted_text() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        // The signed claim names the digest of OTHER text: refused outright —
+        // the signature would authorise a source that is not being registered.
+        let claimed = source_hash(b"some other source");
+        let err = verify_registration(&c.code_hash, KNOWN_WAT.as_bytes(), &claimed, "wat", "")
+            .expect_err("a mismatched claim must be refused");
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn registration_verifies_only_a_source_that_rebuilds_to_the_code() {
+        let (reg, addr) = deploy_known();
+        let c = reg.get(&addr).expect("contract");
+        // Honest source: hash matches the text AND the rebuild matches.
+        let honest_hash = source_hash(KNOWN_WAT.as_bytes());
+        let v = verify_registration(&c.code_hash, KNOWN_WAT.as_bytes(), &honest_hash, "wat", "")
+            .expect("claim is consistent");
+        assert!(v.verified, "honest registration verifies: {}", v.reason);
+
+        // Benign, unrelated source: its own hash matches the text, but the
+        // rebuild does NOT match the deployed code — `verified: false`, so a
+        // caller must refuse to register it (F7).
+        let unrelated =
+            "(module (memory (export \"memory\") 1) (func (export \"safe\") (result i64) (i64.const 1)))";
+        let unrelated_hash = source_hash(unrelated.as_bytes());
+        let v = verify_registration(
+            &c.code_hash,
+            unrelated.as_bytes(),
+            &unrelated_hash,
+            "wat",
+            "",
+        )
+        .expect("claim is internally consistent");
+        assert!(!v.verified, "an unrelated source must NOT verify");
+        assert!(v.reason.contains("does not match"), "{}", v.reason);
+    }
+
+    #[test]
+    fn register_signature_round_trip() {
+        // INVERTED (FULL-PQ): a GENUINE 64-byte Ed25519 registration
+        // signature — valid under the old creator-key rule — is REFUSED with
+        // the explicit removal error. Classical signatures never register
+        // contract source any more.
+        use ed25519_dalek::Signer;
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let creator = sk.verifying_key().to_bytes();
+        let contract = [1u8; 32];
+        let shash = source_hash(b"src");
+        let sig = sk.sign(&register_message(&contract, &shash));
+        let err =
+            verify_register_signature(&creator, &contract, &shash, &hex::encode(sig.to_bytes()))
+                .expect_err("a 64-byte classical registration signature must be refused");
+        assert!(err.contains("REMOVED"), "{err}");
+        assert!(err.contains("Falcon-512"), "{err}");
+    }
+
+    #[test]
+    fn pq_falcon512_register_signature_round_trip() {
+        use crate::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+        use crate::sharding::{PqSignatureEnvelope, Transaction};
+
+        let kp = FalconKeypair::generate_from_seed(0x4A);
+        let creator = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+        let contract = [3u8; 32];
+        let shash = source_hash(b"pq-src");
+        let msg = register_message(&contract, &shash);
+        let sig = kp.sign(&msg);
+
+        // 1. Explicit PQ1 envelope
+        let explicit_env = PqSignatureEnvelope::new_explicit(
+            PqScheme::Falcon512,
+            kp.public_key.clone(),
+            sig.clone(),
+        )
+        .encode();
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&explicit_env))
+            .expect("explicit PQ1 registration signature verifies");
+
+        // Wrong creator is refused.
+        assert!(verify_register_signature(
+            &[9u8; 32],
+            &contract,
+            &shash,
+            &hex::encode(&explicit_env)
+        )
+        .is_err());
+
+        // Wrong contract is refused.
+        assert!(verify_register_signature(
+            &creator,
+            &[4u8; 32],
+            &shash,
+            &hex::encode(&explicit_env)
+        )
+        .is_err());
+
+        // 2. Raw pubkey || signature
+        let mut combined = kp.public_key.clone();
+        combined.extend_from_slice(&sig);
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&combined))
+            .expect("raw pubkey+sig registration verifies");
+
+        // 3. Raw signature + explicit pubkey parameter
+        verify_register_signature_with_pubkey(
+            &creator,
+            &contract,
+            &shash,
+            &hex::encode(&sig),
+            Some(&hex::encode(&kp.public_key)),
+        )
+        .expect("raw sig with pubkey param verifies");
+
+        // 4. Implicit PQ1 envelope via global implicit registry
+        Transaction::global_implicit_registry()
+            .register(creator, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+            .expect("register creator PQ key");
+        let implicit_env =
+            PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig.clone()).encode();
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&implicit_env))
+            .expect("implicit PQ1 registration signature verifies");
+        verify_register_signature(&creator, &contract, &shash, &hex::encode(&sig))
+            .expect("raw implicit Falcon signature verifies");
+    }
+}

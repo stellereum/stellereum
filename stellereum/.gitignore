@@ -1,0 +1,54 @@
+/target
+/fuzz/target
+/data
+/keys
+/wallet_data
+/wallet_keys
+*.bin
+*.log
+*.tmp
+.env
+
+# docker local volumes
+/docker/data-store
+/docker/keys-store
+docs/handoff/
+
+# Sled/artifacts landing in the repo root when a stray `--help` (or other
+# unknown flag) is passed as a data-dir path. Tracked once by accident.
+/--help/
+/--version/
+
+# --- fuzz decode-corpus (cargo-fuzz / libFuzzer artifacts, binary) ---
+# Explicit per-target list (allowlist style): these are fuzzer-GENERATED
+# inputs for the *_decode harnesses (hex-hash names, a few KB each —
+# verified 2026-10-25: 4427 files, no secrets, no sources). Never
+# blanket-ignore real sources: harness code (fuzz/fuzz_targets/*.rs) and
+# any future seed files stay tracked.
+fuzz/corpus/block_decode/
+fuzz/corpus/cert_envelope_decode/
+fuzz/corpus/consensus_msg_decode/
+fuzz/corpus/evm_raw_tx_decode/
+fuzz/corpus/frame_decode/
+fuzz/corpus/peer_msg_decode/
+fuzz/corpus/transaction_decode/
+fuzz/artifacts/
+# --- open-source hardening (OS1): never publish secrets or local state ---
+*.key
+*.pem
+keys/
+.env*
+env.*
+*handoff*
+*helper*keys*
+node_modules/
+.opencode/
+
+# --- publish: local runtime/state dirs (never commit) ---
+.archive/
+artifacts/
+run/
+tmp/
+node-data/
+data-store/
+chunks/

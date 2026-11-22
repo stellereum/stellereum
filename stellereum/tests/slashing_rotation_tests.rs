@@ -1,0 +1,1175 @@
+//! Agent B: slashing parity (local vs adopt_committed) + validator rotation proofs.
+//!
+//! Context (a): `adopt_committed` mints a fresh `HeightConsensus`, so
+//! `precommit_qc` is `None` and `apply_downtime_slashes` early-returns: NO burn
+//! on the catch-up path while the local path slashes. Context (b): rotation
+//! from the ledger has no live-ish proof.
+//!
+//! Tests 1-2 assert PARITY (same burn / pool debit / root). On the current code
+//! they FAIL and the failure message names what each path skipped. Tests 3-5
+//! prove rotation live and must PASS.
+
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use std::sync::Arc;
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
+use stellereum::runtime::{fund_genesis, ValidatorRuntime};
+use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
+use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::svm::OpCode;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+const BAL: u64 = 10_000_000_000_000;
+
+/// Genesis bond every validator in `cluster()` carries (and the floor every
+/// new bond must clear): bare-MIN bonds are refused.
+fn floor() -> u64 {
+    MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
+}
+
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
+}
+fn vset(ks: &[SigningKey]) -> ValidatorSet {
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
+}
+fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
+    ks.iter().map(|k| k.verifying_key().to_bytes()).collect()
+}
+
+async fn cluster(ks: &[SigningKey]) -> Vec<ValidatorRuntime> {
+    let vs = vset(ks);
+    let fks: Vec<(ValidatorId, FalconKeypair)> = ks
+        .iter()
+        .map(|k| (k.verifying_key().to_bytes(), fk_for(k)))
+        .collect();
+    let mut out = Vec::new();
+    for k in ks {
+        let st = Arc::new(InMemoryStateEngine::new());
+        fund_genesis(&st, &vs, BAL).await;
+        {
+            let mut ledger = st.staking_write().await;
+            let mut pq_reg = st.pq_registry_write().await;
+            for (vid, fk) in &fks {
+                ledger
+                    .validator_pq_keys
+                    .insert(*vid, (PqScheme::Falcon512, fk.public_key.clone()));
+                pq_reg
+                    .adopt_legacy_key_at(*vid, PqScheme::Falcon512, fk.public_key.clone(), 0, true)
+                    .expect("seed pq_registry");
+            }
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
+        out.push(ValidatorRuntime::new(k.clone(), vs.clone(), st, 1));
+    }
+    out
+}
+
+/// FULL-PQ companion for a signer: `falcon_set` derives each Falcon key from
+/// the Ed key's own first byte; re-register it so Falcon-only block/vote
+/// verification sees the key (idempotent).
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
+
+fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
+    let mut b = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: h,
+        prev_hash: prev,
+        state_root: root,
+        transactions: vec![],
+        cross_shard_out: vec![],
+        timestamp: 1_000,
+        proposer: pkey.verifying_key().to_bytes(),
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        mmr_epoch_root: [0u8; 32],
+        cnvrf_v3: None,
+        order_merkle_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        round: 0,
+    };
+    b.sign_block_with_falcon(pkey, &fk_for(pkey));
+    b
+}
+
+fn proposer_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> &'a SigningKey {
+    let want = vs.proposer_for(h, r).expect("non-empty set has a proposer");
+    ks.iter()
+        .find(|k| k.verifying_key().to_bytes() == want)
+        .expect("schedule proposer is one of our keys")
+}
+
+async fn pool_of(st: &Arc<InMemoryStateEngine>) -> u64 {
+    st.get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
+}
+
+/// Preset one engine for the downtime-threshold test: silent validator sits at
+/// `missed = threshold-1` so the NEXT miss fires exactly one slash, and the
+/// staking pool is funded so the pool debit is observable.
+async fn preset_downtime_threshold(st: &Arc<InMemoryStateEngine>, silent: &ValidatorId) {
+    st.credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND)
+        .await
+        .unwrap();
+    let mut l = st.staking_write().await;
+    let rec = l.validators.get_mut(silent).expect("silent must be bonded");
+    rec.missed = stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1;
+    rec.last_downtime_penalty = 0;
+}
+
+// ============================================================================
+// Test 1 — downtime parity: local path vs adopt_committed with a genuine QC
+// ============================================================================
+// ============================================================================
+// Test 1 — downtime parity: local path vs adopt_committed with a genuine QC
+//
+// W10.5 canonical-evidence form: downtime is attributed ONLY from the
+// block-carried `last_qc` (height H-1), on EVERY path, through the same
+// `apply_block_transition` — never from local vote observations. A
+// height-1 block is a genesis child (`last_qc: None`), so height 1
+// attributes nothing on either path; height 2 carries the height-1 QC and
+// BOTH paths must burn, debit and mark identically.
+#[tokio::test]
+async fn test1_downtime_parity_local_vs_adopt() {
+    let (ks, fks) = keys(4);
+    let vs = vset(&ks);
+    let idv = ids(&ks);
+    let silent = idv[3];
+    let signers = [0usize, 1, 2];
+
+    // Two identical engines, silent parked one miss short of the threshold.
+    let mut c1 = cluster(&ks).await;
+    let mut c2 = cluster(&ks).await;
+    preset_downtime_threshold(&c1[0].state, &silent).await;
+    preset_downtime_threshold(&c2[0].state, &silent).await;
+    let root_before_1 = c1[0].state.get_state_root().await;
+    let root_before_2 = c2[0].state.get_state_root().await;
+    assert_eq!(
+        root_before_1, root_before_2,
+        "precondition: engines must start identical"
+    );
+
+    // Block authored by the schedule proposer for (1,0), committing to the live root.
+    let pkey = proposer_key(&ks, &vs, 1, 0).clone();
+    let block1 = mkblock(&pkey, 1, [0u8; 32], root_before_1);
+    let bh1 = block1.compute_hash();
+
+    // Height-1 round on path A (local): 3 honest votes, silent absent.
+    for &i in &signers {
+        c1[0]
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh1),
+            ))
+            .unwrap();
+        c1[0]
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh1),
+            ))
+            .unwrap();
+    }
+    assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh1));
+    let cert1: QuorumCertificate = c1[0].hc.precommit_qc.clone().expect("local QC exists");
+    assert!(cert1.verify(&vs), "precondition: QC must be genuine");
+    c1[0].blocks.insert(bh1, block1.clone());
+    assert_eq!(c1[0].try_finalize().await, Some(bh1));
+    // Path B adopts height 1.
+    assert_eq!(
+        c2[0]
+            .adopt_committed(1, block1.clone(), cert1.clone())
+            .await,
+        Ok(bh1),
+        "precondition: adopt must accept the genuine cert"
+    );
+    // Genesis child: no evidence on either path, so nothing attributed —
+    // identically — and the roots agree.
+    let root_after_1_a = c1[0].state.get_state_root().await;
+    let root_after_1_b = c2[0].state.get_state_root().await;
+    assert_eq!(root_after_1_a, root_after_1_b, "height-1 roots must agree");
+    for (tag, rt) in [("local", &c1[0]), ("adopt", &c2[0])] {
+        assert_eq!(
+            rt.state.staking_read().await.validators[&silent].missed,
+            stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1,
+            "{tag}: with no canonical evidence, the parked streak must be untouched"
+        );
+    }
+
+    // Height 2 carries the height-1 QC as canonical evidence (production
+    // `decided_parent_qc`); the silent validator misses it at the threshold.
+    let pkey2 = proposer_key(&ks, &c1[0].validators, 2, 0).clone();
+    let mut block2 = mkblock(&pkey2, 2, bh1, root_after_1_a);
+    block2.last_qc = Some(cert1.clone());
+    block2.validator_signatures.clear();
+    block2.sign_block_with_falcon(&pkey2, &fk_for(&pkey2));
+    let bh2 = block2.compute_hash();
+    // FULL-PQ: compile the QC through VoteSet so it carries the committee
+    // envelope (a raw signature list has no power at all).
+    let mut cert2_set = VoteSet::new();
+    for &i in &signers {
+        let v = falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2));
+        cert2_set
+            .add(v, &vs, 2, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    let cert2 = cert2_set
+        .certificate_with_parent(Some(bh2), &vs, Some(&bh1))
+        .expect("3-of-4 precommits reach quorum");
+
+    // ---- Local path: run the height-2 round, then try_finalize. ----
+    let burn_before_l = c1[0].state.staking_read().await.total_burned;
+    let pool_before_l = pool_of(&c1[0].state).await;
+    for &i in &signers {
+        c1[0]
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
+            .unwrap();
+        c1[0]
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
+            .unwrap();
+    }
+    assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh2));
+    c1[0].blocks.insert(bh2, block2.clone());
+    let decided = c1[0].try_finalize().await;
+    assert_eq!(
+        decided,
+        Some(bh2),
+        "precondition: local path must finalize height 2"
+    );
+    let burn_local = c1[0].state.staking_read().await.total_burned - burn_before_l;
+    let pool_after_l = pool_of(&c1[0].state).await;
+    let pool_debit_local = pool_before_l.saturating_sub(pool_after_l);
+    let root_local = c1[0].state.get_state_root().await;
+    let missed_local = c1[0].state.staking_read().await.validators[&silent].missed;
+
+    // ---- Catch-up path: adopt height 2 with the genuine decision QC. ----
+    let burn_before_c = c2[0].state.staking_read().await.total_burned;
+    let pool_before_c = pool_of(&c2[0].state).await;
+    let r = c2[0]
+        .adopt_committed(2, block2.clone(), cert2.clone())
+        .await;
+    assert_eq!(
+        r,
+        Ok(bh2),
+        "precondition: adopt must accept the height-2 cert: {r:?}"
+    );
+    let burn_catchup = c2[0].state.staking_read().await.total_burned - burn_before_c;
+    let pool_after_c = pool_of(&c2[0].state).await;
+    let pool_debit_catchup = pool_before_c.saturating_sub(pool_after_c);
+    let root_catchup = c2[0].state.get_state_root().await;
+    let missed_catchup = c2[0]
+        .state
+        .staking_read()
+        .await
+        .validators
+        .get(&silent)
+        .map(|v| v.missed)
+        .unwrap_or(999);
+
+    println!(
+        "[test1] burn local={} catchup={} | pool_debit local={} catchup={} | missed local={} catchup={} | root_local={} root_catchup={}",
+        burn_local,
+        burn_catchup,
+        pool_debit_local,
+        pool_debit_catchup,
+        missed_local,
+        missed_catchup,
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
+    assert!(
+        burn_local > 0,
+        "precondition: the height-2 evidence must slash at the threshold (missed was threshold-1)"
+    );
+    assert_eq!(
+        burn_local, burn_catchup,
+        "DOWNTIME PARITY FAILURE: local path burned {burn_local} from the block-carried last_qc; \
+         catch-up path burned {burn_catchup} — both must attribute the same canonical evidence"
+    );
+    assert_eq!(
+        pool_debit_local, pool_debit_catchup,
+        "DOWNTIME POOL PARITY FAILURE: local debited {pool_debit_local} from STAKING_POOL, catch-up debited {pool_debit_catchup}"
+    );
+    assert_eq!(
+        missed_local, missed_catchup,
+        "DOWNTIME MISS PARITY FAILURE: local marked {missed_local}, catch-up marked {missed_catchup}"
+    );
+    assert_eq!(
+        root_local, root_catchup,
+        "DOWNTIME ROOT PARITY FAILURE: local root {} != catch-up root {} (staking_digest commits missed/last_penalty + pool balance, so a skipped slash splits the chain)",
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
+}
+
+// ============================================================================
+// Test 2 — equivocation parity, same shape
+// ============================================================================
+#[tokio::test]
+async fn test2_equivocation_parity_local_vs_adopt() {
+    let (ks, fks) = keys(4);
+    let vs = vset(&ks);
+    let idv = ids(&ks);
+    let cheater = idv[3];
+    let signers = [0usize, 1, 2];
+
+    let mut c1 = cluster(&ks).await;
+    let mut c2 = cluster(&ks).await;
+    // Fund the pool identically so pool-debit comparison is meaningful (equiv
+    // path currently debits nothing on either path; the point is the burn).
+    for c in [&c1[0], &c2[0]] {
+        c.state
+            .credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND)
+            .await
+            .unwrap();
+    }
+    let root_before_1 = c1[0].state.get_state_root().await;
+    let root_before_2 = c2[0].state.get_state_root().await;
+    assert_eq!(
+        root_before_1, root_before_2,
+        "precondition: identical engines"
+    );
+
+    let pkey = proposer_key(&ks, &vs, 1, 0).clone();
+    let block = mkblock(&pkey, 1, [0u8; 32], root_before_1);
+    let bh = block.compute_hash();
+
+    // ---- Local: honest quorum for bh + a conflicting prevote by the cheater.
+    let burn_before_l = c1[0].state.staking_read().await.total_burned;
+    let pool_before_l = pool_of(&c1[0].state).await;
+    for &i in &signers {
+        c1[0]
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
+    }
+    // Cheater's first prevote (for bh) then conflicting prevote (for 0x99..).
+    let v1 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some(bh));
+    let v2 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
+    c1[0].on_prevote(v1).unwrap();
+    c1[0].on_prevote(v2).unwrap();
+    assert_eq!(
+        c1[0].hc.equivocations().len(),
+        1,
+        "precondition: local node must hold double-vote evidence"
+    );
+    for &i in &signers {
+        c1[0]
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
+    }
+    assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh));
+    let cert = c1[0].hc.precommit_qc.clone().expect("local QC");
+    assert!(cert.verify(&vs), "precondition: genuine QC");
+    c1[0].blocks.insert(bh, block.clone());
+    assert_eq!(c1[0].try_finalize().await, Some(bh));
+    let burn_local = c1[0].state.staking_read().await.total_burned - burn_before_l;
+    let pool_debit_local = pool_before_l.saturating_sub(pool_of(&c1[0].state).await);
+    let root_local = c1[0].state.get_state_root().await;
+    let bond_local = c1[0].state.staking_read().await.validators[&cheater].self_bond;
+
+    // ---- Catch-up: same block + same genuine QC, but no local equiv evidence.
+    let burn_before_c = c2[0].state.staking_read().await.total_burned;
+    let pool_before_c = pool_of(&c2[0].state).await;
+    assert!(
+        c2[0].hc.equivocations().is_empty(),
+        "precondition: catch-up node never saw the conflicting vote"
+    );
+    assert_eq!(
+        c2[0].adopt_committed(1, block.clone(), cert.clone()).await,
+        Ok(bh)
+    );
+    let burn_catchup = c2[0].state.staking_read().await.total_burned - burn_before_c;
+    let pool_debit_catchup = pool_before_c.saturating_sub(pool_of(&c2[0].state).await);
+    let root_catchup = c2[0].state.get_state_root().await;
+    let bond_catchup = c2[0].state.staking_read().await.validators[&cheater].self_bond;
+
+    println!(
+        "[test2] burn local={} catchup={} | bond local={} catchup={} | pool_debit local={} catchup={} | root_local={} root_catchup={}",
+        burn_local,
+        burn_catchup,
+        bond_local,
+        bond_catchup,
+        pool_debit_local,
+        pool_debit_catchup,
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
+    assert!(
+        burn_local == 0,
+        "F4 FIX: equivocation slashing must be absent from the state transition \
+         (evidence is node-local vote gossip, not block content)"
+    );
+    // F4 FIX: equivocation slashing is no longer part of ANY state transition.
+    // The local node still OBSERVED the double-vote (asserted above), but that
+    // observation must not move consensus state, because a catching-up node
+    // never sees it and the two would otherwise commit different state roots for
+    // the same block. Both routes burn nothing and reach the SAME root.
+    assert_eq!(
+        burn_catchup, 0,
+        "F4 FIX: catch-up burns nothing; equivocation is deferred"
+    );
+    assert_eq!(
+        bond_local, MIN_VALIDATOR_BOND,
+        "F4 FIX: local path must NOT slash on local evidence (genesis bonds at bare MIN)"
+    );
+    assert_eq!(
+        bond_catchup, MIN_VALIDATOR_BOND,
+        "F4 FIX: catch-up bond must be untouched (genesis bonds at bare MIN)"
+    );
+    assert_eq!(pool_debit_local, 0, "F4 FIX: no local burn, no pool debit");
+    assert_eq!(
+        pool_debit_catchup, 0,
+        "F4 FIX: no catch-up burn, no pool debit"
+    );
+    assert_eq!(
+        root_local,
+        root_catchup,
+        "F4 PARITY FAILURE: local finalize root {} != adopt root {}. Equivocation \
+         slashing must be a function of block content, not of which votes this \
+         node happened to receive.",
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
+    let _ = (
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
+}
+
+// ============================================================================
+// Test 3 — bond a new validator mid-chain
+// ============================================================================
+#[tokio::test]
+async fn test3_bond_new_validator_mid_chain() {
+    let (ks, fks) = keys(4);
+    let mut nodes = cluster(&ks).await;
+    // Drive one finished height so the bond happens "mid-chain".
+    let vs0 = nodes[0].validators.clone();
+    let pkey0 = proposer_key(&ks, &vs0, 1, 0).clone();
+    let root0 = nodes[0].state.get_state_root().await;
+    let b1 = mkblock(&pkey0, 1, [0u8; 32], root0);
+    let bh1 = b1.compute_hash();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        nodes[0]
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh1),
+            ))
+            .unwrap();
+        nodes[0]
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh1),
+            ))
+            .unwrap();
+    }
+    assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh1));
+    nodes[0].blocks.insert(bh1, b1);
+    assert_eq!(nodes[0].try_finalize().await, Some(bh1));
+    assert_eq!(nodes[0].height(), 2);
+
+    let before = nodes[0].validators.clone();
+    let q_before = before.quorum_power();
+    let p_before = before.proposer_for(2, 0);
+    let len_before = before.len();
+
+    // Bond a brand-new validator through the funded-account path.
+    let new_k = SigningKey::generate(&mut OsRng);
+    let new_id = new_k.verifying_key().to_bytes();
+    nodes[0]
+        .state
+        .update_account(AccountState::new(new_id, 10 * MIN_VALIDATOR_BOND))
+        .await;
+    nodes[0]
+        .stake_bond(new_id, floor(), 0)
+        .await
+        .expect("bond must succeed");
+    // W10.5 ACTIVATION BOUNDARY: a set derived at ledger-height L takes
+    // effect at height L+1, NEVER immediately — the refresh only STAGES the
+    // change, so a round in flight never has its quorum moved under it.
+    // Here L == hc.height == 2, so the change is staged for height 3 and
+    // the in-force set is untouched until this node advances there.
+    let changed = nodes[0].refresh_validator_set_from_staking().await;
+    assert!(changed, "validator set must refresh after the bond");
+    let (activation, _) = nodes[0]
+        .pending_validators
+        .clone()
+        .expect("the rotation must be staged, not installed");
+    assert_eq!(
+        activation, 3,
+        "a change derived at height 2 takes effect at height 3"
+    );
+    assert_eq!(
+        nodes[0].validators.len(),
+        len_before,
+        "the in-force set must not move mid-flight"
+    );
+
+    // Advance one height under the STILL-IN-FORCE old set (all four old
+    // members vote; the newcomer is not yet a member and must not be
+    // needed for quorum).
+    let pkey2 = proposer_key(&ks, &nodes[0].validators, 2, 0).clone();
+    let root2 = nodes[0].state.get_state_root().await;
+    let prev2 = nodes[0]
+        .finalized
+        .last()
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
+    let b2 = mkblock(&pkey2, 2, prev2, root2);
+    let bh2 = b2.compute_hash();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        nodes[0]
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
+            .unwrap();
+        nodes[0]
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
+            .unwrap();
+    }
+    assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
+    nodes[0].blocks.insert(bh2, b2);
+    assert_eq!(nodes[0].try_finalize().await, Some(bh2));
+    assert_eq!(nodes[0].height(), 3);
+
+    // The staged set activates exactly on arrival at height 3.
+    let after = nodes[0].validators.clone();
+    println!(
+        "[test3] len {} -> {} | quorum {} -> {} | proposer(2,0) {:?} -> {:?}",
+        len_before,
+        after.len(),
+        q_before,
+        after.quorum_power(),
+        p_before.map(|p| hex::encode(&p[..4])),
+        after.proposer_for(2, 0).map(|p| hex::encode(&p[..4])),
+    );
+    assert_eq!(
+        after.len(),
+        len_before + 1,
+        "set must gain exactly one member"
+    );
+    assert!(after.contains(&new_id), "new validator must be in the set");
+    assert_ne!(
+        after.quorum_power(),
+        q_before,
+        "quorum_power must update with the new stake"
+    );
+    // The schedule must reflect the new member. Hash-slot draws are
+    // statistical, so probe a wide window: the new key holds ~21.6% of the
+    // power (1.1/5.1), and missing it in 64 draws has probability ~1e-7.
+    // (A 5-height probe flaked ~45% — same class as the finding-5 flake.)
+    let before_seq: Vec<_> = (1..=64u64).map(|h| before.proposer_for(h, 0)).collect();
+    let after_seq: Vec<_> = (1..=64u64).map(|h| after.proposer_for(h, 0)).collect();
+    assert!(
+        after_seq.contains(&Some(new_id)),
+        "new validator must own slots in the new schedule"
+    );
+    assert_ne!(
+        before_seq, after_seq,
+        "adding a member must change the rotation"
+    );
+}
+
+// ============================================================================
+// Test 4 — full unbond drops the validator at the boundary
+// ============================================================================
+#[tokio::test]
+async fn test4_full_unbond_drops_validator_at_boundary() {
+    let (ks, fks) = keys(4);
+    let idv = ids(&ks);
+    let mut nodes = cluster(&ks).await;
+    let victim = idv[0];
+
+    // Full exit of one validator, then the boundary rotation. The fixture is
+    // genesis-bonded at bare MIN (bond_genesis is floor-exempt by design), so
+    // the full exit unbonds MIN, not the runtime floor.
+    nodes[0]
+        .stake_unbond(victim, MIN_VALIDATOR_BOND, 0)
+        .await
+        .expect("full unbond must succeed");
+    // W10.5 ACTIVATION BOUNDARY (see test3): the refresh STAGES the removal
+    // for height H+1 instead of dropping the victim mid-flight. The victim
+    // is still in force for the current height — and must still be counted
+    // for its quorum — until this node advances.
+    assert!(nodes[0].refresh_validator_set_from_staking().await);
+    let (activation, staged) = nodes[0]
+        .pending_validators
+        .clone()
+        .expect("the removal must be staged, not installed");
+    assert_eq!(activation, nodes[0].height() + 1);
+    assert!(
+        !staged.contains(&victim),
+        "the staged set must drop the victim"
+    );
+    assert!(
+        nodes[0].validators.contains(&victim),
+        "the victim stays in force until the boundary"
+    );
+    assert_eq!(nodes[0].validators.len(), 4);
+
+    // Later blocks finalize WITHOUT the dropped validator's vote.
+    let h = nodes[0].height();
+    let r = nodes[0].hc.round;
+    let pkey = proposer_key(&ks, &nodes[0].validators, h, r).clone();
+    // NOTE: the proposer may legitimately BE the victim here: it is still
+    // the scheduled proposer for the in-force (pre-boundary) set, and
+    // authorship is not a vote. What matters is that no vote from it is
+    // needed — only the 3 survivors vote below, and the quorum they form
+    // (3 of 4 in-force power) is what finalizes.
+    let root = nodes[0].state.get_state_root().await;
+    let prev = nodes[0]
+        .finalized
+        .last()
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
+    let blk = mkblock(&pkey, h, prev, root);
+    let bh = blk.compute_hash();
+    // Only the 3 remaining validators vote; the victim is silent/absent.
+    for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
+        nodes[0]
+            .on_prevote(falcon_votes::fvote(
+                k,
+                fk,
+                h,
+                r,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
+    }
+    for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
+        nodes[0]
+            .on_precommit(falcon_votes::fvote(
+                k,
+                fk,
+                h,
+                r,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        nodes[0].hc.try_precommit_quorum(),
+        Some(bh),
+        "remaining 3 must still reach quorum without the dropped validator"
+    );
+    nodes[0].blocks.insert(bh, blk);
+    let fin = nodes[0].try_finalize().await;
+    println!(
+        "[test4] finalized height {h} without victim vote: {:?}",
+        fin.map(|x| hex::encode(&x[..4]))
+    );
+    assert_eq!(
+        fin,
+        Some(bh),
+        "later block must finalize without the victim"
+    );
+    assert!(!nodes[0].validators.contains(&victim), "victim stays out");
+}
+
+// ============================================================================
+// Test 5 — downtime slash below MIN drops the validator, remainder quorate
+// ============================================================================
+#[tokio::test]
+async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
+    let (ks, fks) = keys(4);
+    let vs = vset(&ks);
+    let idv = ids(&ks);
+    let victim = idv[3];
+    let mut nodes = cluster(&ks).await;
+    nodes[0]
+        .state
+        .credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND)
+        .await
+        .unwrap();
+    // Victim sits exactly at MIN with a 9-miss streak: the next miss ejects it.
+    {
+        let mut l = nodes[0].state.staking_write().await;
+        let rec = l.validators.get_mut(&victim).expect("victim bonded");
+        rec.self_bond = MIN_VALIDATOR_BOND;
+        rec.missed = stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1;
+        rec.last_downtime_penalty = 0;
+    }
+
+    let pkey = proposer_key(&ks, &vs, 1, 0).clone();
+    let root = nodes[0].state.get_state_root().await;
+    let blk = mkblock(&pkey, 1, [0u8; 32], root);
+    let bh = blk.compute_hash();
+    for &i in &[0usize, 1, 2] {
+        nodes[0]
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
+        nodes[0]
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
+    }
+    assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
+    let cert1 = nodes[0]
+        .hc
+        .precommit_qc
+        .clone()
+        .expect("height-1 QC exists");
+    nodes[0].blocks.insert(bh, blk);
+    assert_eq!(
+        nodes[0].try_finalize().await,
+        Some(bh),
+        "height 1 must finalize on the 3 honest votes"
+    );
+    // Genesis child: no canonical evidence, so no attribution yet — the
+    // victim survives height 1 with its streak intact.
+    assert_eq!(
+        nodes[0].state.staking_read().await.validators[&victim].missed,
+        stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1
+    );
+
+    // Height 2 carries the height-1 QC as canonical evidence
+    // (`decided_parent_qc`): the victim misses it at the threshold, the
+    // 0.1% slash fires, and the bare-MIN bond drops below the minimum.
+    let pkey2 = proposer_key(&ks, &nodes[0].validators, 2, 0).clone();
+    let root2 = nodes[0].state.get_state_root().await;
+    let mut blk2 = mkblock(&pkey2, 2, bh, root2);
+    blk2.last_qc = Some(cert1);
+    blk2.validator_signatures.clear();
+    blk2.sign_block_with_falcon(&pkey2, &fk_for(&pkey2));
+    let bh2 = blk2.compute_hash();
+    for &i in &[0usize, 1, 2] {
+        nodes[0]
+            .on_prevote(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Prevote,
+                Some(bh2),
+            ))
+            .unwrap();
+        nodes[0]
+            .on_precommit(falcon_votes::fvote(
+                &ks[i],
+                &fks[i],
+                2,
+                0,
+                VoteKind::Precommit,
+                Some(bh2),
+            ))
+            .unwrap();
+    }
+    assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
+    nodes[0].blocks.insert(bh2, blk2);
+    let fin = nodes[0].try_finalize().await;
+    assert_eq!(
+        fin,
+        Some(bh2),
+        "height 2 must finalize on the 3 honest votes"
+    );
+
+    let bond = nodes[0].state.staking_read().await.validators[&victim].self_bond;
+    println!("[test5] victim bond after slash: {bond} (MIN={MIN_VALIDATOR_BOND})");
+    assert!(
+        bond < MIN_VALIDATOR_BOND,
+        "0.1% slash on exactly-MIN bond must push it below the minimum"
+    );
+    assert!(
+        !nodes[0].validators.contains(&victim),
+        "validator below MIN must be dropped from the set at the boundary"
+    );
+    assert_eq!(nodes[0].validators.len(), 3);
+    let q = nodes[0].validators.quorum_power();
+    let total = nodes[0].validators.total_power();
+    println!("[test5] remainder total={total} quorum={q}");
+    assert_ne!(q, u64::MAX, "remainder must still have a reachable quorum");
+    assert!(total >= q, "remainder must still be quorate");
+
+    // The remainder can still certify: build a QC from the 3 survivors for the
+    // NEXT height and verify it against the post-rotation set.
+    let h2 = nodes[0].height();
+    let bh2 = [0x77u8; 32];
+    let post_vs = nodes[0].validators.clone();
+    // FULL-PQ: the survivor certificate must be the committee envelope, not a
+    // raw signature list (which carries zero power).
+    let mut set = VoteSet::new();
+    for &i in &[0usize, 1, 2] {
+        let v = falcon_votes::fvote(&ks[i], &fks[i], h2, 0, VoteKind::Precommit, Some(bh2));
+        set.add(v, &post_vs, h2, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    let qc = set
+        .certificate(Some(bh2), &post_vs, &[0u8; 32])
+        .expect("survivors reach quorum");
+    // NOTE: post-rotation powers are stake-weighted (MIN each), while the votes
+    // above were checked against power; QC::verify weights by the CURRENT set,
+    // so it must verify with the survivors alone.
+    assert!(
+        qc.verify(&post_vs),
+        "survivor-only QC must verify against the rotated set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pentest F7 regression: a downtime jail has a live, fail-closed exit.
+// ---------------------------------------------------------------------------
+
+/// The ledger's unjail path is reachable for a real downtime jail: refused one
+/// height before `release_height`, accepted exactly at it, and refused again
+/// once the record is gone (missing jail). The same checks gate the live
+/// `SysCallUnjail` carrier (see `tests/pentest_state_wave.rs`), which calls
+/// this primitive with `block.height`.
+#[test]
+fn downtime_jail_release_is_fail_closed_then_reachable() {
+    use stellereum::staking::{
+        StakingLedger, DEFAULT_COMMISSION_BPS, DOWNTIME_MISS_THRESHOLD, JAIL_RELEASE_DELAY_HEIGHTS,
+    };
+    let mut l = StakingLedger::new();
+    let v = [0xF7u8; 32];
+    l.bond(v, 2_000 * 1_000_000_000, DEFAULT_COMMISSION_BPS)
+        .unwrap();
+
+    let mut jailed_at = 0;
+    for h in 0..DOWNTIME_MISS_THRESHOLD as u64 {
+        l.note_missed_heights(h, &|_| false, &[v]);
+        if l.is_jailed(&v) {
+            jailed_at = h;
+        }
+    }
+    let rec = l.jail_record(&v).expect("downtime slash must jail");
+    assert_eq!(rec.jailed_at_height, jailed_at);
+    assert_eq!(rec.release_height, jailed_at + JAIL_RELEASE_DELAY_HEIGHTS);
+
+    // One height early: refused, nothing changes.
+    assert_eq!(
+        l.unjail(v, rec.release_height - 1),
+        Err(stellereum::staking::StakingError::CooldownNotElapsed)
+    );
+    assert!(l.is_jailed(&v));
+    // At the release height: accepted and back in the set.
+    l.unjail(v, rec.release_height).unwrap();
+    assert!(!l.is_jailed(&v));
+    assert!(l.to_validator_set().contains(&v));
+    // Missing jail record: refused (the live carrier surfaces this as a revert).
+    assert_eq!(
+        l.unjail(v, rec.release_height + 1),
+        Err(stellereum::staking::StakingError::NotJailed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pentest F6 regression: an exit recorded in the evidence block is still in
+// the set the NEXT block's `last_qc` is attributed against.
+// ---------------------------------------------------------------------------
+
+/// The ledger records a full exit at height 9 with its PRE-EXIT power.
+/// Applying block 10 with a genuine height-9 QC that verifies only under the
+/// set INCLUDING that power must still slash the exiting validator (0.1% of
+/// the pending unbonding) and jail it. Without the attribution-set fix the
+/// pre-transition set is `{witness}` only, the slash is 0 and no jail exists.
+#[tokio::test]
+async fn recorded_full_exit_is_still_attributed_on_the_block_path() {
+    use stellereum::consensus::VoteSet;
+    use stellereum::staking::{BPS_DENOMINATOR, DOWNTIME_SLASH_BPS, STAKING_POOL};
+
+    let (ks, _fks) = keys(2);
+    let w = ks[0].verifying_key().to_bytes();
+    let v = ks[1].verifying_key().to_bytes();
+    let fk_w = fk_for(&ks[0]);
+
+    let e = InMemoryStateEngine::new();
+    let w_power = 10 * floor();
+    let v_power = 2 * floor();
+    e.staking_write().await.bond(w, w_power, 0).unwrap();
+    e.staking_write().await.bond(v, v_power, 0).unwrap();
+    e.credit_native(&STAKING_POOL, 10 * floor()).await.unwrap();
+    // Victim is one miss short of the threshold.
+    {
+        let mut l = e.staking_write().await;
+        l.validators.get_mut(&v).unwrap().missed = stellereum::staking::DOWNTIME_MISS_THRESHOLD - 1;
+        l.validators.get_mut(&v).unwrap().last_downtime_penalty = 0;
+        // Height 9: the victim FULLY unbonds and the block apply records the
+        // exit with the power it held at height 9's start.
+        l.unbond(v, v_power, 1_000).unwrap();
+        l.record_full_exits_at(&[(v, v_power)], 9);
+    }
+    // Pre-state for block 10 no longer contains the victim; the attribution
+    // set must add it back.
+    let live = e.staking_read().await.to_validator_set();
+    assert!(!live.contains(&v));
+    let mut at_9 = live.clone();
+    at_9.add(v, v_power);
+    assert!(at_9.contains(&v));
+
+    // Genuine height-9 precommit QC signed by the witness alone. It carries
+    // quorum power under `at_9` (witness is >2/3) and NOT under `live`.
+    let vote = falcon_votes::fvote(&ks[0], &fk_w, 9, 0, VoteKind::Precommit, None);
+    assert!(vote.verify());
+    let mut vs = VoteSet::new();
+    vs.add(vote, &at_9, 9, 0, VoteKind::Precommit).unwrap();
+    let qc = vs
+        .certificate_with_parent(None, &at_9, Some(&[0u8; 32]))
+        .expect("witness-alone quorum under the height-9 set");
+    assert!(qc.verify(&at_9));
+    assert!(
+        !qc.verify(&live),
+        "the QC must NOT verify under the post-exit set (proves the fixture)"
+    );
+
+    let root = e.get_state_root().await;
+    let mut blk = mkblock(&ks[0], 10, [0u8; 32], root);
+    blk.last_qc = Some(qc);
+    blk.validator_signatures.clear();
+    blk.sign_block_with_falcon(&ks[0], &fk_for(&ks[0]));
+    let out = e.apply_block_transition(&blk, 0).await;
+
+    let expected = v_power * DOWNTIME_SLASH_BPS / BPS_DENOMINATOR;
+    assert_eq!(out.slashed, expected, "the H-1 miss is attributed");
+    let l = e.staking_read().await;
+    assert_eq!(l.validators[&v].total_slashed, expected);
+    assert_eq!(l.validators[&v].missed, 0, "slash reset the deficit");
+    assert!(l.is_jailed(&v), "the exit cannot escape the jail");
+}
+
+// ---------------------------------------------------------------------------
+// ROTATION ESCAPE (SLASH-01): a rotation applied by the SAME block that
+// carries the downtime evidence must not forgive the miss.
+// ---------------------------------------------------------------------------
+
+fn pq_addr(kp: &FalconKeypair) -> [u8; 32] {
+    derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+}
+
+/// A self-signed PQ transaction that rotates `from` -> `to`. The sender is the
+/// OLD validator's PQ address (the opcode requires `ctx.sender == old`).
+fn rotation_tx(
+    kp: &FalconKeypair,
+    old: [u8; 32],
+    new: [u8; 32],
+    nonce: u64,
+    gas: u64,
+) -> Transaction {
+    let payload = vec![OpCode::SysCallRotateValidatorKey {
+        old_validator: old,
+        new_validator: new,
+    }];
+    let probe = Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        [0xEEu8; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+    );
+    let sig = kp.sign(&probe.signing_message());
+    Transaction::new_pq_explicit(
+        PqScheme::Falcon512,
+        kp.public_key.clone(),
+        sig,
+        [0xEEu8; 32],
+        0,
+        gas,
+        nonce,
+        0,
+        1,
+        payload,
+        &DEFAULT_SALT,
+    )
+}
+
+/// A validator one miss short of the downtime threshold rotates its key in the
+/// very block whose `last_qc` omits it. The evidence names the OLD id; the
+/// rotation has already removed that record. Without the engine's alias map
+/// the ledger lookup misses, burns 0 and the validator escapes the slash (and
+/// can repeat this every height). With it, the miss lands on the NEW record,
+/// which inherited the deficit, and the slash + jail follow the rotated stake.
+#[tokio::test]
+async fn rotation_in_the_evidence_block_cannot_forgive_a_downtime_miss() {
+    struct PqLifecyclePreV7Guard;
+    impl Drop for PqLifecyclePreV7Guard {
+        fn drop(&mut self) {
+            stellereum::pq_registry::set_pq_lifecycle_activation_override(None);
+        }
+    }
+    stellereum::pq_registry::set_pq_lifecycle_activation_override(Some(u64::MAX));
+    let _pre_v7 = PqLifecyclePreV7Guard;
+
+    use stellereum::consensus::VoteSet;
+    use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS};
+
+    let (wsk, wfk) = falcon_votes::falcon_set(1);
+    let witness = wsk[0].verifying_key().to_bytes();
+
+    let silent_kp = FalconKeypair::generate_from_seed(0x61);
+    let fresh_kp = FalconKeypair::generate_from_seed(0x62);
+    let silent = pq_addr(&silent_kp);
+    let fresh = pq_addr(&fresh_kp);
+    assert_ne!(silent, witness);
+    assert_ne!(silent, fresh);
+
+    let e = InMemoryStateEngine::new();
+    let silent_power = floor();
+    let witness_power = 10 * floor();
+    e.staking_write()
+        .await
+        .bond(silent, silent_power, 0)
+        .unwrap();
+    e.staking_write()
+        .await
+        .bond(witness, witness_power, 0)
+        .unwrap();
+    // Back the slash's pool debit and the rotation transaction's fee.
+    e.credit_native(&STAKING_POOL, 11 * floor()).await.unwrap();
+    e.credit_native(&silent, 10_000_000).await.unwrap();
+    {
+        let mut l = e.staking_write().await;
+        let rec = l.validators.get_mut(&silent).unwrap();
+        rec.missed = DOWNTIME_MISS_THRESHOLD - 1;
+        rec.last_downtime_penalty = 0;
+    }
+
+    // The set the height-9 evidence was formed under (the pre-transition set).
+    let at_9 = e.staking_read().await.to_validator_set();
+    assert!(at_9.contains(&silent) && at_9.contains(&witness));
+    let vote = falcon_votes::fvote(&wsk[0], &wfk[0], 9, 0, VoteKind::Precommit, None);
+    assert!(vote.verify());
+    let mut vs = VoteSet::new();
+    vs.add(vote, &at_9, 9, 0, VoteKind::Precommit).unwrap();
+    let qc = vs
+        .certificate_with_parent(None, &at_9, Some(&[0u8; 32]))
+        .expect("witness-alone quorum");
+
+    let root = e.get_state_root().await;
+    let mut blk = mkblock(&wsk[0], 10, [0u8; 32], root);
+    blk.last_qc = Some(qc);
+    blk.transactions = vec![rotation_tx(&silent_kp, silent, fresh, 0, 1_000_000)];
+    blk.order_merkle_root = stellereum::mev::compute_order_merkle_root(&blk.transactions);
+    blk.validator_signatures.clear();
+    blk.sign_block_with_falcon(&wsk[0], &fk_for(&wsk[0]));
+
+    let out = e.apply_block_transition(&blk, 0).await;
+    assert_eq!(
+        out.status,
+        vec![true],
+        "the rotation transaction itself must apply"
+    );
+    let expected = silent_power * DOWNTIME_SLASH_BPS / stellereum::staking::BPS_DENOMINATOR;
+    assert!(
+        out.slashed > 0,
+        "the H-1 miss must not be forgiven by a same-block rotation"
+    );
+    assert_eq!(
+        out.slashed, expected,
+        "the aliased miss burns the pre-slash base"
+    );
+
+    let l = e.staking_read().await;
+    assert!(
+        !l.validators.contains_key(&silent),
+        "the rotation removed the old id (precondition)"
+    );
+    let new_rec = l.validators.get(&fresh).expect("new record exists");
+    assert_eq!(
+        new_rec.missed, 0,
+        "the miss hit the new record and reset it"
+    );
+    assert_eq!(
+        new_rec.total_slashed, expected,
+        "the new record paid the burn"
+    );
+    assert!(l.is_jailed(&fresh), "the jail followed the rotated stake");
+}

@@ -1,0 +1,968 @@
+use super::types::{Height, Round, ValidatorId, ValidatorSet};
+
+/// Consensus-domain quorum floor: `floor(2n/3) + 1` votes (or voting power)
+/// out of `n`.
+///
+/// FREEZE (protocol freeze 2026-11-03): value = BFT safety curve, no env knob
+/// ever existed. Change requires spec update + audit note (AGENTS.md §7).
+///
+/// Domain: PBFT/PQ-BFT finality. It is deliberately NOT the bridge threshold
+/// [`crate::bridge::quorum_threshold`] (`floor((2n+2)/3)`, floored at 1): that
+/// counts DISTINCT signers of an external cross-chain signer set. The two
+/// curves MUST still live in separate functions with separate pins
+/// (`bridge::tests::quorum_formulas_are_pinned_per_domain` pins both value
+/// lists for n = 1..8), but the safety narrative is exactly the paper result
+/// (`papers/01_quorum.md` §3, Theorem 2): under the STRICT threat model
+/// `B_w < W/3` the bridge curve `ceil(2n/3)` is the MINIMUM safe threshold
+/// `t*(n)`, and this consensus curve `floor(2n/3)+1` coincides with it except
+/// at `n % 3 == 0`, where it is exactly one vote MORE conservative. That +1
+/// is a deliberate margin, and it is REQUIRED (not redundant) if the model
+/// ever admits `B_w = n/3` exactly: at `2t - W = 0` the `ceil` curve stops
+/// intersecting honestly (paper §3, Oговорка). So: bridge = exact optimum
+/// under `B < W/3`; consensus = optimum + one-vote margin at `3|n`, kept so
+/// both the strict and the non-strict model stay safe.
+pub fn consensus_quorum_min(n: u64) -> u64 {
+    // Audit F4: u128 arithmetic — `(n*2)` panics in debug / wraps in release
+    // at absurd powers, and saturating would UNDERESTIMATE the quorum
+    // (weakening it). floor(2n/3)+1 always fits u64, computed exactly.
+    ((n as u128 * 2) / 3 + 1) as u64
+}
+
+/// Strict quorum threshold for micro-committee of size k: floor(2*k/3) + 1.
+///
+/// FREEZE (protocol freeze 2026-11-03): same consensus-domain curve as
+/// [`consensus_quorum_min`]. Change requires spec update + audit note.
+///
+/// Same consensus-domain curve as [`consensus_quorum_min`]; a zero-size
+/// committee is unrepresentable as a real threshold, so it fails closed with
+/// `usize::MAX` instead of the formula's 1.
+///
+/// LEGACY head-count curve: kept for wire/backward-compat inspection and
+/// pinned by `bridge::tests::quorum_formulas_are_pinned_per_domain`. Live
+/// µQC VERIFICATION does not gate on this anymore — it sums committee voting
+/// power against [`pq_micro_quorum_power`].
+pub fn pq_micro_quorum_threshold(committee_size: u32) -> usize {
+    if committee_size == 0 {
+        return usize::MAX;
+    }
+    consensus_quorum_min(committee_size as u64) as usize
+}
+
+/// Power-weighted quorum threshold for a micro-committee: `floor(2*W/3) + 1`
+/// over the committee's total voting power `W`.
+///
+/// FREEZE (protocol freeze 2026-11-03): the LIVE µQC rule. Change requires
+/// spec update + audit note (AGENTS.md §7).
+///
+/// This is the LIVE µQC rule (classical BFT accounting applied to the
+/// sortition committee): the verifier sums the powers of the committee
+/// members with valid signatures and requires `>=` this value. A zero-power
+/// committee is unrepresentable as a real threshold, so it fails closed with
+/// `u64::MAX` — exactly like [`ValidatorSet::quorum_power`] for the empty
+/// set — and can never be satisfied.
+pub fn pq_micro_quorum_power(committee_total_power: u64) -> u64 {
+    if committee_total_power == 0 {
+        return u64::MAX;
+    }
+    consensus_quorum_min(committee_total_power)
+}
+
+/// Maximum size of the sortition micro-committee (µQC).
+///
+/// AUDIT W6.5 (committee capture): the cap was hard-coded to `16` in TWO
+/// places (the µQC compiler and the µQC verifier). A single, named constant
+/// removes the fork hazard of the two drifting apart, and the value itself is
+/// raised because a 16-seat committee is a very weak finality target — see
+/// [`micro_committee_size`] and [`pq_micro_required_power`].
+///
+/// 128 seats x 666 B ≈ 85 KB per µQC. The seat count is NOT sized for
+/// bandwidth anymore: it is sized for CAPTURE RESISTANCE. Under the
+/// conservative with-replacement model (`X ~ Bin(k, α)`, `α = 1/3`) the
+/// Chernoff bound `P[X > 2k/3] ≤ exp(−k·D(2/3‖1/3))` with
+/// `D(2/3‖1/3) = (1/3)·ln 2 ≈ 0.2310` gives `k ≥ 105` for `2^-40`
+/// (`papers/01_quorum.md` §5, `results/q_quorum.json`); `k = 128` clears it
+/// with margin (`exp(−128·0.2310) ≈ 1.4e−13 ≈ 2^−42.6`), while `k = 64` only
+/// reached ≈ 2^−25 — NOT cryptographically negligible. Capture alone still
+/// does not grant finality (the network-anchored quorum of
+/// [`pq_micro_required_power`] holds regardless), but a captured committee
+/// can censor/sabotage the fast path, so the seats are cheap insurance.
+pub const MICRO_COMMITTEE_MAX_SIZE: u32 = 128;
+
+/// Size of the µQC sortition committee for a validator set of `n` members.
+///
+/// AUDIT W6.5 — WHY THIS IS NOT A CONSTANT:
+///
+/// The µQC is a *sample* of the validator set, so its finality threshold is
+/// `(2/3) x (the committee's share of the network's stake)`. With a fixed
+/// 16-seat committee and N = 100 uniformly staked validators, the committee
+/// holds only ~16% of the network's stake, so a µQC could be forged by an
+/// attacker holding ~11% of the stake (2/3 of 16%) — a ~6x weakening of the
+/// network's own 2/3 threshold, and a straight break of the "an attacker with
+/// < 1/3 of the stake cannot finalize a block" invariant.
+///
+/// The seat count is therefore raised to 128 (still `min(N, ...)`): capture
+/// resistance, not bandwidth, sizes it — `k = 128` clears the `2^-40` bound
+/// (`k ≥ 105` at `α = 1/3`, `papers/01_quorum.md` §5) with margin, and the
+/// NETWORK-ANCHORED quorum rule ([`pq_micro_required_power`]) then demands
+/// TWO THIRDS of the *network's* stake, not just of the committee's.
+///
+/// While `N <= MICRO_COMMITTEE_MAX_SIZE` the committee IS the whole validator
+/// set (see [`derive_sortition_committee`]): the µQC threshold is then exactly
+/// the network threshold and the two-tier finality is indistinguishable from a
+/// single-tier one. That is the live configuration (N = 4).
+pub fn micro_committee_size(validator_count: usize) -> u32 {
+    validator_count.min(MICRO_COMMITTEE_MAX_SIZE as usize) as u32
+}
+
+/// µQC quorum threshold in voting POWER: the value the signers' summed power
+/// must reach for the certificate to be accepted.
+///
+/// AUDIT W6.5 (committee capture) + P1 (quorum intersection) — the rule is
+///
+/// ```text
+/// required = max( floor(2 * W_committee / 3) + 1,      // the committee's own 2/3
+///                  floor(2 * W_network / 3) + 1 )       // the NETWORK's 2/3 (BFT floor)
+/// ```
+///
+/// The second term is what makes a µQC safe to accept as a FINALITY
+/// certificate on its own. Paper `papers/01_quorum.md` §4, Theorems 1–4: a
+/// threshold `t` is safe against Byzantine weight `B_w` iff `2t − W > B_w`.
+/// The OLD network term `floor(W_network/2) + 1` gives `2T − W ∈ {1, 2}`, so
+/// ANY `B_w ≥ 2` breaks it — even though it is a strict majority of the
+/// network. Counterexample (`results/q_quorum.json → weighted.explicit_attack`,
+/// `W = 100, B = 32`): two conflicting 51-power certs (32 Byzantine + 19
+/// honest each, all-Byzantine intersection) BOTH pass `51 = floor(100/2)+1`.
+/// Strict majority does NOT imply quorum intersection; only `2t − W > B_w`
+/// does. The network term is therefore the same BFT curve as
+/// [`consensus_quorum_min`]: `floor(2·W_network/3) + 1`.
+///
+/// Cross-level safety (paper §4, Corollary 3): with the network term at the
+/// BFT floor, a mixed pair (µQC at `T_µ`, full QC at `T_f = floor(2W/3)+1`)
+/// satisfies `T_µ + T_f − W ≥ 2·T_f − W > B_w` for every `B_w < W/3`, so no
+/// conflicting µQC/full-QC pair can both verify. Enforced fail-closed by
+/// [`mixed_quorum_pair_safe`], checked in `verify_micro_cert`.
+///
+/// * Because the floor is anchored to the NETWORK, a committee that cannot
+///   reach it (a small committee of a large network) is REFUSED outright
+///   rather than silently accepted at a weakened threshold. The µQC is only
+///   an accelerator: the full Ed25519 QC path stays authoritative, so
+///   refusing a µQC costs bandwidth, never liveness.
+///
+/// Compatibility: when the committee is the whole validator set (N <= the
+/// committee cap — the live N = 4 network and the N <= 16 test fixtures) the
+/// two terms coincide with the old `floor(2W/3)+1` rule, so historic
+/// certificates verify byte-for-byte unchanged.
+pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: u64) -> u64 {
+    if committee_total_power == 0 {
+        return u64::MAX;
+    }
+    let committee_two_thirds = consensus_quorum_min(committee_total_power);
+    let network_two_thirds = match network_total_power {
+        0 => u64::MAX,
+        w => consensus_quorum_min(w),
+    };
+    committee_two_thirds.max(network_two_thirds)
+}
+
+/// C1 split activation height (FIXES §1.7, sketch §4.1, formulas §2.3).
+///
+/// At/after this height the µQC is ADVISORY-ONLY and never finalizes: the
+/// µQC branch of finality verification refuses outright and finality
+/// requires the FULL network QC (`pq_full_required_power` over the network's
+/// total power, enforced on the epoch/CEC path). Before this height the
+/// legacy network-anchored `max` rule ([`pq_micro_required_power`]) applies
+/// byte-identically.
+///
+/// INACTIVE default (`u64::MAX`, unreachable): the lead flips it via
+/// governance rollout. Pre-activation behavior is unchanged — proven by the
+/// existing QC pins running green unmodified.
+pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Validator-set size at which the full-network QC (epoch/CEC) becomes
+/// MANDATORY — independent of [`QC_SPLIT_ACTIVATION_HEIGHT`] (review F1, the
+/// "finality cliff").
+///
+/// ## Derivation (from the quorum math above, uniform stake)
+///
+/// The µQC committee is `min(N, MICRO_COMMITTEE_MAX_SIZE)` seats, i.e. at most
+/// 128. Its acceptance rule is [`pq_micro_required_power`]:
+///
+/// ```text
+/// required = max(floor(2·W_committee/3)+1, floor(2·W_network/3)+1)
+/// ```
+///
+/// and the signed power can never exceed the committee's own total power, so
+/// a µQC is *reachable at all* only when
+///
+/// ```text
+/// W_committee >= floor(2·W_network/3)+1.
+/// ```
+///
+/// On a uniform set `W_committee/W_network = min(N,128)/N`, so the condition
+/// is `128 >= floor(2N/3)+1`, which holds exactly for `N <= 191`:
+///
+/// * `N = 191` → `floor(382/3)+1 = 127+1 = 128 <= 128` (reachable, but only
+///   with a UNANIMOUS committee);
+/// * `N = 192` → `floor(384/3)+1 = 129 > 128` (UNREACHABLE — even every
+///   committee member signing cannot meet the network's two-thirds, so no
+///   µQC ever finalizes).
+///
+/// `192` is therefore the SMALLEST set size at which the µQC path is provably
+/// dead: exactly `ceil(MICRO_COMMITTEE_MAX_SIZE · 3 / 2)`, the point where the
+/// 128-seat committee holds 2/3 of the network and the strict `2/3 + 1` floor
+/// needs one more seat than the cap allows. Above it a 128-seat committee is a
+/// strict subset that can only ever carry `2/3` by stake luck, and relying on
+/// that makes liveness stake-distribution dependent (a re-stake can strand
+/// finality again). At or above this count the deterministic, always-available
+/// certificate is the full-network CEC (it needs the same `2/3` of the set
+/// every BFT round already assumes), so switching costs bandwidth, never
+/// liveness.
+///
+/// The value is a *count*: it is compared against `validators.len()` in
+/// [`qc_split_required`], never against a height, and it is deliberately below
+/// `staking::MAX_ACTIVE_VALIDATORS` (250) so the documented decentralization
+/// window runs on the path that finalizes.
+///
+/// LIVENESS IS NOT THIS PREDICATE'S JOB (review F1, generalised). The count
+/// catches the UNIFORM-stake crossing at 192, but whether a drawn committee can
+/// carry the network's two-thirds is a POWER question: at N = 191 with uniform
+/// stake the 128-seat committee reaches the network quorum (128) only
+/// unanimously, and a skewed distribution can make a draw infeasible below
+/// 192. The producer therefore falls back to the full-network CEC whenever the
+/// µQC it actually compiled cannot carry quorum
+/// (`produce_decision_certificate_with_schedule`); this constant remains the
+/// fail-closed SAFETY gate for the governance rollout and the provably dead
+/// uniform case, not the liveness rule.
+///
+/// FREEZE-shaped pin: `qc_split_size_threshold_is_the_quorum_crossing` in the
+/// consensus unit tests asserts that `191` is still reachable and `192` is the
+/// first unreachable size for a 128-seat committee, so this literal can never
+/// drift away from the quorum curve it is derived from.
+pub const QC_SPLIT_BY_SIZE_THRESHOLD: usize = (MICRO_COMMITTEE_MAX_SIZE as usize * 3) / 2;
+
+// TEST-ONLY override of the C1 activation height, scoped to the calling
+// thread.
+//
+// The frozen constant stays `u64::MAX`, so a process that never calls
+// [`set_qc_split_activation_override`] behaves byte-identically to before
+// (the gate is inert). Tests need to exercise the ACTIVE branch — a
+// producer/verifier round trip at a reachable activation height — without
+// shipping a reachable default. Thread-scoped for the same reason as the
+// chain-id and pure-PQ overrides: the test binary runs tests in parallel and
+// one test's activation window must not change an unrelated test's verdict.
+//
+// Release builds have no override at all (`debug_assertions` is off), so the
+// knob cannot be reached by a production node even in principle.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static QC_SPLIT_ACTIVATION_OVERRIDE: std::cell::Cell<Option<Height>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST-ONLY C1 activation-height override for
+/// the CALLING THREAD.
+///
+/// Mirrors [`crate::post_quantum::set_pure_pq_override`]: available in test
+/// and debug builds, nonexistent in release builds. `Some(h)` makes
+/// [`qc_split_active_at`] true exactly for heights `>= h`, which is how the
+/// producer/verifier test suites drive the ACTIVE branch without changing
+/// [`QC_SPLIT_ACTIVATION_HEIGHT`] (still `u64::MAX`, frozen off).
+#[cfg(any(test, debug_assertions))]
+pub fn set_qc_split_activation_override(activation: Option<Height>) {
+    QC_SPLIT_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// The C1 activation height in force for the calling thread.
+///
+/// The frozen [`QC_SPLIT_ACTIVATION_HEIGHT`] unless a test/debug caller
+/// installed [`set_qc_split_activation_override`].
+pub fn qc_split_activation_height() -> Height {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if let Some(activation) = QC_SPLIT_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+            return activation;
+        }
+    }
+    QC_SPLIT_ACTIVATION_HEIGHT
+}
+
+/// True once the C1 advisory/finality split is active at `height`.
+///
+/// Reads [`qc_split_activation_height`] (the frozen constant in production),
+/// so the `>=` comparison is the only activation semantics there is.
+pub fn qc_split_active_at(height: Height) -> bool {
+    height >= qc_split_activation_height()
+}
+
+/// THE gate every producer and verifier shares: true when the decision
+/// certificate for this `(height, validator_count)` MUST be the full-network
+/// epoch/CEC and a µQC is advisory-only (refused, attributes nobody).
+///
+/// `= qc_split_active_at(height) || validator_count >=
+/// QC_SPLIT_BY_SIZE_THRESHOLD`
+///
+/// * The height leg is the governance rollout gate (frozen `u64::MAX`; tests
+///   drive it through the thread-scoped override).
+/// * The size leg closes review F1: once the set reaches
+///   [`QC_SPLIT_BY_SIZE_THRESHOLD`] a 128-seat committee can no longer carry
+///   the network-anchored two-thirds, so the full-set certificate is the only
+///   one that can finalize. It is a pure function of the count, so it fires
+///   with no rollout step and cannot be half-armed.
+///
+/// Pure and total: no I/O, no global state beyond the height gate, so a
+/// producer that calls it and a verifier that calls it at the same
+/// `(height, validator_count)` cannot disagree about which certificate shape
+/// is legal. Below BOTH legs the verdicts are the legacy µQC ones
+/// byte-for-byte.
+pub fn qc_split_required(height: Height, validator_count: usize) -> bool {
+    qc_split_active_at(height) || validator_count >= QC_SPLIT_BY_SIZE_THRESHOLD
+}
+
+/// Advisory µQC threshold (sketch §4.1): `floor(2*W_committee/3) + 1`.
+///
+/// ADVISORY ONLY — reaching this never finalizes a block. It measures the
+/// committee's own two-thirds so a small committee of a large network can
+/// still signal (liveness), while finality stays gated on
+/// [`pq_full_required_power`]. Fail-closed (`u64::MAX`) on zero committee
+/// power, exactly like [`pq_micro_quorum_power`].
+pub fn pq_micro_advisory_power(committee_total_power: u64) -> u64 {
+    if committee_total_power == 0 {
+        return u64::MAX;
+    }
+    consensus_quorum_min(committee_total_power)
+}
+
+/// Finality gate (sketch §4.1): `floor(2*W_network/3) + 1` over the NETWORK.
+///
+/// Post-activation every finality path requires THIS — never
+/// `max(committee, network)`, which is the documented liveness trap: when
+/// `W_c < floor(2*W_n/3)+1` the committee alone can never reach the max, so
+/// no µQC ever forms. Fail-closed (`u64::MAX`) on zero network power,
+/// exactly like [`ValidatorSet::quorum_power`] — the same curve the
+/// epoch/CEC finality path already enforces.
+pub fn pq_full_required_power(network_total_power: u64) -> u64 {
+    if network_total_power == 0 {
+        return u64::MAX;
+    }
+    consensus_quorum_min(network_total_power)
+}
+
+/// Fail-closed cross-tier intersection gate: a µQC threshold `t_micro` and a
+/// full-QC threshold `t_full` over the same total power `total` can only both
+/// certify conflicting blocks if their signer sets can avoid sharing an
+/// honest validator. By the inclusion–exclusion lemma
+/// (`papers/01_quorum.md` §2, Lemma 1) the guaranteed intersection weight is
+/// `t_micro + t_full − total`, so the pair is safe against Byzantine weight
+/// up to `total/3` (the strict `B_w < W/3` model, conservative integer form)
+/// iff `t_micro + t_full > total + total/3`.
+///
+/// Returns `false` (refuse) on any degenerate input — zero total, or a
+/// threshold at/above the `u64::MAX` fail-closed sentinel — so a caller that
+/// wires this in can never accept on missing data. `u128` arithmetic: no
+/// overflow at any `u64` input.
+///
+/// Pins: `(51, 67, 100) → false` (the `W=100, B=32` mixed attack:
+/// `51 + 67 − 100 = 18 ≤ 33`), `(67, 67, 100) → true`
+/// (`67 + 67 − 100 = 34 > 33`).
+pub fn mixed_quorum_pair_safe(t_micro: u64, t_full: u64, total_power: u64) -> bool {
+    if total_power == 0 || t_micro == u64::MAX || t_full == u64::MAX {
+        return false;
+    }
+    let (t_mu, t_f, w) = (t_micro as u128, t_full as u128, total_power as u128);
+    t_mu + t_f > w + w / 3
+}
+
+/// Deterministic BLAKE3 sortition committee selector.
+///
+/// Selects a subset of validators of size `committee_size` weighted proportionally
+/// by validator stake (voting power), without replacement.
+/// The resulting committee is returned in canonical sorted order.
+///
+/// ENTROPY (audit: predictable committee selection). The draw is seeded with
+/// the PARENT BLOCK HASH — the hash of the block at `height - 1`, i.e. the
+/// `prev_hash` committed in the header of the block at `height`. Without it
+/// the ticket for `(height, round, step)` was a pure function of the height
+/// and the round, so anybody could compute the committee for every future
+/// height ahead of time and aim a DDoS (or a collusion) at a chosen round.
+/// With the parent hash in the preimage the committee for a height is only
+/// knowable once its parent exists, and it changes completely if the parent
+/// changes (a fork re-elects a different committee).
+///
+/// The seed is `BLAKE3("STELL_SORTITION_V5" || prev_block_hash || height ||
+/// round)` and each ticket is `BLAKE3("STELL_SORTITION_V5" || seed || step)`.
+///
+/// AGREEMENT: every validator of a height MUST pass the SAME parent hash —
+/// the one committed in the block header — or they elect different
+/// committees and cannot agree on a certificate. The parent hash travels
+/// with the certificate ([`PqMicroCertificate::sortition_parent`]) so a
+/// verifier re-derives exactly the committee the builders used.
+///
+/// RESIDUAL RISK — GRINDING (audit W6.5, NOT closed by the parent hash):
+/// the parent hash makes the committee UNKNOWABLE IN ADVANCE (nobody can
+/// compute the committee of a future height before its parent exists), but
+/// it is not UNFORGEABLE: the proposer of the parent block chooses the
+/// parent's bytes, hence its hash, hence the committee of the next height.
+/// A proposer that can vary the parent hash (a nonce, a timestamp, the tx
+/// set) can therefore SEARCH for a favourable committee: each candidate
+/// parent hash is a fresh sortition draw, and BLAKE3 is cheap enough
+/// (10^9+ draws/s on a GPU) that a capture is a matter of minutes, not
+/// years, for an attacker who controls a meaningful share of the set.
+///
+/// The parent hash is therefore NOT the security boundary — the
+/// NETWORK-ANCHORED QUORUM is (see [`pq_micro_required_power`]): a µQC must
+/// carry two-thirds of the WHOLE network's stake, so grinding for a
+/// favourable committee does not lower the bar an attacker has to clear.
+/// Grinding can only pick WHICH honest validators are asked to sign, not
+/// manufacture the 2/3-of-the-network the certificate needs. A VRF-based
+/// (ungrindable) selection would remove the grinding surface entirely; that
+/// is the structural fix and is out of scope here.
+///
+/// Canonical stake-weighted without-replacement committee draw from a
+/// pre-derived 32-byte seed and domain separator.
+///
+/// Shared by [`derive_sortition_committee`], [`beacon_draw_committee`], and
+/// [`cnvrf_v3_beacon_draw_committee`] so all three use identical weighted
+/// without-replacement ticket math without duplication.
+fn select_committee_from_seed(
+    validators: &ValidatorSet,
+    committee_size: u32,
+    domain: &str,
+    seed: &[u8; 32],
+) -> Vec<ValidatorId> {
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    // Filter positive-power validators in canonical sorted order (BTreeMap order)
+    let mut pool: Vec<(ValidatorId, u64)> = validators
+        .validators
+        .iter()
+        .filter(|(_, &p)| p > 0)
+        .map(|(&id, &p)| (id, p))
+        .collect();
+
+    let target_k = (committee_size as usize).min(pool.len());
+    if target_k == 0 {
+        return Vec::new();
+    }
+    if target_k == pool.len() {
+        let mut ids: Vec<ValidatorId> = pool.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        return ids;
+    }
+
+    let mut selected = Vec::with_capacity(target_k);
+    // An unrepresentable stake total is refused at the quorum boundary, but it
+    // must not PANIC here (debug) or wrap (release): the draw stays
+    // deterministic under saturation and the certificate gate fails closed.
+    let mut total_power: u64 = pool.iter().fold(0u64, |acc, (_, p)| acc.saturating_add(*p));
+
+    for step in 0..target_k {
+        if total_power == 0 || pool.is_empty() {
+            break;
+        }
+
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(seed);
+        hasher.update(&(step as u32).to_le_bytes());
+        let hash = hasher.finalize();
+
+        let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
+        let ticket = rand_val % total_power;
+
+        let mut acc = 0u64;
+        let mut chosen_idx = 0;
+        for (idx, (_id, power)) in pool.iter().enumerate() {
+            acc = acc.saturating_add(*power);
+            if ticket < acc {
+                chosen_idx = idx;
+                break;
+            }
+        }
+
+        let (winner_id, winner_power) = pool.remove(chosen_idx);
+        total_power = total_power.saturating_sub(winner_power);
+        selected.push(winner_id);
+    }
+
+    selected.sort_unstable();
+    selected
+}
+
+/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
+pub fn derive_sortition_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    prev_block_hash: &[u8; 32],
+) -> Vec<ValidatorId> {
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    // Per-(height, round) seed: the parent block hash is the only entropy
+    // that is not known before the chain reaches this height.
+    let seed = sortition_seed(prev_block_hash, height, round);
+    select_committee_from_seed(validators, committee_size, SORTITION_DRAW_DOMAIN, &seed)
+}
+
+/// Domain separator of the sortition draw (v5 = parent-block entropy).
+///
+/// Bumped from `STELL_SORTITION_V4` (which hashed `height || round || step`
+/// only) so a v5 draw can never be confused with a v4 one.
+pub const SORTITION_DRAW_DOMAIN: &str = "STELL_SORTITION_V5";
+
+/// The per-`(height, round)` sortition seed: `BLAKE3("STELL_SORTITION_V5" ||
+/// prev_block_hash || height || round)`.
+///
+/// Exposed so a verifier can prove that two nodes derived the same seed
+/// (and therefore the same committee) without re-running the whole draw.
+pub fn sortition_seed(prev_block_hash: &[u8; 32], height: Height, round: Round) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(SORTITION_DRAW_DOMAIN);
+    hasher.update(prev_block_hash);
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+// ============================================================================
+// BEACON DRAW (gated-OFF; parent-hash draw above stays the live default)
+// ============================================================================
+//
+// The parent-hash draw (`derive_sortition_committee`) is grindable: the
+// proposer of the parent block chooses its bytes, hence its hash, hence the
+// next committee (papers/13_grinding_and_structural_capture.md §A — `1/P_cap`
+// is ~0.03 s classically at `k=64`). The structural fix is an ungrindable
+// beacon draw seeded by the epoch-bound XMSS-VRF output (`crate::xmss_vrf`,
+// sibling workstream: one leaf per epoch, re-signing an epoch burns the leaf
+// and is slashable, so the beacon cannot be re-rolled).
+//
+// This region is PURE draw logic, gated OFF by default:
+// [`BEACON_DRAW_ACTIVATION_HEIGHT`] is `u64::MAX`, so
+// [`beacon_draw_active_at`] is false at every reachable height and NO caller
+// switches draws until the lead flips the constant at rollout. The two live
+// call sites that would swap (`micro_cert_valid_signers`,
+// `verify_micro_cert`) keep calling `derive_sortition_committee` unchanged.
+// Tests below pin the parent-hash draw green unmodified alongside the new one.
+
+/// Activation height of the beacon draw: `u64::MAX` = never (gated OFF).
+///
+/// The lead flips this to a real height at rollout; until then the
+/// parent-hash draw stays the live default and this draw is test-only.
+pub const BEACON_DRAW_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Domain separator of the beacon draw. Distinct from
+/// [`SORTITION_DRAW_DOMAIN`] so a beacon draw can never be confused with a
+/// parent-hash draw (different entropy, different epoch binding).
+pub const BEACON_DRAW_DOMAIN: &str = "STELL_SORTITION_BEACON_V1";
+
+/// True once the beacon draw is live at `height` (never, while the
+/// activation constant is `u64::MAX`).
+pub fn beacon_draw_active_at(height: Height) -> bool {
+    #[allow(clippy::absurd_extreme_comparisons)]
+    // GATE: `>=` is the rollout semantic (live at/after the flipped height);
+    // the lint fires only because the constant is currently the never-value
+    // `u64::MAX`, and goes quiet on its own when the lead flips it.
+    {
+        height >= BEACON_DRAW_ACTIVATION_HEIGHT
+    }
+}
+
+/// The per-`(epoch, height, round)` beacon seed:
+/// `BLAKE3("STELL_SORTITION_BEACON_V1" || beacon_output || epoch || height || round)`.
+///
+/// The epoch is bound into the seed (not just the height) so a beacon from
+/// one epoch cannot be replayed as the draw of another: the same
+/// `beacon_output` at the same height in a different epoch seeds a different
+/// draw, and [`beacon_draw_committee`] additionally REFUSES a beacon whose
+/// claimed epoch is not the height's epoch.
+pub fn beacon_seed(
+    beacon_output: &[u8; 32],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BEACON_DRAW_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Beacon-draw committee selector: same shape as
+/// [`derive_sortition_committee`] so callers swap trivially (replace the
+/// `prev_block_hash` argument with the `(beacon_output, beacon_epoch)` pair),
+/// except for the one extra epoch argument that carries the epoch binding.
+///
+/// ENTROPY: `beacon_output` MUST be the epoch-bound XMSS-VRF output for
+/// `beacon_epoch` (`crate::xmss_vrf`, sibling workstream). It is taken as a
+/// parameter — never sampled inside — so the draw is a pure deterministic
+/// function of its inputs (no hidden randomness, no clock, no env).
+///
+/// EPOCH BINDING (fail-closed): the height's epoch is
+/// `crate::mev_epoch::epoch_of_height(height)`; a beacon whose claimed
+/// `beacon_epoch` differs is REFUSED (empty committee), exactly like an empty
+/// set or a zero target. A refused draw elects nobody and therefore can never
+/// reach quorum.
+///
+/// GATED OFF: nothing calls this on any live path until the lead flips
+/// [`BEACON_DRAW_ACTIVATION_HEIGHT`]. The parent-hash draw stays canonical.
+pub fn beacon_draw_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    beacon_output: &[u8; 32],
+    beacon_epoch: u64,
+) -> Vec<ValidatorId> {
+    // Epoch binding first: a beacon from the wrong epoch is not entropy for
+    // this height — refuse before touching any stake table.
+    if beacon_epoch != crate::mev_epoch::epoch_of_height(height) {
+        return Vec::new();
+    }
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    // Same weighted without-replacement ticket loop as the parent-hash draw,
+    // but seeded by the epoch-bound beacon instead of the parent hash.
+    let seed = beacon_seed(beacon_output, beacon_epoch, height, round);
+    select_committee_from_seed(validators, committee_size, BEACON_DRAW_DOMAIN, &seed)
+}
+
+// ============================================================================
+// CN-VRF v3 BEACON DRAW & PROPOSER SORTITION (7,200-block epoch; gated-OFF)
+// ============================================================================
+
+/// Activation height of CN-VRF v3 sortition and proposer beacon selection:
+/// `u64::MAX` = never (GatedOff sentinel until Sub-wave B + audit/rollout).
+///
+/// # Activation-height rule (review F4)
+///
+/// The lead may flip this to a real height, but NOT to one that lands on an
+/// epoch boundary or inside the freeze lookahead before one. The boundary block
+/// at `N * EPOCH_LEN` must carry epoch `N`'s `epoch_vdf`, which is only
+/// dispatched at `H_freeze(N) = N * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`
+/// (and the dispatcher is gated on activation). Activating AT `N * EPOCH_LEN`
+/// therefore leaves `H_freeze < H` inactive, no beacon exists, and the
+/// activation block is unproposable.
+///
+/// Legal heights: `H == 0` (genesis; block 0 is not a boundary) or
+///
+/// ```text
+/// 0 < H mod EPOCH_LEN <= EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS
+/// ```
+///
+/// [`cnvrf_v3_activation_height_allowed`] is that predicate,
+/// [`assert_cnvrf_v3_activation_height`] enforces it on the test-only setter,
+/// and a `const` assertion below fails the BUILD if this constant is edited to
+/// an unproducible height. The activation epoch itself is then bootstrapped
+/// deterministically (`crate::cn_vrf::epoch_beacon_for`), and every later epoch
+/// has a dispatched beacon — so a working activation height exists.
+pub const CNVRF_V3_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Canonical CN-VRF v3 epoch length in heights (30,000 blocks = 2 h at
+/// 240 ms, ruleset v2), pinned at compile time to
+/// [`crate::cn_vrf::EPOCH_LEN`].
+pub const CNVRF_V3_EPOCH_LEN: u64 = 30_000;
+
+const _: () = assert!(CNVRF_V3_EPOCH_LEN == crate::cn_vrf::EPOCH_LEN);
+
+/// Domain separator for CN-VRF v3 committee sortition draws.
+pub const CNVRF_V3_DRAW_DOMAIN: &str = "STELL_SORTITION_CNVRF_V3";
+
+/// Domain separator for CN-VRF v3 proposer selection draws.
+pub const CNVRF_V3_PROPOSER_DOMAIN: &str = "STELL_PROPOSER_CNVRF_V3";
+
+/// True once CN-VRF v3 sortition is active at `height` (false at every
+/// reachable height while [`CNVRF_V3_ACTIVATION_HEIGHT`] is `u64::MAX`).
+pub fn cnvrf_v3_active_at(height: Height) -> bool {
+    #[allow(clippy::absurd_extreme_comparisons)]
+    // GATE: `>=` is the rollout semantic (live at/after the flipped height);
+    // the lint fires only because the constant is currently the never-value
+    // `u64::MAX`, and goes quiet on its own when the lead flips it.
+    {
+        height >= CNVRF_V3_ACTIVATION_HEIGHT
+    }
+}
+
+/// CN-VRF v3 epoch index for `height` (`height / CNVRF_V3_EPOCH_LEN`).
+pub fn cnvrf_v3_epoch_of_height(height: Height) -> u64 {
+    height / CNVRF_V3_EPOCH_LEN
+}
+
+/// The per-`(epoch, height, round)` CN-VRF v3 committee seed:
+/// `BLAKE3_derive_key("STELL_SORTITION_CNVRF_V3", beacon_output (48B) || beacon_epoch || height || round)`.
+pub fn cnvrf_v3_beacon_seed(
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CNVRF_V3_DRAW_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// The per-`(epoch, height, round)` CN-VRF v3 proposer seed:
+/// `BLAKE3_derive_key("STELL_PROPOSER_CNVRF_V3", beacon_output (48B) || beacon_epoch || height || round)`.
+pub fn cnvrf_v3_proposer_seed(
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CNVRF_V3_PROPOSER_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// CN-VRF v3 beacon-draw committee selector using 7,200-block epochs.
+///
+/// Fail closed (`Vec::new()`) if `beacon_epoch != cnvrf_v3_epoch_of_height(height)`,
+/// `committee_size == 0`, `validators` is empty, or total voting power is zero.
+pub fn cnvrf_v3_beacon_draw_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    beacon_output: &[u8; 48],
+    beacon_epoch: u64,
+) -> Vec<ValidatorId> {
+    if beacon_epoch != cnvrf_v3_epoch_of_height(height) {
+        return Vec::new();
+    }
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+    let seed = cnvrf_v3_beacon_seed(beacon_output, beacon_epoch, height, round);
+    select_committee_from_seed(validators, committee_size, CNVRF_V3_DRAW_DOMAIN, &seed)
+}
+
+/// THE committee of `height`/`round` — the ONE source of truth for "who
+/// signs at height H" (review F2).
+///
+/// * `CommitteeSchedule::ParentHash` (below activation): byte-identical
+///   canonical v5 parent-hash draw ([`derive_sortition_committee`]) from the
+///   parent hash the header committed. `parent_hash == None` elects nobody —
+///   the fail-closed rule the producer and verifier already shared.
+/// * `CommitteeSchedule::Beacon(Some(b))` (at/after activation): the CN-VRF v3
+///   epoch-beacon draw ([`cnvrf_v3_beacon_draw_committee`]) from the epoch
+///   beacon, IGNORING the parent hash for entropy (parent-hash grinding is
+///   removed). `CommitteeSchedule::Beacon(None)` — the beacon for this epoch
+///   is not known here — elects nobody (fail closed), never a parent-hash
+///   fallback: falling back would let two nodes disagree about the committee at
+///   one height, which is exactly the fork the beacon draw exists to prevent.
+///
+/// Used by BOTH the producer ([`VoteSet::certificate_with_schedule`]) and the
+/// verifier (`QuorumCertificate::verify_with_schedule` →
+/// `micro_cert_valid_signers_and_committee_with_beacon`), so a certificate a
+/// node builds can never name a committee its own verifier refuses.
+pub fn committee_for_height(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    parent_hash: Option<&[u8; 32]>,
+    schedule: crate::consensus::CommitteeSchedule,
+) -> Vec<ValidatorId> {
+    match schedule {
+        crate::consensus::CommitteeSchedule::ParentHash => match parent_hash {
+            Some(parent) => {
+                derive_sortition_committee(validators, height, round, committee_size, parent)
+            }
+            None => Vec::new(),
+        },
+        crate::consensus::CommitteeSchedule::Beacon(beacon) => match beacon {
+            Some(b) => cnvrf_v3_beacon_draw_committee(
+                validators,
+                height,
+                round,
+                committee_size,
+                &b.output,
+                b.epoch,
+            ),
+            None => Vec::new(),
+        },
+    }
+}
+
+// ============================================================================
+// ACTIVATION-HEIGHT RULE (review F4)
+// ============================================================================
+//
+// A height `H` where CN-VRF v3 is activated is only producible when the NEXT
+// epoch boundary can carry its `epoch_vdf`:
+//
+//  * The boundary block at `N * EPOCH_LEN` REQUIRES the beacon of epoch `N`
+//    (`runtime::validate_cnvrf_v3_payload`), and that beacon is only dispatched
+//    at `H_freeze(N) = N * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`.
+//  * The dispatcher is gated on activation (`cnvrf_v3_is_active_at(H_freeze)`),
+//    so activating AT `N * EPOCH_LEN` (the rollout checklist's "exact
+//    multiple" advice) leaves `H_freeze(N) < H` inactive: no beacon exists,
+//    the activation block is unproposable, and the chain cannot start.
+//  * The same hole opens for the last `V3_COMMIT_LOOKAHEAD_BLOCKS` heights of
+//    an epoch (`H_freeze(next) < H`).
+//
+// RULE (enforced by `cnvrf_v3_activation_height_allowed`, asserted by the
+// test-only activation setter and compile-checked for the frozen constant):
+//
+//   activation height `H` is allowed iff `H == 0` (genesis, no boundary) or
+//
+//       0 < H mod EPOCH_LEN <= EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS
+//
+//   i.e. never on an epoch boundary (for `N >= 1`) and never inside the
+//   freeze lookahead of the next one.
+//
+// The epoch of activation itself is then bootstrapped deterministically
+// (`crate::cn_vrf::epoch_beacon_for`), and EVERY later epoch has a dispatched
+// beacon — so there is an activation height that works (unlike the pre-fix
+// state, where neither an exact multiple nor a mid-epoch height could cross
+// the first boundary).
+
+/// True when `height` is a legal CN-VRF v3 activation height (see the rule
+/// above). `u64::MAX` (the frozen "never" sentinel) is legal.
+pub const fn cnvrf_v3_activation_height_allowed(height: Height) -> bool {
+    if height == 0 || height == u64::MAX {
+        return true;
+    }
+    let remainder = height % CNVRF_V3_EPOCH_LEN;
+    remainder != 0 && remainder <= CNVRF_V3_EPOCH_LEN - crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS
+}
+
+/// Panic with the documented reason when `height` would land on an
+/// unproducible epoch boundary. Called by the test-only activation setter.
+pub fn assert_cnvrf_v3_activation_height(height: Height) {
+    assert!(
+        cnvrf_v3_activation_height_allowed(height),
+        "CN-VRF v3 activation height {height} is unproducible: it is on an epoch \
+         boundary or inside the {}-block freeze lookahead before one, so the next \
+         boundary block would require an epoch_vdf whose H_freeze preceded activation \
+         (review F4). Choose `0 < H mod {EPOCH} <= {safe}`.",
+        crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS,
+        EPOCH = CNVRF_V3_EPOCH_LEN,
+        safe = CNVRF_V3_EPOCH_LEN - crate::cn_vrf::V3_COMMIT_LOOKAHEAD_BLOCKS,
+    );
+}
+
+/// Compile-time enforcement: a governance edit of the frozen constant that
+/// lands on an unproducible boundary fails the build.
+const _: () = assert!(cnvrf_v3_activation_height_allowed(
+    CNVRF_V3_ACTIVATION_HEIGHT
+));
+
+/// Multiplicative per-round backoff factor of the DETERMINISTIC round timeout.
+///
+/// Safety role (liveness): under PERSISTENT slowdown (a network stuck in the
+/// "slow" state for several rounds) a timeout is evidence of hidden state, so
+/// the ladder is geometric with `ρ = 2` — NOT additive `+500ms`. Per the
+/// report correction (FIXES §1.8, §2.9): a persistent `ρ ≈ 2` is NOT
+/// identifiable (selection bias); the `×2` ladder is a heuristic, not an
+/// optimum (`papers/02_liveness.md` §4–§7; rec 1 keeps the 3000ms base for
+/// `γ≈2, p50≈660ms, c≈500ms — and replaces the additive rung with `×2`).
+/// At base 3000ms the rungs are 3s, 6s, 12s, 24s, then the cap — a wedged
+/// round on a slow/Byzantine proposer unwedges far faster than `+500ms` per
+/// round. Deterministic on every node (function of round only) so rounds stay
+/// synchronized. Bounded by [`DETERMINISTIC_BACKOFF_CAP_MS`].
+pub const DETERMINISTIC_BACKOFF_FACTOR: u64 = 2;
+/// Cap on the round-driven backoff half of the deterministic timeout.
+///
+/// Safety role (liveness + DoS bound): keeps a pathological round (round 1M)
+/// from installing an unbounded timeout that would stall finality; the cap
+/// still exceeds any realistic WAN skew, so honest catch-up is unaffected.
+pub const DETERMINISTIC_BACKOFF_CAP_MS: u64 = 10_000;
+/// Adaptive extension per unit of proposer missed-streak (ledger `missed`).
+///
+/// Safety role (liveness): gives a historically slow proposer's rounds extra
+/// time instead of timing out a valid proposal; input is committed block
+/// content (identical on every node), so the extension cannot desynchronize
+/// rounds. Bounded by [`ADAPTIVE_EXTENSION_CAP_MS`].
+pub const ADAPTIVE_EXTENSION_PER_MISS_MS: u64 = 500;
+/// Hard cap on the adaptive (slow-proposer) extension half.
+///
+/// Safety role (liveness + DoS bound): bounds how far one proposer's streak
+/// can stretch a round, so a grinded `missed` streak cannot park the chain;
+/// the cap still covers the observed slow-proposer tail.
+pub const ADAPTIVE_EXTENSION_CAP_MS: u64 = 5_000;
+
+/// Consecutive missed proposals per validator that counts as "repeatedly
+/// missing" for OBSERVABILITY (M). No protocol punishment — only metering +
+/// suspicion-free fast-path re-admission (the counter resets the moment the
+/// proposer proposes again). Pinned by test.
+pub const PROPOSER_MISS_THRESHOLD_M: u32 = 3;
+
+/// Deterministic round timeout for `(height, round)`.
+///
+/// CHOICE (1a) adaptive round timeout — and why (1b)/(1c) were rejected:
+///
+/// * (1a) CHOSEN: extend the timeout for rounds whose scheduled proposer is
+///   historically slow. The slowness signal is the staking-ledger `missed`
+///   streak for the scheduled proposer — block content, identical on every
+///   node that finalized the same prefix — so every honest node computes the
+///   SAME extension for the SAME (height, round). Bounded
+///   (`ADAPTIVE_EXTENSION_CAP_MS`), deterministic, rounds stay synchronized.
+/// * (1b) vote-aggregation grace REJECTED as the primary fix: prevotes for
+///   round r are ALREADY counted after the node leaves r (the scan window +
+///   the polka ledger keep every round of the height votable — that was the
+///   2026-10-21 parked-height fix). Counting r-prevotes toward an r+1 QC
+///   would additionally MIX rounds: two different quorums (r for A, r+1 for
+///   B) could both "decide" and break quorum intersection. Safety over grace.
+/// * (1c, "faster base timeout") REJECTED: shrinking the base from 3.5s buys
+///   view-change storms on 1-vCPU members (responder p50 ~660ms leaves no
+///   headroom), not throughput.
+///
+/// INPUTS (exhaustive — anything else is a bug):
+///  1. `base_ms` — the frozen canonical base [`FROZEN_ROUND_TIMEOUT_BASE_MS`].
+///     MUST match on all validators (documented rollout invariant); there is
+///     no per-node env override anymore (protocol freeze 2026-11-03).
+///  2. `round` — the round the timeout is FOR (not a local failure count).
+///  3. `proposer_missed_streak` — ledger `missed` of the scheduled proposer
+///     for (height, round). Deterministic block content, not observation.
+///
+/// NO wall-clock input: no `Instant::now`, no `SystemTime`, no elapsed, no
+/// peer-seen timestamps, no local vote-observation flags. A reader can verify
+/// with `grep -n "Instant\|SystemTime" ` on this function: zero hits.
+///
+/// FREEZE (protocol freeze 2026-11-03): canonical round-timeout base, 3_000 ms.
+/// Value = pre-freeze `STELL_ROUND_TIMEOUT_MS` code default (was read in
+/// `main.rs` with clamp 200..=3_600_000; the frozen value is inside that
+/// range, so default-env behavior is byte-identical). Rationale: this base
+/// feeds the same-on-all-nodes ladder (spec
+/// `docs/specs/04_NETWORK_AND_CONSENSUS_PHASE2.md` §2) and MUST match on all
+/// validators — a per-node env knob for a must-match value is a fork risk.
+/// Change requires spec update + audit note (AGENTS.md §7).
+pub const FROZEN_ROUND_TIMEOUT_BASE_MS: u64 = 3_000;
+
+pub fn deterministic_round_timeout_ms(
+    base_ms: u64,
+    round: Round,
+    proposer_missed_streak: u32,
+) -> u64 {
+    // Geometric ladder `T(r) = min(base·2^r, base + CAP)` (paper 02_liveness
+    // §6, rec 1): `×DETERMINISTIC_BACKOFF_FACTOR` per round, same ceiling as
+    // before (`DETERMINISTIC_BACKOFF_CAP_MS` above the base), so the
+    // saturation rung is byte-identical to the old additive cap.
+    // `saturating_pow`/`saturating_mul`: `Round = u32` can name absurd rounds
+    // (tests pin round 1_000_000) — saturation, never wrap, then the cap.
+    let grown = base_ms.saturating_mul(DETERMINISTIC_BACKOFF_FACTOR.saturating_pow(round));
+    let backoff_capped = grown.min(base_ms.saturating_add(DETERMINISTIC_BACKOFF_CAP_MS));
+    let adaptive = (proposer_missed_streak as u64)
+        .saturating_mul(ADAPTIVE_EXTENSION_PER_MISS_MS)
+        .min(ADAPTIVE_EXTENSION_CAP_MS);
+    // ADAPTIVE BASE (paper 02_liveness §5–§6, formula (2) — NOT implemented):
+    // the principled base is `T0 = clamp(0.6·q99_committed, 0.5s, 10s)` where
+    // `q99_committed` is a latency-tail quantile committed into epoch state
+    // (same on every node — never a local clock). No committed-q99 feed
+    // exists yet, so the frozen 3000ms base stays; when the feed lands, it
+    // replaces ONLY `base_ms` upstream — this ladder is already multiplicative
+    // in the base and needs no further change.
+    backoff_capped.saturating_add(adaptive)
+}

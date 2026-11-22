@@ -1,0 +1,866 @@
+//! F-01 (audit HIGH): the base-fee floor is consensus-enforced, twice.
+//!
+//! Admission (mempool) and packing (proposer filter) always refused
+//! below-floor transactions, but a Byzantine proposer could bypass both by
+//! constructing a block directly: `validate_proposal` had no fee condition
+//! and the apply path re-checked everything EXCEPT the floor, so every
+//! honest validator accepted and executed underpriced transactions — and
+//! failed ones paid nothing (the D2 free-failure loop). These tests pin the
+//! two closing checks:
+//!
+//! * VALIDATE (`ValidatorRuntime::validate_proposal`): refuses any block
+//!   carrying a transaction below the effective floor
+//!   (`Mempool::effective_floor_for_tx` = base + D2 penalty + PQ surcharge),
+//!   fail-closed with a reason naming the transaction.
+//! * APPLY (`InMemoryStateEngine` block path): charges at least the floor
+//!   (`commit_native` floors the fee; the fast path floors identically), and
+//!   attributable execution failures still pay the floor while consuming
+//!   their nonce (no more free failures).
+//!
+//! NONCE NOTE (documented behaviour): the failure fee and the nonce advance
+//! are ATOMIC — either both happen (floor debited, nonce consumed) or
+//! neither does. A failed transaction whose failure is attributable (valid
+//! signature, right chain, sender exists, `tx.nonce == sender.nonce` at
+//! execution, sender covers the floor) pays the floor AND advances the
+//! sender nonce — exactly like a success, minus the value movement. The
+//! consumed nonce is the replay protection and the spam rate-limit: without
+//! the advance the same failing transaction could be re-packed forever for
+//! one floor payment, and the block's own per-sender sequence would cascade
+//! into further failures. A failure that takes no money (bad signature,
+//! wrong chain-id, stale/future nonce, missing sender, or a sender that
+//! cannot cover the floor) changes NO state at all — balance AND nonce
+//! untouched, on the block path just like on the single-transaction path
+//! (the historical atomicity pin holds for the zero-payment case).
+
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
+use stellereum::consensus::ValidatorSet;
+use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+use stellereum::runtime::ValidatorRuntime;
+use stellereum::sharding::{Block, PqSignatureEnvelope, Transaction, MASTERCHAIN_SHARD};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
+
+/// Governed consensus floor for the apply tests: above the 280k default
+/// transfer cost, so the floor (not the operation price) is what binds.
+const FLOOR: u64 = 500_000;
+/// PQ activation surcharge, pinned here so the tests name the same number
+/// the floor formula adds (mirrors `PQ_ACTIVATION_SURCHARGE_GAS`).
+const PQ_SURCHARGE: u64 = 45_000;
+const TS: u64 = 1_760_000_000;
+const BAL: u64 = 10_000_000;
+
+fn user_key() -> SigningKey {
+    SigningKey::generate(&mut OsRng)
+}
+
+fn id_of(k: &SigningKey) -> [u8; 32] {
+    k.verifying_key().to_bytes()
+}
+
+/// FULL-PQ transaction sender: implicit Falcon-512 (registered globally;
+/// no surcharge), so fee assertions match the old classical fixtures.
+static NEXT_PQ: AtomicU8 = AtomicU8::new(0xF0);
+
+fn pq_user() -> u8 {
+    NEXT_PQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn pq_id(seed: &u8) -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
+}
+
+fn tx(seed: &u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    txp(seed, to, amount, gas, nonce, Vec::new())
+}
+
+fn txp(
+    seed: &u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = pq_id(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
+/// Engine with the governed consensus floor set (the apply path reads the
+/// GOVERNED base — the env half of admission is node-local config and must
+/// not move consensus; see `consensus_floor_parts`).
+async fn engine_with_floor(floor: u64) -> Arc<InMemoryStateEngine> {
+    let e = Arc::new(InMemoryStateEngine::new());
+    e.governance_write().await.applied.min_gas_limit = Some(floor);
+    e
+}
+
+/// A payload that cannot run on `gas`: a plain transfer costs
+/// `GAS_BASIC_TRANSFER`, so executing it with a tiny limit ends out of gas
+/// AFTER admission (admission only reserves `amount + gas`, which is
+/// covered) — the canonical attributable execution failure.
+fn oom_payload() -> Vec<OpCode> {
+    vec![OpCode::Transfer {
+        recipient: [0xCC; 32],
+        amount: 1,
+    }]
+}
+
+fn mk_block(txs: Vec<Transaction>, proposer: &SigningKey) -> Block {
+    let order_merkle_root = stellereum::mev::compute_order_merkle_root(&txs);
+    let mut blk = Block {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 1,
+        prev_hash: [0u8; 32],
+        state_root: [0u8; 32],
+        transactions: txs,
+        cross_shard_out: vec![],
+        timestamp: TS,
+        proposer: id_of(proposer),
+        validator_signatures: vec![],
+        shard_headers: vec![],
+        precommit_qc: None,
+        last_qc: None,
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+        cnvrf_v3: None,
+        round: 0,
+    };
+    blk.sign_block(proposer);
+    blk
+}
+
+// ===========================================================================
+// APPLY: charge at least the floor
+// ===========================================================================
+
+/// A below-floor transaction still executes (the floor is a price, not a
+/// ban) but is charged the floor, never its declaration.
+#[tokio::test]
+async fn apply_charges_floor_for_underpriced_tx() {
+    let engine = engine_with_floor(FLOOR).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Declares 100, floor is 500k: applies, pays the floor.
+    let tx = tx(&alice, [0xB0; 32], 1_000, 100, 0);
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![FLOOR],
+        "must charge the floor, not the declaration"
+    );
+    assert_eq!(fees_collected, FLOOR);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - 1_000 - FLOOR);
+    assert_eq!(sender.nonce, 1);
+}
+
+/// An attributable execution failure (out-of-gas payload, head nonce, funded
+/// sender) still pays the floor AND consumes its nonce — the D2
+/// free-failure loop is closed.
+#[tokio::test]
+async fn failed_tx_pays_floor_and_advances_nonce() {
+    let engine = engine_with_floor(FLOOR).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Gas 100 cannot run a 280k transfer: admitted (0 + 100 is covered),
+    // fails at execution, pays the floor.
+    let oom_tx = txp(&alice, [0xB0; 32], 0, 100, 0, oom_payload());
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[oom_tx], TS).await;
+
+    assert_eq!((applied, failed), (0, 1));
+    assert_eq!(status, vec![false]);
+    assert_eq!(fees, vec![FLOOR], "a failed tx must still pay the floor");
+    assert_eq!(fees_collected, FLOOR);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - FLOOR,
+        "only the floor leaves the account"
+    );
+    assert_eq!(sender.nonce, 1, "a paid failure consumes its nonce");
+
+    // The follow-up at the advanced nonce applies: failures no longer
+    // cascade, and the consumed nonce cannot be replayed.
+    let next = tx(&alice, [0xB0; 32], 0, FLOOR, 1);
+    let (applied2, failed2, _, status2, _) = engine.apply_block_parallel_fees(&[next], TS).await;
+    assert_eq!((applied2, failed2), (1, 0));
+    assert_eq!(status2, vec![true]);
+}
+
+/// A sender that cannot cover the floor at execution fails atomically:
+/// no debit AND no nonce advance (no pay, no state change). A transaction
+/// whose fee the sender cannot cover was never going to run, and charging
+/// their remaining dust for it would be a griefing surface, not a safety
+/// property. The transaction is replayable but worthless, while each failure
+/// still escalates the sender's D2 mirror (see below), so retrying only
+/// raises the price of the sender's future transactions.
+#[tokio::test]
+async fn broke_sender_failure_changes_nothing() {
+    let engine = engine_with_floor(FLOOR).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine
+        .update_account(AccountState::new(from, 1_200_000))
+        .await;
+
+    // tx1: declared 500k, moves 600k via payload. Admitted (500k reserved),
+    // applies (1.1M affordable), leaves 100k.
+    let drain = txp(
+        &alice,
+        [0xB0; 32],
+        0,
+        FLOOR,
+        0,
+        vec![OpCode::Transfer {
+            recipient: [0xB0; 32],
+            amount: 600_000,
+        }],
+    );
+    // tx2: admitted against the simulated remainder, out of gas at
+    // execution, with only 100k left against the 500k floor.
+    let broke = txp(&alice, [0xB0; 32], 0, 100, 1, oom_payload());
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[drain, broke], TS).await;
+
+    assert_eq!((applied, failed), (1, 1));
+    assert_eq!(status, vec![true, false]);
+    assert_eq!(fees, vec![FLOOR, 0], "cannot cover the floor: pays nothing");
+    assert_eq!(fees_collected, FLOOR);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, 100_000, "dust is not drained");
+    assert_eq!(sender.nonce, 1, "no pay, no advance: nonce untouched");
+}
+
+/// A transaction that cannot even reserve the floor at admission never
+/// executes and moves nothing (the documented residual: admission-invalid
+/// transactions fail free — only a Byzantine proposer can pack them, at its
+/// own block-space cost).
+#[tokio::test]
+async fn unfunded_for_floor_fails_free_at_admission() {
+    let engine = engine_with_floor(FLOOR).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    // Covers amount (0) + gas (100) but not the 500k floor.
+    engine.update_account(AccountState::new(from, 100)).await;
+
+    let tx = txp(&alice, [0xB0; 32], 0, 100, 0, oom_payload());
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (0, 1));
+    assert_eq!(status, vec![false]);
+    assert_eq!(fees, vec![0]);
+    assert_eq!(fees_collected, 0);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, 100);
+    assert_eq!(sender.nonce, 0, "never admitted: nonce untouched");
+}
+
+/// Non-attributable failures move nothing: a replay (stale nonce) must not
+/// double-charge, and a gap (future nonce) must not burn the sequence.
+///
+/// Note the D2 mirror still records the SENDER of any failed block
+/// transaction (status-based, exactly like mempool `note_apply_feedback`),
+/// so the gap below escalates this sender's next floor by one step — the
+/// honest apply therefore declares (and pays) above it.
+#[tokio::test]
+async fn replay_and_gap_failures_pay_nothing() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Gap first: nonce 5 while the head is 0 — never admitted, never charged.
+    let gap = tx(&alice, [0xB0; 32], 0, FLOOR, 5);
+    let (a1, f1, _, s1, fees1) = engine.apply_block_parallel_fees(&[gap], TS).await;
+    assert_eq!((a1, f1), (0, 1));
+    assert_eq!(s1, vec![false]);
+    assert_eq!(fees1, vec![0]);
+
+    // Consume nonce 0 honestly (declaring above the one-step penalty the gap
+    // just recorded), then replay it: the replay fails free (it already paid
+    // when it first applied — charging again is double-charge).
+    let first = tx(&alice, [0xB0; 32], 0, FLOOR, 0);
+    assert_eq!(engine.apply_block_parallel_fees(&[first], TS).await.0, 1);
+    let replay = tx(&alice, [0xB0; 32], 0, FLOOR, 0);
+    let (a3, f3, _, s3, fees3) = engine.apply_block_parallel_fees(&[replay], TS).await;
+    assert_eq!((a3, f3), (0, 1));
+    assert_eq!(s3, vec![false]);
+    assert_eq!(fees3, vec![0]);
+
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.nonce, 1, "only the honest apply advanced the nonce");
+    // FEE-01: the honest apply is an empty-payload transfer declaring
+    // `FLOOR` = 500 000 gas on a floor-0 chain, so it pays the 280 000
+    // intrinsic envelope cost — not its declaration. (The old expectation,
+    // `BAL - FLOOR`, encoded the declared-limit rule this fix removes.)
+    assert_eq!(
+        sender.balance,
+        BAL - GAS_BASIC_TRANSFER,
+        "only the honest apply was charged, and only for what it used"
+    );
+}
+
+/// Mixed block through the shared transition core: a valid tx, an
+/// underpriced success and an attributable failure. Every coin that leaves
+/// a sender arrives somewhere (proposer or recipient): supply conserved.
+#[tokio::test]
+async fn fee_accounting_balances_with_floor_and_failure_fees() {
+    let engine = engine_with_floor(FLOOR).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    let proposer = user_key();
+    let proposer_id = id_of(&proposer);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    let valid = tx(&alice, [0xB0; 32], 1_000, 600_000, 0);
+    let cheap_ok = tx(&alice, [0xB0; 32], 500, 100, 1);
+    let fails = txp(&alice, [0xB0; 32], 0, 100, 2, oom_payload());
+    let total_before = BAL; // proposer starts at 0
+    let out = engine
+        .apply_block_transition(&mk_block(vec![valid, cheap_ok, fails], &proposer), 0)
+        .await;
+
+    assert_eq!(out.status, vec![true, true, false]);
+    // FEE-01: `valid` declares 600 000 gas but is an empty-payload transfer,
+    // so it is billed `min(600 000, 280 000)` = the 280 000 intrinsic, which
+    // the 500 000 consensus floor raises to FLOOR. (The old expectation,
+    // 600 000, encoded the declared-limit over-charge this fix removes.)
+    assert_eq!(out.tx_fees, vec![FLOOR, FLOOR, FLOOR]);
+    assert_eq!(out.fees_collected, FLOOR + FLOOR + FLOOR);
+
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - (1_000 + FLOOR) - (500 + FLOOR) - FLOOR
+    );
+    assert_eq!(
+        sender.nonce, 3,
+        "success, paid floor AND paid failure all advance"
+    );
+    let bob = engine.get_account(&[0xB0; 32]).await.unwrap();
+    assert_eq!(bob.balance, 1_000 + 500);
+    let proposer_acct = engine.get_account(&proposer_id).await.unwrap();
+    let burn = ((out.fees_collected as u128)
+        * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
+    assert_eq!(proposer_acct.balance, out.fees_collected - burn);
+    assert_eq!(
+        sender.balance + bob.balance + proposer_acct.balance + burn,
+        total_before,
+        "supply conserved: every debit arrived somewhere or was burned"
+    );
+}
+
+/// The consensus D2 mirror escalates the floor after failures (same step as
+/// admission) and clears on success — derived purely from applied blocks.
+#[tokio::test]
+async fn consensus_penalty_mirror_escalates_and_clears() {
+    let engine = engine_with_floor(0).await; // floor = penalty only
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Fail once at floor 0: pays 0 and - no pay, no state change - leaves
+    // the nonce alone, but the mirror records the failure.
+    let fail = txp(&alice, [0xB0; 32], 0, 0, 0, oom_payload());
+    let (_, _, _, s1, fees1) = engine.apply_block_parallel_fees(&[fail], TS).await;
+    assert_eq!(s1, vec![false]);
+    assert_eq!(fees1, vec![0]);
+    assert_eq!(
+        engine.get_account(&from).await.unwrap().nonce,
+        0,
+        "unpaid failure burns no nonce"
+    );
+    // Next transaction is charged the one-step penalty as its floor.
+    let punished = tx(&alice, [0xB0; 32], 0, 100_000, 0);
+    let (_, _, _, s2, fees2) = engine.apply_block_parallel_fees(&[punished], TS).await;
+    assert_eq!(s2, vec![true]);
+    assert_eq!(
+        fees2,
+        vec![GAS_BASIC_TRANSFER],
+        "one failure escalates the floor by one bond step"
+    );
+
+    // Success clears the mirror: the floor is 0 again.
+    let cleared = tx(&alice, [0xB0; 32], 0, 0, 1);
+    let (_, _, _, s3, fees3) = engine.apply_block_parallel_fees(&[cleared], TS).await;
+    assert_eq!(s3, vec![true]);
+    assert_eq!(fees3, vec![0], "one success clears the penalty");
+}
+
+/// PQ activation floor includes the 45k surcharge at apply, under the same
+/// predicate admission uses.
+#[tokio::test]
+async fn pq_activation_floor_includes_surcharge_at_apply() {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    use stellereum::sharding::{PqSignatureEnvelope, Transaction as Tx};
+
+    let engine = engine_with_floor(FLOOR).await;
+    let seed = 0xA0u8;
+    let pk = Tx::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Declares exactly the base floor: the surcharge is charged on top.
+    let mut tx = Tx {
+        from,
+        to: [0xB0; 32],
+        amount: 0,
+        gas_limit: FLOOR,
+        nonce: 0,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = Tx::create_falcon512_test_signature(&pk, &msg, seed);
+    tx.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
+    assert!(tx.is_pq_activation());
+
+    let (applied, failed, _, status, fees) = engine.apply_block_parallel_fees(&[tx], TS).await;
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![FLOOR + PQ_SURCHARGE],
+        "activation pays base floor + surcharge"
+    );
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - FLOOR - PQ_SURCHARGE);
+}
+
+// ===========================================================================
+// FEE-01: the fee is the gas CONSUMED, never the declared limit
+// ===========================================================================
+
+/// GOLDEN FEE-01 CASE (empty payload): a transfer declaring 1 000 000 gas on
+/// a floor-0 chain is billed the intrinsic envelope cost and REFUNDED the
+/// rest.
+///
+/// Before the fix the block path passed `tx.gas_limit` as the gas it had
+/// charged, so `min(gas_charged, gas_limit)` was a no-op and this transaction
+/// paid 1 000 000 for consuming ~0.
+#[tokio::test]
+async fn block_refunds_unused_gas_on_a_plain_transfer() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    let declared = 1_000_000u64;
+    let tx = tx(&alice, [0xB0; 32], 1_000, declared, 0);
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "the fee is the intrinsic envelope cost, not the 1 000 000 declaration"
+    );
+    assert_eq!(
+        fees_collected, GAS_BASIC_TRANSFER,
+        "fees_collected is the sum of charged fees (the proposer credit)"
+    );
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - 1_000 - GAS_BASIC_TRANSFER);
+    assert_eq!(sender.nonce, 1);
+}
+
+/// GOLDEN FEE-01 CASE (payload): the VM's own `gas_used` prices the fee.
+///
+/// A `Transfer` opcode consumes `GAS_BASIC_TRANSFER`; declaring 1 000 000 and
+/// consuming 280 000 must debit 280 000, not the declaration.
+#[tokio::test]
+async fn block_charges_the_measured_gas_of_a_payload() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    let tx = txp(
+        &alice,
+        [0xB0; 32],
+        1_000,
+        1_000_000,
+        0,
+        vec![OpCode::Transfer {
+            recipient: [0xB1; 32],
+            amount: 3_000,
+        }],
+    );
+    let (applied, failed, _, status, fees) = engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0));
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "one Transfer opcode consumes GAS_BASIC_TRANSFER; the rest is refunded"
+    );
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - 1_000 - 3_000 - GAS_BASIC_TRANSFER,
+        "only the consumed gas leaves the sender"
+    );
+}
+
+/// GOLDEN FEE-01 CASE (zero-gas success): a payload that measured ZERO gas is
+/// NOT a free transaction.
+///
+/// `OpCode::Halt` is priced at `GAS_HALT = 0` and succeeds immediately, so the
+/// executor reports `gas_used = 0`. Before the fix the intrinsic was added
+/// only for an EMPTY payload, so `[Halt]` paid nothing at all: a
+/// self-authenticated, nonce-advancing transaction that cost the sender 0 and
+/// bypassed the admission floor (the floor only constrains the DECLARED limit,
+/// which is refunded when nothing is used). It must pay the intrinsic envelope
+/// exactly like a failing transaction does.
+#[tokio::test]
+async fn a_zero_gas_successful_payload_pays_the_intrinsic_envelope() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // Implicit Falcon-512 envelope: no PQ activation surcharge, so the fee is
+    // the base charge alone and a zero base is observable.
+    let tx = txp(&alice, [0xB0; 32], 0, 1_000_000, 0, vec![OpCode::Halt]);
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (1, 0), "Halt itself succeeds");
+    assert_eq!(status, vec![true]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "a zero-gas success must pay the intrinsic envelope, never 0"
+    );
+    assert_eq!(fees_collected, GAS_BASIC_TRANSFER);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(
+        sender.balance,
+        BAL - GAS_BASIC_TRANSFER,
+        "the sender cannot get the envelope back as a refund"
+    );
+    assert_eq!(sender.nonce, 1);
+}
+
+/// GOLDEN FEE-01 CASE (failure): an attributable failure is priced at the
+/// intrinsic envelope, floored by consensus — never at the declared limit.
+///
+/// The failure arm of the VM result carries no consumption measurement, so
+/// the declared limit must not be used as a stand-in price (that was the
+/// over-charge). The fee stays strictly positive, so the D2 free-failure loop
+/// is still closed.
+#[tokio::test]
+async fn failed_block_tx_pays_measured_gas_not_the_declaration() {
+    let engine = engine_with_floor(0).await;
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+
+    // A token transfer against a non-existent token reverts.
+    let tx = txp(
+        &alice,
+        [0xB0; 32],
+        0,
+        1_000_000,
+        0,
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: [0xAB; 32],
+            to: [0x44; 32],
+            amount: 1,
+        }],
+    );
+    let (applied, failed, fees_collected, status, fees) =
+        engine.apply_block_parallel_fees(&[tx], TS).await;
+
+    assert_eq!((applied, failed), (0, 1));
+    assert_eq!(status, vec![false]);
+    assert_eq!(
+        fees,
+        vec![GAS_BASIC_TRANSFER],
+        "a failure pays the intrinsic envelope cost, not the 1 000 000 declaration"
+    );
+    assert_eq!(fees_collected, GAS_BASIC_TRANSFER);
+    let sender = engine.get_account(&from).await.unwrap();
+    assert_eq!(sender.balance, BAL - GAS_BASIC_TRANSFER);
+    assert_eq!(sender.nonce, 1, "a paid failure consumes its nonce");
+}
+
+// ===========================================================================
+// VALIDATE: refuse underpriced blocks, loudly
+// ===========================================================================
+
+fn single_validator() -> (
+    SigningKey,
+    stellereum::post_quantum::FalconKeypair,
+    ValidatorSet,
+    Arc<InMemoryStateEngine>,
+) {
+    let key = SigningKey::generate(&mut OsRng);
+    let me = id_of(&key);
+    let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&key.to_bytes());
+    stellereum::consensus::register_validator_pq_key(
+        me,
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    let engine = Arc::new(InMemoryStateEngine::new());
+    let vset = ValidatorSet::from_list(vec![(me, 1)]);
+    (key, fk, vset, engine)
+}
+
+/// A honestly-proposed block at/above the floor validates.
+#[tokio::test]
+async fn validate_accepts_block_at_or_above_floor() {
+    let (key, fk, vset, engine) = single_validator();
+    let me = id_of(&key);
+    engine
+        .update_account(AccountState::new(me, 10_000_000))
+        .await;
+    let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk);
+    rt.mempool.write().await.base_fee = FLOOR;
+
+    // Funded above amount + floor, declared above the floor: packed + valid.
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+    let tx = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
+    rt.mempool
+        .write()
+        .await
+        .add_checked(tx, BAL)
+        .expect("above-floor funded tx admitted");
+
+    let block = rt.propose(TS).await.expect("propose must succeed");
+    assert!(!block.transactions.is_empty());
+    let root = engine.get_state_root().await;
+    assert_eq!(block.state_root, root);
+    rt.validate_proposal(&block, root)
+        .expect("a block at the floor must validate");
+}
+
+/// A block carrying a valid-signature but underpriced transaction is refused,
+/// naming the transaction hash.
+#[tokio::test]
+async fn validate_refuses_underpriced_block_naming_tx() {
+    let (key, fk, vset, engine) = single_validator();
+    let me = id_of(&key);
+    engine
+        .update_account(AccountState::new(me, 10_000_000))
+        .await;
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
+    rt.mempool.write().await.base_fee = FLOOR;
+
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+    // Genuine above-floor block first (fixes height/root/prev/proposer).
+    let good = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
+    rt.mempool
+        .write()
+        .await
+        .add_checked(good, BAL)
+        .expect("admitted");
+    let genuine = rt.propose(TS).await.expect("propose must succeed");
+    let root = engine.get_state_root().await;
+    rt.validate_proposal(&genuine, root)
+        .expect("genuine block validates");
+
+    // Byzantine swap: same envelope, one underpriced (but correctly signed
+    // and funded) transaction, re-signed by the real proposer.
+    let cheap = tx(&alice, [0xB0; 32], 1_000, 100, 0);
+    let cheap_hash = hex::encode(cheap.compute_tx_hash());
+    let mut bad = genuine.clone();
+    bad.transactions = vec![cheap];
+    // The proposer re-commits to the order it packed: the order root is part
+    // of the signed hash, so a Byzantine proposer updates it too (that is
+    // exactly what keeps the ORDER commitment meaningful).
+    bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
+    let err = rt
+        .validate_proposal(&bad, root)
+        .expect_err("underpriced block must be refused");
+    assert!(
+        err.contains("fee floor"),
+        "refusal must name the rule: {err}"
+    );
+    assert!(
+        err.contains(&cheap_hash),
+        "refusal must name the transaction: {err}"
+    );
+}
+
+/// The surcharge is part of the validate floor: an activation transaction
+/// covering the base but not the 45k surcharge is refused.
+#[tokio::test]
+async fn validate_refuses_activation_missing_surcharge() {
+    use stellereum::post_quantum::{
+        derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+    };
+    use stellereum::sharding::Transaction as Tx;
+
+    let (key, fk, vset, engine) = single_validator();
+    let me = id_of(&key);
+    engine
+        .update_account(AccountState::new(me, 10_000_000))
+        .await;
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
+    rt.mempool.write().await.base_fee = FLOOR;
+
+    // Genuine block for a correct envelope.
+    let alice = pq_user();
+    engine
+        .update_account(AccountState::new(pq_id(&alice), BAL))
+        .await;
+    let good = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
+    rt.mempool
+        .write()
+        .await
+        .add_checked(good, BAL)
+        .expect("admitted");
+    let genuine = rt.propose(TS).await.expect("propose must succeed");
+    let root = engine.get_state_root().await;
+
+    // Activation declaring base but not base + surcharge.
+    let seed = 0xA1u8;
+    let pk = Tx::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    let mut act = Tx {
+        from,
+        to: [0xB0; 32],
+        amount: 0,
+        gas_limit: FLOOR,
+        nonce: 0,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+
+        priority_fee_per_gas: 0,
+    };
+    let msg = act.signing_message();
+    let sig = Tx::create_falcon512_test_signature(&pk, &msg, seed);
+    act.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
+    assert!(act.is_pq_activation());
+
+    let mut bad = genuine.clone();
+    bad.transactions = vec![act];
+    bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
+    let err = rt
+        .validate_proposal(&bad, root)
+        .expect_err("activation missing the surcharge must be refused");
+    assert!(err.contains("fee floor"), "must name the rule: {err}");
+    assert!(err.contains("45000"), "must show the surcharge leg: {err}");
+}
+
+/// The D2 penalty is part of the validate floor: after a recorded failure
+/// the sender must over-post, exactly like admission.
+#[tokio::test]
+async fn validate_enforces_failure_penalty_like_admission() {
+    let (key, fk, vset, engine) = single_validator();
+    let me = id_of(&key);
+    engine
+        .update_account(AccountState::new(me, 10_000_000))
+        .await;
+    let mut rt =
+        ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1).with_falcon_key(fk.clone());
+
+    let alice = pq_user();
+    let from = pq_id(&alice);
+    engine.update_account(AccountState::new(from, BAL)).await;
+    // Admit the envelope block tx BEFORE the penalty lands (`add` enforces
+    // the current floor, so it must precede the failure feedback).
+    let ok_tx = tx(&alice, [0xB0; 32], 1, FLOOR, 0);
+    rt.mempool
+        .write()
+        .await
+        .add(ok_tx)
+        .expect("at-floor tx admitted before any penalty");
+    {
+        let mut mp = rt.mempool.write().await;
+        mp.base_fee = FLOOR;
+        // One recorded failure: penalty is one bond step (280k).
+        mp.note_apply_feedback(&[from], &[]);
+        assert_eq!(mp.effective_floor(&from), FLOOR + GAS_BASIC_TRANSFER);
+    }
+    // Direct admission would refuse this (penalty not covered)...
+    let penalised = tx(&alice, [0xB0; 32], 1, FLOOR, 1);
+    assert_eq!(
+        rt.mempool.write().await.add_checked(penalised.clone(), BAL),
+        Err(stellereum::mempool::MempoolError::FeeTooLow)
+    );
+
+    // ...and so must validation of a block carrying it.
+    let genuine = rt.propose(TS).await.expect("propose must succeed");
+    let root = engine.get_state_root().await;
+    let mut bad = genuine.clone();
+    bad.transactions = vec![penalised];
+    bad.order_merkle_root = stellereum::mev::compute_order_merkle_root(&bad.transactions);
+    bad.validator_signatures.clear();
+    bad.sign_block_with_falcon(&key, &fk);
+    let err = rt
+        .validate_proposal(&bad, root)
+        .expect_err("penalty-underpriced block must be refused");
+    assert!(err.contains("fee floor"), "must name the rule: {err}");
+    assert!(err.contains("penalty"), "must show the penalty leg: {err}");
+
+    // Covering base + penalty validates.
+    let rich = tx(&alice, [0xB0; 32], 1, FLOOR + GAS_BASIC_TRANSFER, 1);
+    let mut good = genuine.clone();
+    good.transactions = vec![rich];
+    good.order_merkle_root = stellereum::mev::compute_order_merkle_root(&good.transactions);
+    good.validator_signatures.clear();
+    good.sign_block_with_falcon(&key, &fk);
+    rt.validate_proposal(&good, root)
+        .expect("base + penalty must validate");
+}

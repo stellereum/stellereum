@@ -12,7 +12,7 @@
 //!
 ////! Account Object (Hardened Native Account Abstraction) Contract
 //!
-//! Fully Audited & Pentested:
+//! Design properties (NOT an audit; see the DEMO-GRADE status above):
 //! - Protected against integer wrap-around slot collisions (bounded session_id).
 //! - Protected against decimal packing bleed (strict modulus boundary assertions).
 //! - Strict access controls: caller authentication on ownership, guardian, and sessions.

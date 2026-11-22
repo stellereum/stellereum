@@ -8,6 +8,10 @@
 #                     falcon.key via `stellereum keys init`, node.yaml, node.env,
 #                     snapshot bootstrap, and registration instructions)
 #
+# Note: the public faucet is capped at 50 STELL and cannot fund the 1,100 STELL
+# validator bond. Validator stake is provisioned by the Foundation on request
+# or by an operator transfer.
+#
 # Usage:
 #   scripts/join-testnet.sh --mode observer [OPTIONS]
 #   scripts/join-testnet.sh --mode validator [OPTIONS]
@@ -394,6 +398,9 @@ EOF
    the cold withdrawal address with >= 1,100 STELL (1,000 STELL minimum bond +
    100 STELL admission buffer, plus a small gas margin, e.g. 1,101 STELL) on
    shard 0 (masterchain: -1:<withdrawal_address>).
+   The public faucet is capped at 50 STELL (2 STELL per drip, 45-minute
+   cooldown) and CANNOT fund this bond. Validator stake comes from the
+   Foundation on request or an operator transfer.
 
 4. Register your validator on-chain (OpCode 59, Falcon-512 PoP):
      set -a; source "$HOME_DIR/node.env"; set +a

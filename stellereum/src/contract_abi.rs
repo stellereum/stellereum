@@ -30,9 +30,6 @@
 //! args_payload := u32_le(arg_count) || arg_0 || arg_1 || ...
 //! arg_i       := u8(type_tag) || value_payload
 //!
-//! calldata     := u32_le(selector) || args_payload
-//! selector     := sha256(method_name)[0..4] read as u32_le
-//!
 //! return_value := u8(type_tag) || value_payload
 //!
 //! event_payload := u32_le(topic_count) || topic_0 || ... || u32_le(data_count) || data_0 || ...
@@ -52,14 +49,35 @@
 //! host-dependent encodings. Variable-length payloads are length-prefixed with
 //! a little-endian `u32` so a decoder can skip a value without knowing its
 //! type in advance.
+//!
+//! # What the runtime actually sees
+//!
+//! `host.calldata` receives [`encode_args`](ContractAbi::encode_args) output
+//! **only** — the `args_payload` above, with no method selector and no count
+//! framing beyond `arg_count`. Dispatch is by the exported method name, not by
+//! a selector. [`encode_call`](ContractAbi::encode_call) prepends
+//! `u32_le(sha256(method_name)[0..4])` as a *client-side* envelope helper; the
+//! engine never consumes that prefix, and `SysCallCallContract` /
+//! `SysCallCallContractArgs` pass whatever raw calldata they carry straight to
+//! wasm without consulting a manifest.
+//!
+//! Manifest validation is therefore a preview/RPC check, not a consensus rule.
+//! The manifest blob cap is 1 MiB ([`MAX_ABI_BLOB_LEN`]), but signed-path
+//! transaction calldata is capped at 64 KiB (`MAX_CONTRACT_CALLDATA_BYTES` in
+//! `svm.rs`), so the latter is the practical on-chain limit.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
 use std::fmt;
 
-/// Maximum number of arguments accepted by a single ABI-encoded call.
-pub const MAX_ABI_ARGS: usize = 16;
+/// Maximum number of parameters a method may declare, and of arguments a
+/// single ABI-encoded call may carry.
+///
+/// This is aligned with the VM's `MAX_CONTRACT_CALL_ARGS` (8 `i64`
+/// parameters): a wider manifest is refused here at validation time instead of
+/// validating and then failing at execution.
+pub const MAX_ABI_ARGS: usize = 8;
 /// Maximum size (bytes) of a single length-prefixed blob (`bytes` / `string`).
 pub const MAX_ABI_BLOB_LEN: usize = 1024 * 1024;
 
@@ -974,9 +992,11 @@ impl ContractAbi {
             seen.push(&m.name);
             if m.params.len() > MAX_ABI_ARGS {
                 return Err(AbiError::Json(format!(
-                    "method {} declares {} parameters, the maximum is {MAX_ABI_ARGS}",
+                    "method {} declares {} parameters; the manifest limit is {MAX_ABI_ARGS} \
+                     and the VM dispatches at most {} i64 parameters (MAX_CONTRACT_CALL_ARGS)",
                     m.name,
-                    m.params.len()
+                    m.params.len(),
+                    crate::contract::MAX_CONTRACT_CALL_ARGS
                 )));
             }
         }
@@ -1510,6 +1530,32 @@ mod tests {
             vec![AbiValue::I64(2), AbiValue::I64(1)]
         );
         let _ = (a2,);
+    }
+
+    #[test]
+    fn manifest_rejects_more_parameters_than_the_vm_dispatches() {
+        let params = |n: usize| {
+            (0..n)
+                .map(|i| AbiParam::new(format!("p{i}"), AbiType::I64))
+                .collect::<Vec<_>>()
+        };
+        let at_limit = ContractAbi {
+            methods: vec![AbiMethod::view("eight", params(8), AbiType::I64)],
+            events: vec![],
+        };
+        at_limit.validate().expect("8 parameters must validate");
+
+        let over = ContractAbi {
+            methods: vec![AbiMethod::view("nine", params(9), AbiType::I64)],
+            events: vec![],
+        };
+        let err = over
+            .validate()
+            .expect_err("9 parameters must be refused at manifest validation");
+        let msg = err.to_string();
+        assert!(msg.contains("declares 9 parameters"), "{msg}");
+        assert!(msg.contains("manifest limit is 8"), "{msg}");
+        assert!(msg.contains("at most 8 i64"), "{msg}");
     }
 
     #[test]

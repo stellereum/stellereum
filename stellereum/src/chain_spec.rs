@@ -54,11 +54,58 @@ pub const EXEC_HARDENING_V1_ACTIVATION_HEIGHT: u64 = 0;
 /// and strict canonical `PQ1` envelope decoding.
 pub const WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
 
+/// Contract-originated cross-shard send refusal activation height
+/// (`0` = active from genesis).
+///
+/// A WASM contract that calls `host.send_message` for a recipient whose
+/// address→shard resolution is NOT the executing shard has no authenticated
+/// delivery path. The router synthesized an unsigned transaction with
+/// `nonce = 0`, zero `source_state_root` / `finalized_in_block`, no Merkle
+/// proof, no escrow leaf, and then OVERWROTE the canonical `msg_id` with the
+/// contract-supplied id. The inbound chokepoint requires `verify_msg_id`,
+/// `tx.verify_signature`, an anchored source escrow proof and anchored source
+/// finality — none of which such a record can satisfy — so the record was
+/// never credited, yet the hardened router had already debited
+/// `accounts[msg.sender]`. Every cross-shard contract send was therefore a
+/// BURN: the source lost the value, the target received nothing, and no bounce
+/// was possible (there is no consumer of `cross_shard_out` for these records).
+///
+/// `0` is safe because NO valid, deliverable cross-shard contract send exists
+/// to break: there is no authenticated producer, no committed escrow leaf and
+/// no delivery consumer. Refusing the message before the debit turns a silent
+/// burn into a deterministic revert, so the sender keeps its value. The
+/// refusal is a safety fix, not a feature removal: a real protocol (canonical
+/// `msg_id`, committed escrow leaf, anchored finality, delivery, bounce/2PC)
+/// would need its own activation gate and would replace this refusal.
+pub const WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT: u64 = 0;
+
+/// Contract-visible `host.block_hash` activation height (`u64::MAX` =
+/// disabled, the default).
+///
+/// Before this gate, `host.block_hash` writes 32 zero bytes: the VM had no
+/// block identifier wired in. Zero is deterministic but useless, and it also
+/// invited callers to treat "all zeros" as a sentinel.
+///
+/// Enabling the gate makes the host function return the PARENT block hash
+/// (`block.prev_hash`) of the block being applied. The parent is used, not the
+/// current block hash, because the current hash commits execution output
+/// (`body_commitment` includes `cross_shard_out`), which cannot be known before
+/// the transactions run. The parent hash is identical on every node applying
+/// the same block and across repeated executions of that block.
+///
+/// `u64::MAX` (disabled) keeps the historical zero so this contract-visible
+/// change needs an explicit governance decision.
+pub const CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static WASM_XSHARD_PMM_HARDENING_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static WASM_XSHARD_CONTRACT_SEND_REFUSAL_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static CONTRACT_BLOCK_HASH_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -74,6 +121,20 @@ pub fn set_exec_hardening_v1_activation_override(activation: Option<u64>) {
 #[cfg(any(test, debug_assertions))]
 pub fn set_wasm_xshard_pmm_hardening_activation_override(activation: Option<u64>) {
     WASM_XSHARD_PMM_HARDENING_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Set (or clear with `None`) the TEST-ONLY `WASM_XSHARD_CONTRACT_SEND_REFUSAL`
+/// activation height override for the calling thread.
+#[cfg(any(test, debug_assertions))]
+pub fn set_wasm_xshard_contract_send_refusal_override(activation: Option<u64>) {
+    WASM_XSHARD_CONTRACT_SEND_REFUSAL_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Set (or clear with `None`) the TEST-ONLY `CONTRACT_BLOCK_HASH` activation
+/// height override for the calling thread.
+#[cfg(any(test, debug_assertions))]
+pub fn set_contract_block_hash_activation_override(activation: Option<u64>) {
+    CONTRACT_BLOCK_HASH_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
 }
 
 /// Effective `EXEC_HARDENING_V1` activation height for the calling thread.
@@ -109,6 +170,43 @@ pub fn exec_hardening_v1_active_at(height: u64) -> bool {
 /// effective gate is `u64::MAX` (`GatedOff`).
 pub fn wasm_xshard_pmm_hardening_active_at(height: u64) -> bool {
     let gate = wasm_xshard_pmm_hardening_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Effective `WASM_XSHARD_CONTRACT_SEND_REFUSAL` activation height for the
+/// calling thread.
+pub fn wasm_xshard_contract_send_refusal_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = WASM_XSHARD_CONTRACT_SEND_REFUSAL_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT
+}
+
+/// True iff contract-originated cross-shard messages are REFUSED at `height`.
+///
+/// Strictly returns `false` for EVERY height when the effective gate is
+/// `u64::MAX` (test/operator override only; the compiled value is `0`).
+pub fn wasm_xshard_contract_send_refusal_active_at(height: u64) -> bool {
+    let gate = wasm_xshard_contract_send_refusal_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Effective `CONTRACT_BLOCK_HASH` activation height for the calling thread.
+pub fn contract_block_hash_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = CONTRACT_BLOCK_HASH_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT
+}
+
+/// True iff `host.block_hash` returns the parent block hash at `height`.
+///
+/// Strictly returns `false` for EVERY height when the effective gate is
+/// `u64::MAX` (the compiled default): contracts keep seeing zero.
+pub fn contract_block_hash_active_at(height: u64) -> bool {
+    let gate = contract_block_hash_activation_height();
     gate != u64::MAX && height >= gate
 }
 
@@ -401,6 +499,18 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "Ruleset v7 WASM/XShard/PMM/PQ1 hardening: SubCallSnapshot, caller vs origin, outbound post-commit + balance sync, deploy_with_nonce, PMM ZeroMint/ZeroPayout, canonical PQ1",
             ),
             ActivationGate::new(
+                "WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT",
+                "stellereum::svm",
+                wasm_xshard_contract_send_refusal_height(),
+                "Safety fix: a contract-originated message to a non-local shard is refused before the debit (it had no authenticated delivery path and was a burn)",
+            ),
+            ActivationGate::new(
+                "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
+                "stellereum::svm",
+                contract_block_hash_activation_height(),
+                "Contract-visible host.block_hash returns the parent block hash (compiled default u64::MAX: contracts see zero)",
+            ),
+            ActivationGate::new(
                 "HEADER_COMMIT_ACTIVATION_HEIGHT",
                 "stellereum::sharding::block",
                 HEADER_COMMIT_ACTIVATION_HEIGHT,
@@ -577,6 +687,14 @@ mod tests {
                 WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
             ),
             (
+                "WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT",
+                WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT,
+            ),
+            (
+                "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
+                CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,
+            ),
+            (
                 "HEADER_COMMIT_ACTIVATION_HEIGHT",
                 HEADER_COMMIT_ACTIVATION_HEIGHT,
             ),
@@ -619,6 +737,7 @@ mod tests {
         for r2_r4_gate in [
             "EXEC_HARDENING_V1_ACTIVATION_HEIGHT",
             "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
+            "WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT",
             "HEADER_COMMIT_ACTIVATION_HEIGHT",
             "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
             "PQ_LIFECYCLE_ACTIVATION_HEIGHT",

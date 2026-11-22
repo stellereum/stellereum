@@ -1575,9 +1575,53 @@ pub struct VmExecOptions {
     pub chain_id: Option<u64>,
     pub chain_height: u64,
     pub pq_registry: Option<crate::pq_registry::PqRegistry>,
+    /// Parent block hash (`block.prev_hash`) of the block whose payload is
+    /// being executed. Contract-visible ONLY at/after
+    /// [`crate::chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT`]; below the
+    /// gate (and at the compiled default `u64::MAX`) contracts keep seeing
+    /// zero, exactly as before.
+    ///
+    /// This rides in the execution OPTIONS rather than [`VmContext`] so every
+    /// existing `VmContext { ... }` literal keeps compiling. Callers without a
+    /// block context (single-transaction apply, RPC preview) leave the default
+    /// zero, which is the pre-gate behaviour.
+    pub contract_block_hash: [u8; 32],
 }
 
 pub struct Svm;
+
+/// Deterministic refusal returned when a contract emits an outbound message
+/// for a shard other than the executing one while
+/// [`crate::chain_spec::WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT`] is active.
+///
+/// There is no authenticated cross-shard delivery protocol: the old router
+/// synthesized an unsigned, unproven transaction, overwrote its canonical
+/// `msg_id`, wrote no escrow leaf and enqueued a record no inbound gate can
+/// accept — after debiting the sender. Refusing before the debit is the only
+/// safety-positive outcome: the transaction reverts and the sender keeps the
+/// value.
+pub const CROSS_SHARD_CONTRACT_SEND_REFUSAL: &str =
+    "cross-shard contract messages are not available: no authenticated delivery protocol is active";
+
+/// True iff `recipient` resolves to a shard other than `local_shard` while
+/// cross-shard routing is enabled.
+///
+/// Shared by the routers and by the pre-commit refusal in the apply path so
+/// there is exactly ONE address→shard rule and ONE notion of "cross-shard".
+pub fn contract_recipient_is_cross_shard(
+    recipient: &[u8; 32],
+    local_shard: u32,
+    sharded: bool,
+    topology: &crate::sharding::ShardTopology,
+) -> bool {
+    if !sharded {
+        return false;
+    }
+    crate::sharding::route_shard(
+        topology,
+        &crate::sharding::ShardAddress::Workchain(*recipient),
+    ) != local_shard
+}
 
 impl Svm {
     /// Execute `instructions` against every domain wired into `ctx`.
@@ -1664,6 +1708,18 @@ impl Svm {
         };
 
         let mut current_balance = ctx.balance;
+
+        // Contract-visible block identifier. Threaded from the apply path as
+        // the PARENT block hash (the current block hash commits execution
+        // output, so it cannot be known before the payloads run). Below the
+        // activation gate — including the compiled default `u64::MAX` — the
+        // historical zero is preserved byte-for-byte for compatibility.
+        let contract_block_hash =
+            if crate::chain_spec::contract_block_hash_active_at(opts.chain_height) {
+                opts.contract_block_hash
+            } else {
+                [0u8; 32]
+            };
 
         // Outbound messages emitted by contracts during call execution via host.send_message
         let mut outbound_messages: Vec<crate::contract::ContractMessage> = Vec::new();
@@ -2339,7 +2395,7 @@ impl Svm {
                         caller: ctx.sender,
                         value: 0,
                         block_time: ctx.timestamp,
-                        block_hash: [0u8; 32],
+                        block_hash: contract_block_hash,
                     };
                     let call_res = if opts.wasm_pmm_hardening {
                         reg.call_with_context_hardened(
@@ -2445,7 +2501,7 @@ impl Svm {
                         caller: ctx.sender,
                         value: 0,
                         block_time: ctx.timestamp,
-                        block_hash: [0u8; 32],
+                        block_hash: contract_block_hash,
                     };
                     let call_res = if opts.wasm_pmm_hardening {
                         reg.call_with_context_args_calldata_hardened(
@@ -4242,6 +4298,13 @@ impl Svm {
     /// rule (see `crate::sharding::ROUTING_RULE`): the longest matching
     /// routing prefix wins, ties broken by the smallest shard id. The master
     /// chain is never a candidate here — it is addressed explicitly.
+    ///
+    /// CROSS-SHARD WARNING: this legacy (pre-hardening) router keeps its
+    /// historical shape only for non-consensus/direct helper callers. Its
+    /// cross-shard branch builds a record that no inbound gate can accept and
+    /// must NEVER be treated as a delivery path. Transaction execution refuses
+    /// such messages before settlement; the hardened router refuses them
+    /// before the debit.
     pub fn route_contract_messages_with_topology(
         messages: &[crate::contract::ContractMessage],
         accounts: &mut HashMap<[u8; 32], crate::state_engine::AccountState>,
@@ -4322,6 +4385,14 @@ impl Svm {
 
     /// Hardened (`>= H`) contract outbound message router that enforces 1:1
     /// balance conservation across `accounts` and `cross_shard_out`:
+    /// - REFUSES a cross-shard message at/after
+    ///   [`crate::chain_spec::WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT`]
+    ///   (`0`): no authenticated delivery protocol exists, so the old
+    ///   debit-then-enqueue path burned the value into an unverifiable record.
+    ///   The refusal happens BEFORE the debit, so a caller that reaches this
+    ///   router with such a message leaves both the balance and
+    ///   `cross_shard_out` untouched. The transaction-level refusal (and its
+    ///   deterministic error) is enforced earlier, in `execute_payload`.
     /// - Rejects non-empty raw payloads that do not decode as [`crate::state_engine::ActorSendBody`]
     ///   (prevents bounce-minting from failed `decode_actor_body`).
     /// - Checks `accounts[msg.sender].balance >= msg.value` and debits
@@ -4331,6 +4402,9 @@ impl Svm {
     ///   transfers deliver cleanly (or bounce only already-debited value).
     /// - Returns `(addr, balance, nonce)` of every debited `msg.sender` so the
     ///   caller can update `state_trie`.
+    ///
+    /// `chain_height` is the COMMITTED block height; it selects the refusal
+    /// gate and must never be a caller-supplied wall-clock value.
     pub fn route_contract_messages_hardened(
         messages: &[crate::contract::ContractMessage],
         accounts: &mut HashMap<[u8; 32], crate::state_engine::AccountState>,
@@ -4338,8 +4412,11 @@ impl Svm {
         local_shard: u32,
         sharded: bool,
         topology: &crate::sharding::ShardTopology,
+        chain_height: u64,
     ) -> Vec<([u8; 32], u64, u64)> {
         use bincode::Options;
+        let refuse_cross_shard =
+            crate::chain_spec::wasm_xshard_contract_send_refusal_active_at(chain_height);
         let mut debited_senders = Vec::new();
         for msg in messages {
             let body_bytes = if msg.payload.is_empty() {
@@ -4361,6 +4438,19 @@ impl Svm {
                 msg.payload.clone()
             };
 
+            let target_shard = crate::sharding::route_shard(
+                topology,
+                &crate::sharding::ShardAddress::Workchain(msg.recipient),
+            );
+            let is_cross_shard = sharded && (target_shard != local_shard);
+            // SAFETY FIX: refuse BEFORE any mutation. The record this branch
+            // would build is unverifiable inbound (no signature, zero roots,
+            // no escrow leaf, rebound msg_id), so debiting and enqueuing it
+            // destroys the value with no delivery and no bounce.
+            if is_cross_shard && refuse_cross_shard {
+                continue;
+            }
+
             let Some(sender_acc) = accounts.get_mut(&msg.sender) else {
                 continue;
             };
@@ -4371,12 +4461,6 @@ impl Svm {
                 sender_acc.balance -= msg.value;
                 debited_senders.push((msg.sender, sender_acc.balance, sender_acc.nonce));
             }
-
-            let target_shard = crate::sharding::route_shard(
-                topology,
-                &crate::sharding::ShardAddress::Workchain(msg.recipient),
-            );
-            let is_cross_shard = sharded && (target_shard != local_shard);
 
             if is_cross_shard {
                 let tx = crate::sharding::Transaction {

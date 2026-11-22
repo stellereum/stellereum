@@ -752,12 +752,45 @@ impl InMemoryStateEngine {
     ///
     /// GATE: `chain_height` MUST be the COMMITTED block height — never a
     /// caller-supplied value. [`Self::apply_block_transition`] passes
-    /// `block.height`.
+    /// `block.height` (and the parent-aware variant passes
+    /// `block.prev_hash` for the contract-visible block identifier).
     pub async fn apply_block_parallel_fees_with_events_at_height(
         &self,
         txs: &[crate::sharding::Transaction],
         timestamp: u64,
         chain_height: u64,
+    ) -> (
+        usize,
+        usize,
+        u64,
+        Vec<bool>,
+        Vec<u64>,
+        Vec<Vec<crate::contract::ContractEvent>>,
+    ) {
+        self.apply_block_parallel_fees_with_events_at_height_and_parent(
+            txs,
+            timestamp,
+            chain_height,
+            [0u8; 32],
+        )
+        .await
+    }
+
+    /// [`Self::apply_block_parallel_fees_with_events_at_height`] with the
+    /// PARENT block hash (`block.prev_hash`) threaded to contract execution.
+    ///
+    /// The parent hash is deterministic for the block being applied and does
+    /// not depend on execution output; contracts observe it via
+    /// `host.block_hash` only at/after
+    /// [`crate::chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT`]. Callers
+    /// without a block (the single-tx path, RPC preview) leave it zero.
+    #[allow(clippy::type_complexity)]
+    pub async fn apply_block_parallel_fees_with_events_at_height_and_parent(
+        &self,
+        txs: &[crate::sharding::Transaction],
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
     ) -> (
         usize,
         usize,
@@ -1310,10 +1343,11 @@ impl InMemoryStateEngine {
                                         .await,
                                 );
                                 match self
-                                    .execute_payload_with_preverify_at_height(
+                                    .execute_payload_with_preverify_at_height_and_parent(
                                         tx,
                                         timestamp,
                                         chain_height,
+                                        parent_block_hash,
                                     )
                                     .await
                                 {
@@ -1394,6 +1428,7 @@ impl InMemoryStateEngine {
                                         let outbound_touched = self
                                             .process_contract_outbound_messages_hardened(
                                                 &actions.outbound_messages,
+                                                chain_height,
                                             )
                                             .await;
                                         touched.extend(outbound_touched);
@@ -1556,7 +1591,12 @@ impl InMemoryStateEngine {
                             .await,
                     );
                     match self
-                        .execute_payload_with_preverify_at_height(tx, timestamp, chain_height)
+                        .execute_payload_with_preverify_at_height_and_parent(
+                            tx,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                        )
                         .await
                     {
                         Ok((
@@ -1650,6 +1690,7 @@ impl InMemoryStateEngine {
                                 let outbound_touched = self
                                     .process_contract_outbound_messages_hardened(
                                         &actions.outbound_messages,
+                                        chain_height,
                                     )
                                     .await;
                                 touched.extend(outbound_touched);

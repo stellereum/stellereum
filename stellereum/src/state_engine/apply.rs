@@ -2,7 +2,7 @@ use super::types::{
     contract_key, decode_actor_body, encode_actor_body, hashpool_commitment_key,
     hashpool_nullifier_key, restore_oracle_after_failure, token_balance_key, token_supply_key,
     write_contract_trie_entries_for_addrs, ActorSnapshot, BridgeSnapshot, ClobQuoteMode,
-    DeliveryCtx, MessageUndo, PayloadDomainSnapshot,
+    DeliveryCtx, MessageUndo, NativeAccountSnapshot, PayloadDomainSnapshot,
 };
 use super::verify_once::require_pq_tx_envelope_at_height;
 use super::{
@@ -462,6 +462,10 @@ impl InMemoryStateEngine {
     }
 
     /// Height-gated variant of [`Self::execute_payload_with_preverify`].
+    ///
+    /// Callers WITHOUT a block context pass through here; the contract-visible
+    /// block identifier is the default zero, which is exactly the pre-gate
+    /// behaviour at every height.
     #[allow(clippy::type_complexity)]
     // GATE: execution snapshot uses account tuple layout shared with commit path.
     pub async fn execute_payload_with_preverify_at_height(
@@ -469,6 +473,33 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
         chain_height: u64,
+    ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        self.execute_payload_with_preverify_at_height_and_parent(
+            tx,
+            timestamp,
+            chain_height,
+            [0u8; 32],
+        )
+        .await
+    }
+
+    /// [`Self::execute_payload_with_preverify_at_height`] with an explicit
+    /// PARENT block hash (`block.prev_hash`).
+    ///
+    /// The parent hash — never the current block hash — is what contracts see
+    /// via `host.block_hash` once
+    /// [`crate::chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT`] is active:
+    /// the current block hash commits execution output (`body_commitment`
+    /// includes `cross_shard_out`), so it cannot be known before the payloads
+    /// run. The parent is identical on every node applying the same block and
+    /// across repeated executions of that block.
+    // GATE: execution snapshot uses account tuple layout shared with commit path.
+    pub async fn execute_payload_with_preverify_at_height_and_parent(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
         let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         let wasm_pmm_hardening =
@@ -631,6 +662,21 @@ impl InMemoryStateEngine {
         } else {
             None
         };
+
+        // Cross-shard contract-send refusal inputs, captured BEFORE the domain
+        // write guards below. `shard_topology` is a separate lock: taking it
+        // while holding the contracts/tokens guards would introduce a new lock
+        // order. The snapshot is only needed when the gate is active; a node
+        // that is not sharded has no cross-shard branch at all.
+        let contract_send_refusal =
+            crate::chain_spec::wasm_xshard_contract_send_refusal_active_at(chain_height);
+        let contract_send_refusal_topology = if contract_send_refusal {
+            Some(self.shard_topology.read().await.clone())
+        } else {
+            None
+        };
+        let contract_send_local_shard = self.shard_id();
+        let contract_send_sharded = self.cross_shard_enabled();
 
         let mut tokens = self.tokens_write().await;
         let mut orderbooks = self.orderbooks_write().await;
@@ -882,6 +928,9 @@ impl InMemoryStateEngine {
             chain_id: Some(self.chain_id),
             chain_height,
             pq_registry: pq_registry_snap,
+            // PARENT block hash: deterministic, already fixed by the block
+            // header and independent of this payload's execution output.
+            contract_block_hash: parent_block_hash,
         };
         let res = crate::svm::Svm::execute_with_confidential_and_sends_at(
             &tx.payload,
@@ -901,6 +950,52 @@ impl InMemoryStateEngine {
             .map(|p| std::mem::take(&mut p.events))
             .unwrap_or_default();
         drop(ctx);
+
+        // SAFETY FIX (cross-shard contract sends): a contract that emitted an
+        // outbound message for a NON-LOCAL shard cannot be delivered. The
+        // legacy router built an unsigned, unproven record and the hardened
+        // router debited the sender before enqueuing it — a silent burn with
+        // no delivery and no bounce (no consumer of `cross_shard_out` can
+        // verify it). Refuse the WHOLE payload BEFORE any settlement or native
+        // commit, so `apply_transaction` / the block path revert it, the fee
+        // path runs as for any revert, and the sender keeps the value.
+        //
+        // Same-shard contract messages are untouched: they keep taking the
+        // actor-inbox path. Inbound cross-shard validation is untouched too.
+        if contract_send_refusal {
+            let has_cross_shard = match (&res, &contract_send_refusal_topology) {
+                (
+                    crate::svm::VmExecutionResult::Success {
+                        outbound_messages, ..
+                    },
+                    Some(topology),
+                ) => outbound_messages.iter().any(|m| {
+                    crate::svm::contract_recipient_is_cross_shard(
+                        &m.recipient,
+                        contract_send_local_shard,
+                        contract_send_sharded,
+                        topology,
+                    )
+                }),
+                _ => false,
+            };
+            if has_cross_shard {
+                // Undo the domain halves the VM committed in place that this
+                // function can restore locally (PMM + its quote-token leg, the
+                // orderbook, the oracle). The caller's `rollback_payload`
+                // restores the full domain snapshot, so both apply paths are
+                // all-or-nothing.
+                if let Some((before_pmm, before_tokens)) = pmm_before.take() {
+                    *pmm = before_pmm;
+                    *tokens = before_tokens;
+                }
+                if let Some(before) = books_before.take() {
+                    orderbooks.books = before;
+                }
+                restore_oracle_after_failure(&mut oracle, oracle_before.take());
+                return Err(crate::svm::CROSS_SHARD_CONTRACT_SEND_REFUSAL.to_string());
+            }
+        }
 
         // Bridge intents are read straight off the payload (the VM only
         // validates them - it has no account map). Settlement below is the
@@ -939,11 +1034,11 @@ impl InMemoryStateEngine {
         // straddles native and wUSDT and half of it cannot be left behind: a
         // surviving wUSDT mint with no native debit would be free money, a
         // surviving burn with no mint would destroy it.
-        let mut pmm_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::new();
+        let mut pmm_native_snapshot: NativeAccountSnapshot = Vec::new();
         // Global-supply reservation the PMM buy leg took (0 when no buy ran or
         // the swap was refused). Rolled back with the swap on a later failure.
         let mut pmm_minted_nano: u64 = 0;
-        let mut clob_native_snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::new();
+        let mut clob_native_snapshot: NativeAccountSnapshot = Vec::new();
         // Same idea for the bridge's native leg: the account halves settle here
         // so the escrow settlement below is priced against post-bridge balances,
         // and a later failure restores exactly this snapshot - accounts AND the
@@ -1044,6 +1139,34 @@ impl InMemoryStateEngine {
                     && self.cross_shard_enabled()
                     && tx.source_shard != crate::sharding::MASTERCHAIN_SHARD
                 {
+                    // B1: the PMM native leg was settled ABOVE this gate, so a
+                    // refusal here must undo it before returning. The caller
+                    // receives `Err` and rolls back with an EMPTY
+                    // `ExecPostActions` (it never got one), so leaving the
+                    // native STELL movement and the supply reservation behind
+                    // would make a rejected transaction net-mint (buy) or
+                    // net-burn (sell). The two account/trie/counter writes are
+                    // not covered by the caller's payload-domain snapshot; the
+                    // domain halves are also restored here so a direct
+                    // `execute_payload` caller sees the same all-or-nothing
+                    // result as the apply paths.
+                    //
+                    // Rollback-only: the refusal VERDICT is unchanged; a
+                    // rejected transaction simply leaves less state behind.
+                    if pmm_minted_nano > 0 {
+                        self.release_mint_nano(pmm_minted_nano);
+                    }
+                    self.restore_pmm_native(&pmm_native_snapshot).await;
+                    if !pmm_events.is_empty() {
+                        if let Some((before_pmm, before_tokens)) = pmm_before.take() {
+                            *pmm = before_pmm;
+                            *tokens = before_tokens;
+                        }
+                    }
+                    if let Some(before) = books_before.take() {
+                        orderbooks.books = before;
+                    }
+                    restore_oracle_after_failure(&mut oracle, oracle_before.take());
                     return Err("bridge intents settle on the masterchain only".to_string());
                 }
                 match self
@@ -1672,7 +1795,10 @@ impl InMemoryStateEngine {
         if let Some(ref actions) = post_actions {
             if !actions.outbound_messages.is_empty() {
                 let outbound_touched = self
-                    .process_contract_outbound_messages_hardened(&actions.outbound_messages)
+                    .process_contract_outbound_messages_hardened(
+                        &actions.outbound_messages,
+                        chain_height,
+                    )
                     .await;
                 touched.extend(outbound_touched);
             }
@@ -3087,10 +3213,11 @@ impl InMemoryStateEngine {
         //    block height goes down as the chain-binding gate's clock (A14
         //    phase 3); see `apply_block_parallel_fees_with_events_at_height`.
         let (applied, failed, fees, status, tx_fees, events) = self
-            .apply_block_parallel_fees_with_events_at_height(
+            .apply_block_parallel_fees_with_events_at_height_and_parent(
                 &block.transactions,
                 block.timestamp,
                 block.height,
+                block.prev_hash,
             )
             .await;
 
@@ -5619,6 +5746,7 @@ impl InMemoryStateEngine {
     pub(super) async fn process_contract_outbound_messages_hardened(
         &self,
         messages: &[crate::contract::ContractMessage],
+        chain_height: u64,
     ) -> Vec<([u8; 32], u64, u64)> {
         if messages.is_empty() {
             return Vec::new();
@@ -5629,7 +5757,13 @@ impl InMemoryStateEngine {
         let mut map = self.accounts.write().await;
         let mut xout = self.cross_shard_out.write().await;
         crate::svm::Svm::route_contract_messages_hardened(
-            messages, &mut map, &mut xout, my_shard, sharded, &topology,
+            messages,
+            &mut map,
+            &mut xout,
+            my_shard,
+            sharded,
+            &topology,
+            chain_height,
         )
     }
 }

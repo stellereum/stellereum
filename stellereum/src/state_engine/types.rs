@@ -607,6 +607,11 @@ pub(super) fn restore_oracle_after_failure(
     oracle.breaker_tripped |= latched;
 }
 
+/// Pre-change native balances for a set of addresses: `(address, (balance,
+/// nonce)?)`, where `None` means the account did not exist. Shared by the PMM,
+/// CLOB and bridge rollback snapshots so the tuple shape lives in ONE place.
+pub(super) type NativeAccountSnapshot = Vec<([u8; 32], Option<(u64, u64)>)>;
+
 /// Rollback record for one applied bridge settlement: the pre-change native
 /// balances AND the pre-change committed bridge domain, so a failure after the
 /// bridge leg can undo the coins and the policy state together (a leftover
@@ -615,7 +620,7 @@ pub(super) fn restore_oracle_after_failure(
 #[allow(clippy::type_complexity)]
 // GATE: snapshot mirrors account tuple layout; alias would churn commitment code.
 pub(super) struct BridgeSnapshot {
-    pub(super) accounts: Vec<([u8; 32], Option<(u64, u64)>)>,
+    pub(super) accounts: NativeAccountSnapshot,
     pub(super) domain: crate::bridge::BridgeState,
     /// Global-supply reservation this bridge settlement took for the NEW
     /// issuance it credited (the gross sum of `BridgeEffect::Credit`).

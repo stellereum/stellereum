@@ -144,6 +144,15 @@ pub struct ContractCallContext {
     pub caller: [u8; 32],
     pub value: u64,
     pub block_time: u64,
+    /// Value written by `host.block_hash`.
+    ///
+    /// The VM threads the PARENT block hash (`block.prev_hash`) here once
+    /// [`crate::chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT`] is active;
+    /// below the gate (and at the compiled default `u64::MAX`) it stays
+    /// `[0u8; 32]`, exactly as before. The parent is used because the current
+    /// block hash commits execution output (`body_commitment`) and cannot be
+    /// known before the payloads run. The VM never invents a value: callers
+    /// without a block context leave this at zero.
     pub block_hash: [u8; 32],
 }
 

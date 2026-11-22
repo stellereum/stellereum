@@ -67,10 +67,10 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    // FULL-PQ: an Ed-only block is refused by `verify_proposer_signature`
-    // (Falcon-only, height-indexed). `falcon_set` has registered the
-    // proposer's Falcon key under its Ed id.
+        round: 0,
+    }; // FULL-PQ: an Ed-only block is refused by `verify_proposer_signature`
+       // (Falcon-only, height-indexed). `falcon_set` has registered the
+       // proposer's Falcon key under its Ed id.
     b.sign_block_with_falcon(pkey, fkey);
     b
 }

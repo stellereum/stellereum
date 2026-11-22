@@ -296,7 +296,8 @@ fn mempool_fee_density_orders_small_high_density_ahead_of_bloated_low_density() 
 
 #[tokio::test]
 async fn fee_market_v2_pre_activation_byte_identical() {
-    assert_eq!(FEE_MARKET_V2_ACTIVATION_HEIGHT, u64::MAX);
+    assert_eq!(FEE_MARKET_V2_ACTIVATION_HEIGHT, 0);
+    let _pre_v7 = FeeMarketGateGuard::at(u64::MAX);
 
     let sender_kp = falcon(0x03);
     let sender = pq_addr(&sender_kp);

@@ -126,7 +126,10 @@ async fn locked_reproposal_records_live_proposal_and_broadcasts_once() {
         .propose(1_000)
         .await
         .expect("locked re-proposal must succeed");
-    assert_eq!(b1.round, rt.hc.round, "the rescue is re-stamped to THIS round");
+    assert_eq!(
+        b1.round, rt.hc.round,
+        "the rescue is re-stamped to THIS round"
+    );
     assert_ne!(
         b1.compute_hash(),
         h,
@@ -186,7 +189,10 @@ async fn demanded_reproposal_records_live_proposal_and_broadcasts_once() {
         .propose(1_000)
         .await
         .expect("demanded re-proposal must succeed");
-    assert_eq!(b1.round, rt.hc.round, "the demand is re-stamped to THIS round");
+    assert_eq!(
+        b1.round, rt.hc.round,
+        "the demand is re-stamped to THIS round"
+    );
     assert_eq!(
         b1.value_id(),
         b0.value_id(),

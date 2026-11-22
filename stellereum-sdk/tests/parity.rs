@@ -314,8 +314,8 @@ fn priority_bid_is_signed_and_hashed_like_node() {
 use stellereum::evm_adapter::{
     binding_message as node_binding_message, build_binding_transaction, build_carrier_transaction,
     carrier_intent_digest, carrier_signing_message, decode_raw_transaction,
-    eip1559_tx_signing_hash, evm_transfer_facts, verify_binding_claim, verify_carrier_intent,
-    verify_evm_payload_against_tx, Eip1559Transaction,
+    eip1559_tx_signing_hash, evm_transfer_facts, evm_transfer_facts_at, verify_binding_claim,
+    verify_carrier_intent, verify_evm_payload_against_tx, Eip1559Transaction,
 };
 use stellereum_sdk::evm::{EvmBindingBuilder, EvmCarrierBuilder};
 use stellereum_sdk::governance::{GovAction, VoteChoice};
@@ -391,6 +391,18 @@ fn protocol_identity_matches_the_node() {
     assert_eq!(PROTOCOL_MAJOR, stellereum::protocol::PROTOCOL_MAJOR);
     assert_eq!(PROTOCOL_MINOR, stellereum::protocol::PROTOCOL_MINOR);
     assert_eq!(FORK_ID, stellereum::protocol::FORK_ID);
+    assert_eq!(FORK_ID, 0x3ae0_0ebc);
+    assert_eq!(
+        stellereum_sdk::protocol::CONSENSUS_RULESET_VERSION,
+        stellereum::protocol::CONSENSUS_RULESET_VERSION
+    );
+    assert_eq!(stellereum_sdk::protocol::CONSENSUS_RULESET_VERSION, 7);
+    assert_eq!(
+        stellereum_sdk::protocol::DOMAIN_SET_VERSION,
+        stellereum::protocol::DOMAIN_SET_VERSION
+    );
+    assert_eq!(stellereum_sdk::protocol::DOMAIN_SET_VERSION, 4);
+    assert_eq!(stellereum_sdk::protocol::FORK_ID_RULES.len(), 32);
     assert_eq!(
         stellereum_sdk::protocol::FORK_ID_RULES,
         stellereum::protocol::FORK_ID_RULES,
@@ -435,6 +447,10 @@ fn evm_intent_decode_matches_node_transfer_facts() {
         ours.chain_id,
         decode_raw_transaction(&raw).unwrap().chain_id().unwrap()
     );
+
+    let sub_nano_raw = eip1559_raw(12, 1_500_000_000, to);
+    assert!(stellereum_sdk::evm::decode_evm_intent(&sub_nano_raw).is_err());
+    assert!(evm_transfer_facts_at(&sub_nano_raw, true).is_err());
 }
 
 #[test]

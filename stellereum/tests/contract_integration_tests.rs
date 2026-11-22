@@ -171,11 +171,13 @@ async fn out_of_fuel_call_reverts() {
         .await;
     let addr = engine.all_contract_addresses().await[0];
 
-    // gas_limit barely covers the base call cost -> almost no wasmi fuel left.
+    // gas_limit barely covers the base call cost -> 1 wasmi fuel left, which is
+    // insufficient to execute `double` even under eager compilation.
+    let call_gas = stellereum::svm::contract_call_gas(b"double".len(), 1, 0);
     let tx = pq_sign_with_payload(
         seed,
         1,
-        1_050,
+        call_gas + 1,
         vec![OpCode::SysCallCallContract {
             contract: addr,
             method: b"double".to_vec(),

@@ -229,7 +229,13 @@ impl Cluster {
             {
                 if let Some(block) = self.nodes[i].rt.propose(ts).await {
                     let round = self.nodes[i].rt.hc.round;
-                    self.broadcast(i, Msg::Proposal { round, block: Box::new(block) });
+                    self.broadcast(
+                        i,
+                        Msg::Proposal {
+                            round,
+                            block: Box::new(block),
+                        },
+                    );
                 }
             }
 
@@ -263,10 +269,7 @@ impl Cluster {
                     && !self.nodes[i].at_or_below_prevote_floor(height, round)
                 {
                     if let Some(v) = self.nodes[i].rt.make_prevote() {
-                        debug_assert!(
-                            v.block_hash.is_none(),
-                            "no live proposal must prevote nil"
-                        );
+                        debug_assert!(v.block_hash.is_none(), "no live proposal must prevote nil");
                         self.cast_prevote(i, v);
                     }
                 }
@@ -479,8 +482,7 @@ impl Cluster {
             self.nodes[i].peer_seen = None;
             self.nodes[i].last_rexmit_ms = 0;
             self.nodes[i].round_started_ms = self.now_ms;
-            self.nodes[i].last_prevoted =
-                self.nodes[i].prevote_floor.filter(|(h, _)| *h == height);
+            self.nodes[i].last_prevoted = self.nodes[i].prevote_floor.filter(|(h, _)| *h == height);
         }
     }
 
@@ -522,7 +524,10 @@ impl Cluster {
                     self.nodes[i].rt.hc.round
                 )
             });
-            assert_eq!(v.round, round, "node {i}: the vote must name the current round");
+            assert_eq!(
+                v.round, round,
+                "node {i}: the vote must name the current round"
+            );
             assert_eq!(
                 v.block_hash,
                 Some(expected),
@@ -829,9 +834,7 @@ async fn one_restart_with_inflight_stale_proposal_finalises_in_the_first_round()
     c.confirm_first_round_quorum(k + 1, current_hash);
 
     let consumed = c
-        .run_until(60_000, |c| {
-            c.nodes.iter().all(|n| n.rt.hc.height > height)
-        })
+        .run_until(60_000, |c| c.nodes.iter().all(|n| n.rt.hc.height > height))
         .await;
     assert!(
         c.nodes.iter().all(|n| n.rt.hc.height > height),
@@ -947,9 +950,7 @@ async fn all_three_restart_with_inflight_stale_proposal_finalises_in_the_first_r
     c.confirm_first_round_quorum(k + 1, current_hash);
 
     let consumed = c
-        .run_until(60_000, |c| {
-            c.nodes.iter().all(|n| n.rt.hc.height > height)
-        })
+        .run_until(60_000, |c| c.nodes.iter().all(|n| n.rt.hc.height > height))
         .await;
     assert!(
         c.nodes.iter().all(|n| n.rt.hc.height > height),
@@ -971,10 +972,7 @@ async fn all_three_restart_with_inflight_stale_proposal_finalises_in_the_first_r
 /// does the same: a lock names a signed hash, the body is durable state, and
 /// `value_id` is how a re-stamped rescue body is recognised as the same value.
 fn restart_with_persisted_locks(c: &mut Cluster, indices: &[usize], restored_round: Round) {
-    let locks: Vec<_> = indices
-        .iter()
-        .map(|&i| c.nodes[i].rt.hc.locked)
-        .collect();
+    let locks: Vec<_> = indices.iter().map(|&i| c.nodes[i].rt.hc.locked).collect();
     c.restart(indices, restored_round);
     for (slot, &i) in indices.iter().enumerate() {
         if let Some((h, lock_round)) = locks[slot] {
@@ -1116,9 +1114,7 @@ async fn all_three_restart_with_restored_lock_and_stale_rebroadcast_decide_first
     c.confirm_first_round_quorum(r, current_hash);
 
     let consumed = c
-        .run_until(60_000, |c| {
-            c.nodes.iter().all(|n| n.rt.hc.height > height)
-        })
+        .run_until(60_000, |c| c.nodes.iter().all(|n| n.rt.hc.height > height))
         .await;
     assert!(
         c.nodes.iter().all(|n| n.rt.hc.height > height),
@@ -1194,7 +1190,9 @@ async fn stale_rebroadcast_never_arms_a_fresh_node_when_current_body_exists() {
         .on_proposal(p, current.clone(), r)
         .await
         .expect("the current-round body must still be accepted");
-    let v = c.value_prevote(fresh).expect("the fresh node votes the genuine body");
+    let v = c
+        .value_prevote(fresh)
+        .expect("the fresh node votes the genuine body");
     assert_eq!(v.round, r);
     assert_eq!(
         v.block_hash,

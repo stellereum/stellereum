@@ -100,7 +100,8 @@ fn test_block(height: u64, prev: [u8; 32], proposer: [u8; 32], state_root: [u8; 
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 // ===========================================================================
 // F1: boot restores the FULL replay snapshot (produced/completed included)
@@ -257,8 +258,8 @@ fn f2_push_policy_classes() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    // Prune is the ONLY droppable class (re-scheduled next cadence).
+        round: 0,
+    }; // Prune is the ONLY droppable class (re-scheduled next cadence).
     assert_eq!(
         persist_push_policy(&PersistJob::Prune { keep_from: 9 }),
         PersistPushPolicy::DropFirst
@@ -637,14 +638,8 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         let evidence_height = DOWNTIME_MISS_THRESHOLD as u64 - 1;
         let w_fk = FalconKeypair::generate_from_seed(0xF5);
         register_validator_pq_key(w, PqScheme::Falcon512, w_fk.public_key.clone());
-        let vote = Vote::sign_with_falcon(
-            w_key,
-            &w_fk,
-            evidence_height,
-            0,
-            VoteKind::Precommit,
-            None,
-        );
+        let vote =
+            Vote::sign_with_falcon(w_key, &w_fk, evidence_height, 0, VoteKind::Precommit, None);
         assert!(vote.verify(), "witness vote must verify");
         let set0 = e.staking_read().await.to_validator_set();
         let mut vs = VoteSet::new();
@@ -677,8 +672,9 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        let out = e.apply_block_transition(&block, REWARD).await;
+            round: 0,
+        };
+        let out = e.apply_block_transition(&block, REWARD).await;
         (e, out)
     }
 

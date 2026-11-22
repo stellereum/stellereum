@@ -51,10 +51,27 @@ fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
 
 async fn cluster(ks: &[SigningKey]) -> Vec<ValidatorRuntime> {
     let vs = vset(ks);
+    let fks: Vec<(ValidatorId, FalconKeypair)> = ks
+        .iter()
+        .map(|k| (k.verifying_key().to_bytes(), fk_for(k)))
+        .collect();
     let mut out = Vec::new();
     for k in ks {
         let st = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&st, &vs, BAL).await;
+        {
+            let mut ledger = st.staking_write().await;
+            let mut pq_reg = st.pq_registry_write().await;
+            for (vid, fk) in &fks {
+                ledger
+                    .validator_pq_keys
+                    .insert(*vid, (PqScheme::Falcon512, fk.public_key.clone()));
+                pq_reg
+                    .adopt_legacy_key_at(*vid, PqScheme::Falcon512, fk.public_key.clone(), 0, true)
+                    .expect("seed pq_registry");
+            }
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
         out.push(ValidatorRuntime::new(k.clone(), vs.clone(), st, 1));
     }
     out
@@ -91,8 +108,9 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(pkey, &fk_for(pkey));
+        round: 0,
+    };
+    b.sign_block_with_falcon(pkey, &fk_for(pkey));
     b
 }
 
@@ -1061,6 +1079,15 @@ fn rotation_tx(
 /// which inherited the deficit, and the slash + jail follow the rotated stake.
 #[tokio::test]
 async fn rotation_in_the_evidence_block_cannot_forgive_a_downtime_miss() {
+    struct PqLifecyclePreV7Guard;
+    impl Drop for PqLifecyclePreV7Guard {
+        fn drop(&mut self) {
+            stellereum::pq_registry::set_pq_lifecycle_activation_override(None);
+        }
+    }
+    stellereum::pq_registry::set_pq_lifecycle_activation_override(Some(u64::MAX));
+    let _pre_v7 = PqLifecyclePreV7Guard;
+
     use stellereum::consensus::VoteSet;
     use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, DOWNTIME_SLASH_BPS};
 

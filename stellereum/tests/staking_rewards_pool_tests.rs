@@ -12,6 +12,7 @@
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_EMISSION_CAP, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER,
@@ -19,11 +20,12 @@ use stellereum::staking::{
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 /// New-bond floor since the re-entry fix: bare-MIN bonds are refused, so every
-/// SysCallStake below bonds exactly MIN+buffer.
+/// SysCallRegisterValidator below bonds exactly MIN+buffer.
 fn bond_amount() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
-use stellereum::svm::{OpCode, GAS_STAKE_CLAIM};
+use stellereum::svm::{OpCode, RegisterValidatorPayload, GAS_BASIC_TRANSFER};
+use stellereum::zkml::effective_chain_id;
 
 const STELL: u64 = 1_000_000_000;
 const TS: u64 = 1_760_000_000;
@@ -79,10 +81,33 @@ fn block_of(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
     engine.get_account(a).await.map(|x| x.balance).unwrap_or(0)
+}
+
+fn register_op(cold_addr: [u8; 32], hot_kp: &FalconKeypair, amount: u64) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
 }
 
 /// (1) Rewards come from the pool, not principal: the block mint credits
@@ -93,23 +118,14 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
 async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
     let engine = InMemoryStateEngine::new();
     let (val, val_addr) = pq_key(0x91);
+    let (val_hot, _) = pq_key(0xA1);
+    let (reg_op, val_vid) = register_op(val_addr, &val_hot, bond_amount());
     engine
         .update_account(AccountState::new(val_addr, bond_amount() + 5_000_000))
         .await;
 
     engine
-        .apply_transaction(
-            &tx_of(
-                &val,
-                0,
-                20_000,
-                vec![OpCode::SysCallStake {
-                    validator: val_addr,
-                    amount: bond_amount(),
-                }],
-            ),
-            0,
-        )
+        .apply_transaction(&tx_of(&val, 0, 20_000, vec![reg_op]), 0)
         .await
         .unwrap();
     assert_eq!(bal(&engine, &STAKING_POOL).await, bond_amount());
@@ -117,7 +133,7 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
     // The block mint: reward R to the proposer.
     let r = 5 * STELL;
     engine
-        .apply_block_transition(&block_of(1, vec![], val_addr), r)
+        .apply_block_transition(&block_of(1, vec![], val_vid), r)
         .await;
     {
         let l = engine.staking_read().await;
@@ -127,7 +143,7 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
         );
         assert_eq!(l.rewards_pool, r, "mint funds the ledger pool 1:1");
         assert_eq!(
-            l.validators[&val_addr].pending_rewards, r,
+            l.validators[&val_vid].pending_rewards, r,
             "proposer accrues the full reward (no delegators)"
         );
     }
@@ -142,17 +158,15 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
         "principal is untouched by the mint"
     );
 
-    // Claim: exact payout minus claim gas, drained from the rewards pool.
+    // Claim: exact payout minus intrinsic claim gas, drained from the rewards pool.
     let before = bal(&engine, &val_addr).await;
     engine
         .apply_transaction(
             &tx_of(
                 &val,
                 1,
-                100_000,
-                vec![OpCode::SysCallClaimRewards {
-                    validator: val_addr,
-                }],
+                500_000,
+                vec![OpCode::SysCallClaimRewards { validator: val_vid }],
             ),
             0,
         )
@@ -160,8 +174,8 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
         .expect("claim works");
     assert_eq!(
         bal(&engine, &val_addr).await,
-        before + r - GAS_STAKE_CLAIM,
-        "exact claim payout minus claim gas"
+        before + r - GAS_BASIC_TRANSFER,
+        "exact claim payout minus intrinsic claim gas"
     );
     assert_eq!(
         bal(&engine, &REWARDS_POOL).await,
@@ -181,24 +195,14 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
 #[tokio::test]
 async fn delegator_rewards_come_from_pool_not_principal() {
     let engine = InMemoryStateEngine::new();
-    let validator = [0xCCu8; 32];
     let (funder, funder_addr) = pq_key(0x92);
+    let (val_hot, _) = pq_key(0xA2);
+    let (reg_op, validator) = register_op(funder_addr, &val_hot, bond_amount());
     engine
         .update_account(AccountState::new(funder_addr, bond_amount() + 20_000))
         .await;
     engine
-        .apply_transaction(
-            &tx_of(
-                &funder,
-                0,
-                20_000,
-                vec![OpCode::SysCallStake {
-                    validator,
-                    amount: bond_amount(),
-                }],
-            ),
-            0,
-        )
+        .apply_transaction(&tx_of(&funder, 0, 20_000, vec![reg_op]), 0)
         .await
         .unwrap();
 
@@ -252,7 +256,7 @@ async fn delegator_rewards_come_from_pool_not_principal() {
             &tx_of(
                 &delegator,
                 1,
-                100_000,
+                500_000,
                 vec![OpCode::SysCallClaimDelegatorRewards { validator }],
             ),
             0,
@@ -261,7 +265,7 @@ async fn delegator_rewards_come_from_pool_not_principal() {
         .expect("delegator claim works");
     assert_eq!(
         bal(&engine, &delegator_addr).await,
-        before + owed - GAS_STAKE_CLAIM
+        before + owed - GAS_BASIC_TRANSFER
     );
     assert_eq!(
         bal(&engine, &STAKING_POOL).await,
@@ -276,22 +280,13 @@ async fn delegator_rewards_come_from_pool_not_principal() {
 async fn rewards_cap_is_fail_closed_over_cap() {
     let engine = InMemoryStateEngine::new();
     let (val, val_addr) = pq_key(0x94);
+    let (val_hot, _) = pq_key(0xA4);
+    let (reg_op, val_vid) = register_op(val_addr, &val_hot, bond_amount());
     engine
         .update_account(AccountState::new(val_addr, bond_amount() + 5_000_000))
         .await;
     engine
-        .apply_transaction(
-            &tx_of(
-                &val,
-                0,
-                20_000,
-                vec![OpCode::SysCallStake {
-                    validator: val_addr,
-                    amount: bond_amount(),
-                }],
-            ),
-            0,
-        )
+        .apply_transaction(&tx_of(&val, 0, 20_000, vec![reg_op]), 0)
         .await
         .unwrap();
 
@@ -304,7 +299,7 @@ async fn rewards_cap_is_fail_closed_over_cap() {
 
     // 101 over the remaining 100: refused end-to-end (no mint, no credit).
     engine
-        .apply_block_transition(&block_of(1, vec![], val_addr), 101)
+        .apply_block_transition(&block_of(1, vec![], val_vid), 101)
         .await;
     {
         let l = engine.staking_read().await;
@@ -315,7 +310,7 @@ async fn rewards_cap_is_fail_closed_over_cap() {
         );
         assert_eq!(l.rewards_pool, 50, "pool untouched by refused mint");
         assert_eq!(
-            l.validators[&val_addr].pending_rewards, 0,
+            l.validators[&val_vid].pending_rewards, 0,
             "refused mint credits no phantom rewards"
         );
     }
@@ -327,25 +322,25 @@ async fn rewards_cap_is_fail_closed_over_cap() {
 
     // Exactly to the cap: allowed.
     engine
-        .apply_block_transition(&block_of(2, vec![], val_addr), 100)
+        .apply_block_transition(&block_of(2, vec![], val_vid), 100)
         .await;
     {
         let l = engine.staking_read().await;
         assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP);
         assert_eq!(l.rewards_pool, 150);
-        assert_eq!(l.validators[&val_addr].pending_rewards, 100);
+        assert_eq!(l.validators[&val_vid].pending_rewards, 100);
     }
     assert_eq!(bal(&engine, &REWARDS_POOL).await, 100);
 
     // At the cap: even 1 nano refuses.
     engine
-        .apply_block_transition(&block_of(3, vec![], val_addr), 1)
+        .apply_block_transition(&block_of(3, vec![], val_vid), 1)
         .await;
     {
         let l = engine.staking_read().await;
         assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP);
         assert_eq!(
-            l.validators[&val_addr].pending_rewards, 100,
+            l.validators[&val_vid].pending_rewards, 100,
             "still no phantom credit"
         );
     }

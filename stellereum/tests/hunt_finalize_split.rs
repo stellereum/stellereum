@@ -63,13 +63,44 @@ async fn funded_state(owner: [u8; 32], bal: u64) -> Arc<InMemoryStateEngine> {
 /// in production: funded AND bonded, so the staking ledger really contains all
 /// four validators and `note_missed_heights` has an `eligible` set to walk.
 /// `payer` is funded too so a transfer in a block actually executes.
-async fn cluster(ks: &[SigningKey], payer: ValidatorId, bal: u64) -> Vec<ValidatorRuntime> {
+static PQ_REG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn cluster(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    payer: ValidatorId,
+    bal: u64,
+) -> Vec<ValidatorRuntime> {
     let vs = vset(ks);
     let mut out = Vec::new();
     for k in ks {
         let st = Arc::new(InMemoryStateEngine::new());
         stellereum::runtime::fund_genesis(&st, &vs, bal).await;
         st.update_account(AccountState::new(payer, bal)).await;
+        {
+            let mut ledger = st.staking_write().await;
+            let mut pq_reg = st.pq_registry_write().await;
+            for (vk, fk) in ks.iter().zip(fks.iter()) {
+                let vid = vk.verifying_key().to_bytes();
+                ledger.validator_pq_keys.insert(
+                    vid,
+                    (
+                        stellereum::post_quantum::PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                    ),
+                );
+                pq_reg
+                    .adopt_legacy_key_at(
+                        vid,
+                        stellereum::post_quantum::PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                        0,
+                        true,
+                    )
+                    .expect("seed pq_registry");
+            }
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
         out.push(ValidatorRuntime::new(k.clone(), vs.clone(), st, 1));
     }
     out
@@ -142,8 +173,9 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(proposer_key, proposer_fk);
+        round: 0,
+    };
+    b.sign_block_with_falcon(proposer_key, proposer_fk);
     b
 }
 
@@ -211,10 +243,11 @@ fn prevote_for(
 /// assertions that the height does not advance.
 #[tokio::test]
 async fn hunt_finding_2_finalize_without_the_block_splits_state() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(N);
     let from = pq_id(10);
     let to = [0x77u8; 32];
-    let mut nodes = cluster(&ks, from, 10_000_000_000_000).await;
+    let mut nodes = cluster(&ks, &fks, from, 10_000_000_000_000).await;
 
     let proposer = nodes
         .iter()
@@ -408,6 +441,7 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
 /// and reach the same root.
 #[tokio::test]
 async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(N);
     let from = pq_id(11);
     let to = [0x88u8; 32];
@@ -427,7 +461,7 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     // The header must commit to the state it BUILDS ON, so we need the real
     // post-genesis root. Every cluster in this test is funded identically, so one
     // of them gives us that root.
-    let probe = cluster(&ks, from, BONDABLE_BALANCE).await;
+    let probe = cluster(&ks, &fks, from, BONDABLE_BALANCE).await;
     let genesis_root = probe[0].state.get_state_root().await;
 
     // ---------- Height 1 (genesis child: no evidence, no attribution) ----------
@@ -448,7 +482,7 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     );
 
     // Path A: finalized locally.
-    let mut local = cluster(&ks, from, BONDABLE_BALANCE).await;
+    let mut local = cluster(&ks, &fks, from, BONDABLE_BALANCE).await;
     for (j, k) in ks.iter().enumerate().take(3) {
         local[0]
             .hc
@@ -482,7 +516,7 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     assert_eq!(local[0].try_finalize().await, Some(bh1));
 
     // Path B: adopted from a peer.
-    let mut peer = cluster(&ks, from, BONDABLE_BALANCE).await;
+    let mut peer = cluster(&ks, &fks, from, BONDABLE_BALANCE).await;
     let r1 = peer[1]
         .adopt_committed(1, block1.clone(), cert1.clone())
         .await;
@@ -630,10 +664,11 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
 
 #[tokio::test]
 async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(N);
     let from = pq_id(12);
     let to = [0x99u8; 32];
-    let mut nodes = cluster(&ks, from, BONDABLE_BALANCE).await;
+    let mut nodes = cluster(&ks, &fks, from, BONDABLE_BALANCE).await;
     // Use the validator the schedule actually names for (height 1, round 0), so this
     // test exercises the state-root binding rather than being refused earlier for
     // an unrelated reason.
@@ -696,6 +731,7 @@ async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
 
 #[tokio::test]
 async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(N);
     let real = vset(&ks);
     assert_eq!(real.len(), 4);

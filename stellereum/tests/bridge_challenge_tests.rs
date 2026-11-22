@@ -56,6 +56,11 @@ fn register_falcon(sk: &SigningKey) {
     );
 }
 
+fn fee_burn(fees: u64) -> u64 {
+    ((fees as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64
+}
+
 fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
     (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
 }
@@ -74,10 +79,20 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
         e.credit_native(&pk, 10 * MIN_VALIDATOR_BOND)
             .await
             .expect("fund the validator");
-        e.staking_write()
+        let fk = falcon_for(&k);
+        {
+            let mut ledger = e.staking_write().await;
+            ledger
+                .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+                .expect("bond it into the committed ledger");
+            ledger
+                .validator_pq_keys
+                .insert(pk, (PqScheme::Falcon512, fk.public_key.clone()));
+        }
+        e.pq_registry_write()
             .await
-            .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
-            .expect("bond it into the committed ledger");
+            .adopt_legacy_key_at(pk, PqScheme::Falcon512, fk.public_key.clone(), 0, true)
+            .expect("seed committed pq_registry");
         // FIXES §1.1: the committed Ed identity carries a registered
         // Falcon-512 key the bridge quorum verifies against.
         register_falcon(&k);
@@ -202,7 +217,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 fn ops_list(intents: Vec<BridgeIntent>) -> Vec<OpCode> {
     intents
@@ -254,6 +270,7 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
     // False challenge freezes the honest deposit.
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -265,6 +282,7 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
     assert_eq!(balance(&e, &recipient).await, 0, "clawed back while open");
 
     // Suppression window passes with no confirm — then the evidence lands
@@ -284,6 +302,7 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
         )
         .await;
     assert_eq!(out.status, vec![true], "late valid evidence still confirms");
+    burned += fee_burn(out.fees_collected);
     assert_eq!(
         balance(&e, &recipient).await,
         amount + bond,
@@ -291,8 +310,8 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
     );
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10_000 * STELL - bond,
-        "false challenger nets -bond (the 5k reward never pays): unprofitable"
+        10_000 * STELL - bond - burned,
+        "false challenger nets -bond minus burned gas (the 5k reward never pays): unprofitable"
     );
     {
         let br = e.bridge_read().await;
@@ -319,6 +338,7 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -330,6 +350,7 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
 
     // SEC-01 FIX: Submitting failing evidence past the deadline does NOT trigger
     // fraud payout. It simply defers (Path 3) without paying a single coin to the challenger.
@@ -352,10 +373,11 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
         vec![true],
         "resolve with unverified evidence defers"
     );
+    burned += fee_burn(out.fees_collected);
     // Challenger is STILL down the bond and nets ZERO reward!
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10 * STELL - bond,
+        10 * STELL - bond - burned,
         "challenger still down the bond: ZERO profit from fabricated failing evidence"
     );
     assert_eq!(
@@ -398,6 +420,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // deferral cap binds after exactly MAX_RESOLVE_DEFERRALS extensions:
     // D0 = CH_T + WINDOW, cap = TS + MAX_AGE + WINDOW*(1+K).
     let challenge_at = TS + CHALLENGE_MAX_AGE_SECS - 100;
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -409,6 +432,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         .apply_block_transition(&bridge_block(2, challenge_at, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
     let d0 = challenge_at + DISPUTE_WINDOW_SECS;
     assert_eq!(e.bridge_read().await.disputes.get(&0).unwrap().deadline, d0);
 
@@ -426,6 +450,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         let out = e
             .apply_block_transition(&bridge_block(height, now, vec![tx_r], challenger_pk), 0)
             .await;
+        burned += fee_burn(out.fees_collected);
         if out.status != vec![true] {
             break;
         }
@@ -441,7 +466,10 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         );
         // No coin moves on a defer: challenger still down the bond,
         // recipient still clawed back, escrow still holds both.
-        assert_eq!(balance(&e, &challenger_pk).await, 10 * STELL - bond);
+        assert_eq!(
+            balance(&e, &challenger_pk).await,
+            10 * STELL - bond - burned
+        );
         assert_eq!(balance(&e, &recipient).await, 0);
         assert_eq!(
             balance(&e, &stellereum::bridge::BRIDGE_ESCROW).await,
@@ -457,8 +485,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // F-01 note: a refused resolve is an attributable failure, and the loop's
     // first refusal already recorded one D2 penalty step for the challenger,
     // so this refusal PAYS that floor step (nonce advances). Payer and
-    // proposer coincide here, so the fee self-rebates: no bridge coin moves,
-    // only the nonce does. A state-root-equality check would be stale.
+    // proposer coincide here, so 50% burns and 50% rebates to proposer: no
+    // bridge coin moves, only the nonce and burned fee do.
     //
     // The retry must carry the challenger's CURRENT nonce: the loop's own
     // refusal already consumed one (a refused transaction still advances the
@@ -483,6 +511,8 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         vec![GAS_BASIC_TRANSFER],
         "paid refusal: exactly one D2 penalty step (fail-closed, never free, never a payout)"
     );
+    let last_burn = fee_burn(out.fees_collected);
+    burned += last_burn;
     let challenger_after = e.get_account(&challenger_pk).await.unwrap();
     assert_eq!(
         challenger_after.nonce,
@@ -490,10 +520,14 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         "paid refusal consumes its nonce"
     );
     assert_eq!(
-        challenger_after.balance, challenger_before.balance,
-        "payer == proposer: the refusal fee self-rebates, no bridge coin moves"
+        challenger_after.balance,
+        challenger_before.balance - last_burn,
+        "payer == proposer: 50% of refusal fee burns, remainder self-rebates, no bridge coin moves"
     );
-    assert_eq!(balance(&e, &challenger_pk).await, 10 * STELL - bond);
+    assert_eq!(
+        balance(&e, &challenger_pk).await,
+        10 * STELL - bond - burned
+    );
     assert_eq!(balance(&e, &recipient).await, 0);
     assert_eq!(
         balance(&e, &stellereum::bridge::BRIDGE_ESCROW).await,
@@ -550,6 +584,7 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -561,6 +596,7 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
 
     // Garbage evidence while the window is still open: refused, dispute open.
     let settled = e.get_state_root().await;
@@ -580,16 +616,16 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
         vec![false],
         "failing evidence alone revokes only at/after the deadline"
     );
+    burned += fee_burn(out.fees_collected);
     // The refusal moves NO BRIDGE COIN: the deposit stays clawed back in
     // escrow, the challenger's bond stays locked and the dispute stays open.
     // (The STATE ROOT does move: a refused transaction is an attributable
     // failure, so it pays the D2 floor step and consumes its nonce - that is
-    // the engine's fail-closed rule, not a bridge effect. Payer == proposer
-    // here, so the fee self-rebates and no balance changes.)
+    // the engine's fail-closed rule, not a bridge effect.)
     assert_eq!(balance(&e, &recipient).await, 0, "the credit stays parked");
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10 * STELL - bond,
+        10 * STELL - bond - burned,
         "the bond stays locked: a refused resolve pays the challenger nothing"
     );
     assert_eq!(

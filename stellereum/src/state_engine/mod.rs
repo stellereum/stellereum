@@ -94,10 +94,8 @@ pub use crate::governance::GOV_OPS_ACTIVATION_HEIGHT;
 /// `Domain::EvmBindings` state commitment and first-writer-wins consensus
 /// transition in `apply()`.
 ///
-/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation so historical
-/// blocks, `FORK_ID == 0x0f584a46`, `COMMITMENT_VERSION == 5`, and
-/// `EXPECTED_GENESIS_ROOT` remain byte-identical.
-pub const EVM_BINDINGS_STATE_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Ruleset v7 canonical `Domain::EvmBindings` activation height (`0` = active from genesis).
+pub const EVM_BINDINGS_STATE_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {

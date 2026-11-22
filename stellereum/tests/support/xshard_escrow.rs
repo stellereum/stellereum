@@ -69,8 +69,9 @@ pub async fn escrow_backed_message(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    let out = source.apply_block_transition(&escrow_block, 0).await;
+        round: 0,
+    };
+    let out = source.apply_block_transition(&escrow_block, 0).await;
     assert_eq!(out.status, vec![true], "the escrow tx must apply");
     let post_root = source.get_state_root().await;
     assert_eq!(
@@ -124,4 +125,5 @@ pub fn carrier(shard_id: u32, height: u64, msgs: Vec<CrossShardMessage>) -> Bloc
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}

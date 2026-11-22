@@ -816,11 +816,11 @@ async fn snap_bundle_evm_bindings_state_and_load_full_state_into_roundtrip() {
 
 #[tokio::test]
 async fn default_gates_preserve_fork_id_commitment_version_and_genesis_root() {
-    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, u64::MAX);
-    assert_eq!(EVM_BINDINGS_STATE_ACTIVATION_HEIGHT, u64::MAX);
-    assert_eq!(CONSENSUS_RULESET_VERSION, 6);
-    assert_eq!(DOMAIN_SET_VERSION, 3);
-    assert_eq!(FORK_ID, 0x0f58_4a46);
+    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, 0);
+    assert_eq!(EVM_BINDINGS_STATE_ACTIVATION_HEIGHT, 0);
+    assert_eq!(CONSENSUS_RULESET_VERSION, 7);
+    assert_eq!(DOMAIN_SET_VERSION, 4);
+    assert_eq!(FORK_ID, 0x3ae0_0ebc);
     assert_eq!(COMMITMENT_VERSION, 5);
 
     const V1: [u8; 32] = [0x11u8; 32];

@@ -249,7 +249,7 @@ pub const MIN_TON_CONFIRMATIONS: u64 = 12;
 /// Ruleset/FORK_ID bump lands: no environment variable can move this in a
 /// release build, and [`bridge_v2_active_at`] returns `false` at EVERY height
 /// (including `u64::MAX`) while the gate is `GatedOff`.
-pub const BRIDGE_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const BRIDGE_V2_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -3941,25 +3941,25 @@ mod tests {
     }
 
     #[test]
-    fn bridge_v2_gate_is_gated_off_at_u64_max_and_override_is_honoured() {
+    fn bridge_v2_gate_is_active_at_genesis_and_override_is_honoured() {
         let _guard = BridgeV2GateGuard;
-        // Default: `GatedOff` — FALSE even at the top of the range (the
-        // `pq_lifecycle_active_at` shape, not a bare `height >= gate`).
+        // Default under Ruleset v7: `ActiveFromGenesis` (0).
         assert_eq!(
             effective_bridge_v2_activation_height(),
             BRIDGE_V2_ACTIVATION_HEIGHT
         );
-        assert_eq!(BRIDGE_V2_ACTIVATION_HEIGHT, u64::MAX);
-        assert!(!bridge_v2_active_at(0));
-        assert!(!bridge_v2_active_at(u64::MAX - 1));
-        assert!(!bridge_v2_active_at(u64::MAX));
+        assert_eq!(BRIDGE_V2_ACTIVATION_HEIGHT, 0);
+        assert!(bridge_v2_active_at(0));
+        assert!(bridge_v2_active_at(u64::MAX - 1));
+        assert!(bridge_v2_active_at(u64::MAX));
         // Explicit override: active from the boundary height onward.
         set_bridge_v2_activation_override(Some(100));
         assert!(!bridge_v2_active_at(99));
         assert!(bridge_v2_active_at(100));
         assert!(bridge_v2_active_at(101));
-        // Overriding to u64::MAX re-gates it off everywhere.
+        // Overriding to u64::MAX gates it off everywhere (pre-v7 replay).
         set_bridge_v2_activation_override(Some(u64::MAX));
+        assert!(!bridge_v2_active_at(0));
         assert!(!bridge_v2_active_at(u64::MAX));
         set_bridge_v2_activation_override(None);
         assert_eq!(

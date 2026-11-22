@@ -7,9 +7,25 @@ use ed25519_dalek::{Signer, SigningKey};
 use stellereum::consensus::ValidatorId;
 use stellereum::post_quantum::{FalconKeypair, PqScheme, FALCON512_PUBKEY_LEN, MLDSA44_PUBKEY_LEN};
 use stellereum::pq_registry::{
-    verify_rotation_announcement, PqRegistry, PqRegistryError, PQ_KEY_HISTORY_LIMIT,
-    PQ_MAX_KEY_BYTES, PQ_ROTATION_DELAY_HEIGHTS,
+    set_pq_lifecycle_activation_override, verify_rotation_announcement, PqRegistry,
+    PqRegistryError, PQ_EVIDENCE_RETENTION_HEIGHTS, PQ_KEY_HISTORY_LIMIT, PQ_MAX_KEY_BYTES,
+    PQ_ROTATION_DELAY_HEIGHTS,
 };
+
+struct PqLifecycleGateGuard;
+
+impl PqLifecycleGateGuard {
+    fn gated_off() -> Self {
+        set_pq_lifecycle_activation_override(Some(u64::MAX));
+        Self
+    }
+}
+
+impl Drop for PqLifecycleGateGuard {
+    fn drop(&mut self) {
+        set_pq_lifecycle_activation_override(None);
+    }
+}
 use stellereum::staking::{
     StakingLedger, COMMISSION_EFFECT_DELAY_HEIGHTS, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER,
 };
@@ -352,6 +368,7 @@ fn refusals_unknown_double_pending_past_oversize_disabled_not_due() {
 
 #[test]
 fn announcing_current_key_cancels_pending_rotation() {
+    let _gate = PqLifecycleGateGuard::gated_off();
     let id = vid(1);
     let cur = falcon_key(0xA5);
     let (mut ledger, mut reg) = registered_pair(id, &cur, 0);
@@ -370,10 +387,37 @@ fn announcing_current_key_cancels_pending_rotation() {
     );
 }
 
+#[test]
+fn w3_reannouncing_current_key_refuses_and_explicit_cancel_works() {
+    let id = vid(1);
+    let cur = falcon_key(0xA5);
+    let (mut ledger, mut reg) = registered_pair(id, &cur, 0);
+    ledger
+        .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, falcon_key(0x5A), 0)
+        .unwrap();
+    assert!(reg.pending_of(&id).is_some());
+    // Under Ruleset v7 (W3 PQ lifecycle active), re-announcing the current key refuses;
+    // cancellation uses explicit `cancel_rotation`.
+    assert_eq!(
+        ledger.pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, cur.clone(), 50),
+        Err(PqRegistryError::SameKey)
+    );
+    assert!(reg.pending_of(&id).is_some());
+    let next_seq = reg.record_of(&id).unwrap().next_seq;
+    reg.cancel_rotation(id, 50, next_seq, true)
+        .expect("explicit W3 cancel_rotation must succeed");
+    assert!(reg.pending_of(&id).is_none());
+    assert_eq!(
+        reg.get_active_key(&id, 7_200),
+        Some((PqScheme::Falcon512, cur))
+    );
+}
+
 // ---- bounded history ----
 
 #[test]
 fn history_is_bounded_oldest_evicted_first() {
+    let _gate = PqLifecycleGateGuard::gated_off();
     let id = vid(1);
     let (mut ledger, mut reg) = registered_pair(id, &falcon_key(0xA0), 0);
     // Three rotations: A -> B -> C -> D.
@@ -408,6 +452,47 @@ fn history_is_bounded_oldest_evicted_first() {
     assert_eq!(
         reg.get_active_key(&id, 3 * PQ_ROTATION_DELAY_HEIGHTS),
         Some((PqScheme::Falcon512, falcon_key(0xD0)))
+    );
+}
+
+#[test]
+fn w3_history_retains_within_evidence_retention_window_then_evicts() {
+    let id = vid(1);
+    let (mut ledger, mut reg) = registered_pair(id, &falcon_key(0xA0), 0);
+    for (i, fill) in [0xB0u8, 0xC0, 0xD0].iter().enumerate() {
+        let at = (i as u64) * PQ_ROTATION_DELAY_HEIGHTS;
+        ledger
+            .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, falcon_key(*fill), at)
+            .unwrap();
+        ledger
+            .pq_apply_rotation(&mut reg, id, at + PQ_ROTATION_DELAY_HEIGHTS)
+            .unwrap();
+    }
+    // Within PQ_EVIDENCE_RETENTION_HEIGHTS (90_000 < 720_000), all 3 superseded keys are kept.
+    let history = reg.history_of(&id).expect("history must exist");
+    assert_eq!(history.len(), 3);
+    assert_eq!(
+        reg.get_active_key(&id, 100),
+        Some((PqScheme::Falcon512, falcon_key(0xA0)))
+    );
+
+    // After PQ_EVIDENCE_RETENTION_HEIGHTS has elapsed past the first two keys, applying a
+    // rotation prunes the expired entries down to PQ_KEY_HISTORY_LIMIT.
+    let late = PQ_EVIDENCE_RETENTION_HEIGHTS + PQ_ROTATION_DELAY_HEIGHTS;
+    ledger
+        .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, falcon_key(0xE0), late)
+        .unwrap();
+    ledger
+        .pq_apply_rotation(&mut reg, id, late + PQ_ROTATION_DELAY_HEIGHTS)
+        .unwrap();
+    let history = reg.history_of(&id).expect("history must exist");
+    assert_eq!(history.len(), PQ_KEY_HISTORY_LIMIT);
+    assert_eq!(history[0].pubkey, falcon_key(0xC0));
+    assert_eq!(history[1].pubkey, falcon_key(0xD0));
+    assert_eq!(reg.get_active_key(&id, 100), None);
+    assert_eq!(
+        reg.get_active_key(&id, 2 * PQ_ROTATION_DELAY_HEIGHTS + 10),
+        Some((PqScheme::Falcon512, falcon_key(0xC0)))
     );
 }
 

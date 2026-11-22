@@ -1,6 +1,13 @@
 //! Comprehensive round-trip, anti-DoS, cryptographic binding, and safety-isolation
 //! tests for `stellereum::snapshot_v4` (`SnapV4`).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use stellereum::consensus::{consensus_chain_id, register_validator_pq_key, ValidatorSet};
+use stellereum::contract::Contract;
+use stellereum::governance::GovAction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::Transaction;
 use stellereum::snapshot_v4::{
     self, build_base_snapshot, build_delta_snapshot, canonical_manifest_body_bytes,
     canonical_vset_hash, compute_unit_hash, compute_units_merkle_root, decode_canonical_exact,
@@ -10,23 +17,15 @@ use stellereum::snapshot_v4::{
     verify_and_apply_base, verify_and_apply_base_with_key_resolver, verify_and_apply_delta,
     verify_and_apply_delta_chain, verify_unit_chunk, verify_unit_merkle_proof, AccountBucketDelta,
     AccountBucketFull, CanonicalScalars, DomainUnitId, EncodedSnapshotV4, MapDiff, SnapStateV4,
-    SnapV4Error, SnapshotBuildParams, SnapshotManifestV1, SnapshotUnitDesc,
-    TrustedSnapshotAnchor, UnitKind, DELTA_FULL_THRESHOLD_DEN, DELTA_FULL_THRESHOLD_NUM,
-    MAX_ACCOUNTS_PER_CHUNK, MAX_DELTA_CHAIN_LEN, MAX_MANIFEST_WIRE_BYTES,
-    MAX_SNAPSHOT_DECODE_BYTES, MAX_SNAP_CHUNK_BYTES, MAX_SNAP_UNITS, MAX_SNAP_WIRE_BYTES,
-    N_ACCOUNT_BUCKETS, N_DOMAIN_UNITS, SNAP_BUCKET_MULTI_DOMAIN, SNAP_DOMAIN_MULTI_DOMAIN,
-    SNAP_EMPTY_BUCKET_DOMAIN, SNAP_MANIFEST_MAGIC, SNAP_MANIFEST_SIG_DOMAIN,
-    SNAP_MANIFEST_VERSION, SNAP_MERKLE_EMPTY_DOMAIN, SNAP_MERKLE_LEAF_DOMAIN,
-    SNAP_MERKLE_NODE_DOMAIN, SNAP_UNIT_HASH_DOMAIN, SNAP_VSET_HASH_DOMAIN, TOTAL_UNIT_TAGS,
-    UNIT_ENC_DELTA, UNIT_ENC_FULL, UNIT_ENC_UNCHANGED,
+    SnapV4Error, SnapshotBuildParams, SnapshotManifestV1, SnapshotUnitDesc, TrustedSnapshotAnchor,
+    UnitKind, DELTA_FULL_THRESHOLD_DEN, DELTA_FULL_THRESHOLD_NUM, MAX_ACCOUNTS_PER_CHUNK,
+    MAX_DELTA_CHAIN_LEN, MAX_MANIFEST_WIRE_BYTES, MAX_SNAPSHOT_DECODE_BYTES, MAX_SNAP_CHUNK_BYTES,
+    MAX_SNAP_UNITS, MAX_SNAP_WIRE_BYTES, N_ACCOUNT_BUCKETS, N_DOMAIN_UNITS,
+    SNAP_BUCKET_MULTI_DOMAIN, SNAP_DOMAIN_MULTI_DOMAIN, SNAP_EMPTY_BUCKET_DOMAIN,
+    SNAP_MANIFEST_MAGIC, SNAP_MANIFEST_SIG_DOMAIN, SNAP_MANIFEST_VERSION, SNAP_MERKLE_EMPTY_DOMAIN,
+    SNAP_MERKLE_LEAF_DOMAIN, SNAP_MERKLE_NODE_DOMAIN, SNAP_UNIT_HASH_DOMAIN, SNAP_VSET_HASH_DOMAIN,
+    TOTAL_UNIT_TAGS, UNIT_ENC_DELTA, UNIT_ENC_FULL, UNIT_ENC_UNCHANGED,
 };
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use stellereum::consensus::{consensus_chain_id, register_validator_pq_key, ValidatorSet};
-use stellereum::contract::Contract;
-use stellereum::governance::GovAction;
-use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
-use stellereum::sharding::Transaction;
 use stellereum::staking::{required_bond_floor_nano, StakingLedger};
 use stellereum::state_engine::{AccountState, EscrowRecord, InMemoryStateEngine};
 use stellereum::storage::{
@@ -64,8 +63,7 @@ fn make_hash(label: &[u8]) -> [u8; 32] {
 fn make_validator_setup(tag: &[u8]) -> (FalconKeypair, StakingLedger, ValidatorSet) {
     let kp = unique_keypair(tag);
     let mut staking = StakingLedger::new();
-    let min_bond =
-        required_bond_floor_nano().max(stellereum::governance::PROPOSAL_MIN_STAKE_NANO);
+    let min_bond = required_bond_floor_nano().max(stellereum::governance::PROPOSAL_MIN_STAKE_NANO);
     staking
         .bond(kp.validator_id(), min_bond, 500)
         .expect("bond must succeed");

@@ -248,7 +248,7 @@ pub const CAP_EXACT_R0_NANO: u64 = 4_379_227_780;
 /// INACTIVE by default (`u64::MAX`): every height, including `u64::MAX`,
 /// keeps today's lenient conversion so historical carrier txs replay
 /// byte-identically. Imported by `evm_adapter` / `svm` behind this gate.
-pub const SUB_NANO_STRICT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const SUB_NANO_STRICT_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -293,7 +293,7 @@ pub fn sub_nano_strict_active_at(height: u64) -> bool {
 /// INACTIVE by default (`u64::MAX`): `apply()` is byte-identical to today at
 /// every height while gated off. Registered additionally in
 /// `chain_spec::current_activation_schedule()` by the rollout owner.
-pub const FEE_MARKET_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const FEE_MARKET_V2_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -1299,48 +1299,59 @@ mod w4_economics_tests {
     use super::*;
 
     #[test]
-    fn activation_gates_are_inactive_at_every_height_by_default() {
+    fn activation_gates_are_active_from_genesis_by_default() {
         assert_eq!(
-            SUB_NANO_STRICT_ACTIVATION_HEIGHT,
-            u64::MAX,
-            "strict sub-nano gate INACTIVE until rollout"
+            SUB_NANO_STRICT_ACTIVATION_HEIGHT, 0,
+            "strict sub-nano gate ACTIVE from genesis under Ruleset v7"
         );
         assert_eq!(
-            FEE_MARKET_V2_ACTIVATION_HEIGHT,
-            u64::MAX,
-            "fee market v2 gate INACTIVE until rollout"
+            FEE_MARKET_V2_ACTIVATION_HEIGHT, 0,
+            "fee market v2 gate ACTIVE from genesis under Ruleset v7"
         );
         for &h in &[0u64, 1, 100, u64::MAX - 1, u64::MAX] {
             assert!(
-                !sub_nano_strict_active_at(h),
-                "strict sub-nano must be false @ {h}"
+                sub_nano_strict_active_at(h),
+                "strict sub-nano must be true @ {h}"
             );
             assert!(
-                !fee_market_v2_active_at(h),
-                "fee market v2 must be false @ {h}"
+                fee_market_v2_active_at(h),
+                "fee market v2 must be true @ {h}"
             );
         }
     }
 
     #[test]
     fn activation_gate_overrides_take_effect_and_clear() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_sub_nano_strict_activation_override(None);
+                set_fee_market_v2_activation_override(None);
+            }
+        }
+        let _reset = Reset;
+
         set_sub_nano_strict_activation_override(Some(1_000));
         assert!(!sub_nano_strict_active_at(999));
         assert!(sub_nano_strict_active_at(1_000));
         assert!(sub_nano_strict_active_at(u64::MAX));
         assert_eq!(effective_sub_nano_strict_activation_height(), 1_000);
-        set_sub_nano_strict_activation_override(None);
-        assert_eq!(effective_sub_nano_strict_activation_height(), u64::MAX);
+        set_sub_nano_strict_activation_override(Some(u64::MAX));
         assert!(!sub_nano_strict_active_at(u64::MAX));
+        set_sub_nano_strict_activation_override(None);
+        assert_eq!(effective_sub_nano_strict_activation_height(), 0);
+        assert!(sub_nano_strict_active_at(0));
 
         set_fee_market_v2_activation_override(Some(500));
         assert!(!fee_market_v2_active_at(499));
         assert!(fee_market_v2_active_at(500));
         assert!(fee_market_v2_active_at(u64::MAX));
         assert_eq!(effective_fee_market_v2_activation_height(), 500);
-        set_fee_market_v2_activation_override(None);
-        assert_eq!(effective_fee_market_v2_activation_height(), u64::MAX);
+        set_fee_market_v2_activation_override(Some(u64::MAX));
         assert!(!fee_market_v2_active_at(u64::MAX));
+        set_fee_market_v2_activation_override(None);
+        assert_eq!(effective_fee_market_v2_activation_height(), 0);
+        assert!(fee_market_v2_active_at(0));
     }
 
     #[test]

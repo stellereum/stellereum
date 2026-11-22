@@ -87,7 +87,8 @@ fn blank_block(shard: u32, height: u64, out: Vec<CrossShardMessage>) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 /// The ordering rule, pinned: within and across blocks, records sort by
 /// `(source_height, source_shard, msg_id)`; sequence numbers follow that

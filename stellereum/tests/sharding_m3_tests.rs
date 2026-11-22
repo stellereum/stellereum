@@ -82,7 +82,8 @@ fn xpc_carrier(shard_id: u32, height: u64, msg: stellereum::sharding::CrossShard
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 /// REGRESSION (was F2 FINDING, refund leg): the §9 ABORT-ACK refunds value the
 /// source already ESCROWED, so it is a transfer of existing supply and must not
@@ -675,8 +676,9 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    forged.sign_block(&validator);
+        round: 0,
+    };
+    forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
         .expect_err("replayed terminal record must be refused");
@@ -761,8 +763,9 @@ async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    forged.sign_block(&validator);
+        round: 0,
+    };
+    forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
         .expect_err("second bounce must be refused");
@@ -824,8 +827,9 @@ async fn proof_carrying_ack_or_bounce_is_refused() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    forged.sign_block(&validator);
+        round: 0,
+    };
+    forged.sign_block(&validator);
     assert!(node.validate_proposal(&forged, root).is_err());
     // No mint happened on the source shard either way.
     assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 100 - 10);

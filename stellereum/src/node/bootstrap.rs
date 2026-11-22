@@ -1098,6 +1098,29 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 GENESIS_FAUCET_BALANCE / 1_000_000_000
             );
         }
+        if stellereum::pq_registry::pq_lifecycle_active_at(0) {
+            let self_falcon_pk: Option<&[u8]> = local_falcon
+                .as_ref()
+                .map(|k| k.public_key.as_slice())
+                .or_else(|| {
+                    pq_signer_early
+                        .as_ref()
+                        .map(|ps| ps.public_key().as_slice())
+                });
+            let peers_env = std::env::var("STELL_PEER_PQ_KEYS").ok();
+            let seeded = seed_genesis_pq_registry(
+                &state_engine,
+                &vset,
+                validator_pub,
+                self_falcon_pk,
+                peers_env.as_deref(),
+            )
+            .await?;
+            info!(
+                "Genesis: seeded {seeded}/{} validator PQ keys into committed PqRegistry",
+                vset.len()
+            );
+        }
         info!(
             "Genesis: funded {} validator account(s); state root {}",
             vset.len(),
@@ -1937,6 +1960,105 @@ mod genesis_fingerprint_gate_tests {
     }
 }
 
+/// Deterministically seed genesis validators' Falcon-512 voting keys into
+/// `ledger.validator_pq_keys`, `engine.pq_registry`, and the process-global
+/// `PQ_COMMITTED_REGISTRY` when `PQ_LIFECYCLE_ACTIVATION_HEIGHT == 0`.
+///
+/// Only members of `vset` (in deterministic sorted `ValidatorId` order) are
+/// seeded, so every node sharing the same validator set and PQ keys derives
+/// the exact same genesis `state_root` regardless of whether `STELL_PEER_PQ_KEYS`
+/// omits `self_ed` (supplied via local `falcon.key` / remote signer) or lists
+/// all validators.
+pub(crate) async fn seed_genesis_pq_registry(
+    engine: &InMemoryStateEngine,
+    vset: &ValidatorSet,
+    self_ed: [u8; 32],
+    self_falcon_pk: Option<&[u8]>,
+    peers_env: Option<&str>,
+) -> anyhow::Result<usize> {
+    use std::collections::BTreeMap;
+    use stellereum::post_quantum::{PqScheme, FALCON512_PUBKEY_LEN};
+
+    let mut keys: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
+    if let Some(raw) = peers_env {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((ed_hex, pq_hex)) = entry.split_once(':') else {
+                anyhow::bail!("malformed STELL_PEER_PQ_KEYS entry (missing ':')");
+            };
+            let ed = hex::decode(ed_hex.trim())
+                .map_err(|e| anyhow::anyhow!("bad ed hex in STELL_PEER_PQ_KEYS: {e}"))?;
+            let pq = hex::decode(pq_hex.trim())
+                .map_err(|e| anyhow::anyhow!("bad falcon hex in STELL_PEER_PQ_KEYS: {e}"))?;
+            let ed_arr: [u8; 32] = ed
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("STELL_PEER_PQ_KEYS ed id must be 32 bytes"))?;
+            if pq.len() != FALCON512_PUBKEY_LEN {
+                anyhow::bail!(
+                    "STELL_PEER_PQ_KEYS pubkey for {} must be {} bytes (Falcon-512), got {}",
+                    hex::encode(&ed_arr[..6]),
+                    FALCON512_PUBKEY_LEN,
+                    pq.len()
+                );
+            }
+            if vset.validators.contains_key(&ed_arr) {
+                keys.insert(ed_arr, pq);
+            }
+        }
+    }
+    if vset.validators.contains_key(&self_ed) {
+        if let Some(pk) = self_falcon_pk {
+            if pk.len() != FALCON512_PUBKEY_LEN {
+                anyhow::bail!(
+                    "local Falcon-512 pubkey must be {} bytes, got {}",
+                    FALCON512_PUBKEY_LEN,
+                    pk.len()
+                );
+            }
+            if let Some(prev) = keys.get(&self_ed) {
+                if prev.as_slice() != pk {
+                    anyhow::bail!(
+                        "local Falcon pubkey for {} conflicts with STELL_PEER_PQ_KEYS",
+                        hex::encode(&self_ed[..6])
+                    );
+                }
+            }
+            keys.insert(self_ed, pk.to_vec());
+        }
+    }
+
+    let mut seeded = 0usize;
+    {
+        let mut ledger = engine.staking_write().await;
+        let mut pq_reg = engine.pq_registry_write().await;
+        for id in vset.validators.keys() {
+            let Some(pk) = keys.get(id) else {
+                tracing::warn!(
+                    validator = %hex::encode(&id[..6]),
+                    "[genesis] missing Falcon-512 pubkey for genesis validator (set STELL_PEER_PQ_KEYS)"
+                );
+                continue;
+            };
+            ledger
+                .validator_pq_keys
+                .insert(*id, (PqScheme::Falcon512, pk.clone()));
+            if pq_reg.record_of(id).is_none()
+                && pq_reg
+                    .adopt_legacy_key_at(*id, PqScheme::Falcon512, pk.clone(), 0, true)
+                    .is_ok()
+            {
+                seeded += 1;
+            }
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
+    Ok(seeded)
+}
+
 #[cfg(test)]
 mod r3_bootstrap_pq_tests {
     use super::*;
@@ -1975,5 +2097,65 @@ mod r3_bootstrap_pq_tests {
             .expect("must return Some");
         assert_eq!(local_res.validator_id(), vid);
         assert_eq!(local_res.public_key(), local_kp.public_key());
+    }
+
+    #[tokio::test]
+    async fn seed_genesis_pq_registry_produces_identical_roots_across_peers() {
+        let ed_a = [0x11u8; 32];
+        let ed_b = [0x22u8; 32];
+        let fk_a = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x11);
+        let fk_b = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x22);
+        let non_val = [0x99u8; 32];
+        let fk_non = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x99);
+
+        let vset = ValidatorSet::from_list(vec![(ed_a, 1), (ed_b, 1)]);
+
+        // Node A has own key A + peer B (plus an unrelated non-validator entry ignored).
+        let eng_a = InMemoryStateEngine::new();
+        stellereum::runtime::fund_genesis(&eng_a, &vset, 1_000_000_000_000).await;
+        let env_a = format!(
+            "{}:{},{}:{}",
+            hex::encode(ed_b),
+            hex::encode(&fk_b.public_key),
+            hex::encode(non_val),
+            hex::encode(&fk_non.public_key)
+        );
+        let n_a =
+            seed_genesis_pq_registry(&eng_a, &vset, ed_a, Some(&fk_a.public_key), Some(&env_a))
+                .await
+                .expect("seed a");
+        assert_eq!(n_a, 2);
+
+        // Node B has own key B + peer A.
+        let eng_b = InMemoryStateEngine::new();
+        stellereum::runtime::fund_genesis(&eng_b, &vset, 1_000_000_000_000).await;
+        let env_b = format!("{}:{}", hex::encode(ed_a), hex::encode(&fk_a.public_key));
+        let n_b =
+            seed_genesis_pq_registry(&eng_b, &vset, ed_b, Some(&fk_b.public_key), Some(&env_b))
+                .await
+                .expect("seed b");
+        assert_eq!(n_b, 2);
+
+        assert_eq!(
+            eng_a.get_state_root().await,
+            eng_b.get_state_root().await,
+            "genesis root must be identical whether a validator key came from falcon.key or STELL_PEER_PQ_KEYS"
+        );
+        let reg_a = eng_a.pq_registry_read().await;
+        assert_eq!(
+            reg_a.get_active_key(&ed_a, 0),
+            Some((
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk_a.public_key.clone()
+            ))
+        );
+        assert_eq!(
+            reg_a.get_active_key(&ed_b, 0),
+            Some((
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk_b.public_key.clone()
+            ))
+        );
+        assert!(reg_a.record_of(&non_val).is_none());
     }
 }

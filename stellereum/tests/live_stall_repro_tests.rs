@@ -343,9 +343,7 @@ async fn same_body_is_prevoted_in_the_signed_round() {
         .into_iter()
         .enumerate()
         .map(|(i, p)| {
-            p.unwrap_or_else(|| {
-                panic!("node {i} must precommit the certified body at round {r}")
-            })
+            p.unwrap_or_else(|| panic!("node {i} must precommit the certified body at round {r}"))
         })
         .collect();
     assert!(precommits.iter().all(|p| p.round == r));
@@ -388,7 +386,9 @@ async fn same_body_converges_to_one_round_and_finalises() {
     );
     let q = rounds[0];
     assert!(
-        sc.prevotes.iter().all(|v| v.block_hash == Some(sc.block_hash)),
+        sc.prevotes
+            .iter()
+            .all(|v| v.block_hash == Some(sc.block_hash)),
         "all three prevotes must still name the re-served body"
     );
     assert_eq!(
@@ -559,7 +559,10 @@ async fn restamped_locked_body_is_voted_above_a_nil_watermark_and_finalises() {
     let mut prevotes = Vec::new();
     for (i, n) in nodes.iter().enumerate() {
         let v = n.rt.make_prevote().unwrap_or_else(|| {
-            panic!("node {i} at round {} produced no value prevote", n.rt.hc.round)
+            panic!(
+                "node {i} at round {} produced no value prevote",
+                n.rt.hc.round
+            )
         });
         assert_eq!(v.round, q, "node {i} must prevote at the re-stamped round");
         assert_eq!(
@@ -585,9 +588,7 @@ async fn restamped_locked_body_is_voted_above_a_nil_watermark_and_finalises() {
     }
     for (i, n) in nodes.iter().enumerate() {
         assert!(
-            n.rt.hc
-                .prevote_set(q)
-                .and_then(|s| s.quorum_target(&vset))
+            n.rt.hc.prevote_set(q).and_then(|s| s.quorum_target(&vset))
                 == Some(Some(restamped_hash)),
             "node {i} must hold the polka for the re-stamped body at q"
         );

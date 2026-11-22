@@ -864,7 +864,8 @@ async fn sponsored_priority_bid_composes() {
     assert!(back.verify_signature());
     assert_eq!(back.sponsored_grant().unwrap().max_fee_per_tx, 1_000_000);
 
-    // Admission and execution accept it; the fee is declared gas + PQ activation surcharge.
+    // Admission and execution accept it; under FEE_MARKET_V2 the priority bid
+    // is added to the billed core (capped at GAS_LIMIT), plus PQ activation surcharge.
     let mut pool = Mempool::new(100, 100);
     admit_sponsored(&mut pool, back.clone(), 1_000_000, 5_000_000, 0)
         .expect("priority sponsored admits");
@@ -872,12 +873,14 @@ async fn sponsored_priority_bid_composes() {
     let (applied, failed, fees, _, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&back), 0)
         .await;
+    let expected_fee =
+        (stellereum::svm::GAS_BASIC_TRANSFER + 50_000).min(GAS_LIMIT) + PQ_ACTIVATION_SURCHARGE_GAS;
     assert_eq!((applied, failed), (1, 0));
-    assert_eq!(fees, EXPECTED_SPONSORED_FEE);
+    assert_eq!(fees, expected_fee);
     assert_eq!(balance_of(&engine, &user).await, 1_000_000 - 100);
     assert_eq!(
         balance_of(&engine, &sponsor).await,
-        5_000_000 - EXPECTED_SPONSORED_FEE
+        5_000_000 - expected_fee
     );
 }
 

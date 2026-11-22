@@ -275,7 +275,11 @@ impl<'a> FlakyPeers<'a> {
             qc: b.precommit_qc.clone()?,
             shard_id: b.shard_id,
             round: b.round,
-            body_commitment: None,
+            body_commitment: if stellereum::sharding::header_commit_active_at(b.height) {
+                Some(b.body_commitment())
+            } else {
+                None
+            },
             mmr_epoch_root: b.mmr_epoch_root,
             epoch_key_commitment: b.epoch_key_commitment,
             timestamp: b.timestamp,

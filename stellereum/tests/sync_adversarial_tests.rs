@@ -119,7 +119,7 @@ fn qc_for(
 /// One honest header link at `height`, QC-signed by `signers` under `set`.
 fn header_link(
     height: u64,
-    block_hash: [u8; 32],
+    body_tag: [u8; 32],
     prev_hash: [u8; 32],
     set: &ValidatorSet,
     signers: &[SigningKey],
@@ -127,16 +127,30 @@ fn header_link(
     let proposer = set
         .proposer_for(height, 0)
         .expect("non-empty fixture set names a proposer");
+    let state_root = [height as u8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash,
+        state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer,
+    };
+    let block_hash = hdr.compute_hash();
     HeaderLink {
         height,
         block_hash,
         prev_hash,
-        state_root: [height as u8; 32],
+        state_root,
         proposer,
         qc: qc_for(signers, set, height, block_hash, prev_hash),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_tag),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         timestamp: 0,
@@ -148,9 +162,9 @@ fn honest_window(keys: &[SigningKey], vs: &ValidatorSet, n: u64) -> Vec<HeaderLi
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
     for h in 1..=n {
-        let hash = [h as u8; 32];
-        out.push(header_link(h, hash, prev, vs, keys));
-        prev = hash;
+        let link = header_link(h, [h as u8; 32], prev, vs, keys);
+        prev = link.block_hash;
+        out.push(link);
     }
     out
 }

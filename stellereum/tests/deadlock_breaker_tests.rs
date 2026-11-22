@@ -60,7 +60,11 @@ fn stale_vote_feeds_round_counter_without_voting() {
         moved,
         "one verified peer is f+1 on a 2-member set and may chase"
     );
-    assert_eq!(hc.round, 318 + 8, "the chase stays capped at one +8 step per call");
+    assert_eq!(
+        hc.round,
+        318 + 8,
+        "the chase stays capped at one +8 step per call"
+    );
     assert_eq!(hc.max_peer_round(), Some(1550));
     // A SECOND distinct validator vouching for the same far round is more
     // evidence but still buys only another bounded step.
@@ -74,7 +78,10 @@ fn stale_vote_feeds_round_counter_without_voting() {
     );
     assert!(corroborator.verify());
     let moved2 = hc.observe_peer_round(id(&ks[1]), corroborator.round);
-    assert!(moved2, "the next corroborated chase step is bounded, not refused");
+    assert!(
+        moved2,
+        "the next corroborated chase step is bounded, not refused"
+    );
     // Bounded chase: +8 per call, NOT a jump to 1550.
     assert_eq!(hc.round, 318 + 16, "stale sync stays capped at +8 per call");
     // The far vote formed no quorum.

@@ -254,6 +254,8 @@ fn sync_committed_pq_registry_enforces_rotation_boundary_and_invalidates_vote_ca
 fn sync_committed_pq_registry_clear_legacy_map_prevents_process_local_leaks() {
     let _lock = TEST_LOCK.lock().unwrap();
     let _guard = TestStateGuard::new();
+    // Test pre-W3 -> W3 transition at height 100 (height 10 < 100 keeps legacy fallback).
+    set_pq_lifecycle_activation_override(Some(100));
 
     let legacy_sk = SigningKey::from_bytes(&[0x51u8; 32]);
     let legacy_id = legacy_sk.verifying_key().to_bytes();

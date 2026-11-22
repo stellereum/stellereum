@@ -77,11 +77,11 @@ impl Drop for TempDir {
 // ============================================================================
 
 #[test]
-fn chain_spec_registers_pq_lifecycle_gate_at_u64_max() {
+fn chain_spec_registers_pq_lifecycle_gate_at_genesis() {
     let _reset = LifecycleOverrideReset;
-    assert_eq!(PQ_LIFECYCLE_ACTIVATION_HEIGHT, u64::MAX);
-    assert!(!pq_lifecycle_active_at(0));
-    assert!(!pq_lifecycle_active_at(u64::MAX));
+    assert_eq!(PQ_LIFECYCLE_ACTIVATION_HEIGHT, 0);
+    assert!(pq_lifecycle_active_at(0));
+    assert!(pq_lifecycle_active_at(u64::MAX));
 
     let schedule = current_activation_schedule();
     let gate = schedule
@@ -89,16 +89,20 @@ fn chain_spec_registers_pq_lifecycle_gate_at_u64_max() {
         .iter()
         .find(|g| g.name == "PQ_LIFECYCLE_ACTIVATION_HEIGHT")
         .expect("PQ_LIFECYCLE_ACTIVATION_HEIGHT must be registered in chain_spec");
-    assert_eq!(gate.activation_height, u64::MAX);
-    assert_eq!(gate.status, ActivationStatus::GatedOff);
+    assert_eq!(gate.activation_height, 0);
+    assert_eq!(gate.status, ActivationStatus::ActiveFromGenesis);
     assert_eq!(
         schedule.is_active("PQ_LIFECYCLE_ACTIVATION_HEIGHT", 0),
-        Some(false)
+        Some(true)
     );
     assert_eq!(
         schedule.is_active("PQ_LIFECYCLE_ACTIVATION_HEIGHT", u64::MAX),
-        Some(false)
+        Some(true)
     );
+
+    set_pq_lifecycle_activation_override(Some(u64::MAX));
+    assert!(!pq_lifecycle_active_at(0));
+    assert!(!pq_lifecycle_active_at(u64::MAX));
 
     set_pq_lifecycle_activation_override(Some(500));
     assert!(!pq_lifecycle_active_at(499));

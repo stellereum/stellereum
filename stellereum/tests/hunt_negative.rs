@@ -647,8 +647,9 @@ fn hunt_neg_p11_block_hash_binds_the_svm_payload() {
             cnvrf_v3: None,
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block_with_falcon(&pk, &block_fk);
+            round: 0,
+        };
+        b.sign_block_with_falcon(&pk, &block_fk);
         b
     };
     let honest = mk(vec![tx.clone()]);
@@ -678,8 +679,9 @@ fn hunt_neg_p12_proposer_signature_must_match_the_declared_proposer() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block(&liar); // signed by someone else
+        round: 0,
+    };
+    b.sign_block(&liar); // signed by someone else
     println!(
         "[NEG P12] block signed by a non-proposer verifies: {}",
         b.verify_proposer_signature()
@@ -714,8 +716,9 @@ fn hunt_neg_p13_sync_walk_rejects_cycles_gaps_and_overlong_chains() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block(&sk);
+            round: 0,
+        };
+        b.sign_block(&sk);
         b
     };
     let a = mk(1, [0xAA; 32]);

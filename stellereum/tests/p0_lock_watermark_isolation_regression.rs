@@ -33,13 +33,8 @@ fn runtime(ks: &[SigningKey], fk: &stellereum::post_quantum::FalconKeypair) -> V
             .map(|k| (k.verifying_key().to_bytes(), 1))
             .collect(),
     );
-    ValidatorRuntime::new(
-        ks[0].clone(),
-        vs,
-        Arc::new(InMemoryStateEngine::new()),
-        H,
-    )
-    .with_falcon_key(fk.clone())
+    ValidatorRuntime::new(ks[0].clone(), vs, Arc::new(InMemoryStateEngine::new()), H)
+        .with_falcon_key(fk.clone())
 }
 
 fn polka(
@@ -50,14 +45,7 @@ fn polka(
     value: [u8; 32],
 ) {
     for i in 0..3 {
-        let vote = falcon_votes::fvote(
-            &ks[i],
-            &fks[i],
-            H,
-            round,
-            VoteKind::Prevote,
-            Some(value),
-        );
+        let vote = falcon_votes::fvote(&ks[i], &fks[i], H, round, VoteKind::Prevote, Some(value));
         assert!(vote.verify());
         rt.on_prevote(vote).unwrap();
     }

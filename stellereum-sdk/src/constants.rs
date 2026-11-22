@@ -66,3 +66,26 @@ pub const CHAIN_SUPPLY_PARTITION_VERSION: u64 = 1;
 /// The chain-wide total supply cap in nano-STELL (9 decimals), folded into the
 /// fork id because changing it redefines what a valid mint is.
 pub const TOTAL_SUPPLY_CAP: u64 = 1_000_000_000 * 1_000_000_000;
+
+// Ruleset v7: R1..R4 unified activation heights and PQ evidence retention.
+pub const EXEC_HARDENING_V1_ACTIVATION_HEIGHT: u64 = 0;
+pub const WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
+pub const HEADER_COMMIT_ACTIVATION_HEIGHT: u64 = 0;
+pub const EVM_BINDINGS_STATE_ACTIVATION_HEIGHT: u64 = 0;
+pub const PQ_LIFECYCLE_ACTIVATION_HEIGHT: u64 = 0;
+pub const PQ_EVIDENCE_RETENTION_HEIGHTS: u64 = 720_000;
+pub const BRIDGE_V2_ACTIVATION_HEIGHT: u64 = 0;
+pub const FEE_MARKET_V2_ACTIVATION_HEIGHT: u64 = 0;
+pub const SUB_NANO_STRICT_ACTIVATION_HEIGHT: u64 = 0;
+
+// Ruleset v7 domain-separation constants.
+pub const BODY_COMMITMENT_V4_DOMAIN: &[u8] = b"STELLEREUM_BODY_V4\0";
+pub const HEADER_COMMIT_V4_DOMAIN: &[u8] = b"STELLEREUM_HDR_V4\0";
+pub const PQ_KEY_POP_DST: &[u8] = b"STELL_PQ_KEY_POP_V1";
+pub const PQ_VAL_ID_DST: &[u8] = b"STELL_VAL_ID_V1";
+pub const BRIDGE_RELEASE_RECEIPT_DOMAIN_V2: &[u8] = b"STELL_BRIDGE_RELEASE_RECEIPT_V2";
+pub const BRIDGE_HEADER_SIGN_DOMAIN_V2: &[u8] = b"STELL_BRIDGE_HEADER_V2";
+pub const TON_MULTISIG_RELEASE_V2_DOMAIN: &[u8] = b"TON_MULTISIG_RELEASE_V2";
+pub const EVM_TELEPORT_RELEASE_V2_DOMAIN: &[u8] = b"EVM_TELEPORT_RELEASE_V2";
+pub const MULTISIG_RELAYER_MODEL_RELEASE_V2_DOMAIN: &[u8] =
+    b"STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V2";

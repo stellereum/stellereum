@@ -227,13 +227,13 @@ fn claim_withdrawal_op(
 }
 
 #[test]
-fn frozen_defaults_preserve_v5_commitment_and_fork_id() {
-    assert_eq!(PQ_LIFECYCLE_ACTIVATION_HEIGHT, u64::MAX);
-    assert!(!pq_lifecycle_active_at(0));
-    assert!(!pq_lifecycle_active_at(1_000_000));
-    assert!(!pq_lifecycle_active_at(u64::MAX));
+fn frozen_defaults_preserve_v5_commitment_and_v7_fork_id() {
+    assert_eq!(PQ_LIFECYCLE_ACTIVATION_HEIGHT, 0);
+    assert!(pq_lifecycle_active_at(0));
+    assert!(pq_lifecycle_active_at(1_000_000));
+    assert!(pq_lifecycle_active_at(u64::MAX));
     assert_eq!(COMMITMENT_VERSION, 5);
-    assert_eq!(FORK_ID, 0x0f584a46);
+    assert_eq!(FORK_ID, 0x3ae00ebc);
 }
 
 #[tokio::test]

@@ -338,20 +338,7 @@ impl<'a> PrunedPeers<'a> {
         if b.height != h {
             return None;
         }
-        Some(HeaderLink {
-            height: b.height,
-            block_hash: b.compute_hash(),
-            prev_hash: b.prev_hash,
-            state_root: b.state_root,
-            proposer: b.proposer,
-            qc: b.precommit_qc.clone()?,
-            shard_id: b.shard_id,
-            round: b.round,
-            body_commitment: None,
-            mmr_epoch_root: b.mmr_epoch_root,
-            epoch_key_commitment: b.epoch_key_commitment,
-            timestamp: b.timestamp,
-        })
+        HeaderLink::from_block(b)
     }
 
     fn snapshot_at(&self, h: u64) -> Option<Vec<u8>> {
@@ -546,7 +533,11 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
         .map(|k| k.verifying_key().to_bytes())
         .find(|pk| *pk != wrong[&(boundary + 1)].proposer)
         .unwrap();
-    wrong.get_mut(&(boundary + 1)).unwrap().proposer = other;
+    let mut bad_b = chain.blocks[boundary as usize].clone();
+    bad_b.proposer = other;
+    let bad_bh = bad_b.compute_hash();
+    attach_quorum(&mut bad_b, &ks, &fks, boundary + 1, bad_bh);
+    wrong.insert(boundary + 1, HeaderLink::from_block(&bad_b).unwrap());
     let err = verify_snapshot_anchor_tail(boundary + 1, &vs, |h| {
         let l = wrong.get(&h).cloned();
         async move { l }

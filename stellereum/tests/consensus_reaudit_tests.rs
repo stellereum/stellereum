@@ -275,60 +275,48 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
     let boundary = 100u64;
     let next_height = boundary + 1;
 
-    // A genuine two-block segment: block B at `boundary`, block C at
-    // `next_height` linking to it.
-    let b_hash = [0xB1u8; 32];
-    let c_hash = [0xC2u8; 32];
-    // The tail window reaches one height BELOW the boundary, so the segment
-    // is three linked, QC-verified blocks.
+    // A genuine three-block segment: `boundary - 1`, `boundary`, and `next_height`.
+    let make_link = |h: u64, prev: [u8; 32], tag: u8| -> HeaderLink {
+        let proposer = vs.proposer_for(h, 0).unwrap();
+        let hdr = stellereum::sharding::BlockHeader {
+            shard_id: 0,
+            height: h,
+            round: 0,
+            prev_hash: prev,
+            state_root: [0x5u8; 32],
+            body_commitment: [tag; 32],
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 0,
+            proposer,
+        };
+        let block_hash = hdr.compute_hash();
+        HeaderLink {
+            height: h,
+            block_hash,
+            prev_hash: prev,
+            state_root: [0x5u8; 32],
+            proposer,
+            qc: qc_for(&ks, &fks, vs.clone(), h, block_hash, &prev),
+            shard_id: 0,
+            round: 0,
+            body_commitment: Some(hdr.body_commitment),
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 0,
+        }
+    };
+    let link_prev = make_link(boundary - 1, [0x8Au8; 32], 0x9A);
+    let link_b = make_link(boundary, link_prev.block_hash, 0xB1);
+    let b_hash = link_b.block_hash;
+    let link_c = make_link(next_height, b_hash, 0xC2);
     let link = |h: u64| -> Option<HeaderLink> {
         if h == boundary {
-            Some(HeaderLink {
-                height: boundary,
-                block_hash: b_hash,
-                // Links to the block one height below the boundary, which the
-                // window also covers.
-                prev_hash: [0x9Au8; 32],
-                state_root: [0x5u8; 32],
-                proposer: vs.proposer_for(boundary, 0).unwrap(),
-                qc: qc_for(&ks, &fks, vs.clone(), boundary, b_hash, &[0x9Au8; 32]),
-                shard_id: 0,
-                round: 0,
-                body_commitment: None,
-                mmr_epoch_root: [0u8; 32],
-                epoch_key_commitment: [0u8; 32],
-                timestamp: 0,
-            })
+            Some(link_b.clone())
         } else if h == next_height {
-            Some(HeaderLink {
-                height: next_height,
-                block_hash: c_hash,
-                prev_hash: b_hash,
-                state_root: [0x5u8; 32],
-                proposer: vs.proposer_for(next_height, 0).unwrap(),
-                qc: qc_for(&ks, &fks, vs.clone(), next_height, c_hash, &b_hash),
-                shard_id: 0,
-                round: 0,
-                body_commitment: None,
-                mmr_epoch_root: [0u8; 32],
-                epoch_key_commitment: [0u8; 32],
-                timestamp: 0,
-            })
+            Some(link_c.clone())
         } else if h + 1 == boundary {
-            Some(HeaderLink {
-                height: h,
-                block_hash: [0x9Au8; 32],
-                prev_hash: [0x8Au8; 32],
-                state_root: [0x5u8; 32],
-                proposer: vs.proposer_for(h, 0).unwrap(),
-                qc: qc_for(&ks, &fks, vs.clone(), h, [0x9Au8; 32], &[0x8Au8; 32]),
-                shard_id: 0,
-                round: 0,
-                body_commitment: None,
-                mmr_epoch_root: [0u8; 32],
-                epoch_key_commitment: [0u8; 32],
-                timestamp: 0,
-            })
+            Some(link_prev.clone())
         } else {
             None
         }
@@ -433,10 +421,26 @@ fn the_invalidation_signal_type_is_usable() {
 
 use stellereum::consensus::QuorumCertificate;
 
-async fn adopt_runtime(ks: &[SigningKey], idx: usize) -> ValidatorRuntime {
+async fn adopt_runtime(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    idx: usize,
+) -> ValidatorRuntime {
     let vs = vset(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     stellereum::runtime::fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
+    {
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let _ = pq_reg.adopt_legacy_key_at(
+                id(k),
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            );
+        }
+    }
     ValidatorRuntime::new(ks[idx].clone(), vs, st, 1)
 }
 
@@ -510,7 +514,7 @@ async fn a_later_round_certificate_supersedes_the_lock() {
     // `locked_round <= certificate.round` test) partitioned the node from
     // every canonical commit after a single lost vote.
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = adopt_runtime(&ks, 0).await;
+    let mut rt = adopt_runtime(&ks, &fks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(6, &rt, &ks, &fks).await;
@@ -530,7 +534,7 @@ async fn a_same_round_certificate_naming_another_block_is_refused() {
     // power, so a certificate at the lock's own round that names a DIFFERENT
     // block is a genuine safety conflict and must be refused.
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = adopt_runtime(&ks, 0).await;
+    let mut rt = adopt_runtime(&ks, &fks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(5, &rt, &ks, &fks).await;
@@ -548,7 +552,7 @@ async fn a_same_round_certificate_naming_another_block_is_refused() {
 #[tokio::test]
 async fn an_earlier_round_certificate_naming_another_block_is_refused() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = adopt_runtime(&ks, 0).await;
+    let mut rt = adopt_runtime(&ks, &fks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(4, &rt, &ks, &fks).await;

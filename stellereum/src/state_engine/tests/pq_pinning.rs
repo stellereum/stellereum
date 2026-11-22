@@ -1,6 +1,6 @@
 use super::*;
-use crate::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope};
-use crate::sharding::Transaction;
+use crate::post_quantum::{derive_pq_address, PqScheme};
+use crate::sharding::{PqSignatureEnvelope, Transaction};
 
 #[tokio::test]
 async fn test_dormant_account_activation_and_spend_pinned_pubkey() {
@@ -405,7 +405,7 @@ async fn test_block_execution_pq_activation_pinning_and_disk_persistence() {
     let from = derive_pq_address(scheme, &pk, &salt);
     let recipient = [0x77u8; 32];
 
-    let initial_balance = 10_000_000u64;
+    let initial_balance = 50_000_000u64;
     engine.credit_native(&from, initial_balance).await.unwrap();
 
     // Verify account is legacy / unpinned before execution
@@ -421,7 +421,7 @@ async fn test_block_execution_pq_activation_pinning_and_disk_persistence() {
 
     // Build PQ activation transaction
     let amount = 50_000u64;
-    let gas_limit = 60_000u64;
+    let gas_limit = 500_000u64;
     let mut tx = Transaction {
         from,
         to: recipient,
@@ -456,7 +456,9 @@ async fn test_block_execution_pq_activation_pinning_and_disk_persistence() {
     assert_eq!(acc_after.nonce, 1);
 
     // Verify activation surcharge gas fee deducted from sender's balance in commit_native
-    let expected_balance = initial_balance - amount - gas_limit - PQ_ACTIVATION_SURCHARGE_GAS;
+    // Under Ruleset v7 (`EXEC_HARDENING_V1_ACTIVATION_HEIGHT = 0`), intrinsic floor is `TX_INTRINSIC_GAS`.
+    let billed = InMemoryStateEngine::TX_INTRINSIC_GAS;
+    let expected_balance = initial_balance - amount - billed - PQ_ACTIVATION_SURCHARGE_GAS;
     assert_eq!(acc_after.balance, expected_balance);
 
     // 2. Verify account leaf becomes 49 bytes (ACCOUNT_LEAF_LEN_PQ)
@@ -514,7 +516,7 @@ async fn test_steady_state_implicit_transactions_follow_activation_and_lookup_pi
         from,
         to: recipient,
         amount: 10_000,
-        gas_limit: 50_000,
+        gas_limit: 500_000,
         nonce: 0,
         source_shard: 1,
         target_shard: 1,
@@ -543,7 +545,7 @@ async fn test_steady_state_implicit_transactions_follow_activation_and_lookup_pi
         from,
         to: recipient,
         amount: 20_000,
-        gas_limit: 30_000,
+        gas_limit: 500_000,
         nonce: 1,
         source_shard: 1,
         target_shard: 1,
@@ -593,7 +595,7 @@ async fn test_steady_state_implicit_transactions_follow_activation_and_lookup_pi
         from,
         to: recipient,
         amount: 5_000,
-        gas_limit: 25_000,
+        gas_limit: 500_000,
         nonce: 2,
         source_shard: 1,
         target_shard: 1,

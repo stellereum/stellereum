@@ -84,14 +84,12 @@ use crate::post_quantum::{
 // Activation gate (Ruleset v7 — frozen at u64::MAX until R5)
 // ============================================================================
 
-/// Compiled default activation height for Ruleset v7 PQ validator lifecycle
-/// (3-key separation with `withdrawal_address`, Falcon-512 PoP rotation,
-/// explicit `cancel_rotation`, `next_seq` replay protection, and 720k-height
-/// evidence retention).
+/// Ruleset v7 PQ validator lifecycle activation height (`0` = active from genesis).
 ///
-/// Frozen at `u64::MAX` (`GatedOff`) in release builds until Ruleset v7
-/// activation; no environment variable can override this in release builds.
-pub const PQ_LIFECYCLE_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Activates 3-key separation with `withdrawal_address`, Falcon-512 PoP
+/// rotation, explicit `cancel_rotation`, `next_seq` replay protection, and
+/// 720k-height evidence retention.
+pub const PQ_LIFECYCLE_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {

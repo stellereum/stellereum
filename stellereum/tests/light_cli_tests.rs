@@ -134,10 +134,21 @@ fn anchor_fixture(
 ) -> (PathBuf, PathBuf, Checkpoint) {
     let ids = ids_of(keys);
     let validators_path = write_validators_file(dir, &ids);
-    let block_hash = [0x11u8; 32];
-    let state_root = [0xAAu8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height: 1,
+        round: 0,
+        prev_hash: [0u8; 32],
+        state_root: [0xAAu8; 32],
+        body_commitment: [0x11u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let block_hash = hdr.compute_hash();
     let cert = qc_from(&keys[..3], &fks[..3], vs, 1, block_hash, &[0u8; 32]);
-    let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+    let checkpoint = Checkpoint::from_block_header(hdr, cert);
     let checkpoint_path = write_json_file(dir, "checkpoint.json", &checkpoint);
     (validators_path, checkpoint_path, checkpoint)
 }
@@ -148,25 +159,39 @@ fn anchor_fixture(
 fn header_at(
     height: u64,
     prev_hash: [u8; 32],
-    block_hash: [u8; 32],
+    body_tag: [u8; 32],
     state_root: [u8; 32],
     proposer: ValidatorId,
     signers: &[SigningKey],
     fks: &[FalconKeypair],
     vs: &ValidatorSet,
 ) -> LightHeader {
+    let timestamp = 1_700_000_000 + height;
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash,
+        state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp,
+        proposer,
+    };
+    let block_hash = hdr.compute_hash();
     LightHeader {
         height,
         prev_hash,
         state_root,
         block_hash,
-        timestamp: 1_700_000_000 + height,
+        timestamp,
         proposer,
         cert: qc_from(signers, fks, vs, height, block_hash, &prev_hash),
         signatures: Vec::new(),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_tag),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     }

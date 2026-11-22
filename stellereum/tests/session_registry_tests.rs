@@ -240,8 +240,8 @@ async fn registry_persists_across_snapshot_and_restore() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    // FULL-PQ: the proposal signature is verified Falcon-only.
+        round: 0,
+    }; // FULL-PQ: the proposal signature is verified Falcon-only.
     anchor.sign_block_with_falcon(&sk, &anchor_fk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
     store
@@ -505,8 +505,9 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    let outcome = state.apply_block_transition(&block, 0).await;
+        round: 0,
+    };
+    let outcome = state.apply_block_transition(&block, 0).await;
     assert_eq!(
         outcome.status,
         vec![true],

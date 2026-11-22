@@ -95,15 +95,26 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(PROTOCOL_MAJO
 /// older signed round that the fsynced vote watermark may already refuse.
 /// `HeightConsensus` compares locks with `Block::value_id` (the block hash
 /// with `round := 0`) via `same_value`, while votes/QCs/signatures keep the
-/// real signed hash. No wire field, domain string or constant value changed;
-/// the ruleset version itself is the activation marker. Fork id
-/// `0x0f584a46`. See `docs/RULESET_V6.md`.
-pub const CONSENSUS_RULESET_VERSION: u32 = 6;
+/// real signed hash. Fork id `0x0f584a46`. See `docs/RULESET_V6.md`.
+///
+/// RULESET v7 (2026-11-22): UNIFIED ACTIVATION OF R1..R4 HARDENING & ECONOMICS.
+/// Activates from height `0` all 8 Ruleset v7 gates:
+///   - R1 (`EXEC_HARDENING_V1`, `WASM_XSHARD_PMM_HARDENING`)
+///   - R2 (`HEADER_COMMIT` two-level `BlockHeader` v4, `EVM_BINDINGS_STATE`)
+///   - R3 (`PQ_LIFECYCLE` 3-key validator separation + PoP + 720k evidence retention)
+///   - R4 (`BRIDGE_V2` release receipt authorization & V2 headers,
+///     `FEE_MARKET_V2` priority debit & burn/proposer/staking split,
+///     `SUB_NANO_STRICT` exact EVM/mint/reward/emission carry).
+///
+/// Folds the 9 new rule constants and 9 new domain-separation strings into
+/// [`FORK_ID`], bumps [`DOMAIN_SET_VERSION`] to `4`, and requires a new v7
+/// genesis. See `docs/RULESET_V7.md`.
+pub const CONSENSUS_RULESET_VERSION: u32 = 7;
 
 /// Version of the set of domain-separation strings folded into [`FORK_ID`].
 /// Bump when a domain string is added/renamed without changing a hashed
 /// constant's value.
-pub const DOMAIN_SET_VERSION: u32 = 3;
+pub const DOMAIN_SET_VERSION: u32 = 4;
 
 /// Deterministic ceiling for a block timestamp ahead of its parent, in
 /// MILLISECONDS (ruleset v4, S8).
@@ -172,6 +183,16 @@ pub const FORK_ID_RULES: &[u64] = &[
     MAX_BLOCK_TIMESTAMP_DRIFT_MS,
     crate::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION,
     crate::tokenomics::TOTAL_SUPPLY_CAP,
+    // Ruleset v7 (R1..R4 unified activation gates + 720k PQ evidence retention):
+    crate::chain_spec::EXEC_HARDENING_V1_ACTIVATION_HEIGHT,
+    crate::chain_spec::WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
+    crate::sharding::HEADER_COMMIT_ACTIVATION_HEIGHT,
+    crate::state_engine::EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
+    crate::pq_registry::PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+    crate::pq_registry::PQ_EVIDENCE_RETENTION_HEIGHTS,
+    crate::bridge::BRIDGE_V2_ACTIVATION_HEIGHT,
+    crate::tokenomics::FEE_MARKET_V2_ACTIVATION_HEIGHT,
+    crate::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
 ];
 
 const fn fold_u64(h: u32, v: u64) -> u32 {
@@ -210,6 +231,20 @@ pub const fn derive_fork_id(chain_id: u64, ruleset_version: u32, rules: &[u64]) 
     h = fnv1a32(h, crate::consensus::VOTE_FALCON_MAGIC);
     h = fnv1a32(h, crate::consensus::QC_UQC_MAGIC);
     h = fnv1a32(h, crate::consensus::QC_PQ_MAGIC);
+    // Ruleset v7 domains: v4 block header/body commitment, PQ validator PoP
+    // and ID derivation, and Bridge V2 payout/header/relayer domains.
+    h = fnv1a32(h, crate::sharding::BODY_COMMITMENT_V4_DOMAIN);
+    h = fnv1a32(h, crate::sharding::HEADER_COMMIT_V4_DOMAIN);
+    h = fnv1a32(h, crate::pq_registry::PQ_KEY_POP_DST);
+    h = fnv1a32(h, crate::pq_registry::PQ_VAL_ID_DST);
+    h = fnv1a32(h, crate::bridge::BRIDGE_RELEASE_RECEIPT_DOMAIN_V2);
+    h = fnv1a32(
+        h,
+        crate::bridge::bridge_adapters::BRIDGE_HEADER_SIGN_DOMAIN_V2,
+    );
+    h = fnv1a32(h, b"TON_MULTISIG_RELEASE_V2");
+    h = fnv1a32(h, b"EVM_TELEPORT_RELEASE_V2");
+    h = fnv1a32(h, b"STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V2");
     let mut i = 0;
     while i < rules.len() {
         h = fold_u64(h, rules[i]);

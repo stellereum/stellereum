@@ -362,9 +362,15 @@ async fn nshard_3_all_finalize_and_xfer_across_pairs() {
         + balance_at(&sc, SHARD1, &r1).await
         + balance_at(&sc, SHARD2, &r2).await
         + balance_at(&sc, SHARD2, &validator_addr).await;
+    let burn_of = |fee: u64| -> u64 {
+        ((fee as u128 * stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+            / stellereum::staking::BPS_DENOMINATOR as u128) as u64
+    };
+    let total_burned = burn_of(50) + burn_of(20) + burn_of(25);
     assert_eq!(
-        supply_after, supply_before,
-        "N=3 cross-pair transfers must conserve supply"
+        supply_after + total_burned,
+        supply_before,
+        "N=3 cross-pair transfers must conserve supply (accounting for FEE_MARKET_V2 burn)"
     );
     eprintln!(
         "N3 soak: finals0={f0} finals1={f1} finals2={f2} \

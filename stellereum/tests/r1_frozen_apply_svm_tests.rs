@@ -153,15 +153,21 @@ fn sstore_contract_wasm() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn default_u64_max_invariants_fork_id_commitment_and_genesis_root() {
-    assert_eq!(EXEC_HARDENING_V1_ACTIVATION_HEIGHT, u64::MAX);
-    assert_eq!(WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT, u64::MAX);
-    assert!(!exec_hardening_v1_active_at(0));
-    assert!(!exec_hardening_v1_active_at(u64::MAX));
-    assert!(!wasm_xshard_pmm_hardening_active_at(0));
-    assert!(!wasm_xshard_pmm_hardening_active_at(u64::MAX));
-    assert_eq!(FORK_ID, 0x0f584a46);
+async fn default_v7_invariants_fork_id_commitment_and_genesis_root() {
+    let _guard = GateResetGuard;
+    assert_eq!(EXEC_HARDENING_V1_ACTIVATION_HEIGHT, 0);
+    assert_eq!(WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT, 0);
+    assert!(exec_hardening_v1_active_at(0));
+    assert!(exec_hardening_v1_active_at(u64::MAX));
+    assert!(wasm_xshard_pmm_hardening_active_at(0));
+    assert!(wasm_xshard_pmm_hardening_active_at(u64::MAX));
+    assert_eq!(FORK_ID, 0x3ae00ebc);
     assert_eq!(COMMITMENT_VERSION, 5);
+
+    set_exec_hardening_v1_activation_override(Some(u64::MAX));
+    set_wasm_xshard_pmm_hardening_activation_override(Some(u64::MAX));
+    assert!(!exec_hardening_v1_active_at(0));
+    assert!(!wasm_xshard_pmm_hardening_active_at(0));
 
     let engine = Arc::new(InMemoryStateEngine::new());
     let vs = ValidatorSet::from_list(vec![([0x11u8; 32], 1), ([0x22u8; 32], 1)]);
@@ -238,6 +244,16 @@ async fn halt_barrier_blocks_post_halt_bridge_rotate_unjail_and_equivocation_at_
     // 2. Post-Halt SysCallRotateValidatorKey in apply_cnvrf_v3, SysCallUnjail in
     //    apply_staking_unjail_ops, and SysCallReportEquivocation in apply_equivocation_slash.
     //    Use H_UNJAIL > JAIL_RELEASE_DELAY_HEIGHTS (4_000) so unjail is eligible on H_UNJAIL-1.
+    //    Keep PQ_LIFECYCLE gated off here because this test exercises legacy SysCallRotateValidatorKey
+    //    and legacy SysCallUnjail without withdrawal_address behind the Halt barrier.
+    struct PreV7PqGuard;
+    impl Drop for PreV7PqGuard {
+        fn drop(&mut self) {
+            stellereum::pq_registry::set_pq_lifecycle_activation_override(None);
+        }
+    }
+    let _pre_v7_pq = PreV7PqGuard;
+    stellereum::pq_registry::set_pq_lifecycle_activation_override(Some(u64::MAX));
     let h_unjail: u64 = JAIL_RELEASE_DELAY_HEIGHTS + 500;
     set_exec_hardening_v1_activation_override(Some(h_unjail));
 
@@ -750,6 +766,15 @@ async fn nop_billed_gas_280k_and_bonding_pre_h_gas_limit_10k_boundary() {
 
     // Pre-H (`H - 1`) preserves `SysCallStake` with `gas_limit = 10_000` billing 2_000 (`GAS_STAKE_BOND`).
     {
+        struct ResetPq;
+        impl Drop for ResetPq {
+            fn drop(&mut self) {
+                stellereum::pq_registry::set_pq_lifecycle_activation_override(None);
+            }
+        }
+        let _reset_pq = ResetPq;
+        stellereum::pq_registry::set_pq_lifecycle_activation_override(Some(u64::MAX));
+
         let engine = InMemoryStateEngine::new();
         let kp = FalconKeypair::generate_from_seed(0x73);
         let sender = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
@@ -1215,7 +1240,10 @@ async fn outbound_messages_rollback_bounce_conservation_and_sync_contract_balanc
         );
         let sender_bal = engine.get_account(&sender).await.unwrap().balance;
         let prop_bal = engine.get_account(&proposer).await.unwrap().balance;
-        assert_eq!(sender_bal + prop_bal, 5_000_000);
+        let burn = ((outcome.fees_collected as u128)
+            * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+            / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
+        assert_eq!(sender_bal + prop_bal + burn, 5_000_000);
     }
 
     // 3. sync_contract_balance + pure-value delivery & bounce conservation with funded contract.
@@ -1282,10 +1310,14 @@ async fn outbound_messages_rollback_bounce_conservation_and_sync_contract_balanc
             engine.get_account(&contract_addr).await.unwrap().balance,
             600
         );
+        let burn = ((outcome.fees_collected as u128)
+            * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+            / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
         let total = engine.get_account(&sender).await.unwrap().balance
             + engine.get_account(&proposer).await.unwrap().balance
             + engine.get_account(&recipient).await.unwrap().balance
-            + engine.get_account(&contract_addr).await.unwrap().balance;
+            + engine.get_account(&contract_addr).await.unwrap().balance
+            + burn;
         assert_eq!(total, 5_000_000 + 100 + 1_000);
     }
 }

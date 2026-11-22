@@ -14,9 +14,11 @@
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload};
+use stellereum::zkml::effective_chain_id;
 
 mod support;
 use support::{assert_refused_tx_paid_failure_fee, failure_fee};
@@ -83,6 +85,28 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
     engine.get_account(a).await.map(|x| x.balance).unwrap_or(0)
 }
 
+fn register_op(cold_addr: [u8; 32], hot_kp: &FalconKeypair, amount: u64) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
+}
+
 /// Anyone with dust can drain any validator's accrued rewards out of the shared
 /// staking pool. The victim's `pending_rewards` is zeroed, so the honest
 /// validator never even sees the loss coming.
@@ -92,21 +116,16 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
 
     let victim = FalconKeypair::generate();
     let victim_addr = pq_addr(&victim);
+    let victim_hot = FalconKeypair::generate();
     let attacker = FalconKeypair::generate();
     let attacker_addr = pq_addr(&attacker);
 
     // Victim bonds 10,000 STELL -> the coins land in the shared STAKING_POOL.
     engine
-        .update_account(AccountState::new(victim_addr, stell(10_000) + 100_000))
+        .update_account(AccountState::new(victim_addr, stell(10_000) + 200_000))
         .await;
-    let bond = tx_of(
-        &victim,
-        0,
-        vec![OpCode::SysCallStake {
-            validator: victim_addr,
-            amount: stell(10_000),
-        }],
-    );
+    let (reg_op, victim_vid) = register_op(victim_addr, &victim_hot, stell(10_000));
+    let bond = tx_of(&victim, 0, vec![reg_op]);
     engine
         .apply_transaction(&bond, 0)
         .await
@@ -121,8 +140,8 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
     // with no backing must not pay).
     {
         let mut l = engine.staking_write().await;
-        l.distribute_reward(victim_addr, stell(500)).unwrap();
-        assert_eq!(l.validators[&victim_addr].pending_rewards, stell(500));
+        l.distribute_reward(victim_vid, stell(500)).unwrap();
+        assert_eq!(l.validators[&victim_vid].pending_rewards, stell(500));
     }
     engine
         .credit_native(&REWARDS_POOL, stell(500))
@@ -141,7 +160,7 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
         &attacker,
         0,
         vec![OpCode::SysCallClaimRewards {
-            validator: victim_addr,
+            validator: victim_vid,
         }],
     );
     // FIXED: ClaimRewards is owner-only, so the theft is refused outright.
@@ -159,7 +178,7 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
     println!("staking pool:     {pool_after_bond} -> {pool_after} (untouched)");
     println!(
         "victim pending:   {} (still owed in full)",
-        engine.staking_read().await.validators[&victim_addr].pending_rewards
+        engine.staking_read().await.validators[&victim_vid].pending_rewards
     );
 
     // F-01 / SEC-07: the refusal is ATTRIBUTABLE (the syscall ran and said
@@ -178,28 +197,28 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
         "the pool still fully backs every bonded obligation"
     );
     assert_eq!(
-        engine.staking_read().await.validators[&victim_addr].pending_rewards,
+        engine.staking_read().await.validators[&victim_vid].pending_rewards,
         stell(500),
         "the victim's reward is intact and still claimable by the victim"
     );
     assert_eq!(
-        engine.staking_read().await.total_stake(&victim_addr),
+        engine.staking_read().await.total_stake(&victim_vid),
         stell(10_000),
         "ledger still records the full bond"
     );
     // Solvency invariant restored.
     assert!(
-        pool_after >= engine.staking_read().await.total_stake(&victim_addr),
+        pool_after >= engine.staking_read().await.total_stake(&victim_vid),
         "POOL IS SOLVENT: the coins still cover the bonded obligation"
     );
 
-    // The owner can still claim, so this is an auth check and not a freeze.
+    // The owner (cold withdrawal_address) can still claim, so this is an auth check and not a freeze.
     let owner = tx_of_gas(
         &victim,
         1,
         2_000,
         vec![OpCode::SysCallClaimRewards {
-            validator: victim_addr,
+            validator: victim_vid,
         }],
     );
     engine
@@ -207,7 +226,7 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
         .await
         .expect("the validator may still claim its own rewards");
     assert_eq!(
-        engine.staking_read().await.validators[&victim_addr].pending_rewards,
+        engine.staking_read().await.validators[&victim_vid].pending_rewards,
         0
     );
 }
@@ -228,23 +247,18 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
     for _i in 0..20u8 {
         let k = FalconKeypair::generate();
         let a = pq_addr(&k);
+        let k_hot = FalconKeypair::generate();
         engine
             .update_account(AccountState::new(a, floor() + 100_000))
             .await;
-        let t = tx_of(
-            &k,
-            0,
-            vec![OpCode::SysCallStake {
-                validator: a,
-                amount: floor(),
-            }],
-        );
+        let (reg_op, vid) = register_op(a, &k_hot, floor());
+        let t = tx_of(&k, 0, vec![reg_op]);
         engine.apply_transaction(&t, 0).await.unwrap();
         {
             let mut l = engine.staking_write().await;
-            l.distribute_reward(a, stell(900)).unwrap();
+            l.distribute_reward(vid, stell(900)).unwrap();
         }
-        validators.push(a);
+        validators.push(vid);
     }
 
     let pool_before = bal(&engine, &STAKING_POOL).await;
@@ -322,25 +336,20 @@ async fn failed_claim_does_not_burn_validator_rewards() {
     let engine = InMemoryStateEngine::new();
     let victim = FalconKeypair::generate();
     let victim_addr = pq_addr(&victim);
+    let victim_hot = FalconKeypair::generate();
     let attacker = FalconKeypair::generate();
     let attacker_addr = pq_addr(&attacker);
 
     engine
         .update_account(AccountState::new(victim_addr, floor() + 100_000))
         .await;
-    let bond = tx_of(
-        &victim,
-        0,
-        vec![OpCode::SysCallStake {
-            validator: victim_addr,
-            amount: floor(),
-        }],
-    );
+    let (reg_op, victim_vid) = register_op(victim_addr, &victim_hot, floor());
+    let bond = tx_of(&victim, 0, vec![reg_op]);
     engine.apply_transaction(&bond, 0).await.unwrap();
     {
         let mut l = engine.staking_write().await;
         // Reward far larger than the pool: 5,000 STELL earned on a floor bond.
-        l.distribute_reward(victim_addr, stell(5_000)).unwrap();
+        l.distribute_reward(victim_vid, stell(5_000)).unwrap();
     }
     engine
         .update_account(AccountState::new(attacker_addr, 100_000))
@@ -350,12 +359,12 @@ async fn failed_claim_does_not_burn_validator_rewards() {
         &attacker,
         0,
         vec![OpCode::SysCallClaimRewards {
-            validator: victim_addr,
+            validator: victim_vid,
         }],
     );
     let res = engine.apply_transaction(&t, 0).await;
     println!("apply_transaction result: {res:?}");
-    let pending = engine.staking_read().await.validators[&victim_addr].pending_rewards;
+    let pending = engine.staking_read().await.validators[&victim_vid].pending_rewards;
     println!("victim pending_rewards after the FAILED tx: {pending}");
     println!("pool: {}", bal(&engine, &STAKING_POOL).await);
     assert!(

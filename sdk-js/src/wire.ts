@@ -56,7 +56,8 @@ export type GovAction =
   | { type: "reset_oracle_breaker" }
   | { type: "set_min_gas_limit"; value: number }
   | { type: "software_upgrade"; name: string; height: number; sha256: string }
-  | { type: "cancel_upgrade" };
+  | { type: "cancel_upgrade" }
+  | { type: "set_fee_split_bps"; burn_bps: number; proposer_bps: number; staking_bps: number };
 
 /** An unsigned, fully encoded transaction plus the exact bytes to sign. */
 export interface UnsignedTransaction {
@@ -236,6 +237,30 @@ export function encodeGovAction(action: GovAction): Uint8Array {
     case "cancel_upgrade":
       w.u32le(12);
       break;
+    case "set_fee_split_bps": {
+      if (
+        !Number.isInteger(action.burn_bps) ||
+        action.burn_bps < 0 ||
+        !Number.isInteger(action.proposer_bps) ||
+        action.proposer_bps < 0 ||
+        !Number.isInteger(action.staking_bps) ||
+        action.staking_bps < 0
+      ) {
+        throw new Error("set_fee_split_bps: burn_bps, proposer_bps, staking_bps must be non-negative integers");
+      }
+      if (action.burn_bps + action.proposer_bps + action.staking_bps !== 10_000) {
+        throw new Error(
+          `set_fee_split_bps: burn_bps + proposer_bps + staking_bps must equal 10000, got ${
+            action.burn_bps + action.proposer_bps + action.staking_bps
+          }`,
+        );
+      }
+      w.u32le(13);
+      u64(action.burn_bps);
+      u64(action.proposer_bps);
+      u64(action.staking_bps);
+      break;
+    }
     default: {
       const never: never = action;
       throw new Error(`unknown governance action ${JSON.stringify(never)}`);

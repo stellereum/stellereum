@@ -539,7 +539,8 @@ fn spv_depth_refuses_header_ahead_of_finalized_head() {
         prev_hash: [0u8; 32],
         tx_root: [0xAAu8; 32],
     };
-    let msg = header.signing_message();
+    let chain_id = stellereum::zkml::effective_chain_id();
+    let msg = header.signing_message_v2_binding(chain_id, adapters::AdapterKindTag::Ton, 199);
     let sigs = vec![sign_msg(&a, &msg), sign_msg(&b, &msg)];
     let claim = adapters::DepositClaim {
         chain: SupportedChain::Ton,
@@ -562,12 +563,14 @@ fn spv_depth_refuses_header_ahead_of_finalized_head() {
     // Sanity: the depth gate still measures real buried headers (this fails
     // later at BoC parsing, which proves depth PASSED — the failure moved).
     header.height = 100;
-    let msg2 = header.signing_message();
+    let finalized = 100 + MIN_TON_CONFIRMATIONS;
+    let msg2 =
+        header.signing_message_v2_binding(chain_id, adapters::AdapterKindTag::Ton, finalized);
     let sigs2 = vec![sign_msg(&a, &msg2), sign_msg(&b, &msg2)];
     let buried_evidence = adapters::DepositEvidence::TonCell {
         header,
         header_signatures: sigs2,
-        finalized_seqno: 100 + MIN_TON_CONFIRMATIONS,
+        finalized_seqno: finalized,
         boc_bytes: vec![0x01],
     };
     let err = adapters::verify_evidence(&claim, &buried_evidence, &validators)

@@ -1091,7 +1091,7 @@ async fn a_refused_escrow_leaves_no_prepared_record() {
         shard_headers: vec![],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
+        round: 0,
     };
     let outcome = engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.failed, 1, "precondition: the escrow tx was refused");

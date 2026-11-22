@@ -282,7 +282,8 @@ fn mk_block(
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    blk.sign_block(proposer);
+    };
+    blk.sign_block(proposer);
     blk
 }
 
@@ -345,19 +346,40 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // status false - the canonical "one failing tx" in a block.
     let tx_fail = tx(&dave, bob, 100, 500_000, 7);
 
-    // --- block 2: staking bond + order placement ---------------------------
-    // FULL-PQ: nova/trader are Falcon-512; the bond/validator ids are their
-    // PQ addresses (the stake logic keys on addresses, not schemes).
+    // --- block 2: staking bond (SysCallRegisterValidator under Ruleset v7) + order placement ---
+    let nova_withdrawal = pq_id(&nova);
+    let nova_voting_kp =
+        stellereum::post_quantum::FalconKeypair::generate_from_seed(nova.wrapping_add(0x10));
+    let nova_vid = stellereum::pq_registry::derive_validator_id(
+        engine_live.chain_id,
+        &nova_withdrawal,
+        &nova_voting_kp.public_key,
+    );
+    let nova_pop_msg = stellereum::pq_registry::pq_voting_key_pop_preimage(
+        engine_live.chain_id,
+        &nova_vid,
+        &nova_withdrawal,
+        0,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &nova_voting_kp.public_key,
+    );
+    let nova_pop_sig = nova_voting_kp.sign(&nova_pop_msg);
     let tx_bond = txp(
         &nova,
-        pq_id(&nova),
+        nova_withdrawal,
         0,
-        500_000, // declared; GAS_STAKE_BOND = 2_000 is what the VM consumes
+        500_000,
         0,
-        vec![OpCode::SysCallStake {
-            validator: pq_id(&nova),
-            amount: floor(),
-        }],
+        vec![OpCode::SysCallRegisterValidator(Box::new(
+            stellereum::svm::RegisterValidatorPayload {
+                amount: floor(),
+                commission_bps: 0,
+                withdrawal_address: nova_withdrawal,
+                voting_scheme: stellereum::post_quantum::PqScheme::Falcon512.id(),
+                voting_pubkey: nova_voting_kp.public_key.clone(),
+                voting_pop: nova_pop_sig,
+            },
+        ))],
     );
     let tx_order = txp(
         &trader,
@@ -416,9 +438,11 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // quorum below is unsatisfiable. Carrying it makes this test the
     // end-to-end live-vs-reorg parity proof under a rotation boundary.
     let mut parent_qc: Option<stellereum::consensus::QuorumCertificate> = None;
-    // FEE-01: fees are no longer the declared limits, so the proposer's
-    // credit is accumulated from the per-block receipts instead of a literal.
-    let mut total_fees: u64 = 0;
+    // FEE-01 + FEE_MARKET_V2: fees are no longer the declared limits, and
+    // Fee Market v2 splits each block's fees into 50% burn, 20% staking pool,
+    // and 30% proposer direct credit. Accumulate the per-block shares from receipts.
+    let mut total_staking_fees: u64 = 0;
+    let mut total_proposer_fees: u64 = 0;
     for (i, txs) in blocks.into_iter().enumerate() {
         let height = (i + 1) as u64;
         let root = engine_live.get_state_root().await;
@@ -467,7 +491,15 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             live.applied_txs, reorg.applied_txs,
             "APPLIED TX COUNT DIVERGED at height {height}"
         );
-        total_fees = total_fees.saturating_add(live.applied_fees.iter().sum::<u64>());
+        let block_fees: u64 = live.applied_fees.iter().sum();
+        let burn = ((block_fees as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+            / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
+        let staking = ((block_fees as u128)
+            * (stellereum::tokenomics::DEFAULT_FEE_STAKING_BPS as u128)
+            / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
+        let proposer_share = block_fees.saturating_sub(burn).saturating_sub(staking);
+        total_staking_fees = total_staking_fees.saturating_add(staking);
+        total_proposer_fees = total_proposer_fees.saturating_add(proposer_share);
         prev_hash = bh;
     }
 
@@ -523,45 +555,45 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             expected_pool,
             "the pool must move by bond in and burn only - never by claims"
         );
-        // The rewards pool moved by the mint (3 heights x REWARD); the
-        // third-party claim reverted, so nothing was claimed, on both paths
-        // identically.
+        // The rewards pool moved by the mint (3 heights x REWARD) plus the
+        // 20% staking fee share from Fee Market v2; the third-party claim
+        // reverted, so nothing was claimed, on both paths identically.
         assert_eq!(
             balance(e, &REWARDS_POOL).await,
-            3 * REWARD,
-            "the rewards pool must hold the full mint when the claim reverts"
+            3 * REWARD + total_staking_fees,
+            "the rewards pool must hold the full mint plus staking fee share when the claim reverts"
         );
         assert_eq!(
             e.staking_read().await.rewards_pool,
-            3 * REWARD,
+            3 * REWARD + total_staking_fees,
             "ledger pool accounting must match the native rewards pool"
         );
         assert_eq!(
             e.staking_read()
                 .await
                 .to_validator_set()
-                .power_of(&pq_id(&nova)),
+                .power_of(&nova_vid),
             floor(),
             "the bond must buy voting power"
         );
     }
 
     // No validator self-claim exists in FULL-PQ: the proposer's accrual from
-    // heights 1-3 sits unclaimed, and the third-party claim reverted.
-    // Height 3's OWN reward is distributed after the block's transactions
-    // ran, so exactly 3 * REWARD is pending once the block is applied.
+    // heights 1-3 plus the 20% staking fee shares sit unclaimed, and the
+    // third-party claim reverted. Height 3's OWN reward is distributed after
+    // the block's transactions ran, so 3 * REWARD + total_staking_fees is
+    // pending once the block is applied.
     for e in [&engine_live, &engine_reorg] {
         let pending = e.staking_read().await.validators[&proposer_id].pending_rewards;
         assert_eq!(
             pending,
-            3 * REWARD,
-            "with no valid self-claim, all three heights stay pending"
+            3 * REWARD + total_staking_fees,
+            "with no valid self-claim, all three heights plus staking fee shares stay pending"
         );
         assert_eq!(
             balance(e, &id_of(&ks[0])).await,
-            proposer_before + total_fees,
-            "only the fees actually charged (FEE-01: consumed gas, not the \
-             declared limits) may credit the proposer, never a claim payout"
+            proposer_before + total_proposer_fees,
+            "only the proposer's 30% share of charged fees (FEE-01 + FEE_MARKET_V2) may credit the proposer, never a claim payout"
         );
         // The reverted claim still paid the floor and consumed its nonce
         // (attributable execution failure), on both paths identically.
@@ -752,7 +784,7 @@ async fn mempool_pruning_is_node_local_and_cannot_move_the_state_root() {
     let e_nopool = engines[2].clone();
 
     let mut live = ValidatorRuntime::new(ks[0].clone(), vs.clone(), e_live.clone(), 1);
-    let tx = tx(&mempool_user, [0x99u8; 32], 10, 100, 0);
+    let tx = tx(&mempool_user, [0x99u8; 32], 10, GAS_BASIC_TRANSFER, 0);
 
     // The same transaction sits in both pools.
     let live_pool: Arc<tokio::sync::RwLock<Mempool>> =

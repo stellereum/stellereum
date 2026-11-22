@@ -32,7 +32,7 @@
 
 use std::path::PathBuf;
 
-use stellereum::consensus::{BlockHash, VoteKind, ValidatorId};
+use stellereum::consensus::{BlockHash, ValidatorId, VoteKind};
 use stellereum::sharding::Block;
 use stellereum::storage::Storage;
 
@@ -185,7 +185,8 @@ async fn restarted_proposer_reconstructs_downtime_evidence_from_persisted_tip() 
     );
     for n in report.nodes.iter().filter(|n| n.index != index) {
         assert_eq!(
-            n.proposals_refused, refusals_before[n.index],
+            n.proposals_refused,
+            refusals_before[n.index],
             "peer {} refused the restarted proposer's block: {}",
             n.index,
             report.diagnostics()
@@ -194,7 +195,8 @@ async fn restarted_proposer_reconstructs_downtime_evidence_from_persisted_tip() 
 
     let block = finalized_block(&cluster, index, tip + 1);
     assert_eq!(
-        block.proposer, restarted_id,
+        block.proposer,
+        restarted_id,
         "the restarted node must have authored height {} (it owned the round-0 slot)",
         tip + 1
     );

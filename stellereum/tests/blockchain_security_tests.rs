@@ -155,7 +155,7 @@ fn attack_test_rogue_validator_sybil_block_rejected() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
+        round: 0,
     };
     // Rogue attacker signs the block
     block.sign_block(&rogue_attacker);

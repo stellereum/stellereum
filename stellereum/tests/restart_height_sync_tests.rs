@@ -61,11 +61,75 @@ fn vs_of(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
 
-async fn runtime(ks: &[SigningKey], idx: usize) -> ValidatorRuntime {
+static PQ_REG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn runtime(ks: &[SigningKey], fks: &[FalconKeypair], idx: usize) -> ValidatorRuntime {
     let vs = vs_of(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
+    {
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let vid = id(k);
+            ledger.validator_pq_keys.insert(
+                vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            pq_reg
+                .adopt_legacy_key_at(
+                    vid,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                    0,
+                    true,
+                )
+                .expect("seed pq_registry");
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     ValidatorRuntime::new(ks[idx].clone(), vs, st, 1)
+}
+
+async fn seed_cluster_pq(c: &ConsensusCluster) {
+    const CLUSTER_SEED: u64 = 0x5741_5220_4C49_5645u64;
+    let n = c.len();
+    let pairs: Vec<([u8; 32], FalconKeypair)> = (0..n)
+        .map(|i| {
+            let vid = consensus_cluster::key_at(CLUSTER_SEED, i as u64)
+                .verifying_key()
+                .to_bytes();
+            let mut fseed = [0u8; 32];
+            fseed[0] = i as u8;
+            fseed[31] = (i as u8).wrapping_mul(79);
+            (vid, FalconKeypair::generate_from_seed_bytes(&fseed))
+        })
+        .collect();
+    for idx in 0..n {
+        let st = &c.runtime(idx).state;
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (vid, fk) in &pairs {
+            ledger.validator_pq_keys.insert(
+                *vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            let _ = pq_reg.adopt_legacy_key_at(
+                *vid,
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            );
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
 }
 
 async fn block_at_round(
@@ -132,8 +196,9 @@ fn precommit_cert(
 
 #[tokio::test]
 async fn a_restarted_node_adopts_a_forward_round_commit() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(3);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     // Restart shape: consensus at height 1, round 0 (no checkpoint/watermark).
     assert_eq!((rt.hc.height, rt.hc.round), (1, 0));
     // The network decided height 1 in round 3 (round churn while we were out).
@@ -155,8 +220,9 @@ async fn a_restarted_node_adopts_a_forward_round_commit() {
 
 #[tokio::test]
 async fn forward_round_adoption_still_refuses_a_conflicting_lock() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(3);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let locked = [0xAAu8; 32];
     rt.hc.locked = Some((locked, 5));
     let blk = block_at_round(&rt, &ks, &fks, 1, 3, [0u8; 32]).await;
@@ -184,6 +250,7 @@ async fn forward_round_adoption_still_refuses_a_conflicting_lock() {
 /// `base` while the network advances `CATCH_UP_HEIGHTS` without it.
 async fn single_restart_cluster() -> (ConsensusCluster, u64) {
     let mut c = ConsensusCluster::with_powers(&[2, 1, 1]);
+    seed_cluster_pq(&c).await;
     c.retain_commits();
     c.seed_transactions(64).await;
     let x_id = c.runtime(2).id;
@@ -245,6 +312,7 @@ fn assert_common_finality(c: &consensus_cluster::ClusterReport, target: u64) {
 
 #[tokio::test]
 async fn one_restarted_node_adopts_forward_round_commits_and_finality_resumes() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (mut c, base) = single_restart_cluster().await;
     let x = 2usize;
     c.set_down(x, true);
@@ -267,6 +335,7 @@ async fn one_restarted_node_adopts_forward_round_commits_and_finality_resumes() 
     // from memory) and push the retained commits, exactly like a peer's
     // `Committed` rebroadcast.
     c.restart_member(x, Some(base)).await;
+    seed_cluster_pq(&c).await;
     c.set_down(x, false);
     c.deliver_committed_above(x, base);
 
@@ -280,6 +349,7 @@ async fn one_restarted_node_adopts_forward_round_commits_and_finality_resumes() 
 
 #[tokio::test]
 async fn two_restarted_nodes_reconverge_and_finality_resumes() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (mut c, base) = single_restart_cluster().await;
     let x = 2usize;
     let y = 1usize;
@@ -302,6 +372,7 @@ async fn two_restarted_nodes_reconverge_and_finality_resumes() {
     // Y from the live tip. The cluster then has to re-anchor on them again.
     c.restart_member(x, Some(base)).await;
     c.restart_member(y, None).await;
+    seed_cluster_pq(&c).await;
     c.set_down(x, false);
     c.deliver_committed_above(x, base);
 
@@ -315,11 +386,36 @@ async fn two_restarted_nodes_reconverge_and_finality_resumes() {
 
 #[tokio::test]
 async fn a_runtime_above_its_finalized_parent_builds_no_proposal() {
+    let _pq_guard = PQ_REG_LOCK.lock().await;
     let (ks, fks) = falcon_votes::falcon_set(1);
     assert_eq!(fks.len(), 1);
     let vs = vs_of(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
+    {
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let vid = id(k);
+            ledger.validator_pq_keys.insert(
+                vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            pq_reg
+                .adopt_legacy_key_at(
+                    vid,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                    0,
+                    true,
+                )
+                .expect("seed pq_registry");
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, st, 1);
     assert!(rt.is_proposer(), "solo validator owns every slot");
     // Positive control: the one legal relationship builds a block.

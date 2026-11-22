@@ -115,7 +115,7 @@ fn signed_block(
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    // FULL-PQ: Ed-only blocks are refused by `verify_proposer_signature`.
+    }; // FULL-PQ: Ed-only blocks are refused by `verify_proposer_signature`.
     b.sign_block_with_falcon(k, fk);
     b
 }

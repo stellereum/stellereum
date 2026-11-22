@@ -16,11 +16,15 @@
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::{OpCode, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND};
+use stellereum::svm::{
+    OpCode, RegisterValidatorPayload, GAS_BASIC_TRANSFER, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
+};
+use stellereum::zkml::effective_chain_id;
 
 mod support;
 use support::{assert_refused_tx_paid_failure_fee, failure_fee};
@@ -84,14 +88,38 @@ async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
 }
 
 /// The engine's SUCCESS fee for a syscall that consumes `gas_used`:
-/// `max(gas_used, consensus floor) + surcharge` (same rule as `commit_native`).
+/// `max(max(gas_used, TX_INTRINSIC_GAS).min(gas_limit), consensus floor) + surcharge`
+/// (same rule as `commit_native` under `EXEC_HARDENING_V1`).
 async fn success_fee(
     engine: &InMemoryStateEngine,
     tx: &stellereum::sharding::Transaction,
     gas_used: u64,
 ) -> u64 {
     let (floor_base, surcharge) = engine.consensus_floor_parts(tx).await;
-    gas_used.max(floor_base).saturating_add(surcharge)
+    let billed = gas_used.max(GAS_BASIC_TRANSFER).min(tx.gas_limit);
+    billed.max(floor_base).saturating_add(surcharge)
+}
+
+fn register_op(cold_addr: [u8; 32], hot_kp: &FalconKeypair, amount: u64) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
 }
 
 /// One dust-funded transaction from a stranger empties an honest validator's
@@ -101,6 +129,7 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
     let engine = InMemoryStateEngine::new();
     let honest = pq_key(0x31);
     let honest_addr = pq_addr(&honest);
+    let honest_hot = pq_key(0x33);
     let attacker = pq_key(0x32);
     let attacker_addr = pq_addr(&attacker);
 
@@ -108,15 +137,8 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
     engine
         .update_account(AccountState::new(honest_addr, honest_start))
         .await;
-    let bond = tx_of(
-        &honest,
-        0,
-        20_000,
-        vec![OpCode::SysCallStake {
-            validator: honest_addr,
-            amount: floor(),
-        }],
-    );
+    let (reg_op, honest_vid) = register_op(honest_addr, &honest_hot, floor());
+    let bond = tx_of(&honest, 0, 20_000, vec![reg_op]);
     engine.apply_transaction(&bond, 0).await.unwrap();
     // Snapshot AFTER the successful bond: the grief below must not move a
     // single nano of the honest validator's remaining balance.
@@ -127,7 +149,7 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
             .await
             .to_validator_set()
             .validators
-            .contains_key(&honest_addr),
+            .contains_key(&honest_vid),
         "precondition: honest validator is in the set"
     );
 
@@ -141,7 +163,7 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         0,
         20_000,
         vec![OpCode::SysCallUnbond {
-            validator: honest_addr,
+            validator: honest_vid,
             amount: floor(),
         }],
     );
@@ -154,12 +176,12 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
 
     let l = engine.staking_read().await;
     assert_eq!(
-        l.validators[&honest_addr].self_bond,
+        l.validators[&honest_vid].self_bond,
         floor(),
         "the honest validator keeps its whole bond"
     );
     assert!(
-        l.to_validator_set().validators.contains_key(&honest_addr),
+        l.to_validator_set().validators.contains_key(&honest_vid),
         "the honest validator is still in the consensus set"
     );
     assert!(l.unbonding.is_empty(), "no unbonding entry was created");
@@ -172,13 +194,13 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
     );
     assert_eq!(bal(&engine, &STAKING_POOL).await, floor());
 
-    // And the owner may still unbond, so the check is an auth check, not a ban.
+    // And the owner (cold withdrawal_address) may still unbond, so the check is an auth check, not a ban.
     let owner_tx = tx_of(
         &honest,
         1,
         2_000,
         vec![OpCode::SysCallUnbond {
-            validator: honest_addr,
+            validator: honest_vid,
             amount: floor(),
         }],
     );
@@ -187,7 +209,7 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         .await
         .expect("the validator may still unbond its own stake");
     assert_eq!(
-        engine.staking_read().await.validators[&honest_addr].self_bond,
+        engine.staking_read().await.validators[&honest_vid].self_bond,
         0
     );
 }
@@ -199,40 +221,28 @@ async fn one_tx_cannot_capture_the_validator_set() {
     let engine = InMemoryStateEngine::new();
     let attacker = pq_key(0x41);
     let attacker_addr = pq_addr(&attacker);
+    let attacker_hot = pq_key(0x42);
 
     // 10 honest validators.
     let mut honest = Vec::new();
     for i in 0..10u8 {
         let k = pq_key(0x50 + i);
         let a = pq_addr(&k);
+        let k_hot = pq_key(0xA0 + i);
         engine
             .update_account(AccountState::new(a, floor() + 200_000))
             .await;
-        let t = tx_of(
-            &k,
-            0,
-            20_000,
-            vec![OpCode::SysCallStake {
-                validator: a,
-                amount: floor(),
-            }],
-        );
+        let (reg_op, vid) = register_op(a, &k_hot, floor());
+        let t = tx_of(&k, 0, 20_000, vec![reg_op]);
         engine.apply_transaction(&t, 0).await.unwrap();
-        honest.push(a);
+        honest.push(vid);
     }
     // Attacker buys in with the bare minimum.
     engine
         .update_account(AccountState::new(attacker_addr, floor() + 4_000_000))
         .await;
-    let t = tx_of(
-        &attacker,
-        0,
-        4_000_000,
-        vec![OpCode::SysCallStake {
-            validator: attacker_addr,
-            amount: floor(),
-        }],
-    );
+    let (atk_reg_op, attacker_vid) = register_op(attacker_addr, &attacker_hot, floor());
+    let t = tx_of(&attacker, 0, 4_000_000, vec![atk_reg_op]);
     engine.apply_transaction(&t, 0).await.unwrap();
 
     let vs = engine.staking_read().await.to_validator_set();
@@ -268,7 +278,7 @@ async fn one_tx_cannot_capture_the_validator_set() {
     );
     assert_eq!(vs.validators.len(), 11, "the honest set is intact");
     assert!(
-        !vs.validators.contains_key(&attacker_addr) || vs.validators.len() == 11,
+        !vs.validators.contains_key(&attacker_vid) || vs.validators.len() == 11,
         "the attacker captured nothing"
     );
     assert_eq!(
@@ -302,27 +312,17 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
     let engine = InMemoryStateEngine::new();
     let delegator = pq_key(0x61);
     let delegator_addr = pq_addr(&delegator);
-    let validator = [0xAAu8; 32];
 
-    // A validator bond paid for by a third party.
+    // A validator registered and bonded by a cold withdrawal address.
     let funder = pq_key(0x62);
     let funder_addr = pq_addr(&funder);
+    let val_hot = pq_key(0x63);
+    let (reg_op, validator) = register_op(funder_addr, &val_hot, floor());
     engine
         .update_account(AccountState::new(funder_addr, floor() + 200_000))
         .await;
     engine
-        .apply_transaction(
-            &tx_of(
-                &funder,
-                0,
-                20_000,
-                vec![OpCode::SysCallStake {
-                    validator,
-                    amount: floor(),
-                }],
-            ),
-            0,
-        )
+        .apply_transaction(&tx_of(&funder, 0, 20_000, vec![reg_op]), 0)
         .await
         .unwrap();
 
@@ -526,25 +526,15 @@ async fn test_only_snark_vk_registration_reverts() {
 #[tokio::test]
 async fn delegator_rewards_claim_through_opcode() {
     let engine = InMemoryStateEngine::new();
-    let validator = [0xBBu8; 32];
     let funder = pq_key(0x81);
     let funder_addr = pq_addr(&funder);
+    let val_hot = pq_key(0x84);
+    let (reg_op, validator) = register_op(funder_addr, &val_hot, floor());
     engine
         .update_account(AccountState::new(funder_addr, floor() + 200_000))
         .await;
     engine
-        .apply_transaction(
-            &tx_of(
-                &funder,
-                0,
-                20_000,
-                vec![OpCode::SysCallStake {
-                    validator,
-                    amount: floor(),
-                }],
-            ),
-            0,
-        )
+        .apply_transaction(&tx_of(&funder, 0, 20_000, vec![reg_op]), 0)
         .await
         .unwrap();
 

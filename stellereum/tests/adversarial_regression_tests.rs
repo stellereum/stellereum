@@ -21,13 +21,17 @@ use stellereum::orderbook::{OrderSide, OrderType};
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{
+    derive_validator_id, pq_voting_key_pop_preimage, PQ_ROTATION_DELAY_HEIGHTS,
+};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload, RotateVotingKeyPayload};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
 use stellereum::token::{TokenMetadata, TokenOp};
+use stellereum::zkml::effective_chain_id;
 
 const NANO: u64 = 1_000_000_000;
 
@@ -61,6 +65,57 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
 
 fn pq_id(fk: &FalconKeypair) -> [u8; 32] {
     derive_pq_address(PqScheme::Falcon512, fk.public_key(), &DEFAULT_SALT)
+}
+
+fn register_validator_op(
+    cold_addr: [u8; 32],
+    hot_kp: &FalconKeypair,
+    amount: u64,
+) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
+}
+
+fn rotate_voting_key_op(
+    validator_id: [u8; 32],
+    cold_addr: [u8; 32],
+    rotation_seq: u64,
+    new_hot_kp: &FalconKeypair,
+) -> OpCode {
+    let chain_id = effective_chain_id();
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &validator_id,
+        &cold_addr,
+        rotation_seq,
+        PqScheme::Falcon512,
+        new_hot_kp.public_key(),
+    );
+    OpCode::SysCallRotateVotingKey(Box::new(RotateVotingKeyPayload {
+        validator_id,
+        rotation_seq,
+        new_scheme: PqScheme::Falcon512.id(),
+        new_pubkey: new_hot_kp.public_key().to_vec(),
+        pop_signature: new_hot_kp.sign(&pop_msg),
+        cancel: false,
+    }))
 }
 
 fn svm_tx(key: &FalconKeypair, nonce: u64, gas: u64, payload: Vec<OpCode>) -> Transaction {
@@ -115,8 +170,9 @@ fn mkblock(signer: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    b.sign_block(signer);
+        round: 0,
+    };
+    b.sign_block(signer);
     b
 }
 
@@ -144,8 +200,9 @@ fn mkblock_falcon(
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    b.sign_block_with_falcon(signer, fk);
+        round: 0,
+    };
+    b.sign_block_with_falcon(signer, fk);
     b
 }
 
@@ -198,33 +255,24 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
     let e = InMemoryStateEngine::new();
     let victim = FalconKeypair::generate_from_seed(0x11);
     let victim_addr = pq_id(&victim);
+    let victim_hot = FalconKeypair::generate_from_seed(0x13);
     let attacker = FalconKeypair::generate_from_seed(0x12);
     let attacker_addr = pq_id(&attacker);
 
+    let (reg_op, victim_vid) = register_validator_op(victim_addr, &victim_hot, stell(10_000));
     e.update_account(AccountState::new(
         victim_addr,
-        stell(10_000) + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+        stell(10_000) + 1_000_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    e.apply_transaction(
-        &svm_tx(
-            &victim,
-            0,
-            20_000,
-            vec![OpCode::SysCallStake {
-                validator: victim_addr,
-                amount: stell(10_000),
-            }],
-        ),
-        0,
-    )
-    .await
-    .expect("victim bond");
+    e.apply_transaction(&svm_tx(&victim, 0, 500_000, vec![reg_op]), 0)
+        .await
+        .expect("victim bond");
     assert_eq!(bal(&e, &STAKING_POOL).await, stell(10_000));
 
     e.staking_write()
         .await
-        .distribute_reward(victim_addr, stell(500))
+        .distribute_reward(victim_vid, stell(500))
         .unwrap();
     // E2: back the accrual the way the block mint does (bare ledger entries
     // with no pool coins must not pay).
@@ -242,7 +290,7 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
                 0,
                 10_000,
                 vec![OpCode::SysCallClaimRewards {
-                    validator: victim_addr,
+                    validator: victim_vid,
                 }],
             ),
             0,
@@ -275,7 +323,7 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
         "pool untouched"
     );
     assert_eq!(
-        e.staking_read().await.validators[&victim_addr].pending_rewards,
+        e.staking_read().await.validators[&victim_vid].pending_rewards,
         stell(500),
         "victim reward intact"
     );
@@ -284,14 +332,14 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
         "POOL SOLVENT"
     );
 
-    // Positive control: the owner can still claim.
+    // Positive control: the owner (cold withdrawal_address) can still claim.
     e.apply_transaction(
         &svm_tx(
             &victim,
             1,
-            2_000,
+            500_000,
             vec![OpCode::SysCallClaimRewards {
-                validator: victim_addr,
+                validator: victim_vid,
             }],
         ),
         0,
@@ -299,7 +347,7 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
     .await
     .expect("owner claim works");
     assert_eq!(
-        e.staking_read().await.validators[&victim_addr].pending_rewards,
+        e.staking_read().await.validators[&victim_vid].pending_rewards,
         0
     );
 }
@@ -313,34 +361,25 @@ async fn adv_stranger_cannot_force_unbond() {
     let e = InMemoryStateEngine::new();
     let honest = FalconKeypair::generate_from_seed(0x21);
     let honest_addr = pq_id(&honest);
+    let honest_hot = FalconKeypair::generate_from_seed(0x23);
     let attacker = FalconKeypair::generate_from_seed(0x22);
     let attacker_addr = pq_id(&attacker);
 
+    let (reg_op, honest_vid) = register_validator_op(honest_addr, &honest_hot, floor());
     e.update_account(AccountState::new(
         honest_addr,
-        floor() + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+        floor() + 1_000_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    e.apply_transaction(
-        &svm_tx(
-            &honest,
-            0,
-            20_000,
-            vec![OpCode::SysCallStake {
-                validator: honest_addr,
-                amount: floor(),
-            }],
-        ),
-        0,
-    )
-    .await
-    .unwrap();
+    e.apply_transaction(&svm_tx(&honest, 0, 500_000, vec![reg_op]), 0)
+        .await
+        .unwrap();
     assert!(e
         .staking_read()
         .await
         .to_validator_set()
         .validators
-        .contains_key(&honest_addr));
+        .contains_key(&honest_vid));
 
     e.update_account(AccountState::new(
         attacker_addr,
@@ -354,7 +393,7 @@ async fn adv_stranger_cannot_force_unbond() {
                 0,
                 20_000,
                 vec![OpCode::SysCallUnbond {
-                    validator: honest_addr,
+                    validator: honest_vid,
                     amount: floor(),
                 }],
             ),
@@ -368,20 +407,20 @@ async fn adv_stranger_cannot_force_unbond() {
     );
 
     let l = e.staking_read().await;
-    assert_eq!(l.validators[&honest_addr].self_bond, floor());
-    assert!(l.to_validator_set().validators.contains_key(&honest_addr));
+    assert_eq!(l.validators[&honest_vid].self_bond, floor());
+    assert!(l.to_validator_set().validators.contains_key(&honest_vid));
     assert!(l.unbonding.is_empty(), "no unbonding entry created");
     drop(l);
     assert_eq!(bal(&e, &STAKING_POOL).await, floor(), "pool solvent");
 
-    // Positive control: owner may still unbond.
+    // Positive control: owner (cold withdrawal_address) may still unbond.
     e.apply_transaction(
         &svm_tx(
             &honest,
             1,
-            10_000,
+            500_000,
             vec![OpCode::SysCallUnbond {
-                validator: honest_addr,
+                validator: honest_vid,
                 amount: floor(),
             }],
         ),
@@ -392,8 +431,8 @@ async fn adv_stranger_cannot_force_unbond() {
 }
 
 // ===========================================================================
-// 1b2. Stranger rotates another validator's key (SysCallRotateValidatorKey
-//      owner check) + owner rotation moves the whole record live.
+// 1b2. Stranger rotates another validator's voting key (SysCallRotateVotingKey
+//      owner check) + owner rotation schedules & promotes the new key live.
 // ===========================================================================
 
 #[tokio::test]
@@ -401,161 +440,169 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     let e = InMemoryStateEngine::new();
     let honest = FalconKeypair::generate_from_seed(0x31);
     let honest_addr = pq_id(&honest);
-    let fresh = FalconKeypair::generate_from_seed(0x32);
-    let fresh_addr = pq_id(&fresh);
+    let honest_hot = FalconKeypair::generate_from_seed(0xB1);
+    let fresh_hot = FalconKeypair::generate_from_seed(0xB2);
     let attacker = FalconKeypair::generate_from_seed(0x33);
     let attacker_addr = pq_id(&attacker);
 
+    let (reg_op, honest_vid) = register_validator_op(honest_addr, &honest_hot, floor());
     e.update_account(AccountState::new(
         honest_addr,
-        floor() + 100_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
+        floor() + 2_000_000 + 4 * PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    e.apply_transaction(
-        &svm_tx(
-            &honest,
-            0,
-            20_000,
-            vec![OpCode::SysCallStake {
-                validator: honest_addr,
-                amount: floor(),
-            }],
-        ),
-        0,
-    )
-    .await
-    .unwrap();
+    e.apply_transaction_at_height(&svm_tx(&honest, 0, 500_000, vec![reg_op]), 0, 1)
+        .await
+        .unwrap();
     assert!(e
         .staking_read()
         .await
         .to_validator_set()
         .validators
-        .contains_key(&honest_addr));
+        .contains_key(&honest_vid));
 
-    // A delegator rides along, so rotation must carry foreign positions too.
+    // A delegator rides along, so voting-key rotation keeps foreign positions intact.
     let delegator = FalconKeypair::generate_from_seed(0x34);
     let delegator_addr = pq_id(&delegator);
     e.update_account(AccountState::new(
         delegator_addr,
-        MIN_VALIDATOR_BOND + 20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        MIN_VALIDATOR_BOND + 500_000 + PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    e.apply_transaction(
+    e.apply_transaction_at_height(
         &svm_tx(
             &delegator,
             0,
-            20_000,
+            500_000,
             vec![OpCode::SysCallDelegate {
-                validator: honest_addr,
+                validator: honest_vid,
                 amount: 2_000_000_000,
             }],
         ),
         0,
+        2,
     )
     .await
     .unwrap();
 
     e.update_account(AccountState::new(
         attacker_addr,
-        20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        500_000 + 2 * PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    let err = e
-        .apply_transaction(
+    // Legacy SysCallRotateValidatorKey is disabled after W3 PQ lifecycle activation.
+    let legacy_err = e
+        .apply_transaction_at_height(
             &svm_tx(
                 &attacker,
                 0,
                 20_000,
                 vec![OpCode::SysCallRotateValidatorKey {
-                    old_validator: honest_addr,
-                    new_validator: fresh_addr,
+                    old_validator: honest_vid,
+                    new_validator: attacker_addr,
                 }],
             ),
             0,
+            3,
         )
         .await
-        .expect_err("stranger rotation must be refused");
+        .expect_err("legacy rotate must be refused after W3 activation");
     assert!(
-        err.contains("only the old validator key"),
+        legacy_err.contains("disabled"),
+        "legacy opcode refusal must cite W3 disablement: {legacy_err}"
+    );
+
+    // Stranger cannot rotate via SysCallRotateVotingKey either.
+    let err = e
+        .apply_transaction_at_height(
+            &svm_tx(
+                &attacker,
+                1,
+                20_000,
+                vec![rotate_voting_key_op(honest_vid, honest_addr, 1, &fresh_hot)],
+            ),
+            0,
+            3,
+        )
+        .await
+        .expect_err("stranger voting-key rotation must be refused");
+    assert!(
+        err.contains("unauthorized"),
         "refusal must be the auth check: {err}"
     );
-    assert!(e.staking_read().await.validators.contains_key(&honest_addr));
-    assert!(!e.staking_read().await.validators.contains_key(&fresh_addr));
+    assert!(e.pq_registry_read().await.pending_of(&honest_vid).is_none());
+    assert_eq!(
+        e.pq_registry_read().await.current_key_of(&honest_vid),
+        Some((PqScheme::Falcon512, honest_hot.public_key().to_vec()))
+    );
 
-    // Owner rotates: record, delegation and validator-set membership move.
-    e.apply_transaction(
+    // Owner (cold withdrawal_address) rotates: stages pending key, then Step 0
+    // promotes it at the effective height while delegations remain intact.
+    e.apply_transaction_at_height(
         &svm_tx(
             &honest,
             1,
-            20_000,
-            vec![OpCode::SysCallRotateValidatorKey {
-                old_validator: honest_addr,
-                new_validator: fresh_addr,
-            }],
+            500_000,
+            vec![rotate_voting_key_op(honest_vid, honest_addr, 1, &fresh_hot)],
         ),
         0,
+        3,
     )
     .await
-    .expect("owner rotation works");
+    .expect("owner voting-key rotation works");
+    let eff = 3 + PQ_ROTATION_DELAY_HEIGHTS;
+    assert!(e.pq_registry_read().await.pending_of(&honest_vid).is_some());
+    let promote_blk = mkblock(&keys(1)[0], eff, [0u8; 32], e.get_state_root().await);
+    e.apply_block_transition(&promote_blk, 0).await;
     {
-        let l = e.staking_read().await;
-        assert!(!l.validators.contains_key(&honest_addr), "old key is gone");
-        assert!(l.validators.contains_key(&fresh_addr), "new key validates");
+        let reg = e.pq_registry_read().await;
         assert_eq!(
-            l.delegations.get(&(fresh_addr, delegator_addr)).copied(),
-            Some(2_000_000_000),
-            "delegation follows the record"
+            reg.current_key_of(&honest_vid),
+            Some((PqScheme::Falcon512, fresh_hot.public_key().to_vec()))
         );
-        assert!(l.to_validator_set().validators.contains_key(&fresh_addr));
-        assert!(!l.to_validator_set().validators.contains_key(&honest_addr));
+        assert!(reg.pending_of(&honest_vid).is_none());
+        let l = e.staking_read().await;
+        assert_eq!(
+            l.get_pq_key(&honest_vid),
+            Some((PqScheme::Falcon512, fresh_hot.public_key().to_vec()))
+        );
+        assert_eq!(
+            l.delegations.get(&(honest_vid, delegator_addr)).copied(),
+            Some(2_000_000_000),
+            "delegation stays on the validator record"
+        );
+        assert!(l.to_validator_set().validators.contains_key(&honest_vid));
     }
 
-    // Rotating onto an existing validator refuses (no merging, ever).
+    // Rotating onto an existing validator's voting key refuses (no key aliasing/merging, ever).
     let other = FalconKeypair::generate_from_seed(0x35);
     let other_addr = pq_id(&other);
+    let other_hot = FalconKeypair::generate_from_seed(0xB5);
+    let (other_reg_op, _other_vid) = register_validator_op(other_addr, &other_hot, floor());
     e.update_account(AccountState::new(
         other_addr,
-        floor() + 20_000 + PQ_ACTIVATION_SURCHARGE_GAS,
+        floor() + 500_000 + PQ_ACTIVATION_SURCHARGE_GAS,
     ))
     .await;
-    e.apply_transaction(
-        &svm_tx(
-            &other,
-            0,
-            20_000,
-            vec![OpCode::SysCallStake {
-                validator: other_addr,
-                amount: floor(),
-            }],
-        ),
-        0,
-    )
-    .await
-    .unwrap();
-    // The rotated key needs gas money of its own to transact.
-    e.update_account(AccountState::new(
-        fresh_addr,
-        100_000 + PQ_ACTIVATION_SURCHARGE_GAS,
-    ))
-    .await;
+    e.apply_transaction_at_height(&svm_tx(&other, 0, 500_000, vec![other_reg_op]), 0, eff + 1)
+        .await
+        .unwrap();
     let err = e
-        .apply_transaction(
+        .apply_transaction_at_height(
             &svm_tx(
-                &fresh,
-                0,
-                20_000,
-                vec![OpCode::SysCallRotateValidatorKey {
-                    old_validator: fresh_addr,
-                    new_validator: other_addr,
-                }],
+                &honest,
+                2,
+                500_000,
+                vec![rotate_voting_key_op(honest_vid, honest_addr, 2, &other_hot)],
             ),
             0,
+            eff + 2,
         )
         .await
-        .expect_err("rotation onto a live validator must be refused");
+        .expect_err("rotation onto a live validator's voting key must be refused");
     assert!(
-        err.contains("rotate failed"),
-        "refusal must come from the ledger: {err}"
+        err.contains("rotate voting key rejected"),
+        "refusal must come from the registry duplicate-key gate: {err}"
     );
 }
 
@@ -702,8 +749,9 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                    round: 0,
-        };        b.sign_block(&atk[0]);
+            round: 0,
+        };
+        b.sign_block(&atk[0]);
         for k in atk.iter().skip(1) {
             use ed25519_dalek::Signer;
             b.validator_signatures

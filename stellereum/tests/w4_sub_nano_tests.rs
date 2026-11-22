@@ -113,7 +113,7 @@ fn signed_evm_raw(sk: &k256::ecdsa::SigningKey, value_wei: u128, nonce: u64) -> 
 
 #[test]
 fn evm_carrier_rejects_sub_nano_wei_when_strict() {
-    assert_eq!(SUB_NANO_STRICT_ACTIVATION_HEIGHT, u64::MAX);
+    assert_eq!(SUB_NANO_STRICT_ACTIVATION_HEIGHT, 0);
     let h = 50u64;
     let _gate = SubNanoGateGuard::at(h);
 
@@ -226,7 +226,7 @@ fn staking_accumulator_rescales_remainder_on_delegation_change() {
 #[test]
 fn geometric_emission_with_q64_carry_never_exceeds_emission_cap_or_1b_cap() {
     assert_eq!(COMMITMENT_VERSION, 5);
-    assert_eq!(FORK_ID, 0x0f584a46);
+    assert_eq!(FORK_ID, 0x3ae00ebc);
 
     // Small half-life H = 8 where fractional bits dominate.
     let pool = 1_000u64;

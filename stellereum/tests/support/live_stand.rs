@@ -314,13 +314,15 @@ impl Report {
 }
 
 pub struct Cluster {
+    _pq_reg_guard: tokio::sync::OwnedMutexGuard<()>,
     nodes: Vec<Node>,
     wire: Wire,
     delays: Vec<u64>,
     vote_delays: Vec<u64>,
     losses: Vec<u32>,
     now_ms: u64,
-    tx_key: SigningKey,
+    tx_falcon: FalconKeypair,
+    tx_addr: [u8; 32],
     tx_nonce: u64,
     /// Print the "precommit quorum but no decision" diagnosis every tick.
     pub diagnose_finalize: bool,
@@ -330,8 +332,14 @@ pub struct Cluster {
     pub proposed: std::collections::HashSet<BlockHash>,
 }
 
+fn live_stand_pq_lock() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+}
+
 impl Cluster {
     pub async fn new(profiles: &[Profile]) -> Cluster {
+        let pq_reg_guard = Arc::clone(live_stand_pq_lock()).lock_owned().await;
         let n = profiles.len();
         let keys: Vec<SigningKey> = (0..n)
             .map(|i| {
@@ -340,6 +348,9 @@ impl Cluster {
                 seed[31] = 0x5A;
                 SigningKey::from_bytes(&seed)
             })
+            .collect();
+        let falcons: Vec<FalconKeypair> = (0..n)
+            .map(|i| FalconKeypair::generate_from_seed(i as u8))
             .collect();
         let vset = ValidatorSet::from_list(
             keys.iter()
@@ -360,7 +371,8 @@ impl Cluster {
             // the one under test.
             {
                 let mut ledger = state.staking_write().await;
-                for (k, p) in keys.iter().zip(profiles.iter()) {
+                let mut pq_reg = state.pq_registry_write().await;
+                for ((k, p), fk) in keys.iter().zip(profiles.iter()).zip(falcons.iter()) {
                     if p.power == 0 {
                         continue;
                     }
@@ -372,6 +384,16 @@ impl Cluster {
                         ))
                         .await;
                     let _ = ledger.bond_genesis(id, p.power, 0);
+                    ledger
+                        .validator_pq_keys
+                        .insert(id, (PqScheme::Falcon512, fk.public_key.clone()));
+                    let _ = pq_reg.adopt_legacy_key_at(
+                        id,
+                        PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                        0,
+                        true,
+                    );
                 }
             }
             // FULL-PQ: deterministic Falcon-512 keypair (seed = index, mirrors
@@ -379,7 +401,7 @@ impl Cluster {
             // `ValidatorRuntime::with_falcon_key` which registers the pubkey
             // globally). Without it `make_prevote`/`make_precommit` mint
             // Ed-only votes that `Vote::verify` refuses.
-            let falcon = FalconKeypair::generate_from_seed(i as u8);
+            let falcon = falcons[i].clone();
             register_validator_pq_key(
                 keys[i].verifying_key().to_bytes(),
                 PqScheme::Falcon512,
@@ -409,14 +431,27 @@ impl Cluster {
             node.rt.hc.round = profiles[i].late_rounds;
             nodes.push(node);
         }
-        // A funded account whose transactions make every proposal DIFFERENT
+        if let Some(first) = nodes.first() {
+            let pq_reg = first.rt.state.pq_registry_read().await;
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
+        // A funded PQ account whose transactions make every proposal DIFFERENT
         // (an empty mempool makes every proposal byte-identical, which hides
         // the lock / re-propose pathology).
-        let mut seed = [0u8; 32];
-        seed[0] = 0x77;
-        seed[31] = 0xA5;
-        let tx_key = SigningKey::from_bytes(&seed);
-        let tx_addr = tx_key.verifying_key().to_bytes();
+        let tx_falcon = FalconKeypair::generate_from_seed(0x77);
+        let tx_addr = stellereum::post_quantum::derive_pq_address(
+            PqScheme::Falcon512,
+            &tx_falcon.public_key,
+            &stellereum::post_quantum::DEFAULT_SALT,
+        );
+        Transaction::global_implicit_registry()
+            .register(
+                tx_addr,
+                PqScheme::Falcon512,
+                &tx_falcon.public_key,
+                &stellereum::post_quantum::DEFAULT_SALT,
+            )
+            .expect("live_stand tx PQ key must register");
         for node in &nodes {
             node.rt
                 .state
@@ -427,13 +462,15 @@ impl Cluster {
                 .await;
         }
         Cluster {
+            _pq_reg_guard: pq_reg_guard,
             nodes,
             wire: Wire::default(),
             delays: profiles.iter().map(|p| p.delay_ms).collect(),
             vote_delays: profiles.iter().map(|p| p.vote_delay_ms).collect(),
             losses: profiles.iter().map(|p| p.loss_permille).collect(),
             now_ms: 0,
-            tx_key,
+            tx_falcon,
+            tx_addr,
             tx_nonce: 0,
             diagnose_finalize: false,
             rng: Rng::new(0x5EED_1234_ABCD_0001),
@@ -442,8 +479,36 @@ impl Cluster {
     }
 
     async fn seed_tx(&mut self) {
+        let nonce = self.tx_nonce;
         self.tx_nonce += 1;
-        let tx = Transaction::sign(&self.tx_key, [7u8; 32], 1, 1_000, self.tx_nonce, 0, 0);
+        let chain_id = stellereum::consensus::consensus_chain_id();
+        let probe = Transaction::new_pq_implicit_with_chain(
+            self.tx_addr,
+            PqScheme::Falcon512,
+            Vec::new(),
+            [7u8; 32],
+            1,
+            stellereum::svm::GAS_BASIC_TRANSFER,
+            nonce,
+            0,
+            0,
+            Vec::new(),
+            chain_id,
+        );
+        let sig = self.tx_falcon.sign(&probe.signing_message());
+        let tx = Transaction::new_pq_implicit_with_chain(
+            self.tx_addr,
+            PqScheme::Falcon512,
+            sig,
+            [7u8; 32],
+            1,
+            stellereum::svm::GAS_BASIC_TRANSFER,
+            nonce,
+            0,
+            0,
+            Vec::new(),
+            chain_id,
+        );
         for node in self.nodes.iter_mut() {
             node.rt.add_tx(tx.clone()).await;
         }

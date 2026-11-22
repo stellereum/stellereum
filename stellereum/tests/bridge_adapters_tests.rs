@@ -12,8 +12,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use stellereum::bridge::bridge_adapters::{
     binary_proof_for, build_binary_merkle_root, evm_receipt_encoding, evm_receipt_key,
     solana_leaf_encoding, ton_leaf_encoding, verify_binary_merkle_proof, verify_evidence,
-    BinaryMerkleProof, ChainAdapter, DepositClaim, DepositEvidence, EvmAdapter, HeaderStore,
-    SolanaAdapter, StoredHeader, TonAdapter, SOLANA_FINALITY_SLOTS,
+    AdapterKindTag, BinaryMerkleProof, ChainAdapter, DepositClaim, DepositEvidence, EvmAdapter,
+    HeaderStore, SolanaAdapter, StoredHeader, TonAdapter, SOLANA_FINALITY_SLOTS,
 };
 use stellereum::bridge::{
     SupportedChain, ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
@@ -21,6 +21,7 @@ use stellereum::bridge::{
 use stellereum::cell::{BagOfCells, Cell, PatriciaTrie};
 use stellereum::consensus::register_validator_pq_key;
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::zkml::effective_chain_id;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -52,8 +53,16 @@ fn validators(n: usize, base: u8) -> (Vec<SigningKey>, Vec<[u8; 32]>) {
     (keys, pks)
 }
 
-fn sign_all(header: &StoredHeader, keys: &[SigningKey]) -> Vec<([u8; 32], Vec<u8>)> {
-    let msg = header.signing_message();
+fn sign_all(
+    header: &StoredHeader,
+    finalized_head: u64,
+    keys: &[SigningKey],
+) -> Vec<([u8; 32], Vec<u8>)> {
+    let msg = header.signing_message_v2_binding(
+        effective_chain_id(),
+        AdapterKindTag::from(header.chain),
+        finalized_head,
+    );
     keys.iter()
         .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
         .collect()
@@ -88,7 +97,7 @@ fn valid_ton_evidence(
     let finalized = finalized_override.unwrap_or(HEIGHT + MIN_TON_CONFIRMATIONS);
     let ev = DepositEvidence::TonCell {
         header: header.clone(),
-        header_signatures: sign_all(&header, &keys[..2]),
+        header_signatures: sign_all(&header, finalized, &keys[..2]),
         finalized_seqno: finalized,
         boc_bytes: boc.to_boc_bytes(),
     };
@@ -140,7 +149,7 @@ fn valid_evm_evidence(
         };
     let ev = DepositEvidence::EvmReceipt {
         header: header.clone(),
-        header_signatures: sign_all(&header, &keys[..2]),
+        header_signatures: sign_all(&header, finalized, &keys[..2]),
         finalized_number: finalized,
         log_index,
         receipt_value: receipt,
@@ -181,10 +190,11 @@ fn valid_sol_evidence(
         prev_hash: [0x33u8; 32],
         tx_root: root_override.unwrap_or(root),
     };
+    let finalized = SLOT + SOLANA_FINALITY_SLOTS;
     let ev = DepositEvidence::SolanaTx {
         header: header.clone(),
-        header_signatures: sign_all(&header, &keys[..2]),
-        finalized_slot: SLOT + SOLANA_FINALITY_SLOTS,
+        header_signatures: sign_all(&header, finalized, &keys[..2]),
+        finalized_slot: finalized,
         tx_index: 1,
         proof,
     };
@@ -425,11 +435,16 @@ fn ton_adapter_rejects_every_tampering() {
     if let DepositEvidence::TonCell {
         header,
         header_signatures,
+        finalized_seqno,
         ..
     } = &mut ev
     {
         let outsider = key(0xEE);
-        let msg = header.signing_message();
+        let msg = header.signing_message_v2_binding(
+            effective_chain_id(),
+            AdapterKindTag::Ton,
+            *finalized_seqno,
+        );
         *header_signatures = vec![
             (
                 outsider.verifying_key().to_bytes(),
@@ -455,10 +470,12 @@ fn ton_adapter_rejects_every_tampering() {
         tx_root: header.tx_root,
     };
     if let DepositEvidence::TonCell {
-        header_signatures, ..
+        header_signatures,
+        finalized_seqno,
+        ..
     } = &mut ev
     {
-        *header_signatures = sign_all(&other, &keys[..2]);
+        *header_signatures = sign_all(&other, *finalized_seqno, &keys[..2]);
     }
     assert!(
         adapter.verify_deposit(&claim, &ev, &pks).is_err(),
@@ -553,11 +570,16 @@ fn evm_adapter_rejects_every_tampering() {
     if let DepositEvidence::EvmReceipt {
         header,
         header_signatures,
+        finalized_number,
         ..
     } = &mut ev
     {
         let outsider = key(0xEE);
-        let msg = header.signing_message();
+        let msg = header.signing_message_v2_binding(
+            effective_chain_id(),
+            AdapterKindTag::Evm,
+            *finalized_number,
+        );
         *header_signatures = vec![
             (
                 outsider.verifying_key().to_bytes(),
@@ -641,11 +663,16 @@ fn solana_adapter_rejects_every_tampering() {
     if let DepositEvidence::SolanaTx {
         header,
         header_signatures,
+        finalized_slot,
         ..
     } = &mut ev
     {
         let outsider = key(0xEE);
-        let msg = header.signing_message();
+        let msg = header.signing_message_v2_binding(
+            effective_chain_id(),
+            AdapterKindTag::Solana,
+            *finalized_slot,
+        );
         *header_signatures = vec![(
             outsider.verifying_key().to_bytes(),
             outsider.sign(&msg).to_vec(),

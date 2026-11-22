@@ -289,6 +289,12 @@ function finishFacts(input: {
   if (input.valueWei === 0n) {
     throw new Error("invalid EVM intent: an EVM carrier settles value transfers only (no value)");
   }
+  const rem = input.valueWei % WEI_PER_NANO;
+  if (rem !== 0n) {
+    throw new Error(
+      `invalid EVM intent: sub-nano wei remainder (${rem} wei): value must be a multiple of 1_000_000_000 wei`,
+    );
+  }
   const nano = input.valueWei / WEI_PER_NANO;
   if (nano === 0n) {
     throw new Error("invalid EVM intent: EVM value is below one nano-STELL and cannot be settled");

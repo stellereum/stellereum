@@ -81,7 +81,10 @@ async fn two_shards_cannot_jointly_mint_past_the_chain_cap() {
     // A single engine may no longer mint the FULL chain cap: its share is the
     // joint cap divided by the shard count.
     assert!(
-        master.mint_native(&addr(0x01), TOTAL_SUPPLY_CAP).await.is_err(),
+        master
+            .mint_native(&addr(0x01), TOTAL_SUPPLY_CAP)
+            .await
+            .is_err(),
         "a shard must not be able to mint the whole chain cap"
     );
 
@@ -179,8 +182,7 @@ async fn genesis_premine_on_two_workchains_counts_toward_the_aggregate() {
     let aggregate = shard_a.committed_minted_nano().await as u128
         + shard_b.committed_minted_nano().await as u128;
     assert_eq!(
-        aggregate,
-        TOTAL_SUPPLY_CAP as u128,
+        aggregate, TOTAL_SUPPLY_CAP as u128,
         "genesis + emission on both workchains is exactly the chain cap"
     );
     assert!(shard_a.mint_native(&addr(0xA5), 1).await.is_err());

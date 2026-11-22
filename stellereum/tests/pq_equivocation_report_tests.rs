@@ -135,9 +135,17 @@ async fn engine_with(
         .expect("pool funded");
     {
         let mut l = e.staking_write().await;
+        let mut reg = e.pq_registry_write().await;
         l.bond(victim, BOND, 0).unwrap();
-        l.register_pq_key(victim, PqScheme::Falcon512, victim_fk.public_key().to_vec())
-            .expect("victim PQ key must register");
+        l.pq_register_key(
+            &mut reg,
+            victim,
+            PqScheme::Falcon512,
+            victim_fk.public_key().to_vec(),
+            0,
+            0,
+        )
+        .expect("victim PQ key must register");
     }
     e
 }

@@ -171,7 +171,8 @@ fn mk_block(height: u64, ts: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> 
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 // ===========================================================================
 // 1. The queue: a send reaches the recipient's inbox via the block's
@@ -306,6 +307,8 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
         .await;
     assert_eq!(out.status, vec![true]);
     let fee = out.tx_fees[0];
+    let burn = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
 
     assert_eq!(
         balance(&engine, &recipient).await,
@@ -319,14 +322,15 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
     );
     assert_eq!(
         balance(&engine, &proposer).await,
-        fee,
-        "the fee charged is the proposer's entire credit"
+        fee - burn,
+        "under FEE_MARKET_V2, proposer receives fee minus the burned share"
     );
-    // Conservation: nothing minted, nothing destroyed.
+    // Conservation: nothing minted; only the FEE_MARKET_V2 burn leaves circulation.
     assert_eq!(
         balance(&engine, &sender).await
             + balance(&engine, &recipient).await
-            + balance(&engine, &proposer).await,
+            + balance(&engine, &proposer).await
+            + burn,
         start
     );
     assert!(
@@ -375,6 +379,8 @@ async fn bounce_returns_the_value_exactly_once() {
         .await;
     assert_eq!(out.status, vec![true], "the send itself applies");
     let fee = out.tx_fees[0];
+    let burn = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
 
     assert_eq!(
         balance(&engine, &sender).await,
@@ -382,7 +388,7 @@ async fn bounce_returns_the_value_exactly_once() {
         "value came back exactly once: sender is down ONLY the fee - not down \
          9_999 (lost) and not up 9_999 (credited twice)"
     );
-    assert_eq!(balance(&engine, &proposer).await, fee);
+    assert_eq!(balance(&engine, &proposer).await, fee - burn);
     assert!(
         engine.get_account(&missing).await.is_none(),
         "a bounce must not create the dead recipient's account"
@@ -433,8 +439,8 @@ async fn failed_body_has_no_partial_effect() {
         vec![send_op(recipient, 100, body, 5_000)],
     );
 
-    // Proposer == sender: the declared fee is credited straight back, so the
-    // assertion below isolates the message value round-trip.
+    // Proposer == sender: the proposer share comes straight back and only the
+    // FEE_MARKET_V2 burn leaves, isolating the message value round-trip.
     let out = engine
         .apply_block_transition(&mk_block(1, TS, vec![tx], sender), 0)
         .await;
@@ -443,6 +449,9 @@ async fn failed_body_has_no_partial_effect() {
         vec![true],
         "the SEND applies; its body failed later, at delivery"
     );
+    let fee = out.tx_fees[0];
+    let burn = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
 
     assert_eq!(
         balance(&engine, &recipient).await,
@@ -456,9 +465,9 @@ async fn failed_body_has_no_partial_effect() {
     );
     assert_eq!(
         balance(&engine, &sender).await,
-        start,
-        "the value bounced back exactly once and the fee came back as the \
-         proposer credit - so the sender is whole, and nobody else gained"
+        start - burn,
+        "the value bounced back exactly once and the non-burned fee came back \
+         as the proposer credit - so only the fee burn left, and nobody else gained"
     );
     assert!(
         mailbox_is_empty(&engine).await,
@@ -765,27 +774,30 @@ async fn cross_shard_actor_send_is_refused() {
         vec![false],
         "v1 refuses an actor send inside a cross-shard transaction"
     );
+    let fee = out.tx_fees[0];
+    let burn = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
     assert_eq!(
         balance(&engine, &sender).await,
-        start,
-        "the refused transaction moved nothing"
+        start - burn,
+        "the refused transaction moved no value (only the FEE_MARKET_V2 burn of the failure fee left)"
     );
     assert!(mailbox_is_empty(&engine).await, "nothing was queued");
 
     // The refused transaction moved NO value and queued NO message. The only
-    // state it may touch is the sender's NONCE: a failed transaction must
-    // still advance the nonce (anti-replay, SEC-07 - a free-failure tx that
-    // could be replayed forever was a DoS vector). So the precise assertion
-    // is "the tree equals a control engine whose only difference is the
-    // sender's nonce".
+    // state it may touch is the sender's NONCE (and the FEE_MARKET_V2 burn of
+    // the failure fee): a failed transaction must still advance the nonce
+    // (anti-replay, SEC-07 - a free-failure tx that could be replayed forever
+    // was a DoS vector). So the precise assertion is "the tree equals a
+    // control engine whose only difference is the sender's nonce (plus burn)".
     let control = InMemoryStateEngine::new();
-    let mut control_sender = AccountState::new(sender, start);
+    let mut control_sender = AccountState::new(sender, start - burn);
     control_sender.nonce = 1;
     control.update_account(control_sender).await;
     assert_eq!(
         engine.get_state_root().await,
         control.get_state_root().await,
-        "the refused transaction touched nothing but the sender's nonce"
+        "the refused transaction touched nothing but the sender's nonce and fee burn"
     );
     let _ = before;
 }
@@ -914,8 +926,8 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    // FULL-PQ: the live adoption path verifies the proposer's Falcon
-    // signature (Ed25519-only blocks are refused).
+    }; // FULL-PQ: the live adoption path verifies the proposer's Falcon
+       // signature (Ed25519-only blocks are refused).
     blk.sign_block_with_falcon(&ks[0], &fks[0]);
     let bh = certify(&mut live, &ks, &fks, &mut blk).await;
 
@@ -991,13 +1003,17 @@ async fn actor_send_coexists_with_a_plain_payload_transfer() {
         .apply_block_transition(&mk_block(1, TS, vec![tx], sender), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    let fee = out.tx_fees[0];
+    let burn = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
     assert_eq!(balance(&engine, &transfer_to).await, 1_000);
     assert_eq!(balance(&engine, &recipient).await, 2_000);
     assert_eq!(
         balance(&engine, &sender).await,
-        start - 1_000 - 2_000,
-        "the transfer and the message value leave the sender; the declared \
-         fee comes straight back because the sender IS the proposer"
+        start - 1_000 - 2_000 - burn,
+        "the transfer, the message value, and the FEE_MARKET_V2 burn leave the \
+         sender; the non-burned fee comes straight back because the sender IS \
+         the proposer"
     );
     assert!(mailbox_is_empty(&engine).await);
 }

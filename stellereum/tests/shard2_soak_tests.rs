@@ -242,8 +242,11 @@ async fn shard2_soak_cross_shard_transfer_conserves_supply() {
         "sender debited amount + gas exactly"
     );
     assert_eq!(
-        supply_after, supply_before,
-        "cross-shard transfer must conserve supply end to end through the soak"
+        supply_after
+            + ((gas as u128 * stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+                / stellereum::staking::BPS_DENOMINATOR as u128) as u64,
+        supply_before,
+        "cross-shard transfer must conserve supply end to end through the soak (accounting for FEE_MARKET_V2 burn)"
     );
 }
 

@@ -247,7 +247,7 @@ impl Fixture {
             signatures: b.validator_signatures.clone(),
             shard_id: b.shard_id,
             round: b.round,
-            body_commitment: None,
+            body_commitment: Some(b.body_commitment()),
             mmr_epoch_root: b.mmr_epoch_root,
             epoch_key_commitment: b.epoch_key_commitment,
         }
@@ -280,7 +280,21 @@ impl Fixture {
     ) {
         let height = header.height;
         let prev = header.prev_hash;
-        header.block_hash = new_hash;
+        let hdr = stellereum::sharding::BlockHeader {
+            shard_id: header.shard_id,
+            height: header.height,
+            round: header.round,
+            prev_hash: header.prev_hash,
+            state_root: header.state_root,
+            body_commitment: new_hash,
+            mmr_epoch_root: header.mmr_epoch_root,
+            epoch_key_commitment: header.epoch_key_commitment,
+            timestamp: header.timestamp,
+            proposer: header.proposer,
+        };
+        let actual_hash = hdr.compute_hash();
+        header.body_commitment = Some(new_hash);
+        header.block_hash = actual_hash;
         header.signatures.clear();
         for k in keys.iter().take(3) {
             header.sign_with(k);
@@ -291,7 +305,7 @@ impl Fixture {
             vs,
             height,
             VoteKind::Precommit,
-            new_hash,
+            actual_hash,
             &prev,
         );
     }
@@ -989,15 +1003,30 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     // The certificate is genuine (over the alternative hash) so this exercises
     // the window conflict, not the finality check.
     let mut conflicting = f.checkpoint(3);
-    conflicting.block_hash = hash_of(0xEE);
+    let alt_bc = hash_of(0xEE);
+    let alt_hdr = stellereum::sharding::BlockHeader {
+        shard_id: conflicting.shard_id,
+        height: conflicting.height,
+        round: conflicting.round,
+        prev_hash: conflicting.parent_hash,
+        state_root: conflicting.state_root,
+        body_commitment: alt_bc,
+        mmr_epoch_root: conflicting.mmr_epoch_root,
+        epoch_key_commitment: conflicting.epoch_key_commitment,
+        timestamp: conflicting.timestamp,
+        proposer: conflicting.proposer,
+    };
+    let alt_hash = alt_hdr.compute_hash();
+    conflicting.body_commitment = Some(alt_bc);
+    conflicting.block_hash = alt_hash;
     conflicting.cert = cert(
         &f.keys[..3],
         &f.fks[..3],
         &f.validators,
         4,
         VoteKind::Precommit,
-        hash_of(0xEE),
-        &[0u8; 32],
+        alt_hash,
+        &conflicting.parent_hash,
     );
     let err = lc
         .advance_to_checkpoint(conflicting)
@@ -1008,32 +1037,48 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     );
 
     // Same block at the same height, but a different state root: the finalized
-    // block's commitment is not negotiable. (The certificate does not commit
-    // to the state root — see the module docs — so this has to be caught here.)
-    let mut forked_root = f.checkpoint(3);
-    forked_root.state_root = [0x99u8; 32];
-    let err = lc
-        .advance_to_checkpoint(forked_root)
-        .expect_err("a finalized block's state root is not negotiable");
-    assert!(err.contains("different state root"), "got: {err}");
+    // block's commitment is not negotiable. Under v4 `BlockHeader::compute_hash()`
+    // commits to both `state_root` and `height` (caught at header-hash binding),
+    // while under pre-v7 v3 headers (explicitly gated below) the certificate
+    // does not commit to `state_root`, isolating the post-verify window checks.
+    {
+        struct PreV7Guard;
+        impl Drop for PreV7Guard {
+            fn drop(&mut self) {
+                stellereum::sharding::set_header_commit_activation_override(None);
+            }
+        }
+        stellereum::sharding::set_header_commit_activation_override(Some(u64::MAX));
+        let _v3_guard = PreV7Guard;
 
-    // The same block re-claimed at a different height is a re-labelling
-    // attempt, refused even though the certificate is a genuine quorum.
-    let mut moved = f.checkpoint(3);
-    moved.height = 9;
-    moved.cert = cert(
-        &f.keys[..3],
-        &f.fks[..3],
-        &f.validators,
-        9,
-        VoteKind::Precommit,
-        f.blocks[3].compute_hash(),
-        &[0u8; 32],
-    );
-    let err = lc
-        .advance_to_checkpoint(moved)
-        .expect_err("a block cannot move between heights");
-    assert!(err.contains("already accepted at height 4"), "got: {err}");
+        let f_v3 = Fixture::new(vec![]);
+        let mut lc_v3 = f_v3.client(0, 3);
+
+        let mut forked_root = f_v3.checkpoint(3);
+        forked_root.state_root = [0x99u8; 32];
+        let err = lc_v3
+            .advance_to_checkpoint(forked_root)
+            .expect_err("a finalized block's state root is not negotiable");
+        assert!(err.contains("different state root"), "got: {err}");
+
+        // The same block re-claimed at a different height is a re-labelling
+        // attempt, refused even though the certificate is a genuine quorum.
+        let mut moved = f_v3.checkpoint(3);
+        moved.height = 9;
+        moved.cert = cert(
+            &f_v3.keys[..3],
+            &f_v3.fks[..3],
+            &f_v3.validators,
+            9,
+            VoteKind::Precommit,
+            f_v3.blocks[3].compute_hash(),
+            &[0u8; 32],
+        );
+        let err = lc_v3
+            .advance_to_checkpoint(moved)
+            .expect_err("a block cannot move between heights");
+        assert!(err.contains("already accepted at height 4"), "got: {err}");
+    }
 
     // An unverified checkpoint cannot re-anchor the client either: the signer
     // is not a member of the set, so no envelope compiles for it.
@@ -1194,22 +1239,36 @@ fn a_cli_anchoring_header_at_another_height_is_refused() {
     // The proof is at height 3, so the anchoring header must be height 4. A
     // genuinely signed header at height 5 with the SAME state root is still
     // the wrong answer to this question.
+    let body_commitment = [0x11u8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 5,
+        round: 0,
+        prev_hash: [0x22u8; 32],
+        state_root: [0x33u8; 32],
+        body_commitment,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let block_hash = hdr.compute_hash();
     let header = ServedHeader {
         height: 5,
-        block_hash: [0x11u8; 32],
+        block_hash,
         prev_hash: [0x22u8; 32],
         state_root: [0x33u8; 32],
         cert: QuorumCertificate {
             height: 5,
             round: 0,
             kind: VoteKind::Precommit,
-            block_hash: Some([0x11u8; 32]),
+            block_hash: Some(block_hash),
             signatures: vec![],
             shard_id: MASTERCHAIN_SHARD,
         },
         shard_id: MASTERCHAIN_SHARD,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_commitment),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         timestamp: 0,
@@ -1426,30 +1485,33 @@ fn an_absent_key_is_reported_as_not_included_and_never_as_a_zero() {
     // (see the module docs, limitation 3), so anchoring a client on a synthetic
     // root for this boundary case is expressible. In the real pipeline it is
     // full nodes that check a header's root against the state they applied.
+    let solo_hdr = stellereum::sharding::BlockHeader {
+        shard_id: f.blocks[0].shard_id,
+        height: 1,
+        round: f.blocks[0].round,
+        prev_hash: f.blocks[0].prev_hash,
+        state_root: single_root,
+        body_commitment: f.blocks[0].body_commitment(),
+        mmr_epoch_root: f.blocks[0].mmr_epoch_root,
+        epoch_key_commitment: f.blocks[0].epoch_key_commitment,
+        timestamp: f.blocks[0].timestamp,
+        proposer: f.blocks[0].proposer,
+    };
+    let solo_hash = solo_hdr.compute_hash();
     let solo = LightClient::new(
         f.validators.clone(),
-        Checkpoint {
-            height: 1,
-            block_hash: f.blocks[0].compute_hash(),
-            parent_hash: f.blocks[0].prev_hash,
-            state_root: single_root,
-            cert: cert(
+        Checkpoint::from_block_header(
+            solo_hdr,
+            cert(
                 &f.keys[..3],
                 &f.fks[..3],
                 &f.validators,
                 1,
                 VoteKind::Precommit,
-                f.blocks[0].compute_hash(),
+                solo_hash,
                 &f.blocks[0].prev_hash,
             ),
-            shard_id: f.blocks[0].shard_id,
-            round: f.blocks[0].round,
-            body_commitment: None,
-            mmr_epoch_root: f.blocks[0].mmr_epoch_root,
-            epoch_key_commitment: f.blocks[0].epoch_key_commitment,
-            timestamp: f.blocks[0].timestamp,
-            proposer: f.blocks[0].proposer,
-        },
+        ),
     )
     .unwrap();
     let leaf = solo

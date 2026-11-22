@@ -3692,10 +3692,21 @@ fn light_client_for(state_root: [u8; 32]) -> crate::light_client::LightClient {
         fk.public_key.clone(),
     );
     let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
-    let block_hash = [0x88u8; 32];
+    let hdr = crate::sharding::BlockHeader {
+        shard_id: 0,
+        height: 1,
+        round: 0,
+        prev_hash: [0u8; 32],
+        state_root,
+        body_commitment: [0x88u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let block_hash = hdr.compute_hash();
     let cert = pq_anchor_cert(val_id, &fk, &validators, 1, block_hash);
-    let checkpoint =
-        crate::light_client::Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+    let checkpoint = crate::light_client::Checkpoint::from_block_header(hdr, cert);
     crate::light_client::LightClient::new(validators, checkpoint).expect("light client")
 }
 
@@ -10043,4 +10054,218 @@ async fn eth_tx_lookup_rebuilds_restart_hydrated_body_from_archive_store() {
         "receipt must not fall back to the zero address when the body is archived: {receipt}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn receipt_index_by_contract_events_matches_full_scan_under_overwrites_and_eviction() {
+    let mut idx = ReceiptIndex::default();
+    let c1 = [0xC1u8; 32];
+    let c2 = [0xC2u8; 32];
+
+    let mk = |h: u64, tx_idx: u32, hash_seed: u64, evs: Vec<crate::contract::ContractEvent>| {
+        let mut tx_hash = [0u8; 32];
+        tx_hash[..8].copy_from_slice(&hash_seed.to_be_bytes());
+        tx_hash[8..16].copy_from_slice(&h.to_be_bytes());
+        TxReceipt {
+            tx_hash,
+            block_hash: [0xBBu8; 32],
+            height: h,
+            index: tx_idx,
+            success: true,
+            gas_limit: 280_000,
+            fee_charged: 280_000,
+            gas_used: Some(280_000),
+            return_value: None,
+            raw_tx: None,
+            events: evs,
+            contract_address: None,
+        }
+    };
+
+    // Synthetic duplicate `(height, index = 0)` receipts with distinct tx_hash.
+    idx.insert(mk(
+        1,
+        0,
+        1,
+        vec![crate::contract::ContractEvent {
+            contract: c1,
+            topic: 7,
+            value: 100,
+        }],
+    ));
+    idx.insert(mk(
+        1,
+        0,
+        2,
+        vec![crate::contract::ContractEvent {
+            contract: c1,
+            topic: 8,
+            value: 200,
+        }],
+    ));
+    // Overwrite tx 1 removing c1 and adding c2.
+    idx.insert(mk(
+        1,
+        0,
+        1,
+        vec![crate::contract::ContractEvent {
+            contract: c2,
+            topic: 9,
+            value: 300,
+        }],
+    ));
+
+    // Fill past MAX_RECEIPTS so old receipts (including hash_seed 2 at height 1) evict.
+    let total = MAX_RECEIPTS as u64 + 50;
+    for i in 10..(10 + total) {
+        let evs = if i % 97 == 0 {
+            vec![crate::contract::ContractEvent {
+                contract: c1,
+                topic: (i % 5) as i64,
+                value: i as i64,
+            }]
+        } else {
+            vec![]
+        };
+        idx.insert(mk(i / 4, (i % 4) as u32, i + 1000, evs));
+    }
+
+    for contract in [c1, c2] {
+        for reverse in [false, true] {
+            let indexed: Vec<[u8; 32]> = idx
+                .for_contract_events(&contract, 0, u64::MAX, reverse)
+                .into_iter()
+                .map(|r| r.tx_hash)
+                .collect();
+
+            let mut brute: Vec<&TxReceipt> = idx
+                .map
+                .values()
+                .filter(|r| r.events.iter().any(|e| e.contract == contract))
+                .collect();
+            brute.sort_by_key(|r| (r.height, r.index, r.tx_hash));
+            if reverse {
+                brute.reverse();
+            }
+            let expected: Vec<[u8; 32]> = brute.into_iter().map(|r| r.tx_hash).collect();
+            assert_eq!(indexed, expected, "contract index must match brute scan");
+        }
+    }
+    // No stale contract key left for evicted `c2` at height 1.
+    assert!(idx.for_contract_events(&c2, 0, u64::MAX, false).is_empty());
+}
+
+#[tokio::test]
+async fn clone_for_simulation_for_tx_matches_full_clone_across_domains() {
+    let eng = InMemoryStateEngine::new();
+    let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0x41);
+    let from = crate::post_quantum::derive_pq_address(
+        crate::post_quantum::PqScheme::Falcon512,
+        kp.public_key(),
+        &crate::post_quantum::DEFAULT_SALT,
+    );
+    let to = [0x55u8; 32];
+    eng.update_account(AccountState::new(from, 50_000_000_000_000))
+        .await;
+
+    // Seed a token so SysCallTokenTransfer exercises real token state.
+    let token_id = [0x77u8; 32];
+    {
+        let mut reg = eng.tokens_write().await;
+        let tok = crate::token::TokenActor::new(
+            token_id,
+            crate::token::TokenMetadata {
+                name: "SimTok".to_string(),
+                symbol: "SIM".to_string(),
+                decimals: 6,
+                total_supply: 1_000_000,
+                max_supply: None,
+                minter: from,
+                paused: false,
+                description: String::new(),
+            },
+            500_000,
+        )
+        .expect("sim token");
+        reg.tokens.insert(token_id, tok);
+    }
+
+    let make_tx = |nonce: u64, gas_limit: u64, payload: Vec<crate::svm::OpCode>| {
+        let mut probe = crate::sharding::Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            kp.public_key().to_vec(),
+            vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            to,
+            100,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload.clone(),
+            &crate::post_quantum::DEFAULT_SALT,
+            eng.chain_id,
+        );
+        let sig = kp.sign(&probe.signing_message());
+        probe = crate::sharding::Transaction::new_pq_explicit_with_chain(
+            crate::post_quantum::PqScheme::Falcon512,
+            kp.public_key().to_vec(),
+            sig,
+            to,
+            100,
+            gas_limit,
+            nonce,
+            crate::sharding::MASTERCHAIN_SHARD,
+            crate::sharding::MASTERCHAIN_SHARD,
+            payload,
+            &crate::post_quantum::DEFAULT_SALT,
+            eng.chain_id,
+        );
+        probe
+    };
+
+    let cases = vec![
+        make_tx(
+            0,
+            2_000_000,
+            vec![crate::svm::OpCode::SysCallTokenTransfer {
+                token_id,
+                to,
+                amount: 1_000,
+            }],
+        ),
+        make_tx(
+            0,
+            2_000_000,
+            vec![crate::svm::OpCode::SysCallTokenTransfer {
+                token_id,
+                to,
+                amount: 999_999_999, // triggers revert
+            }],
+        ),
+        make_tx(0, 1, vec![crate::svm::OpCode::Nop]), // out of gas / under-budget
+        make_tx(
+            0,
+            2_000_000,
+            vec![crate::svm::OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: true,
+                price: 100,
+                amount: 10,
+            }],
+        ),
+    ];
+
+    for tx in &cases {
+        let full = eng.clone_for_simulation().await;
+        let sel = eng.clone_for_simulation_for_tx(tx).await;
+        let r_full = full
+            .apply_transaction_at_height(tx, 1_760_000_000, 10)
+            .await;
+        let r_sel = sel.apply_transaction_at_height(tx, 1_760_000_000, 10).await;
+        assert_eq!(r_sel, r_full, "selective sim must match full sim");
+        assert_eq!(
+            sel.get_account(&from).await.map(|a| (a.balance, a.nonce)),
+            full.get_account(&from).await.map(|a| (a.balance, a.nonce)),
+        );
+    }
 }

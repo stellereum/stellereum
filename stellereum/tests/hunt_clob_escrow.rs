@@ -65,7 +65,7 @@ fn tx_of(
         from,
         to: from,
         amount: 0,
-        gas_limit: 100_000,
+        gas_limit: 500_000,
         nonce,
         source_shard: 1,
         target_shard: 1,
@@ -162,7 +162,7 @@ async fn svm_crossing_settles_a_makers_escrow() {
 
     // 2. Attacker crosses it through the SVM.
     engine
-        .update_account(AccountState::new(attacker_addr, cost + 100_000))
+        .update_account(AccountState::new(attacker_addr, cost + 1_000_000))
         .await;
     let attacker_before = engine.get_account(&attacker_addr).await.unwrap().balance;
     let t = tx_of(
@@ -182,14 +182,16 @@ async fn svm_crossing_settles_a_makers_escrow() {
         .expect("cross must succeed");
     let attacker_after = engine.get_account(&attacker_addr).await.unwrap().balance;
 
-    // The taker paid the quote and received the 1,000 STELL collateral.
+    // The taker paid the quote + intrinsic envelope fee and received the 1,000 STELL collateral.
+    let fee = (stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL)
+        .max(stellereum::svm::GAS_BASIC_TRANSFER);
     assert_eq!(
         attacker_after,
-        attacker_before - cost + amount - 1_240,
-        "the taker pays order_cost (1 match level = 1_240 gas) and receives the base"
+        attacker_before - cost + amount - fee,
+        "the taker pays order_cost + billed gas ({fee}) and receives the base"
     );
     println!(
-        "attacker: {attacker_before} -> {attacker_after} (cost {cost}, got {amount} back, 1240 gas)"
+        "attacker: {attacker_before} -> {attacker_after} (cost {cost}, got {amount} back, {fee} gas)"
     );
 
     // 3. The victim was PAID the quote and no longer has anything locked.
@@ -272,10 +274,11 @@ async fn one_tx_settles_many_maker_escrows() {
         .sum();
     assert_eq!(escrowed_before, n * per_order);
 
-    // One transaction, N crossings: N * (GAS_ORDER_PLACE + one match level).
+    // One transaction, N crossings: N * (GAS_ORDER_PLACE + one match level),
+    // floored at TX_INTRINSIC_GAS (GAS_BASIC_TRANSFER).
     let (attacker_addr, attacker_fk) = pq_trader(0x51);
     engine
-        .update_account(AccountState::new(attacker_addr, n * per_cost + 100_000))
+        .update_account(AccountState::new(attacker_addr, n * per_cost + 1_000_000))
         .await;
     let before = engine.get_account(&attacker_addr).await.unwrap().balance;
     let payload: Vec<OpCode> = (0..n)
@@ -289,7 +292,8 @@ async fn one_tx_settles_many_maker_escrows() {
     let t = tx_of(&attacker_fk, attacker_addr, 0, payload);
     engine.apply_transaction(&t, 0).await.unwrap();
     let after = engine.get_account(&attacker_addr).await.unwrap().balance;
-    let gas = n * (stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL);
+    let gas = (n * (stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL))
+        .max(stellereum::svm::GAS_BASIC_TRANSFER);
     println!("attacker spent {gas} gas to consume {n} resting orders");
     assert_eq!(
         after,
@@ -359,9 +363,10 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
         .await
         .expect("order must be accepted");
     let after = engine.get_account(&trader_addr).await.unwrap().balance;
+    let fee = stellereum::svm::GAS_ORDER_PLACE.max(stellereum::svm::GAS_BASIC_TRANSFER);
     assert_eq!(
         after,
-        before - cost - stellereum::svm::GAS_ORDER_PLACE,
+        before - cost - fee,
         "the whole order cost is debited from the real balance, plus gas"
     );
 
@@ -394,7 +399,7 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
         .expect("order exists");
     assert_eq!(
         engine.get_account(&trader_addr).await.unwrap().balance,
-        before - stellereum::svm::GAS_ORDER_PLACE,
+        before - fee,
         "the lock came back in full; only gas was spent"
     );
     assert!(engine.order_escrow_read().await.is_empty());

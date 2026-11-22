@@ -37,24 +37,22 @@ use crate::zkml::DEFAULT_CHAIN_ID;
 pub const DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT: u64 = UPGRADE_EXEC_ACTIVATION_HEIGHT;
 
 /// Compiled default activation height for Ruleset v7 Execution Hardening v1
-/// (`OpCode::Halt` barrier in block scanners, `SysCallCallContractArgs` /
+/// Ruleset v7 execution hardening activation height (`0` = active from genesis).
+///
+/// Covers `OpCode::Halt` barriers in block scanners, `SysCallCallContractArgs` /
 /// `SysCallSubmitPqPriceFeed` rollback snapshots, `TX_INTRINSIC_GAS` minimum
-/// billing, and CLOB `PlaceOrder`/`CancelOrder` gas & fill bounds).
-///
-/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation so historical
-/// blocks, `FORK_ID == 0x0f584a46`, `COMMITMENT_VERSION == 5`, and
-/// `EXPECTED_GENESIS_ROOT` remain byte-identical.
-pub const EXEC_HARDENING_V1_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// billing, and CLOB `PlaceOrder`/`CancelOrder` gas & fill bounds.
+pub const EXEC_HARDENING_V1_ACTIVATION_HEIGHT: u64 = 0;
 
-/// Compiled default activation height for Ruleset v7 WASM / XShard / PMM /
-/// Canonical-PQ1 Hardening (`SubCallSnapshot`, `caller()` vs `origin()`,
-/// `outbound_messages` post-commit atomicity + `sync_contract_balance` + bounce
-/// conservation, `deploy_with_nonce(tx.nonce)`, `validate_code`/`send_message`
-/// fuel, `PMM`/`GenesisVault` `ZeroMint`/`ZeroPayout`, `cross_shard_completed`
-/// guard, and strict canonical `PQ1` envelope decoding).
+/// Ruleset v7 WASM / XShard / PMM / Canonical-PQ1 Hardening activation height
+/// (`0` = active from genesis).
 ///
-/// Frozen at `u64::MAX` (`GatedOff`) until Ruleset v7 activation.
-pub const WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Covers `SubCallSnapshot`, `caller()` vs `origin()`, `outbound_messages`
+/// post-commit atomicity + `sync_contract_balance` + bounce conservation,
+/// `deploy_with_nonce(tx.nonce)`, `validate_code`/`send_message` fuel,
+/// `PMM`/`GenesisVault` `ZeroMint`/`ZeroPayout`, `cross_shard_completed` guard,
+/// and strict canonical `PQ1` envelope decoding.
+pub const WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -618,7 +616,9 @@ mod tests {
             );
         }
 
-        for r2_r3_gate in [
+        for r2_r4_gate in [
+            "EXEC_HARDENING_V1_ACTIVATION_HEIGHT",
+            "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
             "HEADER_COMMIT_ACTIVATION_HEIGHT",
             "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
             "PQ_LIFECYCLE_ACTIVATION_HEIGHT",
@@ -629,10 +629,10 @@ mod tests {
             let gate = schedule
                 .gates
                 .iter()
-                .find(|g| g.name == r2_r3_gate)
-                .expect("R2/R3 gate must be registered");
-            assert_eq!(gate.activation_height, u64::MAX);
-            assert_eq!(gate.status, ActivationStatus::GatedOff);
+                .find(|g| g.name == r2_r4_gate)
+                .expect("Ruleset v7 gate must be registered");
+            assert_eq!(gate.activation_height, 0);
+            assert_eq!(gate.status, ActivationStatus::ActiveFromGenesis);
         }
     }
 
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn r1_hardening_gates_default_off_even_at_u64_max_and_respect_overrides() {
+    fn r1_hardening_gates_default_active_from_genesis_and_respect_overrides() {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -731,8 +731,15 @@ mod tests {
         }
         let _reset = Reset;
 
-        assert_eq!(exec_hardening_v1_activation_height(), u64::MAX);
-        assert_eq!(wasm_xshard_pmm_hardening_activation_height(), u64::MAX);
+        assert_eq!(exec_hardening_v1_activation_height(), 0);
+        assert_eq!(wasm_xshard_pmm_hardening_activation_height(), 0);
+        assert!(exec_hardening_v1_active_at(0));
+        assert!(exec_hardening_v1_active_at(u64::MAX));
+        assert!(wasm_xshard_pmm_hardening_active_at(0));
+        assert!(wasm_xshard_pmm_hardening_active_at(u64::MAX));
+
+        set_exec_hardening_v1_activation_override(Some(u64::MAX));
+        set_wasm_xshard_pmm_hardening_activation_override(Some(u64::MAX));
         assert!(!exec_hardening_v1_active_at(0));
         assert!(!exec_hardening_v1_active_at(u64::MAX));
         assert!(!wasm_xshard_pmm_hardening_active_at(0));

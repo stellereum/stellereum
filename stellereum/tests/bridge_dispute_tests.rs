@@ -47,6 +47,11 @@ fn register_falcon(sk: &SigningKey) {
     );
 }
 
+fn fee_burn(fees: u64) -> u64 {
+    ((fees as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64
+}
+
 fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
     (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
 }
@@ -65,10 +70,20 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
         e.credit_native(&pk, 10 * MIN_VALIDATOR_BOND)
             .await
             .expect("fund the validator");
-        e.staking_write()
+        let fk = falcon_for(&k);
+        {
+            let mut ledger = e.staking_write().await;
+            ledger
+                .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+                .expect("bond it into the committed ledger");
+            ledger
+                .validator_pq_keys
+                .insert(pk, (PqScheme::Falcon512, fk.public_key.clone()));
+        }
+        e.pq_registry_write()
             .await
-            .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
-            .expect("bond it into the committed ledger");
+            .adopt_legacy_key_at(pk, PqScheme::Falcon512, fk.public_key.clone(), 0, true)
+            .expect("seed committed pq_registry");
         // FIXES §1.1: the committed Ed identity carries a registered
         // Falcon-512 key the bridge quorum verifies against.
         register_falcon(&k);
@@ -181,7 +196,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    }}
+    }
+}
 
 fn ops_list(intents: Vec<BridgeIntent>) -> Vec<OpCode> {
     intents
@@ -245,11 +261,12 @@ async fn challenge_freezes_quorum_deposit() {
         vec![true],
         "a fresh quorum deposit challenges cleanly"
     );
+    let burned = fee_burn(out.fees_collected);
     assert_eq!(balance(&e, &recipient).await, 0, "full amount clawed back");
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10 * STELL - CHALLENGE_BOND_NANO,
-        "bond locked (gas goes to the proposer and back here)"
+        10 * STELL - CHALLENGE_BOND_NANO - burned,
+        "bond locked minus burned fee (remainder rebates to proposer)"
     );
     {
         let br = e.bridge_read().await;
@@ -540,6 +557,7 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
     let bond = stellereum::bridge::challenge_bond_for(amount);
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -551,6 +569,7 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
 
     // Past the 1h window with FAILING evidence (fraud signal) and no valid
     // evidence: revoke. (An empty resolve here would DEFER with no payout —
@@ -575,10 +594,11 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
         )
         .await;
     assert_eq!(out.status, vec![true], "expiry defers under SEC-01");
+    burned += fee_burn(out.fees_collected);
     // Under SEC-01: unverified evidence defers without payout; challenger is still down the bond.
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10 * STELL - bond,
+        10 * STELL - bond - burned,
         "challenger remains down the bond during deferrals: zero unearned profit"
     );
     assert_eq!(
@@ -637,6 +657,7 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
+    let mut burned = 0u64;
     let tx_c = bridge_tx(
         challenger_seed,
         0,
@@ -648,6 +669,7 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
+    burned += fee_burn(out.fees_collected);
     assert_eq!(balance(&e, &recipient).await, 0, "clawed back into escrow");
     assert_eq!(
         balance(&e, &stellereum::bridge::BRIDGE_ESCROW).await,
@@ -672,10 +694,11 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
         )
         .await;
     assert_eq!(out.status, vec![true], "a verified fraud proof revokes");
+    burned += fee_burn(out.fees_collected);
     assert_eq!(
         balance(&e, &challenger_pk).await,
-        10 * STELL + reward,
-        "the finder gets its bond back plus the 10% finder reward"
+        10 * STELL + reward - burned,
+        "the finder gets its bond back plus the 10% finder reward minus burned gas"
     );
     assert_eq!(
         balance(&e, &recipient).await,
@@ -707,6 +730,15 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
 
 #[tokio::test]
 async fn challenge_evidence_path_deposit_is_refused() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (e, vals) = setup(3).await;
     let payer_pk = pq_id(0x03);
     fund(&e, &payer_pk, 1_000_000).await;

@@ -26,10 +26,34 @@ fn vs_of(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
 
-async fn runtime(ks: &[SigningKey], idx: usize) -> ValidatorRuntime {
+async fn runtime(ks: &[SigningKey], fks: &[FalconKeypair], idx: usize) -> ValidatorRuntime {
     let vs = vs_of(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
+    {
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let vid = id(k);
+            ledger.validator_pq_keys.insert(
+                vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            pq_reg
+                .adopt_legacy_key_at(
+                    vid,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                    0,
+                    true,
+                )
+                .expect("seed pq_registry");
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     ValidatorRuntime::new(ks[idx].clone(), vs, st, 1)
 }
 
@@ -55,8 +79,9 @@ async fn good_block(rt: &ValidatorRuntime, ks: &[SigningKey], fks: &[FalconKeypa
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(&ks[idx],&fks[idx]);
+        round: 0,
+    };
+    b.sign_block_with_falcon(&ks[idx], &fks[idx]);
     b
 }
 
@@ -89,7 +114,7 @@ fn precommit_cert(
 #[tokio::test]
 async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let cert = precommit_cert(&ks, &fks, bh);
@@ -107,7 +132,7 @@ async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
 #[tokio::test]
 async fn matching_prevote_and_precommit_is_accepted() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
@@ -130,7 +155,7 @@ async fn matching_prevote_and_precommit_is_accepted() {
 #[tokio::test]
 async fn conflicting_local_prevote_quorum_refuses_adoption() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     let other = [0xEEu8; 32];
@@ -164,7 +189,7 @@ async fn conflicting_local_prevote_quorum_refuses_adoption() {
 #[tokio::test]
 async fn anti_lock_adoption_is_refused() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some(([0xAAu8; 32], 0));
@@ -179,7 +204,7 @@ async fn anti_lock_adoption_is_refused() {
 #[tokio::test]
 async fn adopting_the_locked_block_succeeds() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = runtime(&ks, 0).await;
+    let mut rt = runtime(&ks, &fks, 0).await;
     let blk = good_block(&rt, &ks, &fks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some((bh, 0));

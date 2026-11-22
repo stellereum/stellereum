@@ -37,11 +37,11 @@ pub const PROTOCOL_MINOR: u16 = 0;
 
 /// Version of the consensus rule logic not captured by a hashed constant
 /// (`stellereum/src/protocol.rs:CONSENSUS_RULESET_VERSION`).
-pub const CONSENSUS_RULESET_VERSION: u32 = 6;
+pub const CONSENSUS_RULESET_VERSION: u32 = 7;
 
 /// Version of the folded domain-separation string set
 /// (`stellereum/src/protocol.rs:DOMAIN_SET_VERSION`).
-pub const DOMAIN_SET_VERSION: u32 = 3;
+pub const DOMAIN_SET_VERSION: u32 = 4;
 
 /// The consensus rule constants folded into [`FORK_ID`], in the node's order
 /// (`stellereum/src/protocol.rs:FORK_ID_RULES`).
@@ -73,6 +73,15 @@ pub const FORK_ID_RULES: &[u64] = &[
     crate::constants::MAX_BLOCK_TIMESTAMP_DRIFT_MS,
     crate::constants::CHAIN_SUPPLY_PARTITION_VERSION,
     crate::constants::TOTAL_SUPPLY_CAP,
+    crate::constants::EXEC_HARDENING_V1_ACTIVATION_HEIGHT,
+    crate::constants::WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
+    crate::constants::HEADER_COMMIT_ACTIVATION_HEIGHT,
+    crate::constants::EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
+    crate::constants::PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+    crate::constants::PQ_EVIDENCE_RETENTION_HEIGHTS,
+    crate::constants::BRIDGE_V2_ACTIVATION_HEIGHT,
+    crate::constants::FEE_MARKET_V2_ACTIVATION_HEIGHT,
+    crate::constants::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
 ];
 
 const FNV_OFFSET: u32 = 0x811c_9dc5;
@@ -109,6 +118,18 @@ pub const fn derive_fork_id(chain_id: u64, ruleset_version: u32, rules: &[u64]) 
     h = fnv1a32(h, crate::constants::VOTE_FALCON_MAGIC);
     h = fnv1a32(h, crate::constants::QC_UQC_MAGIC);
     h = fnv1a32(h, crate::constants::QC_PQ_MAGIC);
+    h = fnv1a32(h, crate::constants::BODY_COMMITMENT_V4_DOMAIN);
+    h = fnv1a32(h, crate::constants::HEADER_COMMIT_V4_DOMAIN);
+    h = fnv1a32(h, crate::constants::PQ_KEY_POP_DST);
+    h = fnv1a32(h, crate::constants::PQ_VAL_ID_DST);
+    h = fnv1a32(h, crate::constants::BRIDGE_RELEASE_RECEIPT_DOMAIN_V2);
+    h = fnv1a32(h, crate::constants::BRIDGE_HEADER_SIGN_DOMAIN_V2);
+    h = fnv1a32(h, crate::constants::TON_MULTISIG_RELEASE_V2_DOMAIN);
+    h = fnv1a32(h, crate::constants::EVM_TELEPORT_RELEASE_V2_DOMAIN);
+    h = fnv1a32(
+        h,
+        crate::constants::MULTISIG_RELAYER_MODEL_RELEASE_V2_DOMAIN,
+    );
     let mut i = 0;
     while i < rules.len() {
         h = fold_u64(h, rules[i]);
@@ -118,7 +139,7 @@ pub const fn derive_fork_id(chain_id: u64, ruleset_version: u32, rules: &[u64]) 
 }
 
 /// The consensus ruleset identifier this SDK build speaks
-/// (`stellereum/src/protocol.rs:FORK_ID`, ruleset v6).
+/// (`stellereum/src/protocol.rs:FORK_ID`, ruleset v7).
 pub const FORK_ID: u32 = derive_fork_id(DEFAULT_CHAIN_ID, CONSENSUS_RULESET_VERSION, FORK_ID_RULES);
 
 /// Capability bit of `COMPACT_GOSSIP` (`infnode::proto::Capabilities`).
@@ -297,8 +318,8 @@ mod tests {
         let id = ProtocolIdentity::local();
         id.verify().unwrap();
         id.verify_for_chain(DEFAULT_CHAIN_ID).unwrap();
-        assert_eq!(id.fork_id_hex(), "0x0f584a46");
-        assert!(id.startup_line().contains("fork_id 0x0f584a46"));
+        assert_eq!(id.fork_id_hex(), "0x3ae00ebc");
+        assert!(id.startup_line().contains("fork_id 0x3ae00ebc"));
     }
 
     #[test]

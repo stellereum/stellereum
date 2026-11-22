@@ -117,7 +117,8 @@ fn block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32])
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 fn register_tx(
     seed: u8,

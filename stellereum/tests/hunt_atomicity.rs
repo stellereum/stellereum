@@ -28,10 +28,12 @@
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload};
 use stellereum::token::TokenMetadata;
+use stellereum::zkml::effective_chain_id;
 
 fn stell(n: u64) -> u64 {
     n * 1_000_000_000
@@ -98,12 +100,22 @@ async fn free_validator_bond_from_a_rejected_transaction() {
     let engine = InMemoryStateEngine::new();
     let attacker = pq_key(0xA1);
     let attacker_addr = pq_addr(&attacker);
-    let validator = [0x42u8; 32];
+    let attacker_hot = pq_key(0xA2);
+    let chain_id = effective_chain_id();
+    let validator = derive_validator_id(chain_id, &attacker_addr, attacker_hot.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &validator,
+        &attacker_addr,
+        0,
+        PqScheme::Falcon512,
+        attacker_hot.public_key(),
+    );
 
     // Enough to pass admission and the bond floor inside the VM, but not
     // enough to ALSO pay the carried amount plus the failure fee: the VM
     // spends the bond first, then the real debit is discovered short.
-    let balance = floor() + 2_000;
+    let balance = floor() + 55_000;
     engine
         .update_account(AccountState::new(attacker_addr, balance))
         .await;
@@ -115,11 +127,17 @@ async fn free_validator_bond_from_a_rejected_transaction() {
         &attacker,
         [0x99u8; 32],
         100,
-        2_000,
-        vec![OpCode::SysCallStake {
-            validator,
-            amount: floor(),
-        }],
+        10_000,
+        vec![OpCode::SysCallRegisterValidator(Box::new(
+            RegisterValidatorPayload {
+                amount: floor(),
+                commission_bps: 0,
+                withdrawal_address: attacker_addr,
+                voting_scheme: PqScheme::Falcon512.id(),
+                voting_pubkey: attacker_hot.public_key().to_vec(),
+                voting_pop: attacker_hot.sign(&pop_msg),
+            },
+        ))],
     );
     let fee = failure_fee(&engine, &t).await;
     let res = engine.apply_transaction(&t, 0).await;
@@ -256,6 +274,17 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
     let engine = InMemoryStateEngine::new();
     let validator = pq_key(0xC1);
     let validator_addr = pq_addr(&validator);
+    let validator_hot = pq_key(0xC3);
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &validator_addr, validator_hot.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &validator_addr,
+        0,
+        PqScheme::Falcon512,
+        validator_hot.public_key(),
+    );
     let attacker = pq_key(0xC2);
     let attacker_addr = pq_addr(&attacker);
 
@@ -268,15 +297,21 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
         validator_addr,
         0,
         20_000,
-        vec![OpCode::SysCallStake {
-            validator: validator_addr,
-            amount: floor(),
-        }],
+        vec![OpCode::SysCallRegisterValidator(Box::new(
+            RegisterValidatorPayload {
+                amount: floor(),
+                commission_bps: 0,
+                withdrawal_address: validator_addr,
+                voting_scheme: PqScheme::Falcon512.id(),
+                voting_pubkey: validator_hot.public_key().to_vec(),
+                voting_pop: validator_hot.sign(&pop_msg),
+            },
+        ))],
     );
     engine.apply_transaction(&b, 0).await.unwrap();
     {
         let mut l = engine.staking_write().await;
-        l.distribute_reward(validator_addr, stell(5_000)).unwrap();
+        l.distribute_reward(vid, stell(5_000)).unwrap();
     }
 
     let start = 100_000u64;
@@ -306,7 +341,7 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
     );
     println!(
         "validator pending_rewards now {} (was 5000000000000)",
-        engine.staking_read().await.validators[&validator_addr].pending_rewards
+        engine.staking_read().await.validators[&vid].pending_rewards
     );
 
     assert!(res.is_err(), "the claim is refused");
@@ -329,7 +364,7 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
     // the counter. (Before the ownership fix this transaction reached the payout
     // stage as a THIRD PARTY and zeroed it while crediting the wrong account.)
     assert_eq!(
-        engine.staking_read().await.validators[&validator_addr].pending_rewards,
+        engine.staking_read().await.validators[&vid].pending_rewards,
         5_000_000_000_000u64,
         "a failed claim must not destroy the validator's accrued rewards"
     );

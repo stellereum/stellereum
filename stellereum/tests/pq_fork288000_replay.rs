@@ -21,8 +21,38 @@
 //! two engines starting from identical pre-state that apply the same
 //! block MUST reach identical verdicts and identical roots.
 
+use stellereum::chain_spec::{
+    set_exec_hardening_v1_activation_override, set_wasm_xshard_pmm_hardening_activation_override,
+};
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::tokenomics::{
+    set_fee_market_v2_activation_override, set_sub_nano_strict_activation_override,
+};
+
+/// RAII guard restoring pre-Ruleset-v7 activation gates (`u64::MAX`) on the
+/// calling thread so historical block `#288000` (legacy no-salt PQ1 framing,
+/// pre-FEE_MARKET_V2 100% proposer fee credit) replays with its exact era rules.
+struct PreV7ReplayGuard;
+
+impl PreV7ReplayGuard {
+    fn enable() -> Self {
+        set_exec_hardening_v1_activation_override(Some(u64::MAX));
+        set_wasm_xshard_pmm_hardening_activation_override(Some(u64::MAX));
+        set_fee_market_v2_activation_override(Some(u64::MAX));
+        set_sub_nano_strict_activation_override(Some(u64::MAX));
+        Self
+    }
+}
+
+impl Drop for PreV7ReplayGuard {
+    fn drop(&mut self) {
+        set_exec_hardening_v1_activation_override(None);
+        set_wasm_xshard_pmm_hardening_activation_override(None);
+        set_fee_market_v2_activation_override(None);
+        set_sub_nano_strict_activation_override(None);
+    }
+}
 
 /// Exact wire bytes of the block-#288000 transaction, captured from the
 /// live cluster (identical on B and C, tx_hash 6b096d17...).
@@ -166,6 +196,7 @@ async fn install_live_prestate(engine: &InMemoryStateEngine, tx: &Transaction) {
 /// post-state leaf this test derives its pre-state from.
 #[tokio::test]
 async fn fork288000_replay_of_exact_bytes_is_a_success_charging_canonical_fee() {
+    let _pre_v7 = PreV7ReplayGuard::enable();
     let tx = decode_live_tx();
     let engine = InMemoryStateEngine::new().with_parallel_exec(true);
     install_live_prestate(&engine, &tx).await;
@@ -205,6 +236,7 @@ async fn fork288000_replay_of_exact_bytes_is_a_success_charging_canonical_fee() 
 /// shapes the fleet runs) and demands bit-identical outcomes.
 #[tokio::test]
 async fn fork288000_identical_prestate_gives_identical_verdicts_and_roots() {
+    let _pre_v7 = PreV7ReplayGuard::enable();
     let tx = decode_live_tx();
     let mut roots = Vec::new();
     let mut verdicts = Vec::new();
@@ -240,6 +272,7 @@ async fn fork288000_identical_prestate_gives_identical_verdicts_and_roots() {
 /// shape from the incident hypothesis.
 #[tokio::test]
 async fn fork288000_conflicting_pin_refuses_with_failure_fee() {
+    let _pre_v7 = PreV7ReplayGuard::enable();
     let tx = decode_live_tx();
     let engine = InMemoryStateEngine::new().with_parallel_exec(true);
     // Fund first, then install a DIVERGENT pin directly (same shape the
@@ -264,6 +297,7 @@ async fn fork288000_conflicting_pin_refuses_with_failure_fee() {
 /// (Either pin shape converges to the same success verdict.)
 #[tokio::test]
 async fn fork288000_unpinned_prestate_still_succeeds() {
+    let _pre_v7 = PreV7ReplayGuard::enable();
     let tx = decode_live_tx();
     let engine = InMemoryStateEngine::new().with_parallel_exec(true);
     let mut acc = AccountState::new(tx.from, POST_BALANCE + CANONICAL_FEE);
@@ -283,6 +317,7 @@ async fn fork288000_unpinned_prestate_still_succeeds() {
 /// verdict. A single flip would be the nondeterminism that split B and C.
 #[tokio::test]
 async fn fork288000_verdict_is_deterministic_across_runs() {
+    let _pre_v7 = PreV7ReplayGuard::enable();
     let tx = decode_live_tx();
     // Pollute the process-global implicit registry the way a long-lived node
     // would be: a stale entry for the faucet must not move an explicit tx.

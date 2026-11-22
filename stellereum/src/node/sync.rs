@@ -457,7 +457,7 @@ pub(crate) async fn try_snapshot_sync(
         {
             let pq_reg = rt.state.pq_registry_read().await;
             let active = stellereum::pq_registry::pq_lifecycle_active_at(boundary);
-            if active || !pq_reg.is_empty() {
+            if !pq_reg.is_empty() {
                 stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
             }
         }
@@ -727,7 +727,7 @@ pub(crate) async fn try_catch_up(
         Some((ph, phash)) if stellereum::network::peer_head_is_ahead(our_height, ph) => (ph, phash),
         _ => {
             let probe_h = our_height.saturating_add(1);
-            match adapter.fetch_block_qc(shard, probe_h).await {
+            match adapter.fetch_block_qc_probe(shard, probe_h).await {
                 Some(qc) if qc.height == probe_h => match qc.block_hash {
                     Some(bh) => {
                         eprintln!(
@@ -1302,7 +1302,7 @@ async fn walk_chain_once(
         {
             let pq_reg = rt.state.pq_registry_read().await;
             let active = stellereum::pq_registry::pq_lifecycle_active_at(b.height);
-            if active || !pq_reg.is_empty() {
+            if !pq_reg.is_empty() {
                 stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
             }
         }
@@ -1605,6 +1605,24 @@ mod recovery_walk_tests {
         b.precommit_qc = set.certificate_with_parent(Some(bh), vs, Some(&parent));
     }
 
+    async fn seed_engine_pq_keys(
+        engine: &InMemoryStateEngine,
+        ks: &[SigningKey],
+        fks: &[FalconKeypair],
+    ) {
+        let mut ledger = engine.staking_write().await;
+        let mut pq_reg = engine.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let id = k.verifying_key().to_bytes();
+            ledger
+                .validator_pq_keys
+                .insert(id, (PqScheme::Falcon512, fk.public_key.clone()));
+            let _ =
+                pq_reg.adopt_legacy_key_at(id, PqScheme::Falcon512, fk.public_key.clone(), 0, true);
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
+
     /// Build a contiguous chain by running the SAME full transition the walk
     /// applies (`apply_and_advance`), so every block's committed parent root
     /// is exactly the root a node holding the prefix will have.
@@ -1615,6 +1633,7 @@ mod recovery_walk_tests {
     ) -> (Vec<Block>, [u8; 32]) {
         let vs = vset(ks);
         let engine = Arc::new(InMemoryStateEngine::new());
+        seed_engine_pq_keys(&engine, ks, fks).await;
         let mut builder = ValidatorRuntime::new(ks[0].clone(), vs.clone(), engine, 1);
         let mut blocks = Vec::with_capacity(n as usize);
         let mut prev = [0u8; 32];
@@ -1762,6 +1781,7 @@ mod recovery_walk_tests {
         // The lagging node replays only its prefix through the same full
         // transition, then has to close `gap` by the walk alone.
         let lagging_engine = Arc::new(InMemoryStateEngine::new());
+        seed_engine_pq_keys(&lagging_engine, &ks, &fks).await;
         let mut lagging = ValidatorRuntime::new(ks[0].clone(), vs, lagging_engine, 1);
         for b in blocks.iter().take(B as usize) {
             let bh = b.compute_hash();

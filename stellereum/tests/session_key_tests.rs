@@ -342,8 +342,25 @@ fn derive_block_hash(
     h.finalize().into()
 }
 
+struct HeaderCommitGateGuard;
+
+impl HeaderCommitGateGuard {
+    fn pre_v7() -> Self {
+        stellereum::sharding::set_header_commit_activation_override(Some(u64::MAX));
+        Self
+    }
+}
+
+impl Drop for HeaderCommitGateGuard {
+    fn drop(&mut self) {
+        stellereum::sharding::set_header_commit_activation_override(None);
+    }
+}
+
 #[test]
 fn legacy_block_rehash_is_unchanged() {
+    // Pin the pre-v7 STELLEREUM_BLOCK_V3 golden rehash under the explicit pre-v7 gate.
+    let _v3_guard = HeaderCommitGateGuard::pre_v7();
     let sk = golden_key();
     let tx: Transaction = bincode::deserialize(&h(GOLDEN_TX_BYTES)).unwrap();
     let raw_block = h(GOLDEN_BLOCK_BYTES);
@@ -418,8 +435,9 @@ fn legacy_block_rehash_is_unchanged() {
         cnvrf_v3: None,
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    rebuilt.sign_block(&sk);
+        round: 0,
+    };
+    rebuilt.sign_block(&sk);
     assert_eq!(
         hex::encode(rebuilt.compute_hash()),
         GOLDEN_BLOCK_HASH_CURRENT,

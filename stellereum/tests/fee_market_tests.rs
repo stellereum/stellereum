@@ -59,12 +59,22 @@ async fn proposer_collects_transaction_fees_and_value_is_conserved() {
     let sender = st.get_account(&from).await.unwrap();
     let recipient = st.get_account(&to).await.unwrap();
 
-    assert_eq!(proposer.balance, 1_000, "proposer must collect the fee");
-    assert_eq!(sender.balance, 1_000_000 - 100 - 1_000);
-    assert_eq!(recipient.balance, 100);
-    // Value conservation: everything that left the sender arrived somewhere.
+    // Under FEE_MARKET_V2, 50% of block fees are burned and the remainder goes
+    // to the proposer (plus staking fallback since `val_addr` has no staking
+    // bond entry in this fixture).
+    let fee = 1_000u64;
+    let burned = ((fee as u128) * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
     assert_eq!(
-        proposer.balance + sender.balance + recipient.balance,
+        proposer.balance,
+        fee - burned,
+        "proposer must collect the non-burned fee share"
+    );
+    assert_eq!(sender.balance, 1_000_000 - 100 - fee);
+    assert_eq!(recipient.balance, 100);
+    // Value conservation: everything that left the sender arrived somewhere or was burned.
+    assert_eq!(
+        proposer.balance + sender.balance + recipient.balance + burned,
         1_000_000
     );
 }

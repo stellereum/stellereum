@@ -61,7 +61,8 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32], sk: &SigningKey) -
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    b.sign_block(sk);
+    };
+    b.sign_block(sk);
     b
 }
 

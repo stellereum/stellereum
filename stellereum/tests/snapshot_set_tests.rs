@@ -364,71 +364,60 @@ fn bonded_full_domains(keys: &[SigningKey]) -> Vec<u8> {
 
 // ==================== per-height anchor verification ====================
 
-struct WindowLink {
-    height: u64,
-    block_hash: [u8; 32],
-    prev_hash: [u8; 32],
-}
-
-fn window_links(hashes: &[[u8; 32]]) -> Vec<WindowLink> {
-    hashes
-        .iter()
-        .enumerate()
-        .map(|(i, h)| WindowLink {
-            height: (i + 2) as u64, // window covers heights 2,3,4
-            block_hash: *h,
-            prev_hash: if i == 0 { [0x10u8; 32] } else { hashes[i - 1] },
-        })
-        .collect()
-}
-
 fn qc_for(
     signers: &[SigningKey],
     set: &ValidatorSet,
     height: u64,
     block_hash: [u8; 32],
-    parent: [u8; 32],
+    prev_hash: [u8; 32],
 ) -> QuorumCertificate {
     let mut votes = VoteSet::new();
-    let mut raw = Vec::with_capacity(signers.len());
     for k in signers {
-        let v = falcon_votes::fvote(
-            k,
-            &fk_for(k),
-            height,
-            0,
-            VoteKind::Precommit,
-            Some(block_hash),
-        );
-        let _ = votes.add(v.clone(), set, height, 0, VoteKind::Precommit);
-        raw.push(v);
+        let fk = fk_for(k);
+        let v = falcon_votes::fvote(k, &fk, height, 0, VoteKind::Precommit, Some(block_hash));
+        votes
+            .add(v, set, height, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
     }
     votes
-        .certificate_with_parent(Some(block_hash), set, Some(&parent))
-        .unwrap_or(QuorumCertificate {
-            shard_id: 0,
-            height,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(block_hash),
-            signatures: raw.into_iter().map(|v| (v.voter, v.signature)).collect(),
-        })
+        .certificate(Some(block_hash), set, &prev_hash)
+        .expect("quorum must compile a Falcon µQC")
 }
 
-fn header_link(w: &WindowLink, set: &ValidatorSet, signers: &[SigningKey]) -> HeaderLink {
+fn header_link(
+    height: u64,
+    prev_hash: [u8; 32],
+    body_tag: [u8; 32],
+    set: &ValidatorSet,
+    signers: &[SigningKey],
+) -> HeaderLink {
     let proposer = set
-        .proposer_for(w.height, 0)
+        .proposer_for(height, 0)
         .expect("non-empty set names a proposer");
-    HeaderLink {
-        height: w.height,
-        block_hash: w.block_hash,
-        prev_hash: w.prev_hash,
-        state_root: [w.height as u8; 32],
+    let state_root = [height as u8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash,
+        state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
         proposer,
-        qc: qc_for(signers, set, w.height, w.block_hash, w.prev_hash),
+    };
+    let block_hash = hdr.compute_hash();
+    HeaderLink {
+        height,
+        block_hash,
+        prev_hash,
+        state_root,
+        proposer,
+        qc: qc_for(signers, set, height, block_hash, prev_hash),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_tag),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         timestamp: 0,
@@ -453,18 +442,11 @@ async fn anchor_with_sets_threads_rotation_while_single_set_fail_closes() {
     );
     // Rotation between heights 2 and 3: height 2 vouched by the old set,
     // heights 3..4 by the new set.
-    let hashes = [[0xA2u8; 32], [0xA3u8; 32], [0xA4u8; 32]];
-    let window = window_links(&hashes);
-    let links: Vec<HeaderLink> = window
-        .iter()
-        .map(|w| {
-            if w.height <= 2 {
-                header_link(w, &old_set, &old_keys)
-            } else {
-                header_link(w, &new_set, &new_keys)
-            }
-        })
-        .collect();
+    let l2 = header_link(2, [0x10u8; 32], [0xA2u8; 32], &old_set, &old_keys);
+    let l3 = header_link(3, l2.block_hash, [0xA3u8; 32], &new_set, &new_keys);
+    let l4 = header_link(4, l3.block_hash, [0xA4u8; 32], &new_set, &new_keys);
+    let boundary_hash = l3.block_hash;
+    let links = vec![l2, l3, l4];
 
     let fetch = |links: Vec<HeaderLink>| {
         move |h: u64| {
@@ -490,7 +472,7 @@ async fn anchor_with_sets_threads_rotation_while_single_set_fail_closes() {
     .await
     .expect("set-at-height must verify a rotated window");
     assert_eq!(anchor.state_root, [4u8; 32]);
-    assert_eq!(anchor.boundary_hash, hashes[1]);
+    assert_eq!(anchor.boundary_hash, boundary_hash);
 
     // Single old set: the rotated heights are not its quorum — refused
     // (fail-closed at the proposer-slot gate first: a rotated-in proposer
@@ -521,9 +503,10 @@ async fn anchor_with_sets_refuses_an_unresolvable_height() {
             .map(|k| (k.verifying_key().to_bytes(), 1))
             .collect(),
     );
-    let hashes = [[0xB2u8; 32], [0xB3u8; 32], [0xB4u8; 32]];
-    let window = window_links(&hashes);
-    let links: Vec<HeaderLink> = window.iter().map(|w| header_link(w, &set, &keys)).collect();
+    let l2 = header_link(2, [0x10u8; 32], [0xB2u8; 32], &set, &keys);
+    let l3 = header_link(3, l2.block_hash, [0xB3u8; 32], &set, &keys);
+    let l4 = header_link(4, l3.block_hash, [0xB4u8; 32], &set, &keys);
+    let links = vec![l2, l3, l4];
 
     let err = verify_snapshot_anchor_tail_with_sets(
         4,

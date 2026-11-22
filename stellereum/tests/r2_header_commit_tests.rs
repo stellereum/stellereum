@@ -289,9 +289,9 @@ fn build_populated_block(height: u64) -> Block {
 }
 
 #[test]
-fn default_u64_max_keeps_header_commit_inactive_everywhere() {
-    let _guard = HeaderCommitOverrideGuard::new(None);
-    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, u64::MAX);
+fn default_v7_activates_header_commit_and_u64_max_override_preserves_legacy() {
+    let _guard = HeaderCommitOverrideGuard::new(Some(u64::MAX));
+    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, 0);
     assert_eq!(effective_header_commit_activation_height(), u64::MAX);
     assert!(!header_commit_active_at(0));
     assert!(!header_commit_active_at(1));

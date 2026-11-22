@@ -89,7 +89,8 @@ fn mk_block(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 async fn funded(seed: u8) -> (InMemoryStateEngine, FalconKeypair, [u8; 32]) {
     let (kp, addr) = pq_key(seed);

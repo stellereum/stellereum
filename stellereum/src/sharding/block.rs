@@ -184,7 +184,7 @@ pub const HEADER_COMMIT_V4_DOMAIN: &[u8] = b"STELLEREUM_HDR_V4\0";
 /// activation; no environment variable can override this in release builds.
 /// At heights `< effective_header_commit_activation_height()`,
 /// [`Block::compute_hash`] remains byte-identical to `"STELLEREUM_BLOCK_V3"`.
-pub const HEADER_COMMIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+pub const HEADER_COMMIT_ACTIVATION_HEIGHT: u64 = 0;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {

@@ -1393,8 +1393,9 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        target.apply_cross_shard_consumptions(&block_bad).await;
+            round: 0,
+        };
+        target.apply_cross_shard_consumptions(&block_bad).await;
         assert!(
             target.xpc_record(&unsigned_hash).await.is_none(),
             "unsigned XPC_PREPARE must be rejected"
@@ -1511,8 +1512,9 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        engine.apply_cross_shard_consumptions(&legacy_block).await;
+            round: 0,
+        };
+        engine.apply_cross_shard_consumptions(&legacy_block).await;
         assert_eq!(engine.cross_shard_produced_len().await, 1);
 
         // Height 2: a Byzantine proposer tries to escrow the SAME transfer as
@@ -1633,7 +1635,7 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
+            round: 0,
         };
         // Control: this message carries NO source-escrow proof, so the legacy
         // credit is refused even with no 2PC record (pentest XSHARD-01: an
@@ -1775,7 +1777,7 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
+            round: 0,
         };
         let credited = target.apply_cross_shard_consumptions(&block).await;
         assert_eq!(
@@ -1902,8 +1904,9 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        let credited = source.apply_cross_shard_consumptions(&block).await;
+            round: 0,
+        };
+        let credited = source.apply_cross_shard_consumptions(&block).await;
         assert_eq!(credited, 0, "a PREPARE-ACK moves no value");
 
         let rec = source

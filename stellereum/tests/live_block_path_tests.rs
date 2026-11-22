@@ -25,14 +25,16 @@ use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::sharding::Transaction;
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{
-    OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
+    OpCode, RegisterValidatorPayload, GAS_BASIC_TRANSFER, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
 };
+use stellereum::zkml::effective_chain_id;
 
 /// A fixed, realistic block timestamp. Never 0: 0 is exactly the bug.
 const BLOCK_TS: u64 = 1_760_000_000;
@@ -101,6 +103,28 @@ async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
 
 async fn pool(e: &InMemoryStateEngine) -> u64 {
     balance(e, &STAKING_POOL).await
+}
+
+fn register_op(cold_addr: [u8; 32], hot_kp: &FalconKeypair, amount: u64) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,25 +202,15 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x22);
     let validator = addr(&sk);
-    let start = floor() + GAS_STAKE_BOND + PQ_ACTIVATION_SURCHARGE_GAS + 4_242;
+    let hot = key(0x23);
+    let (reg_op, vid) = register_op(validator, &hot, floor());
+    let start = floor() + GAS_BASIC_TRANSFER + PQ_ACTIVATION_SURCHARGE_GAS + 4_242;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
     assert_eq!(pool(&engine).await, 0, "the pool starts empty");
 
-    let tx = pq_tx(
-        &sk,
-        validator,
-        0,
-        GAS_STAKE_BOND,
-        0,
-        1,
-        1,
-        vec![OpCode::SysCallStake {
-            validator,
-            amount: floor(),
-        }],
-    );
+    let tx = pq_tx(&sk, validator, 0, GAS_BASIC_TRANSFER, 0, 1, 1, vec![reg_op]);
 
     let (applied, failed, fees, status, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS)
@@ -218,7 +232,7 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
     );
     let vs = engine.staking_read().await.to_validator_set();
     assert_eq!(
-        vs.power_of(&validator),
+        vs.power_of(&vid),
         floor(),
         "the bond still buys voting power - now backed by real coins"
     );
@@ -234,25 +248,15 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     let engine = InMemoryStateEngine::new();
     let sk = key(0x33);
     let validator = addr(&sk);
-    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_CLAIM + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
+    let hot = key(0x34);
+    let (reg_op, vid) = register_op(validator, &hot, floor());
+    let start = floor() + GAS_BASIC_TRANSFER + GAS_STAKE_CLAIM + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
 
-    // Block 1: bond through the live path, so the pool really holds the coins.
-    let bond_tx = pq_tx(
-        &sk,
-        validator,
-        0,
-        GAS_STAKE_BOND,
-        0,
-        1,
-        1,
-        vec![OpCode::SysCallStake {
-            validator,
-            amount: floor(),
-        }],
-    );
+    // Block 1: register & bond through the live path, so the pool really holds the coins.
+    let bond_tx = pq_tx(&sk, validator, 0, GAS_BASIC_TRANSFER, 0, 1, 1, vec![reg_op]);
     let (applied, failed, _, _, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS)
         .await;
@@ -267,18 +271,18 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     engine
         .staking_write()
         .await
-        .distribute_reward(validator, reward)
+        .distribute_reward(vid, reward)
         .unwrap();
     engine
         .credit_native(&REWARDS_POOL, reward)
         .await
         .expect("back the accrual");
     assert_eq!(
-        engine.staking_read().await.validators[&validator].pending_rewards,
+        engine.staking_read().await.validators[&vid].pending_rewards,
         reward
     );
 
-    // Block 2: claim through the live path.
+    // Block 2: claim through the live path (signed by cold withdrawal_address).
     let claim_tx = pq_tx(
         &sk,
         [0u8; 32],
@@ -287,7 +291,7 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
         1,
         1,
         1,
-        vec![OpCode::SysCallClaimRewards { validator }],
+        vec![OpCode::SysCallClaimRewards { validator: vid }],
     );
     let (applied, failed, claim_fees, status, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&claim_tx), BLOCK_TS)
@@ -299,7 +303,7 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     // discarded - the reward simply vanished. E2: the payout must drain the
     // rewards pool while bonded principal stays untouched.
     assert_eq!(
-        engine.staking_read().await.validators[&validator].pending_rewards,
+        engine.staking_read().await.validators[&vid].pending_rewards,
         0,
         "the claim consumes the accrued reward"
     );
@@ -334,25 +338,15 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x44);
     let validator = addr(&sk);
-    let start = floor() + GAS_STAKE_BOND + GAS_STAKE_UNBOND + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
+    let hot = key(0x45);
+    let (reg_op, vid) = register_op(validator, &hot, floor());
+    let start = floor() + GAS_BASIC_TRANSFER + GAS_STAKE_UNBOND + 2 * PQ_ACTIVATION_SURCHARGE_GAS;
     engine
         .update_account(AccountState::new(validator, start))
         .await;
 
-    // Block 1: bond so there is something to unbond.
-    let bond_tx = pq_tx(
-        &sk,
-        validator,
-        0,
-        GAS_STAKE_BOND,
-        0,
-        1,
-        1,
-        vec![OpCode::SysCallStake {
-            validator,
-            amount: floor(),
-        }],
-    );
+    // Block 1: register & bond so there is something to unbond.
+    let bond_tx = pq_tx(&sk, validator, 0, GAS_BASIC_TRANSFER, 0, 1, 1, vec![reg_op]);
     let (applied, failed, _, _, _) = engine
         .apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS)
         .await;
@@ -368,7 +362,7 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         1,
         1,
         vec![OpCode::SysCallUnbond {
-            validator,
+            validator: vid,
             amount: floor(),
         }],
     );
@@ -399,7 +393,7 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS - 1)
         .unwrap();
     assert_eq!(
-        engine.staking_read().await.withdrawable_of(&validator),
+        engine.staking_read().await.withdrawable_of(&vid),
         0,
         "not mature one second early"
     );
@@ -409,7 +403,7 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS)
         .unwrap();
     assert_eq!(
-        engine.staking_read().await.withdrawable_of(&validator),
+        engine.staking_read().await.withdrawable_of(&vid),
         floor(),
         "mature exactly at release_at"
     );

@@ -226,15 +226,13 @@ async fn both_apply_paths_reach_the_identical_state_root() {
     }
 }
 
-/// FEE-01: the former fee divergence is GONE. The single-tx path and the block
-/// path both charge `min(gas_limit, gas_used + intrinsic)` — here the CLOB
-/// payload's own 1 240 — so a settlement declaring 50 000 gas costs the same
-/// on both, and every OTHER observable (book, escrow, the whole commitment
-/// digest, both balances) is identical too.
-///
-/// (Before FEE-01 the block path charged the 50 000 declaration while the
-/// single-tx path charged 1 240, and this test pinned that 48 760-nano delta
-/// as documented behaviour. That delta was the over-charge the fix removes.)
+/// FEE-01 + EXEC_HARDENING_V1: the former fee divergence is GONE. The
+/// single-tx path and the block path both charge
+/// `max(gas_used, GAS_BASIC_TRANSFER).min(gas_limit)` — here the 280 000
+/// intrinsic envelope minimum on a 500 000 declaration — so a settlement
+/// declaring 500 000 gas costs the same on both, refunds the unused 220 000,
+/// and every OTHER observable (book, escrow, the whole commitment digest, both
+/// balances) is identical too.
 #[tokio::test]
 async fn settlement_is_identical_and_both_paths_charge_consumed_gas() {
     let (_, seller) = pq_key(0xB1);
@@ -243,19 +241,20 @@ async fn settlement_is_identical_and_both_paths_charge_consumed_gas() {
     let b = build(seller, taker).await;
 
     let gas_used = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
-    let declared = 50_000u64; // declared >> consumed
-    assert!(declared > gas_used);
+    let expected_fee = gas_used.max(stellereum::svm::GAS_BASIC_TRANSFER);
+    let declared = 500_000u64; // declared >> expected_fee
+    assert!(declared > expected_fee);
     let tx = buy_tx(&taker_kp, 0, declared, 4 * STELL);
 
     a.apply_transaction(&tx, 7).await.expect("single-tx path");
     let (applied, failed, fees, _, _) = b.apply_block_parallel_fees(&[tx], 7).await;
-    // FEE-01: the fee is `min(declared, gas_used + intrinsic)` — a payload's
-    // own measured gas, never the declaration. A CLOB settlement declaring
-    // 50 000 costs its 1 240 on BOTH paths; the other 48 760 is refunded.
+    // FEE-01 + EXEC_HARDENING_V1: the fee is `min(declared, max(gas_used,
+    // TX_INTRINSIC_GAS))` = 280 000 on BOTH paths; the remaining 220 000 is
+    // refunded.
     assert_eq!(
         (applied, failed, fees),
-        (1, 0, gas_used),
-        "the block path charges the consumed gas, not the 50 000 declaration"
+        (1, 0, expected_fee),
+        "the block path charges the billed gas, not the 500 000 declaration"
     );
 
     // Everything except the fee is the same.
@@ -284,9 +283,9 @@ async fn settlement_is_identical_and_both_paths_charge_consumed_gas() {
         "FEE-01: identical settlement AND identical fee on both paths"
     );
     assert_eq!(
-        declared - gas_used,
-        50_000 - gas_used,
-        "the old divergence was exactly the unused declared gas"
+        declared - expected_fee,
+        500_000 - expected_fee,
+        "unused declared gas above the billed intrinsic floor is refunded"
     );
 }
 

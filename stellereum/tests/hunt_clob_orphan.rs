@@ -143,9 +143,13 @@ async fn svm_place_order_escrows_the_order_cost() {
             amount,
         }],
     );
-    // The engine's own fee rule: `max(gas used, consensus floor) + surcharge`.
+    // The engine's own fee rule under EXEC_HARDENING_V1:
+    // `max(gas_used.max(TX_INTRINSIC_GAS), consensus_floor) + surcharge`.
     let (floor_base, surcharge) = e.consensus_floor_parts(&order_tx).await;
-    let fee = GAS_ORDER_PLACE.max(floor_base).saturating_add(surcharge);
+    let fee = GAS_ORDER_PLACE
+        .max(stellereum::svm::GAS_BASIC_TRANSFER)
+        .max(floor_base)
+        .saturating_add(surcharge);
     e.apply_transaction(&order_tx, 0)
         .await
         .expect("order must be accepted");

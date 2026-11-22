@@ -378,12 +378,18 @@ pub struct TxReceipt {
     pub contract_address: Option<[u8; 32]>,
 }
 
+pub type ContractEventIndex = HashMap<[u8; 32], std::collections::BTreeSet<(u64, u32, [u8; 32])>>;
+
 /// Bounded LRU-ish index of transaction receipts, ordered by inclusion.
 #[derive(Default)]
 pub struct ReceiptIndex {
     pub order: std::collections::VecDeque<[u8; 32]>,
     pub map: HashMap<[u8; 32], TxReceipt>,
     pub by_height: std::collections::BTreeMap<u64, Vec<[u8; 32]>>,
+    /// Per-contract ordered receipt index `(height, tx_index, tx_hash)`,
+    /// avoiding O(MAX_RECEIPTS) scans in `stell_getEvents` while staying
+    /// collision-free even if two receipts share `(height, index)`.
+    pub by_contract_events: ContractEventIndex,
 }
 
 impl ReceiptIndex {
@@ -398,9 +404,49 @@ impl ReceiptIndex {
         }
     }
 
+    fn remove_from_contract_events_index(
+        by_contract: &mut ContractEventIndex,
+        height: u64,
+        tx_index: u32,
+        hash: [u8; 32],
+        events: &[crate::contract::ContractEvent],
+    ) {
+        for ev in events {
+            if let Some(set) = by_contract.get_mut(&ev.contract) {
+                set.remove(&(height, tx_index, hash));
+                if set.is_empty() {
+                    by_contract.remove(&ev.contract);
+                }
+            }
+        }
+    }
+
+    fn add_to_contract_events_index(
+        by_contract: &mut ContractEventIndex,
+        height: u64,
+        tx_index: u32,
+        hash: [u8; 32],
+        events: &[crate::contract::ContractEvent],
+    ) {
+        for ev in events {
+            by_contract
+                .entry(ev.contract)
+                .or_default()
+                .insert((height, tx_index, hash));
+        }
+    }
+
     pub fn insert(&mut self, r: TxReceipt) {
         let hash = r.tx_hash;
         let new_height = r.height;
+        let new_index = r.index;
+        Self::add_to_contract_events_index(
+            &mut self.by_contract_events,
+            new_height,
+            new_index,
+            hash,
+            &r.events,
+        );
         match self.map.insert(hash, r) {
             None => {
                 self.by_height.entry(new_height).or_default().push(hash);
@@ -409,6 +455,13 @@ impl ReceiptIndex {
                     if let Some(old) = self.order.pop_front() {
                         if let Some(removed) = self.map.remove(&old) {
                             self.remove_from_height_index(removed.height, &old);
+                            Self::remove_from_contract_events_index(
+                                &mut self.by_contract_events,
+                                removed.height,
+                                removed.index,
+                                old,
+                                &removed.events,
+                            );
                         }
                     }
                 }
@@ -417,6 +470,31 @@ impl ReceiptIndex {
                 if prev.height != new_height {
                     self.remove_from_height_index(prev.height, &hash);
                     self.by_height.entry(new_height).or_default().push(hash);
+                }
+                if prev.height != new_height || prev.index != new_index {
+                    Self::remove_from_contract_events_index(
+                        &mut self.by_contract_events,
+                        prev.height,
+                        prev.index,
+                        hash,
+                        &prev.events,
+                    );
+                } else {
+                    let current = self
+                        .map
+                        .get(&hash)
+                        .map(|cur| &cur.events[..])
+                        .unwrap_or(&[]);
+                    for ev in &prev.events {
+                        if !current.iter().any(|c| c.contract == ev.contract) {
+                            if let Some(set) = self.by_contract_events.get_mut(&ev.contract) {
+                                set.remove(&(prev.height, prev.index, hash));
+                                if set.is_empty() {
+                                    self.by_contract_events.remove(&ev.contract);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -439,10 +517,38 @@ impl ReceiptIndex {
         rows
     }
 
+    /// O(log N + K) lookup of receipts that emitted at least one event for
+    /// `contract` inside `from_block..=to_block`, ordered by `(height, index)`
+    /// ascending (`reverse == false`) or descending (`reverse == true`).
+    pub fn for_contract_events(
+        &self,
+        contract: &[u8; 32],
+        from_block: u64,
+        to_block: u64,
+        reverse: bool,
+    ) -> Vec<&TxReceipt> {
+        if from_block > to_block {
+            return Vec::new();
+        }
+        let Some(by_pos) = self.by_contract_events.get(contract) else {
+            return Vec::new();
+        };
+        let range = by_pos.range((from_block, 0, [0u8; 32])..=(to_block, u32::MAX, [0xFFu8; 32]));
+        if reverse {
+            range
+                .rev()
+                .filter_map(|(_, _, h)| self.map.get(h))
+                .collect()
+        } else {
+            range.filter_map(|(_, _, h)| self.map.get(h)).collect()
+        }
+    }
+
     pub fn clear(&mut self) {
         self.order.clear();
         self.map.clear();
         self.by_height.clear();
+        self.by_contract_events.clear();
     }
 
     pub fn len(&self) -> usize {

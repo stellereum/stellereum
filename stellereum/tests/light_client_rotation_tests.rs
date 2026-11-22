@@ -100,23 +100,39 @@ fn pq_for(keys: &[SigningKey], tag: u8) -> Vec<stellereum::post_quantum::FalconK
 fn header(
     height: u64,
     prev_hash: BlockHash,
-    block_hash: BlockHash,
+    body_tag: BlockHash,
     signers: &[SigningKey],
     fks: &[stellereum::post_quantum::FalconKeypair],
     vs: &ValidatorSet,
 ) -> LightHeader {
+    let proposer = signers[0].verifying_key().to_bytes();
+    let timestamp = 1_700_000_000 + height;
+    let state_root = [0xA0u8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash,
+        state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp,
+        proposer,
+    };
+    let block_hash = hdr.compute_hash();
     LightHeader {
         height,
         prev_hash,
-        state_root: [0xA0u8; 32],
+        state_root,
         block_hash,
-        timestamp: 1_700_000_000 + height,
-        proposer: signers[0].verifying_key().to_bytes(),
+        timestamp,
+        proposer,
         cert: cert(signers, fks, vs, height, block_hash, &prev_hash),
         signatures: Vec::new(),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_tag),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     }
@@ -129,12 +145,21 @@ fn client_at_tip2(
     old_fks: &[stellereum::post_quantum::FalconKeypair],
 ) -> (LightClient, BlockHash) {
     let validators = set_of(old_keys);
-    let anchor_hash = hash_of(0x10);
-    let anchor = Checkpoint::new(
-        1,
-        anchor_hash,
-        [0u8; 32],
-        [0xA0u8; 32],
+    let hdr1 = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height: 1,
+        round: 0,
+        prev_hash: [0u8; 32],
+        state_root: [0xA0u8; 32],
+        body_commitment: hash_of(0x10),
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let anchor_hash = hdr1.compute_hash();
+    let anchor = Checkpoint::from_block_header(
+        hdr1,
         cert(
             &old_keys[..3],
             &old_fks[..3],
@@ -146,16 +171,16 @@ fn client_at_tip2(
     );
     let mut lc = LightClient::new(validators.clone(), anchor).expect("anchor verifies");
     assert_eq!(lc.validator_set_height(), 1);
-    let tip_hash = hash_of(0x20);
-    lc.apply_header(header(
+    let tip_hdr = header(
         2,
         anchor_hash,
-        tip_hash,
+        hash_of(0x20),
         &old_keys[..3],
         &old_fks[..3],
         &validators,
-    ))
-    .expect("same-set advance verifies");
+    );
+    let tip_hash = tip_hdr.block_hash;
+    lc.apply_header(tip_hdr).expect("same-set advance verifies");
     (lc, tip_hash)
 }
 
@@ -168,16 +193,17 @@ fn same_set_advance_verifies() {
     let old_vs = set_of(&old_keys);
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
     assert_eq!(lc.tip_height(), 2);
-    let next_hash = hash_of(0x21);
-    lc.apply_header(header(
+    let next_hdr = header(
         3,
         tip_hash,
-        next_hash,
+        hash_of(0x21),
         &old_keys[1..],
         &old_fks[1..],
         &old_vs,
-    ))
-    .expect("a quorum of the anchored set advances the chain");
+    );
+    let next_hash = next_hdr.block_hash;
+    lc.apply_header(next_hdr)
+        .expect("a quorum of the anchored set advances the chain");
     assert_eq!(lc.tip_height(), 3);
     assert_eq!(lc.tip_hash(), next_hash);
     assert_eq!(lc.validator_set_height(), 1);
@@ -221,18 +247,16 @@ fn rotation_with_old_quorum_is_accepted() {
     let new_vs = set_of(&new_keys);
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
 
-    let rotation_hash = hash_of(0x30);
-    let rotation = ValidatorSetRotation::new(
-        header(
-            3,
-            tip_hash,
-            rotation_hash,
-            &old_keys[..3],
-            &old_fks[..3],
-            &old_vs,
-        ),
-        new_vs.clone(),
+    let rot_hdr = header(
+        3,
+        tip_hash,
+        hash_of(0x30),
+        &old_keys[..3],
+        &old_fks[..3],
+        &old_vs,
     );
+    let rotation_hash = rot_hdr.block_hash;
+    let rotation = ValidatorSetRotation::new(rot_hdr, new_vs.clone());
     assert_eq!(rotation.effective_height(), 3);
     lc.rotate_validator_set(rotation)
         .expect("an old-quorum rotation must be accepted");
@@ -242,11 +266,10 @@ fn rotation_with_old_quorum_is_accepted() {
     assert_eq!(lc.validators.validators, set_of(&new_keys).validators);
 
     // The chain continues: a header certified by the NEW set verifies.
-    let next_hash = hash_of(0x31);
     lc.apply_header(header(
         4,
         rotation_hash,
-        next_hash,
+        hash_of(0x31),
         &new_keys[..3],
         &new_fks[..3],
         &new_vs,
@@ -332,19 +355,17 @@ fn stale_set_header_is_refused_after_rotation() {
     let new_vs = set_of(&new_keys);
     let (mut lc, tip_hash) = client_at_tip2(&old_keys, &old_fks);
 
-    let rotation_hash = hash_of(0x30);
-    lc.rotate_validator_set(ValidatorSetRotation::new(
-        header(
-            3,
-            tip_hash,
-            rotation_hash,
-            &old_keys[..3],
-            &old_fks[..3],
-            &old_vs,
-        ),
-        new_vs.clone(),
-    ))
-    .expect("rotation must succeed first");
+    let rot_hdr = header(
+        3,
+        tip_hash,
+        hash_of(0x30),
+        &old_keys[..3],
+        &old_fks[..3],
+        &old_vs,
+    );
+    let rotation_hash = rot_hdr.block_hash;
+    lc.rotate_validator_set(ValidatorSetRotation::new(rot_hdr, new_vs.clone()))
+        .expect("rotation must succeed first");
 
     let stale = header(
         4,

@@ -128,7 +128,9 @@ fn durable_restart_and_identity_binding() {
             } else {
                 other.persist(Some(2), vec![]).unwrap_err()
             };
-            assert!(error.to_string().contains("identity or generation mismatch"));
+            assert!(error
+                .to_string()
+                .contains("identity or generation mismatch"));
             assert!(correct
                 .load()
                 .unwrap_err()

@@ -62,6 +62,21 @@ fn golden_key() -> SigningKey {
 // 1. Legacy bytes, hashes and signing messages are unchanged
 // ===========================================================================
 
+struct HeaderCommitGateGuard;
+
+impl HeaderCommitGateGuard {
+    fn pre_v7() -> Self {
+        stellereum::sharding::set_header_commit_activation_override(Some(u64::MAX));
+        Self
+    }
+}
+
+impl Drop for HeaderCommitGateGuard {
+    fn drop(&mut self) {
+        stellereum::sharding::set_header_commit_activation_override(None);
+    }
+}
+
 #[test]
 fn legacy_tx_and_block_encodings_are_unchanged() {
     let sk = golden_key();
@@ -107,7 +122,9 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
         Transaction::sign_with_payload(&sk, [9u8; 32], 5, 700, 8, 1, 2, vec![OpCode::Push(42)]);
     assert_eq!(hex::encode(ptx.compute_tx_hash()), GOLDEN_PAYLOAD_TX_HASH);
 
-    // The pinned legacy block still decodes and rehashes to its voted hash.
+    // The pinned legacy block still decodes and rehashes to its voted hash
+    // (pre-v7 v3 block hash encoding, pinned under the explicit pre-v7 gate).
+    let _v3_guard = HeaderCommitGateGuard::pre_v7();
     let raw_block = h(GOLDEN_BLOCK_BYTES);
     // The legacy body shape (the trailing commitment fields absent) is
     // tolerated on the STORE path only: the wire decodes strictly, so a

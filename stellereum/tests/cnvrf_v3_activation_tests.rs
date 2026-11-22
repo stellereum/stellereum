@@ -398,8 +398,24 @@ fn first_boundary_seed_agrees_between_producer_and_validator() {
 fn light_client_verifies_under_the_beacon_schedule() {
     let set = big_set();
     let height = ACTIVATION;
-    let block = [0x66u8; 32];
     let schedule = bootstrap_schedule(height);
+    let proposer = set
+        .validators
+        .proposer_for_with_schedule(height, 0, schedule)
+        .expect("beacon schedule names a proposer");
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash: [0u8; 32],
+        state_root: [0u8; 32],
+        body_commitment: [0x66u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 1_760_000_000,
+        proposer,
+    };
+    let block = hdr.compute_hash();
     let qc = certificate_at(
         set,
         height,
@@ -416,15 +432,12 @@ fn light_client_verifies_under_the_beacon_schedule() {
         state_root: [0u8; 32],
         block_hash: block,
         timestamp: 1_760_000_000,
-        proposer: set
-            .validators
-            .proposer_for_with_schedule(height, 0, schedule)
-            .expect("beacon schedule names a proposer"),
+        proposer,
         cert: qc.clone(),
         signatures: Vec::new(),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(hdr.body_commitment),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };
@@ -451,8 +464,7 @@ fn light_client_verifies_under_the_beacon_schedule() {
     // A configured client (activation reached) re-anchors on this checkpoint:
     // `advance_to_checkpoint` verifies the certificate under the client's own
     // schedule, deriving the bootstrap beacon itself (nothing recorded).
-    let cp =
-        stellereum::light_client::Checkpoint::new(height, block, [0u8; 32], [0u8; 32], qc.clone());
+    let cp = stellereum::light_client::Checkpoint::of(&header);
     let mut light =
         LightClient::with_genesis_anchor(set.validators.clone(), genesis.clone()).unwrap();
     light.configure_cnvrf_v3(chain_id(), ACTIVATION);
@@ -461,7 +473,23 @@ fn light_client_verifies_under_the_beacon_schedule() {
         .expect("a beacon-aware light client must follow the first post-activation anchor (F2)");
 
     // ... and then follows the NEXT header of the same epoch under the beacon.
-    let next_block = [0x67u8; 32];
+    let next_proposer = set
+        .validators
+        .proposer_for_with_schedule(height + 1, 0, schedule)
+        .expect("beacon schedule names a proposer");
+    let next_hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height: height + 1,
+        round: 0,
+        prev_hash: block,
+        state_root: [0u8; 32],
+        body_commitment: [0x67u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 1_760_000_001,
+        proposer: next_proposer,
+    };
+    let next_block = next_hdr.compute_hash();
     let next_qc = certificate_at(
         set,
         height + 1,
@@ -477,15 +505,12 @@ fn light_client_verifies_under_the_beacon_schedule() {
         state_root: [0u8; 32],
         block_hash: next_block,
         timestamp: 1_760_000_001,
-        proposer: set
-            .validators
-            .proposer_for_with_schedule(height + 1, 0, schedule)
-            .expect("beacon schedule names a proposer"),
+        proposer: next_proposer,
         cert: next_qc,
         signatures: Vec::new(),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(next_hdr.body_commitment),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     };

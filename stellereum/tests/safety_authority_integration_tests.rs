@@ -249,13 +249,9 @@ async fn nil_after_conflicting_non_nil_prevote_does_not_bypass_cross_kind_guard(
             .map(|k| (k.verifying_key().to_bytes(), 1))
             .collect(),
     );
-    let mut rt = ValidatorRuntime::new(
-        ks[0].clone(),
-        vset,
-        Arc::new(InMemoryStateEngine::new()),
-        H,
-    )
-    .with_falcon_key(fks[0].clone());
+    let mut rt =
+        ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+            .with_falcon_key(fks[0].clone());
 
     let (blk_x, x_hash) = block_at(H, 0, ks[0].verifying_key().to_bytes(), 0x11);
     let (blk_y, y_hash) = block_at(H, 10, ks[1].verifying_key().to_bytes(), 0x22);
@@ -434,10 +430,7 @@ async fn no_sign_bytes_before_safety_record_persist_in_driver_and_in_process() {
     );
     let finalized_bh = cluster.run_height(1_700_000_100).await;
     assert_eq!(cluster.nodes[0].finalized, vec![(1, finalized_bh)]);
-    assert_eq!(
-        cluster.nodes[0].safety.current_state().unwrap().height,
-        2
-    );
+    assert_eq!(cluster.nodes[0].safety.current_state().unwrap().height, 2);
 }
 
 // ============================================================================
@@ -453,13 +446,9 @@ async fn late_polka_precommit_after_nil_prevote_succeeds_and_not_pruned_by_outbo
             .map(|k| (k.verifying_key().to_bytes(), 1))
             .collect(),
     );
-    let mut rt = ValidatorRuntime::new(
-        ks[0].clone(),
-        vset,
-        Arc::new(InMemoryStateEngine::new()),
-        H,
-    )
-    .with_falcon_key(fks[0].clone());
+    let mut rt =
+        ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+            .with_falcon_key(fks[0].clone());
 
     let (blk, x_hash) = block_at(H, 0, ks[0].verifying_key().to_bytes(), 0x55);
     rt.blocks.insert(x_hash, blk);
@@ -578,15 +567,21 @@ fn legacy_absent_safety_record_quarantines_to_observer_except_clean_genesis() {
         ctx2.legacy_watermark = storage.vote_watermark().unwrap();
         let auth2 = SafetyAuthority::open_from_storage(storage, id.clone(), ctx2);
         assert_eq!(auth2.mode(), AuthorityMode::Active);
-        assert_eq!(auth2.current_state().unwrap().highest_prevote_round, Some(6));
+        assert_eq!(
+            auth2.current_state().unwrap().highest_prevote_round,
+            Some(6)
+        );
     }
 
     // (ii) Clean dir + STELL_NEW_CHAIN=1 + height 0 + zero prior votes -> Active gen 1!
     {
         let dir = TestDir::new("clean-genesis");
         let storage = init_clean_genesis_storage(&dir, genesis_root);
-        let auth =
-            SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+        let auth = SafetyAuthority::open_from_storage(
+            storage.clone(),
+            id.clone(),
+            clean_genesis_boot_ctx(),
+        );
         assert_eq!(auth.mode(), AuthorityMode::Active);
         assert!(auth.can_sign());
         assert_eq!(auth.generation(), Some(1));
@@ -594,7 +589,12 @@ fn legacy_absent_safety_record_quarantines_to_observer_except_clean_genesis() {
         assert_eq!(payload.height, 1);
         assert_eq!(payload.finalized_height, 0);
         // Persisted on disk at generation 1.
-        let on_disk = storage.safety_record_store(id).unwrap().load().unwrap().unwrap();
+        let on_disk = storage
+            .safety_record_store(id)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert_eq!(on_disk.generation, 1);
     }
 }
@@ -620,8 +620,11 @@ async fn crash_after_put_block_flush_before_safety_persist() {
 
     {
         let storage = init_clean_genesis_storage(&dir, genesis_root);
-        let auth =
-            SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+        let auth = SafetyAuthority::open_from_storage(
+            storage.clone(),
+            id.clone(),
+            clean_genesis_boot_ctx(),
+        );
         auth.set_io_fault_hook_for_test(Some(Arc::new(|stage| {
             if stage == SafetyIoStage::RecordPersist {
                 anyhow::bail!("simulated crash before Step B persist");
@@ -687,8 +690,11 @@ async fn crash_after_safety_persist_before_sign_bytes_and_remote_signer_failure(
 
     {
         let storage = init_clean_genesis_storage(&dir, genesis_root);
-        let auth =
-            SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+        let auth = SafetyAuthority::open_from_storage(
+            storage.clone(),
+            id.clone(),
+            clean_genesis_boot_ctx(),
+        );
         let signer = RemoteSigner::new(Arc::new(SpyTransport {
             key: ks[0].clone(),
             on_sign: Arc::new(|_| {}),
@@ -739,9 +745,10 @@ async fn crash_after_safety_persist_before_sign_bytes_and_remote_signer_failure(
         auth.locked().map(|l| (l.block_hash, l.round)),
         Some((bh, 0))
     );
-    let mut rt2 = ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
-        .with_falcon_key(fks[0].clone())
-        .with_safety_authority(auth);
+    let mut rt2 =
+        ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+            .with_falcon_key(fks[0].clone())
+            .with_safety_authority(auth);
     rt2.blocks.insert(other_bh, blk_other);
     for i in 0..3 {
         rt2.on_prevote(falcon_votes::fvote(
@@ -783,8 +790,7 @@ async fn injected_put_block_or_flush_or_persist_error_quarantines_and_emits_zero
         let val_id = ks[0].verifying_key().to_bytes();
         let id = identity_for(val_id, genesis_root, 0);
         let storage = init_clean_genesis_storage(&dir, genesis_root);
-        let auth =
-            SafetyAuthority::open_from_storage(storage, id, clean_genesis_boot_ctx());
+        let auth = SafetyAuthority::open_from_storage(storage, id, clean_genesis_boot_ctx());
         auth.set_io_fault_hook_for_test(Some(Arc::new(move |stage| {
             if stage == stage_to_fail {
                 anyhow::bail!("injected fault at {stage:?}");
@@ -800,16 +806,12 @@ async fn injected_put_block_or_flush_or_persist_error_quarantines_and_emits_zero
             messages: Arc::new(Mutex::new(Vec::new())),
         }))
         .unwrap();
-        let mut rt = ValidatorRuntime::new(
-            ks[0].clone(),
-            vset,
-            Arc::new(InMemoryStateEngine::new()),
-            H,
-        )
-        .with_falcon_key(fks[0].clone())
-        .with_remote_signer(Arc::new(signer))
-        .unwrap()
-        .with_safety_authority(auth);
+        let mut rt =
+            ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+                .with_falcon_key(fks[0].clone())
+                .with_remote_signer(Arc::new(signer))
+                .unwrap()
+                .with_safety_authority(auth);
 
         let (blk, bh) = block_at(H, 0, val_id, 0x61);
         rt.blocks.insert(bh, blk);
@@ -949,8 +951,11 @@ async fn missing_or_corrupt_lock_body_on_restart_fails_closed() {
 
     {
         let storage = init_clean_genesis_storage(&dir, genesis_root);
-        let auth =
-            SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+        let auth = SafetyAuthority::open_from_storage(
+            storage.clone(),
+            id.clone(),
+            clean_genesis_boot_ctx(),
+        );
         let mut rt = ValidatorRuntime::new(
             ks[0].clone(),
             vset.clone(),
@@ -982,9 +987,10 @@ async fn missing_or_corrupt_lock_body_on_restart_fails_closed() {
     ctx.new_chain_explicit = false;
     let auth = SafetyAuthority::open_from_storage(storage.clone(), id, ctx);
     let lock = auth.locked().expect("lock stays present");
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
-        .with_falcon_key(fks[0].clone())
-        .with_safety_authority(auth);
+    let mut rt =
+        ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+            .with_falcon_key(fks[0].clone())
+            .with_safety_authority(auth);
     rt.hc.locked = Some((lock.block_hash, lock.round));
     rt.hc.note_value_id(lock.block_hash, lock.value_id);
     if storage
@@ -1023,15 +1029,11 @@ fn make_precommit_without_body_in_blocks_refuses_hash_only_lock() {
         messages: Arc::new(Mutex::new(Vec::new())),
     }))
     .unwrap();
-    let mut rt = ValidatorRuntime::new(
-        ks[0].clone(),
-        vset,
-        Arc::new(InMemoryStateEngine::new()),
-        H,
-    )
-    .with_falcon_key(fks[0].clone())
-    .with_remote_signer(Arc::new(signer))
-    .unwrap();
+    let mut rt =
+        ValidatorRuntime::new(ks[0].clone(), vset, Arc::new(InMemoryStateEngine::new()), H)
+            .with_falcon_key(fks[0].clone())
+            .with_remote_signer(Arc::new(signer))
+            .unwrap();
 
     let ghost_hash = [0xDE; 32];
     for i in 0..3 {
@@ -1080,7 +1082,8 @@ async fn propose_shrink_signs_once_and_prevents_double_propose_across_crash() {
 
     let state = Arc::new(InMemoryStateEngine::new());
     let storage = init_clean_genesis_storage(&dir, genesis_root);
-    let auth = SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+    let auth =
+        SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
 
     let mut rt = ValidatorRuntime::new(key.clone(), vset.clone(), state.clone(), H)
         .with_falcon_key(fk.clone())
@@ -1095,8 +1098,11 @@ async fn propose_shrink_signs_once_and_prevents_double_propose_across_crash() {
     let deploy_gas = stellereum::svm::contract_deploy_gas(big_code.len()) + 500_000;
     for s_idx in 0..4u8 {
         let sender_fk = FalconKeypair::generate_from_seed(0x70 + s_idx);
-        let sender_addr =
-            stellereum::post_quantum::derive_pq_address(PqScheme::Falcon512, &sender_fk.public_key, &DEFAULT_SALT);
+        let sender_addr = stellereum::post_quantum::derive_pq_address(
+            PqScheme::Falcon512,
+            &sender_fk.public_key,
+            &DEFAULT_SALT,
+        );
         rt.state
             .update_account(AccountState::new(sender_addr, 10_000_000_000_000))
             .await;
@@ -1172,7 +1178,8 @@ async fn height_advance_finalize_adopt_snapshot_sync_persists_new_height_and_cle
     let vset = ValidatorSet::from_list(vec![(val_id, 1)]);
     let id = identity_for(val_id, genesis_root, 0);
     let storage = init_clean_genesis_storage(&dir, genesis_root);
-    let auth = SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
+    let auth =
+        SafetyAuthority::open_from_storage(storage.clone(), id.clone(), clean_genesis_boot_ctx());
 
     let mut rt = ValidatorRuntime::new(
         ks[0].clone(),
@@ -1193,7 +1200,10 @@ async fn height_advance_finalize_adopt_snapshot_sync_persists_new_height_and_cle
     assert!(rt.safety.locked().is_some());
     assert_eq!(rt.try_finalize().await, Some(bh1));
     let s2 = rt.safety.current_state().unwrap();
-    assert_eq!((s2.height, s2.finalized_height, s2.finalized_hash), (2, 1, bh1));
+    assert_eq!(
+        (s2.height, s2.finalized_height, s2.finalized_hash),
+        (2, 1, bh1)
+    );
     assert_eq!(s2.locked, None);
     assert_eq!(s2.highest_prevote_round, None);
     assert_eq!(s2.highest_precommit_round, None);
@@ -1214,7 +1224,10 @@ async fn height_advance_finalize_adopt_snapshot_sync_persists_new_height_and_cle
     };
     assert_eq!(completed.height, 2);
     let s3 = rt.safety.current_state().unwrap();
-    assert_eq!((s3.height, s3.finalized_height, s3.finalized_hash), (3, 2, bh2));
+    assert_eq!(
+        (s3.height, s3.finalized_height, s3.finalized_hash),
+        (3, 2, bh2)
+    );
 
     // 3. adopt_committed (h=3 -> 4).
     let mut b3 = rt.propose(1_700_000_003).await.unwrap();
@@ -1223,14 +1236,22 @@ async fn height_advance_finalize_adopt_snapshot_sync_persists_new_height_and_cle
     rt.on_prevote(pv3).unwrap();
     let pc3 = rt.make_precommit().unwrap();
     rt.on_precommit(pc3).unwrap();
-    let cert3 = rt.hc.precommit_set(0).unwrap().certificate(Some(bh3), &vset, &bh2).unwrap();
+    let cert3 = rt
+        .hc
+        .precommit_set(0)
+        .unwrap()
+        .certificate(Some(bh3), &vset, &bh2)
+        .unwrap();
     // Reset local hc proposal/votes to test adopt_committed cleanly at h=3.
     rt.hc = HeightConsensus::new(3, vset.clone());
     rt.hc.set_parent_hash(bh2);
     b3.precommit_qc = None;
     assert_eq!(rt.adopt_committed(3, b3, cert3).await, Ok(bh3));
     let s4 = rt.safety.current_state().unwrap();
-    assert_eq!((s4.height, s4.finalized_height, s4.finalized_hash), (4, 3, bh3));
+    assert_eq!(
+        (s4.height, s4.finalized_height, s4.finalized_hash),
+        (4, 3, bh3)
+    );
     assert_eq!(s4.locked, None);
 
     // 4. Snapshot sync advance_height (h=4 -> 101).
@@ -1320,10 +1341,7 @@ fn concurrent_runtime_threads_and_corrupt_record_quarantine() {
     assert!(!auth_corrupt.can_sign());
 
     // Wrong identity (validator / chain / shard) -> Quarantined!
-    let wrong_id = SafetyRecordIdentity {
-        shard: 9,
-        ..id
-    };
+    let wrong_id = SafetyRecordIdentity { shard: 9, ..id };
     let auth_wrong =
         SafetyAuthority::open_from_storage(storage, wrong_id, clean_genesis_boot_ctx());
     assert!(matches!(auth_wrong.mode(), AuthorityMode::Quarantined(_)));

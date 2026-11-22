@@ -5877,6 +5877,19 @@ mod tests {
         use crate::state_engine::{AccountState, InMemoryStateEngine};
         use crate::svm::OpCode;
 
+        // Pre-v7 legacy `SysCallStake` with `gas_limit = 10_000`: pin R1/R3
+        // gates off for this thread so historical pre-v7 replay stays intact.
+        struct PreV7LegacyGuard;
+        impl Drop for PreV7LegacyGuard {
+            fn drop(&mut self) {
+                crate::chain_spec::set_exec_hardening_v1_activation_override(None);
+                crate::pq_registry::set_pq_lifecycle_activation_override(None);
+            }
+        }
+        crate::chain_spec::set_exec_hardening_v1_activation_override(Some(u64::MAX));
+        crate::pq_registry::set_pq_lifecycle_activation_override(Some(u64::MAX));
+        let _pre_v7 = PreV7LegacyGuard;
+
         // FULL-PQ: implicit Falcon-512 envelope (the `pq_tx_payload` idiom
         // from the state_engine tests) — no activation surcharge, so the
         // gas assertions match the old classical fixture exactly.

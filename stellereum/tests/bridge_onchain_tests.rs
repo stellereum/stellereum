@@ -83,10 +83,20 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
         e.credit_native(&pk, 10 * MIN_VALIDATOR_BOND)
             .await
             .expect("fund the validator");
-        e.staking_write()
+        let fk = falcon_for(&k);
+        {
+            let mut ledger = e.staking_write().await;
+            ledger
+                .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+                .expect("bond it into the committed ledger");
+            ledger
+                .validator_pq_keys
+                .insert(pk, (PqScheme::Falcon512, fk.public_key.clone()));
+        }
+        e.pq_registry_write()
             .await
-            .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
-            .expect("bond it into the committed ledger");
+            .adopt_legacy_key_at(pk, PqScheme::Falcon512, fk.public_key.clone(), 0, true)
+            .expect("seed committed pq_registry");
         // FIXES §1.1: the committed Ed identity carries a registered
         // Falcon-512 key the bridge quorum verifies against.
         register_falcon(&k);
@@ -182,7 +192,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 /// Wrap an intent pair as the payload of one transaction.
 fn ops(att: Option<BridgeIntent>, intent: BridgeIntent) -> Vec<OpCode> {
@@ -400,6 +411,15 @@ async fn replayed_source_tx_is_refused_in_a_later_block() {
 /// can only ever apply once.
 #[tokio::test]
 async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (e, _vals) = setup(3).await;
     let payer_seed: u8 = 0x05;
     let payer_pk = pq_id(payer_seed);
@@ -421,11 +441,14 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
     assert_eq!(out.status, vec![true], "the withdrawal request applies");
+    let burned = ((out.fees_collected as u128)
+        * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
 
     assert_eq!(
         balance(&e, &payer_pk).await,
-        start - LARGE_WITHDRAWAL_THRESHOLD_NANO,
-        "the sender is debited (the fee nets back: the payer is the proposer)"
+        start - LARGE_WITHDRAWAL_THRESHOLD_NANO - burned,
+        "the sender is debited the withdrawal plus the 50% burned fee (remainder rebates to proposer)"
     );
     assert_eq!(
         balance(&e, &escrow).await,
@@ -508,6 +531,15 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
 /// time-lock delay, but the queue entry and the escrow are still committed.
 #[tokio::test]
 async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (e, _vals) = setup(3).await;
     let payer_seed: u8 = 0x06;
     let payer_pk = pq_id(payer_seed);
@@ -958,14 +990,19 @@ fn ton_proof(
         prev_hash: [0x11u8; 32],
         tx_root: root_override.unwrap_or(root),
     };
-    let msg = header.signing_message();
+    let finalized = 1_000 + stellereum::bridge::MIN_TON_CONFIRMATIONS;
+    let msg = header.signing_message_v2_binding(
+        stellereum::zkml::effective_chain_id(),
+        stellereum::bridge::bridge_adapters::AdapterKindTag::Ton,
+        finalized,
+    );
     let header_signatures = keys[..2].iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash,
         evidence: Box::new(DepositEvidence::TonCell {
             header,
             header_signatures,
-            finalized_seqno: 1_000 + stellereum::bridge::MIN_TON_CONFIRMATIONS,
+            finalized_seqno: finalized,
             boc_bytes: boc.to_boc_bytes(),
         }),
     }
@@ -998,14 +1035,19 @@ fn evm_proof(
         prev_hash: [0x22u8; 32],
         tx_root: trie.root_hash(),
     };
-    let msg = header.signing_message();
+    let finalized = 10_000 + stellereum::bridge::ETHEREUM_FINALITY_BLOCKS;
+    let msg = header.signing_message_v2_binding(
+        stellereum::zkml::effective_chain_id(),
+        stellereum::bridge::bridge_adapters::AdapterKindTag::Evm,
+        finalized,
+    );
     let header_signatures = keys[..2].iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash,
         evidence: Box::new(DepositEvidence::EvmReceipt {
             header,
             header_signatures,
-            finalized_number: 10_000 + stellereum::bridge::ETHEREUM_FINALITY_BLOCKS,
+            finalized_number: finalized,
             log_index,
             receipt_value: receipt,
             mpt_proof: trie

@@ -355,8 +355,9 @@ async fn restart_replay_refused_at_propose_validate_and_apply() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    forged.sign_block(&validator);
+        round: 0,
+    };
+    forged.sign_block(&validator);
     let err = fnode
         .validate_proposal(&forged, root)
         .expect_err("a replayed consume record must be refused");
@@ -533,8 +534,9 @@ async fn engine_gate_backstops_empty_runtime() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    let _ = &mut carrier;
+        round: 0,
+    };
+    let _ = &mut carrier;
     let engine = &fresh.shard(SHARD1).nodes[0].state;
     let credited = engine.apply_cross_shard_consumptions(&carrier).await;
     assert_eq!(credited, 0, "engine must skip the already-consumed record");

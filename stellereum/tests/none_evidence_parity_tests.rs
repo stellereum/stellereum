@@ -56,7 +56,11 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
 /// short of the downtime threshold — so the FIRST certificate that
 /// attributes downtime burns, and any route that skips attribution lands
 /// on a visibly different root.
-async fn parked_engines(ks: &[SigningKey], silent: &[u8; 32]) -> Vec<Arc<InMemoryStateEngine>> {
+async fn parked_engines(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    silent: &[u8; 32],
+) -> Vec<Arc<InMemoryStateEngine>> {
     let vs = vset(ks);
     let mut out = Vec::new();
     for _ in 0..4 {
@@ -70,6 +74,27 @@ async fn parked_engines(ks: &[SigningKey], silent: &[u8; 32]) -> Vec<Arc<InMemor
             let rec = l.validators.get_mut(silent).expect("silent is bonded");
             rec.missed = DOWNTIME_MISS_THRESHOLD - 1;
             rec.last_downtime_penalty = 0;
+            let mut pq_reg = st.pq_registry_write().await;
+            for (k, fk) in ks.iter().zip(fks.iter()) {
+                let vid = k.verifying_key().to_bytes();
+                l.validator_pq_keys.insert(
+                    vid,
+                    (
+                        stellereum::post_quantum::PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                    ),
+                );
+                pq_reg
+                    .adopt_legacy_key_at(
+                        vid,
+                        stellereum::post_quantum::PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                        0,
+                        true,
+                    )
+                    .expect("seed pq_registry");
+            }
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
         }
         out.push(st);
     }
@@ -110,8 +135,9 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(pkey, pfk);
+        round: 0,
+    };
+    b.sign_block_with_falcon(pkey, pfk);
     b
 }
 
@@ -145,7 +171,7 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
     let vs = vset(&ks);
     let silent_id = ks[3].verifying_key().to_bytes();
 
-    let engines = parked_engines(&ks, &silent_id).await;
+    let engines = parked_engines(&ks, &fks, &silent_id).await;
     let (st_live, st_adopt, st_walk, st_replay) = (
         engines[0].clone(),
         engines[1].clone(),

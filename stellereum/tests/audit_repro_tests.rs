@@ -239,7 +239,19 @@ fn repro_4_light_client_spv_accepts_both_16b_and_49b_leaves() {
     let state_root = trie.root_hash();
     let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
-    let block_hash = [0x99u8; 32];
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
+        height: 1,
+        round: 0,
+        prev_hash: [0u8; 32],
+        state_root,
+        body_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let block_hash = hdr.compute_hash();
     // FULL-PQ: `LightClient::new` verifies the checkpoint, so the 1-of-1
     // cert is compiled by the committee path production uses.
     let s_fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x11);
@@ -261,7 +273,7 @@ fn repro_4_light_client_spv_accepts_both_16b_and_49b_leaves() {
     let cert = vset1
         .certificate(Some(block_hash), &validators, &[0u8; 32])
         .expect("1-of-1 reaches quorum");
-    let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+    let checkpoint = Checkpoint::from_block_header(hdr, cert);
     let lc = LightClient::new(validators, checkpoint).expect("light client init");
 
     let proven = lc

@@ -2874,7 +2874,7 @@ impl ValidatorRuntime {
         {
             let pq_reg = self.state.pq_registry_read().await;
             let active = crate::pq_registry::pq_lifecycle_active_at(height);
-            if active || !pq_reg.is_empty() {
+            if !pq_reg.is_empty() {
                 crate::consensus::sync_committed_pq_registry(&pq_reg, active);
             }
         }

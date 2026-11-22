@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use stellereum::consensus::ValidatorSet;
-use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
 use stellereum::runtime::ValidatorRuntime;
-use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
+use stellereum::sharding::{Block, PqSignatureEnvelope, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 
@@ -151,8 +151,9 @@ fn mk_block(txs: Vec<Transaction>, proposer: &SigningKey) -> Block {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    blk.sign_block(proposer);
+        round: 0,
+    };
+    blk.sign_block(proposer);
     blk
 }
 
@@ -377,11 +378,14 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
     let bob = engine.get_account(&[0xB0; 32]).await.unwrap();
     assert_eq!(bob.balance, 1_000 + 500);
     let proposer_acct = engine.get_account(&proposer_id).await.unwrap();
-    assert_eq!(proposer_acct.balance, FLOOR + FLOOR + FLOOR);
+    let burn = ((out.fees_collected as u128)
+        * (stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (stellereum::staking::BPS_DENOMINATOR as u128)) as u64;
+    assert_eq!(proposer_acct.balance, out.fees_collected - burn);
     assert_eq!(
-        sender.balance + bob.balance + proposer_acct.balance,
+        sender.balance + bob.balance + proposer_acct.balance + burn,
         total_before,
-        "supply conserved: every debit arrived somewhere"
+        "supply conserved: every debit arrived somewhere or was burned"
     );
 }
 
@@ -426,10 +430,8 @@ async fn consensus_penalty_mirror_escalates_and_clears() {
 /// predicate admission uses.
 #[tokio::test]
 async fn pq_activation_floor_includes_surcharge_at_apply() {
-    use stellereum::post_quantum::{
-        derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
-    };
-    use stellereum::sharding::Transaction as Tx;
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    use stellereum::sharding::{PqSignatureEnvelope, Transaction as Tx};
 
     let engine = engine_with_floor(FLOOR).await;
     let seed = 0xA0u8;

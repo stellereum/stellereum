@@ -38,10 +38,37 @@ fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
     ks.iter().map(|k| k.verifying_key().to_bytes()).collect()
 }
 
-async fn funded(ks: &[SigningKey]) -> Arc<InMemoryStateEngine> {
+async fn funded(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+) -> Arc<InMemoryStateEngine> {
     let vs = vset(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, BAL).await;
+    {
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let vid = k.verifying_key().to_bytes();
+            ledger.validator_pq_keys.insert(
+                vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            pq_reg
+                .adopt_legacy_key_at(
+                    vid,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                    0,
+                    true,
+                )
+                .expect("seed pq_registry");
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     st
 }
 
@@ -69,8 +96,9 @@ fn mkblock(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block_with_falcon(pkey, pfk);
+        round: 0,
+    };
+    b.sign_block_with_falcon(pkey, pfk);
     b
 }
 
@@ -116,10 +144,10 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
     let cheater_id = idv[3];
 
     // Four identical engines: local finalize, adopt, walk, replay.
-    let st_a = funded(&ks).await;
-    let st_b = funded(&ks).await;
-    let st_c = funded(&ks).await;
-    let st_d = funded(&ks).await;
+    let st_a = funded(&ks, &fks).await;
+    let st_b = funded(&ks, &fks).await;
+    let st_c = funded(&ks, &fks).await;
+    let st_d = funded(&ks, &fks).await;
 
     for st in [&st_a, &st_b, &st_c, &st_d] {
         assert_eq!(st.get_state_root().await, st_a.get_state_root().await);
@@ -256,7 +284,7 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     let vs = vset(&ks);
     let cheater = ks[3].clone();
     let cheater_id = cheater.verifying_key().to_bytes();
-    let st = funded(&ks).await;
+    let st = funded(&ks, &fks).await;
 
     let root0 = st.get_state_root().await;
     let pi = proposer_idx(&ks, &vs, 1, 0);

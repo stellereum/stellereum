@@ -160,20 +160,7 @@ fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
 }
 
 fn link_of(b: &Block) -> sync::HeaderLink {
-    sync::HeaderLink {
-        height: b.height,
-        block_hash: b.compute_hash(),
-        prev_hash: b.prev_hash,
-        state_root: b.state_root,
-        proposer: b.proposer,
-        qc: b.precommit_qc.clone().expect("quorum chain carries QCs"),
-        shard_id: b.shard_id,
-        round: b.round,
-        body_commitment: None,
-        mmr_epoch_root: b.mmr_epoch_root,
-        epoch_key_commitment: b.epoch_key_commitment,
-        timestamp: b.timestamp,
-    }
+    sync::HeaderLink::from_block(b).expect("quorum chain carries QCs")
 }
 
 async fn funded_engine() -> (InMemoryStateEngine, [u8; 32]) {
@@ -535,71 +522,98 @@ fn finality_gate_rejects_every_qc_mismatch() {
     let b = &blocks[1];
     let hash = b.compute_hash();
     let qc = b.precommit_qc.clone().unwrap();
-    assert!(
-        sync::verify_finality_for_header(&vs, b.height, &hash, &b.prev_hash, &b.proposer, &qc)
-            .is_ok()
-    );
-
-    // Wrong kind.
-    let mut wrong = qc.clone();
-    wrong.kind = VoteKind::Prevote;
-    assert!(sync::verify_finality_for_header(
+    let v4 = sync::HeaderV4Fields {
+        shard_id: b.shard_id,
+        round: b.round,
+        state_root: b.state_root,
+        body_commitment: Some(b.body_commitment()),
+        mmr_epoch_root: b.mmr_epoch_root,
+        epoch_key_commitment: b.epoch_key_commitment,
+        timestamp: b.timestamp,
+    };
+    let sched = stellereum::consensus::CommitteeSchedule::ParentHash;
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
         &vs,
         b.height,
         &hash,
         &b.prev_hash,
         &b.proposer,
-        &wrong
+        &qc,
+        sched,
+        Some(v4),
+    )
+    .is_ok());
+
+    // Wrong kind.
+    let mut wrong = qc.clone();
+    wrong.kind = VoteKind::Prevote;
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
+        &vs,
+        b.height,
+        &hash,
+        &b.prev_hash,
+        &b.proposer,
+        &wrong,
+        sched,
+        Some(v4),
     )
     .is_err());
 
     // QC for another height.
     let mut wrong = qc.clone();
     wrong.height += 1;
-    assert!(sync::verify_finality_for_header(
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
         &vs,
         b.height,
         &hash,
         &b.prev_hash,
         &b.proposer,
-        &wrong
+        &wrong,
+        sched,
+        Some(v4),
     )
     .is_err());
 
     // QC binding another block.
     let mut wrong = qc.clone();
     wrong.block_hash = Some([0x5Eu8; 32]);
-    assert!(sync::verify_finality_for_header(
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
         &vs,
         b.height,
         &hash,
         &b.prev_hash,
         &b.proposer,
-        &wrong
+        &wrong,
+        sched,
+        Some(v4),
     )
     .is_err());
 
     // Non-member proposer holds no schedule slot.
-    assert!(sync::verify_finality_for_header(
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
         &vs,
         b.height,
         &hash,
         &b.prev_hash,
         &[0x5Eu8; 32],
-        &qc
+        &qc,
+        sched,
+        Some(v4),
     )
     .is_err());
 
     // Sub-quorum signatures: one of four votes cannot decide.
     let mut thin = qc.clone();
     thin.signatures.truncate(1);
-    assert!(sync::verify_finality_for_header(
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
         &vs,
         b.height,
         &hash,
         &b.prev_hash,
         &b.proposer,
-        &thin
+        &thin,
+        sched,
+        Some(v4),
     )
     .is_err());
 }
@@ -615,11 +629,29 @@ fn header_finality_refuses_a_foreign_sortition_parent() {
     let hash = b.compute_hash();
     let qc = b.precommit_qc.clone().expect("quorum chain carries a QC");
     let parent = b.prev_hash;
+    let v4 = sync::HeaderV4Fields {
+        shard_id: b.shard_id,
+        round: b.round,
+        state_root: b.state_root,
+        body_commitment: Some(b.body_commitment()),
+        mmr_epoch_root: b.mmr_epoch_root,
+        epoch_key_commitment: b.epoch_key_commitment,
+        timestamp: b.timestamp,
+    };
+    let sched = stellereum::consensus::CommitteeSchedule::ParentHash;
 
     // The genuine certificate binds this parent.
-    assert!(
-        sync::verify_finality_for_header(&vs, b.height, &hash, &parent, &b.proposer, &qc).is_ok()
-    );
+    assert!(sync::verify_finality_for_header_v2_with_schedule(
+        &vs,
+        b.height,
+        &hash,
+        &parent,
+        &b.proposer,
+        &qc,
+        sched,
+        Some(v4),
+    )
+    .is_ok());
 
     // Re-elect the µQC under a different parent: everything else (kind,
     // height, block hash, proposer) is unchanged.
@@ -627,9 +659,17 @@ fn header_finality_refuses_a_foreign_sortition_parent() {
     inner.sortition_parent = [0xEEu8; 32];
     let mut foreign = qc.clone();
     foreign.attach_pq_micro_certificate(&inner);
-    let err =
-        sync::verify_finality_for_header(&vs, b.height, &hash, &parent, &b.proposer, &foreign)
-            .expect_err("a header anchor must refuse a certificate elected with a foreign parent");
+    let err = sync::verify_finality_for_header_v2_with_schedule(
+        &vs,
+        b.height,
+        &hash,
+        &parent,
+        &b.proposer,
+        &foreign,
+        sched,
+        Some(v4),
+    )
+    .expect_err("a header anchor must refuse a certificate elected with a foreign parent");
     assert!(
         err.contains("different parent block"),
         "refusal must name the parent binding, got: {err}"

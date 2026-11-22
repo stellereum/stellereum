@@ -75,7 +75,8 @@ fn gov_ops_block(
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    block.sign_block(proposer);
+    };
+    block.sign_block(proposer);
     block
 }
 

@@ -8,7 +8,8 @@ import {
   buildGovPropose,
   buildGovVote,
 } from "../src/builders.ts";
-import { keccak256 } from "../src/evm.ts";
+import { decodeEvmIntent, keccak256 } from "../src/evm.ts";
+import { encodeGovAction } from "../src/wire.ts";
 import {
   FORK_ID,
   FORK_ID_HEX,
@@ -88,11 +89,11 @@ test("keccak256 matches the EVM vectors (not SHA3-256)", () => {
   );
 });
 
-test("fork id mirrors the node's ruleset-v6 derivation", () => {
-  assert.equal(FORK_ID_HEX, "0x0f584a46");
-  assert.equal(FORK_ID_RULES.length, 23);
+test("fork id mirrors the node's ruleset-v7 derivation", () => {
+  assert.equal(FORK_ID_HEX, "0x3ae00ebc");
+  assert.equal(FORK_ID_RULES.length, 32);
   assert.equal(
-    deriveForkId(5757n, 6, FORK_ID_RULES),
+    deriveForkId(5757n, 7, FORK_ID_RULES),
     FORK_ID,
   );
 });
@@ -254,5 +255,62 @@ test("(c) gov propose/vote bytes match the node builder's fixed vectors", () => 
       "5041594c4f414400000020010000000000000036000000080000000000000002" +
       "0000007b00000000000000434841494e5f4944000000000000167d",
     "gov vote signing preimage differs from the node builder",
+  );
+});
+
+test("encodeGovAction encodes set_fee_split_bps and rejects invalid splits", () => {
+  const encoded = encodeGovAction({
+    type: "set_fee_split_bps",
+    burn_bps: 5_000,
+    proposer_bps: 3_000,
+    staking_bps: 2_000,
+  });
+  assert.equal(
+    hex(encoded),
+    "0d000000" +
+      "8813000000000000" +
+      "b80b000000000000" +
+      "d007000000000000",
+  );
+
+  assert.throws(
+    () =>
+      encodeGovAction({
+        type: "set_fee_split_bps",
+        burn_bps: 5_000,
+        proposer_bps: 3_000,
+        staking_bps: 1_999,
+      }),
+    /must equal 10000/,
+  );
+
+  assert.throws(
+    () =>
+      encodeGovAction({
+        type: "set_fee_split_bps",
+        burn_bps: -1,
+        proposer_bps: 5_001,
+        staking_bps: 5_000,
+      }),
+    /non-negative integers/,
+  );
+
+  assert.throws(
+    () =>
+      encodeGovAction({
+        type: "set_fee_split_bps",
+        burn_bps: 5_000.5,
+        proposer_bps: 2_500.5,
+        staking_bps: 2_499,
+      }),
+    /non-negative integers/,
+  );
+});
+
+test("decodeEvmIntent refuses sub-nano wei remainders", () => {
+  const subNanoRaw = legacyRaw(7, 1_500_000_000n, 5757);
+  assert.throws(
+    () => decodeEvmIntent(subNanoRaw),
+    /sub-nano wei remainder.*value must be a multiple of 1_000_000_000 wei/,
   );
 });

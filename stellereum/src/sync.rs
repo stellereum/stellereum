@@ -3933,7 +3933,20 @@ mod tests {
         let vs = crate::consensus::ValidatorSet::from_list(vec![(gpk, 1)]);
         let gkeys = vec![(gk.clone(), gfk.clone())];
         let mk_link = |h: u64, prev: [u8; 32], root: [u8; 32]| {
-            let block_hash = [h as u8; 32];
+            let body_commitment = [h as u8; 32];
+            let hdr = crate::sharding::BlockHeader {
+                shard_id: 0,
+                height: h,
+                round: 0,
+                prev_hash: prev,
+                state_root: root,
+                body_commitment,
+                mmr_epoch_root: [0u8; 32],
+                epoch_key_commitment: [0u8; 32],
+                timestamp: h,
+                proposer: gpk,
+            };
+            let block_hash = hdr.compute_hash();
             let qc = pq_cert_for(h, 0, block_hash, prev, &vs, &gkeys);
             HeaderLink {
                 height: h,
@@ -3944,7 +3957,7 @@ mod tests {
                 qc,
                 shard_id: 0,
                 round: 0,
-                body_commitment: None,
+                body_commitment: Some(body_commitment),
                 mmr_epoch_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 timestamp: h,
@@ -3953,8 +3966,9 @@ mod tests {
         let mut links: HashMap<u64, HeaderLink> = HashMap::new();
         let mut prev = [0u8; 32];
         for h in 1..=3u64 {
-            links.insert(h, mk_link(h, prev, [h as u8; 32]));
-            prev = [h as u8; 32];
+            let link = mk_link(h, prev, [h as u8; 32]);
+            prev = link.block_hash;
+            links.insert(h, link);
         }
         let root = verify_snapshot_anchor(None, [0u8; 32], 3, &vs, 1_000_000, |h| {
             let l = links.get(&h).cloned();

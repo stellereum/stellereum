@@ -220,20 +220,7 @@ impl<'a> FlakyPeers<'a> {
         if b.height != h {
             return None;
         }
-        Some(HeaderLink {
-            height: b.height,
-            block_hash: b.compute_hash(),
-            prev_hash: b.prev_hash,
-            state_root: b.state_root,
-            proposer: b.proposer,
-            qc: b.precommit_qc.clone()?,
-            shard_id: b.shard_id,
-            round: b.round,
-            body_commitment: None,
-            mmr_epoch_root: b.mmr_epoch_root,
-            epoch_key_commitment: b.epoch_key_commitment,
-            timestamp: b.timestamp,
-        })
+        HeaderLink::from_block(b)
     }
 
     fn snapshot_at(&self, h: u64) -> Option<Vec<u8>> {

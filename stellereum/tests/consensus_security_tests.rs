@@ -455,7 +455,8 @@ async fn proposal_from_wrong_proposer_rejected() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    bad.sign_block(impostor);
+    };
+    bad.sign_block(impostor);
     assert!(
         rt.on_proposal(impostor.verifying_key().to_bytes(), bad, rt.hc.round)
             .await

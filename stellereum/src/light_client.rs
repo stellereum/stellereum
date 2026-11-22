@@ -2798,13 +2798,46 @@ mod tests {
             .expect("quorum must compile a Falcon µQC")
     }
 
+    /// Build a v4 checkpoint with a valid `BlockHeader` commitment and Falcon µQC.
+    fn v4_checkpoint(
+        height: u64,
+        parent_hash: BlockHash,
+        state_root: CellHash,
+        body_commitment: [u8; 32],
+        cert_parent: [u8; 32],
+        vs: &ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
+    ) -> Checkpoint {
+        let hdr = crate::sharding::BlockHeader {
+            shard_id: 0,
+            height,
+            round: 0,
+            prev_hash: parent_hash,
+            state_root,
+            body_commitment,
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 0,
+            proposer: [0u8; 32],
+        };
+        let block_hash = hdr.compute_hash();
+        let cert = pq_cert_for(height, 0, block_hash, cert_parent, vs, keys);
+        Checkpoint::from_block_header(hdr, cert)
+    }
+
     /// A light client anchored at a checkpoint over `state_root`.
     fn client_for(state_root: CellHash) -> LightClient {
         let (validators, sk, fk) = pq_singleton(0x33);
-        let block_hash = [0x44u8; 32];
         let parent = [0x99u8; 32];
-        let cert = pq_cert_for(1, 0, block_hash, parent, &validators, &[(sk, fk)]);
-        let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+        let checkpoint = v4_checkpoint(
+            1,
+            [0u8; 32],
+            state_root,
+            [0x44u8; 32],
+            parent,
+            &validators,
+            &[(sk, fk)],
+        );
         LightClient::new(validators, checkpoint).expect("light client init")
     }
 
@@ -3014,9 +3047,15 @@ mod tests {
         let state_root = trie.root_hash();
         let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
-        let block_hash = [0x22u8; 32];
-        let cert = pq_cert_for(1, 0, block_hash, [0x99u8; 32], &validators, &[(sk, fk)]);
-        let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+        let checkpoint = v4_checkpoint(
+            1,
+            [0u8; 32],
+            state_root,
+            [0x22u8; 32],
+            [0x99u8; 32],
+            &validators,
+            &[(sk, fk)],
+        );
         let lc = LightClient::new(validators, checkpoint).expect("light client init");
 
         // Verify SPV account query against 49-byte leaf
@@ -3061,9 +3100,15 @@ mod tests {
         let state_root = trie.root_hash();
         let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
-        let block_hash = [0x33u8; 32];
-        let cert = pq_cert_for(1, 0, block_hash, [0x99u8; 32], &validators, &[(sk, fk)]);
-        let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
+        let checkpoint = v4_checkpoint(
+            1,
+            [0u8; 32],
+            state_root,
+            [0x33u8; 32],
+            [0x99u8; 32],
+            &validators,
+            &[(sk, fk)],
+        );
         let lc = LightClient::new(validators, checkpoint).expect("light client init");
 
         let proven = lc
@@ -3281,19 +3326,30 @@ mod tests {
     fn historical_root_fixture(
         archive_height: u64,
         root: CellHash,
+        anchor_parent: [u8; 32],
         vs: &ValidatorSet,
         keys: &[(SigningKey, FalconKeypair)],
     ) -> (serde_json::Value, Checkpoint, [u8; 32]) {
         let anchor_height = archive_height + 1;
-        let anchor_hash = [0xB0u8; 32];
-        let parent_hash = [0xA0u8; 32];
-        let cert = pq_cert_for(anchor_height, 0, anchor_hash, parent_hash, vs, keys);
+        let body_commitment = [0xB0u8; 32];
+        let cp = v4_checkpoint(
+            anchor_height,
+            anchor_parent,
+            root,
+            body_commitment,
+            anchor_parent,
+            vs,
+            keys,
+        );
+        let anchor_hash = cp.block_hash;
+        let cert = &cp.cert;
         let answer = serde_json::json!({
             "height": archive_height,
             "state_root": hex::encode(root),
             "anchor_height": anchor_height,
             "anchor_hash": hex::encode(anchor_hash),
-            "prev_hash": hex::encode(parent_hash),
+            "prev_hash": hex::encode(anchor_parent),
+            "body_commitment": hex::encode(body_commitment),
             "cert": {
                 "height": cert.height,
                 "round": cert.round,
@@ -3306,7 +3362,6 @@ mod tests {
             },
             "finalized": true,
         });
-        let cp = Checkpoint::new(anchor_height, anchor_hash, parent_hash, root, cert);
         (answer, cp, anchor_hash)
     }
 
@@ -3463,22 +3518,22 @@ mod tests {
 
         // The client's trusted anchor: the finalized block AT the archive
         // height, committing to the historical root.
-        let anchor_hash = [0xA0u8; 32];
-        let anchor_parent = [0x99u8; 32];
-        let anchor_cert = pq_cert_for(
+        let anchor = v4_checkpoint(
             archive_height,
-            0,
-            anchor_hash,
-            anchor_parent,
+            [0u8; 32],
+            root,
+            [0xA0u8; 32],
+            [0x99u8; 32],
             &validators,
             &keys,
         );
-        let anchor = Checkpoint::new(archive_height, anchor_hash, [0u8; 32], root, anchor_cert);
+        let anchor_hash = anchor.block_hash;
         let mut lc = LightClient::new(validators.clone(), anchor).expect("anchor");
 
         // The historical-root answer for the SAME height, anchored at
         // height+1 with a fresh QC: parse, verify, adopt.
-        let (answer, cp, _) = historical_root_fixture(archive_height, root, &validators, &keys);
+        let (answer, cp, _) =
+            historical_root_fixture(archive_height, root, anchor_hash, &validators, &keys);
         let parsed = Checkpoint::from_historical_root_json(&answer).expect("parse");
         assert_eq!(parsed, cp);
         parsed

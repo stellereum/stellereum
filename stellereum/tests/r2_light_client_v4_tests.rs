@@ -198,8 +198,10 @@ fn finalized_header_json_from_block(block: &Block) -> serde_json::Value {
 }
 
 #[test]
-fn v3_legacy_checkpoints_and_headers_without_body_commitment_pass_at_default_and_below_h() {
-    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, u64::MAX);
+fn v3_legacy_checkpoints_and_headers_without_body_commitment_pass_below_h() {
+    assert_eq!(HEADER_COMMIT_ACTIVATION_HEIGHT, 0);
+    assert!(header_commit_active_at(0));
+    let _pre_v7 = HeaderCommitOverrideGuard::new(Some(u64::MAX));
     assert!(!header_commit_active_at(0));
     assert!(!header_commit_active_at(100));
 

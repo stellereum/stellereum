@@ -120,8 +120,9 @@ fn hunt1_sync_accepts_chain_signed_only_by_non_validators() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        for k in &attacker {
+            round: 0,
+        };
+        for k in &attacker {
             sign_with(&mut b, k);
         }
         prev = b.compute_hash();
@@ -219,8 +220,9 @@ async fn hunt1b_forged_chain_passes_the_state_root_replay_too() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        for k in &attacker {
+            round: 0,
+        };
+        for k in &attacker {
             sign_with(&mut b, k);
         }
         prev = b.compute_hash();
@@ -311,8 +313,9 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block(&proposer_k);
+            round: 0,
+        };
+        b.sign_block(&proposer_k);
         b
     };
     let block_hash = block.compute_hash();
@@ -401,8 +404,9 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block(&proposer_k);
+            round: 0,
+        };
+        b.sign_block(&proposer_k);
         b
     };
     let block_hash = block.compute_hash();
@@ -484,8 +488,9 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block(pk);
+            round: 0,
+        };
+        b.sign_block(pk);
         b
     };
 
@@ -701,8 +706,9 @@ fn hunt7b_proposal_round_field_is_unauthenticated_metadata() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    b.sign_block(&fake_proposer[0]);
+        round: 0,
+    };
+    b.sign_block(&fake_proposer[0]);
     let msg = ConsensusMsg::Proposal {
         height: 1,
         round: 1_000_000,

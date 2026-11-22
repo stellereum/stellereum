@@ -82,7 +82,10 @@ fn fork_mismatch_is_refused_and_two_node_side_waits_for_the_third() {
             report(b, 1, true, Some(FORK_B), Some(PROTOCOL)),
         ],
     );
-    assert!(!b_view.eligible, "the fork-B node must be refused consensus");
+    assert!(
+        !b_view.eligible,
+        "the fork-B node must be refused consensus"
+    );
     assert_eq!(b_view.matching_power, 1);
 
     // The third is upgraded: both sides now see the whole committed set on
@@ -140,7 +143,11 @@ fn threshold_is_strictly_more_than_two_thirds_of_stake() {
         PROTOCOL,
         4,
         3,
-        &[matching(a, 1), matching(b, 1), report(c, 1, false, None, None)],
+        &[
+            matching(a, 1),
+            matching(b, 1),
+            report(c, 1, false, None, None),
+        ],
     );
     assert!(!two.eligible);
     let three = evaluate_supermajority_gate(
@@ -194,7 +201,10 @@ fn weighted_stake_uses_power_not_validator_count() {
         PROTOCOL,
         100,
         67,
-        &[matching(a, 60), report(b, 40, true, Some(FORK_B), Some(PROTOCOL))],
+        &[
+            matching(a, 60),
+            report(b, 40, true, Some(FORK_B), Some(PROTOCOL)),
+        ],
     );
     assert!(!a60.eligible);
     assert_eq!(a60.matching_power, 60);
@@ -217,7 +227,10 @@ fn weighted_stake_uses_power_not_validator_count() {
 fn environment_parsing_is_fail_closed() {
     assert_eq!(parse_wait_supermajority_height(None).unwrap(), None);
     assert_eq!(parse_wait_supermajority_height(Some("  ")).unwrap(), None);
-    assert_eq!(parse_wait_supermajority_height(Some(" 4242 ")).unwrap(), Some(4242));
+    assert_eq!(
+        parse_wait_supermajority_height(Some(" 4242 ")).unwrap(),
+        Some(4242)
+    );
     assert_eq!(parse_wait_supermajority_height(Some("0")).unwrap(), Some(0));
     assert!(
         parse_wait_supermajority_height(Some("not-a-height")).is_err(),
@@ -311,7 +324,10 @@ fn committed_set_requires_an_exact_snapshot_instead_of_guessing() {
     let store = stellereum::storage::Storage::open(&dir.join("store")).expect("open store");
     let err = upgrade_halt::committed_validator_set_at(&store, 12)
         .expect_err("a missing committed snapshot must fail closed");
-    assert!(err.contains("no committed domain snapshot at height 12"), "{err}");
+    assert!(
+        err.contains("no committed domain snapshot at height 12"),
+        "{err}"
+    );
     drop(store);
     std::fs::remove_dir_all(&dir).ok();
 }

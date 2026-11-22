@@ -1113,7 +1113,10 @@ async fn parallel_sponsored_tx_sponsor_equals_recipient_matches_sequential() {
     tx.signature.extend_from_slice(&suffix);
 
     assert_eq!(tx.sponsored_grant().expect("third-party grant").sponsor, to);
-    assert!(!tx.is_pq_activation(), "fixture must take the plain planner");
+    assert!(
+        !tx.is_pq_activation(),
+        "fixture must take the plain planner"
+    );
 
     let seq = InMemoryStateEngine::new();
     let par = InMemoryStateEngine::new().with_parallel_exec(true);

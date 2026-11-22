@@ -185,15 +185,10 @@ fn dummy_contract(address: [u8; 32]) -> Contract {
     }
 }
 
-async fn call_router(
-    svc: &mut axum::Router,
-    req: Request<Body>,
-) -> axum::response::Response {
-    std::future::poll_fn(|cx| {
-        <axum::Router as tower::Service<Request<Body>>>::poll_ready(svc, cx)
-    })
-    .await
-    .unwrap();
+async fn call_router(svc: &mut axum::Router, req: Request<Body>) -> axum::response::Response {
+    std::future::poll_fn(|cx| <axum::Router as tower::Service<Request<Body>>>::poll_ready(svc, cx))
+        .await
+        .unwrap();
     <axum::Router as tower::Service<Request<Body>>>::call(svc, req)
         .await
         .unwrap()
@@ -291,7 +286,9 @@ async fn explorer_router_rpc_enforces_concurrency_limit_without_double_rate_limi
         }));
         let mut svc = app.clone();
         let req = rpc_post_request(body, 43000 + i);
-        handles.push(tokio::spawn(async move { call_router(&mut svc, req).await }));
+        handles.push(tokio::spawn(
+            async move { call_router(&mut svc, req).await },
+        ));
     }
 
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -159,7 +159,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 /// Wrap an attested deposit as one transaction's payload.
 fn ops(att: BridgeIntent, intent: BridgeIntent) -> Vec<OpCode> {
@@ -313,8 +314,9 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    anchor.sign_block(&sk);
+        round: 0,
+    };
+    anchor.sign_block(&sk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
     store
         .set_finalized(NEXT_H, &anchor_hash)
@@ -487,6 +489,15 @@ async fn bridge_snapshot_bytes_round_trip_and_absent_means_empty() {
 
 #[tokio::test]
 async fn withdrawal_queue_and_rate_window_survive_the_restore() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (e, _vals) = setup(3).await;
     // FULL-PQ: the payer is an implicit Falcon-512 sender (amounts, queue
     // shape and time-lock asserts unchanged).

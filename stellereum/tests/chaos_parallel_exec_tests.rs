@@ -934,7 +934,7 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         &trader_1,
         dest_t1,
         0,
-        1_000,
+        5_000,
         2,
         1,
         1,

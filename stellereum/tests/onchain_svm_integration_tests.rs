@@ -171,19 +171,19 @@ async fn block_execution_runs_payloads_and_conserves_native_value() {
     let engine = funded_engine(from, 1_000_000).await;
 
     let payload = vec![OpCode::Push(42), OpCode::Halt];
-    let tx = pq_tx(&fk, from, to, 1_000, 560, 0, payload);
+    let tx = pq_tx(&fk, from, to, 1_000, 500_000, 0, payload);
     let (applied, failed) = engine.apply_block_parallel(&[tx], 0).await;
     assert_eq!((applied, failed), (1, 0));
 
     let sender = engine.get_account(&from).await.unwrap();
     let recipient = engine.get_account(&to).await.unwrap();
-    // FEE-01: the bill is `min(declared, consumed + intrinsic)` — floored at
-    // consensus (0 here). The payload consumed one `Push` (`Halt` is free), so
-    // the fee is that measurement, capped at the declared 560. (Before FEE-01
-    // the block path charged the whole 560 declaration.)
+    // FEE-01 + EXEC_HARDENING_V1: the bill is
+    // `min(declared, max(consumed, TX_INTRINSIC_GAS))` — floored at consensus
+    // (0 here). The payload consumed 1 gas (< TX_INTRINSIC_GAS), so the billed
+    // fee is `GAS_BASIC_TRANSFER` (280 000), refunding the rest of 500 000.
     assert_eq!(
         sender.balance,
-        1_000_000 - 1_000 - stellereum::svm::GAS_PUSH
+        1_000_000 - 1_000 - stellereum::svm::GAS_BASIC_TRANSFER
     );
     assert_eq!(recipient.balance, 1_000);
 }

@@ -1174,7 +1174,9 @@ mod refused_chunk_regression {
         assert_eq!(accepted.len(), MAX_BATCH_ITEMS);
         assert_eq!(
             ids(outbox.iter().cloned()),
-            (MAX_BATCH_ITEMS..count).map(|x| x as u8).collect::<Vec<_>>()
+            (MAX_BATCH_ITEMS..count)
+                .map(|x| x as u8)
+                .collect::<Vec<_>>()
         );
         assert!(!enqueue_outbox(&mut outbox, vote(MAX_BATCH_ITEMS as u8, 4)));
         flush_outbox_with(&mut outbox, 9, 4, 1, |chunk| {

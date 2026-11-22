@@ -574,9 +574,13 @@ async fn shard2_n3_cross_shard_transfer_through_degraded_soak() {
         1_000_000 - amount - gas - PQ_ACTIVATION_SURCHARGE_GAS
     );
     let supply_after = supply_view(&sc, &s0_view, &[recipient_addr]).await;
+    let total_fee = gas + PQ_ACTIVATION_SURCHARGE_GAS;
+    let burned = ((total_fee as u128 * stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / stellereum::staking::BPS_DENOMINATOR as u128) as u64;
     assert_eq!(
-        supply_after, supply_before,
-        "supply must be conserved through the degraded soak"
+        supply_after + burned,
+        supply_before,
+        "supply must be conserved through the degraded soak (accounting for FEE_MARKET_V2 burn)"
     );
     eprintln!(
         "N3 degraded xfer ok: amount={amount} gas={gas} supply={supply_before}->{supply_after} \
@@ -884,8 +888,9 @@ async fn shard2_n3_double_spend_refused_everywhere() {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                round: 0,
-        };        forged.sign_block_with_falcon(&skey, fk);
+            round: 0,
+        };
+        forged.sign_block_with_falcon(&skey, fk);
         let err = node
             .validate_proposal(&forged, root)
             .expect_err("replayed consumption must be refused");

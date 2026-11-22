@@ -47,10 +47,12 @@ use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload};
+use stellereum::zkml::effective_chain_id;
 
 #[path = "support/falcon_votes.rs"]
 mod falcon_votes;
@@ -73,30 +75,51 @@ fn pq_identity(seed: u8) -> ([u8; 32], FalconKeypair) {
     (addr, fk)
 }
 
-/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures.
-fn pq_stake_tx(
-    fk: &FalconKeypair,
-    from: [u8; 32],
-    validator: [u8; 32],
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures,
+/// registering a new validator under Ruleset v7 `SysCallRegisterValidator`.
+fn pq_register_validator_tx(
+    cold_fk: &FalconKeypair,
+    cold_addr: [u8; 32],
+    hot_fk: &FalconKeypair,
     amount: u64,
     gas_limit: u64,
-) -> Transaction {
+) -> (Transaction, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let validator_id = derive_validator_id(chain_id, &cold_addr, hot_fk.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &validator_id,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_fk.public_key(),
+    );
+    let voting_pop = hot_fk.sign(&pop_msg);
     let mut tx = Transaction {
-        from,
-        to: validator,
+        from: cold_addr,
+        to: validator_id,
         amount: 0,
         gas_limit,
         nonce: 0,
         source_shard: MASTERCHAIN_SHARD,
         target_shard: MASTERCHAIN_SHARD,
         signature: Vec::new(),
-        payload: vec![OpCode::SysCallStake { validator, amount }],
+        payload: vec![OpCode::SysCallRegisterValidator(Box::new(
+            RegisterValidatorPayload {
+                amount,
+                commission_bps: 0,
+                withdrawal_address: cold_addr,
+                voting_scheme: PqScheme::Falcon512.id(),
+                voting_pubkey: hot_fk.public_key().to_vec(),
+                voting_pop,
+            },
+        ))],
         priority_fee_per_gas: 0,
     };
     let msg = tx.signing_message();
-    let sig = fk.sign(&msg);
+    let sig = cold_fk.sign(&msg);
     tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
-    tx
+    (tx, validator_id)
 }
 
 /// Four bonded validators with funded accounts, plus a funded staking pool
@@ -214,12 +237,19 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
     // A newcomer E bonds INSIDE block H=2. After the transition the set has
     // 5 members and the same 3 signatures are a sub-quorum — but the
     // evidence is for H-1, when the set still had 4.
-    let (newcomer_id, newcomer_fk) = pq_identity(0xE1);
+    let (newcomer_cold_addr, newcomer_cold_fk) = pq_identity(0xE1);
+    let (_, newcomer_hot_fk) = pq_identity(0xE3);
     engine
-        .credit_native(&newcomer_id, BOND * 4)
+        .credit_native(&newcomer_cold_addr, BOND * 4)
         .await
         .expect("fund newcomer");
-    let bond_tx = pq_stake_tx(&newcomer_fk, newcomer_id, newcomer_id, BOND, 500_000);
+    let (bond_tx, newcomer_id) = pq_register_validator_tx(
+        &newcomer_cold_fk,
+        newcomer_cold_addr,
+        &newcomer_hot_fk,
+        BOND,
+        500_000,
+    );
 
     let block = block_h2_with_bond(a, bond_tx, qc);
     engine.apply_block_transition(&block, 0).await;

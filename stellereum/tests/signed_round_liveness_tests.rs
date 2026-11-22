@@ -21,7 +21,7 @@ use ed25519_dalek::SigningKey;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use stellereum::consensus::{register_validator_pq_key, Vote, VoteKind, ValidatorSet};
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet, Vote, VoteKind};
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
@@ -37,7 +37,11 @@ const REXMIT_MS: u64 = 400;
 
 #[derive(Clone)]
 enum Msg {
-    Proposal { from: usize, block: Box<Block>, round: u32 },
+    Proposal {
+        from: usize,
+        block: Box<Block>,
+        round: u32,
+    },
     Vote(Vote),
 }
 
@@ -86,10 +90,7 @@ impl Rig {
     /// (1500/1000/1000: the 1500 node is in every quorum), then force every
     /// node onto the SAME locked body signed at an older round and stagger
     /// their local rounds/starts.
-    async fn locked_body(
-        starts_ms: &[u64],
-        round_offsets: &[u32],
-    ) -> (Rig, [u8; 32], u32) {
+    async fn locked_body(starts_ms: &[u64], round_offsets: &[u32]) -> (Rig, [u8; 32], u32) {
         let ks = node_keys(0x51);
         let powers = [1000u64, 1000, 1500];
         let vs = ValidatorSet::from_list(
@@ -131,8 +132,7 @@ impl Rig {
         };
         let dev_addr = dev_key.verifying_key().to_bytes();
         for n in nodes.iter_mut() {
-            n.rt
-                .state
+            n.rt.state
                 .update_account(AccountState::new(dev_addr, 1_000_000_000_000_000_000))
                 .await;
         }
@@ -283,8 +283,7 @@ impl Rig {
             match p.msg {
                 Msg::Proposal { from, block, round } => {
                     let proposer = self.nodes[from].rt.id;
-                    let _ = self
-                        .nodes[p.to]
+                    let _ = self.nodes[p.to]
                         .rt
                         .on_proposal(proposer, *block, round)
                         .await;
@@ -355,7 +354,8 @@ impl Rig {
 
         // 7. view change
         for i in 0..self.nodes.len() {
-            if self.active(i) && self.now_ms.saturating_sub(self.nodes[i].round_started_ms) >= self.timeout_ms
+            if self.active(i)
+                && self.now_ms.saturating_sub(self.nodes[i].round_started_ms) >= self.timeout_ms
             {
                 self.nodes[i].rt.hc.next_round();
                 self.nodes[i].round_started_ms = self.now_ms;
@@ -475,8 +475,7 @@ async fn same_value_vote_keeps_the_proposal_live_in_the_peer_round() {
     );
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vs, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1)
-        .with_falcon_key(fks[0].clone());
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1).with_falcon_key(fks[0].clone());
 
     // A live proposal accepted in the current round.
     let body = Block {
@@ -499,7 +498,10 @@ async fn same_value_vote_keeps_the_proposal_live_in_the_peer_round() {
     // ROUND_LOOKBACK) with the proposal wiped.
     assert!(rt.note_peer_vote_round_for(rt.hc.height, r + 10, Some(bh)));
     assert_eq!(rt.hc.round, r + 10, "same-value vote must reach its round");
-    assert!(rt.hc.has_live_proposal(), "locked proposal must survive the sync");
+    assert!(
+        rt.hc.has_live_proposal(),
+        "locked proposal must survive the sync"
+    );
     assert_eq!(rt.hc.decide_prevote(), Some(bh));
     assert_eq!(rt.prevote_round(), r);
 
@@ -535,8 +537,7 @@ async fn two_near_head_peers_corroborate_the_full_chase() {
     );
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vs, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1)
-        .with_falcon_key(fks[0].clone());
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1).with_falcon_key(fks[0].clone());
     let r = rt.hc.round;
     // Two distinct peers in the head's neighbourhood (r+2 and r+10) let the
     // r->r+10 jump finish in one call; a lone reporter would stop at +8.

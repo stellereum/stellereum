@@ -30,8 +30,8 @@ export class ProtocolError extends Error {
 
 export const PROTOCOL_MAJOR = 1;
 export const PROTOCOL_MINOR = 0;
-export const CONSENSUS_RULESET_VERSION = 6;
-export const DOMAIN_SET_VERSION = 3;
+export const CONSENSUS_RULESET_VERSION = 7;
+export const DOMAIN_SET_VERSION = 4;
 export const DEFAULT_CHAIN_ID = 5757;
 export const CAP_COMPACT_GOSSIP = 1n << 0n;
 export const CAP_MESH_DIRECT = 1n << 1n;
@@ -62,6 +62,15 @@ export const FORK_ID_RULES: readonly bigint[] = [
   3_600_000n, // MAX_BLOCK_TIMESTAMP_DRIFT_MS (1 hour; ruleset v4)
   1n, // CHAIN_SUPPLY_PARTITION_VERSION (ruleset v5)
   1_000_000_000_000_000_000n, // TOTAL_SUPPLY_CAP (ruleset v5)
+  0n,
+  0n,
+  0n,
+  0n,
+  0n,
+  720_000n,
+  0n,
+  0n,
+  0n,
 ];
 
 const FORK_DOMAINS: readonly Uint8Array[] = [
@@ -72,6 +81,15 @@ const FORK_DOMAINS: readonly Uint8Array[] = [
   new TextEncoder().encode("STELL_VOTEFAL_V1"),
   new TextEncoder().encode("STELL_UQC_PQ_V5_"),
   new TextEncoder().encode("STELL_QC_PQ_V5__"),
+  new TextEncoder().encode("STELLEREUM_BODY_V4\0"),
+  new TextEncoder().encode("STELLEREUM_HDR_V4\0"),
+  new TextEncoder().encode("STELL_PQ_KEY_POP_V1"),
+  new TextEncoder().encode("STELL_VAL_ID_V1"),
+  new TextEncoder().encode("STELL_BRIDGE_RELEASE_RECEIPT_V2"),
+  new TextEncoder().encode("STELL_BRIDGE_HEADER_V2"),
+  new TextEncoder().encode("TON_MULTISIG_RELEASE_V2"),
+  new TextEncoder().encode("EVM_TELEPORT_RELEASE_V2"),
+  new TextEncoder().encode("STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V2"),
 ];
 
 const FNV_OFFSET = 0x811c9dc5;
@@ -117,7 +135,7 @@ export function deriveForkId(
   return h >>> 0;
 }
 
-/** The fork id this package was built for (ruleset v6). */
+/** The fork id this package was built for (ruleset v7). */
 export const FORK_ID = deriveForkId(
   BigInt(DEFAULT_CHAIN_ID),
   CONSENSUS_RULESET_VERSION,

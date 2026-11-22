@@ -3171,7 +3171,36 @@ mod tests {
             );
             br.next_withdrawal_id = 2;
         }
-        // Matured small withdrawal: nothing missing.
+        // Matured small withdrawal: under Ruleset v7 (`BRIDGE_V2_ACTIVATION_HEIGHT = 0`),
+        // `missing` flags `release-receipt` until the 2/3 Falcon release receipt is recorded.
+        let pre_receipt = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 0 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pre_receipt["missing"],
+            json!(["release-receipt"]),
+            "missing must flag release-receipt before receipt is attached"
+        );
+        {
+            let mut br = engine.bridge_write().await;
+            br.release_receipts.insert(
+                0,
+                crate::bridge::ReleaseReceiptRecord {
+                    target_chain: crate::bridge::SupportedChain::Ton,
+                    target_address: "ton-recipient".to_string(),
+                    amount: 10,
+                    external_tx_hash: [0xABu8; 32],
+                    finalized_head: 100,
+                    attestation_height: 0,
+                    settled_at: now,
+                },
+            );
+        }
+        // Now nothing is missing.
         let ready = dispatch(
             &engine,
             "stell_bridgeReleaseEstimate",

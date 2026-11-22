@@ -18,13 +18,15 @@ use stellereum::consensus::ValidatorSet;
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::staking::{
     StakingLedger, MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload, GAS_BASIC_TRANSFER};
 use stellereum::token::{TokenError, TokenMetadata};
+use stellereum::zkml::effective_chain_id;
 
 fn stell(n: u64) -> u64 {
     n * 1_000_000_000
@@ -273,41 +275,59 @@ async fn staking_withdrawal_moves_coins_from_the_pool() {
 async fn third_party_can_buy_any_validators_voting_power() {
     let engine = InMemoryStateEngine::new();
     let (victim, victim_addr) = pq_key(0x81);
+    let (victim_hot, _) = pq_key(0x83);
     let (funder, funder_addr) = pq_key(0x82);
+
+    let chain_id = effective_chain_id();
+    let validator_id = derive_validator_id(chain_id, &victim_addr, victim_hot.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &validator_id,
+        &victim_addr,
+        0,
+        PqScheme::Falcon512,
+        victim_hot.public_key(),
+    );
 
     engine
         .update_account(AccountState::new(
             victim_addr,
-            MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 20_000,
+            MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 500_000,
         ))
         .await;
     let b = pq_tx(
         &victim,
         0,
-        20_000,
-        vec![OpCode::SysCallStake {
-            validator: victim_addr,
-            amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
-        }],
+        500_000,
+        vec![OpCode::SysCallRegisterValidator(Box::new(
+            RegisterValidatorPayload {
+                amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
+                commission_bps: 0,
+                withdrawal_address: victim_addr,
+                voting_scheme: PqScheme::Falcon512.id(),
+                voting_pubkey: victim_hot.public_key().to_vec(),
+                voting_pop: victim_hot.sign(&pop_msg),
+            },
+        ))],
     );
     engine.apply_transaction(&b, 0).await.unwrap();
     let before = engine
         .staking_read()
         .await
         .to_validator_set()
-        .power_of(&victim_addr);
+        .power_of(&validator_id);
     println!("victim validator power before: {before}");
 
     // The funder signs a transaction that names the VICTIM's validator id.
     engine
-        .update_account(AccountState::new(funder_addr, stell(1_000_000) + 100_000))
+        .update_account(AccountState::new(funder_addr, stell(1_000_000) + 500_000))
         .await;
     let t = pq_tx(
         &funder,
         0,
-        100_000,
+        500_000,
         vec![OpCode::SysCallStake {
-            validator: victim_addr,
+            validator: validator_id,
             amount: stell(1_000_000),
         }],
     );
@@ -316,7 +336,7 @@ async fn third_party_can_buy_any_validators_voting_power() {
         .staking_read()
         .await
         .to_validator_set()
-        .power_of(&victim_addr);
+        .power_of(&validator_id);
     println!(
         "the funder paid {} STELL and bought a stranger {} STELL of voting power",
         stell(1_000_000) / 1_000_000_000,
@@ -325,12 +345,12 @@ async fn third_party_can_buy_any_validators_voting_power() {
     assert_eq!(power, before + stell(1_000_000));
     assert_eq!(
         engine.get_account(&funder_addr).await.unwrap().balance,
-        98_000,
-        "the funder's coins left their account (only the 2,000 gas stayed)"
+        500_000 - GAS_BASIC_TRANSFER,
+        "the funder's coins left their account (only unused gas above TX_INTRINSIC_GAS stayed)"
     );
     assert_eq!(
         engine.get_account(&victim_addr).await.unwrap().balance,
-        18_000,
+        500_000 - GAS_BASIC_TRANSFER,
         "the validator was never debited: the coins went to the pool"
     );
     assert_eq!(

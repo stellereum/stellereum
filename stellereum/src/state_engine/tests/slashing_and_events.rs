@@ -239,8 +239,9 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    block.sign_block(&proposer);
+        round: 0,
+    };
+    block.sign_block(&proposer);
 
     let outcome = engine.apply_block_transition(&block, 0).await;
 
@@ -266,16 +267,21 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     );
     assert_eq!(sender.nonce, 1, "sender nonce incremented");
 
-    // 4. Conservation of value: proposer receives fees, total supply unchanged
+    // 4. Conservation of value: under Ruleset v7 (`FEE_MARKET_V2 = 0`),
+    // 50% of `gas_limit` is burned and the remainder goes to the proposer
+    // (proposer is not an active validator so the 20% staking leg falls back to proposer).
+    let burn1 = ((gas_limit as u128) * (crate::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (crate::staking::BPS_DENOMINATOR as u128)) as u64;
+    let proposer_fee1 = gas_limit - burn1;
     let proposer_acc = engine.get_account(&proposer_addr).await.unwrap();
     assert_eq!(
-        proposer_acc.balance, gas_limit,
-        "proposer credited with failure fee"
+        proposer_acc.balance, proposer_fee1,
+        "proposer credited with post-burn share of failure fee"
     );
     assert_eq!(
-        sender.balance + proposer_acc.balance,
+        sender.balance + proposer_acc.balance + burn1,
         initial_balance,
-        "funds conserved"
+        "funds conserved across sender, proposer, and burn"
     );
 
     // 5. Test sender whose balance drops below fee during execution:
@@ -284,10 +290,8 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     let alice_drain_seed = 0xA2u8;
     let (alice_drain_addr, _alice_drain_pk) = pq_pair(alice_drain_seed);
     let bob_addr = [0xB0; 32];
-    // FEE-01: Tx1 is charged the gas it CONSUMED (`GAS_BASIC_TRANSFER` for
-    // the `Transfer` opcode), not its declared 500 000, so the funding is
-    // sized to leave 120 000 after it — below Tx2's 200 000 failure fee, so
-    // the "uncoverable failure moves nothing" scenario still occurs.
+    // Under Ruleset v7 (`EXEC_HARDENING_V1 = 0`), Tx1 bills `TX_INTRINSIC_GAS` (280_000).
+    // 1_000_000 - 600_000 - 280_000 = 120_000 left, below Tx2's 200_000 failure fee.
     engine
         .credit_native(&alice_drain_addr, 1_000_000)
         .await
@@ -337,32 +341,26 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    block2.sign_block(&proposer);
+        round: 0,
+    };
+    block2.sign_block(&proposer);
 
     let outcome2 = engine.apply_block_transition(&block2, 0).await;
     assert_eq!(outcome2.applied, 1);
     assert_eq!(outcome2.failed, 1);
     assert_eq!(outcome2.status, vec![true, false]);
-    // Tx2 fails with only 120k left against its 200k failure fee: a
-    // failure whose FEE the sender cannot cover moves NOTHING at all (no
-    // dust burn, no nonce burn) - the grief rule. A failure the sender CAN
-    // pay for is charged that fee and consumes the nonce (see
-    // `broke_sender_failure_changes_nothing` and the block path).
-    //
-    // FEE-01: Tx1 pays the gas it CONSUMED (GAS_BASIC_TRANSFER for its
-    // `Transfer` opcode), not the 500 000 it declared.
+    let tx1_fee = InMemoryStateEngine::TX_INTRINSIC_GAS;
     assert_eq!(
         outcome2.tx_fees,
-        vec![crate::svm::GAS_BASIC_TRANSFER, 0],
+        vec![tx1_fee, 0],
         "an uncoverable failure fee moves nothing"
     );
-    assert_eq!(outcome2.fees_collected, crate::svm::GAS_BASIC_TRANSFER);
+    assert_eq!(outcome2.fees_collected, tx1_fee);
 
     let sender_drain = engine.get_account(&alice_drain_addr).await.unwrap();
     assert_eq!(
         sender_drain.balance,
-        1_000_000 - 600_000 - crate::svm::GAS_BASIC_TRANSFER,
+        1_000_000 - 600_000 - tx1_fee,
         "the dust is not drained by an uncoverable failure"
     );
     assert_eq!(sender_drain.nonce, 1, "no pay, no advance: nonce untouched");
@@ -370,18 +368,16 @@ async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
     let bob = engine.get_account(&bob_addr).await.unwrap();
     assert_eq!(bob.balance, 600_000);
 
+    let burn2 = ((tx1_fee as u128) * (crate::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / (crate::staking::BPS_DENOMINATOR as u128)) as u64;
+    let proposer_fee2 = tx1_fee - burn2;
     let proposer_acc2 = engine.get_account(&proposer_addr).await.unwrap();
-    assert_eq!(
-        proposer_acc2.balance,
-        gas_limit + crate::svm::GAS_BASIC_TRANSFER
-    );
+    assert_eq!(proposer_acc2.balance, proposer_fee1 + proposer_fee2);
 
     // Value conservation: the drain sender's 1M is the sender's remainder +
-    // bob's 600k + the fee the proposer collected for THIS block. (The
-    // proposer's total also holds the first block's fee, which came out of
-    // a different sender - so it is not part of this balance.)
+    // bob's 600k + proposer's fee share + burn for THIS block.
     assert_eq!(
-        sender_drain.balance + bob.balance + crate::svm::GAS_BASIC_TRANSFER,
+        sender_drain.balance + bob.balance + proposer_fee2 + burn2,
         1_000_000,
         "funds conserved: every debit arrived somewhere"
     );
@@ -441,7 +437,8 @@ async fn test_block_execution_collects_contract_events() {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    block.sign_block(&proposer);
+    };
+    block.sign_block(&proposer);
 
     let outcome = engine.apply_block_transition(&block, 0).await;
     assert_eq!(outcome.applied, 1);

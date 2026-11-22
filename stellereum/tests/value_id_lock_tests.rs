@@ -39,12 +39,7 @@ fn id(k: &SigningKey) -> [u8; 32] {
 }
 
 /// A minimally complete block body at `round`, signed by `key` (Ed + Falcon).
-fn signed_body(
-    key: &SigningKey,
-    fk: &FalconKeypair,
-    round: u32,
-    state_root: [u8; 32],
-) -> Block {
+fn signed_body(key: &SigningKey, fk: &FalconKeypair, round: u32, state_root: [u8; 32]) -> Block {
     let mut b = Block {
         height: HEIGHT,
         timestamp: 1,
@@ -122,7 +117,10 @@ fn lock_rule_accepts_a_registered_restamp_and_rejects_other_values() {
     hc.note_value_id(restamp, value);
     hc.note_value_id(other, [0xBBu8; 32]);
 
-    assert!(hc.same_value(old, restamp), "registered re-stamp: same value");
+    assert!(
+        hc.same_value(old, restamp),
+        "registered re-stamp: same value"
+    );
     assert!(
         !hc.same_value(old, unknown),
         "an unknown hash must never be assumed equal"
@@ -170,14 +168,12 @@ async fn restamped_body_is_accepted_by_a_peer_that_never_held_the_old_hash() {
     let mut a = {
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-        ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
-            .with_falcon_key(fks[0].clone())
+        ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1).with_falcon_key(fks[0].clone())
     };
     let mut b = {
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-        ValidatorRuntime::new(ks[1].clone(), vset.clone(), state, 1)
-            .with_falcon_key(fks[1].clone())
+        ValidatorRuntime::new(ks[1].clone(), vset.clone(), state, 1).with_falcon_key(fks[1].clone())
     };
 
     // A authors the original body at a round it owns.
@@ -212,7 +208,9 @@ async fn restamped_body_is_accepted_by_a_peer_that_never_held_the_old_hash() {
 
     assert!(b.blocks.contains_key(&restamped_hash));
     assert!(!b.blocks.contains_key(&old_hash));
-    let v = b.make_prevote().expect("the peer must vote the body it accepted");
+    let v = b
+        .make_prevote()
+        .expect("the peer must vote the body it accepted");
     assert_eq!(v.kind, VoteKind::Prevote);
     assert_eq!(v.round, restamped.round);
     assert_eq!(v.block_hash, Some(restamped_hash));

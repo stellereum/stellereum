@@ -339,6 +339,25 @@ async fn runtime_across_join() -> (
         engine.credit_native(&id, amt * 2).await.unwrap();
         engine.staking_write().await.bond(id, amt, 0).unwrap();
     }
+    {
+        let mut ledger = engine.staking_write().await;
+        let mut pq_reg = engine.pq_registry_write().await;
+        for k in [&ka, &kb, &kc] {
+            let vid = k.verifying_key().to_bytes();
+            let fk = fk_for(k);
+            ledger
+                .validator_pq_keys
+                .insert(vid, (PqScheme::Falcon512, fk.public_key.clone()));
+            let _ = pq_reg.adopt_legacy_key_at(
+                vid,
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            );
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     let old = ValidatorSet::from_list(vec![(b, floor()), (c, floor())]);
     let mut rt = stellereum::runtime::ValidatorRuntime::new(
         kb.clone(),
@@ -416,21 +435,44 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
 
     // Quorate-under-new QC {A,C} (=3F >= floor(8F/3)+1), signed at H+1/round 0,
     // with the header naming the deterministic new-set proposer.
-    let block_hash = [0xABu8; 32];
     let proposer = in_force.proposer_for(BOUNDARY_H + 1, 0).expect("elects");
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
+        height: BOUNDARY_H + 1,
+        round: 0,
+        prev_hash: [0x11u8; 32],
+        state_root: [0u8; 32],
+        body_commitment: [0xABu8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 1,
+        proposer,
+    };
+    let block_hash = hdr.compute_hash();
+    let v4 = stellereum::sync::HeaderV4Fields {
+        shard_id: hdr.shard_id,
+        round: hdr.round,
+        state_root: hdr.state_root,
+        body_commitment: Some(hdr.body_commitment),
+        mmr_epoch_root: hdr.mmr_epoch_root,
+        epoch_key_commitment: hdr.epoch_key_commitment,
+        timestamp: hdr.timestamp,
+    };
     let qc = precommit_qc(&[&ka, &kc], &in_force, BOUNDARY_H + 1, 0, block_hash);
     assert!(
         qc.verify(&in_force),
         "fixture QC must verify under the H+1 set"
     );
     assert!(
-        verify_finality_for_header(
+        stellereum::sync::verify_finality_for_header_v2_with_schedule(
             &in_force,
             BOUNDARY_H + 1,
             &block_hash,
             &[0x11u8; 32],
             &proposer,
-            &qc
+            &qc,
+            stellereum::consensus::CommitteeSchedule::ParentHash,
+            Some(v4),
         )
         .is_ok(),
         "header+QC valid under the set in force at H+1"
@@ -445,13 +487,15 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
         "fixture QC must NOT verify under the old set"
     );
     assert!(
-        verify_finality_for_header(
+        stellereum::sync::verify_finality_for_header_v2_with_schedule(
             &stale,
             BOUNDARY_H + 1,
             &block_hash,
             &[0x11u8; 32],
             &proposer,
-            &qc
+            &qc,
+            stellereum::consensus::CommitteeSchedule::ParentHash,
+            Some(v4),
         )
         .is_err(),
         "stale-set verification must refuse a rotated-height header"
@@ -459,24 +503,32 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     // Wrong-QC-kind / wrong-hash variants fail closed under the right set too.
     let mut wrong_kind = qc.clone();
     wrong_kind.kind = VoteKind::Prevote;
-    assert!(verify_finality_for_header(
-        &in_force,
-        BOUNDARY_H + 1,
-        &block_hash,
-        &[0x11u8; 32],
-        &proposer,
-        &wrong_kind
-    )
-    .is_err());
-    assert!(verify_finality_for_header(
-        &in_force,
-        BOUNDARY_H + 1,
-        &[0x00u8; 32],
-        &[0u8; 32],
-        &proposer,
-        &qc
-    )
-    .is_err());
+    assert!(
+        stellereum::sync::verify_finality_for_header_v2_with_schedule(
+            &in_force,
+            BOUNDARY_H + 1,
+            &block_hash,
+            &[0x11u8; 32],
+            &proposer,
+            &wrong_kind,
+            stellereum::consensus::CommitteeSchedule::ParentHash,
+            Some(v4),
+        )
+        .is_err()
+    );
+    assert!(
+        stellereum::sync::verify_finality_for_header_v2_with_schedule(
+            &in_force,
+            BOUNDARY_H + 1,
+            &[0x00u8; 32],
+            &[0u8; 32],
+            &proposer,
+            &qc,
+            stellereum::consensus::CommitteeSchedule::ParentHash,
+            Some(v4),
+        )
+        .is_err()
+    );
     let _ = (a, kb);
 }
 

@@ -303,28 +303,25 @@ fn fork_id_is_stable_for_equal_inputs_and_changes_with_the_ruleset() {
     }
 }
 
-/// Ruleset v6 pin: the SDKs ship `FORK_ID = 0x0f584a46` (protocol 1.0,
-/// `CONSENSUS_RULESET_VERSION = 6`) from the same 23-entry rules list. The
-/// node MUST produce exactly that value or every SDK builder refuses to sign.
-///
-/// v6 is a LOGIC change (locks compare the round-free `Block::value_id` and
-/// rescued bodies are re-stamped), so the rules list is unchanged and only the
-/// ruleset version moves the fold. See `docs/RULESET_V6.md`.
+/// Ruleset v7 pin: the SDKs ship `FORK_ID = 0x3ae00ebc` (protocol 1.0,
+/// `CONSENSUS_RULESET_VERSION = 7`, `DOMAIN_SET_VERSION = 4`) from the same
+/// 32-entry rules list and 16 consensus/wire domains. The node MUST produce
+/// exactly that value or every SDK builder refuses to sign. See `docs/RULESET_V7.md`.
 #[test]
-fn fork_id_v6_is_pinned_and_matches_the_sdk_guard() {
+fn fork_id_v7_is_pinned_and_matches_the_sdk_guard() {
     /// The value pinned by `stellereum-sdk/src/protocol.rs` and
-    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0x0f584a46"`).
-    const SDK_FORK_ID: u32 = 0x0f58_4a46;
+    /// `sdk-js/src/protocol.ts` (`FORK_ID_HEX === "0x3ae00ebc"`).
+    const SDK_FORK_ID: u32 = 0x3ae0_0ebc;
 
     assert_eq!(FORK_ID, SDK_FORK_ID);
-    assert_eq!(CONSENSUS_RULESET_VERSION, 6);
-    assert_eq!(FORK_ID_RULES.len(), 23, "SDKs fold 23 rules");
+    assert_eq!(CONSENSUS_RULESET_VERSION, 7);
+    assert_eq!(FORK_ID_RULES.len(), 32, "SDKs fold 32 rules");
 
     // Exact order matters: the fold is sequential. This is the SDK list,
-    // constant-for-constant. The first 19 keep the v2 order; the 20th is the
-    // now-ACTIVE proposal-slashing height (0), the 21st is the ruleset-v4
-    // deterministic block-timestamp drift bound.
-    let expected: [u64; 23] = [
+    // constant-for-constant. The first 23 keep the v6 order; entries 23..32
+    // are the 8 Ruleset v7 activation heights (all 0) plus the 720k PQ evidence
+    // retention window.
+    let expected: [u64; 32] = [
         stellereum::consensus::MAX_COMMIT_CERT_SIGNERS as u64,
         stellereum::consensus::MAX_ROUND_AHEAD as u64,
         stellereum::consensus::MAX_ROUND_ADVANCE_PER_MESSAGE as u64,
@@ -348,6 +345,15 @@ fn fork_id_v6_is_pinned_and_matches_the_sdk_guard() {
         stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS,
         stellereum::tokenomics::CHAIN_SUPPLY_PARTITION_VERSION,
         stellereum::tokenomics::TOTAL_SUPPLY_CAP,
+        stellereum::chain_spec::EXEC_HARDENING_V1_ACTIVATION_HEIGHT,
+        stellereum::chain_spec::WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
+        stellereum::sharding::HEADER_COMMIT_ACTIVATION_HEIGHT,
+        stellereum::state_engine::EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
+        stellereum::pq_registry::PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+        stellereum::pq_registry::PQ_EVIDENCE_RETENTION_HEIGHTS,
+        stellereum::bridge::BRIDGE_V2_ACTIVATION_HEIGHT,
+        stellereum::tokenomics::FEE_MARKET_V2_ACTIVATION_HEIGHT,
+        stellereum::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
     ];
     assert_eq!(
         FORK_ID_RULES, &expected,
@@ -368,13 +374,16 @@ fn fork_id_v6_is_pinned_and_matches_the_sdk_guard() {
         stellereum::consensus::VOTE_SIGN_DOMAIN,
         b"STELLEREUM_BFT_VOTE_V3"
     );
-    assert_eq!(stellereum::protocol::DOMAIN_SET_VERSION, 3);
-    // Ruleset v4 is ACTIVE, not a sentinel: slashing fires from genesis.
+    assert_eq!(stellereum::protocol::DOMAIN_SET_VERSION, 4);
+    // Ruleset v4 & v7 are ACTIVE from genesis (`0`).
     assert_eq!(
         stellereum::consensus::PROPOSAL_EQUIVOCATION_ACTIVATION_HEIGHT,
         0
     );
-    assert_eq!(stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS, 3_600_000);
+    assert_eq!(
+        stellereum::protocol::MAX_BLOCK_TIMESTAMP_DRIFT_MS,
+        3_600_000
+    );
 }
 
 /// Historical ruleset v2: version 2, domain set 1, the 19 v2 rules and the

@@ -1135,6 +1135,87 @@ pub struct P2pNetworkAdapter {
     /// read (the local manifest shadows peers). The guard makes each process
     /// publish a strictly increasing sequence; see `head_publish_allowed`.
     last_published_head: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+    /// Bounded per-(shard, height) negative cache / exponential backoff for
+    /// missing `_hq_` QC sidecars (`fetch_block_qc` / `fetch_block_qc_probe`).
+    qc_miss_backoff: std::sync::Mutex<QcMissBackoff>,
+}
+
+/// Bounded per-(shard, height) exponential miss backoff for `fetch_block_qc`.
+///
+/// Prevents a node stuck one block behind from hammering peers with repeated
+/// `dht.find_value` calls on the same missing `_hq_{shard}_{height}` sidecar
+/// every reactive catch-up tick (~500ms-1.4s). First probe for `(shard, height)`
+/// is always immediate; consecutive misses back off `2s -> 4s -> 8s -> 16s -> 30s`,
+/// and any hit clears the entry.
+#[derive(Debug, Clone, Default)]
+pub struct QcMissBackoff {
+    entries: std::collections::HashMap<(u32, u64), QcMissEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QcMissEntry {
+    misses: u32,
+    next_probe_at_ms: u64,
+}
+
+impl QcMissBackoff {
+    pub const BASE_MS: u64 = 2_000;
+    pub const MAX_MS: u64 = 30_000;
+    pub const CAP: usize = 128;
+
+    /// Returns `true` when `(shard_id, height)` is still inside its cooldown
+    /// window at `now_ms` and should skip querying the DHT.
+    pub fn should_skip(&self, shard_id: u32, height: u64, now_ms: u64) -> bool {
+        self.entries
+            .get(&(shard_id, height))
+            .is_some_and(|e| now_ms < e.next_probe_at_ms)
+    }
+
+    /// Record a QC fetch miss for `(shard_id, height)` at `now_ms`, returning
+    /// the applied backoff duration in milliseconds.
+    pub fn record_miss(&mut self, shard_id: u32, height: u64, now_ms: u64) -> u64 {
+        let misses = self
+            .entries
+            .get(&(shard_id, height))
+            .map(|e| e.misses.saturating_add(1))
+            .unwrap_or(1);
+        let shift = misses.saturating_sub(1).min(4);
+        let backoff_ms = Self::BASE_MS
+            .saturating_mul(1u64 << shift)
+            .min(Self::MAX_MS);
+        if self.entries.len() >= Self::CAP && !self.entries.contains_key(&(shard_id, height)) {
+            // Evict the oldest/earliest-expiring entry to stay strictly bounded.
+            if let Some(evict_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.next_probe_at_ms)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&evict_key);
+            }
+        }
+        self.entries.insert(
+            (shard_id, height),
+            QcMissEntry {
+                misses,
+                next_probe_at_ms: now_ms.saturating_add(backoff_ms),
+            },
+        );
+        backoff_ms
+    }
+
+    /// Clear any miss backoff for `(shard_id, height)` once a QC is obtained.
+    pub fn record_hit(&mut self, shard_id: u32, height: u64) {
+        self.entries.remove(&(shard_id, height));
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Whether publishing `height` as a shard head is safe, given `last_published`
@@ -1437,6 +1518,7 @@ impl P2pNetworkAdapter {
             prune_cursor_loaded: std::sync::atomic::AtomicBool::new(false),
             last_prune_tip: std::sync::atomic::AtomicU64::new(0),
             last_published_head: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qc_miss_backoff: std::sync::Mutex::new(QcMissBackoff::default()),
         }
     }
 
@@ -1627,8 +1709,10 @@ impl P2pNetworkAdapter {
     /// `PREFIX_BLOCK_HASH` entry. See `plan_block_body_publish` for why those two
     /// writes must not be replayed from a re-publish.
     pub async fn retro_publish_block(&self, block: &Block) -> Result<[u8; 32], String> {
-        let writes = plan_block_body_publish(&self.epoch(), block)?;
+        let epoch = self.epoch();
+        let writes = plan_block_body_publish(&epoch, block)?;
         apply_publish_plan(&self.node, &writes).await?;
+        publish_block_qc_companion(&self.node, &epoch, block).await;
         Ok(block.compute_hash())
     }
 
@@ -1672,12 +1756,18 @@ impl P2pNetworkAdapter {
         I: IntoIterator<Item = &'a Block>,
     {
         let shared = self.node.clone();
+        let epoch = self.epoch();
         let mut it = blocks.into_iter();
         retro_publish_chunk(&mut it, max, move |b| {
             let node = shared.clone();
+            let epoch = epoch.clone();
             async move {
-                match plan_block_body_publish(&self.epoch(), b) {
-                    Ok(writes) => apply_publish_plan(&node, &writes).await,
+                match plan_block_body_publish(&epoch, b) {
+                    Ok(writes) => {
+                        apply_publish_plan(&node, &writes).await?;
+                        publish_block_qc_companion(&node, &epoch, b).await;
+                        Ok(())
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -2187,10 +2277,40 @@ impl P2pNetworkAdapter {
         shard_id: u32,
         height: u64,
     ) -> Option<crate::consensus::QuorumCertificate> {
+        self.fetch_block_qc_inner(shard_id, height, 3).await
+    }
+
+    /// Lightweight 1-attempt precommit-QC sidecar probe for `blind-QC-probe`.
+    /// Shares the per-`(shard_id, height)` exponential miss backoff with
+    /// [`Self::fetch_block_qc`] so repeated catch-up ticks never flood peers
+    /// with `dht.find_value` requests for a missing `_hq_` sidecar.
+    pub async fn fetch_block_qc_probe(
+        &self,
+        shard_id: u32,
+        height: u64,
+    ) -> Option<crate::consensus::QuorumCertificate> {
+        self.fetch_block_qc_inner(shard_id, height, 1).await
+    }
+
+    async fn fetch_block_qc_inner(
+        &self,
+        shard_id: u32,
+        height: u64,
+        max_attempts: u32,
+    ) -> Option<crate::consensus::QuorumCertificate> {
+        let now_ms = mesh_now_ms();
+        if self
+            .qc_miss_backoff
+            .lock()
+            .is_ok_and(|g| g.should_skip(shard_id, height, now_ms))
+        {
+            return None;
+        }
         let _permit = fetch_sem().acquire().await.ok()?;
         let name = header_qc_name(&self.epoch(), shard_id, height);
         let mut last_err = "missing";
-        for attempt in 1..=3u32 {
+        let attempts = max_attempts.max(1);
+        for attempt in 1..=attempts {
             let blob_res = tokio::time::timeout(
                 std::time::Duration::from_millis(10_000),
                 self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
@@ -2203,17 +2323,29 @@ impl P2pNetworkAdapter {
                     &bytes,
                     MAX_WIRE_SMALL_BYTES,
                 ) {
-                    Ok(qc) => return Some(qc),
+                    Ok(qc) => {
+                        if let Ok(mut g) = self.qc_miss_backoff.lock() {
+                            g.record_hit(shard_id, height);
+                        }
+                        return Some(qc);
+                    }
                     Err(_) => last_err = "bad bincode",
                 }
             } else {
                 last_err = "fetch miss/timeout";
             }
-            if attempt < 3 {
+            if attempt < attempts {
                 tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
             }
         }
-        eprintln!("[sync] fetch_block_qc shard={shard_id} height={height} name={name}: failed ({last_err})");
+        let backoff_ms = self
+            .qc_miss_backoff
+            .lock()
+            .map(|mut g| g.record_miss(shard_id, height, mesh_now_ms()))
+            .unwrap_or(QcMissBackoff::BASE_MS);
+        eprintln!(
+            "[sync] fetch_block_qc shard={shard_id} height={height} name={name}: failed ({last_err}); backing off {backoff_ms}ms"
+        );
         None
     }
 
@@ -3232,6 +3364,40 @@ pub fn plan_block_body_publish_bytes(
         ));
     }
     Ok(body_write(epoch, block_hash, body.to_vec()))
+}
+
+/// Plan the optional height-addressed precommit-QC sidecar write (`_hq_{shard}_{height}`)
+/// that rides alongside retro-published block bodies.
+///
+/// Safe to republish from any node: keyed strictly by `(epoch, shard_id, height)`
+/// and carries a cryptographic [`crate::consensus::QuorumCertificate`], with zero
+/// `kv` writes and zero effect on `shard_{shard}_head`.
+pub fn plan_block_qc_publish(epoch: &EpochTag, block: &Block) -> Option<PublishWrite> {
+    let qc = block.precommit_qc.as_ref()?;
+    let bytes = bincode::serialize(qc).ok()?;
+    Some(PublishWrite {
+        bucket: BUCKET_STELLEREUM_HEADERS,
+        name: header_qc_name(epoch, block.shard_id, block.height),
+        bytes,
+        kv: Vec::new(),
+    })
+}
+
+async fn publish_block_qc_companion(node: &Arc<Node>, epoch: &EpochTag, block: &Block) {
+    if let Some(w) = plan_block_qc_publish(epoch, block) {
+        let ttl = dht_blob_ttl_ms(retention_keep_blocks());
+        let qc_slot = header_publish_slots()[2];
+        paced_store_blob_in_lane(
+            node,
+            w.bucket,
+            &w.name,
+            &w.bytes,
+            ttl,
+            qc_slot.charge,
+            qc_slot.lane,
+        )
+        .await;
+    }
 }
 
 /// The one write a body publish is: a blob in the block bucket, named by hash,
@@ -5284,6 +5450,52 @@ mod retention_tests {
             writes[0].name,
             block_body_blob_name(&epoch, &block.compute_hash())
         );
+        assert!(
+            plan_block_qc_publish(&epoch, &block).is_none(),
+            "block without precommit_qc plans no _hq_ write"
+        );
+
+        let mut qc_block = block.clone();
+        qc_block.precommit_qc = Some(crate::consensus::QuorumCertificate {
+            height: 7,
+            round: 0,
+            kind: crate::consensus::VoteKind::Precommit,
+            block_hash: Some(block.compute_hash()),
+            signatures: vec![],
+            shard_id: crate::sharding::MASTERCHAIN_SHARD,
+        });
+        let qc_write = plan_block_qc_publish(&epoch, &qc_block).expect("qc write");
+        assert_eq!(qc_write.bucket, BUCKET_STELLEREUM_HEADERS);
+        assert_eq!(qc_write.name, header_qc_name(&epoch, 0, 7));
+        assert!(qc_write.kv.is_empty(), "qc sidecar writes no kv");
+    }
+
+    #[test]
+    fn qc_miss_backoff_scales_resets_and_stays_bounded() {
+        let mut backoff = QcMissBackoff::default();
+        assert!(!backoff.should_skip(0, 100, 1_000));
+
+        // 2s -> 4s -> 8s -> 16s -> 30s -> 30s
+        let d1 = backoff.record_miss(0, 100, 1_000);
+        assert_eq!(d1, 2_000);
+        assert!(backoff.should_skip(0, 100, 2_999));
+        assert!(!backoff.should_skip(0, 100, 3_000));
+        assert!(!backoff.should_skip(0, 101, 1_500));
+
+        assert_eq!(backoff.record_miss(0, 100, 3_000), 4_000);
+        assert_eq!(backoff.record_miss(0, 100, 7_000), 8_000);
+        assert_eq!(backoff.record_miss(0, 100, 15_000), 16_000);
+        assert_eq!(backoff.record_miss(0, 100, 31_000), 30_000);
+        assert_eq!(backoff.record_miss(0, 100, 61_000), 30_000);
+
+        backoff.record_hit(0, 100);
+        assert!(!backoff.should_skip(0, 100, 61_001));
+        assert_eq!(backoff.record_miss(0, 100, 61_001), 2_000);
+
+        for h in 1..=(QcMissBackoff::CAP as u64 + 32) {
+            backoff.record_miss(0, h + 1_000, 100_000 + h);
+        }
+        assert!(backoff.len() <= QcMissBackoff::CAP);
     }
 }
 
@@ -5492,6 +5704,77 @@ mod pointer_overwrite_tests {
             .expect("pointer must read back");
         assert_eq!(latest, N * 100);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retro_publish_blocks_republishes_hq_qc_without_moving_head_and_backs_off_misses() {
+        let (adapter, dir) = test_adapter("retro_hq").await;
+        let sk = {
+            use ed25519_dalek::SigningKey;
+            use rand::rngs::OsRng;
+            SigningKey::generate(&mut OsRng)
+        };
+        let mut block = crate::sharding::Block {
+            shard_id: crate::sharding::MASTERCHAIN_SHARD,
+            height: 42,
+            prev_hash: [0x11u8; 32],
+            state_root: [0x22u8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![],
+            timestamp: 1_700_000_042,
+            proposer: sk.verifying_key().to_bytes(),
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            round: 0,
+        };
+        let hash = block.compute_hash();
+        let qc = crate::consensus::QuorumCertificate {
+            height: 42,
+            round: 0,
+            kind: crate::consensus::VoteKind::Precommit,
+            block_hash: Some(hash),
+            signatures: vec![],
+            shard_id: crate::sharding::MASTERCHAIN_SHARD,
+        };
+        block.precommit_qc = Some(qc.clone());
+
+        // Missing height triggers backoff so the second immediate probe is skipped.
+        assert!(adapter.fetch_block_qc_probe(0, 999).await.is_none());
+        assert!(
+            adapter
+                .qc_miss_backoff
+                .lock()
+                .unwrap()
+                .should_skip(0, 999, mesh_now_ms()),
+            "missing _hq_ must enter miss backoff immediately"
+        );
+        assert!(adapter.fetch_block_qc_probe(0, 999).await.is_none());
+
+        let report = adapter.retro_publish_blocks([&block], 1).await;
+        assert_eq!(report.published, 1);
+        assert_eq!(report.failed, 0);
+
+        // Both body and _hq_ sidecar are retrievable, while shard_head remains untouched.
+        assert!(adapter.fetch_block(&hash).await.is_some());
+        let fetched_qc = adapter
+            .fetch_block_qc(0, 42)
+            .await
+            .expect("retro_publish_blocks must republish _hq_ QC");
+        assert_eq!(fetched_qc.height, 42);
+        assert_eq!(fetched_qc.block_hash, Some(hash));
+        assert!(
+            adapter.fetch_head(0).await.is_none(),
+            "retro_publish_blocks must never touch shard_head"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -26,6 +26,34 @@ fn bh(n: u8) -> [u8; 32] {
 fn vs_of(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
+async fn seed_pq(
+    st: &Arc<InMemoryStateEngine>,
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+) {
+    let mut ledger = st.staking_write().await;
+    let mut pq_reg = st.pq_registry_write().await;
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let vid = id(k);
+        ledger.validator_pq_keys.insert(
+            vid,
+            (
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            ),
+        );
+        pq_reg
+            .adopt_legacy_key_at(
+                vid,
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            )
+            .expect("seed pq_registry");
+    }
+    stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+}
 async fn missed_map(st: &Arc<InMemoryStateEngine>) -> BTreeMap<[u8; 32], (u32, u64, u64)> {
     let g = st.staking_read().await;
     g.validators
@@ -61,7 +89,7 @@ fn block_at(
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    // FULL-PQ: Ed-only proposals are refused by `verify_proposer_signature`.
+    }; // FULL-PQ: Ed-only proposals are refused by `verify_proposer_signature`.
     b.sign_block_with_falcon(&ks[idx], &fks[idx]);
     b
 }
@@ -115,11 +143,13 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
     };
     let (st_a, ksa, vs_a) = mk();
     fund_genesis(&st_a, &vs_a, 1_000_000_000_000_000).await;
+    seed_pq(&st_a, &ksa, &fks).await;
     let blk = block_at(&vs_a, &ksa, &fks, 1, st_a.get_state_root().await);
     let block_hash = blk.compute_hash();
 
     let (st_b, ksb, vs_b) = mk();
     fund_genesis(&st_b, &vs_b, 1_000_000_000_000_000).await;
+    seed_pq(&st_b, &ksb, &fks).await;
     assert_eq!(
         blk.compute_hash(),
         block_at(&vs_b, &ksb, &fks, 1, st_b.get_state_root().await).compute_hash()
@@ -223,6 +253,7 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
     let victim = ks[3].clone();
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
+    seed_pq(&st, &ks, &fks).await;
     let blk = block_at(&vset, &ks, &fks, 1, st.get_state_root().await);
     let block_hash = blk.compute_hash();
 
@@ -295,6 +326,7 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
     let mut rt = {
         let st = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
+        seed_pq(&st, &ks, &fks).await;
         ValidatorRuntime::new(ks[0].clone(), vset.clone(), st, 1)
     };
     // This node is LOCKED on A (it saw a prevote quorum for A earlier).
@@ -334,8 +366,9 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    block.sign_block(&ks[0]);
+        round: 0,
+    };
+    block.sign_block(&ks[0]);
     rt.blocks.insert(block.compute_hash(), block);
     let decided = rt.try_finalize().await;
     assert_eq!(
@@ -367,6 +400,7 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
     let vset = vs_of(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
+    seed_pq(&st, &ks, &fks).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
 
     // Push validator #4's self-bond below the minimum, so `to_validator_set`
@@ -403,8 +437,9 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        b.sign_block(pk);
+            round: 0,
+        };
+        b.sign_block(pk);
         let bhash = b.compute_hash();
         prev = bhash;
         rt.blocks.insert(bhash, b);

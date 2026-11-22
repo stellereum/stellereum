@@ -536,6 +536,15 @@ async fn deploy_with_nonce_and_rpc_prediction_parity() {
     // advance contracts.next_nonce to 1 by deploying once, then verify RPC predicts
     // SDK-canonical address under `"contract_address"` while exposing `"legacy_contract_address"`
     // from contracts.next_nonce=1 pre-gate, and 1:1 parity on-chain post-gate.
+    struct ResetWasmGate;
+    impl Drop for ResetWasmGate {
+        fn drop(&mut self) {
+            stellereum::chain_spec::set_wasm_xshard_pmm_hardening_activation_override(None);
+        }
+    }
+    let _reset_gate = ResetWasmGate;
+    stellereum::chain_spec::set_wasm_xshard_pmm_hardening_activation_override(Some(u64::MAX));
+
     let rpc_code = value_target_wasm();
     let engine = Arc::new(InMemoryStateEngine::new());
     let first_deployed = engine
@@ -595,13 +604,6 @@ async fn deploy_with_nonce_and_rpc_prediction_parity() {
 
     // Post-gate (>= H): enable WASM_XSHARD_PMM_HARDENING at height 0 (with RAII reset)
     // and verify 1:1 parity between RPC `"contract_address"` and real on-chain block apply.
-    struct ResetWasmGate;
-    impl Drop for ResetWasmGate {
-        fn drop(&mut self) {
-            stellereum::chain_spec::set_wasm_xshard_pmm_hardening_activation_override(None);
-        }
-    }
-    let _reset_gate = ResetWasmGate;
     stellereum::chain_spec::set_wasm_xshard_pmm_hardening_activation_override(Some(0));
 
     let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x7A);

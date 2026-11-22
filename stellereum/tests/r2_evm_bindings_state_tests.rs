@@ -264,18 +264,24 @@ async fn activation_boundary_h_minus_1_h_h_plus_1_and_domain_cache_and_sim_isola
     let recipient_pq = pq_of(&recipient_kp);
     let recipient_evm = evm_of(&secp(0x43));
 
-    // Reference engine with default gate (u64::MAX, GatedOff) at H - 1.
-    let ref_pre = InMemoryStateEngine::new();
-    ref_pre.update_account(AccountState::new(pq1, FUNDS)).await;
-    ref_pre.update_account(AccountState::new(pq2, FUNDS)).await;
-    ref_pre
-        .update_account(AccountState::new(recipient_pq, 0))
-        .await;
+    // Reference engine with pre-v7 gate (u64::MAX, GatedOff) at H - 1.
+    let ref_pre = {
+        let _pre_gate = EvmBindingsGateGuard::at(u64::MAX);
+        let ref_pre = InMemoryStateEngine::new();
+        ref_pre.update_account(AccountState::new(pq1, FUNDS)).await;
+        ref_pre.update_account(AccountState::new(pq2, FUNDS)).await;
+        ref_pre
+            .update_account(AccountState::new(recipient_pq, 0))
+            .await;
+        let bind_pre = binding_tx(&kp1, &evm_key1, evm1, 0);
+        let b_pre_ref = block(h - 1, vec![bind_pre.clone()]);
+        let out_ref = ref_pre.apply_block_transition(&b_pre_ref, 0).await;
+        assert_eq!(out_ref.status, vec![true]);
+        assert!(ref_pre.evm_bindings_read().await.is_empty());
+        ref_pre
+    };
     let bind_pre = binding_tx(&kp1, &evm_key1, evm1, 0);
-    let b_pre_ref = block(h - 1, vec![bind_pre.clone()]);
-    let out_ref = ref_pre.apply_block_transition(&b_pre_ref, 0).await;
-    assert_eq!(out_ref.status, vec![true]);
-    assert!(ref_pre.evm_bindings_read().await.is_empty());
+    let b_pre_ref = block(h - 1, vec![bind_pre]);
     let root_ref_pre = ref_pre.get_state_root().await;
 
     // Activate gate at H = 100.
@@ -450,12 +456,12 @@ fn evm_bindings_state_bijection_and_rebuild_inverse_fail_closed() {
 }
 
 #[tokio::test]
-async fn default_u64_max_preserves_commitment_version_5_and_genesis_kat() {
+async fn default_v7_preserves_commitment_version_5_and_genesis_kat() {
     assert_eq!(COMMITMENT_VERSION, 5);
-    assert_eq!(EVM_BINDINGS_STATE_ACTIVATION_HEIGHT, u64::MAX);
-    assert_eq!(effective_evm_bindings_state_activation_height(), u64::MAX);
-    assert!(!evm_bindings_state_active_at(0));
-    assert!(!evm_bindings_state_active_at(u64::MAX));
+    assert_eq!(EVM_BINDINGS_STATE_ACTIVATION_HEIGHT, 0);
+    assert_eq!(effective_evm_bindings_state_activation_height(), 0);
+    assert!(evm_bindings_state_active_at(0));
+    assert!(evm_bindings_state_active_at(u64::MAX));
 
     const V1: [u8; 32] = [0x11u8; 32];
     const V2: [u8; 32] = [0x22u8; 32];

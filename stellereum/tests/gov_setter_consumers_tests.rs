@@ -87,7 +87,8 @@ fn empty_block(height: u64) -> Block {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    }}
+    }
+}
 
 #[tokio::test]
 async fn set_min_validator_bond_updates_the_consensus_set_filter() {

@@ -132,6 +132,30 @@ pub struct EvmIntentFacts {
     pub chain_id: u64,
 }
 
+/// Exact conversion from Wei (`u128`) to nano-STELL (`u64`), fail-closed.
+///
+/// Refuses any sub-nano remainder (`wei % WEI_PER_NANO != 0`) and any value
+/// whose quotient exceeds `u64::MAX`.
+pub fn wei_to_nano_exact(wei: u128) -> Result<u64> {
+    let remainder = wei % WEI_PER_NANO;
+    if remainder != 0 {
+        return Err(evm_err(
+            "sub-nano",
+            &format!(
+                "sub-nano wei remainder {remainder}: value must be a multiple of {WEI_PER_NANO} wei"
+            ),
+        ));
+    }
+    let nano = wei / WEI_PER_NANO;
+    if nano > u64::MAX as u128 {
+        return Err(evm_err(
+            "value-overflow",
+            "wei amount overflows u64 nano-STELL",
+        ));
+    }
+    Ok(nano as u64)
+}
+
 /// `wei / 1e9`, saturating at `u64::MAX` like the node.
 pub fn wei_to_nano(wei: u128) -> u64 {
     let nano = wei / WEI_PER_NANO;
@@ -497,13 +521,7 @@ pub fn decode_evm_intent(raw: &[u8]) -> Result<EvmIntentFacts> {
             "an EVM carrier settles value transfers only: the intent carries no value",
         ));
     }
-    let value_nano = wei_to_nano(decoded.value_wei);
-    if value_nano == 0 {
-        return Err(evm_err(
-            "sub-nano",
-            "EVM value is below one nano-STELL and cannot be settled",
-        ));
-    }
+    let value_nano = wei_to_nano_exact(decoded.value_wei)?;
     Ok(EvmIntentFacts {
         from: recover_sender(&decoded)?,
         to: decoded.to,
@@ -961,6 +979,34 @@ mod tests {
             err,
             SdkError::InvalidEvmIntent { ref reason, .. } if reason == "sub-nano"
         ));
+    }
+
+    #[test]
+    fn wei_to_nano_exact_refuses_sub_nano_remainder_and_overflow() {
+        let err = wei_to_nano_exact(1_500_000_000).unwrap_err();
+        assert!(matches!(
+            err,
+            SdkError::InvalidEvmIntent { ref reason, .. } if reason == "sub-nano"
+        ));
+        let raw = legacy_raw(1, 1_500_000_000, 5757);
+        let err = decode_evm_intent(&raw).unwrap_err();
+        assert!(matches!(
+            err,
+            SdkError::InvalidEvmIntent { ref reason, .. } if reason == "sub-nano"
+        ));
+
+        assert_eq!(wei_to_nano_exact(0).unwrap(), 0);
+        assert_eq!(wei_to_nano_exact(2_000_000_000).unwrap(), 2);
+        assert_eq!(
+            wei_to_nano_exact((u64::MAX as u128) * WEI_PER_NANO).unwrap(),
+            u64::MAX
+        );
+        let err = wei_to_nano_exact((u64::MAX as u128 + 1) * WEI_PER_NANO).unwrap_err();
+        assert!(matches!(
+            err,
+            SdkError::InvalidEvmIntent { ref reason, .. } if reason == "value-overflow"
+        ));
+        assert_eq!(wei_to_nano(1_500_000_000), 1);
     }
 
     #[test]

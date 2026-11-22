@@ -452,7 +452,8 @@ async fn block_transition_threads_committed_height_into_gate() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    block.sign_block(&block_signer);
+    };
+    block.sign_block(&block_signer);
 
     let engine = InMemoryStateEngine::new().with_chain_id(TEST_CHAIN_ID);
     let from = sender_of(&block.transactions[0]);

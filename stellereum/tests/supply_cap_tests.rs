@@ -66,7 +66,8 @@ fn empty_block(proposer_key: &SigningKey, height: u64) -> Block {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    block.sign_block(proposer_key);
+    };
+    block.sign_block(proposer_key);
     block
 }
 
@@ -436,8 +437,14 @@ async fn chain_partition_closes_the_per_engine_gap() {
     // Each engine accepts at most ITS SHARE, never the full chain cap.
     let share = partition.quota_for(MASTERCHAIN_SHARD);
     assert_eq!(share, TOTAL_SUPPLY_CAP / 2);
-    assert!(shard_a.mint_native(&addr(0xA1), TOTAL_SUPPLY_CAP).await.is_err());
-    assert!(shard_b.mint_native(&addr(0xB2), TOTAL_SUPPLY_CAP).await.is_err());
+    assert!(shard_a
+        .mint_native(&addr(0xA1), TOTAL_SUPPLY_CAP)
+        .await
+        .is_err());
+    assert!(shard_b
+        .mint_native(&addr(0xB2), TOTAL_SUPPLY_CAP)
+        .await
+        .is_err());
     shard_a
         .mint_native(&addr(0xA1), share)
         .await
@@ -451,8 +458,7 @@ async fn chain_partition_closes_the_per_engine_gap() {
     assert_eq!(shard_b.total_minted_nano(), share);
     let chain_total = shard_a.total_minted_nano() as u128 + shard_b.total_minted_nano() as u128;
     assert_eq!(
-        chain_total,
-        TOTAL_SUPPLY_CAP as u128,
+        chain_total, TOTAL_SUPPLY_CAP as u128,
         "the two engines' minted supplies add up to EXACTLY the advertised cap, \
          not twice it"
     );

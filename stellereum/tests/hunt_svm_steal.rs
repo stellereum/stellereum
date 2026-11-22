@@ -14,10 +14,12 @@
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::sharding::Transaction;
 use stellereum::staking::{self, StakingLedger};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::OpCode;
+use stellereum::svm::{OpCode, RegisterValidatorPayload};
+use stellereum::zkml::effective_chain_id;
 
 const NANO: u64 = 1_000_000_000;
 /// A generous gas limit; only the *consumed* gas is charged.
@@ -65,6 +67,28 @@ async fn bal(e: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
     e.get_account(a).await.map(|x| x.balance).unwrap_or(0)
 }
 
+fn register_op(cold_addr: [u8; 32], hot_kp: &FalconKeypair, amount: u64) -> (OpCode, [u8; 32]) {
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &cold_addr, hot_kp.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &cold_addr,
+        0,
+        PqScheme::Falcon512,
+        hot_kp.public_key(),
+    );
+    let op = OpCode::SysCallRegisterValidator(Box::new(RegisterValidatorPayload {
+        amount,
+        commission_bps: 0,
+        withdrawal_address: cold_addr,
+        voting_scheme: PqScheme::Falcon512.id(),
+        voting_pubkey: hot_kp.public_key().to_vec(),
+        voting_pop: hot_kp.sign(&pop_msg),
+    }));
+    (op, vid)
+}
+
 // ---------------------------------------------------------------------------
 // ATTACK 1: steal a validator's accrued staking rewards.
 // ---------------------------------------------------------------------------
@@ -73,9 +97,9 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     let e = InMemoryStateEngine::new();
 
     let (victim, victim_addr) = pq_key(0x71);
+    let (victim_hot, _) = pq_key(0x73);
     let (attacker, attacker_addr) = pq_key(0x72);
 
-    let validator = [0x77; 32];
     let start = 100_000 * NANO;
     let attacker_start = 1_000 * NANO;
     e.update_account(AccountState::new(victim_addr, start))
@@ -85,19 +109,10 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
 
     // 1. The victim bonds, so the staking pool is funded with real value.
     let bond = 10_000 * NANO;
-    e.apply_transaction(
-        &tx(
-            &victim,
-            0,
-            vec![OpCode::SysCallStake {
-                validator,
-                amount: bond,
-            }],
-        ),
-        0,
-    )
-    .await
-    .expect("victim bond");
+    let (reg_op, validator) = register_op(victim_addr, &victim_hot, bond);
+    e.apply_transaction(&tx(&victim, 0, vec![reg_op]), 0)
+        .await
+        .expect("victim bond");
     let pool = bal(&e, &staking::STAKING_POOL).await;
     assert_eq!(pool, bond, "victim's bond is parked in the pool");
 
@@ -257,28 +272,19 @@ async fn reward_theft_is_not_loopable() {
 async fn a_stranger_cannot_force_unbond_a_validator_and_eject_it_from_the_set() {
     let e = InMemoryStateEngine::new();
     let (victim, victim_addr) = pq_key(0x75);
+    let (victim_hot, _) = pq_key(0x77);
     let (attacker, attacker_addr) = pq_key(0x76);
 
-    let validator = [0x55; 32];
     e.update_account(AccountState::new(victim_addr, 100_000 * NANO))
         .await;
     e.update_account(AccountState::new(attacker_addr, NANO))
         .await;
 
     let bond = 50_000 * NANO;
-    e.apply_transaction(
-        &tx(
-            &victim,
-            0,
-            vec![OpCode::SysCallStake {
-                validator,
-                amount: bond,
-            }],
-        ),
-        0,
-    )
-    .await
-    .unwrap();
+    let (reg_op, validator) = register_op(victim_addr, &victim_hot, bond);
+    e.apply_transaction(&tx(&victim, 0, vec![reg_op]), 0)
+        .await
+        .unwrap();
 
     let vs = e.staking_read().await.to_validator_set();
     println!(

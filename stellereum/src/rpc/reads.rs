@@ -709,7 +709,7 @@ pub(super) async fn simulate_and_estimate_fee(
             .max(crate::svm::GAS_BASIC_TRANSFER);
         (surcharge, base_fee, crate::svm::GAS_BASIC_TRANSFER)
     } else {
-        let sim_engine = st.engine.clone_for_simulation().await;
+        let sim_engine = st.engine.clone_for_simulation_for_tx(&sim_tx).await;
 
         // Consensus floor and surcharge (e.g. PQ activation or penalties)
         let (floor_base, surcharge) = sim_engine.consensus_floor_parts(&sim_tx).await;
@@ -2463,10 +2463,9 @@ pub(super) async fn dispatch_reads(
                     let mut mem_truncated = false;
                     {
                         let idx = st.receipts.read().await;
-                        'receipts: for r in idx.map.values() {
-                            if r.height < from_block || r.height > to_block {
-                                continue;
-                            }
+                        'receipts: for r in
+                            idx.for_contract_events(&contract_addr, from_block, to_block, true)
+                        {
                             for (log_index, e) in r.events.iter().enumerate() {
                                 if scanned >= STORAGE_SCAN_HARD_CAP {
                                     mem_truncated = true;
@@ -2593,12 +2592,8 @@ pub(super) async fn dispatch_reads(
                     .min(MAX_EVENTS_RETURNED);
 
                 let idx = st.receipts.read().await;
-                let mut matched_receipts: Vec<&TxReceipt> = idx
-                    .map
-                    .values()
-                    .filter(|r| r.height >= from_block && r.height <= to_block)
-                    .collect();
-                matched_receipts.sort_by_key(|r| (r.height, r.index));
+                let matched_receipts =
+                    idx.for_contract_events(&contract_addr, from_block, to_block, false);
 
                 let mut matched_events: Vec<Value> = Vec::new();
                 'scan: for r in matched_receipts {

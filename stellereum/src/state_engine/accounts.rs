@@ -242,6 +242,309 @@ impl InMemoryStateEngine {
         }
     }
 
+    /// Selective sandbox clone for read-only fee estimation (`stell_estimateFee`):
+    /// skips `state_trie`, `pq_db`, `cross_shard_*`, `hashpool`, `cnvrf_*`, and
+    /// any domain that `tx`'s payload and envelope cannot read or mutate.
+    ///
+    /// Equivalence contract: `apply_transaction_at_height(&tx, now, h)` returns
+    /// the exact same gas / fee / error verdict as `clone_for_simulation()`,
+    /// while avoiding deep-cloning untouched subsystems (`contracts`,
+    /// `orderbooks`, `staking`, `zkml_models`, `bridge`, `state_trie`).
+    pub async fn clone_for_simulation_for_tx(&self, tx: &crate::sharding::Transaction) -> Self {
+        self.clone_for_simulation_inner(
+            &tx.payload,
+            tx.delegation().is_some(),
+            crate::evm_adapter::is_evm_carrier_tx(tx) || crate::evm_adapter::is_evm_binding_tx(tx),
+            tx.is_pq_implicit(),
+        )
+        .await
+    }
+
+    /// Payload-only entry point for [`Self::clone_for_simulation_for_tx`].
+    pub async fn clone_for_simulation_for_payload(&self, payload: &[crate::svm::OpCode]) -> Self {
+        self.clone_for_simulation_inner(payload, false, false, false)
+            .await
+    }
+
+    async fn clone_for_simulation_inner(
+        &self,
+        payload: &[crate::svm::OpCode],
+        has_delegation: bool,
+        has_evm_envelope: bool,
+        has_implicit_pq: bool,
+    ) -> Self {
+        use crate::svm::OpCode::*;
+        let mut need_tokens = false;
+        let mut need_contracts = false;
+        let mut need_books = false;
+        let mut need_pmm = false;
+        let mut need_staking = false;
+        let mut need_oracle = false;
+        let mut need_session = has_delegation;
+        let mut need_zkml = false;
+        let mut need_bridge = false;
+        let mut need_evm_bindings = has_evm_envelope;
+        let mut need_pq_registry = false;
+
+        for op in payload {
+            match op {
+                SysCallTokenTransfer { .. }
+                | SysCallTokenTransferFrom { .. }
+                | SysCallTokenMint { .. }
+                | SysCallTokenBurn { .. }
+                | SysCallTokenApprove { .. }
+                | SysCallTokenBalanceOf { .. }
+                | SysCallTokenCreate { .. } => need_tokens = true,
+                SysCallDeployContract { .. } => need_contracts = true,
+                SysCallCallContract { .. }
+                | SysCallCallContractArgs { .. }
+                | SysCallActorSend { .. } => {
+                    // WASM contracts and actor bodies can invoke arbitrary host
+                    // syscalls across domains, so clone all execution domains.
+                    need_tokens = true;
+                    need_contracts = true;
+                    need_books = true;
+                    need_pmm = true;
+                    need_staking = true;
+                    need_oracle = true;
+                    need_session = true;
+                    need_zkml = true;
+                    need_bridge = true;
+                    need_pq_registry = true;
+                }
+                SysCallPlaceOrder { .. } | SysCallCancelOrder { .. } => {
+                    need_books = true;
+                    need_tokens = true;
+                }
+                SysCallPmmBuy { .. } | SysCallPmmSell { .. } => {
+                    need_books = true;
+                    need_pmm = true;
+                    need_tokens = true;
+                    need_oracle = true;
+                }
+                SysCallStake { .. }
+                | SysCallStakeWithCommission { .. }
+                | SysCallUnbond { .. }
+                | SysCallDelegate { .. }
+                | SysCallUndelegate { .. }
+                | SysCallBeginUndelegate { .. }
+                | SysCallClaimRewards { .. }
+                | SysCallClaimDelegatorRewards { .. }
+                | SysCallWithdrawSelfBond { .. }
+                | SysCallRotateValidatorKey { .. }
+                | SysCallUnjail { .. }
+                | SysCallRegisterValidator(_)
+                | SysCallRotateVotingKey(_)
+                | SysCallChangeWithdrawal(_)
+                | SysCallClaimWithdrawal(_)
+                | SysCallAnnounceCommission { .. }
+                | SysCallApplyCommission { .. }
+                | SysCallReportPqEquivocation { .. }
+                | SysCallGovPropose { .. }
+                | SysCallGovVote { .. } => {
+                    need_staking = true;
+                    need_pq_registry = true;
+                }
+                SysCallBridge(_) => {
+                    need_bridge = true;
+                    need_staking = true;
+                    need_pq_registry = true;
+                }
+                SysCallSubmitPriceFeed { .. } | SysCallSubmitPqPriceFeed { .. } => {
+                    need_oracle = true;
+                }
+                SysCallPublishSessionGrant { .. } | SysCallRevokeSession { .. } => {
+                    need_session = true;
+                }
+                SysCallVerifyZkMl
+                | SysCallVerifyZkMlReexec { .. }
+                | SysCallRegisterZkMlModel { .. }
+                | SysCallRegisterZkMlSpec { .. }
+                | SysCallVerifyZkMlAttestation { .. } => {
+                    need_zkml = true;
+                }
+                SysCallEvmCarrier(_) | SysCallBindEvmAddress(_) => {
+                    need_evm_bindings = true;
+                }
+                _ => {}
+            }
+        }
+
+        let accounts = self.accounts.read().await.clone();
+        let governance = self.governance.read().await.clone();
+        let consensus_penalty = self.consensus_penalty.read().await.clone();
+        let tokens = if need_tokens {
+            self.tokens.read().await.clone()
+        } else {
+            TokenRegistry::new()
+        };
+        let orderbooks = if need_books {
+            self.orderbooks.read().await.clone()
+        } else {
+            crate::orderbook::OrderbookManager::new()
+        };
+        let order_escrow = if need_books {
+            self.order_escrow.read().await.clone()
+        } else {
+            HashMap::new()
+        };
+        let contracts = if need_contracts {
+            self.contracts.read().await.clone()
+        } else {
+            crate::contract::ContractRegistry::new()
+        };
+        let (pmm, pmm_usdt_token, pmm_treasury) = if need_pmm {
+            (
+                self.pmm.read().await.clone(),
+                *self.pmm_usdt_token.read().await,
+                *self.pmm_treasury.read().await,
+            )
+        } else {
+            (crate::pmm::PrimaryMarketMaker::default(), None, [0u8; 32])
+        };
+        let staking = if need_staking {
+            self.staking.read().await.clone()
+        } else {
+            let l = self.staking.read().await;
+            if l.vesting_schedules.is_empty() {
+                crate::staking::StakingLedger::default()
+            } else {
+                crate::staking::StakingLedger {
+                    vesting_schedules: l.vesting_schedules.clone(),
+                    ..Default::default()
+                }
+            }
+        };
+        let oracle = if need_oracle {
+            self.oracle.read().await.clone()
+        } else {
+            crate::oracle::OracleState::default()
+        };
+        let session_keys = if need_session {
+            self.session_keys.read().await.clone()
+        } else {
+            crate::zkml::SessionKeyRegistry::default()
+        };
+        let zkml_models = if need_zkml {
+            self.zkml_models.read().await.clone()
+        } else {
+            crate::zkml::ZkMlModelRegistry::default()
+        };
+        let bridge = if need_bridge {
+            self.bridge.read().await.clone()
+        } else {
+            crate::bridge::BridgeState::default()
+        };
+        let evm_bindings = if need_evm_bindings {
+            self.evm_bindings.read().await.clone()
+        } else {
+            Default::default()
+        };
+        let pq_registry = if need_pq_registry {
+            self.pq_registry.read().await.clone()
+        } else {
+            crate::pq_registry::PqRegistry::default()
+        };
+        let pq_keys_fallback = if has_implicit_pq {
+            self.pq_keys_fallback
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            memory_bounds::BoundedLruCache::with_env(
+                "pq_keys_fallback",
+                "STELL_MAX_PQ_FALLBACK_ENTRIES",
+                memory_bounds::DEFAULT_MAX_PQ_FALLBACK_ENTRIES,
+            )
+        };
+
+        Self {
+            accounts: Arc::new(RwLock::new(accounts)),
+            chain_id: self.chain_id,
+            state_trie: Arc::new(RwLock::new(PatriciaTrie::new())),
+            tokens: Arc::new(RwLock::new(tokens)),
+            orderbooks: Arc::new(RwLock::new(orderbooks)),
+            contracts: Arc::new(RwLock::new(contracts)),
+            pmm: Arc::new(RwLock::new(pmm)),
+            pmm_op: Arc::new(tokio::sync::Mutex::new(())),
+            pmm_usdt_token: Arc::new(RwLock::new(pmm_usdt_token)),
+            pmm_treasury: Arc::new(RwLock::new(pmm_treasury)),
+            order_escrow: Arc::new(RwLock::new(order_escrow)),
+            staking: Arc::new(RwLock::new(staking)),
+            governance: Arc::new(RwLock::new(governance)),
+            oracle: Arc::new(RwLock::new(oracle)),
+            session_keys: Arc::new(RwLock::new(session_keys)),
+            zkml_models: Arc::new(RwLock::new(zkml_models)),
+            commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.commitment_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.committed_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            total_minted_nano: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.total_minted_nano
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            chain_mint_limit_nano: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.chain_mint_limit_nano
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            domain_gens: {
+                let fresh = crate::commitment::DomainGenerations::default();
+                self.domain_gens.copy_values_into(&fresh);
+                Arc::new(fresh)
+            },
+            domain_cache: Arc::new(std::sync::Mutex::new(
+                crate::commitment::DomainCache::default(),
+            )),
+            cross_shard_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.cross_shard_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            finalized_headers: Arc::new(std::sync::RwLock::new(None)),
+            cross_shard_consumed: Arc::new(RwLock::new(HashSet::new())),
+            cross_shard_produced: Arc::new(RwLock::new(Default::default())),
+            cross_shard_completed: Arc::new(RwLock::new(HashSet::new())),
+            cross_shard_xpc: Arc::new(RwLock::new(Default::default())),
+            bridge: Arc::new(RwLock::new(bridge)),
+            parallel_exec: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.parallel_exec
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            pq_tree: Arc::new(std::sync::RwLock::new(None)),
+            pq_db: Arc::new(std::sync::RwLock::new(None)),
+            pq_keys_fallback: Arc::new(std::sync::RwLock::new(pq_keys_fallback)),
+            consensus_penalty: Arc::new(RwLock::new(consensus_penalty)),
+            shard_id: Arc::new(std::sync::atomic::AtomicU32::new(
+                self.shard_id.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            shard_topology: Arc::new(RwLock::new(self.shard_topology.read().await.clone())),
+            cross_shard_out: Arc::new(RwLock::new(Vec::new())),
+            hashpool: Arc::new(RwLock::new(Default::default())),
+            hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.hashpool_tests_on
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            gov_ops_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.gov_ops_tests_on
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            cnvrf_v3: Arc::new(RwLock::new(Default::default())),
+            cnvrf_abort: Arc::new(RwLock::new(Default::default())),
+            epoch_vdf_beacons: Arc::new(RwLock::new(Default::default())),
+            cnvrf_freeze_inputs: Arc::new(RwLock::new(Default::default())),
+            evm_bindings: Arc::new(RwLock::new(evm_bindings)),
+            pq_registry: Arc::new(RwLock::new(pq_registry)),
+            #[cfg(any(test, debug_assertions))]
+            cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.cnvrf_v3_activation_override
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+        }
+    }
+
     /// Attach persistent storage tree for post-quantum public keys.
     pub fn attach_pq_tree(&self, tree: sled::Tree) {
         *self.pq_tree.write().unwrap_or_else(|e| e.into_inner()) = Some(tree);

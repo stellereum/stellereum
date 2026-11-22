@@ -82,7 +82,8 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32]) -> Block {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(&sk);
+    };
+    b.sign_block(&sk);
     b
 }
 

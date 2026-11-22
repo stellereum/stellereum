@@ -1207,6 +1207,15 @@ fn b2_failing_evidence_before_deadline_revokes_nothing() {
 
 #[test]
 fn b3_release_then_refund_is_refused_executed_wins() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (_ks, pubs) = validators();
     let payer = [0x05u8; 32];
     let amount = STELL;
@@ -1246,6 +1255,15 @@ fn b3_release_then_refund_is_refused_executed_wins() {
 
 #[test]
 fn b3_refund_then_release_is_refused_deletion_wins() {
+    struct BridgeV2PreV7Guard;
+    impl Drop for BridgeV2PreV7Guard {
+        fn drop(&mut self) {
+            stellereum::bridge::set_bridge_v2_activation_override(None);
+        }
+    }
+    stellereum::bridge::set_bridge_v2_activation_override(Some(u64::MAX));
+    let _pre_v7 = BridgeV2PreV7Guard;
+
     let (_ks, pubs) = validators();
     let payer = [0x05u8; 32];
     let amount = STELL;

@@ -345,14 +345,7 @@ async fn single_byzantine_cannot_ratchet_past_the_budgets() {
     for k in 0..rounds {
         for j in 0..10u32 {
             let target = start + 500 + k * 1_000 + j;
-            let v = falcon_votes::fvote(
-                &ks[1],
-                &fks[1],
-                height,
-                target,
-                VoteKind::Prevote,
-                None,
-            );
+            let v = falcon_votes::fvote(&ks[1], &fks[1], height, target, VoteKind::Prevote, None);
             let _ = nodes[0].rt.on_prevote(v);
         }
         nodes[0].rt.hc.next_round();

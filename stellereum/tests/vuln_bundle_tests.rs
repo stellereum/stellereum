@@ -14,9 +14,11 @@ use stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
 use stellereum::post_quantum::{
     derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
 };
+use stellereum::pq_registry::{derive_validator_id, pq_voting_key_pop_preimage};
 use stellereum::staking::{STAKING_POOL, UNBONDING_PERIOD_SECS};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::{OpCode, GAS_STAKE_UNBOND};
+use stellereum::svm::{OpCode, RegisterValidatorPayload, GAS_BASIC_TRANSFER};
+use stellereum::zkml::effective_chain_id;
 
 mod support;
 use support::{assert_refused_tx_paid_failure_fee, failure_fee};
@@ -79,26 +81,43 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     let engine = InMemoryStateEngine::new();
     let validator = FalconKeypair::generate_from_seed(0x41);
     let vaddr = pq_addr(&validator);
-    // Floor for the bond plus gas headroom for bond/unbond/withdraw
-    // (bond burns 2000, unbond/withdraw 800 each) AND for the FAILURE FEES:
-    // a refused transaction is attributable, so it pays its DECLARED limit
-    // (100_000 + PQ_ACTIVATION_SURCHARGE_GAS here) and consumes its nonce
-    // (F-01 / SEC-07 - a free failure is a free DoS and a free replay).
+    let val_hot = FalconKeypair::generate_from_seed(0x45);
+    let chain_id = effective_chain_id();
+    let vid = derive_validator_id(chain_id, &vaddr, val_hot.public_key());
+    let pop_msg = pq_voting_key_pop_preimage(
+        chain_id,
+        &vid,
+        &vaddr,
+        0,
+        PqScheme::Falcon512,
+        val_hot.public_key(),
+    );
+    let voting_pop = val_hot.sign(&pop_msg);
+    // Floor for the bond plus gas headroom for register/unbond/withdraw
+    // (Ruleset v7 EXEC_HARDENING_V1 bills max(gas_used, TX_INTRINSIC_GAS).min(gas_limit)
+    // = 280_000 when gas_limit >= 280_000, or gas_limit when lower, plus 45_000 surcharge)
+    // AND for the FAILURE FEES.
     engine
         .update_account(AccountState::new(vaddr, floor + 5_000_000))
         .await;
 
-    // Bond the floor as self-bond (sender == validator).
+    // Register & bond the floor as self-bond (sender == withdrawal_address).
     engine
         .apply_transaction(
             &tx_of(
                 &validator,
                 0,
-                100_000,
-                vec![OpCode::SysCallStake {
-                    validator: vaddr,
-                    amount: floor,
-                }],
+                500_000,
+                vec![OpCode::SysCallRegisterValidator(Box::new(
+                    RegisterValidatorPayload {
+                        amount: floor,
+                        commission_bps: 0,
+                        withdrawal_address: vaddr,
+                        voting_scheme: PqScheme::Falcon512.id(),
+                        voting_pubkey: val_hot.public_key().to_vec(),
+                        voting_pop,
+                    },
+                ))],
             ),
             0,
         )
@@ -113,9 +132,9 @@ async fn m1_self_bond_withdraws_only_when_matured() {
             &tx_of(
                 &validator,
                 1,
-                100_000,
+                500_000,
                 vec![OpCode::SysCallUnbond {
-                    validator: vaddr,
+                    validator: vid,
                     amount: floor,
                 }],
             ),
@@ -130,8 +149,8 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     let early = tx_of(
         &validator,
         2,
-        100_000,
-        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+        500_000,
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vid }],
     );
     let early_fee = failure_fee(&engine, &early).await;
     let before_early = bal(&engine, &vaddr).await;
@@ -153,7 +172,7 @@ async fn m1_self_bond_withdraws_only_when_matured() {
         .process_unbonding(UNBONDING_PERIOD_SECS + 1)
         .unwrap();
     assert_eq!(
-        engine.staking_read().await.withdrawable_of(&vaddr),
+        engine.staking_read().await.withdrawable_of(&vid),
         floor,
         "cooldown matured the full self-bond"
     );
@@ -171,7 +190,7 @@ async fn m1_self_bond_withdraws_only_when_matured() {
         &attacker,
         0,
         20_000,
-        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vid }],
     );
     let steal_fee = failure_fee(&engine, &steal).await;
     let before_steal = bal(&engine, &aaddr).await;
@@ -183,7 +202,7 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     // NOTHING of the validator's matured stake.
     assert_refused_tx_paid_failure_fee(&engine, &steal, steal_fee, before_steal, 0).await;
     assert_eq!(
-        engine.staking_read().await.withdrawable_of(&vaddr),
+        engine.staking_read().await.withdrawable_of(&vid),
         floor,
         "stranger attempt consumes nothing"
     );
@@ -196,8 +215,8 @@ async fn m1_self_bond_withdraws_only_when_matured() {
             &tx_of(
                 &validator,
                 3,
-                100_000,
-                vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+                500_000,
+                vec![OpCode::SysCallWithdrawSelfBond { validator: vid }],
             ),
             0,
         )
@@ -210,11 +229,11 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     );
     assert_eq!(
         bal(&engine, &vaddr).await,
-        mine_before + floor - GAS_STAKE_UNBOND - PQ_ACTIVATION_SURCHARGE_GAS,
-        "validator credited minus exactly the withdraw gas and activation surcharge"
+        mine_before + floor - GAS_BASIC_TRANSFER - PQ_ACTIVATION_SURCHARGE_GAS,
+        "validator credited minus exactly the intrinsic withdraw gas and activation surcharge"
     );
     assert_eq!(
-        engine.staking_read().await.withdrawable_of(&vaddr),
+        engine.staking_read().await.withdrawable_of(&vid),
         0,
         "entry consumed by the payout"
     );
@@ -228,8 +247,8 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     let again = tx_of(
         &validator,
         4,
-        100_000,
-        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+        500_000,
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vid }],
     );
     let again_fee = failure_fee(&engine, &again).await;
     let before_again = bal(&engine, &vaddr).await;

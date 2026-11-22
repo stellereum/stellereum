@@ -137,14 +137,24 @@ fn anchor_over(
     keys: &[SigningKey],
     fks: &[stellereum::post_quantum::FalconKeypair],
     height: u64,
-    block_hash: BlockHash,
+    body_tag: BlockHash,
     state_root: CellHash,
 ) -> Checkpoint {
-    Checkpoint::new(
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: MASTERCHAIN_SHARD,
         height,
-        block_hash,
-        [0x11u8; 32],
+        round: 0,
+        prev_hash: [0x11u8; 32],
         state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let block_hash = hdr.compute_hash();
+    Checkpoint::from_block_header(
+        hdr,
         cert(
             &keys[..3],
             &fks[..3],
@@ -282,7 +292,19 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     let liars2 = SigningKey::from_bytes(&[0xF1u8; 32]);
     let liars3 = SigningKey::from_bytes(&[0xF2u8; 32]);
     let lying_root = [0x77u8; 32];
-    let lying_hash = [0x66u8; 32];
+    let lying_hdr = stellereum::sharding::BlockHeader {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 43,
+        round: 0,
+        prev_hash: [0x11u8; 32],
+        state_root: lying_root,
+        body_commitment: [0x66u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let lying_hash = lying_hdr.compute_hash();
     let liar_keys = [liars, liars2, liars3];
     let liar_fks = pq_for(&liar_keys, 0xE1);
     let lying_cert = cert(&liar_keys, &liar_fks, &vs, 43, lying_hash, &[0x11u8; 32]);
@@ -290,7 +312,7 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     // (a) The certificate is checked against the OPERATOR'S set: three
     //     signatures that are not from it carry no power, so the anchor is
     //     REFUSED and the client never gets to believe the root.
-    let lying_cp = Checkpoint::new(43, lying_hash, [0x11u8; 32], lying_root, lying_cert.clone());
+    let lying_cp = Checkpoint::from_block_header(lying_hdr, lying_cert.clone());
     assert!(
         LightClient::new(vs.clone(), lying_cp).is_err(),
         "a certificate signed by outsiders must not anchor anything"
@@ -301,8 +323,7 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     //     not the root the proof is against — the client notices the two
     //     stories do not match.
     let honest_cert = cert(&ks[..3], &fks[..3], &vs, 43, lying_hash, &[0x11u8; 32]);
-    let honest_but_wrong_root =
-        Checkpoint::new(43, lying_hash, [0x11u8; 32], lying_root, honest_cert);
+    let honest_but_wrong_root = Checkpoint::from_block_header(lying_hdr, honest_cert);
     let lc = LightClient::new(vs.clone(), honest_but_wrong_root).expect("the anchor verifies");
     assert!(
         matches!(
@@ -376,8 +397,9 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    let bh = b.compute_hash();
+        round: 0,
+    };
+    let bh = b.compute_hash();
     b.precommit_qc = Some(cert(&ks, &fks, &vs, 43, bh, &b.prev_hash));
     st.record_finalized_header(&b).await;
 
@@ -423,13 +445,20 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
 
     // And the served header really does anchor a light client.
     let header = stellereum::light_client_cli::parse_served_header(&served).expect("parses");
-    let cp = Checkpoint::new(
-        header.height,
-        header.block_hash,
-        header.prev_hash,
-        header.state_root,
-        header.cert,
-    );
+    let cp = Checkpoint {
+        height: header.height,
+        block_hash: header.block_hash,
+        parent_hash: header.prev_hash,
+        state_root: header.state_root,
+        cert: header.cert,
+        shard_id: header.shard_id,
+        round: header.round,
+        body_commitment: header.body_commitment,
+        mmr_epoch_root: header.mmr_epoch_root,
+        epoch_key_commitment: header.epoch_key_commitment,
+        timestamp: header.timestamp,
+        proposer: header.proposer,
+    };
     assert!(LightClient::new(vs, cp).is_ok());
 }
 
@@ -508,26 +537,44 @@ fn the_cli_refuses_to_run_without_an_out_of_band_validator_set() {
 fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
     let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: MASTERCHAIN_SHARD,
+        height: 43,
+        round: 0,
+        prev_hash: [0x11u8; 32],
+        state_root: [0x33u8; 32],
+        body_commitment: [0x22u8; 32],
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 1_700_000_000,
+        proposer: [0u8; 32],
+    };
+    let bh = hdr.compute_hash();
     // The served shape is produced by the same committee path as a real QC,
     // then rendered to wire JSON (member signatures plus the PQ envelope
     // entry, which is what a verifying light client receives).
-    let qc = cert(&ks[..3], &fks[..3], &vs, 43, [0x22u8; 32], &[0x11u8; 32]);
+    let qc = cert(&ks[..3], &fks[..3], &vs, 43, bh, &[0x11u8; 32]);
     let cert_json = json!({
         "height": qc.height,
         "round": qc.round,
         "kind": "Precommit",
-        "block_hash": hex::encode([0x22u8; 32]),
+        "block_hash": hex::encode(bh),
         "signatures": qc.signatures.iter().map(|(v, s)| {
             json!({ "validator": hex::encode(v), "signature": hex::encode(s) })
         }).collect::<Vec<Value>>(),
     });
     let served = json!({
         "height": 43u64,
-        "block_hash": hex::encode([0x22u8; 32]),
+        "block_hash": hex::encode(bh),
         "prev_hash": hex::encode([0x11u8; 32]),
         "state_root": hex::encode([0x33u8; 32]),
         "proposer": hex::encode([0x00u8; 32]),
         "timestamp": 1_700_000_000u64,
+        "shard_id": MASTERCHAIN_SHARD,
+        "round": 0u32,
+        "body_commitment": hex::encode(hdr.body_commitment),
+        "mmr_epoch_root": hex::encode([0u8; 32]),
+        "epoch_key_commitment": hex::encode([0u8; 32]),
         "cert": cert_json,
     });
     let header =
@@ -538,13 +585,20 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
     assert_eq!(header.cert.signatures.len(), 4);
 
     // The certificate verifies against the operator's set: the anchor holds.
-    let cp = Checkpoint::new(
-        header.height,
-        header.block_hash,
-        header.prev_hash,
-        header.state_root,
-        header.cert,
-    );
+    let cp = Checkpoint {
+        height: header.height,
+        block_hash: header.block_hash,
+        parent_hash: header.prev_hash,
+        state_root: header.state_root,
+        cert: header.cert,
+        shard_id: header.shard_id,
+        round: header.round,
+        body_commitment: header.body_commitment,
+        mmr_epoch_root: header.mmr_epoch_root,
+        epoch_key_commitment: header.epoch_key_commitment,
+        timestamp: header.timestamp,
+        proposer: header.proposer,
+    };
     assert!(LightClient::new(vs.clone(), cp).is_ok());
 
     // A PREVOTE quorum is not finality: the anchor must be refused.
@@ -552,26 +606,40 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
         "height": 43u64,
         "round": 0u64,
         "kind": "Prevote",
-        "block_hash": hex::encode([0x22u8; 32]),
+        "block_hash": hex::encode(bh),
         "signatures": [],
     });
     let bad = json!({
         "height": 43u64,
-        "block_hash": hex::encode([0x22u8; 32]),
+        "block_hash": hex::encode(bh),
         "prev_hash": hex::encode([0x11u8; 32]),
         "state_root": hex::encode([0x33u8; 32]),
+        "proposer": hex::encode([0x00u8; 32]),
+        "timestamp": 1_700_000_000u64,
+        "shard_id": MASTERCHAIN_SHARD,
+        "round": 0u32,
+        "body_commitment": hex::encode(hdr.body_commitment),
+        "mmr_epoch_root": hex::encode([0u8; 32]),
+        "epoch_key_commitment": hex::encode([0u8; 32]),
         "cert": prevote,
     });
     let bad_header =
         stellereum::light_client_cli::parse_served_header(&bad).expect("the header parses");
     assert_eq!(bad_header.cert.kind, VoteKind::Prevote);
-    let bad_cp = Checkpoint::new(
-        bad_header.height,
-        bad_header.block_hash,
-        bad_header.prev_hash,
-        bad_header.state_root,
-        bad_header.cert,
-    );
+    let bad_cp = Checkpoint {
+        height: bad_header.height,
+        block_hash: bad_header.block_hash,
+        parent_hash: bad_header.prev_hash,
+        state_root: bad_header.state_root,
+        cert: bad_header.cert,
+        shard_id: bad_header.shard_id,
+        round: bad_header.round,
+        body_commitment: bad_header.body_commitment,
+        mmr_epoch_root: bad_header.mmr_epoch_root,
+        epoch_key_commitment: bad_header.epoch_key_commitment,
+        timestamp: bad_header.timestamp,
+        proposer: bad_header.proposer,
+    };
     assert!(
         LightClient::new(vs, bad_cp).is_err(),
         "a prevote quorum must not anchor a light client"
@@ -610,8 +678,9 @@ fn chain(
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        let bh = b.compute_hash();
+            round: 0,
+        };
+        let bh = b.compute_hash();
         let parent = b.prev_hash;
         b.precommit_qc = Some(cert(keys, fks, vs, h, bh, &parent));
         prev = bh;
@@ -871,14 +940,32 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
         let answer = ProofAnswer::from_json(&raw).expect("the answer parses");
         // The chain's convention: the header at h+1 commits to the state at h.
         let height = answer.height.expect("the answer carries a height") + 1;
-        let block_hash = [0x22u8; 32];
+        let proposer = ks[0].verifying_key().to_bytes();
+        let hdr = stellereum::sharding::BlockHeader {
+            shard_id: MASTERCHAIN_SHARD,
+            height,
+            round: 0,
+            prev_hash: [0x11u8; 32],
+            state_root: answer.state_root,
+            body_commitment: [0x22u8; 32],
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 1_700_000_000,
+            proposer,
+        };
+        let block_hash = hdr.compute_hash();
         let header = json!({
             "height": height,
             "block_hash": hex::encode(block_hash),
             "prev_hash": hex::encode([0x11u8; 32]),
             "state_root": hex::encode(answer.state_root),
-            "proposer": hex::encode(ks[0].verifying_key().to_bytes()),
+            "proposer": hex::encode(proposer),
             "timestamp": 1_700_000_000u64,
+            "shard_id": MASTERCHAIN_SHARD,
+            "round": 0u32,
+            "body_commitment": hex::encode(hdr.body_commitment),
+            "mmr_epoch_root": hex::encode([0u8; 32]),
+            "epoch_key_commitment": hex::encode([0u8; 32]),
             "cert": cert_json(&ks[..3], &fks[..3], &validators(&ks), height, block_hash, &[0x11u8; 32]),
         });
         (raw, header)
@@ -935,7 +1022,19 @@ fn the_light_client_command_detects_a_lying_server_end_to_end() {
             .await;
         let answer = ProofAnswer::from_json(&raw).expect("the answer parses");
         let height = answer.height.expect("the answer carries a height") + 1;
-        let block_hash = [0x22u8; 32];
+        let hdr = stellereum::sharding::BlockHeader {
+            shard_id: MASTERCHAIN_SHARD,
+            height,
+            round: 0,
+            prev_hash: [0x11u8; 32],
+            state_root: answer.state_root,
+            body_commitment: [0x22u8; 32],
+            mmr_epoch_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            timestamp: 1_700_000_000,
+            proposer: [0xEEu8; 32],
+        };
+        let block_hash = hdr.compute_hash();
         // The liar's certificate: signed by OUTSIDERS. They are not members
         // of the operator's set, so no envelope can be compiled for them and
         // the served shape stays envelope-less (refused at power counting).
@@ -952,6 +1051,11 @@ fn the_light_client_command_detects_a_lying_server_end_to_end() {
             "state_root": hex::encode(answer.state_root),
             "proposer": hex::encode([0xEEu8; 32]),
             "timestamp": 1_700_000_000u64,
+            "shard_id": MASTERCHAIN_SHARD,
+            "round": 0u32,
+            "body_commitment": hex::encode(hdr.body_commitment),
+            "mmr_epoch_root": hex::encode([0u8; 32]),
+            "epoch_key_commitment": hex::encode([0u8; 32]),
             "cert": cert_json(&liars, &liar_fks, &validators(&ks), height, block_hash, &[0x11u8; 32]),
         });
         (raw, header)

@@ -155,8 +155,9 @@ fn epoch_mmr_root_keeps_legacy_hashes_and_moves_hash_when_set() {
         epoch_key_commitment: legacy.epoch_key_commitment,
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-            round: 0,
-    };    assert_eq!(legacy_shaped.compute_hash(), legacy_hash);
+        round: 0,
+    };
+    assert_eq!(legacy_shaped.compute_hash(), legacy_hash);
 }
 
 #[test]
@@ -379,8 +380,9 @@ fn legacy_block_bytes_still_decode() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    assert_eq!(decoded.compute_hash(), rebuilt.compute_hash());
+        round: 0,
+    };
+    assert_eq!(decoded.compute_hash(), rebuilt.compute_hash());
 
     // A block WITH the field round-trips through bincode.
     let modern = block_with(vec![head(1, 5, 0x01)]);
@@ -664,6 +666,15 @@ fn xshard_rebound_msg_id_is_refused() {
 
 #[test]
 fn xshard_empty_block_hash_is_byte_identical_to_the_legacy_preimage() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::sharding::set_header_commit_activation_override(None);
+        }
+    }
+    let _reset = Reset;
+    crate::sharding::set_header_commit_activation_override(Some(u64::MAX));
+
     // VERSION RULE proof: an empty-`cross_shard_out` block must hash
     // EXACTLY as it did before the full-message commitment existed. The
     // legacy preimage is hashed manually here (no call into the new
@@ -685,8 +696,9 @@ fn xshard_empty_block_hash_is_byte_identical_to_the_legacy_preimage() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-            round: 0,
-    };    let mut legacy = Sha256::new();
+        round: 0,
+    };
+    let mut legacy = Sha256::new();
     legacy.update(b"STELLEREUM_BLOCK_V3");
     legacy.update(crate::consensus::consensus_chain_id().to_be_bytes());
     legacy.update(block.shard_id.to_be_bytes());
@@ -726,8 +738,9 @@ fn xshard_full_message_commitment_binds_the_body_beyond_msg_id() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
-            round: 0,
-    };    let honest_hash = block.compute_hash();
+        round: 0,
+    };
+    let honest_hash = block.compute_hash();
 
     // A body swap that keeps the stale `msg_id` MUST move the block hash:
     // the commitment binds the body, not just the id.
@@ -811,6 +824,15 @@ fn perf_batched_vs_single_hashing() {
 
 #[test]
 fn block_compute_hash_matches_single_tx_hash_reference() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::sharding::set_header_commit_activation_override(None);
+        }
+    }
+    let _reset = Reset;
+    crate::sharding::set_header_commit_activation_override(Some(u64::MAX));
+
     for count in [0usize, 1, 32] {
         let txs = batch_test_txs(count);
         let block = Block::new_for_test(1, 42, [0xAAu8; 32], [0xBBu8; 32], txs);
@@ -843,6 +865,15 @@ fn block_compute_hash_matches_single_tx_hash_reference() {
 
 #[test]
 fn cnvrf_v3_payload_preserves_legacy_hash_commits_every_field_and_fails_closed_on_eof() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::sharding::set_header_commit_activation_override(None);
+        }
+    }
+    let _reset = Reset;
+    crate::sharding::set_header_commit_activation_override(Some(u64::MAX));
+
     use crate::cn_vrf::{cnvrf_v3_commit, CommitCarrierV3};
     use crate::minroot_vdf::{eval, TEST_VDF_STEPS};
 

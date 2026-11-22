@@ -132,7 +132,8 @@ fn mk_block(
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 struct Harness {
     engine: InMemoryStateEngine,

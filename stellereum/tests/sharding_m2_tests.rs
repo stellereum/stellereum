@@ -196,8 +196,9 @@ async fn escrow_backed_legacy_message(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    let out = source.apply_block_transition(&escrow_block, 0).await;
+        round: 0,
+    };
+    let out = source.apply_block_transition(&escrow_block, 0).await;
     assert_eq!(out.status, vec![true], "the escrow tx must apply");
     let post_root = source.get_state_root().await;
     assert_eq!(
@@ -252,7 +253,8 @@ fn carrier(shard_id: u32, height: u64, msgs: Vec<CrossShardMessage>) -> Block {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    }}
+    }
+}
 
 // ===========================================================================
 // XSHARD-01: the affordability-only inbound credit is REFUSED.
@@ -482,13 +484,15 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
     );
 
     // Sender debited amount + gas; the amount is burned off-source into the
-    // escrow; the gas is the proposer fee. The recipient does NOT exist on the
-    // source shard.
+    // escrow; the non-burned fee share is the proposer credit. The recipient
+    // does NOT exist on the source shard.
+    let burn = ((gas as u128 * stellereum::tokenomics::DEFAULT_FEE_BURN_BPS as u128)
+        / stellereum::staking::BPS_DENOMINATOR as u128) as u64;
     assert_eq!(
         balance(sc.shard(SHARD0), &sender_addr).await,
         1_000 - amount - gas
     );
-    assert_eq!(balance(sc.shard(SHARD0), &validator_addr).await, gas);
+    assert_eq!(balance(sc.shard(SHARD0), &validator_addr).await, gas - burn);
     assert!(sc.shard(SHARD0).nodes[0]
         .state
         .get_account(&recipient_addr)
@@ -537,13 +541,14 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
     );
 
     // Supply across BOTH shards is conserved (the escrow is released, not
-    // minted): the amount moved, the fee paid the proposer.
+    // minted): the amount moved, the non-burned fee paid the proposer.
     let supply_after = balance(sc.shard(SHARD0), &sender_addr).await
         + balance(sc.shard(SHARD0), &validator_addr).await
         + balance(sc.shard(SHARD1), &recipient_addr).await;
     assert_eq!(
-        supply_after, supply_before,
-        "cross-shard transfer must conserve supply"
+        supply_after + burn,
+        supply_before,
+        "cross-shard transfer must conserve supply (accounting for FEE_MARKET_V2 burn)"
     );
 
     // Determinism: a block's cross-shard records are bound into its identity.
@@ -775,7 +780,8 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
         round: 0,
-    };    forged.sign_block(&validator);
+    };
+    forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
         .expect_err("a replayed consumption must be refused");

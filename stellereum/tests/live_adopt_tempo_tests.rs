@@ -44,10 +44,37 @@ fn vs_of(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
 
-async fn observer_runtime(ks: &[SigningKey]) -> ValidatorRuntime {
+async fn observer_runtime(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+) -> ValidatorRuntime {
     let vs = vs_of(ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
+    {
+        let mut ledger = st.staking_write().await;
+        let mut pq_reg = st.pq_registry_write().await;
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            let vid = id(k);
+            ledger.validator_pq_keys.insert(
+                vid,
+                (
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                ),
+            );
+            pq_reg
+                .adopt_legacy_key_at(
+                    vid,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                    0,
+                    true,
+                )
+                .expect("seed pq_registry");
+        }
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+    }
     ValidatorRuntime::new(ks[0].clone(), vs, st, 1)
 }
 
@@ -85,13 +112,13 @@ async fn live_block_for(
         cnvrf_v3: None,
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-            round: 0,
-    };    // Canonical downtime evidence (W10.5): a live block above the genesis
-    // child carries the QC that decided its parent (production
-    // `decided_parent_qc`), and an adopter that knows the parent decision
-    // REFUSES a block that omits it. The observer learns each height's QC
-    // from the adopt itself (`last_decision`), so the evidence chains
-    // forward exactly like the live network.
+        round: 0,
+    }; // Canonical downtime evidence (W10.5): a live block above the genesis
+       // child carries the QC that decided its parent (production
+       // `decided_parent_qc`), and an adopter that knows the parent decision
+       // REFUSES a block that omits it. The observer learns each height's QC
+       // from the adopt itself (`last_decision`), so the evidence chains
+       // forward exactly like the live network.
     if h > 1 {
         if let Some((dh, _, qc)) = rt.last_decision.clone() {
             if dh + 1 == h {
@@ -319,7 +346,7 @@ async fn adopted_records_keep_order_and_completeness_off_tick() {
 #[tokio::test]
 async fn forked_commit_dies_on_linkage_before_quorum_crypto() {
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = observer_runtime(&ks).await;
+    let mut rt = observer_runtime(&ks, &fks).await;
     let (mut b, _) = live_block_for(&rt, &ks, &fks, 1, [0u8; 32]).await;
     // Форк: чужой prev при нашей высоте.
     b.prev_hash = [0xEEu8; 32];
@@ -357,7 +384,7 @@ async fn observer_holds_chain_tempo_on_empty_blocks() {
     // с запасом от флаков CI, но на два порядка строже 30с/блок (900с на N).
     const BUDGET_SECS: u64 = 10;
     let (ks, fks) = falcon_votes::falcon_set(4);
-    let mut rt = observer_runtime(&ks).await;
+    let mut rt = observer_runtime(&ks, &fks).await;
     let t0 = Instant::now();
     for _ in 1..=N {
         let h = rt.hc.height;

@@ -129,19 +129,33 @@ fn header_at(
     fks: &[stellereum::post_quantum::FalconKeypair],
     vs: &ValidatorSet,
 ) -> LightHeader {
-    let hash = block_hash(height, &prev_hash, &state_root);
+    let body_tag = block_hash(height, &prev_hash, &state_root);
+    let timestamp = 1_700_000_000 + height;
+    let hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height,
+        round: 0,
+        prev_hash,
+        state_root,
+        body_commitment: body_tag,
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp,
+        proposer,
+    };
+    let hash = hdr.compute_hash();
     LightHeader {
         height,
         prev_hash,
         state_root,
         block_hash: hash,
-        timestamp: 1_700_000_000 + height,
+        timestamp,
         proposer,
         cert: qc_from(signers, fks, vs, height, hash, &prev_hash),
         signatures: Vec::new(),
         shard_id: 0,
         round: 0,
-        body_commitment: None,
+        body_commitment: Some(body_tag),
         mmr_epoch_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
     }
@@ -550,12 +564,21 @@ fn light_e2e_forgery_classes_refused() {
     // 4. Rolled-back anchor: a checkpoint older than the accepted tip whose
     //    QC genuinely verifies under the set in force, so the refusal comes
     //    from the ANCHOR gate (not from bad evidence).
-    let rollback_hash = block_hash(3, &[0x99u8; 32], &chain.roots[1]);
-    let rollback = Checkpoint::new(
-        3,
-        rollback_hash,
-        [0x99u8; 32],
-        chain.roots[1],
+    let rollback_hdr = stellereum::sharding::BlockHeader {
+        shard_id: 0,
+        height: 3,
+        round: 0,
+        prev_hash: [0x99u8; 32],
+        state_root: chain.roots[1],
+        body_commitment: block_hash(3, &[0x99u8; 32], &chain.roots[1]),
+        mmr_epoch_root: [0u8; 32],
+        epoch_key_commitment: [0u8; 32],
+        timestamp: 0,
+        proposer: [0u8; 32],
+    };
+    let rollback_hash = rollback_hdr.compute_hash();
+    let rollback = Checkpoint::from_block_header(
+        rollback_hdr,
         qc_from(
             &chain.new_keys[..3],
             &chain.new_fks[..3],

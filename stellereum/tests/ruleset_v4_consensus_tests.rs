@@ -185,7 +185,11 @@ async fn child(
         .proposer_for(2, rt.hc.round)
         .expect("non-empty set has a proposer");
     b.round = rt.hc.round;
-    register_validator_pq_key(b.proposer, PqScheme::Falcon512, falcon_for(k).public_key.clone());
+    register_validator_pq_key(
+        b.proposer,
+        PqScheme::Falcon512,
+        falcon_for(k).public_key.clone(),
+    );
     b.sign_block_with_falcon(k, &falcon_for(k));
     b
 }
@@ -239,7 +243,10 @@ async fn timestamp_rule_is_a_pure_function_of_parent_and_block() {
 async fn honest_proposer_clamps_into_the_validator_window() {
     let (mut rt, _parent_hash, k) = runtime_with_parent(1_000_000).await;
     // Our slot at this height/round (single-validator set).
-    assert_eq!(rt.validators.proposer_for(rt.hc.height, rt.hc.round), Some(id(&k)));
+    assert_eq!(
+        rt.validators.proposer_for(rt.hc.height, rt.hc.round),
+        Some(id(&k))
+    );
 
     // A very fast local clock asks for far more than the protocol allows.
     let mut block = rt
@@ -285,13 +292,7 @@ async fn block_round_must_match_the_proposal_round() {
     let root = rt.state.get_state_root().await;
 
     let build = |round: u32| {
-        let mut b = Block::new_for_test(
-            MASTERCHAIN_SHARD,
-            2,
-            parent_hash,
-            root,
-            vec![],
-        );
+        let mut b = Block::new_for_test(MASTERCHAIN_SHARD, 2, parent_hash, root, vec![]);
         b.timestamp = 1_000_000;
         b.proposer = proposer;
         b.round = round;

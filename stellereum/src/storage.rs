@@ -2732,7 +2732,29 @@ impl Storage {
             .filter(|k| k.len() == 8)
             .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
             .collect();
-        let Some(height) = state_heights.intersection(&domain_heights).copied().max() else {
+        let mut candidates: Vec<u64> = state_heights
+            .intersection(&domain_heights)
+            .copied()
+            .collect();
+        if !self.pq_registry.is_empty() {
+            let pq_heights: std::collections::BTreeSet<u64> = self
+                .pq_registry
+                .iter()
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| k.len() == 8)
+                .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+                .collect();
+            let with_pq: Vec<u64> = candidates
+                .iter()
+                .copied()
+                .filter(|h| pq_heights.contains(h))
+                .collect();
+            if !with_pq.is_empty() {
+                candidates = with_pq;
+            }
+        }
+        let Some(height) = candidates.into_iter().max() else {
             return Ok(None);
         };
         let Some(bytes) = self.state.get(height.to_be_bytes())? else {
@@ -6640,6 +6662,7 @@ impl AsyncPersistence {
         let zkml_models = engine.zkml_models_snapshot().await;
         let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
         let evm_bindings = engine.evm_bindings_snapshot().await;
+        let pq_registry = engine.pq_registry_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
         // tests) - and that is CORRECT here, because there is nothing live to
@@ -6676,6 +6699,7 @@ impl AsyncPersistence {
         if let Some(bytes) = serialize_off_tick(snap).await {
             self.enqueue_cnvrf_v3(height, cnvrf_v3);
             self.enqueue_evm_bindings_state(height, evm_bindings);
+            self.enqueue_pq_registry(height, pq_registry);
             self.enqueue_domains(
                 height,
                 bytes,
@@ -8782,6 +8806,66 @@ mod persist_policy_tests {
         assert_eq!(ap.pending(), 0);
         ap.enqueue_finalized(1, [1u8; 32]);
         assert_eq!(ap.pending(), 1, "accepted job increments the gauge");
+        drop(ap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_domains_persists_pq_registry_and_latest_paired_skips_missing_pq_tail() {
+        let dir = tmpdir("pq_snap_domains");
+        let st = Arc::new(Storage::open(&dir).expect("open storage"));
+        let engine = InMemoryStateEngine::new();
+        let vid = [0x44u8; 32];
+        let pk = crate::sharding::Transaction::sample_falcon512_pubkey(0x44);
+        {
+            let mut reg = engine.pq_registry_write().await;
+            reg.adopt_legacy_key_at(vid, crate::post_quantum::PqScheme::Falcon512, pk, 0, true)
+                .expect("seed pq key");
+        }
+        let ledger = engine.staking_read().await.clone();
+        let gov = engine.governance_read().await.clone();
+
+        let ap = AsyncPersistence::start(Arc::clone(&st));
+        ap.snapshot_state(&engine, 10).await;
+        ap.snapshot_domains(&engine, &ledger, &gov, 10).await;
+        let _ = wait_for_persist_drain(|| ap.pending()).await;
+        let _ = st.flush();
+
+        // Simulate an older incomplete tail at height 20 missing pq_registry:
+        // `latest_paired_snapshot` must skip 20 and return the complete 10.
+        ap.snapshot_state(&engine, 20).await;
+        let snap20 = DomainSnapshot::capture(&engine, &ledger, &gov).await;
+        ap.enqueue_domains(
+            20,
+            bincode::serialize(&snap20).unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let _ = wait_for_persist_drain(|| ap.pending()).await;
+        let _ = st.flush();
+
+        let paired = st
+            .latest_paired_snapshot()
+            .expect("latest_paired_snapshot")
+            .expect("some paired");
+        assert_eq!(
+            paired.0, 10,
+            "paired snapshot with pq_registry must win over incomplete tail"
+        );
+        assert!(st.pq_registry_at(10).expect("read pq 10").is_some());
+
+        let restored_engine = InMemoryStateEngine::new();
+        let (rh, _, _) = load_full_state_into(&st, &restored_engine)
+            .await
+            .expect("load_full_state_into")
+            .expect("some state");
+        assert_eq!(rh, 10);
+        assert_eq!(
+            restored_engine.get_state_root().await,
+            engine.get_state_root().await
+        );
         drop(ap);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,0 +1,13 @@
+[package]
+name = "account-object"
+version = "0.1.0"
+edition = "2021"
+description = "Native Account Abstraction with session keys, spend limits, and guardian recovery"
+authors = ["Stellereum Core Developers"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+stellereum-contract-sdk = { path = "../../crates/stellereum-contract-sdk" }

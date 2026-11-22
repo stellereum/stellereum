@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stellereum-contract-sdk",
+    "crates/e2e-tests",
+    "contracts/stl-dns",
+    "contracts/sts20-token",
+    "contracts/liquidity-pool",
+    "contracts/account-object",
+]
+default-members = [
+    "crates/stellereum-contract-sdk",
+    "contracts/stl-dns",
+    "contracts/sts20-token",
+    "contracts/liquidity-pool",
+    "contracts/account-object",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+strip = "symbols"

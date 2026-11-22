@@ -1,0 +1,13 @@
+[package]
+name = "stellereum-contract-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Official Smart Contract SDK for the Stellereum Layer-1 Blockchain"
+authors = ["Stellereum Core Developers"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[features]
+default = []
+std = []

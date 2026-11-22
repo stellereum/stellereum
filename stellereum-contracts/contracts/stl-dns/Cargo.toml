@@ -1,0 +1,13 @@
+[package]
+name = "stl-dns"
+version = "0.1.0"
+edition = "2021"
+description = "Stellereum Name Service (SNS / STL-DNS) with TON-style auction grid and burn black hole"
+authors = ["Stellereum Core Developers"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+stellereum-contract-sdk = { path = "../../crates/stellereum-contract-sdk" }

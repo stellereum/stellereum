@@ -1,0 +1,13 @@
+[package]
+name = "sts20-token"
+version = "0.1.0"
+edition = "2021"
+description = "STS-20 Fungible Token Standard with 50bps liquidity fee and black hole burn"
+authors = ["Stellereum Core Developers"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+stellereum-contract-sdk = { path = "../../crates/stellereum-contract-sdk" }

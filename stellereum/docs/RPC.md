@@ -19,13 +19,15 @@ operating one, see [`OPERATIONS.md`](OPERATIONS.md).
 | Content type | any; the body is read as a string and parsed with `serde_json` |
 | Max body | 1 MiB (`MAX_RPC_BODY`). Larger → `-32600 "request too large"` |
 | Rate limit | standalone RPC: **300 req/s per IP** (`STELL_STANDALONE_RATE_LIMIT`, default `STANDALONE_RATE_LIMIT_DEFAULT = 300`; the legacy `STELL_RPC_RATE_LIMIT_PER_SEC` is honoured when the new name is unset). The gateway nests the same router under its own **30 req/s per IP** limiter (`STELL_RATE_LIMIT_PER_SEC`). Both are in-process fixed windows — a speed bump, not access control. |
-| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_pmmBuy`, `stell_pmmSell` (open when unset, require the token when set). TOKEN-ALWAYS (N-02/N-03, no loopback escape): the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` and the two contract previews `stell_deployContract`, `stell_callContract` require a valid token on EVERY bind, loopback included — with no token configured they refuse with `-32001` instead of serving (a loopback bind is not proof of a local caller behind a proxy; `src/rpc.rs:49-67`). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
+| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_submitPqPriceFeed`, `stell_pmmBuy`, `stell_pmmSell` (open when unset, require the token when set). TOKEN-ALWAYS (N-02/N-03, no loopback escape): the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` and the two contract previews `stell_deployContract`, `stell_callContract` require a valid token on EVERY bind, loopback included — with no token configured they refuse with `-32001` instead of serving (a loopback bind is not proof of a local caller behind a proxy; `src/rpc.rs:49-67`). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
 
 There is exactly one route in the router — `("/", post(rpc_handler))` — so
 `GET /`, or a POST to any other path, returns 404. `/health`, `/healthz`,
 `/readyz`, `/metrics` and `/api/*` live on the explorer port, not here. The
-router also serves the two streaming transports, `GET /ws` (WebSocket) and
-`GET /events` (SSE) — see §11.
+node gateway exposes `/healthz`, `/readyz` and `/metrics`. The **indexer** is
+a separate service: its health probe is `GET /api/v2/status`, and it has no
+`/health` and no `/metrics` endpoint. The router also serves the two streaming
+transports, `GET /ws` (WebSocket) and `GET /events` (SSE) — see §11.
 
 ### Request shape
 
@@ -1070,26 +1072,44 @@ Parameters: `{"address": "<hex>"}` or the bare string form, plus an optional
 ```json
 {"method":"stell_faucet","params":{"address":"<64 hex>"}}
 → {"result":{
-     "credited_nano":"10000000000",
+     "credited_nano":"2000000000",
      "recipient":"<64 hex>",
      "tx_hash":"<64 hex>",
      "shard":1
    }}
 ```
 
-`credited_nano` is a decimal string, **not** the amount you asked for. The drip
-is 10 STELL by default (`STELL_FAUCET_DRIP_STELL` overrides it) and the lifetime
-cap per address is 1000 STELL, hardcoded where the `Faucet` is constructed.
-`amount` is clamped down to the drip, and
-then down to whatever remains of the lifetime cap. Asking for `u64::MAX` gets you
-one drip, not an error.
+`credited_nano` is a decimal string, **not** the amount you asked for. The
+token-authenticated `stell_faucet` drip is **2 STELL** by default
+(`Faucet::default_drip_nano`; `STELL_FAUCET_DRIP_STELL` overrides it, whole
+STELL) and the lifetime cap per address is **50 STELL** on **both** faucet
+paths (`FAUCET_LIFETIME_CAP`; `STELL_FAUCET_LIFETIME_CAP_STELL` overrides it in
+whole STELL, and every node must carry the same cap). `amount` is clamped down
+to the drip, and then down to whatever remains of the lifetime cap. Asking for
+`u64::MAX` gets you one drip, not an error.
+
+The public (tokenless) path `POST /api/faucet-public/:address` drips a fixed
+**2 STELL** (`PUBLIC_DRIP_NANO`; `STELL_PUBLIC_DRIP_NANO` overrides it, nano)
+under a **45-minute per-address cooldown** (`PUBLIC_DRIP_COOLDOWN_SECS`;
+`STELL_PUBLIC_DRIP_COOLDOWN_SECS` overrides it). Only the public path has that
+per-address cooldown; the token-authenticated `stell_faucet` path has none.
+Both paths share the per-IP budget (20 requests/hour,
+`STELL_FAUCET_IP_MAX_PER_HOUR`) and the 50 STELL lifetime cap.
+
+**Consequence for validators.** The public faucet can never fund the **1,100
+STELL** new-validator bond (1,000 STELL minimum + 100 STELL buffer) — 50 STELL
+is the lifetime ceiling. Validator stake is provisioned by the Foundation on
+request, or by an operator transfer, never by faucet drips. Raising the cap
+requires setting `STELL_FAUCET_LIFETIME_CAP_STELL` and restarting with the
+network's agreement.
 
 **Which shard the drip lands on.** The drip is always a *same-shard* transfer
 (`source_shard == target_shard`) on the shard the RECIPIENT lives on, resolved
 by the documented address→shard rule (`ROUTING_RULE`, `route_shard`):
 * `-1:<hex>` (or `0:<hex>`) names a **masterchain** account explicitly → the
-  drip executes on shard 0. This is the form to fund for the
-  drip→consolidate→stake onboarding flow: staking happens on the masterchain.
+  drip executes on shard 0. Use this form for gas funding: staking happens on
+  the masterchain, but the 1,100 STELL stake itself must come from the
+  Foundation or an operator transfer (see above).
 * a bare 64-hex address is a **workchain** address → the drip executes on the
   workchain shard the routing prefix selects. A bare address NEVER routes to
   the masterchain.
@@ -1117,7 +1137,7 @@ Errors:
 | --- | --- |
 | `-32601 "faucet is disabled on this node"` | `STELL_FAUCET` is not `1`/`true` on this node — the default |
 | `-32602 "missing address"` / `"invalid address: …"` | no address, not 32 bytes, or a malformed `-1:`/`N:` prefix |
-| `-32000 "faucet limit reached for this address"` | the 1000 STELL lifetime cap for that address is spent |
+| `-32000 "faucet limit reached for this address"` | the 50 STELL lifetime cap for that address is spent |
 | `-32000 "faucet on shard S cannot serve an address on shard T …"` | sharded node, recipient lives on another shard — fund it from that shard's faucet instead. The refusal burns NO nonce and reserves NO cap: the next servable drip keeps its exact nonce |
 | `-32000 "faucet transfer rejected: …"` | the transfer could not be admitted to the mempool |
 
@@ -1139,10 +1159,12 @@ chain; but they no longer reset to 0 on a clean restart as they once did. A
 corrupt stored record fails closed to empty so it cannot mint extra credit.
 
 It is covered by `STELL_FAUCET_TOKEN` (fail-closed without it) on BOTH the
-RPC method and the gateway route, plus a per-IP budget (20 drips/hour) and the
-per-address lifetime cap. The gateway route is `POST /api/faucet/:address`
-(GET returns 405); both paths reconcile nonces. The standalone RPC has the
-same 30/s/IP limiter as the gateway plus request timeouts.
+RPC method and the token-gated gateway route, plus a per-IP budget (20
+drips/hour) and the 50 STELL per-address lifetime cap. The token-gated gateway
+route is `POST /api/faucet/:address` (GET returns 405); the public route is
+`POST /api/faucet-public/:address` (2 STELL, 45-minute per-address cooldown).
+Both routes reconcile nonces. The standalone RPC has the same 30/s/IP limiter
+as the gateway plus request timeouts.
 
 ---
 
@@ -1158,13 +1180,16 @@ opcodes are `SysCallStake` (bond / top-up), `SysCallDelegate`,
 see `docs/VALIDATOR_ONBOARDING.md` §7–§11 for the exact flow). Two facts
 integrators get wrong:
 
-- **Commission is set once, at bond time** — from `--commission-bps N`
-  on the wallet `stake` command when given (`SysCallStakeWithCommission`),
-  else from governance (`ctx.default_commission_bps`,
-  `DEFAULT_COMMISSION_BPS` = 1000 bps = 10 %, `src/staking.rs:232`) — and
-  the ledger has **no setter**: it is immutable afterwards, and a top-up
-  keeps the registered rate. A passed `SetDefaultCommissionBps`
-  governance action prices **new** bonds only.
+- **Commission is set at bond time and changeable in Ruleset v7.** A new bond
+  takes `--commission-bps N` on the wallet `stake` command when given
+  (`SysCallStakeWithCommission`), else the governance default
+  (`ctx.default_commission_bps`, `DEFAULT_COMMISSION_BPS` = 1000 bps = 10 %,
+  `src/staking.rs:232`). The validator changes it with
+  `stellereum validator announce-commission` (OpCode 63) followed by
+  `apply-commission` (OpCode 64): the change matures after a **30,000-height
+  delay**, is capped at **500 bps per step**, and has a **30,000-height
+  cooldown** between changes. A top-up keeps the registered rate. A passed
+  `SetDefaultCommissionBps` governance action prices **new** bonds only.
 - **No user-level multisig / threshold accounts** (explicit non-goal,
   `KNOWN_ISSUES.md` §J D-11): one key authorizes one transaction. The only
   "multisig" in the tree is the *bridge relayer* 2/3 quorum
@@ -1468,8 +1493,10 @@ defaults to the zero address).
   `oracle` publisher actions and the `upgrade_plan`).
 - The proposal must be **`Passed`** (quorum reached and `yes > no`); an `Open`
   one is refused with `-32000 "execute failed: …"`.
-- There is **no timelock**: execution is allowed as soon as the proposal has
-  passed.
+- Execution **is timelocked**: after a proposal passes, execution refuses
+  (`-32000 "execute failed: …"`) until `GOV_TIMELOCK_HEIGHTS` = **90,000
+  heights** have elapsed since the pass height. Maturity is recorded per
+  proposal.
 - Any account may execute (no proposer-only gate), so a lost proposer key
   cannot brick execution.
 - **Oracle actions** (`register_oracle_publisher`, `unregister_oracle_publisher`,
@@ -1641,7 +1668,7 @@ non-public and can aid front-running, so this arm is **fail-closed**: with no
 `-32001 "unauthorized: stell_mempoolDump is disabled when auth_token is not
 configured"`, and with a token configured it demands it.
 
-### `stell_submitPriceFeed`, `stell_pmmBuy`, `stell_pmmSell`
+### `stell_submitPriceFeed`, `stell_submitPqPriceFeed`, `stell_pmmBuy`, `stell_pmmSell`
 
 **WRITE-shaped, token-gated** (when `STELL_RPC_AUTH_TOKEN` is set).
 
@@ -1653,10 +1680,10 @@ Parameters: `{"tx": "<hex of bincode(Transaction)>"}`.
 → {"result":"<64 hex tx hash>"}
 ```
 
-All three are the same **thin admission path**: decode and verify the wrapping
+All four are the same **thin admission path**: decode and verify the wrapping
 transaction, check the payload actually carries the opcode the method name
-promises (`SysCallSubmitPriceFeed` / `SysCallPmmBuy` / `SysCallPmmSell`), and
-admit it to the mempool. Nothing else.
+promises (`SysCallSubmitPriceFeed` / `SysCallSubmitPqPriceFeed` /
+`SysCallPmmBuy` / `SysCallPmmSell`), and admit it to the mempool. Nothing else.
 
 They deliberately do **not** write state. A price, a swap or an order only
 becomes consensus state when a proposer includes the transaction in a block and
@@ -1671,13 +1698,12 @@ Errors: `-32001` (no/invalid token), `-32602 "missing tx"` / `"bad hex: …"` /
 **Feed liveness note (FULL-PQ).** The classical `SysCallSubmitPriceFeed`
 (`svm.rs:551`) still admits through the path above, but it can never commit:
 `PriceFeedUpdate::verify()` is hardcoded `false` (`oracle.rs:322-330`), so
-`commit_feed` (`oracle.rs:487`) always reverts the transaction. The PQ
-successor exists one layer down — `PqPriceFeedUpdate` (`oracle.rs:339`,
-Falcon-512 `verify()` at `oracle.rs:380`) with `commit_feed_pq`
-(`oracle.rs:611`) — but no `SysCall*` opcode exposes it: the `OpCode` enum
-(`svm.rs`) carries only the classical feed variant, so today no PQ feed can
-be committed via a block. A PQ-feed opcode (and its RPC row) lands with the
-opcode it rides on; until then treat this method as admission-only.
+`commit_feed` (`oracle.rs:487`) always reverts the transaction. The committed
+path is the PQ feed: `SysCallSubmitPqPriceFeed` carries `PqPriceFeedUpdate`
+(`oracle.rs:339`, Falcon-512 `verify()` at `oracle.rs:380`) and commits through
+`commit_feed_pq` (`oracle.rs:611`). Submit it with
+`stell_submitPqPriceFeed`, which accepts the same token-gated `{"tx": …}`
+envelope as `stell_submitPriceFeed`.
 
 ### `stell_pmmState`
 
@@ -1804,9 +1830,13 @@ dispute_id"` / `"bad dispute_id"`.
 A contract may carry a **typed ABI manifest**: a JSON description of every
 method it exports (name, typed parameters, typed return, whether it mutates
 state) and every event it emits (typed topics and data). The manifest is
-stored with the contract and committed to the state trie next to the code hash
-(`sha256("STELL_CONTRACT_ABI" || address)`), so the typed interface of a
-contract is discoverable from the state root alone.
+**preview-only**: the deploy preview validates it and then discards it, and a
+block applying `SysCallDeployContract { code }` calls
+`deploy_with_nonce(creator, code, nonce, now)` without an ABI field. No RPC
+commits a manifest either (`ContractRegistry::set_contract_abi` has no caller).
+So `stell_getContractAbi` answers `null` for a contract deployed through a
+normal transaction, and only the previews (`stell_callContract` direct form,
+`stell_runGetMethod`) ever consult a manifest.
 
 ```json
 {
@@ -1841,10 +1871,9 @@ Arguments are encoded canonically — **not** hand-packed into one integer
 
 ```text
 args_payload := u32_le(arg_count) || arg_0 || arg_1 || ...
-arg_i       := u8(type_tag) || value_payload
+arg_i        := u8(type_tag) || value_payload
 
-calldata     := u32_le(selector) || args_payload
-selector     := sha256(method_name)[0..4] read as u32_le
+return_value := u8(type_tag) || value_payload
 
 value_payload per type (the type tags are frozen, never renumbered):
   I64     0x01 : 8 bytes, big-endian two's complement
@@ -1856,6 +1885,16 @@ value_payload per type (the type tags are frozen, never renumbered):
   String  0x07 : u32_le(len) || len UTF-8 bytes
 ```
 
+**`host.calldata` receives `args_payload` only — there is no selector prefix.**
+Dispatch is by the exported method name. `ContractAbi::encode_call` prepends
+`u32_le(sha256(method_name)[0..4])` when building a client envelope, but that
+4-byte selector is not part of the value the engine hands to wasm, and
+`SysCallCallContract` / `SysCallCallContractArgs` pass their raw calldata
+straight through without consulting the manifest (see "Honest limitations"
+below). The manifest blob cap is 1 MiB, but signed-path call calldata is
+capped at **64 KiB** (`MAX_CONTRACT_CALLDATA_BYTES`), so the latter is the
+practical limit.
+
 Fixed-width integers are big-endian so the encoding does not depend on the
 host architecture; variable-length payloads are length-prefixed so a decoder
 can skip a value without knowing its type.
@@ -1866,43 +1905,61 @@ can skip a value without knowing its type.
 auth token ALWAYS** (same fail-closed gate as the governance writes —
 `require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
-`-32602` — sign locally (SDK `TxBuilder::contract_deploy` + `sign`) and submit
-the sealed transaction via the `tx` form. Nothing here touches the mempool or
+`-32602` — sign the deploy transaction locally and submit the sealed
+transaction via the `tx` form. There is **no SDK deploy builder today**:
+`TxBuilder::contract_call` exists, `TxBuilder::contract_deploy` does not, and
+the SDK `Op` enum has no deploy variant, so you must build and sign the
+`SysCallDeployContract` payload yourself. Nothing here touches the mempool or
 gossip: state changes exclusively when a block applies a transaction submitted
-via `stell_sendRawTransaction`.
+via `stell_sendRawTransaction`. **No receipt is filed** by either preview form.
 
 Two request forms are accepted.
 
-**(a) Direct parameters** — `{code, [gas_limit], [abi]}` (no `private_key`,
-no `from`, no `init_data`/`salt` — the salt is retired: it never entered the
-replayable payload, so no block path could observe it).
+**(a) Direct parameters** — `{sender, code, [nonce], [gas_limit], [abi]}`
+(no `private_key`, no `from`, no `init_data`/`salt` — the salt is retired: it
+never entered the replayable payload, so no block path could observe it).
+`sender` is required for an address prediction: without it the answer carries
+`predicted:false` and a null `contract_address`.
 
 ```json
 {"method":"stell_deployContract",
- "params":{"code":"<hex of the WASM module>",
+ "params":{"sender":"<64 hex>",
+           "code":"<hex of the WASM module>",
            "gas_limit":50000000,
            "abi":{"methods":[],"events":[]}}}
 → {"result":{
-     "contract_address":"<64 hex>",
-     "contract_address_stl57":"EQ…",
+     "contract_address":"<64 hex> | null",
+     "contract_address_stl57":"EQ… | null",
      "code_hash":"<64 hex>",
-     "tx_hash":"<64 hex>"
+     "sender":"<64 hex>",
+     "nonce":0,
+     "gas_estimate":280000,
+     "predicted":true,
+     "deployed":false,
+     "preview_only":true,
+     "tx_hash":null,
+     "address_derivation":"contract_address(tx.from, tx.nonce)",
+     "note":"prediction only: …"
    }}
 ```
 
+- `sender` — the deploy creator. The predicted address is
+  `contract_address(sender, nonce)` (the SDK-canonical
+  `contract_address(tx.from, tx.nonce)` shape on the hardened path). Without
+  `sender` no address is derived; the preview fails closed to `predicted:false`
+  and a null address.
+- `nonce` — optional; defaults to the sender account's current nonce.
 - `code` — the hex of the WASM module. At most **2 MiB**
   (`MAX_CONTRACT_CODE_SIZE`); a bigger module is refused by the contract
   registry. `0x` prefix optional.
 - `gas_limit` — default **`MAX_CONTRACT_FUEL` = 50,000,000**. This is the
   contract-execution ceiling.
 - `abi` — optional: a JSON manifest (object) or a string containing one. It is
-  validated here; it is committed with the code only by block application,
-  never by this arm.
-- The `contract_address` predicted here belongs to an EPHEMERAL throwaway key
-  the node generates for the clone preview (a self-contained Falcon-512
-  vehicle) — it is NOT your address. To deploy as yourself, use form (b) with
-  a locally-signed transaction, then submit that same sealed tx via
-  `stell_sendRawTransaction` for the real deploy.
+  validated here and then **discarded**. `SysCallDeployContract` has no ABI
+  field, so block application commits no manifest; `stell_getContractAbi`
+  answers `null` for a normally deployed contract.
+- `tx_hash` is always `null` on this form (no transaction exists) and **no
+  receipt is filed**: a preview that was never submitted must not look mined.
 
 **(b) A signed raw transaction** — `{"tx": "<hex of bincode(Transaction)>"}"
 
@@ -1918,8 +1975,9 @@ verified exactly like `stell_sendRawTransaction` (signature check + FULL-PQ
 classical-envelope refusal at intake), the code is validated read-only, and the
 predicted address is the SDK-canonical `contract_address(tx.from, tx.nonce)`:
 exactly what block application derives when this tx applies first for its
-sender. The tx is then DROPPED — a node-local preview receipt is filed, but
-nothing is admitted or gossipped.
+sender. The response carries the previewed `tx_hash`, `predicted:true`,
+`deployed:false` and `preview_only:true`. The tx is then DROPPED — **no
+receipt is filed** and nothing is admitted or gossipped.
 
 Errors: `-32001` (no/invalid token, on every bind), `-32602` (missing `code`,
 bad hex, undecodable `tx`, `private_key`/`from` present, invalid `abi`),
@@ -1933,26 +1991,29 @@ the auth token ALWAYS** (same fail-closed gate as the governance writes —
 `require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
 `-32602` — sign locally (SDK `TxBuilder::contract_call` + `sign`) and submit
-the sealed transaction via the `tx` form, or use direct parameters for a
-keyless preview. To move state, submit via `stell_sendRawTransaction`.
+the sealed transaction via the `tx` form. The direct form requires an explicit
+`caller`; there is no keyless form and the node never falls back to a zero
+address. To move state, submit via `stell_sendRawTransaction`.
 
-Parameters: `{contract, method, args, [value], [gas_limit]}` (`private_key` /
-`from` are refused with `-32602` — sign locally instead).
+Parameters: `{contract, method, args, caller, [value], [gas_limit]}`.
 
 ```json
 {"method":"stell_callContract",
  "params":{"contract":"<64 hex>",
            "method":"transfer_direct",
            "args":[1,2,1000],
+           "caller":"<64 hex>",
            "value":0,
            "gas_limit":50000000}}
 → {"result":{
-     "tx_hash":"<64 hex>",
+     "tx_hash":null,
+     "preview_only":true,
+     "mined":false,
      "status":"success",
      "return_value":1000,
      "gas_used":280000,
      "events":[{"contract":"<64 hex>","contract_stl57":"EQ…",
-                "topic":"Transfer","value":"1000"}],
+                "topic":1,"value":1000}],
      "outcome":{"status":"success","return_value":1000,
                 "gas_used":280000,"events":[…],"error":null}
    }}
@@ -1961,11 +2022,16 @@ Parameters: `{contract, method, args, [value], [gas_limit]}` (`private_key` /
 - `contract` (alias `address`) — the contract address. Accepts the bare
   32-byte hex and the TON-style `<shard>:<addr>` form (`-1:` for the
   masterchain).
+- `caller` — **required** on the direct form: the address the call would
+  execute as. It is authenticated input to the contract, so omitting it is
+  `-32602 "missing 'caller': …"`. (The `tx` form derives it from `tx.from`.)
 - `args` (alias `arg`) — a single value **or an array of one value per
   parameter**. A method with three parameters is called with three arguments,
   no packing. The dispatch is by exact arity: an argument is never dropped.
   At most **8** arguments (`MAX_CONTRACT_CALL_ARGS`) — the same bound on the
-  call path and on the read-only getter path.
+  call path and on the read-only getter path. A manifest may also declare at
+  most 8 parameters (`MAX_ABI_ARGS`), so a 9-parameter method is refused at
+  manifest validation rather than failing at execution.
 - `value` — nano-STELL to transfer with the call. Previewed against the
   CLONE (a sender that cannot cover it gets `-32000 "insufficient funds to
   transfer value: …"`); nothing is debited or credited on live state — the
@@ -1975,16 +2041,19 @@ Parameters: `{contract, method, args, [value], [gas_limit]}` (`private_key` /
   the CLONE preview's verdict, not an on-chain receipt.
 - `outcome` — the same result nested, plus `error` (a string when the call
   failed, `null` otherwise). This is the canonical "what happened" object.
+  Event `topic` and `value` are **numeric `i64`**, never strings.
 
-When the contract has an ABI manifest, the manifest is authoritative: the
+When the contract carries an ABI manifest (only previews can, see
+"Honest limitations"), the manifest is authoritative for this preview: the
 method must be declared, the number of arguments must match exactly and every
 argument must have the declared type. A call that does not match is rejected
-with `-32602 "ABI validation failed: …"` **before it touches consensus state**.
+with `-32602 "ABI validation failed: …"`. This check is **not** enforced on the
+signed path.
 
 Errors: `-32001` (no/invalid token, on every bind), `-32602` (missing
-`contract` / `method`, bad address, bad `args`, `private_key`/`from` present,
-`ABI validation failed`, `ABI encoding failed`), `-32000` (insufficient funds
-for `value`, contract execution failure).
+`contract` / `method` / `caller`, bad address, bad `args`,
+`private_key`/`from` present, `ABI validation failed`, `ABI encoding failed`),
+`-32000` (insufficient funds for `value`, contract execution failure).
 
 ### `stell_runGetMethod`
 
@@ -2020,10 +2089,30 @@ Parameters: `{address, method, args, [fuel], [height]}`.
   **`GET_METHOD_SAFETY_FUEL_LIMIT` = 5,000,000** (an unbounded getter is an
   infinite loop); the default is the same ceiling. A read that exceeds it
   comes back as `{"success":false,"error":"…","fuel_used":…}`.
-- `height` — an optional pin. A height **above** this node's finalized height
-  is refused with `{"success":false,"error":"pinned block height N exceeds
-  current finalized height M","fuel_used":0}`. A height at or below the tip is
-  served from the current state (this node keeps no historical state).
+- `height` — an optional pin. The node keeps **no historical contract
+  state** and **no versioned contract registry**, so it can answer only at the
+  height it is currently serving:
+  - a height **above** this node's finalized height is refused with
+    `{"success":false,"error":"pinned block height N exceeds current finalized
+    height M","fuel_used":0}`;
+  - a **current** height is answered against live state (`N == current`);
+  - a **past** height is REFUSED with
+    `{"success":false,"error":"historical state is not available on this node:
+    it serves height M, not N","fuel_used":0}`. Serving today's getter result
+    under an older height's label would be a false historical answer: the
+    registry holds only the current code/storage/balance, not a per-height
+    version, so no past execution can be reproduced.
+
+**Block identifier in previews.** `stell_runGetMethod` runs the getter without
+a block context. Until `CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT` is activated
+(compiled default `u64::MAX`, disabled), a contract's `host.block_hash` is 32
+zero bytes, exactly as during block application. Once activated, block
+application exposes the **parent** block hash (`block.prev_hash`) — the current
+hash commits execution output and is not known before the payloads run — while
+this preview path still has no block context and therefore still sees zero.
+Wiring the preview to a real identifier (the parent of the served tip, which is
+deterministic for the caller) is part of the activation work; a preview must
+never invent a value inside the VM.
 
 The response also carries `shard`, `local_shard` and `shard_is_local`: the
 shard the **address→shard rule** resolves the address to, the shard this node
@@ -2051,9 +2140,11 @@ bare string form is accepted too):
 {"method":"stell_getEvents","params":{"tx_hash":"<64 hex>"}}
 → {"result":[
     {"contract":"<64 hex>","contract_stl57":"EQ…",
-     "topic":"Transfer","value":"1000"}
+     "topic":1,"value":1000}
   ]}
 ```
+
+`topic` and `value` are numeric `i64` values, not strings.
 
 An unknown transaction is an **empty array**, not an error.
 
@@ -2178,18 +2269,20 @@ Parameters: `{"contract": "<hex>"}` (alias `address`).
 → {"result":{
      "contract":"<64 hex>",
      "contract_stl57":"EQ…",
-     "abi":{"methods":[…],"events":[…]},
-     "abi_json":"{\"methods\":[…],\"events\":[…]}"
+     "abi":null
    }}
 ```
 
-- `abi` — the parsed manifest, or `null` when the contract has none (in which
-  case `abi_json` is absent).
-- `abi_json` — the manifest as the **raw string** the node committed, so a
-  client can byte-compare it against what it expects.
-- The manifest is committed to the state trie next to the code hash
-  (`sha256("STELL_CONTRACT_ABI" ‖ address)`), so the typed interface of a
-  contract is discoverable from the state root alone.
+- `abi` — the parsed manifest, or `null` when the contract has none. A contract
+  deployed through a normal `SysCallDeployContract` transaction always has
+  none: the deploy preview validates `abi` and discards it, block application
+  calls `deploy_with_nonce` without an ABI field, and no RPC sets one. Only an
+  engine-level `set_contract_abi` call (no RPC/opcode caller) could populate
+  it, so expect `null` in practice.
+- `abi_json` — the manifest as the **raw string** the node stored, present only
+  when `abi` is non-null.
+- The manifest is **not committed to the state trie** by block application and
+  cannot be discovered from the state root alone.
 
 Errors: `-32602 "missing 'contract' parameter"`, `-32602 "invalid contract
 address: …"`.
@@ -2293,17 +2386,20 @@ next to the code hash as `sha256("STELL_CONTRACT_SOURCE" ‖ address)` and
 folded into the state digest when present; absent = unverified and
 contributes nothing, so legacy roots are unchanged).
 
-Authorization is the contract creator's ed25519 signature over
+Authorization is the contract creator's **Falcon-512 (PQ1)** signature over
 `b"STELL_REGISTER_SOURCE" ‖ contract ‖ source_hash` — self-authenticating
 like `stell_sendRawTransaction` (anyone may submit; only the creator's
 signature verifies). Call `stell_verifyContractSource` first and register the
-`source_hash` it returns.
+`source_hash` it returns. A `PQ1` envelope or a raw Falcon-512 signature
+(with `pubkey`, or an already-registered creator key) is accepted; a 64-byte
+classical (Ed25519) signature is **refused**.
 
 ```json
 {"method":"stell_registerContractSource","params":{
   "contract":"<64 hex>",
   "source_hash":"<64 hex>",
-  "signature":"<128 hex>"
+  "signature":"<hex Falcon-512 signature or PQ1 envelope>",
+  "pubkey":"<hex Falcon-512 public key, optional>"
 }}
 → {"result":{"contract":"<64 hex>","contract_stl57":"EQ…",
              "source_hash":"<64 hex>","registered":true,"verified":true}}
@@ -2332,6 +2428,19 @@ cargo run --bin abi_codegen -- contracts/sts20_token_abi.json --lang both --out-
 This writes `sts20_token_abi_client.rs` (typed Rust client: one method per
 contract method, event decoders) and `sts20_token_abi_client.ts` (the same in
 TypeScript, dependency free, implementing the very same wire format).
+
+### Honest limitations
+
+- **No in-place upgrade.** No upgrade opcode exists; "upgrading" means
+  deploying a new contract at a new address and migrating state explicitly.
+- **ABI is not enforced on the signed path.** `SysCallDeployContract { code }`
+  has no ABI field and block application commits no manifest, so
+  `stell_getContractAbi` answers `null` for normally deployed contracts and no
+  RPC sets one. `SysCallCallContract` / `SysCallCallContractArgs` pass raw
+  calldata to wasm; only the previews consult a manifest.
+- **Pause is not reachable.** `ContractRegistry::pause` exists at the engine
+  level, but no RPC or opcode calls it and there is no unpause, so a live
+  contract cannot be paused through any supported path.
 
 ---
 
@@ -2365,7 +2474,7 @@ parameter names) so a client can discover it with a single call.
 
 ### Method list
 
-The namespace has **35 methods** in seven domains plus discovery. **No method in
+The namespace has **32 methods** in seven domains plus discovery. **No method in
 this namespace is token-gated**: a read answers from committed state, and a
 "prepare" method answers with bytes to sign — neither touches the chain.
 
@@ -2674,7 +2783,7 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_getTransactionStatus` | read | — | hash (bare or object) | `{status, height}` |
 | `stell_sendRawTransaction` | write (open) | — | `{tx}` | tx hash hex |
 | `stell_faucet` | write | faucet token | `{address, [amount]}` | `{credited_nano, recipient, tx_hash}` |
-| `stell_submitPriceFeed` | write | gated when set | `{tx}` | tx hash hex |
+| `stell_submitPriceFeed` / `stell_submitPqPriceFeed` | write | gated when set | `{tx}` | tx hash hex |
 | `stell_pmmBuy` / `stell_pmmSell` | write | gated when set | `{tx}` | tx hash hex |
 | `stell_pmmState` | read | — | — | the committed PMM curve |
 | `stell_orderBook` | read | — | `{pair}` | the committed book (≤20 levels/side) |
@@ -2717,7 +2826,7 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_verifyMessage` | read | — | `{address, message\|message_hex, signature, [chain_id]}` | `{valid, address, scheme, scheme_id, chain_id}` |
 | `stell_signTypedData` | sign (node key, devnet-only) | **yes** (fail-closed without a token; loopback-only) | `{contract, method, [args], [value], [nonce], [chain_id]}` | `{address, scheme, scheme_id, signature, canonical, chain_id}` |
 | `stell_verifyTypedData` | read | — | `{address, contract, method, [args], [value], [nonce], [chain_id], signature}` | `{valid, address, scheme, scheme_id, canonical}` |
-| `stell_nativeApi` | read | — | — | the native-namespace manifest (35 methods) |
+| `stell_nativeApi` | read | — | — | the native-namespace manifest (32 methods) |
 | `stell_token*` (9) | read / prepare | — | see §9 | see §9 |
 | `stell_stake*` / `stell_delegate` / `stell_undelegate` / `stell_claimRewards` | prepare | — | see §9 | see §9 |
 | `stell_bridge*` (6) | read / prepare | — | see §9 | see §9 |

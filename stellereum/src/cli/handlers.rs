@@ -754,6 +754,10 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     Some(v) => parse_wallet_address(&v)?,
                     None => signer_addr,
                 };
+                // Same local preflight as `validator unjail`: refuse an early
+                // release / unmanageable / unfunded tx that the block would
+                // reject anyway. The on-chain checks are untouched.
+                preflight_unjail(&rpc, &validator_addr, dry_run, false)?;
 
                 let query = |method: &str,
                              params: serde_json::Value|
@@ -2182,6 +2186,14 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 let validator_id = parse_wallet_address(&validator_id)?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                // Funding diagnosis BEFORE signing: a claim from an unfunded
+                // new cold address can be signed but never included (no gas).
+                // Printed again after signing so the last line before
+                // submission cannot hide it. --dry-run still works.
+                let funding_warning = claim_withdrawal_funding_warning(&rpc, &withdrawal_addr);
+                if let Some(msg) = &funding_warning {
+                    eprintln!("⚠️  {msg}");
+                }
                 let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
                 let tx = build_claim_withdrawal_tx_with_chain(
                     &withdrawal_kp,
@@ -2194,6 +2206,9 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     anyhow::bail!(
                         "refusing to submit: built claim-withdrawal tx failed chain-bound verify"
                     );
+                }
+                if let Some(msg) = &funding_warning {
+                    eprintln!("⚠️  {msg}");
                 }
                 println!("✅ ClaimWithdrawal signed (OpCode 62, chain_id={chain_id}):");
                 println!("  Validator ID:       {}", hex::encode(validator_id));
@@ -2318,6 +2333,10 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     "  Known:          {}",
                     status["known"].as_bool().unwrap_or(false)
                 );
+                // Prominent diagnosis FIRST: it answers the only question an
+                // operator has when a validator is down — can this bond be
+                // recovered at all with the keys currently on chain?
+                println!("  {}", format_manageability(&status));
                 println!(
                     "  In Active Set:  {}",
                     status["in_set"].as_bool().unwrap_or(false)
@@ -2339,6 +2358,15 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "none".to_string())
                     );
+                    let current_height = rpc_call(&rpc, "stell_blockNumber", serde_json::json!([]))
+                        .ok()
+                        .and_then(|v| json_block_height(&v));
+                    if let Some(line) = format_jail_release(&status, current_height) {
+                        println!("  {line}");
+                    }
+                    if let Some(current) = current_height {
+                        println!("  Current Height: {current}");
+                    }
                 }
                 println!(
                     "  Total Stake:    {} nano-STELL",
@@ -2691,6 +2719,10 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 let validator_id = parse_wallet_address(&validator_id)?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                // Refuse a provably dead unjail BEFORE signing/paying: early
+                // release height, no cold address, or an unfunded withdrawal
+                // address. --dry-run prints the same diagnosis but proceeds.
+                preflight_unjail(&rpc, &validator_id, dry_run, true)?;
                 let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
                 let tx = build_unjail_tx_with_chain(
                     &withdrawal_kp,
@@ -2879,6 +2911,219 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse a JSON-RPC block height that may be a number, a decimal string, or a
+/// `0x`-prefixed hex string (`stell_blockNumber` uses the hex form today).
+fn json_block_height(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    let s = value.as_str()?;
+    if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex_str, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse a nano-STELL amount returned by `stell_getBalance` (`balance` is a
+/// decimal string today; accept a JSON number too for forward compatibility).
+fn json_nano_amount(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    value.as_str().and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// The prominent `MANAGEABILITY` line for `stellereum validator status`.
+///
+/// Pure so the CLI's operator-facing diagnosis is testable without a node.
+/// `None` for `withdrawal_address` is the exact live incident shape: the
+/// record exists, but no key can authorize unjail/unbond/withdraw until the
+/// one-time ClaimWithdrawal migration claims a cold address.
+fn format_manageability(status: &serde_json::Value) -> String {
+    if !status["known"].as_bool().unwrap_or(false) {
+        return "MANAGEABILITY: UNKNOWN — no staking record, so unjail/unbond/withdraw cannot be authorized"
+            .to_string();
+    }
+    match status["withdrawal_address"].as_str() {
+        Some(addr) => format!("MANAGEABILITY: OK (withdrawal {addr})"),
+        None => "MANAGEABILITY: UNMANAGEABLE: no withdrawal_address — unjail/unbond/withdraw will be refused; run validator claim-withdrawal"
+            .to_string(),
+    }
+}
+
+/// The `released: yes/no` line for a jailed validator, with the release
+/// height (and the current chain height when known). Pure for unit tests.
+fn format_jail_release(status: &serde_json::Value, current_height: Option<u64>) -> Option<String> {
+    if !status["jailed"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let release = status["release_height"].as_u64();
+    let released = match (release, current_height) {
+        (Some(r), Some(c)) => Some(c >= r),
+        _ => None,
+    };
+    Some(format!(
+        "released: {} (release_height {})",
+        match released {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        },
+        release
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    ))
+}
+
+/// Local preflight shared by `validator unjail` and `wallet unjail`.
+///
+/// The block still makes every acceptance decision; this only refuses a
+/// transaction that is provably dead on arrival:
+///  * validator record missing / no cold withdrawal address (no key can ever
+///    authorize the op until ClaimWithdrawal);
+///  * `release_height` in the future (the block would refuse it);
+///  * zero balance at the withdrawal address (the tx cannot pay gas).
+///
+/// `--dry-run` is never blocked: the same conditions are printed as warnings
+/// so an operator can inspect the signed transaction before funding/retrying.
+/// RPC/parse failures are warnings, never a new hard gate: an unreachable or
+/// older node must not turn a UX preflight into a refusal the chain itself
+/// would not make.
+///
+/// `refuse_unmanageable` is true only for `validator unjail` (the Ruleset v7
+/// cold-key command). `wallet unjail` keeps its legacy pre-W3 shape, where a
+/// record may legitimately still have `withdrawal_address == None` and the
+/// validator id itself signs; there it warns instead of refusing.
+fn preflight_unjail(
+    rpc: &str,
+    validator_id: &[u8; 32],
+    dry_run: bool,
+    refuse_unmanageable: bool,
+) -> anyhow::Result<()> {
+    let validator_hex = hex::encode(validator_id);
+    let warn_or_refuse = |msg: String, dry_run: bool| -> anyhow::Result<()> {
+        if dry_run {
+            eprintln!("⚠️  UNJAIL PREFLIGHT (dry-run): {msg}");
+            Ok(())
+        } else {
+            anyhow::bail!("refusing to submit unjail: {msg}")
+        }
+    };
+
+    let status = match rpc_call(
+        rpc,
+        "stell_getValidatorStatus",
+        serde_json::json!({ "validator": validator_hex }),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "⚠️  UNJAIL PREFLIGHT: could not query stell_getValidatorStatus ({e}); \
+                 continuing — the block still enforces every check"
+            );
+            return Ok(());
+        }
+    };
+
+    if !status["known"].as_bool().unwrap_or(false) {
+        return warn_or_refuse(
+            format!(
+                "validator {validator_hex} has no staking record; the block will refuse the unjail"
+            ),
+            dry_run,
+        );
+    }
+
+    let Some(withdrawal) = status["withdrawal_address"].as_str() else {
+        let msg = format!(
+            "validator {validator_hex} has no cold withdrawal_address, so NO post-W3 owner \
+             operation (including unjail) can be authorized. If this chain is post-W3, run \
+             `stellereum validator claim-withdrawal --validator-id {validator_hex} \
+             --voting-key-file ./keys/falcon.key --withdrawal-key-file <cold-withdrawal-key>` first"
+        );
+        // `validator unjail` is strictly post-W3 and must refuse. The legacy
+        // `wallet unjail` shape (validator id signs) stays usable pre-W3, so
+        // it only diagnoses.
+        if dry_run {
+            eprintln!("⚠️  UNJAIL PREFLIGHT (dry-run): {msg}");
+            return Ok(());
+        }
+        if refuse_unmanageable {
+            return warn_or_refuse(msg, false);
+        }
+        eprintln!("⚠️  UNJAIL PREFLIGHT: {msg}");
+        return Ok(());
+    };
+
+    let current_height = rpc_call(rpc, "stell_blockNumber", serde_json::json!([]))
+        .ok()
+        .and_then(|v| json_block_height(&v));
+    if let (Some(release), Some(current)) = (status["release_height"].as_u64(), current_height) {
+        if current < release {
+            let remaining = release.saturating_sub(current);
+            // RULESET v2 tempo is ~240 ms/height; the exact height is the
+            // authority, the ETA is only a human hint.
+            let eta_secs = remaining.saturating_mul(240).div_ceil(1_000);
+            return warn_or_refuse(
+                format!(
+                    "release_height {release} is {remaining} height(s) in the future \
+                     (current height {current}, ETA ~{eta_secs}s at 240 ms/height); retry at/after \
+                     release_height — the block would refuse it now"
+                ),
+                dry_run,
+            );
+        }
+    }
+
+    match rpc_call(
+        rpc,
+        "stell_getBalance",
+        serde_json::json!({ "address": withdrawal }),
+    ) {
+        Ok(bal) => {
+            if json_nano_amount(&bal["balance"]) == Some(0) {
+                return warn_or_refuse(
+                    format!(
+                        "withdrawal address {withdrawal} has ZERO balance: fund the withdrawal \
+                         address first (faucet or a transfer) — the transaction cannot pay gas. No \
+                         on-chain check is weakened"
+                    ),
+                    dry_run,
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "⚠️  UNJAIL PREFLIGHT: could not query the withdrawal-address balance ({e}); \
+             continuing — the block still enforces every check"
+        ),
+    }
+    Ok(())
+}
+
+/// Funding warning for `validator claim-withdrawal`: a claim signed by an
+/// unfunded NEW cold address cannot be included (it cannot pay gas). The
+/// command still signs/submits exactly as before, and `--dry-run` is allowed;
+/// this is a loud preflight diagnosis, not a new acceptance rule.
+fn claim_withdrawal_funding_warning(rpc: &str, withdrawal_addr: &[u8; 32]) -> Option<String> {
+    let addr = hex::encode(withdrawal_addr);
+    let bal = rpc_call(
+        rpc,
+        "stell_getBalance",
+        serde_json::json!({ "address": addr }),
+    )
+    .ok()?;
+    if json_nano_amount(&bal["balance"]) == Some(0) {
+        Some(format!(
+            "PREFLIGHT: new withdrawal address {addr} has ZERO balance. The ClaimWithdrawal \
+             transaction cannot be included until that address is funded (faucet or a transfer); \
+             it cannot pay gas. The claim is still signed/submitted unchanged"
+        ))
+    } else {
+        None
+    }
+}
+
 fn rpc_call(
     rpc: &str,
     method: &str,
@@ -2940,4 +3185,70 @@ fn verify_and_submit_chain_bound_tx(
     let hash = rpc_submit_tx(rpc, "stell_sendRawTransaction", tx, token)?;
     println!("  Submitted, mempool tx hash: {hash}");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_status_tests {
+    use super::*;
+
+    #[test]
+    fn manageability_line_is_prominent_and_actionable() {
+        let ok = serde_json::json!({
+            "known": true,
+            "withdrawal_address": "77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa77aa",
+        });
+        let line = format_manageability(&ok);
+        assert!(line.starts_with("MANAGEABILITY: OK (withdrawal "), "{line}");
+
+        let missing = serde_json::json!({ "known": true, "withdrawal_address": null });
+        let line = format_manageability(&missing);
+        assert!(line.starts_with("MANAGEABILITY: UNMANAGEABLE"), "{line}");
+        assert!(line.contains("no withdrawal_address"), "{line}");
+        assert!(line.contains("claim-withdrawal"), "{line}");
+        assert!(line.contains("unjail/unbond/withdraw"), "{line}");
+
+        let unknown = serde_json::json!({ "known": false });
+        let line = format_manageability(&unknown);
+        assert!(line.starts_with("MANAGEABILITY: UNKNOWN"), "{line}");
+    }
+
+    #[test]
+    fn jail_release_line_reports_released_yes_and_no() {
+        let future = serde_json::json!({
+            "jailed": true,
+            "release_height": 24_421,
+        });
+        let line = format_jail_release(&future, Some(20_421)).expect("jailed line");
+        assert!(line.starts_with("released: no"), "{line}");
+        assert!(line.contains("24421"), "{line}");
+
+        let past = serde_json::json!({
+            "jailed": true,
+            "release_height": 24_421,
+        });
+        let line = format_jail_release(&past, Some(25_000)).expect("jailed line");
+        assert!(line.starts_with("released: yes"), "{line}");
+
+        let healthy = serde_json::json!({ "jailed": false });
+        assert!(format_jail_release(&healthy, Some(25_000)).is_none());
+    }
+
+    #[test]
+    fn block_height_accepts_hex_decimal_and_number() {
+        assert_eq!(
+            json_block_height(&serde_json::json!("0x2710")),
+            Some(10_000)
+        );
+        assert_eq!(json_block_height(&serde_json::json!("10000")), Some(10_000));
+        assert_eq!(json_block_height(&serde_json::json!(10_000)), Some(10_000));
+        assert_eq!(json_block_height(&serde_json::json!("nope")), None);
+    }
+
+    #[test]
+    fn nano_amount_accepts_string_and_number() {
+        assert_eq!(json_nano_amount(&serde_json::json!("0")), Some(0));
+        assert_eq!(json_nano_amount(&serde_json::json!("123")), Some(123));
+        assert_eq!(json_nano_amount(&serde_json::json!(123)), Some(123));
+        assert_eq!(json_nano_amount(&serde_json::json!(null)), None);
+    }
 }

@@ -5779,7 +5779,10 @@ async fn run_get_method_block_height_pinning() {
     assert_eq!(res_curr["success"], json!(true));
     assert_eq!(res_curr["return_value"], json!(42));
 
-    // 2. Height pin at past height (10) succeeds
+    // 2. Height pin at a PAST height (10) is REFUSED: this node keeps no
+    // historical contract state, so running the getter against live state and
+    // calling it "height 10" would be a false historical answer. (Before the
+    // fix this returned today's value labelled with the old height.)
     let res_past = call(
         &st,
         "stell_runGetMethod",
@@ -5791,8 +5794,15 @@ async fn run_get_method_block_height_pinning() {
         }),
     )
     .await;
-    assert_eq!(res_past["success"], json!(true));
-    assert_eq!(res_past["return_value"], json!(42));
+    assert_eq!(res_past["success"], json!(false));
+    assert!(
+        res_past["error"]
+            .as_str()
+            .unwrap()
+            .contains("historical state is not available"),
+        "a past height pin must be refused, not relabelled as current: {res_past}"
+    );
+    assert_eq!(res_past["fuel_used"], json!(0));
 
     // 3. Height pin in future (100 > 42) fails with descriptive error
     let res_future = call(

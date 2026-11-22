@@ -70,6 +70,69 @@ fn restored_round(persisted_round: u32, vote_watermark_floor: Option<u32>) -> u3
     vote_watermark_floor.map_or(capped, |floor| capped.max(floor))
 }
 
+/// Boot-time validator self-check text for THIS node's local validator id.
+///
+/// Returns `(loud_eprintln, message)`:
+///  * a record with a cold `withdrawal_address` -> `None` (healthy, no log);
+///  * a record with `withdrawal_address == None` -> LOUD: every owner
+///    operation (unjail/unbond/claim/withdraw/commission/rotation) is
+///    impossible until the one-time `SysCallClaimWithdrawal` migration;
+///  * no record at all -> explicit WARN that this node is not bonded (or the
+///    restored ledger lags), never a silent skip.
+///
+/// Read-only and never fatal: the check exists so the nodeB failure mode (a
+/// jailed validator whose release height passed while every unjail was
+/// refused because the record had no cold address) is visible at boot
+/// instead of only under a refusal. It MUST NOT mutate state or block startup.
+fn local_validator_self_check_message(
+    local_id: &[u8; 32],
+    ledger: &stellereum::staking::StakingLedger,
+) -> Option<(bool, String)> {
+    match ledger.validators.get(local_id) {
+        None => Some((
+            false,
+            format!(
+                "[validator-self-check] local validator {} has NO staking record in the restored \
+                 ledger: this node is not bonded (yet), so it cannot earn voting power from stake. \
+                 No state was modified; if this node is supposed to validate, bond it once the \
+                 ledger is fully synced",
+                hex::encode(local_id)
+            ),
+        )),
+        Some(v) if v.withdrawal_address.is_none() => Some((
+            true,
+            format!(
+                "[validator-self-check] UNMANAGEABLE: local validator {} has NO cold \
+                 withdrawal_address. Every owner operation (unjail, unbond, claim-rewards, \
+                 withdraw self-bond, commission change, voting-key rotation) is refused until \
+                 SysCallClaimWithdrawal (OpCode 62) claims one. Recover with: `stellereum \
+                 validator claim-withdrawal --validator-id {} --voting-key-file ./keys/falcon.key \
+                 --withdrawal-key-file <cold-withdrawal-key>` (use --dry-run first). No state was \
+                 modified and startup continues",
+                hex::encode(local_id),
+                hex::encode(local_id)
+            ),
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Emit [`local_validator_self_check_message`] once at startup. The
+/// unmanageable case also goes to stderr so an operator sees it even when
+/// `tracing` is filtered to a file, exactly like the other LOUD startup
+/// warnings in this driver.
+fn log_local_validator_self_check(
+    local_id: &[u8; 32],
+    ledger: &stellereum::staking::StakingLedger,
+) {
+    if let Some((loud, msg)) = local_validator_self_check_message(local_id, ledger) {
+        tracing::warn!("{msg}");
+        if loud {
+            eprintln!("{msg}");
+        }
+    }
+}
+
 const SMALL_GAP_LIVE_CATCHUP_WINDOW_MS: u64 = 1_500;
 const SMALL_GAP_LIVE_CATCHUP_BUDGET_MS: u64 = 120;
 
@@ -1095,6 +1158,18 @@ pub(crate) async fn run_consensus_node(
                     let _ = healed;
                 }
             }
+        }
+
+        // BOOT VALIDATOR SELF-CHECK (validator resilience). Runs on the
+        // masterchain only (the staking registry lives there; a workchain's
+        // ledger is intentionally empty) and after the restore/heal above, so
+        // it sees the ledger this node will actually vote with. Read-only:
+        // warns loudly when THIS node's record exists without a cold
+        // withdrawal address (every owner op impossible until ClaimWithdrawal)
+        // or when the record is missing, and never fails startup.
+        if is_validator && block_shard == stellereum::sharding::MASTERCHAIN_SHARD {
+            let ledger = rt.staking_read().await;
+            log_local_validator_self_check(&self_vote_id, &ledger);
         }
 
         // DOWNTIME-RESTORE (P0): rebuild the parent-decision stash from the
@@ -6211,5 +6286,49 @@ mod r3_driver_pq_tests {
             None,
             "STELL_PEER_PQ_KEYS must not populate PQ_VALIDATOR_KEYS when pq_lifecycle_active_at(init_height) is true"
         );
+    }
+}
+
+#[cfg(test)]
+mod validator_self_check_tests {
+    use super::*;
+
+    #[test]
+    fn self_check_is_silent_for_manageable_validator_and_loud_without_withdrawal() {
+        let local = [0xA1u8; 32];
+        let cold = [0xC0u8; 32];
+        let mut ledger = stellereum::staking::StakingLedger::new();
+
+        // Not bonded yet: explicit (non-eprintln) warning, never a silent skip.
+        let missing = local_validator_self_check_message(&local, &ledger)
+            .expect("missing record must be reported");
+        assert!(!missing.0);
+        assert!(missing.1.contains("NO staking record"));
+
+        // Unclaimed pre-W3 record: LOUD and actionable, with the exact command.
+        ledger
+            .bond(
+                local,
+                stellereum::staking::required_bond_floor_nano(),
+                stellereum::staking::DEFAULT_COMMISSION_BPS,
+            )
+            .unwrap();
+        let unmanageable = local_validator_self_check_message(&local, &ledger)
+            .expect("None withdrawal must be reported");
+        assert!(unmanageable.0, "must also go to stderr");
+        assert!(unmanageable.1.contains("UNMANAGEABLE"));
+        assert!(unmanageable.1.contains("claim-withdrawal"));
+        assert!(unmanageable.1.contains("SysCallClaimWithdrawal"));
+
+        // Claimed record: healthy, no log at all.
+        ledger
+            .bond_with_withdrawal(
+                [0xA2u8; 32],
+                stellereum::staking::required_bond_floor_nano(),
+                stellereum::staking::DEFAULT_COMMISSION_BPS,
+                cold,
+            )
+            .unwrap();
+        assert!(local_validator_self_check_message(&[0xA2u8; 32], &ledger).is_none());
     }
 }

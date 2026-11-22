@@ -507,7 +507,11 @@ pub(crate) enum ValidatorCommands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// One-time migration to claim a cold withdrawal_address for a pre-W3 validator (OpCode 62)
+    /// One-time migration to claim a cold withdrawal_address for a pre-W3 validator (OpCode 62).
+    ///
+    /// Warns (before and after signing) when the NEW withdrawal address has a
+    /// zero balance: the claim cannot be included until that address is funded,
+    /// because it cannot pay gas. `--dry-run` is always allowed.
     ClaimWithdrawal {
         /// New cold withdrawal Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
@@ -597,7 +601,11 @@ pub(crate) enum ValidatorCommands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Inspect on-chain validator status, stake, jail, and withdrawal balance
+    /// Inspect on-chain validator status, stake, jail, and withdrawal balance.
+    ///
+    /// Prints a prominent MANAGEABILITY line (`OK (withdrawal <addr>)` or
+    /// `UNMANAGEABLE: no withdrawal_address`) and, when jailed, `released:
+    /// yes/no` with the release height and the current height.
     Status {
         /// Validator ID / address in hex (32 bytes)
         #[arg(long)]
@@ -810,7 +818,13 @@ pub(crate) enum ValidatorCommands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Re-admit a downtime-jailed validator (SysCallUnjail, Ruleset v7 cold withdrawal key)
+    /// Re-admit a downtime-jailed validator (SysCallUnjail, Ruleset v7 cold withdrawal key).
+    ///
+    /// Local preflight refuses a provably dead transaction before signing:
+    /// `release_height` in the future (names the exact height/ETA), a record
+    /// with no cold withdrawal_address (run claim-withdrawal first), or a zero
+    /// withdrawal-address balance (fund it first — it cannot pay gas).
+    /// `--dry-run` prints the same diagnosis but is never blocked.
     Unjail {
         /// Cold withdrawal Falcon-512 key file
         #[arg(long)]
@@ -951,6 +965,12 @@ pub(crate) enum WalletCommands {
     /// Signs ONE PQ transaction carrying an optional `SysCallStake` top-up
     /// followed by `SysCallUnjail`, and submits it to a node. Under Ruleset v7
     /// the validator's cold `withdrawal_address` signs to unjail `validator_id`.
+    ///
+    /// Same local release-height / withdrawal-balance preflight as
+    /// `validator unjail`: a provably dead transaction is refused before
+    /// signing (diagnosed but allowed under `--dry-run`). A missing cold
+    /// withdrawal_address is diagnosed but still allowed here, because this
+    /// legacy command is also the pre-W3 path where the validator id signs.
     Unjail {
         /// Falcon-512 seed in hex (32 bytes) of the signing key (cold withdrawal or pre-W3 validator key)
         #[arg(long)]

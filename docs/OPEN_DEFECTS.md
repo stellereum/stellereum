@@ -1,7 +1,9 @@
 # OPEN_DEFECTS — реестр найденных дефектов и статус закрытия
 
-Snapshot: после пентеста-2 и кросс-кат свипа. Источники: `docs/PENTEST2_*.md`,
-`docs/REVIEW_WAVE_REGRESSIONS.md`, `docs/LOGIC_BUG_SWEEP.md`.
+Snapshot: после пентеста-2 и кросс-кат свипа. Рабочие логи ревью/пентеста
+удалены из публичного дерева (см. `docs/audits/INTERNAL_REVIEW_ARCHIVE.md`);
+этот реестр сохраняет результаты и тесты-пины, по которым они закрыты.
+Статус: Ruleset v7; `UP-5` (`stellereum-upgrader`) закрыт в дереве.
 Обновлено на HEAD `c58375443` (+ HEIGHT-SPLIT wave; закрыты `--owner-key` и `store_mail`).
 Дополнено 2026-11-21 по контрактам `docs/specs/05_LOCK_SAFETY_P0.md`,
 `06_BRIDGE_RELEASE_AUTHORIZATION_DRAFT.md`, `07_PQ_VALIDATOR_LIFECYCLE_DRAFT.md`,
@@ -207,7 +209,7 @@ P0-LOCK-WATERMARK: локально реализован `SafetyAuthority` (`ste
 | UP-2 | gate в chain-spec на генезисе + включение on-chain исполнения + fork-id в digest | **FIXED** (env-высота на генезисе, в digest; retroactive отказан) |
 | UP-3 | deadlock восстановления: walk vs snapshot cadence + recovery-режим | **FIXED** (multi-hop recovery 400/1100) |
 | UP-4 | `scripts/upgrade_drill.sh` (manual + onchain) + runbook + замер RTO | **FIXED** (manual PASS, RTO 10.8 s; onchain fail-closed) |
-| UP-5 | `cosmovisor`-аналог (демон, следящий за committed-планом) | OPEN (после деплоя) |
+| UP-5 | `cosmovisor`-аналог (демон, следящий за committed-планом) | **FIXED (локально, не задеплоено)**: `stellereum-upgrader` — `--supervise` (перехват exit 42), `--staged-dir`, `--print-systemd`, точный v1-маркер, `[u8;32]` digest из RPC, fallback на маркер при уже упавшем RPC, atomic swap; 19/19 тестов (`cargo test -p stellereum-upgrader`). Живой кластер ещё не обновлён. |
 
 ## Изолированные модули W1/W2/W4 (прошли `W0-CONSOLIDATE-GATE`, локально)
 
@@ -219,6 +221,18 @@ P0-LOCK-WATERMARK: локально реализован `SafetyAuthority` (`ste
 | W2-INFNODE-EC | Erasure coding в `infnode` (`ec_encode`/`ec_decode`, bounded read, key_box/hash checks) | **FIXED (локально, не задеплоено)**: живой кластер `infnode` ещё не обновлён; сетевая интеграция с `stellereum` идёт в **R2**. | `infnode/crates/infnode/src/node.rs` (`mod ec_tests`, 15 тестов: `ec_roundtrip_no_loss` .. `ec_invalid_key_box_bounds_are_refused`) + `infnode/crates/infnode/tests/storage_seal_tests.rs` (`store_mail_with_unboxable_owner_key_fails_closed` и др.) |
 | W2-EC-MAIL-RECOVERY | Автономная утилита восстановления EC-почты `ec-mail-recovery` | **FIXED (локально, не задеплоено)**: живой кластер/релизные бинари ещё не обновлены. | `infnode/tools/ec-mail-recovery/src/main.rs` (9/9: `legacy_writer_with_missing_data_shard` .. `ml_kem_box_and_legacy_x25519_refusal`) |
 | W4-INDEXER-GEYSER | Апгрейд `stellereum-indexer`: keyset-курсоры, таблицы `token_balances`/`contracts`, reorg cleanup, SSE `GET /api/v2/stream` | **FIXED (локально, не задеплоено)**: и индексерная, и нодовая стороны (`tx_by_addr`/`events_by_contract`/`stell_getProgramAccounts` и Geyser `rpc/streams.rs`) полностью реализованы и прошли гейты; живой индексер/кластер ещё не обновлены. | `stellereum-indexer/src/{db,syncer,server,events}.rs`; `stellereum-indexer/tests/w4_indexer_tests.rs` (4/4: `indexer_keyset_cursor_stable_under_concurrent_inserts`, `indexer_token_balances_and_contracts_tables_and_reorg_cleanup`, `indexer_sse_parser_and_push_sync_with_backfill_fallback`, `indexer_stream_endpoint_filtering_replay_and_limits`) |
+
+## Аудит исполнения и шардинга (внешнее ревью, 2026-11-23)
+
+| ID | Находка | Статус |
+|---|---|---|
+| EXEC-PMM-SHARDGATE-ATOMICITY | `PmmBuy`/`PmmSell` → `settle_pmm_native` → отказ C7 shard-gate оставлял native-кредит/списание и резерв эмиссии: отклонённый buy давал бесплатные STELL, sell сжигал деньги. | **FIXED (локально, не задеплоено)**: на отказе выполняются `release_mint_nano` + `restore_pmm_native` + восстановление книг/oracle; вердикт отказа не менялся (rollback-only). Тесты: `tests/review_exec_pmm_bridge_atomicity.rs` (2, fail-before). |
+| RPC-GETMETHOD-PAST-HEIGHT | `stell_runGetMethod` с `height < tip` исполнял геттер на ЖИВОМ registry и отдавал текущий результат как исторический. | **FIXED (локально)**: прошлая высота теперь fail-closed `historical state is not available on this node` (как `stell_getProof`); движковый helper тоже. Тесты: `tests/review_xshard_rpc_height_pinning.rs` (2) + обновлён `rpc::tests`. |
+| XSHARD-CONTRACT-SEND-BURN | Контрактный `send_message` на другой шард дебетовал отправителя и клал в `cross_shard_out` запись, которую inbound принять не может (битый `msg_id`, пустая подпись, нет escrow-листа, нет потребителя очереди) → сжигание value без доставки и bounce. | **FIXED (локально)**: `WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT = 0` — источник отказывает весь payload ДО любых мутаций; same-shard доставка не изменилась; inbound-проверки не тронуты. Тесты: `tests/review_final_cross_shard_contract_send.rs` (3). Реальный протокол — `stellereum/docs/specs/CONTRACT_XSHARD_SEND_REFUSAL.md`. |
+| CONTRACT-BLOCK-HASH-ZERO | `host.block_hash` всегда отдавал 32 нуля (оба opcode-варианта и preview). | **FIXED, gated (локально)**: `CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT = u64::MAX` (выключено). При активации контракт видит **хеш родителя** (детерминирован, известен до исполнения). Тесты: `tests/review_final_contract_block_hash.rs` (3, оба состояния). **ACTIVATION-REQUIRED** для включения; RPC-preview и одиночный `apply_transaction*` пока передают ноль. |
+| XSHARD-CONFIG-DIVERGENCE | `cross_shard_enabled` — node-local (`STELL_SHARDS`). Валидаторы на одном consensus-топике разойтись не могут, но одиночный **observer** на шардированной цепи применяет shard-0 блоки с флагом off и получает другой post-state. | **ACCEPTED (митигация)**: расхождение ловится громким `DIVERGENCE` и не форкает молча; observer шардированной цепи обязан `STELL_SHARDS=0,1`. Долгосрочный фикс (genesis-committed набор шардов / вывод burn-credit только из полей tx) — отдельный активационный пункт. |
+
+Проверено и **не подтверждено** на текущем дереве (ревью опиралось на код до hardening-гейтов; добавлены тесты-пины, чтобы не «починили» обратно): PQ-oracle rollback (`review_exec_pq_oracle_revert.rs`), `SysCallCallContractArgs` в снапшоте, публикация сообщений контракта до `commit_native`, bridge-opcode после `Halt` (`r1_frozen_apply_svm_tests`).
 
 ## Правило закрытия
 

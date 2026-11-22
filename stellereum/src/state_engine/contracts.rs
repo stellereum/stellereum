@@ -734,6 +734,13 @@ impl InMemoryStateEngine {
     }
 
     /// Read-only getter execution with optional block height pinning.
+    ///
+    /// This engine keeps no historical contract state, so the ONLY height it
+    /// can answer for is the one it is serving (`current_height`). A future
+    /// pin is refused as not-yet-finalized; a PAST pin is refused as
+    /// unsupported rather than silently running against live state and
+    /// labelling the result with an older height (which would be a false
+    /// historical answer).
     pub async fn run_get_method_with_height(
         &self,
         address: &[u8; 32],
@@ -747,6 +754,14 @@ impl InMemoryStateEngine {
             if pin > current_height {
                 return crate::contract::GetMethodResponse::error(
                     format!("pinned block height {pin} exceeds current finalized height {current_height}"),
+                    0,
+                );
+            }
+            if pin < current_height {
+                return crate::contract::GetMethodResponse::error(
+                    format!(
+                        "historical state is not available on this node: it serves height {current_height}, not {pin}"
+                    ),
                     0,
                 );
             }

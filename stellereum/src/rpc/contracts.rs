@@ -523,6 +523,24 @@ async fn dispatch_contracts_inner(
                         }),
                     );
                 }
+                // FAIL CLOSED on a PAST height. This node keeps no historical
+                // contract state: the getter below always runs against the
+                // live registry, so answering a request pinned at `pin <
+                // current_h` would present CURRENT state under an older
+                // height's label. Refuse instead of mislabelling (the same
+                // rule `stell_getProof` / the `eth_*` state tags apply).
+                if pin < current_h {
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": format!(
+                                "historical state is not available on this node: it serves height {current_h}, not {pin}"
+                            ),
+                            "fuel_used": 0,
+                        }),
+                    );
+                }
             }
 
             let addr_val = params.get("address").or_else(|| {

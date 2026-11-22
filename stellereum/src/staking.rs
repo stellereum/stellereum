@@ -537,12 +537,30 @@ pub enum StakingError {
     DelegationCapReached,
     /// Caller is not authorized for this validator lifecycle operation
     /// (`sender != validator` pre-W3 or `withdrawal_address != Some(sender)` post-W3).
+    /// A post-W3 record with `withdrawal_address == None` is the DISTINCT
+    /// [`StakingError::NoWithdrawalAddress`] instead of this generic mismatch.
     Unauthorized,
     /// One-time `ClaimWithdrawal` or `set_withdrawal_address` conflict: the
     /// validator already has a `withdrawal_address` set (or `new == current`).
     WithdrawalAlreadySet,
     /// Operation rejected by [`crate::pq_registry::PqRegistry`].
     PqRegistryRejected(String),
+    /// Post-W3 owner authorization found a validator with NO cold
+    /// `withdrawal_address` (`None`, e.g. an un-migrated pre-W3 record).
+    ///
+    /// This is deliberately DISTINCT from [`StakingError::Unauthorized`]:
+    /// the sender is not merely the wrong key, there is no key that could
+    /// ever authorize an owner operation until the one-time
+    /// `SysCallClaimWithdrawal` (OpCode 62) migration runs. Before this
+    /// variant the only signal was a generic "not authorized", which made a
+    /// jailed validator look like a wrong-key mistake instead of a locked
+    /// bond with no in-band recovery (live nodeB incident:
+    /// `jailed_at_height 20421`, `release_height 24421`, chain past release,
+    /// every `unjail` refused because the record had `withdrawal_address:
+    /// None`).
+    ///
+    /// Appended LAST so every existing serialized variant index is untouched.
+    NoWithdrawalAddress,
 }
 
 impl std::fmt::Display for StakingError {
@@ -601,6 +619,16 @@ impl std::fmt::Display for StakingError {
             }
             StakingError::WithdrawalAlreadySet => {
                 "validator withdrawal address is already set"
+            }
+            StakingError::NoWithdrawalAddress => {
+                return write!(
+                    f,
+                    "validator has no cold withdrawal_address: every owner operation \
+                     (unjail/unbond/claim-rewards/withdraw/commission/rotate-voting-key) is \
+                     refused until SysCallClaimWithdrawal (OpCode 62) is submitted with the hot \
+                     voting key (and the new cold key as sender); run `stellereum validator \
+                     claim-withdrawal`"
+                );
             }
             StakingError::PqRegistryRejected(msg) => {
                 return write!(f, "PQ registry rejected operation: {msg}");
@@ -1689,8 +1717,17 @@ impl StakingLedger {
     ///
     /// - `post_w3 == false`: legacy rule `sender == validator`.
     /// - `post_w3 == true`: strictly requires `v.withdrawal_address == Some(*sender)`
-    ///   (rejects `None`, unknown validators, `[0u8; 32]`, and even `sender == validator`
-    ///   when `withdrawal_address` differs, fail-closed with [`StakingError::Unauthorized`]).
+    ///   (unknown validators, `[0u8; 32]`, and even `sender == validator` when
+    ///   `withdrawal_address` differs fail closed with [`StakingError::Unauthorized`]).
+    ///
+    /// A recorded validator whose `withdrawal_address` is `None` (an
+    /// un-migrated pre-W3 record) is a DISTINCT failure: no sender can ever
+    /// authorize an owner operation until `SysCallClaimWithdrawal` (OpCode
+    /// 62) claims one, so the caller gets [`StakingError::NoWithdrawalAddress`]
+    /// with the exact recovery command instead of the generic mismatch text.
+    /// The accept/refuse boundary is unchanged: every case that returned
+    /// `Err` before still returns `Err`; only the error identity/message is
+    /// more actionable.
     pub fn authorize_validator_owner(
         &self,
         validator: &ValidatorId,
@@ -1712,7 +1749,8 @@ impl StakingLedger {
         };
         match v.withdrawal_address {
             Some(addr) if addr == *sender => Ok(()),
-            _ => Err(StakingError::Unauthorized),
+            Some(_) => Err(StakingError::Unauthorized),
+            None => Err(StakingError::NoWithdrawalAddress),
         }
     }
 
@@ -5352,6 +5390,44 @@ mod tests {
             l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS),
             Err(StakingError::AlreadyValidator)
         );
+    }
+
+    #[test]
+    fn authorize_validator_owner_distinguishes_missing_withdrawal_from_mismatch() {
+        let mut l = StakingLedger::new();
+        let legacy = vid(41);
+        let w3 = vid(42);
+        let cold = [0x77u8; 32];
+        l.bond(legacy, required_bond_floor_nano(), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond_with_withdrawal(w3, required_bond_floor_nano(), DEFAULT_COMMISSION_BPS, cold)
+            .unwrap();
+
+        // Post-W3 record with no withdrawal address: every sender gets the
+        // distinct recovery error, never a generic mismatch.
+        assert_eq!(
+            l.authorize_validator_owner(&legacy, &legacy, true),
+            Err(StakingError::NoWithdrawalAddress)
+        );
+        assert_eq!(
+            l.authorize_validator_owner(&legacy, &cold, true),
+            Err(StakingError::NoWithdrawalAddress)
+        );
+        let msg = format!("{}", StakingError::NoWithdrawalAddress);
+        assert!(msg.contains("claim-withdrawal"), "{msg}");
+        assert!(msg.contains("SysCallClaimWithdrawal"), "{msg}");
+
+        // A record WITH a withdrawal address keeps the genuine-mismatch path:
+        // wrong sender (including the validator id itself) stays Unauthorized.
+        assert_eq!(
+            l.authorize_validator_owner(&w3, &legacy, true),
+            Err(StakingError::Unauthorized)
+        );
+        assert_eq!(
+            l.authorize_validator_owner(&w3, &w3, true),
+            Err(StakingError::Unauthorized)
+        );
+        assert_eq!(l.authorize_validator_owner(&w3, &cold, true), Ok(()));
     }
 
     #[test]

@@ -618,10 +618,21 @@ fn authorize_validator_owner_enforces_withdrawal_address_post_w3() {
         Ok(())
     );
 
-    // Unclaimed legacy validator (`withdrawal_address == None`) fails closed on post-W3.
+    // Unclaimed legacy validator (`withdrawal_address == None`) fails closed on post-W3
+    // with the DISTINCT, actionable error: no key can authorize owner ops until the
+    // one-time ClaimWithdrawal migration claims a cold address.
     assert_eq!(
         ledger.authorize_validator_owner(&val_legacy, &val_legacy, true),
-        Err(StakingError::Unauthorized)
+        Err(StakingError::NoWithdrawalAddress)
+    );
+    let no_withdrawal_msg = format!("{}", StakingError::NoWithdrawalAddress);
+    assert!(
+        no_withdrawal_msg.contains("claim-withdrawal"),
+        "NoWithdrawalAddress must name the recovery command, got: {no_withdrawal_msg}"
+    );
+    assert!(
+        no_withdrawal_msg.contains("SysCallClaimWithdrawal"),
+        "NoWithdrawalAddress must name the opcode, got: {no_withdrawal_msg}"
     );
 
     // Zero withdrawal address rejected on bond_with_withdrawal & set_withdrawal_address.

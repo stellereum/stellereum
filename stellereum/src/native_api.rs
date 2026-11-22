@@ -2409,8 +2409,13 @@ async fn session_key_register(
                 "max_value_per_tx": max_value_per_tx,
                 "chain_id": chain_id,
                 "master_signature": "",
-                "master_scheme": "Ed25519",
-                "session_scheme": "Ed25519",
+                // FULL-PQ: the grant policy refuses any non-post-quantum
+                // scheme (`check_session_policy`), so the template must never
+                // advertise a classical one. The wire envelope encodes the
+                // numeric `PqScheme::Falcon512.id()`; this is the human label
+                // a wallet puts in its own JSON before sealing.
+                "master_scheme": "Falcon512",
+                "session_scheme": "Falcon512",
             }
         }),
         Some(&master),
@@ -3715,6 +3720,16 @@ mod tests {
         assert_eq!(v["transaction"]["op"], "SysCallPublishSessionGrant");
         assert!(v["grant_message"].as_str().unwrap().starts_with("0x"));
         assert_eq!(v["chain_id"], engine.chain_id);
+        // FULL-PQ regression: a classical scheme in the template would make
+        // every wallet that follows it mint a grant the block refuses.
+        assert_eq!(
+            v["transaction"]["args"]["grant"]["master_scheme"],
+            "Falcon512"
+        );
+        assert_eq!(
+            v["transaction"]["args"]["grant"]["session_scheme"],
+            "Falcon512"
+        );
     }
 
     #[tokio::test]

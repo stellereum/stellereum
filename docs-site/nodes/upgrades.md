@@ -380,6 +380,146 @@ binary's genesis constants match the store. If they do not, the old binary
 exits with `genesis state root mismatch` — that refusal is the safety net, not
 a bug.
 
+## Live rolling deploy
+
+A governed upgrade halts the chain at a height. A **rolling deploy** is the
+other shape: replace the binary on one live validator at a time, with no
+governance height and no halt. The constraint is not the binary, it is the
+downtime jail.
+
+### The 16.8 s arithmetic
+
+`DOWNTIME_MISS_THRESHOLD = 42` counts **consecutive missed heights**. At the
+live tempo (`STELL_MIN_BLOCK_MS=400`):
+
+```text
+42 misses × 400 ms = 16 800 ms = 16.8 s
+```
+
+That is the entire budget between the last vote a validator casts and the first
+one it casts after the restart. Past it, the chain jails the validator:
+`release_height = jailed_at_height + 4000`, which is `4000 × 400 ms ≈ 26 min
+40 s`, plus a **0.1 %** downtime slash. A jailed validator does not resume by
+itself, and the unjail transaction must be signed by the **cold withdrawal
+key** — not by the hot voting key on the node.
+
+The 2026-11-23 incident made this concrete: a rolling deploy copied a **43 MB**
+binary to a 1-vCPU validator and restarted it in one window. The transfer
+starved the consensus thread on the single core, the restart and the ~600-block
+catch-up followed, and the total exceeded 16.8 s. Node D was jailed; A/B/C
+survived only because their windows were shorter.
+
+### Why the binary is pre-staged
+
+Copying 43 MB to a small host is not a constant-time operation: page cache
+pressure, disk write-back and one shared vCPU add seconds to tens of seconds,
+and the copy competes with the process that must keep voting. If the copy and
+the restart share one window, **the window is the copy plus the restart**. They
+are therefore separate phases:
+
+```bash
+# Phase 1 — transfer and verify while the old binary keeps voting.
+scripts/rolling-deploy.sh stage ./stellereum/target/release/stellereum
+
+# Phase 2 — rename and restart, one node at a time.
+scripts/rolling-deploy.sh activate
+```
+
+`stage <binary> [nodes...]`:
+
+1. streams the file to `<node-dir>/stellereum.new.next` with
+   `nice -n 19 ionice -c3` (falls back to `nice -n 19` when `ionice` is
+   absent), so the transfer yields to consensus;
+2. verifies the remote SHA-256 against the local file;
+3. writes the expected digest to `<node-dir>/stellereum.new.sha256`;
+4. never writes `<node-dir>/stellereum`. The running binary is untouched.
+
+`activate [nodes...]` processes nodes **in sequence** and, per node:
+
+1. preflights `stellereum.new.next` against `stellereum.new.sha256`; a missing
+   file, symlink or digest mismatch refuses the node;
+2. records `T0`, runs `cp -f stellereum stellereum.prev`,
+   `mv -f stellereum.new.next stellereum`, then restarts the unit
+   (`systemctl --user` for nodeB, `systemctl` elsewhere);
+3. waits up to 120 s for `is-active`, then polls the node's local
+   `stell_blockNumber` until it is within **5 blocks** of the public tip
+   (`STELL_PUBLIC_RPC`, default `https://rpc.stellereum.org`);
+4. prints the measured downtime from `T0` to that point — catch-up included,
+   because a node replaying 600 blocks is not voting — and warns above
+   **15 s**;
+5. queries `stell_getValidatorStatus`; if the validator is jailed it prints
+   `release_height`, an ETA in blocks and minutes, and the exact cold-key
+   unjail command. It never auto-unjails unless both `--unjail-on-jail` and
+   `--withdrawal-key-file` are given. A jail also stops the rollout;
+6. re-checks `stell_getValidators` and **aborts the rollout** if the count
+   drops below 3 or `fragile` becomes `true`. The next node is not touched.
+
+### Downtime budget
+
+| Interval | Budget |
+| --- | --- |
+| binary transfer + SHA-256 verification | **outside** the restart window (`stage`) |
+| `cp`/`mv` + restart + `is-active` | inside the measured window |
+| local RPC reaching public tip − 5 | inside the measured window |
+| measured `T0` → caught up | **warn above 15 s**; 16.8 s is the jail |
+
+The 1.8 s between 15 s and 16.8 s is not a safety margin; it is the difference
+between a warning and a jail. If `activate` warns, stop the rollout and
+investigate before restarting the next validator. A node that has not caught up
+within `STELL_ROLL_DEPLOY_CATCHUP_SECS` (300 s) also stops the rollout.
+
+Selection and inspection:
+
+```bash
+# print the whole plan; contacts no node
+scripts/rolling-deploy.sh --dry-run --nodes "A"
+
+# one node, explicit validator id
+scripts/rolling-deploy.sh activate --nodes D \
+  --validator <64-hex-validator-id>
+
+# a different reference endpoint
+scripts/rolling-deploy.sh activate --public-rpc https://rpc.example.org
+
+# stage a subset
+scripts/rolling-deploy.sh stage ./stellereum/target/release/stellereum A C
+```
+
+The script reads `scripts/cluster-nodes.conf` for hosts, directories, units,
+RPC ports and optional `NODE_<X>_VALIDATOR` ids. It never reads an env file and
+never prints key material.
+
+### If a validator is jailed
+
+Read `release_height` from the status output. The node must stay up and keep
+catching up; do **not** restart it again while it is jailed. When the chain
+height reaches `release_height`, unjail with the cold key:
+
+```bash
+stellereum validator unjail \
+  --validator-id <64-hex-validator-id> \
+  --withdrawal-key-file /path/to/cold-withdrawal.key
+```
+
+If `withdrawal_address` is `null`, no unjail, unbond or withdrawal is possible
+until a cold address is claimed (`stellereum validator claim-withdrawal`), which
+also requires the cold key. Restarting the node, editing the store or reusing
+the hot key does not clear a jail.
+
+### Rollback
+
+`activate` leaves the previous binary at `<node-dir>/stellereum.prev`:
+
+```bash
+cd /root/nodeD
+mv -f stellereum.prev stellereum
+systemctl restart stell-nodeD
+```
+
+This is the pre-`H` rollback: it is safe only while the old binary can read the
+same store and derives the same genesis root. After a governed halt height it
+is not supported — see [Rollback](#rollback).
+
 ## What an upgrade can and cannot change
 
 | Change class | Mixed-version behavior |

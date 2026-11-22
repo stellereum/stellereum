@@ -101,6 +101,13 @@ systems or product work (`docs/ROADMAP.md`, “Deferred Post-Mainnet”;
   1-vCPU hosts. The measured load-test baseline was sender-bound, not a node
   capacity claim; 107 accepted tx/s is not a 500 tx/s result
   (`docs/LOADTEST_RUNBOOK.md` §0 and §“What these numbers mean”).
+* **A rolling restart has a hard downtime budget.** At the live 400 ms tempo
+  `DOWNTIME_MISS_THRESHOLD = 42` misses is only 16.8 s; a copy-plus-restart of
+  the 43 MB binary on a 1-vCPU validator can exceed it and jail the validator
+  for ~27 min (0.1 % slash, cold-key unjail). Pre-stage with
+  `scripts/rolling-deploy.sh stage` and activate inside the <15 s window with
+  `scripts/rolling-deploy.sh activate`
+  (`../docs-site/nodes/upgrades.md`, “Live rolling deploy”).
 * **Disk and inodes are a first-class failure mode.** Run
   `scripts/node-prune-cron.sh` on **every** node, and use
   `scripts/stell-sync.sh preflight` / `health` plus `scripts/doctor.sh` to

@@ -1,0 +1,19 @@
+name: obsLocal
+listen: "0.0.0.0:9420"
+advertise: "178.155.74.242:9420"
+validators:
+  - "inf1:56d7b3a5570626a6822b992041367bb7e2b7298a"
+  - "inf1:c82d52e5cae4787ab6150ed2b129f1635a1e3610"
+peers:
+  - name: nodeA
+    node-id: "inf1:56d7b3a5570626a6822b992041367bb7e2b7298a"
+    ed-pub: "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361"
+    x-pub: "04fe590d752cecec371dd3f98943ca241ad0e6f741db5e7feb20326ec899fc7c"
+    endpoints: ["212.113.103.105:9410"]
+    allow: ["*"]
+  - name: nodeB
+    node-id: "inf1:c82d52e5cae4787ab6150ed2b129f1635a1e3610"
+    ed-pub: "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd"
+    x-pub: "b896e4262d3ae6baaf3644b2d65c7cd4bf50d3f6609fdbb5381e0eaa1dab0f40"
+    endpoints: ["127.0.0.1:9410"]
+    allow: ["*"]

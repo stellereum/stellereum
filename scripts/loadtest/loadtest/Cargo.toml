@@ -1,0 +1,40 @@
+[package]
+name = "stell-loadtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone dry-run-first load-test harness for the Stellereum testnet JSON-RPC"
+
+# Deliberately NOT a member of the node's workspace: this is an operator tool,
+# not a node dependency, and it must never change `stellereum/Cargo.lock` or
+# affect `cargo build` in the node tree.
+[workspace]
+
+[dependencies]
+# Falcon-512 signing is NOT re-implemented. `src/post_quantum.rs` and
+# `src/sharding/envelope.rs` are included verbatim from the node tree with
+# `#[path]` (see `src/main.rs` for why a plain path dependency cannot be used
+# while the node tree is mid-refactor). These are their transitive deps.
+bincode = "1.3"
+blake3 = "1"
+hex = "0.4"
+pqcrypto-falcon = "0.4.1"
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tracing = "0.1"
+ureq = "2"
+zeroize = "1"
+
+[profile.release]
+# Keep a small amount of debug info so an operator can get a backtrace from a
+# failed wave without a second build.
+debug = 1
+
+[dev-dependencies]
+# Only the test module inside the included `post_quantum.rs` uses these; the
+# harness itself does not link a classical scheme.
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "batch"] }
+falcon-rust = "0.3.1"

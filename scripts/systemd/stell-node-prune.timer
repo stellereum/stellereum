@@ -1,0 +1,22 @@
+[Unit]
+# Hourly orphan-chunk sweep. The chunks leak continuously (the head pointer
+# is rewritten on every finalize and retires a whole chunk set), so an hourly
+# cadence keeps the inode usage flat instead of letting it climb until the
+# filesystem goes read-only.
+#
+# Persistent=true: a sweep that was missed (the box was down) runs at the next
+# boot. RandomizedDelaySec spreads the load when several nodes run the timer
+# at the same time.
+Description=Run the Stellereum orphan-chunk sweeper hourly
+Documentation=file:/home/imm/stellereum-project/scripts/node-prune-cron.sh
+
+[Timer]
+OnCalendar=hourly
+# Do not run the sweep in lockstep with the node's own write path.
+RandomizedDelaySec=600
+# Catch up after a downtime.
+Persistent=true
+Unit=stell-node-prune.service
+
+[Install]
+WantedBy=timers.target

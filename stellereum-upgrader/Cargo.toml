@@ -1,0 +1,15 @@
+[package]
+name = "stellereum-upgrader"
+version = "0.1.0"
+edition = "2021"
+description = "Cosmovisor-like supervisor for Stellereum coordinated binary upgrades"
+license = "MIT"
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"
+ureq = "2"
+
+[[bin]]
+name = "stellereum-upgrader"
+path = "src/main.rs"

@@ -1,0 +1,533 @@
+# CODE INDEX — every Rust file, generated; do not hand-edit
+# Regen: `python3` block in session 2026-11-04 (see tool history). Paths relative to workspace root.
+
+> **STALE SNAPSHOT (2026-11-04).** The 2026-11-18 module split and the FULL-PQ
+> wipe changed this tree: `consensus.rs`, `runtime.rs`, `state_engine.rs`,
+> `rpc.rs`, `sharding.rs`, `evm_adapter.rs`, `bls.rs` and `crypto_privacy.rs`
+> are now directories or are deleted. Do not trust a path in this file without
+> re-grepping; the current module map is `docs/specs/00_PROJECT_MAP_PHASE2.md`.
+
+## stellereum/src — L1 node core (consensus, execution, crypto, storage, RPC)
+
+- `stellereum/src/address.rs` (366 ln) — Stellereum Branded Address Format (`Stl57...`)
+- `stellereum/src/bls.rs` — **DELETED** (FULL-PQ wipe; no `bls12_381` dependency, no BLS QC path). Any older `bls.rs` pointer is stale.
+- `stellereum/src/bootstrap.rs` (444 ln) — Fresh-observer bootstrap: from an empty data directory to the live tip
+- `stellereum/src/bridge.rs` (2732 ln) — Native Teleport Bridges (TON, Arbitrum, Ethereum, Solana)
+- `stellereum/src/bridge_adapters.rs` (1133 ln) — §8 chain adapters: LIVE deposit-proof verification framework.
+- `stellereum/src/cell.rs` (361 ln) — Core Cell / Bag of Cells (BoC) and Patricia DAG data structure for Stellereum
+- `stellereum/src/chain.rs` (1439 ln) — Chain management: block tree, fork-choice and reorg planning.
+- `stellereum/src/chain_binding.rs` (312 ln) — Chain-binding rollout (A14 structural fix), PHASE 1.
+- `stellereum/src/client_ip.rs` (604 ln) — Real client IP behind a reverse proxy.
+- `stellereum/src/cn_vrf.rs` (732 ln) — Committed-Nonce VRF (CN-VRF) — SANDBOX pure module.
+- `stellereum/src/commitment.rs` (3086 ln) — Canonical commitment to every consensus-visible subsystem that does NOT
+- `stellereum/src/compact_prop.rs` — Compact proposal gossip (wired, active from genesis) + compact µQC codec (active, emitter call site deferred). Includes short-id KATs and bounded `BodyPull`/`Body` resolver/server.
+- `stellereum/src/consensus.rs` (7737 ln) — Pipelined BFT Consensus Engine (Tendermint/HotStuff-inspired)
+- `stellereum/src/consensus_net.rs` (4462 ln) — Consensus P2P transport: carries proposals and votes between validators over
+- `stellereum/src/contract.rs` (2993 ln) — On-chain WASM smart contracts (deterministic, metered).
+- `stellereum/src/contract_abi.rs` (1736 ln) — Typed contract ABI: multi-argument methods, typed returns, typed events and
+- `stellereum/src/contract_source.rs` (436 ln) — On-chain contract SOURCE VERIFICATION (audit P2 item 15).
+- `stellereum/src/cpat2.rs` (2108 ln) — Compressed Patricia-Merkle trie — v2, relative-skip model.
+- `stellereum/src/crypto_privacy.rs` (2234 ln) — Confidentiality module: Pedersen Commitments & Stealth Addresses
+- `stellereum/src/dns_seeds.rs` (1245 ln) — DNS seed discovery: bootstrap peers from public DNS TXT records.
+- `stellereum/src/evm_adapter/` — Ethereum JSON-RPC 2.0 adapter: read views, strict EIP-155/1559 decode, and the FULL-PQ EVM write path (`binding.rs`: `SysCallBindEvmAddress` binding + `SysCallEvmCarrier` value-transfer carrier; no EVM interpreter).
+- `stellereum/src/explorer.rs` (2439 ln) — Public block explorer + rate-limited gateway.
+- `stellereum/src/governance.rs` (2653 ln) — On-chain Governance: stake-weighted proposals and voting.
+- `stellereum/src/lib.rs` (62 ln)
+- `stellereum/src/light_client.rs` (2859 ln) — Light client: follow the chain from quorum-certified anchors and answer
+- `stellereum/src/light_client_cli.rs` (620 ln) — The `stellereum light-client` command: an EXTERNAL verifier.
+- `stellereum/src/liveness_alarm.rs` (98 ln) — Fail-loud consensus-traffic liveness alarm (pure decision + counter).
+- `stellereum/src/main.rs` (12043 ln) — Stellereum Node Runner & CLI Entry Point
+- `stellereum/src/mempool.rs` (4456 ln) — Transaction mempool: fee-priority ordering, bounded size with eviction, and
+- `stellereum/src/metrics.rs` (1773 ln) — Prometheus exposition-format metrics for the consensus engine.
+- `stellereum/src/mev.rs` (920 ln) — Zero-Overhead MEV-Preemption (Threshold Encryption / Blind Pre-Rounds)
+- `stellereum/src/mev_epoch.rs` (3766 ln) — EPOCH SEAL (ES1) — asymmetric, threshold-sealed transaction gossip.
+- `stellereum/src/mev_pq_plan.rs` (316 ln) — MEV PQ migration PLAN — design + KAT prototype, UNWIRED.
+- `stellereum/src/mev_v4.rs` (1000 ln) — Post-Quantum MEV-Preemption Module v4/v5
+- `stellereum/src/mmr.rs` (571 ln) — Merkle Mountain Range (MMR) over finalized block hashes — the V5 Tier-2
+- `stellereum/src/native_api.rs` (5164 ln) — ONE stable, wallet-facing namespace for Stellereum's native capabilities.
+- `stellereum/src/network.rs` (4898 ln) — P2P Networking Layer Adapter for Stellereum
+- `stellereum/src/node_keys.rs` (1231 ln) — Node key security hardening: Argon2id + XChaCha20-Poly1305 encryption
+- `stellereum/src/oracle.rs` (740 ln) — 3-Tier Price Safety Network & Oracle Module
+- `stellereum/src/orderbook.rs` (449 ln) — Native Orderbook-Actor CLOB (Central Limit Order Book)
+- `stellereum/src/parallel_exec.rs` (803 ln) — Disjoint Wave Scheduler & Resource Conflict Detection (Sealevel-lite)
+- `stellereum/src/pmm.rs` (524 ln) — Primary Market Maker (PMM) — the native Mint & Redeem exchange.
+- `stellereum/src/post_quantum.rs` (3358 ln) — Post-Quantum Cryptography & Address Architecture for Stellereum L1
+- `stellereum/src/pq_registry.rs` (614 ln) — On-chain post-quantum (PQ) key registry with delayed rotation.
+- `stellereum/src/remote_signer.rs` (1001 ln) — Remote / HSM-style signing for validator keys.
+- `stellereum/src/rpc.rs` (16196 ln) — JSON-RPC 2.0 API for wallets, block explorers and bots.
+- `stellereum/src/runtime.rs` (11260 ln) — Consensus runtime: wires the BFT engine to block production, the mempool and
+- `stellereum/src/sharding.rs` (8774 ln) — Sharding, Shared-Liquidity Hub & Blockchain Consensus
+- `stellereum/src/simulator.rs` (1943 ln) — Deterministic local devnet + chain simulator.
+- `stellereum/src/snapshot_cadence.rs` (153 ln) — Adaptive snapshot cadence gate (pure decision logic, no I/O).
+- `stellereum/src/staking.rs` (5885 ln) — Staking, delegation, slashing and validator rewards.
+- `stellereum/src/state_engine.rs` (14644 ln) — Pipelined Execution & In-Memory State Engine
+- `stellereum/src/storage.rs` (5007 ln) — Persistent storage for blocks and state, backed by `sled` (embedded ACID KV).
+- `stellereum/src/svm.rs` (4176 ln) — Stellereum Virtual Machine (SVM) and Micro-Gas Model
+- `stellereum/src/sync.rs` (2941 ln) — Block sync: bring a lagging node up to a peer's head by walking the chain
+- `stellereum/src/token.rs` (1307 ln) — Stellereum Fungible Token Standard (STS-20)
+- `stellereum/src/tokenomics.rs` (305 ln) — Genesis Vault and Tokenomics module
+- `stellereum/src/turnstile.rs` (454 ln) — Cloudflare Turnstile captcha gate for the public faucet.
+- `stellereum/src/vrf.rs` (1282 ln) — VRF sortition scaffolding (A6/C1 structural fix), PHASE 1.
+- `stellereum/src/wallet.rs` (1737 ln) — Lightweight Wallet Module for Stellereum (SPV & Light Client)
+- `stellereum/src/wallet_signing.rs` (1036 ln) — Wallet Signature Standard for Stellereum (audit P2 item 15).
+- `stellereum/src/xshard2pc.rs` (611 ln) — §9 CROSS-SHARD TWO-PHASE COMMIT (2PC) for native value transfers.
+- `stellereum/src/zkml.rs` — Session keys and zkML **verifiable-inference-by-re-execution** engine (SOUND, not zero-knowledge/succinct; `zkml_capabilities()` is the machine-readable claim).
+- `stellereum/src/zkml_attestation.rs` — **Re-execution attestation** for quantized inference: verifier re-runs the forward pass and recomputes the BLAKE3 Merkle trace root + Fiat–Shamir hash. NOT a STARK/SNARK and NOT zero-knowledge; `STELLEREUM_PQ_STARK_BLAKE3_V1` is a legacy committed tag.
+- `stellereum/src/bin/abi_codegen.rs` (835 ln) — ABI code generator: reads a JSON ABI manifest and emits typed Rust and
+- `stellereum/src/bin/ledger_tool.rs` (209 ln) — Ops tool: inspect (and, with `--demote`, surgically demote) the staking
+
+## stellereum/tests — L1 integration suites (sim, adversarial, pentest, audit)
+
+- `stellereum/tests/a_crypto_audit_poc.rs` (176 ln) — A-CRYPTO PoC: strictness / confusion / disabled-scheme probes.
+- `stellereum/tests/a_money_poc.rs` (182 ln) — A-MONEY adversarial PoCs: money-conservation invariants that MUST hold.
+- `stellereum/tests/a_surface_poc.rs` (239 ln) — A-SURFACE PoC suite: unauthenticated / unbounded-input / DoS-amplification
+- `stellereum/tests/actor_block_path_tests.rs` (899 ln) — §1 ACTOR MAILBOX on the LIVE BLOCK PATH.
+- `stellereum/tests/actor_envelope_compat_tests.rs` (591 ln) — §1 ACTOR MAILBOX: envelope compatibility.
+- `stellereum/tests/actor_state_root_tests.rs` (201 ln) — §1 ACTOR MAILBOX: state-root discipline.
+- `stellereum/tests/adopt_prevote_tests.rs` (170 ln) — Adopt-path parity with `try_precommit_quorum` (consensus.rs):
+- `stellereum/tests/adversarial_4node_tests.rs` (479 ln) — Adversarial 4-node tests: thinking-byzantine attacks, not just crash faults.
+- `stellereum/tests/adversarial_economic_tests.rs` (605 ln) — Adversarial economic review (Agent C): the money paths as a SYSTEM.
+- `stellereum/tests/adversarial_regression_tests.rs` (1258 ln) — ADVERSARIAL RE-VERIFICATION: re-exploit every closed finding class against the
+- `stellereum/tests/apply_floor_tests.rs` (626 ln) — F-01 (audit HIGH): the base-fee floor is consensus-enforced, twice.
+- `stellereum/tests/attack_round3_tests.rs` (322 ln) — Round 3: remaining historical attack classes and suspicious code paths.
+- `stellereum/tests/audit_closure_bridge_tests.rs` (1313 ln) — Audit closure: bridge findings B1 (zk-gate reachability), B2 (challenge
+- `stellereum/tests/audit_closure_oracle_gov_tests.rs` (370 ln) — Audit closure: oracle O1 (drift walk, freshness, peg, publisher allowlist /
+- `stellereum/tests/audit_closure_privacy_tests.rs` (528 ln) — Audit closure: confidential gates C1/C2 (range/spent/ownership on every
+- `stellereum/tests/audit_poc_a_consensus.rs` (130 ln) — A-CONSENSUS PoC suite (adversarial, read-only + tests).
+- `stellereum/tests/audit_repro_tests.rs` (255 ln) — Adversarial Audit Reproduction & Verification Test Suite
+- `stellereum/tests/audit_rpc_evm_closeout.rs` (1083 ln) — Audit closeout tests — RPC + EVM adapter findings (`audit-rpc-evm.md`, 2026-10-14).
+- `stellereum/tests/audit_state_sync_closeout_tests.rs` (1002 ln) — Audit closeout (`audit-state-sync.md`): per-finding regression pins for the
+- `stellereum/tests/batch_verify_tests.rs` (531 ln) — Batch Ed25519 verification tests for transactions.
+- `stellereum/tests/bft_lock_safety_tests.rs` (343 ln) — REVIEW DIMENSION 1 (enterprise-testnet consensus review): SAFETY
+- `stellereum/tests/blind_qc_probe_tests.rs` (190 ln) — Live incident: a 1-height-behind node could never catch up because
+- `stellereum/tests/block_apply_parity_tests.rs` (700 ln) — Differential: the two block-apply paths must be byte-identical.
+- `stellereum/tests/block_cpu_budget_tests.rs` (299 ln) — Per-height CPU budget: prove a full block pipeline fits in 0.6s with margin.
+- `stellereum/tests/block_hash_binding_tests.rs` (114 ln) — The block hash MUST commit to every consensus-relevant transaction field.
+- `stellereum/tests/block_packing_scale_tests.rs` (534 ln) — Block-packing at scale: 10k-transaction blocks build and apply
+- `stellereum/tests/block_state_root_binding_tests.rs` (166 ln) — P0-4 follow-up: the state root in a block header has to mean something.
+- `stellereum/tests/block_tempo_lan.rs` (242 ln) — R-TEMPO BLOCK-TEMPO PROOF — 100 consecutive heights on a 4-node LAN-like
+- `stellereum/tests/blockchain_security_tests.rs` (374 ln) — Comprehensive Blockchain Security & Penetration Testing Suite for Stellereum
+- `stellereum/tests/bls_classical_tests.rs` (80 ln) — BLS is CLASSICAL (quantum-breakable) — LEGACY-ONLY marker and default-off pins.
+- `stellereum/tests/bls_pop_tests.rs` (280 ln) — BLS proof-of-possession: gated strict registry path (PLAN-POP phase 1).
+- `stellereum/tests/bls_qc_compat_tests.rs` (577 ln) — BLS quorum certificates on the real path (passport §6B) — RETIRED counting.
+- `stellereum/tests/bls_registry_audit_tests.rs` (335 ln) — BLS registry / proof-of-possession audit tests.
+- `stellereum/tests/bls_tests.rs` (109 ln)
+- `stellereum/tests/bridge_adapters_tests.rs` (794 ln) — §8 chain-adapter verification framework: unit tests.
+- `stellereum/tests/bridge_challenge_tests.rs` (616 ln) — Bridge challenge truth gate (audit B2): resolve-time re-verification.
+- `stellereum/tests/bridge_dispute_tests.rs` (837 ln) — Bridge dispute layer (optimistic L1) on the live block path.
+- `stellereum/tests/bridge_onchain_tests.rs` (1673 ln) — §8 BRIDGE policy on the LIVE block path.
+- `stellereum/tests/bridge_oracle_audit_tests.rs` (567 ln) — Bridge/oracle audit: attestation, publisher-trust, staleness and PMM-feed
+- `stellereum/tests/bridge_persistence_tests.rs` (551 ln) — §8 bridge domain PERSISTENCE: a restored node must still refuse a replayed
+- `stellereum/tests/bridge_zk_gate_tests.rs` (254 ln) — Fail-closed Teleport zk-proof gate (audit W1).
+- `stellereum/tests/byzantine_fault_tests.rs` (407 ln) — Byzantine fault tolerance: 4-validator in-process cluster tests.
+- `stellereum/tests/catch_up_tests.rs` (385 ln) — Catch-up: a node that fell behind must be able to replay the gap and land on
+- `stellereum/tests/catchup_storm_regression_tests.rs` (218 ln) — Regression for the 2026-10-13 catch-up storm (observer C).
+- `stellereum/tests/chain_mempool_security_tests.rs` (163 ln) — Security tests for chain (fork-choice/tree) and mempool hardening.
+- `stellereum/tests/chaos_n4_tests.rs` (551 ln) — One member is DOWN (f=1) and one member is SLOW (5x round-timeout factor +
+- `stellereum/tests/chaos_parallel_exec_tests.rs` (1162 ln) — Chaos, Adversarial, and Differential Tests for Parallel Execution Engine.
+- `stellereum/tests/chase_livelock_tests.rs` (802 ln) — Regression tests for the post-restart chase livelock observed live:
+- `stellereum/tests/client_ip_proxy_tests.rs` (180 ln) — Proxy-aware IP tests: the gateway/explorer must key rate limits (and, via
+- `stellereum/tests/clob_apply_parity_tests.rs` (429 ln) — On-chain CLOB settlement on the LIVE path:
+- `stellereum/tests/clob_atomicity.rs` (309 ln) — CLOB atomicity follow-ups (review of the B1 fix).
+- `stellereum/tests/clob_settlement_tests.rs` (902 ln) — A7: the native CLOB actually settles matched trades against real balances
+- `stellereum/tests/cn_vrf_tests.rs` (598 ln) — CN-VRF sandbox KATs — spec §4 (all 9 groups), fixed seeds/keys/nonces,
+- `stellereum/tests/commitment_assembly_differential_tests.rs` (495 ln) — Differential: zero-copy batch assembly equals the streaming digest.
+- `stellereum/tests/confidential_preverify_tests.rs` (466 ln) — Block-level parallel pre-verification of shielded proofs.
+- `stellereum/tests/confidential_solvency_tests.rs` (352 ln) — Shielded-pool solvency regression tests (gap F-A).
+- `stellereum/tests/consensus_audit_hardening_tests.rs` (508 ln) — Audit-consensus hardening tests (2026-10-14 report) for `src/consensus.rs`.
+- `stellereum/tests/consensus_byzantine_tests.rs` (234 ln) — Four deterministic virtual-clock scenarios on the real consensus path
+- `stellereum/tests/consensus_liveness_harness.rs` (946 ln) — THE FAILURE THIS EXISTS FOR: the live 4-node WAN stand was parked at
+- `stellereum/tests/consensus_liveness_repro.rs` (1072 ln) — Regression tests for the LIVE masterchain liveness failure.
+- `stellereum/tests/consensus_quorum_constants_pin_tests.rs` (92 ln) — Frozen-core constant pins (CONSENSUS audit).
+- `stellereum/tests/consensus_reaudit_tests.rs` (481 ln) — Regression tests for the consensus re-audit (audit W6.4b).
+- `stellereum/tests/consensus_rephase_tests.rs` (316 ln) — Regression tests for the deadlock RE-PHASE and the deadlock BREAKER
+- `stellereum/tests/consensus_security_tests.rs` (445 ln) — Consensus security tests: BFT safety & liveness under Byzantine faults.
+- `stellereum/tests/contract_integration_tests.rs` (194 ln) — On-chain WASM contract lifecycle through the real transaction/block path.
+- `stellereum/tests/cpat2_stress.rs` (70 ln)
+- `stellereum/tests/cpat2_tests.rs` (147 ln) — Property tests for compressed Patricia v2 (relative-skip model).
+- `stellereum/tests/cpu_budget_tests.rs` (343 ln) — Per-height CPU budget proof (0.6s/block program, safety-first, measurement only).
+- `stellereum/tests/cross_shard_anchor_tests.rs` (123 ln) — C1 anchored inclusion: a cross-shard message is consumable only when its
+- `stellereum/tests/cross_shard_e2e_pq_tests.rs` (294 ln) — Comprehensive E2E Cross-Shard Integration Test (Shard 0 <-> Shard 1)
+- `stellereum/tests/cross_shard_persistence_tests.rs` (508 ln) — §5 cross-shard replay persistence (audit F-I).
+- `stellereum/tests/deadlock_breaker_tests.rs` (457 ln) — Deadlock breaker regression: live 2026-10-14 A r1550 vs B r318 at h92078.
+- `stellereum/tests/deterministic_genesis_tests.rs` (88 ln) — P1: deterministic genesis — all nodes with the same validator set derive an
+- `stellereum/tests/dht_retention_tests.rs` (218 ln) — DHT retention: the kv.json growth driver and its bound.
+- `stellereum/tests/discovery_tests.rs` (196 ln) — Eclipse-resistant discovery: identity comes from config, endpoints may come
+- `stellereum/tests/domain_persistence_tests.rs` (413 ln) — §9 shielded ledger + §2 zkML registry PERSISTENCE (audit F-B).
+- `stellereum/tests/downtime_attribution_boundary_tests.rs` (279 ln) — REVIEW DIMENSIONS 3 + 4 (enterprise-testnet consensus review):
+- `stellereum/tests/ecosystem_contracts_tests.rs` (773 ln) — Comprehensive Integration Tests for Ecosystem Smart Contracts:
+- `stellereum/tests/ed_batch_strictness_tests.rs` (82 ln) — Batch-vs-scalar strictness differential (F-MED-6): an S-malleated Ed25519
+- `stellereum/tests/epoch_sync_tests.rs` (818 ln) — Epoch-scoped sync: a wiped node must not see the previous chain, and two
+- `stellereum/tests/equivocation_slash_tests.rs` (502 ln) — WIRED PATH: equivocation (double-sign) slashing at 5%, from block-carried
+- `stellereum/tests/evm_adapter_audit_tests.rs` (373 ln) — EVM-adapter + SVM audit tests (gas, precompiles, isolation, F4 estimate split).
+- `stellereum/tests/evm_adapter_tests.rs` (5466 ln)
+- `stellereum/tests/explorer_audit_tests.rs` (719 ln) — Explorer-gateway security audit tests (`src/explorer.rs` ONLY).
+- `stellereum/tests/explorer_smoke_tests.rs` (276 ln) — Live HTTP smoke test for the explorer + gateway: starts the real axum server
+- `stellereum/tests/explorer_ux_tests.rs` (590 ln) — Human-explorer read views: happy-path, cap enforcement, empty-store.
+- `stellereum/tests/f4_equivocation_determinism_tests.rs` (275 ln) — Audit finding F4 — equivocation slashing must be a function of the BLOCK,
+- `stellereum/tests/failure_fee_contract_tests.rs` (325 ln) — THE F-01 / SEC-07 FAILURE-FEE CONTRACT (`PROTOCOL.md` §4c), pinned in one
+- `stellereum/tests/faucet_pq_tests.rs` (324 ln) — Faucet on the post-quantum path (Falcon-512), end to end.
+- `stellereum/tests/faucet_turnstile_tests.rs` (640 ln) — Public-faucet captcha tests (`POST /api/faucet-public/:address`).
+- `stellereum/tests/fee_batching_parity_tests.rs` (255 ln) — Fee-batching parity: the apply-FEE batched path charges byte-identical
+- `stellereum/tests/fee_market_live_tests.rs` (294 ln) — P1 (d): live fee-market behaviour on full and overflowing blocks.
+- `stellereum/tests/fee_market_tests.rs` (43 ln) — A11: transaction fees are collected and paid to the block proposer, and
+- `stellereum/tests/flood_bigchain_tests.rs` (270 ln) — CometBFT-style SEND-side flood controls ("как у больших").
+- `stellereum/tests/freeze_pins_tests.rs` (175 ln) — Protocol-freeze pins (lead decision 2026-11-03).
+- `stellereum/tests/fuzz_certificate_decoder_tests.rs` (315 ln) — Deterministic (stable-toolchain) coverage for the two fuzz targets added by
+- `stellereum/tests/fuzz_consensus_stress.rs` (944 ln) — Structured fuzz / stress for the consensus-critical decode + verify paths.
+- `stellereum/tests/fuzz_decoder_tests.rs` (685 ln) — Decoder fuzzing (deterministic, stable-toolchain).
+- `stellereum/tests/fuzz_economics_ext.rs` (620 ln) — Deterministic economics fuzz battery (wave-4 QA, extends the audit suite
+- `stellereum/tests/genesis_guard_tests.rs` (81 ln) — Genesis-guard message tests (fail-closed text only).
+- `stellereum/tests/genesis_root_known_answer_tests.rs` (221 ln) — The genesis state root must be a known answer.
+- `stellereum/tests/gov_oracle_e_regressions.rs` (437 ln) — E-series regression pins (governance/oracle HIGHs left open after E3/E5/E8).
+- `stellereum/tests/governance_applied_tests.rs` (704 ln) — Governance-applied parameters must DRIVE block production, not sit in the
+- `stellereum/tests/governance_audit_tests.rs` (584 ln) — Governance audit attack tests (scope: `src/governance.rs` only).
+- `stellereum/tests/heal_fail_closed_tests.rs` (104 ln) — Heal-failure fail-closed regression tests.
+- `stellereum/tests/historical_attacks_tests.rs` (738 ln) — Historical blockchain attack reproduction suite.
+- `stellereum/tests/hunt_a3_d2_tests.rs` (453 ln) — Hunt A3 (consensus timestamps fail-open) + D2 (free failures).
+- `stellereum/tests/hunt_amplify.rs` (446 ln) — HUNT: the two-representations bug in the staking ledger.
+- `stellereum/tests/hunt_atomicity.rs` (289 ln) — HUNT (CLOSED as B1): `apply_transaction` used to commit the SVM's state
+- `stellereum/tests/hunt_clob_escrow.rs` (426 ln) — CLOB escrow on the SVM place-order path - the fix for the original hunt.
+- `stellereum/tests/hunt_clob_orphan.rs` (410 ln) — ADVERSARIAL HUNT: the SVM order syscalls and CLOB escrow custody.
+- `stellereum/tests/hunt_commitment.rs` (419 ln) — HUNT: src/commitment.rs -- can two DIFFERENT consensus states produce the
+- `stellereum/tests/hunt_consensus_core.rs` (824 ln) — ADVERSARIAL HUNT: consensus-layer break attempts.
+- `stellereum/tests/hunt_consensus_round2.rs` (731 ln) — ADVERSARIAL HUNT round 2: slashing, commitment completeness, validator-set
+- `stellereum/tests/hunt_consensus_round3.rs` (388 ln) — ADVERSARIAL HUNT round 3: the remaining loose ends.
+- `stellereum/tests/hunt_d1_d5_tests.rs` (208 ln) — Hunt D1 (wire/proof caps) + D5 (faucet rate persistence).
+- `stellereum/tests/hunt_f3f4f5_verify.rs` (315 ln) — VERIFY-ONLY: sync-surface HIGHs F3 / F4 / F5 (reported fixed-or-open).
+- `stellereum/tests/hunt_finalize_split.rs` (674 ln) — HUNT: finalization paths that reach DIFFERENT state for the SAME certified block.
+- `stellereum/tests/hunt_ledger_desync.rs` (288 ln) — ADVERSARIAL HUNT: the staking ledger keeps the SAME quantity in two places.
+- `stellereum/tests/hunt_negative.rs` (802 ln) — HUNT: attacks that FAILED. Recorded so the holes above are not confused with
+- `stellereum/tests/hunt_pmm_race.rs` (256 ln) — HUNT: the PMM's bonding curve is a read-clone-commit WITHOUT holding a lock
+- `stellereum/tests/hunt_qc_kind.rs` (245 ln) — HUNT: `adopt_committed` accepts a PREVOTE quorum as a finality proof.
+- `stellereum/tests/hunt_round_dos.rs` (458 ln) — HUNT: unauthenticated round-counter advance -> permanent consensus liveness kill.
+- `stellereum/tests/hunt_slashing.rs` (557 ln) — HUNT: slashing verdicts are computed from LOCAL gossip, not from the block.
+- `stellereum/tests/hunt_staking_grief.rs` (655 ln) — HUNT: unauthenticated forced unbonding -> validator-set capture + 2-day
+- `stellereum/tests/hunt_staking_theft.rs` (340 ln) — HUNT: unauthenticated theft of staking rewards from the shared STAKING_POOL.
+- `stellereum/tests/hunt_svm_steal.rs` (337 ln) — ADVERSARIAL HUNT: the SVM staking syscalls.
+- `stellereum/tests/hunt_sweep_final.rs` (355 ln) — ADVERSARIAL HUNT: final sweep -- bonding curve, token burn ordering, and the
+- `stellereum/tests/hunt_sync_quorum.rs` (291 ln) — HUNT: `validate_sync_chain` verifies a SIGNATURE COUNT where the caller means
+- `stellereum/tests/hunt_token_and_withdraw.rs` (310 ln) — HUNT: token supply invariants (mostly negative results), and the staking
+- `stellereum/tests/integration_tests.rs` (553 ln) — Integration tests covering all Stellereum core modules:
+- `stellereum/tests/light_cli_tests.rs` (285 ln) — Light-client offline CLI (8.0): anchor show, header verify, rotation.
+- `stellereum/tests/light_client_rotation_tests.rs` (221 ln) — Validator-set ROTATION for the light client.
+- `stellereum/tests/light_client_tests.rs` (1204 ln) — P1-b: a light client that follows the chain from signed checkpoints and
+- `stellereum/tests/light_client_wiring_tests.rs` (906 ln) — Audit W8.3 / production blocker A10: the LIGHT CLIENT, wired in.
+- `stellereum/tests/light_e2e_tests.rs` (452 ln) — Light-client end-to-end third-party verify flow (light 8.0 -> 9.0, no network).
+- `stellereum/tests/live_adopt_tempo_tests.rs` (385 ln) — Live-adopt tempo regression (observer C, 2026-10-13).
+- `stellereum/tests/live_block_path_tests.rs` (544 ln) — P0 regression: the LIVE consensus path moved no native funds.
+- `stellereum/tests/liveness_alarm_tests.rs` (150 ln) — Fail-loud liveness alarm: pure decision-function matrix + counter.
+- `stellereum/tests/liveness_breaker_tests.rs` (548 ln) — Pins the liveness-8.5→9.0 timing bounds in simulation. Deterministic:
+- `stellereum/tests/liveness_horizon_tests.rs` (715 ln) — Long-horizon liveness in virtual time only (no wall-clock asserts). One
+- `stellereum/tests/lock_rules_audit_tests.rs` (421 ln) — Lock-rule audit tests (Tendermint locking, fail-closed).
+- `stellereum/tests/masterchain_liveness_tests.rs` (179 ln) — THE INCIDENT (live 4-node WAN stand, parked at height 285027 since
+- `stellereum/tests/memory_bounds_tests.rs` (322 ln) — Phase-1 memory-bound tests: every new cap has a test.
+- `stellereum/tests/mempool_dos_economics_tests.rs` (617 ln) — Mempool DoS economics: attacker-cost modeling + fail-closed proofs.
+- `stellereum/tests/mempool_econ_tests.rs` (170 ln) — Mempool economics hardening (audit-mempool F-03 + F-04, MEDIUM).
+- `stellereum/tests/mempool_mev_audit_closure_tests.rs` (415 ln) — Mempool / fee-market / MEV / emission audit closure
+- `stellereum/tests/merkle_proof_tests.rs` (108 ln) — Merkle inclusion proof regression tests.
+- `stellereum/tests/metrics_tests.rs` (1545 ln) — Prometheus exposition-format tests for the consensus metrics registry.
+- `stellereum/tests/mev_epoch_seal_tests.rs` (1292 ln) — THE EPOCH-SEAL (ES1) PATH — end-to-end tests of the asymmetric,
+- `stellereum/tests/mev_pq_tests.rs` (403 ln) — Integration and Verification Tests for Post-Quantum MEV-Preemption Module v4/v5
+- `stellereum/tests/mev_pq_transport_tests.rs` (1288 ln) — MEV DKG PQ-TRANSPORT FALLBACK STEP — Falcon-authenticated framing around
+- `stellereum/tests/mev_preemption_tests.rs` (528 ln) — MEV preemption on the REAL path (passport §6).
+- `stellereum/tests/mmr_epoch_root_tests.rs` (243 ln) — V5 Tier-2 MMR epoch roots, end to end at the RPC boundary.
+- `stellereum/tests/more_attacks_tests.rs` (444 ln) — Second wave of adversarial tests: consensus, orderbook, actor model,
+- `stellereum/tests/multi_shard_stress_bench_tests.rs` (259 ln) — Final Stress Test & Speed Benchmark across two parallel shards (Shard 0 & Shard 1)
+- `stellereum/tests/network_audit_close_tests.rs` (537 ln) — Audit-network close-out (2026-10-14): one pin per finding in
+- `stellereum/tests/nil_veto_stall_tests.rs` (219 ln) — REVIEW DIMENSIONS 2 + 7 (enterprise-testnet consensus review).
+- `stellereum/tests/node_bootstrap_tests.rs` (477 ln) — `node-bootstrap` readiness: a fresh observer goes from ZERO to the tip
+- `stellereum/tests/node_keys_hardening_tests.rs` (402 ln) — Security hardening tests for Stellereum node keys (`identity.key`, `falcon.key`, `e2e.key`).
+- `stellereum/tests/node_keys_security_tests.rs` (402 ln) — Security hardening tests for Stellereum node keys (`identity.key`, `falcon.key`, `e2e.key`).
+- `stellereum/tests/none_evidence_parity_tests.rs` (241 ln) — `None` downtime evidence must mean the same thing on every apply path.
+- `stellereum/tests/nshard_soak_tests.rs` (350 ln) — N-shard enablement soak: 3 shards finalize + interoperate, 4 shards boot,
+- `stellereum/tests/observer_and_recovery_tests.rs` (565 ln) — Observer nodes and stale-round recovery.
+- `stellereum/tests/observer_return_without_copy_tests.rs` (667 ln) — Возврат вылетевшей observer-ноды БЕЗ ручного копирования дата-директорий.
+- `stellereum/tests/onchain_svm_integration_tests.rs` (149 ln) — End-to-end tests proving the SVM / token / orderbook are actually executed
+- `stellereum/tests/one_call_order_placement_tests.rs` (319 ln) — F2 one-call order placement: `stell_placeOrder` / `stell_cancelOrder`.
+- `stellereum/tests/oracle_governance_tests.rs` (630 ln) — ORACLE GOVERNANCE: the two deferred on-chain items.
+- `stellereum/tests/oracle_onchain_tests.rs` (854 ln) — Oracle ON-CHAIN wiring: the price lives in consensus state and moves only
+- `stellereum/tests/oracle_single_publisher_drift_tests.rs` (334 ln) — Oracle single-publisher drift cap (audit O1 MEDIUM follow-up):
+- `stellereum/tests/orderbook_griefing_tests.rs` (173 ln) — Gas-griefing in the orderbook: a single order can match against an unbounded
+- `stellereum/tests/p2_mempool_pentest.rs` (595 ln) — Agent P2: mempool/transaction pentest exploits (code only).
+- `stellereum/tests/p3_byzantine_pentest.rs` (1043 ln) — Agent P3 — CONSENSUS / BFT ADVERSARIAL PENTEST (code only).
+- `stellereum/tests/p4_crypto_pentest.rs` (1413 ln) — Agent P4 — CRYPTO / PQ / PRIVACY PENTEST (code only).
+- `stellereum/tests/packing_1k_tests.rs` (57 ln) — Packing-math pin for the 1k-TPS recipe: 1785 plain transfers fit 500M gas.
+- `stellereum/tests/parallel_apply_parity_tests.rs` (400 ln) — Differential parity: parallel apply == serial apply, byte-exact.
+- `stellereum/tests/parallel_exec_tests.rs` (355 ln) — Tests for batched + parallel block application.
+- `stellereum/tests/parallel_execution_tests.rs` (427 ln) — Integration and equivalence tests for Disjoint Wave Parallel Execution (Track #1).
+- `stellereum/tests/parallel_intake_parity_tests.rs` (188 ln) — Parallel-intake parity: the §6.2 live path
+- `stellereum/tests/partition_heal_tests.rs` (750 ln) — Partition-heal tests: a partitioned network must heal, not deadlock.
+- `stellereum/tests/passport_rpc_evm_tests.rs` (341 ln) — Passport-agents closeout — EVM chain-identity serving completeness
+- `stellereum/tests/paymaster_tests.rs` (857 ln) — PAYMASTER v1 (gasless / sponsored transactions), pinned in one place.
+- `stellereum/tests/pentest_fees_intake.rs` (755 ln) — HDAE PENTEST: fee-batching + parallel-intake adversarial parity.
+- `stellereum/tests/pentest_light_shard2.rs` (560 ln) — HDAE pentest (shard-2): light-CLI + shard-boundary attacks.
+- `stellereum/tests/pentest_mempool_dos.rs` (561 ln) — HDAE pentest: DoS against the NEW mempool admission paths.
+- `stellereum/tests/pentest_mev_kem.rs` (605 ln) — PENTEST: MEV PQ-KEM leg (ML-KEM-768 share packages + Falcon envelope).
+- `stellereum/tests/pentest_net_api_tests.rs` (651 ln) — Behavioral network/API pentest regressions (2026-11-01, local 3-node cluster).
+- `stellereum/tests/pentest_privacy_gates.rs` (397 ln) — HDAE PENTEST: Ristretto pure-PQ gate bypass attempts (read-only).
+- `stellereum/tests/pentest_rpc_surface.rs` (774 ln) — HDAE PENTEST: new RPC surface (`stell_getPqKey` / `stell_getPqRegistryStatus`
+- `stellereum/tests/pentest_ws_faucet.rs` (725 ln) — WS + faucet abuse pentest (HDAE lead, read-only vs `src/rpc.rs`).
+- `stellereum/tests/performance_tests.rs` (112 ln) — Performance smoke tests (part of `cargo test`).
+- `stellereum/tests/pipeline_state_gating_tests.rs` (749 ln) — §7 Phase 2 sequenced execution lane: gating, parity, ordering, actor cap.
+- `stellereum/tests/pmm_onchain_tests.rs` (314 ln) — Proves the PMM operates on real on-chain balances: buying mints native
+- `stellereum/tests/pmm_security_tests.rs` (99 ln) — PMM security tests: the primary market maker must be arbitrage-proof and
+- `stellereum/tests/post_quantum_audit_tests.rs` (692 ln) — Post-Quantum Cryptographic & Consensus Adversarial Test Suite
+- `stellereum/tests/post_quantum_svm_tests.rs` (481 ln) — Tests for SVM OpCode 46 (`SysCallVerifyPqSignature`).
+- `stellereum/tests/pq_audit_closure_tests.rs` (665 ln) — Audit-closure tests for `audit-pq-crypto.md` findings owned by
+- `stellereum/tests/pq_equivocation_report_tests.rs` (313 ln) — THE PQ EQUIVOCATION REPORT PATH: a post-quantum double-sign must be
+- `stellereum/tests/pq_fork288000_replay.rs` (298 ln) — Offline replay of live-testnet block #288000 (PQ fork anchor).
+- `stellereum/tests/pq_gates_staking_light_tests.rs` (390 ln) — PQ gate-first tests: staking ED-fallback + slash paths + light-client quorum.
+- `stellereum/tests/pq_registry_tests.rs` (637 ln) — On-chain PQ key registry tests: registration, delayed rotation, refusals,
+- `stellereum/tests/pq_rpc_tests.rs` (230 ln) — PQ registry RPC visibility: `stell_getPqKey` / `stell_getPqRegistryStatus`.
+- `stellereum/tests/pq_uqc_power_quorum_tests.rs` (338 ln) — Power-weighted µQC quorum — regression for the N=3 fragile-unanimous audit.
+- `stellereum/tests/pq_wallet_2pc_tests.rs` (446 ln) — PQ wallet transfer path for `STELL_PURE_PQ=1` chains (the mode live + the
+- `stellereum/tests/privacy_live_tests.rs` (1097 ln) — §9 confidential transfers on the LIVE block path.
+- `stellereum/tests/privacy_onchain_tests.rs` (753 ln) — §9 CONFIDENTIAL TRANSFER engine layer, at the API/commitment level.
+- `stellereum/tests/privacy_pq_tests.rs` (309 ln) — Pure-PQ enforcement gate for the Ristretto privacy module.
+- `stellereum/tests/proposal_refire_tests.rs` (277 ln) — Regression tests for section-1 proposal refire spam observed live:
+- `stellereum/tests/proposal_validation_audit_tests.rs` (719 ln) — Proposal-validation pipeline audit tests.
+- `stellereum/tests/propose_select_differential_tests.rs` (346 ln) — Differential: optimized `select_for_block_multi` == original, tx-for-tx.
+- `stellereum/tests/protocol_fuzz_tests.rs` (626 ln) — Stateful protocol fuzz: random BLOCK sequences through the real block path.
+- `stellereum/tests/pruning_live_tests.rs` (447 ln) — Live retention proofs: pruning vs archive mode on real `Storage`.
+- `stellereum/tests/pruning_tests.rs` (336 ln) — P1 (a): disk pruning and archive mode.
+- `stellereum/tests/pure_pq_enforcement_tests.rs` (307 ln) — Integration and Enforcement Tests for Pure Post-Quantum Mode
+- `stellereum/tests/qc_batch_verify_tests.rs` (292 ln) — QC batch verification: benchmarks + batched==serial differentials.
+- `stellereum/tests/quorum_fragility_tests.rs` (200 ln) — Quorum-safety (fragile-set) detector — урок ночи C.
+- `stellereum/tests/readiness_tests.rs` (482 ln) — Readiness (`/healthz` + `/readyz` + `stell_ready`) and log-rotation tests.
+- `stellereum/tests/remote_signer_tests.rs` (971 ln) — Tests for the remote/HSM-style validator signer.
+- `stellereum/tests/remote_signing_consensus_tests.rs` (199 ln) — End-to-end proof that a REMOTE signer actually signs consensus messages.
+- `stellereum/tests/replay_enforcement_tests.rs` (527 ln) — Phase-3 replay-enforcement differentials (A14 chain-binding rollout).
+- `stellereum/tests/replay_epoch_tests.rs` (270 ln) — Replay-domain hardening differentials: chain-id BINDING + epoch/nonce pin.
+- `stellereum/tests/replication_backpressure_tests.rs` (450 ln) — Replication-backpressure regression suite (2026-10-14 storm).
+- `stellereum/tests/restore_root_verification_tests.rs` (333 ln) — Local-restore root verification (`load_state_into` / `load_full_state_into`).
+- `stellereum/tests/retro_publish_tests.rs` (642 ln) — Retro-publish: making bodies that were finalized long ago fetchable again.
+- `stellereum/tests/round_sync_audit_tests.rs` (567 ln) — Round-sync audit pins — SCOPE: ROUND SYNC ONLY.
+- `stellereum/tests/rpc_batch_tests.rs` (162 ln) — JSON-RPC batch support (rpc 9.5): HTTP-level coverage.
+- `stellereum/tests/rpc_drift_regression.rs` (286 ln) — RPC/API/SDK drift regression: pins request/response shapes for
+- `stellereum/tests/rpc_surface_audit_tests.rs` (799 ln) — RPC-surface security audit tests (`src/rpc.rs` + `src/explorer.rs` behavior).
+- `stellereum/tests/rpc_tests.rs` (447 ln) — Targeted tests for RPC hardening, EVM adapter compatibility, and filter manager invariants.
+- `stellereum/tests/rpc_ws_tests.rs` (306 ln) — WS residual close-out (rpc 8.5->9.0): subscriptions bounded per connection,
+- `stellereum/tests/sender_detach_tests.rs` (228 ln) — Sender-detach regressions (dead-peer flush stall).
+- `stellereum/tests/sequencer_m3_tests.rs` (263 ln) — Sequencer milestone M3 (§5 core): deterministic shared sequencing +
+- `stellereum/tests/session_budget_tests.rs` (456 ln) — Bot/session-key visibility: `stell_sessionBudget` RPC + human-readable
+- `stellereum/tests/session_key_tests.rs` (1798 ln) — Session keys phase 0+1: golden byte-compatibility, envelope verification,
+- `stellereum/tests/session_registry_tests.rs` (1116 ln) — Session keys PHASE 2: the stateful, committed registry.
+- `stellereum/tests/shard2_n3_soak_tests.rs` (718 ln) — Shard-2 N=3 soak: three validators per shard (workchain 7.5 -> 8.5 proof, no live touch).
+- `stellereum/tests/shard2_soak_tests.rs` (301 ln) — Shard-2 soak: two shards finalize + interoperate in-process (UNPARK §4 proof).
+- `stellereum/tests/sharding_m1_tests.rs` (199 ln) — Sharding milestone M1: two shards in one process.
+- `stellereum/tests/sharding_m2_tests.rs` (466 ln) — Sharding milestone M2: atomic, deterministic cross-shard value transfer.
+- `stellereum/tests/sharding_m3_tests.rs` (426 ln) — Sharding milestone M3 (§5 core): shared-sequencer-adjacent two-phase
+- `stellereum/tests/sharding_topology_tests.rs` (480 ln) — Reproducible load test of the DYNAMIC SHARDING path: a split and a merge
+- `stellereum/tests/shielded_path_tests.rs` (679 ln) — First-class shielded path: `stell_shieldedTransfer` -> `stell_shieldedBalance`
+- `stellereum/tests/sim_byzantine_evict.rs` (128 ln) — The vote-equivocation half is pinned elsewhere and is NOT repeated here:
+- `stellereum/tests/sim_dead_member_4node.rs` (225 ln) — The static-DOWN cases (dead from genesis) are pinned in
+- `stellereum/tests/sim_happy3.rs` (142 ln) — Every other scenario in `docs/SIMULATOR.md` is read AGAINST this one: if
+- `stellereum/tests/sim_nil_grace_tests.rs` (458 ln) — CONTEXT: the view-change straggler grace was subsumed into the pre-existing
+- `stellereum/tests/sim_proposer_straggler.rs` (347 ln) — LIVE COUPLING (see task context: 3 validators, unanimity 3/3, one member on
+- `stellereum/tests/sim_round_hold_accounting.rs` (297 ln) — ROUND-TIMER ACCOUNTING (see docs/TEMPO_PROFILE.md §5.3 + the unit proof in
+- `stellereum/tests/sim_round_skew_converge.rs` (123 ln) — The single-late-node case (30 rounds behind) is pinned in
+- `stellereum/tests/sim_slow_voter_unanimity.rs` (146 ln) — LIVE COUPLING (see also `tests/unanimity3_slow_voter_tests.rs`, which pins
+- `stellereum/tests/sim_tempo_target06_tests.rs` (343 ln) — CONTEXT: `docs/TEMPO_PROFILE.md` and `docs/PROPOSER_REWORK.md` named in the
+- `stellereum/tests/slash_drill_tests.rs` (608 ln) — WHAT EACH TEST PROVES:
+- `stellereum/tests/slashing_rotation_tests.rs` (751 ln) — Agent B: slashing parity (local vs adopt_committed) + validator rotation proofs.
+- `stellereum/tests/snapshot_cadence_tests.rs` (306 ln) — Adaptive snapshot cadence: skip rule + restore-equivalence (9.5 HDAE).
+- `stellereum/tests/snapshot_fanout_regression_tests.rs` (285 ln) — Regression for the chunk-fan-out follow-up to the 2026-10-13 storm.
+- `stellereum/tests/snapshot_publish_tests.rs` (342 ln) — Snapshot take→publish regression (live incident 2026-10-15).
+- `stellereum/tests/snapshot_resume_regression_tests.rs` (244 ln) — Regression for the weak-link snapshot death (observer, 1vCPU/60%).
+- `stellereum/tests/snapshot_set_tests.rs` (519 ln) — F5 set-at-height snapshot binding (KI-13) + strict trust-anchor parser.
+- `stellereum/tests/sortition_integration_tests.rs` (566 ln) — SCHEDULE / sortition integration surface (read-only review + pinning tests).
+- `stellereum/tests/staking_audit_closure_tests.rs` (786 ln) — Staking + slashing audit closure (audit-staking.md / mission bundle).
+- `stellereum/tests/staking_economics_audit_tests.rs` (897 ln) — Economic audit of the staking ledger (2026-11-01).
+- `stellereum/tests/staking_integration_tests.rs` (433 ln) — Integration tests: staking powers consensus and equivocation slashing.
+- `stellereum/tests/staking_invariants_tests.rs` (972 ln) — Staking invariant state-machine suite (staking 9.0 -> 9.5).
+- `stellereum/tests/staking_ledger_migration_tests.rs` (184 ln) — Staking-ledger V2 migration: bytes persisted before the coordinated upgrade
+- `stellereum/tests/staking_load_tests.rs` (537 ln) — Staking load tests: MANY delegators (50 across 3 validators).
+- `stellereum/tests/staking_reentry_tests.rs` (399 ln) — Re-entry hysteresis (validator C incident): MIN+buffer entry floor plus
+- `stellereum/tests/staking_rewards_pool_tests.rs` (344 ln) — E2 (staking economics): rewards are minted into an explicit, capped pool.
+- `stellereum/tests/startup_guards_tests.rs` (410 ln) — Startup guards (fail-closed, loud): tasks (a) (b) (c).
+- `stellereum/tests/state_root_completeness_tests.rs` (788 ln) — P0-4: the state root must commit to EVERY piece of consensus state.
+- `stellereum/tests/stl57_audit_pentest_tests.rs` (373 ln)
+- `stellereum/tests/storage_crash_tests.rs` (457 ln) — Storage crash-consistency battery (8.5 -> 9.0).
+- `stellereum/tests/storage_restore_perf_tests.rs` (433 ln) — Storage restore performance + correctness at scale (9.0 -> 9.5).
+- `stellereum/tests/storage_sync_integrity_tests.rs` (1143 ln) — Storage/sync integrity audit: attack + fault tests for the snapshot
+- `stellereum/tests/streaming_sse_http_tests.rs` (130 ln) — End-to-end check of the streaming transports over a REAL socket.
+- `stellereum/tests/sustained_06_tests.rs` (280 ln) — GOAL: 0.6s/block sustained proof in sim — virtual clock, deterministic seeds.
+- `stellereum/tests/svm_atomicity_tests.rs` (139 ln) — SVM atomicity tests: orderbook mutations must roll back on VM revert,
+- `stellereum/tests/svm_hotpath_opt_tests.rs` (469 ln) — Guard tests for the SVM hot-path optimization (single dispatch + lazy
+- `stellereum/tests/sync_adversarial_tests.rs` (794 ln) — Sync 9.0 -> 9.5 adversarial battery (unit + integration).
+- `stellereum/tests/team_vesting_gate_tests.rs` (306 ln) — Team vesting claim gate: spending from a vesting-tracked account above the
+- `stellereum/tests/tempo_recipe_tests.rs` (270 ln) — GOAL: validate the 0.6s/block recipe in SIM on a 3-member instant-link
+- `stellereum/tests/tempo_sustained_tests.rs` (298 ln) — GOAL: 0.6s/block sustained proof in sim — virtual clock, deterministic seeds.
+- `stellereum/tests/tick_offload_tests.rs` (266 ln) — §7 Phase 1 "remove non-transport milliseconds": snapshot serialization left
+- `stellereum/tests/tick_tuning_tests.rs` (264 ln) — GOAL (0.6s/block, safety-first): tune tick / down-proposer fast-path in SIM
+- `stellereum/tests/token_adversarial_tests.rs` (577 ln) — Aggressive adversarial & fuzz security suite for the Stellereum Token Standard.
+- `stellereum/tests/token_integration_tests.rs` (611 ln) — Integration tests: on-chain token state binding + SVM token syscalls.
+- `stellereum/tests/token_security_tests.rs` (666 ln) — Adversarial Security & Penetration Testing Suite for the Stellereum Token Standard (STS-20)
+- `stellereum/tests/transport_audit_fixes.rs` (140 ln) — Transport-audit small fixes: one regression test per item.
+- `stellereum/tests/unanimity3_slow_voter_tests.rs` (163 ln) — Live incident (4-validator BFT testnet, quorum `(2n/3)+1`): slow voters on
+- `stellereum/tests/v34_verification_pentest.rs` (869 ln) — Agent V-P34 — INDEPENDENT VERIFICATION of the P3 (consensus) + P4 (crypto)
+- `stellereum/tests/validator_set_freshness_tests.rs` (265 ln) — Regression for the stale-ledger node-C incident.
+- `stellereum/tests/validator_set_quorum_tests.rs` (177 ln) — P1 follow-up: the chain must not run without validators.
+- `stellereum/tests/validator_ux_tests.rs` (478 ln) — Validator-UX gap coverage: unjail flow, redelegate fast path, mutable
+- `stellereum/tests/verify_once_tests.rs` (209 ln) — Verify-once signature attestation (PERF_PROFILE §6.1).
+- `stellereum/tests/vote_qc_assembly_audit_tests.rs` (648 ln) — Vote-counting + QC-assembly audit tests (scope: vote-set/QC regions only).
+- `stellereum/tests/vote_verify_cache_tests.rs` (257 ln) — Verified-vote cache (verify-once for votes): fixed-fixture ingest probe +
+- `stellereum/tests/vp2_verify.rs` (954 ln) — V-P2 verification: independent re-test of every P2 mempool/transaction fix
+- `stellereum/tests/vrf_bls_adversarial_tests.rs` (338 ln) — Hostile battery for the default-off VRF + BLS paths (activation unwired).
+- `stellereum/tests/vrf_canonical_draw_tests.rs` (205 ln) — Canonical-draw pin: the parent-hash draw is THE sortition mechanism.
+- `stellereum/tests/vrf_provisioning_tests.rs` (349 ln) — VRF secret provisioning + registry loader (startup seam).
+- `stellereum/tests/vuln_bundle_tests.rs` (417 ln) — Audit-bundle regression tests (fail-closed, coordinated).
+- `stellereum/tests/w10_5_activation_race.rs` (329 ln) — W10.5 activation-race regression tests (live 2026-10-23 #292785/#292786).
+- `stellereum/tests/wallet_chain_binding_tests.rs` (171 ln) — PLAN-BINDING rollout-gap regression tests (phase-3 enforcement, in-scope
+- `stellereum/tests/wallet_pq_tests.rs` (315 ln) — Phase-2 wallet track: PQ-first signing in the wallet library.
+- `stellereum/tests/workchain_guard_tests.rs` (116 ln) — Workchain boot-guard tests (fail-closed text + hatch only).
+- `stellereum/tests/xshard_2pc_tests.rs` (1140 ln) — §9 CROSS-SHARD TWO-PHASE COMMIT (2PC) for native value transfers.
+- `stellereum/tests/xshard_replay_tests.rs` (513 ln) — Audit F1 (HIGH): cross-shard replay sets vs snapshot install.
+- `stellereum/tests/zkml_attestation_tests.rs` — §2 zkML ATTESTATION half: re-execution + BLAKE3 Merkle trace root. The legacy protocol tag is `STELLEREUM_PQ_STARK_BLAKE3_V1`, but the mechanism is **not a STARK** and not ZK; the tests pin that honestly.
+- `stellereum/tests/zkml_live_tests.rs` (921 ln) — §2 zkML on the live block path: reachable + sound-checked.
+- `stellereum/tests/zz_committed_rt.rs` (58 ln)
+- `stellereum/tests/zz_inspect_qc.rs` (60 ln)
+- `stellereum/tests/zz_scratch_w75.rs` (168 ln) — TEMPORARY scratch probe (deleted before the final run).
+- `stellereum/tests/zz_vel_measure.rs` (313 ln) — VEL measurement: WAN + slow member + MIXED content, 300 heights.
+- `stellereum/tests/support/consensus_cluster.rs` (2046 ln) — A deterministic, in-process MULTI-NODE CONSENSUS LIVENESS harness.
+- `stellereum/tests/support/live_stand.rs` (932 ln) — A deterministic, in-process MULTI-NODE rig that models the production
+- `stellereum/tests/support/mod.rs` (158 ln) — Shared integration-test helpers.
+
+## stellereum/benches — Criterion-style benches / probes
+
+- `stellereum/benches/apply_speedup.rs` (185 ln) — Parallel-apply speedup curve + plan-chunk sensitivity (std-only; no criterion).
+- `stellereum/benches/block_cpu_budget.rs` (244 ln) — Per-height CPU budget bench (0.6s/block program, measurement only).
+- `stellereum/benches/fee_path.rs` (221 ln) — Fee-path timing harness for the apply-FEE optimization (std-only; no criterion).
+- `stellereum/benches/packing.rs` (245 ln) — Packing + apply benchmarks for the 1k-TPS recipe (std-only; no criterion).
+- `stellereum/benches/privacy_batch.rs` (181 ln) — §9 MSM batch benchmarks (std-only; the repo carries no criterion dep).
+- `stellereum/benches/propose_latency.rs` (328 ln) — Propose-latency breakdown: select + build + sign on fixed fixtures.
+- `stellereum/benches/svm_hot_path.rs` (318 ln) — SVM hot-path benchmarks (std-only; the repo carries no criterion dep).
+- `stellereum/benches/tempo_probe.rs` (604 ln) — TEMPO probe: rank the costs inside TEMPO scope (`commitment.rs`, `cpat2.rs`).
+- `stellereum/benches/zkml_attestation.rs` (115 ln) — zkML ATTESTATION benchmarks (std-only; the repo carries no criterion dep).
+
+## infnode/crates/infnode/src — P2P transport (QUIC, DHT, pubsub, reputation)
+
+- `infnode/crates/infnode/src/config.rs` (195 ln) — Falcon-512 long-term PQ public key (897 bytes, hex). `None` (absent)
+- `infnode/crates/infnode/src/dht.rs` (794 ln) — Kademlia DHT: routing table (k-buckets) + KV-хранилище.
+- `infnode/crates/infnode/src/federation.rs` (251 ln) — federation.rs — подтверждение валидатора через DNS TXT (федерации).
+- `infnode/crates/infnode/src/keyring.rs` (565 ln) — Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
+- `infnode/crates/infnode/src/lib.rs` (18 ln) — infnode — сетевой слой (протокол): QUIC + DHT + storage (чанки RF≤3) + rewards + proof-of-storage.
+- `infnode/crates/infnode/src/log.rs` (210 ln) — Структурированные JSON-логи для диагностики в проде.
+- `infnode/crates/infnode/src/mailbox.rs` (180 ln) — Почтовый ящик InfMail: E2E-шифрование (crypto_box: X25519 + XChaCha20),
+- `infnode/crates/infnode/src/main.rs` (1371 ln) — Сгенерировать ключи ноды и пример конфига
+- `infnode/crates/infnode/src/metrics.rs` (313 ln) — Prometheus-метрики: минимальный HTTP-эндпоинт /metrics (без зависимостей).
+- `infnode/crates/infnode/src/migration.rs` (332 ln) — Миграция чанков и batch-проверка целостности (П.3.3).
+- `infnode/crates/infnode/src/node.rs` (9903 ln) — Токен-бакет для rate limiting запросов пира.
+- `infnode/crates/infnode/src/pq_transport.rs` (775 ln) — PQ TRANSPORT MIGRATION — design doc + KAT-level prototype. UNWIRED BY DESIGN.
+- `infnode/crates/infnode/src/proto.rs` (891 ln) — Fail-closed ingress caps (audit 2026-11-01). The 32 MiB `MAX_FRAME` is a
+- `infnode/crates/infnode/src/reputation.rs` (292 ln) — Per-peer (ed25519-identity) reputation for the QUIC accept path.
+- `infnode/crates/infnode/src/rewards.rs` (634 ln) — Трекер наград: валидатор периодически пингует пиров (аптайм) и запрашивает
+- `infnode/crates/infnode/src/services.rs` (206 ln)
+- `infnode/crates/infnode/src/totp.rs` (238 ln) — TOTP (RFC 6238) на чистом Rust — без внешних крейтов.
+
+## infnode/crates/infnode/tests — Transport integration suites
+
+- `infnode/crates/infnode/tests/accept_hardening_tests.rs` (488 ln) — F8 accept-path hardening (2026-11-01 audit): fail-closed tests.
+- `infnode/crates/infnode/tests/backpressure_tests.rs` (713 ln) — Backpressure audit tests (2026-11-03): caps, sheds, fairness.
+- `infnode/crates/infnode/tests/circuit_breaker_tests.rs` (343 ln) — Per-peer outbound-dial circuit breaker (redial-storm incident).
+- `infnode/crates/infnode/tests/concurrent_stream_tests.rs` (267 ln) — Regression tests for concurrent per-stream handling in `frame_loop`.
+- `infnode/crates/infnode/tests/dht_scale_tests.rs` (552 ln) — DHT/routing scale + pubsub fanout measurements (infnode scale task).
+- `infnode/crates/infnode/tests/eclipse_tests.rs` (813 ln) — Eclipse / poison resistance battery (p2p 8.0 -> 9.0).
+- `infnode/crates/infnode/tests/endpoint_hygiene_tests.rs` (207 ln) — Endpoint hygiene (port-scan incident): dial order + per-cycle budgets.
+- `infnode/crates/infnode/tests/federation_security_tests.rs` (106 ln) — DNS federation security tests (offline: parsing, self-consistency, trust anchor).
+- `infnode/crates/infnode/tests/frame_fuzz_tests.rs` (467 ln) — Fuzz tests for the infnode wire parser (`Frame::decode`).
+- `infnode/crates/infnode/tests/gossip_scale_tests.rs` (653 ln) — Gossip-at-scale suite (p2p 9.0 -> 9.5): broadcast coverage, all-to-all
+- `infnode/crates/infnode/tests/kem_kat_tests.rs` (275 ln) — ML-KEM (FIPS 203) Known-Answer Tests — vendored implementation pin.
+- `infnode/crates/infnode/tests/kex_session_tests.rs` (510 ln) — Transport-KEX full: AEAD frame bodies under the established hybrid
+- `infnode/crates/infnode/tests/keystore_security_tests.rs` (123 ln) — Security hardening tests for the infnode keystore (keyring + mailbox).
+- `infnode/crates/infnode/tests/nodeid_ceremony_tests.rs` (237 ln) — NodeId re-ceremony tests (HDAE, lead-commits-only: NEW FILE ONLY).
+- `infnode/crates/infnode/tests/opt_parity_tests.rs` (454 ln) — Parity + never-slower gate for the `merge_index_union` HashSet optimization.
+- `infnode/crates/infnode/tests/p2p_audit_tests.rs` (878 ln) — P2P transport security audit (2026-11-01) — attack tests, fail-closed.
+- `infnode/crates/infnode/tests/pentest_caps_bypass.rs` (504 ln) — Pentest: bypass the backpressure caps (`node.rs` cap consts) via the REAL
+- `infnode/crates/infnode/tests/pentest_codec_dht.rs` (694 ln) — HDAE pentest: codec/DHT under storm (NEW-FILE-ONLY, lead-ordered).
+- `infnode/crates/infnode/tests/pentest_pq_downgrade.rs` (663 ln) — PQ downgrade / confusion pentest (HDAE, lead-commits-only: NEW FILE ONLY).
+- `infnode/crates/infnode/tests/pentest_pq_identity.rs` (457 ln) — PQ identity/confusion pentest (HDAE, lead-commits-only: NEW FILE ONLY).
+- `infnode/crates/infnode/tests/pentest_reputation_bypass.rs` (633 ln) — Reputation-ban bypass pentest (HDAE, NEW-FILE-ONLY).
+- `infnode/crates/infnode/tests/pq_handshake_tests.rs` (1245 ln) — PQ handshake tests (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
+- `infnode/crates/infnode/tests/pubsub_bidir_tests.rs` (179 ln) — Regression test for the one-way pubsub bug (the fix that unblocked the
+- `infnode/crates/infnode/tests/pubsub_sender_id_tests.rs` (144 ln) — The pubsub delivery must carry the SENDER's node id, and the
+- `infnode/crates/infnode/tests/reputation_tests.rs` (648 ln) — F8 residual (M2 blast radius, `docs/PENTEST_NET_API.md`): per-identity
+
+## stellereum-contracts/contracts — On-chain programs
+
+- `stellereum-contracts/contracts/account-object/src/lib.rs` (524 ln) — STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). Ownership,
+- `stellereum-contracts/contracts/account-object/tests/auth_ct_p0.rs` (50 ln) — CT-P0 auth matrix for account-object (audit KI-38): spoofed owner /
+- `stellereum-contracts/contracts/account-object/tests/econ_abuse.rs` (98 ln) — HDAE economic-abuse pentest for account-object budgets (read-only).
+- `stellereum-contracts/contracts/account-object/tests/poc_p0_takeover.rs` (21 ln) — P0 PoC (fixed by CT-P0 auth, kept as regression pin): account-object
+- `stellereum-contracts/contracts/account-object/tests/regression_audit_60_80.rs` (41 ln) — Audit 6.0->8.0 residual pin for account-object sessions (wire-frozen).
+- `stellereum-contracts/contracts/liquidity-pool/src/lib.rs` (387 ln) — STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). `deposit`
+- `stellereum-contracts/contracts/liquidity-pool/tests/auth_ct_p0.rs` (29 ln) — CT-P0 auth matrix for liquidity-pool (audit KI-38, same spoof class as
+- `stellereum-contracts/contracts/liquidity-pool/tests/econ_abuse.rs` (153 ln) — HDAE economic-abuse pentest for liquidity-pool (read-only vs programs).
+- `stellereum-contracts/contracts/liquidity-pool/tests/poc_p1_dust_withdraw.rs` (38 ln) — P1 regression: liquidity-pool `withdraw` floored payouts, burning shares
+- `stellereum-contracts/contracts/liquidity-pool/tests/regression_audit_60_80.rs` (39 ln) — Audit 6.0->8.0 regression pins for liquidity-pool.
+- `stellereum-contracts/contracts/stl-dns/src/lib.rs` (459 ln) — STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). `transfer`
+- `stellereum-contracts/contracts/stl-dns/tests/auth_ct_p0.rs` (65 ln) — CT-P0 auth matrix for STL-DNS (audit KI-38): forged owner/treasury ids
+- `stellereum-contracts/contracts/stl-dns/tests/econ_abuse.rs` (119 ln) — HDAE economic-abuse pentest for STL-DNS (read-only vs program).
+- `stellereum-contracts/contracts/stl-dns/tests/poc_p0_domain_hijack.rs` (23 ln) — P0 PoC (fixed by CT-P0 auth, kept as regression pin): STL-DNS
+- `stellereum-contracts/contracts/stl-dns/tests/regression_audit_60_80.rs` (51 ln) — Audit 6.0->8.0 regression pins for STL-DNS.
+- `stellereum-contracts/contracts/sts20-token/src/lib.rs` (394 ln) — STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). Every
+- `stellereum-contracts/contracts/sts20-token/tests/auth_ct_p0.rs` (71 ln) — CT-P0 auth matrix for STS-20 (audit KI-38): stranger refused with the
+- `stellereum-contracts/contracts/sts20-token/tests/econ_abuse.rs` (143 ln) — HDAE economic-abuse pentest for STS-20 (read-only vs program).
+- `stellereum-contracts/contracts/sts20-token/tests/poc_p0_forged_burn.rs` (22 ln) — P0 PoC (fixed by CT-P0 auth, kept as regression pin): STS-20 `burn`/`mint`
+- `stellereum-contracts/contracts/sts20-token/tests/poc_p0_unauth_transfer.rs` (23 ln) — P0 PoC (fixed by CT-P0 auth, kept as regression pin): STS-20 `transfer`
+- `stellereum-contracts/contracts/sts20-token/tests/regression_audit_60_80.rs` (79 ln) — Audit 6.0->8.0 regression pins for STS-20.
+
+## stellereum-contracts/crates — Contract SDK + e2e harness
+
+- `stellereum-contracts/crates/e2e-tests/src/lib.rs` (2 ln)
+- `stellereum-contracts/crates/e2e-tests/tests/adversarial_pentest_tests.rs` (798 ln) — Adversarial Penetration Testing & Bug Hunting Suite for Stellereum Smart Contracts
+- `stellereum-contracts/crates/e2e-tests/tests/onchain_wasm_e2e_tests.rs` (322 ln) — End-to-End Onchain Integration Tests for Rust-Compiled WASM Contracts in Stellereum VM
+- `stellereum-contracts/crates/stellereum-contract-sdk/src/address.rs` (155 ln) — Pure Rust Address Utilities for Stellereum Smart Contracts and Tooling
+- `stellereum-contracts/crates/stellereum-contract-sdk/src/lib.rs` (274 ln) — Stellereum Smart Contract SDK (Pure Rust)
+- `stellereum-contracts/crates/stellereum-contract-sdk/src/storage.rs` (85 ln) — High-level Storage Abstractions for Stellereum Smart Contracts
+
+## stellereum-indexer/src — Chain indexer
+
+- `stellereum-indexer/src/db.rs` (1175 ln)
+- `stellereum-indexer/src/events.rs` (590 ln) — Contract events for the explorer: the stored shape, the ABI decoder and
+- `stellereum-indexer/src/lib.rs` (5 ln)
+- `stellereum-indexer/src/main.rs` (62 ln)
+- `stellereum-indexer/src/server.rs` (1420 ln) — The contract ABI manifests the indexer knows about, filled by the
+- `stellereum-indexer/src/syncer.rs` (355 ln) — The contract ABI manifests the indexer knows about. They are what makes
+
+## stell-wallet/src — CLI wallet
+
+- `stell-wallet/src/client.rs` (1526 ln) — Lightweight SPV Network Client for Stellereum Wallet
+- `stell-wallet/src/main.rs` (5596 ln) — Official Lightweight CLI Wallet & SPV Client for Stellereum L1 Blockchain
+- `stell-wallet/src/notes.rs` (1793 ln) — Shielded Note Storage and Tracking for Stellereum Confidential Pool
+- `stell-wallet/src/pq.rs` (785 ln) — Post-Quantum Cryptography & Address Utilities for Stellereum L1
+- `stell-wallet/src/rpc.rs` (883 ln) — Minimal HTTP JSON-RPC client for Stellereum nodes.
+- `stell-wallet/src/security.rs` (376 ln) — Military-Grade Security & Anti-Malware Hardening Module
+- `stell-wallet/src/wallets.rs` (367 ln) — Multi-Wallet Management Engine for Stellereum Light Wallet
+
+## stellereum-sdk/src — Tx-builder SDK
+
+- `stellereum-sdk/src/lib.rs` (672 ln) — Minimal canonical transaction-builder SDK for Stellereum (kills B2:
+
+## Ruleset v6 / consensus reference (docs; hand-maintained)
+
+- `docs/RULESET_V2.md` — 240 ms height re-scale (historical, superseded).
+- `docs/RULESET_V3.md` — shard-bound vote preimage `STELLEREUM_BFT_VOTE_V3` (historical fork id).
+- `docs/RULESET_V4.md` — signed block `round`, deterministic timestamp bound, proposal-equivocation ON.
+- `docs/RULESET_V5.md` — chain-wide supply cap, fork `0x9d59096b` (historical, superseded by v6).
+- `docs/RULESET_V6.md` — current ruleset: round-free `value_id` locks + re-stamped rescue, `FORK_ID 0x0f584a46`, 23 rules.
+- `docs/SUPPLY_CAP.md` — `SupplyPartition` + `minted_total_nano` + masterchain aggregate model.
+- `docs/LIVENESS_ROUND_SYNC_AUDIT.md` — live round-divergence analysis (defect FIXED by ruleset v6).
+- `stellereum/docs/OBSERVABILITY.md` — metrics/logs/alert surfaces.
+- `docs/CI.md` — continuous-integration gate and job layout.
+
+Code anchors: `stellereum/src/protocol.rs` (`FORK_ID`, `FORK_ID_RULES`,
+`MAX_BLOCK_TIMESTAMP_DRIFT_MS`); `sharding/block.rs` (`STELLEREUM_BLOCK_V3`,
+`ROUND001`, `SHARDHDR`, `SHMINT01`, `Block::compute_hash`);
+`consensus/types.rs` (`VOTE_SIGN_DOMAIN`, `vote_sign_bytes_for_shard`);
+`runtime/consensus_step.rs` (`accepts_block_round`, `check_block_timestamp`);
+`tokenomics.rs` (`TOTAL_SUPPLY_CAP`, `SupplyPartition`);
+`runtime/anchors.rs` (`check_chain_supply_commitment`).
+
+Total: 473 Rust files.

@@ -1,8 +1,7 @@
 use super::types::{write_contract_trie_entries, PayloadDomainSnapshot};
 use super::verify_once::verify_block_tx_signatures_at_height;
 use super::{AccountState, ExecPostActions, InMemoryStateEngine, PQ_ACTIVATION_SURCHARGE_GAS};
-use rayon::iter::ParallelIterator;
-use rayon::slice::ParallelSlice;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::collections::{HashMap, HashSet};
 
 /// Minimum number of transactions a wave must carry before the CONCURRENT
@@ -67,9 +66,35 @@ struct PlainTxPlan {
     applied: bool,
     /// Amount actually debited from the sender (0 when nothing was charged).
     fee: u64,
+    /// Number of occupied slots in `writes` (`0..=3`: sender, optional
+    /// sponsor, optional recipient). Inline fixed array removes one heap
+    /// allocation per planned transaction (`OPT-PARALLEL-WAVE`).
+    write_len: u8,
     /// Final `(address, balance, nonce)` of every account the transaction
     /// touched, in application order.
-    writes: Vec<([u8; 32], u64, u64)>,
+    writes: [([u8; 32], u64, u64); 3],
+}
+
+impl PlainTxPlan {
+    #[inline]
+    fn push_write(&mut self, entry: ([u8; 32], u64, u64)) {
+        let idx = self.write_len as usize;
+        debug_assert!(idx < self.writes.len());
+        if idx < self.writes.len() {
+            self.writes[idx] = entry;
+            self.write_len += 1;
+        }
+    }
+
+    #[inline]
+    fn clear_writes(&mut self) {
+        self.write_len = 0;
+    }
+
+    #[inline]
+    fn writes(&self) -> &[([u8; 32], u64, u64)] {
+        &self.writes[..self.write_len as usize]
+    }
 }
 
 /// F-01 failure fee: the sender's post-fee state and the amount debited, or
@@ -164,7 +189,7 @@ fn plan_plain_tx(
     if tx.delegation().is_some() && !session_ok {
         if let Some((debited, balance, nonce)) = failure_fee_state(tx, sender, fail_fee) {
             plan.fee = debited;
-            plan.writes.push((tx.from, balance, nonce));
+            plan.push_write((tx.from, balance, nonce));
         }
         return plan;
     }
@@ -198,8 +223,8 @@ fn plan_plain_tx(
             // fee-payer leg).
             if fail_fee > 0 && sbal >= fail_fee {
                 plan.fee = fail_fee;
-                plan.writes.push((tx.from, ubal, unonce + 1));
-                plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+                plan.push_write((tx.from, ubal, unonce + 1));
+                plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
             }
             return plan;
         }
@@ -214,8 +239,8 @@ fn plan_plain_tx(
                 );
                 if fail_fee > 0 && sbal >= fail_fee {
                     plan.fee = fail_fee;
-                    plan.writes.push((tx.from, ubal, unonce + 1));
-                    plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+                    plan.push_write((tx.from, ubal, unonce + 1));
+                    plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
                 }
                 return plan;
             }
@@ -225,12 +250,11 @@ fn plan_plain_tx(
         if tx.from == tx.to {
             // A self-transfer only pays the fee (from the sponsor): the
             // value goes straight back, the user nonce still advances.
-            plan.writes.push((tx.from, ubal, unonce + 1));
-            plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+            plan.push_write((tx.from, ubal, unonce + 1));
+            plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
             return plan;
         }
-        plan.writes
-            .push((tx.from, ubal.saturating_sub(tx.amount), unonce + 1));
+        plan.push_write((tx.from, ubal.saturating_sub(tx.amount), unonce + 1));
         if !cross_shard && auth.sponsor == tx.to {
             // The sponsor IS the recipient (`sponsored_grant()` only excludes
             // `sponsor == from`, so a third-party sponsor can name itself as
@@ -240,43 +264,43 @@ fn plan_plain_tx(
             // the sponsor: a separate recipient write would overwrite the fee
             // debit (last write wins in `commit_plain_plan`) and mint the fee.
             match (sbal - fail_fee).checked_add(tx.amount) {
-                Some(final_balance) => plan.writes.push((tx.to, final_balance, snonce)),
+                Some(final_balance) => plan.push_write((tx.to, final_balance, snonce)),
                 None => {
                     // The credit would overflow: the failure-fee path
                     // (sponsor pays, user nonce advances) - same shape as
                     // the recipient-overflow arm below.
                     plan.applied = false;
                     plan.fee = 0;
-                    plan.writes.clear();
+                    plan.clear_writes();
                     if fail_fee > 0 && sbal >= fail_fee {
                         plan.fee = fail_fee;
-                        plan.writes.push((tx.from, ubal, unonce + 1));
-                        plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+                        plan.push_write((tx.from, ubal, unonce + 1));
+                        plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
                     }
                 }
             }
             return plan;
         }
-        plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+        plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
         if !cross_shard {
             match recipient {
                 Some((rbalance, rnonce)) => match rbalance.checked_add(tx.amount) {
-                    Some(new_balance) => plan.writes.push((tx.to, new_balance, rnonce)),
+                    Some(new_balance) => plan.push_write((tx.to, new_balance, rnonce)),
                     None => {
                         // The credit would overflow: the failure-fee path
                         // (sponsor pays, user nonce advances).
                         plan.applied = false;
                         plan.fee = 0;
-                        plan.writes.clear();
+                        plan.clear_writes();
                         if fail_fee > 0 && sbal >= fail_fee {
                             plan.fee = fail_fee;
-                            plan.writes.push((tx.from, ubal, unonce + 1));
-                            plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
+                            plan.push_write((tx.from, ubal, unonce + 1));
+                            plan.push_write((auth.sponsor, sbal - fail_fee, snonce));
                         }
                     }
                 },
                 None => {
-                    plan.writes.push((tx.to, tx.amount, 0));
+                    plan.push_write((tx.to, tx.amount, 0));
                 }
             }
         }
@@ -301,7 +325,7 @@ fn plan_plain_tx(
         // the floor (capped at the balance) and consumes the nonce.
         if let Some((debited, balance, nonce)) = failure_fee_state(tx, sender, fail_fee) {
             plan.fee = debited;
-            plan.writes.push((tx.from, balance, nonce));
+            plan.push_write((tx.from, balance, nonce));
         }
         return plan;
     }
@@ -320,7 +344,7 @@ fn plan_plain_tx(
             );
             if let Some((debited, balance, nonce)) = failure_fee_state(tx, sender, fail_fee) {
                 plan.fee = debited;
-                plan.writes.push((tx.from, balance, nonce));
+                plan.push_write((tx.from, balance, nonce));
             }
             return plan;
         }
@@ -331,36 +355,34 @@ fn plan_plain_tx(
 
     if tx.from == tx.to {
         // A self-transfer only pays the fee: the amount goes straight back.
-        plan.writes
-            .push((tx.from, balance.saturating_sub(fee), nonce + 1));
+        plan.push_write((tx.from, balance.saturating_sub(fee), nonce + 1));
         return plan;
     }
 
-    plan.writes
-        .push((tx.from, balance.saturating_sub(total_cost), nonce + 1));
+    plan.push_write((tx.from, balance.saturating_sub(total_cost), nonce + 1));
 
     if !cross_shard {
         match recipient {
             Some((rbalance, rnonce)) => match rbalance.checked_add(tx.amount) {
-                Some(new_balance) => plan.writes.push((tx.to, new_balance, rnonce)),
+                Some(new_balance) => plan.push_write((tx.to, new_balance, rnonce)),
                 None => {
                     // The credit would overflow: the sender is refunded and
                     // the floor is charged (the sequential path rolls the
                     // commit back and charges the same floor).
                     plan.applied = false;
                     plan.fee = 0;
-                    plan.writes.clear();
+                    plan.clear_writes();
                     if let Some((debited, balance, nonce)) = failure_fee_state(tx, sender, fail_fee)
                     {
                         plan.fee = debited;
-                        plan.writes.push((tx.from, balance, nonce));
+                        plan.push_write((tx.from, balance, nonce));
                     }
                 }
             },
             None => {
                 // The recipient does not exist yet: it is created with the
                 // transferred amount (nonce 0).
-                plan.writes.push((tx.to, tx.amount, 0));
+                plan.push_write((tx.to, tx.amount, 0));
             }
         }
     }
@@ -381,7 +403,7 @@ fn commit_plain_plan(
     fees: &mut [u64],
     trie_dirty: &mut Vec<([u8; 32], u64, u64)>,
 ) {
-    for (addr, balance, nonce) in &plan.writes {
+    for (addr, balance, nonce) in plan.writes() {
         match map.get_mut(addr) {
             Some(acc) => {
                 acc.balance = *balance;
@@ -405,7 +427,7 @@ fn commit_plain_plan(
     // Trie: the FINAL value of every account this transaction touched.
     // Absolute values, so the last write per account is the account's final
     // state - the same rule the sequential path relies on.
-    for (addr, balance, nonce) in &plan.writes {
+    for (addr, balance, nonce) in plan.writes() {
         trie_dirty.push((*addr, *balance, *nonce));
     }
 }
@@ -505,38 +527,36 @@ impl InMemoryStateEngine {
                 snap
             };
 
-            // (b) PLAN - in parallel, on the rayon pool, in chunks of
-            // `parallel_plan_chunk()` transactions per task. The collect is
-            // order-preserving, so the chunking never changes the plans.
+            // (b) PLAN - in parallel, on the rayon pool, with a minimum chunk
+            // size of `parallel_plan_chunk()` and ZERO intermediate per-chunk
+            // `Vec` allocations (`OPT-PARALLEL-WAVE`). IndexedParallelIterator
+            // collects directly in wave order.
             let chunk = parallel_plan_chunk().min(wave.len().div_ceil(4).max(1));
             let plans: Vec<(usize, PlainTxPlan)> = wave
-                .par_chunks(chunk)
-                .flat_map(|c| {
-                    c.iter()
-                        .map(|&i| {
-                            let tx = &txs[i];
-                            let (floor_base, surcharge) = fee_floors[i];
-                            let session_ok = session_valid
-                                .map(|sv| sv.get(&i).copied().unwrap_or(false))
-                                .unwrap_or(true);
-                            let plan = plan_plain_tx(
-                                tx,
-                                admitted[i],
-                                session_ok,
-                                snapshot.get(&tx.from).copied().flatten(),
-                                snapshot.get(&tx.to).copied().flatten(),
-                                floor_base,
-                                surcharge,
-                                vesting_floors.get(&tx.from).copied(),
-                                burn_for_cross_shard && tx.source_shard != tx.target_shard,
-                                tx.effective_sponsor()
-                                    .and_then(|s| snapshot.get(&s).copied().flatten()),
-                                exec_hardening,
-                                fee_market_v2,
-                            );
-                            (i, plan)
-                        })
-                        .collect::<Vec<_>>()
+                .par_iter()
+                .with_min_len(chunk)
+                .map(|&i| {
+                    let tx = &txs[i];
+                    let (floor_base, surcharge) = fee_floors[i];
+                    let session_ok = session_valid
+                        .map(|sv| sv.get(&i).copied().unwrap_or(false))
+                        .unwrap_or(true);
+                    let plan = plan_plain_tx(
+                        tx,
+                        admitted[i],
+                        session_ok,
+                        snapshot.get(&tx.from).copied().flatten(),
+                        snapshot.get(&tx.to).copied().flatten(),
+                        floor_base,
+                        surcharge,
+                        vesting_floors.get(&tx.from).copied(),
+                        burn_for_cross_shard && tx.source_shard != tx.target_shard,
+                        tx.effective_sponsor()
+                            .and_then(|s| snapshot.get(&s).copied().flatten()),
+                        exec_hardening,
+                        fee_market_v2,
+                    );
+                    (i, plan)
                 })
                 .collect();
 
@@ -822,19 +842,42 @@ impl InMemoryStateEngine {
             .applied
             .min_gas_limit
             .unwrap_or(0);
-        let penalties: HashMap<[u8; 32], u64> = self.consensus_penalty.read().await.clone();
+        // `OPT-PARALLEL-WAVE`: read ONLY the penalty and vesting entries for
+        // the distinct senders present in this block (`order`), skipping full-map
+        // clones completely when the maps are empty.
+        let penalties: HashMap<[u8; 32], u64> = {
+            let guard = self.consensus_penalty.read().await;
+            if guard.is_empty() {
+                HashMap::new()
+            } else {
+                let mut sub = HashMap::with_capacity(order.len().min(guard.len()));
+                for sender in &order {
+                    if let Some(&v) = guard.get(sender) {
+                        sub.insert(*sender, v);
+                    }
+                }
+                sub
+            }
+        };
         // Team-vesting locked floors at the block timestamp, snapshotted once
         // per block (same shape as the penalty snapshot above): the parallel
         // PLAIN fast path below bypasses `commit_native`, so it enforces the
         // same gate inline from this snapshot. Empty on every live chain
-        // today (no vested allocations exist) → collecting it is a no-op.
+        // today (no vested allocations exist) → fast-path no-op.
         let vesting_floors: HashMap<[u8; 32], u64> = {
             let ledger = self.staking.read().await;
-            ledger
-                .vesting_schedules
-                .iter()
-                .map(|(acct, sched)| (*acct, sched.locked_amount(timestamp)))
-                .collect()
+            if ledger.vesting_schedules.is_empty() {
+                HashMap::new()
+            } else {
+                let mut sub =
+                    HashMap::with_capacity(order.len().min(ledger.vesting_schedules.len()));
+                for sender in &order {
+                    if let Some(sched) = ledger.vesting_schedules.get(sender) {
+                        sub.insert(*sender, sched.locked_amount(timestamp));
+                    }
+                }
+                sub
+            }
         };
         // FEE-PATH BATCH (execution 9.0): the per-transaction fee-floor
         // inputs, computed ONCE per block from the snapshot above.

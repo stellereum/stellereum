@@ -1357,6 +1357,18 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             put_addr(h, b"withdrawal_address", addr);
         }
     }
+
+    // Conditional Q0.64 emission-carry domain (W4 E2): writes ZERO bytes when
+    // `emission_carry_q64 == 0`, preserving all pre-W4 snapshots and genesis
+    // KATs byte-for-byte.
+    if l.emission_carry_q64 != 0 {
+        put_bytes(
+            h,
+            b"staking_emission_carry_domain",
+            b"STAKING_EMISSION_CARRY_V1",
+        );
+        put_u64(h, b"staking_emission_carry_q64", l.emission_carry_q64);
+    }
 }
 
 fn unbonding_digest<S: PreimageSink>(h: &mut S, e: &UnbondingEntry) {

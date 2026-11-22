@@ -2386,8 +2386,15 @@ impl InMemoryStateEngine {
         // plus the additive PQ surcharge — NEVER the declared limit. Both
         // apply paths pass the executor's measurement, so a transaction
         // that declared more than it used is refunded the difference.
-        let fee = Self::billed_gas_at(tx, gas_used, exec_hardening).max(floor_base);
-        let fee_with_surcharge = fee.saturating_add(surcharge);
+        let fee_market_v2 = crate::tokenomics::fee_market_v2_active_at(chain_height);
+        let fee_with_surcharge = Self::fee_for_gas_at_v2(
+            tx,
+            gas_used,
+            floor_base,
+            surcharge,
+            exec_hardening,
+            fee_market_v2,
+        );
         let charge = tx
             .amount
             .checked_add(fee_with_surcharge)
@@ -2399,11 +2406,7 @@ impl InMemoryStateEngine {
         // The floored fee is what is actually debited, so the reservation
         // check prices it (not the declared limit): when the floor binds,
         // `fee > gas_limit` and the declared-limit check would under-reserve.
-        let total_cost = tx
-            .amount
-            .checked_add(fee)
-            .and_then(|t| t.checked_add(surcharge))
-            .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
+        let total_cost = charge;
 
         // Team-vesting locked floors, looked up in the caller-supplied
         // block snapshot (lock order concern gone: no locks are taken for
@@ -2975,10 +2978,11 @@ impl InMemoryStateEngine {
         // caller-supplied value is only the static fallback for a chain whose
         // governance has never executed `SetBlockReward`; the governed value
         // itself is never taken from a caller copy.
-        let block_reward = {
+        let gov_block_reward = {
             let gov = self.governance_read().await;
-            gov.applied.block_reward.unwrap_or(default_block_reward)
+            gov.applied.block_reward
         };
+        let block_reward = gov_block_reward.unwrap_or(default_block_reward);
         // Downtime-attribution oracle (W10.5 activation boundary): the
         // validator set the `last_qc` downtime evidence (height H-1) is
         // verified and attributed against is snapshotted HERE, from the
@@ -3168,7 +3172,7 @@ impl InMemoryStateEngine {
                     let credited = self
                         .staking_write()
                         .await
-                        .distribute_fee_reward(block.proposer, staking)
+                        .distribute_fee_reward_at_height(block.proposer, staking, block.height)
                         .is_ok();
                     if credited {
                         if self
@@ -3211,19 +3215,50 @@ impl InMemoryStateEngine {
         //    there is nothing to unwind. Reversed (distribute-then-mint), a
         //    cap refusal would leave the validator's pending counter credited
         //    against a pool that holds no coins.
-        if block_reward > 0 && self.reserve_mint(block_reward).await.is_ok() {
-            let distributed = self
-                .staking_write()
-                .await
-                .distribute_reward(block.proposer, block_reward)
-                .is_ok();
+        // W4 `SUB_NANO_STRICT` + `EMISSIONCapEXACT`: when both gates are active
+        // (and governance has not overridden `block_reward`), emit via Q64.64
+        // carry (`emit_with_q64_carry`) and persist `emission_carry_q64` in
+        // `StakingLedger` on the exact success arm.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        // GATE: `EMISSIONCapEXACT_ACTIVATION_HEIGHT` is compiled as `u64::MAX`
+        // until the geometric emission rollout flips it to a reachable height.
+        let use_geometric_carry = gov_block_reward.is_none()
+            && crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT != u64::MAX
+            && block.height >= crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT
+            && crate::tokenomics::sub_nano_strict_active_at(block.height);
+        let (effective_reward, next_carry_opt) = if use_geometric_carry {
+            let carry_now = self.staking.read().await.emission_carry_q64;
+            let (emit_nano, next_carry) = crate::tokenomics::emit_with_q64_carry(
+                crate::tokenomics::CAP_EXACT_R0_NANO,
+                crate::tokenomics::CAP_EXACT_HALF_LIFE_BLOCKS,
+                block.height - crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT,
+                carry_now,
+            );
+            (emit_nano, Some(next_carry))
+        } else {
+            (block_reward, None)
+        };
+
+        if effective_reward > 0 && self.reserve_mint(effective_reward).await.is_ok() {
+            let distributed = {
+                let mut l = self.staking_write().await;
+                let ok = l
+                    .distribute_reward_at_height(block.proposer, effective_reward, block.height)
+                    .is_ok();
+                if ok {
+                    if let Some(next_carry) = next_carry_opt {
+                        l.emission_carry_q64 = next_carry;
+                    }
+                }
+                ok
+            };
             if !distributed {
                 // Ledger refused (its own 350M cap, jailed or unknown
                 // proposer): the coin was never created, give the global
                 // headroom back.
-                self.release_mint_nano(block_reward);
+                self.release_mint_nano(effective_reward);
             } else if self
-                .credit_reserved_native(&crate::staking::REWARDS_POOL, block_reward)
+                .credit_reserved_native(&crate::staking::REWARDS_POOL, effective_reward)
                 .await
                 .is_err()
             {
@@ -3232,8 +3267,15 @@ impl InMemoryStateEngine {
                 // by this same leg), the pool credit cannot overflow. Keep
                 // the two legs 1:1 if it ever does.
                 let mut l = self.staking_write().await;
-                l.rewards_pool = l.rewards_pool.saturating_sub(block_reward);
-                l.rewards_minted = l.rewards_minted.saturating_sub(block_reward);
+                l.rewards_pool = l.rewards_pool.saturating_sub(effective_reward);
+                l.rewards_minted = l.rewards_minted.saturating_sub(effective_reward);
+            }
+        } else if let Some(next_carry) = next_carry_opt {
+            if effective_reward == 0 {
+                let mut l = self.staking_write().await;
+                if l.rewards_minted < crate::staking::REWARDS_EMISSION_CAP {
+                    l.emission_carry_q64 = next_carry;
+                }
             }
         }
 

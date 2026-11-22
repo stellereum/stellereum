@@ -600,6 +600,11 @@ fn parse_gov_action(value: &serde_json::Value) -> Result<GovAction> {
             }
         }
         "cancel_upgrade" => GovAction::CancelUpgrade,
+        "set_fee_split_bps" => GovAction::SetFeeSplitBps {
+            burn_bps: u64_arg("burn_bps")?,
+            proposer_bps: u64_arg("proposer_bps")?,
+            staking_bps: u64_arg("staking_bps")?,
+        },
         other => {
             return Err(SdkError::InvalidArgument(format!(
                 "unknown governance action type {other:?}"
@@ -650,5 +655,64 @@ mod tests {
         .unwrap();
         let (signed, _) = sign_request(&key, &req).unwrap();
         signed.verify().unwrap();
+    }
+
+    #[test]
+    fn gov_propose_set_fee_split_bps_roundtrip_and_validation() {
+        let key = FalconKeypair::generate().unwrap();
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "gov_propose",
+                "proposal_id": 10,
+                "title": "fee split v2",
+                "action": {
+                    "type": "set_fee_split_bps",
+                    "burn_bps": 5000,
+                    "proposer_bps": 3000,
+                    "staking_bps": 2000
+                },
+                "height_observed": 42,
+                "nonce": 2
+            }
+        }))
+        .unwrap();
+        let (signed, _) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+
+        let bad_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "gov_propose",
+                "proposal_id": 11,
+                "title": "bad fee split",
+                "action": {
+                    "type": "set_fee_split_bps",
+                    "burn_bps": 5000,
+                    "proposer_bps": 3000,
+                    "staking_bps": 1999
+                },
+                "height_observed": 42,
+                "nonce": 3
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &bad_req).is_err());
+
+        let overflow_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "gov_propose",
+                "proposal_id": 12,
+                "title": "overflow fee split",
+                "action": {
+                    "type": "set_fee_split_bps",
+                    "burn_bps": u64::MAX,
+                    "proposer_bps": 10001,
+                    "staking_bps": 0
+                },
+                "height_observed": 42,
+                "nonce": 4
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &overflow_req).is_err());
     }
 }

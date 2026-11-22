@@ -4808,6 +4808,7 @@ impl StakingLedgerV4 {
             // recorder is applied per block and the map holds only the
             // current + previous height), so empty is not a guess.
             recent_full_exits: std::collections::HashMap::new(),
+            emission_carry_q64: 0,
         }
     }
 }
@@ -4873,6 +4874,7 @@ impl StakingLedgerV5 {
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
             recent_full_exits: HashMap::new(),
+            emission_carry_q64: 0,
         }
     }
 }
@@ -4935,6 +4937,7 @@ impl StakingLedgerV6 {
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
             recent_full_exits: self.recent_full_exits,
+            emission_carry_q64: 0,
         }
     }
 }
@@ -5033,6 +5036,99 @@ pub struct DomainSnapshotV9 {
 }
 
 impl DomainSnapshotV9 {
+    pub fn upgrade(self) -> DomainSnapshot {
+        DomainSnapshot {
+            tokens: self.tokens,
+            contracts: self.contracts,
+            orderbooks: self.orderbooks,
+            pmm: self.pmm,
+            pmm_usdt_token: self.pmm_usdt_token,
+            pmm_treasury: self.pmm_treasury,
+            order_escrow: self.order_escrow,
+            staking: self.staking.upgrade(),
+            governance: self.governance,
+            oracle: self.oracle,
+        }
+    }
+}
+
+/// Pre-W4 `emission_carry_q64` ledger shape: identical to
+/// [`crate::staking::StakingLedger`] (including 8-field `ValidatorStake` and
+/// `recent_full_exits`) without the trailing `emission_carry_q64: u64`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StakingLedgerV7 {
+    pub validators: HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorStake>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    pub rewards_pool: u64,
+    pub rewards_minted: u64,
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+    pub min_validator_bond: Option<u64>,
+    pub vesting_schedules:
+        std::collections::BTreeMap<[u8; 32], crate::tokenomics::TeamVestingSchedule>,
+    pub reward_accumulators:
+        HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorRewardState>,
+    pub delegator_reward_checkpoints: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
+    pub jail: HashMap<crate::consensus::ValidatorId, crate::staking::JailRecord>,
+    pub commission_schedule:
+        HashMap<crate::consensus::ValidatorId, crate::staking::CommissionSchedule>,
+    pub redelegation_lock: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub recent_full_exits: HashMap<crate::consensus::ValidatorId, (u64, u64)>,
+}
+
+impl StakingLedgerV7 {
+    pub fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedger {
+            validators: self.validators,
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            reward_accumulators: self.reward_accumulators,
+            delegator_reward_checkpoints: self.delegator_reward_checkpoints,
+            jail: self.jail,
+            commission_schedule: self.commission_schedule,
+            redelegation_lock: self.redelegation_lock,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            equivocation_dedup: self.equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+            vesting_schedules: self.vesting_schedules,
+            min_validator_bond: self.min_validator_bond,
+            recent_full_exits: self.recent_full_exits,
+            emission_carry_q64: 0,
+        }
+    }
+}
+
+/// Pre-W4 `emission_carry_q64` domain shape: identical to [`DomainSnapshot`]
+/// except the staking ledger is [`StakingLedgerV7`]. Upgrade sets
+/// `emission_carry_q64: 0`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DomainSnapshotV10 {
+    pub tokens: crate::token::TokenRegistry,
+    pub contracts: crate::contract::ContractRegistry,
+    pub orderbooks: crate::orderbook::OrderbookManager,
+    pub pmm: crate::pmm::PrimaryMarketMaker,
+    pub pmm_usdt_token: Option<[u8; 32]>,
+    pub pmm_treasury: [u8; 32],
+    pub order_escrow: HashMap<(u32, u64), crate::state_engine::EscrowRecord>,
+    pub staking: StakingLedgerV7,
+    pub governance: crate::governance::Governance,
+    pub oracle: crate::oracle::OracleState,
+}
+
+impl DomainSnapshotV10 {
     pub fn upgrade(self) -> DomainSnapshot {
         DomainSnapshot {
             tokens: self.tokens,
@@ -5441,6 +5537,15 @@ pub fn decode_pq_registry(bytes: &[u8]) -> Result<crate::pq_registry::PqRegistry
 pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
     if let Ok(snap) = bincode::deserialize::<DomainSnapshot>(bytes) {
         return Ok(snap);
+    }
+    // V10: pre-W4 current-shape domains (`StakingLedgerV7`), identical to
+    // current except `emission_carry_q64` was appended last. Upgrade sets
+    // `emission_carry_q64: 0` (exact for any pre-W4 snapshot).
+    if let Ok(v10) = bincode::deserialize::<DomainSnapshotV10>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-W4 V10 staking state: emission_carry_q64 starts at 0"
+        );
+        return Ok(v10.upgrade());
     }
     // V9: pre-W3 current-shape domains (`StakingLedgerV6`, including
     // `recent_full_exits`), with 7-field `ValidatorStakeV1` (no

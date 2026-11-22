@@ -1468,6 +1468,7 @@ pub struct CanonicalStakingLedger {
     pub commission_schedule: BTreeMap<ValidatorId, CommissionSchedule>,
     pub redelegation_lock: BTreeMap<(ValidatorId, [u8; 32]), u64>,
     pub recent_full_exits: BTreeMap<ValidatorId, (u64, u64)>,
+    pub emission_carry_q64: u64,
 }
 
 impl CanonicalStakingLedger {
@@ -1509,6 +1510,7 @@ impl CanonicalStakingLedger {
                 .collect(),
             redelegation_lock: s.redelegation_lock.iter().map(|(k, v)| (*k, *v)).collect(),
             recent_full_exits: s.recent_full_exits.iter().map(|(k, v)| (*k, *v)).collect(),
+            emission_carry_q64: s.emission_carry_q64,
         }
     }
 
@@ -1570,6 +1572,7 @@ impl CanonicalStakingLedger {
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect(),
+            emission_carry_q64: self.emission_carry_q64,
         }
     }
 }

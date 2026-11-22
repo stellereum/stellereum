@@ -70,6 +70,11 @@ pub enum GovAction {
         sha256: [u8; 32],
     },
     CancelUpgrade,
+    SetFeeSplitBps {
+        burn_bps: u64,
+        proposer_bps: u64,
+        staking_bps: u64,
+    },
 }
 
 impl GovAction {
@@ -89,6 +94,7 @@ impl GovAction {
             GovAction::SetMinGasLimit(_) => "set_min_gas_limit",
             GovAction::SoftwareUpgrade { .. } => "software_upgrade",
             GovAction::CancelUpgrade => "cancel_upgrade",
+            GovAction::SetFeeSplitBps { .. } => "set_fee_split_bps",
         }
     }
 
@@ -156,6 +162,15 @@ impl GovAction {
             }
             GovAction::CancelUpgrade => {}
             GovAction::ResetOracleBreaker => {}
+            GovAction::SetFeeSplitBps {
+                burn_bps,
+                proposer_bps,
+                staking_bps,
+            } => {
+                if !fee_split_bps_valid(*burn_bps, *proposer_bps, *staking_bps) {
+                    return invalid("set_fee_split_bps shares must sum to 10_000");
+                }
+            }
         }
         Ok(())
     }
@@ -216,6 +231,16 @@ impl GovAction {
                 11
             }
             GovAction::CancelUpgrade => 12,
+            GovAction::SetFeeSplitBps {
+                burn_bps,
+                proposer_bps,
+                staking_bps,
+            } => {
+                put_u64(&mut out, *burn_bps);
+                put_u64(&mut out, *proposer_bps);
+                put_u64(&mut out, *staking_bps);
+                13
+            }
         };
         let mut framed = Vec::with_capacity(4 + out.len());
         framed.extend_from_slice(&tag.to_le_bytes());
@@ -262,6 +287,13 @@ pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+fn fee_split_bps_valid(burn_bps: u64, proposer_bps: u64, staking_bps: u64) -> bool {
+    burn_bps
+        .checked_add(proposer_bps)
+        .and_then(|s| s.checked_add(staking_bps))
+        == Some(10_000)
+}
+
 fn invalid<T>(message: &str) -> Result<T> {
     Err(SdkError::InvalidArgument(message.to_string()))
 }
@@ -281,6 +313,15 @@ mod tests {
             9u32.to_le_bytes()
         );
         assert_eq!(GovAction::CancelUpgrade.encode()[..4], 12u32.to_le_bytes());
+        assert_eq!(
+            GovAction::SetFeeSplitBps {
+                burn_bps: 5_000,
+                proposer_bps: 3_000,
+                staking_bps: 2_000,
+            }
+            .encode()[..4],
+            13u32.to_le_bytes()
+        );
         assert_eq!(VoteChoice::Abstain.encode(), 2u32.to_le_bytes());
     }
 
@@ -300,6 +341,22 @@ mod tests {
     }
 
     #[test]
+    fn set_fee_split_bps_encodes_fields_in_order() {
+        let action = GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        };
+        assert_eq!(action.action_type(), "set_fee_split_bps");
+        let bytes = action.encode();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(&bytes[..4], &13u32.to_le_bytes());
+        assert_eq!(&bytes[4..12], &5_000u64.to_le_bytes());
+        assert_eq!(&bytes[12..20], &3_000u64.to_le_bytes());
+        assert_eq!(&bytes[20..28], &2_000u64.to_le_bytes());
+    }
+
+    #[test]
     fn action_validation_refuses_unsafe_upgrade_names() {
         let action = GovAction::SoftwareUpgrade {
             name: "../escape".into(),
@@ -307,5 +364,40 @@ mod tests {
             sha256: [1u8; 32],
         };
         assert!(action.validate().is_err());
+    }
+
+    #[test]
+    fn action_validation_enforces_fee_split_bps_sum() {
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        }
+        .validate()
+        .is_ok());
+
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 1_999,
+        }
+        .validate()
+        .is_err());
+
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_001,
+        }
+        .validate()
+        .is_err());
+
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: u64::MAX,
+            proposer_bps: 10_001,
+            staking_bps: 0,
+        }
+        .validate()
+        .is_err());
     }
 }

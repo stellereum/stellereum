@@ -1048,19 +1048,27 @@ pub struct ValidatorRewardState {
 }
 
 impl ValidatorRewardState {
-    /// The scaled rate increment for `pool` spread over `delegated` units of
-    /// stake, carrying the un-truncated remainder into the next call.
-    ///
-    /// O(1): no delegator is touched.
-    fn accrue(&mut self, pool: u64, delegated: u64) {
+    /// W4 `SUB_NANO_STRICT` version of `accrue`: when `rescale_carry`
+    /// is true and `delegated` changes, re-denominates `self.remainder` via
+    /// `floor(old_rem * new_den / old_den)` instead of zeroing it, preserving
+    /// sub-nano precision across delegation changes while keeping
+    /// `0 <= remainder < delegated`.
+    fn accrue_with_rescale(&mut self, pool: u64, delegated: u64, rescale_carry: bool) {
         if pool == 0 || delegated == 0 {
             return;
         }
         if self.remainder_den != delegated {
-            // The carried remainder is denominated in the OLD delegated
-            // total: re-denominate by dropping it (worth < 1/SCALE of the
-            // rate, i.e. a fraction of a nano per delegator).
-            self.remainder = 0;
+            if rescale_carry && self.remainder_den > 0 && self.remainder > 0 {
+                self.remainder = mul_div_floor(
+                    self.remainder,
+                    delegated as u128,
+                    self.remainder_den as u128,
+                );
+            } else {
+                // Pre-activation: re-denominate by dropping it (worth < 1/SCALE
+                // of the rate, i.e. a fraction of a nano per delegator).
+                self.remainder = 0;
+            }
             self.remainder_den = delegated;
         }
         let den = delegated as u128;
@@ -1457,6 +1465,12 @@ pub struct StakingLedger {
     /// `jail` comment above for the versioned-decoder rule).
     #[serde(default)]
     pub recent_full_exits: HashMap<ValidatorId, (u64, u64)>,
+    /// W4 `SUB_NANO_STRICT`: carried fractional nano-STELL remainder (Q0.64)
+    /// across heights for exact geometric block emission (`emit_with_q64_carry`).
+    /// Appended at the END with `#[serde(default)]`; pre-change snapshots
+    /// decode via `StakingLedgerV7` / `DomainSnapshotV10` with `0`.
+    #[serde(default)]
+    pub emission_carry_q64: u64,
 }
 
 impl StakingLedger {
@@ -4656,6 +4670,31 @@ impl StakingLedger {
         validator: ValidatorId,
         reward: u64,
     ) -> Result<(), StakingError> {
+        self.distribute_reward_inner(validator, reward, false)
+    }
+
+    /// Height-aware [`Self::distribute_reward`]: enables W4 sub-nano
+    /// accumulator carry rescaling once `SUB_NANO_STRICT_ACTIVATION_HEIGHT` is
+    /// reached. Below activation, bit-identical to `distribute_reward`.
+    pub fn distribute_reward_at_height(
+        &mut self,
+        validator: ValidatorId,
+        reward: u64,
+        height: u64,
+    ) -> Result<(), StakingError> {
+        self.distribute_reward_inner(
+            validator,
+            reward,
+            crate::tokenomics::sub_nano_strict_active_at(height),
+        )
+    }
+
+    fn distribute_reward_inner(
+        &mut self,
+        validator: ValidatorId,
+        reward: u64,
+        rescale_carry: bool,
+    ) -> Result<(), StakingError> {
         let (total, delegated, commission_bps) = {
             let v = self
                 .validators
@@ -4710,7 +4749,7 @@ impl StakingLedger {
             self.reward_accumulators
                 .entry(validator)
                 .or_default()
-                .accrue(delegator_pool, delegated);
+                .accrue_with_rescale(delegator_pool, delegated, rescale_carry);
         }
         Ok(())
     }
@@ -4734,6 +4773,31 @@ impl StakingLedger {
         &mut self,
         validator: ValidatorId,
         reward: u64,
+    ) -> Result<(), StakingError> {
+        self.distribute_fee_reward_inner(validator, reward, false)
+    }
+
+    /// Height-aware [`Self::distribute_fee_reward`]: enables W4 sub-nano
+    /// accumulator carry rescaling once `SUB_NANO_STRICT_ACTIVATION_HEIGHT` is
+    /// reached.
+    pub fn distribute_fee_reward_at_height(
+        &mut self,
+        validator: ValidatorId,
+        reward: u64,
+        height: u64,
+    ) -> Result<(), StakingError> {
+        self.distribute_fee_reward_inner(
+            validator,
+            reward,
+            crate::tokenomics::sub_nano_strict_active_at(height),
+        )
+    }
+
+    fn distribute_fee_reward_inner(
+        &mut self,
+        validator: ValidatorId,
+        reward: u64,
+        rescale_carry: bool,
     ) -> Result<(), StakingError> {
         let (total, delegated, commission_bps) = {
             let v = self
@@ -4767,7 +4831,7 @@ impl StakingLedger {
             self.reward_accumulators
                 .entry(validator)
                 .or_default()
-                .accrue(delegator_pool, delegated);
+                .accrue_with_rescale(delegator_pool, delegated, rescale_carry);
         }
         Ok(())
     }
@@ -5047,6 +5111,7 @@ impl StakingLedgerV1 {
             vesting_schedules: BTreeMap::new(),
             min_validator_bond: None,
             recent_full_exits: HashMap::new(),
+            emission_carry_q64: 0,
         }
     }
 }
@@ -5106,6 +5171,7 @@ impl StakingLedgerV2 {
             vesting_schedules: BTreeMap::new(),
             min_validator_bond: None,
             recent_full_exits: HashMap::new(),
+            emission_carry_q64: 0,
         }
     }
 }
@@ -5175,6 +5241,7 @@ impl StakingLedgerV3 {
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
             recent_full_exits: HashMap::new(),
+            emission_carry_q64: 0,
         }
     }
 }

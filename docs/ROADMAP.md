@@ -106,7 +106,7 @@ Defect registry: `docs/OPEN_DEFECTS.md` (zero-backlog rule: every item ends `FIX
 - [x] `R3-A..E`: `PQ_LIFECYCLE_ACTIVATION_HEIGHT = u64::MAX`, `PqRegistry` PoP/retention `720_000`/explicit `cancel_rotation`, `RemotePqSigner` v2 (`897B`/`666B`), `ValidatorStake::withdrawal_address`, `Domain::PqRegistry`, `ValidatorStakeV1`/`DomainSnapshotV9`, `SnapV4::PqRegistry = 272`, `OpCode 59..=64`, `InMemoryStateEngine::pq_registry`, `sync_committed_pq_registry`, `light_client` height-key.
 - [x] `R3-F` + `R3` тесты: `r3_pq_registry_signer_tests` 11/11, `r3_staking_commit_tests` 6/6, `r3_vm_engine_apply_tests` 6/6, `r3_storage_pq_registry_tests` 3/3, `r3_consensus_readers_tests` 3/3, `r3_runtime_node_rpc_cli_tests` 6/6; `pq_rpc_tests` 4/4, `pentest_rpc_surface` 5/5.
 - [x] **Полный гейт `stellereum`: `397/397` бинарей зелёные, `clippy --all-targets -D warnings` 0/0** (`docs/OPEN_DEFECTS.md` обновлён; `FORK_ID`/`COMMITMENT_VERSION` не двигались).
-- [ ] **Optional W0 non-fork optimizations** (can run alongside R4.1 or right before R5): `OPT-PARALLEL-WAVE` (`PlainTxPlan` inline `[;3]` + selective penalty/vesting read), `clone_for_simulation_for_payload` in `accounts.rs`/`rpc/reads.rs`, `ReceiptIndex::by_contract_events` in `rpc/state.rs`.
+- [x] `OPT-PARALLEL-WAVE` (`PlainTxPlan` inline `[;3]` + selective penalty/vesting read + flat `par_iter().with_min_len`). *(Опционально на будущее: `clone_for_simulation_for_payload`, `ReceiptIndex::by_contract_events`.)*
 
 #### Wave 2 (DONE 2026-11-21, активация в R5): Эшелон **R4** — Bridge V2 Release Authorization + W4 Economics, History & Geyser-Lite
 - [x] **Phase R4.1** (4 parallel no-cargo workers on disjoint files; все правки вошли в дерево):
@@ -118,7 +118,7 @@ Defect registry: `docs/OPEN_DEFECTS.md` (zero-backlog rule: every item ends `FIX
   - `R4.2-Commit`: `commitment.rs` (`BRIDGE_V2_RELEASE_V1`, `STAKING_EMISSION_CARRY_V1`, optional `SetFeeSplitBps`, `0B` when empty/zero), `chain_spec.rs` (`BRIDGE_V2_ACTIVATION_HEIGHT`, `FEE_MARKET_V2_ACTIVATION_HEIGHT`, `SUB_NANO_STRICT_ACTIVATION_HEIGHT` all `u64::MAX`).
   - `R4.2-Engine`: `state_engine/{apply,parallel,settlement,accounts,types}.rs`, `svm.rs`, `mempool.rs`, `runtime/{mev_sync,consensus_step}.rs`, `cli/{args,tx_builders}.rs` (Bridge V2 settlement wiring, `FEE_MARKET_V2` priority fee debit + burn/proposer/staking split + `MP04` fee-density ordering, `SUB_NANO_STRICT` EVM/reward wiring).
 - [x] **R4 Gate**: `bridge_authorization_p0_regression.rs` **4/4 GREEN**, `H-1/H/H+1` & `parallel == sequential` parity (`propose_select_differential_tests` 3/3, `state_commit_batch_tests` 5/5), full `test_parallel.sh -p stellereum` **397/397 GREEN**.
-- [ ] **Остаток W4 E2** (`FEE-SUBNANO-EXACT`, `OPEN`): rescale-carry в `ValidatorRewardState::accrue` (`new_rem = floor(old_rem * new_den / old_den)`) и committed `emission_carry_q64` (`pow_half_fixed_exact_q64`/`emit_with_q64_carry` уже готовы, нужен `StakingLedger`-слот + `DomainSnapshotV10`) — за тем же `SUB_NANO_STRICT_ACTIVATION_HEIGHT`.
+- [x] **Полное закрытие W4 E1/E2 (`FEE-SUBNANO-EXACT` + тесты W4)**: `accrue_with_rescale`, `emission_carry_q64` (`STAKING_EMISSION_CARRY_V1` + `StakingLedgerV7`/`DomainSnapshotV10`), `w4_priority_fee_tests` **4/4**, `w4_sub_nano_tests` **4/4**.
 
 #### Wave 3: Эшелон **R5** — Ruleset v7 Unified Hard-Fork Activation & Frozen-Core Gate
 - [ ] Switch all 8 Ruleset v7 gates in `chain_spec.rs` / `sharding/block.rs` / `bridge.rs` / `pq_registry.rs` from `u64::MAX` to `0` (new v7 genesis) or coordinated height `H`.

@@ -713,6 +713,11 @@ fn every_supported_gov_action_serializes_identically() {
             sha256: [9u8; 32],
         },
         GovAction::CancelUpgrade,
+        GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        },
     ];
     let theirs = vec![
         stellereum::governance::GovAction::SetMinValidatorBond(1_500_000_000_000),
@@ -732,12 +737,22 @@ fn every_supported_gov_action_serializes_identically() {
             sha256: [9u8; 32],
         },
         stellereum::governance::GovAction::CancelUpgrade,
+        stellereum::governance::GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        },
     ];
     for (ours, theirs) in ours.iter().zip(theirs.iter()) {
         assert_eq!(
             ours.encode(),
             bincode::serialize(theirs).unwrap(),
             "GovAction bytes differ for {ours:?}"
+        );
+        assert_eq!(
+            ours.action_type(),
+            theirs.action_type(),
+            "GovAction action_type differs for {ours:?}"
         );
     }
 }

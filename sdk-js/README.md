@@ -1,29 +1,74 @@
-# @stellereum/sdk (TypeScript)
+# @stellereum/sdk
 
-Stellereum dApp client:
+TypeScript dApp client for Stellereum: an EIP-1193-style **read** provider,
+typed `stell_*`/`eth_*` helpers, `buildAndSign` with a real Falcon-512 signer
+sidecar, a protocol/fork guard, and unsigned EVM/governance builders.
 
-- **`StellereumProvider`** — EIP-1193-style, read-only provider. `eth_*` reads
-  pass through to the node; `stell_*` methods pass through; EVM signing and
-  write methods throw `UnsupportedMethodError` (4200).
-- **`StellereumClient`** — typed reads, `buildAndSign`, submission retries
-  that resend the same raw bytes, and receipt waiting.
-- **`SubprocessFalconSigner` / `HttpFalconSigner`** — real Falcon-512 signing.
+[![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange)](../stellereum-sdk/LICENSE)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](package.json)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.6-brightgreen)](package.json)
+[![Network](https://img.shields.io/badge/network-testnet-yellow)](https://docs.stellereum.org/get-started/networks)
+[![Audit](https://img.shields.io/badge/audit-none%20yet-red)](https://docs.stellereum.org/security/status)
 
-## Honest statement: JS does not sign Falcon natively here
+## What it is / what it is not
 
-There is no WASM Falcon binding in this repository. Falcon-512 signing needs
-the FIPS 206 discrete-Gaussian sampler over the private NTRU basis; the only
-audited implementation in the tree is the Rust one. This package therefore
-delegates `buildAndSign` to:
+- **Is** a client for reads, transaction intents, PQ submission, receipt
+  waiting, and the node's EVM-binding/carrier and governance transaction
+  shapes.
+- **Is not** a Falcon-512 implementation. JavaScript never signs Falcon here;
+  `buildAndSign` delegates the signature to the Rust
+  [`stellereum-sdk-cli`](../stellereum-sdk/README.md) binary (subprocess or
+  loopback HTTP).
+- **Is not** an EVM wallet. It never holds a secp256k1 account, returns `[]`
+  for `eth_accounts`, and refuses EVM signing/write methods locally with
+  `UnsupportedMethodError` (code `4200`).
+- **Is not** an EVM execution client. The EVM carrier settles a value transfer
+  only; there is no calldata, contract creation, or EVM state.
+- **Is not** a subscription transport, batch client, or address-derivation
+  library. It has no WebSocket/`eth_subscription` support, no JSON-RPC
+  batching, and no BLAKE3 address derivation (pass `from`/`pqPublicKey`).
 
-1. `stellereum-sdk-cli sign --key wallet.json` (default, subprocess), or
-2. `stellereum-sdk-cli serve --key wallet.json` (localhost HTTP helper).
+## Install and build
 
-The key never enters JavaScript; only the intent and the signed `PQ1` bytes
-cross the process boundary. The Rust CLI must be on `PATH`, or pass
-`command`/`args`.
+```bash
+cd sdk-js
+
+npm install
+npm run typecheck       # tsc --noEmit
+npm test                # node --test test/*.test.ts
+npm run build           # tsc -> dist/
+```
+
+Requirements:
+
+- **Node >= 22.6** — the test script runs TypeScript directly through Node's
+  type stripping. Use a current Node 22.x or newer; the declared engine floor is
+  the package minimum, not a promise that every 22.6.x patch has type stripping
+  enabled by default.
+- The Rust signing CLI on `PATH`, or an explicit `command`/`args`:
+
+```bash
+cd ../stellereum-sdk
+cargo install --path .
+stellereum-sdk-cli version
+```
+
+The package entry point is `dist/index.js` (`main`/`exports`), so run
+`npm run build` before importing `@stellereum/sdk` as a package. This tree is
+consumed by path or workspace link until a registry release is published:
+
+```json
+{
+  "dependencies": {
+    "@stellereum/sdk": "file:../sdk-js"
+  }
+}
+```
 
 ## Quickstart
+
+Start a node on `127.0.0.1:8545`, create and fund a key, and install the CLI as
+shown above. Then:
 
 ```ts
 import {
@@ -32,90 +77,187 @@ import {
   SubprocessFalconSigner,
 } from "@stellereum/sdk";
 
-const rpcUrl = "http://127.0.0.1:8545";
-const provider = new StellereumProvider({ url: rpcUrl });
+const RPC = "http://127.0.0.1:8545";
 
-console.log(await provider.chainId());          // 5757
+// Read-only EIP-1193 surface.
+const provider = new StellereumProvider({ url: RPC });
+console.log(await provider.chainId());        // 5757
+console.log(await provider.blockNumber());
 console.log(await provider.stellValidators());
 
+// The signer runs in the Rust process; the key never enters JavaScript.
+const PQ_ADDRESS = "22".repeat(32);           // output of `stellereum-sdk-cli address`
 const signer = new SubprocessFalconSigner({
   command: "stellereum-sdk-cli",
   keyPath: "/home/me/wallet.json",
+  address: PQ_ADDRESS,
 });
-const client = new StellereumClient({ url: rpcUrl, signer });
 
-const signed = await client.transfer("22".repeat(32), 1_000_000);
+const client = new StellereumClient({ url: RPC, signer, address: PQ_ADDRESS });
+const signed = await client.transfer("33".repeat(32), 1_000_000);
+
 console.log(signed.rawTransaction, signed.hash);
-
 const { submit, receipt } = await client.sendAndWait(signed);
-console.log(submit.hash, receipt.status);
+console.log(submit.hash, submit.attempts, receipt.status);
 ```
 
 `buildAndSign` fills the nonce (`stell_getBalance`), chain id
-(`stell_chainId`) and current base floor (`stell_baseFee`) before signing. The
-Rust signer computes the final `gas_limit`:
-`max(opcode_gas, base_fee) + 45_000 (explicit PQ1) + priority`.
+(`stell_chainId`), and current base floor (`stell_baseFee`) before handing the
+intent to the signer. The Rust signer computes the final `gas_limit`:
 
-## HTTP signer
-
-```ts
-import { HttpFalconSigner } from "@stellereum/sdk";
-
-const signer = new HttpFalconSigner({
-  url: "http://127.0.0.1:8787",
-  token: process.env.STELL_SDK_SIGNER_TOKEN,
-});
+```text
+max(opcode_gas, base_fee) + 45_000 (explicit PQ1) + priority
 ```
 
-## Protocol guard and the new unsigned builders
+If you do not pass `address`, the client uses `signer.address`; without either,
+nonce lookup fails with an explicit error.
 
-Every new-shape builder refuses a chain id / fork id that is not the
-configured node identity (`ProtocolError`, codes `chain_id_mismatch`,
-`fork_id_mismatch`, `protocol_version_mismatch`). The current identity is
-protocol 1.0, consensus ruleset v5, fork id `0x9d59096b`, chain 5757.
+## API surface
 
-```ts
-import { buildEvmCarrier, buildGovPropose } from "@stellereum/sdk";
+### Provider and client
 
-const unsigned = buildGovPropose({
-  from, nonce: 6, gasLimit: 500_000,
-  proposalId: 4, title: "raise the floor",
-  action: { type: "set_min_gas_limit", value: 300_000 },
-  heightObserved: 99,
-});
-const signed = await client.signPrepared(unsigned);
+| API | Description |
+| --- | --- |
+| `new StellereumProvider({ url, fetch?, headers?, timeoutMs? })` | EIP-1193-style read provider. |
+| `provider.request({ method, params })` | Forward `eth_*`/`stell_*`/`net_*`/`web3_*` methods; refuse EVM signing/write methods. |
+| `provider.chainId/chainIdHex/blockNumber` | `eth_chainId` / `eth_blockNumber`. |
+| `provider.getBalance/getNonce/getCode/call/getReceipt` | Standard `eth_*` reads. |
+| `provider.stellChainId/stellAccount/stellNonce` | `stell_*` account reads. |
+| `provider.stellReceipt/stellBlock/stellValidators/stellBaseFee` | `stell_*` chain reads. |
+| `provider.on/once/removeListener/emit` | Local EIP-1193-shaped events; no polling or subscription transport. |
+| `new StellereumClient({ url, signer, address?, identity?, fetch?, headers?, timeoutMs? })` | Client with signing and submission. |
+| `client.chainId/account/nonce/baseFee/blockNumber/block/validators` | Typed reads. |
+| `client.receipt(hash)` | Receipt, or `null` while pending/unknown. |
+| `client.estimateFee(rawTransaction)` | `stell_estimateFee`. |
+| `client.buildAndSign(intent, options?)` | Fill nonce/chain/fee, then ask the signer for the envelope. |
+| `client.transfer/contractCall/stake/unjail` | Convenience intent wrappers. |
+| `client.signPrepared(unsigned)` | Attach a `PQ1` envelope to bytes from a builder. |
+| `client.evmBinding/evmCarrier` | Build and sign EVM registry/carrier shapes; the caller submits them. |
+| `client.govPropose/govVote` | Build and sign governance shapes; the caller submits them. |
+| `client.identity()/address()` | Configured identity and sender address. |
+| `client.sendSigned/sendAndWait` | Submit with retries; retries resend the same raw bytes. |
+| `client.waitForReceipt(hash, { timeoutMs?, pollMs? })` | Poll `stell_getTransactionReceipt`. |
+
+### Builders, protocol and signers
+
+| API | Description |
+| --- | --- |
+| `buildGovPropose/buildGovVote` | Unsigned self-addressed governance transactions. |
+| `buildEvmBinding` | Unsigned `SysCallBindEvmAddress`; requires the 65-byte proof and a Falcon binding signature. |
+| `buildEvmCarrier` | Unsigned `SysCallEvmCarrier`; decodes the EVM intent and pins nonce/value. |
+| `evmBindingDigest/evmCarrierDigest` | The inner Falcon digests for those two shapes. |
+| `localIdentity/assertIdentity/assertChainId/assertIdentityForChain` | Protocol and fork guard. |
+| `FORK_ID/FORK_ID_HEX/CONSENSUS_RULESET_VERSION` | Ruleset v7 identity constants (`FORK_ID_HEX === "0x3ae00ebc"`). |
+| `SubprocessFalconSigner` | Runs `stellereum-sdk-cli sign --key …` once per signature. |
+| `HttpFalconSigner` | POSTs the same JSON to `stellereum-sdk-cli serve`. |
+| `ProtocolError` | `chain_id_mismatch`, `fork_id_mismatch`, `protocol_version_mismatch`, `invalid_identity`. |
+| `BuilderError` | `invalid_argument`, `missing_evm_proof`, `missing_inner_signature`, `carrier_nonce_mismatch`, `carrier_value_mismatch`, `invalid_evm_intent`. |
+
+The current guard identity is protocol `1.0`, consensus ruleset v7, fork id
+`0x3ae00ebc`, chain id `5757`. `client.identity()` is the configured/local
+identity; the package does not fetch the node's identity over RPC.
+
+### Signer protocol
+
+Both signer transports speak the same JSON. Request:
+
+```json
+{
+  "tx": {
+    "kind": "transfer",
+    "to": "Stl57... or 64-hex",
+    "amount": 1000,
+    "nonce": 7,
+    "chain_id": 5757,
+    "base_fee": 280000,
+    "priority_fee_per_gas": 0
+  }
+}
 ```
 
-`buildEvmBinding` requires the 65-byte secp256k1 proof of possession and a
-Falcon binding signature; `buildEvmCarrier` requires a Falcon signature over
-`keccak256(evmTx)` and takes the transaction nonce/value from the EVM intent
-(passing `nonce`/`amountNano` pins them and a mismatch is refused). The inner
-Falcon signatures come from the Rust sidecar (`signer.signDigest`, backed by
-`stellereum-sdk-cli sign-digest`); without that hook, pass them explicitly.
+Response:
 
-Limits: JS never signs Falcon, never recovers the EVM sender and never
-verifies the EVM signature (the node does, over the same bytes); address
-derivation needs BLAKE3, so pass `from`/`pqPublicKey`. The carrier is a value
-transfer only: no contract calls or calldata. EVM binding is
-first-committed-wins.
+```json
+{
+  "ok": true,
+  "tx_hex": "...",
+  "tx_hash": "...",
+  "from": "...",
+  "from_stl57": "Stl57...",
+  "to": "...",
+  "nonce": 7,
+  "chain_id": 5757,
+  "gas_limit": 325000,
+  "activation": true,
+  "envelope": "pq1-explicit"
+}
+```
 
-## What is not supported
+Supported `kind` values: `transfer`, `contract_call`, `stake`, `unjail`,
+`evm_binding`, `evm_carrier`, `gov_propose`, `gov_vote`, `prepared`.
 
-- No native Falcon signing in JS (see above).
-- No EVM account: `eth_accounts` returns `[]`; signing/write methods throw.
-- `eth_sendRawTransaction` is refused **locally** with 4200. The node also
-  refuses the EVM write path (`stellereum/src/rpc/eth.rs:898-916`); the honest
-  replacement is `stell_sendRawTransaction` with a PQ envelope.
-- No EVM contract execution, no JSON-RPC batching, no wallet UI.
-- No node RPC for the protocol identity yet; `client.identity()` is the
-  configured/local identity.
-- The signer is trusted with the key. Keep the CLI/helper on localhost.
-
-## Commands
+Start the HTTP helper with:
 
 ```bash
-npm install
-npm test                  # node --test test/*.test.ts (Node >= 22.6 type stripping)
-npm run typecheck         # tsc --noEmit
-npm run build             # tsc -> dist/ with .js imports
+stellereum-sdk-cli serve --key /home/me/wallet.json --listen 127.0.0.1:8787
 ```
+
+Set `STELL_SDK_SIGNER_TOKEN` on the helper to require
+`Authorization: Bearer <token>`; pass the same token to `HttpFalconSigner`.
+The helper is plain HTTP on loopback.
+
+## Configuration
+
+| Option | Default | Description |
+| --- | --- | --- |
+| Provider/client `url` | `http://127.0.0.1:8545` | Node JSON-RPC endpoint. |
+| `timeoutMs` (RPC) | `15_000` | Per-request fetch timeout. |
+| `headers` | `{}` | Extra HTTP headers for the RPC client. |
+| `fetch` | platform `fetch` | Injectable fetch implementation (tests/proxies). |
+| Client `address` | `signer.address` | Sender for nonce lookup. |
+| Client `identity` | `localIdentity()` | Protocol/fork guard identity. |
+| `SubprocessFalconSigner.command` | `stellereum-sdk-cli` | Signer binary. |
+| `SubprocessFalconSigner.keyPath` | required unless `args` supplied | Key file passed as `sign --key`. |
+| `SubprocessFalconSigner.args` | `["sign","--key",keyPath]` | Override the CLI arguments. |
+| `SubprocessFalconSigner.timeoutMs` | `30_000` | Kill a hung signer. |
+| `HttpFalconSigner.url` | required | Loopback `serve` URL. |
+| `HttpFalconSigner.token` | unset | Bearer token for the helper. |
+| `STELL_SDK_SIGNER_TOKEN` | unset | Read by the CLI helper, not by this package; pass it explicitly to `HttpFalconSigner`. |
+
+Node.js `>= 22.6` is required for the test/build toolchain.
+
+## Testing
+
+```bash
+cd sdk-js
+npm test
+npm run typecheck
+npm run build
+```
+
+`npm test` is `node --test test/*.test.ts`. The suite uses injected fetch and a
+fake signer; it does not need a running node. It is an independent process and
+does not use the node crate's serial-lib wrapper; it can run alongside the Rust
+workspace suites.
+
+## Documentation
+
+- [TypeScript SDK guide](https://docs.stellereum.org/sdk/typescript)
+- [Rust SDK and signer](https://docs.stellereum.org/sdk/rust)
+- [JSON-RPC reference](https://docs.stellereum.org/api/json-rpc)
+- [WebSocket and SSE](https://docs.stellereum.org/api/websocket-sse)
+- [Security status](https://docs.stellereum.org/security/status)
+- [Security policy](../SECURITY.md)
+- [License](../stellereum-sdk/LICENSE) — MIT OR Apache-2.0
+  ([MIT](../stellereum-sdk/LICENSE-MIT),
+  [Apache-2.0](../stellereum-sdk/LICENSE-APACHE))
+
+## Status
+
+Testnet only. No external audit. The package does not sign Falcon in
+JavaScript and depends on a trusted Rust signer process that holds the key.
+Keep that signer on localhost and do not expose it to untrusted callers.
+
+Open work before production use: an external audit; a published package; and,
+only if a vetted implementation appears, an in-process Falcon signer. Until
+then, `buildAndSign` always crosses the Rust boundary.

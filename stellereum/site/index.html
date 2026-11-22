@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stellereum — Pure Post-Quantum Layer 1 · Testnet</title>
-<meta name="description" content="Stellereum is a pure post-quantum Layer 1 written in Rust. Falcon-512 validator votes, shards {0,1} with shard 0 live, chain ID 5757, ruleset v6. Testnet only; no external audit.">
+<meta name="description" content="Stellereum is a pure post-quantum Layer 1 written in Rust. Falcon-512 validator votes, shards {0,1} with shard 0 live, chain ID 5757, ruleset v7. Testnet only; no external audit.">
 <meta name="theme-color" content="#060811">
 <meta name="color-scheme" content="dark">
 <link rel="canonical" href="https://stellereum.org/">
@@ -129,6 +129,7 @@ window.setTimeout(function () {
     <a href="#deformation-lab">02. Protocol</a>
     <a href="#selected-works">03. Primitives</a>
     <a href="#shader-lab">04. Build</a>
+    <a href="https://docs.stellereum.org">Docs ↗</a>
   </nav>
   <div class="header-actions">
     <a class="header-cta" href="https://testnet.stellereum.org">Enter testnet ↗</a>
@@ -264,7 +265,7 @@ window.setTimeout(function () {
               <div class="work-name"><h3>Post-quantum votes</h3><p>Falcon-512 at intake</p></div>
             </div>
           </div>
-          <div class="work-foot"><span>Ed25519 refused · no classical lane</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>
+          <div class="work-foot"><span>Ed25519 refused · no classical lane</span><a href="https://docs.stellereum.org/core-concepts/post-quantum">Read docs →</a></div>
         </article>
 
         <article class="work-card" data-reveal>
@@ -275,7 +276,7 @@ window.setTimeout(function () {
               <div class="work-name"><h3>BFT finality</h3><p>One finalized block is final</p></div>
             </div>
           </div>
-          <div class="work-foot"><span>Quorum floor(2·power/3)+1</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>
+          <div class="work-foot"><span>Quorum floor(2·power/3)+1</span><a href="https://docs.stellereum.org/core-concepts/consensus-finality">Read docs →</a></div>
         </article>
 
         <article class="work-card" data-reveal>
@@ -286,18 +287,18 @@ window.setTimeout(function () {
               <div class="work-name"><h3>Shard 0 live</h3><p>Fixed pair {0,1} · shard 1 parked</p></div>
             </div>
           </div>
-          <div class="work-foot"><span>2PC from genesis · no live split</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>
+          <div class="work-foot"><span>2PC from genesis · no live split</span><a href="https://docs.stellereum.org/core-concepts/sharding">Read docs →</a></div>
         </article>
 
         <article class="work-card" data-reveal>
           <div class="work-media canvas-stage" data-card-canvas="3">
             <canvas class="dither-canvas" id="card-canvas-3"></canvas>
             <div class="work-overlay">
-              <div class="work-top"><span class="work-chip">04 / Contracts</span><span class="work-chip work-chip--accent">13 host fns</span></div>
+              <div class="work-top"><span class="work-chip">04 / Contracts</span><span class="work-chip work-chip--accent">14 host fns</span></div>
               <div class="work-name"><h3>WASM runtime</h3><p>wasmi · fuel before effect</p></div>
             </div>
           </div>
-          <div class="work-foot"><span>wasmi · upgrade means redeploy</span><a href="https://github.com/immtes/stellereum/tree/main/docs/site">Read docs →</a></div>
+          <div class="work-foot"><span>wasmi · upgrade means redeploy</span><a href="https://docs.stellereum.org/contracts/overview">Read docs →</a></div>
         </article>
       </div>
     </div>
@@ -329,7 +330,7 @@ window.setTimeout(function () {
               <span class="step-num">02</span>
               <div>
                 <h3>Request test STELL</h3>
-                <p>The public faucet sends 5 STELL per address every 45 minutes, with 20 requests per hour per IP and a 1,000 STELL lifetime cap.</p>
+                <p>The public faucet sends 2 STELL per address every 45 minutes, with 20 requests per hour per IP and a 50 STELL lifetime cap.</p>
               </div>
             </li>
             <li>
@@ -349,8 +350,8 @@ window.setTimeout(function () {
           </div>
 
           <div class="lab-actions">
-            <a class="btn btn--electric" href="https://faucet.stellereum.org">Open faucet <span class="arrow" aria-hidden="true">↗</span></a>
-            <a class="btn btn--outline" href="https://github.com/immtes/stellereum/tree/main/docs/site">Read the docs <span class="arrow" aria-hidden="true">↗</span></a>
+            <a class="btn btn--electric" href="https://faucet-testnet.stellereum.org">Open faucet <span class="arrow" aria-hidden="true">↗</span></a>
+            <a class="btn btn--outline" href="https://docs.stellereum.org/get-started/quickstart">Read the docs <span class="arrow" aria-hidden="true">↗</span></a>
           </div>
         </div>
 
@@ -385,25 +386,27 @@ window.setTimeout(function () {
         <a href="#optical-stage">Optical</a>
         <a href="#type-engine">Network</a>
         <a href="#selected-works">Protocol</a>
+        <a href="https://docs.stellereum.org">Docs ↗</a>
       </nav>
     </div>
 
     <div class="footer-links">
       <a href="https://testnet.stellereum.org">Testnet ↗</a>
       <a href="https://explorer.stellereum.org">Explorer ↗</a>
-      <a href="https://faucet.stellereum.org">Faucet ↗</a>
+      <a href="https://faucet-testnet.stellereum.org">Faucet ↗</a>
       <a href="https://rpc.stellereum.org">RPC gateway ↗</a>
-      <a href="https://github.com/immtes/stellereum/tree/main/docs/site">Documentation ↗</a>
-      <a href="https://github.com/immtes/stellereum">GitHub ↗</a>
+      <a href="https://docs.stellereum.org">Documentation ↗</a>
+      <a href="https://github.com/stellereum/stellereum">GitHub ↗</a>
+      <a href="https://x.com/stellereum">X ↗</a>
       <a href="https://t.me/stellereum">Telegram ↗</a>
     </div>
 
     <dl class="footer-colophon">
       <div><dt>Protocol</dt><dd>1.0</dd></div>
-      <div><dt>Consensus ruleset</dt><dd>v6</dd></div>
-      <div><dt>Fork ID</dt><dd>0x0f584a46</dd></div>
+      <div><dt>Consensus ruleset</dt><dd>v7</dd></div>
+      <div><dt>Fork ID</dt><dd>0x3ae00ebc</dd></div>
       <div><dt>Chain ID</dt><dd>5757</dd></div>
-      <div><dt>Site build</dt><dd>static-v18 · 2026.11.20</dd></div>
+      <div><dt>Site build</dt><dd>static-v19 · 2026.11.22</dd></div>
     </dl>
   </div>
 </footer>

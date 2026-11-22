@@ -27,12 +27,14 @@ curl -X POST $STELL_RPC_URL -d '{
   "jsonrpc":"2.0","id":1,"method":"stell_faucet",
   "params":{"address":"<MASTER_PUBKEY_64_HEX>"}
 }'
-# -> {"result":{"credited_nano":"10000000000","recipient":"...","tx_hash":"..."}}
+# -> {"result":{"credited_nano":"2000000000","recipient":"...","tx_hash":"..."}}
 ```
 
-Facts that bite: the drip is 10 STELL by default (`STELL_FAUCET_DRIP_STELL`
-overrides it) with a 1000 STELL lifetime cap per
-address; the faucet is **fail-closed** (needs `STELL_FAUCET=1` plus a
+Facts that bite: the token-authenticated drip is **2 STELL** by default
+(`STELL_FAUCET_DRIP_STELL` overrides it) with a **50 STELL lifetime cap** per
+address on every faucet path; the public (tokenless) path also drips 2 STELL
+under a 45-minute per-address cooldown. The faucet is **fail-closed** (needs
+`STELL_FAUCET=1` plus a
 `STELL_FAUCET_TOKEN` on the node, otherwise it refuses); the returned
 `tx_hash` is a *pending* mempool transaction, not finality - poll
 `stell_getTransactionStatus` until `success`. Gateway alternative:

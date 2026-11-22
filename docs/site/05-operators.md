@@ -2,7 +2,7 @@
 
 Lifecycle: `install → configure → keygen → join → snapshot-sync →
 monitor → alert → prune → upgrade → rollback → disaster-recover`.
-Authority: `docs/OPERATIONS.md`; join scripts: `stellereum/scripts/join-network.sh`,
+Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-testnet.sh`,
 `stellereum/scripts/add-peer.sh`; health tooling: `scripts/stell-sync.sh`,
 `scripts/doctor.sh`, `scripts/cluster-watchdog.sh`,
 `scripts/node-prune-cron.sh`, `scripts/tools/stelops/`.
@@ -14,7 +14,8 @@ Authority: `docs/OPERATIONS.md`; join scripts: `stellereum/scripts/join-network.
    live binary → 203/EXEC crash-loop).
 2. **Configure:** `node.yaml` (`peers:`, `validators:`, DNS seeds) + env
    file (mode 600). Values that must match **every** node: `STELL_SHARDS`,
-   chain id, `STELL_MIN_BLOCK_MS` (default 50), `STELL_KEEP_BLOCKS`, admission
+   chain id, `STELL_MIN_BLOCK_MS` (live fleet **400**; code default 50),
+   `STELL_KEEP_BLOCKS`, admission
    base fee — drift = split or silent isolation (`OPERATIONS.md` §15.3). The
    base round timeout is **compiled** (`FROZEN_ROUND_TIMEOUT_BASE_MS = 3 000`);
    the former `STELL_ROUND_TIMEOUT_MS` env override is gone, so it must match
@@ -24,10 +25,12 @@ Authority: `docs/OPERATIONS.md`; join scripts: `stellereum/scripts/join-network.
    default; passphrase via `STELL_NODE_PASSPHRASE`, never in history).
    Falcon pre-FIPS keys still load; migrate with
    `keys rotate-falcon --force` (changes the validator address → re-stake).
-4. **Join:** `join-network.sh` (writes config, systemd unit
-   `MemoryMax=2G`, disk-guard cron, firewall UDP 9410) → send
-   `peer-stanza.txt` to the admin → admin `add-peer.sh` (observer: peers
-   only; `--role validator` changes genesis = coordinated restart).
+4. **Join:** `scripts/join-testnet.sh --mode observer|validator` (writes
+   config + env, downloads the snapshot — pass `--skip-snapshot` when
+   `node-bootstrap` follows in step 5; systemd unit/firewall come from its
+   printed next steps) → send `peer-stanza.txt` to the admin → admin
+   `add-peer.sh` (observer: peers only; `--role validator` changes genesis =
+   coordinated restart).
 5. **Snapshot-sync:** `stellereum node-bootstrap` — fail-closed preflight
    (clean dir, `STELL_OBSERVER=1`, faucet key, peers, non-empty
    validators), then state + all domains with per-height QC proofs, then
@@ -52,9 +55,9 @@ Authority: `docs/OPERATIONS.md`; join scripts: `stellereum/scripts/join-network.
 11. **Disaster-recover:** coordinated whole-`./data` wipe on **all** nodes
     at once for a new genesis; single-node wipes re-fork. Last resort.
 
-- TODO (snapshot cadence): `OPERATIONS.md` §1 says snapshots every 100
-  heights; `src/main.rs` says `STELL_SNAPSHOT_INTERVAL` default 1000.
-  Verify: `rg -n "SNAPSHOT_INTERVAL|every 100" src/main.rs docs/OPERATIONS.md`.
+- Snapshot cadence: `STELL_SNAPSHOT_INTERVAL` defaults to **1000** heights in
+  code; the live config uses **500**. Verify:
+  `rg -n "SNAPSHOT_INTERVAL" src docs/OPERATIONS.md`.
 
 ## Tool map
 

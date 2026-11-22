@@ -81,15 +81,18 @@ rpc stell_faucet '{"address":"<64-hex>"}'
 
 Documented result shape (`docs/RPC.md` §4):
 `{"credited_nano":"…","recipient":"…","tx_hash":"…","shard":…}`. Defaults:
-**10 STELL drip** (`STELL_FAUCET_DRIP_STELL`), **1000 STELL lifetime cap**
-per address, 20 drips/hour/IP, gated by `STELL_FAUCET_TOKEN` (fail-closed).
-Fund the **`-1:<hex>` masterchain form** if you will stake; a bare address
-is a workchain address and never routes to shard 0.
+**2 STELL drip** (`STELL_FAUCET_DRIP_STELL`), **50 STELL lifetime cap** per
+address, 20 requests/hour/IP, gated by `STELL_FAUCET_TOKEN` (fail-closed).
+The public (tokenless) path also drips 2 STELL under a 45-minute per-address
+cooldown. Fund the **`-1:<hex>` masterchain form** for gas; a bare address is
+a workchain address and never routes to shard 0. The faucet **cannot fund a
+validator**: 50 STELL is the lifetime ceiling while a new bond needs 1,100
+STELL, which comes from the Foundation on request or an operator transfer.
 
 - TODO (live output): run the command against a faucet-enabled node and
   paste the real JSON. Verify: `curl … stell_faucet` above.
 - **If `-32601 faucet is disabled`:** node lacks `STELL_FAUCET=1`.
-- **If `-32000 faucet limit reached`:** the 1000 STELL cap is spent.
+- **If `-32000 faucet limit reached`:** the 50 STELL cap is spent.
 - **If `-32000 … cannot serve an address on shard T`:** sharded faucet
   serves only its own shard — drip from that shard's faucet. Burns no nonce.
 

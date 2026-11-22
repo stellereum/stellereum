@@ -419,7 +419,7 @@ keeps `code`, `message`, `data`.
 
 ---
 
-## 8. Protocol identity, EVM binding/carrier and governance (protocol v1, ruleset v6)
+## 8. Protocol identity, EVM binding/carrier and governance (protocol v1, ruleset v7)
 
 ### 8.1 Chain/fork guard (both SDKs)
 
@@ -435,7 +435,7 @@ Rust:
 ```rust
 use stellereum_sdk::{ProtocolIdentity, SdkError, TxBuilder, FORK_ID};
 
-let identity = ProtocolIdentity::local(); // chain 5757, fork 0x0f584a46
+let identity = ProtocolIdentity::local(); // chain 5757, fork 0x3ae00ebc
 assert_eq!(identity.fork_id, FORK_ID);
 
 // Refused with SdkError::ChainIdMismatch { expected: 5757, got: 1 }
@@ -465,8 +465,8 @@ assertChainId(localIdentity(), 5757);       // throws ProtocolError otherwise
 `ProtocolError.code` is one of `chain_id_mismatch`, `fork_id_mismatch`,
 `protocol_version_mismatch`, `invalid_identity`.
 
-The current identity is **protocol 1.0, consensus ruleset v6, fork id
-`0x0f584a46`** (chain id 5757). A consensus-rule change moves the id; the Rust
+The current identity is **protocol 1.0, consensus ruleset v7, fork id
+`0x3ae00ebc`** (chain id 5757). A consensus-rule change moves the id; the Rust
 parity suite compares every folded constant and the derivation result against
 the node, so a stale SDK fails its own tests.
 
@@ -616,7 +616,7 @@ elsewhere) and `POST /sign-digest` / `stellereum-sdk-cli sign-digest`
 ### 8.6 Breaking changes (SDK 0.3)
 
 - The default `ProtocolIdentity` is now the local chain (5757, fork
-  `0x0f584a46`). `TxBuilder::chain_id(x)` with `x != 5757` now fails at `sign`
+  `0x3ae00ebc`). `TxBuilder::chain_id(x)` with `x != 5757` now fails at `sign`
   with `ChainIdMismatch` unless a matching identity was configured. A wallet
   for another deployment must build the SDK with that deployment's fork id (or
   pass an explicit identity whose fork id this build speaks).
@@ -727,7 +727,7 @@ The parity suite covers:
 | Session grant struct / signature / scopes | `stellereum/src/zkml.rs:180,247-263,276,554,584,669,752` |
 | Stl57 address format | `stellereum/src/address.rs:57` |
 | Chain id default 5757 | `stellereum/src/zkml.rs:203` |
-| Protocol identity / fork id / ruleset v6 | `stellereum/src/protocol.rs` (`PROTOCOL_MAJOR`, `PROTOCOL_MINOR`, `CONSENSUS_RULESET_VERSION`, `FORK_ID_RULES`, `FORK_ID`, `version_info`) |
+| Protocol identity / fork id / ruleset v7 | `stellereum/src/protocol.rs` (`PROTOCOL_MAJOR`, `PROTOCOL_MINOR`, `CONSENSUS_RULESET_VERSION`, `FORK_ID_RULES`, `FORK_ID`, `version_info`) |
 | EVM binding + carrier + proof of possession | `stellereum/src/evm_adapter/binding.rs` (`binding_message`, `build_binding_transaction`, `verify_binding_claim`, `verify_carrier_intent`, `build_carrier_transaction`) |
 | Carrier/binding opcode payloads | `stellereum/src/svm.rs` (`EvmCarrierIntent`, `EvmAddressClaim`, `SysCallEvmCarrier`, `SysCallBindEvmAddress`) |
 | Governance opcodes and builders | `stellereum/src/governance.rs` (`GovAction`, `VoteChoice`, `gov_propose_tx`, `gov_vote_tx`); `stellereum/src/svm.rs` (`SysCallGovPropose`, `SysCallGovVote`) |

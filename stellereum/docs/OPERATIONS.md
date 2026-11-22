@@ -51,8 +51,9 @@ the retained suffix always links back to genesis.
 
 ### State and domain snapshots
 
-Snapshots of accounts and of every non-account domain are written **every 100
-heights**. In prune mode, snapshots older than `height - 300` are also dropped —
+Snapshots of accounts and of every non-account domain are written **every
+`STELL_SNAPSHOT_INTERVAL` heights** (code default **1000**; the live config
+uses **500**). In prune mode, snapshots older than `height - 300` are also dropped —
 a small ring, because `load_state_into` reads only the newest. In archive mode
 they are never pruned, so they accumulate too.
 
@@ -62,7 +63,7 @@ it on you get neither.
 
 ### Pruning is not free and not immediate
 
-A prune pass rides the same 100-height cadence as the snapshot job and removes at
+A prune pass rides the same snapshot cadence as the snapshot job and removes at
 most `PRUNE_BATCH` = 20,000 bodies per pass. The reason is that the background
 flusher task is the *only* writer to the store; a prune that scanned the whole
 tree inline would stall every other write behind it. The next pass is scheduled
@@ -78,8 +79,9 @@ a per-block constant — it scales with how many transactions each block carries
 and with the snapshot ring — but it is a real number produced by the current
 defaults rather than an estimate.
 
-Rough scale on defaults: `STELL_MIN_BLOCK_MS=400` caps a node at ~2.5 blocks per
-second, so ~216,000 blocks a day, indefinitely.
+Rough scale: the live fleet runs `STELL_MIN_BLOCK_MS=400` (the code default is
+**50**), which caps a node at ~2.5 blocks per second, so ~216,000 blocks a day,
+indefinitely.
 
 #### Minimum hardware (honest floor, not marketing)
 
@@ -211,7 +213,8 @@ the rate yourself.** A gauge alone tells you nothing: a node frozen at height
 Alert on the *derivative* over a window of a few minutes.
 
 What the rate should be: bounded by `1 / STELL_MIN_BLOCK_MS` per node, and by
-how often the proposer is scheduled. At the default 400 ms, ~2.5/s. A rate
+how often the proposer is scheduled. At the live 400 ms (code default 50 ms),
+~2.5/s. A rate
 comfortably above zero but far below the ceiling usually means the proposer is
 not being selected on every height.
 
@@ -490,9 +493,9 @@ missed, derived from that block, so every node counts identically.
 
 | | |
 | --- | --- |
-| consecutive missed heights before a penalty | **10** (`DOWNTIME_MISS_THRESHOLD`) |
+| consecutive missed heights before a penalty | **42** (`DOWNTIME_MISS_THRESHOLD`) |
 | penalty | **0.1%** of the validator's total stake (`DOWNTIME_SLASH_BPS` = 10 bps), self-bond first, then delegated |
-| cooldown between penalties | **100 heights** (`DOWNTIME_PENALTY_COOLDOWN`) |
+| cooldown between penalties | **500 heights** (`DOWNTIME_PENALTY_COOLDOWN`) |
 | forgiveness | signing again resets the missed counter to 0 |
 | equivocation (double-vote) | **5%** (`EQUIVOCATION_SLASH_BPS` = 500 bps), no cooldown |
 
@@ -502,13 +505,14 @@ sum of individual slashes. A genesis validator bonded at 1000 STELL loses
 1 STELL per downtime penalty and 50 STELL per equivocation.
 
 The cooldown deliberately does **not** apply to a first offence, because on a
-chain younger than 100 heights nobody would ever be punished.
+chain younger than 500 heights nobody would ever be punished.
 
-**Scale this to your block time.** `STELL_MIN_BLOCK_MS` defaults to 400 ms, so on
-a default-paced network 10 consecutive misses is about **4 seconds** and the
-100-height cooldown is about **40 seconds**. If you are running a busy testnet
-with a validator on a shared host, a 5-second GC pause or a container restart is
-enough to burn. If you want a realistic window, raise `STELL_MIN_BLOCK_MS`.
+**Scale this to your block time.** `STELL_MIN_BLOCK_MS` defaults to 50 ms in
+code and the live fleet runs 400 ms. At 400 ms, 42 consecutive misses is about
+**17 seconds** and the 500-height cooldown is about **200 seconds**. If you are
+running a busy testnet with a validator on a shared host, a 5-second GC pause
+or a container restart is enough to burn. If you want a realistic window, raise
+`STELL_MIN_BLOCK_MS`.
 
 And the counter-intuitive part: **a 2-validator network that has halted cannot
 slash you at all.** Slashing needs a finalized block, and a finalized block
@@ -524,9 +528,9 @@ accounting starts.
   set stops the chain regardless of how gracefully you stop it. There is no
   "leaving the validator set" mechanism in this code — the set is re-derived
   from the staking ledger, and unbonding takes an unbonding period
-  (`UNBONDING_PERIOD_SECS`, 2 days at the 3s block rate the constant's comment
-  assumes, which is not the 400 ms default — at 400 ms it is 2 days of blocks,
-  which is the same wall-clock time but 5× more of them).
+  (`UNBONDING_PERIOD_SECS`, 2 days at the 3 s block rate the constant's comment
+  assumes — not the live 400 ms, code default 50 ms — so the wall-clock window
+  is the same but spans far more blocks).
 - **Ctrl-C, not `kill -9`.** The node persists finalized blocks, the finalized
   head, and a consensus safety checkpoint, and restores the lock on restart so it
   cannot double-vote a height it already locked. An unclean stop loses at most
@@ -821,6 +825,10 @@ answer 404 on `/healthz` and `/readyz` and export no `stell_ready` gauge —
 any HTTP answer still means "process alive"; `scripts/monitor/check.sh`
 handles both cases.
 
+The **indexer** is a separate service: its health probe is `GET
+/api/v2/status`. It has no `/health` and no `/metrics` — those probes below
+belong to the node gateway.
+
 ### `GET /healthz` → 200 (liveness, cheap by design)
 
 No locks, no state reads, so a wedged subsystem cannot fail it
@@ -918,7 +926,7 @@ so there is less room to get those rules wrong.
 
 | side | script | does |
 | --- | --- | --- |
-| new node (operator) | `scripts/join-network.sh` | generates keys, builds `node.yaml` + env, installs the systemd unit, disk-guard cron and firewall rule, prints the peer-stanza |
+| new node (operator) | `scripts/join-testnet.sh` | generates the cold withdrawal + hot voting Falcon-512 keys, builds `node.yaml` + env, downloads the snapshot, prints the peer-stanza and next steps |
 | network (admin) | `scripts/add-peer.sh` | appends the stanza to `node.yaml` + `STELL_PEER_PQ_KEYS`, rolling-restarts one unit |
 
 The join script mints a key passphrase and writes it into the node's env file
@@ -962,33 +970,33 @@ while the old bond is still in place — is in [§11.1](#111-the-falcon-512-fips
 ```sh
 # ONE command. New nodes always start as OBSERVERS (STELL_OBSERVER=1):
 # a fresh key must FOLLOW the existing chain, not mint its own genesis.
-scripts/join-network.sh \
-  --faucet-key <64-HEX-SHARED-WITH-THE-NETWORK> \
+scripts/join-testnet.sh --mode validator \
   --advertise <PUBLIC_IP:9410> \
   --peers-file <admin-supplied-current-set.yaml>
 ```
 
-What it does, in order: `keys init` (never overwrites existing keys —
-identity is stable across restarts); saves + prints the peer-stanza block
-(`peer-stanza.txt`); writes `node.yaml` (template + `peers:`/`validators:`
-copied verbatim from `--peers-file`, DNS seeds `seeds.stellereum.org` for
-discovery); writes `node.env` (mode 600) with `STELL_OBSERVER=1`,
-`STELL_ARCHIVE=0` + `STELL_KEEP_BLOCKS=1000000` (the §1 public-testnet
-starting point — archive is unbounded), `STELL_DNS_SEEDS`; installs the
-`stellereum-node` systemd unit (`MemoryMax=2G`, `CPUQuota=80%`, `Nice=5`,
-journal rate caps + a 500M journald drop-in + logrotate) and a disk-guard
-cron (every 15 min, warn ≥80% / crit ≥90%, read-only); opens UDP 9410
-(`ufw`, else `iptables`, else prints the command).
+What it does, in order: `keys init` for the node identity + hot Falcon-512
+voting key and a second `keys init --falcon-file` for the cold withdrawal key
+(never overwrites existing keys — identity is stable across restarts); saves +
+prints the peer-stanza block (`peer-stanza.txt`); writes `node.yaml` (template
++ `peers:` from `--peers-file`, empty `validators:` for an observer, DNS seeds
+`seeds.stellereum.org` for discovery); writes `node.env` (mode 600) with
+`STELL_OBSERVER=1`, `STELL_ARCHIVE=0` + `STELL_KEEP_BLOCKS`, `STELL_DNS_SEEDS`;
+downloads the snapshot (pass `--skip-snapshot` if you will run the §2.5
+bootstrap gate, which needs a clean data dir); then prints the next steps
+(systemd unit, firewall UDP 9410 and funding are operator actions from those
+steps).
 
 Three inputs MUST be right, and the script cannot verify two of them:
 
-- **`--faucet-key` must match every other node byte-for-byte.** It funds the
+- **`STELL_FAUCET_KEY` (set in `node.env`, not a script flag) must match every
+  other node byte-for-byte** when this node runs the faucet. It funds the
   faucet account at genesis, so one wrong byte is a different genesis root
-  and a private chain (§3, rule (a)). Placeholder values are refused.
+  and a private chain (§3, rule (a)).
 - **`--peers-file` must be the network's CURRENT validator set.** Without it
-  `node.yaml` ships with empty lists and the unit is installed but NOT
-  started — an empty `validators:` derives a solo genesis, which splits
-  silently. Ask the admin for a live `node.yaml`, re-run with `--force`.
+  `node.yaml` ships with empty lists — an empty `validators:` derives a solo
+  genesis, which splits silently. Ask the admin for a live `node.yaml`, re-run
+  with `--force`.
 - **`--advertise` must be diallable.** Autodetect falls back to the LAN IP;
   behind NAT pass the public IP explicitly. QUIC is UDP: `9410/udp` inbound.
 
@@ -1039,8 +1047,8 @@ What it does, in order (`[bootstrap] stage N/4` in the log):
    `STELL_OBSERVER=1` (a fresh key without it mints its own genesis),
    `STELL_FAUCET_KEY` set (must match the network byte-for-byte),
    a live peer pointer (`peers:` non-empty or `STELL_DNS_SEEDS` set) and a
-   non-empty `validators:` (empty derives a solo genesis). `scripts/join-network.sh`
-   runs the same gate as `--no-exec` before starting the unit.
+   non-empty `validators:` (empty derives a solo genesis). `stellereum
+   node-bootstrap` enforces the same gate before starting the unit.
 2. **Snapshot-sync** (inside the `run` engine this execs into): newest usable
    boundary (exact latest-snapshot pointer when sane), state + EVERY committed
    domain — accounts *including the staking ledger*, `domains`, `session`,
@@ -1595,9 +1603,10 @@ rules), and confirm the tarball lists its four members (`tar -tzf`).
 before you roll back to it.** State layout that matters:
 
 - live state snapshots: written every `STELL_SNAPSHOT_INTERVAL` heights
-  (default **1000**, minimum 50; `src/main.rs:157-159`,
-  `src/storage.rs:1405`), archive proofs served only at snapshot heights;
-- retained-block / snapshot ring: the 100-height cadence job (§1) with
+  (code default **1000**, minimum 50; the live config uses **500**;
+  `src/main.rs:157-159`, `src/storage.rs:1405`), archive proofs served only at
+  snapshot heights;
+- retained-block / snapshot ring: the snapshot-cadence job (§1) with
   `PRUNE_BATCH` = 20 000 bodies per pass — a node far behind the boundary
   converges gradually, not instantly.
 

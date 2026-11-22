@@ -39,12 +39,14 @@ rpc() { curl -s -X POST "$RPC" -H 'content-type: application/json' \
 - **Quorum math decides liveness:** `quorum_power() = floor(2·total/3)+1`
   (`OPERATIONS.md` §5). With 2–3 equal-stake validators **every** validator
   must sign; run four or more before you depend on the chain.
-- **Commission is fixed at bond time** and **immutable
-  afterwards** — the wallet `stake` command takes `--commission-bps N`
-  (0–10000) for a NEW validator and the governance default (1000 bps =
-  10 %, `DEFAULT_COMMISSION_BPS`, `src/staking.rs:232`) when omitted; a
-  top-up keeps the registered rate. See §6 and
-  `RPC.md` §5.
+- **Commission is set at bond time and changeable in Ruleset v7** — the
+  wallet `stake` command takes `--commission-bps N` (0–10000) for a NEW
+  validator and the governance default (1000 bps = 10 %,
+  `DEFAULT_COMMISSION_BPS`, `src/staking.rs:232`) when omitted; a top-up
+  keeps the registered rate. Thereafter `stellereum validator
+  announce-commission` → `apply-commission` (OpCodes 63/64) changes it after
+  a 30,000-height delay, at most 500 bps per step, with a 30,000-height
+  cooldown. See §7 and `RPC.md` §5.
 
 Hardware before you start: 1 vCPU is **explicitly insufficient** for a
 validator (scheduler starvation measured live). See `OPERATIONS.md` §1
@@ -69,6 +71,9 @@ write keys unencrypted (`OPERATIONS.md` §14.2). Set **one** of
 `STELL_NODE_PASSPHRASE` / `STELL_KEY_PASSPHRASE` /
 `INFNODE_KEY_PASSPHRASE` (first non-empty wins).
 
+Validator signing is **FULL-PQ**: the cold withdrawal key and the hot voting
+key are both Falcon-512. There is no Ed25519 key path for validator signing.
+
 ## 2. Print the peer stanza — `stellereum keys peer-stanza`
 
 ```sh
@@ -81,26 +86,30 @@ this is the one file you send to the network admin; `src/main.rs`,
 (`keys rotate-falcon --force`), the validator address **changes** and you
 must re-stake under the new address (`OPERATIONS.md` §10–§11.1).
 
-## 3. Join the network — `scripts/join-network.sh`
+## 3. Join the network — `scripts/join-testnet.sh`
 
 ```sh
-stellereum/scripts/join-network.sh \
-  --faucet-key <64-HEX-SHARED-WITH-THE-NETWORK> \
+scripts/join-testnet.sh --mode validator \
   --advertise <PUBLIC_IP:9410> \
   --peers-file <admin-supplied-current-set.yaml>
 ```
 
-What it does (`OPERATIONS.md` §10, Step 1): `keys init`, saves + prints
-the peer-stanza (`peer-stanza.txt`), writes `node.yaml` (peers/validators
-copied verbatim from `--peers-file`), writes `node.env` (mode 600) with
-`STELL_OBSERVER=1`, installs the systemd unit + disk-guard cron + firewall
-rule, opens UDP 9410.
+What it does (`OPERATIONS.md` §10, Step 1): `keys init` for the node identity
+and hot Falcon-512 voting key, a second `keys init --falcon-file` for the cold
+withdrawal key, saves + prints the peer-stanza (`peer-stanza.txt`), writes
+`node.yaml` (peers copied from `--peers-file`; `validators:` empty), writes
+`node.env` (mode 600) with `STELL_OBSERVER=1`, downloads the snapshot, and
+prints the next steps. It does **not** install a systemd unit or firewall rule
+— do that from the printed steps and `OPERATIONS.md` §10. Pass
+`--skip-snapshot` if you intend to run the `node-bootstrap` gate in §4 (it
+requires a clean data dir).
 
 **New nodes always start as observers** (`STELL_OBSERVER=1`): a fresh key
-must follow the chain, not mint its own genesis. Three inputs must be
-right: `--faucet-key` byte-identical to the network (else a private
-genesis + silent split, `OPERATIONS.md` §3), `--peers-file` the network's
-**current** validator set, `--advertise` diallable.
+must follow the chain, not mint its own genesis. Inputs that must be right:
+`--peers-file` the network's **current** validator set, `--advertise`
+diallable, and — if this node runs the faucet — `STELL_FAUCET_KEY` in
+`node.env` byte-identical to the network (else a private genesis + silent
+split, `OPERATIONS.md` §3).
 
 ## 4. First start through the bootstrap gate — `node-bootstrap`
 
@@ -138,18 +147,28 @@ Same roots at equal heights = one chain. Same height + different root =
 reporting an empty/zero-power set never enters the consensus loop
 (`OPERATIONS.md` §4).
 
-## 6. Fund the account — faucet drip, then consolidate to the masterchain
+## 6. Fund the account — faucet drip (fees only; it cannot fund the bond)
 
 ```sh
 rpc stell_faucet '{"address":"-1:<YOUR-64-HEX>"}'
 ```
 
 - Method: `stell_faucet` (`src/rpc.rs:4092`). Gated by `STELL_FAUCET_TOKEN`
-  (fail-closed) + 20 drips/hour/IP + **1000 STELL lifetime cap per address**.
-- Default drip **10 STELL** (`STELL_FAUCET_DRIP_STELL`); `amount` is clamped
-  down to the drip, then to the cap remainder (`RPC.md` §4).
+  (fail-closed) + 20 requests/hour/IP + **50 STELL lifetime cap per address**,
+  enforced on every faucet path.
+- Default token-authenticated drip **2 STELL** (`Faucet::default_drip_nano`;
+  `STELL_FAUCET_DRIP_STELL` overrides it, whole STELL); `amount` is clamped
+  down to the drip, then to the cap remainder (`RPC.md` §4). The public
+  (tokenless) `POST /api/faucet-public/:address` path also drips **2 STELL**
+  (`STELL_PUBLIC_DRIP_NANO`) under a **45-minute per-address cooldown**.
+- **The faucet cannot fund a validator.** 50 STELL is the lifetime ceiling;
+  a new bond needs **1,100 STELL** (1,000 STELL minimum + 100 STELL buffer).
+  Validator stake is provisioned by the Foundation on request, or by an
+  operator transfer. Raising the cap means setting
+  `STELL_FAUCET_LIFETIME_CAP_STELL` and restarting with the network's
+  agreement.
 - Success shape: `{"credited_nano":"…","recipient":"…","tx_hash":"…","shard":…}`.
-- **Fund the masterchain form** (`-1:<hex>`): staking bonds on the
+- **Fund the masterchain form** (`-1:<hex>`) for gas: staking bonds on the
   masterchain, and a bare-address drip executes on the workchain where a
   bond can never be read. On a sharded node the faucet serves **only its own
   shard's** recipients (`RPC.md` §4).
@@ -179,7 +198,12 @@ stell-wallet stake --validator <YOUR-64-HEX> 1100 --dry-run
   (`ctx.default_commission_bps`, default 1000 bps, `src/staking.rs:232`)
   — the plain `SysCallStake` opcode carries **no** commission field
   (E1b added `SysCallStakeWithCommission` for the explicit rate).
-  It is immutable from this point on.
+  In Ruleset v7 it is **changeable afterwards** via `announce-commission` →
+  `apply-commission` (30,000-height delay, max 500 bps per step,
+  30,000-height cooldown).
+- The **1,100 STELL must already be on the masterchain**, provisioned by the
+  Foundation on request or an operator transfer; the faucet cannot supply it
+  (§6).
 
 Verify: `rpc stell_stakeOf '{"validator":"<hex>"}'` → `total` ≥ floor;
 `rpc stell_getValidators` → your id listed with power `≥ 1` once inside
@@ -195,9 +219,10 @@ voting (no `view change` storm, `OPERATIONS.md` §4/§14.1).
 
 - `fragile: true` in `stell_getValidators` = quorum needs 100 % of the set
   — add validators before you rely on the chain (`OPERATIONS.md` §5).
-- Downtime costs: 10 consecutive missed heights → **0.1 %** slash;
-  equivocation → **5 %** (`OPERATIONS.md` §5). On a default-paced network
-  10 misses is ~4 s — keep the host inside the §1 sizing table.
+- Downtime costs: **42 consecutive misses** (`DOWNTIME_MISS_THRESHOLD`) →
+  **0.1 %** slash; equivocation → **5 %** (`OPERATIONS.md` §5). At the live
+  fleet's 400 ms block interval 42 misses is ~17 s (the code default is
+  50 ms, ~2.1 s) — keep the host inside the §1 sizing table.
 
 ## 9. Claim rewards — `stell-wallet claim-rewards`
 

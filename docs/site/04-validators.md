@@ -20,15 +20,18 @@ Quorum is `floor(2·power/3)+1`: 1→1, 2→2, 3→3, 4→3, 5→4 — so 2- and
 3-validator nets halt on one outage; **run four or more**
 (`docs/OPERATIONS.md` §5).
 
-## Commission immutability
+## Commission (changeable in Ruleset v7)
 
-Commission is set **once at bond time** — either the governance default
+Commission is set **at bond time** — either the governance default
 (`ctx.default_commission_bps`, `DEFAULT_COMMISSION_BPS` = **1000 bps = 10 %**,
 `src/staking.rs`) or an explicit `--commission-bps N` on a **new** bond
-(`SysCallStakeWithCommission`, `src/svm.rs`). There is no later setter: the
-ledger has no commission-change opcode wired, and the rate is forever.
-A later `SetDefaultCommissionBps` vote prices **new** bonds only. Pick your
-validator accordingly.
+(`SysCallStakeWithCommission`, `src/svm.rs`). A later `SetDefaultCommissionBps`
+vote prices **new** bonds only.
+
+In Ruleset v7 the validator can change its rate: `announce-commission` →
+`apply-commission` (OpCodes 63/64) with a **30,000-height delay**, a maximum
+step of **500 bps**, and a **30,000-height cooldown** between changes. CLI:
+`stellereum validator announce-commission|apply-commission`.
 
 ## Rewards (F1 lazy — how and when claimed)
 
@@ -64,9 +67,9 @@ Misses derive from the finalized block's embedded parent QC, so every
 node counts identically; signing again resets the counter; the cooldown
 skips the first offence (chains < 500 blocks). Burns debit the staking
 pool for real. Genesis math: 1000 STELL bond loses 1 STELL per downtime
-hit, 50 per equivocation. At the current 50 ms floor, 42 misses
-≈ 2.1 s; at live 2–3 s/block it is ≈ 84–126 s — a GC pause can cost you
-(`OPERATIONS.md` §5). A halted 2-validator
+hit, 50 per equivocation. At the code default 50 ms floor, 42 misses
+≈ 2.1 s; at the live fleet's configured `STELL_MIN_BLOCK_MS=400` it is
+≈ 17 s — a GC pause can cost you (`OPERATIONS.md` §5). A halted 2-validator
 net slashes nobody (no blocks, no evidence). `missed` has no RPC — watch
 `stell_stakeOf` for a `total` below your bond.
 
@@ -100,12 +103,17 @@ Spinning disk stalls the persist queue and reads as consensus lag.
 ```sh
 stellereum keys init --keys-dir ./keys
 stellereum keys peer-stanza --keys-dir ./keys --name node-e
-stellereum/scripts/join-network.sh --faucet-key <64-HEX> --advertise <IP:9410> \
-  --peers-file <admin-set.yaml>     # new nodes start STELL_OBSERVER=1
+# new nodes start STELL_OBSERVER=1; --skip-snapshot because node-bootstrap follows
+scripts/join-testnet.sh --mode validator --advertise <IP:9410> \
+  --peers-file <admin-set.yaml> --skip-snapshot
 stellereum node-bootstrap --config node.yaml --shard 1
-rpc stell_faucet '{"address":"-1:<YOUR-HEX>"}'   # masterchain form
+rpc stell_faucet '{"address":"-1:<YOUR-HEX>"}'   # gas only: 50 STELL cap
 stell-wallet stake --validator <YOUR-HEX> 1100
 ```
+
+The public faucet is capped at **50 STELL** lifetime and cannot fund the
+**1,100 STELL** bond; validator stake is provisioned by the Foundation on
+request or by an operator transfer.
 
 Troubleshooting table (stale lock, topic drift, nonce gaps, genesis
 mismatch): `VALIDATOR_ONBOARDING.md` §Troubleshooting and

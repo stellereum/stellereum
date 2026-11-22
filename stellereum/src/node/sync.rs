@@ -1202,11 +1202,16 @@ async fn walk_chain_once_with_lanes(
     }
 
     let store = persist.map(|ap| ap.storage());
-    // Seed local cache from `rt.blocks` (in-memory) before touching disk or DHT.
+    // Seed local cache from `rt.blocks` (in-memory) ONLY for blocks that already
+    // carry a decision QC (`precommit_qc.is_some()`): `rt.blocks` also holds
+    // uncertified candidate proposals (`precommit_qc: None`), which would
+    // otherwise shadow the DHT's decided body and fail `carries no decision proof`.
     let mut prefetched: std::collections::HashMap<[u8; 32], stellereum::sharding::Block> = rt
         .blocks
         .iter()
-        .filter(|(_, b)| b.height >= expected_first_height && b.height <= peer_height)
+        .filter(|(_, b)| {
+            b.height >= expected_first_height && b.height <= peer_height && b.precommit_qc.is_some()
+        })
         .map(|(h, b)| (*h, b.clone()))
         .collect();
 
@@ -1217,10 +1222,15 @@ async fn walk_chain_once_with_lanes(
             Some(b)
         } else if let Some(st) = store.clone() {
             let h = peer_hash;
-            match tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten())
-                .await
-                .ok()
-                .flatten()
+            match tokio::task::spawn_blocking(move || {
+                st.get_block(&h)
+                    .ok()
+                    .flatten()
+                    .filter(|b| b.precommit_qc.is_some())
+            })
+            .await
+            .ok()
+            .flatten()
             {
                 Some(b) => Some(b),
                 None => adapter.fetch_block(&peer_hash).await,
@@ -1254,10 +1264,15 @@ async fn walk_chain_once_with_lanes(
                 Some(b)
             } else if let Some(st) = store.clone() {
                 let h = cur_hash;
-                tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten())
-                    .await
-                    .ok()
-                    .flatten()
+                tokio::task::spawn_blocking(move || {
+                    st.get_block(&h)
+                        .ok()
+                        .flatten()
+                        .filter(|b| b.precommit_qc.is_some())
+                })
+                .await
+                .ok()
+                .flatten()
             } else {
                 None
             };
@@ -1267,6 +1282,9 @@ async fn walk_chain_once_with_lanes(
             let Ok(verified) = stellereum::sync::verify_fetched_block(cur_hash, local_blk) else {
                 break;
             };
+            if verified.precommit_qc.is_none() {
+                break;
+            }
             let block_hash = cur_hash;
             cur_hash = verified.prev_hash;
             cur_height = verified.height.saturating_sub(1);
@@ -1309,7 +1327,10 @@ async fn walk_chain_once_with_lanes(
                             async move {
                                 if let Some(st) = st {
                                     if let Ok(Some(b)) = tokio::task::spawn_blocking(move || {
-                                        st.get_block(&h).ok().flatten()
+                                        st.get_block(&h)
+                                            .ok()
+                                            .flatten()
+                                            .filter(|b| b.precommit_qc.is_some())
                                     })
                                     .await
                                     {
@@ -1325,7 +1346,9 @@ async fn walk_chain_once_with_lanes(
                 for (h, maybe_blk) in fetched_bodies {
                     if let Some(blk) = maybe_blk {
                         if let Ok(verified) = stellereum::sync::verify_fetched_block(h, blk) {
-                            prefetched.insert(h, verified);
+                            if verified.precommit_qc.is_some() {
+                                prefetched.insert(h, verified);
+                            }
                         }
                     }
                 }
@@ -1352,8 +1375,13 @@ async fn walk_chain_once_with_lanes(
                     return Some(b.clone());
                 }
                 if let Some(st) = st {
-                    if let Ok(Some(b)) =
-                        tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten()).await
+                    if let Ok(Some(b)) = tokio::task::spawn_blocking(move || {
+                        st.get_block(&h)
+                            .ok()
+                            .flatten()
+                            .filter(|b| b.precommit_qc.is_some())
+                    })
+                    .await
                     {
                         return Some(b);
                     }
@@ -2202,5 +2230,55 @@ mod recovery_walk_tests {
         // Explicit 256-block per-hop window (the historical honest bound):
         // 400 must now take MULTIPLE verified hops, not one long walk.
         run_recovery_case(0x43, 400, 256, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_ignores_uncertified_proposal_in_rt_blocks_and_fetches_decided_body() {
+        const B: u64 = 4;
+        const N: u64 = 7;
+        let ks = vec![SigningKey::from_bytes(&[0x59; 32])];
+        let fks = fks_for(&ks);
+        let vs = vset(&ks);
+        let (blocks, tip_root) = build_chain(&ks, &fks, N).await;
+
+        let (adapter, dir) = test_adapter("uncert-proposal").await;
+        let adapter = Arc::new(adapter);
+        let tail: Vec<&Block> = blocks.iter().filter(|b| b.height > B).collect();
+        let report = adapter.retro_publish_blocks(tail, blocks.len()).await;
+        assert_eq!(report.failed, 0);
+
+        let lagging_engine = Arc::new(InMemoryStateEngine::new());
+        seed_engine_pq_keys(&lagging_engine, &ks, &fks).await;
+        let mut lagging = ValidatorRuntime::new(ks[0].clone(), vs, lagging_engine, 1);
+        for b in blocks.iter().take(B as usize) {
+            let bh = b.compute_hash();
+            lagging.apply_and_advance(bh, b).await;
+        }
+
+        // Inject an uncertified copy of block B+1 (`precommit_qc: None`, matching an
+        // in-flight proposal that was never finalized) into `lagging.blocks`:
+        // `walk_chain_once` must skip it and fetch the QC-certified block from DHT.
+        let mut uncert = blocks[B as usize].clone();
+        let decided_hash = uncert.compute_hash();
+        uncert.precommit_qc = None;
+        assert_eq!(uncert.compute_hash(), decided_hash);
+        lagging.blocks.insert(decided_hash, uncert);
+
+        let head_hash = blocks.last().expect("non-empty chain").compute_hash();
+        let rpc = test_rpc_state();
+        let got = walk_chain_once(
+            &adapter,
+            &mut lagging,
+            MASTERCHAIN_SHARD,
+            N,
+            head_hash,
+            None,
+            &rpc,
+            64,
+        )
+        .await;
+        assert_eq!(got, Some(N));
+        assert_eq!(lagging.state.get_state_root().await, tip_root);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

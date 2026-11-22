@@ -110,10 +110,9 @@ async fn proof_verify(
     // Только манифесты, у которых чанки имеют хэш (целостность проверяема).
     // все 4 префикса: repair принимает mail:/files: наряду с m:/f: (старые ключи,
     // DHT-слепки) — иначе часть манифестов выпадала из подсчёта
-    let mut keys: Vec<String> = node.kv_manifest_keys("m:").await;
-    keys.extend(node.kv_manifest_keys("mail:").await);
-    keys.extend(node.kv_manifest_keys("f:").await);
-    keys.extend(node.kv_manifest_keys("files:").await);
+    let keys: Vec<String> = node
+        .kv_manifest_keys_with_prefixes(&["m:", "mail:", "f:", "files:"])
+        .await;
     if keys.is_empty() {
         return res;
     }

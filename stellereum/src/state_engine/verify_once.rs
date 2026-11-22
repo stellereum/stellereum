@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -68,6 +68,8 @@ struct VerifyOnceState {
     // attested on two chains keep two records, so a foreign-chain replay can
     // never evict (or hit) the home-chain attestation.
     map: HashMap<([u8; 32], [u8; 32], u64), VerifiedSigRecord>,
+    /// FIFO insertion order for bounded partial eviction (evicts oldest 1/4).
+    order: VecDeque<([u8; 32], [u8; 32], u64)>,
 }
 
 fn verify_once_state() -> &'static Mutex<VerifyOnceState> {
@@ -75,6 +77,7 @@ fn verify_once_state() -> &'static Mutex<VerifyOnceState> {
     STATE.get_or_init(|| {
         Mutex::new(VerifyOnceState {
             map: HashMap::new(),
+            order: VecDeque::new(),
         })
     })
 }
@@ -96,6 +99,9 @@ thread_local! {
     /// transaction, so this reuses the allocation. `TxHashBatch::hash_one`
     /// feeds the IDENTICAL update sequence, so hashes are byte-identical.
     static TX_HASHER: RefCell<Option<crate::sharding::TxHashBatch>> = const { RefCell::new(None) };
+    /// Per-thread signing-message hasher + bincode scratch buffer so
+    /// `signing_message_digest` avoids per-tx `Vec<u8>` heap allocations.
+    static MSG_HASHER: RefCell<(Sha256, Vec<u8>)> = RefCell::new((Sha256::new(), Vec::new()));
 }
 
 /// `Transaction::compute_tx_hash` without the per-call allocation.
@@ -104,6 +110,67 @@ fn tx_hash(tx: &crate::sharding::Transaction) -> [u8; 32] {
         let mut slot = cell.borrow_mut();
         let batch = slot.get_or_insert_with(crate::sharding::Transaction::batch_hasher);
         batch.hash_one(tx)
+    })
+}
+
+/// `sha256_bytes(&tx.signing_message())` computed via streaming `Sha256` and
+/// a reusable thread-local bincode scratch buffer (zero per-tx `Vec<u8>`
+/// heap allocation). Byte-identical to `sha256_bytes(&tx.signing_message())`.
+fn signing_message_digest(tx: &crate::sharding::Transaction) -> [u8; 32] {
+    MSG_HASHER.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let (hasher, scratch) = &mut *guard;
+        hasher.update(tx.from);
+        hasher.update(tx.to);
+        hasher.update(tx.amount.to_be_bytes());
+        hasher.update(tx.gas_limit.to_be_bytes());
+        hasher.update(tx.nonce.to_be_bytes());
+        hasher.update(tx.source_shard.to_be_bytes());
+        hasher.update(tx.target_shard.to_be_bytes());
+        hasher.update(b"PAYLOAD");
+        scratch.clear();
+        match bincode::serialize_into(&mut *scratch, &tx.payload) {
+            Ok(()) => {
+                hasher.update((scratch.len() as u32).to_be_bytes());
+                hasher.update(&scratch[..]);
+            }
+            Err(_) => hasher.update(u32::MAX.to_be_bytes()),
+        }
+        if tx.priority_fee_per_gas != 0 {
+            hasher.update(crate::sharding::PRIORITY_FEE_COMMITMENT_TAG);
+            hasher.update(tx.priority_fee_per_gas.to_be_bytes());
+        }
+        if !tx.is_evm() {
+            let sponsor_auth = tx.sponsor_auth();
+            if let Some(d) = tx.delegation() {
+                hasher.update(b"SESSION");
+                scratch.clear();
+                match bincode::serialize_into(&mut *scratch, &d) {
+                    Ok(()) => {
+                        hasher.update((scratch.len() as u32).to_be_bytes());
+                        hasher.update(&scratch[..]);
+                    }
+                    Err(_) => hasher.update(u32::MAX.to_be_bytes()),
+                }
+            } else if sponsor_auth.is_none() {
+                if let Some(cid) = tx.chain_id() {
+                    hasher.update(crate::sharding::CHAIN_ID_COMMITMENT_TAG);
+                    hasher.update(cid.to_be_bytes());
+                }
+            }
+            if let Some(ref auth) = sponsor_auth {
+                hasher.update(crate::sharding::SPONSOR_COMMITMENT_TAG);
+                scratch.clear();
+                match bincode::serialize_into(&mut *scratch, auth) {
+                    Ok(()) => {
+                        hasher.update((scratch.len() as u32).to_be_bytes());
+                        hasher.update(&scratch[..]);
+                    }
+                    Err(_) => hasher.update(u32::MAX.to_be_bytes()),
+                }
+            }
+        }
+        hasher.finalize_reset().into()
     })
 }
 
@@ -137,7 +204,7 @@ fn signature_digest(tx: &crate::sharding::Transaction) -> [u8; 32] {
 pub fn record_verified_signature(tx: &crate::sharding::Transaction, verified_for_chain: u64) {
     let tx_hash = tx_hash(tx);
     let sig_hash = signature_digest(tx);
-    let msg_hash = sha256_bytes(&tx.signing_message());
+    let msg_hash = signing_message_digest(tx);
     let rec = VerifiedSigRecord {
         from: tx.from,
         tx_hash,
@@ -147,15 +214,38 @@ pub fn record_verified_signature(tx: &crate::sharding::Transaction, verified_for
         verified_for_chain,
         pure_pq_enforced: crate::post_quantum::is_pure_pq_enforced(),
     };
+    let key = (tx_hash, sig_hash, verified_for_chain);
     let mut guard = verify_once_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.map.len() >= VERIFY_ONCE_CACHE_CAP {
-        guard.map.clear();
+    let is_new = !guard.map.contains_key(&key);
+    if is_new && guard.map.len() >= VERIFY_ONCE_CACHE_CAP {
+        let evict_target = (VERIFY_ONCE_CACHE_CAP / 4).max(1);
+        let mut evicted = 0usize;
+        while evicted < evict_target {
+            let Some(old_key) = guard.order.pop_front() else {
+                break;
+            };
+            if guard.map.remove(&old_key).is_some() {
+                evicted += 1;
+            }
+        }
+        if guard.map.len() >= VERIFY_ONCE_CACHE_CAP {
+            let extra: Vec<_> = guard
+                .map
+                .keys()
+                .take(evict_target.saturating_sub(evicted).max(1))
+                .copied()
+                .collect();
+            for k in extra {
+                guard.map.remove(&k);
+            }
+        }
     }
-    guard
-        .map
-        .insert((tx_hash, sig_hash, verified_for_chain), rec);
+    if is_new {
+        guard.order.push_back(key);
+    }
+    guard.map.insert(key, rec);
     VERIFY_ONCE_RECORDED.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -180,7 +270,7 @@ pub fn verified_signature_covers(tx: &crate::sharding::Transaction, expected_cha
     // values are unchanged.
     let tx_hash = tx_hash(tx);
     let sig_hash = signature_digest(tx);
-    let msg_hash = sha256_bytes(&tx.signing_message());
+    let msg_hash = signing_message_digest(tx);
     let bound_chain = tx.chain_id();
     let pure_pq_enforced = crate::post_quantum::is_pure_pq_enforced();
     let guard = verify_once_state()
@@ -365,11 +455,11 @@ pub fn verify_once_reset_stats() {
 
 /// Clear all verify-once attestations (tests/probes only; forces re-verify).
 pub fn verify_once_clear() {
-    verify_once_state()
+    let mut guard = verify_once_state()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .map
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.map.clear();
+    guard.order.clear();
 }
 
 #[cfg(test)]
@@ -453,6 +543,102 @@ mod tests {
                 "the same bytes under another chain context must miss"
             );
         }
+        verify_once_clear();
+    }
+
+    #[test]
+    fn streaming_signing_message_digest_matches_allocating_version() {
+        use crate::post_quantum::{PqScheme, PqSignatureEnvelope};
+
+        // 1. Plain PQ1 with priority bid + payload.
+        let mut t1 = bare_tx(
+            PqSignatureEnvelope::new_explicit(
+                PqScheme::Falcon512,
+                vec![0x11u8; crate::post_quantum::FALCON512_PUBKEY_LEN],
+                vec![0x22u8; crate::post_quantum::FALCON512_SIG_LEN],
+            )
+            .encode(),
+            42,
+        );
+        t1.priority_fee_per_gas = 55;
+        t1.payload = vec![crate::svm::OpCode::Nop];
+        assert_eq!(
+            signing_message_digest(&t1),
+            sha256_bytes(&t1.signing_message())
+        );
+
+        // 2. Unbound PQ1 implicit.
+        let t2 = bare_tx(
+            PqSignatureEnvelope::new_implicit(
+                PqScheme::Falcon512,
+                vec![0x44u8; crate::post_quantum::FALCON512_SIG_LEN],
+            )
+            .encode(),
+            99,
+        );
+        assert_eq!(
+            signing_message_digest(&t2),
+            sha256_bytes(&t2.signing_message())
+        );
+
+        // 3. EVM envelope.
+        let t3 = Transaction::new_evm(
+            [0x11; 32],
+            [0x22; 32],
+            10,
+            280_000,
+            0,
+            1,
+            1,
+            vec![0x01, 0x02],
+        );
+        assert_eq!(
+            signing_message_digest(&t3),
+            sha256_bytes(&t3.signing_message())
+        );
+    }
+
+    #[test]
+    fn verify_once_partial_eviction_keeps_recent_entries() {
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        verify_once_clear();
+
+        let kp_sig = {
+            let mut s = b"PQ1".to_vec();
+            s.extend_from_slice(&[0x42u8; 700]);
+            s
+        };
+        let mut first_tx = bare_tx(kp_sig.clone(), 0);
+        first_tx.nonce = 0;
+        record_verified_signature(&first_tx, 5);
+
+        // Fill up to cap + 1 to trigger bounded partial (1/4) eviction.
+        for nonce in 1..=(VERIFY_ONCE_CACHE_CAP as u64) {
+            let mut t = bare_tx(kp_sig.clone(), nonce);
+            t.nonce = nonce;
+            record_verified_signature(&t, 5);
+        }
+
+        let len_after = verify_once_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len();
+        assert_eq!(
+            len_after,
+            VERIFY_ONCE_CACHE_CAP - (VERIFY_ONCE_CACHE_CAP / 4) + 1
+        );
+        assert!(
+            !verified_signature_covers(&first_tx, 5),
+            "oldest entry must be evicted"
+        );
+        let mut newest = bare_tx(kp_sig, VERIFY_ONCE_CACHE_CAP as u64);
+        newest.nonce = VERIFY_ONCE_CACHE_CAP as u64;
+        assert!(
+            verified_signature_covers(&newest, 5),
+            "newest entry must survive partial eviction"
+        );
+
         verify_once_clear();
     }
 }

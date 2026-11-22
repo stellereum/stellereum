@@ -223,16 +223,28 @@ async fn dispatch_writes_inner(
                 Ok(e) => e,
                 Err(e) => return err(id, -32602, format!("refusing the sealed transaction: {e}")),
             };
-            let mut pool = st.mempool.write().await;
-            match pool.add_sealed(envelope) {
-                Ok(hash) => {
+            let res = {
+                let mut pool = st.mempool.write().await;
+                let need_env = crate::consensus_net::global_tx_gossip().is_some();
+                pool.add_sealed(envelope).map(|hash| {
+                    let env = if need_env {
+                        pool.sealed_envelope(&hash).cloned()
+                    } else {
+                        None
+                    };
+                    (hash, env)
+                })
+            };
+            match res {
+                Ok((hash, env_opt)) => {
                     let hash_hex = hex::encode(hash);
                     // Gossip the sealed frame to the peers (the ciphertext
-                    // only).
-                    if let Some(gossip) = crate::consensus_net::global_tx_gossip().as_ref() {
-                        if let Some(env) = pool.sealed_envelope(&hash).cloned() {
-                            gossip.broadcast_sealed(&env).await;
-                        }
+                    // only), after releasing the mempool write lock.
+                    if let (Some(gossip), Some(env)) = (
+                        crate::consensus_net::global_tx_gossip().as_ref(),
+                        env_opt.as_ref(),
+                    ) {
+                        gossip.broadcast_sealed(env).await;
                     }
                     ok(id, json!({ "tx_hash": hash_hex, "sealed": true }))
                 }
@@ -331,15 +343,7 @@ async fn dispatch_writes_inner(
                 .await
                 .map(|acc| acc.nonce)
                 .unwrap_or(0);
-            let pending: Vec<u64> = st
-                .mempool
-                .read()
-                .await
-                .all()
-                .iter()
-                .filter(|t| t.from == faucet_addr)
-                .map(|t| t.nonce)
-                .collect();
+            let pending: Vec<u64> = st.mempool.read().await.nonces_for_sender(&faucet_addr);
             let chain_id = faucet
                 .chain_id()
                 .unwrap_or_else(crate::consensus::consensus_chain_id);

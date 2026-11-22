@@ -312,8 +312,19 @@ pub fn running_version() -> String {
 /// `sha256` names. `None` where the kernel does not expose the image (then the
 /// version string is the only identity, which is the stricter direction).
 pub fn running_exe_sha256() -> Option<[u8; 32]> {
-    let bytes = std::fs::read("/proc/self/exe").ok()?;
-    let digest = Sha256::digest(&bytes);
+    use std::io::Read;
+    let mut file = std::fs::File::open("/proc/self/exe").ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    let digest = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Some(out)

@@ -644,6 +644,16 @@ pub(crate) async fn refresh_validator_set_from_fresh_snapshot(
     false
 }
 
+/// Optional background lanes + shared consensus network passed by the live
+/// consensus driver so `walk_chain_once` offloads RPC indexing and tip DHT
+/// publishes off the consensus tick without breaking standalone/test callers.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SyncLanes<'a> {
+    pub record_lane: Option<&'a TickLane>,
+    pub publish_lane: Option<&'a TickLane>,
+    pub consensus_net: Option<&'a Arc<ConsensusNetwork>>,
+}
+
 /// Bring this node up to a peer's published head.
 ///
 /// Returns `Some(height)` when the node actually caught up.
@@ -666,6 +676,17 @@ pub(crate) async fn try_catch_up(
     shard: u32,
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
+) -> Option<u64> {
+    try_catch_up_with_lanes(adapter, rt, shard, persist, rpc, SyncLanes::default()).await
+}
+
+pub(crate) async fn try_catch_up_with_lanes(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    lanes: SyncLanes<'_>,
 ) -> Option<u64> {
     // Read the replicated head pointer, not the local one: `get_latest_shard_height`
     // reads this node's own KV, so it can only ever report our own height and the
@@ -811,7 +832,18 @@ pub(crate) async fn try_catch_up(
         }
     }
 
-    if let Some(h) = walk_chain(adapter, rt, shard, peer_height, peer_hash, persist, rpc).await {
+    if let Some(h) = walk_chain_with_lanes(
+        adapter,
+        rt,
+        shard,
+        peer_height,
+        peer_hash,
+        persist,
+        rpc,
+        lanes,
+    )
+    .await
+    {
         return Some(h);
     }
     // If snapshot-sync advanced our height to a verified boundary, return it
@@ -825,8 +857,17 @@ pub(crate) async fn try_catch_up(
         let our_now = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
         if peer_height > our_now && peer_height - our_now > 100 {
             if let Some(b) = try_snapshot_sync(adapter, rt, shard, peer_height).await {
-                if let Some(h) =
-                    walk_chain(adapter, rt, shard, peer_height, peer_hash, persist, rpc).await
+                if let Some(h) = walk_chain_with_lanes(
+                    adapter,
+                    rt,
+                    shard,
+                    peer_height,
+                    peer_hash,
+                    persist,
+                    rpc,
+                    lanes,
+                )
+                .await
                 {
                     return Some(h);
                 }
@@ -847,6 +888,7 @@ pub(crate) async fn try_catch_up(
 /// (hash linkage, per-height QC/proposer, parent-root continuity), so the
 /// recovery path never accepts an unverified chain; only the AMOUNT fetched
 /// per pass changes, and that is node-local sync policy.
+#[cfg(test)]
 pub(crate) async fn walk_chain(
     adapter: &Arc<P2pNetworkAdapter>,
     rt: &mut ValidatorRuntime,
@@ -856,7 +898,31 @@ pub(crate) async fn walk_chain(
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
 ) -> Option<u64> {
-    walk_chain_multi_hop(
+    walk_chain_with_lanes(
+        adapter,
+        rt,
+        shard,
+        peer_height,
+        peer_hash,
+        persist,
+        rpc,
+        SyncLanes::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // GATE: mirrors `walk_chain` with optional background lanes.
+pub(crate) async fn walk_chain_with_lanes(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: stellereum::consensus::Height,
+    peer_hash: stellereum::consensus::BlockHash,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    lanes: SyncLanes<'_>,
+) -> Option<u64> {
+    walk_chain_multi_hop_with_lanes(
         adapter,
         rt,
         shard,
@@ -865,6 +931,7 @@ pub(crate) async fn walk_chain(
         persist,
         rpc,
         crate::node::policy::max_walk_gap(),
+        lanes,
     )
     .await
 }
@@ -900,6 +967,7 @@ const RECOVERY_MAX_HOPS: u32 = 64;
 /// Determinism: hop sizing is a local sync policy, never consensus input. Two
 /// nodes may take different numbers of hops and still apply the identical
 /// blocks in the identical order, ending on the identical state root.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // GATE: mirrors `walk_chain`'s production signature; grouping into a struct would churn every caller.
 pub(crate) async fn walk_chain_multi_hop(
     adapter: &Arc<P2pNetworkAdapter>,
@@ -911,12 +979,38 @@ pub(crate) async fn walk_chain_multi_hop(
     rpc: &Arc<stellereum::rpc::RpcState>,
     hop_cap: u64,
 ) -> Option<u64> {
+    walk_chain_multi_hop_with_lanes(
+        adapter,
+        rt,
+        shard,
+        peer_height,
+        peer_hash,
+        persist,
+        rpc,
+        hop_cap,
+        SyncLanes::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // GATE: same verified multi-hop walk with optional off-tick lanes.
+pub(crate) async fn walk_chain_multi_hop_with_lanes(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: stellereum::consensus::Height,
+    peer_hash: stellereum::consensus::BlockHash,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    hop_cap: u64,
+    lanes: SyncLanes<'_>,
+) -> Option<u64> {
     // A zero cap would make every hop target our own tip; treat it as one
     // block rather than looping forever.
     let hop_cap = hop_cap.max(1);
     let start_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
     if peer_height.saturating_sub(start_height) <= hop_cap {
-        return walk_chain_once(
+        return walk_chain_once_with_lanes(
             adapter,
             rt,
             shard,
@@ -925,6 +1019,7 @@ pub(crate) async fn walk_chain_multi_hop(
             persist,
             rpc,
             hop_cap,
+            lanes,
         )
         .await;
     }
@@ -960,7 +1055,7 @@ pub(crate) async fn walk_chain_multi_hop(
         };
 
         let before = our_height;
-        if walk_chain_once(
+        if walk_chain_once_with_lanes(
             adapter,
             rt,
             shard,
@@ -969,6 +1064,7 @@ pub(crate) async fn walk_chain_multi_hop(
             persist,
             rpc,
             hop_cap,
+            lanes,
         )
         .await
         .is_none()
@@ -1027,9 +1123,25 @@ async fn fetch_hop_head(
     }
 }
 
+/// Fast single-attempt hash lookup for concurrent multi-block prefetch.
+async fn fetch_hop_head_fast(
+    adapter: &Arc<P2pNetworkAdapter>,
+    shard: u32,
+    height: u64,
+) -> Option<stellereum::consensus::BlockHash> {
+    if let Some(hash) = adapter.fetch_head_hash_probe(shard, height).await {
+        return Some(hash);
+    }
+    match adapter.fetch_block_qc_probe(shard, height).await {
+        Some(qc) if qc.height == height => qc.block_hash,
+        _ => None,
+    }
+}
+
 /// One verified walk window: fetch at most `walk_cap` bodies back to our
 /// finalized tip, validate every height, apply the full transition, and
 /// re-anchor consensus on the walked tail.
+#[cfg_attr(not(test), allow(dead_code))] // GATE: test-compatible wrapper delegating to `walk_chain_once_with_lanes`.
 #[allow(clippy::too_many_arguments)] // GATE: same verified walk, split only to bound one hop's fetch/apply window.
 async fn walk_chain_once(
     adapter: &Arc<P2pNetworkAdapter>,
@@ -1041,6 +1153,33 @@ async fn walk_chain_once(
     rpc: &Arc<stellereum::rpc::RpcState>,
     walk_cap: u64,
 ) -> Option<u64> {
+    walk_chain_once_with_lanes(
+        adapter,
+        rt,
+        shard,
+        peer_height,
+        peer_hash,
+        persist,
+        rpc,
+        walk_cap,
+        SyncLanes::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // GATE: same verified walk with optional off-tick record/publish lanes.
+async fn walk_chain_once_with_lanes(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: stellereum::consensus::Height,
+    peer_hash: stellereum::consensus::BlockHash,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    walk_cap: u64,
+    lanes: SyncLanes<'_>,
+) -> Option<u64> {
+    use futures::stream::{self, StreamExt};
     // F3(c): anchor the walk on OUR finalized head and demand the NEXT height,
     // never the walked chain's own first height (passing `blocks[0].height` made
     // the height check a tautology). At genesis the chain roots at the zero
@@ -1061,7 +1200,142 @@ async fn walk_chain_once(
         );
         return None;
     }
+
+    let store = persist.map(|ap| ap.storage());
+    // Seed local cache from `rt.blocks` (in-memory) before touching disk or DHT.
+    let mut prefetched: std::collections::HashMap<[u8; 32], stellereum::sharding::Block> = rt
+        .blocks
+        .iter()
+        .filter(|(_, b)| b.height >= expected_first_height && b.height <= peer_height)
+        .map(|(h, b)| (*h, b.clone()))
+        .collect();
+
+    // Fetch & verify the tail block (`peer_hash`) first so an unreachable or
+    // forged tip fails in one fetch instead of triggering concurrent fan-out.
+    if peer_hash != our_last {
+        let tip_blk = if let Some(b) = prefetched.get(&peer_hash).cloned() {
+            Some(b)
+        } else if let Some(st) = store.clone() {
+            let h = peer_hash;
+            match tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten())
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(b) => Some(b),
+                None => adapter.fetch_block(&peer_hash).await,
+            }
+        } else {
+            adapter.fetch_block(&peer_hash).await
+        };
+        let Some(raw_tip) = tip_blk else {
+            eprintln!(
+                "[sync] block sync: missing block {}",
+                hex::encode(peer_hash)
+            );
+            return None;
+        };
+        let verified_tip = match stellereum::sync::verify_fetched_block(peer_hash, raw_tip) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[sync] {e}");
+                return None;
+            }
+        };
+        let mut cur_hash = verified_tip.prev_hash;
+        let mut cur_height = verified_tip.height.saturating_sub(1);
+        prefetched.insert(peer_hash, verified_tip);
+
+        // Walk backward locally through `rt.blocks` + `Storage` before querying DHT.
+        let mut local_steps = 1u64;
+        while cur_hash != our_last && cur_height >= expected_first_height && local_steps < walk_cap
+        {
+            let maybe_local = if let Some(b) = prefetched.get(&cur_hash).cloned() {
+                Some(b)
+            } else if let Some(st) = store.clone() {
+                let h = cur_hash;
+                tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let Some(local_blk) = maybe_local else {
+                break;
+            };
+            let Ok(verified) = stellereum::sync::verify_fetched_block(cur_hash, local_blk) else {
+                break;
+            };
+            let block_hash = cur_hash;
+            cur_hash = verified.prev_hash;
+            cur_height = verified.height.saturating_sub(1);
+            prefetched.insert(block_hash, verified);
+            local_steps += 1;
+        }
+
+        // Bounded-concurrent catch-up when >= 2 blocks remain missing.
+        if cur_hash != our_last && cur_height > expected_first_height {
+            let resolved_hashes: Vec<(u64, Option<stellereum::consensus::BlockHash>)> =
+                stream::iter(expected_first_height..cur_height)
+                    .map(|h| {
+                        let a = adapter.clone();
+                        async move { (h, fetch_hop_head_fast(&a, shard, h).await) }
+                    })
+                    .buffer_unordered(stellereum::sync::FETCH_MAX_CONCURRENCY)
+                    .collect()
+                    .await;
+
+            let mut seen_fetch: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
+            let mut hashes_to_fetch: Vec<[u8; 32]> = Vec::new();
+            if !prefetched.contains_key(&cur_hash) && seen_fetch.insert(cur_hash) {
+                hashes_to_fetch.push(cur_hash);
+            }
+            for (_, maybe_h) in resolved_hashes {
+                if let Some(h) = maybe_h {
+                    if h != our_last && !prefetched.contains_key(&h) && seen_fetch.insert(h) {
+                        hashes_to_fetch.push(h);
+                    }
+                }
+            }
+
+            if !hashes_to_fetch.is_empty() {
+                let fetched_bodies: Vec<([u8; 32], Option<stellereum::sharding::Block>)> =
+                    stream::iter(hashes_to_fetch)
+                        .map(|h| {
+                            let a = adapter.clone();
+                            let st = store.clone();
+                            async move {
+                                if let Some(st) = st {
+                                    if let Ok(Some(b)) = tokio::task::spawn_blocking(move || {
+                                        st.get_block(&h).ok().flatten()
+                                    })
+                                    .await
+                                    {
+                                        return (h, Some(b));
+                                    }
+                                }
+                                (h, a.fetch_block(&h).await)
+                            }
+                        })
+                        .buffer_unordered(stellereum::sync::FETCH_MAX_CONCURRENCY)
+                        .collect()
+                        .await;
+                for (h, maybe_blk) in fetched_bodies {
+                    if let Some(blk) = maybe_blk {
+                        if let Ok(verified) = stellereum::sync::verify_fetched_block(h, blk) {
+                            prefetched.insert(h, verified);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let prefetched = Arc::new(prefetched);
     let fetch_adapter = adapter.clone();
+    let fetch_store = store.clone();
     let mut blocks = match stellereum::sync::collect_missing_blocks(
         peer_hash,
         our_last,
@@ -1070,8 +1344,22 @@ async fn walk_chain_once(
         // lossless on every supported target.
         walk_cap as usize,
         move |h| {
+            let p = Arc::clone(&prefetched);
+            let st = fetch_store.clone();
             let a = fetch_adapter.clone();
-            async move { a.fetch_block(&h).await }
+            async move {
+                if let Some(b) = p.get(&h) {
+                    return Some(b.clone());
+                }
+                if let Some(st) = st {
+                    if let Ok(Some(b)) =
+                        tokio::task::spawn_blocking(move || st.get_block(&h).ok().flatten()).await
+                    {
+                        return Some(b);
+                    }
+                }
+                a.fetch_block(&h).await
+            }
         },
     )
     .await
@@ -1310,13 +1598,41 @@ async fn walk_chain_once(
         // application's outcome so the serve path covers walked heights
         // too. Verified data only: every block here passed validate_sync_chain
         // (QC per height) plus the parent-root/divergence checks in this loop.
-        // Records stay inline (the walk already runs off the per-tick drain,
-        // time-boxed by the catch-up budget), but the body is NOT sled-put
-        // synchronously here: the `enqueue_block` call below persists the same
-        // verified bytes asynchronously (finalize-path parity), and the sync
-        // `committed_body` + `put_verified_block` round trip only held the
-        // walk's budget on disk I/O.
-        {
+        // When `record_lane` is provided (live consensus loop), RPC indexing
+        // rides the off-tick FIFO lane just like adopt/finalize; standalone
+        // callers without lanes await inline.
+        if let Some(lane) = lanes.record_lane {
+            let hdr = b.clone();
+            let r = rpc.clone();
+            let statuses = rt.applied_statuses.clone();
+            let fees = rt.applied_fees.clone();
+            let events = rt.applied_events.clone();
+            lane.submit(async move {
+                // LIGHT CLIENT (audit W8.3): publish the finalized header with its
+                // quorum certificate, so an external verifier can check a served
+                // proof against a root a QUORUM committed to.
+                r.record_finalized_header(&hdr).await;
+                if statuses.len() == hdr.transactions.len() {
+                    r.record_adopted_block_with_events(
+                        hdr.height,
+                        bh,
+                        &hdr.transactions,
+                        &statuses,
+                        &fees,
+                        &events,
+                        hdr.timestamp,
+                    )
+                    .await;
+                } else {
+                    eprintln!(
+                        "[repl] walk #{}: statuses {}/{} txs, receipts skipped",
+                        hdr.height,
+                        statuses.len(),
+                        hdr.transactions.len()
+                    );
+                }
+            });
+        } else {
             // LIGHT CLIENT (audit W8.3): publish the finalized header with its
             // quorum certificate, so an external verifier can check a served
             // proof against a root a QUORUM committed to.
@@ -1421,18 +1737,27 @@ async fn walk_chain_once(
     // hash and height were pinned before the loop from the validated tail.
     if let Some(last) = rt.blocks.get(&tail_hash).cloned() {
         if let Some(qc) = last.precommit_qc.clone() {
-            let net = ConsensusNetwork::new(adapter.clone());
-            // PUSH (fast path): the caught-up tip goes straight to every
-            // directly connected peer, so a peer that is behind US learns the
-            // outcome now instead of on its next DHT poll. The DHT publishes
-            // below are unchanged.
-            push_committed(&net, tail_height, last.clone(), qc).await;
-            // Publish the tip body immediately (same reason as the finalize
-            // path above): without this, a peer one block behind waits the
-            // whole retro window for it.
-            let _ = adapter.retro_publish_blocks([&last], 1).await;
-            // And its header, so a cold node can anchor a snapshot walk on it.
-            adapter.persist_block_header(shard, &last).await;
+            let net = lanes.consensus_net.cloned().unwrap_or_else(|| {
+                Arc::new(ConsensusNetwork::new_for_shard(
+                    adapter.clone(),
+                    rt.shard_id,
+                    &rt.shard_registry,
+                ))
+            });
+            if let Some(lane) = lanes.publish_lane {
+                // PUSH (fast path): detached push onto direct peers, and tip
+                // DHT publishes offloaded onto `publish_lane` off the tick.
+                spawn_committed_push(&net, tail_height, last.clone(), qc);
+                let a = adapter.clone();
+                lane.submit(async move {
+                    let _ = a.retro_publish_blocks([&last], 1).await;
+                    a.persist_block_header(shard, &last).await;
+                });
+            } else {
+                push_committed(&net, tail_height, last.clone(), qc).await;
+                let _ = adapter.retro_publish_blocks([&last], 1).await;
+                adapter.persist_block_header(shard, &last).await;
+            }
         }
     }
     Some(next_height.saturating_sub(1))

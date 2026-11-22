@@ -1,4 +1,4 @@
-use super::types::{write_contract_trie_entries, PayloadDomainSnapshot};
+use super::types::{write_contract_trie_entries_for_addrs, PayloadDomainSnapshot};
 use super::verify_once::verify_block_tx_signatures_at_height;
 use super::{AccountState, ExecPostActions, InMemoryStateEngine, PQ_ACTIVATION_SURCHARGE_GAS};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -39,6 +39,10 @@ const PARALLEL_PLAN_CHUNK: usize = 128;
 /// Effective plan chunk for one wave: the configured chunk, capped so a
 /// wave always splits into at least four chunks (a wave smaller than the
 /// chunk must still spread over workers instead of collapsing to one task).
+///
+/// NOTE: deliberately NOT cached in a `OnceLock` because tests and benchmarks
+/// (`tests/parallel_apply_parity_tests.rs`, `benches/apply_speedup.rs`) sweep
+/// `STELL_PARALLEL_PLAN_CHUNK` dynamically at runtime within one process.
 fn parallel_plan_chunk() -> usize {
     std::env::var("STELL_PARALLEL_PLAN_CHUNK")
         .ok()
@@ -1055,6 +1059,23 @@ impl InMemoryStateEngine {
         let mut applied = 0usize;
         let mut failed = 0usize;
         let mut fees_collected = 0u64;
+        let mut pq_keys_pinned = false;
+        let pre_deploy_addrs: Option<HashSet<[u8; 32]>> = if txs.iter().any(|tx| {
+            tx.payload
+                .iter()
+                .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
+        }) {
+            Some(
+                self.contracts_read()
+                    .await
+                    .contracts
+                    .keys()
+                    .copied()
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let mut trie_dirty: Vec<([u8; 32], u64, u64)> = Vec::with_capacity(txs.len() * 2);
         let mut status: Vec<bool> = vec![false; txs.len()];
         // Nano-STELL actually charged per transaction, in block order: what
@@ -1345,7 +1366,7 @@ impl InMemoryStateEngine {
                         // limit — `commit_native_with_floor_at` caps it at the
                         // limit and refunds the rest.
                         match self
-                            .commit_native_with_floor_at(
+                            .commit_native_with_floor_at_opts(
                                 tx,
                                 gas_used,
                                 &transfers,
@@ -1356,19 +1377,15 @@ impl InMemoryStateEngine {
                                 vesting_floors.get(&tx.from).copied(),
                                 &vesting_floors,
                                 chain_height,
+                                false,
                             )
                             .await
                         {
                             Ok((mut touched, fee)) => {
                                 if tx.is_pq_activation() {
                                     if let Some(env) = tx.pq_envelope_at_height(chain_height) {
-                                        if !env.is_implicit {
-                                            if let Some(ref pk) = env.pubkey {
-                                                let salt = crate::post_quantum::DEFAULT_SALT;
-                                                let _ = self
-                                                    .pin_pubkey(tx.from, env.scheme, pk, &salt)
-                                                    .await;
-                                            }
+                                        if !env.is_implicit && env.pubkey.is_some() {
+                                            pq_keys_pinned = true;
                                         }
                                     }
                                 }
@@ -1605,7 +1622,7 @@ impl InMemoryStateEngine {
                 // sum of those fees to the proposer, so unused gas is
                 // refunded and `fee_charged` equals what left the sender.
                 match self
-                    .commit_native_with_floor_at(
+                    .commit_native_with_floor_at_opts(
                         tx,
                         gas_used,
                         &transfers,
@@ -1616,18 +1633,15 @@ impl InMemoryStateEngine {
                         vesting_floors.get(&tx.from).copied(),
                         &vesting_floors,
                         chain_height,
+                        false,
                     )
                     .await
                 {
                     Ok((mut touched, fee)) => {
                         if tx.is_pq_activation() {
                             if let Some(env) = tx.pq_envelope_at_height(chain_height) {
-                                if !env.is_implicit {
-                                    if let Some(ref pk) = env.pubkey {
-                                        let salt = crate::post_quantum::DEFAULT_SALT;
-                                        let _ =
-                                            self.pin_pubkey(tx.from, env.scheme, pk, &salt).await;
-                                    }
+                                if !env.is_implicit && env.pubkey.is_some() {
+                                    pq_keys_pinned = true;
                                 }
                             }
                         }
@@ -1712,17 +1726,9 @@ impl InMemoryStateEngine {
         };
         // Contract deploys commit code hashes here — AFTER every commit in
         // this block, never speculatively inside execution (B1: the trie has
-        // no undo). Cheap check per block: only runs when some tx deployed.
+        // no undo). Only contracts newly deployed in this block are written to
+        // `state_trie` without cloning `ContractRegistry`.
         // Lock order contracts-then-trie (see apply_transaction).
-        let deployed_contracts = if txs.iter().any(|tx| {
-            tx.payload
-                .iter()
-                .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
-        }) {
-            Some((*self.contracts_read().await).clone())
-        } else {
-            None
-        };
         let entries: Vec<([u8; 32], Vec<u8>)> = {
             let map = self.accounts.read().await;
             writes
@@ -1740,15 +1746,35 @@ impl InMemoryStateEngine {
                 })
                 .collect()
         };
+        let contracts_guard = if pre_deploy_addrs.is_some() {
+            Some(self.contracts_read().await)
+        } else {
+            None
+        };
         let mut trie = self.state_trie.write().await;
         for (addr, data) in entries {
             trie.insert(&addr, &data);
         }
-        if let Some(contracts) = deployed_contracts.as_ref() {
-            write_contract_trie_entries(&mut trie, contracts);
+        if let (Some(contracts), Some(pre_addrs)) =
+            (contracts_guard.as_deref(), pre_deploy_addrs.as_ref())
+        {
+            let changed: Vec<[u8; 32]> = contracts
+                .contracts
+                .keys()
+                .filter(|addr| !pre_addrs.contains(*addr))
+                .copied()
+                .collect();
+            write_contract_trie_entries_for_addrs(&mut trie, contracts, &changed);
         }
         debug_assert_eq!(applied + failed, txs.len(), "every tx must get a verdict");
         drop(trie);
+        drop(contracts_guard);
+
+        if pq_keys_pinned {
+            if let Err(e) = self.flush_pq_tree() {
+                tracing::error!("pq_keys block flush failed: {e}");
+            }
+        }
 
         // Fold the subsystems this block may have changed (staking via the
         // stake syscalls, order books, escrow, PMM, contract storage) into the

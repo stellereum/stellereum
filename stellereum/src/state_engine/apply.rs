@@ -1,8 +1,8 @@
 use super::types::{
     contract_key, decode_actor_body, encode_actor_body, hashpool_commitment_key,
     hashpool_nullifier_key, restore_oracle_after_failure, token_balance_key, token_supply_key,
-    write_contract_trie_entries, ActorSnapshot, BridgeSnapshot, ClobQuoteMode, DeliveryCtx,
-    MessageUndo, PayloadDomainSnapshot,
+    write_contract_trie_entries_for_addrs, ActorSnapshot, BridgeSnapshot, ClobQuoteMode,
+    DeliveryCtx, MessageUndo, PayloadDomainSnapshot,
 };
 use super::verify_once::require_pq_tx_envelope_at_height;
 use super::{
@@ -1689,12 +1689,12 @@ impl InMemoryStateEngine {
         // never speculatively inside execution (B1: the trie has no undo).
         // Read (never write-locked together with the trie below): lock order
         // is contracts-then-trie everywhere, or ABBA-deadlock with writers.
-        let deployed_contracts = if tx
+        let has_deploy = tx
             .payload
             .iter()
-            .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
-        {
-            Some((*self.contracts_read().await).clone())
+            .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }));
+        let pre_contracts = if has_deploy {
+            domain_snap.as_ref().and_then(|s| s.contracts.as_ref())
         } else {
             None
         };
@@ -1715,14 +1715,32 @@ impl InMemoryStateEngine {
                 })
                 .collect()
         };
+        let contracts_guard = if pre_contracts.is_some() {
+            Some(self.contracts_read().await)
+        } else {
+            None
+        };
         let mut trie = self.state_trie.write().await;
         for (addr, data) in entries {
             trie.insert(&addr, &data);
         }
-        if let Some(contracts) = deployed_contracts.as_ref() {
-            write_contract_trie_entries(&mut trie, contracts);
+        if let (Some(contracts), Some(pre)) = (contracts_guard.as_deref(), pre_contracts) {
+            let changed: Vec<[u8; 32]> = contracts
+                .contracts
+                .iter()
+                .filter(|(addr, c)| {
+                    pre.contracts.get(*addr).is_none_or(|prev| {
+                        prev.code_hash != c.code_hash
+                            || prev.abi != c.abi
+                            || prev.source_hash != c.source_hash
+                    })
+                })
+                .map(|(addr, _)| *addr)
+                .collect();
+            write_contract_trie_entries_for_addrs(&mut trie, contracts, &changed);
         }
         drop(trie);
+        drop(contracts_guard);
         // R7/C2: the carrier committed, so consume its intent nullifier (the
         // check ran before execution in `execute_payload_with_preverify`).
         if let Some(digest) = crate::evm_adapter::carrier_intent_digest(tx) {
@@ -2358,6 +2376,41 @@ impl InMemoryStateEngine {
         vesting_floors: &HashMap<[u8; 32], u64>,
         chain_height: u64,
     ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
+        self.commit_native_with_floor_at_opts(
+            tx,
+            gas_used,
+            transfers,
+            payouts,
+            burns,
+            floor_base,
+            surcharge,
+            sender_vesting_floor,
+            vesting_floors,
+            chain_height,
+            true,
+        )
+        .await
+    }
+
+    /// Block-path / configurable variant of [`Self::commit_native_with_floor_at`]
+    /// allowing the block apply loop to defer `pq_tree.flush()` (`fsync`) once
+    /// per block instead of flushing per PQ-activation transaction.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    // GATE: mirrors commit_native_with_floor_at with flush_pq flag for end-of-block batch flush.
+    pub(super) async fn commit_native_with_floor_at_opts(
+        &self,
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        transfers: &[([u8; 32], u64)],
+        payouts: &[([u8; 32], [u8; 32], u64)],
+        burns: &[([u8; 32], u64)],
+        floor_base: u64,
+        surcharge: u64,
+        sender_vesting_floor: Option<u64>,
+        vesting_floors: &HashMap<[u8; 32], u64>,
+        chain_height: u64,
+        flush_pq: bool,
+    ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
         let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         // The VM ran against the sender's balance without knowing about the fee
         // and about the plain `amount` transfer, so the combined debit has to be
@@ -2787,7 +2840,13 @@ impl InMemoryStateEngine {
                 if !env.is_implicit {
                     if let Some(ref pk) = env.pubkey {
                         let salt = env.salt;
-                        if let Err(e) = self.pin_pubkey(tx.from, env.scheme, pk, &salt).await {
+                        let pin_res = if flush_pq {
+                            self.pin_pubkey(tx.from, env.scheme, pk, &salt).await
+                        } else {
+                            self.pin_pubkey_no_flush(tx.from, env.scheme, pk, &salt)
+                                .await
+                        };
+                        if let Err(e) = pin_res {
                             // Fork-288000 atomicity: the mutations above
                             // already landed under the dropped lock, and the
                             // only remaining failure mode here is node-local
@@ -4544,10 +4603,9 @@ impl InMemoryStateEngine {
         // `Beacon(None)` (a VDF-era beacon we have not committed) elects
         // nobody and verifies nothing — fail closed, exactly like every other
         // beacon consumer.
-        if !cert.verify_with_schedule(val_set, schedule) {
+        let Some(signers) = cert.verify_and_signers_with_schedule(val_set, schedule) else {
             return 0;
-        }
-        let signers = cert.signers_set_with_schedule(val_set, schedule);
+        };
         let eligible: Vec<[u8; 32]> = val_set.validators.keys().copied().collect();
         // SLASH-02: settle BOTH backing pools from the ledger's own split.
         // `note_missed_heights` burns on the evidence scope (SLASH-01), so

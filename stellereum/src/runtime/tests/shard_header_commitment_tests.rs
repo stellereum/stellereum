@@ -130,7 +130,8 @@ fn workchain_block(height: u64, root: [u8; 32]) -> Block {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    }}
+    }
+}
 
 /// A masterchain block must commit to the latest finalized header of
 /// every workchain shard: the shard id, the height, the block hash, the

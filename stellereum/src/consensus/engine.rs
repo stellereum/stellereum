@@ -681,6 +681,23 @@ impl VoteSet {
         self.add_verified(vote, validators)
     }
 
+    /// Admit a vote whose signature was ALREADY verified, checking scope first.
+    /// Used by runtime late-precommit enrichment without re-verifying or
+    /// thrashing the global vote-cache validator-set snapshot across heights.
+    pub fn add_verified_in_scope(
+        &mut self,
+        vote: Vote,
+        validators: &ValidatorSet,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+    ) -> Result<(), String> {
+        if vote.height != height || vote.round != round || vote.kind != kind {
+            return Err("vote out of scope".to_string());
+        }
+        self.add_verified(vote, validators)
+    }
+
     /// Admit a vote whose signature was ALREADY verified (single or batch).
     /// Scope, membership, dedup and equivocation handling are exactly the
     /// second half of [`VoteSet::add`]; factored out so batch ingestion pays
@@ -885,6 +902,14 @@ impl VoteSet {
         self.votes
             .values()
             .filter(|v| v.falcon_signature().is_some())
+            .count()
+    }
+
+    /// Return the count of collected votes for `target` carrying Falcon signatures.
+    pub fn falcon_votes_count_for_target(&self, target: Option<BlockHash>) -> usize {
+        self.votes
+            .values()
+            .filter(|v| v.block_hash == target && v.falcon_signature().is_some())
             .count()
     }
 
@@ -1577,6 +1602,9 @@ impl HeightConsensus {
     /// WITHOUT setting it leaves the zero (genesis) parent in place, which
     /// elects a different committee than the rest of the network.
     pub fn set_parent_hash(&mut self, parent_hash: [u8; 32]) {
+        if !self.parent_hash_known || self.parent_hash != parent_hash {
+            self.prevote_qc.clear();
+        }
         self.parent_hash = parent_hash;
         self.parent_hash_known = true;
     }
@@ -1594,6 +1622,9 @@ impl HeightConsensus {
     /// height PRODUCES are drawn from exactly the schedule its own verifier
     /// (`QuorumCertificate::verify_with_schedule`) attributes them with.
     pub fn set_committee_schedule(&mut self, schedule: CommitteeSchedule) {
+        if self.committee_schedule != schedule {
+            self.prevote_qc.clear();
+        }
         self.committee_schedule = schedule;
     }
 
@@ -2121,14 +2152,20 @@ impl HeightConsensus {
                 continue;
             };
             if found.is_none() {
-                if let Some(qc) = produce_decision_certificate_with_schedule(
-                    set,
-                    target,
-                    &self.validators,
-                    self.sortition_parent(),
-                    self.committee_schedule,
-                ) {
-                    self.prevote_qc.insert(round, qc);
+                let already_cached = self
+                    .prevote_qc
+                    .get(&round)
+                    .is_some_and(|qc| qc.block_hash == target);
+                if !already_cached {
+                    if let Some(qc) = produce_decision_certificate_with_schedule(
+                        set,
+                        target,
+                        &self.validators,
+                        self.sortition_parent(),
+                        self.committee_schedule,
+                    ) {
+                        self.prevote_qc.insert(round, qc);
+                    }
                 }
                 found = Some((round, target));
             }
@@ -2211,14 +2248,20 @@ impl HeightConsensus {
             let Some(Some(target)) = set.quorum_target(&self.validators) else {
                 continue;
             };
-            if let Some(qc) = produce_decision_certificate_with_schedule(
-                set,
-                Some(target),
-                &self.validators,
-                self.sortition_parent(),
-                self.committee_schedule,
-            ) {
-                self.prevote_qc.insert(round, qc);
+            let already_cached = self
+                .prevote_qc
+                .get(&round)
+                .is_some_and(|qc| qc.block_hash == Some(target));
+            if !already_cached {
+                if let Some(qc) = produce_decision_certificate_with_schedule(
+                    set,
+                    Some(target),
+                    &self.validators,
+                    self.sortition_parent(),
+                    self.committee_schedule,
+                ) {
+                    self.prevote_qc.insert(round, qc);
+                }
             }
             return Some((round, target));
         }
@@ -2252,15 +2295,21 @@ impl HeightConsensus {
         if self.observed_polka.map(|(r, _)| r > round).unwrap_or(false) {
             return; // an older polka never supersedes a newer one
         }
-        let qc = produce_decision_certificate_with_schedule(
-            set,
-            Some(target),
-            &self.validators,
-            self.sortition_parent(),
-            self.committee_schedule,
-        );
-        if let Some(qc) = qc {
-            self.prevote_qc.insert(round, qc);
+        let already_cached = self
+            .prevote_qc
+            .get(&round)
+            .is_some_and(|qc| qc.block_hash == Some(target));
+        if !already_cached {
+            let qc = produce_decision_certificate_with_schedule(
+                set,
+                Some(target),
+                &self.validators,
+                self.sortition_parent(),
+                self.committee_schedule,
+            );
+            if let Some(qc) = qc {
+                self.prevote_qc.insert(round, qc);
+            }
         }
         self.observed_polka = Some((round, target));
     }
@@ -2279,11 +2328,31 @@ impl HeightConsensus {
     /// height late and never saw the quorum-completing prevote arrive).
     pub fn best_polka(&mut self) -> Option<(Round, BlockHash)> {
         let scanned = self.try_polka_at();
-        match (self.observed_polka, scanned) {
+        let best = match (self.observed_polka, scanned) {
             (Some((r1, b1)), Some((r2, b2))) => Some(if r1 >= r2 { (r1, b1) } else { (r2, b2) }),
             (a, None) => a,
             (None, b) => b,
+        };
+        if let Some((r, b)) = best {
+            let already_cached = self
+                .prevote_qc
+                .get(&r)
+                .is_some_and(|qc| qc.block_hash == Some(b));
+            if !already_cached {
+                if let Some(set) = self.prevotes.get(&r) {
+                    if let Some(qc) = produce_decision_certificate_with_schedule(
+                        set,
+                        Some(b),
+                        &self.validators,
+                        self.sortition_parent(),
+                        self.committee_schedule,
+                    ) {
+                        self.prevote_qc.insert(r, qc);
+                    }
+                }
+            }
         }
+        best
     }
 
     /// Target-only view of [`Self::try_prevote_quorum_at`] (kept for the many
@@ -2989,9 +3058,8 @@ impl HeightConsensus {
     /// Returns false when there is nothing left to do, so the caller can
     /// skip stamping/logging.
     pub fn apply_deadlock_local_reset(&mut self, _locked_body_present: bool) -> bool {
-        let needs_work = !self.rephase_applied
-            || self.proposal.is_some()
-            || self.proposal_round.is_some();
+        let needs_work =
+            !self.rephase_applied || self.proposal.is_some() || self.proposal_round.is_some();
         if !needs_work {
             return false;
         }

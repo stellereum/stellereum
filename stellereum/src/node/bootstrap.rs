@@ -200,6 +200,71 @@ pub(crate) fn resolve_startup_pq_signer(
     Ok(None)
 }
 
+fn spawn_bounded_tx_gossip(
+    gossip: Arc<stellereum::consensus_net::TxGossip>,
+) -> tokio::sync::mpsc::UnboundedSender<stellereum::sharding::Transaction> {
+    const TX_BCAST_BOUND: usize = 4096;
+    let (tx_bcast_tx, mut tx_bcast_rx) =
+        tokio::sync::mpsc::unbounded_channel::<stellereum::sharding::Transaction>();
+    let (bounded_tx, mut bounded_rx) =
+        tokio::sync::mpsc::channel::<stellereum::sharding::Transaction>(TX_BCAST_BOUND);
+    tokio::spawn(async move {
+        let mut dropped: u64 = 0;
+        while let Some(tx) = tx_bcast_rx.recv().await {
+            if bounded_tx.try_send(tx).is_err() {
+                dropped += 1;
+                if dropped == 1 || dropped.is_multiple_of(100) {
+                    tracing::warn!(
+                        "[gossip] tx_bcast bounded queue ({TX_BCAST_BOUND}) full; dropped {dropped} tx broadcast(s)"
+                    );
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(tx) = bounded_rx.recv().await {
+            gossip.broadcast(&tx).await;
+        }
+    });
+    tx_bcast_tx
+}
+
+type ShutdownMempoolTarget = (
+    Arc<tokio::sync::RwLock<stellereum::mempool::Mempool>>,
+    PathBuf,
+);
+type ShutdownPersistTarget = Arc<stellereum::storage::AsyncPersistence>;
+
+#[derive(Default)]
+pub(crate) struct ShutdownTargets {
+    mempools: std::sync::Mutex<Vec<ShutdownMempoolTarget>>,
+    persists: std::sync::Mutex<Vec<ShutdownPersistTarget>>,
+}
+
+impl ShutdownTargets {
+    fn register_persist(&self, ap: ShutdownPersistTarget) {
+        if let Ok(mut g) = self.persists.lock() {
+            g.push(ap);
+        }
+    }
+
+    fn register_mempool(
+        &self,
+        mp: Arc<tokio::sync::RwLock<stellereum::mempool::Mempool>>,
+        path: PathBuf,
+    ) {
+        if let Ok(mut g) = self.mempools.lock() {
+            g.push((mp, path));
+        }
+    }
+
+    fn snapshot(&self) -> (Vec<ShutdownMempoolTarget>, Vec<ShutdownPersistTarget>) {
+        let mempools = self.mempools.lock().map(|g| g.clone()).unwrap_or_default();
+        let persists = self.persists.lock().map(|g| g.clone()).unwrap_or_default();
+        (mempools, persists)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_workchain_shard(
     adapter: Arc<P2pNetworkAdapter>,
@@ -213,6 +278,7 @@ pub(crate) async fn start_workchain_shard(
     pq_signer: Option<Arc<dyn stellereum::remote_signer::PqSigner>>,
     header_registry: Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
     master_staking: stellereum::sharding::MasterStakingLedger,
+    shutdown_targets: Arc<ShutdownTargets>,
 ) -> anyhow::Result<()> {
     install_genesis_chain_spec_from_env();
     let state_engine = Arc::new(InMemoryStateEngine::new());
@@ -352,6 +418,7 @@ pub(crate) async fn start_workchain_shard(
         }
     }
     let persistence = Arc::new(stellereum::storage::AsyncPersistence::start(storage));
+    shutdown_targets.register_persist(persistence.clone());
     persistence.enqueue_block(genesis_block);
     // C1 anchor durability: hydrate anchors written before a restart. Runs
     // BEFORE `run_consensus_node` below, so the runtime never verifies against
@@ -368,18 +435,12 @@ pub(crate) async fn start_workchain_shard(
     let shared_staking = state_engine.staking_handle();
     let shared_gov = state_engine.governance_handle();
     let mev_engine = MevPreemptionEngine::new();
-    let (tx_bcast_tx, mut tx_bcast_rx) = tokio::sync::mpsc::unbounded_channel();
     let gossip_bcast =
         std::sync::Arc::new(stellereum::consensus_net::TxGossip::new(adapter.clone()));
     // The epoch-seal path publishes SEALED ciphertexts (and the DKG /
     // order-commitment / share-release frames) through the same channel.
     stellereum::consensus_net::set_global_tx_gossip(gossip_bcast.clone());
-    let gossip_bcast_task = gossip_bcast.clone();
-    tokio::spawn(async move {
-        while let Some(tx) = tx_bcast_rx.recv().await {
-            gossip_bcast_task.broadcast(&tx).await;
-        }
-    });
+    let tx_bcast_tx = spawn_bounded_tx_gossip(gossip_bcast);
     let base_fee = stellereum::mempool::Mempool::frozen_base_fee_floor();
     info!("[config] admission base_fee floor={base_fee} (FROZEN_MIN_GAS_FLOOR; same on all validators by construction)");
     let init_height = persistence
@@ -432,6 +493,10 @@ pub(crate) async fn start_workchain_shard(
         shard_registry: registry.clone(),
     });
     stellereum::rpc::hydrate_rpc_from_store(&rpc_state, &persistence.storage()).await;
+    shutdown_targets.register_mempool(
+        rpc_state.mempool.clone(),
+        mempool_path_for_shard(shard, registry.is_sharded()),
+    );
     info!(
         "[shard {shard}] workchain genesis {} (staking registry lives on the masterchain, dev-funded)",
         hex::encode(&genesis_root[..6])
@@ -847,6 +912,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     // NOTE: genesis accounts are funded AFTER the validator set is known
     // (see below), so every node credits exactly the same accounts.
 
+    let shutdown_targets = Arc::new(ShutdownTargets::default());
+    let shutdown_done = Arc::new(tokio::sync::Notify::new());
     if config.exists() {
         info!("Bootstrapping infnode P2P transport from {:?}", config);
         let node_cfg = node_config::load(&config)?;
@@ -1320,15 +1387,15 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 }
             }
         }
-        // Graceful shutdown: persistence is a background queue, and a
-        // SIGTERM used to drop queued bodies/snapshots on the floor --
-        // the next start then missed bodies it had finalized (observed:
-        // healing stuck on a body finalized minutes before the kill).
-        // On signal, push a flush barrier and give the writer time to
-        // drain before exiting.
-        // (Mempool is saved separately below, once rpc_state exists.)
+        // Consolidated graceful shutdown: persistence is a background queue, and
+        // competing SIGTERM/ctrl_c handlers previously raced `exit(0)` against
+        // mempool save. On signal, save every shard's mempool atomically FIRST,
+        // then push flush barriers and drain every shard's persistence before
+        // exiting.
+        shutdown_targets.register_persist(persistence.clone());
         {
-            let ap = persistence.clone();
+            let targets = Arc::clone(&shutdown_targets);
+            let done = Arc::clone(&shutdown_done);
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -1348,8 +1415,14 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 {
                     let _ = tokio::signal::ctrl_c().await;
                 }
+                let (mempools, persists) = targets.snapshot();
+                for (mp, path) in mempools {
+                    mp.read().await.save(&path);
+                }
                 eprintln!("[storage] signal received; flushing persistence...");
-                ap.request_flush();
+                for ap in &persists {
+                    ap.request_flush();
+                }
                 // Wait-for-drain (not a fixed sleep): real flushes take
                 // 55-110s+, so the old fixed 15s sleep exited mid-write
                 // and bricked the node on next boot (torn sled state:
@@ -1357,15 +1430,19 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // the persist queue with an overall cap (240s) plus a
                 // settle grace after it reads empty, staying inside
                 // systemd's TimeoutStopSec=300s. Keeps exit(0).
-                let outcome = stellereum::storage::wait_for_persist_drain(|| ap.pending()).await;
-                if outcome.drained {
-                    eprintln!("[storage] persistence drained; exiting");
-                } else {
-                    eprintln!(
-                        "[storage] shutdown drain cap reached ({} blocks pending); exiting",
-                        outcome.last_pending
-                    );
+                for ap in &persists {
+                    let outcome =
+                        stellereum::storage::wait_for_persist_drain(|| ap.pending()).await;
+                    if outcome.drained {
+                        eprintln!("[storage] persistence drained; exiting");
+                    } else {
+                        eprintln!(
+                            "[storage] shutdown drain cap reached ({} blocks pending); exiting",
+                            outcome.last_pending
+                        );
+                    }
                 }
+                done.notify_waiters();
                 std::process::exit(0);
             });
         }
@@ -1401,14 +1478,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         let master_staking = shared_staking.clone();
 
         // Mempool gossip forwarder: transactions submitted via RPC on this node
-        // are broadcast immediately over P2P gossip to all other validators.
-        let (tx_bcast_tx, mut tx_bcast_rx) = tokio::sync::mpsc::unbounded_channel();
-        let gossip_bcast = stellereum::consensus_net::TxGossip::new(adapter.clone());
-        tokio::spawn(async move {
-            while let Some(tx) = tx_bcast_rx.recv().await {
-                gossip_bcast.broadcast(&tx).await;
-            }
-        });
+        // are broadcast immediately over P2P gossip to all other validators
+        // through a 4096-bounded queue.
+        let gossip_bcast = Arc::new(stellereum::consensus_net::TxGossip::new(adapter.clone()));
+        let tx_bcast_tx = spawn_bounded_tx_gossip(gossip_bcast);
 
         let init_height = persistence
             .storage()
@@ -1732,36 +1805,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         let c_rpc = rpc_state.clone();
         let c_remote_signer = remote_signer.clone();
         let c_pq_signer = pq_signer.clone();
-        // Persist the mempool on shutdown too (not just every 15s): a
-        // restart between submit and the next periodic save otherwise
-        // silently drops fresh transactions. Best-effort and tiny.
-        {
-            let mp = rpc_state.mempool.clone();
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut term = signal(SignalKind::terminate()).ok();
-                    let ctrlc = tokio::signal::ctrl_c();
-                    if let Some(t) = term.as_mut() {
-                        tokio::select! {
-                            _ = t.recv() => {},
-                            _ = ctrlc => {},
-                        }
-                    } else {
-                        let _ = ctrlc.await;
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                mp.read().await.save(&mempool_path_for_shard(
-                    stellereum::sharding::MASTERCHAIN_SHARD,
-                    sharded,
-                ));
-            });
-        }
+        // Register masterchain mempool with the consolidated shutdown handler
+        // so it saves atomically before `wait_for_persist_drain` and `exit(0)`.
+        shutdown_targets.register_mempool(
+            rpc_state.mempool.clone(),
+            mempool_path_for_shard(stellereum::sharding::MASTERCHAIN_SHARD, sharded),
+        );
         // Additional shards in this process (`STELL_SHARDS=0,1[,2...]`):
         // EACH configured workchain runs its own run_consensus_node
         // instance over the SAME infnode node, so their
@@ -1805,6 +1854,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // rotation is adopted at the workchain's next height
                 // boundary.
                 master_staking.clone(),
+                Arc::clone(&shutdown_targets),
             )
             .await?;
         }
@@ -1885,7 +1935,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     }
 
     info!("Stellereum Node operational and processing orders.");
-    tokio::signal::ctrl_c().await?;
+    if config.exists() {
+        shutdown_done.notified().await;
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
     info!("Stellereum Node shutting down cleanly.");
     Ok(())
 }

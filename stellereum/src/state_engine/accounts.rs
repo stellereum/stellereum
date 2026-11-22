@@ -582,6 +582,46 @@ impl InMemoryStateEngine {
         pubkey: &[u8],
         salt: &[u8; 16],
     ) -> Result<(), String> {
+        self.pin_pubkey_inner(address, scheme, pubkey, salt, true)
+            .await
+    }
+
+    /// Block-apply variant of [`Self::pin_pubkey`]: inserts into `pq_tree`
+    /// without calling `tree.flush()` (`fsync`) per transaction so the block
+    /// path can batch one `flush_pq_tree()` at the end of the block.
+    pub(super) async fn pin_pubkey_no_flush(
+        &self,
+        address: [u8; 32],
+        scheme: crate::post_quantum::PqScheme,
+        pubkey: &[u8],
+        salt: &[u8; 16],
+    ) -> Result<(), String> {
+        self.pin_pubkey_inner(address, scheme, pubkey, salt, false)
+            .await
+    }
+
+    /// Flush pending `pq_tree` writes once at the end of block application.
+    pub(super) fn flush_pq_tree(&self) -> Result<(), String> {
+        if let Some(tree) = self
+            .pq_tree
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            tree.flush()
+                .map_err(|e| format!("pq_keys flush failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn pin_pubkey_inner(
+        &self,
+        address: [u8; 32],
+        scheme: crate::post_quantum::PqScheme,
+        pubkey: &[u8],
+        salt: &[u8; 16],
+        flush: bool,
+    ) -> Result<(), String> {
         // Disabled schemes pin nothing: ML-DSA-44's verifier is forgeable, so
         // admitting its keys would mint spendable-looking addresses.
         if scheme.is_disabled() {
@@ -636,7 +676,7 @@ impl InMemoryStateEngine {
         let val = bincode::serialize(&(scheme, pubkey, *salt))
             .map_err(|e| format!("Serialization error: {e}"))?;
 
-        if let Some(tree) = self
+        let has_tree = if let Some(tree) = self
             .pq_tree
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -652,19 +692,15 @@ impl InMemoryStateEngine {
             hash_key.extend_from_slice(&pk_hash);
             tree.insert(hash_key, pubkey)
                 .map_err(|e| format!("pq_keys hash insert failed: {e}"))?;
-            tree.flush()
-                .map_err(|e| format!("pq_keys flush failed: {e}"))?;
-        }
-        if self
-            .pq_tree
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
-            // Disk is authoritative: reads prefer the tree and never consult
-            // the fallback while attached, so populating it too would double
-            // every key in RAM for nothing (memory audit #9).
+            if flush {
+                tree.flush()
+                    .map_err(|e| format!("pq_keys flush failed: {e}"))?;
+            }
+            true
         } else {
+            false
+        };
+        if !has_tree {
             // Sled unconfigured: the bounded LRU fallback is the ONLY store.
             // Eviction here is LOUD (throttled warn inside `insert`) and reads
             // fail open; size it for tests / diskless nodes only.
@@ -775,11 +811,18 @@ impl InMemoryStateEngine {
     /// Check whether disjoint wave parallel execution is enabled.
     /// Gated by in-memory engine configuration or `STELL_PARALLEL_EXEC` env var.
     pub fn is_parallel_exec_enabled(&self) -> bool {
-        self.parallel_exec
+        static ENV_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self
+            .parallel_exec
             .load(std::sync::atomic::Ordering::Acquire)
-            || std::env::var("STELL_PARALLEL_EXEC")
+        {
+            return true;
+        }
+        *ENV_ENABLED.get_or_init(|| {
+            std::env::var("STELL_PARALLEL_EXEC")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
+        })
     }
 
     /// Builder method to enable/disable parallel execution.
@@ -790,6 +833,87 @@ impl InMemoryStateEngine {
 
     pub async fn get_account(&self, address: &[u8; 32]) -> Option<AccountState> {
         self.accounts.read().await.get(address).cloned()
+    }
+
+    /// Lightweight paginated account projection for `stell_getProgramAccounts`
+    /// (`program == "system"`). Never clones WASM bytecodes (`code`), mailboxes
+    /// (`inbox`/`outbox`), or `consensus_penalty`.
+    ///
+    /// Returns `(items, next_cursor, has_more, scanned, scan_truncated)`.
+    pub async fn accounts_page(
+        &self,
+        owner: Option<[u8; 32]>,
+        min_balance: u64,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        scan_cap: usize,
+    ) -> (Vec<AccountState>, Option<[u8; 32]>, bool, usize, bool) {
+        let project = |acc: &AccountState| AccountState {
+            address: acc.address,
+            balance: acc.balance,
+            nonce: acc.nonce,
+            code: Vec::new(),
+            code_hash: acc.code_hash,
+            storage_root: acc.storage_root,
+            inbox: VecDeque::new(),
+            outbox: VecDeque::new(),
+            scheme: acc.scheme,
+            pubkey_hash: acc.pubkey_hash,
+        };
+
+        let map = self.accounts.read().await;
+        if let Some(target) = owner {
+            let mut items = Vec::new();
+            let scanned = usize::from(map.contains_key(&target));
+            if let Some(acc) = map.get(&target) {
+                if cursor.is_none_or(|c| acc.address > c) && acc.balance >= min_balance && limit > 0
+                {
+                    items.push(project(acc));
+                }
+            }
+            return (items, None, false, scanned, false);
+        }
+
+        let mut addrs: Vec<[u8; 32]> = map.keys().copied().collect();
+        addrs.sort_unstable();
+        let start = match cursor {
+            Some(c) => addrs.partition_point(|a| *a <= c),
+            None => 0,
+        };
+
+        let mut items = Vec::with_capacity(limit.min(addrs.len().saturating_sub(start)));
+        let mut scanned = 0usize;
+        let mut scan_truncated = false;
+        let mut has_more = false;
+        let mut last_scanned: Option<[u8; 32]> = None;
+
+        for &addr in &addrs[start..] {
+            if scanned >= scan_cap {
+                scan_truncated = true;
+                has_more = true;
+                break;
+            }
+            let Some(acc) = map.get(&addr) else {
+                continue;
+            };
+            scanned += 1;
+            last_scanned = Some(addr);
+            if acc.balance < min_balance {
+                continue;
+            }
+            if items.len() >= limit {
+                has_more = true;
+                break;
+            }
+            items.push(project(acc));
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|a| a.address).or(last_scanned)
+        } else {
+            None
+        };
+        (items, next_cursor, has_more, scanned, scan_truncated)
     }
 
     /// PAYMASTER: the sponsor's CURRENT balance for `tx`, for the admission

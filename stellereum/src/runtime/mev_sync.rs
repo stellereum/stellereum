@@ -2188,7 +2188,7 @@ impl ValidatorRuntime {
             .map(|b| b.timestamp)
             .or_else(|| {
                 self.last_decision.as_ref().and_then(|(h, b, _)| {
-                    if *h + 1 == self.hc.height && b.compute_hash() == prev_hash {
+                    if *h + 1 == self.hc.height && self.decision_block_hash(*h, b) == prev_hash {
                         Some(b.timestamp)
                     } else {
                         None
@@ -2290,14 +2290,21 @@ impl ValidatorRuntime {
             ));
         }
         {
+            #[derive(serde::Serialize)]
+            enum ProposalMsgSizeProbe<'a> {
+                Proposal {
+                    height: u64,
+                    round: u32,
+                    block: &'a Block,
+                },
+            }
             let cap = crate::consensus_net::MAX_CONSENSUS_MSG;
-            let mut encoded_len = crate::consensus_net::ConsensusMsg::Proposal {
+            let mut encoded_len = bincode::serialized_size(&ProposalMsgSizeProbe::Proposal {
                 height: self.hc.height,
                 round: self.hc.round,
-                block: block.clone(),
-            }
-            .encode()
-            .map(|b| b.len())
+                block: &block,
+            })
+            .map(|n| n as usize)
             .unwrap_or(usize::MAX);
             if encoded_len > cap {
                 let orig_txs = block.transactions.len();
@@ -2314,9 +2321,8 @@ impl ValidatorRuntime {
                     }
                     drop[i] = true;
                     dropped += 1;
-                    // Re-encode the candidate survivor set each drop. O(drops)
-                    // encodes, but this path only runs when the estimate
-                    // already failed, i.e. essentially never on healthy blocks.
+                    // Re-measure the candidate survivor set each drop without
+                    // allocating an encoded Vec<u8> buffer.
                     let kept: Vec<crate::sharding::Transaction> = block
                         .transactions
                         .iter()
@@ -2328,13 +2334,12 @@ impl ValidatorRuntime {
                         transactions: kept,
                         ..block.clone()
                     };
-                    encoded_len = crate::consensus_net::ConsensusMsg::Proposal {
+                    encoded_len = bincode::serialized_size(&ProposalMsgSizeProbe::Proposal {
                         height: self.hc.height,
                         round: self.hc.round,
-                        block: probe,
-                    }
-                    .encode()
-                    .map(|b| b.len())
+                        block: &probe,
+                    })
+                    .map(|n| n as usize)
                     .unwrap_or(usize::MAX);
                 }
                 if encoded_len > cap {

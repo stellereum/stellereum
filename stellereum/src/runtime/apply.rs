@@ -1,7 +1,7 @@
 use super::lanes::{
     count_block_actor_sends, ApplyInflight, ApplyJob, ApplyLane, LaneJob, SnapshotJob,
 };
-use super::{ApplyCompleted, BlockHash, SnapBundle, ValidatorRuntime};
+use super::{ApplyCompleted, BlockHash, DecidedParentVotes, SnapBundle, ValidatorRuntime};
 use crate::consensus::{Height, HeightConsensus};
 use crate::sharding::{Block, CrossShardKey, CrossShardMessage};
 use std::collections::HashMap;
@@ -628,7 +628,7 @@ impl ValidatorRuntime {
         // commitment is on the wire and signed by the quorum, a mismatch is
         // real tamper evidence, and every node derives the same verdict — so
         // it is a hard refusal, not a log line.
-        if let Err(e) = self.check_order_commitment(&block) {
+        if let Err(e) = self.check_order_commitment_with_hash(&block, &bh) {
             tracing::error!(height, "{e}; refusing to finalize");
             return None;
         }
@@ -729,6 +729,18 @@ impl ValidatorRuntime {
                 crate::metrics::global().inc_weak_qc_refused();
                 return None;
             }
+            let votes = self.hc.precommit_set(qc.round).cloned().unwrap_or_default();
+            self.decided_parent_votes = Some(DecidedParentVotes {
+                height,
+                round: qc.round,
+                block_hash: bh,
+                shard_id: qc.shard_id,
+                validators: in_force,
+                parent_hash: self.hc.sortition_parent().copied(),
+                schedule: self.hc.committee_schedule,
+                votes,
+                decision_block_hash: bh,
+            });
         }
         let block = finalized_block;
         Some((height, bh, block))
@@ -1319,8 +1331,9 @@ mod tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                    round: 0,
-        };        let outcome = BlockTransitionOutcome {
+            round: 0,
+        };
+        let outcome = BlockTransitionOutcome {
             applied: 1,
             failed: 2,
             fees_collected: 0,

@@ -74,6 +74,7 @@
 //! | `STELL_INF_REP_PEN_RATE` | `5` | debit per rate-limit violation |
 //! | `STELL_INF_REP_PEN_PROTO` | `10` | debit per protocol violation |
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Lowest a score can sink (flood bound: one identity cannot accrue
@@ -131,9 +132,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 impl RepConfig {
     /// Read the current `STELL_INF_REP_*` env (defaults on missing/garbage).
-    /// Read per operation — like the existing accept-hardening getters —
-    /// so tests can retune without a restart.
-    pub fn load() -> Self {
+    pub fn from_env() -> Self {
         Self {
             soft_score: env_i64("STELL_INF_REP_SOFT_SCORE", -20),
             ban_score: env_i64("STELL_INF_REP_BAN_SCORE", -50),
@@ -146,6 +145,12 @@ impl RepConfig {
             pen_rate: env_i64("STELL_INF_REP_PEN_RATE", 5).max(0),
             pen_proto: env_i64("STELL_INF_REP_PEN_PROTO", 10).max(0),
         }
+    }
+
+    /// Cached process-wide reputation config (via `OnceLock`).
+    pub fn load() -> Self {
+        static CACHED: OnceLock<RepConfig> = OnceLock::new();
+        *CACHED.get_or_init(Self::from_env)
     }
 }
 

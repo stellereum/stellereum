@@ -173,7 +173,10 @@ pub fn validator_txt(node_id: &str, pq_pub: &str, ip: &str) -> String {
 ///   - запрос идёт к НЕСКОЛЬКИМ DoH-резолверам (fallback), а не к одному;
 ///   - запись обязана нести pq_pub, и node_id обязан выводиться из него.
 pub async fn verify_domain_validator(domain: &str, expected_node_id: &str) -> Result<bool> {
-    let records = query_txt(domain)?;
+    let dom = domain.to_string();
+    let records = tokio::task::spawn_blocking(move || query_txt(&dom))
+        .await
+        .map_err(|e| anyhow!("DoH query task failed: {e}"))??;
     for data in &records {
         let Some(rec) = parse_validator_record(data) else {
             continue;
@@ -192,7 +195,10 @@ pub async fn verify_domain_validator(domain: &str, expected_node_id: &str) -> Re
 /// Найти валидатора сети по домену: вернуть (node_id, pq_pub, ip).
 /// Несогласованные записи (node_id != pq_id_from_pub(pq_pub)) пропускаются.
 pub async fn resolve_validator(domain: &str) -> Result<Option<(String, Option<String>, String)>> {
-    let records = query_txt(domain)?;
+    let dom = domain.to_string();
+    let records = tokio::task::spawn_blocking(move || query_txt(&dom))
+        .await
+        .map_err(|e| anyhow!("DoH query task failed: {e}"))??;
     for data in &records {
         let Some(rec) = parse_validator_record(data) else {
             continue;
@@ -216,7 +222,11 @@ pub async fn resolve_with_trust_anchor(
     match pinned {
         Some((node_id, pq_pub)) => {
             // Пиннед: доверяем ключу из конфига, IP берём из DNS если получится.
-            let ip = match query_txt(domain) {
+            let dom = domain.to_string();
+            let res = tokio::task::spawn_blocking(move || query_txt(&dom))
+                .await
+                .map_err(|e| anyhow!("DoH query task failed: {e}"))?;
+            let ip = match res {
                 Ok(records) => records
                     .iter()
                     .filter_map(|d| parse_validator_record(d))

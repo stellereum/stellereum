@@ -541,6 +541,20 @@ impl std::fmt::Display for MempoolError {
     }
 }
 
+/// Bincode-compatible mirror of [`Mempool`]'s serialized fields so background
+/// persistence (`save_mempool_throttled`) can run serialization + disk I/O off
+/// the pool lock and off the async runtime thread.
+#[derive(Clone, Debug, Serialize)]
+pub struct MempoolSaveSnapshot {
+    txs: HashMap<TxHash, Transaction>,
+    order: BTreeMap<(u64, u64, TxHash), TxHash>,
+    per_sender: HashMap<[u8; 32], usize>,
+    inserted_at: HashMap<TxHash, u64>,
+    max_size: usize,
+    per_sender_limit: usize,
+    base_fee: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mempool {
     /// hash -> transaction
@@ -693,6 +707,11 @@ pub struct Mempool {
     /// sender).
     #[serde(skip)]
     pub sealed: HashMap<[u8; 32], crate::mev_epoch::SealedEnvelope>,
+    /// Admission timestamps for sealed entries (for bounded TTL eviction when
+    /// the sealed pool is at `sealed_cap()`). `#[serde(skip)]` keeps the
+    /// `MP03` bincode layout unchanged.
+    #[serde(skip)]
+    sealed_inserted_at: HashMap<[u8; 32], u64>,
     /// The MEV epoch the pool currently accepts sealed transactions for.
     /// A sealed envelope for another epoch is refused: the epoch key is
     /// rotated every 128 blocks and a stale ciphertext can never be
@@ -757,6 +776,7 @@ impl Mempool {
             implicit_registry: None,
             pure_pq_enforced: None,
             sealed: HashMap::new(),
+            sealed_inserted_at: HashMap::new(),
             sealed_epoch: crate::mev_epoch::epoch_of_height(0),
             mev_seal: crate::mev_epoch::EpochSealManager::new(),
         }
@@ -1365,6 +1385,7 @@ impl Mempool {
             for envelope in std::mem::take(&mut self.sealed).into_values() {
                 self.release_sender_slot(&envelope.meta.from);
             }
+            self.sealed_inserted_at.clear();
             self.sealed_epoch = epoch;
         }
     }
@@ -1410,18 +1431,60 @@ impl Mempool {
         if sender_count >= self.per_sender_limit {
             return Err(MempoolError::TooManyFromSender);
         }
-        // Sealed-quota containment (audit: mempool economics — free sealed
-        // fill): the sealed path proves no funds, so the sealed count — not
-        // just the combined pool size — is capped. Without this, forged
-        // envelopes (free keygen, spoofed `from` per envelope) fill the whole
-        // combined cap and evict honest plain transactions by pressure.
-        if self.sealed.len() >= self.sealed_cap() {
-            return Err(MempoolError::Full);
-        }
-        if self.sealed.len() + self.txs.len() >= self.max_size {
+        let now_secs = crate::zkml::now_secs();
+        let cap = self.sealed_cap();
+        if self.sealed.len() >= cap {
+            if self.sealed.len().saturating_sub(1) + self.txs.len() >= self.max_size {
+                return Err(MempoolError::Full);
+            }
+            // Prefer evicting an expired sealed entry first (oldest expired wins);
+            // otherwise evict the lowest-priority sealed entry iff the incoming
+            // transaction has a strictly higher `priority_fee_per_gas`.
+            let expired_victim = self
+                .sealed
+                .iter()
+                .filter_map(|(h, env)| {
+                    let ts = self.sealed_inserted_at.get(h).copied().unwrap_or(now_secs);
+                    if now_secs.saturating_sub(ts) >= Self::STUCK_TX_TTL_SECS {
+                        Some((*h, ts, env.meta.priority_fee_per_gas, env.meta.gas_limit))
+                    } else {
+                        None
+                    }
+                })
+                .min_by_key(|(h, ts, prio, gas)| (*ts, *prio, *gas, *h))
+                .map(|(h, ..)| h);
+
+            let victim_hash = if let Some(h) = expired_victim {
+                Some(h)
+            } else {
+                let lowest = self
+                    .sealed
+                    .iter()
+                    .map(|(h, env)| {
+                        let ts = self.sealed_inserted_at.get(h).copied().unwrap_or(now_secs);
+                        (*h, env.meta.priority_fee_per_gas, env.meta.gas_limit, ts)
+                    })
+                    .min_by_key(|(h, prio, gas, ts)| (*prio, *gas, *ts, *h));
+                match lowest {
+                    Some((vh, low_prio, ..)) if envelope.meta.priority_fee_per_gas > low_prio => {
+                        Some(vh)
+                    }
+                    _ => None,
+                }
+            };
+
+            let Some(vh) = victim_hash else {
+                return Err(MempoolError::Full);
+            };
+            if let Some(evicted) = self.sealed.remove(&vh) {
+                self.sealed_inserted_at.remove(&vh);
+                self.release_sender_slot(&evicted.meta.from);
+            }
+        } else if self.sealed.len() + self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);
         }
         *self.per_sender.entry(sender).or_insert(0) += 1;
+        self.sealed_inserted_at.insert(hash, now_secs);
         self.sealed.insert(hash, envelope);
         Ok(hash)
     }
@@ -1481,6 +1544,7 @@ impl Mempool {
 
     /// Drop a sealed transaction that left the pool (included in a block).
     pub fn remove_sealed(&mut self, hash: &[u8; 32]) {
+        self.sealed_inserted_at.remove(hash);
         if let Some(envelope) = self.sealed.remove(hash) {
             self.release_sender_slot(&envelope.meta.from);
         }
@@ -1514,6 +1578,7 @@ impl Mempool {
     /// transaction is NOT implemented (it would need a new block-level
     /// construct); see `docs/MEV.md`.
     pub fn drop_sealed(&mut self, hash: &[u8; 32], from: &[u8; 32]) {
+        self.sealed_inserted_at.remove(hash);
         if self.sealed.remove(hash).is_some() {
             self.release_sender_slot(from);
         }
@@ -1536,8 +1601,13 @@ impl Mempool {
     /// A sender in both lists (one tx applied, another failed) keeps the
     /// penalty: a failure happened, and the next submission must bond for it.
     pub fn note_apply_feedback(&mut self, failed: &[[u8; 32]], succeeded: &[[u8; 32]]) {
+        if failed.is_empty() && succeeded.is_empty() {
+            return;
+        }
+        let failed_set: HashSet<[u8; 32]> = failed.iter().copied().collect();
+        let succeeded_set: HashSet<[u8; 32]> = succeeded.iter().copied().collect();
         for s in failed {
-            if succeeded.contains(s) {
+            if succeeded_set.contains(s) {
                 continue;
             }
             let e = self.failed_penalty.entry(*s).or_insert(0);
@@ -1545,8 +1615,8 @@ impl Mempool {
                 .saturating_add(FAILED_SENDER_PENALTY)
                 .min(MAX_FAILED_SENDER_PENALTY);
         }
-        for s in succeeded {
-            if !failed.contains(s) {
+        for s in &succeeded_set {
+            if !failed_set.contains(s) {
                 self.failed_penalty.remove(s);
             }
         }
@@ -1629,6 +1699,63 @@ impl Mempool {
     /// `load_into` reads the prefix and falls back to the older layouts
     /// (`MP02` and the bare pre-TTL bincode), so old files restore (with
     /// fresh timestamps) instead of silently vanishing.
+    /// Capture a persistence snapshot of the serialized mempool fields without
+    /// running `bincode` or disk I/O under the pool lock.
+    pub fn save_snapshot(&self) -> Option<MempoolSaveSnapshot> {
+        if self.txs.is_empty() {
+            return None;
+        }
+        Some(MempoolSaveSnapshot {
+            txs: self.txs.clone(),
+            order: self.order.clone(),
+            per_sender: self.per_sender.clone(),
+            inserted_at: self.inserted_at.clone(),
+            max_size: self.max_size,
+            per_sender_limit: self.per_sender_limit,
+            base_fee: self.base_fee,
+        })
+    }
+
+    /// Write a previously captured [`MempoolSaveSnapshot`] atomically to `path`
+    /// (`tmp` file in same dir + `std::fs::rename`).
+    pub fn write_save_snapshot(path: &std::path::Path, snapshot: Option<MempoolSaveSnapshot>) {
+        let Some(snap) = snapshot else {
+            let _ = std::fs::remove_file(path);
+            return;
+        };
+        if let Ok(mut bytes) = bincode::serialize(&snap) {
+            let mut out = Self::MEMPOOL_FILE_MAGIC.to_vec();
+            out.append(&mut bytes);
+            Self::write_bytes_atomic(path, &out);
+        }
+    }
+
+    fn write_bytes_atomic(path: &std::path::Path, data: &[u8]) {
+        static SAVE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("mempool.bin");
+        let seq = SAVE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_name = format!(".{file_name}.tmp.{}.{seq}", std::process::id());
+        let tmp_path = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+            _ => std::path::PathBuf::from(tmp_name),
+        };
+        if std::fs::write(&tmp_path, data).is_ok() {
+            if std::fs::rename(&tmp_path, path).is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
     pub fn save(&self, path: &std::path::Path) {
         if self.txs.is_empty() {
             let _ = std::fs::remove_file(path);
@@ -1637,10 +1764,7 @@ impl Mempool {
         if let Ok(mut bytes) = bincode::serialize(self) {
             let mut out = Self::MEMPOOL_FILE_MAGIC.to_vec();
             out.append(&mut bytes);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, out);
+            Self::write_bytes_atomic(path, &out);
         }
     }
 
@@ -1950,8 +2074,8 @@ impl Mempool {
         let heads = self.sender_heads(&mut account);
         let doomed: Vec<TxHash> = self
             .txs
-            .values()
-            .filter_map(|tx| {
+            .iter()
+            .filter_map(|(&hash, tx)| {
                 let (nonce, balance) = account(&tx.from)?;
                 let stale_nonce = tx.nonce < nonce;
                 // PAYMASTER: the legs split — the user leg (`amount`) is
@@ -1976,9 +2100,9 @@ impl Mempool {
                 // pending payment.
                 let head = heads.get(&tx.from).copied().unwrap_or(nonce);
                 let aged_future = tx.nonce > head
-                    && self.tx_age_secs(now_secs, tx) >= Self::FUTURE_NONCE_TTL_SECS;
+                    && self.tx_age_secs_by_hash(now_secs, &hash) >= Self::FUTURE_NONCE_TTL_SECS;
                 if stale_nonce || unaffordable || aged_future {
-                    Some(tx.compute_tx_hash())
+                    Some(hash)
                 } else {
                     None
                 }
@@ -2039,12 +2163,8 @@ impl Mempool {
     }
 
     /// Age of a pooled transaction in seconds (0 when it has no stamp).
-    fn tx_age_secs(&self, now_secs: u64, tx: &Transaction) -> u64 {
-        let inserted = self
-            .inserted_at
-            .get(&tx.compute_tx_hash())
-            .copied()
-            .unwrap_or(now_secs);
+    fn tx_age_secs_by_hash(&self, now_secs: u64, hash: &TxHash) -> u64 {
+        let inserted = self.inserted_at.get(hash).copied().unwrap_or(now_secs);
         now_secs.saturating_sub(inserted)
     }
 
@@ -2831,14 +2951,10 @@ impl Mempool {
         let heads = self.sender_heads(&mut account);
         let doomed: Vec<TxHash> = self
             .txs
-            .values()
-            .filter_map(|tx| {
-                let age = now_secs.saturating_sub(
-                    *self
-                        .inserted_at
-                        .get(&tx.compute_tx_hash())
-                        .unwrap_or(&now_secs),
-                );
+            .iter()
+            .filter_map(|(&hash, tx)| {
+                let age =
+                    now_secs.saturating_sub(*self.inserted_at.get(&hash).unwrap_or(&now_secs));
                 if age < Self::STUCK_TX_TTL_SECS {
                     return None;
                 }
@@ -2864,7 +2980,7 @@ impl Mempool {
                 let head = heads.get(&tx.from).copied().unwrap_or(nonce);
                 let gap = tx.nonce > head;
                 if stale_nonce || unaffordable || gap {
-                    Some(tx.compute_tx_hash())
+                    Some(hash)
                 } else {
                     None
                 }
@@ -3065,16 +3181,18 @@ impl Mempool {
             // MP04 applies to the single-pass selector too: the whole pool is
             // ranked once by fee density, so `select_for_block` and
             // `select_for_block_multi` cannot disagree about what "best" means.
-            let mut ordered: Vec<&Transaction> =
-                order.values().rev().filter_map(|h| txs.get(h)).collect();
-            ordered.sort_unstable_by(|a, b| {
-                Self::fee_density(b)
-                    .cmp(&Self::fee_density(a))
+            let mut ordered: Vec<(u128, &TxHash, &Transaction)> = order
+                .values()
+                .rev()
+                .filter_map(|h| txs.get(h).map(|tx| (Self::fee_density(tx), h, tx)))
+                .collect();
+            ordered.sort_unstable_by(|(da, ha, a), (db, hb, b)| {
+                db.cmp(da)
                     .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
                     .then(b.gas_limit.cmp(&a.gas_limit))
-                    .then(a.compute_tx_hash().cmp(&b.compute_tx_hash()))
+                    .then(ha.cmp(hb))
             });
-            for tx in ordered {
+            for (_, _, tx) in ordered {
                 if selected.len() >= max_txs {
                     break;
                 }
@@ -3116,17 +3234,19 @@ impl Mempool {
         // MP04: rank the whole pool by fee DENSITY before packing, so a small
         // high-bid transaction is never displaced by a bloated low-bid one.
         // The tie-breakers make the order total and deterministic.
-        let mut ordered: Vec<&Transaction> =
-            order.values().rev().filter_map(|h| txs.get(h)).collect();
-        ordered.sort_unstable_by(|a, b| {
-            Self::fee_density(b)
-                .cmp(&Self::fee_density(a))
+        let mut ordered: Vec<(u128, &TxHash, &Transaction)> = order
+            .values()
+            .rev()
+            .filter_map(|h| txs.get(h).map(|tx| (Self::fee_density(tx), h, tx)))
+            .collect();
+        ordered.sort_unstable_by(|(da, ha, a), (db, hb, b)| {
+            db.cmp(da)
                 .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
                 .then(b.gas_limit.cmp(&a.gas_limit))
-                .then(a.compute_tx_hash().cmp(&b.compute_tx_hash()))
+                .then(ha.cmp(hb))
         });
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(ordered.len());
-        for tx in ordered {
+        for (_, _, tx) in ordered {
             if selected.len() >= max_txs {
                 break;
             }
@@ -3361,10 +3481,43 @@ impl Mempool {
     /// sponsored transaction. The filter debits the fee leg from the sponsor
     /// and advances only the user's nonce, so it needs both balances up
     /// front (a sponsor missing from the snapshot would read as unfunded).
-    pub fn fee_payers(&self) -> std::collections::BTreeSet<[u8; 32]> {
-        let mut set = self.senders();
-        set.extend(self.txs.values().filter_map(|t| t.effective_sponsor()));
-        set
+    pub fn fee_payers(&self) -> Vec<[u8; 32]> {
+        let mut set = HashSet::with_capacity(self.per_sender.len());
+        for tx in self.txs.values() {
+            set.insert(tx.from);
+            if let Some(sponsor) = tx.effective_sponsor() {
+                set.insert(sponsor);
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Pending nonces currently pooled for `sender`, in ascending order.
+    pub fn nonces_for_sender(&self, sender: &[u8; 32]) -> Vec<u64> {
+        if let Some(nonces) = self.sender_nonces.get(sender) {
+            return nonces.keys().copied().collect();
+        }
+        if self.sender_nonces.is_empty() && !self.txs.is_empty() {
+            let mut out: Vec<u64> = self
+                .txs
+                .values()
+                .filter(|t| t.from == *sender)
+                .map(|t| t.nonce)
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            return out;
+        }
+        Vec::new()
+    }
+
+    /// Compact `(sender, nonce, tx_hash)` summaries for every pooled transaction
+    /// without cloning any `Transaction`.
+    pub fn summaries(&self) -> Vec<([u8; 32], u64, TxHash)> {
+        self.txs
+            .iter()
+            .map(|(hash, tx)| (tx.from, tx.nonce, *hash))
+            .collect()
     }
 
     /// Pending transaction hashes.
@@ -3407,6 +3560,7 @@ impl Mempool {
             .map(|(_, e)| e.meta.from)
             .collect();
         self.sealed.retain(|h, _| !set.contains(h));
+        self.sealed_inserted_at.retain(|h, _| !set.contains(h));
         for sender in sealed_gone {
             self.release_sender_slot(&sender);
         }
@@ -3440,9 +3594,9 @@ impl Mempool {
         // in step (never remove straight from `txs`).
         let stale_floor: Vec<TxHash> = self
             .txs
-            .values()
-            .filter(|tx| tx.gas_limit < self.required_fee_for_tx(tx))
-            .map(|tx| tx.compute_tx_hash())
+            .iter()
+            .filter(|(_, tx)| tx.gas_limit < self.required_fee_for_tx(tx))
+            .map(|(&h, _)| h)
             .collect();
         for h in &stale_floor {
             self.evict(h);
@@ -5296,6 +5450,141 @@ mod tests {
             0,
             "the sweep must release the claim"
         );
+    }
+
+    #[test]
+    fn fee_payers_nonces_for_sender_and_summaries_work_without_cloning() {
+        let sk1 = key();
+        let sk2 = key();
+        let a1 = addr(&sk1);
+        let a2 = addr(&sk2);
+        let mut mp = Mempool::new(100, 100);
+
+        let t0 = tx(&sk1, [1; 32], 1_000, 2);
+        let t1 = tx(&sk1, [1; 32], 1_000, 0);
+        let t2 = tx(&sk2, [1; 32], 1_000, 5);
+        let h0 = mp.add(t0).unwrap();
+        let h1 = mp.add(t1).unwrap();
+        let h2 = mp.add(t2).unwrap();
+
+        let mut payers = mp.fee_payers();
+        payers.sort();
+        let mut expected_payers = vec![a1, a2];
+        expected_payers.sort();
+        assert_eq!(payers, expected_payers);
+
+        assert_eq!(mp.nonces_for_sender(&a1), vec![0, 2]);
+        assert_eq!(mp.nonces_for_sender(&a2), vec![5]);
+        assert!(mp.nonces_for_sender(&[0xEEu8; 32]).is_empty());
+
+        let mut sums = mp.summaries();
+        sums.sort_by_key(|(_, n, h)| (*n, *h));
+        let mut expected_sums = vec![(a1, 0, h1), (a1, 2, h0), (a2, 5, h2)];
+        expected_sums.sort_by_key(|(_, n, h)| (*n, *h));
+        assert_eq!(sums, expected_sums);
+    }
+
+    #[test]
+    fn add_sealed_evicts_lower_priority_or_expired_when_full() {
+        use crate::mev_epoch::{SealedEnvelope, TransparentMeta};
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+        let make_sealed = |epoch: u64, from: [u8; 32], prio: u64, uniq: u8| {
+            let mut tx_hash = [uniq; 32];
+            tx_hash[0] = uniq.max(1);
+            SealedEnvelope {
+                epoch,
+                tx_hash,
+                ephemeral_pk: RISTRETTO_BASEPOINT_POINT.compress().to_bytes(),
+                nonce: [uniq; 24],
+                ciphertext: vec![uniq, 0x42],
+                meta: TransparentMeta {
+                    from,
+                    nonce: 0,
+                    gas_limit: 300_000,
+                    priority_fee_per_gas: prio,
+                    source_shard: 1,
+                    target_shard: 1,
+                },
+            }
+        };
+
+        // 8-slot pool -> sealed_cap = 2.
+        let mut mp = Mempool::new(8, 10);
+        mp.set_sealed_epoch(1);
+        assert_eq!(mp.sealed_cap(), 2);
+
+        let s1 = addr(&key());
+        let s2 = addr(&key());
+        let s3 = addr(&key());
+        let s4 = addr(&key());
+
+        let h_low = mp.add_sealed(make_sealed(1, s1, 10, 1)).unwrap();
+        let h_mid = mp.add_sealed(make_sealed(1, s2, 20, 2)).unwrap();
+        assert_eq!(mp.sealed_count(), 2);
+
+        // Equal or lower priority must still be rejected.
+        assert_eq!(
+            mp.add_sealed(make_sealed(1, s3, 10, 3)),
+            Err(MempoolError::Full)
+        );
+
+        // Strictly higher priority evicts the lowest-priority entry (h_low)
+        // and releases s1's sender slot.
+        let h_high = mp.add_sealed(make_sealed(1, s3, 50, 4)).unwrap();
+        assert_eq!(mp.sealed_count(), 2);
+        assert!(mp.sealed_envelope(&h_low).is_none());
+        assert!(mp.sealed_envelope(&h_mid).is_some());
+        assert!(mp.sealed_envelope(&h_high).is_some());
+        assert_eq!(mp.per_sender.get(&s1).copied().unwrap_or(0), 0);
+
+        // Mark h_mid as expired: even a priority-0 newcomer can evict it.
+        mp.sealed_inserted_at.insert(
+            h_mid,
+            crate::zkml::now_secs().saturating_sub(Mempool::STUCK_TX_TTL_SECS + 5),
+        );
+        let h_reclaim = mp.add_sealed(make_sealed(1, s4, 0, 5)).unwrap();
+        assert_eq!(mp.sealed_count(), 2);
+        assert!(mp.sealed_envelope(&h_mid).is_none());
+        assert!(mp.sealed_envelope(&h_reclaim).is_some());
+    }
+
+    #[test]
+    fn atomic_save_and_save_snapshot_match_bincode_layout() {
+        let sk = key();
+        let mut mp = Mempool::new(16, 16).with_base_fee(5);
+        mp.add(tx(&sk, [1; 32], 100, 0)).unwrap();
+
+        let snap = mp.save_snapshot().expect("non-empty snapshot");
+        assert_eq!(
+            bincode::serialize(&mp).unwrap(),
+            bincode::serialize(&snap).unwrap(),
+            "MempoolSaveSnapshot must produce byte-identical bincode to Mempool"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "stell_mempool_atomic_save_{}_{}",
+            std::process::id(),
+            crate::zkml::now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.bin");
+        mp.save(&path);
+        assert!(path.exists());
+        let saved_bytes = std::fs::read(&path).unwrap();
+        assert!(saved_bytes.starts_with(Mempool::MEMPOOL_FILE_MAGIC));
+        let decoded: Mempool =
+            bincode::deserialize(&saved_bytes[Mempool::MEMPOOL_FILE_MAGIC.len()..]).unwrap();
+        assert_eq!(decoded.len(), 1);
+
+        // No stray temp files left in directory.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

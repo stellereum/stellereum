@@ -521,23 +521,46 @@ pub(super) fn write_contract_trie_entries(
     trie: &mut PatriciaTrie,
     contracts: &crate::contract::ContractRegistry,
 ) {
-    for (addr, c) in &contracts.contracts {
-        trie.insert(&contract_key(addr), &c.code_hash);
-        match &c.abi {
-            Some(abi) => {
-                trie.insert(&contract_abi_key(addr), abi.to_json().as_bytes());
-            }
-            None => {
-                trie.remove(&contract_abi_key(addr));
-            }
+    for addr in contracts.contracts.keys() {
+        write_single_contract_trie_entry(trie, contracts, addr);
+    }
+}
+
+/// Write only the specified contract addresses' code hash, ABI manifest, and
+/// verified-source fingerprint into the Patricia trie.
+pub(super) fn write_contract_trie_entries_for_addrs<'a>(
+    trie: &mut PatriciaTrie,
+    contracts: &crate::contract::ContractRegistry,
+    addrs: impl IntoIterator<Item = &'a [u8; 32]>,
+) {
+    for addr in addrs {
+        write_single_contract_trie_entry(trie, contracts, addr);
+    }
+}
+
+fn write_single_contract_trie_entry(
+    trie: &mut PatriciaTrie,
+    contracts: &crate::contract::ContractRegistry,
+    addr: &[u8; 32],
+) {
+    let Some(c) = contracts.contracts.get(addr) else {
+        return;
+    };
+    trie.insert(&contract_key(addr), &c.code_hash);
+    match &c.abi {
+        Some(abi) => {
+            trie.insert(&contract_abi_key(addr), abi.to_json().as_bytes());
         }
-        match &c.source_hash {
-            Some(sh) => {
-                trie.insert(&contract_source_key(addr), sh);
-            }
-            None => {
-                trie.remove(&contract_source_key(addr));
-            }
+        None => {
+            trie.remove(&contract_abi_key(addr));
+        }
+    }
+    match &c.source_hash {
+        Some(sh) => {
+            trie.insert(&contract_source_key(addr), sh);
+        }
+        None => {
+            trie.remove(&contract_source_key(addr));
         }
     }
 }

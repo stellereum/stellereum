@@ -4,8 +4,9 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct Metrics {
@@ -55,7 +56,51 @@ pub struct Metrics {
     pub start_unix: std::sync::atomic::AtomicI64,
 }
 
-pub type ServiceCounters = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+pub struct ServiceCounterTable {
+    slots: Vec<(&'static str, AtomicU64)>,
+    by_id: HashMap<u64, usize>,
+    unknown: AtomicU64,
+}
+
+impl ServiceCounterTable {
+    pub fn new() -> Arc<Self> {
+        let mut slots = Vec::with_capacity(crate::services::SERVICE_NAMES.len());
+        let mut by_id = HashMap::with_capacity(crate::services::SERVICE_NAMES.len());
+        for (idx, &name) in crate::services::SERVICE_NAMES.iter().enumerate() {
+            slots.push((name, AtomicU64::new(0)));
+            by_id.insert(crate::proto::svc_id(name), idx);
+        }
+        Arc::new(Self {
+            slots,
+            by_id,
+            unknown: AtomicU64::new(0),
+        })
+    }
+
+    #[inline]
+    pub fn inc(&self, svc_id: u64) {
+        if let Some(&idx) = self.by_id.get(&svc_id) {
+            self.slots[idx].1.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.unknown.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub type ServiceCounters = Arc<ServiceCounterTable>;
+
+fn escape_prom_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
 
 fn fmt_metric(out: &mut String, name: &str, help: &str, value: u64) {
     out.push_str(&format!(
@@ -265,26 +310,50 @@ pub fn render(
         "configured peers",
         peer_count as u64,
     );
-    let svc = svc.lock().unwrap_or_else(|e| e.into_inner());
-    for (name, count) in svc.iter() {
-        let key = format!("infnode_service_requests_total{{service=\"{name}\"}} {count}\n");
-        out.push_str(&key);
+    for (name, counter) in &svc.slots {
+        let count = counter.load(Ordering::Relaxed);
+        if count > 0 {
+            let escaped = escape_prom_label(name);
+            let key = format!("infnode_service_requests_total{{service=\"{escaped}\"}} {count}\n");
+            out.push_str(&key);
+        }
+    }
+    let unk = svc.unknown.load(Ordering::Relaxed);
+    if unk > 0 {
+        out.push_str(&format!(
+            "infnode_service_requests_total{{service=\"?\"}} {unk}\n"
+        ));
     }
     out
 }
 
-pub fn spawn(
-    addr: &str,
-    metrics: Arc<Metrics>,
-    svc: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-) -> Result<()> {
+const MAX_METRICS_CONNS: usize = 32;
+
+pub fn spawn(addr: &str, metrics: Arc<Metrics>, svc: ServiceCounters) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let active = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            let prev = active.fetch_add(1, Ordering::AcqRel);
+            if prev >= MAX_METRICS_CONNS {
+                active.fetch_sub(1, Ordering::Release);
+                drop(s);
+                continue;
+            }
             let m = metrics.clone();
             let svc = svc.clone();
+            let active_c = active.clone();
             std::thread::spawn(move || {
+                struct ActiveGuard(Arc<AtomicUsize>);
+                impl Drop for ActiveGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Release);
+                    }
+                }
+                let _guard = ActiveGuard(active_c);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
                 let _ = handle(&mut s, &m, &svc);
             });
         }
@@ -295,6 +364,9 @@ pub fn spawn(
 fn handle(s: &mut TcpStream, m: &Metrics, svc: &ServiceCounters) -> Result<()> {
     let mut buf = [0u8; 2048];
     let n = s.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return Ok(());
+    }
     let req = String::from_utf8_lossy(&buf[..n]);
     if req.starts_with("GET /metrics") {
         let body = render(m, svc, 0, 0, 0, 0);

@@ -872,14 +872,7 @@ impl SubscriptionHub {
         self.tx.subscribe()
     }
 
-    /// True when at least one live subscription follows block deltas
-    /// (`accountUpdates` or `tokenTransfers`).
-    ///
-    /// The record lane consults this to do NO delta work (no per-account
-    /// publish calls) on a node nobody subscribed deltas on. Conservative on
-    /// an inconsistent index: a rebuild may turn a hidden subscriber up, so
-    /// an out-of-sync index answers `true`.
-    pub fn has_block_delta_subscribers(&self) -> bool {
+    fn has_subscribers(&self, pred: impl FnOnce(&SubscriptionIndex) -> bool) -> bool {
         let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
         if reg.is_empty() {
             return false;
@@ -888,7 +881,40 @@ impl SubscriptionHub {
         if idx.total_len != reg.len() {
             return true;
         }
-        !idx.account_updates.is_empty() || !idx.token_transfers.is_empty()
+        pred(&idx)
+    }
+
+    pub fn has_new_heads_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| !idx.new_heads.is_empty())
+    }
+
+    pub fn has_new_txs_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| !idx.new_txs.is_empty())
+    }
+
+    pub fn has_events_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| !idx.events.is_empty())
+    }
+
+    pub fn has_account_update_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| !idx.account_updates.is_empty())
+    }
+
+    pub fn has_token_transfer_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| !idx.token_transfers.is_empty())
+    }
+
+    /// True when at least one live subscription follows block deltas
+    /// (`accountUpdates` or `tokenTransfers`).
+    ///
+    /// The record lane consults this to do NO delta work (no per-account
+    /// publish calls) on a node nobody subscribed deltas on. Conservative on
+    /// an inconsistent index: a rebuild may turn a hidden subscriber up, so
+    /// an out-of-sync index answers `true`.
+    pub fn has_block_delta_subscribers(&self) -> bool {
+        self.has_subscribers(|idx| {
+            !idx.account_updates.is_empty() || !idx.token_transfers.is_empty()
+        })
     }
 
     /// Address a payload to every subscription whose filter matches `event`.
@@ -1118,7 +1144,7 @@ pub fn publish_new_head_with_header(
     header: Option<&crate::rpc::FinalizedHeaderRecord>,
 ) -> usize {
     let h = hub();
-    if h.is_empty() {
+    if !h.has_new_heads_subscribers() {
         return 0;
     }
     h.publish(
@@ -1150,7 +1176,7 @@ pub fn publish_new_tx(
     status: &str,
 ) -> usize {
     let h = hub();
-    if h.is_empty() {
+    if !h.has_new_txs_subscribers() {
         return 0;
     }
     h.publish(
@@ -1176,7 +1202,7 @@ pub fn publish_contract_event(
     tx_hash: [u8; 32],
 ) -> usize {
     let h = hub();
-    if h.is_empty() {
+    if !h.has_events_subscribers() {
         return 0;
     }
     let contract = hex::encode(event.contract);
@@ -1245,7 +1271,7 @@ pub fn publish_account_update(
     shard_id: u32,
 ) -> usize {
     let h = hub();
-    if h.is_empty() {
+    if !h.has_account_update_subscribers() {
         return 0;
     }
     let account = hex::encode(account);
@@ -1274,7 +1300,7 @@ pub fn publish_token_transfer(
     shard_id: u32,
 ) -> usize {
     let h = hub();
-    if h.is_empty() {
+    if !h.has_token_transfer_subscribers() {
         return 0;
     }
     let token = hex::encode(token_id);
@@ -2352,7 +2378,12 @@ pub(super) async fn ws_handler(
             crate::client_ip::resolve_client_ip(&headers, addr.ip())
         })
     });
-    ws.on_upgrade(move |socket| handle_ws(socket, st, header_token, client))
+    // Bound the WebSocket frame buffer (2 MiB vs tungstenite's 64 MiB default)
+    // while allowing slightly-over-cap frames to reach `ws_handle_text` / the
+    // binary length check so the socket returns `-32600` ("request too large")
+    // and remains open as expected by WS oversize tests.
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES * 2)
+        .on_upgrade(move |socket| handle_ws(socket, st, header_token, client))
 }
 
 /// One event of the WebSocket select loop.
@@ -2405,50 +2436,71 @@ pub(super) async fn handle_ws_with_timeout(
             note = rx.recv() => WsIn::Note(note),
             _ = tokio::time::sleep_until(deadline) => break,
         };
-        deadline = tokio::time::Instant::now() + idle_timeout;
         match next {
-            WsIn::Message(Some(Ok(m))) => match m {
-                axum::extract::ws::Message::Text(t) => {
-                    if !ws_handle_text(
-                        &st,
-                        &t,
-                        &mut owned,
-                        &mut socket,
-                        header_token.as_deref(),
-                        client,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                }
-                axum::extract::ws::Message::Binary(b) => {
-                    let t = String::from_utf8_lossy(&b).to_string();
-                    if !ws_handle_text(
-                        &st,
-                        &t,
-                        &mut owned,
-                        &mut socket,
-                        header_token.as_deref(),
-                        client,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                }
-                axum::extract::ws::Message::Ping(p) => {
-                    if socket
-                        .send(axum::extract::ws::Message::Pong(p))
+            WsIn::Message(Some(Ok(m))) => {
+                deadline = tokio::time::Instant::now() + idle_timeout;
+                match m {
+                    axum::extract::ws::Message::Text(t) => {
+                        if !ws_handle_text(
+                            &st,
+                            &t,
+                            &mut owned,
+                            &mut socket,
+                            header_token.as_deref(),
+                            client,
+                        )
                         .await
-                        .is_err()
-                    {
-                        break;
+                        {
+                            break;
+                        }
                     }
+                    axum::extract::ws::Message::Binary(b) => {
+                        if b.len() > WS_MAX_MESSAGE_BYTES {
+                            let resp = err(
+                                Value::Null,
+                                -32600,
+                                format!(
+                                    "request too large: {} bytes (max {WS_MAX_MESSAGE_BYTES})",
+                                    b.len()
+                                ),
+                            );
+                            let out = serde_json::to_string(&resp.0).unwrap_or_default();
+                            if socket
+                                .send(axum::extract::ws::Message::Text(out))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        let t = String::from_utf8_lossy(&b);
+                        if !ws_handle_text(
+                            &st,
+                            &t,
+                            &mut owned,
+                            &mut socket,
+                            header_token.as_deref(),
+                            client,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    axum::extract::ws::Message::Ping(p) => {
+                        if socket
+                            .send(axum::extract::ws::Message::Pong(p))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    axum::extract::ws::Message::Pong(_) => {}
+                    axum::extract::ws::Message::Close(_) => break,
                 }
-                axum::extract::ws::Message::Pong(_) => {}
-                axum::extract::ws::Message::Close(_) => break,
-            },
+            }
             WsIn::Message(Some(Err(_))) | WsIn::Message(None) => break,
             WsIn::Note(Ok(note)) => {
                 if !owned.contains(&note.subscription) {
@@ -2459,6 +2511,7 @@ pub(super) async fn handle_ws_with_timeout(
                     owned.remove(&note.subscription);
                     continue;
                 }
+                deadline = tokio::time::Instant::now() + idle_timeout;
                 let payload = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
                 if socket
                     .send(axum::extract::ws::Message::Text(payload))
@@ -2469,6 +2522,10 @@ pub(super) async fn handle_ws_with_timeout(
                 }
             }
             WsIn::Note(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                if owned.is_empty() {
+                    continue;
+                }
+                deadline = tokio::time::Instant::now() + idle_timeout;
                 tracing::warn!(
                     skipped,
                     "WebSocket subscriber lagged behind the stream fan-out"
@@ -2769,6 +2826,10 @@ pub(super) async fn rpc_handler(
         Err(e) => return err(Value::Null, -32600, format!("invalid request: {e}")).into_response(),
     };
     let id = req.id.unwrap_or(Value::Null);
+    let _expensive_permit = match try_acquire_http_expensive_read(&req.method) {
+        Ok(p) => p,
+        Err(msg) => return err(id, -32000, msg).into_response(),
+    };
     dispatch_client(&st, id, &req.method, &req.params, header_token, client)
         .await
         .into_response()

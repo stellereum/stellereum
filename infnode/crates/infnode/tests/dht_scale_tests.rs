@@ -235,9 +235,7 @@ async fn dht_ops_scale_table_n10_15_20() {
             "repair scan sees aged replicas, skips dedup:*"
         );
         assert!(
-            !republish
-                .iter()
-                .any(|(k, _, _, _, _)| k.starts_with("dedup:")),
+            !republish.iter().any(|(k, _)| k.starts_with("dedup:")),
             "dedup never republished"
         );
         // LWW conflict rule pinned at scale: stale replica loses.

@@ -175,8 +175,9 @@ mod gossip_batch_tests {
                 cnvrf_v3: None,
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-                        round: 0,
-            }        }
+                round: 0,
+            }
+        }
         let commit = |h: u64, r: u32| ConsensusMsg::Committed {
             height: h,
             block: block_at(h),
@@ -312,8 +313,9 @@ mod gossip_batch_tests {
                 cnvrf_v3: None,
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-                        round: 0,
-            }        }
+                round: 0,
+            }
+        }
         let commit = |h: u64, r: u32| ConsensusMsg::Committed {
             height: h,
             block: block_at(h),
@@ -393,8 +395,9 @@ mod gossip_batch_tests {
             cnvrf_v3: None,
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-                round: 0,
-        };        let mut outbox = std::collections::VecDeque::new();
+            round: 0,
+        };
+        let mut outbox = std::collections::VecDeque::new();
         outbox.push_back(ConsensusMsg::Proposal {
             height: 7,
             round: 2,

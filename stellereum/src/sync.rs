@@ -133,6 +133,44 @@ pub fn genesis_light_anchor(
     }
 }
 
+/// Verify a fetched block body against its requested hash (F3(a)) and sanitize
+/// any carried cross-shard outbound messages (XSHARD integrity: recompute/verify
+/// `msg_id` and force `trusted = false` at the adoption boundary).
+pub fn verify_fetched_block(expected_hash: [u8; 32], mut blk: Block) -> Result<Block, String> {
+    // F3(a): the body we were handed MUST hash to the hash we asked for. A
+    // source (buggy fetch, poisoned DHT entry, malicious peer) that serves a
+    // different body under this key would otherwise have its `prev_hash`
+    // followed and re-anchor us onto a chain we never requested. Reject at
+    // the fetch boundary, before anything is applied.
+    if blk.compute_hash() != expected_hash {
+        return Err(format!(
+            "block sync: fetched body at height {} does not hash to the requested {} \
+             (mismatched block rejected)",
+            blk.height,
+            hex::encode(expected_hash)
+        ));
+    }
+    // XSHARD INTEGRITY at the adoption boundary (fail-closed): every
+    // carried cross-shard message must carry its construction-time id —
+    // recomputed here (domain-aware) from (source, target, tx hash,
+    // finalizing block) — and no adopted message may arrive `trusted`.
+    // A forged `msg_id` rebinds a valid proof to a different body; a set
+    // `trusted` bit would bypass the inclusion proof at trusted-honoring
+    // call sites. A forged id refuses the whole block; the flag is
+    // cleared so no downstream path can observe wire-set trust.
+    for m in blk.cross_shard_out.iter_mut() {
+        if !m.verify_msg_id() {
+            return Err(format!(
+                "block sync: block {} carries a cross-shard message with a forged msg_id \
+                 (recomputed id mismatch; refusing the block)",
+                blk.height
+            ));
+        }
+        m.trusted = false;
+    }
+    Ok(blk)
+}
+
 /// Walk from `head` back to `last_finalized` (exclusive) and return the missing
 /// blocks in ANCESTOR-FIRST order (ready to apply sequentially).
 ///
@@ -161,44 +199,14 @@ where
         if !seen.insert(cur) {
             return Err("block sync: cycle detected".to_string());
         }
-        let mut blk = fetch(cur)
+        let blk = fetch(cur)
             .await
             .ok_or_else(|| format!("block sync: missing block {}", hex::encode(cur)))?;
         // Yield per height: on a 1-vCPU node a long walk of slow (2.5s-RTT)
         // fetches must not starve consensus traffic queued behind this task.
         // Zero cost when idle; one scheduler pass per height when loaded.
         tokio::task::yield_now().await;
-        // F3(a): the body we were handed MUST hash to the hash we asked for. A
-        // source (buggy fetch, poisoned DHT entry, malicious peer) that serves a
-        // different body under this key would otherwise have its `prev_hash`
-        // followed and re-anchor us onto a chain we never requested. Reject at
-        // the fetch boundary, before anything is applied.
-        if blk.compute_hash() != cur {
-            return Err(format!(
-                "block sync: fetched body at height {} does not hash to the requested {} \
-                 (mismatched block rejected)",
-                blk.height,
-                hex::encode(cur)
-            ));
-        }
-        // XSHARD INTEGRITY at the adoption boundary (fail-closed): every
-        // carried cross-shard message must carry its construction-time id —
-        // recomputed here (domain-aware) from (source, target, tx hash,
-        // finalizing block) — and no adopted message may arrive `trusted`.
-        // A forged `msg_id` rebinds a valid proof to a different body; a set
-        // `trusted` bit would bypass the inclusion proof at trusted-honoring
-        // call sites. A forged id refuses the whole block; the flag is
-        // cleared so no downstream path can observe wire-set trust.
-        for m in blk.cross_shard_out.iter_mut() {
-            if !m.verify_msg_id() {
-                return Err(format!(
-                    "block sync: block {} carries a cross-shard message with a forged msg_id \
-                     (recomputed id mismatch; refusing the block)",
-                    blk.height
-                ));
-            }
-            m.trusted = false;
-        }
+        let blk = verify_fetched_block(cur, blk)?;
         let prev = blk.prev_hash;
         chain.push(blk);
         cur = prev;
@@ -2637,12 +2645,12 @@ pub fn should_skip_retro_while_behind(our_tip: u64, peer_tip: u64) -> bool {
 
 /// Gap within which the LIVE Committed path owns catch-up (observer fast path).
 ///
-/// When the hint gap is this small, the missing bodies are already arriving as
-/// `ConsensusMsg::Committed` broadcasts carrying the full block + QC — no DHT
-/// fetch is needed. Running the catch-up machine on top (DHT `fetch_head` +
-/// body walk) only duplicates the same heights' QC verification while holding
-/// the tick for seconds on a weak link. Pure.
-pub const LIVE_ADOPT_GAP_THRESHOLD: u64 = 16;
+/// Only a 0- or 1-block gap can be adopted directly by the next imminent
+/// `ConsensusMsg::Committed` broadcast. Once verified evidence shows a gap >= 2,
+/// live adoption cannot catch up without walking missing intermediate blocks, so
+/// catch-up must NEVER defer for `LIVE_ADOPT_FRESH_MS` (avoiding a 2s idle stall).
+/// Pure.
+pub const LIVE_ADOPT_GAP_THRESHOLD: u64 = 1;
 
 /// Whether this tick should DEFER the catch-up machine so live adopt runs first.
 ///

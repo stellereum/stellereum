@@ -205,15 +205,21 @@ impl RoutingTable {
 
     /// Ближайшие n узлов к target (по XOR).
     pub fn closest(&self, target: &[u8; NODEID_LEN], n: usize) -> Vec<NodeInfo> {
-        let mut all: Vec<(NodeInfo, [u8; NODEID_LEN])> = Vec::new();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut refs: Vec<(&NodeInfo, [u8; NODEID_LEN])> = Vec::new();
         for b in &self.buckets {
             for node in b {
-                let d = xor_distance(&node.id, target);
-                all.push((node.clone(), d));
+                refs.push((node, xor_distance(&node.id, target)));
             }
         }
-        all.sort_by(|a, b| a.1.cmp(&b.1));
-        all.into_iter().take(n).map(|(n, _)| n).collect()
+        if refs.len() > n {
+            refs.select_nth_unstable_by(n - 1, |a, b| a.1.cmp(&b.1));
+            refs.truncate(n);
+        }
+        refs.sort_by(|a, b| a.1.cmp(&b.1));
+        refs.into_iter().map(|(node, _)| node.clone()).collect()
     }
 
     pub fn all(&self) -> Vec<NodeInfo> {
@@ -239,9 +245,15 @@ impl RoutingTable {
 /// - мутация одного ключа (`store`/`store_replica`/`merge_replica`/`restore`)
 ///   меняет ровно один слот карты и никогда не клонирует всю карту, даже пока
 ///   предыдущий снапшот сериализуется в `spawn_blocking`.
+pub const MAX_KV_ENTRIES: usize = 100_000;
+pub const MAX_KV_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct KvStore {
     entries: HashMap<String, Arc<StoredValue>>,
+    total_bytes: usize,
+    chunk_hashes: HashMap<String, String>,
+    manifest_chunks: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -251,21 +263,170 @@ pub struct StoredValue {
     pub origin: [u8; NODEID_LEN],
     pub ttl_ms: i64,
     pub stored_at: i64,
+    #[serde(skip)]
+    pub last_republished_ms: i64,
+}
+
+fn is_manifest_candidate(key: &str, val: &str) -> bool {
+    if key.starts_with("dedup:")
+        || key.starts_with("sealed-owner:")
+        || key.starts_with("recovery:")
+        || key.starts_with("blacklist:")
+        || key.starts_with("share:")
+        || key.starts_with("user:")
+    {
+        return false;
+    }
+    (key.starts_with("m:")
+        || key.starts_with("mail:")
+        || key.starts_with("f:")
+        || key.starts_with("files:")
+        || key.contains(':'))
+        && val.trim_start().starts_with('{')
+        && val.contains("chunks")
+}
+
+fn extract_manifest_chunk_hashes(key: &str, val: &str) -> Vec<(String, String)> {
+    if !is_manifest_candidate(key, val) {
+        return Vec::new();
+    }
+    let Ok(m) = serde_json::from_str::<serde_json::Value>(val) else {
+        return Vec::new();
+    };
+    let Some(cs) = m["chunks"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in cs {
+        if let (Some(cid), Some(hash)) = (c["id"].as_str(), c["hash"].as_str()) {
+            if !cid.is_empty() && !hash.is_empty() {
+                out.push((cid.to_string(), hash.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn is_pinned_kv_key(key: &str) -> bool {
+    key.starts_with("sealed-owner:")
+        || key.starts_with("recovery:")
+        || key.starts_with("blacklist:")
+        || key.starts_with("share:")
+        || key.starts_with("user:")
 }
 
 impl KvStore {
+    fn unindex_key(&mut self, key: &str) {
+        if let Some(cids) = self.manifest_chunks.remove(key) {
+            for cid in cids {
+                self.chunk_hashes.remove(&cid);
+            }
+        }
+    }
+
+    fn index_key(&mut self, key: &str, val: &str) {
+        self.unindex_key(key);
+        let pairs = extract_manifest_chunk_hashes(key, val);
+        if !pairs.is_empty() {
+            let mut cids = Vec::with_capacity(pairs.len());
+            for (cid, hash) in pairs {
+                cids.push(cid.clone());
+                self.chunk_hashes.insert(cid, hash);
+            }
+            self.manifest_chunks.insert(key.to_string(), cids);
+        }
+    }
+
+    fn insert_entry(&mut self, key: String, v: StoredValue) {
+        if let Some(old) = self.entries.get(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(key.len() + old.value.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(key.len() + v.value.len());
+        self.index_key(&key, &v.value);
+        self.entries.insert(key, Arc::new(v));
+    }
+
+    fn remove_entry(&mut self, key: &str) {
+        if let Some(old) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(key.len() + old.value.len());
+            self.unindex_key(key);
+        }
+    }
+
+    fn ensure_remote_capacity(&mut self, key: &str, incoming_val_len: usize, now: i64) -> bool {
+        let existing_val_len = self.entries.get(key).map(|v| v.value.len());
+        let is_new = existing_val_len.is_none();
+        let added_bytes = match existing_val_len {
+            Some(old_len) => incoming_val_len.saturating_sub(old_len),
+            None => key.len().saturating_add(incoming_val_len),
+        };
+        if !(is_new && self.entries.len() >= MAX_KV_ENTRIES)
+            && self.total_bytes.saturating_add(added_bytes) <= MAX_KV_BYTES
+        {
+            return true;
+        }
+        // Step 1: sweep expired / stale dedup / expired stell blobs first.
+        self.sweep(now);
+        let existing_val_len = self.entries.get(key).map(|v| v.value.len());
+        let is_new = existing_val_len.is_none();
+        let added_bytes = match existing_val_len {
+            Some(old_len) => incoming_val_len.saturating_sub(old_len),
+            None => key.len().saturating_add(incoming_val_len),
+        };
+        if !(is_new && self.entries.len() >= MAX_KV_ENTRIES)
+            && self.total_bytes.saturating_add(added_bytes) <= MAX_KV_BYTES
+        {
+            return true;
+        }
+        // Step 2: evict oldest non-pinned entries (excluding `key` itself).
+        let mut victims: Vec<(i64, String)> = self
+            .entries
+            .iter()
+            .filter(|(k, _)| k.as_str() != key && !is_pinned_kv_key(k))
+            .map(|(k, v)| (v.stored_at, k.clone()))
+            .collect();
+        victims.sort_unstable_by_key(|(sa, _)| *sa);
+        for (_, vkey) in victims {
+            self.remove_entry(&vkey);
+            if !(is_new && self.entries.len() >= MAX_KV_ENTRIES)
+                && self.total_bytes.saturating_add(added_bytes) <= MAX_KV_BYTES
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// O(1) lookup of expected BLAKE3 chunk hash from live manifests.
+    pub fn expected_chunk_hash(&self, chunk_id: &str) -> Option<&str> {
+        self.chunk_hashes.get(chunk_id).map(|s| s.as_str())
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn keys_with_prefixes(&self, prefixes: &[&str], now: i64) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(k, v)| v.expires > now && prefixes.iter().any(|p| k.starts_with(p)))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     pub fn store(&mut self, key: &str, value: String, ttl_ms: i64, origin: [u8; NODEID_LEN]) {
         let now = now_ms();
         let expires = now + ttl_ms;
-        self.entries.insert(
+        self.insert_entry(
             key.to_string(),
-            Arc::new(StoredValue {
+            StoredValue {
                 value,
                 expires,
                 origin,
                 ttl_ms,
                 stored_at: now,
-            }),
+                last_republished_ms: 0,
+            },
         );
     }
 
@@ -288,15 +449,19 @@ impl KvStore {
         if expires <= now {
             return;
         }
-        self.entries.insert(
+        if !self.ensure_remote_capacity(key, value.len(), now) {
+            return;
+        }
+        self.insert_entry(
             key.to_string(),
-            Arc::new(StoredValue {
+            StoredValue {
                 value,
                 expires,
                 origin,
                 ttl_ms,
                 stored_at: sa,
-            }),
+                last_republished_ms: 0,
+            },
         );
     }
 
@@ -334,15 +499,19 @@ impl KvStore {
             Some(local) => stored_at > local.stored_at,
         };
         if apply {
-            self.entries.insert(
+            if !self.ensure_remote_capacity(key, value.len(), now) {
+                return false;
+            }
+            self.insert_entry(
                 key.to_string(),
-                Arc::new(StoredValue {
+                StoredValue {
                     value,
                     expires,
                     origin,
                     ttl_ms,
                     stored_at,
-                }),
+                    last_republished_ms: 0,
+                },
             );
         }
         apply
@@ -367,32 +536,26 @@ impl KvStore {
         now: i64,
     ) -> bool {
         let incoming: Vec<String> = serde_json::from_str(&value).unwrap_or_default();
-        match self.entries.get(key) {
+        match self.entries.get(key).cloned() {
             None => {
-                self.entries.insert(
+                if !self.ensure_remote_capacity(key, value.len(), now) {
+                    return false;
+                }
+                self.insert_entry(
                     key.to_string(),
-                    Arc::new(StoredValue {
+                    StoredValue {
                         value,
                         expires: now + ttl_ms,
                         origin,
                         ttl_ms,
                         stored_at,
-                    }),
+                        last_republished_ms: 0,
+                    },
                 );
                 true
             }
             Some(local) => {
                 let mut ids: Vec<String> = serde_json::from_str(&local.value).unwrap_or_default();
-                // чистим от tombstones при слиянии, чтобы удалённое не воскресало
-                // от старых реплик (удаление реплицируется и списком, и tombstone)
-                //
-                // Perf: исходный тройной вложенный скан (`retain` × tombs +
-                // цикл × (tombs + ids)) — O(n·m) строковых сравнений; на
-                // индексе из тысяч id это миллисекунды под write-lock'ом на
-                // КАЖДОЕ слияние. Множества дают ТЕ ЖЕ порядок/флаги/байты за
-                // O(n+m): `ids` растёт только push'ами в исходном порядке
-                // (сначала локальные, затем входящие по порядку), `changed` —
-                // только при push'е, проверки tombstone — раньше dedup'а.
                 let tombs = self.tombs_for(key);
                 let tomb_set: HashSet<&str> = tombs.iter().map(String::as_str).collect();
                 if !tomb_set.is_empty() {
@@ -413,14 +576,18 @@ impl KvStore {
                 }
                 if changed || stored_at > local.stored_at {
                     let v = serde_json::to_string(&ids).unwrap_or_else(|_| local.value.clone());
+                    if !self.ensure_remote_capacity(key, v.len(), now) {
+                        return false;
+                    }
                     let newv = StoredValue {
                         value: v,
                         expires: now + ttl_ms.max(local.ttl_ms),
                         origin,
                         ttl_ms: ttl_ms.max(local.ttl_ms),
                         stored_at: stored_at.max(local.stored_at),
+                        last_republished_ms: local.last_republished_ms,
                     };
-                    self.entries.insert(key.to_string(), Arc::new(newv));
+                    self.insert_entry(key.to_string(), newv);
                 }
                 changed
             }
@@ -439,17 +606,21 @@ impl KvStore {
     ) -> bool {
         let incoming: std::collections::HashMap<String, i64> =
             serde_json::from_str(&value).unwrap_or_default();
-        match self.entries.get(key) {
+        match self.entries.get(key).cloned() {
             None => {
-                self.entries.insert(
+                if !self.ensure_remote_capacity(key, value.len(), now) {
+                    return false;
+                }
+                self.insert_entry(
                     key.to_string(),
-                    Arc::new(StoredValue {
+                    StoredValue {
                         value,
                         expires: now + ttl_ms,
                         origin,
                         ttl_ms,
                         stored_at,
-                    }),
+                        last_republished_ms: 0,
+                    },
                 );
                 true
             }
@@ -466,14 +637,18 @@ impl KvStore {
                 }
                 if changed || stored_at > local.stored_at {
                     let v = serde_json::to_string(&tombs).unwrap_or_else(|_| local.value.clone());
+                    if !self.ensure_remote_capacity(key, v.len(), now) {
+                        return false;
+                    }
                     let newv = StoredValue {
                         value: v,
                         expires: now + ttl_ms.max(local.ttl_ms),
                         origin,
                         ttl_ms: ttl_ms.max(local.ttl_ms),
                         stored_at: stored_at.max(local.stored_at),
+                        last_republished_ms: local.last_republished_ms,
                     };
-                    self.entries.insert(key.to_string(), Arc::new(newv));
+                    self.insert_entry(key.to_string(), newv);
                 }
                 changed
             }
@@ -494,14 +669,9 @@ impl KvStore {
     }
 
     /// Список ключей для republish (переиздание значений на k-ближайших).
-    /// `dedup:*` исключены: это локальная подсказка «этот контент уже у нас»,
-    /// а не DHT-значение. При 5-минутном окне они иначе републикуются каждые
-    /// 2.5 минуты, и каждая репликация сбрасывает `stored_at` у соседа —
-    /// запись живёт вечно и снова раздувает kv.json.
-    /// (key, value, ttl_ms, origin, stored_at): the age rides along so a
-    /// replica keeps the ORIGINAL clock instead of resetting it on every hop
-    /// (audit 2026-10-06: without it mutual republish made TTL immortal).
-    pub fn keys_to_republish(&self, now: i64) -> Vec<(String, String, i64, [u8; NODEID_LEN], i64)> {
+    /// Возвращает `Vec<(String, Arc<StoredValue>)>` без глубокого копирования `value`,
+    /// с троттлингом по `last_republished_ms`.
+    pub fn keys_to_republish(&self, now: i64) -> Vec<(String, Arc<StoredValue>)> {
         self.entries
             .iter()
             .filter(|(k, v)| {
@@ -511,22 +681,32 @@ impl KvStore {
                     && !k.starts_with("sealed-owner:")
                     && v.expires > now
                     && now - v.stored_at > v.ttl_ms / 2
+                    && (v.last_republished_ms == 0
+                        || now.saturating_sub(v.last_republished_ms)
+                            >= (v.ttl_ms / 4).max(3_600_000))
             })
-            .map(|(k, v)| (k.clone(), v.value.clone(), v.ttl_ms, v.origin, v.stored_at))
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect()
+    }
+
+    /// Пометить ключ как переизданный в момент `now`.
+    pub fn mark_republished(&mut self, key: &str, now: i64) {
+        if let Some(arc) = self.entries.get_mut(key) {
+            Arc::make_mut(arc).last_republished_ms = now.max(1);
+        }
     }
 
     pub fn get(&mut self, key: &str) -> Option<String> {
         let now = now_ms();
-        let v = self.entries.get(key);
-        match v {
-            Some(v) if v.expires > now => Some(v.value.clone()),
-            Some(_) => {
-                self.entries.remove(key);
-                None
-            }
-            None => None,
+        let expired = match self.entries.get(key) {
+            Some(v) if v.expires > now => return Some(v.value.clone()),
+            Some(_) => true,
+            None => return None,
+        };
+        if expired {
+            self.remove_entry(key);
         }
+        None
     }
 
     /// Read-only peek for hot paths (audit 2026-10-06): returns the live
@@ -542,7 +722,7 @@ impl KvStore {
 
     /// Удалить значение по строковому ключу.
     pub fn remove(&mut self, key: &str) {
-        self.entries.remove(key);
+        self.remove_entry(key);
     }
 
     pub fn len(&self) -> usize {
@@ -561,33 +741,50 @@ impl KvStore {
 
     pub fn prune(&mut self) {
         let now = now_ms();
-        self.entries.retain(|_, v| v.expires > now);
+        let mut unindex = Vec::new();
+        let mut bytes_sub = 0usize;
+        let manifest_chunks = &self.manifest_chunks;
+        self.entries.retain(|k, v| {
+            if v.expires > now {
+                true
+            } else {
+                bytes_sub = bytes_sub.saturating_add(k.len() + v.value.len());
+                if manifest_chunks.contains_key(k.as_str()) {
+                    unindex.push(k.clone());
+                }
+                false
+            }
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(bytes_sub);
+        for k in unindex {
+            self.unindex_key(&k);
+        }
     }
 
     /// Выкинуть мёртвое ПЕРЕД сериализацией kv.json. Возвращает
-    /// (удалено всего, из них dedup:*). Считаем, чтобы тесты/диагностика могли
-    /// замерить «до/после».
-    ///
-    /// 1) записи с истёкшим `expires` — раньше просроченное только ПРОПУСКАЛОСЬ
-    ///    при чтении (`get`/`kv_manifest_keys`), а в карте и в файле копилось
-    ///    до ближайшего `prune` из 60-секундного цикла (а на путях
-    ///    `handle_dht_store`/`catch_up_with` вообще без prune);
-    /// 2) `dedup:*` старше `DEDUP_TTL_MS` по `stored_at` — включая легаси-записи
-    ///    с 30-дневным TTL: их `expires` продлевается при каждой записи, т.е.
-    ///    они не протухают сами и именно они давали основной рост файла.
-    pub fn sweep(&mut self, now: i64) -> (usize, usize, Vec<(String, String)>) {
+    /// (удалено всего, из них dedup:*, удалённые Arc-значения без dedup:*).
+    pub fn sweep(&mut self, now: i64) -> (usize, usize, Vec<(String, Arc<StoredValue>)>) {
         let mut expired = 0usize;
         let mut dedup = 0usize;
-        let mut removed: Vec<(String, String)> = Vec::new();
+        let mut removed: Vec<(String, Arc<StoredValue>)> = Vec::new();
+        let mut unindex = Vec::new();
+        let mut bytes_sub = 0usize;
+        let manifest_chunks = &self.manifest_chunks;
         self.entries.retain(|k, v| {
             if v.expires <= now {
                 expired += 1;
-                removed.push((k.clone(), v.value.clone()));
+                bytes_sub = bytes_sub.saturating_add(k.len() + v.value.len());
+                if manifest_chunks.contains_key(k.as_str()) {
+                    unindex.push(k.clone());
+                }
+                if !k.starts_with("dedup:") {
+                    removed.push((k.clone(), Arc::clone(v)));
+                }
                 return false;
             }
             if k.starts_with("dedup:") && now.saturating_sub(v.stored_at) > DEDUP_TTL_MS {
                 dedup += 1;
-                removed.push((k.clone(), v.value.clone()));
+                bytes_sub = bytes_sub.saturating_add(k.len() + v.value.len());
                 return false;
             }
             // Retention cap for heavy stell DHT manifests: blocks, headers, snapshots older than 2h
@@ -599,11 +796,19 @@ impl KvStore {
                 && (v.stored_at == 0 || now.saturating_sub(v.stored_at) > 2 * 3600 * 1000)
             {
                 expired += 1;
-                removed.push((k.clone(), v.value.clone()));
+                bytes_sub = bytes_sub.saturating_add(k.len() + v.value.len());
+                if manifest_chunks.contains_key(k.as_str()) {
+                    unindex.push(k.clone());
+                }
+                removed.push((k.clone(), Arc::clone(v)));
                 return false;
             }
             true
         });
+        self.total_bytes = self.total_bytes.saturating_sub(bytes_sub);
+        for k in unindex {
+            self.unindex_key(&k);
+        }
         (expired + dedup, dedup, removed)
     }
 
@@ -626,9 +831,10 @@ impl KvStore {
             .collect()
     }
 
-    pub fn restore(&mut self, key: String, v: StoredValue) {
+    pub fn restore(&mut self, key: String, mut v: StoredValue) {
         if v.expires > now_ms() {
-            self.entries.insert(key, Arc::new(v));
+            v.last_republished_ms = 0;
+            self.insert_entry(key, v);
         }
     }
 }
@@ -663,6 +869,7 @@ mod kv_sweep_tests {
             origin: origin(),
             ttl_ms,
             stored_at,
+            last_republished_ms: 0,
         }
     }
 
@@ -801,7 +1008,7 @@ mod kv_sweep_tests {
         let mut keys: Vec<String> = kv
             .keys_to_republish(now)
             .into_iter()
-            .map(|(k, _, _, _, _)| k)
+            .map(|(k, _)| k)
             .collect();
         keys.sort();
         assert_eq!(
@@ -909,5 +1116,88 @@ mod kv_sweep_tests {
             assert_eq!(av.ttl_ms, ev.ttl_ms);
             assert_eq!(av.stored_at, ev.stored_at);
         }
+    }
+
+    #[test]
+    fn chunk_hashes_index_tracks_store_merge_remove_sweep_and_restore() {
+        let mut kv = KvStore::default();
+        let now = now_ms();
+        let mf1 = serde_json::json!({
+            "chunks": [
+                {"id": "aa11", "hash": "deadbeef"},
+                {"id": "bb22", "hash": "cafebabe"}
+            ]
+        })
+        .to_string();
+        kv.store("files:doc1", mf1, 60_000, origin());
+        assert_eq!(kv.expected_chunk_hash("aa11"), Some("deadbeef"));
+        assert_eq!(kv.expected_chunk_hash("bb22"), Some("cafebabe"));
+
+        // Updating the manifest replaces its chunk hashes cleanly.
+        let mf2 = serde_json::json!({
+            "chunks": [{"id": "cc33", "hash": "feedface"}]
+        })
+        .to_string();
+        assert!(kv.merge_replica("files:doc1", mf2, 60_000, origin(), now + 10));
+        assert_eq!(kv.expected_chunk_hash("aa11"), None);
+        assert_eq!(kv.expected_chunk_hash("cc33"), Some("feedface"));
+
+        // Restore rebuilds index; remove and sweep clean it up.
+        let mf_m = serde_json::json!({
+            "chunks": [{"id": "dd44", "hash": "12345678"}]
+        })
+        .to_string();
+        kv.restore(
+            "m:mail1".into(),
+            StoredValue {
+                value: mf_m,
+                expires: now + 1_000,
+                origin: origin(),
+                ttl_ms: 1_000,
+                stored_at: now,
+                last_republished_ms: 0,
+            },
+        );
+        assert_eq!(kv.expected_chunk_hash("dd44"), Some("12345678"));
+
+        kv.remove("files:doc1");
+        assert_eq!(kv.expected_chunk_hash("cc33"), None);
+
+        let (removed, _, _) = kv.sweep(now + 2_000);
+        assert_eq!(removed, 1);
+        assert_eq!(kv.expected_chunk_hash("dd44"), None);
+    }
+
+    #[test]
+    fn keys_to_republish_throttled_by_mark_republished() {
+        let mut kv = KvStore::default();
+        let now = now_ms();
+        let ttl = 600_000;
+        kv.store_replica("files:aged", "v".into(), ttl, origin(), now - 450_000);
+
+        let first = kv.keys_to_republish(now);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "files:aged");
+
+        kv.mark_republished("files:aged", now);
+        assert!(
+            kv.keys_to_republish(now + 1_000).is_empty(),
+            "must be throttled right after mark_republished"
+        );
+        // Interval is (ttl / 4).max(3_600_000) = 3_600_000 ms.
+        kv.restore(
+            "files:aged2".into(),
+            StoredValue {
+                value: "v".into(),
+                expires: now + 10_000_000,
+                origin: origin(),
+                ttl_ms: ttl,
+                stored_at: now - 450_000,
+                last_republished_ms: 0,
+            },
+        );
+        kv.mark_republished("files:aged2", now);
+        assert!(kv.keys_to_republish(now + 3_599_999).is_empty());
+        assert_eq!(kv.keys_to_republish(now + 3_600_000).len(), 1);
     }
 }

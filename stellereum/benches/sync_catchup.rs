@@ -143,8 +143,8 @@ fn build_chain(ks: &[SigningKey], fks: &[FalconKeypair], n: u64, txs: u64) -> Ve
             cnvrf_v3: None,
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-                round: 0,
-};
+            round: 0,
+        };
         b.sign_block_with_falcon(&ks[proposer_idx], &fks[proposer_idx]);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);

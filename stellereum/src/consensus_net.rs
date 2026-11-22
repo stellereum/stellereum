@@ -25,7 +25,7 @@ use crate::protocol::{self, Capabilities};
 use crate::sharding::{Block, ShardRegistry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -725,7 +725,7 @@ pub struct ConsensusNetwork {
     /// rule (see [`probe_evict_after`]): incremented on probe timeout, cleared
     /// on any answering probe (ok or fast error). Mutex-only, never held
     /// across await (snapshot-then-update).
-    probe_timeouts: Mutex<HashMap<[u8; 20], u32>>,
+    probe_timeouts: Arc<Mutex<HashMap<[u8; 20], u32>>>,
     /// Per-peer last broadcast schedule (epoch-ms) for the send-pacing floor
     /// (see [`CONS_BCAST_MIN_INTERVAL_MS_DEFAULT`]). Mutex-only, never held
     /// across await.
@@ -774,6 +774,23 @@ struct PeerHealth {
     backoff_until: Option<std::time::Instant>,
 }
 
+/// Hard cap on `peer_health` entries (bounds memory against sybil/rotating peer keys).
+const PEER_HEALTH_MAX_ENTRIES: usize = 1024;
+
+/// Evict expired or oldest failure entries from `peer_health` when at capacity.
+fn enforce_peer_health_cap(h: &mut HashMap<[u8; 20], PeerHealth>, now: std::time::Instant) {
+    if h.len() < PEER_HEALTH_MAX_ENTRIES {
+        return;
+    }
+    h.retain(|_, ph| peer_dial_suppressed(ph.fails, ph.last_fail, ph.backoff_until, now));
+    while h.len() >= PEER_HEALTH_MAX_ENTRIES {
+        let Some(oldest) = h.iter().min_by_key(|(_, ph)| ph.last_fail).map(|(k, _)| *k) else {
+            break;
+        };
+        h.remove(&oldest);
+    }
+}
+
 /// Skip a peer after this many consecutive failures.
 ///
 /// Safety role (liveness): one slow/dead peer's consecutive timeouts stop
@@ -790,12 +807,15 @@ const PEER_SKIP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3
 /// for all consensus-net request caps; the unit-test deadline below keeps
 /// its own literal 2s.
 fn send_timeout() -> std::time::Duration {
-    std::env::var("STELL_SEND_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v >= 500)
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(2))
+    static CACHED: OnceLock<std::time::Duration> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_SEND_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 500)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(2))
+    })
 }
 
 /// Pure cooldown decision (unit-tested): skip once the failure count reaches
@@ -861,7 +881,8 @@ pub fn parse_probe_evict_after(raw: Option<String>) -> u32 {
 
 /// Effective probe-eviction streak (`STELL_PROBE_EVICT_AFTER`, default 3).
 pub fn probe_evict_after() -> u32 {
-    parse_probe_evict_after(std::env::var("STELL_PROBE_EVICT_AFTER").ok())
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_probe_evict_after(std::env::var("STELL_PROBE_EVICT_AFTER").ok()))
 }
 
 /// Pure eviction decision: evict only once the consecutive-timeout streak
@@ -897,7 +918,10 @@ pub fn parse_dial_backoff_base_ms(raw: Option<String>) -> u64 {
 
 /// Effective dial-backoff base (`STELL_DIAL_BACKOFF_BASE_MS`, default 2000).
 pub fn dial_backoff_base_ms() -> u64 {
-    parse_dial_backoff_base_ms(std::env::var("STELL_DIAL_BACKOFF_BASE_MS").ok())
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_dial_backoff_base_ms(std::env::var("STELL_DIAL_BACKOFF_BASE_MS").ok())
+    })
 }
 
 /// Parse helper for [`dial_backoff_max_ms`]: garbage/zero falls back to the
@@ -910,7 +934,9 @@ pub fn parse_dial_backoff_max_ms(raw: Option<String>) -> u64 {
 
 /// Effective dial-backoff cap (`STELL_DIAL_BACKOFF_MAX_MS`, default 300000).
 pub fn dial_backoff_max_ms() -> u64 {
-    parse_dial_backoff_max_ms(std::env::var("STELL_DIAL_BACKOFF_MAX_MS").ok())
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED
+        .get_or_init(|| parse_dial_backoff_max_ms(std::env::var("STELL_DIAL_BACKOFF_MAX_MS").ok()))
 }
 
 /// Parse helper for [`dial_budget_per_sec`]: garbage/zero falls back to the
@@ -924,7 +950,9 @@ pub fn parse_dial_budget_per_sec(raw: Option<String>) -> u32 {
 
 /// Effective process-wide dial budget (`STELL_DIAL_BUDGET_PER_SEC`, default 4).
 pub fn dial_budget_per_sec() -> u32 {
-    parse_dial_budget_per_sec(std::env::var("STELL_DIAL_BUDGET_PER_SEC").ok())
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED
+        .get_or_init(|| parse_dial_budget_per_sec(std::env::var("STELL_DIAL_BUDGET_PER_SEC").ok()))
 }
 
 /// Pure exponential dial backoff (unit-tested): below [`PEER_SKIP_THRESHOLD`]
@@ -1270,7 +1298,7 @@ impl ConsensusNetwork {
                 VOTE_SEND_DEDUP_TTL_MS,
             ))),
             peer_health: Arc::new(Mutex::new(HashMap::new())),
-            probe_timeouts: Mutex::new(HashMap::new()),
+            probe_timeouts: Arc::new(Mutex::new(HashMap::new())),
             bcast_last_ms: Mutex::new(HashMap::new()),
             probe_last_ms: Mutex::new(HashMap::new()),
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
@@ -1302,7 +1330,7 @@ impl ConsensusNetwork {
                 VOTE_SEND_DEDUP_TTL_MS,
             ))),
             peer_health: Arc::new(Mutex::new(HashMap::new())),
-            probe_timeouts: Mutex::new(HashMap::new()),
+            probe_timeouts: Arc::new(Mutex::new(HashMap::new())),
             bcast_last_ms: Mutex::new(HashMap::new()),
             probe_last_ms: Mutex::new(HashMap::new()),
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
@@ -1371,16 +1399,9 @@ impl ConsensusNetwork {
         (compact_ok, full_only)
     }
 
-    /// Record one send/probe outcome for the backoff ledger. Returns the
-    /// pre-update failure streak (see [`Self::record_health`]).
-    fn peer_record(&self, pid: [u8; 20], ok: bool) -> u32 {
-        Self::record_health(&self.peer_health, pid, ok)
-    }
-
-    /// Ledger update shared by the inline paths ([`Self::peer_record`]) and
-    /// the DETACHED per-peer tasks ([`Self::send_one_peer`]), which only hold
-    /// an `Arc` to the ledger — never `&self`, because they may outlive the
-    /// flush that spawned them.
+    /// Ledger update shared by the inline paths and the DETACHED per-peer
+    /// tasks ([`Self::send_one_peer`]), which only hold an `Arc` to the ledger
+    /// — never `&self`, because they may outlive the flush that spawned them.
     ///
     /// Returns the failure streak BEFORE this update (0 when the peer was
     /// healthy): callers use it to keep per-attempt logs quiet for
@@ -1410,6 +1431,9 @@ impl ConsensusNetwork {
                     }
                 } else {
                     let fails_before = h.get(&pid).map_or(0, |e| e.fails);
+                    if !h.contains_key(&pid) {
+                        enforce_peer_health_cap(&mut h, now);
+                    }
                     let e = h.entry(pid).or_default();
                     e.fails = e.fails.saturating_add(1);
                     e.last_fail = Some(now);
@@ -1452,9 +1476,17 @@ impl ConsensusNetwork {
     }
 
     /// One more consecutive probe TIMEOUT for `pid`; returns the new streak.
-    fn probe_timeout_hit(&self, pid: [u8; 20]) -> u32 {
-        match self.probe_timeouts.lock() {
+    fn record_probe_timeout_hit(
+        probe_timeouts: &Mutex<HashMap<[u8; 20], u32>>,
+        pid: [u8; 20],
+    ) -> u32 {
+        match probe_timeouts.lock() {
             Ok(mut m) => {
+                if !m.contains_key(&pid) && m.len() >= PEER_HEALTH_MAX_ENTRIES {
+                    if let Some(k) = m.keys().next().copied() {
+                        m.remove(&k);
+                    }
+                }
                 let e = m.entry(pid).or_insert(0);
                 *e = e.saturating_add(1);
                 *e
@@ -1465,8 +1497,8 @@ impl ConsensusNetwork {
 
     /// Clear `pid`'s probe-timeout streak: any answering probe (ok or fast
     /// error) proves the connection is alive and breaks the streak.
-    fn probe_timeout_clear(&self, pid: &[u8; 20]) {
-        if let Ok(mut m) = self.probe_timeouts.lock() {
+    fn clear_probe_timeout(probe_timeouts: &Mutex<HashMap<[u8; 20], u32>>, pid: &[u8; 20]) {
+        if let Ok(mut m) = probe_timeouts.lock() {
             m.remove(pid);
         }
     }
@@ -1578,6 +1610,7 @@ impl ConsensusNetwork {
     /// hang until timeout) are indistinguishable from health without this:
     /// a failing probe names the dead direction in one line.
     pub async fn probe_peers(&self) {
+        let mut handles = Vec::new();
         for pid in self.peer_ids() {
             // Probe pacing (backpressure 2026-10-14): a probe is a full
             // `request_to` round trip per peer; without a floor, overlapping
@@ -1615,92 +1648,102 @@ impl ConsensusNetwork {
                 );
                 continue;
             }
-            let t = std::time::Instant::now();
-            let r = tokio::time::timeout(
-                send_timeout(),
-                self.adapter
-                    .node
-                    .request_to(pid, "core.ping", b"{}".to_vec()),
-            )
-            .await;
-            match r {
-                Ok(Ok(_)) => {
-                    let fails_before = self.peer_record(pid, true);
-                    self.probe_timeout_clear(&pid);
-                    // EMISSION ONLY (calibration feed, FIXES.md §2.12 peer-
-                    // latency series): the just-measured `core.ping` round
-                    // trip for this peer. Success arm only — see
-                    // `record_probe_rtt`. Never affects the health/backoff
-                    // verdicts below, which are computed independently.
-                    record_probe_rtt(&hex::encode(pid), t.elapsed());
-                    if fails_before >= PEER_SKIP_THRESHOLD {
-                        // Recovery already logged its one loud line inside
-                        // `record_health`; keep this attempt quiet.
-                        tracing::debug!(
-                            "[net] probe {} ok in {:?} (recovered)",
-                            hex::encode(pid),
-                            t.elapsed()
-                        );
-                    } else {
-                        tracing::info!("[net] probe {} ok in {:?}", hex::encode(pid), t.elapsed());
+            let node = Arc::clone(&self.adapter.node);
+            let health = Arc::clone(&self.peer_health);
+            let timeouts = Arc::clone(&self.probe_timeouts);
+            handles.push(tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                let r = tokio::time::timeout(
+                    send_timeout(),
+                    node.request_to(pid, "core.ping", b"{}".to_vec()),
+                )
+                .await;
+                match r {
+                    Ok(Ok(_)) => {
+                        let fails_before = Self::record_health(&health, pid, true);
+                        Self::clear_probe_timeout(&timeouts, &pid);
+                        // EMISSION ONLY (calibration feed, FIXES.md §2.12 peer-
+                        // latency series): the just-measured `core.ping` round
+                        // trip for this peer. Success arm only — see
+                        // `record_probe_rtt`. Never affects the health/backoff
+                        // verdicts below, which are computed independently.
+                        record_probe_rtt(&hex::encode(pid), t.elapsed());
+                        if fails_before >= PEER_SKIP_THRESHOLD {
+                            // Recovery already logged its one loud line inside
+                            // `record_health`; keep this attempt quiet.
+                            tracing::debug!(
+                                "[net] probe {} ok in {:?} (recovered)",
+                                hex::encode(pid),
+                                t.elapsed()
+                            );
+                        } else {
+                            tracing::info!(
+                                "[net] probe {} ok in {:?}",
+                                hex::encode(pid),
+                                t.elapsed()
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        Self::record_health(&health, pid, false);
+                        // A fast error still proves the connection answers, so it
+                        // breaks the TIMEOUT streak: eviction is for consecutive
+                        // timeouts, not for any failure.
+                        Self::clear_probe_timeout(&timeouts, &pid);
+                        if health_is_known_dead(&health, &pid) {
+                            // Known-dead peer: the transition warn already fired;
+                            // per-attempt errors stay at debug.
+                            tracing::debug!(
+                                "[net] probe {} err in {:?}: {e}",
+                                hex::encode(pid),
+                                t.elapsed()
+                            );
+                        } else {
+                            tracing::warn!(
+                                "[net] probe {} err in {:?}: {e}",
+                                hex::encode(pid),
+                                t.elapsed()
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        Self::record_health(&health, pid, false);
+                        let streak = Self::record_probe_timeout_hit(&timeouts, pid);
+                        let after = probe_evict_after();
+                        if probe_timeout_should_evict(streak, after) {
+                            tracing::warn!(
+                                "[net] probe {} TIMEOUT after {:?}; evicting conn ({streak} consecutive timeouts >= {after})",
+                                hex::encode(pid),
+                                t.elapsed(),
+                            );
+                            node.invalidate_peer_conn(pid).await;
+                        } else if health_is_known_dead(&health, &pid) {
+                            // Single (or sub-threshold) timeout on a known-dead
+                            // peer: record + move on quietly. The connection
+                            // stays; a transient stall must not cascade into a
+                            // conn-close/redial storm.
+                            tracing::debug!(
+                                "[net] probe {} TIMEOUT after {:?}; keeping conn ({streak}/{after} consecutive timeouts)",
+                                hex::encode(pid),
+                                t.elapsed(),
+                            );
+                        } else {
+                            // Single (or sub-threshold) timeout: record + move on.
+                            // The connection stays; a transient stall must not
+                            // cascade into a conn-close/redial storm.
+                            tracing::warn!(
+                                "[net] probe {} TIMEOUT after {:?}; keeping conn ({streak}/{after} consecutive timeouts)",
+                                hex::encode(pid),
+                                t.elapsed(),
+                            );
+                        }
                     }
                 }
-                Ok(Err(e)) => {
-                    self.peer_record(pid, false);
-                    // A fast error still proves the connection answers, so it
-                    // breaks the TIMEOUT streak: eviction is for consecutive
-                    // timeouts, not for any failure.
-                    self.probe_timeout_clear(&pid);
-                    if health_is_known_dead(&self.peer_health, &pid) {
-                        // Known-dead peer: the transition warn already fired;
-                        // per-attempt errors stay at debug.
-                        tracing::debug!(
-                            "[net] probe {} err in {:?}: {e}",
-                            hex::encode(pid),
-                            t.elapsed()
-                        );
-                    } else {
-                        tracing::warn!(
-                            "[net] probe {} err in {:?}: {e}",
-                            hex::encode(pid),
-                            t.elapsed()
-                        );
-                    }
-                }
-                Err(_) => {
-                    self.peer_record(pid, false);
-                    let streak = self.probe_timeout_hit(pid);
-                    let after = probe_evict_after();
-                    if probe_timeout_should_evict(streak, after) {
-                        tracing::warn!(
-                            "[net] probe {} TIMEOUT after {:?}; evicting conn ({streak} consecutive timeouts >= {after})",
-                            hex::encode(pid),
-                            t.elapsed(),
-                        );
-                        self.adapter.node.invalidate_peer_conn(pid).await;
-                    } else if health_is_known_dead(&self.peer_health, &pid) {
-                        // Single (or sub-threshold) timeout on a known-dead
-                        // peer: record + move on quietly. The connection
-                        // stays; a transient stall must not cascade into a
-                        // conn-close/redial storm.
-                        tracing::debug!(
-                            "[net] probe {} TIMEOUT after {:?}; keeping conn ({streak}/{after} consecutive timeouts)",
-                            hex::encode(pid),
-                            t.elapsed(),
-                        );
-                    } else {
-                        // Single (or sub-threshold) timeout: record + move on.
-                        // The connection stays; a transient stall must not
-                        // cascade into a conn-close/redial storm.
-                        tracing::warn!(
-                            "[net] probe {} TIMEOUT after {:?}; keeping conn ({streak}/{after} consecutive timeouts)",
-                            hex::encode(pid),
-                            t.elapsed(),
-                        );
-                    }
-                }
-            }
+            }));
         }
+        let budget =
+            std::time::Duration::from_millis(broadcast_join_timeout_ms().clamp(500, 1_500));
+        let (_done, _detached) = join_with_timeout(handles, budget).await;
         // Peer-target policy (flood control): no-op at/below target, so the
         // probe cadence is unchanged on honest stands.
         self.enforce_peer_target().await;
@@ -1856,7 +1899,7 @@ impl ConsensusNetwork {
         };
         let nbytes = frame.encoded_len;
         let data = frame.data;
-        let payload = frame.payload;
+        let payload_arc = Arc::new(frame.payload);
         log_stage(
             &ENCODE_STAGE_GATE,
             "encode",
@@ -1888,7 +1931,7 @@ impl ConsensusNetwork {
         ) {
             let delivery = self
                 .adapter
-                .deliver_consensus_mesh(&self.topic, &data)
+                .deliver_consensus_mesh_frame(&self.topic, &data, Arc::clone(&payload_arc))
                 .await;
             // COMPLETE means every ATTEMPTED direct copy succeeded.
             // `direct_targets` already excludes peers the scoring marks dead
@@ -1936,6 +1979,7 @@ impl ConsensusNetwork {
         // ACK also delays the NEXT chunk. A chunk carrying a `Committed`
         // keeps the acknowledged form (the catch-up proof). `fof`/`exempt`
         // were computed before the capability split above.
+        let payload = Arc::try_unwrap(payload_arc).unwrap_or_else(|a| (*a).clone());
         self.send_payload_with_skip(payload, exempt, fof).await;
     }
 
@@ -2592,6 +2636,18 @@ pub fn parse_incoming(raw: &str) -> Option<ConsensusMsg> {
     let data = v["data"].as_str()?;
     let bytes = hex::decode(data).ok()?;
     ConsensusMsg::decode(&bytes).ok()
+}
+
+/// Parse a raw pubsub payload `{ "topic", "data", "src" }` in ONE JSON pass,
+/// returning both the decoded `ConsensusMsg` and the validated `inbound_peer_key`.
+/// Avoids parsing the JSON envelope twice on the consensus inbound hot path.
+pub fn parse_incoming_with_peer_key(raw: &str) -> Option<(ConsensusMsg, String)> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let data = v["data"].as_str()?;
+    let bytes = hex::decode(data).ok()?;
+    let msg = ConsensusMsg::decode(&bytes).ok()?;
+    let peer_key = peer_key_from_json(&v);
+    Some((msg, peer_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -3402,8 +3458,11 @@ pub const COMPACT_PULL_RATE_MAX: u32 = 8;
 /// lost reply is retried after the window instead of being suppressed forever.
 pub const COMPACT_FULL_REPLY_COOLDOWN_MS: u64 = 5_000;
 
+/// Hard cap on per-requester rate entries tracked by [`CompactBodyServer`].
+pub const COMPACT_PULL_RATE_MAX_PEERS: usize = 1024;
+
 /// One `(requester, request)` already answered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ServedKey {
     requester: String,
     block_hash: [u8; 32],
@@ -3435,6 +3494,7 @@ pub struct CompactBodyServer {
     recent: VecDeque<ServedBlock>,
     bytes: usize,
     served: VecDeque<ServedKey>,
+    served_set: HashSet<ServedKey>,
     rates: HashMap<String, (u64, u32)>,
     served_total: u64,
 }
@@ -3527,8 +3587,22 @@ impl CompactBodyServer {
                 pull.attempt as u64
             },
         };
-        if self.served.contains(&key) {
+        if self.served_set.contains(&key) {
             return false;
+        }
+        if !self.rates.contains_key(requester) && self.rates.len() >= COMPACT_PULL_RATE_MAX_PEERS {
+            self.rates
+                .retain(|_, (ts, _)| now_ms.saturating_sub(*ts) < COMPACT_PULL_RATE_WINDOW_MS);
+            if self.rates.len() >= COMPACT_PULL_RATE_MAX_PEERS {
+                if let Some(oldest) = self
+                    .rates
+                    .iter()
+                    .min_by_key(|(_, (ts, _))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.rates.remove(&oldest);
+                }
+            }
         }
         let entry = self
             .rates
@@ -3541,9 +3615,12 @@ impl CompactBodyServer {
             return false;
         }
         entry.1 += 1;
+        self.served_set.insert(key.clone());
         self.served.push_back(key);
         while self.served.len() > COMPACT_SERVED_ONCE_MAX {
-            self.served.pop_front();
+            if let Some(old) = self.served.pop_front() {
+                self.served_set.remove(&old);
+            }
         }
         true
     }
@@ -4175,6 +4252,9 @@ impl TxGossip {
                     }
                 } else {
                     let fails_before = h.get(&pid).map_or(0, |e| e.fails);
+                    if !h.contains_key(&pid) {
+                        enforce_peer_health_cap(&mut h, now);
+                    }
                     let e = h.entry(pid).or_default();
                     e.fails = e.fails.saturating_add(1);
                     e.last_fail = Some(now);
@@ -6866,37 +6946,49 @@ pub const INBOUND_MAX_TRACKED_PEERS: usize = 1024;
 
 /// Effective per-peer send floor (`STELL_CONS_BCAST_MIN_INTERVAL_MS`, default 25).
 pub fn cons_bcast_min_interval_ms() -> u64 {
-    std::env::var("STELL_CONS_BCAST_MIN_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(CONS_BCAST_MIN_INTERVAL_MS_DEFAULT)
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_CONS_BCAST_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(CONS_BCAST_MIN_INTERVAL_MS_DEFAULT)
+    })
 }
 
 /// Effective per-peer probe floor (`STELL_CONS_PROBE_MIN_INTERVAL_MS`, default 5000).
 pub fn cons_probe_min_interval_ms() -> u64 {
-    std::env::var("STELL_CONS_PROBE_MIN_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n >= 100)
-        .unwrap_or(CONS_PROBE_MIN_INTERVAL_MS_DEFAULT)
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_CONS_PROBE_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 100)
+            .unwrap_or(CONS_PROBE_MIN_INTERVAL_MS_DEFAULT)
+    })
 }
 
 /// Effective inbound bulk rate (`STELL_INBOUND_BULK_BYTES_PER_SEC`, default 512 KiB).
 pub fn inbound_bulk_bytes_per_sec() -> u64 {
-    std::env::var("STELL_INBOUND_BULK_BYTES_PER_SEC")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n >= 1024)
-        .unwrap_or(INBOUND_BULK_BYTES_PER_SEC_DEFAULT)
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_INBOUND_BULK_BYTES_PER_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(INBOUND_BULK_BYTES_PER_SEC_DEFAULT)
+    })
 }
 
 /// Effective inbound burst (`STELL_INBOUND_BULK_BURST_BYTES`, default 1 MiB).
 pub fn inbound_bulk_burst_bytes() -> u64 {
-    std::env::var("STELL_INBOUND_BULK_BURST_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n >= 1024)
-        .unwrap_or(INBOUND_BULK_BURST_BYTES_DEFAULT)
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_INBOUND_BULK_BURST_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(INBOUND_BULK_BURST_BYTES_DEFAULT)
+    })
 }
 
 /// Pure pacing decision: due when never sent (`None`) or the floor elapsed.
@@ -7029,11 +7121,7 @@ pub const INBOUND_PEER_KEY_MAX_LEN: usize = 128;
 /// instead of becoming a distinct attacker-minted map key.
 ///
 /// Pure so the contract is testable without a live peer.
-pub fn inbound_peer_key(raw: &str) -> String {
-    let v: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return INBOUND_BROADCAST_PEER_KEY.to_string(),
-    };
+fn peer_key_from_json(v: &serde_json::Value) -> String {
     let sender = v
         .get("src")
         .or_else(|| v.get("from"))
@@ -7056,6 +7144,14 @@ pub fn inbound_peer_key(raw: &str) -> String {
         }
         None => INBOUND_BROADCAST_PEER_KEY.to_string(),
     }
+}
+
+pub fn inbound_peer_key(raw: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return INBOUND_BROADCAST_PEER_KEY.to_string(),
+    };
+    peer_key_from_json(&v)
 }
 
 /// Per-peer byte-rate limiter for inbound bulk traffic.

@@ -40,6 +40,7 @@ fn ref_merge_index(
                 origin,
                 ttl_ms,
                 stored_at,
+                last_republished_ms: 0,
             }),
             true,
         ),
@@ -71,6 +72,7 @@ fn ref_merge_index(
                     origin,
                     ttl_ms: ttl_ms.max(local.ttl_ms),
                     stored_at: stored_at.max(local.stored_at),
+                    last_republished_ms: 0,
                 };
                 (Some(newv), changed)
             } else {
@@ -192,6 +194,7 @@ fn opt_index_union_parity_randomized() {
                 origin: origin(),
                 ttl_ms: 86_400_000,
                 stored_at: now - rng.below(100_000) as i64,
+                last_republished_ms: 0,
             })
         } else {
             None
@@ -244,6 +247,7 @@ fn opt_index_union_parity_randomized() {
                     origin: origin(),
                     ttl_ms: 86_400_000,
                     stored_at: now,
+                    last_republished_ms: 0,
                 },
             );
         }
@@ -340,6 +344,7 @@ fn opt_index_union_tombs_key_parity_randomized() {
                     origin: origin(),
                     ttl_ms: 86_400_000,
                     stored_at: now - 1000,
+                    last_republished_ms: 0,
                 },
             );
         }
@@ -381,6 +386,7 @@ fn bench_union_fixture(n: usize) -> (StoredValue, String, String) {
         origin: origin(),
         ttl_ms: 86_400_000,
         stored_at: now_ms() - 5000,
+        last_republished_ms: 0,
     };
     (
         local,
@@ -402,6 +408,7 @@ fn time_prod(n: usize, iters: usize) -> f64 {
                 origin: origin(),
                 ttl_ms: 86_400_000,
                 stored_at: now_ms(),
+                last_republished_ms: 0,
             },
         );
         std::hint::black_box(kv.merge_replica(
@@ -424,6 +431,7 @@ fn time_prod(n: usize, iters: usize) -> f64 {
                 origin: origin(),
                 ttl_ms: 86_400_000,
                 stored_at: now_ms(),
+                last_republished_ms: 0,
             },
         );
         std::hint::black_box(kv.merge_replica(

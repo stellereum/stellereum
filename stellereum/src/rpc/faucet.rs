@@ -435,6 +435,55 @@ pub(super) struct FaucetStateV2 {
 /// swept from memory (and, with the incremental store, from disk). Lifetime
 /// `dispensed` totals are NEVER pruned: they are the anti-drain cap.
 pub const PUBLIC_DRIP_PRUNE_THRESHOLD: usize = 10_000;
+/// Hard ceiling on per-hour IP rate-limit buckets retained in [`FaucetState`].
+pub const IP_BUCKETS_MAX_ENTRIES: usize = 100_000;
+
+fn cap_ip_buckets(
+    ip_buckets: &mut std::collections::HashMap<String, (u64, u32)>,
+    hour: u64,
+    incoming_key: &str,
+) {
+    if ip_buckets.len() < IP_BUCKETS_MAX_ENTRIES || ip_buckets.contains_key(incoming_key) {
+        return;
+    }
+    ip_buckets.retain(|_, (h, _)| hour.saturating_sub(*h) <= 1);
+    while ip_buckets.len() >= IP_BUCKETS_MAX_ENTRIES {
+        let victim = ip_buckets
+            .iter()
+            .min_by(|(ka, (ha, na)), (kb, (hb, nb))| {
+                (*ha, *na, ka.as_str()).cmp(&(*hb, *nb, kb.as_str()))
+            })
+            .map(|(k, _)| k.clone());
+        let Some(k) = victim else {
+            break;
+        };
+        ip_buckets.remove(&k);
+    }
+}
+
+fn cap_last_public_drip(
+    last_public_drip: &mut std::collections::HashMap<[u8; 32], u64>,
+    now_secs: u64,
+    cooldown: u64,
+    incoming_who: &[u8; 32],
+) {
+    if last_public_drip.len() < PUBLIC_DRIP_PRUNE_THRESHOLD
+        || last_public_drip.contains_key(incoming_who)
+    {
+        return;
+    }
+    last_public_drip.retain(|_, last| now_secs.saturating_sub(*last) < cooldown);
+    while last_public_drip.len() >= PUBLIC_DRIP_PRUNE_THRESHOLD {
+        let victim = last_public_drip
+            .iter()
+            .min_by(|(ka, ta), (kb, tb)| (*ta, *ka).cmp(&(*tb, *kb)))
+            .map(|(k, _)| *k);
+        let Some(k) = victim else {
+            break;
+        };
+        last_public_drip.remove(&k);
+    }
+}
 /// Failed durable faucet writes (serialize / write / flush). A repeating
 /// failure is visible even when logs rotate; the consequence (a drip that
 /// could not be made durable is refused, never silently granted) is named at
@@ -1097,7 +1146,10 @@ impl Faucet {
                 }
             }
         };
-        Ok((self.sign_transfer_for_chain(who, amount, nonce, None), amount))
+        Ok((
+            self.sign_transfer_for_chain(who, amount, nonce, None),
+            amount,
+        ))
     }
 
     /// Single-lock drip request for BOTH ingress paths. Runs strictly:
@@ -1214,6 +1266,7 @@ impl Faucet {
                             *n += 1;
                         }
                         _ => {
+                            cap_ip_buckets(&mut st.ip_buckets, hour, key);
                             st.ip_buckets.insert(key.to_string(), (hour, 1));
                         }
                     }
@@ -1296,17 +1349,16 @@ impl Faucet {
                     *n += 1;
                 }
                 _ => {
+                    cap_ip_buckets(&mut st.ip_buckets, hour, key);
                     st.ip_buckets.insert(key.to_string(), (hour, 1));
                 }
             }
         }
         if public {
-            // Bound the cooldown map: expired entries are dead weight. The
+            // Bound the cooldown map: expired entries are dead weight, and
+            // within a single window the oldest entries are evicted at cap. The
             // lifetime `dispensed` ledger is NEVER touched by this sweep.
-            if st.last_public_drip.len() >= PUBLIC_DRIP_PRUNE_THRESHOLD {
-                st.last_public_drip
-                    .retain(|_, last| now_secs.saturating_sub(*last) < cooldown);
-            }
+            cap_last_public_drip(&mut st.last_public_drip, now_secs, cooldown, &who);
             st.last_public_drip.insert(who, now_secs);
         }
         // Durable before returning: a crash between here and the transfer must
@@ -1505,6 +1557,7 @@ impl Faucet {
                 }
             }
             _ => {
+                cap_ip_buckets(&mut st.ip_buckets, hour, &key);
                 st.ip_buckets.insert(key.clone(), (hour, 1));
                 true
             }
@@ -1622,5 +1675,51 @@ pub(super) fn parse_addr_from_val(val: Option<&Value>) -> Result<[u8; 32], Strin
             serde_json::from_value::<[u8; 32]>(v.clone()).map_err(|e| e.to_string())
         }
         _ => Err("missing or invalid address in opcode".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faucet_ip_buckets_and_public_drip_stay_bounded_within_window() {
+        let mut buckets = std::collections::HashMap::new();
+        let hour = 100u64;
+        for i in 0..IP_BUCKETS_MAX_ENTRIES {
+            let count = if i == 0 { 1 } else { 5 };
+            buckets.insert(format!("10.0.{}.{}", i / 256, i % 256), (hour, count));
+        }
+        assert_eq!(buckets.len(), IP_BUCKETS_MAX_ENTRIES);
+
+        cap_ip_buckets(&mut buckets, hour, "192.168.1.1");
+        buckets.insert("192.168.1.1".to_string(), (hour, 1));
+        assert_eq!(buckets.len(), IP_BUCKETS_MAX_ENTRIES);
+        assert!(
+            !buckets.contains_key("10.0.0.0"),
+            "lowest-count bucket in current hour must be evicted"
+        );
+        assert!(buckets.contains_key("192.168.1.1"));
+
+        let mut drips = std::collections::HashMap::new();
+        let now = 50_000u64;
+        let cooldown = 2_700u64;
+        for i in 0..PUBLIC_DRIP_PRUNE_THRESHOLD {
+            let mut who = [0u8; 32];
+            who[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            // Entry 0 is oldest active within window.
+            drips.insert(who, now - 100 + if i == 0 { 0 } else { 50 });
+        }
+        assert_eq!(drips.len(), PUBLIC_DRIP_PRUNE_THRESHOLD);
+
+        let newcomer = [0xFFu8; 32];
+        cap_last_public_drip(&mut drips, now, cooldown, &newcomer);
+        drips.insert(newcomer, now);
+        assert_eq!(drips.len(), PUBLIC_DRIP_PRUNE_THRESHOLD);
+        assert!(
+            !drips.contains_key(&[0u8; 32]),
+            "oldest active cooldown must be evicted at cap"
+        );
+        assert!(drips.contains_key(&newcomer));
     }
 }

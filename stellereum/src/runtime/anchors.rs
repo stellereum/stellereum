@@ -185,6 +185,7 @@ impl ValidatorRuntime {
             governance: None,
             block_reward: 0,
             last_decision: None,
+            decided_parent_votes: None,
             parent_evidence_missing: false,
             shard_id: MASTERCHAIN_SHARD,
             shard_registry: ShardRegistry::single(),
@@ -2212,6 +2213,7 @@ impl ValidatorRuntime {
         if block.height == 0 {
             // Genesis has no decided predecessor: no downtime evidence exists
             // and none is required for the height-1 proposal.
+            self.decided_parent_votes = None;
             self.parent_evidence_missing = false;
             return Ok(());
         }
@@ -2265,8 +2267,17 @@ impl ValidatorRuntime {
             ));
         }
         let qc = qc.clone();
+        let schedule = self.committee_schedule_at(block.height);
         self.blocks.insert(bh, block.clone());
-        self.last_decision = Some((block.height, block.clone(), qc));
+        self.last_decision = Some((block.height, block.clone(), qc.clone()));
+        self.seed_decided_parent_votes_from_qc(
+            block.height,
+            bh,
+            &qc,
+            set,
+            Some(block.prev_hash),
+            schedule,
+        );
         self.parent_evidence_missing = false;
         Ok(())
     }

@@ -560,24 +560,120 @@ impl ReceiptIndex {
     }
 }
 
+struct MempoolSaveSlot {
+    owner: std::sync::Weak<RwLock<Mempool>>,
+    last_ms: std::sync::atomic::AtomicU64,
+    in_flight: std::sync::atomic::AtomicBool,
+    path: std::sync::RwLock<Option<std::path::PathBuf>>,
+}
+
+fn mempool_save_slots() -> &'static std::sync::Mutex<HashMap<usize, Arc<MempoolSaveSlot>>> {
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Arc<MempoolSaveSlot>>>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 impl RpcState {
+    fn mempool_save_slot(&self) -> Arc<MempoolSaveSlot> {
+        let key = Arc::as_ptr(&self.mempool) as usize;
+        let mut guard = mempool_save_slots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&key) {
+            if existing.owner.strong_count() > 0
+                && std::ptr::eq(existing.owner.as_ptr(), Arc::as_ptr(&self.mempool))
+            {
+                return Arc::clone(existing);
+            }
+        }
+        // Prune dropped RpcState slots so repeated test/node setups never leak.
+        if guard.len() > 64 {
+            guard.retain(|_, slot| slot.owner.strong_count() > 0);
+        }
+        let slot = Arc::new(MempoolSaveSlot {
+            owner: Arc::downgrade(&self.mempool),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            in_flight: std::sync::atomic::AtomicBool::new(false),
+            path: std::sync::RwLock::new(None),
+        });
+        guard.insert(key, Arc::clone(&slot));
+        slot
+    }
+
+    /// Configure the mempool persistence file path for this [`RpcState`] instance.
+    pub fn set_mempool_path(&self, path: impl Into<std::path::PathBuf>) {
+        let slot = self.mempool_save_slot();
+        *slot.path.write().unwrap_or_else(|e| e.into_inner()) = Some(path.into());
+    }
+
+    /// Configured mempool persistence path, defaulting to `./data/mempool.bin` if unset.
+    pub fn mempool_path(&self) -> std::path::PathBuf {
+        let slot = self.mempool_save_slot();
+        let out = slot
+            .path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/mempool.bin"));
+        out
+    }
+
     /// Best-effort mempool durability after admissions: restarts between the
     /// 15s periodic save and execution silently drop fresh transactions
-    /// (observed live: 1000-tx blasts vanishing). Throttled to once per 2s so
-    /// a burst doesn't fsync per tx; the shutdown hook and periodic saver
-    /// cover the rest. Path matches the loader in main.rs.
+    /// (observed live: 1000-tx blasts vanishing). Throttled to once per 2s and
+    /// executed off-thread (`tokio::spawn` + `spawn_blocking`) as a
+    /// single-flight operation using per-`RpcState` atomics (`AtomicU64` +
+    /// `AtomicBool`), so admissions never block on `bincode` or disk I/O.
     pub async fn save_mempool_throttled(&self) {
-        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::sync::atomic::Ordering;
+        let slot = self.mempool_save_slot();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if now.saturating_sub(LAST_MS.load(std::sync::atomic::Ordering::Relaxed)) < 2000 {
+        let last = slot.last_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) < 2000 {
             return;
         }
-        LAST_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-        let path = std::path::PathBuf::from("./data/mempool.bin");
-        self.mempool.read().await.save(&path);
+        if slot
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let last_recheck = slot.last_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last_recheck) < 2000 {
+            slot.in_flight.store(false, Ordering::Release);
+            return;
+        }
+        slot.last_ms.store(now, Ordering::Release);
+
+        struct InFlightGuard(Arc<MempoolSaveSlot>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.in_flight.store(false, Ordering::Release);
+            }
+        }
+        let in_flight_guard = InFlightGuard(Arc::clone(&slot));
+        let path = slot
+            .path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/mempool.bin"));
+        let mempool = Arc::clone(&self.mempool);
+        tokio::spawn(async move {
+            let _guard = in_flight_guard;
+            let snapshot = {
+                let pool = mempool.read().await;
+                pool.save_snapshot()
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::mempool::Mempool::write_save_snapshot(&path, snapshot);
+            })
+            .await;
+        });
     }
 
     /// Record a newly finalized block. Called by the consensus loop.
@@ -1207,6 +1303,22 @@ pub async fn handle_rpc_batch_call_client(
             });
             continue;
         }
+        let _expensive_permit = match try_acquire_http_expensive_read(&req.method) {
+            Ok(p) => p,
+            Err(msg) => {
+                out.push(RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(RpcError {
+                        code: -32000,
+                        message: msg.to_string(),
+                        data: None,
+                    }),
+                });
+                continue;
+            }
+        };
         out.push(
             dispatch_client(st, id, &req.method, &req.params, header_token, client)
                 .await

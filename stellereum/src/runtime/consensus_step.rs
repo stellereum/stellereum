@@ -1,10 +1,13 @@
 use super::lanes::{block_actor_sends_exceed_cap, count_block_actor_sends};
 use super::{
     master_set_stamp, publish_master_set_stamp, set_fingerprint, workchain_set_activation_height,
-    BlockHash, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS, MAX_COMMIT_CERT_SIGNERS,
-    PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS, VALIDATOR_SET_HISTORY_CAP,
+    BlockHash, DecidedParentVotes, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS,
+    MAX_COMMIT_CERT_SIGNERS, PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS,
+    VALIDATOR_SET_HISTORY_CAP,
 };
-use crate::consensus::{Height, Round, Step, ValidatorId, ValidatorSet, Vote, VoteKind};
+use crate::consensus::{
+    CommitteeSchedule, Height, Round, Step, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
+};
 use crate::sharding::{Block, CrossShardKey, Transaction, ValidatorSetSource};
 use sha2::{Digest as _, Sha256};
 
@@ -56,7 +59,8 @@ impl ValidatorRuntime {
             .map(|b| b.timestamp)
             .or_else(|| {
                 self.last_decision.as_ref().and_then(|(h, b, _)| {
-                    if *h + 1 == block.height && b.compute_hash() == block.prev_hash {
+                    if *h + 1 == block.height && self.decision_block_hash(*h, b) == block.prev_hash
+                    {
                         Some(b.timestamp)
                     } else {
                         None
@@ -115,9 +119,17 @@ impl ValidatorRuntime {
     /// the signatures too: hashing 64 B x N is memcmp-cheap next to N
     /// Ed25519 verifies, so the verify-once speedup is kept and the verdict
     /// is a pure function of the key.
-    pub(super) fn batch_verify_cache_key(block: &Block) -> [u8; 32] {
+    pub(super) fn decision_block_hash(&self, h: Height, b: &Block) -> BlockHash {
+        self.decided_parent_votes
+            .as_ref()
+            .filter(|dpv| dpv.height == h)
+            .map(|dpv| dpv.decision_block_hash)
+            .unwrap_or_else(|| b.compute_hash())
+    }
+
+    pub(super) fn batch_verify_cache_key_with_hash(block: &Block, bh: &BlockHash) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(block.compute_hash());
+        h.update(bh);
         h.update((block.transactions.len() as u32).to_be_bytes());
         for tx in &block.transactions {
             h.update((tx.signature.len() as u32).to_be_bytes());
@@ -125,6 +137,7 @@ impl ValidatorRuntime {
         }
         h.finalize().into()
     }
+
     /// Same aliasing class as above: `compute_hash` excludes
     /// `validator_signatures` (evidence ABOUT the block, decided after the
     /// hash is fixed), so a body with a FORGED proposer signature shares the
@@ -132,9 +145,9 @@ impl ValidatorRuntime {
     /// (block hash, proposer, validator_signatures), which is exactly what
     /// this key commits to (`proposer` is hashed already; it is mixed in
     /// again so the key is self-describing).
-    pub(super) fn proposer_sig_cache_key(block: &Block) -> [u8; 32] {
+    pub(super) fn proposer_sig_cache_key_with_hash(block: &Block, bh: &BlockHash) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(block.compute_hash());
+        h.update(bh);
         h.update(block.proposer);
         h.update((block.validator_signatures.len() as u32).to_be_bytes());
         for (id, sig) in &block.validator_signatures {
@@ -144,16 +157,47 @@ impl ValidatorRuntime {
         }
         h.finalize().into()
     }
-    pub(super) fn check_order_commitment(&self, block: &Block) -> Result<(), String> {
+
+    pub(super) fn verify_proposer_sig_cached(
+        &self,
+        block: &Block,
+        bh: &BlockHash,
+        cache_failures: bool,
+    ) -> bool {
+        let cache_key = Self::proposer_sig_cache_key_with_hash(block, bh);
+        if let Some(v) = self
+            .proposer_sig_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&cache_key).copied())
+        {
+            return v;
+        }
+        let ok = crate::consensus::verify_proposer_signature_with_hash(block, bh);
+        if ok || cache_failures {
+            if let Ok(mut g) = self.proposer_sig_cache.lock() {
+                if g.len() > 1024 {
+                    g.clear();
+                }
+                g.insert(cache_key, ok);
+            }
+        }
+        ok
+    }
+
+    pub(super) fn check_order_commitment_with_hash(
+        &self,
+        block: &Block,
+        bh: &BlockHash,
+    ) -> Result<(), String> {
         // STAB: per-block-hash cache — the root is a pure function of the body,
         // so repeat validations of the same block (round retries, demanded
         // re-propose, adopt) hit O(1) instead of re-hashing O(txs).
-        let bh = block.compute_hash();
         if let Some(cached) = self
             .order_root_cache
             .lock()
             .ok()
-            .and_then(|g| g.get(&bh).copied())
+            .and_then(|g| g.get(bh).copied())
         {
             if block.order_merkle_root != cached {
                 return Err(format!(
@@ -169,7 +213,7 @@ impl ValidatorRuntime {
             if g.len() > 1024 {
                 g.clear();
             }
-            g.insert(bh, expected);
+            g.insert(*bh, expected);
         }
         if block.order_merkle_root != expected {
             return Err(format!(
@@ -205,15 +249,23 @@ impl ValidatorRuntime {
     /// `last_decision` names it) rejects `None` outright: the evidence exists
     /// and omitting it would silently suppress one height of downtime
     /// accounting.
+    #[cfg(test)]
     pub(super) fn check_last_qc_evidence(&self, block: &Block) -> Result<(), String> {
+        self.check_last_qc_evidence_with_hash(block, &block.compute_hash())
+    }
+
+    pub(super) fn check_last_qc_evidence_with_hash(
+        &self,
+        block: &Block,
+        bh: &BlockHash,
+    ) -> Result<(), String> {
         let Some(parent_h) = block.height.checked_sub(1) else {
             return Ok(());
         };
         let Some(qc) = &block.last_qc else {
-            let knows_parent_decision = self
-                .last_decision
-                .as_ref()
-                .is_some_and(|(h, b, _)| *h == parent_h && b.compute_hash() == block.prev_hash);
+            let knows_parent_decision = self.last_decision.as_ref().is_some_and(|(h, b, _)| {
+                *h == parent_h && self.decision_block_hash(*h, b) == block.prev_hash
+            });
             if knows_parent_decision {
                 return Err(format!(
                     "proposal: block at height {} omits the downtime evidence for decided height {parent_h}",
@@ -252,12 +304,11 @@ impl ValidatorRuntime {
         // block; the second+ visits hit O(1) instead of re-running
         // verify-grade `signers_set` crypto. Failures are NOT cached (a
         // history advance could turn a weak QC into a passing one).
-        let bh = block.compute_hash();
         if let Some((ok, _)) = self
             .qc_power_cache
             .lock()
             .ok()
-            .and_then(|g| g.get(&bh).copied())
+            .and_then(|g| g.get(bh).copied())
         {
             if ok {
                 return Ok(());
@@ -295,7 +346,7 @@ impl ValidatorRuntime {
             // Do NOT run attribution again just to fill a readout number: no
             // caller reads the second tuple element, and a second Falcon pass
             // per proposal is exactly the CPU cost the cap work removed.
-            g.insert(bh, (true, 0));
+            g.insert(*bh, (true, 0));
         }
         Ok(())
     }
@@ -322,13 +373,157 @@ impl ValidatorRuntime {
         parent_hash: &BlockHash,
     ) -> Option<crate::consensus::QuorumCertificate> {
         let h = self.hc.height.checked_sub(1)?;
-        self.last_decision.as_ref().and_then(|(dh, b, qc)| {
-            if *dh == h && b.compute_hash() == *parent_hash {
-                Some(qc.clone())
-            } else {
-                None
+        let (dh, b, qc) = self.last_decision.as_ref()?;
+        if *dh != h || self.decision_block_hash(*dh, b) != *parent_hash {
+            return None;
+        }
+        if let Some(dpv) = self.decided_parent_votes.as_ref() {
+            if dpv.height == h
+                && dpv.block_hash == *parent_hash
+                && dpv.decision_block_hash == *parent_hash
+            {
+                let current_signers = qc.pq_signer_count();
+                let target_votes = dpv
+                    .votes
+                    .falcon_votes_count_for_target(Some(dpv.block_hash));
+                if target_votes > current_signers {
+                    if let Some(rebuilt) =
+                        crate::consensus::produce_decision_certificate_with_schedule(
+                            &dpv.votes,
+                            Some(dpv.block_hash),
+                            &dpv.validators,
+                            dpv.parent_hash.as_ref(),
+                            dpv.schedule,
+                        )
+                    {
+                        if rebuilt.pq_signer_count() > current_signers
+                            && rebuilt.verify_with_schedule(&dpv.validators, dpv.schedule)
+                        {
+                            return Some(rebuilt);
+                        }
+                    }
+                }
             }
-        })
+        }
+        Some(qc.clone())
+    }
+
+    pub(super) fn seed_decided_parent_votes_from_qc(
+        &mut self,
+        height: Height,
+        bh: BlockHash,
+        qc: &crate::consensus::QuorumCertificate,
+        validators: ValidatorSet,
+        parent_hash: Option<[u8; 32]>,
+        schedule: CommitteeSchedule,
+    ) {
+        let mut votes = VoteSet::new();
+        for (voter, fsig) in qc.pq_signer_signatures_with_schedule(&validators, schedule) {
+            let mut sig = qc
+                .signatures
+                .iter()
+                .find(|(id, s)| *id == voter && s.len() == 64)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| vec![0u8; 64]);
+            crate::consensus::attach_vote_falcon_sig(&fsig, &mut sig);
+            let vote = Vote::signed_with_in_shard(
+                voter,
+                qc.shard_id,
+                height,
+                qc.round,
+                VoteKind::Precommit,
+                Some(bh),
+                sig,
+            );
+            let _ = votes.add_verified_in_scope(
+                vote,
+                &validators,
+                height,
+                qc.round,
+                VoteKind::Precommit,
+            );
+        }
+        if self.hc.height == height {
+            if let Some(hc_set) = self.hc.precommit_set(qc.round) {
+                for voter in validators.validators.keys() {
+                    if votes.vote_by(voter).is_some() {
+                        continue;
+                    }
+                    if let Some(v) = hc_set.vote_by(voter) {
+                        if v.block_hash == Some(bh)
+                            && v.shard_id == qc.shard_id
+                            && v.falcon_signature().is_some()
+                        {
+                            let _ = votes.add_verified_in_scope(
+                                v.clone(),
+                                &validators,
+                                height,
+                                qc.round,
+                                VoteKind::Precommit,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.decided_parent_votes = Some(DecidedParentVotes {
+            height,
+            round: qc.round,
+            block_hash: bh,
+            shard_id: qc.shard_id,
+            validators,
+            parent_hash,
+            schedule,
+            votes,
+            decision_block_hash: bh,
+        });
+    }
+
+    /// Admit a late-arriving valid `Precommit` for the already-decided parent
+    /// height (`H-1`) into `decided_parent_votes.votes` ONLY so `Block.last_qc`
+    /// includes slower honest validators without touching `self.hc`,
+    /// `self.safety`, floors, or round chasing.
+    pub fn record_late_parent_precommit(&mut self, v: &Vote) -> bool {
+        if v.kind != VoteKind::Precommit || v.shard_id != self.shard_id {
+            return false;
+        }
+        let Some(dpv) = self.decided_parent_votes.as_mut() else {
+            return false;
+        };
+        if v.shard_id != dpv.shard_id
+            || v.height != dpv.height
+            || v.round != dpv.round
+            || v.block_hash != Some(dpv.block_hash)
+        {
+            return false;
+        }
+        if dpv.validators.power_of(&v.voter) == 0 {
+            return false;
+        }
+        if dpv.votes.vote_by(&v.voter).is_some() {
+            return false;
+        }
+        if !v.verify() {
+            return false;
+        }
+        dpv.votes
+            .add_verified_in_scope(
+                v.clone(),
+                &dpv.validators,
+                dpv.height,
+                dpv.round,
+                VoteKind::Precommit,
+            )
+            .is_ok()
+    }
+
+    pub(super) fn try_admit_late_parent_precommit(&mut self, v: &Vote) -> bool {
+        let eligible = v.height.checked_add(1) == Some(self.hc.height)
+            || (v.height == self.hc.height && self.apply_in_flight.is_some());
+        if !eligible {
+            return false;
+        }
+        self.record_late_parent_precommit(v)
     }
 
     /// SHARD SCOPE, shared by every entry point that can apply a block.
@@ -403,6 +598,19 @@ impl ValidatorRuntime {
         &self,
         block: &Block,
         expected_state_root: [u8; 32],
+    ) -> Result<(), String> {
+        self.validate_proposal_unaligned_with_hash(
+            block,
+            expected_state_root,
+            &block.compute_hash(),
+        )
+    }
+
+    pub(super) fn validate_proposal_unaligned_with_hash(
+        &self,
+        block: &Block,
+        expected_state_root: [u8; 32],
+        bh: &BlockHash,
     ) -> Result<(), String> {
         if block.height != self.hc.height {
             return Err("proposal: wrong height".to_string());
@@ -559,7 +767,7 @@ impl ValidatorRuntime {
                 "DIVERGENCE height={} block={} proposer={} their_root={} our_root={} \
                  same finalized hash, different post-state: execution diverged, resync the minority side from a canonical snapshot",
                 block.height,
-                hex::encode(block.compute_hash()),
+                hex::encode(bh),
                 hex::encode(block.proposer),
                 their_root,
                 our_root,
@@ -596,40 +804,19 @@ impl ValidatorRuntime {
         // no longer matches the commitment is refused for the ORDER reason,
         // not for the incidental "the signature does not cover this body"
         // reason — the order commitment is the rule that is being violated.
-        self.check_order_commitment(block)?;
+        self.check_order_commitment_with_hash(block, bh)?;
         // CANONICAL DOWNTIME EVIDENCE (W10.5): the proposer-chosen QC for the
         // parent height — verified here (linkage, finality shape, quorum under
         // the set in force at H-1) so the evidence every applier attributes
         // from is byte-identical across the network.
-        self.check_last_qc_evidence(block)?;
+        self.check_last_qc_evidence_with_hash(block, bh)?;
         // Authenticity: the block must actually be signed by its declared
         // proposer, otherwise a peer could propose on another validator's behalf.
         // STAB verify-once: cache the verdict per block hash (pure function
         // of block bytes); the timed attribution path below hits the cache
         // instead of re-verifying the same Ed25519/Falcon signature.
-        {
-            let bh = Self::proposer_sig_cache_key(block);
-            let cached = self
-                .proposer_sig_cache
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&bh).copied());
-            let ok = match cached {
-                Some(v) => v,
-                None => {
-                    let v = crate::consensus::verify_proposer_signature(block);
-                    if let Ok(mut g) = self.proposer_sig_cache.lock() {
-                        if g.len() > 1024 {
-                            g.clear();
-                        }
-                        g.insert(bh, v);
-                    }
-                    v
-                }
-            };
-            if !ok {
-                return Err("proposal: invalid or missing proposer signature".to_string());
-            }
+        if !self.verify_proposer_sig_cached(block, bh, true) {
+            return Err("proposal: invalid or missing proposer signature".to_string());
         }
         let expected_prev = self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
         if block.prev_hash != expected_prev {
@@ -670,12 +857,12 @@ impl ValidatorRuntime {
         // STAB verify-once: cache per signature-committing key; the timed attribution re-run
         // below becomes an O(1) HashMap hit with a byte-identical verdict.
         {
-            let bh = Self::batch_verify_cache_key(block);
+            let batch_key = Self::batch_verify_cache_key_with_hash(block, bh);
             let cached = self
                 .batch_verify_cache
                 .lock()
                 .ok()
-                .and_then(|g| g.get(&bh).copied());
+                .and_then(|g| g.get(&batch_key).copied());
             let ok = match cached {
                 Some(v) => v,
                 None => {
@@ -687,7 +874,7 @@ impl ValidatorRuntime {
                         if g.len() > 1024 {
                             g.clear();
                         }
-                        g.insert(bh, v);
+                        g.insert(batch_key, v);
                     }
                     v
                 }
@@ -867,21 +1054,33 @@ impl ValidatorRuntime {
         block: &Block,
         expected_state_root: [u8; 32],
     ) -> (Result<(), String>, Vec<(String, u64)>) {
+        self.validate_proposal_timed_with_hash(block, expected_state_root, &block.compute_hash())
+    }
+
+    pub(super) fn validate_proposal_timed_with_hash(
+        &self,
+        block: &Block,
+        expected_state_root: [u8; 32],
+        bh: &BlockHash,
+    ) -> (Result<(), String>, Vec<(String, u64)>) {
         // Authoritative verdict: exactly one run, same order, same errors.
         // STAB verify-once: the verdict above populates the per-block caches
         // (order root, batch verify, proposer sig); attribution below reads
         // those caches O(1) instead of re-running O(txs) crypto, so the timed
         // path costs one verification per block, not two, with a
         // byte-identical verdict.
-        let verdict = self.validate_proposal_unaligned(block, expected_state_root);
+        let verdict = self.validate_proposal_unaligned_with_hash(block, expected_state_root, bh);
         let mut stages: Vec<(String, u64)> = Vec::with_capacity(6);
         let t = std::time::Instant::now();
         let _ = self
             .proposer_sig_cache
             .lock()
             .ok()
-            .and_then(|g| g.get(&Self::proposer_sig_cache_key(block)).copied())
-            .unwrap_or_else(|| crate::consensus::verify_proposer_signature(block));
+            .and_then(|g| {
+                g.get(&Self::proposer_sig_cache_key_with_hash(block, bh))
+                    .copied()
+            })
+            .unwrap_or_else(|| crate::consensus::verify_proposer_signature_with_hash(block, bh));
         stages.push(("proposer_sig_verify".into(), t.elapsed().as_millis() as u64));
         let t = std::time::Instant::now();
         let _ = block.state_root == expected_state_root;
@@ -889,14 +1088,17 @@ impl ValidatorRuntime {
         let t = std::time::Instant::now();
         // Cache hit: `check_order_commitment` already cached the root during
         // the verdict above, so this is a HashMap lookup, not O(txs) hashes.
-        let _ = self.check_order_commitment(block);
+        let _ = self.check_order_commitment_with_hash(block, bh);
         stages.push(("order_commit".into(), t.elapsed().as_millis() as u64));
         let t = std::time::Instant::now();
         let _ = self
             .batch_verify_cache
             .lock()
             .ok()
-            .and_then(|g| g.get(&Self::batch_verify_cache_key(block)).copied())
+            .and_then(|g| {
+                g.get(&Self::batch_verify_cache_key_with_hash(block, bh))
+                    .copied()
+            })
             .unwrap_or_else(|| Transaction::verify_signatures_batch_parallel(&block.transactions));
         stages.push(("tx_batch_verify".into(), t.elapsed().as_millis() as u64));
         let t = std::time::Instant::now();
@@ -1277,11 +1479,12 @@ impl ValidatorRuntime {
         // Read our root BEFORE accepting, so the header is checked against the
         // state the block would actually extend.
         let our_root = self.state.get_state_root().await;
+        let bh = block.compute_hash();
         // Authenticity FIRST, before height/state checks: only the declared
         // proposer could have signed this, so a verified signature makes the
         // header's claims (height, prev_hash) attributable -- and worth
         // learning from even when we must refuse the block itself.
-        if !crate::consensus::verify_proposer_signature(&block) {
+        if !self.verify_proposer_sig_cached(&block, &bh, false) {
             return Err("proposal: invalid or missing proposer signature".to_string());
         }
         // Record the peer head BEFORE any refusal below: a genuine proposal at
@@ -1310,7 +1513,7 @@ impl ValidatorRuntime {
         // C2 BACKPRESSURE HONESTY: run the TIMED validation (same verdict,
         // plus per-stage attribution). A node too slow to validate says WHICH
         // stage was slow instead of silently voting nil.
-        let (vres, stages) = self.validate_proposal_timed(&block, our_root);
+        let (vres, stages) = self.validate_proposal_timed_with_hash(&block, our_root, &bh);
         self.note_validation_timing(&stages);
         vres?;
         // Actor-mailbox cap, backlog-inclusive half (async: reads the engine).
@@ -1419,7 +1622,6 @@ impl ValidatorRuntime {
         if block.proposer != proposer {
             return Err("proposal: proposer field mismatch".to_string());
         }
-        let bh = block.compute_hash();
         // ROUND-FREE VALUE IDENTITY (ruleset v6): register the value behind
         // this signed hash so the lock rules can recognise a re-stamped body
         // of the SAME value. The signed hash stays the vote/QC identity.
@@ -1733,6 +1935,11 @@ impl ValidatorRuntime {
                 v.shard_id, self.shard_id
             ));
         }
+        // Late-precommit enrichment for the already-decided parent height H-1
+        // (both during `apply_in_flight` and after advancing to H): admits into
+        // `decided_parent_votes.votes` ONLY so `Block.last_qc` includes slower
+        // honest validators without mutating `hc`, `safety`, or floors.
+        let _ = self.try_admit_late_parent_precommit(&v);
         let res = self.hc.add_precommit(v.clone());
         // V-P34 (R1 verification gap): the round chase MUST be gated on
         // verification here, exactly as on the prevote path.
@@ -2654,9 +2861,9 @@ impl ValidatorRuntime {
                 crate::xshard2pc::XPC_MAX_CROSS_SHARD_RECORDS_PER_BLOCK
             ));
         }
-        // Single proposer signature before the quorum loop: one Ed25519 verify
+        // Single proposer signature before the quorum loop: one verify
         // filters forged bodies before paying per-signer QC cost.
-        if !crate::consensus::verify_proposer_signature(&block) {
+        if !self.verify_proposer_sig_cached(&block, &bh, false) {
             return Err("committed block has no valid proposer signature".to_string());
         }
         if !certificate.binds_to_parent(&block.prev_hash) {
@@ -2832,7 +3039,7 @@ impl ValidatorRuntime {
         // binds the block hash (which contains the order root), so on an
         // upgraded network this can only fire for a body whose order was
         // never committed — refused, never applied.
-        self.check_order_commitment(&block)?;
+        self.check_order_commitment_with_hash(&block, &bh)?;
         // Timestamp gate (adopt side, A3): the same fail-closed parent check
         // the proposal path runs, so a commit cannot smuggle a timestamp no
         // proposer could publish. Runs BEFORE the body is stored: the check
@@ -2843,7 +3050,7 @@ impl ValidatorRuntime {
         // proposal path applies. The transition attributes downtime from the
         // embedded parent QC, so an adopted block must carry evidence the
         // network actually decided — verified against the set in force at H-1.
-        self.check_last_qc_evidence(&block)?;
+        self.check_last_qc_evidence_with_hash(&block, &bh)?;
 
         // DOWNTIME PARITY with the local path: the transition reads its slash
         // evidence from `block.last_qc` (canonical, proposer-chosen — see
@@ -2867,7 +3074,17 @@ impl ValidatorRuntime {
         // the NEXT proposal embeds it as canonical downtime evidence. A boot
         // that could not reconstruct the old tip's evidence (DOWNTIME-RESTORE)
         // is healed by this verified peer decision.
-        self.last_decision = Some((height, block.clone(), certificate));
+        let parent_hash_for_dpv = Some(block.prev_hash);
+        let schedule_for_dpv = self.committee_schedule_at(height);
+        self.last_decision = Some((height, block.clone(), certificate.clone()));
+        self.seed_decided_parent_votes_from_qc(
+            height,
+            bh,
+            &certificate,
+            validators,
+            parent_hash_for_dpv,
+            schedule_for_dpv,
+        );
         self.parent_evidence_missing = false;
         self.blocks.insert(bh, block.clone());
         self.apply_and_advance(bh, &block).await;
@@ -2879,5 +3096,299 @@ impl ValidatorRuntime {
             }
         }
         Ok(bh)
+    }
+}
+
+#[cfg(test)]
+mod consensus_step_tests {
+    use crate::consensus::{FalconKeypair, ValidatorId, ValidatorSet, Vote, VoteKind};
+    use crate::runtime::ValidatorRuntime;
+    use crate::state_engine::InMemoryStateEngine;
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+
+    async fn make_4node_cluster(seed_base: u8) -> (Vec<ValidatorRuntime>, ValidatorSet) {
+        let keys: Vec<SigningKey> = (0..4u8)
+            .map(|i| SigningKey::from_bytes(&[seed_base.wrapping_add(i); 32]))
+            .collect();
+        let ids: Vec<ValidatorId> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let falcons: Vec<FalconKeypair> = (0..4u8)
+            .map(|i| FalconKeypair::generate_from_seed(seed_base.wrapping_add(0x40 + i)))
+            .collect();
+        let validators = ValidatorSet::from_list(ids.iter().map(|id| (*id, 10)).collect());
+        let mut nodes = Vec::with_capacity(4);
+        for (i, k) in keys.into_iter().enumerate() {
+            let st = Arc::new(InMemoryStateEngine::new());
+            crate::runtime::fund_genesis(&st, &validators, 1_000_000).await;
+            {
+                let mut ledger = st.staking_write().await;
+                let mut pq_reg = st.pq_registry_write().await;
+                for (vid, fk) in ids.iter().zip(falcons.iter()) {
+                    ledger.validator_pq_keys.insert(
+                        *vid,
+                        (
+                            crate::post_quantum::PqScheme::Falcon512,
+                            fk.public_key.clone(),
+                        ),
+                    );
+                    let _ = pq_reg.adopt_legacy_key_at(
+                        *vid,
+                        crate::post_quantum::PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                        0,
+                        true,
+                    );
+                }
+                crate::consensus::sync_committed_pq_registry(&pq_reg, true);
+            }
+            let mut rt = ValidatorRuntime::new(k, validators.clone(), st, 1)
+                .with_falcon_key(falcons[i].clone());
+            rt.hc.set_parent_hash([0u8; 32]);
+            nodes.push(rt);
+        }
+        (nodes, validators)
+    }
+
+    #[tokio::test]
+    async fn late_precommit_enriches_last_qc_during_apply_in_flight_and_after_advance() {
+        // Window A: 4th precommit arrives while `apply_in_flight` is active at H-1=1.
+        {
+            let (mut nodes, validators) = make_4node_cluster(0x10).await;
+            let ts = 1_700_001_000u64;
+            let pidx = nodes
+                .iter()
+                .position(|n| validators.proposer_for(1, 0) == Some(n.id))
+                .expect("proposer for h=1 r=0");
+            let block = nodes[pidx].propose(ts).await.expect("propose h=1");
+            let bh = block.compute_hash();
+            let pid = nodes[pidx].id;
+            for (i, n) in nodes.iter_mut().enumerate() {
+                if i != pidx {
+                    n.on_proposal(pid, block.clone(), 0)
+                        .await
+                        .expect("on_proposal h=1");
+                }
+            }
+            let prevotes: Vec<Vote> = nodes.iter().filter_map(|n| n.make_prevote()).collect();
+            assert_eq!(prevotes.len(), 4);
+            for v in &prevotes {
+                for n in nodes.iter_mut() {
+                    n.on_prevote(v.clone()).expect("on_prevote");
+                }
+            }
+            let precommits: Vec<Vote> = nodes
+                .iter_mut()
+                .filter_map(|n| n.make_precommit())
+                .collect();
+            assert_eq!(precommits.len(), 4);
+
+            // Deliver only 3 of 4 precommits to the proposer (node[pidx]) and submit apply.
+            let target_idx = pidx;
+            let late_idx = (0..4).find(|&i| i != target_idx).unwrap();
+            for (i, v) in precommits.iter().enumerate() {
+                if i != late_idx {
+                    nodes[target_idx]
+                        .on_precommit(v.clone())
+                        .expect("on_precommit");
+                }
+            }
+            let submitted = nodes[target_idx]
+                .try_finalize_submit()
+                .await
+                .expect("3/4 quorum decides h=1");
+            assert_eq!(submitted, bh);
+            assert!(nodes[target_idx].has_pending_apply());
+            assert_eq!(nodes[target_idx].hc.height, 1);
+
+            let safety_before = nodes[target_idx].safety.current_state();
+            let round_before = nodes[target_idx].hc.round;
+
+            // 4th precommit arrives during Window A (`apply_in_flight` active).
+            let late_vote = precommits[late_idx].clone();
+            nodes[target_idx]
+                .on_precommit(late_vote)
+                .expect("same-height Window A precommit");
+            assert_eq!(
+                nodes[target_idx].safety.current_state(),
+                safety_before,
+                "Window A late precommit must not mutate SafetyAuthority"
+            );
+            assert_eq!(
+                nodes[target_idx].hc.round, round_before,
+                "Window A late precommit must not mutate hc.round"
+            );
+
+            // Complete apply -> advances to height 2.
+            let completed = nodes[target_idx]
+                .await_apply_completion()
+                .await
+                .expect("apply completion");
+            assert_eq!(completed.height, 1);
+            assert_eq!(nodes[target_idx].hc.height, 2);
+
+            let enriched = nodes[target_idx]
+                .decided_parent_qc(&bh)
+                .expect("decided_parent_qc");
+            assert_eq!(enriched.pq_signer_count(), 4);
+
+            // Also advance a peer to height 2 and verify check_last_qc_evidence accepts enriched QC.
+            let peer_idx = late_idx;
+            for v in &precommits {
+                nodes[peer_idx]
+                    .on_precommit(v.clone())
+                    .expect("peer precommit");
+            }
+            assert_eq!(nodes[peer_idx].try_finalize().await, Some(bh));
+            assert_eq!(nodes[peer_idx].hc.height, 2);
+            let mut h2_probe = block;
+            h2_probe.height = 2;
+            h2_probe.prev_hash = bh;
+            h2_probe.last_qc = Some(enriched);
+            nodes[peer_idx]
+                .check_last_qc_evidence(&h2_probe)
+                .expect("enriched Window A last_qc must pass check_last_qc_evidence");
+        }
+
+        // Window B: 4th precommit arrives AFTER hc.height already moved to H=2.
+        {
+            let (mut nodes, validators) = make_4node_cluster(0x60).await;
+            let ts = 1_700_002_000u64;
+            let pidx = nodes
+                .iter()
+                .position(|n| validators.proposer_for(1, 0) == Some(n.id))
+                .expect("proposer for h=1 r=0");
+            let block = nodes[pidx].propose(ts).await.expect("propose h=1");
+            let bh = block.compute_hash();
+            let pid = nodes[pidx].id;
+            for (i, n) in nodes.iter_mut().enumerate() {
+                if i != pidx {
+                    n.on_proposal(pid, block.clone(), 0)
+                        .await
+                        .expect("on_proposal h=1");
+                }
+            }
+            let prevotes: Vec<Vote> = nodes.iter().filter_map(|n| n.make_prevote()).collect();
+            for v in &prevotes {
+                for n in nodes.iter_mut() {
+                    n.on_prevote(v.clone()).expect("on_prevote");
+                }
+            }
+            let precommits: Vec<Vote> = nodes
+                .iter_mut()
+                .filter_map(|n| n.make_precommit())
+                .collect();
+            assert_eq!(precommits.len(), 4);
+
+            let target_idx = pidx;
+            let late_idx = (0..4).find(|&i| i != target_idx).unwrap();
+            for (i, v) in precommits.iter().enumerate() {
+                if i != late_idx {
+                    nodes[target_idx]
+                        .on_precommit(v.clone())
+                        .expect("on_precommit");
+                }
+            }
+            assert_eq!(nodes[target_idx].try_finalize().await, Some(bh));
+            assert_eq!(nodes[target_idx].hc.height, 2);
+            assert_eq!(
+                nodes[target_idx]
+                    .decided_parent_qc(&bh)
+                    .expect("3/4 qc")
+                    .pq_signer_count(),
+                3
+            );
+
+            let safety_before = nodes[target_idx].safety.current_state();
+            let round_before = nodes[target_idx].hc.round;
+            let hc_precommits_before = nodes[target_idx].hc.precommit_set(0).map(|s| s.len());
+
+            // Negative checks on record_late_parent_precommit before admitting valid 4th vote.
+            let late_vote = precommits[late_idx].clone();
+            let mut wrong_kind = late_vote.clone();
+            wrong_kind.kind = VoteKind::Prevote;
+            assert!(!nodes[target_idx].record_late_parent_precommit(&wrong_kind));
+            let mut wrong_round = late_vote.clone();
+            wrong_round.round = 1;
+            assert!(!nodes[target_idx].record_late_parent_precommit(&wrong_round));
+            let mut wrong_hash = late_vote.clone();
+            wrong_hash.block_hash = Some([0xAA; 32]);
+            assert!(!nodes[target_idx].record_late_parent_precommit(&wrong_hash));
+            let mut forged = late_vote.clone();
+            let last = forged.signature.len() - 1;
+            forged.signature[last] ^= 0xFF;
+            assert!(!nodes[target_idx].record_late_parent_precommit(&forged));
+
+            // Valid 4th precommit arrives at height 2 (Window B) via `on_precommit`.
+            assert!(nodes[target_idx].on_precommit(late_vote.clone()).is_err());
+            // Duplicate is a no-op.
+            assert!(!nodes[target_idx].record_late_parent_precommit(&late_vote));
+            assert_eq!(
+                nodes[target_idx].safety.current_state(),
+                safety_before,
+                "Window B late precommit must not mutate SafetyAuthority"
+            );
+            assert_eq!(
+                nodes[target_idx].hc.round, round_before,
+                "Window B late precommit must not mutate hc.round"
+            );
+            assert_eq!(
+                nodes[target_idx].hc.precommit_set(0).map(|s| s.len()),
+                hc_precommits_before,
+                "Window B late precommit must not mutate hc.precommits"
+            );
+
+            let enriched = nodes[target_idx]
+                .decided_parent_qc(&bh)
+                .expect("enriched Window B qc");
+            assert_eq!(enriched.pq_signer_count(), 4);
+
+            // Peer checks enriched last_qc and accepts it; adopt_committed path also enriches.
+            let peer_idx = late_idx;
+            let qc3 = nodes[peer_idx].decided_parent_qc(&bh);
+            assert!(qc3.is_none());
+            // Build a 3/4 certificate for peer adopt_committed.
+            let mut set3 = crate::consensus::VoteSet::new();
+            for (i, v) in precommits.iter().enumerate() {
+                if i != late_idx {
+                    set3.add(v.clone(), &validators, 1, 0, VoteKind::Precommit)
+                        .expect("add");
+                }
+            }
+            let cert3 = crate::consensus::produce_decision_certificate_with_schedule(
+                &set3,
+                Some(bh),
+                &validators,
+                Some(&[0u8; 32]),
+                crate::consensus::CommitteeSchedule::ParentHash,
+            )
+            .expect("3/4 cert");
+            assert_eq!(cert3.pq_signer_count(), 3);
+            let adopted = nodes[peer_idx]
+                .adopt_committed(1, block.clone(), cert3)
+                .await
+                .expect("adopt_committed h=1");
+            assert_eq!(adopted, bh);
+            assert_eq!(nodes[peer_idx].hc.height, 2);
+            assert_eq!(
+                nodes[peer_idx]
+                    .decided_parent_qc(&bh)
+                    .expect("3/4 qc after adopt")
+                    .pq_signer_count(),
+                3
+            );
+            assert!(nodes[peer_idx].on_precommit(late_vote).is_err());
+            let adopted_enriched = nodes[peer_idx]
+                .decided_parent_qc(&bh)
+                .expect("enriched after adopt + Window B");
+            assert_eq!(adopted_enriched.pq_signer_count(), 4);
+
+            let mut h2_probe = block;
+            h2_probe.height = 2;
+            h2_probe.prev_hash = bh;
+            h2_probe.last_qc = Some(enriched);
+            nodes[peer_idx]
+                .check_last_qc_evidence(&h2_probe)
+                .expect("enriched Window B last_qc must pass check_last_qc_evidence");
+        }
     }
 }

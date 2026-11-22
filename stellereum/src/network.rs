@@ -261,23 +261,29 @@ pub fn dht_prune_max_per_run() -> usize {
 /// Effectively non-expiring TTL for head/snapshot blobs (`STELL_DHT_FOREVER_TTL_MS`,
 /// default 100 years in ms).
 pub fn dht_forever_ttl_ms() -> i64 {
-    std::env::var("STELL_DHT_FOREVER_TTL_MS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(STELL_DHT_FOREVER_TTL_MS)
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_DHT_FOREVER_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(STELL_DHT_FOREVER_TTL_MS)
+    })
 }
 
 /// How many recent heights the DHT retains (bodies, headers, indices).
 /// Same env name the consensus loop uses for the local store
 /// (`STELL_KEEP_BLOCKS` in `src/main.rs`), so one knob moves both horizons.
 pub fn retention_keep_blocks() -> u64 {
-    std::env::var("STELL_KEEP_BLOCKS")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(dht_keep_blocks_default)
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_KEEP_BLOCKS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(dht_keep_blocks_default)
+    })
 }
 
 /// Parse the `STELL_KEEP_BLOCKS` value; pure so tests need no env mutation.
@@ -451,6 +457,19 @@ pub trait ValidatorMeshTransport: Send + Sync {
         topic: &'a str,
         data: &'a str,
     ) -> MeshFuture<'a, Result<(), String>>;
+
+    /// Deliver a pre-serialized `{topic, data}` JSON frame directly to one
+    /// validator so N peers do not re-serialize JSON N times. Default impl
+    /// delegates to [`Self::deliver_direct`] for test fakes.
+    fn deliver_direct_frame<'a>(
+        &'a self,
+        peer: [u8; infnode::proto::NODEID_LEN],
+        topic: &'a str,
+        data: &'a str,
+        _frame: &'a [u8],
+    ) -> MeshFuture<'a, Result<(), String>> {
+        self.deliver_direct(peer, topic, data)
+    }
 
     /// Heartbeat/reconnect attempt: proves the peer is reachable and keeps
     /// its direct link warm.
@@ -901,6 +920,19 @@ impl ValidatorMesh {
     /// direct target set) is handed to the DHT/overlay fallback ONCE, so a
     /// message is never dropped merely because the mesh is degraded.
     pub async fn deliver(&self, topic: &str, data: &str, now_ms: u64) -> MeshDelivery {
+        let frame = Arc::new(InfnodeMeshTransport::envelope(topic, data));
+        self.deliver_frame(topic, data, frame, now_ms).await
+    }
+
+    /// Deliver a pre-serialized `{topic, data}` JSON frame to the whole mesh,
+    /// avoiding redundant JSON serialization across N peers.
+    pub async fn deliver_frame(
+        &self,
+        topic: &str,
+        data: &str,
+        frame: Arc<Vec<u8>>,
+        now_ms: u64,
+    ) -> MeshDelivery {
         let targets = self.direct_targets(now_ms);
         let mut delivery = MeshDelivery {
             targets: targets.len(),
@@ -908,7 +940,15 @@ impl ValidatorMesh {
         };
         let mut sends = Vec::with_capacity(targets.len());
         for id in targets {
-            sends.push(async move { (id, self.transport.deliver_direct(id, topic, data).await) });
+            let frame = Arc::clone(&frame);
+            sends.push(async move {
+                (
+                    id,
+                    self.transport
+                        .deliver_direct_frame(id, topic, data, &frame)
+                        .await,
+                )
+            });
         }
         let results = futures::future::join_all(sends).await;
         for (id, result) in results {
@@ -1040,6 +1080,28 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
         })
     }
 
+    fn deliver_direct_frame<'a>(
+        &'a self,
+        peer: [u8; 20],
+        _topic: &'a str,
+        _data: &'a str,
+        frame: &'a [u8],
+    ) -> MeshFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let payload = frame.to_vec();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(mesh_send_timeout_ms()),
+                self.node.send_to(peer, "pubsub.msg", payload),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("mesh direct send timeout".to_string()),
+            }
+        })
+    }
+
     fn probe<'a>(&'a self, peer: [u8; 20]) -> MeshFuture<'a, Result<(), String>> {
         Box::pin(async move {
             match tokio::time::timeout(
@@ -1080,11 +1142,14 @@ fn mesh_now_ms() -> u64 {
 /// on every send/probe. Clamped to a sane range; unset/invalid keeps the
 /// documented 2 s default.
 pub fn mesh_send_timeout_ms() -> u64 {
-    std::env::var("STELL_SEND_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|v| v.clamp(500, 60_000))
-        .unwrap_or(VALIDATOR_MESH_SEND_TIMEOUT_MS)
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_SEND_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.clamp(500, 60_000))
+            .unwrap_or(VALIDATOR_MESH_SEND_TIMEOUT_MS)
+    })
 }
 
 /// Mesh membership from operator config.
@@ -1138,7 +1203,14 @@ pub struct P2pNetworkAdapter {
     /// Bounded per-(shard, height) negative cache / exponential backoff for
     /// missing `_hq_` QC sidecars (`fetch_block_qc` / `fetch_block_qc_probe`).
     qc_miss_backoff: std::sync::Mutex<QcMissBackoff>,
+    /// Recently published `_hq_{shard}_{height}` companion QCs (`(shard, height) -> (block_hash, at)`),
+    /// bounded to avoid redundant duplicate `_hq_` DHT stores when both
+    /// `retro_publish_blocks` and `persist_block_header` publish the same tip.
+    recent_hq_published: Arc<RecentHqPublishCache>,
 }
+
+type RecentHqPublishCache =
+    std::sync::Mutex<std::collections::HashMap<(u32, u64), ([u8; 32], std::time::Instant)>>;
 
 /// Bounded per-(shard, height) exponential miss backoff for `fetch_block_qc`.
 ///
@@ -1519,6 +1591,7 @@ impl P2pNetworkAdapter {
             last_prune_tip: std::sync::atomic::AtomicU64::new(0),
             last_published_head: std::sync::Mutex::new(std::collections::HashMap::new()),
             qc_miss_backoff: std::sync::Mutex::new(QcMissBackoff::default()),
+            recent_hq_published: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1594,6 +1667,19 @@ impl P2pNetworkAdapter {
     /// fallback for any failed copy (or when the mesh is entirely down).
     pub async fn deliver_consensus_mesh(&self, topic: &str, data_hex: &str) -> MeshDelivery {
         self.mesh.deliver(topic, data_hex, mesh_now_ms()).await
+    }
+
+    /// Consensus delivery over the mesh using a pre-serialized `{topic, data}`
+    /// JSON frame so N peers do not re-serialize JSON.
+    pub async fn deliver_consensus_mesh_frame(
+        &self,
+        topic: &str,
+        data_hex: &str,
+        frame: Arc<Vec<u8>>,
+    ) -> MeshDelivery {
+        self.mesh
+            .deliver_frame(topic, data_hex, frame, mesh_now_ms())
+            .await
     }
 
     /// Deliver ONE consensus frame to exactly ONE peer (unicast).
@@ -1673,15 +1759,19 @@ impl P2pNetworkAdapter {
 
     /// Fetch a block from the P2P overlay network by hash
     pub async fn fetch_block(&self, block_hash: &[u8; 32]) -> Option<Block> {
-        let _permit = fetch_sem().acquire().await.ok()?;
+        let permit = fetch_sem().acquire().await.ok()?;
         let hash_hex = hex::encode(block_hash);
-        let bytes = self
-            .node
-            .fetch_blob(
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_millis(15_000),
+            self.node.fetch_blob(
                 BUCKET_STELLEREUM_BLOCKS,
                 &block_name(&self.epoch(), &hash_hex),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        drop(permit);
 
         decode_wire_limited(&bytes, MAX_WIRE_BLOCK_BYTES).ok()
     }
@@ -1712,8 +1802,16 @@ impl P2pNetworkAdapter {
         let epoch = self.epoch();
         let writes = plan_block_body_publish(&epoch, block)?;
         apply_publish_plan(&self.node, &writes).await?;
-        publish_block_qc_companion(&self.node, &epoch, block).await;
-        Ok(block.compute_hash())
+        let block_hash = block.compute_hash();
+        if claim_hq_publish(
+            &self.recent_hq_published,
+            block.shard_id,
+            block.height,
+            block_hash,
+        ) {
+            publish_block_qc_companion(&self.node, &epoch, block).await;
+        }
+        Ok(block_hash)
     }
 
     /// Publish one already-finalized block body from its stored bytes, addressed
@@ -1757,15 +1855,19 @@ impl P2pNetworkAdapter {
     {
         let shared = self.node.clone();
         let epoch = self.epoch();
+        let recent_hq = Arc::clone(&self.recent_hq_published);
         let mut it = blocks.into_iter();
         retro_publish_chunk(&mut it, max, move |b| {
             let node = shared.clone();
             let epoch = epoch.clone();
+            let recent_hq = Arc::clone(&recent_hq);
             async move {
                 match plan_block_body_publish(&epoch, b) {
                     Ok(writes) => {
                         apply_publish_plan(&node, &writes).await?;
-                        publish_block_qc_companion(&node, &epoch, b).await;
+                        if claim_hq_publish(&recent_hq, b.shard_id, b.height, b.compute_hash()) {
+                            publish_block_qc_companion(&node, &epoch, b).await;
+                        }
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -1883,11 +1985,16 @@ impl P2pNetworkAdapter {
     /// own, so callers must treat a result that is not strictly ahead of their own
     /// finalized height as "nothing to do" rather than as a peer being ahead.
     pub async fn fetch_head(&self, shard_id: u32) -> Option<(u64, [u8; 32])> {
-        let _permit = fetch_sem().acquire().await.ok()?;
-        let bytes = self
-            .node
-            .fetch_blob(BUCKET_STELLEREUM_HEAD, &head_name(&self.epoch(), shard_id))
-            .await?;
+        let permit = fetch_sem().acquire().await.ok()?;
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_millis(10_000),
+            self.node
+                .fetch_blob(BUCKET_STELLEREUM_HEAD, &head_name(&self.epoch(), shard_id)),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        drop(permit);
         let s = String::from_utf8(bytes).ok()?;
         let mut it = s.split(':');
         let height = it.next()?.parse::<u64>().ok()?;
@@ -1909,6 +2016,7 @@ impl P2pNetworkAdapter {
         let rec = crate::storage::BlockHeaderRecord::of(block);
         if let Ok(bytes) = bincode::serialize(&rec) {
             let ttl = dht_blob_ttl_ms(retention_keep_blocks());
+            let block_hash = block.compute_hash();
             // One logical publish: only the header body charges the pacing gate;
             // the index + QC sidecar ride along (same bounded store, no extra
             // interval charge) so a 3-blob header never pays 3x the floor.
@@ -1950,7 +2058,7 @@ impl P2pNetworkAdapter {
             }
             // And the height -> hash pointer, so a caller can ask for "the header at
             // height N" without already knowing the hash.
-            let idx = format!("{}:{}", block.height, hex::encode(block.compute_hash()));
+            let idx = format!("{}:{}", block.height, hex::encode(block_hash));
             paced_store_blob_in_lane(
                 &self.node,
                 BUCKET_STELLEREUM_HEADERS,
@@ -1967,17 +2075,24 @@ impl P2pNetworkAdapter {
             // never as trusted. Header first, then QC: a crash between writes
             // yields "missing QC → skip", never a half-trusted header.
             if let Some(qc) = block.precommit_qc.as_ref() {
-                if let Ok(qc_bytes) = bincode::serialize(qc) {
-                    paced_store_blob_in_lane(
-                        &self.node,
-                        BUCKET_STELLEREUM_HEADERS,
-                        &header_qc_name(&self.epoch(), shard_id, block.height),
-                        &qc_bytes,
-                        ttl,
-                        slots[2].charge,
-                        slots[2].lane,
-                    )
-                    .await;
+                if claim_hq_publish(
+                    &self.recent_hq_published,
+                    shard_id,
+                    block.height,
+                    block_hash,
+                ) {
+                    if let Ok(qc_bytes) = bincode::serialize(qc) {
+                        paced_store_blob_in_lane(
+                            &self.node,
+                            BUCKET_STELLEREUM_HEADERS,
+                            &header_qc_name(&self.epoch(), shard_id, block.height),
+                            &qc_bytes,
+                            ttl,
+                            slots[2].charge,
+                            slots[2].lane,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -2107,17 +2222,38 @@ impl P2pNetworkAdapter {
     /// link — both worth exactly one line, never silence (a silent miss here
     /// kills a whole snapshot-sync attempt with zero trace).
     pub async fn fetch_head_hash(&self, shard_id: u32, height: u64) -> Option<[u8; 32]> {
-        let _permit = fetch_sem().acquire().await.ok()?;
+        self.fetch_head_hash_inner(shard_id, height, 3, 10_000, true)
+            .await
+    }
+
+    /// Lightweight 1-attempt height-index lookup for concurrent catch-up prefetch
+    /// (3s timeout, no sleep backoff; misses fall back seamlessly to backward `prev_hash` walk).
+    pub async fn fetch_head_hash_probe(&self, shard_id: u32, height: u64) -> Option<[u8; 32]> {
+        self.fetch_head_hash_inner(shard_id, height, 1, 3_000, false)
+            .await
+    }
+
+    async fn fetch_head_hash_inner(
+        &self,
+        shard_id: u32,
+        height: u64,
+        max_attempts: u32,
+        timeout_ms: u64,
+        log_failure: bool,
+    ) -> Option<[u8; 32]> {
         let name = header_index_name(&self.epoch(), shard_id, height);
         let mut last_err = "missing";
-        for attempt in 1..=3u32 {
+        let attempts = max_attempts.max(1);
+        for attempt in 1..=attempts {
+            let permit = fetch_sem().acquire().await.ok()?;
             let blob_res = tokio::time::timeout(
-                std::time::Duration::from_millis(10_000),
+                std::time::Duration::from_millis(timeout_ms),
                 self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
             )
             .await
             .ok()
             .flatten();
+            drop(permit);
             if let Some(bytes) = blob_res {
                 // VERIFICATION F4-hardening: parse through the VALIDATED
                 // index parser (`parse_header_index`), not an ad-hoc split.
@@ -2144,11 +2280,13 @@ impl P2pNetworkAdapter {
             } else {
                 last_err = "fetch miss/timeout";
             }
-            if attempt < 3 {
+            if attempt < attempts {
                 tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
             }
         }
-        eprintln!("[sync] fetch_head_hash shard={shard_id} height={height} name={name}: failed ({last_err})");
+        if log_failure {
+            eprintln!("[sync] fetch_head_hash shard={shard_id} height={height} name={name}: failed ({last_err})");
+        }
         None
     }
 
@@ -2162,10 +2300,10 @@ impl P2pNetworkAdapter {
         height: u64,
         expected_hash: [u8; 32],
     ) -> Option<crate::storage::BlockHeaderRecordV2> {
-        let _permit = fetch_sem().acquire().await.ok()?;
         let name = header_v2_name(&self.epoch(), shard_id, height);
         let mut last_err = "missing";
         for attempt in 1..=3u32 {
+            let permit = fetch_sem().acquire().await.ok()?;
             let blob_res = tokio::time::timeout(
                 std::time::Duration::from_millis(10_000),
                 self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
@@ -2173,6 +2311,7 @@ impl P2pNetworkAdapter {
             .await
             .ok()
             .flatten();
+            drop(permit);
             if let Some(bytes) = blob_res {
                 match decode_wire_limited::<crate::storage::BlockHeaderRecordV2>(
                     &bytes,
@@ -2233,10 +2372,10 @@ impl P2pNetworkAdapter {
                 block_hash: v2.block_hash,
             });
         }
-        let _permit = fetch_sem().acquire().await.ok()?;
         let name = header_name(&self.epoch(), height);
         let mut last_err = "missing";
         for attempt in 1..=3u32 {
+            let permit = fetch_sem().acquire().await.ok()?;
             let blob_res = tokio::time::timeout(
                 std::time::Duration::from_millis(10_000),
                 self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
@@ -2244,6 +2383,7 @@ impl P2pNetworkAdapter {
             .await
             .ok()
             .flatten();
+            drop(permit);
             if let Some(bytes) = blob_res {
                 match decode_wire_limited::<crate::storage::BlockHeaderRecord>(
                     &bytes,
@@ -2306,11 +2446,11 @@ impl P2pNetworkAdapter {
         {
             return None;
         }
-        let _permit = fetch_sem().acquire().await.ok()?;
         let name = header_qc_name(&self.epoch(), shard_id, height);
         let mut last_err = "missing";
         let attempts = max_attempts.max(1);
         for attempt in 1..=attempts {
+            let permit = fetch_sem().acquire().await.ok()?;
             let blob_res = tokio::time::timeout(
                 std::time::Duration::from_millis(10_000),
                 self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &name),
@@ -2318,6 +2458,7 @@ impl P2pNetworkAdapter {
             .await
             .ok()
             .flatten();
+            drop(permit);
             if let Some(bytes) = blob_res {
                 match decode_wire_limited::<crate::consensus::QuorumCertificate>(
                     &bytes,
@@ -2445,10 +2586,18 @@ impl P2pNetworkAdapter {
     /// state snapshot), if any peer published one. Returns `None` on miss —
     /// callers fall back to the %100 probe walk.
     pub async fn fetch_latest_snapshot(&self, shard_id: u32) -> Option<u64> {
-        let _permit = fetch_sem().acquire().await.ok()?;
         let name = snapshot_latest_name(&self.epoch(), shard_id);
         for attempt in 1..=3u32 {
-            if let Some(bytes) = self.node.fetch_blob(BUCKET_STELLEREUM_STATE, &name).await {
+            let permit = fetch_sem().acquire().await.ok()?;
+            let bytes_opt = tokio::time::timeout(
+                std::time::Duration::from_millis(10_000),
+                self.node.fetch_blob(BUCKET_STELLEREUM_STATE, &name),
+            )
+            .await
+            .ok()
+            .flatten();
+            drop(permit);
+            if let Some(bytes) = bytes_opt {
                 if bytes.len() == 8 {
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(&bytes);
@@ -2483,8 +2632,6 @@ impl P2pNetworkAdapter {
     /// under the generous snapshot budget (tens of MB is normal). A `None`
     /// is always logged loudly with size/chunk/budget — never silent.
     pub async fn fetch_state_snapshot(&self, shard_id: u32, height: u64) -> Option<Vec<u8>> {
-        let _permit = fetch_sem().acquire().await.ok()?;
-        let _snap = snapshot_fetch_sem().acquire().await.ok()?;
         let name = snapshot_name(&self.epoch(), shard_id, height);
         let out =
             Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await;
@@ -2512,6 +2659,7 @@ impl P2pNetworkAdapter {
         bucket: &str,
         name: &str,
     ) -> Option<(Vec<SnapshotChunkMeta>, [u8; 32], Vec<u8>, usize)> {
+        use futures::stream::{FuturesUnordered, StreamExt};
         let mkey = Node::blob_manifest_key(bucket, name);
         let attempt = tokio::time::timeout(
             std::time::Duration::from_millis(crate::sync::SNAPSHOT_MANIFEST_TIMEOUT_MS),
@@ -2524,21 +2672,52 @@ impl P2pNetworkAdapter {
                 target.copy_from_slice(&h.as_bytes()[..infnode::proto::NODEID_LEN]);
                 let closest = node.dht_find_node(&target).await;
                 let q = serde_json::json!({ "key": mkey }).to_string().into_bytes();
-                for n in closest.iter() {
-                    if node.ensure_dht_peer(n).await.is_ok() {
-                        if let Ok(resp) = node.request_to(n.id, "dht.find_value", q.clone()).await {
-                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                                if v["found"].as_bool().unwrap_or(false) {
-                                    if let Some(s) = v["value"].as_str() {
-                                        return Some(s.to_string());
+                const MANIFEST_PROBE_CONCURRENCY: usize = 4;
+                const MANIFEST_PEER_TIMEOUT_MS: u64 = 2_500;
+                let mut iter = closest.into_iter();
+                let mut in_flight = FuturesUnordered::new();
+                let spawn_probe = |n: infnode::dht::NodeInfo| {
+                    let node = Arc::clone(node);
+                    let q = q.clone();
+                    async move {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(MANIFEST_PEER_TIMEOUT_MS),
+                            async move {
+                                if node.ensure_dht_peer(&n).await.is_ok() {
+                                    if let Ok(resp) =
+                                        node.request_to(n.id, "dht.find_value", q).await
+                                    {
+                                        if let Ok(v) =
+                                            serde_json::from_slice::<serde_json::Value>(&resp)
+                                        {
+                                            if v["found"].as_bool().unwrap_or(false) {
+                                                if let Some(s) = v["value"].as_str() {
+                                                    return Some(s.to_string());
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
+                                None
+                            },
+                        )
+                        .await
+                        .ok()
+                        .flatten()
                     }
-                    // Yield between peers: a manifest sweep over a slow peer
-                    // set must not wedge the 1-vCPU tick.
-                    tokio::task::yield_now().await;
+                };
+                for _ in 0..MANIFEST_PROBE_CONCURRENCY {
+                    if let Some(n) = iter.next() {
+                        in_flight.push(spawn_probe(n));
+                    }
+                }
+                while let Some(res) = in_flight.next().await {
+                    if let Some(s) = res {
+                        return Some(s);
+                    }
+                    if let Some(n) = iter.next() {
+                        in_flight.push(spawn_probe(n));
+                    }
                 }
                 None
             },
@@ -2601,9 +2780,13 @@ impl P2pNetworkAdapter {
         name: &str,
     ) -> Option<Vec<u8>> {
         for blob_attempt in 1..=crate::sync::SNAPSHOT_BLOB_ATTEMPTS {
+            let permit = fetch_sem().acquire().await.ok()?;
+            let snap_permit = snapshot_fetch_sem().acquire().await.ok()?;
             let Some((metas, dk, nonce, size)) =
                 Self::fetch_snapshot_manifest(node, bucket, name).await
             else {
+                drop(snap_permit);
+                drop(permit);
                 eprintln!(
                     "[sync] snapshot-fetch {bucket}/{name}: manifest attempt \
                      {blob_attempt}/{} missed (see manifest line above)",
@@ -2746,6 +2929,8 @@ impl P2pNetworkAdapter {
                     }
                 }
             }
+            drop(snap_permit);
+            drop(permit);
             if blob_attempt < crate::sync::SNAPSHOT_BLOB_ATTEMPTS {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     crate::sync::fetch_retry_backoff_with_jitter_ms(
@@ -2828,8 +3013,6 @@ impl P2pNetworkAdapter {
         height: u64,
         kind: &str,
     ) -> Option<Vec<u8>> {
-        let _permit = fetch_sem().acquire().await.ok()?;
-        let _snap = snapshot_fetch_sem().acquire().await.ok()?;
         let name = format!(
             "{}_dom_{kind}",
             snapshot_name(&self.epoch(), shard_id, height)
@@ -2933,9 +3116,16 @@ impl P2pNetworkAdapter {
         state_root: &[u8; 32],
         expected_hash: Option<&[u8; 32]>,
     ) -> Option<crate::snapshot_v4::SnapshotManifestV1> {
-        let _permit = fetch_sem().acquire().await.ok()?;
+        let permit = fetch_sem().acquire().await.ok()?;
         let name = snapv4_manifest_name(&self.epoch(), shard_id, height, state_root);
-        let bytes = self.node.fetch_blob(BUCKET_STELLEREUM_STATE, &name).await?;
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_millis(crate::sync::SNAPSHOT_MANIFEST_TIMEOUT_MS),
+            self.node.fetch_blob(BUCKET_STELLEREUM_STATE, &name),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        drop(permit);
         if let Some(exp) = expected_hash {
             if !verify_bytes_blake3_hash(&bytes, exp) {
                 eprintln!(
@@ -2972,8 +3162,6 @@ impl P2pNetworkAdapter {
         shard_id: u32,
         expected_hash: &[u8; 32],
     ) -> Option<Vec<u8>> {
-        let _permit = fetch_sem().acquire().await.ok()?;
-        let _snap = snapshot_fetch_sem().acquire().await.ok()?;
         let name = snapv4_unit_name(&self.epoch(), shard_id, expected_hash);
         let bytes =
             Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await?;
@@ -3383,6 +3571,37 @@ pub fn plan_block_qc_publish(epoch: &EpochTag, block: &Block) -> Option<PublishW
     })
 }
 
+const RECENT_HQ_CACHE_CAP: usize = 512;
+const RECENT_HQ_TTL_SECS: u64 = 30;
+
+fn claim_hq_publish(
+    cache: &RecentHqPublishCache,
+    shard_id: u32,
+    height: u64,
+    block_hash: [u8; 32],
+) -> bool {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(RECENT_HQ_TTL_SECS);
+    let Ok(mut guard) = cache.lock() else {
+        return true;
+    };
+    if let Some((prev_hash, prev_at)) = guard.get(&(shard_id, height)) {
+        if *prev_hash == block_hash && now.saturating_duration_since(*prev_at) < ttl {
+            return false;
+        }
+    }
+    if guard.len() >= RECENT_HQ_CACHE_CAP {
+        guard.retain(|_, (_, at)| now.saturating_duration_since(*at) < ttl);
+        if guard.len() >= RECENT_HQ_CACHE_CAP {
+            if let Some(oldest_key) = guard.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+                guard.remove(&oldest_key);
+            }
+        }
+    }
+    guard.insert((shard_id, height), (block_hash, now));
+    true
+}
+
 async fn publish_block_qc_companion(node: &Arc<Node>, epoch: &EpochTag, block: &Block) {
     if let Some(w) = plan_block_qc_publish(epoch, block) {
         let ttl = dht_blob_ttl_ms(retention_keep_blocks());
@@ -3537,14 +3756,18 @@ pub async fn fetch_verified_body(
     // Same process-wide cap as every other fetch: verified body fetches
     // (walk, heal, backfill) share the 8 slots with snapshot/header probes
     // instead of adding an unbounded second lane.
-    let _permit = fetch_sem().acquire().await.ok()?;
-    let bytes = adapter
-        .node
-        .fetch_blob(
+    let permit = fetch_sem().acquire().await.ok()?;
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_millis(15_000),
+        adapter.node.fetch_blob(
             BUCKET_STELLEREUM_BLOCKS,
             &block_body_blob_name(&adapter.epoch(), expected_hash),
-        )
-        .await?;
+        ),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    drop(permit);
     // A body fetched from a PEER is wire data: it must decode STRICTLY. The
     // legacy tolerance (a body persisted before the trailing commitment
     // fields existed) applies to the LOCAL STORE only — otherwise a
@@ -3951,6 +4174,7 @@ impl LocalTopicBus {
 pub struct InfnodeCrossShardPubSub {
     node: Arc<Node>,
     local: Arc<LocalTopicBus>,
+    peer_ids_cache: std::sync::OnceLock<Vec<[u8; 20]>>,
 }
 
 impl InfnodeCrossShardPubSub {
@@ -3958,22 +4182,33 @@ impl InfnodeCrossShardPubSub {
         Self {
             node,
             local: LocalTopicBus::shared(),
+            peer_ids_cache: std::sync::OnceLock::new(),
         }
     }
 
-    /// Resolve every configured peer to a node id.
+    /// Resolve every configured peer to a node id (cached once all resolve).
     ///
     /// Same rule as the consensus path (`consensus_net::ConsensusNetwork`):
     /// the peer-config PQ id first, the name only as a fallback — name
     /// resolution depends on a registry that fills in asymmetrically, and a
     /// failed lookup would silently publish to nobody.
     fn peer_ids(&self) -> Vec<[u8; 20]> {
-        let mut out = Vec::new();
+        if let Some(ids) = self.peer_ids_cache.get() {
+            return ids.clone();
+        }
+        let mut out = Vec::with_capacity(self.node.cfg.peers.len());
+        let mut all_resolved = true;
         for p in &self.node.cfg.peers {
             match p.primary_id().or_else(|_| self.node.resolve(&p.name)) {
                 Ok(pid) => out.push(pid),
-                Err(e) => tracing::warn!("[cross_shard] cannot resolve peer {}: {e}", p.name),
+                Err(e) => {
+                    all_resolved = false;
+                    tracing::warn!("[cross_shard] cannot resolve peer {}: {e}", p.name);
+                }
             }
+        }
+        if all_resolved {
+            let _ = self.peer_ids_cache.set(out.clone());
         }
         out
     }
@@ -4004,18 +4239,50 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
                 u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"))
             };
 
+            let req_timeout = std::time::Duration::from_millis(mesh_send_timeout_ms());
             // (a) DIRECT PUSH to every peer — the payload lands in the peer's
             //     app subscription for that topic, exactly like the consensus
             //     gossip. This is the path that reaches a peer hosting the
             //     target shard, with no mesh hop.
             let payload = envelope.clone().into_bytes();
+            let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut handles = Vec::new();
             for pid in peers.iter().copied() {
                 let node = Arc::clone(&self.node);
                 let payload = payload.clone();
+                let delivered = Arc::clone(&delivered);
                 handles.push(tokio::spawn(async move {
-                    let r = node.request_to(pid, "pubsub.msg", payload).await;
-                    (pid, r)
+                    match tokio::time::timeout(
+                        req_timeout,
+                        node.request_to(pid, "pubsub.msg", payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => {
+                            if resp.starts_with(b"{\"ok\":false") {
+                                tracing::warn!(
+                                    "[cross_shard] publish to {} denied: {}",
+                                    hex::encode(pid),
+                                    String::from_utf8_lossy(&resp)
+                                );
+                            } else {
+                                delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "[cross_shard] publish to {} failed: {e}",
+                                hex::encode(pid)
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "[cross_shard] publish to {} timed out after {:?}",
+                                hex::encode(pid),
+                                req_timeout
+                            );
+                        }
+                    }
                 }));
             }
 
@@ -4036,37 +4303,36 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
                 .to_string()
                 .into_bytes();
                 tokio::spawn(async move {
-                    if let Err(e) = node.request_to(relay_peer, "pubsub.publish", relay).await {
-                        tracing::debug!(
+                    match tokio::time::timeout(
+                        req_timeout,
+                        node.request_to(relay_peer, "pubsub.publish", relay),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::debug!(
                             "[cross_shard] mesh relay through {} failed: {e}",
                             hex::encode(relay_peer)
-                        );
+                        ),
+                        Err(_) => tracing::debug!(
+                            "[cross_shard] mesh relay through {} timed out",
+                            hex::encode(relay_peer)
+                        ),
                     }
                 });
             }
 
-            let mut delivered = 0usize;
-            for h in handles {
-                match h.await {
-                    Ok((pid, Ok(resp))) => {
-                        if resp.starts_with(b"{\"ok\":false") {
-                            tracing::warn!(
-                                "[cross_shard] publish to {} denied: {}",
-                                hex::encode(pid),
-                                String::from_utf8_lossy(&resp)
-                            );
-                        } else {
-                            delivered += 1;
-                        }
-                    }
-                    Ok((pid, Err(e))) => {
-                        tracing::warn!("[cross_shard] publish to {} failed: {e}", hex::encode(pid))
-                    }
-                    Err(_) => tracing::warn!("[cross_shard] publish task failed"),
-                }
-            }
-            if delivered == 0 {
-                tracing::warn!("[cross_shard] cross-shard message reached no peer");
+            // Bounded join: wait up to 500ms for fast peers and detach slow peers
+            // so a stalled peer never blocks the caller.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                futures::future::join_all(handles),
+            )
+            .await;
+            if delivered.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                tracing::debug!(
+                    "[cross_shard] cross-shard message reached no peer within join window"
+                );
             }
             Ok(())
         })
@@ -4112,15 +4378,26 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
             let payload = serde_json::json!({ "topic": topic })
                 .to_string()
                 .into_bytes();
+            let req_timeout = std::time::Duration::from_millis(mesh_send_timeout_ms());
             for pid in self.peer_ids() {
                 let node = Arc::clone(&self.node);
                 let payload = payload.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = node.request_to(pid, "pubsub.subscribe", payload).await {
-                        tracing::debug!(
+                    match tokio::time::timeout(
+                        req_timeout,
+                        node.request_to(pid, "pubsub.subscribe", payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::debug!(
                             "[cross_shard] subscribe to {} failed: {e}",
                             hex::encode(pid)
-                        );
+                        ),
+                        Err(_) => tracing::debug!(
+                            "[cross_shard] subscribe to {} timed out",
+                            hex::encode(pid)
+                        ),
                     }
                 });
             }
@@ -4128,6 +4405,9 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
         })
     }
 }
+
+/// Hard per-shard cap on buffered inbound cross-shard gossip messages.
+pub const MAX_CROSS_SHARD_INBOX: usize = 4096;
 
 /// Decode one gossip payload into a cross-shard message (fail-closed).
 ///
@@ -4146,7 +4426,11 @@ fn decode_cross_shard_payload(payload: &str) -> Option<CrossShardMessage> {
     if bytes.is_empty() || bytes.len() > MAX_CROSS_SHARD_MSG {
         return None;
     }
-    P2pNetworkAdapter::parse_cross_shard_incoming(&bytes)
+    let msg = P2pNetworkAdapter::parse_cross_shard_incoming(&bytes)?;
+    if !msg.verify_msg_id() {
+        return None;
+    }
+    Some(msg)
 }
 
 /// Inbound state of a [`P2pCrossShardTransport`].
@@ -4357,6 +4641,9 @@ fn accept_inbound(
     mut msg: CrossShardMessage,
 ) {
     msg.trusted = false;
+    if !msg.verify_msg_id() {
+        return;
+    }
     // Address check FIRST (security: dedupe poisoning). `msg_id` is
     // `SHA256(source || target || tx_hash || finalized_in_block)` — every field
     // is public — so an attacker who learns a pending transfer can publish the
@@ -4368,6 +4655,13 @@ fn accept_inbound(
         return;
     }
     let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.listeners.contains_key(&shard_id)
+        && g.inbox
+            .get(&shard_id)
+            .is_some_and(|q| q.len() >= MAX_CROSS_SHARD_INBOX)
+    {
+        return;
+    }
     // Gossip duplicates are normal (the mesh relays, a peer may re-publish on
     // reconnect): the first copy wins, the rest are dropped.
     if !g.seen.insert(msg.msg_id) {
@@ -4383,13 +4677,19 @@ fn accept_inbound(
         Some(tx) => match tx.send(msg) {
             Ok(()) => {}
             Err(err) => {
-                // The listener is gone: fall back to the buffered inbox.
+                // The listener is gone: fall back to the buffered inbox (bounded).
                 g.listeners.remove(&shard_id);
-                g.inbox.entry(shard_id).or_default().push_back(err.0);
+                let q = g.inbox.entry(shard_id).or_default();
+                if q.len() < MAX_CROSS_SHARD_INBOX {
+                    q.push_back(err.0);
+                }
             }
         },
         None => {
-            g.inbox.entry(shard_id).or_default().push_back(msg);
+            let q = g.inbox.entry(shard_id).or_default();
+            if q.len() < MAX_CROSS_SHARD_INBOX {
+                q.push_back(msg);
+            }
         }
     }
 }
@@ -5959,47 +6259,73 @@ pub fn parse_repl_circuit_cooldown_ms(v: Option<String>) -> u64 {
 
 /// Effective concurrency cap (`STELL_REPL_MAX_CONCURRENT`, default 4).
 pub fn repl_publish_max_concurrent() -> usize {
-    parse_repl_max_concurrent(std::env::var("STELL_REPL_MAX_CONCURRENT").ok())
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED
+        .get_or_init(|| parse_repl_max_concurrent(std::env::var("STELL_REPL_MAX_CONCURRENT").ok()))
 }
 /// Effective bulk floor (`STELL_REPL_MIN_INTERVAL_MS`, default 100).
 pub fn repl_bulk_min_interval_ms() -> u64 {
-    parse_repl_min_interval_ms(std::env::var("STELL_REPL_MIN_INTERVAL_MS").ok())
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_min_interval_ms(std::env::var("STELL_REPL_MIN_INTERVAL_MS").ok())
+    })
 }
 /// Effective pointer floor (`STELL_REPL_HEAD_MIN_INTERVAL_MS`, default 10).
 pub fn repl_head_min_interval_ms() -> u64 {
-    parse_repl_head_min_interval_ms(std::env::var("STELL_REPL_HEAD_MIN_INTERVAL_MS").ok())
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_head_min_interval_ms(std::env::var("STELL_REPL_HEAD_MIN_INTERVAL_MS").ok())
+    })
 }
 /// Effective store timeout (`STELL_REPL_STORE_TIMEOUT_MS`, default 5000).
 pub fn repl_store_timeout_ms() -> u64 {
-    parse_repl_store_timeout_ms(std::env::var("STELL_REPL_STORE_TIMEOUT_MS").ok())
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_store_timeout_ms(std::env::var("STELL_REPL_STORE_TIMEOUT_MS").ok())
+    })
 }
 /// Effective attempt budget (`STELL_REPL_STORE_MAX_ATTEMPTS`, default 3).
 pub fn repl_store_max_attempts() -> u32 {
-    parse_repl_max_attempts(std::env::var("STELL_REPL_STORE_MAX_ATTEMPTS").ok())
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_max_attempts(std::env::var("STELL_REPL_STORE_MAX_ATTEMPTS").ok())
+    })
 }
 /// Effective circuit threshold (`STELL_REPL_CIRCUIT_THRESHOLD`, default 5).
 pub fn repl_circuit_threshold() -> u32 {
-    parse_repl_circuit_threshold(std::env::var("STELL_REPL_CIRCUIT_THRESHOLD").ok())
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_circuit_threshold(std::env::var("STELL_REPL_CIRCUIT_THRESHOLD").ok())
+    })
 }
 /// Effective circuit cooldown (`STELL_REPL_CIRCUIT_COOLDOWN_MS`, default 5000).
 pub fn repl_circuit_cooldown_ms() -> u64 {
-    parse_repl_circuit_cooldown_ms(std::env::var("STELL_REPL_CIRCUIT_COOLDOWN_MS").ok())
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_repl_circuit_cooldown_ms(std::env::var("STELL_REPL_CIRCUIT_COOLDOWN_MS").ok())
+    })
 }
 /// Effective queue-wait bound (`STELL_REPL_QUEUE_WAIT_MS`, default 10000).
 pub fn repl_queue_wait_ms() -> u64 {
-    parse_env_u64(
-        std::env::var("STELL_REPL_QUEUE_WAIT_MS").ok(),
-        REPL_QUEUE_WAIT_MS_DEFAULT,
-        1_000,
-    )
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_u64(
+            std::env::var("STELL_REPL_QUEUE_WAIT_MS").ok(),
+            REPL_QUEUE_WAIT_MS_DEFAULT,
+            1_000,
+        )
+    })
 }
 /// Effective gate-wait bound (`STELL_REPL_PACE_WAIT_MS`, default 5000).
 pub fn repl_pace_wait_ms() -> u64 {
-    parse_env_u64(
-        std::env::var("STELL_REPL_PACE_WAIT_MS").ok(),
-        REPL_PACE_WAIT_MS_DEFAULT,
-        500,
-    )
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_env_u64(
+            std::env::var("STELL_REPL_PACE_WAIT_MS").ok(),
+            REPL_PACE_WAIT_MS_DEFAULT,
+            500,
+        )
+    })
 }
 
 /// Backoff before retry attempt `attempt` (1-based: attempt 1 just failed).
@@ -6081,7 +6407,8 @@ impl ReplPublishConfig {
 
     /// Live configuration from the `STELL_REPL_*` env (local policy: nodes MAY differ).
     pub fn from_env() -> Self {
-        Self {
+        static CACHED: std::sync::OnceLock<ReplPublishConfig> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| Self {
             max_concurrent: repl_publish_max_concurrent(),
             bulk_min_interval_ms: repl_bulk_min_interval_ms(),
             head_min_interval_ms: repl_head_min_interval_ms(),
@@ -6091,7 +6418,7 @@ impl ReplPublishConfig {
             pace_wait_ms: repl_pace_wait_ms(),
             circuit_threshold: repl_circuit_threshold(),
             circuit_cooldown_ms: repl_circuit_cooldown_ms(),
-        }
+        })
     }
 }
 

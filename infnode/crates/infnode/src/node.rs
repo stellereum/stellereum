@@ -150,6 +150,12 @@ pub const MAX_OUTBOX_FLUSH_PER_PEER: usize = 32;
 pub const MAX_REORDER_KEYS: usize = 1024;
 /// Buffered out-of-order messages per (origin, topic) (`reorder` inner map).
 pub const MAX_REORDER_BUF_PER_KEY: usize = 128;
+/// Idle TTL for reorder entries (5 minutes).
+const REORDER_TTL_MS: i64 = 5 * 60 * 1000;
+/// Maximum `origin` string length in pubsub messages.
+pub const MAX_ORIGIN_LEN: usize = 128;
+/// Maximum dynamically admitted peers (TOFU / DHT-discovered); static peers are exempt.
+pub const MAX_DYNAMIC_PEERS: usize = 2048;
 /// Decrypted mail bodies held in RAM (`mail_cache`).
 pub const MAX_MAIL_CACHE_ENTRIES: usize = 256;
 /// Distinct topics with local app subscribers (`app_subs` outer map).
@@ -164,29 +170,48 @@ pub const MAX_ROUTES_TOTAL: usize = 4096;
 /// Distinct peers with a tie-break fallback guard entry (`sessionless_guard`).
 pub const MAX_SESSIONLESS_GUARD_PEERS: usize = 1024;
 
-/// Reorder buffer: (origin, topic) -> (next_seq, {seq -> (data, src)}).
+/// Reorder buffer: (origin, topic) -> (next_seq, last_touched_ms, {seq -> (data, src)}).
 ///
 /// `src` (node id ОТПРАВИТЕЛЯ) едет вместе с `data`: буфер может отдать
 /// сообщение ПОЗЖЕ, когда его уже отправил другой узел, и подставить
 /// чужой `src` значило бы списать трафик с неверного peer-bucket.
-type ReorderMap = HashMap<(String, String), (u64, BTreeMap<u64, (String, String)>)>;
+type ReorderMap = HashMap<(String, String), (u64, i64, BTreeMap<u64, (String, String)>)>;
+type LookupCacheEntry = (i64, Vec<String>, Option<String>);
 
-/// Anti-replay window for ONE QUIC connection.
-///
-/// This used to live on `PeerLink`, i.e. one window shared by every connection to the
-/// same peer. That is wrong whenever the sender has more than one live connection or
-/// reconnects: the sender's `seq` is a single node-wide counter, so frames arrive on
-/// each connection with numbers from one shared sequence, and a window keyed per peer
-/// sees them as out of order. The result was a `replay/out-of-order` error that tore
-/// down `frame_loop` immediately, so the node never completed authentication or
-/// reached consensus — 7 to 20 `conn_closed` and zero `conn_open` in a real log.
-///
-/// A window belongs to the connection it protects: replays are a per-connection
-/// concern, and QUIC already gives each connection a fresh, independent stream space.
+/// Anti-replay window for ONE QUIC connection (lives on `frame_loop`).
 #[derive(Default)]
 pub struct ConnReplayWindow {
     pub last_seq: u32,
     pub last_ts: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionKeys {
+    pub key: [u8; 32],
+    pub pq_digest: [u8; 32],
+}
+
+#[derive(Default)]
+struct SeenWindow {
+    map: HashMap<u64, i64>,
+    order: VecDeque<(i64, u64)>,
+}
+
+fn parse_peer_pq(
+    cfg: &PeerConfig,
+) -> (
+    Option<[u8; proto::PQ_FALCON_PK_LEN]>,
+    Option<Arc<falcon_rust::falcon512::PublicKey>>,
+) {
+    match cfg.pq_bytes() {
+        Ok(Some(bytes)) => {
+            let parsed = falcon_rust::falcon512::PublicKey::from_bytes(&bytes)
+                .ok()
+                .map(Arc::new);
+            (Some(bytes), parsed)
+        }
+        _ => (None, None),
+    }
 }
 
 #[derive(Clone)]
@@ -197,12 +222,31 @@ pub struct PeerLink {
     pub learned: Arc<RwLock<Option<SocketAddr>>>,
     /// Last time a valid frame arrived from this peer. This is the LIVENESS signal
     /// (`peer_last_seen`, rewards for NAT peers) and is intentionally per-peer.
-    pub last_seen: Arc<Mutex<i64>>,
-    /// Per-CONNECTION anti-replay windows, keyed by `Connection::stable_id()`.
-    /// See `ConnReplayWindow` for why one window per peer was wrong.
-    pub replay_windows: Arc<tokio::sync::RwLock<HashMap<usize, Arc<Mutex<ConnReplayWindow>>>>>,
+    pub last_seen: Arc<AtomicI64>,
     pub client_cfg: quinn::ClientConfig,
     pub rate: Arc<Mutex<RateBucket>>,
+    /// Budget for signed rate-limit error replies (caps Falcon signing CPU under floods).
+    pub err_rate: Arc<Mutex<RateBucket>>,
+    /// Pre-decoded Falcon-512 public key bytes.
+    pub pq_pk_bytes: Option<[u8; proto::PQ_FALCON_PK_LEN]>,
+    /// Pre-parsed Falcon-512 public key (eliminates per-frame hex decode + unpack).
+    pub pq_pk: Option<Arc<falcon_rust::falcon512::PublicKey>>,
+}
+
+impl PeerLink {
+    fn verify_frame(&self, f: &Frame) -> Result<bool> {
+        if let Some(pk) = &self.pq_pk {
+            return Ok(f.verify_parsed(pk));
+        }
+        if let Some(bytes) = &self.pq_pk_bytes {
+            return Ok(f.verify(bytes));
+        }
+        let pq_pk = self
+            .cfg
+            .pq_bytes()?
+            .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
+        Ok(f.verify(&pq_pk))
+    }
 }
 
 /// Запись маршрута для discovery (FULL-PQ: the map key `pid` IS the identity
@@ -517,24 +561,16 @@ pub struct Node {
     mail_dir: PathBuf,
     /// pubsub: топик -> (узел -> SubState{время, живые соединения}) — подписки persistent
     subs: RwLock<HashMap<String, HashMap<[u8; NODEID_LEN], SubState>>>,
-    /// pubsub: dedup сообщений (msg_id -> ts), TTL для предотвращения петель
-    seen: Mutex<HashMap<u64, i64>>,
-    /// Anti-replay для CHALLENGE-рукопожатий (nonce -> ts): каждый nonce
-    /// одноразовый внутри `TS_WINDOW_MS`. Занимается ПОСЛЕ проверки подписи,
-    /// чтобы поддельные кадры не засоряли кэш.
-    challenge_nonces: Mutex<HashMap<String, i64>>,
+    /// pubsub: dedup сообщений (msg_id -> ts), O(1) amortized window
+    seen: std::sync::Mutex<SeenWindow>,
+    /// Anti-replay для CHALLENGE-рукопожатий (O(1) amortized paired map + queue).
+    challenge_nonces: Mutex<proto::NonceWindow>,
     /// pubsub: outbox ненадёжной доставки (узел -> очередь) — переживает рестарты
     outbox: RwLock<HashMap<[u8; NODEID_LEN], VecDeque<QueuedMsg>>>,
     /// pubsub: локальные прикладные подписчики (топик -> каналы)
     app_subs: RwLock<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>,
-    /// forward secrecy: session-ключи соединений (stable_id -> [u8;32])
-    sessions: RwLock<HashMap<usize, [u8; 32]>>,
-    /// KEX wiring: PQ transcript digest per connection (stable_id -> digest).
-    /// Present IFF the session negotiated PQ (hybrid key); absent = classical.
-    /// `frame_loop` seals/opens bodies with `kex_frame_*` (AAD-bound) when
-    /// present, else the legacy `e2e_*` path byte-identical. Same cap as
-    /// `sessions`; inserted/removed alongside it, never alone.
-    pq_digests: RwLock<HashMap<usize, [u8; 32]>>,
+    /// forward secrecy: session-ключи и PQ transcript digest соединений (stable_id -> SessionKeys)
+    sessions: RwLock<HashMap<usize, SessionKeys>>,
     /// Guard for the tie-break-exception dial (see `conn_with_session`): per
     /// peer, when we last dropped a session-less cached conn + last fallback
     /// dial. Bounds direct dials so a dead peer cannot turn the exception
@@ -607,20 +643,26 @@ pub struct Node {
     /// R6: debounce-окно kv-флуша (мс). Поле, а не константа — тесты
     /// переопределяют, чтобы проверять окно без реальных пауз.
     kv_debounce_ms: AtomicU64,
-    /// R3: outbox изменялся с последнего persist'а. 1-секундный flush-цикл
-    /// пишет outbox.json ТОЛЬКО когда флаг поднят (swap), а не каждую секунду.
+    /// R3: outbox изменялся с последнего persist'а.
     outbox_dirty: AtomicBool,
+    outbox_last_flush_ms: AtomicI64,
+    /// Debounce state for subs.json writes.
+    subs_dirty: AtomicBool,
+    subs_last_flush_ms: AtomicI64,
+    /// Short-TTL dedup cache for remote `dht.lookup` queries (target -> (ts_ms, endpoints, pq_pub)).
+    lookup_cache: std::sync::Mutex<HashMap<[u8; NODEID_LEN], LookupCacheEntry>>,
+    /// Rate limit for network-facing diagnostic log events.
+    net_log_last_ms: AtomicI64,
     /// F8: per-IP handshake token-buckets (source IP -> bucket).
     handshake_buckets: Mutex<HashMap<IpAddr, RateBucket>>,
     /// F8: failed-handshake timestamps per source IP (for strike window).
     auth_failures: Mutex<HashMap<IpAddr, Vec<std::time::Instant>>>,
     /// F8: strike-ban expiry per source IP.
     auth_bans: Mutex<HashMap<IpAddr, std::time::Instant>>,
-    /// F8-rep: per-identity reputation (node id -> entry). Extends the
-    /// IP-level accept hardening (buckets/strikes): bans follow the offender
-    /// identity across IPs and never hit well-behaved peers sharing an
-    /// address. See `crate::reputation` for the score model.
-    peer_rep: Mutex<HashMap<[u8; NODEID_LEN], RepEntry>>,
+    /// F8-rep: per-identity reputation sharded into 16 sync mutexes.
+    peer_rep: [std::sync::Mutex<HashMap<[u8; NODEID_LEN], RepEntry>>; 16],
+    /// Cached reputation config (read once at Node::new).
+    rep_cfg: RepConfig,
     /// LONG-TERM PQ peer-key verdict cache (perf, safety-first): static
     /// Falcon-512 parse only, keyed by key bytes. Guard is `std` (never held
     /// across await — `check` is pure CPU). Exact invalidation on rotation /
@@ -761,14 +803,16 @@ impl Node {
         let id = crate::node::ceremony_local_id(&keys, &pq);
         let id_hex = format!("inf1:{}", hex::encode(id));
         // `node_id_kind` telemetry now only knows `PQ`.
-        crate::log::emit(
-            2,
-            "info",
-            &cfg.name,
-            0,
-            "node_id_kind",
-            json!({ "kind": crate::keyring::NodeIdKind::Pq.label(), "id": id_hex }),
-        );
+        if crate::log::enabled(2) {
+            crate::log::emit(
+                2,
+                "info",
+                &cfg.name,
+                0,
+                "node_id_kind",
+                json!({ "kind": crate::keyring::NodeIdKind::Pq.label(), "id": id_hex }),
+            );
+        }
         let client_bind = cfg
             .client_listen
             .clone()
@@ -799,6 +843,7 @@ impl Node {
                 .pq_bytes()?
                 .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
             let client_cfg = build_client_cfg(Some(&pq))?;
+            let (pq_pk_bytes, pq_pk) = parse_peer_pq(&p);
             peers.insert(
                 pid,
                 PeerLink {
@@ -806,10 +851,12 @@ impl Node {
                     conn: Arc::new(RwLock::new(None)),
                     rtt: Arc::new(RwLock::new(None)),
                     learned: Arc::new(RwLock::new(None)),
-                    last_seen: Arc::new(Mutex::new(0)),
-                    replay_windows: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    last_seen: Arc::new(AtomicI64::new(0)),
                     client_cfg,
                     rate: Arc::new(Mutex::new(RateBucket::new())),
+                    err_rate: Arc::new(Mutex::new(RateBucket::new_full(50))),
+                    pq_pk_bytes,
+                    pq_pk,
                 },
             );
             by_name.insert(p.name.clone(), pid);
@@ -838,7 +885,9 @@ impl Node {
                             if !routes.contains_key(&pid) && routes.len() >= MAX_ROUTES_TOTAL {
                                 continue;
                             }
-                            routes.entry(pid).or_insert(v.clone());
+                            let mut r = v.clone();
+                            r.endpoints.truncate(crate::proto::MAX_ENDPOINTS_PER_NODE);
+                            routes.entry(pid).or_insert(r);
                             // NAT hole punch: вспоминаем публичный client-адрес пира
                             if let Some(peer) = peers.get_mut(&pid) {
                                 for ep in &v.endpoints {
@@ -873,12 +922,11 @@ impl Node {
             looped: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             mail_dir,
             subs: RwLock::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
-            challenge_nonces: Mutex::new(HashMap::new()),
+            seen: std::sync::Mutex::new(SeenWindow::default()),
+            challenge_nonces: Mutex::new(proto::NonceWindow::new()),
             outbox: RwLock::new(HashMap::new()),
             app_subs: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
-            pq_digests: RwLock::new(HashMap::new()),
             sessionless_guard: std::sync::Mutex::new(HashMap::new()),
             circuit: std::sync::Mutex::new(HashMap::new()),
             circuit_parks: AtomicU64::new(0),
@@ -900,7 +948,7 @@ impl Node {
             reorder: RwLock::new(HashMap::new()),
             mail_cache: RwLock::new(HashMap::new()),
             metrics: Arc::new(crate::metrics::Metrics::default()),
-            svc_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            svc_counters: crate::metrics::ServiceCounterTable::new(),
             trace_seq: AtomicU64::new(1),
             outbox_ttl,
             config_path: config_path.clone(),
@@ -918,10 +966,16 @@ impl Node {
                     .unwrap_or(KV_FLUSH_DEBOUNCE_MS),
             ),
             outbox_dirty: AtomicBool::new(false),
+            outbox_last_flush_ms: AtomicI64::new(0),
+            subs_dirty: AtomicBool::new(false),
+            subs_last_flush_ms: AtomicI64::new(0),
+            lookup_cache: std::sync::Mutex::new(HashMap::new()),
+            net_log_last_ms: AtomicI64::new(0),
             handshake_buckets: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             auth_bans: Mutex::new(HashMap::new()),
-            peer_rep: Mutex::new(HashMap::new()),
+            peer_rep: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
+            rep_cfg: RepConfig::from_env(),
             falcon_peer_key_cache: std::sync::Mutex::new(FalconPeerKeyCache::new()),
             peer_protocol: std::sync::Mutex::new(HashMap::new()),
         });
@@ -978,7 +1032,7 @@ impl Node {
         if let Ok((_, ms)) = written {
             m.fs_write_ms_total.fetch_add(ms, Ordering::Relaxed);
         }
-        if gate_ms >= 200 || write_ms >= 200 {
+        if (gate_ms >= 200 || write_ms >= 200) && crate::log::enabled(2) {
             crate::log::emit(
                 2,
                 "info",
@@ -990,21 +1044,32 @@ impl Node {
         }
     }
 
-    /// Fetch (or create) the anti-replay window for a specific connection.
-    async fn replay_window(peer: &PeerLink, conn_id: usize) -> Arc<Mutex<ConnReplayWindow>> {
-        if let Some(w) = peer.replay_windows.read().await.get(&conn_id) {
-            return Arc::clone(w);
+    fn log_net_warn(&self, event: &str, detail: &str) {
+        if !crate::log::enabled(1) {
+            return;
         }
-        let mut w = peer.replay_windows.write().await;
-        Arc::clone(
-            w.entry(conn_id)
-                .or_insert_with(|| Arc::new(Mutex::new(ConnReplayWindow::default()))),
-        )
+        let now = now_ms();
+        let prev = self.net_log_last_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) < 1000
+            || self
+                .net_log_last_ms
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        crate::log::emit(
+            1,
+            "warn",
+            &self.cfg.name,
+            0,
+            event,
+            json!({ "detail": detail }),
+        );
     }
 
     fn sign_frame(&self, f: &mut Frame) {
-        let d = blake3::hash(&f.sign_data());
-        f.sig = self.pq.sign_digest(d.as_bytes());
+        f.sig = self.pq.sign_digest(&f.sign_digest());
     }
 
     /// F8: check whether `ip` is currently strike-banned. Expired bans are
@@ -1088,10 +1153,24 @@ impl Node {
         let cooldown = Duration::from_secs(auth_ban_cooldown_secs().max(1));
         let now = std::time::Instant::now();
         let mut failures = self.auth_failures.lock().await;
-        // Bound memory: drop whole map if it grows unbounded (DDoS with
-        // spoofed IPs still cannot grow it without bound).
-        if failures.len() > 8192 {
-            failures.clear();
+        // Bound memory: prune expired entries first, then evict the oldest IP
+        // instead of clearing the whole map (which would reset attacker strikes).
+        if !failures.contains_key(&ip) && failures.len() >= 8192 {
+            if let Some(c) = now.checked_sub(window) {
+                failures.retain(|_, ts| {
+                    ts.retain(|t| *t >= c);
+                    !ts.is_empty()
+                });
+            }
+            if failures.len() >= 8192 {
+                if let Some(oldest_ip) = failures
+                    .iter()
+                    .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
+                    .map(|(k, _)| *k)
+                {
+                    failures.remove(&oldest_ip);
+                }
+            }
         }
         let entry = failures.entry(ip).or_default();
         entry.push(now);
@@ -1119,20 +1198,29 @@ impl Node {
     /// at/below the ban score with no ban active, imposes an escalating temp
     /// ban (`base * 2^(bans-1)`, capped). Fail-closed: scores clamp, bans are
     /// time-gated and always forgive (no permanent ban).
+    #[inline]
+    fn rep_shard(pid: &[u8; NODEID_LEN]) -> usize {
+        ((pid[0] ^ pid[NODEID_LEN - 1]) & 0x0f) as usize
+    }
+
     async fn rep_apply(&self, pid: [u8; NODEID_LEN], delta: i64) {
-        let cfg = RepConfig::load();
+        const SHARD_CAP: usize = REP_MAP_CAP / 16;
+        const SHARD_HARD_CAP: usize = REP_MAP_HARD_CAP / 16;
+        let cfg = &self.rep_cfg;
         let now = std::time::Instant::now();
-        let mut map = self.peer_rep.lock().await;
-        if !map.contains_key(&pid) && map.len() >= REP_MAP_CAP {
+        let mut map = self.peer_rep[Self::rep_shard(&pid)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(&pid) && map.len() >= SHARD_CAP {
             // Memory bound: evict neutral entries first, then everything but
             // active bans. The IP layer still binds the sender's address.
             map.retain(|_, e| e.banned_at(now) || e.score != 0);
-            if map.len() >= REP_MAP_HARD_CAP {
+            if map.len() >= SHARD_HARD_CAP {
                 map.retain(|_, e| e.banned_at(now));
             }
         }
         let e = map.entry(pid).or_insert_with(|| RepEntry::fresh(now));
-        e.touch(&cfg, now);
+        e.touch(cfg, now);
         e.score = e.score.saturating_add(delta).clamp(
             crate::reputation::REP_SCORE_MIN,
             crate::reputation::REP_SCORE_MAX,
@@ -1150,12 +1238,13 @@ impl Node {
 
     /// F8-rep: decayed score for an identity (0 = neutral or unknown).
     pub async fn rep_score(&self, pid: &[u8; NODEID_LEN]) -> i64 {
-        let cfg = RepConfig::load();
         let now = std::time::Instant::now();
-        let mut map = self.peer_rep.lock().await;
+        let mut map = self.peer_rep[Self::rep_shard(pid)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match map.get_mut(pid) {
             Some(e) => {
-                e.touch(&cfg, now);
+                e.touch(&self.rep_cfg, now);
                 e.score
             }
             None => 0,
@@ -1165,12 +1254,13 @@ impl Node {
     /// F8-rep: true while the identity holds an unexpired temp ban. Expired
     /// bans are reaped lazily with forgiveness (see `RepEntry::touch`).
     pub async fn rep_is_banned(&self, pid: &[u8; NODEID_LEN]) -> bool {
-        let cfg = RepConfig::load();
         let now = std::time::Instant::now();
-        let mut map = self.peer_rep.lock().await;
+        let mut map = self.peer_rep[Self::rep_shard(pid)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match map.get_mut(pid) {
             Some(e) => {
-                e.touch(&cfg, now);
+                e.touch(&self.rep_cfg, now);
                 e.banned_at(now)
             }
             None => false,
@@ -1182,13 +1272,14 @@ impl Node {
     /// Soft throttle refuses handshakes but imposes no ban — decay alone
     /// lifts the identity out.
     pub async fn rep_is_throttled(&self, pid: &[u8; NODEID_LEN]) -> bool {
-        let cfg = RepConfig::load();
         let now = std::time::Instant::now();
-        let mut map = self.peer_rep.lock().await;
+        let mut map = self.peer_rep[Self::rep_shard(pid)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match map.get_mut(pid) {
             Some(e) => {
-                e.touch(&cfg, now);
-                !e.banned_at(now) && e.score <= cfg.soft_score
+                e.touch(&self.rep_cfg, now);
+                !e.banned_at(now) && e.score <= self.rep_cfg.soft_score
             }
             None => false,
         }
@@ -1197,12 +1288,13 @@ impl Node {
     /// F8-rep: escalation memory — bans imposed on this identity so far
     /// (reset on full recovery). Test/monitoring accessor.
     pub async fn rep_ban_count(&self, pid: &[u8; NODEID_LEN]) -> u32 {
-        let cfg = RepConfig::load();
         let now = std::time::Instant::now();
-        let mut map = self.peer_rep.lock().await;
+        let mut map = self.peer_rep[Self::rep_shard(pid)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match map.get_mut(pid) {
             Some(e) => {
-                e.touch(&cfg, now);
+                e.touch(&self.rep_cfg, now);
                 e.bans
             }
             None => 0,
@@ -1211,30 +1303,26 @@ impl Node {
 
     /// F8-rep: credit a valid handshake / accepted message.
     pub async fn rep_record_valid(&self, pid: &[u8; NODEID_LEN]) {
-        let d = RepConfig::load().reward_valid;
-        self.rep_apply(*pid, d).await;
+        self.rep_apply(*pid, self.rep_cfg.reward_valid).await;
     }
 
     /// F8-rep: debit a failed authentication by the PROVEN (post-handshake)
     /// identity. Pre-auth failures never reach this: the claimed id is
     /// unproven, so the connection is dropped with no identity debit.
     pub async fn rep_record_auth_failure(&self, pid: &[u8; NODEID_LEN]) {
-        let d = RepConfig::load().pen_auth;
-        self.rep_apply(*pid, -d).await;
+        self.rep_apply(*pid, -self.rep_cfg.pen_auth).await;
     }
 
     /// F8-rep: debit an oversize transport frame (envelope over the caps).
     /// App-layer policy refusals (oversized DHT value, bad TTL, ACL deny)
     /// are NOT abuse signals and never call this.
     pub async fn rep_record_oversize(&self, pid: &[u8; NODEID_LEN]) {
-        let d = RepConfig::load().pen_oversize;
-        self.rep_apply(*pid, -d).await;
+        self.rep_apply(*pid, -self.rep_cfg.pen_oversize).await;
     }
 
     /// F8-rep: debit a per-peer rate-limit violation.
     pub async fn rep_record_rate_violation(&self, pid: &[u8; NODEID_LEN]) {
-        let d = RepConfig::load().pen_rate;
-        self.rep_apply(*pid, -d).await;
+        self.rep_apply(*pid, -self.rep_cfg.pen_rate).await;
     }
 
     /// F8-rep: debit a protocol violation by the PROVEN (post-handshake)
@@ -1242,8 +1330,7 @@ impl Node {
     /// failure). Pre-auth sources are unproven: unauthenticated frames drop
     /// the connection with no identity debit.
     pub async fn rep_record_protocol_violation(&self, pid: &[u8; NODEID_LEN]) {
-        let d = RepConfig::load().pen_proto;
-        self.rep_apply(*pid, -d).await;
+        self.rep_apply(*pid, -self.rep_cfg.pen_proto).await;
     }
 
     /// F8-rep: identity temp bans imposed so far.
@@ -1356,7 +1443,7 @@ impl Node {
     /// (distinct reorder keys, largest single buffer).
     pub async fn bp_reorder_sizes(&self) -> (usize, usize) {
         let r = self.reorder.read().await;
-        let max_buf = r.values().map(|(_, b)| b.len()).max().unwrap_or(0);
+        let max_buf = r.values().map(|(_, _, b)| b.len()).max().unwrap_or(0);
         (r.len(), max_buf)
     }
 
@@ -1392,7 +1479,14 @@ impl Node {
 
     /// Insert via the real `session_insert` path. Returns false on shed.
     pub async fn bp_session_insert(&self, sid: usize, key: [u8; 32]) -> bool {
-        self.session_insert(sid, key).await
+        self.session_insert(
+            sid,
+            SessionKeys {
+                key,
+                pq_digest: [0u8; 32],
+            },
+        )
+        .await
     }
 
     /// Stored session keys.
@@ -1491,24 +1585,12 @@ impl Node {
     /// Backpressure admission for the session table. Returns false (fail-closed:
     /// caller must abort the connection) when the table is full and this is a
     /// new entry. No fitting metrics counter exists (follow-up).
-    async fn session_insert(&self, sid: usize, key: [u8; 32]) -> bool {
+    async fn session_insert(&self, sid: usize, keys: SessionKeys) -> bool {
         let mut s = self.sessions.write().await;
         if !s.contains_key(&sid) && s.len() >= MAX_SESSIONS_TOTAL {
             return false;
         }
-        s.insert(sid, key);
-        true
-    }
-
-    /// KEX wiring: remember the PQ transcript digest for a PQ-negotiated
-    /// connection. Same fail-closed cap as `session_insert`; caller drops the
-    /// session + conn when full so the two maps never disagree on PQ-ness.
-    async fn pq_digest_insert(&self, sid: usize, digest: [u8; 32]) -> bool {
-        let mut m = self.pq_digests.write().await;
-        if !m.contains_key(&sid) && m.len() >= MAX_SESSIONS_TOTAL {
-            return false;
-        }
-        m.insert(sid, digest);
+        s.insert(sid, keys);
         true
     }
 
@@ -1741,7 +1823,7 @@ impl Node {
             tokio::time::timeout(std::time::Duration::from_secs(8), conn.open_bi())
                 .await
                 .map_err(|_| anyhow!("open stream timeout"))??;
-        send.write_all(&f.encode()).await?;
+        send.write_all(&f.try_encode()?).await?;
         let _ = send.finish();
         let bytes = timeout(
             Duration::from_secs(8),
@@ -1750,13 +1832,9 @@ impl Node {
         .await
         .map_err(|_| anyhow!("AUTH timeout"))??;
         let auth = Frame::decode(&bytes)?;
-        let pq_pk = peer
-            .cfg
-            .pq_bytes()?
-            .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
         if auth.kind != proto::kind::AUTH
             || auth.src != pid
-            || !auth.verify(&pq_pk)
+            || !peer.verify_frame(&auth)?
             || !ts_ok(auth.ts)
         {
             bail!("auth failed");
@@ -1791,20 +1869,18 @@ impl Node {
         let key = proto::pq_session_key(&pq_agreed.shared, &pq_agreed.digest);
         // Backpressure: fail-closed when the session table is full (the dial
         // fails here instead of growing memory without bound).
-        if !self.session_insert(conn.stable_id(), key).await {
-            self.drop_conn(pid, Some(conn.stable_id())).await;
-            bail!("sessions full");
-        }
-        // KEX wiring: PQ sessions carry their transcript digest so frame
-        // seal/open binds the AAD. Digest-table-full drops the just-stored
-        // session + conn (fail-closed, never a half-PQ session).
         if !self
-            .pq_digest_insert(conn.stable_id(), pq_agreed.digest)
+            .session_insert(
+                conn.stable_id(),
+                SessionKeys {
+                    key,
+                    pq_digest: pq_agreed.digest,
+                },
+            )
             .await
         {
-            self.sessions.write().await.remove(&conn.stable_id());
             self.drop_conn(pid, Some(conn.stable_id())).await;
-            bail!("pq digests full");
+            bail!("sessions full");
         }
         // Post-handshake protocol negotiation (control plane; never a frame
         // header change). Fail-open: a lost HELLO leaves both sides on the
@@ -1849,7 +1925,7 @@ impl Node {
         let node = self.clone();
         // Цикл сам снимет отметку по завершении (см. конец frame_loop).
         tokio::spawn(async move {
-            frame_loop(conn, node, pid).await;
+            frame_loop(conn, node, pid, false).await;
         });
     }
 
@@ -2393,7 +2469,7 @@ impl Node {
             let addr: SocketAddr = match entry.endpoint.parse() {
                 Ok(a) => a,
                 Err(_) => {
-                    eprintln!("[{}] bad endpoint '{}'", self.cfg.name, entry.endpoint);
+                    self.log_net_warn("bad_endpoint", &entry.endpoint);
                     continue;
                 }
             };
@@ -2413,9 +2489,9 @@ impl Node {
                 }
                 Err(e) => {
                     last_err = anyhow!("{} @ {}{tag}: {e}", peer.cfg.name, entry.endpoint);
-                    eprintln!(
-                        "[{}] connect {} @ {}{tag}: {e}",
-                        self.cfg.name, peer.cfg.name, entry.endpoint
+                    self.log_net_warn(
+                        "connect_failed",
+                        &format!("{} @ {}{tag}: {e}", peer.cfg.name, entry.endpoint),
                     );
                 }
             }
@@ -2498,7 +2574,7 @@ impl Node {
         self: &Arc<Self>,
         peer: &PeerLink,
         pid: [u8; NODEID_LEN],
-    ) -> Result<(Connection, [u8; 32])> {
+    ) -> Result<(Connection, SessionKeys)> {
         let mut dropped_sessionless = false;
         // Fast path + scrub: a cached conn without a session is checked with brief wait (100ms)
         // before declaring it dead weight, so concurrent handshakes are not prematurely dropped.
@@ -2614,10 +2690,14 @@ impl Node {
             .await;
         let resp_ms = t_resp.elapsed().as_millis();
         if dial_ms >= 200 || resp_ms >= 200 {
-            eprintln!(
-                "[{}] request_to {} dial={dial_ms}ms resp={resp_ms}ms",
-                self.cfg.name,
-                hex::encode(&pid[..4])
+            self.log_net_warn(
+                "request_slow",
+                &format!(
+                    "peer={} dial={}ms resp={}ms",
+                    hex::encode(&pid[..4]),
+                    dial_ms,
+                    resp_ms
+                ),
             );
         }
         match first {
@@ -2784,7 +2864,7 @@ impl Node {
         &self,
         conn: &Connection,
         pid: &[u8; NODEID_LEN],
-        key: &[u8; 32],
+        skeys: &SessionKeys,
         svc: &str,
         payload: &[u8],
     ) -> Result<()> {
@@ -2802,17 +2882,9 @@ impl Node {
         let seq = self.next_seq();
         let ts = now_ms();
         let svc_id = proto::svc_id(svc);
-        // KEX seal site: PQ sessions bind header+digest AAD, classical None.
-        let pq_digest = self
-            .pq_digests
-            .read()
-            .await
-            .get(&conn.stable_id())
-            .copied()
-            .ok_or_else(|| anyhow!("no pq session digest"))?;
         let (ct, nonce) = frame_seal_body(
-            key,
-            &pq_digest,
+            &skeys.key,
+            &skeys.pq_digest,
             proto::kind::REQ,
             seq,
             ts,
@@ -2833,8 +2905,8 @@ impl Node {
             sig: Vec::new(),
         };
         self.sign_frame(&mut f);
+        let wire = f.try_encode()?;
         self.metrics.frames_out.fetch_add(1, Ordering::Relaxed);
-        let wire = f.encode();
         self.metrics
             .bytes_out
             .fetch_add(wire.len() as u64, Ordering::Relaxed);
@@ -2860,13 +2932,13 @@ impl Node {
         &self,
         conn: &Connection,
         pid: &[u8; NODEID_LEN],
-        key: &[u8; 32],
+        skeys: &SessionKeys,
         peer: &PeerLink,
         svc: &str,
         payload: &[u8],
         timeout_secs: u64,
     ) -> Result<Vec<u8>> {
-        self.request_on_limited(conn, pid, key, peer, svc, payload, timeout_secs, None)
+        self.request_on_limited(conn, pid, skeys, peer, svc, payload, timeout_secs, None)
             .await
     }
 
@@ -2875,7 +2947,7 @@ impl Node {
         &self,
         conn: &Connection,
         pid: &[u8; NODEID_LEN],
-        key: &[u8; 32],
+        skeys: &SessionKeys,
         peer: &PeerLink,
         svc: &str,
         payload: &[u8],
@@ -2903,17 +2975,9 @@ impl Node {
         let seq = self.next_seq();
         let ts = now_ms();
         let svc_id = proto::svc_id(svc);
-        // KEX seal site: PQ sessions bind header+digest AAD, classical None.
-        let pq_digest = self
-            .pq_digests
-            .read()
-            .await
-            .get(&conn.stable_id())
-            .copied()
-            .ok_or_else(|| anyhow!("no pq session digest"))?;
         let (ct, nonce) = frame_seal_body(
-            key,
-            &pq_digest,
+            &skeys.key,
+            &skeys.pq_digest,
             proto::kind::REQ,
             seq,
             ts,
@@ -2934,18 +2998,11 @@ impl Node {
             sig: Vec::new(),
         };
         self.sign_frame(&mut f);
+        let wire = f.try_encode()?;
         self.metrics.frames_out.fetch_add(1, Ordering::Relaxed);
-        // R20: кодируем РОВНО ОДИН раз — раньше encode() считался дважды
-        // (один раз в bytes_out, второй раз в write_all), т.е. каждый запрос
-        // платил за полную сериализацию фрейма дважды.
-        let wire = f.encode();
         self.metrics
             .bytes_out
             .fetch_add(wire.len() as u64, Ordering::Relaxed);
-        // R21: write_all ограничен 8с (симметрично open_bi с коммита 449f4c5).
-        // Зависший write раньше ждал бесконечно и съедал весь бюджет вызывающего
-        // без единой ошибки сверху; теперь это "write timeout" — сетевая ошибка,
-        // при которой request_to делает один повтор на свежем соединении.
         let t_write = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_secs(8), send.write_all(&wire)).await {
             Err(_) => return Err(anyhow!("write timeout")),
@@ -2971,11 +3028,8 @@ impl Node {
             .map_err(|_| anyhow!("response timeout"))??
         };
         let wait_ms = t_wait.elapsed();
-        // Patch B: стадии запроса (open/write/wait) с join-ключом (f.seq, f.ts) —
-        // приёмник логирует ТЕ ЖЕ seq/ts в "dispatch", обе ноды сидят на одних
-        // и тех же часах и строки джойнятся напрямую.
         let max_ms = open_ms.max(write_ms).max(wait_ms);
-        if max_ms >= Duration::from_millis(200) {
+        if max_ms >= Duration::from_millis(200) && crate::log::enabled(2) {
             crate::log::emit(
                 2,
                 "info",
@@ -2993,22 +3047,10 @@ impl Node {
             );
         }
         let resp = Frame::decode(&bytes)?;
-        let pq_pk = peer
-            .cfg
-            .pq_bytes()?
-            .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
-        if resp.kind != proto::kind::RESP || !resp.verify(&pq_pk) {
+        if resp.kind != proto::kind::RESP || !peer.verify_frame(&resp)? {
             bail!("bad response");
         }
-        // KEX open site: every session is PQ, so the AAD-bound tag is required.
-        let pq_digest = self
-            .pq_digests
-            .read()
-            .await
-            .get(&conn.stable_id())
-            .copied()
-            .ok_or_else(|| anyhow!("no pq session digest"))?;
-        frame_open_body(key, &pq_digest, &resp)
+        frame_open_body(&skeys.key, &skeys.pq_digest, &resp)
     }
 
     pub async fn ping(self: &Arc<Self>, sel: &str, count: u32) -> Result<String> {
@@ -3251,7 +3293,8 @@ impl Node {
         // Control frames are tiny; a best-effort priority keeps them from
         // queueing behind a bulk blob transfer on the same connection.
         let _ = send.set_priority(1000);
-        tokio::time::timeout(Duration::from_secs(8), send.write_all(&f.encode()))
+        let wire = f.try_encode()?;
+        tokio::time::timeout(Duration::from_secs(8), send.write_all(&wire))
             .await
             .map_err(|_| anyhow!("control write timeout"))??;
         let _ = send.finish();
@@ -3349,12 +3392,12 @@ impl Node {
 
     /// Учёт известного эндпоинта пира + персистентность.
     async fn add_route(&self, pid: [u8; NODEID_LEN], endpoint: String, pq_hex: &str) {
+        if !crate::dht::endpoint_ok(&endpoint) {
+            return;
+        }
         let mut write_now = false;
         {
             let mut routes = self.routes.write().await;
-            // Backpressure: fail-closed total cap on the route table (per
-            // update and per-node caps stay in `proto`). Unknown nodes beyond
-            // the cap are ignored. No fitting metrics counter (follow-up).
             if !routes.contains_key(&pid) && routes.len() >= MAX_ROUTES_TOTAL {
                 return;
             }
@@ -3366,7 +3409,9 @@ impl Node {
                 route.pq_hex = pq_hex.to_string();
                 write_now = true;
             }
-            if !route.endpoints.contains(&endpoint) {
+            if route.endpoints.len() < crate::proto::MAX_ENDPOINTS_PER_NODE
+                && !route.endpoints.contains(&endpoint)
+            {
                 route.endpoints.push(endpoint);
                 write_now = true;
             }
@@ -3392,33 +3437,66 @@ impl Node {
     /// has not proven a PQ identity gets a verifier that refuses every cert
     /// (outbound redial fails closed until config pins `pq-pub`).
     async fn add_dynamic_peer(&self, pid: [u8; NODEID_LEN], pcfg: PeerConfig) -> Result<()> {
+        if self.static_peers.contains(&pid) {
+            return Ok(());
+        }
         let pq = pcfg.pq_bytes()?;
         let client_cfg = build_client_cfg(pq.as_ref().map(|b| b.as_slice()))?;
-        // EXACT invalidation on key rotation: if this pid already pins a
-        // DIFFERENT long-term PQ key, drop the old verdict so the next
-        // handshake re-verifies fresh (never a stale hit).
-        if let Some(old) = self.peers.read().await.get(&pid) {
-            let old_pq = old.cfg.pq_bytes().unwrap_or(None);
-            let new_pq = pcfg.pq_bytes().unwrap_or(None);
-            if old_pq != new_pq {
-                if let Some(was) = old_pq {
-                    if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
-                        cache.invalidate(&was);
-                    }
-                }
-            }
-        }
+        let (pq_pk_bytes, pq_pk) = parse_peer_pq(&pcfg);
         let link = PeerLink {
             cfg: pcfg,
             conn: Arc::new(RwLock::new(None)),
             rtt: Arc::new(RwLock::new(None)),
             learned: Arc::new(RwLock::new(None)),
-            last_seen: Arc::new(Mutex::new(0)),
-            replay_windows: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            last_seen: Arc::new(AtomicI64::new(now_ms())),
             client_cfg,
             rate: Arc::new(Mutex::new(RateBucket::new())),
+            err_rate: Arc::new(Mutex::new(RateBucket::new_full(50))),
+            pq_pk_bytes,
+            pq_pk,
         };
-        self.peers.write().await.insert(pid, link);
+        let evicted = {
+            let mut peers = self.peers.write().await;
+            if let Some(old) = peers.get(&pid) {
+                let old_pq = old.cfg.pq_bytes().unwrap_or(None);
+                let new_pq = link.cfg.pq_bytes().unwrap_or(None);
+                if old_pq != new_pq {
+                    if let Some(was) = old_pq {
+                        if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
+                            cache.invalidate(&was);
+                        }
+                    }
+                }
+            }
+            let mut evicted = None;
+            if !peers.contains_key(&pid) {
+                let dyn_count = peers
+                    .keys()
+                    .filter(|id| !self.static_peers.contains(*id))
+                    .count();
+                if dyn_count >= MAX_DYNAMIC_PEERS {
+                    let victim = peers
+                        .iter()
+                        .filter(|(id, _)| !self.static_peers.contains(*id))
+                        .min_by_key(|(_, l)| {
+                            let has_conn = l.conn.try_read().map(|g| g.is_some()).unwrap_or(true);
+                            (has_conn, l.last_seen.load(Ordering::Relaxed))
+                        })
+                        .map(|(id, _)| *id);
+                    if let Some(vid) = victim {
+                        peers.remove(&vid);
+                        evicted = Some(vid);
+                    } else {
+                        bail!("dynamic peer table full");
+                    }
+                }
+            }
+            peers.insert(pid, link);
+            evicted
+        };
+        if let Some(vid) = evicted {
+            self.drop_conn(vid, None).await;
+        }
         Ok(())
     }
 
@@ -3453,45 +3531,129 @@ impl Node {
         plain: &[u8],
     ) -> Option<Vec<u8>> {
         use crate::proto::svc_id;
-        let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
-        let topic = v["topic"].as_str().unwrap_or("default").to_string();
+        use serde::Deserialize;
+        use std::borrow::Cow;
 
-        if svc == svc_id("dht.lookup") {
-            return self.handle_dht_lookup(&v, from).await;
+        #[derive(Deserialize)]
+        struct StorageStoreReq<'a> {
+            #[serde(borrow, default)]
+            chunk_id: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            bucket: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            data: Option<Cow<'a, str>>,
         }
-        if svc == svc_id("dht.update") {
-            return self.handle_dht_update(&v, from).await;
+        #[derive(Deserialize)]
+        struct StorageFetchReq<'a> {
+            #[serde(borrow, default)]
+            chunk_id: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            bucket: Option<Cow<'a, str>>,
         }
-        if svc == svc_id("dht.find_node") {
-            return self.handle_dht_find_node(&v).await;
+        #[derive(Deserialize)]
+        struct DhtStoreReq<'a> {
+            #[serde(borrow, default)]
+            key: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            value: Option<Cow<'a, str>>,
+            #[serde(default)]
+            ttl: Option<serde_json::Value>,
+            #[serde(default)]
+            stored_at: Option<i64>,
         }
-        if svc == svc_id("dht.store") {
-            return self.handle_dht_store(&v, from).await;
+        #[derive(Deserialize)]
+        struct ConsensusSignReq<'a> {
+            #[serde(borrow, default)]
+            state_hash: Option<Cow<'a, str>>,
         }
-        if svc == svc_id("dht.find_value") {
-            return self.handle_dht_find_value(&v, from).await;
+        #[derive(Deserialize)]
+        struct PubsubTopicReq<'a> {
+            #[serde(borrow, default)]
+            topic: Option<Cow<'a, str>>,
         }
-        if svc == svc_id("dht.sync") {
-            return self.handle_dht_sync(&v, from).await;
+        #[derive(Deserialize)]
+        struct PubsubPublishReq<'a> {
+            #[serde(borrow, default)]
+            topic: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            data: Option<Cow<'a, str>>,
+            #[serde(default)]
+            msg_id: Option<u64>,
+            #[serde(default)]
+            ttl: Option<u64>,
         }
+        #[derive(Deserialize)]
+        struct PubsubRelayReq<'a> {
+            #[serde(borrow, default)]
+            topic: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            data: Option<Cow<'a, str>>,
+            #[serde(default)]
+            msg_id: Option<u64>,
+            #[serde(default)]
+            ttl: Option<u64>,
+            #[serde(default)]
+            seq: Option<u64>,
+            #[serde(borrow, default)]
+            origin: Option<Cow<'a, str>>,
+        }
+        #[derive(Deserialize)]
+        struct PubsubMsgReq<'a> {
+            #[serde(borrow, default)]
+            topic: Option<Cow<'a, str>>,
+            #[serde(borrow, default)]
+            origin: Option<Cow<'a, str>>,
+            #[serde(default)]
+            seq: Option<u64>,
+            #[serde(borrow, default)]
+            data: Option<Cow<'a, str>>,
+            #[serde(default)]
+            msg_id: Option<serde_json::Value>,
+        }
+
         if svc == svc_id("storage.store") {
-            return self.handle_storage_store(&v).await;
+            let req: StorageStoreReq<'_> = serde_json::from_slice(plain).ok()?;
+            return self
+                .handle_storage_store_typed(
+                    req.chunk_id.as_deref().unwrap_or(""),
+                    req.bucket.as_deref().unwrap_or("files"),
+                    req.data.as_deref().unwrap_or(""),
+                    Some(from),
+                )
+                .await;
         }
         if svc == svc_id("storage.fetch") {
-            return self.handle_storage_fetch(&v).await;
+            let req: StorageFetchReq<'_> = serde_json::from_slice(plain).ok()?;
+            return self
+                .handle_storage_fetch_typed(
+                    req.chunk_id.as_deref().unwrap_or(""),
+                    req.bucket.as_deref().unwrap_or("files"),
+                    Some(from),
+                )
+                .await;
         }
         if svc == svc_id("storage.delete") {
-            return self.handle_storage_delete(&v).await;
+            let req: StorageFetchReq<'_> = serde_json::from_slice(plain).ok()?;
+            return self
+                .handle_storage_delete_typed(
+                    req.chunk_id.as_deref().unwrap_or(""),
+                    req.bucket.as_deref().unwrap_or("files"),
+                    Some(from),
+                )
+                .await;
         }
-        if svc == svc_id("mail.list") {
-            return self.handle_mail_list(&v).await;
+        if svc == svc_id("dht.store") {
+            let req: DhtStoreReq<'_> = serde_json::from_slice(plain).ok()?;
+            return self
+                .handle_dht_store_typed(
+                    req.key.as_deref().unwrap_or(""),
+                    req.value.as_deref().unwrap_or(""),
+                    req.ttl.as_ref(),
+                    req.stored_at.unwrap_or(0),
+                    from,
+                )
+                .await;
         }
-        if svc == svc_id("core.health") {
-            return self.handle_health().await;
-        }
-        // консенсус: суб-валидатор подписывает хэш состояния своим
-        // Falcon-512 PQ ключом (FULL-PQ: the Ed25519 state signer is gone).
-        // Доступ разрешён только пирам из cfg.validators (и самому себе).
         if svc == svc_id("consensus.sign") {
             if !self.is_consensus_signer(&from).await {
                 return Some(
@@ -3500,8 +3662,8 @@ impl Node {
                         .into_bytes(),
                 );
             }
-            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
-            let state_hash = v["state_hash"].as_str().unwrap_or("").to_string();
+            let req: ConsensusSignReq<'_> = serde_json::from_slice(plain).ok()?;
+            let state_hash = req.state_hash.as_deref().unwrap_or("");
             if state_hash.len() != 64 {
                 return Some(
                     json!({ "ok": false, "err": "bad state_hash" })
@@ -3522,16 +3684,17 @@ impl Node {
                 .into_bytes(),
             );
         }
-
         if svc == svc_id("pubsub.subscribe") {
-            if !crate::proto::topic_ok(&topic) {
+            let req: PubsubTopicReq<'_> = serde_json::from_slice(plain).ok()?;
+            let topic = req.topic.as_deref().unwrap_or("default");
+            if !crate::proto::topic_ok(topic) {
                 return Some(
                     json!({ "ok": false, "err": "bad topic" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            if !self.subs_book(&topic, from).await {
+            if !self.subs_book(topic, from).await {
                 return Some(
                     json!({ "ok": false, "err": "too many subscriptions" })
                         .to_string()
@@ -3539,11 +3702,8 @@ impl Node {
                 );
             }
             {
-                // Fail-closed per-(topic, peer) connection slots: beyond the
-                // cap the subscription stays (outbox covers delivery) but no
-                // further live conn is tracked.
                 let mut subs = self.subs.write().await;
-                if let Some(st) = subs.get_mut(&topic).and_then(|m| m.get_mut(&from)) {
+                if let Some(st) = subs.get_mut(topic).and_then(|m| m.get_mut(&from)) {
                     if st.conns.contains_key(&conn.stable_id())
                         || st.conns.len() < MAX_SUB_CONNS_PER_PEER
                     {
@@ -3551,61 +3711,57 @@ impl Node {
                     }
                 }
             }
-            self.persist_subs().await;
-            Some(
+            self.subs_dirty.store(true, Ordering::SeqCst);
+            self.subs_flush_if_due().await;
+            return Some(
                 json!({ "ok": true, "op": "subscribed", "topic": topic })
                     .to_string()
                     .into_bytes(),
-            )
-        } else if svc == svc_id("pubsub.unsubscribe") {
-            if !crate::proto::topic_ok(&topic) {
+            );
+        }
+        if svc == svc_id("pubsub.unsubscribe") {
+            let req: PubsubTopicReq<'_> = serde_json::from_slice(plain).ok()?;
+            let topic = req.topic.as_deref().unwrap_or("default");
+            if !crate::proto::topic_ok(topic) {
                 return Some(
                     json!({ "ok": false, "err": "bad topic" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            if let Some(t) = self.subs.write().await.get_mut(&topic) {
+            if let Some(t) = self.subs.write().await.get_mut(topic) {
                 t.remove(&from);
             }
-            self.persist_subs().await;
-            Some(
+            self.subs_dirty.store(true, Ordering::SeqCst);
+            self.subs_flush_if_due().await;
+            return Some(
                 json!({ "ok": true, "op": "unsubscribed", "topic": topic })
                     .to_string()
                     .into_bytes(),
-            )
-        } else if svc == svc_id("pubsub.publish") {
-            // Fail-closed: топик/данные/TTL ограничены ДО любых side-эффектов
-            // (seq/mark_seen/deliver/forward). Раньше данные принимались вплоть
-            // до 32 МиБ фрейма, а ttl=u64::MAX давал бесконечный веер по mesh.
-            if !crate::proto::topic_ok(&topic) {
+            );
+        }
+        if svc == svc_id("pubsub.publish") {
+            let req: PubsubPublishReq<'_> = serde_json::from_slice(plain).ok()?;
+            let topic = req.topic.as_deref().unwrap_or("default");
+            if !crate::proto::topic_ok(topic) {
                 return Some(
                     json!({ "ok": false, "err": "bad topic" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            let data = v["data"].as_str().unwrap_or("").to_string();
-            if !crate::proto::pubsub_data_ok(&data) {
+            let data = req.data.as_deref().unwrap_or("");
+            if !crate::proto::pubsub_data_ok(data) {
                 return Some(
                     json!({ "ok": false, "err": "data too large" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            let msg_id = v["msg_id"].as_u64().unwrap_or_else(rand_u64);
-            let ttl = v["ttl"]
-                .as_u64()
-                .unwrap_or(3)
-                .min(crate::proto::MAX_PUBSUB_TTL);
-            // порядок: origin присваивает seq из своего per-topic счётчика
-            let seq = self.next_topic_seq(&topic).await;
+            let msg_id = req.msg_id.unwrap_or_else(rand_u64);
+            let ttl = req.ttl.unwrap_or(3).min(crate::proto::MAX_PUBSUB_TTL);
+            let seq = self.next_topic_seq(topic).await;
             let origin = self.id_hex.clone();
-            // Idempotent publish: `msg_id` is the origin's idempotency key.
-            // `request_to` may retry a publish whose response was lost; without
-            // this check the retry would assign a NEW seq and every subscriber
-            // would deliver the payload twice (dedup is by msg_id, not data).
-            // Marking at the origin also stops the mesh relay loop-back.
             if self.mark_seen(msg_id).await {
                 return Some(
                     json!({ "ok": true, "op": "published", "dup": true, "msg_id": msg_id })
@@ -3616,44 +3772,48 @@ impl Node {
             self.metrics.msgs_published.fetch_add(1, Ordering::Relaxed);
             let exclude_conn = conn.stable_id();
             let n = self
-                .deliver_local(&topic, &data, msg_id, seq, &origin, Some(exclude_conn))
+                .deliver_local(topic, data, msg_id, seq, &origin, Some(exclude_conn))
                 .await;
             self.metrics
                 .msgs_delivered
                 .fetch_add(n as u64, Ordering::Relaxed);
-            self.forward(&topic, &data, msg_id, seq, &origin, ttl, Some(from))
+            self.forward(topic, data, msg_id, seq, &origin, ttl, Some(from))
                 .await;
-            Some(
+            return Some(
                 json!({ "ok": true, "op": "published", "topic": topic, "delivered": n, "msg_id": msg_id, "seq": seq })
                     .to_string()
                     .into_bytes(),
-            )
-        } else if svc == svc_id("pubsub.relay") {
-            // Тот же fail-closed гейт, что у publish: битый relay дропается
-            // молча (без forward/deliver), иначе чужой веер качает через нас
-            // гигабайты.
-            if !crate::proto::topic_ok(&topic) {
+            );
+        }
+        if svc == svc_id("pubsub.relay") {
+            let req: PubsubRelayReq<'_> = serde_json::from_slice(plain).ok()?;
+            let topic = req.topic.as_deref().unwrap_or("default");
+            if !crate::proto::topic_ok(topic) {
                 return Some(
                     json!({ "ok": false, "err": "bad topic" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            let data = v["data"].as_str().unwrap_or("").to_string();
-            if !crate::proto::pubsub_data_ok(&data) {
+            let data = req.data.as_deref().unwrap_or("");
+            if !crate::proto::pubsub_data_ok(data) {
                 return Some(
                     json!({ "ok": false, "err": "data too large" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            let msg_id = v["msg_id"].as_u64().unwrap_or_else(rand_u64);
-            let ttl = v["ttl"]
-                .as_u64()
-                .unwrap_or(0)
-                .min(crate::proto::MAX_PUBSUB_TTL);
-            let seq = v["seq"].as_u64().unwrap_or(0);
-            let origin = v["origin"].as_str().unwrap_or("").to_string();
+            let origin = req.origin.as_deref().unwrap_or("");
+            if origin.len() > MAX_ORIGIN_LEN {
+                return Some(
+                    json!({ "ok": false, "err": "bad origin" })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+            let msg_id = req.msg_id.unwrap_or_else(rand_u64);
+            let ttl = req.ttl.unwrap_or(0).min(crate::proto::MAX_PUBSUB_TTL);
+            let seq = req.seq.unwrap_or(0);
             if self.mark_seen(msg_id).await {
                 return Some(
                     json!({ "ok": true, "op": "relayed", "dup": true, "msg_id": msg_id })
@@ -3663,60 +3823,58 @@ impl Node {
             }
             let exclude_conn = conn.stable_id();
             let n = self
-                .deliver_local(&topic, &data, msg_id, seq, &origin, Some(exclude_conn))
+                .deliver_local(topic, data, msg_id, seq, origin, Some(exclude_conn))
                 .await;
-            self.forward(&topic, &data, msg_id, seq, &origin, ttl, Some(from))
+            self.forward(topic, data, msg_id, seq, origin, ttl, Some(from))
                 .await;
-            Some(
+            return Some(
                 json!({ "ok": true, "op": "relayed", "topic": topic, "delivered": n, "msg_id": msg_id })
                     .to_string()
                     .into_bytes(),
-            )
-        } else if svc == svc_id("pubsub.msg") {
-            // терминальная доставка приложению (с per-origin упорядочиванием)
-            //
-            // `src` = node id ОТПРАВИТЕЛЯ. Без него у получателя нет обратного
-            // адреса: приложение (stellereum) выводит ключ ограничителя из
-            // конверта, и без `src`/`from` все входящие сообщения попадали в
-            // ОДИН общий token bucket ("broadcast") — любой пир мог исчерпать
-            // бюджет ВСЕХ остальных. Теперь у каждого отправителя свой bucket.
-            let src = hex::encode(from);
-            let vv: serde_json::Value = match serde_json::from_slice(plain) {
-                Ok(v) => v,
-                Err(_) => {
-                    // legacy (до seq/origin) — отдаём как есть. Не-JSON payload
-                    // приложение всё равно не разберёт, поэтому `src` сюда
-                    // положить некуда: конверт не является объектом.
-                    let senders = {
-                        let s = self.app_subs.read().await;
-                        s.get(&topic).cloned().unwrap_or_default()
-                    };
-                    for tx in senders {
-                        let _ = tx.send(String::from_utf8_lossy(plain).to_string());
-                    }
-                    return Some(
-                        json!({ "ok": true, "op": "msg", "topic": topic })
-                            .to_string()
-                            .into_bytes(),
-                    );
-                }
+            );
+        }
+        if svc == svc_id("pubsub.msg") {
+            let req: PubsubMsgReq<'_> = match serde_json::from_slice(plain) {
+                Ok(r) => r,
+                Err(_) => return None,
             };
-            let origin = vv["origin"].as_str().unwrap_or("").to_string();
-            let seq = vv["seq"].as_u64().unwrap_or(0);
-            let data = vv["data"].as_str().unwrap_or("").to_string();
+            let topic = req.topic.as_deref().unwrap_or("default");
+            if !crate::proto::topic_ok(topic) {
+                return Some(
+                    json!({ "ok": false, "err": "bad topic" })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+            let origin = req.origin.as_deref().unwrap_or("");
+            if origin.len() > MAX_ORIGIN_LEN {
+                return Some(
+                    json!({ "ok": false, "err": "bad origin" })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+            let src = hex::encode(from);
+            let seq = req.seq.unwrap_or(0);
+            let data = req.data.as_deref().unwrap_or("");
+            if !crate::proto::pubsub_data_ok(data) {
+                return Some(
+                    json!({ "ok": false, "err": "data too large" })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
             let mut ordered: Vec<String> = Vec::new();
             if origin.is_empty() || seq == 0 {
+                let mid = req.msg_id.unwrap_or(serde_json::Value::Null);
                 ordered.push(
-                    json!({ "topic": topic, "data": data, "msg_id": vv["msg_id"], "src": src })
-                        .to_string(),
+                    json!({ "topic": topic, "data": data, "msg_id": mid, "src": src }).to_string(),
                 );
             } else {
-                // reorder: выдаём в порядке seq по (origin, topic)
-                // (per-origin ordering; `src` travels with `data` so the
-                // per-sender token bucket is charged to the real sender).
-                // Backpressure sheds deliver immediately instead of buffering
-                // (no loss, no stall; ordering best-effort under overflow).
-                for (d, d_src, d_seq) in self.reorder_offer(&origin, &topic, seq, data, src).await {
+                for (d, d_src, d_seq) in self
+                    .reorder_offer(origin, topic, seq, data.to_string(), src)
+                    .await
+                {
                     ordered.push(
                         json!({ "topic": topic, "data": d, "seq": d_seq, "origin": origin, "src": d_src })
                             .to_string(),
@@ -3725,12 +3883,8 @@ impl Node {
             }
             let senders = {
                 let s = self.app_subs.read().await;
-                s.get(&topic).cloned().unwrap_or_default()
+                s.get(topic).cloned().unwrap_or_default()
             };
-            // Delivery accounting: count receipts with no local subscriber
-            // (topic mismatch / late subscribe). Counter only — the former
-            // throttled [diag] eprintlns were removed after the blackhole
-            // root cause (unsharded-vs-sharded topic mismatch) was found.
             if senders.is_empty() {
                 self.metrics
                     .msgs_dropped_no_sub
@@ -3745,24 +3899,45 @@ impl Node {
                     }
                 }
             }
-            Some(
+            return Some(
                 json!({ "ok": true, "op": "msg", "topic": topic })
                     .to_string()
                     .into_bytes(),
-            )
-        } else {
-            None
+            );
         }
+
+        // Remaining cold/control services fall back to Value parsing only when matched.
+        if svc == svc_id("dht.lookup") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_dht_lookup(&v, from).await;
+        }
+        if svc == svc_id("dht.update") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_dht_update(&v, from).await;
+        }
+        if svc == svc_id("dht.find_node") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_dht_find_node(&v).await;
+        }
+        if svc == svc_id("dht.find_value") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_dht_find_value(&v, from).await;
+        }
+        if svc == svc_id("dht.sync") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_dht_sync(&v, from).await;
+        }
+        if svc == svc_id("mail.list") {
+            let v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_mail_list(&v).await;
+        }
+        if svc == svc_id("core.health") {
+            let _v: serde_json::Value = serde_json::from_slice(plain).ok()?;
+            return self.handle_health().await;
+        }
+        None
     }
 
-    /// Per-origin reorder buffer insert. Returns the messages to deliver NOW,
-    /// in order, as `(data, src, seq)`. Contiguous arrivals drain the buffer;
-    /// duplicates (`seq < next`) return empty. Backpressure sheds (unknown
-    /// key beyond `MAX_REORDER_KEYS`, or a full buffer beyond
-    /// `MAX_REORDER_BUF_PER_KEY`) return the message for IMMEDIATE delivery
-    /// instead of buffering: memory stays bounded, nothing is lost, no gap
-    /// can stall the stream; ordering is best-effort under overflow.
-    /// No fitting metrics counter exists (follow-up).
     async fn reorder_offer(
         &self,
         origin: &str,
@@ -3772,14 +3947,21 @@ impl Node {
         src: String,
     ) -> Vec<(String, String, u64)> {
         let mut out = Vec::new();
+        let now = now_ms();
         let mut reorder = self.reorder.write().await;
         let key = (origin.to_string(), topic.to_string());
         if !reorder.contains_key(&key) && reorder.len() >= MAX_REORDER_KEYS {
-            out.push((data, src, seq));
-            return out;
+            // Evict only TTL-expired entries first so fresh buffers stay untouched
+            // while long-lived nodes never wedge on stale origins.
+            reorder.retain(|_, (_, last_ts, _)| now.saturating_sub(*last_ts) <= REORDER_TTL_MS);
+            if reorder.len() >= MAX_REORDER_KEYS {
+                out.push((data, src, seq));
+                return out;
+            }
         }
-        let entry = reorder.entry(key).or_insert((1, BTreeMap::new()));
-        let (next, buf) = entry;
+        let entry = reorder.entry(key).or_insert((1, now, BTreeMap::new()));
+        let (next, last_ts, buf) = entry;
+        *last_ts = now;
         if seq == *next {
             out.push((data, src, seq));
             *next += 1;
@@ -3830,19 +4012,12 @@ impl Node {
                 .collect();
             if !eligible.is_empty() {
                 for (sid, sub_conn) in eligible {
-                    let key = self.sessions.read().await.get(&sid).copied();
-                    // R16: пира ВЫНИМАЕМ из-под read-guard ДО любого await.
-                    // Раньше `if let (... , self.peers.read().await.get(..))`
-                    // держал временный peers.read() до конца всего выражения
-                    // (включая ветку else с enqueue(..) -> persist -> диск):
-                    // каждый peers.write() (TOFU/reload) вставал за этот guard,
-                    // а за ним вставало и первое await в request_to. Теперь
-                    // guard живёт три строки и нигде не пересекается с await'ом.
+                    let skeys = self.sessions.read().await.get(&sid).copied();
                     let peer = {
                         let peers = self.peers.read().await;
                         peers.get(sub_pid).cloned()
                     };
-                    if let (Some(key), Some(peer)) = (key, peer) {
+                    if let (Some(skeys), Some(peer)) = (skeys, peer) {
                         let node = self.clone();
                         let payload = payload.clone();
                         let pid = *sub_pid;
@@ -3857,7 +4032,15 @@ impl Node {
                         };
                         tokio::spawn(async move {
                             if node
-                                .request_on(&sub_conn, &pid, &key, &peer, "pubsub.msg", &payload, 8)
+                                .request_on(
+                                    &sub_conn,
+                                    &pid,
+                                    &skeys,
+                                    &peer,
+                                    "pubsub.msg",
+                                    &payload,
+                                    8,
+                                )
                                 .await
                                 .is_err()
                             {
@@ -3927,7 +4110,10 @@ impl Node {
         // до снапшота, поэтому мутация не может «потеряться» между флагом и записью.
         self.outbox_dirty.store(true, Ordering::SeqCst);
         drop(outbox);
-        self.persist_outbox().await;
+        let last = self.outbox_last_flush_ms.load(Ordering::SeqCst);
+        if last == 0 || now_ms().saturating_sub(last) >= 1_000 {
+            self.persist_outbox().await;
+        }
     }
 
     /// Дренит outbox: живые соединения подписчика или reconnect; ретраи/сроки.
@@ -3986,11 +4172,9 @@ impl Node {
                     .unwrap_or_default();
                 let sent = if let Some(conn) = live_conns.first() {
                     let sid = conn.stable_id();
-                    let key = self.sessions.read().await.get(&sid).copied();
-                    // R18: ровно один peers.read на итерацию (peer нужен и для
-                    // connect_or_get ниже — он берётся тут же, один раз).
+                    let skeys = self.sessions.read().await.get(&sid).copied();
                     let peer = self.peers.read().await.get(&pid).cloned();
-                    if let (Some(k), Some(p)) = (key, peer) {
+                    if let (Some(k), Some(p)) = (skeys, peer) {
                         let ok = self
                             .request_on(conn, &pid, &k, &p, "pubsub.msg", &payload, 8)
                             .await
@@ -4004,16 +4188,13 @@ impl Node {
                         false
                     }
                 } else {
-                    // нет живого соединения — пробуем reconnect (известный пир).
-                    // R18: один peers.read на итерацию — peer уходит и в
-                    // connect_or_get, и в request_on (раньше читался дважды).
                     let peer = self.peers.read().await.get(&pid).cloned();
                     match peer {
                         Some(p) => match self.connect_or_get(&p, pid).await {
                             Ok(conn) => {
                                 let sid = conn.stable_id();
-                                let key = self.sessions.read().await.get(&sid).copied();
-                                match key {
+                                let skeys = self.sessions.read().await.get(&sid).copied();
+                                match skeys {
                                     Some(k) => self
                                         .request_on(&conn, &pid, &k, &p, "pubsub.msg", &payload, 8)
                                         .await
@@ -4063,6 +4244,19 @@ impl Node {
         if self.outbox_dirty.swap(false, Ordering::SeqCst) {
             self.persist_outbox().await;
         }
+        self.subs_flush_if_due().await;
+    }
+
+    async fn subs_flush_if_due(&self) {
+        if !self.subs_dirty.load(Ordering::SeqCst) {
+            return;
+        }
+        let last = self.subs_last_flush_ms.load(Ordering::SeqCst);
+        if last != 0 && now_ms().saturating_sub(last) < 1_000 {
+            return;
+        }
+        self.subs_dirty.store(false, Ordering::SeqCst);
+        self.persist_subs().await;
     }
 
     async fn persist_subs(&self) {
@@ -4084,6 +4278,7 @@ impl Node {
         if let Ok(json) = serde_json::to_string(&map) {
             // R2: write(2) убран из async-путя (write_file -> spawn_blocking под гейтом).
             self.write_file("subs.json", json).await;
+            self.subs_last_flush_ms.store(now_ms(), Ordering::SeqCst);
         }
     }
 
@@ -4097,14 +4292,11 @@ impl Node {
                 !by_node.is_empty()
             });
         }
+        self.subs_dirty.store(false, Ordering::SeqCst);
         self.persist_subs().await;
     }
 
     async fn persist_outbox(&self) {
-        // R3: очищаем dirty ДО снапшота. Мутация, пришедшая после этого
-        // момента, снова поднимет флаг (она ставит его под write-lock'ом, а
-        // снапшот берётся не раньше, чем write-lock отпущен), так что её запись
-        // не теряется: её либо уже видит этот снапшот, либо поймает следующий flush.
         self.outbox_dirty.store(false, Ordering::SeqCst);
         let map: HashMap<String, Vec<QueuedMsg>> = self
             .outbox
@@ -4120,6 +4312,7 @@ impl Node {
             .collect();
         if let Ok(json) = serde_json::to_string(&map) {
             self.write_file("outbox.json", json).await;
+            self.outbox_last_flush_ms.store(now_ms(), Ordering::SeqCst);
         }
     }
 
@@ -4235,29 +4428,42 @@ impl Node {
     }
 
     /// Dedup: возвращает true, если сообщение уже видели.
-    /// Окно 5 минут — то же `crate::dht::DEDUP_TTL_MS`, что и у KV-ключей `dedup:*`.
+    /// O(1) amortized paired HashMap + VecDeque expiry window.
     async fn mark_seen(&self, msg_id: u64) -> bool {
-        let mut seen = self.seen.lock().await;
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
         let expire = now - crate::dht::DEDUP_TTL_MS;
-        seen.retain(|_, ts| *ts > expire);
-        if seen.contains_key(&msg_id) {
-            return true;
-        }
-        // Fail-closed для памяти: флуд уникальными msg_id не может растить
-        // карту без меры. Сброс лишнего допускает повторную доставку (дубликат
-        // безопасен — прикладной слой идемпотентен), но не потерю памяти.
-        if seen.len() >= crate::proto::MAX_SEEN_IDS {
-            seen.retain(|_, ts| *ts > now - 60_000);
-            if seen.len() >= crate::proto::MAX_SEEN_IDS {
-                let drop_n = seen.len() - crate::proto::MAX_SEEN_IDS + 1;
-                let keys: Vec<u64> = seen.keys().take(drop_n).copied().collect();
-                for k in keys {
-                    seen.remove(&k);
+        while let Some((ts, _)) = seen.order.front() {
+            if *ts > expire {
+                break;
+            }
+            if let Some((ts, old)) = seen.order.pop_front() {
+                if seen.map.get(&old).copied() == Some(ts) {
+                    seen.map.remove(&old);
                 }
             }
         }
-        seen.insert(msg_id, now);
+        if seen.map.contains_key(&msg_id) {
+            return true;
+        }
+        if seen.map.len() >= crate::proto::MAX_SEEN_IDS {
+            let tight_expire = now - 60_000;
+            while let Some((ts, _)) = seen.order.front() {
+                if *ts > tight_expire && seen.map.len() < crate::proto::MAX_SEEN_IDS {
+                    break;
+                }
+                if let Some((ts, old)) = seen.order.pop_front() {
+                    if seen.map.get(&old).copied() == Some(ts) {
+                        seen.map.remove(&old);
+                    }
+                }
+                if seen.map.len() < crate::proto::MAX_SEEN_IDS {
+                    break;
+                }
+            }
+        }
+        seen.map.insert(msg_id, now);
+        seen.order.push_back((now, msg_id));
         false
     }
 
@@ -4314,10 +4520,31 @@ impl Node {
                     .into_bytes(),
             );
         }
+        const LOOKUP_CACHE_TTL_MS: i64 = 2_000;
+        {
+            let now = now_ms();
+            let mut cache = self.lookup_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ts, eps, pq)) = cache.get(&target) {
+                if now.saturating_sub(*ts) <= LOOKUP_CACHE_TTL_MS {
+                    return if eps.is_empty() {
+                        Some(
+                            json!({ "ok": true, "found": false, "node": target_hex })
+                                .to_string()
+                                .into_bytes(),
+                        )
+                    } else {
+                        Some(
+                            json!({ "ok": true, "found": true, "node": target_hex, "endpoints": eps, "pq_pub": pq, "via": self.id_hex })
+                                .to_string()
+                                .into_bytes(),
+                        )
+                    };
+                }
+                cache.remove(&target);
+            }
+        }
         // рекурсивный опрос пиров, BOUNDED: one inbound lookup fans out to at
         // most ALPHA closest peers (Kademlia), never to every connection.
-        // The old code queried all peers at every TTL level, so one request
-        // could amplify into `degree^ttl` requests across the network.
         let candidates: Vec<[u8; NODEID_LEN]> = {
             let peers = self.peers.read().await;
             peers
@@ -4344,14 +4571,25 @@ impl Node {
             if let Ok(Ok(Some(s))) = timeout(Duration::from_millis(1000), h).await {
                 if let Ok(rv) = serde_json::from_slice::<serde_json::Value>(&s) {
                     if rv["found"].as_bool().unwrap_or(false) {
-                        if let Some(eps) = rv["endpoints"].as_array() {
-                            for e in eps {
-                                if let Some(e) = e.as_str() {
-                                    merged.push(e.to_string());
-                                }
-                            }
+                        let Some(pq) = rv["pq_pub"].as_str() else {
+                            continue;
+                        };
+                        let eps: Vec<String> = rv["endpoints"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|e| e.as_str())
+                                    .filter(|e| crate::dht::endpoint_ok(e))
+                                    .take(crate::proto::MAX_ENDPOINTS_PER_NODE)
+                                    .map(String::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if eps.is_empty() || !crate::dht::node_info_valid(&target, pq, &eps) {
+                            continue;
                         }
-                        if let Some(pq) = rv["pq_pub"].as_str() {
+                        merged.extend(eps);
+                        if found_pq.is_none() {
                             found_pq = Some(pq.to_string());
                         }
                     }
@@ -4360,6 +4598,18 @@ impl Node {
         }
         merged.sort();
         merged.dedup();
+        merged.truncate(crate::proto::MAX_ENDPOINTS_PER_NODE);
+        {
+            let now = now_ms();
+            let mut cache = self.lookup_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 1024 {
+                cache.retain(|_, (ts, _, _)| now.saturating_sub(*ts) <= LOOKUP_CACHE_TTL_MS);
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+            }
+            cache.insert(target, (now, merged.clone(), found_pq.clone()));
+        }
         if merged.is_empty() {
             Some(
                 json!({ "ok": true, "found": false, "node": target_hex })
@@ -4454,24 +4704,27 @@ impl Node {
                         }
                     }
                     let route = Route { endpoints, pq_hex };
-                    let entry = mine.entry(pid).or_insert_with(|| route.clone());
-                    // Only a self-advertised route may extend our endpoint
-                    // list; a third party's endpoints are ignored even if the
-                    // entry was first created by that same gossip (it was
-                    // seeded from the pinned set above).
-                    if self_advertised || pinned.is_none() {
-                        for e in &route.endpoints {
-                            if entry.endpoints.len() >= crate::proto::MAX_ENDPOINTS_PER_NODE {
-                                break;
-                            }
-                            if !entry.endpoints.contains(e) {
-                                entry.endpoints.push(e.clone());
-                                changed = true;
+                    if let Some(entry) = mine.get_mut(&pid) {
+                        // Only a self-advertised route may extend an existing
+                        // entry's endpoint list; third parties cannot append
+                        // endpoints to known or unpinned routes.
+                        if self_advertised {
+                            for e in &route.endpoints {
+                                if entry.endpoints.len() >= crate::proto::MAX_ENDPOINTS_PER_NODE {
+                                    break;
+                                }
+                                if !entry.endpoints.contains(e) {
+                                    entry.endpoints.push(e.clone());
+                                    changed = true;
+                                }
                             }
                         }
-                    }
-                    if entry.pq_hex.is_empty() && !route.pq_hex.is_empty() {
-                        entry.pq_hex = route.pq_hex.clone();
+                        if entry.pq_hex.is_empty() && !route.pq_hex.is_empty() {
+                            entry.pq_hex = route.pq_hex.clone();
+                            changed = true;
+                        }
+                    } else {
+                        mine.insert(pid, route);
                         changed = true;
                     }
                 }
@@ -4598,22 +4851,35 @@ impl Node {
             self.persist_routing().await;
         }
         // republish: переиздаём стареющие значения на k-ближайших к ключу
-        let to_republish = self.kv.read().await.keys_to_republish(crate::dht::now_ms());
-        for (key, value, ttl_ms, origin, stored_at) in to_republish {
+        let repub_now = crate::dht::now_ms();
+        let to_republish = self.kv.read().await.keys_to_republish(repub_now);
+        let mut republished_keys = Vec::with_capacity(to_republish.len());
+        for (key, st) in &to_republish {
             let h = blake3::hash(key.as_bytes());
             let mut target = [0u8; NODEID_LEN];
             target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
             let closest = self.routing.read().await.closest(&target, crate::dht::K);
-            // stored_at rides along: the replica keeps the ORIGINAL age, so
-            // TTL actually fires instead of resetting on every hop (audit
-            // 2026-10-06 — mutual republish made entries immortal).
-            let payload = json!({ "key": key, "value": value, "ttl": ttl_ms / 1000, "origin": format!("inf1:{}", hex::encode(origin)), "stored_at": stored_at })
-                .to_string()
-                .into_bytes();
+            let payload = json!({
+                "key": key,
+                "value": st.value,
+                "ttl": st.ttl_ms / 1000,
+                "origin": format!("inf1:{}", hex::encode(st.origin)),
+                "stored_at": st.stored_at,
+            })
+            .to_string()
+            .into_bytes();
             for n in closest {
                 if self.ensure_dht_peer(&n).await.is_ok() {
                     let _ = self.request_to(n.id, "dht.store", payload.clone()).await;
                 }
+            }
+            republished_keys.push(key.clone());
+        }
+        drop(to_republish);
+        if !republished_keys.is_empty() {
+            let mut kv = self.kv.write().await;
+            for k in republished_keys {
+                kv.mark_republished(&k, repub_now);
             }
         }
         // R6: refresh только помечает kv dirty — фактическое сохранение
@@ -4677,7 +4943,7 @@ impl Node {
             let (swept, swept_dedup, swept_out) = self.kv.write().await.sweep(sweep_now);
             self.kv_last_sweep_ms
                 .store(crate::dht::now_ms(), Ordering::SeqCst);
-            if swept > 0 {
+            if swept > 0 && crate::log::enabled(2) {
                 crate::log::emit(
                     2,
                     "info",
@@ -4687,17 +4953,14 @@ impl Node {
                     json!({ "removed": swept, "dedup": swept_dedup }),
                 );
             }
-            // Sweep orphan chunks: an expired manifest whose chunk files stay on
-            // disk leaks forever (audit 2026-10-06: chunks/ 658M vs kv 113M).
-            // Only manifest-shaped values (JSON object with a "chunks" array)
-            // trigger deletes; plain kv/dedup entries never match the prefilter.
-            // Best-effort: a missing file or unparsable value just skips.
-            let mut swept_files: Vec<std::path::PathBuf> = Vec::new();
-            for (k, v) in &swept_out {
-                if !v.contains("\"chunks\"") {
+            // Collect candidate chunk paths from swept manifests, then verify
+            // under kv.read() that no other live manifest still references them.
+            let mut candidate_chunks: Vec<(String, std::path::PathBuf)> = Vec::new();
+            for (k, st) in &swept_out {
+                if !st.value.contains("chunks") {
                     continue;
                 }
-                let Ok(manifest) = serde_json::from_str::<serde_json::Value>(v) else {
+                let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&st.value) else {
                     continue;
                 };
                 let Some(chunks) = manifest.get("chunks").and_then(|c| c.as_array()) else {
@@ -4709,19 +4972,32 @@ impl Node {
                 let dir = self.chunks_dir(bucket);
                 for c in chunks {
                     if let Some(cid) = c.get("id").and_then(|i| i.as_str()) {
-                        swept_files.push(dir.join(cid));
+                        if self.valid_chunk_id(cid) {
+                            candidate_chunks.push((cid.to_string(), dir.join(cid)));
+                        }
                     }
                 }
             }
+            let swept_files: Vec<std::path::PathBuf> = if candidate_chunks.is_empty() {
+                Vec::new()
+            } else {
+                let kv = self.kv.read().await;
+                candidate_chunks
+                    .into_iter()
+                    .filter(|(cid, _)| kv.expected_chunk_hash(cid).is_none())
+                    .map(|(_, path)| path)
+                    .collect()
+            };
             let swept_chunks = swept_files.len();
             if !swept_files.is_empty() {
-                tokio::task::spawn_blocking(move || {
+                let _ = tokio::task::spawn_blocking(move || {
                     for path in swept_files {
                         let _ = std::fs::remove_file(path);
                     }
-                });
+                })
+                .await;
             }
-            if swept_chunks > 0 {
+            if swept_chunks > 0 && crate::log::enabled(2) {
                 crate::log::emit(
                     2,
                     "info",
@@ -4767,7 +5043,7 @@ impl Node {
         // debounce-окно отсчитывается от ЗАВЕРШЕНИЯ: запись долгая,
         // иначе старты соседних сохранений слипались бы в непрерывный поток.
         self.kv_last_flush_ms.store(now_ms(), Ordering::SeqCst);
-        if gate_ms >= 200 || block_ms >= 200 {
+        if (gate_ms >= 200 || block_ms >= 200) && crate::log::enabled(2) {
             crate::log::emit(
                 2,
                 "info",
@@ -5154,34 +5430,45 @@ impl Node {
         )
     }
 
+    #[cfg(test)]
     async fn handle_dht_store(
         self: &Arc<Self>,
         v: &serde_json::Value,
         from: [u8; NODEID_LEN],
     ) -> Option<Vec<u8>> {
-        let key = v["key"].as_str().unwrap_or("").to_string();
-        let value = v["value"].as_str().unwrap_or("").to_string();
-        // Fail-closed: ключ/значение/TTL из сети ограничены. Раньше значение
-        // принималось вплоть до 32 МиБ фрейма (аллокация на каждый store), а
-        // ttl=u64::MAX через `as i64` заворачивался в отрицательный.
-        if !crate::proto::dht_key_ok(&key) {
+        self.handle_dht_store_typed(
+            v["key"].as_str().unwrap_or(""),
+            v["value"].as_str().unwrap_or(""),
+            v.get("ttl"),
+            v["stored_at"].as_i64().unwrap_or(0),
+            from,
+        )
+        .await
+    }
+
+    async fn handle_dht_store_typed(
+        self: &Arc<Self>,
+        key: &str,
+        value: &str,
+        ttl_val: Option<&serde_json::Value>,
+        sa: i64,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
+        if !crate::proto::dht_key_ok(key) {
             return Some(
                 json!({ "ok": false, "err": "bad key" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        if !crate::proto::dht_value_ok(&value) {
+        if !crate::proto::dht_value_ok(value) {
             return Some(
                 json!({ "ok": false, "err": "value too large" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        // Strict: a present-but-malformed ttl (negative, float, 0, huge)
-        // is refused rather than defaulted — silent defaults mint storage
-        // the sender never asked for.
-        let ttl_secs: u64 = match v.get("ttl") {
+        let ttl_secs: u64 = match ttl_val {
             None => 3600,
             Some(t) => match t.as_u64() {
                 Some(s) if (1..=crate::proto::MAX_REMOTE_TTL_SECS).contains(&s) => s,
@@ -5195,12 +5482,6 @@ impl Node {
             },
         };
         let ttl = ttl_secs as i64;
-        // Валидатор-авторитетные ключи web-слоя: recovery-коды и чёрные списки строго локальны
-        // (утечка/подмена = захват аккаунта). Индексы ящиков (mail:) и файлов (files:) можно
-        // реплицировать ТОЛЬКО пирам с соответствующей role хранения — ноды становятся
-        // реальными держателями «каталога» писем/файлов для восстановления после потери kv.
-        // `sealed-owner:` is the LOCAL pin that makes a sealed manifest downgrade-proof;
-        // it is never accepted from (or served to) a peer.
         if key.starts_with("recovery:")
             || key.starts_with("blacklist:")
             || key.starts_with("share:")
@@ -5212,31 +5493,74 @@ impl Node {
                     .into_bytes(),
             );
         }
-        if key.starts_with("mail:") && !self.peer_allows(&from, "mail").await {
+        if (key.starts_with("mail:") || key.starts_with("m:"))
+            && !self.peer_allows(&from, "mail").await
+        {
             return Some(
                 json!({ "ok": false, "err": "peer role denies mail" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        if key.starts_with("files:") && !self.peer_allows(&from, "files").await {
+        if (key.starts_with("files:") || key.starts_with("f:"))
+            && !self.peer_allows(&from, "files").await
+        {
             return Some(
                 json!({ "ok": false, "err": "peer role denies files" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        // Sealed-manifest replacement guard (H2): a storage peer may not
-        // downgrade a sealed manifest to the legacy format, nor swap it for
-        // another owner's seal. The MAC itself is verified by the owner on
-        // fetch (a peer does not hold the owner seed), but this stops the
-        // overwrite from destroying the only good copy.
-        if let Some(incoming) = manifest_owner_of(&value) {
-            // A sealed manifest without an owner/auth marker cannot be
-            // authenticated by the owner and must never be stored (it could
-            // otherwise pin an empty identity and shadow the real one).
-            if incoming.is_some() {
-                let parsed = serde_json::from_str::<serde_json::Value>(&value).ok();
+        // Check skew & LWW BEFORE running expensive Falcon-512 manifest verification.
+        const SKEW_ALLOWANCE_MS: i64 = 5 * 60 * 1000;
+        if sa > 0 && sa > crate::dht::now_ms() + SKEW_ALLOWANCE_MS {
+            return Some(
+                json!({ "ok": true, "stored": key, "lww": "skew" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let pin_key = format!("sealed-owner:{key}");
+        let (local_sa, pinned) = {
+            let kv = self.kv.read().await;
+            let local_sa = kv.stored_at(key);
+            let pinned = match kv.peek(&pin_key).map(|(p, _)| p) {
+                Some(p) => Some(p),
+                None => kv
+                    .peek(key)
+                    .and_then(|(v, _)| manifest_owner_of(&v))
+                    .flatten(),
+            };
+            (local_sa, pinned)
+        };
+        if sa > 0 && sa <= local_sa {
+            return Some(
+                json!({ "ok": true, "stored": key, "lww": "local" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        if sa <= 0 && local_sa > 0 {
+            return Some(
+                json!({ "ok": true, "stored": key, "lww": "local-present" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        // Sealed-manifest replacement guard (H2): check pin & auth BEFORE Falcon verify.
+        let mut sealed_owner_to_pin: Option<String> = None;
+        if let Some(incoming) = manifest_owner_of(value) {
+            if let Some(owner) = pinned {
+                if incoming.as_deref() != Some(owner.as_str()) {
+                    return Some(
+                        json!({ "ok": false, "err": "sealed manifest owner mismatch" })
+                            .to_string()
+                            .into_bytes(),
+                    );
+                }
+            }
+            if let Some(owner) = incoming {
+                let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
                 let has_auth = parsed
                     .as_ref()
                     .and_then(|v| v.get("auth").and_then(|a| a.as_str()))
@@ -5249,8 +5573,6 @@ impl Node {
                             .into_bytes(),
                     );
                 }
-                // Public signature check: a storage peer refuses a manifest
-                // re-sealed/signed by anyone other than the pinned owner.
                 let pk_ok = parsed
                     .as_ref()
                     .and_then(|v| v.get("owner_pk").and_then(|p| p.as_str()))
@@ -5268,52 +5590,13 @@ impl Node {
                             .into_bytes(),
                     );
                 }
-            }
-            let pin_key = format!("sealed-owner:{key}");
-            let pinned = match self.get_local_kv(&pin_key).await {
-                Some(p) => Some(p),
-                None => self
-                    .get_local_kv(&key)
-                    .await
-                    .and_then(|v| manifest_owner_of(&v))
-                    .flatten(),
-            };
-            if let Some(owner) = pinned {
-                if incoming.as_deref() != Some(owner.as_str()) {
-                    return Some(
-                        json!({ "ok": false, "err": "sealed manifest owner mismatch" })
-                            .to_string()
-                            .into_bytes(),
-                    );
-                }
-            }
-            if let Some(owner) = incoming {
-                self.kv_store_local_with_ttl(&pin_key, &owner, ttl * 1000)
-                    .await;
+                sealed_owner_to_pin = Some(owner);
             }
         }
-        // LWW по stored_at (если отправитель прислал): не затирать свежую локальную запись
-        // устаревшей репликацией. Если stored_at не прислан — сохраняем текущее поведение.
-        // R6: читаем РОВНО stored_at одного ключа (раньше здесь клонировалась вся
-        // карта KV — 48–85 МБ копии на КАЖДЫЙ dht.store прямо на воркере).
-        let sa = v["stored_at"].as_i64().unwrap_or(0);
         if sa > 0 {
-            // Skew guard (audit follow-up): a FAR-FUTURE stored_at from a
-            // skewed peer must not win LWW and mint a fresh TTL — keep local.
-            // Only the ancient side is clamped (in store_replica).
-            const SKEW_ALLOWANCE_MS: i64 = 5 * 60 * 1000;
-            if sa > crate::dht::now_ms() + SKEW_ALLOWANCE_MS {
-                return Some(
-                    json!({ "ok": true, "stored": key, "lww": "skew" })
-                        .to_string()
-                        .into_bytes(),
-                );
-            }
-            // Один проход под write-локом: избегаем двойного read -> write и
-            // гонки LWW между проверкой `stored_at` и записью.
             let mut kv = self.kv.write().await;
-            let local_sa = kv.stored_at(&key);
-            if sa <= local_sa {
+            let local_sa_now = kv.stored_at(key);
+            if sa <= local_sa_now {
                 drop(kv);
                 return Some(
                     json!({ "ok": true, "stored": key, "lww": "local" })
@@ -5321,10 +5604,10 @@ impl Node {
                         .into_bytes(),
                 );
             }
-            // Replica with original age (audit 2026-10-06): preserve the
-            // sender's clock so TTL fires on the original schedule instead of
-            // resetting at every republish hop (immortal entries).
-            kv.store_replica(&key, value, ttl * 1000, self.id, sa);
+            kv.store_replica(key, value.to_string(), ttl * 1000, self.id, sa);
+            if let Some(owner) = sealed_owner_to_pin {
+                kv.store(&pin_key, owner, ttl * 1000, self.id);
+            }
             drop(kv);
             self.mark_kv_dirty();
             return Some(
@@ -5333,10 +5616,8 @@ impl Node {
                     .into_bytes(),
             );
         }
-        // No clock on the sender: keep a present local value (audit follow-up
-        // — legacy peers used to clobber newer locals AND reset their age).
         let mut kv = self.kv.write().await;
-        if kv.stored_at(&key) > 0 {
+        if kv.stored_at(key) > 0 {
             drop(kv);
             return Some(
                 json!({ "ok": true, "stored": key, "lww": "local-present" })
@@ -5344,10 +5625,11 @@ impl Node {
                     .into_bytes(),
             );
         }
-        kv.store(&key, value, ttl * 1000, self.id);
+        kv.store(key, value.to_string(), ttl * 1000, self.id);
+        if let Some(owner) = sealed_owner_to_pin {
+            kv.store(&pin_key, owner, ttl * 1000, self.id);
+        }
         drop(kv);
-        // R6: всплеск dht.store => ОДНО отложенное сохранение, а не N полных
-        // перезаписей kv.json ( response клиенту не меняется ).
         self.mark_kv_dirty();
         Some(
             json!({ "ok": true, "stored": key })
@@ -5428,47 +5710,63 @@ impl Node {
         v: &serde_json::Value,
         from: [u8; NODEID_LEN],
     ) -> Option<Vec<u8>> {
-        // Fail-closed: лимит ограничен сверху (иначе пир просит сериализовать
-        // сколь угодно много), а переросшие кап значения не отдаются вовсе.
         let limit =
             (v["limit"].as_u64().unwrap_or(10000) as usize).min(crate::proto::MAX_DHT_SYNC_LIMIT);
         let now = crate::dht::now_ms();
-        let mail_ok = self.peer_allows(&from, "mail").await;
-        let files_ok = self.peer_allows(&from, "files").await;
-        // R6: O(1)-снапшот вместо клона всей карты (слепок уезжает в ответ
-        // уже без лока на kv).
+        let mail_ok = self.peer_allows(&from, "mail").await && self.role_allows("mail");
+        let files_ok = self.peer_allows(&from, "files").await && self.role_allows("files");
+        const MAX_SYNC_RESP_BYTES: usize = crate::proto::MAX_FRAME - 1024 * 1024;
         let map = self.kv.read().await.entries_snapshot();
         let mut out = serde_json::Map::new();
-        for (k, st) in map.iter().take(limit) {
-            if st.expires > now && st.value.len() <= crate::proto::MAX_DHT_VALUE_LEN {
-                // recovery-коды и чёрные списки — локально-авторитетные, не реплицируются
-                // (иначе код восстановления утечёт на другую ноду).
-                // Индексы mail:/files: отдаём только пирам с соответствующей ролью хранения
-                // (приёмщик фильтрует по своей роли в catch_up_with — симметрично).
-                if k.starts_with("recovery:")
-                    || k.starts_with("blacklist:")
-                    || k.starts_with("share:")
-                    || k.starts_with("sealed-owner:")
-                {
-                    continue;
+        let mut approx_bytes = 64usize;
+        for (k, st) in map.iter() {
+            if out.len() >= limit {
+                break;
+            }
+            if st.expires <= now || st.value.len() > crate::proto::MAX_DHT_VALUE_LEN {
+                continue;
+            }
+            if k.starts_with("recovery:")
+                || k.starts_with("blacklist:")
+                || k.starts_with("share:")
+                || k.starts_with("sealed-owner:")
+                || k.starts_with("dedup:")
+            {
+                continue;
+            }
+            if (k.starts_with("mail:") || k.starts_with("m:")) && !mail_ok {
+                continue;
+            }
+            if (k.starts_with("files:") || k.starts_with("f:")) && !files_ok {
+                continue;
+            }
+            let entry_bytes = k.len() + st.value.len() + 64;
+            if approx_bytes.saturating_add(entry_bytes) > MAX_SYNC_RESP_BYTES {
+                break;
+            }
+            approx_bytes = approx_bytes.saturating_add(entry_bytes);
+            out.insert(
+                k.clone(),
+                json!({ "value": st.value, "ttl": st.ttl_ms / 1000, "stored_at": st.stored_at }),
+            );
+        }
+        let mut resp = json!({ "ok": true, "count": out.len(), "entries": out })
+            .to_string()
+            .into_bytes();
+        if resp.len() >= MAX_SYNC_RESP_BYTES {
+            // Trim tail if JSON escaping pushed serialized size past the envelope bound.
+            while resp.len() >= MAX_SYNC_RESP_BYTES && !out.is_empty() {
+                if let Some(last_k) = out.keys().next_back().cloned() {
+                    out.remove(&last_k);
+                } else {
+                    break;
                 }
-                if k.starts_with("mail:") && !mail_ok {
-                    continue;
-                }
-                if k.starts_with("files:") && !files_ok {
-                    continue;
-                }
-                out.insert(
-                    k.clone(),
-                    json!({ "value": st.value, "ttl": st.ttl_ms / 1000, "stored_at": st.stored_at }),
-                );
+                resp = json!({ "ok": true, "count": out.len(), "entries": out })
+                    .to_string()
+                    .into_bytes();
             }
         }
-        Some(
-            json!({ "ok": true, "count": out.len(), "entries": out })
-                .to_string()
-                .into_bytes(),
-        )
+        Some(resp)
     }
 
     /// Догоняющая репликация: после (пере)подключения к пиру тянем KV-слепок и
@@ -5480,48 +5778,139 @@ impl Node {
             .await;
         if let Ok(resp) = resp {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                if let Some(entries) = v["entries"].as_object() {
-                    let allow_mail = self.role_allows("mail");
-                    let allow_files = self.role_allows("files");
-                    for (k, e) in entries {
-                        // нода хранит только бакеты своей роли
-                        if !allow_mail && (k.starts_with("m:") || k.starts_with("mail:")) {
-                            continue;
-                        }
-                        if !allow_files && (k.starts_with("f:") || k.starts_with("files:")) {
-                            continue;
-                        }
-                        // локально-авторитетные ключи не принимаем от пиров (share-токены,
-                        // recovery-коды, чёрные списки) — даже если пир их пришлёт старым слепком
-                        if k.starts_with("share:")
-                            || k.starts_with("recovery:")
-                            || k.starts_with("blacklist:")
-                            || k.starts_with("sealed-owner:")
-                        {
-                            continue;
-                        }
-                        if let Some(val) = e["value"].as_str() {
-                            // LWW: не затирать свежие локальные записи старым слепком пира.
-                            // (иначе индекс/манифест, только что обновлённый валидатором,
-                            // перезаписывается устаревшей репликой при догоняющей репликации)
-                            let sa = e["stored_at"].as_i64().unwrap_or(0);
-                            let ttl = e["ttl"].as_i64().unwrap_or(0) * 1000;
-                            self.kv.write().await.merge_replica(
-                                k,
-                                val.to_string(),
-                                ttl,
-                                self.id,
-                                sa,
-                            );
-                        }
-                    }
-                    // R6: отложенное сохранение — синк не должен ждать
-                    // многомегабайтную запись kv.json перед ответом.
-                    self.mark_kv_dirty();
-                }
+                self.apply_sync_entries(pid, &v).await;
             }
         }
         self.repair_chunks_from(pid).await;
+    }
+
+    async fn apply_sync_entries(&self, pid: [u8; NODEID_LEN], v: &serde_json::Value) {
+        let Some(entries) = v["entries"].as_object() else {
+            return;
+        };
+        let allow_mail = self.role_allows("mail") && self.peer_allows(&pid, "mail").await;
+        let allow_files = self.role_allows("files") && self.peer_allows(&pid, "files").await;
+        const SKEW_ALLOWANCE_MS: i64 = 5 * 60 * 1000;
+        let now = crate::dht::now_ms();
+
+        struct ValidSyncEntry<'a> {
+            key: &'a str,
+            val: &'a str,
+            ttl_ms: i64,
+            sa: i64,
+            incoming_owner: Option<Option<String>>,
+        }
+
+        let mut validated = Vec::with_capacity(entries.len().min(crate::proto::MAX_DHT_SYNC_LIMIT));
+        for (k, e) in entries.iter().take(crate::proto::MAX_DHT_SYNC_LIMIT) {
+            if !crate::proto::dht_key_ok(k) {
+                continue;
+            }
+            if !allow_mail && (k.starts_with("m:") || k.starts_with("mail:")) {
+                continue;
+            }
+            if !allow_files && (k.starts_with("f:") || k.starts_with("files:")) {
+                continue;
+            }
+            if k.starts_with("share:")
+                || k.starts_with("recovery:")
+                || k.starts_with("blacklist:")
+                || k.starts_with("sealed-owner:")
+                || k.starts_with("dedup:")
+            {
+                continue;
+            }
+            let Some(val) = e["value"].as_str() else {
+                continue;
+            };
+            if !crate::proto::dht_value_ok(val) {
+                continue;
+            }
+            let ttl_secs: u64 = match e.get("ttl") {
+                None => 3600,
+                Some(t) => match t.as_u64() {
+                    Some(s) if (1..=crate::proto::MAX_REMOTE_TTL_SECS).contains(&s) => s,
+                    _ => continue,
+                },
+            };
+            let sa = e["stored_at"].as_i64().unwrap_or(0);
+            if sa <= 0 || sa > now + SKEW_ALLOWANCE_MS {
+                continue;
+            }
+            // H2 sealed-manifest verification outside the KV write lock.
+            let incoming_owner = manifest_owner_of(val);
+            if let Some(Some(_)) = &incoming_owner {
+                let parsed = serde_json::from_str::<serde_json::Value>(val).ok();
+                let has_auth = parsed
+                    .as_ref()
+                    .and_then(|pv| pv.get("auth").and_then(|a| a.as_str()))
+                    .map(|a| a == BLOB_MANIFEST_AUTH_V1)
+                    .unwrap_or(false);
+                if !has_auth {
+                    continue;
+                }
+                let pk_ok = parsed
+                    .as_ref()
+                    .and_then(|pv| pv.get("owner_pk").and_then(|p| p.as_str()))
+                    .map(|pk| {
+                        parsed
+                            .as_ref()
+                            .map(|pv| blob_manifest_verify_signature(pv, pk))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !pk_ok {
+                    continue;
+                }
+            }
+            validated.push(ValidSyncEntry {
+                key: k.as_str(),
+                val,
+                ttl_ms: (ttl_secs as i64) * 1000,
+                sa,
+                incoming_owner,
+            });
+        }
+        if validated.is_empty() {
+            return;
+        }
+        let mut any_applied = false;
+        {
+            let mut kv = self.kv.write().await;
+            for item in validated {
+                if let Some(incoming) = item.incoming_owner.as_ref() {
+                    let pin_key = format!("sealed-owner:{}", item.key);
+                    let pinned = match kv.peek(&pin_key).map(|(p, _)| p) {
+                        Some(p) => Some(p),
+                        None => kv
+                            .peek(item.key)
+                            .and_then(|(v, _)| manifest_owner_of(&v))
+                            .flatten(),
+                    };
+                    if let Some(owner) = pinned {
+                        if incoming.as_deref() != Some(owner.as_str()) {
+                            continue;
+                        }
+                    }
+                }
+                if kv.merge_replica(
+                    item.key,
+                    item.val.to_string(),
+                    item.ttl_ms,
+                    self.id,
+                    item.sa,
+                ) {
+                    any_applied = true;
+                    if let Some(Some(owner)) = item.incoming_owner {
+                        let pin_key = format!("sealed-owner:{}", item.key);
+                        kv.store(&pin_key, owner, item.ttl_ms, self.id);
+                    }
+                }
+            }
+        }
+        if any_applied {
+            self.mark_kv_dirty();
+        }
     }
 
     /// Карта «blake3(контент) -> имя локального чанка» для бакета.
@@ -5623,7 +6012,7 @@ impl Node {
             for c in chunks {
                 n_chunks += 1;
                 let cid = c["id"].as_str().unwrap_or("");
-                if self.local_chunk_get(&bucket, cid).is_some() {
+                if self.local_chunk_get_async(&bucket, cid).await.is_some() {
                     continue;
                 }
                 n_missing += 1;
@@ -5636,8 +6025,6 @@ impl Node {
                 // 1) локальный контент-матч (дедуп положил тот же блоб под другим id)
                 if let Some(expected) = c["hash"].as_str() {
                     if map_built_for.as_deref() != Some(bucket.as_str()) {
-                        // строим в blocking-пуле: файловый ввод-вывод не должен занимать
-                        // поток асинхронного рантайма
                         let me = self.clone();
                         let b = bucket.clone();
                         content_map =
@@ -5649,13 +6036,17 @@ impl Node {
                     if let Some(fname) = content_map.as_ref().and_then(|m| m.get(expected)).cloned()
                     {
                         let src = self.chunks_dir(&bucket).join(&fname);
-                        if let Ok(data) = std::fs::read(&src) {
-                            let dir = self.chunks_dir(&bucket);
+                        let dir = self.chunks_dir(&bucket);
+                        let cid_owned = cid.to_string();
+                        let restored = tokio::task::spawn_blocking(move || {
+                            let data = std::fs::read(&src).ok()?;
                             let _ = std::fs::create_dir_all(&dir);
-                            if write_chunk_atomic(&dir, cid, &data).is_ok() {
-                                eprintln!("[node] repair: {cid} восстановлен локально по контенту");
-                                continue;
-                            }
+                            write_chunk_atomic(&dir, &cid_owned, &data).ok()
+                        })
+                        .await;
+                        if matches!(restored, Ok(Some(()))) {
+                            eprintln!("[node] repair: {cid} восстановлен локально по контенту");
+                            continue;
                         }
                     }
                 }
@@ -5688,8 +6079,12 @@ impl Node {
                                         }
                                     }
                                     let dir = self.chunks_dir(&bucket);
-                                    let _ = std::fs::create_dir_all(&dir);
-                                    let _ = write_chunk_atomic(&dir, cid, &data);
+                                    let cid_owned = cid.to_string();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = std::fs::create_dir_all(&dir);
+                                        let _ = write_chunk_atomic(&dir, &cid_owned, &data);
+                                    })
+                                    .await;
                                     eprintln!(
                                         "[node] repair: {cid} получен от пира {}",
                                         hex::encode(&pid[..4])
@@ -5711,9 +6106,18 @@ impl Node {
 
     // ============ Хранилище (storage.*) ============
 
-    /// Валидация chunk_id (только hex, защита от path traversal).
+    /// Валидация chunk_id (непустой hex, защита от path traversal).
     fn valid_chunk_id(&self, id: &str) -> bool {
-        id.len() <= 80 && id.bytes().all(|b| b.is_ascii_hexdigit())
+        !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn bucket_ok(bucket: &str) -> bool {
+        !bucket.is_empty()
+            && bucket.len() <= 64
+            && bucket
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && bucket.bytes().any(|b| b.is_ascii_alphanumeric())
     }
 
     fn chunks_dir(&self, bucket: &str) -> PathBuf {
@@ -5796,11 +6200,11 @@ impl Node {
         if let Some(ts) = map.get(pid) {
             return Some(*ts);
         }
-        let arc: Option<std::sync::Arc<tokio::sync::Mutex<i64>>> = {
+        let arc: Option<std::sync::Arc<AtomicI64>> = {
             let peers = self.peers.read().await;
             peers.get(pid).map(|p| p.last_seen.clone())
         };
-        Some(*arc?.lock().await)
+        Some(arc?.load(Ordering::Relaxed))
     }
 
     /// Все известные ноды сети (routing + конфигурированные пиры). Каждая запись содержит
@@ -5836,13 +6240,15 @@ impl Node {
             return (false, false, 0);
         }
         let dir = self.chunks_dir(bucket);
-        if std::fs::create_dir_all(&dir).is_err() {
+        let d_mk = dir.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(&d_mk)).await,
+            Ok(Ok(()))
+        ) {
             return (false, false, 0);
         }
         let content_hash = blake3::hash(data);
         let dedup_key = format!("dedup:{}", hex::encode(content_hash.as_bytes()));
-        // пропускаем запись, если этот же content_hash УЖЕ хранится на этой ноде
-        // (т.е. файл уже локально). Безопасно: при удалении обновляем dedup-индекс.
         let mut dedup_hit = false;
         {
             let mut kv = self.kv.write().await;
@@ -5860,18 +6266,28 @@ impl Node {
             }
         }
         if dedup_hit {
-            // ВАЖНО: dedup по КОНТЕНТУ мог сказать «уже храним», а файл лежит под
-            // другим chunk_id. Тогда манифест ссылается на несуществующий чанк и
-            // ремонт не находит его ни у нас, ни у пиров (на проде такие «дырки»
-            // не восстанавливались). Гарантируем файл под ЗАПРОШЕННЫМ id.
-            let p = dir.join(chunk_id);
-            if !p.exists() {
-                let _ = write_chunk_atomic(&dir, chunk_id, data);
-            }
-            return (true, true, data.len());
+            let d = dir.clone();
+            let cid = chunk_id.to_string();
+            let data_len = data.len();
+            let bytes = data.to_vec();
+            let _ = tokio::task::spawn_blocking(move || {
+                if !d.join(&cid).exists() {
+                    let _ = write_chunk_atomic(&d, &cid, &bytes);
+                }
+            })
+            .await;
+            return (true, true, data_len);
         }
-        if write_chunk_atomic(&dir, chunk_id, data).is_err() {
-            return (false, false, 0);
+        let nbytes = data.len();
+        {
+            let d = dir.clone();
+            let cid = chunk_id.to_string();
+            let bytes = data.to_vec();
+            let wr =
+                tokio::task::spawn_blocking(move || write_chunk_atomic(&d, &cid, &bytes)).await;
+            if !matches!(wr, Ok(Ok(()))) {
+                return (false, false, 0);
+            }
         }
         {
             let mut nodes: Vec<String> = {
@@ -5891,31 +6307,40 @@ impl Node {
                 nodes.push(me);
             }
             let entry = serde_json::json!({
-                "size": data.len(),
+                "size": nbytes,
                 "ts": crate::dht::now_ms(),
                 "nodes": nodes,
             });
             let payload = serde_json::to_string(&entry).unwrap_or("{}".into());
-            // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
-            // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
             self.kv
                 .write()
                 .await
                 .store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
         }
-        (true, false, data.len())
+        (true, false, nbytes)
     }
 
-    async fn handle_storage_store(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
-        let id = v["chunk_id"].as_str().unwrap_or("").to_string();
-        if !self.valid_chunk_id(&id) {
+    async fn handle_storage_store_typed(
+        self: &Arc<Self>,
+        id: &str,
+        bucket: &str,
+        data_b64: &str,
+        from: Option<[u8; NODEID_LEN]>,
+    ) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(id) {
             return Some(
                 json!({ "ok": false, "err": "bad chunk_id" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        let bucket = v["bucket"].as_str().unwrap_or("files");
+        if !Self::bucket_ok(bucket) {
+            return Some(
+                json!({ "ok": false, "err": "bad bucket" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
         if !self.role_allows(bucket) {
             return Some(
                 json!({ "ok": false, "err": format!("bucket '{bucket}' is not in this node's role") })
@@ -5923,8 +6348,24 @@ impl Node {
                     .into_bytes(),
             );
         }
-        let data_b64 = v["data"].as_str().unwrap_or("").to_string();
-        let data = match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+        if let Some(pid) = from {
+            if !self.peer_allows(&pid, bucket).await {
+                return Some(
+                    json!({ "ok": false, "err": format!("peer role denies {bucket}") })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+        }
+        let max_b64_len = crate::proto::MAX_STORAGE_CHUNK_LEN.div_ceil(3) * 4;
+        if data_b64.len() > max_b64_len {
+            return Some(
+                json!({ "ok": false, "err": "chunk too large" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let data = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
             Ok(d) => d,
             Err(_) => {
                 return Some(
@@ -5934,8 +6375,6 @@ impl Node {
                 )
             }
         };
-        // Fail-closed: чанк ограничен (легитимные — 1 МиБ). Раньше принималось
-        // вплоть до 32 МиБ фрейма на каждый storage.store.
         if data.len() > crate::proto::MAX_STORAGE_CHUNK_LEN {
             return Some(
                 json!({ "ok": false, "err": "chunk too large" })
@@ -5943,72 +6382,20 @@ impl Node {
                     .into_bytes(),
             );
         }
-        // Сверка с известными манифестами: если локально есть манифест с этим
-        // chunk id и хэшем содержимого — несовпадение отклоняем (раньше приём
-        // перезаписывал чанк безусловно: злонамеренная нода могла затереть чужой
-        // чанк мусором — чтение потом падало. Незаметная подмена и раньше была
-        // невозможна, теперь закрыта и порча). Неизвестный id принимаем: проверит читатель.
+        // O(1) expected-hash verification against the KvStore secondary index.
         {
             let got = hex::encode(blake3::hash(&data).as_bytes());
-            // R6: O(1)-снапшот (без клона 48–85 МБ на КАЖДЫЙ storage.store)
-            // + дешёвый префильтр значений перед JSON-парсом (см. ниже).
-            let map = self.kv.read().await.entries_snapshot();
-            let now = crate::dht::now_ms();
-            let mut bad = false;
-            for (k, st) in map.iter() {
-                // Манифесты теперь лежат под ПОЛНЫМ бакетом ("{bucket}:{name}":
-                // "mail:..", "files:..", плюс произвольные бакеты), старые — под
-                // коротким ("m:.."/"f:.."). Принимаем оба формата + любой ключ
-                // с манифестоподобным значением (есть массив "chunks"), чтобы
-                // кастомные бакеты тоже проверялись.
-                let known_prefix = k.starts_with("m:")
-                    || k.starts_with("mail:")
-                    || k.starts_with("f:")
-                    || k.starts_with("files:")
-                    || k.contains(':');
-                if !known_prefix || st.expires <= now {
-                    continue;
+            if let Some(expected) = self.kv.read().await.expected_chunk_hash(id) {
+                if !expected.eq_ignore_ascii_case(&got) {
+                    return Some(
+                        json!({ "ok": false, "err": "chunk hash mismatch with known manifest" })
+                            .to_string()
+                            .into_bytes(),
+                    );
                 }
-                // R6: раньше здесь парсился КАЖДОЙ_VALUE карты (на стенде — все
-                // 127 тыс. ключей, включая stell_*), т.е. сотни мс JSON-парса
-                // на каждый storage.store. Манифест — JSON-объект с ключом
-                // chunks; такой объект обязан содержать подстроку chunks, а
-                // не-объекты/объекты без chunks в проверку не попадали и
-                // раньше (m["chunks"] на них = null). Префильтр сохраняет
-                // семантику дословно и отсекает почти всю карту strncmp'ом.
-                if !(st.value.trim_start().starts_with('{') && st.value.contains("chunks")) {
-                    continue;
-                }
-                if let Ok(m) = serde_json::from_str::<serde_json::Value>(&st.value) {
-                    if let Some(cs) = m["chunks"].as_array() {
-                        for c in cs {
-                            if c["id"].as_str() == Some(id.as_str()) {
-                                if let Some(exp) = c["hash"].as_str() {
-                                    if !exp.eq_ignore_ascii_case(&got) {
-                                        bad = true;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                if bad {
-                    break;
-                }
-            }
-            if bad {
-                return Some(
-                    json!({ "ok": false, "err": "chunk hash mismatch with known manifest" })
-                        .to_string()
-                        .into_bytes(),
-                );
             }
         }
         let dir = self.chunks_dir(bucket);
-        // R2: весь файловый I/O обработчика уходит в spawn_blocking —
-        // create_dir_all/write чанка не должны занимать воркер рантайма
-        // (storage.store прилетает большими батчами и держал воркер на диске).
         let nbytes = data.len();
         {
             let d = dir.clone();
@@ -6017,11 +6404,9 @@ impl Node {
                 return Some(json!({ "ok": false, "err": "io" }).to_string().into_bytes());
             }
         }
-        // dedup по содержимому чанка (П.3.5): если такой же blake3 уже хранится на нужном числе нод
-        // и эта нода уже в списке — пропускаем запись (экономия места). Запись dedup всё равно обновляем.
         let content_hash = blake3::hash(&data);
         let dedup_key = format!("dedup:{}", hex::encode(content_hash.as_bytes()));
-        let want_replicas = 2usize; // RF=2 для dedup (на разных нодах достаточно для отказоустойчивости)
+        let want_replicas = 2usize;
         let mut dedup_hit = false;
         {
             let mut kv = self.kv.write().await;
@@ -6039,13 +6424,9 @@ impl Node {
             }
         }
         if dedup_hit {
-            // уже есть у этой ноды с достаточным RF — НЕ пишем файл, НО только если
-            // файл реально лежит под запрошенным id: иначе манифест ссылается на
-            // несуществующий чанк (prune-скрипт мог его убрать, а dedup-индекс ещё
-            // жив) — та же дыра, что описана в write_chunk_with_dedup.
             {
                 let d = dir.clone();
-                let cid = id.clone();
+                let cid = id.to_string();
                 let _ = tokio::task::spawn_blocking(move || {
                     if !d.join(&cid).exists() {
                         let _ = write_chunk_atomic(&d, &cid, &data);
@@ -6065,16 +6446,13 @@ impl Node {
             );
         }
         {
-            // R2: запись чанка (write+rename) — в blocking-пуле; data переезжает
-            // в замыкание, дальше по коду используется только nbytes.
             let d = dir.clone();
-            let cid = id.clone();
+            let cid = id.to_string();
             let wr = tokio::task::spawn_blocking(move || write_chunk_atomic(&d, &cid, &data)).await;
             if !matches!(wr, Ok(Ok(()))) {
                 return Some(json!({ "ok": false, "err": "io" }).to_string().into_bytes());
             }
         }
-        // обновить dedup-индекс (LWW по stored_at): добавить наш node_id в список
         {
             let now = crate::dht::now_ms();
             let mut entry = serde_json::Map::new();
@@ -6099,8 +6477,6 @@ impl Node {
             entry.insert("nodes".into(), serde_json::json!(nodes));
             let payload =
                 serde_json::to_string(&serde_json::Value::Object(entry)).unwrap_or("{}".into());
-            // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
-            // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
             self.kv
                 .write()
                 .await
@@ -6118,16 +6494,36 @@ impl Node {
         )
     }
 
+    #[allow(dead_code)] // GATE: test/legacy JSON wrapper over typed fetch
     async fn handle_storage_fetch(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
-        let id = v["chunk_id"].as_str().unwrap_or("").to_string();
-        if !self.valid_chunk_id(&id) {
+        self.handle_storage_fetch_typed(
+            v["chunk_id"].as_str().unwrap_or(""),
+            v["bucket"].as_str().unwrap_or("files"),
+            None,
+        )
+        .await
+    }
+
+    async fn handle_storage_fetch_typed(
+        self: &Arc<Self>,
+        id: &str,
+        bucket: &str,
+        from: Option<[u8; NODEID_LEN]>,
+    ) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(id) {
             return Some(
                 json!({ "ok": false, "err": "bad chunk_id" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        let bucket = v["bucket"].as_str().unwrap_or("files");
+        if !Self::bucket_ok(bucket) {
+            return Some(
+                json!({ "ok": false, "err": "bad bucket" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
         if !self.role_allows(bucket) {
             return Some(
                 json!({ "ok": false, "err": format!("bucket '{bucket}' is not in this node's role") })
@@ -6135,9 +6531,16 @@ impl Node {
                     .into_bytes(),
             );
         }
-        let path = self.chunks_dir(bucket).join(&id);
-        // R2: чтение чанка в spawn_blocking — storage.fetch тянет мегабайты и
-        // не должен блокировать воркер рантайма на read(2).
+        if let Some(pid) = from {
+            if !self.peer_allows(&pid, bucket).await {
+                return Some(
+                    json!({ "ok": false, "err": format!("peer role denies {bucket}") })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+        }
+        let path = self.chunks_dir(bucket).join(id);
         let data = tokio::task::spawn_blocking(move || std::fs::read(&path))
             .await
             .ok()
@@ -6160,22 +6563,51 @@ impl Node {
         }
     }
 
-    async fn handle_storage_delete(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
-        let id = v["chunk_id"].as_str().unwrap_or("").to_string();
-        if !self.valid_chunk_id(&id) {
+    async fn handle_storage_delete_typed(
+        self: &Arc<Self>,
+        id: &str,
+        bucket: &str,
+        from: Option<[u8; NODEID_LEN]>,
+    ) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(id) {
             return Some(
                 json!({ "ok": false, "err": "bad chunk_id" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        let bucket = v["bucket"].as_str().unwrap_or("files");
-        let path = self.chunks_dir(bucket).join(&id);
-        // chunk_id = blake3("{bucket}:{name}:{offset}:{content_hash}") — по нему
-        // content_hash не восстановить без чтения файла. Поэтому dedup-индекс
-        // обновляем только после чтения файла ниже.
-        // Читаем файл (если есть) для корректного обновления dedup.
-        // R2: чтение и удаление — в spawn_blocking (аналогично fetch/store).
+        if !Self::bucket_ok(bucket) {
+            return Some(
+                json!({ "ok": false, "err": "bad bucket" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        if !self.role_allows(bucket) {
+            return Some(
+                json!({ "ok": false, "err": format!("bucket '{bucket}' is not in this node's role") })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        if let Some(pid) = from {
+            if !self.peer_allows(&pid, bucket).await {
+                return Some(
+                    json!({ "ok": false, "err": format!("peer role denies {bucket}") })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+        }
+        // Block deleting chunks referenced by a live manifest.
+        if self.kv.read().await.expected_chunk_hash(id).is_some() {
+            return Some(
+                json!({ "ok": false, "err": "chunk referenced by live manifest" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let path = self.chunks_dir(bucket).join(id);
         let read = {
             let p = path.clone();
             tokio::task::spawn_blocking(move || std::fs::read(&p))
@@ -6208,8 +6640,6 @@ impl Node {
                     self.kv.write().await.remove(&dedup_key);
                 } else {
                     let payload = serde_json::to_string(&d).unwrap_or("{}".into());
-                    // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
-                    // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
                     self.kv.write().await.store(
                         &dedup_key,
                         payload,
@@ -6237,12 +6667,15 @@ impl Node {
 
     /// Ключи локальных манифестов с префиксом (m:/f:) — для proof-of-storage челленджей.
     pub async fn kv_manifest_keys(&self, prefix: &str) -> Vec<String> {
-        let map = self.kv.read().await.entries_snapshot();
-        let now = crate::dht::now_ms();
-        map.iter()
-            .filter(|(k, st)| k.starts_with(prefix) && st.expires > now)
-            .map(|(k, _)| k.clone())
-            .collect()
+        self.kv_manifest_keys_with_prefixes(&[prefix]).await
+    }
+
+    /// Ключи локальных манифестов с любым из заданных префиксов за один read-лок.
+    pub async fn kv_manifest_keys_with_prefixes(&self, prefixes: &[&str]) -> Vec<String> {
+        self.kv
+            .read()
+            .await
+            .keys_with_prefixes(prefixes, crate::dht::now_ms())
     }
 
     /// Локальная запись в DHT-KV (валидатор хранит копию всегда — самодостаточность).
@@ -6380,46 +6813,40 @@ impl Node {
     ) -> (usize, Vec<String>) {
         let mkey = Self::blob_manifest_key(bucket, name);
         let manifest_str = self.get_local_kv(&mkey).await;
-        let mut deleted = 0usize;
-        if let Some(ms) = manifest_str.clone() {
+        let mut paths_to_delete: Vec<PathBuf> = Vec::new();
+        let mut chunk_ids: Vec<String> = Vec::new();
+        if let Some(ms) = manifest_str {
             if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&ms) {
                 if let Some(chunks) = manifest["chunks"].as_array() {
+                    let dir = self.chunks_dir(bucket);
                     for c in chunks {
                         if let Some(cid) = c["id"].as_str() {
-                            // PENTEST F6 (P1): chunk ids come from the STORED
-                            // manifest, and manifests replicate over dht.sync
-                            // from UNTRUSTED peers — an unvalidated id
-                            // (`../../x`) turns this join into a path-traversal
-                            // delete outside the bucket dir. Skip anything that
-                            // is not a strict chunk id (same gate as the
-                            // network ingress in `handle_storage_store`).
                             if !self.valid_chunk_id(cid) {
                                 continue;
                             }
-                            // Count only real deletes (audit 2026-10-06: a
-                            // missing file used to inflate prune metrics).
-                            if std::fs::remove_file(self.chunks_dir(bucket).join(cid)).is_ok() {
-                                deleted += 1;
-                            }
+                            paths_to_delete.push(dir.join(cid));
+                            chunk_ids.push(cid.to_string());
                         }
                     }
                 }
             }
         }
-        self.kv_remove_local(&mkey).await;
-        let chunk_ids: Vec<String> = manifest_str
-            .and_then(|ms| serde_json::from_str::<serde_json::Value>(&ms).ok())
-            .and_then(|m| {
-                m["chunks"].as_array().map(|a| {
-                    a.iter()
-                        // PENTEST F6: never fan a traversal id out to peers.
-                        .filter_map(|c| c["id"].as_str())
-                        .filter(|cid| self.valid_chunk_id(cid))
-                        .map(String::from)
-                        .collect::<Vec<String>>()
-                })
+        let deleted = if paths_to_delete.is_empty() {
+            0
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let mut cnt = 0usize;
+                for p in paths_to_delete {
+                    if std::fs::remove_file(p).is_ok() {
+                        cnt += 1;
+                    }
+                }
+                cnt
             })
-            .unwrap_or_default();
+            .await
+            .unwrap_or(0)
+        };
+        self.kv_remove_local(&mkey).await;
         (deleted, chunk_ids)
     }
 
@@ -6434,6 +6861,18 @@ impl Node {
         std::fs::read(&path).ok()
     }
 
+    async fn local_chunk_get_async(&self, bucket: &str, chunk_id: &str) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(chunk_id) {
+            return None;
+        }
+        let path = self.chunks_dir(bucket).join(chunk_id);
+        tokio::task::spawn_blocking(move || std::fs::read(&path))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
+    #[cfg(test)]
     fn local_chunk_get_bounded(
         &self,
         bucket: &str,
@@ -6445,6 +6884,25 @@ impl Node {
         }
         let file = std::fs::File::open(self.chunks_dir(bucket).join(chunk_id)).ok()?;
         read_bounded_chunk(file, limit).ok()
+    }
+
+    async fn local_chunk_get_bounded_async(
+        &self,
+        bucket: &str,
+        chunk_id: &str,
+        limit: usize,
+    ) -> Option<Vec<u8>> {
+        if !self.valid_chunk_id(chunk_id) {
+            return None;
+        }
+        let path = self.chunks_dir(bucket).join(chunk_id);
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(path).ok()?;
+            read_bounded_chunk(file, limit).ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Сохранить чанк на RF реплик (k-ближайших к chunk_id по DHT).
@@ -6499,8 +6957,14 @@ impl Node {
         // резерв: храним и локально, если реплик меньше rf (и роль позволяет бакет)
         if stored == 0 && self.role_allows(bucket) {
             let dir = self.chunks_dir(bucket);
-            let _ = std::fs::create_dir_all(&dir);
-            if write_chunk_atomic(&dir, chunk_id, data).is_ok() {
+            let cid = chunk_id.to_string();
+            let bytes = data.to_vec();
+            let wr = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&dir)?;
+                write_chunk_atomic(&dir, &cid, &bytes)
+            })
+            .await;
+            if matches!(wr, Ok(Ok(()))) {
                 stored = 1;
             }
         }
@@ -6586,11 +7050,11 @@ impl Node {
         // открытие письма, чей чанк лежит у нас, висело/падало по таймауту
         // (наблюдалось: внешнее письмо открывалось без текста, хотя чанк был
         // на диске). Сеть — только если локально нет.
-        let local_get = || match shard_limit {
-            Some(limit) => self.local_chunk_get_bounded(bucket, cid, limit),
-            None => self.local_chunk_get(bucket, cid),
+        let local_opt = match shard_limit {
+            Some(limit) => self.local_chunk_get_bounded_async(bucket, cid, limit).await,
+            None => self.local_chunk_get_async(bucket, cid).await,
         };
-        if let Some(local) = local_get() {
+        if let Some(local) = local_opt {
             // хэш проверяем и для локальных данных (защита от битой записи)
             if let Some(expected) = expected_hash {
                 let actual = hex::encode(blake3::hash(&local).as_bytes());
@@ -6644,7 +7108,10 @@ impl Node {
             eprintln!(
                 "[node] WARN: chunk {cid} of {bucket} served from LOCAL disk, not from the network"
             );
-            got = local_get();
+            got = match shard_limit {
+                Some(limit) => self.local_chunk_get_bounded_async(bucket, cid, limit).await,
+                None => self.local_chunk_get_async(bucket, cid).await,
+            };
         }
         if let Some(expected) = expected_hash {
             if let Some(g) = &got {
@@ -7106,7 +7573,7 @@ impl Node {
                 // письмо лежит у нас, а сетевые проходы по висящим пирам съедали
                 // бюджет чтения (наблюдалось: fetch только что отправленного письма
                 // висел 5с и список отдавал пустое тело). Сеть — только при промахе.
-                let mut got = self.local_chunk_get("mail", cid);
+                let mut got = self.local_chunk_get_async("mail", cid).await;
                 if got.is_some() {
                     eprintln!(
                         "[node] WARN: chunk {cid} of {name} served from LOCAL disk, not from the network"
@@ -7425,8 +7892,14 @@ impl Node {
             let chunk_id = chunk_id_for(bucket, name, offset, &content_hash);
             if have_role {
                 let dir = self.chunks_dir(bucket);
-                let _ = std::fs::create_dir_all(&dir);
-                if write_chunk_atomic(&dir, &chunk_id, chunk).is_ok() {
+                let cid = chunk_id.clone();
+                let bytes = chunk.to_vec();
+                let wr = tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&dir)?;
+                    write_chunk_atomic(&dir, &cid, &bytes)
+                })
+                .await;
+                if matches!(wr, Ok(Ok(()))) {
                     local_chunks += 1;
                 }
             } else {
@@ -7783,7 +8256,7 @@ impl Node {
         let mut buf: Vec<u8> = Vec::new();
         for c in chunks {
             let cid = c["id"].as_str().unwrap_or("");
-            let mut got = self.local_chunk_get(bucket, cid);
+            let mut got = self.local_chunk_get_async(bucket, cid).await;
             if got.is_none() {
                 // таргет = blake3("{bucket}:{cid}") — совпадает с записью (store_chunk_replicated)
                 let h = blake3::hash(format!("{bucket}:{cid}").as_bytes());
@@ -7892,11 +8365,49 @@ impl Node {
     /// mail.list: отдаёт индекс ящика ТОЛЬКО владельцу (проверка
     /// Falcon-512-подписи владельца).
     async fn handle_mail_list(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
-        let email = v["email"].as_str().unwrap_or("").to_string();
+        let email = v["email"].as_str().unwrap_or("");
+        if email.is_empty()
+            || email.len() > 254
+            || !email.contains('@')
+            || email
+                .bytes()
+                .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        {
+            return Some(
+                json!({ "ok": false, "err": "bad email" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
         let ts = v["ts"].as_i64().unwrap_or(0);
-        let sig = hex::decode(v["sig"].as_str().unwrap_or("")).unwrap_or_default();
+        // анти-replay: проверяем свежесть ДО дорогого сетевого поиска user_pq_pub
+        if now_ms().abs_diff(ts) > 5 * 60 * 1000 {
+            return Some(
+                json!({ "ok": false, "err": "signature expired" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let sig_hex = v["sig"].as_str().unwrap_or("");
+        if sig_hex.len() != crate::proto::PQ_FALCON_SIG_LEN * 2 {
+            return Some(
+                json!({ "ok": false, "err": "bad sig" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        let sig = match hex::decode(sig_hex) {
+            Ok(s) if s.len() == crate::proto::PQ_FALCON_SIG_LEN => s,
+            _ => {
+                return Some(
+                    json!({ "ok": false, "err": "bad sig" })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
+        };
         // проверка владения: подпись над "email:ts" ключом владельца
-        let pq_pub_hex = match self.user_pq_pub(&email).await {
+        let pq_pub_hex = match self.user_pq_pub(email).await {
             Some(e) => e,
             None => {
                 return Some(
@@ -7906,13 +8417,6 @@ impl Node {
                 )
             }
         };
-        if sig.len() != crate::proto::PQ_FALCON_SIG_LEN {
-            return Some(
-                json!({ "ok": false, "err": "bad sig" })
-                    .to_string()
-                    .into_bytes(),
-            );
-        }
         let pqk = match hex::decode(&pq_pub_hex) {
             Ok(b) if b.len() == crate::proto::PQ_FALCON_PK_LEN => b,
             _ => {
@@ -7927,14 +8431,6 @@ impl Node {
         if !crate::mailbox::MailKeys::verify(&pqk, msg.as_bytes(), &sig) {
             return Some(
                 json!({ "ok": false, "err": "not mailbox owner" })
-                    .to_string()
-                    .into_bytes(),
-            );
-        }
-        // анти-replay: подпись действительна только в окне ±5 минут
-        if now_ms().abs_diff(ts) > 5 * 60 * 1000 {
-            return Some(
-                json!({ "ok": false, "err": "signature expired" })
                     .to_string()
                     .into_bytes(),
             );
@@ -7993,6 +8489,14 @@ impl Node {
                         }
                     }
                     link.cfg.pq_pub = p.pq_pub;
+                    let (bytes, parsed) = parse_peer_pq(&link.cfg);
+                    link.pq_pk_bytes = bytes;
+                    link.pq_pk = parsed;
+                    if let Some(ref b) = link.pq_pk_bytes {
+                        if let Ok(cc) = build_client_cfg(Some(b)) {
+                            link.client_cfg = cc;
+                        }
+                    }
                 }
                 updated += 1;
             }
@@ -8003,14 +8507,16 @@ impl Node {
             let mut guard = self.unknown_allow_cfg.write().await;
             *guard = new_cfg.unknown_allow.clone();
         }
-        crate::log::emit(
-            2,
-            "info",
-            &self.cfg.name,
-            0,
-            "config_reloaded",
-            json!({ "updated_peers": updated }),
-        );
+        if crate::log::enabled(2) {
+            crate::log::emit(
+                2,
+                "info",
+                &self.cfg.name,
+                0,
+                "config_reloaded",
+                json!({ "updated_peers": updated }),
+            );
+        }
     }
 
     /// Серверный режим: слушаем + поддерживаем исходящие соединения.
@@ -8021,30 +8527,36 @@ impl Node {
         let mut sc = sc;
         sc.transport_config(Arc::new(transport_config()));
         let server_ep = Endpoint::server(sc, listen)?;
-        crate::log::emit(
-            2,
-            "info",
-            &self.cfg.name,
-            0,
-            "serving",
-            json!({ "node": self.id_hex, "listen": listen.to_string() }),
-        );
         if let Some(level) = self.cfg.log_level {
             crate::log::set_level(level);
+        }
+        if crate::log::enabled(2) {
+            crate::log::emit(
+                2,
+                "info",
+                &self.cfg.name,
+                0,
+                "serving",
+                json!({ "node": self.id_hex, "listen": listen.to_string() }),
+            );
         }
         // Prometheus-метрики
         if let Some(addr) = &self.cfg.metrics_listen {
             let m = self.metrics.clone();
             let svc = self.svc_counters.clone();
             match crate::metrics::spawn(addr, m, svc) {
-                Ok(()) => crate::log::emit(
-                    2,
-                    "info",
-                    &self.cfg.name,
-                    0,
-                    "metrics_up",
-                    json!({ "addr": addr }),
-                ),
+                Ok(()) => {
+                    if crate::log::enabled(2) {
+                        crate::log::emit(
+                            2,
+                            "info",
+                            &self.cfg.name,
+                            0,
+                            "metrics_up",
+                            json!({ "addr": addr }),
+                        );
+                    }
+                }
                 Err(e) => crate::terr!(&self.cfg.name, 0, "metrics_failed", err = format!("{e}")),
             }
         }
@@ -8169,14 +8681,16 @@ impl Node {
             });
         }
 
-        crate::log::emit(
-            2,
-            "info",
-            &self.cfg.name,
-            0,
-            "serving_ready",
-            json!({ "peers": self.peers.read().await.len() }),
-        );
+        if crate::log::enabled(2) {
+            crate::log::emit(
+                2,
+                "info",
+                &self.cfg.name,
+                0,
+                "serving_ready",
+                json!({ "peers": self.peers.read().await.len() }),
+            );
+        }
         std::future::pending::<()>().await;
         Ok(())
     }
@@ -8204,12 +8718,12 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
                 let ip = remote_ip;
                 if node.is_banned(&ip).await {
                     node.metrics.auth_bans_hit.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[{}] handshake from banned {ip}, refusing", node.cfg.name);
+                    node.log_net_warn("handshake_banned", &ip.to_string());
                     incoming.refuse();
                     return;
                 }
                 if !node.handshake_allowed(ip).await {
-                    eprintln!("[{}] handshake throttled for {ip}, refusing", node.cfg.name);
+                    node.log_net_warn("handshake_throttled", &ip.to_string());
                     incoming.refuse();
                     return;
                 }
@@ -8217,10 +8731,7 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
             let permit = match sem.try_acquire() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!(
-                        "[{}] too many incoming connections, refusing",
-                        node.cfg.name
-                    );
+                    node.log_net_warn("too_many_incoming", "refusing incoming connection");
                     incoming.refuse();
                     return;
                 }
@@ -8229,10 +8740,14 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let conn = match connecting.await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[{}] accept error: {e}", node.cfg.name);
+            let conn = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    node.log_net_warn("accept_error", &e.to_string());
+                    return;
+                }
+                Err(_) => {
+                    node.log_net_warn("accept_timeout", "quic handshake timeout");
                     return;
                 }
             };
@@ -8248,14 +8763,12 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
             }
             node.metrics.conns_accepted.fetch_add(1, Ordering::Relaxed);
             node.metrics.conns_active.fetch_add(1, Ordering::Relaxed);
-            // Помечаем соединение как обслуживаемое, чтобы ensure_frame_loop не
-            // поднял на нём второй цикл (здесь цикл блокирующий и держит permit).
             let sid = conn.stable_id();
             node.looped
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(sid);
-            frame_loop(conn, node, None).await;
+            frame_loop(conn, node, None, true).await;
             drop(permit);
         });
     }
@@ -8312,10 +8825,9 @@ async fn reconnect_loop(node: Arc<Node>) {
                                     node.ensure_frame_loop(conn, Some(pid));
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "[{}] parked probe {} failed: {e}",
-                                        node.cfg.name,
-                                        hex::encode(pid)
+                                    node.log_net_warn(
+                                        "parked_probe_failed",
+                                        &format!("{}: {e}", hex::encode(pid)),
                                     );
                                 }
                             }
@@ -8350,58 +8862,32 @@ async fn reconnect_loop(node: Arc<Node>) {
     }
 }
 
-async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NODEID_LEN]>) {
+async fn frame_loop(
+    conn: Connection,
+    node: Arc<Node>,
+    known_pid: Option<[u8; NODEID_LEN]>,
+    is_inbound: bool,
+) {
     let mut authed: Option<[u8; NODEID_LEN]> = known_pid;
-    // F8 pre-auth deadline: a connection with no valid CHALLENGE within N
-    // seconds is closed so dead/slow handshakes free their MAX_INCOMING
-    // permit. Applies pre-auth only: once `authed` is Some the wait is
-    // indefinite again (QUIC 120s idle timeout still bounds dead sessions).
+    let replay = Arc::new(std::sync::Mutex::new(ConnReplayWindow::default()));
+    let hello_credited = Arc::new(AtomicBool::new(false));
     let preauth_start = tokio::time::Instant::now();
     let preauth_secs = preauth_deadline_secs();
-    // Per-connection admission control for spawned stream tasks. An exhausted
-    // semaphore means the peer is flooding this connection: log and drop the
-    // stream, never tear the connection down.
     let stream_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONN_STREAMS));
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        // Reap finished stream tasks. Their errors are LOG-ONLY: one bad/failed
-        // stream must never take down the whole connection (that used to turn a
-        // single malformed frame into a full-fleet reconnect storm).
         while let Some(joined) = tasks.try_join_next() {
             if let Err(e) = joined {
-                eprintln!("[{}] stream task error: {e}", node.cfg.name);
+                node.log_net_warn("stream_task_err", &e.to_string());
             }
         }
-        // Таймаут ожидания НОВОГО потока. Без него соединение, чей пир перестал открывать
-        // потоки, но QUIC-сессия ещё жива (keep_alive сбрасывает max_idle_timeout),
-        // висело в accept_bi() вечно и НЕ отпускало пермит MAX_INCOMING — а пермит живёт
-        // ровно столько, сколько frame_loop. Узел упирался в «too many incoming
-        // connections», отказывал пирам, и меш рассыпался на «aborted by peer: refused».
-        // Name the exit reason: `_ => break` hid whether the connection died
-        // (peer closed / local reset) or the idle timer fired, and the two have
-        // opposite meanings -- closing a HEALTHY connection every time the peer
-        // goes quiet for 30s is what turns a working link into a reconnect
-        // storm. conn.close_reason() says who ended it.
-        // Wait indefinitely for the next stream once authed. The old 30s idle
-        // timer had to go: a live QUIC session whose peer is simply quiet for
-        // 30s (keep-alive pings are not application streams) looked "idle", so
-        // we exited and CLOSED a perfectly healthy connection -- measured live
-        // as 40 such idle-exits on one node with close_reason=None, and every
-        // one of them told the peer "closed", killing ITS frame_loop too (the
-        // cascade was ~2300 conn_closed events per node). The permit is still
-        // bounded: pre-auth connections die on `preauth_secs`, and a genuinely
-        // dead authed peer stops answering keep-alive so QUIC's idle timeout
-        // (120s) closes the session, accept_bi errors, we exit and close --
-        // and explicit evictions close their connections directly.
         let (mut send, mut recv) = if authed.is_none() && preauth_secs > 0 {
             let deadline = Duration::from_secs(preauth_secs);
             let elapsed = preauth_start.elapsed();
             if elapsed >= deadline {
-                eprintln!(
-                    "[{}] pre-auth deadline ({}s) on {}, closing",
-                    node.cfg.name,
-                    preauth_secs,
-                    conn.stable_id()
+                node.log_net_warn(
+                    "preauth_deadline",
+                    &format!("{}s on {}", preauth_secs, conn.stable_id()),
                 );
                 node.metrics
                     .preauth_timeouts
@@ -8413,20 +8899,20 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
             match timeout(remaining, conn.accept_bi()).await {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
-                    eprintln!(
-                        "[{}] frame_loop ends on {} ({e}; close_reason={:?})",
-                        node.cfg.name,
-                        conn.stable_id(),
-                        conn.close_reason()
+                    node.log_net_warn(
+                        "frame_loop_end",
+                        &format!(
+                            "{} ({e}; close_reason={:?})",
+                            conn.stable_id(),
+                            conn.close_reason()
+                        ),
                     );
                     break;
                 }
                 Err(_) => {
-                    eprintln!(
-                        "[{}] pre-auth deadline ({}s) on {}, closing",
-                        node.cfg.name,
-                        preauth_secs,
-                        conn.stable_id()
+                    node.log_net_warn(
+                        "preauth_deadline",
+                        &format!("{}s on {}", preauth_secs, conn.stable_id()),
                     );
                     node.metrics
                         .preauth_timeouts
@@ -8439,24 +8925,33 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
             match conn.accept_bi().await {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
-                        "[{}] frame_loop ends on {} ({e}; close_reason={:?})",
-                        node.cfg.name,
-                        conn.stable_id(),
-                        conn.close_reason()
+                    node.log_net_warn(
+                        "frame_loop_end",
+                        &format!(
+                            "{} ({e}; close_reason={:?})",
+                            conn.stable_id(),
+                            conn.close_reason()
+                        ),
                     );
                     break;
                 }
             }
         };
-        // Patch B: момент приёма стрима — handle_stream измерит disp = start -
-        // t_accept (задержка планирования/диспатча, включая sempahore/spawn).
         let t_accept = std::time::Instant::now();
         match authed {
-            // Challenge/auth stays SERIAL on the accept loop: only the accept
-            // loop owns connection lifecycle and may set the authenticated pid.
             None => {
-                match handle_stream(node.clone(), conn.clone(), send, recv, None, t_accept).await {
+                match handle_stream(
+                    node.clone(),
+                    conn.clone(),
+                    send,
+                    recv,
+                    None,
+                    t_accept,
+                    replay.clone(),
+                    hello_credited.clone(),
+                )
+                .await
+                {
                     Ok(Some(pid)) => {
                         let ip = conn.remote_address().ip();
                         node.record_auth_success(&ip).await;
@@ -8465,7 +8960,7 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("[{}] stream error: {e}", node.cfg.name);
+                        node.log_net_warn("preauth_stream_err", &e.to_string());
                         let ip = conn.remote_address().ip();
                         node.record_auth_failure(ip).await;
                         conn.close(quinn::VarInt::from(0u32), b"auth failed");
@@ -8473,21 +8968,11 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                     }
                 }
             }
-            // Authenticated traffic is handled CONCURRENTLY: each stream gets its
-            // own task and its own permit, so one slow/hung request cannot block
-            // every other stream on the connection.
             Some(pid) => {
                 let permit = match stream_sem.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
-                        eprintln!(
-                            "[{}] too many concurrent streams on one connection, dropping stream",
-                            node.cfg.name
-                        );
-                        // Явный RESET вместо молчаливого дропа: отправитель получает
-                        // ошибку сразу, а не ждёт свой таймаут. Молчаливый дроп в части
-                        // случаев оставлял поток читающимся до таймаута чтения (5с), то
-                        // есть ровно держал разрешение занятым.
+                        node.log_net_warn("too_many_streams", "dropping stream");
                         let _ = send.reset(quinn::VarInt::from(0u32));
                         let _ = recv.stop(quinn::VarInt::from(0u32));
                         continue;
@@ -8495,19 +8980,28 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                 };
                 let node = node.clone();
                 let conn = conn.clone();
+                let replay = replay.clone();
+                let hello_credited = hello_credited.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(e) =
-                        handle_stream(node.clone(), conn, send, recv, Some(pid), t_accept).await
+                    if let Err(e) = handle_stream(
+                        node.clone(),
+                        conn,
+                        send,
+                        recv,
+                        Some(pid),
+                        t_accept,
+                        replay,
+                        hello_credited,
+                    )
+                    .await
                     {
-                        eprintln!("[{}] stream task error: {e}", node.cfg.name);
+                        node.log_net_warn("stream_task_err", &e.to_string());
                     }
                 });
             }
         }
     }
-    // Соединение распадается: даём уже запущенным стримам короткое окно
-    // завершиться (best-effort), затем обрываем оставшиеся вместе с JoinSet.
     let _ = timeout(Duration::from_secs(STREAM_DRAIN_TIMEOUT_SECS), async {
         while tasks.join_next().await.is_some() {}
     })
@@ -8516,20 +9010,26 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
     if let Some(pid) = authed {
         node.drop_conn(pid, Some(sid)).await;
     }
-    // Соединение обслуживание закончило — снимаем отметку, чтобы тот же sid
-    // снова не считался «уже с циклом» (важно для accept-пути, где цикл
-    // блокирующий и сам себя не снимает).
     node.looped
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&sid);
     node.sessions.write().await.remove(&sid);
-    node.pq_digests.write().await.remove(&sid);
     node.metrics.conns_closed.fetch_add(1, Ordering::Relaxed);
-    node.metrics.conns_active.fetch_sub(1, Ordering::Relaxed);
-    crate::log::emit(2, "info", &node.cfg.name, 0, "conn_closed", json!({}));
+    if is_inbound {
+        let _ = node
+            .metrics
+            .conns_active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+    if crate::log::enabled(2) {
+        crate::log::emit_empty(2, "info", &node.cfg.name, 0, "conn_closed");
+    }
 }
 
+#[allow(clippy::too_many_arguments)] // GATE: per-conn replay/hello state stays bound to frame_loop
 async fn handle_stream(
     node: Arc<Node>,
     conn: Connection,
@@ -8537,6 +9037,8 @@ async fn handle_stream(
     mut recv: RecvStream,
     authed: Option<[u8; NODEID_LEN]>,
     t_accept: std::time::Instant,
+    replay: Arc<std::sync::Mutex<ConnReplayWindow>>,
+    hello_credited: Arc<AtomicBool>,
 ) -> Result<Option<[u8; NODEID_LEN]>> {
     // Patch B: стадии обработки. disp = start - t_accept (диспатч стрима в
     // задачу), read = чтение фрейма, proc = разбор + сервис + запись ответа.
@@ -8601,22 +9103,12 @@ async fn handle_stream(
         .bytes_in
         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
     let trace = node.next_trace();
-    let tlog = |event: &str, fields: serde_json::Value| {
-        crate::log::emit(2, "info", &node.cfg.name, trace, event, fields);
-    };
-    let terr = |event: &str, fields: serde_json::Value| {
-        crate::log::emit(0, "error", &node.cfg.name, trace, event, fields);
-    };
     let report_stages = |f: &Frame, proc: Duration| {
         let proc_ms = proc.as_millis() as u64;
         node.metrics
             .handler_ms_max
             .fetch_max(proc_ms, Ordering::Relaxed);
-        if disp_ms >= 200 || read_ms >= 200 || proc_ms >= 200 {
-            // R6: svc прямо в dispatch — раньше атрибуция медленных proc
-            // требовала джойна с req/req_stages по trace/seq+ts (и ломалась
-            // на рестартах: trace начинается заново). Стоит только внутри
-            // >=200мс-гейта, т.е. ровно на тех строках, что мы и анализируем.
+        if (disp_ms >= 200 || read_ms >= 200 || proc_ms >= 200) && crate::log::enabled(2) {
             crate::log::emit(
                 2,
                 "info",
@@ -8788,32 +9280,20 @@ async fn handle_stream(
         } else {
             bail!("unknown node claiming {}", hex::encode(claimed));
         };
-        let pq_pk = match peer.cfg.pq_bytes() {
-            Ok(Some(b)) => b,
-            Ok(None) => bail!("pq_pub is mandatory (classical-only peer refused)"),
-            Err(e) => {
-                return Err(e);
-            }
-        };
-        if !f.verify(&pq_pk) || !ts_ok(f.ts) {
+        if !peer.verify_frame(&f)? || !ts_ok(f.ts) {
             bail!("challenge bad sig/ts");
         }
         // Anti-replay: nonce одноразовый. Проверяется ПОСЛЕ подписи, чтобы
         // поддельные кадры не засоряли кэш и не вытесняли чужие nonce.
         {
             let mut seen = node.challenge_nonces.lock().await;
-            if !crate::proto::claim_nonce(&mut seen, &ch_nonce, now_ms()) {
+            if !seen.claim(&ch_nonce, now_ms()) {
                 bail!("challenge replay");
             }
         }
-        // KEM-only сессия: ключ — из ML-KEM секрета + дайджест транскрипта;
-        // свой freshness-nonce отдаём в AUTH для привязки транскрипта (не ECDH).
         let mut srv_fresh = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut srv_fresh);
         let auth_at = now_ms();
-        // PQ handshake (MANDATORY): a CHALLENGE without PQ fields, or with
-        // malformed/mis-versioned PQ, is refused with a clear error and the
-        // connection is dropped fail-closed (no classical fallback).
         let pq_state: (Vec<u8>, PqAgreed) = pq_responder_accept(
             &ch_fresh,
             &ch,
@@ -8822,23 +9302,18 @@ async fn handle_stream(
             auth_at,
             &node.id,
         )?;
-        // KEM-only session: sole inputs are the ML-KEM shared secret +
-        // transcript digest.
         let key = proto::pq_session_key(&pq_state.1.shared, &pq_state.1.digest);
-        // Backpressure bound on the session table (fail-closed: when full the
-        // session is NOT stored, so this conn can serve no requests; the auth
-        // decision above is untouched). No fitting metrics counter (follow-up).
-        if !node.session_insert(conn.stable_id(), key).await {
-            bail!("sessions full");
-        }
-        // KEX wiring: every session carries its transcript digest so frame
-        // seal/open binds the AAD (fail-closed when the digest table is full).
         if !node
-            .pq_digest_insert(conn.stable_id(), pq_state.1.digest)
+            .session_insert(
+                conn.stable_id(),
+                SessionKeys {
+                    key,
+                    pq_digest: pq_state.1.digest,
+                },
+            )
             .await
         {
-            node.sessions.write().await.remove(&conn.stable_id());
-            bail!("pq digests full");
+            bail!("sessions full");
         }
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
@@ -8881,7 +9356,8 @@ async fn handle_stream(
             sig: Vec::new(),
         };
         node.sign_frame(&mut a);
-        send.write_all(&a.encode()).await?;
+        let wire = a.try_encode()?;
+        send.write_all(&wire).await?;
         let _ = send.finish();
         // Post-handshake protocol negotiation (control plane). Sent on its own
         // stream AFTER the AUTH answer so an older peer's single-frame AUTH
@@ -8911,11 +9387,52 @@ async fn handle_stream(
         .get(&pid)
         .cloned()
         .ok_or_else(|| anyhow!("unknown peer"))?;
-    let pq_pk = peer
-        .cfg
-        .pq_bytes()?
-        .ok_or_else(|| anyhow!("pq_pub is mandatory (classical-only peer refused)"))?;
-    if !f.verify(&pq_pk) {
+    // Enforce per-peer rate limit BEFORE Falcon-512 signature verification or HELLO handling.
+    let rate = peer.cfg.rate_limit_per_sec;
+    if !peer.rate.lock().await.allow(rate) {
+        node.rep_record_rate_violation(&pid).await;
+        if f.kind == proto::kind::REQ && f.dst == node.id {
+            if let Some(skeys) = node.sessions.read().await.get(&conn.stable_id()).copied() {
+                if peer.err_rate.lock().await.allow(50) {
+                    let resp = json!({ "ok": false, "err": "rate limit exceeded" })
+                        .to_string()
+                        .into_bytes();
+                    let r_ts = now_ms();
+                    let (ct, nonce) = frame_seal_body(
+                        &skeys.key,
+                        &skeys.pq_digest,
+                        proto::kind::RESP,
+                        f.seq,
+                        r_ts,
+                        &node.id,
+                        &f.src,
+                        f.svc,
+                        &resp,
+                    );
+                    let mut r = Frame {
+                        kind: proto::kind::RESP,
+                        seq: f.seq,
+                        ts: r_ts,
+                        src: node.id,
+                        dst: f.src,
+                        svc: f.svc,
+                        payload: ct,
+                        nonce,
+                        sig: Vec::new(),
+                    };
+                    node.sign_frame(&mut r);
+                    let wire = r.try_encode()?;
+                    send.write_all(&wire).await?;
+                    let _ = send.finish();
+                } else {
+                    let _ = send.reset(quinn::VarInt::from(0u32));
+                }
+            }
+        }
+        report_stages(&f, t_proc.elapsed());
+        return Ok(None);
+    }
+    if !peer.verify_frame(&f)? {
         // F8-rep: forged frame from the proven identity.
         node.rep_record_protocol_violation(&pid).await;
         bail!("bad signature");
@@ -8926,39 +9443,7 @@ async fn handle_stream(
         bail!("stale frame");
     }
     {
-        // Anti-replay is scoped to THIS connection. The sender's `seq` is a single
-        // node-wide counter shared by all of its connections, so a per-peer window
-        // rejects legitimate traffic from a second connection or after a reconnect --
-        // which tore down frame_loop and stopped the node before consensus.
-        //
-        // A replayed (or QUIC-reordered) frame is DROPPED, never fatal: tearing
-        // down the whole connection on one out-of-order frame turned transient
-        // stream races into one-directional blackouts (sender keeps using the
-        // dead cached conn, every request times out until a process restart).
-        // The application layer is best-effort and re-sends; losing one frame
-        // is noise, losing the connection is an outage.
-        // ACCEPT duplicates and out-of-order frames -- the gate is diagnostic
-        // only. Two things made rejecting them an outage rather than a
-        // safety net:
-        //
-        //  1. With the CONCURRENT frame_loop the sender's node-wide monotonic
-        //     `seq` legitimately arrives out of order: this window is a
-        //     max-gate, not a set, so any reordering looks like a replay.
-        //  2. Rejecting returned `Ok(None)` WITHOUT a response, so the sender
-        //     waited its full 2s timeout, evicted the connection and redialled
-        //     -- measured live: 5002 drops and ~1800 connection closes in 10
-        //     minutes, with consensus starved the whole time.
-        //
-        // Nothing depends on frame-level replay protection: the frame is
-        // authenticated (peer signature over the payload, a ±10min timestamp
-        // window, and per-connection e2e encryption with an ephemeral
-        // session key an attacker cannot derive), and every service is
-        // idempotent at the app layer (VoteSet keeps the first vote per
-        // voter/round, KV is an upsert, pubsub marks messages seen). A
-        // duplicate therefore costs one cheap execution instead of an
-        // outage; a forged frame still dies at `f.verify` above.
-        let window = Node::replay_window(&peer, conn.stable_id()).await;
-        let mut w = window.lock().await;
+        let mut w = replay.lock().unwrap_or_else(|e| e.into_inner());
         let seen_recently = (now_ms() - w.last_ts) < proto::TS_WINDOW_MS;
         if f.seq <= w.last_seq && seen_recently {
             let n = node
@@ -8966,9 +9451,9 @@ async fn handle_stream(
                 .out_of_order_frames
                 .fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(500) {
-                eprintln!(
-                    "[{}] out-of-order frame accepted (seq {} <= {}, sample {})",
-                    node.cfg.name, f.seq, w.last_seq, n
+                node.log_net_warn(
+                    "out_of_order_frame",
+                    &format!("seq={} <= {} (sample {})", f.seq, w.last_seq, n),
                 );
             }
         }
@@ -8977,9 +9462,6 @@ async fn handle_stream(
             w.last_ts = f.ts;
         }
     }
-    // Never overwrite a dialable address with this connection's source port
-    // (see `remember_peer_addr`): on an inbound conn that is an ephemeral
-    // client port, and dialing it later wasted the whole request budget.
     node.remember_peer_addr(&peer, conn.remote_address()).await;
 
     match f.kind {
@@ -8987,33 +9469,20 @@ async fn handle_stream(
             if f.dst != node.id {
                 bail!("not addressed to me");
             }
-            // Unknown/malformed control messages are IGNORED, never fatal:
-            // control frames are self-delimiting, so ignoring one cannot
-            // desynchronise the next frame (forward compatibility).
             if let Some(proto::ControlMessage::Hello(hello)) =
                 proto::decode_control(f.kind, &f.payload)
             {
                 node.apply_peer_hello(pid, hello);
-                node.rep_record_valid(&pid).await;
+                if !hello_credited.swap(true, Ordering::Relaxed) {
+                    node.rep_record_valid(&pid).await;
+                }
             }
             report_stages(&f, t_proc.elapsed());
             Ok(None)
         }
         proto::kind::PING => {
-            // PENTEST F4: PING used to bypass the per-peer rate limiter, so a
-            // pinned peer with a budget still had an unlimited CPU path (every
-            // frame pays one Falcon verify). The limiter now covers the cheap
-            // control frame as well; an over-budget PING is dropped without a
-            // PONG (the peer retries at its own pace).
             if f.dst != node.id {
                 bail!("not addressed to me");
-            }
-            {
-                let rate = peer.cfg.rate_limit_per_sec;
-                if !peer.rate.lock().await.allow(rate) {
-                    node.rep_record_rate_violation(&pid).await;
-                    return Ok(None);
-                }
             }
             // F8-rep: valid, authentic message from the proven identity.
             node.rep_record_valid(&pid).await;
@@ -9029,7 +9498,8 @@ async fn handle_stream(
                 sig: Vec::new(),
             };
             node.sign_frame(&mut r);
-            send.write_all(&r.encode()).await?;
+            let wire = r.try_encode()?;
+            send.write_all(&wire).await?;
             let _ = send.finish();
             report_stages(&f, t_proc.elapsed());
             Ok(None)
@@ -9038,97 +9508,28 @@ async fn handle_stream(
             if f.dst != node.id {
                 bail!("not addressed to me");
             }
-            let key = node
+            let skeys = node
                 .sessions
                 .read()
                 .await
                 .get(&conn.stable_id())
                 .copied()
                 .ok_or_else(|| anyhow!("no session key"))?;
-            // rate limiting (защита от флуда)
-            let rate = peer.cfg.rate_limit_per_sec;
-            if !peer.rate.lock().await.allow(rate) {
-                // F8-rep: per-peer rate-limit violation by the proven identity.
-                node.rep_record_rate_violation(&pid).await;
-                let resp = json!({ "ok": false, "err": "rate limit exceeded" })
-                    .to_string()
-                    .into_bytes();
-                // KEX seal site: PQ sessions bind header+digest AAD, classical None.
-                let r_ts = now_ms();
-                let pq_digest = node
-                    .pq_digests
-                    .read()
-                    .await
-                    .get(&conn.stable_id())
-                    .copied()
-                    .ok_or_else(|| anyhow!("no pq session digest"))?;
-                let (ct, nonce) = frame_seal_body(
-                    &key,
-                    &pq_digest,
-                    proto::kind::RESP,
-                    f.seq,
-                    r_ts,
-                    &node.id,
-                    &f.src,
-                    f.svc,
-                    &resp,
-                );
-                let mut r = Frame {
-                    kind: proto::kind::RESP,
-                    seq: f.seq,
-                    ts: r_ts,
-                    src: node.id,
-                    dst: f.src,
-                    svc: f.svc,
-                    payload: ct,
-                    nonce,
-                    sig: Vec::new(),
-                };
-                node.sign_frame(&mut r);
-                send.write_all(&r.encode()).await?;
-                let _ = send.finish();
-                report_stages(&f, t_proc.elapsed());
-                return Ok(None);
-            }
-            // KEX open site: every session is PQ; the AAD-bound tag is
-            // required and a failure drops the frame fail-closed.
-            let pq_digest = node
-                .pq_digests
-                .read()
-                .await
-                .get(&conn.stable_id())
-                .copied()
-                .ok_or_else(|| anyhow!("no pq session digest"))?;
-            let plain = match frame_open_body(&key, &pq_digest, &f) {
+            let plain = match frame_open_body(&skeys.key, &skeys.pq_digest, &f) {
                 Ok(p) => p,
                 Err(e) => {
                     node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
-                    // F8-rep: undecryptable frame from the proven identity.
                     node.rep_record_protocol_violation(&pid).await;
                     return Err(e);
                 }
             };
             // F8-rep: valid, authentic message from the proven identity.
             node.rep_record_valid(&pid).await;
-            // ACL применяется КО ВСЕМУ (включая pubsub/dht), иначе TOFU-нода
-            // могла бы публиковать/подписываться в обход ограничений.
-            let svc_name = proto::svc_name(f.svc).unwrap_or("?").to_string();
+            let svc_name = proto::svc_name(f.svc).unwrap_or("?");
             node.metrics.reqs_total.fetch_add(1, Ordering::Relaxed);
+            node.svc_counters.inc(f.svc);
             {
-                let mut m = node.svc_counters.lock().unwrap_or_else(|e| e.into_inner());
-                *m.entry(svc_name.clone()).or_insert(0) += 1;
-            }
-            // heartbeat: любой успешный запрос от пира обновляет last_seen —
-            // rewards использует его как признак живости (важно для NAT-пиров,
-            // которые сами инициируют соединение и шлют dht.update/core.ping).
-            {
-                *peer.last_seen.lock().await = now_ms();
-                // R12: раньше КАЖДЫЙ запрос брал write-lock на всю карту и при
-                // размере >2000 делал тут же O(2000) retain — чистая работа на
-                // каждом входящем REQ. Теперь read-first: если отметка пира
-                // свежее 1с, write-lock не берётся вовсе; вытеснение тоже
-                // происходит только на записи (retention 24ч, а единственный
-                // потребитель — rewards — читает с трёхминутным окном).
+                peer.last_seen.store(now_ms(), Ordering::Relaxed);
                 let now = now_ms();
                 let fresh = {
                     let m = node.last_req_from_peer.read().await;
@@ -9136,9 +9537,7 @@ async fn handle_stream(
                 };
                 if !fresh {
                     let mut m = node.last_req_from_peer.write().await;
-                    if m.get(&pid).map(|ts| now - *ts < 1_000).unwrap_or(false) {
-                        // свежая запись появилась, пока мы ждали write-lock
-                    } else {
+                    if !m.get(&pid).map(|ts| now - *ts < 1_000).unwrap_or(false) {
                         if m.len() > 2000 {
                             let cutoff = now - 24 * 3600 * 1000;
                             m.retain(|_, ts| *ts > cutoff);
@@ -9147,12 +9546,18 @@ async fn handle_stream(
                     }
                 }
             }
-            let resp: Vec<u8> = if !crate::services::is_allowed(&peer.cfg.allow, &svc_name) {
+            let resp: Vec<u8> = if !crate::services::is_allowed(&peer.cfg.allow, svc_name) {
                 node.metrics.reqs_denied.fetch_add(1, Ordering::Relaxed);
-                tlog(
-                    "req_denied",
-                    json!({ "svc": svc_name, "from": hex::encode(pid) }),
-                );
+                if crate::log::enabled(2) {
+                    crate::log::emit(
+                        2,
+                        "info",
+                        &node.cfg.name,
+                        trace,
+                        "req_denied",
+                        json!({ "svc": svc_name, "from": hex::encode(pid) }),
+                    );
+                }
                 json!({"ok": false, "err": "denied by ACL"})
                     .to_string()
                     .into_bytes()
@@ -9172,10 +9577,16 @@ async fn handle_stream(
                     Ok(v) => v,
                     Err(e) => {
                         node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
-                        terr(
-                            "req_error",
-                            json!({ "svc": svc_name, "err": format!("{e}") }),
-                        );
+                        if crate::log::enabled(0) {
+                            crate::log::emit(
+                                0,
+                                "error",
+                                &node.cfg.name,
+                                trace,
+                                "req_error",
+                                json!({ "svc": svc_name, "err": format!("{e}") }),
+                            );
+                        }
                         json!({"ok": false, "err": format!("{e}")})
                             .to_string()
                             .into_bytes()
@@ -9187,22 +9598,20 @@ async fn handle_stream(
                     .to_string()
                     .into_bytes()
             };
-            tlog(
-                "req",
-                json!({ "svc": svc_name, "from": hex::encode(pid), "ok": !resp.starts_with(b"{\"ok\":false") }),
-            );
-            // KEX seal site: PQ sessions bind header+digest AAD, classical None.
+            if crate::log::enabled(2) {
+                crate::log::emit(
+                    2,
+                    "info",
+                    &node.cfg.name,
+                    trace,
+                    "req",
+                    json!({ "svc": svc_name, "from": hex::encode(pid), "ok": !resp.starts_with(b"{\"ok\":false") }),
+                );
+            }
             let r_ts = now_ms();
-            let pq_digest = node
-                .pq_digests
-                .read()
-                .await
-                .get(&conn.stable_id())
-                .copied()
-                .ok_or_else(|| anyhow!("no pq session digest"))?;
             let (ct, nonce) = frame_seal_body(
-                &key,
-                &pq_digest,
+                &skeys.key,
+                &skeys.pq_digest,
                 proto::kind::RESP,
                 f.seq,
                 r_ts,
@@ -9223,7 +9632,8 @@ async fn handle_stream(
                 sig: Vec::new(),
             };
             node.sign_frame(&mut r);
-            send.write_all(&r.encode()).await?;
+            let wire = r.try_encode()?;
+            send.write_all(&wire).await?;
             let _ = send.finish();
             report_stages(&f, t_proc.elapsed());
             Ok(None)
@@ -10589,13 +10999,12 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
     })
 }
 
-/// Текущий сессионный ключ соединения (stable_id).
-async fn session_key_of(node: &Node, conn: &Connection) -> Option<[u8; 32]> {
+async fn session_key_of(node: &Node, conn: &Connection) -> Option<SessionKeys> {
     node.sessions.read().await.get(&conn.stable_id()).copied()
 }
 
 /// Ожидание появления сессионного ключа с микроопросом (до max_wait_ms).
-async fn wait_session_key(node: &Node, conn: &Connection, max_wait_ms: u64) -> Option<[u8; 32]> {
+async fn wait_session_key(node: &Node, conn: &Connection, max_wait_ms: u64) -> Option<SessionKeys> {
     if let Some(key) = session_key_of(node, conn).await {
         return Some(key);
     }
@@ -11631,6 +12040,7 @@ mod disk_growth_tests {
                     origin: node.id,
                     ttl_ms: 30 * 24 * 3600 * 1000,
                     stored_at: crate::dht::now_ms() - 2 * crate::dht::DEDUP_TTL_MS,
+                    last_republished_ms: 0,
                 },
             );
         }
@@ -12721,5 +13131,116 @@ mod sealed_manifest_store_tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&attacker_tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_sync_enforces_h2_sealed_manifest_validation() {
+        let (node, tmp) = make_node().await;
+        let owner = crate::mailbox::MailKeys::generate();
+        let attacker = crate::mailbox::MailKeys::generate();
+        let report = node
+            .store_blob_boxed(
+                "files",
+                "syncdoc.bin",
+                b"owner sync bytes",
+                Some(&hex::encode(&owner.kem_ek)),
+                Some(&hex::encode(owner.kem_seed)),
+            )
+            .await;
+        assert!(report.chunks > 0);
+        let mkey = Node::blob_manifest_key("files", "syncdoc.bin");
+        let before = node.get_local_kv(&mkey).await.expect("manifest");
+
+        // Attacker node builds a valid sealed manifest signed by a DIFFERENT owner.
+        let (attacker_node, attacker_tmp) = make_node().await;
+        attacker_node
+            .store_blob_boxed(
+                "files",
+                "syncdoc.bin",
+                b"attacker bytes",
+                Some(&hex::encode(&attacker.kem_ek)),
+                Some(&hex::encode(attacker.kem_seed)),
+            )
+            .await;
+        let forged = attacker_node
+            .get_local_kv(&mkey)
+            .await
+            .expect("attacker manifest");
+
+        // Legacy downgrade manifest.
+        let legacy = json!({
+            "bucket": "files",
+            "name": "syncdoc.bin",
+            "size": 0,
+            "nonce": "00",
+            "chunks": [],
+            "key": "00".repeat(32),
+        })
+        .to_string();
+
+        // Tampered sealed manifest (bad sig).
+        let mut bad_sig: serde_json::Value = serde_json::from_str(&before).unwrap();
+        bad_sig["size"] = json!(999);
+
+        let now = crate::dht::now_ms();
+        let sync_payload = json!({
+            "entries": {
+                mkey.clone(): { "value": forged, "ttl": 3600, "stored_at": now + 10_000 },
+                "files:syncdoc-downgrade": { "value": "x", "ttl": 3600, "stored_at": now + 10_000 },
+                "sealed-owner:files:syncdoc.bin": { "value": "hijack", "ttl": 3600, "stored_at": now + 10_000 },
+                "files:skewed": { "value": "bad", "ttl": 3600, "stored_at": now + 1_000_000 },
+            }
+        });
+        node.apply_sync_entries([0x42u8; NODEID_LEN], &sync_payload)
+            .await;
+
+        assert_eq!(
+            node.get_local_kv(&mkey).await.expect("manifest"),
+            before,
+            "dht.sync must reject wrong-owner sealed manifest"
+        );
+        // Also test legacy downgrade and bad signature directly on mkey.
+        for bad_val in [legacy, bad_sig.to_string()] {
+            let p = json!({
+                "entries": {
+                    mkey.clone(): { "value": bad_val, "ttl": 3600, "stored_at": now + 20_000 }
+                }
+            });
+            node.apply_sync_entries([0x42u8; NODEID_LEN], &p).await;
+            assert_eq!(node.get_local_kv(&mkey).await.expect("manifest"), before);
+        }
+        assert!(node.get_local_kv("files:skewed").await.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&attacker_tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dynamic_peers_bounded_by_max_dynamic_peers() {
+        let (node, tmp) = make_node().await;
+        let pq_hex = PqKeys::generate().pq_pub_hex();
+        for i in 0..(MAX_DYNAMIC_PEERS + 16) {
+            let mut pid = [0u8; NODEID_LEN];
+            pid[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let pcfg = PeerConfig {
+                name: format!("dyn-{i}"),
+                consensus_pub: None,
+                pq_pub: Some(pq_hex.clone()),
+                endpoints: vec!["127.0.0.1:19999".to_string()],
+                allow: vec!["core.ping".to_string()],
+                rate_limit_per_sec: DYNAMIC_PEER_RATE_LIMIT_PER_SEC,
+                role: None,
+                storage_roles: vec![],
+            };
+            node.add_dynamic_peer(pid, pcfg)
+                .await
+                .expect("add_dynamic_peer");
+        }
+        let len = node.peers.read().await.len();
+        assert_eq!(
+            len, MAX_DYNAMIC_PEERS,
+            "dynamic peer table must stay capped"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

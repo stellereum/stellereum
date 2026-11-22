@@ -296,7 +296,15 @@ pub fn verify_falcon_signature_or_test(pubkey: &[u8], message: &[u8], signature:
 /// depend on it.
 pub fn verify_proposer_signature(block: &crate::sharding::Block) -> bool {
     let hash = block.compute_hash();
+    verify_proposer_signature_with_hash(block, &hash)
+}
 
+/// [`verify_proposer_signature`] using a caller-supplied precomputed `hash`
+/// (`block.compute_hash()`), avoiding redundant block hashing on hot paths.
+pub fn verify_proposer_signature_with_hash(
+    block: &crate::sharding::Block,
+    hash: &[u8; 32],
+) -> bool {
     // Height-indexed committed read (rotation-aware): fail-closed when the
     // proposer has no key at this height (unknown validator, pre-activation,
     // or pruned history).
@@ -322,7 +330,7 @@ pub fn verify_proposer_signature(block: &crate::sharding::Block) -> bool {
         if sig_bytes.len() != scheme.signature_size() {
             continue;
         }
-        if crate::post_quantum::verify_pq_signature(scheme, &pk, &hash, sig_bytes) {
+        if crate::post_quantum::verify_pq_signature(scheme, &pk, hash, sig_bytes) {
             return true;
         }
         // A matching slot with a bad signature refuses at once: the Ed
@@ -1276,20 +1284,52 @@ impl Vote {
         // `on_precommit` (which verify once in `VoteSet::add` AND once in
         // `observe_peer_vote`), or re-scanned, so the second and later
         // verifications of identical bytes under an identical key context
-        // are pure CPU with no new information. Consult the cache first
-        // (hit skips crypto); miss runs full verification and records it.
-        // Fail-closed: any key-context drift (below) misses and re-verifies.
-        if let Some(hit) = verified_vote_cached(self) {
+        // are pure CPU with no new information. Resolve the PQ key and build
+        // `VerifiedVoteCacheKey` ONCE so a cache miss never rebuilds the key
+        // or re-queries the PQ registry.
+        let pq_entry = pq_key_at_height(&self.voter, self.height);
+        let key = VerifiedVoteCacheKey {
+            voter: self.voter,
+            height: self.height,
+            round: self.round,
+            kind: match self.kind {
+                VoteKind::Prevote => 0,
+                VoteKind::Precommit => 1,
+            },
+            block_hash: self.block_hash,
+            shard_id: self.shard_id,
+            signature: self.signature.clone(),
+            pq_key: pq_entry
+                .as_ref()
+                .map(|(scheme, pk)| (*scheme as u8, pk.clone())),
+            pure_pq: crate::post_quantum::is_pure_pq_enforced(),
+            chain_id: consensus_chain_id(),
+        };
+        if let Some(hit) = VERIFIED_VOTE_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+        {
             VERIFIED_VOTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return hit;
         }
         VERIFIED_VOTE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-        let verdict = self.verify_uncached();
-        record_verified_vote(self, verdict);
+        let verdict = self.verify_uncached_with_pq_key(pq_entry.as_ref());
+        let mut lock = VERIFIED_VOTE_CACHE
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if lock.len() >= VERIFIED_VOTE_CACHE_CAP {
+            // Fail-safe bound: drop everything and re-record (miss = full
+            // verify). Verdicts are recomputed, never approximated.
+            lock.clear();
+        }
+        lock.insert(key, verdict);
         verdict
     }
 
-    /// Full cryptographic verification, bypassing the verified-vote cache.
+    /// Full cryptographic verification, bypassing the verified-vote cache and
+    /// reusing the already-resolved height-indexed PQ key.
     ///
     /// Single definition of vote validity: [`Vote::verify`] (cached),
     /// [`Vote::partition_valid`] (scalar Falcon per vote) and
@@ -1300,13 +1340,16 @@ impl Vote {
     /// deleted. A vote is valid iff it carries a Falcon half that verifies
     /// under the voter's REGISTERED key AT THE VOTE'S HEIGHT — exactly the
     /// old pure-PQ branch, now height-indexed.
-    ///
-    /// Rotation: `self.height` threads into [`pq_key_at_height`] (the
-    /// committed [`crate::pq_registry::PqRegistry::get_active_key`] read,
-    /// reused not duplicated). After `effective_height` only the new key
-    /// verifies; before it only the old one; a validator with no key at
-    /// this height refuses fail-closed (`None`).
-    fn verify_uncached(&self) -> bool {
+    fn verify_uncached_with_pq_key(
+        &self,
+        pq_entry: Option<&(crate::post_quantum::PqScheme, Vec<u8>)>,
+    ) -> bool {
+        let Some(falcon_sig) = self.falcon_signature() else {
+            return false;
+        };
+        let Some((scheme, pk)) = pq_entry else {
+            return false;
+        };
         let msg = vote_sign_bytes_for_shard(
             self.shard_id,
             self.height,
@@ -1314,14 +1357,7 @@ impl Vote {
             self.kind,
             &self.block_hash,
         );
-
-        // FULL-PQ: Falcon-only. Ed25519 branches deleted (no compat).
-        if let Some(falcon_sig) = self.falcon_signature() {
-            if let Some((scheme, pk)) = pq_key_at_height(&self.voter, self.height) {
-                return crate::post_quantum::verify_pq_signature(scheme, &pk, &msg, falcon_sig);
-            }
-        }
-        false
+        crate::post_quantum::verify_pq_signature(*scheme, pk, &msg, falcon_sig)
     }
 
     /// The bare Ed25519 signature bytes (envelope stripped when present).
@@ -1400,7 +1436,7 @@ impl Vote {
                 .expect("slot present during the signature screen")
                 .verify()
         };
-        if indices.len() < 4 {
+        if indices.len() < 2 {
             indices.iter().map(one).collect()
         } else {
             indices.par_iter().map(one).collect()
@@ -1639,45 +1675,6 @@ pub(super) fn note_validator_set_for_vote_cache(validators: &ValidatorSet) {
     }
 }
 
-fn vote_cache_key(vote: &Vote) -> VerifiedVoteCacheKey {
-    VerifiedVoteCacheKey {
-        voter: vote.voter,
-        height: vote.height,
-        round: vote.round,
-        kind: match vote.kind {
-            VoteKind::Prevote => 0,
-            VoteKind::Precommit => 1,
-        },
-        block_hash: vote.block_hash,
-        shard_id: vote.shard_id,
-        signature: vote.signature.clone(),
-        pq_key: pq_key_at_height(&vote.voter, vote.height).map(|(scheme, pk)| (scheme as u8, pk)),
-        pure_pq: crate::post_quantum::is_pure_pq_enforced(),
-        chain_id: consensus_chain_id(),
-    }
-}
-
-fn verified_vote_cached(vote: &Vote) -> Option<bool> {
-    let key = vote_cache_key(vote);
-    let lock = VERIFIED_VOTE_CACHE
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    lock.get(&key).copied()
-}
-
-fn record_verified_vote(vote: &Vote, verdict: bool) {
-    let key = vote_cache_key(vote);
-    let mut lock = VERIFIED_VOTE_CACHE
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    if lock.len() >= VERIFIED_VOTE_CACHE_CAP {
-        // Fail-safe bound: drop everything and re-record (miss = full
-        // verify). Verdicts are recomputed, never approximated.
-        lock.clear();
-    }
-    lock.insert(key, verdict);
-}
-
 /// Drop every cached vote verdict. Fail-closed: the next ingest of any vote
 /// fully re-verifies. See the trigger list above for when this runs
 /// automatically vs. when out-of-zone callers must invoke it.
@@ -1884,16 +1881,170 @@ impl QuorumCertificate {
         self.verify_and_signed_power_with_schedule(validators, schedule)
     }
 
+    /// Verify the certificate AND return the verified signer set under
+    /// `schedule` in ONE crypto pass, returning `None` when verification fails.
+    ///
+    /// Avoids verifying every Falcon signature twice when a caller needs both
+    /// the quorum verdict and the participating validator set.
+    pub fn verify_and_signers_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> Option<HashSet<ValidatorId>> {
+        let (verified, signers) = self.verify_and_signers_inner(validators, None, schedule);
+        if verified {
+            Some(signers)
+        } else {
+            None
+        }
+    }
+
+    /// Count the PQ signers carried by this certificate (decoding the µQC or
+    /// epoch/CEC envelope rather than returning raw `self.signatures.len()`).
+    pub fn pq_signer_count(&self) -> usize {
+        for (voter, payload) in &self.signatures {
+            if *voter == PQ_QC_MARKER_ID {
+                if let Some(cert) =
+                    decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
+                {
+                    return cert.signed_count();
+                }
+            }
+        }
+        if let Some(cert) = self.pq_micro_certificate() {
+            return cert.signed_count();
+        }
+        self.signatures.len()
+    }
+
+    /// Extract `(validator_id, falcon_signature)` pairs from a PQ certificate
+    /// (`PQ_UQC_MARKER_ID` or `PQ_QC_MARKER_ID`) under `schedule`.
+    pub fn pq_signer_signatures_with_schedule(
+        &self,
+        validators: &ValidatorSet,
+        schedule: CommitteeSchedule,
+    ) -> Vec<(ValidatorId, Vec<u8>)> {
+        if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
+            return Vec::new();
+        }
+        if self.resolve_micro_certificate().is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (voter, payload) in &self.signatures {
+            if *voter == PQ_UQC_MARKER_ID {
+                let Some(cert) = decode_pq_micro_envelope(payload) else {
+                    continue;
+                };
+                if !cert.scheme.is_post_quantum()
+                    || cert.height != self.height
+                    || cert.round != self.round
+                    || cert.committee_size == 0
+                    || cert.committee_size as usize > MAX_COMMIT_CERT_SIGNERS
+                {
+                    continue;
+                }
+                let committee = crate::consensus::committee_for_height(
+                    validators,
+                    cert.height,
+                    cert.round,
+                    cert.committee_size,
+                    Some(&cert.sortition_parent),
+                    schedule,
+                );
+                let expected_len = (cert.committee_size as usize).min(validators.len());
+                if committee.len() != expected_len || committee.is_empty() {
+                    continue;
+                }
+                let signed_count = cert.signed_count();
+                let is_compact = cert.signatures.len() == signed_count;
+                let is_full = cert.signatures.len() == cert.committee_size as usize;
+                if !is_compact && !is_full {
+                    continue;
+                }
+                let mut sig_idx = 0usize;
+                for (i, val_id) in committee.iter().enumerate() {
+                    if cert.is_signer(i) {
+                        let sig = if is_compact {
+                            let s = &cert.signatures[sig_idx];
+                            sig_idx += 1;
+                            s
+                        } else {
+                            &cert.signatures[i]
+                        };
+                        if seen.insert(*val_id) {
+                            out.push((*val_id, sig.clone()));
+                        }
+                    }
+                }
+            } else if *voter == PQ_QC_MARKER_ID {
+                let Some(cert) =
+                    decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
+                else {
+                    continue;
+                };
+                if !cert.scheme.is_post_quantum()
+                    || cert.height != self.height
+                    || cert.round != self.round
+                    || cert.committee_size == 0
+                    || cert.committee_size as usize > MAX_COMMIT_CERT_SIGNERS
+                    || cert.committee_size as usize != validators.len()
+                {
+                    continue;
+                }
+                let mut ids: Vec<ValidatorId> = validators.validators.keys().copied().collect();
+                ids.sort_unstable();
+                let signed_count = cert.signed_count();
+                let is_compact = cert.signatures.len() == signed_count;
+                let is_full = cert.signatures.len() == ids.len();
+                if !is_compact && !is_full {
+                    continue;
+                }
+                let mut sig_idx = 0usize;
+                for (i, val_id) in ids.iter().enumerate() {
+                    if cert.is_signer(i) {
+                        let sig = if is_compact {
+                            let s = &cert.signatures[sig_idx];
+                            sig_idx += 1;
+                            s
+                        } else {
+                            &cert.signatures[i]
+                        };
+                        if seen.insert(*val_id) {
+                            out.push((*val_id, sig.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn verify_and_signed_power_inner(
         &self,
         validators: &ValidatorSet,
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
         schedule: CommitteeSchedule,
     ) -> (bool, u64) {
+        let (verified, signers) = self.verify_and_signers_inner(validators, pq_keys, schedule);
+        let power = signers
+            .iter()
+            .map(|v| validators.power_of(v))
+            .fold(0u64, |a, p| a.saturating_add(p));
+        (verified, power)
+    }
+
+    fn verify_and_signers_inner(
+        &self,
+        validators: &ValidatorSet,
+        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        schedule: CommitteeSchedule,
+    ) -> (bool, HashSet<ValidatorId>) {
         // Same anti-DoS cap as `verify` (and `signers_set`): an over-cap
         // attacker-supplied list decides nothing and attributes nobody.
         if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
-            return (false, 0);
+            return (false, HashSet::new());
         }
         let msg = vote_sign_bytes_for_shard(
             self.shard_id,
@@ -1903,9 +2054,9 @@ impl QuorumCertificate {
             &self.block_hash,
         );
         // Same ambiguity refusal as `verify` (PENTEST F-4). `signers_set`
-        // returns an empty set for the same input, so power is 0.
+        // returns an empty set for the same input, so signers is empty.
         if self.resolve_micro_certificate().is_err() {
-            return (false, 0);
+            return (false, HashSet::new());
         }
         let mut verified = false;
         let mut signers: HashSet<ValidatorId> = HashSet::new();
@@ -1948,11 +2099,7 @@ impl QuorumCertificate {
             // NON-QC entries (classical Ed25519 / unknown markers): `verify`
             // never accepts them and `signers_set` never attributes them.
         }
-        let power = signers
-            .iter()
-            .map(|v| validators.power_of(v))
-            .fold(0u64, |a, p| a.saturating_add(p));
-        (verified, power)
+        (verified, signers)
     }
 
     /// Unified certificate verification supporting:
@@ -2124,21 +2271,15 @@ impl QuorumCertificate {
                 crate::post_quantum::verify_pq_signature(scheme, pubkey, msg, sig)
             }
         }
-        // Serial at or below one chunk (rayon task overhead would dominate —
-        // the never-slower gate); chunked-parallel above, mirroring
-        // `verify_signatures_batch_parallel`.
-        const CHUNK: usize = 8;
-        if staged.len() <= CHUNK {
+        if staged.len() < 2 {
             return staged
                 .iter()
                 .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig));
         }
         use rayon::prelude::*;
-        staged.par_chunks(CHUNK).all(|chunk| {
-            chunk
-                .iter()
-                .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig))
-        })
+        staged
+            .par_iter()
+            .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig))
     }
 
     fn micro_cert_valid_signers_with_beacon(
@@ -3083,5 +3224,127 @@ mod audit_tests {
         let (ok, power) = check(&ambiguous, "ambiguous");
         assert!(!ok);
         assert_eq!(power, 0);
+    }
+
+    #[test]
+    fn verify_and_signers_with_schedule_matches_separate_calls() {
+        use crate::consensus::register_validator_pq_key;
+
+        const H: Height = 88;
+        const R: Round = 3;
+        let block_hash = Some([0x5Au8; 32]);
+        let parent = [0x6Bu8; 32];
+        let mut vs = ValidatorSet::new();
+        let mut keys: Vec<(ValidatorId, FalconKeypair)> = Vec::new();
+        for i in 0..4u8 {
+            let fk = FalconKeypair::generate_from_seed(0xC0 + i);
+            let mut id = [0u8; 32];
+            id[0] = 0xD0 + i;
+            id[1] = 0x7E;
+            vs.add(id, 10);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            keys.push((id, fk));
+        }
+        let msg = vote_sign_bytes(H, R, VoteKind::Precommit, &block_hash);
+        let csize = micro_committee_size(vs.len());
+        let schedule = CommitteeSchedule::ParentHash;
+        let committee =
+            crate::consensus::committee_for_height(&vs, H, R, csize, Some(&parent), schedule);
+        let key_of = |id: &ValidatorId| -> &FalconKeypair {
+            &keys
+                .iter()
+                .find(|(k, _)| k == id)
+                .expect("committee member has a key")
+                .1
+        };
+        let full_bitmask = {
+            let mut b = vec![0u8; (csize as usize).div_ceil(8)];
+            for i in 0..committee.len() {
+                b[i / 8] |= 1 << (i % 8);
+            }
+            b
+        };
+        let full_sigs: Vec<Vec<u8>> = committee.iter().map(|id| key_of(id).sign(&msg)).collect();
+        let cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            H,
+            R,
+            csize,
+            full_bitmask,
+            full_sigs.clone(),
+            parent,
+        );
+        let valid_qc = QuorumCertificate {
+            shard_id: 0,
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&cert))],
+        };
+
+        let check = |qc: &QuorumCertificate, label: &str| {
+            let expected = if qc.verify_with_schedule(&vs, schedule) {
+                Some(qc.signers_set_with_schedule(&vs, schedule))
+            } else {
+                None
+            };
+            let got = qc.verify_and_signers_with_schedule(&vs, schedule);
+            assert_eq!(
+                got, expected,
+                "{label}: fused signers must match separate calls"
+            );
+        };
+
+        check(&valid_qc, "valid 4/4");
+        assert_eq!(
+            valid_qc
+                .verify_and_signers_with_schedule(&vs, schedule)
+                .map(|s| s.len()),
+            Some(4)
+        );
+
+        // Sub-quorum (1/4) fails verification -> None.
+        let one_cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            H,
+            R,
+            csize,
+            vec![0x01u8],
+            vec![full_sigs[0].clone()],
+            parent,
+        );
+        let sub_qc = QuorumCertificate {
+            shard_id: 0,
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&one_cert))],
+        };
+        check(&sub_qc, "sub-quorum 1/4");
+        assert!(sub_qc
+            .verify_and_signers_with_schedule(&vs, schedule)
+            .is_none());
+
+        // Forged / tampered signature -> None.
+        let mut forged_cert = cert;
+        forged_cert.signatures[1][0] ^= 0xFF;
+        let forged_qc = QuorumCertificate {
+            shard_id: 0,
+            height: H,
+            round: R,
+            kind: VoteKind::Precommit,
+            block_hash,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&forged_cert))],
+        };
+        check(&forged_qc, "forged signature");
+        assert!(forged_qc
+            .verify_and_signers_with_schedule(&vs, schedule)
+            .is_none());
     }
 }

@@ -679,6 +679,33 @@ pub fn catchup_pass_budget_ms(base_ms: u64, gap: u64) -> u64 {
     base_ms.max(gap_budget)
 }
 
+/// Live-adopt catch-up deferral gate: defer ONLY at round 0 when live-adopt is
+/// fresh (`live_adopt_fresh == true`), no verified evidence shows a gap `>= 2`
+/// (`hint_gap.max(peer_named_gap) < 2`), and live traffic or fresh adopts are
+/// active. Whenever verified evidence (`peer_hint` or `peer_named_height`) shows
+/// a gap `>= 2` (or a `Committed` at `> our_tip + 1` just triggered catch-up),
+/// catch-up runs immediately without waiting out `LIVE_ADOPT_FRESH_MS`.
+pub fn should_defer_live_catchup(
+    round: u32,
+    hint_gap: u64,
+    peer_named_gap: u64,
+    live_traffic_pending: bool,
+    live_adopt_fresh: bool,
+) -> bool {
+    if round > 0 || !live_adopt_fresh {
+        return false;
+    }
+    let verified_gap = hint_gap.max(peer_named_gap);
+    if verified_gap >= 2 {
+        return false;
+    }
+    stellereum::sync::should_defer_catchup_for_live_flow(
+        verified_gap,
+        live_traffic_pending,
+        live_adopt_fresh,
+    )
+}
+
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1418,4 +1445,33 @@ pub(crate) const HEAL_MAX_ATTEMPTS: u32 = 3;
 /// healing (`S == F`), and votes from stale state while reporting healthy).
 pub(crate) fn heal_failure_should_exit(attempt: u32) -> bool {
     attempt >= HEAL_MAX_ATTEMPTS
+}
+
+#[cfg(test)]
+mod live_catchup_defer_tests {
+    use super::*;
+
+    #[test]
+    fn never_defers_when_verified_gap_is_two_or_more() {
+        // 0 or 1 block gap at round 0 with fresh live adopt defers.
+        assert!(should_defer_live_catchup(0, 0, 0, false, true));
+        assert!(should_defer_live_catchup(0, 1, 0, true, true));
+        assert!(should_defer_live_catchup(0, 0, 1, false, true));
+
+        // Any verified gap >= 2 (via peer_hint OR peer_named_height) NEVER defers.
+        for g in [2u64, 3, 16, 17, 100] {
+            assert!(
+                !should_defer_live_catchup(0, g, 0, true, true),
+                "hint_gap={g} must not defer"
+            );
+            assert!(
+                !should_defer_live_catchup(0, 0, g, true, true),
+                "peer_named_gap={g} must not defer"
+            );
+        }
+
+        // Round > 0 or stale live adopt never defers.
+        assert!(!should_defer_live_catchup(1, 0, 0, true, true));
+        assert!(!should_defer_live_catchup(0, 1, 0, true, false));
+    }
 }

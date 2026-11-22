@@ -232,9 +232,9 @@ fn history_role_matches(
 ) -> bool {
     use crate::storage::HistoryRole;
     match role {
-        HistoryRole::All => true,
-        HistoryRole::Sender => meta.map(|m| m.from == *addr).unwrap_or(false),
-        HistoryRole::Recipient => meta.map(|m| m.to == *addr).unwrap_or(false),
+        HistoryRole::All => meta.is_some_and(|m| m.from == *addr || m.to == *addr),
+        HistoryRole::Sender => meta.is_some_and(|m| m.from == *addr),
+        HistoryRole::Recipient => meta.is_some_and(|m| m.to == *addr),
     }
 }
 
@@ -1588,6 +1588,18 @@ pub(super) async fn dispatch_reads(
             };
             let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
             let want = tag.resolve(tip);
+            // Finalized-read cache FIRST: receipts for a finalized height are
+            // filed once (before the height publishes — see `record_*`
+            // ordering) and any late filing evicts via
+            // `record_receipts_with_events`. Only non-empty answers are cached,
+            // and errors bypass.
+            if want <= tip {
+                if let Some(hit) =
+                    finalized_read_cache_get("stell_getBlockTransactions", want, params, tip)
+                {
+                    return ok(id, hit);
+                }
+            }
             // Known height = in the recent window (committed locally or adopted).
             let known_mem = st
                 .recent_blocks
@@ -1604,23 +1616,8 @@ pub(super) async fn dispatch_reads(
             if !known {
                 return err(id, -32004, "block transactions not available yet (height not adopted/replicated on this node)");
             }
-            // Finalized-read cache: receipts for a finalized height are filed
-            // once (before the height publishes — see `record_*` ordering) and
-            // any late filing evicts via `record_receipts_with_events`. Only
-            // non-empty answers are cached: a cached empty list could freeze
-            // the window between "height known" and "receipts filed" (a late
-            // adopted body only ever ADDS receipts). Errors bypass.
-            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-            if want <= tip {
-                if let Some(hit) =
-                    finalized_read_cache_get("stell_getBlockTransactions", want, params, tip)
-                {
-                    return ok(id, hit);
-                }
-            }
             let idx = st.receipts.read().await;
-            let mut rows: Vec<&TxReceipt> = idx.map.values().filter(|r| r.height == want).collect();
-            rows.sort_by_key(|r| r.index);
+            let rows = idx.for_height(want);
             let list: Vec<Value> = rows
                 .iter()
                 .map(|r| {
@@ -2708,35 +2705,56 @@ pub(super) async fn dispatch_reads(
                     Err(e) => return err(id, -32000, format!("address history read failed: {e}")),
                 }
             }
-            // Fresh in-memory window: receipts filed since the last durable
-            // flush (or on a node with no archive store attached at all).
-            let fresh: Vec<TxReceipt> = {
-                let idx = st.receipts.read().await;
-                idx.map
-                    .values()
-                    .filter(|r| r.height >= from_height && r.height <= to_height)
-                    .take(STORAGE_SCAN_HARD_CAP)
-                    .cloned()
-                    .collect()
-            };
-            for r in fresh {
-                scanned += 1;
-                if r.height < from_height || r.height > to_height {
-                    continue;
+            // Fresh in-memory window: walk heights tip-first via `by_height`
+            // without cloning receipts, checking height range, cursor, and
+            // presence of `raw_tx` before decoding.
+            {
+                let mut seen: std::collections::HashSet<[u8; 32]> =
+                    items.iter().map(|it| it.tx_hash).collect();
+                let effective_to = match cursor {
+                    Some(c) => to_height.min(c.height),
+                    None => to_height,
+                };
+                if from_height <= effective_to {
+                    let idx = st.receipts.read().await;
+                    'heights: for (&_h, hashes) in
+                        idx.by_height.range(from_height..=effective_to).rev()
+                    {
+                        let mut row_refs: Vec<&TxReceipt> =
+                            hashes.iter().filter_map(|h| idx.map.get(h)).collect();
+                        row_refs.sort_unstable_by_key(|r| std::cmp::Reverse(r.index));
+                        for r in row_refs {
+                            if r.height < from_height || r.height > to_height {
+                                continue;
+                            }
+                            if !older_than_history(cursor, r.height, r.index) {
+                                continue;
+                            }
+                            if scanned >= STORAGE_SCAN_HARD_CAP {
+                                scan_truncated = true;
+                                break 'heights;
+                            }
+                            scanned += 1;
+                            if seen.contains(&r.tx_hash) {
+                                continue;
+                            }
+                            if r.raw_tx.is_none() {
+                                continue;
+                            }
+                            let meta = receipt_history_meta(r);
+                            if !history_role_matches(role, &address, meta.as_ref()) {
+                                continue;
+                            }
+                            seen.insert(r.tx_hash);
+                            items.push(crate::storage::AddressHistoryItem {
+                                tx_hash: r.tx_hash,
+                                height: r.height,
+                                tx_index: r.index,
+                                meta,
+                            });
+                        }
+                    }
                 }
-                if !older_than_history(cursor, r.height, r.index) {
-                    continue;
-                }
-                let meta = receipt_history_meta(&r);
-                if !history_role_matches(role, &address, meta.as_ref()) {
-                    continue;
-                }
-                items.push(crate::storage::AddressHistoryItem {
-                    tx_hash: r.tx_hash,
-                    height: r.height,
-                    tx_index: r.index,
-                    meta,
-                });
             }
             items.sort_by_key(|item| {
                 (
@@ -2831,9 +2849,9 @@ pub(super) async fn dispatch_reads(
             let include_zero = bool_param(p, "include_zero", false);
 
             let mut entries: Vec<(Value, String)> = Vec::new();
-            let mut has_more: bool;
-            let mut scanned: usize;
-            let mut scan_truncated: bool;
+            let has_more: bool;
+            let scanned: usize;
+            let scan_truncated: bool;
             let next_in: Option<String>;
 
             if program == "token" {
@@ -3087,31 +3105,14 @@ pub(super) async fn dispatch_reads(
                         "refusing an unfiltered system dump: pass `owner`, `min_balance` > 0, or an explicit `cursor`",
                     );
                 }
-                has_more = false;
-                scanned = 0;
-                scan_truncated = false;
-                let snapshot = st.engine.capture_state_snapshot().await;
-                let mut last_scanned: Option<String> = None;
-                for account in snapshot.accounts {
-                    if scanned >= MAX_PROGRAM_ACCOUNTS_SCAN {
-                        scan_truncated = true;
-                        break;
-                    }
-                    scanned += 1;
-                    last_scanned = Some(hex::encode(account.address));
-                    if cursor.map(|c| account.address <= c).unwrap_or(false) {
-                        continue;
-                    }
-                    if owner.is_some_and(|owner| account.address != owner) {
-                        continue;
-                    }
-                    if account.balance < min_balance {
-                        continue;
-                    }
-                    if entries.len() >= limit {
-                        has_more = true;
-                        break;
-                    }
+                let (accounts, page_next_cursor, page_has_more, page_scanned, page_truncated) = st
+                    .engine
+                    .accounts_page(owner, min_balance, cursor, limit, MAX_PROGRAM_ACCOUNTS_SCAN)
+                    .await;
+                scanned = page_scanned;
+                scan_truncated = page_truncated;
+                has_more = page_has_more;
+                for account in accounts {
                     let mut item = json!({
                         "program": "system",
                         "address": hex::encode(account.address),
@@ -3129,11 +3130,11 @@ pub(super) async fn dispatch_reads(
                     }
                     entries.push((item, hex::encode(account.address)));
                 }
-                if scan_truncated {
-                    has_more = true;
-                }
                 next_in = if has_more {
-                    entries.last().map(|(_, c)| c.clone()).or(last_scanned)
+                    entries
+                        .last()
+                        .map(|(_, c)| c.clone())
+                        .or_else(|| page_next_cursor.map(hex::encode))
                 } else {
                     None
                 };
@@ -3585,17 +3586,14 @@ pub(super) async fn dispatch_reads(
             {
                 return err(id, -32001, "unauthorized: missing or invalid API token");
             }
-            let list: Vec<Value> = st
-                .mempool
-                .read()
-                .await
-                .all()
+            let summaries = st.mempool.read().await.summaries();
+            let list: Vec<Value> = summaries
                 .iter()
-                .map(|t| {
+                .map(|(sender, nonce, hash)| {
                     json!({
-                        "sender": hex::encode(&t.from[..6]),
-                        "nonce": t.nonce,
-                        "hash": hex::encode(&t.compute_tx_hash()[..6]),
+                        "sender": hex::encode(&sender[..6]),
+                        "nonce": nonce,
+                        "hash": hex::encode(&hash[..6]),
                     })
                 })
                 .collect();

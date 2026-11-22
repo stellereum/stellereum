@@ -184,36 +184,34 @@ pub async fn integrity_pass(node: &Arc<Node>, data_dir: &Path) -> Value {
     let mut missing_local = 0u64;
     let mut hash_mismatch = 0u64;
 
-    for prefix in ["m:", "f:"] {
-        let keys = node.kv_manifest_keys(prefix).await;
-        for k in keys {
-            total_mfs += 1;
-            let Some(raw) = node.get_local_kv(&k).await else {
+    let keys = node.kv_manifest_keys_with_prefixes(&["m:", "f:"]).await;
+    for k in keys {
+        total_mfs += 1;
+        let Some(raw) = node.get_local_kv(&k).await else {
+            continue;
+        };
+        let Ok(mf) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let bucket = mf["bucket"].as_str().unwrap_or("files");
+        let Some(chunks) = mf["chunks"].as_array() else {
+            continue;
+        };
+        for c in chunks {
+            total_chunks += 1;
+            let Some(cid) = c["id"].as_str() else {
                 continue;
             };
-            let Ok(mf) = serde_json::from_str::<Value>(&raw) else {
+            let expected = c["hash"].as_str();
+            let Some(data) = read_local_chunk(data_dir, bucket, cid) else {
+                missing_local += 1;
                 continue;
             };
-            let bucket = mf["bucket"].as_str().unwrap_or("files");
-            let Some(chunks) = mf["chunks"].as_array() else {
-                continue;
-            };
-            for c in chunks {
-                total_chunks += 1;
-                let Some(cid) = c["id"].as_str() else {
-                    continue;
-                };
-                let expected = c["hash"].as_str();
-                let Some(data) = read_local_chunk(data_dir, bucket, cid) else {
-                    missing_local += 1;
-                    continue;
-                };
-                checked += 1;
-                if let Some(exp) = expected {
-                    let actual = hex::encode(blake3::hash(&data).as_bytes());
-                    if !actual.eq_ignore_ascii_case(exp) {
-                        hash_mismatch += 1;
-                    }
+            checked += 1;
+            if let Some(exp) = expected {
+                let actual = hex::encode(blake3::hash(&data).as_bytes());
+                if !actual.eq_ignore_ascii_case(exp) {
+                    hash_mismatch += 1;
                 }
             }
         }

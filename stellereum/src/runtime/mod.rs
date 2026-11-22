@@ -5,7 +5,10 @@
 //! the rest of the node. The P2P transport that carries proposals/votes between
 //! real nodes is layered on top of this (next stage).
 
-use crate::consensus::{FalconKeypair, Height, HeightConsensus, Round, ValidatorId, ValidatorSet};
+use crate::consensus::{
+    CommitteeSchedule, FalconKeypair, Height, HeightConsensus, Round, ValidatorId, ValidatorSet,
+    VoteSet,
+};
 use crate::mempool::Mempool;
 use crate::sharding::{
     Block, CrossShardKey, MasterStakingLedger, ShardId, ShardRegistry, Transaction,
@@ -308,6 +311,22 @@ pub const DKG_REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// The runtime MIN+buffer floor applies to NEW stakes, not to founding.
 pub const GENESIS_VALIDATOR_BOND: u64 = crate::staking::MIN_VALIDATOR_BOND;
 
+/// Retained precommit votes for the already-decided parent height (`H-1`),
+/// enabling late-arriving valid precommits from slower validators to enrich
+/// `Block.last_qc` during `apply_in_flight` or after advancing to `H`.
+#[derive(Clone, Debug)]
+pub struct DecidedParentVotes {
+    pub height: Height,
+    pub round: Round,
+    pub block_hash: BlockHash,
+    pub shard_id: ShardId,
+    pub validators: ValidatorSet,
+    pub parent_hash: Option<[u8; 32]>,
+    pub schedule: CommitteeSchedule,
+    pub votes: VoteSet,
+    pub decision_block_hash: BlockHash,
+}
+
 pub struct ValidatorRuntime {
     pub key: SigningKey,
     /// Optional out-of-process signer (HSM / KMS / remote service). When present it
@@ -398,6 +417,10 @@ pub struct ValidatorRuntime {
     /// `hc`. The main loop consumes it for the commit broadcast that lets
     /// lagging peers catch up in place.
     pub last_decision: Option<(Height, Block, crate::consensus::QuorumCertificate)>,
+    /// Retained precommits for the last decided parent block (`H-1`) so late
+    /// 4th/N-th precommits can enrich `Block.last_qc` without mutating `hc` or
+    /// `SafetyAuthority`.
+    pub decided_parent_votes: Option<DecidedParentVotes>,
     /// DOWNTIME-RESTORE fail-closed gate: `true` when boot could not rebuild
     /// the finalized parent's decision QC from locally verifiable persisted
     /// data. `propose` refuses to build while set, so the node never emits a

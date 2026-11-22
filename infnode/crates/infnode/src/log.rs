@@ -13,7 +13,6 @@
 //!   * порядок строк сохраняется (FIFO-канал + ровно один писатель), а `ts`
 //!     берётся в момент EMIT, а не в момент записи — запись может запаздывать.
 
-use serde_json::json;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -51,7 +50,7 @@ fn queue() -> &'static SyncSender<String> {
         let spawned = std::thread::Builder::new()
             .name("infnode-log".into())
             .spawn(move || {
-                while let Ok(line) = rx.recv() {
+                while let Ok(first) = rx.recv() {
                     // Тестовый кран: не разбирать очередь, пока HOLD не снят.
                     // (Проверяется на каждой итерации, чтобы после снятия
                     // крана очередь сразу пошла вниз.)
@@ -59,16 +58,36 @@ fn queue() -> &'static SyncSender<String> {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     if DISCARD.load(Ordering::Acquire) {
-                        PROCESSED.fetch_add(1, Ordering::Relaxed);
+                        let mut count = 1u64;
+                        for _ in rx.try_iter() {
+                            count += 1;
+                            if !DISCARD.load(Ordering::Acquire) || HOLD.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        PROCESSED.fetch_add(count, Ordering::Relaxed);
                         continue;
                     }
                     let t0 = Instant::now();
-                    // stderr блокируется на межпоточный мьютекс ВНУТРИ вызова,
-                    // поэтому lock не держим между строками — иначе чужой
-                    // eprintln! в другом потоке завис бы навсегда.
-                    let _ = writeln!(std::io::stderr().lock(), "{line}");
+                    let mut count = 0u64;
+                    {
+                        // stderr блокируется на межпоточный мьютекс только на время
+                        // одного батча (до 256 строк) с BufWriter и одним flush.
+                        let stderr = std::io::stderr();
+                        let mut out = std::io::BufWriter::new(stderr.lock());
+                        let _ = writeln!(out, "{first}");
+                        count += 1;
+                        for line in rx.try_iter().take(255) {
+                            let _ = writeln!(out, "{line}");
+                            count += 1;
+                            if DISCARD.load(Ordering::Acquire) || HOLD.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        let _ = out.flush();
+                    }
                     LOG_WRITE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROCESSED.fetch_add(1, Ordering::Relaxed);
+                    PROCESSED.fetch_add(count, Ordering::Relaxed);
                 }
             });
         spawned.expect("spawn infnode-log writer thread");
@@ -80,6 +99,57 @@ pub fn set_level(l: u8) {
     LEVEL.store(l, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn enabled(level: u8) -> bool {
+    level <= LEVEL.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[derive(serde::Serialize)]
+struct LogLineEmpty<'a> {
+    ts: f64,
+    level: &'a str,
+    event: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    node: &'a str,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    trace: u64,
+}
+
+fn send_line(line: String) {
+    // Никакого блокирующего write(2) здесь: только try_send. Переполнение —
+    // это DROP со счётчиком, а не ожидание (R1).
+    match queue().try_send(line) {
+        Ok(()) => {}
+        Err(_) => {
+            LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn emit_empty(level: u8, level_s: &str, node: &str, trace: u64, event: &str) {
+    if !enabled(level) {
+        return;
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if let Ok(line) = serde_json::to_string(&LogLineEmpty {
+        ts,
+        level: level_s,
+        event,
+        node,
+        trace,
+    }) {
+        send_line(line);
+    }
+}
+
 pub fn emit(
     level: u8,
     level_s: &str,
@@ -88,7 +158,7 @@ pub fn emit(
     event: &str,
     fields: serde_json::Value,
 ) {
-    if level > LEVEL.load(Ordering::Relaxed) {
+    if !enabled(level) {
         return;
     }
     // ts берётся ЗДЕСЬ, в момент emit: писательский поток запаздывает и не
@@ -97,52 +167,97 @@ pub fn emit(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let mut line = json!({
-        "ts": ts,
-        "level": level_s,
-        "event": event,
-    });
-    if !node.is_empty() {
-        line["node"] = json!(node);
-    }
-    if trace != 0 {
-        line["trace"] = json!(trace);
-    }
-    if let Some(obj) = fields.as_object() {
-        for (k, v) in obj {
-            line[k] = v.clone();
+    let line = match fields {
+        serde_json::Value::Object(mut map) => {
+            if map.is_empty() {
+                serde_json::to_string(&LogLineEmpty {
+                    ts,
+                    level: level_s,
+                    event,
+                    node,
+                    trace,
+                })
+            } else {
+                map.insert("ts".to_string(), serde_json::json!(ts));
+                map.insert(
+                    "level".to_string(),
+                    serde_json::Value::String(level_s.to_string()),
+                );
+                map.insert(
+                    "event".to_string(),
+                    serde_json::Value::String(event.to_string()),
+                );
+                if !node.is_empty() {
+                    map.insert(
+                        "node".to_string(),
+                        serde_json::Value::String(node.to_string()),
+                    );
+                }
+                if trace != 0 {
+                    map.insert("trace".to_string(), serde_json::json!(trace));
+                }
+                serde_json::to_string(&map)
+            }
         }
-    }
-    // Никакого блокирующего write(2) здесь: только try_send. Переполнение —
-    // это DROP со счётчиком, а не ожидание (R1).
-    match queue().try_send(line.to_string()) {
-        Ok(()) => {}
-        Err(_) => {
-            LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
-        }
+        _ => serde_json::to_string(&LogLineEmpty {
+            ts,
+            level: level_s,
+            event,
+            node,
+            trace,
+        }),
+    };
+    if let Ok(s) = line {
+        send_line(s);
     }
 }
 
 #[macro_export]
 macro_rules! tlog {
-    ($node:expr, $trace:expr, $event:expr) => {
-        $crate::log::emit(2, "info", $node, $trace, $event, serde_json::json!({}))
-    };
-    ($node:expr, $trace:expr, $event:expr, $($k:ident = $v:expr),*) => {
-        $crate::log::emit(2, "info", $node, $trace, $event, serde_json::json!({ $(stringify!($k): $v),* }))
-    };
+    ($node:expr, $trace:expr, $event:expr) => {{
+        if $crate::log::enabled(2) {
+            $crate::log::emit_empty(2, "info", $node, $trace, $event);
+        }
+    }};
+    ($node:expr, $trace:expr, $event:expr, $($k:ident = $v:expr),* $(,)?) => {{
+        if $crate::log::enabled(2) {
+            $crate::log::emit(
+                2,
+                "info",
+                $node,
+                $trace,
+                $event,
+                serde_json::json!({ $(stringify!($k): $v),* }),
+            );
+        }
+    }};
 }
 
 #[macro_export]
 macro_rules! terr {
-    ($node:expr, $trace:expr, $event:expr, $($k:ident = $v:expr),*) => {
-        $crate::log::emit(0, "error", $node, $trace, $event, serde_json::json!({ $(stringify!($k): $v),* }))
-    };
+    ($node:expr, $trace:expr, $event:expr) => {{
+        if $crate::log::enabled(0) {
+            $crate::log::emit_empty(0, "error", $node, $trace, $event);
+        }
+    }};
+    ($node:expr, $trace:expr, $event:expr, $($k:ident = $v:expr),* $(,)?) => {{
+        if $crate::log::enabled(0) {
+            $crate::log::emit(
+                0,
+                "error",
+                $node,
+                $trace,
+                $event,
+                serde_json::json!({ $(stringify!($k): $v),* }),
+            );
+        }
+    }};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn wait_until(mut cond: impl FnMut() -> bool, ms: u64) -> bool {
         let deadline = Instant::now() + std::time::Duration::from_millis(ms);

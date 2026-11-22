@@ -243,7 +243,8 @@ fn gate_block(height: u64, prev: [u8; 32], ts: u64, proposer: [u8; 32]) -> Block
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    }}
+    }
+}
 
 #[tokio::test]
 async fn p3_timestamp_gate_monotone_and_bounded() {
@@ -1340,8 +1341,9 @@ async fn reorg_restores_state_and_applies_new_chain() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        blk.sign_block(sk);
+            round: 0,
+        };
+        blk.sign_block(sk);
         blk
     };
 
@@ -1426,8 +1428,9 @@ async fn the_state_reorg_reports_the_rolled_back_blocks() {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             cnvrf_v3: None,
-                round: 0,
-        };        blk.sign_block(&user);
+            round: 0,
+        };
+        blk.sign_block(&user);
         blk
     };
     let genesis = mk(0, [0u8; 32], 0x00);
@@ -1492,7 +1495,8 @@ fn fork_block(height: u64, prev: [u8; 32], tag: u8, sk: &SigningKey) -> Block {
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
         round: 0,
-    };    b.sign_block(sk);
+    };
+    b.sign_block(sk);
     b
 }
 
@@ -1758,8 +1762,9 @@ async fn replay_verifies_qc_against_the_height_set_not_the_current_set() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    block.sign_block(&historical[0]);
+        round: 0,
+    };
+    block.sign_block(&historical[0]);
     let bh = block.compute_hash();
     // FULL-PQ: the historical certificate is a Falcon µQC compiled from
     // genuine Falcon votes (mirrors `sync::tests::pq_cert_for`); a
@@ -1928,8 +1933,9 @@ async fn parallel_exec_configuration_and_preservation() {
         epoch_key_commitment: [0u8; 32],
         mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         cnvrf_v3: None,
-            round: 0,
-    };    rt.apply_and_advance(blk.compute_hash(), &blk).await;
+        round: 0,
+    };
+    rt.apply_and_advance(blk.compute_hash(), &blk).await;
     assert!(
         rt.state.is_parallel_exec_enabled(),
         "apply_and_advance preserves parallel exec on state"

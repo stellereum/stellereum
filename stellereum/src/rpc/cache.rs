@@ -128,7 +128,7 @@ pub fn finalized_read_cache_get(
     };
     let mut cache = finalized_read_cache()
         .lock()
-        .expect("finalized-read cache lock");
+        .unwrap_or_else(|e| e.into_inner());
     let hit = match cache.map.get(&key) {
         Some(entry) if finalized_read_cache_fresh(entry, tip) => Some(entry.result.clone()),
         _ => None,
@@ -168,7 +168,7 @@ pub fn finalized_read_cache_put(
     };
     let mut cache = finalized_read_cache()
         .lock()
-        .expect("finalized-read cache lock");
+        .unwrap_or_else(|e| e.into_inner());
     if cache.map.len() >= FINALIZED_READ_CACHE_CAP && !cache.map.contains_key(&key) {
         // Fail-closed eviction: expired entries first, else the oldest fill.
         // Only entry DROPS happen here — correctness never depends on them.
@@ -206,9 +206,9 @@ pub fn finalized_read_cache_put(
 /// the `record_*` publish paths only — never from reads, never from the
 /// mempool, never from auth/rate code.
 pub fn finalized_read_cache_evict_height(height: u64) {
-    let Ok(mut cache) = finalized_read_cache().lock() else {
-        return;
-    };
+    let mut cache = finalized_read_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.map.retain(|k, _| k.height != height);
 }
 
@@ -216,9 +216,9 @@ pub fn finalized_read_cache_evict_height(height: u64) {
 /// epoch or supply its boundary commitment. Epoch keys are few; a full-method
 /// drop is cheaper than range tracking and equally fail-closed.
 pub fn finalized_read_cache_evict_epoch_roots() {
-    let Ok(mut cache) = finalized_read_cache().lock() else {
-        return;
-    };
+    let mut cache = finalized_read_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.map.retain(|k, _| k.method != "stell_getEpochRoot");
 }
 
@@ -226,7 +226,7 @@ pub fn finalized_read_cache_evict_epoch_roots() {
 pub fn finalized_read_cache_stats() -> (usize, u64, u64) {
     let cache = finalized_read_cache()
         .lock()
-        .expect("finalized-read cache lock");
+        .unwrap_or_else(|e| e.into_inner());
     (cache.map.len(), cache.hits, cache.misses)
 }
 
@@ -239,9 +239,9 @@ pub fn finalized_read_cache_len() -> usize {
 /// expiry is fail-closed). `#[doc(hidden)]`, used by the cache tests only.
 #[doc(hidden)]
 pub fn finalized_read_cache_expire_all_for_tests() {
-    let Ok(mut cache) = finalized_read_cache().lock() else {
-        return;
-    };
+    let mut cache = finalized_read_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (_, e) in cache.map.iter_mut() {
         e.filled_at = e
             .filled_at
@@ -403,3 +403,34 @@ pub const MAX_PROGRAM_ACCOUNTS_SCAN: usize = 10_000;
 pub const MAX_PROGRAM_ACCOUNTS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum items carrying a proof in one `stell_getProgramAccounts` page.
 pub const MAX_PROGRAM_ACCOUNTS_PROOFS: usize = 16;
+
+/// Default maximum number of concurrent expensive HTTP reads (`is_ws_expensive_method`).
+pub const HTTP_EXPENSIVE_READ_CONCURRENCY_DEFAULT: usize = 32;
+
+fn http_expensive_read_concurrency() -> usize {
+    std::env::var("STELL_HTTP_EXPENSIVE_READ_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HTTP_EXPENSIVE_READ_CONCURRENCY_DEFAULT)
+}
+
+pub(super) fn http_expensive_read_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(http_expensive_read_concurrency()))
+}
+
+/// Acquire an HTTP concurrency permit if `method` is in [`super::is_ws_expensive_method`].
+/// Fails closed with an error message when all concurrent expensive-read slots
+/// are occupied.
+pub(super) fn try_acquire_http_expensive_read(
+    method: &str,
+) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, &'static str> {
+    if !super::is_ws_expensive_method(method) {
+        return Ok(None);
+    }
+    http_expensive_read_semaphore()
+        .try_acquire()
+        .map(Some)
+        .map_err(|_| "expensive-read concurrency budget exhausted (retry shortly)")
+}

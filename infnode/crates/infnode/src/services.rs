@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -33,6 +35,12 @@ pub const SERVICE_NAMES: &[&str] = &[
     "dht.find_node",
     "dht.store",
     "dht.find_value",
+    "dht.sync",
+    "storage.store",
+    "storage.fetch",
+    "storage.delete",
+    "mail.list",
+    "consensus.sign",
     "pubsub.subscribe",
     "pubsub.unsubscribe",
     "pubsub.publish",
@@ -41,28 +49,36 @@ pub const SERVICE_NAMES: &[&str] = &[
 ];
 
 pub fn handler_for(svc: u64) -> Option<Handler> {
-    match svc {
-        s if s == crate::proto::svc_id("core.echo") => Some(echo),
-        s if s == crate::proto::svc_id("core.ping") => Some(ping),
-        s if s == crate::proto::svc_id("core.perf") => Some(perf),
-        s if s == crate::proto::svc_id("core.perf.up") => Some(perf_up),
-        s if s == crate::proto::svc_id("core.perf.down") => Some(perf_down),
-        s if s == crate::proto::svc_id("core.poke") => Some(poke),
-        s if s == crate::proto::svc_id("core.info") => Some(info),
-        s if s == crate::proto::svc_id("core.storage") => Some(storage_stats),
-        s if s == crate::proto::svc_id("service.dht") => Some(dht),
-        _ => None,
-    }
+    static HANDLERS: OnceLock<HashMap<u64, Handler>> = OnceLock::new();
+    HANDLERS
+        .get_or_init(|| {
+            let mut m = HashMap::with_capacity(9);
+            m.insert(crate::proto::svc_id("core.echo"), echo as Handler);
+            m.insert(crate::proto::svc_id("core.ping"), ping as Handler);
+            m.insert(crate::proto::svc_id("core.perf"), perf as Handler);
+            m.insert(crate::proto::svc_id("core.perf.up"), perf_up as Handler);
+            m.insert(crate::proto::svc_id("core.perf.down"), perf_down as Handler);
+            m.insert(crate::proto::svc_id("core.poke"), poke as Handler);
+            m.insert(crate::proto::svc_id("core.info"), info as Handler);
+            m.insert(
+                crate::proto::svc_id("core.storage"),
+                storage_stats as Handler,
+            );
+            m.insert(crate::proto::svc_id("service.dht"), dht as Handler);
+            m
+        })
+        .get(&svc)
+        .copied()
 }
 
 pub fn is_allowed(allow: &[String], svc_name: &str) -> bool {
-    // честный ACL: "*" = всё, точное имя, или префикс "core.*" → core.ping и т.д.
+    // честный ACL: "*" = всё, точное имя, или префикс "core.*" → требует "core."
     // НЕТ хардкода core.*/pubsub.* — иначе TOFU-ограничение не работает.
     allow.iter().any(|a| {
         if a == "*" || a == svc_name {
             return true;
         }
-        if let Some(prefix) = a.strip_suffix(".*") {
+        if let Some(prefix) = a.strip_suffix('*') {
             return svc_name.starts_with(prefix);
         }
         false
@@ -115,12 +131,15 @@ fn perf_up(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
 }
 
 /// Однонаправленный download: по запросу {size} возвращаем size байт (не эхо).
+pub const MAX_PERF_DOWN_SIZE: usize = 4 * 1024 * 1024;
+
 fn perf_down(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
     Box::pin(async move {
         let v: serde_json::Value =
             serde_json::from_slice(&payload).map_err(|e| anyhow!("bad json: {e}"))?;
-        let size = v["size"].as_u64().unwrap_or(0) as usize;
-        if size > crate::proto::MAX_FRAME {
+        let size = usize::try_from(v["size"].as_u64().unwrap_or(0))
+            .map_err(|_| anyhow!("size too large"))?;
+        if size > MAX_PERF_DOWN_SIZE {
             bail!("size too large");
         }
         Ok(vec![0xabu8; size])
@@ -202,4 +221,41 @@ fn dht(_ctx: Ctx<'_>, _payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
 
 pub fn invoke(handler: Handler, ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
     handler(ctx, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_names_and_is_allowed_prefix_require_dot() {
+        for name in [
+            "dht.sync",
+            "storage.store",
+            "storage.fetch",
+            "storage.delete",
+            "mail.list",
+            "consensus.sign",
+        ] {
+            assert!(
+                SERVICE_NAMES.contains(&name),
+                "SERVICE_NAMES must contain {name}"
+            );
+            assert_eq!(
+                crate::proto::svc_name(crate::proto::svc_id(name)),
+                Some(name)
+            );
+        }
+
+        let acl = vec!["core.*".to_string()];
+        assert!(is_allowed(&acl, "core.ping"));
+        assert!(is_allowed(&acl, "core.perf.down"));
+        assert!(
+            !is_allowed(&acl, "core_evil"),
+            "core.* must require the dot prefix, not match core_evil"
+        );
+        assert!(!is_allowed(&acl, "core"));
+        assert!(handler_for(crate::proto::svc_id("core.ping")).is_some());
+        assert!(handler_for(crate::proto::svc_id("unknown.svc")).is_none());
+    }
 }

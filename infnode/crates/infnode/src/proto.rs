@@ -2,7 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NODEID_LEN: usize = 20;
@@ -68,6 +69,51 @@ pub fn claim_nonce(seen: &mut HashMap<String, i64>, nonce: &str, now: i64) -> bo
     true
 }
 
+/// O(1)-amortized handshake nonce replay window backed by a paired
+/// `HashMap` + `VecDeque` expiry queue.
+#[derive(Default)]
+pub struct NonceWindow {
+    seen: HashMap<String, i64>,
+    order: VecDeque<(i64, String)>,
+}
+
+impl NonceWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn claim(&mut self, nonce: &str, now: i64) -> bool {
+        if nonce.len() < 8 || nonce.len() > 128 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        let cutoff = now.saturating_sub(TS_WINDOW_MS);
+        while let Some((ts, _)) = self.order.front() {
+            if *ts > cutoff {
+                break;
+            }
+            if let Some((ts, old)) = self.order.pop_front() {
+                if self.seen.get(&old).copied() == Some(ts) {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+        if self.seen.contains_key(nonce) {
+            return false;
+        }
+        if self.seen.len() >= MAX_SEEN_IDS {
+            // Fallback exact prune if non-monotonic timestamps kept older entries behind a newer head.
+            self.seen.retain(|_, ts| *ts > cutoff);
+            if self.seen.len() >= MAX_SEEN_IDS {
+                return false;
+            }
+        }
+        let key = nonce.to_string();
+        self.seen.insert(key.clone(), now);
+        self.order.push_back((now, key));
+        true
+    }
+}
+
 pub mod kind {
     pub const PING: u8 = 0;
     pub const PONG: u8 = 1;
@@ -110,9 +156,15 @@ pub fn svc_id(name: &str) -> u64 {
 }
 
 pub fn svc_name(id: u64) -> Option<&'static str> {
-    crate::services::SERVICE_NAMES
-        .iter()
-        .find(|n| svc_id(n) == id)
+    static NAMES: OnceLock<HashMap<u64, &'static str>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            crate::services::SERVICE_NAMES
+                .iter()
+                .map(|&n| (svc_id(n), n))
+                .collect()
+        })
+        .get(&id)
         .copied()
 }
 
@@ -678,7 +730,7 @@ impl Frame {
 
     /// Streaming digest of the signed prefix: byte-identical input to
     /// `blake3::hash(&self.sign_data())` with no intermediate Vec.
-    fn sign_digest(&self) -> [u8; 32] {
+    pub fn sign_digest(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&[FRAME_VERSION]);
         h.update(&[self.kind]);
@@ -692,6 +744,36 @@ impl Frame {
         h.update(&self.payload);
         h.update(&self.nonce);
         *h.finalize().as_bytes()
+    }
+
+    /// Validate wire length invariants before encoding so oversized payloads
+    /// fail cleanly instead of producing un-decodable frames.
+    pub fn try_encode_into(&self, b: &mut Vec<u8>) -> Result<()> {
+        if self.payload.len() > MAX_FRAME {
+            bail!("payload too large");
+        }
+        if self.nonce.len() > MAX_NONCE_LEN {
+            bail!("nonce too large");
+        }
+        if self.sig.len() > u16::MAX as usize {
+            bail!("signature too large");
+        }
+        self.encode_into(b);
+        Ok(())
+    }
+
+    /// Checked encode returning an error if lengths exceed frame bounds.
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        if self.payload.len() > MAX_FRAME {
+            bail!("payload too large");
+        }
+        if self.nonce.len() > MAX_NONCE_LEN {
+            bail!("nonce too large");
+        }
+        if self.sig.len() > u16::MAX as usize {
+            bail!("signature too large");
+        }
+        Ok(self.encode())
     }
 
     /// Append one full frame (prefix + sig_len + sig) with a single reserve.
@@ -795,6 +877,14 @@ impl Frame {
             return false;
         }
         pq_falcon_verify(pq_pub, &self.sign_digest(), &self.sig)
+    }
+
+    /// Fast path using a pre-parsed Falcon-512 public key.
+    pub fn verify_parsed(&self, pk: &falcon_rust::falcon512::PublicKey) -> bool {
+        if self.sig.len() != PQ_FALCON_SIG_LEN {
+            return false;
+        }
+        pq_falcon_verify_parsed(pk, &self.sign_digest(), &self.sig)
     }
 }
 
@@ -1036,6 +1126,19 @@ pub fn pq_falcon_verify(pk_bytes: &[u8], digest: &[u8; 32], sig_bytes: &[u8]) ->
         return false;
     };
     falcon512::verify(digest, &sig, &pk)
+}
+
+/// Fail-closed Falcon-512 verification against an already-parsed public key.
+pub fn pq_falcon_verify_parsed(
+    pk: &falcon_rust::falcon512::PublicKey,
+    digest: &[u8; 32],
+    sig_bytes: &[u8],
+) -> bool {
+    use falcon_rust::falcon512;
+    let Ok(sig) = falcon512::Signature::from_bytes(sig_bytes) else {
+        return false;
+    };
+    falcon512::verify(digest, &sig, pk)
 }
 
 /// PQ-only Falcon-tag policy (FULL-PQ wipe): an absent peer identity, a local

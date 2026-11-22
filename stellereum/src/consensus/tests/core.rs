@@ -1053,7 +1053,8 @@ fn proposal_evidence_refuses_cross_shard_blocks() {
         b.sign_block(&ks[0]);
         let hash = b.compute_hash();
         let falcon_sig = fk0.sign(&hash);
-        b.validator_signatures.push((fk0.validator_id(), falcon_sig));
+        b.validator_signatures
+            .push((fk0.validator_id(), falcon_sig));
         b
     };
     let same = ProposalEquivocationEvidence::new_at_round(
@@ -1200,7 +1201,8 @@ fn proposal_evidence_canonicalize_sorts_and_dedupes() {
     // collapse to ONE canonical entry.
     assert_eq!(out.len(), 2, "two distinct offenses must survive shaping");
     assert!(
-        !out.iter().any(|ev| ev.block_a.compute_hash() == ev.block_b.compute_hash()),
+        !out.iter()
+            .any(|ev| ev.block_a.compute_hash() == ev.block_b.compute_hash()),
         "the same-body pair must be refused"
     );
     assert_eq!(e1.offense_key(), e1dup.offense_key());

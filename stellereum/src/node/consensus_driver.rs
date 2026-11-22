@@ -7,7 +7,9 @@ use crate::liveness_alarm;
 use crate::node::policy::*;
 use crate::node::sync::*;
 use stellereum::consensus::{ValidatorSet, VoteKind};
-use stellereum::consensus_net::{parse_incoming, ConsensusMsg, ConsensusNetwork, TxGossip};
+use stellereum::consensus_net::{
+    parse_incoming_with_peer_key, ConsensusMsg, ConsensusNetwork, TxGossip,
+};
 use stellereum::network::CrossShardTransport;
 use stellereum::network::P2pNetworkAdapter;
 use stellereum::runtime::ValidatorRuntime;
@@ -71,23 +73,39 @@ fn restored_round(persisted_round: u32, vote_watermark_floor: Option<u32>) -> u3
 const SMALL_GAP_LIVE_CATCHUP_WINDOW_MS: u64 = 1_500;
 const SMALL_GAP_LIVE_CATCHUP_BUDGET_MS: u64 = 120;
 
-/// Cap the per-tick `try_catch_up` budget when the chain is actively finalizing
-/// (`since_last_finalized < 1500ms`) and the verified gap is at most 2 heights.
-/// Prevents a 1–2 block catch-up DHT probe from freezing the consensus tick for
-/// 500ms+ mid-round while preserving the full budget and snapshot-sync window
-/// whenever the gap is > 2 or the chain has stalled for >= 1500ms.
+/// Cap the per-tick `try_catch_up` budget ONLY for `budget_gap == 0` blind probes
+/// while the chain is actively finalizing (`since_last_finalized < 1500ms`).
+/// Whenever `budget_gap >= 1` (verified ahead evidence), return `base_budget`
+/// so 1–2 block catch-up never times out mid-WAN-RTT and spins in 500ms retry loops.
 fn effective_catchup_pass_budget(
     base_budget: Duration,
     budget_gap: u64,
     since_last_finalized: Duration,
 ) -> Duration {
-    if budget_gap <= 2
+    if budget_gap == 0
         && since_last_finalized < Duration::from_millis(SMALL_GAP_LIVE_CATCHUP_WINDOW_MS)
     {
         base_budget.min(Duration::from_millis(SMALL_GAP_LIVE_CATCHUP_BUDGET_MS))
     } else {
         base_budget
     }
+}
+
+/// Exact field-wise comparison for `Governance` so the 50ms consensus tick skips
+/// cloning `shared_gov` when no field changed.
+fn governance_equal(
+    a: &stellereum::governance::Governance,
+    b: &stellereum::governance::Governance,
+) -> bool {
+    a.next_id == b.next_id
+        && a.quorum_bps == b.quorum_bps
+        && a.applied == b.applied
+        && a.proposals.len() == b.proposals.len()
+        && a.timelocks.len() == b.timelocks.len()
+        && a.gov_propose_nonces.len() == b.gov_propose_nonces.len()
+        && a.proposals == b.proposals
+        && a.timelocks == b.timelocks
+        && a.gov_propose_nonces == b.gov_propose_nonces
 }
 
 /// Immediate DHT body/head publish gate on finalize/adopt: the block's proposer
@@ -1693,20 +1711,15 @@ pub(crate) async fn run_consensus_node(
     // jobs. Per node instance (this function runs once per shard), so one
     // shard's guard can never suppress another shard's save or prune.
     //
-    //  * `publish_lane` carries every blob/DHT write the loop makes -- head
-    //    pointer (finalize AND probe, so the advertised head can only move
-    //    forward), retro body, header, snapshot -- in submission order.
+    //  * `publish_lane` carries strictly live tip writes -- tip `publish_head`,
+    //    tip `persist_block_header`, and tip single-body publish -- in submission
+    //    order so live finality announcements never queue behind backfill.
+    //  * `backfill_lane` carries periodic/startup `retro_publish_pass`, multi-body
+    //    backfill supplements, and snapshot/domain uploads.
     //  * `record_lane` carries the local RPC records (receipts + height).
-    //  * `prune_lane` carries the DHT retention prune. It used to ride
-    //    `record_lane`, but a prune pass fans out to `fetch_blob` + deletes
-    //    over up to 2048 heights (seconds on a weak link), and the single FIFO
-    //    held every receipt behind it — the record_lane clog. Prune work is
-    //    local housekeeping, order-independent against receipts, so its own
-    //    lane restores "record_lane carries only fast local work".
-    // Three lanes, not one: `store_blob` can wait for a replica for seconds, and
-    // a wallet's receipt lookup must never queue behind that, while a publish
-    // must never queue behind a contended RPC lock either.
+    //  * `prune_lane` carries the DHT retention prune.
     let publish_lane = spawn_tick_lane();
+    let backfill_lane = spawn_tick_lane();
     let record_lane = spawn_tick_lane();
     let prune_lane = spawn_tick_lane();
     let mempool_save_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1722,13 +1735,14 @@ pub(crate) async fn run_consensus_node(
     // pre-activation ticks leave it false.
     let mut chain_binding_drained = false;
 
-    // Push what we already have before waiting for anything from a peer.
+    // Push what we already have onto `backfill_lane` without blocking node
+    // startup awaiting up to 128 DHT body stores.
     retro_publish_pass(
         adapter.clone(),
         &rt,
         persistence.as_ref(),
         &mut retro_published_upto,
-        None,
+        Some(&backfill_lane),
     )
     .await;
 
@@ -1979,19 +1993,17 @@ pub(crate) async fn run_consensus_node(
                 .peer_hint
                 .map(|(ph, _)| ph.saturating_sub(our_tip))
                 .unwrap_or(0);
+            let peer_named_gap = peer_named_height.saturating_sub(our_tip);
             let live_adopt_fresh = last_live_adopt.elapsed() < live_adopt_fresh_window;
-            // Never defer catchup if we have stalled into round > 0 or haven't adopted
-            // recently. Deferring during a round stall causes a permanent deadlock where
-            // peers wait for our vote at H+1 while we defer catchup of H because of peer traffic.
-            if rt.hc.round > 0 || !live_adopt_fresh {
-                false
-            } else {
-                stellereum::sync::should_defer_catchup_for_live_flow(
-                    hint_gap,
-                    !rx.is_empty(),
-                    live_adopt_fresh,
-                )
-            }
+            // Never defer catchup if we have stalled into round > 0, haven't adopted
+            // recently, or hold verified evidence of a gap >= 2 (hint or peer_named_height).
+            should_defer_live_catchup(
+                rt.hc.round,
+                hint_gap,
+                peer_named_gap,
+                !rx.is_empty(),
+                live_adopt_fresh,
+            )
         };
         // Event-driven decision (`policy::catchup_action`): reactive evidence
         // runs NOW; the periodic timer is only a backstop. At-tip nodes skip
@@ -2069,7 +2081,18 @@ pub(crate) async fn run_consensus_node(
             );
             let caught = tokio::time::timeout(
                 catchup_budget,
-                try_catch_up(&adapter, &mut rt, block_shard, persistence.as_ref(), &rpc),
+                try_catch_up_with_lanes(
+                    &adapter,
+                    &mut rt,
+                    block_shard,
+                    persistence.as_ref(),
+                    &rpc,
+                    SyncLanes {
+                        record_lane: Some(&record_lane),
+                        publish_lane: Some(&publish_lane),
+                        consensus_net: Some(&net),
+                    },
+                ),
             )
             .await
             .unwrap_or_else(|_| {
@@ -2257,7 +2280,7 @@ pub(crate) async fn run_consensus_node(
                         &rt,
                         persistence.as_ref(),
                         &mut retro_published_upto,
-                        Some(&publish_lane),
+                        Some(&backfill_lane),
                     ),
                 )
                 .await;
@@ -2267,9 +2290,8 @@ pub(crate) async fn run_consensus_node(
                 // first) so a restart never strands a peer for a whole window.
                 // Publish the last few, not just the tip: a 1-8 block lag needs
                 // middle children the tip-only publish would miss for hours.
-                // OFF-TICK (observer C): `store_blob` waits on replicas — awaited
-                // here it held the consensus tick for seconds every 30s pass. Same
-                // bytes, same order, but on `publish_lane` behind the window above.
+                // OFF-TICK (observer C): runs on `backfill_lane` behind the
+                // window above so live tip writes on `publish_lane` stay unblocked.
                 {
                     let recent: Vec<_> = rt.finalized.iter().rev().take(8).copied().collect();
                     let mut bodies = Vec::with_capacity(recent.len());
@@ -2284,7 +2306,7 @@ pub(crate) async fn run_consensus_node(
                     }
                     if !bodies.is_empty() {
                         let a = adapter.clone();
-                        publish_lane.submit(async move {
+                        backfill_lane.submit(async move {
                             let _ = a.retro_publish_blocks(bodies.iter(), bodies.len()).await;
                         });
                     }
@@ -2301,8 +2323,14 @@ pub(crate) async fn run_consensus_node(
         // engine and is shared by reference, so a bond applied in a block is
         // visible to consensus without a node-local mirror.
         {
-            let gov = shared_gov.read().await.clone();
-            rt.governance = Some(gov);
+            let gov_guard = shared_gov.read().await;
+            let changed = rt
+                .governance
+                .as_ref()
+                .is_none_or(|cur| !governance_equal(&gov_guard, cur));
+            if changed {
+                rt.governance = Some(gov_guard.clone());
+            }
         }
 
         // Re-register as a network subscriber periodically (until peers connect).
@@ -2576,7 +2604,7 @@ pub(crate) async fn run_consensus_node(
         // below) from send-blocked (gate passes but nothing arrives).
         if last_gate_diag != Some((height, round)) {
             last_gate_diag = Some((height, round));
-            tracing::warn!(
+            tracing::debug!(
                 "[consensus] propose-gate h={} r={} can_vote={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} parent_ready={} scheduled={}",
                 height,
                 round,
@@ -2641,20 +2669,15 @@ pub(crate) async fn run_consensus_node(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let engine = rt.state.clone();
+                let payers = rt.mempool.read().await.fee_payers();
                 let mut accounts: std::collections::HashMap<[u8; 32], (u64, u64)> =
-                    std::collections::HashMap::new();
-                let senders: Vec<[u8; 32]> = rt
-                    .mempool
-                    .read()
-                    .await
-                    .all()
-                    .iter()
-                    .map(|t| t.from)
-                    .collect();
-                for s in senders {
-                    if let Some(a) = engine.get_account(&s).await {
-                        accounts.insert(s, (a.nonce, a.balance));
+                    std::collections::HashMap::with_capacity(payers.len());
+                {
+                    let guard = rt.state.accounts.read().await;
+                    for s in payers {
+                        if let Some(a) = guard.get(&s) {
+                            accounts.insert(s, (a.nonce, a.balance));
+                        }
                     }
                 }
                 let dropped = rt
@@ -2921,7 +2944,7 @@ pub(crate) async fn run_consensus_node(
                     }
                 }
             };
-            let Some(msg) = parse_incoming(&raw) else {
+            let Some((msg, peer_key)) = parse_incoming_with_peer_key(&raw) else {
                 // Unparseable payloads on our own topic are a delivery-layer
                 // bug (or garbage from a peer); silent drops here once hid a
                 // one-directional blackout for hours. Count them loudly.
@@ -2957,7 +2980,6 @@ pub(crate) async fn run_consensus_node(
             // for a compact frame that paid admission) and is bounded by
             // `LOOPBACK_QUEUE_CAP`, so it is not re-charged to the shared bulk
             // limiter. It still carries the originating `src` for attribution.
-            let peer_key = stellereum::consensus_net::inbound_peer_key(&raw);
             if !from_loopback {
                 match net.admit_inbound(&peer_key, &msg, raw.len()) {
                     stellereum::consensus_net::InboundDecision::Allow => {}
@@ -3549,8 +3571,12 @@ pub(crate) async fn run_consensus_node(
                             // `on_prevote`/`on_precommit`, so this runs on the
                             // refusal path only (unchanged cost profile).
                             if !accepted {
-                                let vote_verified =
-                                    vcopy.verify() && rt.validators.power_of(&vcopy.voter) != 0;
+                                let late_recorded = vk == VoteKind::Precommit
+                                    && vh.checked_add(1) == Some(rt.hc.height)
+                                    && rt.record_late_parent_precommit(&vcopy);
+                                let vote_verified = late_recorded
+                                    || (vcopy.verify()
+                                        && rt.validators.power_of(&vcopy.voter) != 0);
                                 // Scope/signature failure: the vote does NOT count
                                 // toward any quorum. BUT a verified same-height
                                 // vote still feeds the peer-round counter
@@ -4719,7 +4745,7 @@ pub(crate) async fn run_consensus_node(
                     let ap2 = ap.clone();
                     let adapter2 = adapter.clone();
                     let shard_id = block_shard;
-                    let lane = publish_lane.clone();
+                    let lane = backfill_lane.clone();
                     tokio::spawn(async move {
                         let stellereum::runtime::SnapBundle {
                             height,
@@ -4754,7 +4780,7 @@ pub(crate) async fn run_consensus_node(
                         ap2.enqueue_state(height, bytes.clone());
                         info!(
                             "[snapshot] height {height}: local persist enqueued \
-                             (state {} bytes); handing to publish_lane",
+                             (state {} bytes); handing to backfill_lane",
                             bytes.len()
                         );
                         // A9: persist every non-account domain too.
@@ -4839,7 +4865,7 @@ pub(crate) async fn run_consensus_node(
                                 // node-restart-class alarm, not a retryable miss.
                                 tracing::error!(
                                     "[snapshot] height {height}: domain \
-                                     publish_lane submit FAILED (lane dead? \
+                                     backfill_lane submit FAILED (lane dead? \
                                      domain blobs unpublished)"
                                 );
                             }
@@ -4889,7 +4915,7 @@ pub(crate) async fn run_consensus_node(
                             // dies the same way — node-restart-class alarm.
                             tracing::error!(
                                 "[snapshot] height {height}: state \
-                                 publish_lane submit FAILED (lane dead? \
+                                 backfill_lane submit FAILED (lane dead? \
                                  snapshot + header unpublished)"
                             );
                         }
@@ -5786,27 +5812,36 @@ mod publish_and_catchup_policy_tests {
     #[test]
     fn small_gap_live_catchup_budget_is_capped_at_120ms() {
         let base = Duration::from_millis(2_000);
-        // Live chain (< 1500ms since last finalize/adopt) + gap <= 2 => 120ms cap.
+        // Live chain (< 1500ms since last finalize/adopt) + blind probe (gap == 0) => 120ms cap.
         assert_eq!(
             effective_catchup_pass_budget(base, 0, Duration::from_millis(250)),
             Duration::from_millis(120)
         );
         assert_eq!(
-            effective_catchup_pass_budget(base, 2, Duration::from_millis(1_499)),
+            effective_catchup_pass_budget(base, 0, Duration::from_millis(1_499)),
             Duration::from_millis(120)
         );
-        // Smaller base stays untouched.
+        // Smaller base stays untouched for blind probe.
         assert_eq!(
-            effective_catchup_pass_budget(Duration::from_millis(80), 1, Duration::from_millis(200)),
+            effective_catchup_pass_budget(Duration::from_millis(80), 0, Duration::from_millis(200)),
             Duration::from_millis(80)
         );
-        // Stalled chain (>= 1500ms) or deeper gap (> 2) keeps full base budget.
+        // Verified ahead evidence (gap >= 1) ALWAYS keeps full base budget even on a live chain.
         assert_eq!(
-            effective_catchup_pass_budget(base, 1, Duration::from_millis(1_500)),
+            effective_catchup_pass_budget(base, 1, Duration::from_millis(200)),
+            base
+        );
+        assert_eq!(
+            effective_catchup_pass_budget(base, 2, Duration::from_millis(1_499)),
             base
         );
         assert_eq!(
             effective_catchup_pass_budget(base, 3, Duration::from_millis(100)),
+            base
+        );
+        // Stalled chain (>= 1500ms) keeps full base budget even for blind probes.
+        assert_eq!(
+            effective_catchup_pass_budget(base, 0, Duration::from_millis(1_500)),
             base
         );
     }

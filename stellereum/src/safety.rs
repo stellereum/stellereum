@@ -301,7 +301,9 @@ fn read_tag(bytes: &[u8], cur: &mut usize) -> Result<u8> {
 }
 
 fn read_u16(bytes: &[u8], cur: &mut usize) -> Result<u16> {
-    let end = cur.checked_add(2).ok_or_else(|| anyhow!("offset overflow"))?;
+    let end = cur
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("offset overflow"))?;
     if end > bytes.len() {
         return Err(anyhow!("unexpected EOF reading u16"));
     }
@@ -311,7 +313,9 @@ fn read_u16(bytes: &[u8], cur: &mut usize) -> Result<u16> {
 }
 
 fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
-    let end = cur.checked_add(4).ok_or_else(|| anyhow!("offset overflow"))?;
+    let end = cur
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("offset overflow"))?;
     if end > bytes.len() {
         return Err(anyhow!("unexpected EOF reading u32"));
     }
@@ -321,7 +325,9 @@ fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
 }
 
 fn read_u64(bytes: &[u8], cur: &mut usize) -> Result<u64> {
-    let end = cur.checked_add(8).ok_or_else(|| anyhow!("offset overflow"))?;
+    let end = cur
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("offset overflow"))?;
     if end > bytes.len() {
         return Err(anyhow!("unexpected EOF reading u64"));
     }
@@ -363,10 +369,22 @@ pub fn derive_safety_chain_id(chain_id: u64, genesis_state_root: &[u8; 32]) -> [
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SafetyRefusal {
     NotActive(AuthorityMode),
-    HeightMismatch { expected: Height, got: Height },
-    RoundAtOrBelowPrevoteFloor { round: Round, floor: Round },
-    RoundAtOrBelowPrecommitFloor { round: Round, floor: Round },
-    RoundAtOrBelowProposedFloor { round: Round, floor: Round },
+    HeightMismatch {
+        expected: Height,
+        got: Height,
+    },
+    RoundAtOrBelowPrevoteFloor {
+        round: Round,
+        floor: Round,
+    },
+    RoundAtOrBelowPrecommitFloor {
+        round: Round,
+        floor: Round,
+    },
+    RoundAtOrBelowProposedFloor {
+        round: Round,
+        floor: Round,
+    },
     LockedConflict {
         lock: SafetyLockRecord,
         target_value_id: [u8; 32],
@@ -390,7 +408,10 @@ impl std::fmt::Display for SafetyRefusal {
                 write!(f, "prevote round {round} <= highest_prevote_round {floor}")
             }
             Self::RoundAtOrBelowPrecommitFloor { round, floor } => {
-                write!(f, "precommit round {round} <= highest_precommit_round {floor}")
+                write!(
+                    f,
+                    "precommit round {round} <= highest_precommit_round {floor}"
+                )
             }
             Self::RoundAtOrBelowProposedFloor { round, floor } => {
                 write!(f, "propose round {round} <= highest_proposed.round {floor}")
@@ -585,9 +606,7 @@ impl SafetyAuthority {
                             "STELL_NEW_CHAIN=1 is not set (absent safety_record_v1 cannot be auto-initialized)"
                         ));
                     }
-                    if boot_ctx.restored_finalized.is_some()
-                        || storage.finalized()?.is_some()
-                    {
+                    if boot_ctx.restored_finalized.is_some() || storage.finalized()?.is_some() {
                         return Err(anyhow!("finalized height > 0"));
                     }
                     if boot_ctx.restored_state_height.unwrap_or(0) > 0
@@ -595,14 +614,10 @@ impl SafetyAuthority {
                     {
                         return Err(anyhow!("latest_state_height > 0"));
                     }
-                    if boot_ctx.legacy_watermark.is_some()
-                        || storage.vote_watermark()?.is_some()
-                    {
+                    if boot_ctx.legacy_watermark.is_some() || storage.vote_watermark()?.is_some() {
                         return Err(anyhow!("legacy vote_watermark present"));
                     }
-                    if boot_ctx.legacy_checkpoint.is_some()
-                        || storage.consensus()?.is_some()
-                    {
+                    if boot_ctx.legacy_checkpoint.is_some() || storage.consensus()?.is_some() {
                         return Err(anyhow!("legacy consensus checkpoint present"));
                     }
                     if storage.has_non_genesis_blocks_or_headers()? {
@@ -890,8 +905,11 @@ impl SafetyAuthority {
         }
 
         let target_hash = target.map(|(bh, _)| bh);
-        let msg = vote_sign_bytes_for_shard(shard_id, height, round, VoteKind::Prevote, &target_hash);
-        let sig = signer.sign_ed25519(&msg).ok_or(SafetyRefusal::SignerFailed)?;
+        let msg =
+            vote_sign_bytes_for_shard(shard_id, height, round, VoteKind::Prevote, &target_hash);
+        let sig = signer
+            .sign_ed25519(&msg)
+            .ok_or(SafetyRefusal::SignerFailed)?;
         let mut vote = Vote::signed_with_in_shard(
             signer.validator_id(),
             shard_id,
@@ -989,7 +1007,11 @@ impl SafetyAuthority {
         next_state.highest_precommit_round = Some(polka_round);
         next_state.locked = next_locked;
 
-        let lock_block = if lock_changed { Some(polka_block) } else { None };
+        let lock_block = if lock_changed {
+            Some(polka_block)
+        } else {
+            None
+        };
         if let Err(e) = persist_state(&mut g, &next_state, lock_block) {
             let msg = e.to_string();
             tracing::error!("[safety] precommit persist failed; quarantining: {msg}");
@@ -1005,7 +1027,9 @@ impl SafetyAuthority {
             VoteKind::Precommit,
             &Some(target),
         );
-        let sig = signer.sign_ed25519(&msg).ok_or(SafetyRefusal::SignerFailed)?;
+        let sig = signer
+            .sign_ed25519(&msg)
+            .ok_or(SafetyRefusal::SignerFailed)?;
         let mut vote = Vote::signed_with_in_shard(
             signer.validator_id(),
             shard_id,
@@ -1291,10 +1315,12 @@ pub fn operator_safety_init(
     let genesis_bytes = storage
         .get_meta("genesis_state_root")?
         .ok_or_else(|| anyhow!("store has no genesis_state_root metadata"))?;
-    let genesis_root: [u8; 32] = genesis_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("genesis_state_root has invalid length {}", genesis_bytes.len()))?;
+    let genesis_root: [u8; 32] = genesis_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "genesis_state_root has invalid length {}",
+            genesis_bytes.len()
+        )
+    })?;
     let identity = SafetyRecordIdentity {
         validator: validator_pub,
         chain: derive_safety_chain_id(consensus_chain_id(), &genesis_root),
@@ -1310,9 +1336,12 @@ pub fn operator_safety_init(
 
     let (fh, fhash) = storage.finalized()?.unwrap_or((0, [0u8; 32]));
     if fh > 0 {
-        let blk = storage
-            .get_block(&fhash)?
-            .ok_or_else(|| anyhow!("finalized block #{fh} ({}) missing from store", hex::encode(fhash)))?;
+        let blk = storage.get_block(&fhash)?.ok_or_else(|| {
+            anyhow!(
+                "finalized block #{fh} ({}) missing from store",
+                hex::encode(fhash)
+            )
+        })?;
         if blk.height != fh || blk.compute_hash() != fhash || blk.precommit_qc.is_none() {
             return Err(anyhow!(
                 "finalized block #{fh} failed integrity/QC check; refusing safety-init"
@@ -1331,9 +1360,7 @@ pub fn operator_safety_init(
                     pv.height
                 ));
             }
-            if pv.height == next_height
-                && prevote_round_floor.is_none_or(|f| f < pv.round)
-            {
+            if pv.height == next_height && prevote_round_floor.is_none_or(|f| f < pv.round) {
                 return Err(anyhow!(
                     "prevote_round_floor ({prevote_round_floor:?}) must be >= legacy vote_watermark prevote round {} at height {next_height}",
                     pv.round
@@ -1347,9 +1374,7 @@ pub fn operator_safety_init(
                     pc.height
                 ));
             }
-            if pc.height == next_height
-                && precommit_round_floor.is_none_or(|f| f < pc.round)
-            {
+            if pc.height == next_height && precommit_round_floor.is_none_or(|f| f < pc.round) {
                 return Err(anyhow!(
                     "precommit_round_floor ({precommit_round_floor:?}) must be >= legacy vote_watermark precommit round {} at height {next_height}",
                     pc.round

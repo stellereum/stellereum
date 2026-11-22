@@ -1217,8 +1217,15 @@ type RecentHqPublishCache =
 /// Prevents a node stuck one block behind from hammering peers with repeated
 /// `dht.find_value` calls on the same missing `_hq_{shard}_{height}` sidecar
 /// every reactive catch-up tick (~500ms-1.4s). First probe for `(shard, height)`
-/// is always immediate; consecutive misses back off `2s -> 4s -> 8s -> 16s -> 30s`,
-/// and any hit clears the entry.
+/// is always immediate; consecutive misses back off `300ms -> 600ms -> 1.2s ->
+/// 2.4s -> 4.8s -> 5s`, and any hit clears the entry.
+///
+/// The base used to be 2000ms, which charged a full 2s for the FIRST miss even
+/// when the QC demonstrably existed (the proposer had quorum precommits and was
+/// merely slower than the reader). The live cost was a 2s+ stall per missed
+/// sidecar (block #21508: `fetch_block_qc ... failed; backing off 2000ms`).
+/// A sub-second first cooldown keeps the anti-hammer property without pricing
+/// a single lost packet at five blocks.
 #[derive(Debug, Clone, Default)]
 pub struct QcMissBackoff {
     entries: std::collections::HashMap<(u32, u64), QcMissEntry>,
@@ -1231,8 +1238,8 @@ struct QcMissEntry {
 }
 
 impl QcMissBackoff {
-    pub const BASE_MS: u64 = 2_000;
-    pub const MAX_MS: u64 = 30_000;
+    pub const BASE_MS: u64 = 300;
+    pub const MAX_MS: u64 = 5_000;
     pub const CAP: usize = 128;
 
     /// Returns `true` when `(shard_id, height)` is still inside its cooldown
@@ -1251,7 +1258,8 @@ impl QcMissBackoff {
             .get(&(shard_id, height))
             .map(|e| e.misses.saturating_add(1))
             .unwrap_or(1);
-        let shift = misses.saturating_sub(1).min(4);
+        // Doubling tiers: 300, 600, 1200, 2400, 4800, then clamped to MAX_MS.
+        let shift = misses.saturating_sub(1).min(8);
         let backoff_ms = Self::BASE_MS
             .saturating_mul(1u64 << shift)
             .min(Self::MAX_MS);
@@ -1276,9 +1284,20 @@ impl QcMissBackoff {
         backoff_ms
     }
 
+    /// Drop any miss backoff for `(shard_id, height)`.
+    ///
+    /// Called when a QC for that height is obtained by ANY path: a successful
+    /// `_hq_` fetch (`record_hit`), a QC carried by a consensus `Committed`
+    /// message, or one read from local storage. The next probe of this height
+    /// must be immediate — carrying a stale cooldown past a known QC could
+    /// delay a catch-up for no reason.
+    pub fn clear(&mut self, shard_id: u32, height: u64) {
+        self.entries.remove(&(shard_id, height));
+    }
+
     /// Clear any miss backoff for `(shard_id, height)` once a QC is obtained.
     pub fn record_hit(&mut self, shard_id: u32, height: u64) {
-        self.entries.remove(&(shard_id, height));
+        self.clear(shard_id, height);
     }
 
     pub fn len(&self) -> usize {
@@ -1755,6 +1774,55 @@ impl P2pNetworkAdapter {
         self.node.kv_store_local(&height_kv_key, &height_val).await;
 
         Ok(block_hash)
+    }
+
+    /// Publish a height's `_hq_` precommit-QC sidecar EARLY, as soon as the QC
+    /// exists — before the body is persisted/executed.
+    ///
+    /// The sidecar used to ride `publish_block`/`persist_block_header` only,
+    /// i.e. after header/index writes and often after the apply. Peers that
+    /// missed the deciding votes therefore read "header/body present, QC
+    /// missing" for a window and paid a `fetch_block_qc` miss (the live
+    /// `shard=0 height=21508 ... failed; backing off 2000ms`). This publishes
+    /// the same bytes, under the same name/TTL/lane, directly from the
+    /// finalize path while the QC is already in hand.
+    ///
+    /// Exactly-once is preserved by the shared `claim_hq_publish` cache: a
+    /// later `publish_block`/`persist_block_header` for the same
+    /// `(shard, height, block_hash)` is a no-op duplicate.
+    ///
+    /// ORDERING INVARIANT (same as `persist_block_header`): the header blob
+    /// and index for this `(shard, height)` MUST already be published (the
+    /// proposer publishes them at propose/finalize time). The QC is never the
+    /// only blob present for a height: callers that do not publish the header
+    /// must not call this, because a lone QC sidecar would look to a reader
+    /// like a half-trusted anchor. The finalize call site therefore publishes
+    /// header+index first in the same `publish_lane` job.
+    pub async fn publish_block_qc(
+        &self,
+        shard_id: u32,
+        height: u64,
+        block_hash: [u8; 32],
+        qc: &crate::consensus::QuorumCertificate,
+    ) {
+        if !claim_hq_publish(&self.recent_hq_published, shard_id, height, block_hash) {
+            return;
+        }
+        let Ok(bytes) = bincode::serialize(qc) else {
+            return;
+        };
+        let ttl = dht_blob_ttl_ms(retention_keep_blocks());
+        let qc_slot = header_publish_slots()[2];
+        paced_store_blob_in_lane(
+            &self.node,
+            BUCKET_STELLEREUM_HEADERS,
+            &header_qc_name(&self.epoch(), shard_id, height),
+            &bytes,
+            ttl,
+            qc_slot.charge,
+            qc_slot.lane,
+        )
+        .await;
     }
 
     /// Fetch a block from the P2P overlay network by hash
@@ -2420,6 +2488,21 @@ impl P2pNetworkAdapter {
         self.fetch_block_qc_inner(shard_id, height, 3).await
     }
 
+    /// Drop any `_hq_` miss cooldown for `(shard, height)`.
+    ///
+    /// For callers that obtained the QC by a path OTHER than
+    /// [`Self::fetch_block_qc`] — a consensus `Committed` message, or a QC
+    /// read from local storage. PRECONDITION: the QC must have been decoded
+    /// and validated for exactly this `(shard, height)`; this is never called
+    /// on a hint or a "maybe". The next probe of this height then becomes
+    /// immediate; `fetch_block_qc` clears the entry itself on a decoded,
+    /// height-bound hit.
+    pub fn clear_qc_backoff(&self, shard_id: u32, height: u64) {
+        if let Ok(mut g) = self.qc_miss_backoff.lock() {
+            g.clear(shard_id, height);
+        }
+    }
+
     /// Lightweight 1-attempt precommit-QC sidecar probe for `blind-QC-probe`.
     /// Shares the per-`(shard_id, height)` exponential miss backoff with
     /// [`Self::fetch_block_qc`] so repeated catch-up ticks never flood peers
@@ -2465,8 +2548,14 @@ impl P2pNetworkAdapter {
                     MAX_WIRE_SMALL_BYTES,
                 ) {
                     Ok(qc) => {
-                        if let Ok(mut g) = self.qc_miss_backoff.lock() {
-                            g.record_hit(shard_id, height);
+                        // Clear the miss cooldown only for a QC that DECODED
+                        // and binds THIS height. A corrupt/foreign sidecar is
+                        // a miss, not a hit, and must not lift the backoff
+                        // (callers still run full quorum verification).
+                        if qc.height == height {
+                            if let Ok(mut g) = self.qc_miss_backoff.lock() {
+                                g.record_hit(shard_id, height);
+                            }
                         }
                         return Some(qc);
                     }
@@ -5775,27 +5864,54 @@ mod retention_tests {
         let mut backoff = QcMissBackoff::default();
         assert!(!backoff.should_skip(0, 100, 1_000));
 
-        // 2s -> 4s -> 8s -> 16s -> 30s -> 30s
+        // 300ms -> 600ms -> 1.2s -> 2.4s -> 4.8s -> 5s -> 5s
         let d1 = backoff.record_miss(0, 100, 1_000);
-        assert_eq!(d1, 2_000);
-        assert!(backoff.should_skip(0, 100, 2_999));
-        assert!(!backoff.should_skip(0, 100, 3_000));
+        assert_eq!(d1, QcMissBackoff::BASE_MS);
+        assert_eq!(d1, 300, "first QC miss cooldown is sub-second");
+        assert!(backoff.should_skip(0, 100, 1_299));
+        assert!(!backoff.should_skip(0, 100, 1_300));
         assert!(!backoff.should_skip(0, 101, 1_500));
 
-        assert_eq!(backoff.record_miss(0, 100, 3_000), 4_000);
-        assert_eq!(backoff.record_miss(0, 100, 7_000), 8_000);
-        assert_eq!(backoff.record_miss(0, 100, 15_000), 16_000);
-        assert_eq!(backoff.record_miss(0, 100, 31_000), 30_000);
-        assert_eq!(backoff.record_miss(0, 100, 61_000), 30_000);
+        assert_eq!(backoff.record_miss(0, 100, 1_300), 600);
+        assert_eq!(backoff.record_miss(0, 100, 1_900), 1_200);
+        assert_eq!(backoff.record_miss(0, 100, 3_100), 2_400);
+        assert_eq!(backoff.record_miss(0, 100, 5_500), 4_800);
+        assert_eq!(backoff.record_miss(0, 100, 10_300), 5_000);
+        assert_eq!(backoff.record_miss(0, 100, 15_300), 5_000);
 
         backoff.record_hit(0, 100);
-        assert!(!backoff.should_skip(0, 100, 61_001));
-        assert_eq!(backoff.record_miss(0, 100, 61_001), 2_000);
+        assert!(!backoff.should_skip(0, 100, 15_301));
+        assert_eq!(backoff.record_miss(0, 100, 15_301), 300);
 
         for h in 1..=(QcMissBackoff::CAP as u64 + 32) {
             backoff.record_miss(0, h + 1_000, 100_000 + h);
         }
         assert!(backoff.len() <= QcMissBackoff::CAP);
+    }
+
+    #[test]
+    fn qc_clear_drops_cooldown_for_exactly_one_height() {
+        let mut backoff = QcMissBackoff::default();
+        // Three distinct heights are in cooldown.
+        assert_eq!(backoff.record_miss(0, 7, 10_000), 300);
+        assert_eq!(backoff.record_miss(0, 8, 10_000), 300);
+        assert_eq!(backoff.record_miss(3, 7, 10_000), 300);
+        assert!(backoff.should_skip(0, 7, 10_100));
+        assert!(backoff.should_skip(0, 8, 10_100));
+        assert!(backoff.should_skip(3, 7, 10_100));
+
+        // `clear` (the public path callers use for an out-of-band QC) drops
+        // exactly the named (shard, height), not its neighbours or namesakes.
+        backoff.clear(0, 7);
+        assert!(!backoff.should_skip(0, 7, 10_100));
+        assert!(backoff.should_skip(0, 8, 10_100));
+        assert!(backoff.should_skip(3, 7, 10_100));
+
+        // Clearing an absent entry is a no-op, and the next miss restarts at
+        // the sub-second base instead of carrying an old tier.
+        backoff.clear(9, 999);
+        assert_eq!(backoff.record_miss(0, 7, 10_100), QcMissBackoff::BASE_MS);
+        assert_eq!(backoff.len(), 3);
     }
 }
 

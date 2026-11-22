@@ -194,6 +194,7 @@ mod lanes;
 mod mev_sync;
 
 pub use cluster::{ChainState, Cluster, ShardedCluster};
+pub use consensus_step::{ParkedCommit, ParkedProposal};
 pub use lanes::{
     count_block_actor_sends, fund_genesis, fund_shard_genesis, missing_sender_accounts,
     shard_genesis_block, ApplyCompleted, PackFilterCtx, PrebuiltSelection, SnapBundle,
@@ -497,6 +498,15 @@ pub struct ValidatorRuntime {
     /// reader of post-H state checks this first.
     apply_lane: Option<ApplyLane>,
     apply_in_flight: Option<ApplyInflight>,
+    /// PARK-AND-REPLAY slots (liveness): the newest proposal / peer commit
+    /// that arrived while `apply_in_flight` held post-H state. Each slot holds
+    /// at most ONE item (a newer arrival overwrites the older one), so the
+    /// pair is a hard bound of two entries and can never grow. Replayed
+    /// through the normal fully-validating paths the moment the worker
+    /// reports back (see `take_parked` and the driver hook); never applied
+    /// from here.
+    parked_proposal: Option<ParkedProposal>,
+    parked_commit: Option<ParkedCommit>,
     /// Snapshot capture in flight (see `SnapBundle`): at most one queued or
     /// executing. A second submit while set is refused; the caller retries on
     /// a later height (labels stay exact — a skipped height simply snapshots

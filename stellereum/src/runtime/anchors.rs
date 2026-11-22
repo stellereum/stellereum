@@ -199,6 +199,8 @@ impl ValidatorRuntime {
             xpc_mailbox_seen: HashMap::new(),
             apply_lane: None,
             apply_in_flight: None,
+            parked_proposal: None,
+            parked_commit: None,
             snapshot_in_flight: None,
             parallel_exec: state.is_parallel_exec_enabled(),
             validator_set_stale: false,

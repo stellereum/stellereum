@@ -256,6 +256,53 @@ pub(crate) fn apply_peer_pq_keys_env_at(init_height: u64, peers_env: Option<&str
     }
 }
 
+/// Replay the bounded park slots once the apply worker has released post-H
+/// state (`apply_in_flight` Some -> None).
+///
+/// The replay goes through the SAME public entry points as live traffic —
+/// [`ValidatorRuntime::on_proposal`] and
+/// [`ValidatorRuntime::adopt_committed`] — so every authenticity, height,
+/// round, root, actor-cap, proposer, parent, lock and precommit-quorum check
+/// runs again. Nothing is applied from the parked copy directly; a refusal is
+/// logged and dropped (the peer/gossip retry remains the backstop).
+///
+/// Order: the commit first (it may address the height that just finished),
+/// then the proposal (which typically targets the newly installed H+1).
+async fn replay_parked_apply_window(rt: &mut ValidatorRuntime) {
+    let (proposal, commit) = rt.take_parked();
+    if let Some(c) = commit {
+        match rt.adopt_committed(c.height, c.block, c.certificate).await {
+            Ok(bh) => info!(
+                "[consensus] replayed parked commit #{} {} (adopted)",
+                c.height,
+                hex::encode(&bh[..6])
+            ),
+            Err(e) => tracing::debug!(
+                height = c.height,
+                error = %e,
+                "[consensus] parked commit refused on replay (fail-closed)"
+            ),
+        }
+    }
+    if let Some(p) = proposal {
+        let h = p.block.height;
+        match rt.on_proposal(p.proposer, p.block, p.round).await {
+            Ok(bh) => info!(
+                "[consensus] replayed parked proposal #{} r{} {} (accepted)",
+                h,
+                p.round,
+                hex::encode(&bh[..6])
+            ),
+            Err(e) => tracing::debug!(
+                height = h,
+                round = p.round,
+                error = %e,
+                "[consensus] parked proposal refused on replay (fail-closed)"
+            ),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 // GATE: 16 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
 #[allow(unused_assignments)]
@@ -3850,6 +3897,15 @@ pub(crate) async fn run_consensus_node(
                                             rt.committee_schedule_at(height),
                                         );
                                     if proven {
+                                        // The certificate DECODED and VERIFIED
+                                        // (precommit kind + height + block hash
+                                        // + quorum under the set in force at
+                                        // this height): the `_hq_` sidecar for
+                                        // this height is now known, so lift any
+                                        // miss cooldown. `clear_qc_backoff` is
+                                        // only ever called on such a validated
+                                        // QC, never on a hint.
+                                        adapter.clear_qc_backoff(block_shard, height);
                                         peer_named_height = clamp_peer_named_height(
                                             our_tip,
                                             peer_named_height.max(height),
@@ -3877,8 +3933,18 @@ pub(crate) async fn run_consensus_node(
                             // re-walks the same body, so a one-tick deferral loses
                             // nothing and can never double-apply a height.
                             if rt.has_pending_apply() {
+                                // PARK, do not drop: `adopt_committed` sees the
+                                // in-flight apply and parks this commit in its
+                                // bounded one-slot buffer (returning the
+                                // "parked for replay" error). The replay hook
+                                // after `try_poll_apply` re-runs every check.
+                                if height == rt.hc.height {
+                                    let _ = rt
+                                        .adopt_committed(height, block.clone(), certificate.clone())
+                                        .await;
+                                }
                                 info!(
-                                "[consensus] deferring peer commit at #{height}: apply still in flight"
+                                "[consensus] deferring peer commit at #{height}: apply still in flight (parked for replay)"
                             );
                                 continue;
                             }
@@ -3890,6 +3956,10 @@ pub(crate) async fn run_consensus_node(
                             // quorum it is measured against.
                             match rt.adopt_committed(height, block.clone(), certificate).await {
                                 Ok(bh) => {
+                                    // QC verified inside adopt and the block
+                                    // applied: any `_hq_` miss cooldown for
+                                    // this height is obsolete.
+                                    adapter.clear_qc_backoff(block_shard, height);
                                     {
                                         let pq_reg = rt.state.pq_registry_read().await;
                                         let active =
@@ -4215,13 +4285,56 @@ pub(crate) async fn run_consensus_node(
         // check and the commit broadcast all wait for it (stage-1 gate,
         // `apply_in_flight` checks in the runtime).
         if let Some(decided) = rt.try_finalize_submit().await {
+            let decided_height = rt.hc.height;
             info!(
                 "[consensus] DECIDED block #{} {} (execution queued on the sequenced worker)",
                 height,
                 hex::encode(&decided[..6]),
             );
+            // EARLY `_hq_` QC SIDECAR (liveness, incident #21508): the QC is
+            // already in hand (`try_finalize_submit` stashed it), so publish it
+            // NOW — before the body persist / apply completion path — instead
+            // of waiting for the header publish that rides after the apply.
+            //
+            // ORDERING INVARIANT (kept explicitly): the sidecar is never the
+            // only blob present for a height. The job publishes the
+            // header/index (and v2 record) FIRST via `persist_block_header`,
+            // then the QC, matching the "header first, then QC: a crash
+            // between writes yields missing-QC -> skip, never a half-trusted
+            // header" contract. `claim_hq_publish` makes the later
+            // header-completion publish a no-op duplicate.
+            //
+            // Amplification guard: only nodes that already publish this
+            // height's header (proposer / small set / 8-boundary) take this
+            // path; on other nodes a lone QC write would violate the ordering
+            // invariant, and their sidecar rides the header publish as before.
+            if let Some((dh, block, qc)) = rt.last_decision.clone() {
+                let is_proposer = block.proposer == self_vote_id;
+                let publish_header =
+                    should_publish_header_now(rt.validators.len(), is_proposer, decided_height);
+                if dh == decided_height && block.compute_hash() == decided && publish_header {
+                    let a = adapter.clone();
+                    let shard_id = block_shard;
+                    let decided_for_job = decided;
+                    publish_lane.submit(async move {
+                        a.persist_block_header(shard_id, &block).await;
+                        a.publish_block_qc(shard_id, dh, decided_for_job, &qc).await;
+                    });
+                }
+            }
         }
         if let Some(completed) = rt.try_poll_apply().await {
+            // PARK-AND-REPLAY HOOK (liveness, incident #21508): this is the
+            // exact point where the sequenced apply worker's completion is
+            // observed (`apply_in_flight` just transitioned Some -> None and
+            // `install_apply_outcome` installed H). Anything that arrived
+            // during the execute window was parked, not dropped; replay it
+            // NOW through the normal validating entry points. Placed before
+            // any publish/record work so the proposal is re-validated (and may
+            // be prevoted on the next step) without waiting another tick.
+            // `take_parked` clears both one-slot buffers, so replay is
+            // at-most-once and cannot grow the runtime.
+            replay_parked_apply_window(&mut rt).await;
             // The executed height: the tick-top `height` cannot have moved
             // past it (the height advance happens right here), but naming it
             // keeps every line below honest about what it publishes.
@@ -4283,6 +4396,16 @@ pub(crate) async fn run_consensus_node(
                 let is_proposer = block.proposer == self_vote_id;
                 let validator_count = rt.validators.len();
                 let publish_body = should_publish_body_now(validator_count, is_proposer, height);
+                // NEVER suppress this store just because the early decision-time
+                // job already published the same header. `persist_block_header`
+                // returns `()` and the early job runs on `publish_lane`, where
+                // `paced_store_blob_in_lane` can SHED/DROP under backpressure or
+                // a lane cooldown; if that write was shed, suppression would
+                // mean this node NEVER re-stores the header/index for the height
+                // (catch-up readers then see "body present, header missing").
+                // The store is idempotent and content-addressed, so publishing
+                // twice is safe; publishing zero times is not. Header before QC
+                // ordering is preserved in both jobs.
                 let publish_header =
                     should_publish_header_now(validator_count, is_proposer, height);
                 if publish_body {
@@ -6049,6 +6172,11 @@ mod r3_driver_pq_tests {
 
     #[test]
     fn peer_pq_keys_env_honored_before_w3_and_ignored_at_or_after_w3() {
+        // This test deliberately CLEARS and replaces the process-global PQ
+        // registry. Hold the ONE shared test lock for the whole body so a
+        // parallel test that just registered/signed with its own keys cannot
+        // have them wiped between registration and verification.
+        let _global = crate::node::policy::test_support::global_lock();
         let _g = GateGuard::at(100);
         let peer_id = [0xD7u8; 32];
         let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0xD7);

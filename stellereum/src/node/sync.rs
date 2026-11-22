@@ -2220,7 +2220,12 @@ mod recovery_walk_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry tests serialize across awaits
     async fn recovery_walk_closes_400_and_1100_without_a_new_snapshot() {
+        // The fixtures below seed/replace the process-global PQ registry and
+        // verify votes against it; hold the ONE shared test lock so no
+        // parallel test can swap the key set mid-walk.
+        let _global = crate::node::policy::test_support::global_lock();
         // Production entry point, cadence-derived cap: 400 fits one hop on
         // current policy, 1100 does NOT (1064 default) and must enter
         // multi-hop recovery. On the pre-fix code the 1100 case returns None
@@ -2233,7 +2238,11 @@ mod recovery_walk_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry tests serialize across awaits
     async fn walk_ignores_uncertified_proposal_in_rt_blocks_and_fetches_decided_body() {
+        // See `recovery_walk_closes_*`: this test also seeds the global PQ
+        // registry before checking that votes admit.
+        let _global = crate::node::policy::test_support::global_lock();
         const B: u64 = 4;
         const N: u64 = 7;
         let ks = vec![SigningKey::from_bytes(&[0x59; 32])];

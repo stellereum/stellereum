@@ -11,6 +11,157 @@ use crate::consensus::{
 use crate::sharding::{Block, CrossShardKey, Transaction, ValidatorSetSource};
 use sha2::{Digest as _, Sha256};
 
+/// A proposal that arrived while the apply worker was still executing the
+/// decided height.
+///
+/// The proposal is NOT validated here (our state root is still PRE-H, so a
+/// root check would compare against the wrong parent). It is parked and
+/// replayed through [`ValidatorRuntime::on_proposal`] the moment the worker
+/// reports back, so authentication, height/round, root and actor-cap checks
+/// all run again — fail-closed, never a bypass.
+#[derive(Clone, Debug)]
+pub struct ParkedProposal {
+    pub proposer: ValidatorId,
+    pub block: Block,
+    pub round: Round,
+    /// `(hc.height, hc.round)` when this item was parked.
+    ///
+    /// Used to invalidate the slot on replay: an item is only replayed while
+    /// it still targets the CURRENT consensus height and its envelope round is
+    /// within `SUPERSEDED_ROUND_LAG`; any further height/round advance makes
+    /// it stale and it is dropped instead of replayed.
+    pub parked_at: (Height, Round),
+}
+
+/// A peer commit that arrived while the apply worker was still executing.
+///
+/// Covers the "execution in flight" window of [`ValidatorRuntime::adopt_committed`]: parking
+/// keeps the certificate instead of dropping it, and the replay re-runs the
+/// full precommit-quorum, height, proposer, parent and lock checks.
+#[derive(Clone, Debug)]
+pub struct ParkedCommit {
+    pub height: Height,
+    pub block: Block,
+    pub certificate: crate::consensus::QuorumCertificate,
+    /// `(hc.height, hc.round)` when this item was parked; see
+    /// [`ParkedProposal::parked_at`].
+    pub parked_at: (Height, Round),
+}
+
+impl ValidatorRuntime {
+    /// Park the newest proposal for replay (bounded: overwrites any older
+    /// parked proposal, so at most one is ever held).
+    pub(super) fn park_proposal(&mut self, proposer: ValidatorId, block: Block, round: Round) {
+        if self.parked_proposal.is_some() {
+            tracing::debug!(
+                height = block.height,
+                round,
+                "replacing a parked proposal with a newer one (park depth is 1)"
+            );
+        }
+        self.parked_proposal = Some(ParkedProposal {
+            proposer,
+            block,
+            round,
+            parked_at: (self.hc.height, self.hc.round),
+        });
+    }
+
+    /// Park the newest peer commit for replay (bounded: overwrites any older
+    /// parked commit, so at most one is ever held).
+    pub(super) fn park_commit(
+        &mut self,
+        height: Height,
+        block: Block,
+        certificate: crate::consensus::QuorumCertificate,
+    ) {
+        if self.parked_commit.is_some() {
+            tracing::debug!(
+                height,
+                "replacing a parked commit with a newer one (park depth is 1)"
+            );
+        }
+        self.parked_commit = Some(ParkedCommit {
+            height,
+            block,
+            certificate,
+            parked_at: (self.hc.height, self.hc.round),
+        });
+    }
+
+    /// Take (and clear) both park slots, dropping any item that went stale
+    /// while parked.
+    ///
+    /// STALENESS (explicit): `hc.height`/`hc.round` can advance while an item
+    /// sits in a slot, so each item carries the epoch it was parked in and is
+    /// only returned when it still targets the current height with a
+    /// non-superseded envelope round. Everything else is DROPPED here (and the
+    /// slot cleared) — a stale item can never be replayed a height late. Note
+    /// that `hc` legitimately advances by exactly one between parking (during
+    /// the H apply) and replay (H installed), which is why the check is
+    /// "target == current height" rather than "no advance happened".
+    ///
+    /// Returns at most one of each (two entries total, fixed memory).
+    pub fn take_parked(&mut self) -> (Option<ParkedProposal>, Option<ParkedCommit>) {
+        let now = (self.hc.height, self.hc.round);
+        let proposal = self.parked_proposal.take().filter(|p| {
+            // The apply window that parked this item must have closed (a
+            // height advance happened) AND the body must target the height
+            // now in progress, with a non-superseded envelope round.
+            p.parked_at.0 < now.0
+                && p.block.height == now.0
+                && p.round
+                    .saturating_add(crate::consensus_net::SUPERSEDED_ROUND_LAG)
+                    > now.1
+        });
+        // A commit parked while the PREVIOUS height applied targets the height
+        // that just became current; one parked during the CURRENT height's own
+        // apply is redundant after the advance and is dropped by the same
+        // target-height rule.
+        let commit = self
+            .parked_commit
+            .take()
+            .filter(|c| c.parked_at.0 <= c.height && c.height == now.0);
+        (proposal, commit)
+    }
+
+    /// Drop everything parked without replaying it (used when the node
+    /// deliberately abandons the window, e.g. a hard reset of consensus).
+    pub fn clear_parked(&mut self) {
+        self.parked_proposal = None;
+        self.parked_commit = None;
+    }
+
+    /// Drop slots that can no longer be replayed even after a legitimate
+    /// advance: anything targeting a height more than one ahead of the
+    /// current one (or, for commits, a height already behind us) is stale.
+    /// Called on every round change so a slot cannot linger across view
+    /// changes; the precise stale check (target height AND envelope round)
+    /// runs again in [`Self::take_parked`] at replay time.
+    fn prune_stale_parked(&mut self) {
+        let height = self.hc.height;
+        if self
+            .parked_proposal
+            .as_ref()
+            .is_some_and(|p| p.block.height > height.saturating_add(1))
+        {
+            self.parked_proposal = None;
+        }
+        if self
+            .parked_commit
+            .as_ref()
+            .is_some_and(|c| c.height > height.saturating_add(1) || c.height < height)
+        {
+            self.parked_commit = None;
+        }
+    }
+
+    /// True while a proposal or commit is waiting for the apply worker.
+    pub fn has_parked(&self) -> bool {
+        self.parked_proposal.is_some() || self.parked_commit.is_some()
+    }
+}
+
 impl ValidatorRuntime {
     /// Validate a proposed block before accepting/prevoting it.
     /// SECURITY: rejects wrong height/proposer/prev_hash, oversized blocks and
@@ -1473,8 +1624,15 @@ impl ValidatorRuntime {
         // H+1 proposal looks corrupt, a stale one looks fine), so the
         // proposal is deferred, not validated, until the worker reports back.
         // No state is read and none moves.
+        //
+        // PARK-AND-REPLAY (liveness, incident #21508): the proposal used to be
+        // DROPPED here, so recovering it cost a full retransmit cycle (the
+        // first vote retransmit alone was >=1.5s before the retransmit fix).
+        // It is now parked in a bounded one-slot buffer and replayed through
+        // this same function (all checks run) as soon as the worker reports.
         if self.apply_in_flight.is_some() {
-            return Err("proposal deferred: apply in flight".to_string());
+            self.park_proposal(proposer, block, envelope_round);
+            return Err("proposal parked for replay: apply in flight".to_string());
         }
         // Read our root BEFORE accepting, so the header is checked against the
         // state the block would actually extend.
@@ -2657,6 +2815,11 @@ impl ValidatorRuntime {
 
     /// View change: move to the next round.
     pub fn next_round(&mut self) {
+        // A parked slot must not survive an unbounded number of view changes;
+        // this drops only items that are provably unreplayable (more than one
+        // height ahead). Round staleness of a still-targeted height is
+        // enforced by `take_parked`'s envelope-round predicate.
+        self.prune_stale_parked();
         self.hc.next_round();
     }
 
@@ -2680,10 +2843,13 @@ impl ValidatorRuntime {
         // running for the decided height. The checks below read our root
         // (PRE-H until the worker reports back) and `apply_and_advance` would
         // queue a second apply behind it — for a height we have not advanced
-        // past. Deferred, not validated; the peer rebroadcasts (and catch-up
-        // re-walks) until we are ready.
+        // past. PARK-AND-REPLAY (liveness): the commit used to be dropped, so
+        // the peer had to rebroadcast; it is now parked (one slot, newest
+        // wins) and replayed through this same function, fail-closed, when
+        // the worker reports.
         if self.apply_in_flight.is_some() {
-            return Err("committed block deferred: apply in flight".to_string());
+            self.park_commit(height, block, certificate);
+            return Err("committed block parked for replay: apply in flight".to_string());
         }
         // W10.5: verify against the set IN FORCE AT THIS HEIGHT, never the
         // live set. A peer can only make us apply a block the network genuinely
@@ -3107,6 +3273,16 @@ mod consensus_step_tests {
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
 
+    /// Serializes this module's tests: `make_4node_cluster` replaces the
+    /// PROCESS-GLOBAL committed PQ registry (`sync_committed_pq_registry`), so
+    /// two tests running in parallel would erase each other's validator keys
+    /// and fail as "bad vote signature" / "invalid proposer signature".
+    static STEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn step_lock() -> std::sync::MutexGuard<'static, ()> {
+        STEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     async fn make_4node_cluster(seed_base: u8) -> (Vec<ValidatorRuntime>, ValidatorSet) {
         let keys: Vec<SigningKey> = (0..4u8)
             .map(|i| SigningKey::from_bytes(&[seed_base.wrapping_add(i); 32]))
@@ -3150,7 +3326,9 @@ mod consensus_step_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
     async fn late_precommit_enriches_last_qc_during_apply_in_flight_and_after_advance() {
+        let _global = step_lock();
         // Window A: 4th precommit arrives while `apply_in_flight` is active at H-1=1.
         {
             let (mut nodes, validators) = make_4node_cluster(0x10).await;
@@ -3390,5 +3568,352 @@ mod consensus_step_tests {
                 .check_last_qc_evidence(&h2_probe)
                 .expect("enriched Window B last_qc must pass check_last_qc_evidence");
         }
+    }
+
+    /// Decide height 1 on a 4-node cluster and leave `target_idx` with the
+    /// apply IN FLIGHT (height still 1), while every other node advances to
+    /// height 2. Returns the decided block and hash.
+    async fn decide_h1_and_leave_apply_in_flight(
+        nodes: &mut [ValidatorRuntime],
+        validators: &ValidatorSet,
+        target_idx: usize,
+        ts: u64,
+    ) -> (crate::sharding::Block, [u8; 32]) {
+        let pidx = nodes
+            .iter()
+            .position(|n| validators.proposer_for(1, 0) == Some(n.id))
+            .expect("proposer for h=1 r=0");
+        let block = nodes[pidx].propose(ts).await.expect("propose h=1");
+        let bh = block.compute_hash();
+        let pid = nodes[pidx].id;
+        for (i, n) in nodes.iter_mut().enumerate() {
+            if i != pidx {
+                n.on_proposal(pid, block.clone(), 0)
+                    .await
+                    .expect("on_proposal h=1");
+            }
+        }
+        let prevotes: Vec<Vote> = nodes.iter().filter_map(|n| n.make_prevote()).collect();
+        assert_eq!(prevotes.len(), 4);
+        for v in &prevotes {
+            for n in nodes.iter_mut() {
+                n.on_prevote(v.clone()).expect("on_prevote");
+            }
+        }
+        let precommits: Vec<Vote> = nodes
+            .iter_mut()
+            .filter_map(|n| n.make_precommit())
+            .collect();
+        assert_eq!(precommits.len(), 4);
+        for v in &precommits {
+            for n in nodes.iter_mut() {
+                n.on_precommit(v.clone()).expect("on_precommit");
+            }
+        }
+        assert_eq!(nodes[target_idx].try_finalize_submit().await, Some(bh));
+        assert!(nodes[target_idx].has_pending_apply());
+        assert_eq!(nodes[target_idx].hc.height, 1);
+        for (i, n) in nodes.iter_mut().enumerate() {
+            if i != target_idx {
+                assert_eq!(n.try_finalize().await, Some(bh));
+                assert_eq!(n.hc.height, 2);
+            }
+        }
+        (block, bh)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn parked_proposal_is_replayed_after_apply_and_never_double_votes() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x70).await;
+        let ts = 1_700_020_000u64;
+        // Target must NOT be the h=2 proposer: it needs to stay at height 1
+        // while the H+1 proposal is built by a peer that already advanced.
+        let h2_idx = nodes
+            .iter()
+            .position(|n| validators.proposer_for(2, 0) == Some(n.id))
+            .expect("proposer for h=2 r=0");
+        let target_idx = (h2_idx + 1) % nodes.len();
+        let (_h1, _bh) =
+            decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+        assert_eq!(nodes[h2_idx].hc.height, 2);
+
+        let block2 = nodes[h2_idx]
+            .propose(ts.saturating_add(30))
+            .await
+            .expect("propose h=2");
+        let bh2 = block2.compute_hash();
+        let pid2 = nodes[h2_idx].id;
+
+        // H+1 proposal arrives during the H apply: PARKED, not dropped, and
+        // deliberately NOT validated yet (our root is still PRE-H).
+        let err = nodes[target_idx]
+            .on_proposal(pid2, block2.clone(), 0)
+            .await
+            .expect_err("proposal during apply must be parked");
+        assert!(err.contains("parked"), "unexpected error: {err}");
+        assert!(nodes[target_idx].has_parked());
+        assert_eq!(
+            nodes[target_idx].hc.height, 1,
+            "parking must not move consensus state"
+        );
+
+        // The worker reports back: H=1 is installed, H=2 is current.
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+
+        let (parked, parked_commit) = nodes[target_idx].take_parked();
+        assert!(parked_commit.is_none());
+        let p = parked.expect("proposal must survive the apply window");
+        assert_eq!(p.block.compute_hash(), bh2);
+
+        // Replay through the ORIGINAL entry point: every check runs again.
+        let accepted = nodes[target_idx]
+            .on_proposal(p.proposer, p.block, p.round)
+            .await
+            .expect("replayed proposal must be accepted");
+        assert_eq!(accepted, bh2);
+        assert!(!nodes[target_idx].has_parked());
+
+        // REGRESSION: the replay must not enable a second vote for the same
+        // (height, round) target. The SafetyAuthority watermark stays
+        // authoritative: one prevote, and the immediate second attempt is
+        // refused.
+        let v1 = nodes[target_idx]
+            .make_prevote()
+            .expect("first prevote at (2,0)");
+        assert_eq!((v1.height, v1.round), (2, 0));
+        assert!(
+            nodes[target_idx].make_prevote().is_none(),
+            "parked-then-replayed proposal must never double-vote (2,0)"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn parked_commit_is_revalidated_and_bad_certificate_still_refused() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x72).await;
+        let ts = 1_700_030_000u64;
+        let h2_idx = nodes
+            .iter()
+            .position(|n| validators.proposer_for(2, 0) == Some(n.id))
+            .expect("proposer for h=2 r=0");
+        let target_idx = (h2_idx + 1) % nodes.len();
+        decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        let block2 = nodes[h2_idx]
+            .propose(ts.saturating_add(30))
+            .await
+            .expect("propose h=2");
+        let bh2 = block2.compute_hash();
+        // Structurally well-addressed, cryptographically EMPTY certificate:
+        // right height/round/kind/block hash, zero signers.
+        let bad = crate::consensus::QuorumCertificate {
+            height: 2,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh2),
+            signatures: vec![],
+            shard_id: block2.shard_id,
+        };
+
+        // Parked during the apply window (the gate fires before validation).
+        let err = nodes[target_idx]
+            .adopt_committed(2, block2.clone(), bad)
+            .await
+            .expect_err("commit during apply must be parked");
+        assert!(err.contains("parked"), "unexpected error: {err}");
+        assert!(nodes[target_idx].has_parked());
+
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+
+        let (_, parked) = nodes[target_idx].take_parked();
+        let c = parked.expect("commit must survive the apply window");
+        assert_eq!(c.height, 2);
+        // Replay goes through adopt_committed: the empty certificate is still
+        // refused on quorum verification (fail-closed, nothing bypassed).
+        let refused = nodes[target_idx]
+            .adopt_committed(c.height, c.block, c.certificate)
+            .await
+            .expect_err("bad certificate must be refused on replay");
+        assert!(
+            refused.contains("quorum"),
+            "expected a quorum refusal, got: {refused}"
+        );
+        assert_eq!(
+            nodes[target_idx].hc.height, 2,
+            "refused replay must not advance the height"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn parked_slots_are_bounded_and_overwrite_the_oldest() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x74).await;
+        let ts = 1_700_040_000u64;
+        let target_idx = 1;
+        let (block, _bh) =
+            decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        // Two distinct proposals arriving during the same apply window. The
+        // second overwrites the first: the pad is exactly one slot, so memory
+        // cannot grow with proposal traffic.
+        let mut a = block.clone();
+        a.height = 2;
+        a.timestamp = a.timestamp.saturating_add(1);
+        let mut b = a.clone();
+        b.timestamp = b.timestamp.saturating_add(1);
+        let (ha, hb) = (a.compute_hash(), b.compute_hash());
+        assert_ne!(ha, hb);
+
+        let pid = nodes[0].id;
+        assert!(nodes[target_idx]
+            .on_proposal(pid, a, 0)
+            .await
+            .unwrap_err()
+            .contains("parked"));
+        assert!(nodes[target_idx]
+            .on_proposal(pid, b, 0)
+            .await
+            .unwrap_err()
+            .contains("parked"));
+
+        // Exactly one proposal slot exists, and it holds the NEWEST item.
+        let slot = nodes[target_idx]
+            .parked_proposal
+            .as_ref()
+            .expect("newest proposal is retained");
+        assert_eq!(
+            slot.block.compute_hash(),
+            hb,
+            "a second park must overwrite the first (bounded depth 1)"
+        );
+        assert!(nodes[target_idx].parked_commit.is_none());
+
+        // Explicit abandonment clears both slots without replay.
+        nodes[target_idx].clear_parked();
+        assert!(!nodes[target_idx].has_parked());
+        assert!(nodes[target_idx].parked_proposal.is_none());
+        assert!(nodes[target_idx].parked_commit.is_none());
+
+        // One more item parked during the remaining window still fits and is
+        // replayed after the worker reports back (the pad is reusable, never
+        // growing).
+        let mut c = block;
+        c.height = 2;
+        c.timestamp = c.timestamp.saturating_add(2);
+        let hc = c.compute_hash();
+        assert!(nodes[target_idx]
+            .on_proposal(pid, c, 0)
+            .await
+            .unwrap_err()
+            .contains("parked"));
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        let (parked, parked_commit) = nodes[target_idx].take_parked();
+        assert!(parked_commit.is_none());
+        assert_eq!(
+            parked
+                .expect("parked proposal survives")
+                .block
+                .compute_hash(),
+            hc
+        );
+        assert!(!nodes[target_idx].has_parked());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn parked_items_are_dropped_after_the_height_moves_past_them() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x76).await;
+        let ts = 1_700_050_000u64;
+        let target_idx = 1;
+        let (block, _bh) =
+            decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        // Park a proposal for height 5 while the H=1 apply is in flight. The
+        // apply advances hc to 2, so on take the item targets neither the
+        // current height nor a fresh epoch: it MUST be discarded, never
+        // replayed a few heights late.
+        let mut stale = block;
+        stale.height = 5;
+        let pid = nodes[0].id;
+        assert!(nodes[target_idx]
+            .on_proposal(pid, stale, 0)
+            .await
+            .unwrap_err()
+            .contains("parked"));
+
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+        let (parked, parked_commit) = nodes[target_idx].take_parked();
+        assert!(
+            parked.is_none(),
+            "a parked item for a height other than the current one must be dropped"
+        );
+        assert!(parked_commit.is_none());
+        assert!(!nodes[target_idx].has_parked());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn parked_proposal_is_dropped_after_the_round_moves_beyond_the_lag() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x78).await;
+        let ts = 1_700_060_000u64;
+        let target_idx = 1;
+        let (block, _bh) =
+            decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        let mut next = block;
+        next.height = 2;
+        next.timestamp = next.timestamp.saturating_add(1);
+        let pid = nodes[0].id;
+        assert!(nodes[target_idx]
+            .on_proposal(pid, next, 0)
+            .await
+            .unwrap_err()
+            .contains("parked"));
+
+        // Completion installs H=2 at round 0: the parked r0 envelope is still
+        // fresh there...
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+        assert!(nodes[target_idx].has_parked());
+
+        // ...but once the CURRENT round advances beyond
+        // `SUPERSEDED_ROUND_LAG`, the parked envelope is stale and the slot
+        // must drop it instead of replaying a proposal the live path would
+        // refuse.
+        for _ in 0..=crate::consensus_net::SUPERSEDED_ROUND_LAG {
+            nodes[target_idx].next_round();
+        }
+        assert!(nodes[target_idx].hc.round > crate::consensus_net::SUPERSEDED_ROUND_LAG);
+        let (parked, parked_commit) = nodes[target_idx].take_parked();
+        assert!(
+            parked.is_none(),
+            "round advance past the lag must invalidate the parked proposal"
+        );
+        assert!(parked_commit.is_none());
+        assert!(!nodes[target_idx].has_parked());
     }
 }

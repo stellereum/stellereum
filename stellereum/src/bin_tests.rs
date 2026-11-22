@@ -424,7 +424,12 @@ mod gossip_batch_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry/env tests serialize across awaits
     async fn round_converges_only_on_verified_peer_rounds() {
+        // Serialize against every other test that mutates the process-global
+        // PQ registry or environment: this test signs with the very keys it
+        // registers, so a parallel clear/replace would fail verification.
+        let _global = crate::node::policy::test_support::global_lock();
         // Round-convergence safety: the drain follows a peer's round ONLY via
         // note_peer_vote_round AFTER on_prevote/on_precommit accepted the vote
         // (signature + membership + scope inside VoteSet::add). A forged vote
@@ -514,7 +519,12 @@ mod gossip_batch_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry/env tests serialize across awaits
     async fn batched_vote_then_proposal_accepts() {
+        // Serialize against every other test that mutates the process-global
+        // PQ registry or environment (see the module doc in
+        // `node::policy::test_support`).
+        let _global = crate::node::policy::test_support::global_lock();
         // Ordering: a vote arriving BEFORE its proposal (same Batch, sender
         // order preserved) must not poison the proposal.
         use stellereum::consensus::ValidatorSet;
@@ -1062,8 +1072,9 @@ mod liveness_policy_tests {
 
     #[test]
     fn retro_behind_window_env_parsing() {
-        let saved = std::env::var("STELL_RETRO_BEHIND_WINDOW_SECS").ok();
-        std::env::remove_var("STELL_RETRO_BEHIND_WINDOW_SECS");
+        let _global = crate::node::policy::test_support::global_lock();
+        let _env =
+            crate::node::policy::test_support::EnvRestore::remove("STELL_RETRO_BEHIND_WINDOW_SECS");
         assert_eq!(retro_behind_window_secs(), 120);
         std::env::set_var("STELL_RETRO_BEHIND_WINDOW_SECS", "0");
         assert_eq!(retro_behind_window_secs(), 120, "non-positive falls back");
@@ -1076,10 +1087,6 @@ mod liveness_policy_tests {
                 && should_suppress_retro_no_behind_peer(Some(30), 30, false),
             "window boundary: idle < window runs, idle >= window suppresses"
         );
-        match saved {
-            Some(v) => std::env::set_var("STELL_RETRO_BEHIND_WINDOW_SECS", v),
-            None => std::env::remove_var("STELL_RETRO_BEHIND_WINDOW_SECS"),
-        }
     }
 
     #[test]
@@ -1144,9 +1151,10 @@ mod liveness_policy_tests {
 
     #[test]
     fn down_proposer_timeout_default_and_backoff_intact() {
+        let _global = crate::node::policy::test_support::global_lock();
+        let _env =
+            crate::node::policy::test_support::EnvRestore::remove("STELL_DOWN_PROPOSER_TIMEOUT_MS");
         // Default 800ms when the env is absent, empty, zero or garbage.
-        let saved = std::env::var("STELL_DOWN_PROPOSER_TIMEOUT_MS").ok();
-        std::env::remove_var("STELL_DOWN_PROPOSER_TIMEOUT_MS");
         assert_eq!(down_proposer_timeout_ms(), 800);
         assert_eq!(DOWN_PROPOSER_TIMEOUT_DEFAULT_MS, 800);
         std::env::set_var("STELL_DOWN_PROPOSER_TIMEOUT_MS", "0");
@@ -1155,10 +1163,6 @@ mod liveness_policy_tests {
         assert_eq!(down_proposer_timeout_ms(), 800, "garbage falls back");
         std::env::set_var("STELL_DOWN_PROPOSER_TIMEOUT_MS", "500");
         assert_eq!(down_proposer_timeout_ms(), 500, "explicit override wins");
-        match saved {
-            Some(v) => std::env::set_var("STELL_DOWN_PROPOSER_TIMEOUT_MS", v),
-            None => std::env::remove_var("STELL_DOWN_PROPOSER_TIMEOUT_MS"),
-        }
         // The fast path CAPS (min): backoff growth never leaks through it…
         assert_eq!(800, 800);
         // …while the normal path keeps the full backoff ladder intact.
@@ -1543,6 +1547,10 @@ mod cli_tx_builder_tests {
     /// block can actually apply (rather than a claim every block refuses).
     #[test]
     fn bridge_deposit_tx_carries_the_attestation_a_block_accepts() {
+        // The attestation keys below live in the process-global PQ registry;
+        // hold the shared lock so no parallel test can clear/replace it
+        // between registration and `BridgeState::plan`.
+        let _global = crate::node::policy::test_support::global_lock();
         let signer = falcon_key(0x35);
         let validators = [attest_key(0x51), attest_key(0x52), attest_key(0x53)];
         let validator_pks: Vec<[u8; 32]> = validators.iter().map(|k| k.validator_id).collect();
@@ -1625,6 +1633,12 @@ mod cli_tx_builder_tests {
     /// block would reject (quorum fail-closed).
     #[test]
     fn attest_keys_come_from_explicit_seeds_or_the_local_node_key() {
+        // This fixture writes a plaintext consensus key into a throwaway temp
+        // dir; the opt-out is process-global env, so take the shared lock and
+        // restore the previous value on every exit path (including panics).
+        let _global = crate::node::policy::test_support::global_lock();
+        let _plaintext_env =
+            crate::node::policy::test_support::EnvRestore::set("STELL_KEY_PLAINTEXT", "1");
         let dir = std::env::temp_dir().join(format!(
             "stell-attest-keys-{}-{:?}",
             std::process::id(),
@@ -1665,8 +1679,8 @@ mod cli_tx_builder_tests {
         // either a passphrase or the explicit plaintext opt-out (the hardened
         // default refuses to write an unencrypted private key). This fixture
         // writes into a throwaway temp dir, so opting out is correct here and
-        // keeps the harness independent of the operator's environment.
-        std::env::set_var("STELL_KEY_PLAINTEXT", "1");
+        // keeps the harness independent of the operator's environment. The
+        // `_plaintext_env` guard above owns setting AND restoring it.
         let consensus = stellereum::node_keys::load_or_generate_consensus_key(&dir)
             .expect("create the consensus key");
         let keys = resolve_attest_keys(&[], &dir).expect("consensus-key fallback");

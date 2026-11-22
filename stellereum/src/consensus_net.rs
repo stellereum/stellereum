@@ -150,9 +150,9 @@ pub const MAX_PENDING_CHUNKS: usize = 256;
 /// the background sender a re-enqueue becomes a second wire copy, which is the
 /// 3-4x duplicate RX seen live. Suppressing an identical vote re-send inside
 /// this window coalesces those copies. It is deliberately SHORTER than the
-/// retransmit cadence (`max(150ms, timeout/2)` = 400ms at the live 800ms
-/// timeout): a vote lost in transit is still retried on schedule, only the
-/// same-tick duplicates collapse.
+/// retransmit cadence (the first retransmit is `base = clamp(T/10, 150ms,
+/// 350ms)`, see [`retransmit_interval_ms`]): a vote lost in transit is still
+/// retried on schedule, only the same-tick duplicates collapse.
 pub const VOTE_SEND_DEDUP_TTL_MS: u64 = 200;
 
 /// A vote is superseded once we are two rounds past it: a prevote/precommit
@@ -228,19 +228,58 @@ pub fn coalesce_for_send(msgs: Vec<ConsensusMsg>, height: u64, round: u32) -> Ve
         .collect()
 }
 
-/// Retransmit interval for the current round: `max(150ms, timeout/2)`,
-/// doubling for every full round-timeout elapsed, capped at `2 * timeout`.
+/// Retransmit interval for the current round, as a function of how long the
+/// round has been running. Front-loaded, then exponentially relaxed, capped at
+/// `2 * round_timeout`.
 ///
-/// The old fixed cadence re-sent at full rate no matter how long a round had
-/// been stuck, so a wedged round amplified into a retry storm on top of the
-/// 2s TIMEOUTs. Backing off while stuck keeps loss recovery (the first
-/// retries still fire at the fast cadence) without the thunder.
+/// Schedule (`T = round_timeout_ms`), with `base = clamp(T/10, 150ms, 350ms)`
+/// and `mid = 2 * base`:
+///
+/// | elapsed since round start | interval |
+/// |---------------------------|----------|
+/// | `< T/8`                   | `base`   |
+/// | `< T/2`                   | `mid`    |
+/// | `< 2T`                    | `T`      |
+/// | `>= 2T`                   | `2T`     |
+///
+/// At the live 3000ms round timeout that is ~300ms for the first retransmit,
+/// then ~600ms, then the round timeout, then the cap. A single lost packet
+/// therefore costs ~300ms (well under one block at 400ms tempo) instead of
+/// the previous `T/2 = 1500ms`, while a genuinely wedged round still backs off
+/// to `2T` instead of retrying at full rate forever (the retry storm the old
+/// fixed cadence produced).
+///
+/// DEPENDENCY — vote dedup floor: the send-side coalescing window is
+/// [`VOTE_SEND_DEDUP_TTL_MS`] (200ms), and it suppresses an identical vote
+/// re-send inside that window. The live first interval is therefore set to
+/// 300ms, comfortably ABOVE the dedup window, so the first retransmit is not
+/// swallowed (a first interval below ~250ms would be a NO-OP for votes). Only
+/// sub-2s timeouts fall back to the 150ms floor, which predates this schedule
+/// and is pinned by `bin_tests`; do not lower the live first interval further.
+///
+/// SCOPE — current round only: the caller uses this cadence only for what it
+/// already cast at its CURRENT `(height, round)` (the periodic outbox
+/// retransmit). It is not a catch-up throttle and must never be applied to
+/// historical heights, so a far-behind node cannot be made to re-flood old
+/// rounds faster.
+///
+/// Pure and time-injected (`elapsed_ms`) so the schedule is testable without a
+/// clock; never reads `Instant::now()`.
 pub fn retransmit_interval_ms(round_timeout_ms: u64, elapsed_ms: u64) -> u64 {
-    let base = (round_timeout_ms / 2).max(150);
-    let cap = round_timeout_ms.saturating_mul(2).max(base);
-    let doublings = elapsed_ms / round_timeout_ms.max(1);
-    let shifted = base.saturating_mul(1u64 << doublings.min(2));
-    shifted.min(cap)
+    let timeout = round_timeout_ms.max(1);
+    let base = (timeout / 10).clamp(150, 350);
+    let mid = base.saturating_mul(2);
+    let cap = timeout.saturating_mul(2).max(base);
+    let interval = if elapsed_ms < timeout / 8 {
+        base
+    } else if elapsed_ms < timeout / 2 {
+        mid
+    } else if elapsed_ms < timeout.saturating_mul(2) {
+        timeout
+    } else {
+        cap
+    };
+    interval.min(cap)
 }
 
 /// Send-time dedup of identical votes across flushes (the outbox dedup only
@@ -6392,11 +6431,13 @@ mod tests {
 
     #[test]
     fn retransmit_backoff_starts_fast_then_relaxes_without_thundering() {
-        // At the live 800ms timeout: fast retries while fresh (loss
-        // recovery), then backoff, capped so a wedged round never storms.
-        assert_eq!(retransmit_interval_ms(800, 0), 400);
-        assert_eq!(retransmit_interval_ms(800, 799), 400);
-        assert_eq!(retransmit_interval_ms(800, 800), 800);
+        // Front-loaded loss recovery, then backoff, capped so a wedged round
+        // never storms. At the live 800ms timeout the first retransmit fires
+        // after 150ms (`base = clamp(T/10, 150, 350)`), then 300ms, then the
+        // round timeout itself.
+        assert_eq!(retransmit_interval_ms(800, 0), 150);
+        assert_eq!(retransmit_interval_ms(800, 399), 300);
+        assert_eq!(retransmit_interval_ms(800, 400), 800);
         assert_eq!(
             retransmit_interval_ms(800, 10_000),
             1600,
@@ -6404,6 +6445,30 @@ mod tests {
         );
         // Small timeouts keep a sane floor instead of a hot loop.
         assert_eq!(retransmit_interval_ms(200, 0), 150);
+    }
+
+    #[test]
+    fn retransmit_schedule_is_front_loaded_at_the_live_round_timeout() {
+        // Live 3000ms round timeout: the FIRST retransmit must be sub-block
+        // (<= 400ms), not the old `T/2 = 1500ms` that turned one lost packet
+        // into a multi-second stall (incident: block #21508 took 7.54s).
+        let first = retransmit_interval_ms(3000, 0);
+        assert!(
+            first <= 400,
+            "first retransmit at a 3000ms timeout must be <= 400ms, got {first}ms"
+        );
+        assert!(
+            first >= 250,
+            "first retransmit must not be a hot loop: {first}ms"
+        );
+        // Second tier is roughly double the first, still well under T.
+        let second = retransmit_interval_ms(3000, 500);
+        assert_eq!(second, first * 2);
+        // Mid-round tier is the round timeout itself.
+        assert_eq!(retransmit_interval_ms(3000, 1500), 3000);
+        // And the schedule still covers a wedged round: it reaches the 2T cap.
+        assert_eq!(retransmit_interval_ms(3000, 6000), 6000);
+        assert_eq!(retransmit_interval_ms(3000, 60_000), 6000);
     }
 
     #[tokio::test]

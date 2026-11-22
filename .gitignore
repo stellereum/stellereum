@@ -1,0 +1,42 @@
+# HDAE project ignores (generated 2026-10-29)
+.archive/
+target/
+node_modules/
+explorer-site/node_modules/
+multinode/
+stell-observe/
+tmp/
+run/
+*.log
+*.tmp
+*.key
+keys/
+artifacts/
+.DS_Store
+# live node material (keys, stores, envs) must NEVER be committed:
+*.yaml.bak*
+env.*
+data.bak.*
+
+# Runtime state, build output and agent/session noise
+/multinode/
+/run/
+/tmp/
+/artifacts/
+/stell-observe/data/
+/docs-site/node_modules/
+/docs-site/.vitepress/cache/
+/docs-site/.vitepress/dist/
+AGENTS.md
+*.key
+*.pem
+*.db
+*.db-*
+kv.json
+subs.json
+dht.json
+routes.json
+.env
+.env.*
+*.secret
+*.token

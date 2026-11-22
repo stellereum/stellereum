@@ -1,0 +1,7 @@
+# The host is disk-constrained and `target/debug/incremental` grew to ~21 GB
+# under the parallel agent builds (the 233 GB volume hit 100%). Incremental
+# compilation buys little for this crate (a full debug build is ~15 min) and
+# costs the entire build budget on disk, so it is OFF for every workspace under
+# this repo. Override per-invocation with CARGO_INCREMENTAL=1 if ever needed.
+[build]
+incremental = false

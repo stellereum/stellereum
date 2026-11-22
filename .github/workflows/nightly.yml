@@ -1,0 +1,77 @@
+# AUTHORITATIVE GATE — the nightly full parallel test run.
+#
+# This is the only workflow that builds and runs EVERY test binary in the
+# stellereum crate (~335 harnesses, one per integration test file plus the
+# lib/bin harnesses). The PR workflow runs only a curated subset.
+#
+# It is deliberately not a deploy/soak job: no secrets, no live cluster, no
+# faucet, no external network calls beyond fetching crates.
+name: Nightly full gate
+
+on:
+  schedule:
+    # 02:00 UTC daily.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+# Never cancel a full gate because a newer nightly fired; it is expensive and
+# its log is the audit record. Manual runs queue behind a running schedule.
+concurrency:
+  group: nightly-full-gate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # 4 GB runner: keep the compiler below the memory ceiling. The test runner
+  # itself gets three binaries at a time, two threads each.
+  CARGO_BUILD_JOBS: '2'
+  RUST_BACKTRACE: '1'
+  JOBS: '3'
+  TEST_THREADS: '2'
+
+jobs:
+  full-gate:
+    name: full parallel gate (authoritative)
+    runs-on: ubuntu-latest
+    # The 2026-11-19 local run built in 15m and ran 346 harnesses in ~2,247s
+    # of binary time; a 4 GB hosted runner is slower. Leave headroom, but keep
+    # the step timeout below the job timeout so the artifact step can run.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      # The full test build is disk-heavy (the local target tree is ~27 GB,
+      # ~5 GB of which is test executables). A stock runner has ~14 GB free;
+      # drop preinstalled toolchains we do not use before building.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellereum
+          shared-key: nightly-full-gate
+      - name: Run scripts/test_parallel.sh -p stellereum
+        timeout-minutes: 210
+        env:
+          LOGDIR: ${{ runner.temp }}/test_parallel
+        run: |
+          set -euo pipefail
+          ./scripts/test_parallel.sh -p stellereum 2>&1 | tee "$RUNNER_TEMP/nightly.log"
+      - name: Upload gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-full-gate-log
+          path: |
+            ${{ runner.temp }}/nightly.log
+            ${{ runner.temp }}/test_parallel/*.log
+          if-no-files-found: warn
+          retention-days: 14

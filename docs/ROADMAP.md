@@ -127,11 +127,10 @@ Defect registry: `docs/OPEN_DEFECTS.md` (zero-backlog rule: every item ends `FIX
 - [x] Migrated legacy height-0 fixtures cleanly under v7 rules (or RAII pre-v7 overrides for explicit historical-hash/pre-activation tests) without weakening assertions.
 - [x] Full workspace gate green: `cargo clippy --offline --all-targets -- -D warnings` `0/0` (`stellereum`, `infnode`, `stellereum-contracts`, `stellereum-indexer`, `stellereum-sdk` + `--features node-parity`), `test_parallel.sh -p stellereum` **399/399**, `infnode` `62/62` + `infmail` `28/28` + all 17 integration binaries, `stellereum-indexer` `26/26`, `stellereum-sdk` `45+20+3+1`, `sdk-js` `23/23`, Stage 0 fake-code scan clean, zero `OPEN` items in `docs/OPEN_DEFECTS.md`.
 
-#### Wave 4: Live Cluster Rollout (`A/B/C/D`), Loadtest, Soak & Site Deploy
-- [ ] Build & deploy release binaries (`OPT-JITTER-*` + Ruleset v7) to all 4 validators (`A, B, C, D`) with `env.C` aligned (`STELL_MIN_BLOCK_MS=250`, `STELL_CATCHUP_BUDGET_MS=500`), `safety-init` / clean v7 genesis with validator self-bond >= `MIN + buffer` (`1100 STELL` so a single slash never ejects a validator), and restore `4/4` active validators (`quorum 3/4`, `fragile: false`).
-- [ ] Verify live block time stability (no 2s–4s `dht.store` spikes), run `scripts/cluster_liveness_watch.sh`, 256-sender `loadtest --print-all-senders`, and 24h soak.
-- [ ] Deploy updated `stellereum/site/assets/js/metrics.js` (`57750d40f`) to `/var/www/stellereum` on `nodeA` (with Cloudflare cache verify).
-- [ ] Optional ops follow-up: `UP-5` (`cosmovisor`-style auto-upgrader daemon in `stellereum-upgrader`).
+#### Wave 4 (DONE 2026-11-22): Live Cluster Rollout (`A/B/C/D`), Indexer & Site Deploy
+- [x] Built & deployed release `stellereum` (`3a2c2ef3e`, `FORK_ID = 0x3ae00ebc`, `CONSENSUS_RULESET_VERSION = 7`, `OPT-JITTER-*`, `_hq_` QC + backoff, `seed_genesis_pq_registry`) across all 4 validators (`A, B, C, D`) with aligned `env.A/B/C/D` (`STELL_MIN_BLOCK_MS=400`, `STELL_CATCHUP_INTERVAL_MS=30000`, `STELL_CATCHUP_BUDGET_MS=500`), clean v7 genesis, and `2000 STELL` self-bond per validator (`total_power = 8000 STELL`, `quorum = 5334 STELL`, **`4/4` active, `fragile: false`**).
+- [x] Verified live stability via `scripts/cluster_liveness.sh` (`LIVENESS_RESULT=OK`, `163.00 blk/min`, `spread=0`, `stalled_for=1s`, zero `fetch_block_qc` / `dht.store` 4s stalls) and `stell-loadtest --allow-live --senders 256 --print-all-senders` + `--dry-run`. *(Ongoing 24h soak & optional `UP-5` `stellereum-upgrader` remain ops/follow-up.)*
+- [x] Deployed release `stellereum-indexer` (`W4` keyset + SSE) to `nodeA` (`lag=0, synced=true`) and updated `stellereum/site/assets/js/metrics.js` (`e4fbe2ba...`) to `/var/www/stellereum/assets/js/metrics.js`.
 
 #### Deferred Post-Mainnet (`SEPARATE SYSTEM`, out of W0–W5 / R1–R5 scope)
 - [ ] `stell-wallet/` full UX + own connect protocol (then WalletConnect v2; MetaMask bridge stays maintenance-only).

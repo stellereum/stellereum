@@ -1,0 +1,20 @@
+/target
+/data
+/keys
+/wallet_data
+/wallet_keys
+*.bin
+*.log
+*.tmp
+.env
+
+# --- open-source hardening (OS1): never publish secrets or local state ---
+*.key
+*.pem
+keys/
+.env*
+env.*
+*handoff*
+*helper*keys*
+node_modules/
+.opencode/

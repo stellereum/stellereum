@@ -1,0 +1,31 @@
+{
+  "name": "@stellereum/sdk",
+  "version": "0.3.0",
+  "description": "Stellereum dApp client: EIP-1193 read provider, stell_/eth_ RPC helpers, PQ1 buildAndSign, protocol/fork guard, and unsigned EVM binding/carrier + governance builders",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  }
+}

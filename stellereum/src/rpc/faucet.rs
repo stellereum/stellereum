@@ -10,7 +10,7 @@ use serde_json::Value;
 #[allow(clippy::type_complexity)]
 // GATE: faucet persist callback type is fixed by durability hook; alias would churn public builder API.
 pub struct Faucet {
-    /// Drip amount (`STELL_FAUCET_DRIP_STELL`, default 10 STELL).
+    /// Drip amount (`STELL_FAUCET_DRIP_STELL`, default 2 STELL).
     pub drip: u64,
     /// Lifetime maximum creditable amount for a single address.
     pub max_per_address: u64,
@@ -614,18 +614,18 @@ impl FaucetMetaStore for crate::storage::Storage {
     }
 }
 
-/// Public testnet drip: 5 STELL per address (TON-style onboarding drip).
-/// Default 5 STELL; override with `STELL_PUBLIC_DRIP_NANO`. Faucet policy,
+/// Public testnet drip: 2 STELL per address (TON-style onboarding drip).
+/// Default 2 STELL; override with `STELL_PUBLIC_DRIP_NANO`. Faucet policy,
 /// not consensus — nodes MAY differ; same value recommended so every node's
 /// faucet credits the same amount.
-pub const PUBLIC_DRIP_NANO: u64 = 5 * 1_000_000_000;
+pub const PUBLIC_DRIP_NANO: u64 = 2 * 1_000_000_000;
 /// Public drip cooldown: 45 minutes per address. Default 2700 s; override
 /// with `STELL_PUBLIC_DRIP_COOLDOWN_SECS`. Faucet policy, not consensus —
 /// nodes MAY differ; same value recommended so every node's faucet enforces
 /// the same cooldown.
 pub const PUBLIC_DRIP_COOLDOWN_SECS: u64 = 45 * 60;
 
-/// Effective public drip amount (`STELL_PUBLIC_DRIP_NANO`, default 5 STELL).
+/// Effective public drip amount (`STELL_PUBLIC_DRIP_NANO`, default 2 STELL).
 pub fn public_drip_nano() -> u64 {
     std::env::var("STELL_PUBLIC_DRIP_NANO")
         .ok()
@@ -758,14 +758,14 @@ pub fn sign_pq_explicit_transfer_with_chain(
 }
 
 impl Faucet {
-    /// Default drip, in nano-STELL: 10 STELL unless `STELL_FAUCET_DRIP_STELL`
+    /// Default drip, in nano-STELL: 2 STELL unless `STELL_FAUCET_DRIP_STELL`
     /// carries a whole-STELL override. The single default every node binary
     /// uses, so the drip amount is one definition, not three hardcodings.
     pub fn default_drip_nano() -> u64 {
         let stell: u64 = std::env::var("STELL_FAUCET_DRIP_STELL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(2);
         stell.saturating_mul(1_000_000_000)
     }
 
@@ -1111,7 +1111,7 @@ impl Faucet {
         ))
     }
 
-    /// Public testnet drip (TON-style, tokenless): fixed 5 STELL per address
+    /// Public testnet drip (TON-style, tokenless): fixed 2 STELL per address
     /// per 45 minutes. Cooldown, lifetime cap and persist run under ONE lock.
     ///
     /// Compatibility entry point: its error is the old "seconds to wait"

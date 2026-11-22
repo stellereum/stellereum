@@ -903,12 +903,25 @@ pub(crate) fn log_quorum_safety(tag: &str, validators: &ValidatorSet) {
 pub(crate) const GENESIS_FAUCET_BALANCE: u64 = 1_000_000_000_000_000;
 
 /// Per-address lifetime dispense cap of the testnet faucet (`Faucet::new`'s
-/// `max_per_address`), in nano-STELL. Every faucet construction site (masterchain
+/// `max_per_address`), in nano-STELL. Default 50 STELL; override with
+/// `STELL_FAUCET_LIFETIME_CAP_STELL` (whole STELL, clamped > 0) via
+/// [`faucet_lifetime_cap_nano`]. Every faucet construction site (masterchain
 /// endpoint, sharded faucet, restart path) must pass the SAME cap: the faucet
 /// state it bounds is persisted and reloaded across restarts, so a node running
 /// a different cap would over- or under-serve addresses relative to the rest of
 /// the network.
-pub(crate) const FAUCET_LIFETIME_CAP: u64 = 1_000 * 1_000_000_000;
+pub(crate) const FAUCET_LIFETIME_CAP: u64 = 50 * 1_000_000_000;
+
+/// Effective per-address lifetime faucet cap (`STELL_FAUCET_LIFETIME_CAP_STELL`,
+/// whole STELL, default 50 STELL, clamped > 0).
+pub(crate) fn faucet_lifetime_cap_nano() -> u64 {
+    std::env::var("STELL_FAUCET_LIFETIME_CAP_STELL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(|stell| stell.saturating_mul(1_000_000_000))
+        .unwrap_or(FAUCET_LIFETIME_CAP)
+}
 
 pub(crate) fn lock_hint(
     rt: &ValidatorRuntime,
@@ -1473,5 +1486,90 @@ mod live_catchup_defer_tests {
         // Round > 0 or stale live adopt never defers.
         assert!(!should_defer_live_catchup(1, 0, 0, true, true));
         assert!(!should_defer_live_catchup(0, 1, 0, true, false));
+    }
+}
+
+/// Process-wide serialization for tests that mutate process-global state.
+///
+/// Rust runs tests in one process on parallel threads. The consensus PQ
+/// registry (`PQ_VALIDATOR_KEYS` / `PQ_COMMITTED_REGISTRY`) and the process
+/// environment are shared by every test in that process: a test that
+/// clears/replaces either must hold this ONE lock for its whole body, or a
+/// parallel test signs with one key set while verification reads another and
+/// fails a signature/PQ-registry assertion it never changed.
+///
+/// This module lives here because `node::policy` is compiled into BOTH the
+/// library test target and the `stellereum` bin test target, so every test
+/// module in either crate instance shares the same static.
+#[cfg(test)]
+#[allow(dead_code)] // helpers are target-specific: `set` is used by the bin tests, `remove` by both targets
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static PROCESS_GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the single process-wide test lock.
+    ///
+    /// Poisoning is ignored on purpose: the test that panicked already failed,
+    /// and the remaining tests must keep serializing instead of cascading into
+    /// "poisoned lock" failures.
+    pub(crate) fn global_lock() -> MutexGuard<'static, ()> {
+        PROCESS_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII restore for one environment variable. Callers hold
+    /// [`global_lock`] themselves, so one test can guard several variables
+    /// without trying to re-lock (which would deadlock).
+    pub(crate) struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, saved }
+        }
+
+        pub(crate) fn remove(key: &'static str) -> Self {
+            let saved = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod faucet_policy_tests {
+    use super::*;
+
+    #[test]
+    fn faucet_lifetime_cap_default_and_env_override() {
+        let _global = super::test_support::global_lock();
+        let _env = super::test_support::EnvRestore::remove("STELL_FAUCET_LIFETIME_CAP_STELL");
+        assert_eq!(FAUCET_LIFETIME_CAP, 50 * 1_000_000_000);
+        assert_eq!(faucet_lifetime_cap_nano(), 50 * 1_000_000_000);
+        std::env::set_var("STELL_FAUCET_LIFETIME_CAP_STELL", "0");
+        assert_eq!(
+            faucet_lifetime_cap_nano(),
+            50 * 1_000_000_000,
+            "zero must fall back to default (> 0)"
+        );
+        std::env::set_var("STELL_FAUCET_LIFETIME_CAP_STELL", "not-a-number");
+        assert_eq!(faucet_lifetime_cap_nano(), 50 * 1_000_000_000);
+        std::env::set_var("STELL_FAUCET_LIFETIME_CAP_STELL", "120");
+        assert_eq!(faucet_lifetime_cap_nano(), 120 * 1_000_000_000);
     }
 }

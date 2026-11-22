@@ -150,7 +150,14 @@ Run these from the repository root to reproduce one CI job without the helper:
 (cd infnode && cargo clippy --locked --all-targets -- -D warnings)
 
 # test-lib
-(cd stellereum && cargo test --locked --lib -- --test-threads=2)
+# The stellereum lib suite MUST run one test per thread: several consensus
+# tests replace the PROCESS-GLOBAL committed PQ registry
+# (`consensus::sync_committed_pq_registry`), so parallel execution makes one
+# test erase another test's validator keys and fails as
+# "bad vote signature" / "invalid proposer signature". `cargo nextest` is safe
+# because it runs every test in its own process; plain `cargo test` needs
+# `--test-threads=1` (see docs/CI.md § "Why the lib suite is serial").
+(cd stellereum && cargo test --locked --lib -- --test-threads=1)
 (cd infnode && cargo test --locked --lib -- --test-threads=2)
 
 # one curated suite leg, e.g. consensus
@@ -179,6 +186,40 @@ To match locally, install the same components:
 rustup toolchain install stable --component rustfmt --component clippy
 rustc -V
 ```
+
+## Why the lib suite is serial
+
+`stellereum` keeps the validator post-quantum key registry in **process-global**
+statics (`consensus::rotation::{PQ_VALIDATOR_KEYS, PQ_COMMITTED_REGISTRY}`).
+Production is correct that way: the live node has exactly one committed
+registry per process.
+
+Tests are not that shape. Several suites build their own 4-node fixture and
+call `consensus::sync_committed_pq_registry(&reg, true)`, which **replaces** the
+global registry (by design — it mirrors the on-chain registry at the current
+height). If two such tests run at the same time, one wipes the other's
+validator keys and an **unrelated** test fails with:
+
+```text
+vote admits: "bad vote signature"
+proposal: "invalid or missing proposer signature"
+bridge quorum: no committed PQ key at attestation height
+```
+
+Those failures are 100 % reproducible as a function of scheduling: the same
+tests pass with `--test-threads=1`. The fix is isolation, never a weaker
+assertion. Two safe ways to run:
+
+```sh
+# every test in its own process (preferred when installed)
+cargo nextest run --lib
+
+# plain cargo: serialize the tests that own the global registry
+cargo test --lib -- --test-threads=1
+```
+
+The `bin` target keeps its parallelism because the affected tests there take
+the shared `crate::node::policy::test_support::global_lock()` guard.
 
 ## Expected durations
 

@@ -1924,19 +1924,19 @@ async fn faucet_caps_lifetime_credit_per_address() {
 }
 
 #[tokio::test]
-async fn public_drip_is_5_stell_per_45_minutes_per_address() {
-    // TON-style public drip: fixed 5 STELL, one per address per 45 minutes.
+async fn public_drip_is_2_stell_per_45_minutes_per_address() {
+    // TON-style public drip: fixed 2 STELL, one per address per 45 minutes.
     let faucet = Faucet::new([0x77u8; 32], 0, 10 * 1_000_000_000, 1_000_000_000_000);
     let who = [0x42u8; 32];
     let t0 = 1_700_000_000u64;
 
-    // First drip succeeds with exactly 5 STELL.
+    // First drip succeeds with exactly 2 STELL.
     let (tx1, amount1) = faucet
         .build_public_transfer(who, t0, None)
         .await
         .expect("first public drip must succeed");
     assert_eq!(amount1, PUBLIC_DRIP_NANO);
-    assert_eq!(amount1, 5 * 1_000_000_000);
+    assert_eq!(amount1, 2 * 1_000_000_000);
     assert_eq!(tx1.to, who);
     assert!(
         tx1.verify_signature(),
@@ -4705,13 +4705,13 @@ async fn archive_proof_rpc_refuses_a_pruned_height() {
 }
 
 #[tokio::test]
-async fn faucet_default_drip_is_10_stell_with_env_override() {
-    // The compiled default funds 10 STELL per drip; operators override via
+async fn faucet_default_drip_is_2_stell_with_env_override() {
+    // The compiled default funds 2 STELL per drip; operators override via
     // STELL_FAUCET_DRIP_STELL (whole STELL). Env is process-global, so this
     // test saves and restores it.
     let saved = std::env::var("STELL_FAUCET_DRIP_STELL").ok();
     std::env::remove_var("STELL_FAUCET_DRIP_STELL");
-    assert_eq!(Faucet::default_drip_nano(), 10 * 1_000_000_000);
+    assert_eq!(Faucet::default_drip_nano(), 2 * 1_000_000_000);
     std::env::set_var("STELL_FAUCET_DRIP_STELL", "25");
     assert_eq!(Faucet::default_drip_nano(), 25 * 1_000_000_000);
     match saved {

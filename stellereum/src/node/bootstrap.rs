@@ -329,7 +329,7 @@ pub(crate) async fn start_workchain_shard(
             *seed,
             shard,
             stellereum::rpc::Faucet::default_drip_nano(),
-            FAUCET_LIFETIME_CAP,
+            faucet_lifetime_cap_nano(),
         );
         stellereum::runtime::fund_shard_genesis(
             &state_engine,
@@ -1135,7 +1135,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 *seed,
                 shard,
                 stellereum::rpc::Faucet::default_drip_nano(),
-                FAUCET_LIFETIME_CAP,
+                faucet_lifetime_cap_nano(),
             );
             faucet.account()
         });
@@ -1611,7 +1611,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         *seed,
                         shard,
                         stellereum::rpc::Faucet::default_drip_nano(),
-                        FAUCET_LIFETIME_CAP,
+                        faucet_lifetime_cap_nano(),
                     )
                     .with_chain_id(stellereum::zkml::effective_chain_id());
                     // NOTE: the persisted state is loaded asynchronously just
@@ -2155,7 +2155,13 @@ mod r3_bootstrap_pq_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry tests serialize across awaits
     async fn seed_genesis_pq_registry_produces_identical_roots_across_peers() {
+        // `seed_genesis_pq_registry` mirrors each node's registry into the
+        // process-global committed PQ registry; serialize with every other
+        // test that reads or replaces it so a parallel signature check cannot
+        // observe a half-swapped key set.
+        let _global = crate::node::policy::test_support::global_lock();
         let ed_a = [0x11u8; 32];
         let ed_b = [0x22u8; 32];
         let fk_a = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x11);

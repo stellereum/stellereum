@@ -28,6 +28,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -35,8 +36,209 @@ use sha2::{Digest, Sha256};
 /// Exact marker header written by the halted node.
 pub const MARKER_HEADER: &str = "stell-upgrade-halt v1";
 
+/// Exit code emitted by `stellereum` when halting at an approved upgrade height.
+pub const UPGRADE_EXIT_CODE: i32 = 42;
+
+/// Environment variable telling the restarted `stellereum` node to wait for a
+/// supermajority of committed power at the halt height before voting.
+pub const WAIT_SUPERMAJORITY_ENV: &str = "STELL_WAIT_SUPERMAJORITY";
+
+/// Environment variable declaring the running binary's upgrade target version.
+pub const UPGRADE_VERSION_ENV: &str = "STELL_UPGRADE_VERSION";
+
 /// Marker field parser is strict on this header; a future format must bump it.
 pub const MAX_UPGRADE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Full v1 upgrade-halt marker written by `stellereum` (`upgrade_halt.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HaltMarker {
+    pub height: u64,
+    pub halted_at_height: u64,
+    pub plan_name: String,
+    pub plan_sha256: [u8; 32],
+    pub target_version: String,
+    pub running_version: String,
+    pub halted_unix: u64,
+}
+
+impl HaltMarker {
+    /// Render the exact on-disk v1 marker text.
+    pub fn render(&self) -> String {
+        format!(
+            "{MARKER_HEADER}\n\
+             height={}\n\
+             halted_at_height={}\n\
+             plan_name={}\n\
+             plan_sha256={}\n\
+             target_version={}\n\
+             running_version={}\n\
+             halted_unix={}\n",
+            self.height,
+            self.halted_at_height,
+            self.plan_name,
+            hex_encode(&self.plan_sha256),
+            self.target_version,
+            self.running_version,
+            self.halted_unix,
+        )
+    }
+
+    /// Strict parser matching `stellereum/src/node/upgrade_halt.rs::UpgradeHaltMarker::parse`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(first) if first.trim() == MARKER_HEADER => {}
+            Some(other) => return Err(format!("bad upgrade-halt marker header: {other:?}")),
+            None => return Err("empty upgrade-halt marker".to_string()),
+        }
+        let mut height: Option<u64> = None;
+        let mut halted_at_height: Option<u64> = None;
+        let mut plan_name: Option<String> = None;
+        let mut plan_sha256: Option<[u8; 32]> = None;
+        let mut target_version: Option<String> = None;
+        let mut running_version: Option<String> = None;
+        let mut halted_unix: Option<u64> = None;
+        for raw in lines {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!("malformed marker line: {line:?}"));
+            };
+            match key {
+                "height" => {
+                    height = Some(
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|e| format!("bad marker height: {e}"))?,
+                    );
+                }
+                "halted_at_height" => {
+                    halted_at_height = Some(
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|e| format!("bad marker halted_at_height: {e}"))?,
+                    );
+                }
+                "plan_name" => plan_name = Some(required_marker_text(key, value)?),
+                "plan_sha256" => plan_sha256 = Some(parse_sha256_hex(value)?),
+                "target_version" => target_version = Some(required_marker_text(key, value)?),
+                "running_version" => running_version = Some(value.trim().to_string()),
+                "halted_unix" => {
+                    halted_unix = Some(
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|e| format!("bad marker halted_unix: {e}"))?,
+                    );
+                }
+                _ => {}
+            }
+        }
+        let marker = Self {
+            height: height.ok_or_else(|| "missing marker field 'height'".to_string())?,
+            halted_at_height: halted_at_height
+                .ok_or_else(|| "missing marker field 'halted_at_height'".to_string())?,
+            plan_name: plan_name.ok_or_else(|| "missing marker field 'plan_name'".to_string())?,
+            plan_sha256: plan_sha256
+                .ok_or_else(|| "missing marker field 'plan_sha256'".to_string())?,
+            target_version: target_version
+                .ok_or_else(|| "missing marker field 'target_version'".to_string())?,
+            running_version: running_version
+                .ok_or_else(|| "missing marker field 'running_version'".to_string())?,
+            halted_unix: halted_unix
+                .ok_or_else(|| "missing marker field 'halted_unix'".to_string())?,
+        };
+        if marker.plan_sha256 == [0u8; 32] {
+            return Err("plan_sha256 is all zero; refusing an unverifiable plan".to_string());
+        }
+        Ok(marker)
+    }
+
+    /// Read and parse a full v1 halt marker file. `Ok(None)` means not found.
+    pub fn read(path: &Path) -> Result<Option<Self>, String> {
+        match fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read marker {}: {e}", path.display())),
+        }
+    }
+
+    /// Extract the committed upgrade plan identity from this marker.
+    pub fn to_plan(&self) -> UpgradePlan {
+        UpgradePlan {
+            name: self.plan_name.clone(),
+            height: self.height,
+            sha256: self.plan_sha256,
+        }
+    }
+}
+
+fn required_marker_text(key: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(format!("empty marker field '{key}'"));
+    }
+    if v.contains('\n') || v.contains('\r') {
+        return Err(format!("marker field '{key}' carries a newline"));
+    }
+    Ok(v.to_string())
+}
+
+fn parse_sha256_hex(raw: &str) -> Result<[u8; 32], String> {
+    let trimmed = raw.trim();
+    let hex_str = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let bytes = hex_decode(hex_str)?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "plan_sha256 must be exactly 32 bytes".to_string())
+}
+
+/// True when an upgrade plan's `name` is a safe single path segment
+/// (mirrors `stellereum/src/governance.rs::upgrade_name_is_safe`).
+pub fn upgrade_name_is_safe(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0' || !c.is_ascii())
+    {
+        return false;
+    }
+    if name == "." || name == ".." || name.starts_with('.') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Resolve the staged binary path from either `--staged` or `--staged-dir`.
+pub fn resolve_staged_binary(
+    staged: Option<&Path>,
+    staged_dir: Option<&Path>,
+    plan_name: &str,
+) -> Result<PathBuf, String> {
+    match (staged, staged_dir) {
+        (Some(path), None) => Ok(path.to_path_buf()),
+        (None, Some(dir)) => {
+            if !upgrade_name_is_safe(plan_name) {
+                return Err(format!(
+                    "upgrade plan name {plan_name:?} is not a safe path segment; refusing --staged-dir lookup"
+                ));
+            }
+            Ok(dir.join(plan_name).join("stellereum"))
+        }
+        (Some(_), Some(_)) => {
+            Err("cannot pass both --staged and --staged-dir; choose one".to_string())
+        }
+        (None, None) => Err("either --staged or --staged-dir is required".to_string()),
+    }
+}
 
 /// The committed upgrade plan, in the shape both sources agree on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,7 +255,8 @@ impl UpgradePlan {
     /// Parse the durable marker written by the halted node.
     ///
     /// Unknown `key=value` lines are tolerated (forward compatibility inside
-    /// v1); a wrong header, missing required field or bad digest is refused.
+    /// v1); a wrong header, missing required field, malformed known v1 field,
+    /// or bad/zero digest is refused.
     pub fn from_marker(text: &str) -> Result<Self, String> {
         let mut lines = text.lines();
         match lines.next() {
@@ -73,13 +276,7 @@ impl UpgradePlan {
                 return Err(format!("malformed marker line: {line:?}"));
             };
             match key {
-                "plan_name" => {
-                    let v = value.trim();
-                    if v.is_empty() {
-                        return Err("empty marker field 'plan_name'".to_string());
-                    }
-                    name = Some(v.to_string());
-                }
+                "plan_name" => name = Some(required_marker_text(key, value)?),
                 "height" => {
                     height = Some(
                         value
@@ -89,12 +286,22 @@ impl UpgradePlan {
                     );
                 }
                 "plan_sha256" => {
-                    let bytes = hex_decode(value.trim())?;
-                    let arr: [u8; 32] = bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| "plan_sha256 must be exactly 32 bytes".to_string())?;
-                    sha256 = Some(arr);
+                    sha256 = Some(parse_sha256_hex(value)?);
+                }
+                "halted_at_height" => {
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|e| format!("bad marker halted_at_height: {e}"))?;
+                }
+                "halted_unix" => {
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|e| format!("bad marker halted_unix: {e}"))?;
+                }
+                "target_version" => {
+                    let _ = required_marker_text(key, value)?;
                 }
                 _ => {}
             }
@@ -112,34 +319,56 @@ impl UpgradePlan {
 
     /// Parse `result.applied.upgrade_plan` from `stell_governanceParams`.
     ///
+    /// Supports both the native `[u8; 32]` JSON byte-array encoding produced by
+    /// `stellereum`'s `AppliedParams` and a 64-char hex string encoding.
     /// `Ok(None)` means the committed state has no plan yet (a normal answer
     /// before governance executes the proposal) — never a parse failure.
     pub fn from_rpc_value(value: &serde_json::Value) -> Result<Option<Self>, String> {
-        if let Some(err) = value.get("error") {
+        if let Some(err) = value.get("error").filter(|v| !v.is_null()) {
             return Err(format!("RPC error reading the upgrade plan: {err}"));
         }
         let plan = value.pointer("/result/applied/upgrade_plan");
         match plan {
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(plan) => {
-                let name = plan
+                let raw_name = plan
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| "RPC upgrade plan has no string 'name'".to_string())?
-                    .to_string();
+                    .ok_or_else(|| "RPC upgrade plan has no string 'name'".to_string())?;
+                let name = required_marker_text("name", raw_name)
+                    .map_err(|_| "RPC upgrade plan has empty or invalid 'name'".to_string())?;
                 let height = plan
                     .get("height")
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| "RPC upgrade plan has no integer 'height'".to_string())?;
-                let sha_hex = plan
-                    .get("sha256")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "RPC upgrade plan has no string 'sha256'".to_string())?;
-                let bytes = hex_decode(sha_hex)?;
-                let sha256: [u8; 32] = bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "RPC plan sha256 must be exactly 32 bytes".to_string())?;
+                let sha256 =
+                    match plan.get("sha256") {
+                        Some(serde_json::Value::String(sha_hex)) => parse_sha256_hex(sha_hex)
+                            .map_err(|e| format!("RPC plan sha256: {e}"))?,
+                        Some(serde_json::Value::Array(arr)) => {
+                            if arr.len() != 32 {
+                                return Err(format!(
+                                    "RPC plan sha256 array must have 32 bytes, got {}",
+                                    arr.len()
+                                ));
+                            }
+                            let mut out = [0u8; 32];
+                            for (idx, item) in arr.iter().enumerate() {
+                                let n = item.as_u64().ok_or_else(|| {
+                                    format!("RPC plan sha256[{idx}] is not an unsigned integer")
+                                })?;
+                                let byte = u8::try_from(n).map_err(|_| {
+                                    format!("RPC plan sha256[{idx}]={n} is out of byte range")
+                                })?;
+                                out[idx] = byte;
+                            }
+                            out
+                        }
+                        _ => {
+                            return Err("RPC upgrade plan has no string or 32-byte array 'sha256'"
+                                .to_string());
+                        }
+                    };
                 if sha256 == [0u8; 32] {
                     return Err("RPC plan sha256 is all zero; refusing".to_string());
                 }
@@ -178,8 +407,7 @@ impl UpgradePlan {
             let text = response
                 .into_string()
                 .map_err(|e| format!("RPC {url}: read body: {e}"))?;
-            serde_json::from_str(&text)
-                .map_err(|e| format!("RPC {url}: invalid JSON: {e}"))?
+            serde_json::from_str(&text).map_err(|e| format!("RPC {url}: invalid JSON: {e}"))?
         };
         Self::from_rpc_value(&value)
     }
@@ -220,6 +448,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Format an already-computed 32-byte SHA-256 digest as lowercase hex.
+pub fn format_sha256_hex(digest: &[u8; 32]) -> String {
+    hex_encode(digest)
+}
+
 /// A staged binary whose bytes and digest have already been checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedBinary {
@@ -240,8 +473,8 @@ pub fn verify_staged(path: &Path, expected: &[u8; 32]) -> Result<VerifiedBinary,
     if *expected == [0u8; 32] {
         return Err("expected sha256 is all zero; refusing".to_string());
     }
-    let meta = fs::symlink_metadata(path)
-        .map_err(|e| format!("staged binary {}: {e}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| format!("staged binary {}: {e}", path.display()))?;
     if meta.file_type().is_symlink() {
         return Err(format!(
             "staged binary {} is a SYMLINK; refusing (must be a regular file)",
@@ -305,8 +538,13 @@ fn check_parent_dir(path: &Path, label: &str) -> Result<(), String> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
     };
-    let meta = fs::symlink_metadata(parent)
-        .map_err(|e| format!("{label} {}: parent {}: {e}", path.display(), parent.display()))?;
+    let meta = fs::symlink_metadata(parent).map_err(|e| {
+        format!(
+            "{label} {}: parent {}: {e}",
+            path.display(),
+            parent.display()
+        )
+    })?;
     if meta.file_type().is_symlink() {
         return Err(format!(
             "{label} {}: parent {} is a SYMLINK; refusing",
@@ -337,13 +575,10 @@ fn check_parent_dir(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Atomically replace `live` with the VERIFIED bytes.
-///
-/// The temp file is created in the live binary's directory with a fresh name,
-/// fsynced, chmod 0755, then renamed over `live`. Renaming a temp file of the
-/// same filesystem is atomic: a crash leaves either the old or the new binary,
-/// never a half-written one. `dry_run` performs every check but writes nothing.
-pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> Result<(), String> {
+/// Validate that the live binary path (and its parent directory) is safe to
+/// execute and replace atomically (not a symlink, not a directory, parent not
+/// symlinked or world-writable).
+pub fn check_live_path(live: &Path) -> Result<(), String> {
     match fs::symlink_metadata(live) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(format!(
@@ -361,7 +596,17 @@ pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("stat live binary {}: {e}", live.display())),
     }
-    check_parent_dir(live, "live binary")?;
+    check_parent_dir(live, "live binary")
+}
+
+/// Atomically replace `live` with the VERIFIED bytes.
+///
+/// The temp file is created in the live binary's directory with a fresh name,
+/// fsynced, chmod 0755, then renamed over `live`. Renaming a temp file of the
+/// same filesystem is atomic: a crash leaves either the old or the new binary,
+/// never a half-written one. `dry_run` performs every check but writes nothing.
+pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> Result<(), String> {
+    check_live_path(live)?;
     if dry_run {
         return Ok(());
     }
@@ -416,7 +661,11 @@ pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> 
     }
     if let Err(e) = fs::rename(&tmp, live) {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("rename {} -> {}: {e}", tmp.display(), live.display()));
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            live.display()
+        ));
     }
     sync_dir(parent)
 }
@@ -436,7 +685,7 @@ pub fn run_restart_command(command: &str) -> Result<(), String> {
     if command.trim().is_empty() {
         return Err("restart command is empty".to_string());
     }
-    let status = std::process::Command::new("sh")
+    let status = Command::new("sh")
         .arg("-c")
         .arg(command)
         .status()
@@ -445,6 +694,63 @@ pub fn run_restart_command(command: &str) -> Result<(), String> {
         return Err(format!("restart command exited with {status}"));
     }
     Ok(())
+}
+
+/// Spawn `live` with `child_args` and `extra_env`, inheriting stdio, and wait
+/// for it to exit. Used by `--supervise` mode to catch exit code `42`
+/// (`UPGRADE_EXIT_CODE`) and perform an atomic upgrade + respawn.
+pub fn spawn_child_and_wait(
+    live: &Path,
+    child_args: &[String],
+    extra_env: &[(&str, String)],
+) -> Result<std::process::ExitStatus, String> {
+    let mut cmd = Command::new(live);
+    cmd.args(child_args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.status()
+        .map_err(|e| format!("spawn {}: {e}", live.display()))
+}
+
+/// Print reference `systemd` unit configurations for both `--supervise` mode
+/// and watcher (`RestartPreventExitStatus=42`) mode.
+pub fn systemd_unit_example() -> &'static str {
+    "# Option A: direct supervisor mode (stellereum-upgrader owns the child process)\n\
+[Unit]\n\
+Description=Stellereum Node (supervised by stellereum-upgrader)\n\
+Wants=network-online.target\n\
+After=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+WorkingDirectory=/srv/stellereum\n\
+EnvironmentFile=/srv/stellereum/node.env\n\
+ExecStart=/usr/local/bin/stellereum-upgrader \\\n\
+  --supervise \\\n\
+  --live /srv/stellereum/bin/stellereum \\\n\
+  --staged-dir /srv/stellereum/data/upgrades \\\n\
+  --marker /srv/stellereum/data/upgrade-halt.marker \\\n\
+  --progress /srv/stellereum/data/upgrade-supervisor.progress \\\n\
+  --set-wait-supermajority \\\n\
+  --apply \\\n\
+  -- run --config /srv/stellereum/node.yaml --shard 0 --parallel-exec\n\
+Restart=on-failure\n\
+RestartSec=5\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n\
+\n\
+# Option B: external watcher mode (node unit stops cleanly on exit code 42)\n\
+# In stellereum.service:\n\
+#   Restart=on-failure\n\
+#   RestartPreventExitStatus=42\n\
+# Then run:\n\
+#   stellereum-upgrader --marker /srv/stellereum/data/upgrade-halt.marker \\\n\
+#     --staged /srv/stellereum/data/upgrades/v0.2.0/stellereum \\\n\
+#     --live /srv/stellereum/bin/stellereum \\\n\
+#     --restart-cmd 'systemctl --user restart stellereum' \\\n\
+#     --apply\n"
 }
 
 /// Append-only progress journal. One line per step, timestamped in epoch
@@ -578,7 +884,10 @@ mod tests {
         );
         let mut extra = marker_text("v0.2.0", 7, &SHA);
         extra.push_str("new_future_field=yes\n");
-        assert_eq!(UpgradePlan::from_marker(&extra).expect("forward compat"), plan_with(7));
+        assert_eq!(
+            UpgradePlan::from_marker(&extra).expect("forward compat"),
+            plan_with(7)
+        );
     }
 
     fn plan_with(height: u64) -> UpgradePlan {
@@ -599,12 +908,14 @@ mod tests {
             .join("\n");
         assert!(UpgradePlan::from_marker(&no_name).is_err());
         assert!(UpgradePlan::from_marker(&marker_text("v0.2.0", 1, &[0u8; 32])).is_err());
-        assert!(UpgradePlan::from_marker(&marker_text("v0.2.0", 1, &SHA).replacen(
-            &hex_encode(&SHA),
-            "zz",
-            1
-        ))
-        .is_err());
+        assert!(
+            UpgradePlan::from_marker(&marker_text("v0.2.0", 1, &SHA).replacen(
+                &hex_encode(&SHA),
+                "zz",
+                1
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -627,6 +938,96 @@ mod tests {
 
         let err = serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"message":"nope"}});
         assert!(UpgradePlan::from_rpc_value(&err).is_err());
+
+        // Real `stell_governanceParams` serializes `sha256: [u8; 32]` as a JSON integer array
+        // and may include `"error": null`.
+        let sha_array: Vec<u8> = SHA.to_vec();
+        let real_rpc = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"error":null,
+            "result":{"applied":{"upgrade_plan":{
+                "name":"v0.2.0","height":1200,"sha256":sha_array
+            }}}
+        });
+        assert_eq!(
+            UpgradePlan::from_rpc_value(&real_rpc).expect("real [u8; 32] plan"),
+            Some(plan_with(1200))
+        );
+
+        let bad_len = serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"applied":{"upgrade_plan":{
+                "name":"v0.2.0","height":1200,"sha256":[1,2,3]
+            }}}
+        });
+        assert!(UpgradePlan::from_rpc_value(&bad_len).is_err());
+
+        let empty_name = serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"applied":{"upgrade_plan":{
+                "name":"  ","height":1200,"sha256":hex_encode(&SHA)
+            }}}
+        });
+        assert!(UpgradePlan::from_rpc_value(&empty_name).is_err());
+    }
+
+    #[test]
+    fn halt_marker_roundtrips_with_exact_v1_format_parity() {
+        let m = HaltMarker {
+            height: 1200,
+            halted_at_height: 1205,
+            plan_name: "v0.2.0".to_string(),
+            plan_sha256: SHA,
+            target_version: "v0.2.0".to_string(),
+            running_version: "0.1.0".to_string(),
+            halted_unix: 1763500000,
+        };
+        let rendered = m.render();
+        assert!(rendered.starts_with("stell-upgrade-halt v1\n"));
+        let parsed = HaltMarker::parse(&rendered).expect("parse rendered");
+        assert_eq!(parsed, m);
+        assert_eq!(parsed.to_plan(), plan_with(1200));
+
+        // Missing any required v1 field must fail closed.
+        for required in [
+            "height=",
+            "halted_at_height=",
+            "plan_name=",
+            "plan_sha256=",
+            "target_version=",
+            "running_version=",
+            "halted_unix=",
+        ] {
+            let stripped: String = rendered
+                .lines()
+                .filter(|l| !l.starts_with(required))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                HaltMarker::parse(&stripped).is_err(),
+                "missing {required} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_dir_resolution_rejects_unsafe_plan_names() {
+        assert!(upgrade_name_is_safe("v0.2.0"));
+        assert!(upgrade_name_is_safe("2026-11-22_hotfix.1"));
+        assert!(!upgrade_name_is_safe(""));
+        assert!(!upgrade_name_is_safe("."));
+        assert!(!upgrade_name_is_safe(".."));
+        assert!(!upgrade_name_is_safe(".hidden"));
+        assert!(!upgrade_name_is_safe("../evil"));
+        assert!(!upgrade_name_is_safe("a/b"));
+        assert!(!upgrade_name_is_safe("a\\b"));
+
+        let dir = Path::new("/srv/stellereum/data/upgrades");
+        assert_eq!(
+            resolve_staged_binary(None, Some(dir), "v0.2.0").expect("safe"),
+            PathBuf::from("/srv/stellereum/data/upgrades/v0.2.0/stellereum")
+        );
+        assert!(resolve_staged_binary(None, Some(dir), "../evil").is_err());
+        assert!(resolve_staged_binary(Some(Path::new("/a")), Some(dir), "v0.2.0").is_err());
     }
 
     #[test]
@@ -698,11 +1099,7 @@ mod tests {
         let leftovers = fs::read_dir(&dir)
             .expect("dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".upgrade-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".upgrade-"))
             .count();
         assert_eq!(leftovers, 0, "no temp file may survive a successful rename");
         fs::remove_dir_all(&dir).ok();

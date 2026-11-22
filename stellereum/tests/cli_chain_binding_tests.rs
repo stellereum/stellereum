@@ -160,6 +160,200 @@ fn every_chain_aware_cli_builder_binds_the_envelope() {
 }
 
 #[test]
+fn gov_cli_builders_bind_chain_and_route_on_masterchain() {
+    let cid = chain_id();
+    let keypair = FalconKeypair::generate_from_seed(0x74);
+    let master = stellereum::sharding::MASTERCHAIN_SHARD;
+
+    let action = stellereum::governance::gov_action_from_params(
+        "set_min_gas_limit",
+        &serde_json::json!({ "value": 300_000 }),
+    )
+    .expect("valid gov action");
+    let propose_tx = tx_builders::build_gov_propose_tx_with_chain(
+        &keypair,
+        1,
+        "Raise min gas".to_string(),
+        action.clone(),
+        105,
+        1,
+        cid,
+    )
+    .expect("build gov propose tx");
+    assert_bound(&propose_tx, cid);
+    assert_eq!(propose_tx.source_shard, master);
+    assert_eq!(propose_tx.target_shard, master);
+    assert_eq!(propose_tx.amount, 0);
+    assert_eq!(propose_tx.payload.len(), 1);
+    assert!(matches!(
+        &propose_tx.payload[0],
+        stellereum::svm::OpCode::SysCallGovPropose {
+            proposal_id: 1,
+            title,
+            action: boxed_action,
+            height_observed: 105,
+        } if title == "Raise min gas" && **boxed_action == action
+    ));
+
+    let choice = tx_builders::parse_vote_choice("YeS").expect("parse yes");
+    let vote_tx = tx_builders::build_gov_vote_tx_with_chain(&keypair, 1, choice, 106, 2, cid);
+    assert_bound(&vote_tx, cid);
+    assert_eq!(vote_tx.source_shard, master);
+    assert_eq!(vote_tx.target_shard, master);
+    assert_eq!(vote_tx.amount, 0);
+    assert_eq!(vote_tx.payload.len(), 1);
+    assert!(matches!(
+        vote_tx.payload[0],
+        stellereum::svm::OpCode::SysCallGovVote {
+            proposal_id: 1,
+            choice: stellereum::governance::VoteChoice::Yes,
+            height_observed: 106,
+        }
+    ));
+}
+
+#[test]
+fn validator_cli_builders_bind_chain_and_route_on_masterchain() {
+    let cid = chain_id();
+    let withdrawal_kp = FalconKeypair::generate_from_seed(0x75);
+    let delegator_kp = FalconKeypair::generate_from_seed(0x76);
+    let validator_id = [0xABu8; 32];
+    let master = stellereum::sharding::MASTERCHAIN_SHARD;
+
+    let stake_tx =
+        tx_builders::build_stake_tx_with_chain(&withdrawal_kp, validator_id, 2_000_000_000, 1, cid);
+    assert_bound(&stake_tx, cid);
+    assert_eq!(stake_tx.source_shard, master);
+    assert_eq!(stake_tx.target_shard, master);
+    assert!(matches!(
+        stake_tx.payload[0],
+        stellereum::svm::OpCode::SysCallStake {
+            validator,
+            amount: 2_000_000_000,
+        } if validator == validator_id
+    ));
+
+    let unbond_tx = tx_builders::build_unbond_tx_with_chain(
+        &withdrawal_kp,
+        validator_id,
+        1_000_000_000,
+        2,
+        cid,
+    );
+    assert_bound(&unbond_tx, cid);
+    assert_eq!(unbond_tx.source_shard, master);
+    assert_eq!(unbond_tx.target_shard, master);
+    assert!(matches!(
+        unbond_tx.payload[0],
+        stellereum::svm::OpCode::SysCallUnbond {
+            validator,
+            amount: 1_000_000_000,
+        } if validator == validator_id
+    ));
+
+    let withdraw_tx =
+        tx_builders::build_withdraw_self_bond_tx_with_chain(&withdrawal_kp, validator_id, 3, cid);
+    assert_bound(&withdraw_tx, cid);
+    assert_eq!(withdraw_tx.source_shard, master);
+    assert_eq!(withdraw_tx.target_shard, master);
+    assert!(matches!(
+        withdraw_tx.payload[0],
+        stellereum::svm::OpCode::SysCallWithdrawSelfBond { validator } if validator == validator_id
+    ));
+
+    let delegate_tx = tx_builders::build_delegate_tx_with_chain(
+        &delegator_kp,
+        validator_id,
+        5_000_000_000,
+        4,
+        cid,
+    );
+    assert_bound(&delegate_tx, cid);
+    assert_eq!(delegate_tx.source_shard, master);
+    assert_eq!(delegate_tx.target_shard, master);
+    assert!(matches!(
+        delegate_tx.payload[0],
+        stellereum::svm::OpCode::SysCallDelegate {
+            validator,
+            amount: 5_000_000_000,
+        } if validator == validator_id
+    ));
+
+    let begin_undelegate_tx = tx_builders::build_begin_undelegate_tx_with_chain(
+        &delegator_kp,
+        validator_id,
+        2_500_000_000,
+        5,
+        cid,
+    );
+    assert_bound(&begin_undelegate_tx, cid);
+    assert_eq!(begin_undelegate_tx.source_shard, master);
+    assert_eq!(begin_undelegate_tx.target_shard, master);
+    assert!(matches!(
+        begin_undelegate_tx.payload[0],
+        stellereum::svm::OpCode::SysCallBeginUndelegate {
+            validator,
+            amount: 2_500_000_000,
+        } if validator == validator_id
+    ));
+
+    let withdraw_del_tx =
+        tx_builders::build_withdraw_delegation_tx_with_chain(&delegator_kp, validator_id, 6, cid);
+    assert_bound(&withdraw_del_tx, cid);
+    assert_eq!(withdraw_del_tx.source_shard, master);
+    assert_eq!(withdraw_del_tx.target_shard, master);
+    assert!(matches!(
+        withdraw_del_tx.payload[0],
+        stellereum::svm::OpCode::SysCallUndelegate { validator } if validator == validator_id
+    ));
+
+    let claim_val_tx =
+        tx_builders::build_claim_rewards_tx_with_chain(&withdrawal_kp, validator_id, false, 7, cid);
+    assert_bound(&claim_val_tx, cid);
+    assert_eq!(claim_val_tx.source_shard, master);
+    assert_eq!(claim_val_tx.target_shard, master);
+    assert!(matches!(
+        claim_val_tx.payload[0],
+        stellereum::svm::OpCode::SysCallClaimRewards { validator } if validator == validator_id
+    ));
+
+    let claim_del_tx =
+        tx_builders::build_claim_rewards_tx_with_chain(&delegator_kp, validator_id, true, 8, cid);
+    assert_bound(&claim_del_tx, cid);
+    assert_eq!(claim_del_tx.source_shard, master);
+    assert_eq!(claim_del_tx.target_shard, master);
+    assert!(matches!(
+        claim_del_tx.payload[0],
+        stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator } if validator == validator_id
+    ));
+
+    // Ruleset v7 unjail: cold withdrawal key signs for distinct validator_id on masterchain (0, 0).
+    let unjail_tx = tx_builders::build_unjail_tx_with_chain(
+        &withdrawal_kp,
+        validator_id,
+        Some(1_500_000_000),
+        9,
+        cid,
+    );
+    assert_bound(&unjail_tx, cid);
+    assert_ne!(unjail_tx.from, validator_id);
+    assert_eq!(unjail_tx.source_shard, master);
+    assert_eq!(unjail_tx.target_shard, master);
+    assert_eq!(unjail_tx.payload.len(), 2);
+    assert!(matches!(
+        unjail_tx.payload[0],
+        stellereum::svm::OpCode::SysCallStake {
+            validator,
+            amount: 1_500_000_000,
+        } if validator == validator_id
+    ));
+    assert!(matches!(
+        unjail_tx.payload[1],
+        stellereum::svm::OpCode::SysCallUnjail { validator } if validator == validator_id
+    ));
+}
+
+#[test]
 fn no_chain_id_and_unreachable_rpc_fails_closed_when_binding_is_scheduled() {
     let _env = ActivationEnv::arm(ACTIVATION_HEIGHT);
 

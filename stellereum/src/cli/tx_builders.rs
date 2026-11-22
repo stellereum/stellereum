@@ -434,11 +434,12 @@ fn build_unjail_tx_inner(
     payload.push(stellereum::svm::OpCode::SysCallUnjail { validator });
     let gas =
         cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let master = stellereum::sharding::MASTERCHAIN_SHARD;
     match chain_id {
-        Some(cid) => {
-            sign_pq_explicit_payload_with_chain(signer, from, 0, gas, nonce, 1, 1, payload, cid)
-        }
-        None => sign_pq_explicit_payload(signer, from, 0, gas, nonce, 1, 1, payload),
+        Some(cid) => sign_pq_explicit_payload_with_chain(
+            signer, from, 0, gas, nonce, master, master, payload, cid,
+        ),
+        None => sign_pq_explicit_payload(signer, from, 0, gas, nonce, master, master, payload),
     }
 }
 
@@ -1091,6 +1092,210 @@ pub(crate) fn build_apply_commission_tx_with_chain(
     )
 }
 
+/// Parse a CLI governance vote choice string (`yes`, `no`, `abstain`, case-insensitive).
+pub(crate) fn parse_vote_choice(raw: &str) -> anyhow::Result<stellereum::governance::VoteChoice> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "yes" => Ok(stellereum::governance::VoteChoice::Yes),
+        "no" => Ok(stellereum::governance::VoteChoice::No),
+        "abstain" => Ok(stellereum::governance::VoteChoice::Abstain),
+        other => anyhow::bail!("invalid vote choice '{other}': expected yes, no, or abstain"),
+    }
+}
+
+/// Build a chain-bound `OpCode::SysCallGovPropose` transaction on the masterchain shard.
+#[allow(clippy::too_many_arguments)]
+// GATE: explicit PQ1 chain-bound governance proposal builder requires all tx and proposal parameters.
+pub(crate) fn build_gov_propose_tx_with_chain(
+    proposer: &stellereum::post_quantum::FalconKeypair,
+    proposal_id: u64,
+    title: String,
+    action: stellereum::governance::GovAction,
+    height_observed: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> anyhow::Result<Transaction> {
+    let from = falcon_pq_address(proposer);
+    let op = stellereum::governance::Governance::gov_propose_opcode(
+        proposal_id,
+        title,
+        action,
+        height_observed,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid governance proposal: {e}"))?;
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    Ok(sign_pq_explicit_payload_with_chain(
+        proposer,
+        from,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    ))
+}
+
+/// Build a chain-bound `OpCode::SysCallGovVote` transaction on the masterchain shard.
+pub(crate) fn build_gov_vote_tx_with_chain(
+    voter: &stellereum::post_quantum::FalconKeypair,
+    proposal_id: u64,
+    choice: stellereum::governance::VoteChoice,
+    height_observed: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let from = falcon_pq_address(voter);
+    let op =
+        stellereum::governance::Governance::gov_vote_opcode(proposal_id, choice, height_observed);
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        voter,
+        from,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+fn build_masterchain_op_tx_with_chain(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    op: stellereum::svm::OpCode,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let from = falcon_pq_address(signer);
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        signer,
+        from,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallStake` transaction on the masterchain shard.
+pub(crate) fn build_stake_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    amount: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        withdrawal_key,
+        stellereum::svm::OpCode::SysCallStake { validator, amount },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallUnbond` transaction on the masterchain shard.
+pub(crate) fn build_unbond_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    amount: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        withdrawal_key,
+        stellereum::svm::OpCode::SysCallUnbond { validator, amount },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallWithdrawSelfBond` transaction on the masterchain shard.
+pub(crate) fn build_withdraw_self_bond_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        withdrawal_key,
+        stellereum::svm::OpCode::SysCallWithdrawSelfBond { validator },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallDelegate` transaction on the masterchain shard.
+pub(crate) fn build_delegate_tx_with_chain(
+    delegator_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    amount: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        delegator_key,
+        stellereum::svm::OpCode::SysCallDelegate { validator, amount },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallBeginUndelegate` transaction on the masterchain shard.
+pub(crate) fn build_begin_undelegate_tx_with_chain(
+    delegator_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    amount: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        delegator_key,
+        stellereum::svm::OpCode::SysCallBeginUndelegate { validator, amount },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode::SysCallUndelegate` (withdraw matured delegation) transaction on the masterchain shard.
+pub(crate) fn build_withdraw_delegation_tx_with_chain(
+    delegator_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    build_masterchain_op_tx_with_chain(
+        delegator_key,
+        stellereum::svm::OpCode::SysCallUndelegate { validator },
+        nonce,
+        chain_id,
+    )
+}
+
+/// Build a chain-bound rewards claim transaction (`SysCallClaimRewards` or `SysCallClaimDelegatorRewards`).
+pub(crate) fn build_claim_rewards_tx_with_chain(
+    signer_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    delegator: bool,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let op = if delegator {
+        stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator }
+    } else {
+        stellereum::svm::OpCode::SysCallClaimRewards { validator }
+    };
+    build_masterchain_op_tx_with_chain(signer_key, op, nonce, chain_id)
+}
+
 #[cfg(test)]
 mod unjail_builder_tests {
     use super::*;
@@ -1098,10 +1303,12 @@ mod unjail_builder_tests {
     #[test]
     fn unjail_builder_emits_optional_top_up_then_unjail() {
         let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x71);
-        let validator = falcon_pq_address(&kp);
+        let validator = [0x99u8; 32];
 
-        // No top-up: one unjail op, signed envelope verifies.
+        // No top-up: one unjail op on masterchain shard (0, 0), signed envelope verifies.
         let tx = build_unjail_tx(&kp, validator, None, 3);
+        assert_eq!(tx.source_shard, stellereum::sharding::MASTERCHAIN_SHARD);
+        assert_eq!(tx.target_shard, stellereum::sharding::MASTERCHAIN_SHARD);
         assert_eq!(tx.payload.len(), 1);
         assert!(matches!(
             tx.payload[0],
@@ -1109,8 +1316,10 @@ mod unjail_builder_tests {
         ));
         assert!(tx.verify_signature());
 
-        // With a top-up: stake FIRST, then unjail, same envelope rules.
+        // With a top-up: stake FIRST, then unjail, same envelope rules and masterchain routing.
         let tx = build_unjail_tx(&kp, validator, Some(5_000_000_000), 4);
+        assert_eq!(tx.source_shard, stellereum::sharding::MASTERCHAIN_SHARD);
+        assert_eq!(tx.target_shard, stellereum::sharding::MASTERCHAIN_SHARD);
         assert_eq!(tx.payload.len(), 2);
         assert!(matches!(
             tx.payload[0],
@@ -1123,5 +1332,138 @@ mod unjail_builder_tests {
         ));
         assert!(tx.verify_signature());
         assert_eq!(tx.nonce, 4);
+    }
+
+    #[test]
+    fn parse_vote_choice_accepts_case_insensitive_and_rejects_invalid() {
+        assert_eq!(
+            parse_vote_choice("YES").unwrap(),
+            stellereum::governance::VoteChoice::Yes
+        );
+        assert_eq!(
+            parse_vote_choice("No").unwrap(),
+            stellereum::governance::VoteChoice::No
+        );
+        assert_eq!(
+            parse_vote_choice("abstain").unwrap(),
+            stellereum::governance::VoteChoice::Abstain
+        );
+        assert!(parse_vote_choice("maybe").is_err());
+    }
+
+    #[test]
+    fn gov_and_validator_builders_route_on_masterchain_and_verify() {
+        let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x82);
+        let validator = [0x44u8; 32];
+        let cid = stellereum::consensus::consensus_chain_id();
+
+        let action = stellereum::governance::gov_action_from_params(
+            "signal",
+            &serde_json::json!({ "text": "upgrade check" }),
+        )
+        .unwrap();
+        let propose_tx =
+            build_gov_propose_tx_with_chain(&kp, 7, "Signal #7".into(), action, 42, 1, cid)
+                .unwrap();
+        assert_eq!(
+            propose_tx.source_shard,
+            stellereum::sharding::MASTERCHAIN_SHARD
+        );
+        assert_eq!(
+            propose_tx.target_shard,
+            stellereum::sharding::MASTERCHAIN_SHARD
+        );
+        assert!(propose_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            &propose_tx.payload[0],
+            stellereum::svm::OpCode::SysCallGovPropose {
+                proposal_id: 7,
+                height_observed: 42,
+                ..
+            }
+        ));
+
+        let vote_tx = build_gov_vote_tx_with_chain(
+            &kp,
+            7,
+            stellereum::governance::VoteChoice::Yes,
+            43,
+            2,
+            cid,
+        );
+        assert_eq!(
+            vote_tx.source_shard,
+            stellereum::sharding::MASTERCHAIN_SHARD
+        );
+        assert_eq!(
+            vote_tx.target_shard,
+            stellereum::sharding::MASTERCHAIN_SHARD
+        );
+        assert!(vote_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            vote_tx.payload[0],
+            stellereum::svm::OpCode::SysCallGovVote {
+                proposal_id: 7,
+                choice: stellereum::governance::VoteChoice::Yes,
+                height_observed: 43,
+            }
+        ));
+
+        let stake_tx = build_stake_tx_with_chain(&kp, validator, 1_000_000_000, 3, cid);
+        assert!(stake_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            stake_tx.payload[0],
+            stellereum::svm::OpCode::SysCallStake { validator: v, amount: 1_000_000_000 } if v == validator
+        ));
+
+        let unbond_tx = build_unbond_tx_with_chain(&kp, validator, 500_000_000, 4, cid);
+        assert!(unbond_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            unbond_tx.payload[0],
+            stellereum::svm::OpCode::SysCallUnbond { validator: v, amount: 500_000_000 } if v == validator
+        ));
+
+        let withdraw_tx = build_withdraw_self_bond_tx_with_chain(&kp, validator, 5, cid);
+        assert!(withdraw_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            withdraw_tx.payload[0],
+            stellereum::svm::OpCode::SysCallWithdrawSelfBond { validator: v } if v == validator
+        ));
+
+        let del_tx = build_delegate_tx_with_chain(&kp, validator, 2_000_000_000, 6, cid);
+        assert!(del_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            del_tx.payload[0],
+            stellereum::svm::OpCode::SysCallDelegate { validator: v, amount: 2_000_000_000 } if v == validator
+        ));
+
+        let begin_undel_tx =
+            build_begin_undelegate_tx_with_chain(&kp, validator, 1_000_000_000, 7, cid);
+        assert!(begin_undel_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            begin_undel_tx.payload[0],
+            stellereum::svm::OpCode::SysCallBeginUndelegate { validator: v, amount: 1_000_000_000 } if v == validator
+        ));
+
+        let withdraw_del_tx = build_withdraw_delegation_tx_with_chain(&kp, validator, 8, cid);
+        assert!(withdraw_del_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            withdraw_del_tx.payload[0],
+            stellereum::svm::OpCode::SysCallUndelegate { validator: v } if v == validator
+        ));
+
+        let claim_val_tx = build_claim_rewards_tx_with_chain(&kp, validator, false, 9, cid);
+        assert!(claim_val_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            claim_val_tx.payload[0],
+            stellereum::svm::OpCode::SysCallClaimRewards { validator: v } if v == validator
+        ));
+
+        let claim_del_tx = build_claim_rewards_tx_with_chain(&kp, validator, true, 10, cid);
+        assert!(claim_del_tx.verify_signature_for_chain(cid, true));
+        assert!(matches!(
+            claim_del_tx.payload[0],
+            stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator: v } if v == validator
+        ));
     }
 }

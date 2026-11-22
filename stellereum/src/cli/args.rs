@@ -288,10 +288,112 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         i_fenced_all_signers: bool,
     },
-    /// W3 PQ validator lifecycle transactions (OpCode 59..=64)
+    /// W3 PQ validator lifecycle and staking transactions
     Validator {
         #[command(subcommand)]
         sub: ValidatorCommands,
+    },
+    /// On-chain governance proposals, votes, and parameters
+    Gov {
+        #[command(subcommand)]
+        sub: GovCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GovCommands {
+    /// List governance proposals from the node
+    List {
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Show full details of a governance proposal
+    Show {
+        /// Proposal ID
+        #[arg(long)]
+        id: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Show current governance parameters (quorum, next_id, applied overrides)
+    Params {
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Submit a block-carried governance proposal (SysCallGovPropose)
+    Propose {
+        /// Falcon-512 key file of the proposer
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Falcon-512 seed in hex (32 bytes) of the proposer
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Proposal title
+        #[arg(long)]
+        title: String,
+        /// Canonical governance action type (e.g. signal, set_min_gas_limit, software_upgrade)
+        #[arg(long)]
+        action: String,
+        /// JSON object of action parameters (e.g. '{"value": 500000}' or '{"text": "..."}')
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Expected proposal id (defaults to `stell_governanceParams.next_id`)
+        #[arg(long)]
+        proposal_id: Option<u64>,
+        /// Observed block height (defaults to `stell_blockNumber` + 1)
+        #[arg(long)]
+        height: Option<u64>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Cast a block-carried vote on a governance proposal (SysCallGovVote)
+    Vote {
+        /// Falcon-512 key file of the voter
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Falcon-512 seed in hex (32 bytes) of the voter
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Proposal ID to vote on
+        #[arg(long)]
+        id: u64,
+        /// Vote choice: yes, no, or abstain (case-insensitive)
+        #[arg(long)]
+        choice: String,
+        /// Observed block height (defaults to `stell_blockNumber` + 1)
+        #[arg(long)]
+        height: Option<u64>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -495,6 +597,249 @@ pub(crate) enum ValidatorCommands {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Inspect on-chain validator status, stake, jail, and withdrawal balance
+    Status {
+        /// Validator ID / address in hex (32 bytes)
+        #[arg(long)]
+        validator: String,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+    },
+    /// Add self-bond to a validator (SysCallStake, signed by cold withdrawal key)
+    Stake {
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Amount to stake in nano-STELL
+        #[arg(long)]
+        amount: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Begin unbonding validator self-bond (SysCallUnbond, signed by cold withdrawal key)
+    Unbond {
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Amount to unbond in nano-STELL
+        #[arg(long)]
+        amount: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Withdraw matured validator self-bond (SysCallWithdrawSelfBond, signed by cold withdrawal key)
+    Withdraw {
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Delegate stake to a validator (SysCallDelegate)
+    Delegate {
+        /// Delegator Falcon-512 key file
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Delegator Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Target 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Amount to delegate in nano-STELL
+        #[arg(long)]
+        amount: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Begin unbonding a delegation (SysCallBeginUndelegate)
+    BeginUndelegate {
+        /// Delegator Falcon-512 key file
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Delegator Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Target 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Amount to undelegate in nano-STELL
+        #[arg(long)]
+        amount: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Withdraw matured delegation unbonding (SysCallUndelegate)
+    WithdrawDelegation {
+        /// Delegator Falcon-512 key file
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Delegator Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Target 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Claim validator rewards (SysCallClaimRewards) or delegator rewards (--delegator, SysCallClaimDelegatorRewards)
+    ClaimRewards {
+        /// Signer Falcon-512 key file (cold withdrawal key for validator, or delegator key with --delegator)
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Signer Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Target 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Claim delegator rewards instead of validator rewards
+        #[arg(long, default_value_t = false)]
+        delegator: bool,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Re-admit a downtime-jailed validator (SysCallUnjail, Ruleset v7 cold withdrawal key)
+    Unjail {
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Optional self-bond top-up in nano-STELL emitted before unjail
+        #[arg(long)]
+        top_up: Option<u64>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum WalletCommands {
@@ -601,21 +946,19 @@ pub(crate) enum WalletCommands {
         #[arg(long, default_value_t = false)]
         verbose: bool,
     },
-    /// Re-admit a downtime-jailed validator (SysCallUnjail, pentest F7)
+    /// Re-admit a downtime-jailed validator (SysCallUnjail, pentest F7 / Ruleset v7)
     ///
     /// Signs ONE PQ transaction carrying an optional `SysCallStake` top-up
-    /// followed by `SysCallUnjail`, and submits it to a node. The block
-    /// applies the unjail at its own height: it succeeds only at/after
-    /// `release_height` AND with the self-bond back at MIN+buffer. A missing
-    /// jail record, a sender/validator mismatch, a thin bond or an early
-    /// release all fail closed (the jail stays); the CLI cannot bypass any of
-    /// them.
+    /// followed by `SysCallUnjail`, and submits it to a node. Under Ruleset v7
+    /// the validator's cold `withdrawal_address` signs to unjail `validator_id`.
     Unjail {
-        /// Falcon-512 seed in hex (32 bytes) of the validator signing key
+        /// Falcon-512 seed in hex (32 bytes) of the signing key (cold withdrawal or pre-W3 validator key)
         #[arg(long)]
-        falcon_seed: String,
-        /// Validator address in hex. Defaults to the signer's own address
-        /// (only that key may unjail itself).
+        falcon_seed: Option<String>,
+        /// Falcon-512 key file of the signing key
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Validator address/id in hex. Defaults to the signer's own address.
         #[arg(long)]
         validator: Option<String>,
         /// Optional self-bond top-up in nano-STELL (1 STELL = 1e9 nano).
@@ -1146,5 +1489,91 @@ mod cli_safety_init_tests {
             }
             _ => panic!("expected SafetyInit command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_gov_and_validator_subcommands() {
+        let gov_cli = Cli::try_parse_from([
+            "stellereum",
+            "gov",
+            "propose",
+            "--falcon-seed",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "--title",
+            "Test Proposal",
+            "--action",
+            "signal",
+            "--params",
+            "{\"text\":\"hello\"}",
+            "--dry-run",
+        ])
+        .expect("parse gov propose");
+        assert!(matches!(
+            gov_cli.command,
+            Commands::Gov {
+                sub: GovCommands::Propose { dry_run: true, .. }
+            }
+        ));
+
+        let vote_cli = Cli::try_parse_from([
+            "stellereum",
+            "gov",
+            "vote",
+            "--falcon-key-file",
+            "/tmp/falcon.key",
+            "--id",
+            "3",
+            "--choice",
+            "Yes",
+        ])
+        .expect("parse gov vote");
+        assert!(matches!(
+            vote_cli.command,
+            Commands::Gov {
+                sub: GovCommands::Vote { id: 3, .. }
+            }
+        ));
+
+        let val_cli = Cli::try_parse_from([
+            "stellereum",
+            "validator",
+            "claim-rewards",
+            "--withdrawal-key-file",
+            "/tmp/del.key",
+            "--validator-id",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--delegator",
+        ])
+        .expect("parse validator claim-rewards");
+        assert!(matches!(
+            val_cli.command,
+            Commands::Validator {
+                sub: ValidatorCommands::ClaimRewards {
+                    delegator: true,
+                    ..
+                }
+            }
+        ));
+
+        let unjail_cli = Cli::try_parse_from([
+            "stellereum",
+            "wallet",
+            "unjail",
+            "--falcon-key-file",
+            "/tmp/cold.key",
+            "--validator",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("parse wallet unjail");
+        assert!(matches!(
+            unjail_cli.command,
+            Commands::Wallet {
+                sub: WalletCommands::Unjail {
+                    falcon_key_file: Some(_),
+                    falcon_seed: None,
+                    ..
+                }
+            }
+        ));
     }
 }

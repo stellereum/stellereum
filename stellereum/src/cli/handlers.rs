@@ -732,6 +732,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
             WalletCommands::Unjail {
                 falcon_seed,
+                falcon_key_file,
                 validator,
                 top_up,
                 rpc,
@@ -741,20 +742,18 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 verbose,
                 token,
             } => {
-                let pq_key = falcon_from_hex_seed(&falcon_seed, "falcon_seed")?;
+                if top_up == Some(0) {
+                    anyhow::bail!(
+                        "--top-up must be positive; omit --top-up instead of passing zero"
+                    );
+                }
+                let pq_key = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
                 let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let signer_addr = falcon_pq_address(&pq_key);
                 let validator_addr = match validator {
                     Some(v) => parse_wallet_address(&v)?,
                     None => signer_addr,
                 };
-                if validator_addr != signer_addr {
-                    anyhow::bail!(
-                        "only the validator key may unjail itself: signer {} != validator {}",
-                        hex::encode(signer_addr),
-                        hex::encode(validator_addr),
-                    );
-                }
 
                 let query = |method: &str,
                              params: serde_json::Value|
@@ -2289,7 +2288,656 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
                 println!("  Submitted, mempool tx hash: {hash}");
             }
+            ValidatorCommands::Status { validator, rpc } => {
+                let validator_bytes = parse_wallet_address(&validator)?;
+                let validator_hex = hex::encode(validator_bytes);
+                let status = rpc_call(
+                    &rpc,
+                    "stell_getValidatorStatus",
+                    serde_json::json!({ "validator": validator_hex }),
+                )?;
+                let stake = rpc_call(
+                    &rpc,
+                    "stell_stakeOf",
+                    serde_json::json!({ "validator": validator_hex }),
+                )?;
+                let withdrawal_info = if let Some(w_addr) = status["withdrawal_address"].as_str() {
+                    let bal = rpc_call(
+                        &rpc,
+                        "stell_getBalance",
+                        serde_json::json!({ "address": w_addr }),
+                    )?;
+                    Some((w_addr.to_string(), bal))
+                } else {
+                    None
+                };
+
+                println!("Validator Status:");
+                println!("  Validator ID:   {validator_hex}");
+                println!(
+                    "  Known:          {}",
+                    status["known"].as_bool().unwrap_or(false)
+                );
+                println!(
+                    "  In Active Set:  {}",
+                    status["in_set"].as_bool().unwrap_or(false)
+                );
+                let jailed = status["jailed"].as_bool().unwrap_or(false);
+                println!("  Jailed:         {jailed}");
+                if jailed {
+                    println!(
+                        "  Jailed Height:  {}",
+                        status["jailed_at_height"]
+                            .as_u64()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                    println!(
+                        "  Release Height: {}",
+                        status["release_height"]
+                            .as_u64()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
+                println!(
+                    "  Total Stake:    {} nano-STELL",
+                    stake["total"].as_str().unwrap_or("0")
+                );
+                println!(
+                    "  Self Bond:      {} nano-STELL",
+                    stake["self_bond"].as_str().unwrap_or("0")
+                );
+                println!(
+                    "  Delegated:      {} nano-STELL",
+                    stake["delegated"].as_str().unwrap_or("0")
+                );
+                println!(
+                    "  Commission BPS: {}",
+                    status["commission_bps"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "  Rotation Seq:   {}",
+                    status["rotation_seq"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                if let Some((w_addr, bal)) = withdrawal_info {
+                    println!("  Withdrawal Addr: {w_addr}");
+                    println!(
+                        "  Withdrawal Bal:  {} nano-STELL (nonce: {})",
+                        bal["balance"].as_str().unwrap_or("0"),
+                        bal["nonce"].as_u64().unwrap_or(0)
+                    );
+                } else {
+                    println!("  Withdrawal Addr: none");
+                }
+                if !status["pending_commission"].is_null() {
+                    println!(
+                        "  Pending Comm:   new_bps={}, announced={}, effective={}",
+                        status["pending_commission"]["new_bps"],
+                        status["pending_commission"]["announced_height"],
+                        status["pending_commission"]["effective_height"],
+                    );
+                }
+                if let Some(h) = status["last_commission_change_height"].as_u64() {
+                    println!("  Last Comm Chg:  height {h}");
+                }
+            }
+            ValidatorCommands::Stake {
+                withdrawal_key_file,
+                withdrawal_seed,
+                validator_id,
+                amount,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                if amount == 0 {
+                    anyhow::bail!("amount must be positive");
+                }
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_stake_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    amount,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "stake",
+                    &format!(
+                        "✅ Stake signed (SysCallStake, chain_id={chain_id}):\n  Validator ID: {}\n  Signer:       {}\n  Amount:       {amount} nano-STELL\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(withdrawal_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::Unbond {
+                withdrawal_key_file,
+                withdrawal_seed,
+                validator_id,
+                amount,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                if amount == 0 {
+                    anyhow::bail!("amount must be positive");
+                }
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_unbond_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    amount,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "unbond",
+                    &format!(
+                        "✅ Unbond signed (SysCallUnbond, chain_id={chain_id}):\n  Validator ID: {}\n  Signer:       {}\n  Amount:       {amount} nano-STELL\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(withdrawal_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::Withdraw {
+                withdrawal_key_file,
+                withdrawal_seed,
+                validator_id,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_withdraw_self_bond_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "withdraw",
+                    &format!(
+                        "✅ WithdrawSelfBond signed (SysCallWithdrawSelfBond, chain_id={chain_id}):\n  Validator ID: {}\n  Signer:       {}\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(withdrawal_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::Delegate {
+                falcon_key_file,
+                falcon_seed,
+                validator_id,
+                amount,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                if amount == 0 {
+                    anyhow::bail!("amount must be positive");
+                }
+                let delegator_kp =
+                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let delegator_addr = falcon_pq_address(&delegator_kp);
+                let account_nonce = resolve_nonce(&rpc, &delegator_addr, nonce)?;
+                let tx = build_delegate_tx_with_chain(
+                    &delegator_kp,
+                    validator_id,
+                    amount,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "delegate",
+                    &format!(
+                        "✅ Delegate signed (SysCallDelegate, chain_id={chain_id}):\n  Validator ID: {}\n  Delegator:    {}\n  Amount:       {amount} nano-STELL\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(delegator_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::BeginUndelegate {
+                falcon_key_file,
+                falcon_seed,
+                validator_id,
+                amount,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                if amount == 0 {
+                    anyhow::bail!("amount must be positive");
+                }
+                let delegator_kp =
+                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let delegator_addr = falcon_pq_address(&delegator_kp);
+                let account_nonce = resolve_nonce(&rpc, &delegator_addr, nonce)?;
+                let tx = build_begin_undelegate_tx_with_chain(
+                    &delegator_kp,
+                    validator_id,
+                    amount,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "begin-undelegate",
+                    &format!(
+                        "✅ BeginUndelegate signed (SysCallBeginUndelegate, chain_id={chain_id}):\n  Validator ID: {}\n  Delegator:    {}\n  Amount:       {amount} nano-STELL\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(delegator_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::WithdrawDelegation {
+                falcon_key_file,
+                falcon_seed,
+                validator_id,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let delegator_kp =
+                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let delegator_addr = falcon_pq_address(&delegator_kp);
+                let account_nonce = resolve_nonce(&rpc, &delegator_addr, nonce)?;
+                let tx = build_withdraw_delegation_tx_with_chain(
+                    &delegator_kp,
+                    validator_id,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "withdraw-delegation",
+                    &format!(
+                        "✅ WithdrawDelegation signed (SysCallUndelegate, chain_id={chain_id}):\n  Validator ID: {}\n  Delegator:    {}\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(delegator_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::ClaimRewards {
+                withdrawal_key_file,
+                withdrawal_seed,
+                validator_id,
+                delegator,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let signer_kp = resolve_falcon_keypair(
+                    withdrawal_key_file,
+                    withdrawal_seed,
+                    if delegator { "delegator" } else { "withdrawal" },
+                )?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let signer_addr = falcon_pq_address(&signer_kp);
+                let account_nonce = resolve_nonce(&rpc, &signer_addr, nonce)?;
+                let tx = build_claim_rewards_tx_with_chain(
+                    &signer_kp,
+                    validator_id,
+                    delegator,
+                    account_nonce,
+                    chain_id,
+                );
+                let op_name = if delegator {
+                    "SysCallClaimDelegatorRewards"
+                } else {
+                    "SysCallClaimRewards"
+                };
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "claim-rewards",
+                    &format!(
+                        "✅ ClaimRewards signed ({op_name}, delegator={delegator}, chain_id={chain_id}):\n  Validator ID: {}\n  Signer:       {}\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(signer_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            ValidatorCommands::Unjail {
+                withdrawal_key_file,
+                withdrawal_seed,
+                validator_id,
+                top_up,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                if top_up == Some(0) {
+                    anyhow::bail!(
+                        "--top-up must be positive; omit --top-up instead of passing zero"
+                    );
+                }
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_unjail_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    top_up,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "unjail",
+                    &format!(
+                        "✅ Unjail signed (SysCallUnjail, Ruleset v7, chain_id={chain_id}):\n  Validator ID: {}\n  Withdrawal:   {}\n  Top-up:       {} nano-STELL\n  Nonce:        {account_nonce}",
+                        hex::encode(validator_id),
+                        hex::encode(withdrawal_addr),
+                        top_up.unwrap_or(0),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+        },
+        Commands::Gov { sub } => match sub {
+            GovCommands::List { rpc } => {
+                let proposals = rpc_call(&rpc, "stell_listProposals", serde_json::json!([]))?;
+                let items = proposals.as_array().ok_or_else(|| {
+                    anyhow::anyhow!("unexpected stell_listProposals response (expected array)")
+                })?;
+                if items.is_empty() {
+                    println!("No governance proposals found.");
+                    return Ok(());
+                }
+                println!(
+                    "{:<4} {:<10} {:<28} {:<12} {:<16} {:<16} {:<16} TITLE",
+                    "ID", "STATUS", "ACTION", "VOTING_END", "YES", "NO", "ABSTAIN"
+                );
+                println!("{}", "-".repeat(120));
+                for p in items {
+                    println!(
+                        "{:<4} {:<10} {:<28} {:<12} {:<16} {:<16} {:<16} {}",
+                        p["id"].as_u64().unwrap_or(0),
+                        p["status"].as_str().unwrap_or("?"),
+                        p["action_type"].as_str().unwrap_or("?"),
+                        p["voting_end"].as_u64().unwrap_or(0),
+                        p["yes"].as_str().unwrap_or("0"),
+                        p["no"].as_str().unwrap_or("0"),
+                        p["abstain"].as_str().unwrap_or("0"),
+                        p["title"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            GovCommands::Show { id, rpc } => {
+                let p = rpc_call(&rpc, "stell_proposal", serde_json::json!({ "id": id }))?;
+                let g = rpc_call(&rpc, "stell_governanceParams", serde_json::json!([]))?;
+                println!("Proposal #{}", p["id"].as_u64().unwrap_or(id));
+                println!("  Title:       {}", p["title"].as_str().unwrap_or(""));
+                println!("  Status:      {}", p["status"].as_str().unwrap_or("?"));
+                println!(
+                    "  Action Type: {}",
+                    p["action_type"].as_str().unwrap_or("?")
+                );
+                println!("  Action:      {}", p["action"].as_str().unwrap_or("?"));
+                println!("  Voting End:  {}", p["voting_end"].as_u64().unwrap_or(0));
+                println!("  Yes:         {}", p["yes"].as_str().unwrap_or("0"));
+                println!("  No:          {}", p["no"].as_str().unwrap_or("0"));
+                println!("  Abstain:     {}", p["abstain"].as_str().unwrap_or("0"));
+                println!("  Turnout:     {}", p["turnout"].as_str().unwrap_or("0"));
+                println!("Governance Context:");
+                println!("  Quorum BPS:  {}", g["quorum_bps"].as_u64().unwrap_or(0));
+                println!("  Next ID:     {}", g["next_id"].as_u64().unwrap_or(0));
+            }
+            GovCommands::Params { rpc } => {
+                let g = rpc_call(&rpc, "stell_governanceParams", serde_json::json!([]))?;
+                println!("Governance Parameters:");
+                println!("  quorum_bps: {}", g["quorum_bps"]);
+                println!("  next_id:    {}", g["next_id"]);
+                println!(
+                    "  applied:    {}",
+                    serde_json::to_string_pretty(&g["applied"])?
+                );
+            }
+            GovCommands::Propose {
+                falcon_key_file,
+                falcon_seed,
+                title,
+                action,
+                params,
+                proposal_id,
+                height,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let parsed_params: serde_json::Value = serde_json::from_str(&params)
+                    .map_err(|e| anyhow::anyhow!("invalid --params JSON: {e}"))?;
+                let gov_action =
+                    stellereum::governance::gov_action_from_params(&action, &parsed_params)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let proposer_kp = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let proposer_addr = falcon_pq_address(&proposer_kp);
+                let account_nonce = resolve_nonce(&rpc, &proposer_addr, nonce)?;
+                let pid = match proposal_id {
+                    Some(id) => id,
+                    None => {
+                        let g = rpc_call(&rpc, "stell_governanceParams", serde_json::json!([]))?;
+                        g["next_id"].as_u64().ok_or_else(|| {
+                            anyhow::anyhow!("stell_governanceParams did not return next_id")
+                        })?
+                    }
+                };
+                let height_observed = match height {
+                    Some(h) => h,
+                    None => rpc_next_block_height(&rpc)?,
+                };
+                let tx = build_gov_propose_tx_with_chain(
+                    &proposer_kp,
+                    pid,
+                    title.clone(),
+                    gov_action,
+                    height_observed,
+                    account_nonce,
+                    chain_id,
+                )?;
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "gov-propose",
+                    &format!(
+                        "✅ GovPropose signed (SysCallGovPropose, chain_id={chain_id}):\n  Proposal ID: {pid}\n  Title:       {title}\n  Action:      {action}\n  Height Obs:  {height_observed}\n  Proposer:    {}\n  Nonce:       {account_nonce}",
+                        hex::encode(proposer_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
+            GovCommands::Vote {
+                falcon_key_file,
+                falcon_seed,
+                id,
+                choice,
+                height,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let vote_choice = parse_vote_choice(&choice)?;
+                let voter_kp = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let voter_addr = falcon_pq_address(&voter_kp);
+                let account_nonce = resolve_nonce(&rpc, &voter_addr, nonce)?;
+                let height_observed = match height {
+                    Some(h) => h,
+                    None => rpc_next_block_height(&rpc)?,
+                };
+                let tx = build_gov_vote_tx_with_chain(
+                    &voter_kp,
+                    id,
+                    vote_choice,
+                    height_observed,
+                    account_nonce,
+                    chain_id,
+                );
+                verify_and_submit_chain_bound_tx(
+                    &tx,
+                    chain_id,
+                    "gov-vote",
+                    &format!(
+                        "✅ GovVote signed (SysCallGovVote, chain_id={chain_id}):\n  Proposal ID: {id}\n  Choice:      {vote_choice:?}\n  Height Obs:  {height_observed}\n  Voter:       {}\n  Nonce:       {account_nonce}",
+                        hex::encode(voter_addr),
+                    ),
+                    dry_run,
+                    &rpc,
+                    token.as_deref(),
+                )?;
+            }
         },
     }
+    Ok(())
+}
+
+fn rpc_call(
+    rpc: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    if let Some(e) = resp.get("error") {
+        anyhow::bail!("RPC {method} error: {e}");
+    }
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+fn rpc_next_block_height(rpc: &str) -> anyhow::Result<u64> {
+    let res = rpc_call(rpc, "stell_blockNumber", serde_json::json!([]))?;
+    let current = if let Some(n) = res.as_u64() {
+        n
+    } else if let Some(s) = res.as_str() {
+        if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(hex_str, 16)
+                .map_err(|e| anyhow::anyhow!("invalid stell_blockNumber hex '{s}': {e}"))?
+        } else {
+            s.parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("invalid stell_blockNumber '{s}': {e}"))?
+        }
+    } else {
+        anyhow::bail!("node at {rpc} returned unexpected stell_blockNumber: {res}");
+    };
+    Ok(current.saturating_add(1))
+}
+
+fn verify_and_submit_chain_bound_tx(
+    tx: &Transaction,
+    chain_id: u64,
+    label: &str,
+    summary: &str,
+    dry_run: bool,
+    rpc: &str,
+    token: Option<&str>,
+) -> anyhow::Result<()> {
+    if !tx.verify_signature_for_chain(chain_id, true) {
+        anyhow::bail!("refusing to submit: built {label} tx failed chain-bound verify");
+    }
+    println!("{summary}");
+    println!("  Hash:         {}", hex::encode(tx.compute_tx_hash()));
+    if dry_run {
+        println!("  raw: {}", hex::encode(bincode::serialize(tx)?));
+        return Ok(());
+    }
+    let hash = rpc_submit_tx(rpc, "stell_sendRawTransaction", tx, token)?;
+    println!("  Submitted, mempool tx hash: {hash}");
     Ok(())
 }

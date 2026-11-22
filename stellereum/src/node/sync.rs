@@ -751,10 +751,43 @@ pub(crate) async fn try_catch_up_with_lanes(
             match adapter.fetch_block_qc_probe(shard, probe_h).await {
                 Some(qc) if qc.height == probe_h => match qc.block_hash {
                     Some(bh) => {
-                        eprintln!(
-                            "[sync] blind-QC-probe: tip+1 height {probe_h} carries a QC sidecar; walking one height to adopt it"
-                        );
-                        (probe_h, bh)
+                        // BLIND-ANCHOR-EXTEND (live 2026-11-23): adopting ONE
+                        // height per pass capped a silent follower's catch-up
+                        // at the pass cadence (~2 heights/s). At the live tempo
+                        // (2.5 blocks/s) a node that fell behind could never
+                        // close the gap — it stayed out of the quorum while its
+                        // CPU sat idle. Probe a small ladder ahead and anchor on
+                        // the FURTHEST height that already carries a decided
+                        // sidecar, so the normal snapshot-first/batched walk
+                        // handles a material gap. Liveness only: the walk still
+                        // verifies every block, QC, parent and state root.
+                        //
+                        // The ladder is ascending and stops at the first miss:
+                        // decided heights are contiguous, so a miss means the
+                        // chain is not that far ahead (and we avoid polluting a
+                        // future height's QC-miss backoff).
+                        let mut anchor = (probe_h, bh);
+                        for step in [64u64, 256, 1024] {
+                            let h = our_height.saturating_add(step);
+                            match adapter.fetch_block_qc_probe(shard, h).await {
+                                Some(q) if q.height == h => match q.block_hash {
+                                    Some(b) => anchor = (h, b),
+                                    None => break,
+                                },
+                                _ => break,
+                            }
+                        }
+                        if anchor.0 == probe_h {
+                            eprintln!(
+                                "[sync] blind-QC-probe: tip+1 height {probe_h} carries a QC sidecar; walking one height to adopt it"
+                            );
+                        } else {
+                            eprintln!(
+                                "[sync] blind-QC-probe: tip+1 present; anchoring the walk at decided height {} so a material gap uses the batched/snapshot path",
+                                anchor.0
+                            );
+                        }
+                        anchor
                     }
                     None => return None,
                 },

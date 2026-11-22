@@ -58,9 +58,22 @@ pass "stage 2: rustfmt clean"
 info "stage 3: tests"
 RUNNER="cargo test"
 command -v cargo-nextest >/dev/null 2>&1 && RUNNER="cargo nextest run" && info "using nextest"
+# WHY THE stellereum LIB SUITE IS SERIAL UNDER PLAIN `cargo test`:
+# several consensus tests replace the PROCESS-GLOBAL committed PQ registry
+# (`consensus::sync_committed_pq_registry`). Running them in parallel makes one
+# test erase another test's validator keys, surfacing as "bad vote signature" /
+# "invalid proposer signature" in an unrelated test. `cargo nextest` runs each
+# test in its own process and is therefore safe; plain `cargo test` must use
+# `--test-threads=1`. Do not "fix" this by weakening the assertions.
 for ws in $RUST_WS; do
   if [ ! -f "$ROOT/$ws/Cargo.toml" ]; then continue; fi
-  if [ "$FAST" = 1 ] && [ "$ws" = "stellereum" ]; then
+  if [ "$ws" = "stellereum" ] && [ "$RUNNER" = "cargo test" ]; then
+    if [ "$FAST" = 1 ]; then
+      (cd "$ROOT/$ws" && $RUNNER --lib --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws lib"
+    else
+      (cd "$ROOT/$ws" && $RUNNER --workspace --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws"
+    fi
+  elif [ "$FAST" = 1 ] && [ "$ws" = "stellereum" ]; then
     (cd "$ROOT/$ws" && $RUNNER --lib --no-fail-fast) || fail "stage 3: $ws lib"
   else
     (cd "$ROOT/$ws" && $RUNNER --workspace --no-fail-fast) || fail "stage 3: $ws"

@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stellereum — Pure Post-Quantum Layer 1 · Testnet</title>
+<meta name="description" content="Stellereum is a pure post-quantum Layer 1 written in Rust. Falcon-512 validator votes, shards {0,1} with shard 0 live, chain ID 5757, ruleset v7. Testnet only; no external audit.">
+<meta name="theme-color" content="#060811">
+<meta name="color-scheme" content="dark">
+<link rel="canonical" href="https://stellereum.org/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Stellereum">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://stellereum.org/">
+<meta property="og:title" content="Stellereum — Pure Post-Quantum Layer 1">
+<meta property="og:description" content="Pure post-quantum: Falcon-512 validator votes, shard 0 live ({0,1} supported), WASM (wasmi) runtime, chain ID 5757. Testnet only; no external audit.">
+<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png?v=21">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Stellereum — Pure Post-Quantum Layer 1">
+<meta name="twitter:description" content="Pure post-quantum: Falcon-512 votes, shard 0 live ({0,1} supported), WASM (wasmi) runtime, chain ID 5757. Testnet only.">
+<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png?v=21">
+
+<link rel="icon" href="favicon.ico?v=22" sizes="48x48">
+<link rel="icon" type="image/svg+xml" href="assets/img/favicon.svg?v=22">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=22">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=22">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=22">
+<link rel="manifest" href="site.webmanifest?v=22">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Non-blocking: a blocked fonts.googleapis.com must never hold first paint. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Unbounded:wght@700;800;900&display=swap"></noscript>
+
+<link rel="stylesheet" href="assets/css/tokens.css?v=21">
+<link rel="stylesheet" href="assets/css/base.css?v=21">
+<link rel="stylesheet" href="assets/css/components.css?v=21">
+<link rel="stylesheet" href="assets/css/reference.css?v=21">
+
+<script>
+document.documentElement.classList.add('js');
+window.setTimeout(function () {
+  if (!window.StellMotion) document.documentElement.classList.remove('js');
+}, 3000);
+</script>
+<noscript>
+<style>
+  .stage-mode,
+  .stage-drag { display: none; }
+</style>
+</noscript>
+<script defer src="assets/js/app.js?v=21"></script>
+<script defer src="assets/js/motion.js?v=21"></script>
+<script defer src="assets/js/metrics.js?v=21"></script>
+<script defer src="assets/js/dither.js?v=21"></script>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="cursor" id="custom-cursor" aria-hidden="true"></div>
+
+<!-- ===================================================================== -->
+<!-- HERO STAGE — full-bleed 100svh, reference order: stage before header   -->
+<!-- ===================================================================== -->
+<section id="optical-stage" class="stage" aria-labelledby="hero-title">
+  <span class="stage-corner stage-corner--tl" aria-hidden="true"></span>
+  <span class="stage-corner stage-corner--tr" aria-hidden="true"></span>
+  <span class="stage-corner stage-corner--bl" aria-hidden="true"></span>
+  <span class="stage-corner stage-corner--br" aria-hidden="true"></span>
+
+  <div class="stage-canvas" id="hero-stage" aria-hidden="true">
+    <canvas id="hero-canvas" class="dither-canvas"></canvas>
+    <div class="stage-fallback"><span>PQ Lattice / Bayer 4×4</span></div>
+  </div>
+
+  <div class="stage-hud stage-hud--top">
+    <div class="stage-chip-group">
+      <span class="stage-chip"><span class="bit-dot" aria-hidden="true"></span><span>01 / 04 — 3D BAYER PROJECTION</span></span>
+    </div>
+    <div class="stage-chip-group">
+      <span class="stage-chip stage-chip--wide">
+        <span>STELLEREUM L1</span><span class="dim">•</span>
+        <span id="live-timecode">00:00:00:00</span>
+      </span>
+    </div>
+  </div>
+
+  <div class="stage-title">
+    <h1 class="stage-title-h1" id="hero-title">
+      <span class="stage-line">Stellereum</span>
+      <span class="stage-serif-pill">pure post-quantum</span>
+      <span class="stage-line">Layer One</span>
+    </h1>
+  </div>
+
+  <div class="stage-hud stage-hud--bottom">
+    <div class="stage-controls">
+      <div class="stage-modes" role="group" aria-label="Hero object mode">
+        <button class="stage-mode" type="button" id="hero-mode" data-hero-mode="refract" aria-pressed="true" aria-label="Show the lattice knot">01 // Refract</button>
+        <button class="stage-mode" type="button" id="hero-mode-ribbon" data-hero-mode="ribbon" aria-pressed="false" aria-label="Show the dithered ribbon">02 // Ribbon</button>
+        <a class="scene-pill" href="#type-engine">Protocol ↓</a>
+      </div>
+      <p class="stage-caption">Post-quantum L1 · chain 5757 · shard 0 live · {0,1} supported</p>
+    </div>
+    <div class="stage-telemetry">
+      <div class="stage-chip-group">
+        <span class="stage-chip">BAYER 4×4 MATRIX [16 LEVELS] · ELECTRIC LUT</span>
+      </div>
+      <div class="stage-drag" aria-hidden="true">
+        <span>DRAG 3D OBJECT</span>
+        <span class="drag-track"><span></span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================== -->
+<!-- STICKY SWISS HEADER                                                   -->
+<!-- ===================================================================== -->
+<header id="kinetics-hub" class="site-header">
+  <a class="header-brand" href="#optical-stage">
+    <span>Stellereum</span>
+    <span class="brand-tag">PQ–L1</span>
+  </a>
+  <nav class="header-nav" aria-label="Primary">
+    <a href="#type-engine">01. Network</a>
+    <a href="#deformation-lab">02. Protocol</a>
+    <a href="#selected-works">03. Primitives</a>
+    <a href="#shader-lab">04. Build</a>
+    <a href="https://docs.stellereum.org">Docs ↗</a>
+  </nav>
+  <div class="header-actions">
+    <a class="header-cta" href="https://testnet.stellereum.org">Enter testnet ↗</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- =================================================================== -->
+  <!-- TYPE ENGINE — live network, three metric cells, single source       -->
+  <!-- =================================================================== -->
+  <section id="type-engine" class="section section--dot" aria-labelledby="network-title">
+    <div class="shell">
+      <div class="display-block">
+        <h2 id="network-title">Live Network</h2>
+      </div>
+
+      <div class="hairline-grad" aria-hidden="true"></div>
+
+      <div class="statement-grid" data-reveal>
+        <div class="statement-card">
+          Every value below is read from <b>rpc.stellereum.org</b> and refreshed every
+          fifteen seconds. When the source stops answering, the value becomes a dash.
+          No number is cached or invented. Chain ID <b>5757</b>; this is a testnet.
+        </div>
+        <div class="statement-actions">
+          <a class="btn btn--electric" href="https://explorer.stellereum.org">Open explorer <span class="arrow" aria-hidden="true">↗</span></a>
+          <a class="btn btn--outline" href="#shader-lab">Start building <span class="arrow" aria-hidden="true">↓</span></a>
+        </div>
+      </div>
+    </div>
+
+    <div class="metric-band">
+      <article class="metric-cell" data-metric="height">
+        <div class="metric-cell-top"><span>01 // Height</span><span class="mini-tag">Live</span></div>
+        <strong class="metric-num is-empty" data-value>&#8212;</strong>
+        <div class="metric-ribbon canvas-stage" id="ribbon-wrap" aria-hidden="true">
+          <canvas id="ribbon-canvas" class="dither-canvas"></canvas>
+        </div>
+        <span class="metric-caption">Blocks finalised on this testnet</span>
+      </article>
+
+      <article class="metric-cell metric-cell--hatch" data-metric="blockTime">
+        <div class="metric-cell-top"><span>02 // Height growth pace</span><span class="mini-tag">Sampled</span></div>
+        <strong class="metric-num is-empty" data-value>&#8212;</strong>
+        <span class="metric-caption">Average seconds per height increase, sampled</span>
+      </article>
+
+      <a class="metric-cell metric-cell--accent" href="https://explorer.stellereum.org" data-metric="baseFee">
+        <div class="metric-cell-top"><span>03 // Base fee</span><span class="mini-tag">STELL</span></div>
+        <strong class="metric-num is-empty" data-value>&#8212;</strong>
+        <span class="metric-caption">Admission floor · GAS_BASIC_TRANSFER = 280,000 ↗</span>
+      </a>
+    </div>
+
+    <div class="shell">
+      <dl class="metric-strip">
+        <div><dt>Chain ID</dt><dd data-metric="chainId"><span data-value>5757</span></dd></div>
+        <div><dt>Validators</dt><dd data-metric="validators"><span data-value>—</span></dd></div>
+        <div>
+          <dt>State root</dt>
+          <dd>
+            <span id="state-root-value" data-metric="stateRoot" data-value>&#8212;</span>
+            <button class="copy-btn" type="button" data-copy-from="#state-root-value" aria-label="Copy full state root">Copy</button>
+          </dd>
+        </div>
+        <div class="metric-status" data-status role="status" aria-live="polite">
+          <span class="status-line">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="status-host" data-status-text>Connecting · rpc.stellereum.org</span>
+          </span>
+        </div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- =================================================================== -->
+  <!-- DEFORMATION LAB — scroll-driven protocol rows + interference strip  -->
+  <!-- =================================================================== -->
+  <section id="deformation-lab" class="section" aria-labelledby="deform-title">
+    <div class="shell">
+      <div class="lab-head">
+        <span class="accent-label" id="deform-title">02 // Scroll-driven protocol type</span>
+        <span class="warp-readout">Axis warp <b data-warp-readout>0%</b></span>
+      </div>
+
+      <div class="kinetic-lines">
+        <p class="kinetic-row" data-kinetic data-dir="1">
+          <span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> · </span><span class="k-fill">Stellereum</span><span class="k-dot"> · </span>Post-Quantum<span class="k-dot"> · </span><span class="k-stroke">Chain 5757</span><span class="k-dot"> ·</span>
+        </p>
+        <p class="kinetic-row" data-kinetic data-dir="-1">
+          <span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Shard 0 live<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> · </span><span class="k-stroke">Falcon-512</span><span class="k-dot"> · </span>Shard 0 live<span class="k-dot"> · </span><span class="k-fill">Bayer 4×4</span><span class="k-dot"> ·</span>
+        </p>
+        <p class="kinetic-row kinetic-row--fill" data-kinetic data-dir="1">
+          Light through math · 2PC finality · chain 5757 · Light through math · 2PC finality · chain 5757 ·
+        </p>
+      </div>
+
+      <div class="interference-panel">
+        <div class="interference-meta">
+          <span>03 / Lattice interference</span>
+          <span>Live field · Bayer 4×4</span>
+        </div>
+        <div class="canvas-stage interference-stage" id="interference-wrap" aria-hidden="true">
+          <canvas id="interference-canvas" class="dither-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =================================================================== -->
+  <!-- PROTOCOL CARDS — four real primitives, live Bayer media             -->
+  <!-- =================================================================== -->
+  <section id="selected-works" class="section section--dot" aria-labelledby="works-title">
+    <div class="shell">
+      <div class="works-head" data-reveal>
+        <div class="works-title-card">
+          <div class="eyebrow">03 // Protocol archive</div>
+          <h2 id="works-title">Core primitives</h2>
+        </div>
+        <p class="works-intro">
+          Four parts exist in the repository. Where a part has a limit, the limit is
+          written in the card. Nothing is marked live without a source.
+        </p>
+      </div>
+
+      <div class="works-grid">
+        <article class="work-card" data-reveal>
+          <div class="work-media canvas-stage" data-card-canvas="0">
+            <canvas class="dither-canvas" id="card-canvas-0"></canvas>
+            <div class="work-overlay">
+              <div class="work-top"><span class="work-chip">01 / Signature</span><span class="work-chip work-chip--accent">Falcon-512</span></div>
+              <div class="work-name"><h3>Post-quantum votes</h3><p>Falcon-512 at intake</p></div>
+            </div>
+          </div>
+          <div class="work-foot"><span>Ed25519 refused · no classical lane</span><a href="https://docs.stellereum.org/core-concepts/post-quantum">Read docs →</a></div>
+        </article>
+
+        <article class="work-card" data-reveal>
+          <div class="work-media canvas-stage" data-card-canvas="1">
+            <canvas class="dither-canvas" id="card-canvas-1"></canvas>
+            <div class="work-overlay">
+              <div class="work-top"><span class="work-chip">02 / Consensus</span><span class="work-chip work-chip--accent">1-block</span></div>
+              <div class="work-name"><h3>BFT finality</h3><p>One finalized block is final</p></div>
+            </div>
+          </div>
+          <div class="work-foot"><span>Quorum floor(2·power/3)+1</span><a href="https://docs.stellereum.org/core-concepts/consensus-finality">Read docs →</a></div>
+        </article>
+
+        <article class="work-card" data-reveal>
+          <div class="work-media canvas-stage" data-card-canvas="2">
+            <canvas class="dither-canvas" id="card-canvas-2"></canvas>
+            <div class="work-overlay">
+              <div class="work-top"><span class="work-chip">03 / Shards</span><span class="work-chip work-chip--accent">{0,1}</span></div>
+              <div class="work-name"><h3>Shard 0 live</h3><p>Fixed pair {0,1} · shard 1 parked</p></div>
+            </div>
+          </div>
+          <div class="work-foot"><span>2PC from genesis · no live split</span><a href="https://docs.stellereum.org/core-concepts/sharding">Read docs →</a></div>
+        </article>
+
+        <article class="work-card" data-reveal>
+          <div class="work-media canvas-stage" data-card-canvas="3">
+            <canvas class="dither-canvas" id="card-canvas-3"></canvas>
+            <div class="work-overlay">
+              <div class="work-top"><span class="work-chip">04 / Contracts</span><span class="work-chip work-chip--accent">14 host fns</span></div>
+              <div class="work-name"><h3>WASM runtime</h3><p>wasmi · fuel before effect</p></div>
+            </div>
+          </div>
+          <div class="work-foot"><span>wasmi · upgrade means redeploy</span><a href="https://docs.stellereum.org/contracts/overview">Read docs →</a></div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- =================================================================== -->
+  <!-- BUILD / LIMITS — split block, real commands and real constraints    -->
+  <!-- =================================================================== -->
+  <section id="shader-lab" class="section" aria-labelledby="build-title">
+    <div class="shell">
+      <div class="lab-grid">
+        <div class="lab-left" data-reveal>
+          <span class="accent-label">04 // Build · testnet</span>
+          <h2 id="build-title">Zero to a transaction <em>in three steps</em></h2>
+          <p>
+            The commands below are in the repository. Testnet STELL has no value.
+            Use keys you can lose. One finalized block is final.
+          </p>
+
+          <ol class="step-list">
+            <li>
+              <span class="step-num">01</span>
+              <div>
+                <h3>Connect a network</h3>
+                <p>Point a wallet or the Rust SDK at rpc.stellereum.org with chain ID 5757 and the symbol STELL.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-num">02</span>
+              <div>
+                <h3>Request test STELL</h3>
+                <p>The public faucet sends 2 STELL per address every 45 minutes, with 20 requests per hour per IP and a 50 STELL lifetime cap.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-num">03</span>
+              <div>
+                <h3>Send a transaction</h3>
+                <p>Build with the SDK, sign with a Falcon-512 key, and submit over stell_sendRawTransaction.</p>
+              </div>
+            </li>
+          </ol>
+
+          <div class="code-snippet">
+            <span class="code-label">RPC / chain ID</span>
+<pre>curl -s -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"stell_chainId","params":[]}' \
+  https://rpc.stellereum.org</pre>
+          </div>
+
+          <div class="lab-actions">
+            <a class="btn btn--electric" href="https://faucet-testnet.stellereum.org">Open faucet <span class="arrow" aria-hidden="true">↗</span></a>
+            <a class="btn btn--outline" href="https://docs.stellereum.org/get-started/quickstart">Read the docs <span class="arrow" aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+
+        <aside class="lab-cta" data-reveal data-delay="1">
+          <div class="cta-card">
+            <span class="cta-kicker">Testnet only // no external audit</span>
+            <h3>Hard limits, written down.</h3>
+            <ul class="limit-list">
+              <li><b>0</b><span>external audits</span></li>
+              <li><b>0</b><span>L2 execution</span></li>
+              <li><b>No</b><span>shielded transfers</span></li>
+              <li><b>No</b><span>EVM contracts</span></li>
+              <li><b>zkML</b><span>is re-execution</span></li>
+            </ul>
+            <a class="btn" href="https://testnet.stellereum.org">Open testnet <span class="arrow" aria-hidden="true">↗</span></a>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ===================================================================== -->
+<!-- FOOTER — reference bottom row + real colophon                         -->
+<!-- ===================================================================== -->
+<footer class="site-footer" id="footer">
+  <div class="shell">
+    <div class="footer-bottom">
+      <div>© 2026 Stellereum // Post-quantum Layer 1</div>
+      <nav class="footer-nav" aria-label="Page">
+        <a href="#optical-stage">Optical</a>
+        <a href="#type-engine">Network</a>
+        <a href="#selected-works">Protocol</a>
+        <a href="https://docs.stellereum.org">Docs ↗</a>
+      </nav>
+    </div>
+
+    <div class="footer-links">
+      <a href="https://testnet.stellereum.org">Testnet ↗</a>
+      <a href="https://explorer.stellereum.org">Explorer ↗</a>
+      <a href="https://faucet-testnet.stellereum.org">Faucet ↗</a>
+      <a href="https://rpc.stellereum.org">RPC gateway ↗</a>
+      <a href="https://docs.stellereum.org">Documentation ↗</a>
+      <a href="https://github.com/stellereum/stellereum">GitHub ↗</a>
+      <a href="https://x.com/stellereum">X ↗</a>
+      <a href="https://t.me/stellereum">Telegram ↗</a>
+    </div>
+
+    <dl class="footer-colophon">
+      <div><dt>Protocol</dt><dd>1.0</dd></div>
+      <div><dt>Consensus ruleset</dt><dd>v7</dd></div>
+      <div><dt>Fork ID</dt><dd>0x3ae00ebc</dd></div>
+      <div><dt>Chain ID</dt><dd>5757</dd></div>
+      <div><dt>Site build</dt><dd>static-v19 · 2026.11.22</dd></div>
+    </dl>
+  </div>
+</footer>
+
+</body>
+</html>
